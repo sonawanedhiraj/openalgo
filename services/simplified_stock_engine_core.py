@@ -13,6 +13,22 @@ DIRECTION_BUY = "BUY"
 DIRECTION_SELL = "SELL"
 
 
+# Order routing modes for the simplified stock engine.
+# - MODE_DISABLED:  No orders are sent anywhere. Entries/exits are confirmed
+#                   locally so the engine state advances (useful for paper
+#                   tracing without writing to sandbox.db or the live broker).
+# - MODE_SANDBOX:   Orders are routed to services/sandbox_service.py directly,
+#                   bypassing the global analyze_mode flag. Positions, trades,
+#                   and funds are tracked in sandbox.db.
+# - MODE_LIVE:      Orders go through services/place_order_service.place_order
+#                   which honors the global analyze_mode flag (so if a user
+#                   has flipped that to True, orders still route to sandbox).
+MODE_DISABLED = "disabled"
+MODE_SANDBOX = "sandbox"
+MODE_LIVE = "live"
+VALID_MODES = (MODE_DISABLED, MODE_SANDBOX, MODE_LIVE)
+
+
 @dataclass(frozen=True)
 class SimplifiedEngineConfig:
     account_capital: float = 20000.0
@@ -40,6 +56,14 @@ class SimplifiedEngineConfig:
     lock_profit_pct: float = 0.95
     enable_global_profit_lock: bool = True
     sl_confirm_seconds: float = 3.0
+    # Routing mode for orders the engine emits. See MODE_* constants above.
+    mode: str = MODE_SANDBOX
+
+    def __post_init__(self) -> None:
+        if self.mode not in VALID_MODES:
+            raise ValueError(
+                f"SimplifiedEngineConfig.mode={self.mode!r} is not one of {VALID_MODES}"
+            )
 
 
 @dataclass

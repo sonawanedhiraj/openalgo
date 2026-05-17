@@ -10,6 +10,10 @@ from dateutil import parser as date_parser
 from services.simplified_stock_engine_core import (
     DIRECTION_BUY,
     DIRECTION_SELL,
+    MODE_DISABLED,
+    MODE_LIVE,
+    MODE_SANDBOX,
+    VALID_MODES,
     Candle,
     EntrySignal,
     ExitSignal,
@@ -54,6 +58,37 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _resolve_mode_from_env() -> str:
+    """Resolve the engine routing mode from environment.
+
+    Preference order:
+    1. SIMPLIFIED_ENGINE_MODE explicitly set to disabled|sandbox|live.
+    2. Backward-compat: SIMPLIFIED_ENGINE_DRY_RUN. true -> sandbox, false -> live.
+       (A deprecation warning is logged when this fallback is used.)
+    3. Default: sandbox (safe -- never sends live orders without explicit opt-in).
+    """
+    raw_mode = os.getenv("SIMPLIFIED_ENGINE_MODE")
+    if raw_mode is not None:
+        normalized = raw_mode.strip().lower()
+        if normalized in VALID_MODES:
+            return normalized
+        logger.warning(
+            "Invalid SIMPLIFIED_ENGINE_MODE=%r; expected one of %s. Falling back to sandbox.",
+            raw_mode,
+            VALID_MODES,
+        )
+        return MODE_SANDBOX
+
+    raw_dry_run = os.getenv("SIMPLIFIED_ENGINE_DRY_RUN")
+    if raw_dry_run is not None:
+        logger.warning(
+            "SIMPLIFIED_ENGINE_DRY_RUN is deprecated; use SIMPLIFIED_ENGINE_MODE=sandbox or live instead."
+        )
+        return MODE_SANDBOX if raw_dry_run.strip().lower() in {"1", "true", "yes", "on"} else MODE_LIVE
+
+    return MODE_SANDBOX
+
+
 def config_from_env() -> SimplifiedEngineConfig:
     return SimplifiedEngineConfig(
         account_capital=_env_float("SIMPLIFIED_ENGINE_CAPITAL", 20000.0),
@@ -74,6 +109,7 @@ def config_from_env() -> SimplifiedEngineConfig:
         trail_atr_mult=_env_float("SIMPLIFIED_ENGINE_TRAIL_ATR_MULT", 0.5),
         sl_confirm_seconds=_env_float("SIMPLIFIED_ENGINE_SL_CONFIRM_SECONDS", 3.0),
         enable_global_profit_lock=_env_bool("SIMPLIFIED_ENGINE_GLOBAL_PROFIT_LOCK", True),
+        mode=_resolve_mode_from_env(),
     )
 
 
@@ -142,7 +178,8 @@ class SimplifiedStockEngineService:
             self._handle_candle,
             candle_seconds=self.config.candle_seconds,
         )
-        self.dry_run = _env_bool("SIMPLIFIED_ENGINE_DRY_RUN", True)
+        # Order routing mode: disabled | sandbox | live. See MODE_* in core.
+        self.mode = self.config.mode
         self.history_source = os.getenv("SIMPLIFIED_ENGINE_HISTORY_SOURCE", "api")
         self.history_lookback_days = _env_int("SIMPLIFIED_ENGINE_HISTORY_LOOKBACK_DAYS", 3)
         self.order_poll_attempts = _env_int("SIMPLIFIED_ENGINE_ORDER_POLL_ATTEMPTS", 5)
@@ -233,9 +270,9 @@ class SimplifiedStockEngineService:
             "status": status,
             "direction": direction,
             "mode": self._mode_label(),
+            "engine_mode": self.mode,
             "processed": processed,
             "rejected": rejected,
-            "dry_run": self.dry_run,
         }
 
     @staticmethod
@@ -287,7 +324,7 @@ class SimplifiedStockEngineService:
             ]
             return {
                 "mode": self._mode_label(),
-                "dry_run": self.dry_run,
+                "engine_mode": self.mode,
                 "direction_enabled": dict(self._direction_enabled),
                 "positions": {
                     symbol: {
@@ -379,9 +416,10 @@ class SimplifiedStockEngineService:
     def _place_entry_order(
         self, signal: EntrySignal, api_key: str, strategy_name: str
     ) -> None:
-        if self.dry_run:
+        if self.mode == MODE_DISABLED:
             logger.info(
-                "[SIMPLIFIED-DRY-RUN] BUY %s qty=%s ref=%.2f",
+                "[SIMPLIFIED-DISABLED] %s %s qty=%s ref=%.2f (no order sent)",
+                signal.action,
                 signal.symbol,
                 signal.quantity,
                 signal.reference_price,
@@ -391,9 +429,7 @@ class SimplifiedStockEngineService:
             return
 
         payload = self._order_payload(signal, strategy_name)
-        from services.place_order_service import place_order
-
-        success, response, _ = place_order(payload, api_key=api_key)
+        success, response = self._dispatch_order(payload, api_key, is_entry=True)
         if not success:
             logger.error("[SIMPLIFIED-ENTRY] Order failed for %s: %s", signal.symbol, response)
             with self._lock:
@@ -403,19 +439,27 @@ class SimplifiedStockEngineService:
         order_id = response.get("orderid")
         executed_price = self._wait_for_fill(api_key, strategy_name, order_id)
         if executed_price is None:
-            logger.warning("[SIMPLIFIED-ENTRY] Fill not confirmed for %s", signal.symbol)
+            logger.warning(
+                "[SIMPLIFIED-ENTRY] Fill not confirmed for %s (mode=%s, orderid=%s)",
+                signal.symbol,
+                self.mode,
+                order_id,
+            )
             with self._lock:
                 self.engine.clear_pending_entry(signal.symbol)
             return
 
         with self._lock:
             position = self.engine.confirm_entry(signal.symbol, executed_price)
-        logger.info("[SIMPLIFIED-ENTRY] Position created: %s", position)
+        logger.info(
+            "[SIMPLIFIED-ENTRY] Position created (mode=%s): %s", self.mode, position
+        )
 
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
-        if self.dry_run:
+        if self.mode == MODE_DISABLED:
             logger.info(
-                "[SIMPLIFIED-DRY-RUN] SELL %s qty=%s reason=%s ref=%.2f",
+                "[SIMPLIFIED-DISABLED] %s %s qty=%s reason=%s ref=%.2f (no order sent)",
+                signal.action,
                 signal.symbol,
                 signal.quantity,
                 signal.reason,
@@ -426,9 +470,7 @@ class SimplifiedStockEngineService:
             return
 
         payload = self._order_payload(signal, strategy_name)
-        from services.place_order_service import place_order
-
-        success, response, _ = place_order(payload, api_key=api_key)
+        success, response = self._dispatch_order(payload, api_key, is_entry=False)
         if not success:
             logger.error("[SIMPLIFIED-EXIT] Order failed for %s: %s", signal.symbol, response)
             with self._lock:
@@ -438,7 +480,12 @@ class SimplifiedStockEngineService:
         order_id = response.get("orderid")
         executed_price = self._wait_for_fill(api_key, strategy_name, order_id)
         if executed_price is None:
-            logger.warning("[SIMPLIFIED-EXIT] Fill not confirmed for %s", signal.symbol)
+            logger.warning(
+                "[SIMPLIFIED-EXIT] Fill not confirmed for %s (mode=%s, orderid=%s)",
+                signal.symbol,
+                self.mode,
+                order_id,
+            )
             with self._lock:
                 self.engine.clear_pending_exit(signal.symbol)
             return
@@ -446,11 +493,55 @@ class SimplifiedStockEngineService:
         with self._lock:
             self.engine.confirm_exit(signal.symbol)
         logger.info(
-            "[SIMPLIFIED-EXIT] Closed %s reason=%s price=%.2f",
+            "[SIMPLIFIED-EXIT] Closed %s reason=%s price=%.2f (mode=%s)",
             signal.symbol,
             signal.reason,
             executed_price,
+            self.mode,
         )
+
+    def _dispatch_order(
+        self, payload: dict[str, Any], api_key: str, *, is_entry: bool
+    ) -> tuple[bool, dict[str, Any]]:
+        """Route an order payload according to the engine's mode.
+
+        - sandbox: call sandbox_service.sandbox_place_order directly so the engine
+          can run against virtual Rs1Cr capital regardless of the global
+          analyze_mode setting.
+        - live: call services.place_order_service.place_order, which still honors
+          the global analyze_mode flag (so an operator can flip the whole
+          installation into analyzer mode and the engine follows).
+
+        Returns (success, response_dict). Both modes produce a response with an
+        "orderid" on success; the caller uses _wait_for_fill to confirm.
+        """
+        kind = "ENTRY" if is_entry else "EXIT"
+
+        if self.mode == MODE_SANDBOX:
+            from services.sandbox_service import sandbox_place_order
+
+            success, response, status_code = sandbox_place_order(
+                payload, api_key=api_key, original_data=payload
+            )
+            if not success:
+                logger.warning(
+                    "[SIMPLIFIED-%s] Sandbox rejected order status=%s response=%s",
+                    kind,
+                    status_code,
+                    response,
+                )
+            return success, response
+
+        if self.mode == MODE_LIVE:
+            from services.place_order_service import place_order
+
+            success, response, _ = place_order(payload, api_key=api_key)
+            return success, response
+
+        # Should be unreachable -- disabled is short-circuited by callers, and
+        # config validation rejects unknown modes. Treat defensively.
+        logger.error("[SIMPLIFIED-%s] Unexpected mode=%r; refusing to send order", kind, self.mode)
+        return False, {"status": "error", "message": f"unsupported mode {self.mode}"}
 
     def _wait_for_fill(
         self, api_key: str, strategy_name: str, order_id: str | None
@@ -651,11 +742,21 @@ class SimplifiedStockEngineService:
         return dt.datetime.now()
 
     def _mode_label(self) -> str:
-        if self.dry_run:
-            return "dry_run"
+        """Human-readable mode for status payloads and logs.
+
+        Returns one of: "disabled", "sandbox", or for live mode either "analyze"
+        (when the global analyze_mode flag is on, since place_order would route
+        to sandbox anyway) or "live".
+        """
+        if self.mode == MODE_DISABLED:
+            return MODE_DISABLED
+        if self.mode == MODE_SANDBOX:
+            return MODE_SANDBOX
+        # mode == MODE_LIVE: still surface whether the global toggle would
+        # override us into sandbox.
         from database.settings_db import get_analyze_mode
 
-        return "analyze" if get_analyze_mode() else "live"
+        return "analyze" if get_analyze_mode() else MODE_LIVE
 
 
 _service: SimplifiedStockEngineService | None = None
