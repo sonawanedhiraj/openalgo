@@ -191,6 +191,9 @@ class SimplifiedStockEngineService:
         self._user_callbacks_registered: set[str] = set()
         self._subscribed_symbols: set[tuple[str, str, str]] = set()
         self._sl_timers: dict[str, threading.Timer] = {}
+        # Tracks the date on which the live-mode broker-position-aware EOD
+        # flatten has already run. Reset implicitly when the date rolls.
+        self._eod_flatten_done_date: dt.date | None = None
         # Per-direction kill switches. When False, webhook arms for that direction
         # are rejected. Existing positions are NOT closed by toggling these.
         self._direction_enabled: dict[str, bool] = {
@@ -314,6 +317,8 @@ class SimplifiedStockEngineService:
         for signal in exit_signals:
             self._schedule_exit(signal)
 
+        self._maybe_flatten_eod()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             buy_symbols = [
@@ -325,6 +330,9 @@ class SimplifiedStockEngineService:
             return {
                 "mode": self._mode_label(),
                 "engine_mode": self.mode,
+                "eod_flatten_done": self._eod_flatten_done_date.isoformat()
+                if self._eod_flatten_done_date
+                else None,
                 "direction_enabled": dict(self._direction_enabled),
                 "positions": {
                     symbol: {
@@ -542,6 +550,160 @@ class SimplifiedStockEngineService:
         # config validation rejects unknown modes. Treat defensively.
         logger.error("[SIMPLIFIED-%s] Unexpected mode=%r; refusing to send order", kind, self.mode)
         return False, {"status": "error", "message": f"unsupported mode {self.mode}"}
+
+    def _maybe_flatten_eod(self) -> None:
+        """Trigger broker-position-aware EOD flatten exactly once per day.
+
+        Runs only in live mode and only after the engine's internal
+        eod_exit_time has been reached. Sandbox mode is authoritative (its
+        positions can't drift from the engine's view because both are written
+        by the same process), and disabled mode never sends orders.
+        """
+        if self.mode != MODE_LIVE:
+            return
+
+        now = dt.datetime.now()
+        if now.time() < self.config.eod_exit_time:
+            return
+
+        with self._lock:
+            if self._eod_flatten_done_date == now.date():
+                return
+            self._eod_flatten_done_date = now.date()
+            # Snapshot the api_keys + known engine positions under the lock so
+            # we can release it before doing the (slow) positionbook fetch.
+            api_keys = set(self._api_key_by_symbol.values()) | set(self._user_api_keys.values())
+            known_qty_by_symbol = {
+                symbol: pos.qty for symbol, pos in self.engine.positions.items()
+            }
+            strategy_label = next(iter(self._strategy_by_symbol.values()), "simplified_stock_engine")
+
+        if not api_keys:
+            logger.info("[SIMPLIFIED-EOD] No api_keys registered; skipping broker flatten")
+            return
+
+        logger.info(
+            "[SIMPLIFIED-EOD] Running broker-position flatten across %d api_key(s)",
+            len(api_keys),
+        )
+        for api_key in api_keys:
+            try:
+                self._flatten_for_api_key(api_key, known_qty_by_symbol, strategy_label)
+            except Exception:
+                logger.exception(
+                    "[SIMPLIFIED-EOD] Flatten failed for api_key=%s... (truncated)",
+                    api_key[:6] if api_key else "?",
+                )
+
+    def _flatten_for_api_key(
+        self,
+        api_key: str,
+        known_qty_by_symbol: dict[str, int],
+        strategy_name: str,
+    ) -> None:
+        """Fetch the broker positionbook for one api_key and flatten drift.
+
+        "Drift" here means: the broker reports an open position on the engine's
+        configured exchange/product that the engine has no record of. The
+        engine's own check_eod_exits already emits exits for positions it
+        knows about, so this pass only catches the orphans.
+        """
+        from services.positionbook_service import get_positionbook
+
+        success, response, status_code = get_positionbook(api_key=api_key)
+        if not success:
+            logger.warning(
+                "[SIMPLIFIED-EOD] positionbook fetch failed status=%s response=%s",
+                status_code,
+                response,
+            )
+            return
+
+        broker_positions = response.get("data") or []
+        engine_exchange = self.config.exchange.upper()
+        engine_product = self.config.product.upper()
+        broker_open_symbols: set[str] = set()
+
+        for pos in broker_positions:
+            try:
+                raw_qty = pos.get("quantity") or pos.get("netqty") or pos.get("net_qty") or 0
+                qty = int(float(raw_qty))
+            except (TypeError, ValueError):
+                logger.warning("[SIMPLIFIED-EOD] Skipping malformed position: %r", pos)
+                continue
+
+            if qty == 0:
+                continue
+
+            symbol_raw = str(pos.get("symbol", "")).strip()
+            symbol = normalize_chartink_symbol(symbol_raw)
+            exchange = str(pos.get("exchange", "")).strip().upper()
+            product = str(pos.get("product", "")).strip().upper()
+
+            # Only flatten positions on the exchange/product the engine itself
+            # would touch. Leave the rest of the user's broker positions alone.
+            if exchange and exchange != engine_exchange:
+                continue
+            if product and product != engine_product:
+                continue
+            if not symbol:
+                continue
+
+            broker_open_symbols.add(symbol)
+            engine_qty = known_qty_by_symbol.get(symbol)
+
+            if engine_qty is not None and engine_qty != 0:
+                # The engine knows about this position; its own EOD path will
+                # close it. Skip to avoid double-issuing an exit. Log a hint if
+                # quantities disagree (likely a partial-fill drift we are not
+                # reconciling in v1).
+                if abs(engine_qty) != abs(qty):
+                    logger.warning(
+                        "[SIMPLIFIED-EOD] Qty mismatch on %s: engine=%s broker=%s "
+                        "(engine's exit will close the engine's view only)",
+                        symbol,
+                        engine_qty,
+                        qty,
+                    )
+                continue
+
+            # Drift case: broker has it, engine doesn't know.
+            flatten_action = "SELL" if qty > 0 else "BUY"
+            flatten_qty = abs(qty)
+            logger.warning(
+                "[SIMPLIFIED-EOD] Drift: broker has %s qty=%s but engine doesn't; "
+                "issuing %s %s",
+                symbol,
+                qty,
+                flatten_action,
+                flatten_qty,
+            )
+            payload = {
+                "strategy": strategy_name,
+                "symbol": symbol,
+                "exchange": engine_exchange,
+                "action": flatten_action,
+                "quantity": flatten_qty,
+                "pricetype": self.config.order_pricetype,
+                "product": engine_product,
+                "price": 0,
+                "trigger_price": 0,
+                "disclosed_quantity": 0,
+            }
+            self._dispatch_order(payload, api_key, is_entry=False)
+
+        # Surface engine-only orphans for visibility (positions the engine
+        # thinks are open but the broker doesn't show). We don't issue any
+        # orders here -- there's nothing to flatten -- just warn so operators
+        # can investigate.
+        for symbol, engine_qty in known_qty_by_symbol.items():
+            if engine_qty != 0 and symbol not in broker_open_symbols:
+                logger.warning(
+                    "[SIMPLIFIED-EOD] Engine thinks %s qty=%s is open but broker "
+                    "reports nothing; clearing internal state",
+                    symbol,
+                    engine_qty,
+                )
 
     def _wait_for_fill(
         self, api_key: str, strategy_name: str, order_id: str | None

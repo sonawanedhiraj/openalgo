@@ -284,3 +284,336 @@ def test_mode_label_reflects_engine_mode():
     assert _make_service(MODE_SANDBOX)._mode_label() == "sandbox"
     # Live mode's label depends on the global analyze_mode flag; we do not
     # exercise that here to avoid touching the live settings DB.
+
+
+
+# ---------------------------------------------------------------------------
+# EOD broker-position flatten tests (step 2)
+# ---------------------------------------------------------------------------
+
+
+import datetime as _eod_dt  # noqa: E402  (deliberate alias to avoid clobbering `dt`)
+from unittest.mock import MagicMock  # noqa: E402
+
+
+def _seed_service_for_eod(service, *, api_key: str = "live-key") -> None:
+    """Pre-populate the per-symbol api_key map and a strategy label so the
+    flatten knows which positionbook to query and what strategy name to use."""
+    service._api_key_by_symbol["UNRELATED"] = api_key  # any registration is enough
+    service._strategy_by_symbol["UNRELATED"] = "trend-up"
+
+
+def _force_eod_clock(monkeypatch=None):
+    """Monkey-patch the service module's `dt.datetime.now` to return a time
+    past the engine's default eod_exit_time (15:20)."""
+    import services.simplified_stock_engine_service as svc_mod
+
+    class _FixedDateTime(_eod_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: D401, ARG003
+            return _eod_dt.datetime(2026, 5, 17, 15, 25)
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(svc_mod.dt, "datetime", _FixedDateTime)
+    else:
+        svc_mod.dt.datetime = _FixedDateTime
+    return _FixedDateTime
+
+
+def test_eod_flatten_skipped_in_sandbox_mode(monkeypatch):
+    """Sandbox mode never queries the broker positionbook at EOD."""
+    service = _make_service(MODE_SANDBOX)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    with (
+        patch("services.positionbook_service.get_positionbook") as mock_book,
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_book.assert_not_called()
+    mock_dispatch.assert_not_called()
+    # Idempotency flag is NOT set in sandbox -- the flatten was a no-op.
+    assert service._eod_flatten_done_date is None
+
+
+def test_eod_flatten_skipped_in_disabled_mode(monkeypatch):
+    service = _make_service(MODE_DISABLED)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    with patch("services.positionbook_service.get_positionbook") as mock_book:
+        service._maybe_flatten_eod()
+
+    mock_book.assert_not_called()
+
+
+def test_eod_flatten_skipped_before_eod_time(monkeypatch):
+    """Live mode flatten waits until past eod_exit_time."""
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service)
+
+    import services.simplified_stock_engine_service as svc_mod
+
+    class _PreEodDateTime(_eod_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return _eod_dt.datetime(2026, 5, 17, 14, 0)  # 14:00 - before EOD
+
+    monkeypatch.setattr(svc_mod.dt, "datetime", _PreEodDateTime)
+
+    with patch("services.positionbook_service.get_positionbook") as mock_book:
+        service._maybe_flatten_eod()
+
+    mock_book.assert_not_called()
+
+
+def test_eod_flatten_dispatches_for_broker_drift_position(monkeypatch):
+    """Live mode + broker has a position engine doesn't = flatten order dispatched."""
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service, api_key="live-key")
+    _force_eod_clock(monkeypatch)
+
+    # Broker reports a long position the engine has no record of.
+    positionbook_response = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "ORPHAN",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 50,
+                    "average_price": "100.00",
+                    "ltp": 99.0,
+                }
+            ],
+        },
+        200,
+    )
+
+    dispatched: list[tuple[dict, str, bool]] = []
+
+    def _capture_dispatch(self, payload, api_key, *, is_entry):
+        dispatched.append((payload, api_key, is_entry))
+        return True, {"orderid": "live-flatten-1"}
+
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=positionbook_response,
+        ),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order", _capture_dispatch),
+    ):
+        service._maybe_flatten_eod()
+
+    assert len(dispatched) == 1
+    payload, api_key, is_entry = dispatched[0]
+    assert payload["symbol"] == "ORPHAN"
+    assert payload["action"] == "SELL"  # long position -> SELL to flatten
+    assert payload["quantity"] == 50
+    assert payload["exchange"] == "NSE"
+    assert payload["product"] == "MIS"
+    assert api_key == "live-key"
+    assert is_entry is False
+    # Flag set so a second call within the day is a no-op.
+    assert service._eod_flatten_done_date == _eod_dt.date(2026, 5, 17)
+
+
+def test_eod_flatten_skips_positions_the_engine_already_tracks(monkeypatch):
+    """If the broker shows a position the engine already knows, skip it.
+    The engine's own check_eod_exits is responsible for closing it."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service, api_key="live-key")
+    _force_eod_clock(monkeypatch)
+
+    # Engine already tracks RELIANCE long 10.
+    service.engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+
+    positionbook_response = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 10,
+                    "average_price": "2500.00",
+                    "ltp": 2495.0,
+                }
+            ],
+        },
+        200,
+    )
+
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=positionbook_response,
+        ),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_dispatch.assert_not_called()
+
+
+def test_eod_flatten_is_idempotent_for_the_day(monkeypatch):
+    """Second call within the same date must not re-fetch or re-dispatch."""
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    empty_book = (True, {"status": "success", "data": []}, 200)
+    with patch(
+        "services.positionbook_service.get_positionbook", return_value=empty_book
+    ) as mock_book:
+        service._maybe_flatten_eod()
+        service._maybe_flatten_eod()  # 2nd call same day
+
+    assert mock_book.call_count == 1
+
+
+def test_eod_flatten_warns_when_engine_has_orphan_position(monkeypatch, caplog=None):
+    """Engine thinks it has a position the broker doesn't report -> warn,
+    do not issue any order."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["GHOST"] = Position(
+        symbol="GHOST",
+        entry_price=500.0,
+        qty=5,
+        stop_loss=495.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 11, 0),
+        risk_per_share=5.0,
+    )
+
+    empty_book = (True, {"status": "success", "data": []}, 200)
+    with (
+        patch("services.positionbook_service.get_positionbook", return_value=empty_book),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_dispatch.assert_not_called()
+
+
+def test_eod_flatten_short_position_dispatches_buy(monkeypatch):
+    """Broker shows a short position the engine doesn't know -> dispatch BUY to flatten."""
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service, api_key="live-key")
+    _force_eod_clock(monkeypatch)
+
+    positionbook_response = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "SHORTY",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": -20,
+                    "average_price": "100.00",
+                    "ltp": 101.0,
+                }
+            ],
+        },
+        200,
+    )
+
+    dispatched: list[dict] = []
+
+    def _capture(self, payload, api_key, *, is_entry):
+        dispatched.append(payload)
+        return True, {"orderid": "x"}
+
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=positionbook_response,
+        ),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order", _capture),
+    ):
+        service._maybe_flatten_eod()
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["action"] == "BUY"
+    assert dispatched[0]["quantity"] == 20
+
+
+def test_eod_flatten_ignores_other_exchange_positions(monkeypatch):
+    """Broker positions on a different exchange/product are left alone."""
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service, api_key="live-key")
+    _force_eod_clock(monkeypatch)
+
+    positionbook_response = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "USDINR",
+                    "exchange": "CDS",  # currency, not the engine's NSE
+                    "product": "NRML",
+                    "quantity": 100,
+                },
+                {
+                    "symbol": "CRUDEOIL",
+                    "exchange": "MCX",  # commodity
+                    "product": "NRML",
+                    "quantity": 50,
+                },
+            ],
+        },
+        200,
+    )
+
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=positionbook_response,
+        ),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_dispatch.assert_not_called()
+
+
+def test_eod_flatten_handles_positionbook_fetch_failure(monkeypatch):
+    """If positionbook fetch fails, log and move on without crashing."""
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    failure_response = (False, {"status": "error", "message": "broker down"}, 500)
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=failure_response,
+        ),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        # Must not raise.
+        service._maybe_flatten_eod()
+
+    mock_dispatch.assert_not_called()
