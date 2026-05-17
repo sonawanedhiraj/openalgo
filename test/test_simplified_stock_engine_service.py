@@ -617,3 +617,282 @@ def test_eod_flatten_handles_positionbook_fetch_failure(monkeypatch):
         service._maybe_flatten_eod()
 
     mock_dispatch.assert_not_called()
+
+
+
+# ---------------------------------------------------------------------------
+# Funds-gate tests (step 3)
+# ---------------------------------------------------------------------------
+
+
+def _funds_response(amount: float):
+    """Build a successful funds_service.get_funds response tuple."""
+    return True, {"status": "success", "data": {"availablecash": f"{amount:.2f}"}}, 200
+
+
+def test_funds_gate_allows_entry_when_funds_sufficient():
+    """Live mode + broker reports availablecash >= floor -> entry dispatches."""
+    service = _make_service(MODE_LIVE)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=_funds_response(50_000.0),
+        ) as mock_funds,
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-1"}, 200),
+        ) as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(signal, api_key="live-key", strategy_name="trend-up")
+
+    mock_funds.assert_called_once()
+    mock_live.assert_called_once()
+    assert signal.symbol in service.engine.positions
+
+
+def test_funds_gate_blocks_entry_when_funds_below_floor():
+    """Live mode + availablecash < floor -> no dispatch, pending cleared, no position."""
+    service = _make_service(MODE_LIVE)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    # Floor defaults to account_capital (20,000); report 5,000 available.
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=_funds_response(5_000.0),
+        ),
+        patch("services.place_order_service.place_order") as mock_live,
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+    ):
+        service._place_entry_order(signal, api_key="live-key", strategy_name="trend-up")
+
+    mock_live.assert_not_called()
+    mock_sandbox.assert_not_called()
+    assert signal.symbol not in service.engine.pending_entries
+    assert signal.symbol not in service.engine.positions
+
+
+def test_funds_gate_honors_custom_floor():
+    """If funds_floor is set explicitly, it overrides account_capital."""
+    config = SimplifiedEngineConfig(mode=MODE_LIVE, funds_floor=10_000.0)
+    service = SimplifiedStockEngineService(config=config)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    # availablecash=15k passes the 10k custom floor (would fail the 20k default).
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=_funds_response(15_000.0),
+        ),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-2"}, 200),
+        ) as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(signal, api_key="live-key", strategy_name="trend-up")
+
+    mock_live.assert_called_once()
+
+
+def test_funds_gate_skipped_in_sandbox_mode():
+    """Sandbox path never queries the broker funds endpoint."""
+    service = _make_service(MODE_SANDBOX)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    with (
+        patch("services.funds_service.get_funds") as mock_funds,
+        patch(
+            "services.sandbox_service.sandbox_place_order",
+            return_value=(True, {"orderid": "sbx-1"}, 200),
+        ),
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2501.0),
+    ):
+        service._place_entry_order(signal, api_key="sbx-key", strategy_name="trend-up")
+
+    mock_funds.assert_not_called()
+
+
+def test_funds_gate_skipped_in_disabled_mode():
+    """Disabled mode never queries funds (no orders go anywhere)."""
+    service = _make_service(MODE_DISABLED)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    with patch("services.funds_service.get_funds") as mock_funds:
+        service._place_entry_order(signal, api_key="key", strategy_name="trend-up")
+
+    mock_funds.assert_not_called()
+
+
+def test_funds_gate_fails_open_on_fetch_failure():
+    """Live + funds API returns failure -> entry is allowed through, cache stays empty."""
+    service = _make_service(MODE_LIVE)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=(False, {"status": "error", "message": "broker down"}, 500),
+        ),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-3"}, 200),
+        ) as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(signal, api_key="live-key", strategy_name="trend-up")
+
+    mock_live.assert_called_once()  # fail-open: order goes through
+    # No cache entry written on failure -- next call will re-fetch.
+    assert "live-key" not in service._funds_cache
+
+
+def test_funds_gate_fails_open_when_exception_raised():
+    """If get_funds itself raises, the gate fails open."""
+    service = _make_service(MODE_LIVE)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    def _boom(*a, **k):
+        raise RuntimeError("broker timeout")
+
+    with (
+        patch("services.funds_service.get_funds", side_effect=_boom),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-4"}, 200),
+        ) as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(signal, api_key="live-key", strategy_name="trend-up")
+
+    mock_live.assert_called_once()
+
+
+def test_funds_gate_reuses_cache_within_ttl():
+    """Two entries within funds_cache_ttl_seconds query the funds API once."""
+    service = _make_service(MODE_LIVE)
+    # Two fresh signals so we go through the entry path twice.
+    sig1 = _make_entry_signal()
+    sig2 = EntrySignal(
+        symbol="INFY",
+        action="BUY",
+        quantity=5,
+        reference_price=1500.0,
+        stop_loss=1490.0,
+        risk_per_share=10.0,
+        candle_ts=dt.datetime(2026, 5, 17, 10, 35),
+        exchange="NSE",
+        product="MIS",
+        pricetype="MARKET",
+    )
+    service.engine.pending_entries[sig1.symbol] = sig1
+    service.engine.pending_entries[sig2.symbol] = sig2
+
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=_funds_response(50_000.0),
+        ) as mock_funds,
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-x"}, 200),
+        ),
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(sig1, api_key="live-key", strategy_name="trend-up")
+        service._place_entry_order(sig2, api_key="live-key", strategy_name="trend-up")
+
+    assert mock_funds.call_count == 1  # second call served from cache
+
+
+def test_funds_gate_refetches_after_cache_expires():
+    """After ttl elapses, the next entry re-queries the funds API."""
+    service = _make_service(MODE_LIVE)
+    service.funds_cache_ttl_seconds = 0.05  # 50ms for the test
+
+    sig1 = _make_entry_signal()
+    sig2 = EntrySignal(
+        symbol="INFY",
+        action="BUY",
+        quantity=5,
+        reference_price=1500.0,
+        stop_loss=1490.0,
+        risk_per_share=10.0,
+        candle_ts=dt.datetime(2026, 5, 17, 10, 40),
+        exchange="NSE",
+        product="MIS",
+        pricetype="MARKET",
+    )
+    service.engine.pending_entries[sig1.symbol] = sig1
+    service.engine.pending_entries[sig2.symbol] = sig2
+
+    import time as _time
+
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=_funds_response(50_000.0),
+        ) as mock_funds,
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-y"}, 200),
+        ),
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(sig1, api_key="live-key", strategy_name="trend-up")
+        _time.sleep(0.1)  # exceed the 50ms ttl
+        service._place_entry_order(sig2, api_key="live-key", strategy_name="trend-up")
+
+    assert mock_funds.call_count == 2
+
+
+def test_funds_gate_unparseable_response_fails_open():
+    """availablecash missing or non-numeric -> fail open."""
+    service = _make_service(MODE_LIVE)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    # Response missing the availablecash field entirely.
+    with (
+        patch(
+            "services.funds_service.get_funds",
+            return_value=(True, {"status": "success", "data": {}}, 200),
+        ),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "live-5"}, 200),
+        ) as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
+    ):
+        service._place_entry_order(signal, api_key="live-key", strategy_name="trend-up")
+
+    mock_live.assert_called_once()
+
+
+def test_status_surfaces_funds_summary_after_check():
+    """After a successful funds check, status() includes the latest reading."""
+    service = _make_service(MODE_LIVE)
+
+    with patch(
+        "services.funds_service.get_funds",
+        return_value=_funds_response(42_000.0),
+    ):
+        ok, value, _ = service._check_live_funds("live-key")
+    assert ok is True
+    assert value == 42_000.0
+
+    s = service.status()
+    assert s["funds"] is not None
+    assert s["funds"]["available_cash"] == 42_000.0
+    assert s["funds"]["floor"] == service.config.effective_funds_floor
+    assert "checked_at" in s["funds"]

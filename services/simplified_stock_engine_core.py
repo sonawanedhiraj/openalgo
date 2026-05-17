@@ -58,12 +58,22 @@ class SimplifiedEngineConfig:
     sl_confirm_seconds: float = 3.0
     # Routing mode for orders the engine emits. See MODE_* constants above.
     mode: str = MODE_SANDBOX
+    # Minimum available cash (broker funds) required to arm a new opening
+    # trade in live mode. None means "fall back to account_capital", which
+    # mirrors the source script's gate (require funds >= ACCOUNT_CAPITAL).
+    # The gate is only enforced when mode == MODE_LIVE.
+    funds_floor: float | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in VALID_MODES:
             raise ValueError(
                 f"SimplifiedEngineConfig.mode={self.mode!r} is not one of {VALID_MODES}"
             )
+
+    @property
+    def effective_funds_floor(self) -> float:
+        """The funds_floor to enforce in live mode. Defaults to account_capital."""
+        return float(self.funds_floor) if self.funds_floor is not None else float(self.account_capital)
 
 
 @dataclass

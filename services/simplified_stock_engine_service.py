@@ -110,7 +110,24 @@ def config_from_env() -> SimplifiedEngineConfig:
         sl_confirm_seconds=_env_float("SIMPLIFIED_ENGINE_SL_CONFIRM_SECONDS", 3.0),
         enable_global_profit_lock=_env_bool("SIMPLIFIED_ENGINE_GLOBAL_PROFIT_LOCK", True),
         mode=_resolve_mode_from_env(),
+        funds_floor=_resolve_funds_floor_from_env(),
     )
+
+
+def _resolve_funds_floor_from_env() -> float | None:
+    """Returns None when SIMPLIFIED_ENGINE_FUNDS_FLOOR is unset, signalling
+    SimplifiedEngineConfig to fall back to account_capital."""
+    raw = os.getenv("SIMPLIFIED_ENGINE_FUNDS_FLOOR")
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SIMPLIFIED_ENGINE_FUNDS_FLOOR=%r; falling back to account_capital",
+            raw,
+        )
+        return None
 
 
 def parse_chartink_symbols(payload: dict[str, Any]) -> list[str]:
@@ -184,6 +201,16 @@ class SimplifiedStockEngineService:
         self.history_lookback_days = _env_int("SIMPLIFIED_ENGINE_HISTORY_LOOKBACK_DAYS", 3)
         self.order_poll_attempts = _env_int("SIMPLIFIED_ENGINE_ORDER_POLL_ATTEMPTS", 5)
         self.order_poll_interval = _env_float("SIMPLIFIED_ENGINE_ORDER_POLL_INTERVAL", 1.0)
+        # Funds-cache TTL in seconds. The live-mode entry gate caches the
+        # broker's availablecash reading so a burst of entries within this
+        # window doesn't hammer the broker's funds endpoint.
+        self.funds_cache_ttl_seconds = _env_float(
+            "SIMPLIFIED_ENGINE_FUNDS_CACHE_SECONDS", 30.0
+        )
+        # api_key -> (timestamp, available_cash). Populated on successful
+        # funds-fetch only; failures leave the cache untouched so the next
+        # entry triggers a re-fetch (fail-open-with-retry semantics).
+        self._funds_cache: dict[str, tuple[float, float]] = {}
         self._lock = threading.RLock()
         self._user_api_keys: dict[str, str] = {}
         self._strategy_by_symbol: dict[str, str] = {}
@@ -327,12 +354,23 @@ class SimplifiedStockEngineService:
             sell_symbols = [
                 s for s, d in self.engine.symbol_direction.items() if d == DIRECTION_SELL
             ]
+            # Most recent funds reading across all api_keys we've seen. Surfaced
+            # so operators can tell why the engine has stopped arming entries.
+            funds_summary: dict[str, Any] | None = None
+            if self._funds_cache:
+                last_ts, last_value = max(self._funds_cache.values(), key=lambda t: t[0])
+                funds_summary = {
+                    "available_cash": last_value,
+                    "floor": self.config.effective_funds_floor,
+                    "checked_at": dt.datetime.fromtimestamp(last_ts).isoformat(),
+                }
             return {
                 "mode": self._mode_label(),
                 "engine_mode": self.mode,
                 "eod_flatten_done": self._eod_flatten_done_date.isoformat()
                 if self._eod_flatten_done_date
                 else None,
+                "funds": funds_summary,
                 "direction_enabled": dict(self._direction_enabled),
                 "positions": {
                     symbol: {
@@ -435,6 +473,23 @@ class SimplifiedStockEngineService:
             with self._lock:
                 self.engine.confirm_entry(signal.symbol, signal.reference_price)
             return
+
+        # Live-mode funds gate: refuse to send an opening order if the
+        # broker's reported available cash is below the floor. Sandbox and
+        # disabled modes don't hit this path -- they're handled above.
+        if self.mode == MODE_LIVE:
+            ok, available, reason = self._check_live_funds(api_key)
+            if not ok:
+                logger.warning(
+                    "[SIMPLIFIED-ENTRY] Funds gate blocked %s: available=%.2f floor=%.2f reason=%s",
+                    signal.symbol,
+                    available,
+                    self.config.effective_funds_floor,
+                    reason,
+                )
+                with self._lock:
+                    self.engine.clear_pending_entry(signal.symbol)
+                return
 
         payload = self._order_payload(signal, strategy_name)
         success, response = self._dispatch_order(payload, api_key, is_entry=True)
@@ -550,6 +605,71 @@ class SimplifiedStockEngineService:
         # config validation rejects unknown modes. Treat defensively.
         logger.error("[SIMPLIFIED-%s] Unexpected mode=%r; refusing to send order", kind, self.mode)
         return False, {"status": "error", "message": f"unsupported mode {self.mode}"}
+
+    def _check_live_funds(self, api_key: str) -> tuple[bool, float, str | None]:
+        """Pre-flight funds check for live-mode opening trades.
+
+        Returns (allow, available_cash, reason). Semantics:
+        - allow=True with reason=None when broker reports enough cash.
+        - allow=False with reason="insufficient" when broker reports cash below
+          self.config.effective_funds_floor.
+        - allow=True with reason="fetch_failed" or "unparseable" when the funds
+          API errors out or returns unexpected data. We deliberately fail open
+          and leave the cache empty so the next entry triggers a re-fetch.
+        - allow=True with reason="cache" when a fresh cached reading is reused.
+
+        available_cash is the float value used for the comparison (0.0 when
+        fetch failed and there was no fresh cache).
+        """
+        floor = self.config.effective_funds_floor
+
+        with self._lock:
+            cached = self._funds_cache.get(api_key)
+            now = time.time()
+            if cached is not None and (now - cached[0]) < self.funds_cache_ttl_seconds:
+                cached_value = cached[1]
+                if cached_value < floor:
+                    return False, cached_value, "insufficient_cache"
+                return True, cached_value, "cache"
+
+        try:
+            from services.funds_service import get_funds
+
+            success, response, status_code = get_funds(api_key=api_key)
+        except Exception:
+            logger.exception("[SIMPLIFIED-FUNDS] get_funds raised; failing open")
+            return True, 0.0, "fetch_failed"
+
+        if not success:
+            logger.warning(
+                "[SIMPLIFIED-FUNDS] Funds fetch failed status=%s response=%s; failing open",
+                status_code,
+                response,
+            )
+            return True, 0.0, "fetch_failed"
+
+        data = response.get("data") or {}
+        raw = data.get("availablecash")
+        if raw is None:
+            logger.warning(
+                "[SIMPLIFIED-FUNDS] availablecash missing from funds response; failing open"
+            )
+            return True, 0.0, "unparseable"
+
+        try:
+            available = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[SIMPLIFIED-FUNDS] availablecash=%r is not numeric; failing open", raw
+            )
+            return True, 0.0, "unparseable"
+
+        with self._lock:
+            self._funds_cache[api_key] = (now, available)
+
+        if available < floor:
+            return False, available, "insufficient"
+        return True, available, None
 
     def _maybe_flatten_eod(self) -> None:
         """Trigger broker-position-aware EOD flatten exactly once per day.
