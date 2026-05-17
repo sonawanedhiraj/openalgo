@@ -133,6 +133,106 @@ class ExitSignal:
     pricetype: str
 
 
+@dataclass
+class CompletedTrade:
+    """A round-trip recorded at confirm_exit time.
+
+    qty is positive for longs, negative for shorts (matches Position.qty).
+    Gross P&L is signed: positive = profit, negative = loss. Exit price is
+    the executed price reported by the broker / sandbox fill (falls back to
+    the signal's reference price when neither is available, e.g. disabled mode).
+    """
+    symbol: str
+    qty: int
+    entry_price: float
+    exit_price: float
+    entry_time: dt.datetime
+    exit_time: dt.datetime
+    exit_reason: str | None = None
+
+    @property
+    def is_long(self) -> bool:
+        return self.qty > 0
+
+    @property
+    def abs_qty(self) -> int:
+        return abs(int(self.qty))
+
+    @property
+    def buy_value(self) -> float:
+        """Notional of the BUY leg. For a long, this is the entry; for a short, the exit."""
+        return float(self.abs_qty) * (self.entry_price if self.is_long else self.exit_price)
+
+    @property
+    def sell_value(self) -> float:
+        """Notional of the SELL leg. For a long, this is the exit; for a short, the entry."""
+        return float(self.abs_qty) * (self.exit_price if self.is_long else self.entry_price)
+
+    @property
+    def turnover(self) -> float:
+        return self.buy_value + self.sell_value
+
+    @property
+    def gross_pnl(self) -> float:
+        return self.sell_value - self.buy_value
+
+
+@dataclass(frozen=True)
+class TradeCharges:
+    """Per-trade breakdown of regulatory and broker charges."""
+    brokerage: float
+    stt: float
+    exchange: float
+    sebi: float
+    gst: float
+    stamp: float
+
+    @property
+    def total(self) -> float:
+        return self.brokerage + self.stt + self.exchange + self.sebi + self.gst + self.stamp
+
+
+def compute_zerodha_intraday_charges(buy_value: float, sell_value: float) -> TradeCharges:
+    """Approximate Zerodha NSE equity intraday (MIS) charges for one round trip.
+
+    Mirrors the source script's formula at simplified_stock_engine.py lines
+    1645-1650. Values are illustrative -- the source uses these rates and
+    they were correct for Zerodha equity MIS at the time. Operators on other
+    brokers or product types should treat these numbers as ballpark.
+
+    - Brokerage: min(Rs20, 0.03% of turnover) per leg, applied to both legs.
+    - STT: 0.025% of sell value (intraday equity).
+    - Exchange transaction charge: 0.00345% of turnover (NSE).
+    - SEBI charge: 0.0001% of turnover.
+    - GST: 18% of (brokerage + exchange + SEBI).
+    - Stamp duty: 0.003% of buy value (paid by the buyer).
+    """
+    turnover = buy_value + sell_value
+    # Per-leg brokerage capped at Rs20.
+    per_leg_brokerage = min(20.0, 0.0003 * (buy_value if buy_value else 0.0)) + \
+        min(20.0, 0.0003 * (sell_value if sell_value else 0.0))
+    # The source computes brokerage as min(20, 0.03% turnover) for a single
+    # round trip rather than per leg. Reproduce that for fidelity.
+    brokerage = min(20.0, 0.0003 * turnover) if turnover else 0.0
+    # Per-leg cap is a less aggressive simplification kept as a comment for
+    # operators who want stricter accounting: per_leg_brokerage.
+    _ = per_leg_brokerage  # silence linter; kept for documentation
+
+    stt = 0.00025 * sell_value
+    exchange = 0.0000345 * turnover
+    sebi = 0.000001 * turnover
+    gst = 0.18 * (brokerage + exchange + sebi)
+    stamp = 0.00003 * buy_value
+    return TradeCharges(
+        brokerage=round(brokerage, 2),
+        stt=round(stt, 2),
+        exchange=round(exchange, 2),
+        sebi=round(sebi, 4),
+        gst=round(gst, 2),
+        stamp=round(stamp, 2),
+    )
+
+
 class FiveMinuteCandleBuilder:
     def __init__(
         self,
@@ -224,6 +324,10 @@ class SimplifiedStockEngine:
         self.trades_day = self.now_provider().date()
         self.eod_done_date: dt.date | None = None
         self.global_profit_actioned = False
+        # Ledger of round-trips that closed today. Appended to in confirm_exit
+        # and consumed at EOD by the service to log the trading summary.
+        # Cleared at the start of each new trading day (_reset_trade_day_if_needed).
+        self.completed_trades: list[CompletedTrade] = []
 
         self._tr_deques: dict[str, deque[float]] = {}
         self._atr_map: dict[str, float] = {}
@@ -386,10 +490,42 @@ class SimplifiedStockEngine:
         self.trades_today += 1
         return position
 
-    def confirm_exit(self, symbol: str) -> None:
-        self.pending_exits.pop(symbol, None)
-        self.positions.pop(symbol, None)
+    def confirm_exit(
+        self,
+        symbol: str,
+        exit_price: float | None = None,
+        reason: str | None = None,
+    ) -> CompletedTrade | None:
+        """Pop the position and record the round-trip on completed_trades.
+
+        Returns the CompletedTrade record (or None when there was no open
+        position for this symbol). exit_price defaults to the position's
+        stop_loss when not provided, which keeps the engine usable in tests
+        that don't pass a fill price.
+        """
+        pending = self.pending_exits.pop(symbol, None)
+        position = self.positions.pop(symbol, None)
         self.bought_in_bucket[symbol] = FiveMinuteCandleBuilder.bucket(self.now_provider())
+
+        if position is None:
+            return None
+
+        if exit_price is None and pending is not None:
+            exit_price = float(pending.reference_price)
+        if exit_price is None:
+            exit_price = float(position.stop_loss)
+
+        record = CompletedTrade(
+            symbol=symbol,
+            qty=int(position.qty),
+            entry_price=float(position.entry_price),
+            exit_price=float(exit_price),
+            entry_time=position.entry_time,
+            exit_time=self.now_provider(),
+            exit_reason=reason or (pending.reason if pending else None),
+        )
+        self.completed_trades.append(record)
+        return record
 
     def apply_simple_rr_trailing(self, symbol: str, current_price: float) -> None:
         pos = self.positions.get(symbol)
@@ -695,6 +831,7 @@ class SimplifiedStockEngine:
             self.trades_today = 0
             self.eod_done_date = None
             self.global_profit_actioned = False
+            self.completed_trades.clear()
 
     @staticmethod
     def _normalize_bucket(ts: dt.datetime) -> dt.datetime:

@@ -15,11 +15,14 @@ from services.simplified_stock_engine_core import (
     MODE_SANDBOX,
     VALID_MODES,
     Candle,
+    CompletedTrade,
     EntrySignal,
     ExitSignal,
     FiveMinuteCandleBuilder,
     SimplifiedEngineConfig,
     SimplifiedStockEngine,
+    TradeCharges,
+    compute_zerodha_intraday_charges,
 )
 from utils.logging import get_logger
 
@@ -221,6 +224,10 @@ class SimplifiedStockEngineService:
         # Tracks the date on which the live-mode broker-position-aware EOD
         # flatten has already run. Reset implicitly when the date rolls.
         self._eod_flatten_done_date: dt.date | None = None
+        # Tracks the date on which the EOD trading summary has been logged.
+        # Independent of _eod_flatten_done_date so the summary can run in
+        # sandbox/disabled modes (where the flatten is a no-op).
+        self._eod_summary_done_date: dt.date | None = None
         # Per-direction kill switches. When False, webhook arms for that direction
         # are rejected. Existing positions are NOT closed by toggling these.
         self._direction_enabled: dict[str, bool] = {
@@ -345,6 +352,7 @@ class SimplifiedStockEngineService:
             self._schedule_exit(signal)
 
         self._maybe_flatten_eod()
+        self._maybe_log_eod_summary()
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -370,6 +378,10 @@ class SimplifiedStockEngineService:
                 "eod_flatten_done": self._eod_flatten_done_date.isoformat()
                 if self._eod_flatten_done_date
                 else None,
+                "eod_summary_done": self._eod_summary_done_date.isoformat()
+                if self._eod_summary_done_date
+                else None,
+                "completed_trades_today": len(self.engine.completed_trades),
                 "funds": funds_summary,
                 "direction_enabled": dict(self._direction_enabled),
                 "positions": {
@@ -529,7 +541,11 @@ class SimplifiedStockEngineService:
                 signal.reference_price,
             )
             with self._lock:
-                self.engine.confirm_exit(signal.symbol)
+                self.engine.confirm_exit(
+                    signal.symbol,
+                    exit_price=signal.reference_price,
+                    reason=signal.reason,
+                )
             return
 
         payload = self._order_payload(signal, strategy_name)
@@ -554,7 +570,7 @@ class SimplifiedStockEngineService:
             return
 
         with self._lock:
-            self.engine.confirm_exit(signal.symbol)
+            self.engine.confirm_exit(signal.symbol, exit_price=executed_price, reason=signal.reason)
         logger.info(
             "[SIMPLIFIED-EXIT] Closed %s reason=%s price=%.2f (mode=%s)",
             signal.symbol,
@@ -824,6 +840,78 @@ class SimplifiedStockEngineService:
                     symbol,
                     engine_qty,
                 )
+
+    # ------------------------------------------------------------------
+    # EOD trading summary (step 4)
+    # ------------------------------------------------------------------
+
+    def _maybe_log_eod_summary(self) -> None:
+        """Log the daily trading summary once per day after eod_exit_time.
+
+        Runs in every mode (sandbox/live/disabled) since each may have
+        produced completed trades. Skips silently when no trades closed.
+        """
+        now = dt.datetime.now()
+        if now.time() < self.config.eod_exit_time:
+            return
+
+        with self._lock:
+            if self._eod_summary_done_date == now.date():
+                return
+            # Snapshot the ledger under the lock; mark the date so we don't
+            # log it twice even if the snapshot is empty.
+            trades_snapshot = list(self.engine.completed_trades)
+            self._eod_summary_done_date = now.date()
+
+        if not trades_snapshot:
+            logger.info("[SIMPLIFIED-EOD-SUMMARY] No completed trades today (mode=%s)", self.mode)
+            return
+
+        lines = self._build_eod_summary_lines(trades_snapshot, now.date())
+        # Single multi-line log entry so it's easy to find in error.jsonl / files.
+        logger.info("[SIMPLIFIED-EOD-SUMMARY]\n%s", "\n".join(lines))
+
+    def _build_eod_summary_lines(
+        self, trades: list[CompletedTrade], today: dt.date
+    ) -> list[str]:
+        """Produce the per-trade rows + totals as a list of formatted strings.
+
+        Factored out so tests can assert on individual rows without parsing log
+        output. Charges are approximate (Zerodha NSE equity intraday); the
+        compute_zerodha_intraday_charges docstring explains the caveats.
+        """
+        header = (
+            f"Trading summary for {today.isoformat()} (mode={self.mode}, "
+            f"trades={len(trades)})"
+        )
+        col_header = (
+            f"{'Symbol':<12} {'Side':<5} {'Qty':>5} {'Entry':>10} {'Exit':>10} "
+            f"{'Gross':>10} {'Charges':>9} {'Net':>10}"
+        )
+        rows: list[str] = [header, col_header, "-" * len(col_header)]
+
+        total_gross = 0.0
+        total_charges = 0.0
+        for trade in trades:
+            charges = compute_zerodha_intraday_charges(trade.buy_value, trade.sell_value)
+            gross = trade.gross_pnl
+            net = gross - charges.total
+            total_gross += gross
+            total_charges += charges.total
+            side = "LONG" if trade.is_long else "SHORT"
+            rows.append(
+                f"{trade.symbol:<12} {side:<5} {trade.abs_qty:>5} "
+                f"{trade.entry_price:>10.2f} {trade.exit_price:>10.2f} "
+                f"{gross:>10.2f} {charges.total:>9.2f} {net:>10.2f}"
+            )
+
+        rows.append("-" * len(col_header))
+        rows.append(
+            f"{'TOTAL':<12} {'':<5} {'':>5} {'':>10} {'':>10} "
+            f"{total_gross:>10.2f} {total_charges:>9.2f} "
+            f"{(total_gross - total_charges):>10.2f}"
+        )
+        return rows
 
     def _wait_for_fill(
         self, api_key: str, strategy_name: str, order_id: str | None

@@ -896,3 +896,293 @@ def test_status_surfaces_funds_summary_after_check():
     assert s["funds"]["available_cash"] == 42_000.0
     assert s["funds"]["floor"] == service.config.effective_funds_floor
     assert "checked_at" in s["funds"]
+
+
+
+# ---------------------------------------------------------------------------
+# EOD trading summary tests (step 4)
+# ---------------------------------------------------------------------------
+
+
+from services.simplified_stock_engine_core import (  # noqa: E402
+    CompletedTrade,
+    Position,
+    SimplifiedStockEngine,
+    TradeCharges,
+    compute_zerodha_intraday_charges,
+)
+
+
+def test_completed_trade_records_long_round_trip():
+    """confirm_exit on a long position records a CompletedTrade with gross > 0."""
+    engine = SimplifiedStockEngine(SimplifiedEngineConfig(mode=MODE_SANDBOX))
+    engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+
+    record = engine.confirm_exit("RELIANCE", exit_price=2510.0, reason="target")
+    assert record is not None
+    assert record.symbol == "RELIANCE"
+    assert record.qty == 10
+    assert record.entry_price == 2500.0
+    assert record.exit_price == 2510.0
+    assert record.is_long is True
+    assert record.gross_pnl == 10 * (2510.0 - 2500.0)  # 100
+    assert engine.completed_trades == [record]
+    assert "RELIANCE" not in engine.positions
+
+
+def test_completed_trade_records_short_round_trip():
+    """A short position records a CompletedTrade with the right signs."""
+    engine = SimplifiedStockEngine(SimplifiedEngineConfig(mode=MODE_SANDBOX))
+    engine.positions["SHORTY"] = Position(
+        symbol="SHORTY",
+        entry_price=100.0,
+        qty=-20,
+        stop_loss=105.0,
+        entry_time=dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=5.0,
+    )
+
+    record = engine.confirm_exit("SHORTY", exit_price=95.0, reason="target")
+    assert record.qty == -20
+    assert record.is_long is False
+    # Short PnL: (entry - exit) * qty. Sell at 100, buy back at 95 -> +5/share * 20.
+    assert record.gross_pnl == 20 * (100.0 - 95.0)
+    assert record.buy_value == 20 * 95.0  # bought at exit price
+    assert record.sell_value == 20 * 100.0  # sold at entry price
+
+
+def test_completed_trade_clears_on_new_day():
+    """When _reset_trade_day_if_needed flips the date, the ledger is cleared."""
+    engine = SimplifiedStockEngine(SimplifiedEngineConfig(mode=MODE_SANDBOX))
+    engine.completed_trades.append(
+        CompletedTrade(
+            symbol="X",
+            qty=1,
+            entry_price=1.0,
+            exit_price=2.0,
+            entry_time=dt.datetime(2026, 5, 16, 10, 0),
+            exit_time=dt.datetime(2026, 5, 16, 11, 0),
+        )
+    )
+    # Pretend the trades_day was yesterday.
+    engine.trades_day = dt.date(2026, 5, 16)
+    engine._reset_trade_day_if_needed()
+    assert engine.completed_trades == []
+
+
+def test_zerodha_charges_long_round_trip():
+    """Worked example: buy 10@2500, sell 10@2510. Turnover Rs50,100."""
+    # buy_value=25000, sell_value=25100, turnover=50100
+    charges = compute_zerodha_intraday_charges(25000.0, 25100.0)
+    # Brokerage: min(20, 0.0003 * 50100) = min(20, 15.03) = 15.03
+    assert abs(charges.brokerage - 15.03) < 0.01
+    # STT: 0.00025 * 25100 = 6.275 -> rounded
+    assert abs(charges.stt - 6.28) < 0.01
+    # Exchange: 0.0000345 * 50100 = 1.728...
+    assert abs(charges.exchange - 1.73) < 0.01
+    # SEBI: 0.000001 * 50100 = 0.0501
+    assert abs(charges.sebi - 0.0501) < 0.001
+    # Stamp: 0.00003 * 25000 = 0.75
+    assert abs(charges.stamp - 0.75) < 0.01
+    # GST: 18% of (broker + exchange + sebi)
+    expected_gst = 0.18 * (charges.brokerage + charges.exchange + charges.sebi)
+    assert abs(charges.gst - round(expected_gst, 2)) < 0.01
+    assert charges.total > 0
+
+
+def test_zerodha_charges_brokerage_caps_at_twenty():
+    """Big turnover -> brokerage caps at Rs20."""
+    # 0.0003 * turnover >= 20 -> turnover >= 66,666.67
+    charges = compute_zerodha_intraday_charges(50_000.0, 50_000.0)  # turnover 100k
+    assert charges.brokerage == 20.0
+
+
+def test_zerodha_charges_zero_turnover():
+    """No trades -> zero charges, never raises."""
+    charges = compute_zerodha_intraday_charges(0.0, 0.0)
+    assert charges.total == 0.0
+
+
+def test_build_eod_summary_lines_contains_trade_and_total():
+    """The summary writer emits per-trade rows + a totals row."""
+    service = _make_service(MODE_SANDBOX)
+    trades = [
+        CompletedTrade(
+            symbol="RELIANCE",
+            qty=10,
+            entry_price=2500.0,
+            exit_price=2510.0,
+            entry_time=dt.datetime(2026, 5, 17, 10, 30),
+            exit_time=dt.datetime(2026, 5, 17, 11, 0),
+            exit_reason="target",
+        ),
+        CompletedTrade(
+            symbol="INFY",
+            qty=-5,
+            entry_price=1500.0,
+            exit_price=1510.0,  # short loses
+            entry_time=dt.datetime(2026, 5, 17, 11, 30),
+            exit_time=dt.datetime(2026, 5, 17, 12, 0),
+            exit_reason="stop_loss",
+        ),
+    ]
+    lines = service._build_eod_summary_lines(trades, dt.date(2026, 5, 17))
+    joined = "\n".join(lines)
+    assert "RELIANCE" in joined
+    assert "INFY" in joined
+    assert "LONG" in joined
+    assert "SHORT" in joined
+    assert "TOTAL" in joined
+    # Header includes date and mode.
+    assert "2026-05-17" in lines[0]
+    assert "sandbox" in lines[0]
+
+
+def test_eod_summary_logs_once_per_day(monkeypatch, caplog=None):
+    """Two calls after eod_exit_time on the same date -> summary built once."""
+    service = _make_service(MODE_SANDBOX)
+    service.engine.completed_trades.append(
+        CompletedTrade(
+            symbol="X",
+            qty=1,
+            entry_price=100.0,
+            exit_price=101.0,
+            entry_time=dt.datetime(2026, 5, 17, 10, 0),
+            exit_time=dt.datetime(2026, 5, 17, 11, 0),
+        )
+    )
+
+    import services.simplified_stock_engine_service as svc_mod
+
+    class _AfterEodDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return dt.datetime(2026, 5, 17, 15, 25)
+
+    monkeypatch.setattr(svc_mod.dt, "datetime", _AfterEodDateTime)
+
+    calls = []
+
+    def _spy(self, trades, today):
+        calls.append((list(trades), today))
+        return ["spy-output"]
+
+    monkeypatch.setattr(
+        SimplifiedStockEngineService, "_build_eod_summary_lines", _spy
+    )
+
+    service._maybe_log_eod_summary()
+    service._maybe_log_eod_summary()
+
+    assert len(calls) == 1
+    assert service._eod_summary_done_date == dt.date(2026, 5, 17)
+
+
+def test_eod_summary_skipped_before_eod_time(monkeypatch):
+    """Before eod_exit_time, the summary doesn't run."""
+    service = _make_service(MODE_SANDBOX)
+    service.engine.completed_trades.append(
+        CompletedTrade(
+            symbol="X",
+            qty=1,
+            entry_price=100.0,
+            exit_price=101.0,
+            entry_time=dt.datetime(2026, 5, 17, 10, 0),
+            exit_time=dt.datetime(2026, 5, 17, 11, 0),
+        )
+    )
+
+    import services.simplified_stock_engine_service as svc_mod
+
+    class _PreEodDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return dt.datetime(2026, 5, 17, 14, 0)
+
+    monkeypatch.setattr(svc_mod.dt, "datetime", _PreEodDateTime)
+
+    calls = []
+
+    def _spy(self, trades, today):
+        calls.append(today)
+        return []
+
+    monkeypatch.setattr(
+        SimplifiedStockEngineService, "_build_eod_summary_lines", _spy
+    )
+
+    service._maybe_log_eod_summary()
+    assert calls == []
+    assert service._eod_summary_done_date is None
+
+
+def test_eod_summary_handles_zero_trades(monkeypatch):
+    """Zero completed trades -> log a brief 'no trades' note, still mark done."""
+    service = _make_service(MODE_SANDBOX)
+    # Empty ledger.
+
+    import services.simplified_stock_engine_service as svc_mod
+
+    class _AfterEodDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return dt.datetime(2026, 5, 17, 15, 25)
+
+    monkeypatch.setattr(svc_mod.dt, "datetime", _AfterEodDateTime)
+
+    # Should not crash even though there's nothing to summarize.
+    service._maybe_log_eod_summary()
+    # _eod_summary_done_date set, so a second call is also a no-op.
+    assert service._eod_summary_done_date == dt.date(2026, 5, 17)
+
+
+def test_eod_summary_runs_in_disabled_mode(monkeypatch):
+    """Disabled mode may have completed trades (engine confirms locally) -- summary still runs."""
+    service = _make_service(MODE_DISABLED)
+    service.engine.completed_trades.append(
+        CompletedTrade(
+            symbol="X",
+            qty=2,
+            entry_price=50.0,
+            exit_price=55.0,
+            entry_time=dt.datetime(2026, 5, 17, 10, 0),
+            exit_time=dt.datetime(2026, 5, 17, 11, 0),
+        )
+    )
+
+    import services.simplified_stock_engine_service as svc_mod
+
+    class _AfterEodDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return dt.datetime(2026, 5, 17, 15, 25)
+
+    monkeypatch.setattr(svc_mod.dt, "datetime", _AfterEodDateTime)
+
+    built = []
+    def _spy(self, trades, today):
+        built.append(len(trades))
+        return ["row"]
+    monkeypatch.setattr(SimplifiedStockEngineService, "_build_eod_summary_lines", _spy)
+
+    service._maybe_log_eod_summary()
+    assert built == [1]
+
+
+def test_status_exposes_eod_summary_state():
+    """status() surfaces the eod_summary_done flag + completed trades count."""
+    service = _make_service(MODE_SANDBOX)
+    service.engine.completed_trades.extend([
+        CompletedTrade("A", 1, 1.0, 2.0, dt.datetime(2026, 5, 17, 10), dt.datetime(2026, 5, 17, 11)),
+        CompletedTrade("B", 1, 1.0, 2.0, dt.datetime(2026, 5, 17, 12), dt.datetime(2026, 5, 17, 13)),
+    ])
+    s = service.status()
+    assert s["completed_trades_today"] == 2
+    assert s["eod_summary_done"] is None  # not yet logged
