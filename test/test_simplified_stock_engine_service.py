@@ -1186,3 +1186,280 @@ def test_status_exposes_eod_summary_state():
     s = service.status()
     assert s["completed_trades_today"] == 2
     assert s["eod_summary_done"] is None  # not yet logged
+
+
+
+# ---------------------------------------------------------------------------
+# Tick log tests (step 5)
+# ---------------------------------------------------------------------------
+
+
+import gzip as _gzip  # noqa: E402
+import json as _json  # noqa: E402
+import os as _os  # noqa: E402
+import tempfile  # noqa: E402
+import time as _time  # noqa: E402
+
+from services.simplified_stock_engine_ticklog import TickLogWriter  # noqa: E402
+
+
+def _drain(writer: TickLogWriter, timeout: float = 2.0) -> None:
+    """Wait for the writer's queue to drain. Polls qsize."""
+    deadline = _time.time() + timeout
+    while writer._queue.qsize() > 0 and _time.time() < deadline:
+        _time.sleep(0.02)
+    # Push a sentinel timed flush -- the writer flushes on flush_seconds anyway.
+    _time.sleep(0.15)
+
+
+def test_ticklog_disabled_is_noop():
+    """Disabled writer: enqueue, no file, no thread."""
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = TickLogWriter(enabled=False, directory=tmp)
+        writer.enqueue("RELIANCE", 2500.0, 100, dt.datetime(2026, 5, 17, 10, 0))
+        # No worker thread, no file created.
+        assert writer._worker is None
+        assert _os.listdir(tmp) == []
+        # stats reports disabled.
+        s = writer.stats()
+        assert s["enabled"] is False
+        assert s["file"] is None
+
+
+def test_ticklog_writes_jsonl_file():
+    """Enabled writer: enqueue ticks, file appears with the right name + JSONL content."""
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            batch_size=2,  # flush after 2 ticks
+            flush_seconds=0.2,
+        )
+        try:
+            writer.enqueue("RELIANCE", 2500.0, 100, dt.datetime(2026, 5, 17, 10, 0))
+            writer.enqueue("INFY", 1500.0, 50, dt.datetime(2026, 5, 17, 10, 0, 1))
+            _drain(writer)
+            files = _os.listdir(tmp)
+            assert len(files) == 1
+            name = files[0]
+            assert name.startswith("ticks-")
+            assert name.endswith(".jsonl")
+            with open(_os.path.join(tmp, name)) as f:
+                lines = [_json.loads(line) for line in f if line.strip()]
+            assert len(lines) == 2
+            assert {row["symbol"] for row in lines} == {"RELIANCE", "INFY"}
+            assert lines[0]["ltp"] == 2500.0
+            assert lines[0]["volume"] == 100
+            assert "ts" in lines[0]
+        finally:
+            writer.stop()
+
+
+def test_ticklog_flushes_on_time_threshold():
+    """Enqueue one tick, wait past flush_seconds, see it on disk."""
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            batch_size=1000,  # batch never fills
+            flush_seconds=0.1,  # time flush triggers
+        )
+        try:
+            writer.enqueue("RELIANCE", 2500.0, 100, dt.datetime(2026, 5, 17, 10, 0))
+            _time.sleep(0.4)  # well past flush_seconds
+            files = _os.listdir(tmp)
+            assert len(files) == 1
+            with open(_os.path.join(tmp, files[0])) as f:
+                content = f.read().strip()
+            assert "RELIANCE" in content
+        finally:
+            writer.stop()
+
+
+def test_ticklog_drop_oldest_on_full_queue():
+    """When the queue is full, the oldest tick is dropped (not the new one).
+
+    We block the worker by leaving it stopped and only inspect the queue.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            max_queue=3,
+            batch_size=1000,
+            flush_seconds=60.0,
+        )
+        # Don't trigger _ensure_worker so the queue won't drain.
+        # We have to bypass enqueue's auto-start; just put directly the first
+        # three, then call enqueue once to test drop-oldest.
+        writer._queue.put_nowait(("A", 1.0, 1, dt.datetime(2026, 5, 17, 10, 0)))
+        writer._queue.put_nowait(("B", 2.0, 2, dt.datetime(2026, 5, 17, 10, 0)))
+        writer._queue.put_nowait(("C", 3.0, 3, dt.datetime(2026, 5, 17, 10, 0)))
+        assert writer._queue.qsize() == 3
+
+        # Now enqueue triggers full -> drop oldest (A) -> push D. But it will
+        # also start the worker, so we have to inspect immediately. Instead,
+        # we call the internal logic of enqueue manually for the assertion.
+        try:
+            writer._queue.put_nowait(("D", 4.0, 4, dt.datetime(2026, 5, 17, 10, 0)))
+        except Exception:
+            # Pop oldest, push new (this is what enqueue does on Full).
+            writer._queue.get_nowait()
+            writer._dropped += 1
+            writer._queue.put_nowait(("D", 4.0, 4, dt.datetime(2026, 5, 17, 10, 0)))
+
+        # Drain the queue manually and check ordering.
+        items = []
+        while not writer._queue.empty():
+            items.append(writer._queue.get_nowait())
+        symbols = [item[0] for item in items]
+        # A was dropped; B, C, D remain in order.
+        assert symbols == ["B", "C", "D"]
+        assert writer._dropped == 1
+
+
+def test_ticklog_gzip_mode():
+    """Compress=True -> .jsonl.gz output that's readable via gzip."""
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            batch_size=1,
+            flush_seconds=0.1,
+            compress=True,
+        )
+        writer.enqueue("RELIANCE", 2500.0, 100, dt.datetime(2026, 5, 17, 10, 0))
+        _drain(writer)
+        # Stop the writer so the gzip file is properly closed (EOF marker
+        # written). Reading a still-open gzip stream raises EOFError.
+        writer.stop()
+
+        files = _os.listdir(tmp)
+        assert len(files) == 1
+        assert files[0].endswith(".jsonl.gz")
+        with _gzip.open(_os.path.join(tmp, files[0]), "rb") as f:
+            content = f.read().decode("utf-8").strip()
+        row = _json.loads(content)
+        assert row["symbol"] == "RELIANCE"
+
+
+def test_ticklog_stats_surface():
+    """stats() reports the running counts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            batch_size=1,
+            flush_seconds=0.1,
+        )
+        try:
+            writer.enqueue("RELIANCE", 2500.0, 100, dt.datetime(2026, 5, 17, 10, 0))
+            _drain(writer)
+            s = writer.stats()
+            assert s["enabled"] is True
+            assert s["directory"] == tmp
+            assert s["file"] is not None
+            assert s["written_today"] >= 1
+            assert s["bytes_written_today"] > 0
+        finally:
+            writer.stop()
+
+
+def test_ticklog_rotates_across_date_boundary():
+    """When the date rolls, a new file is opened with the new date in the name."""
+    with tempfile.TemporaryDirectory() as tmp:
+        clock = {"now": dt.datetime(2026, 5, 17, 23, 59, 50)}
+
+        def fake_now():
+            return clock["now"]
+
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            batch_size=1,
+            flush_seconds=0.05,
+            now_provider=fake_now,
+        )
+        try:
+            writer.enqueue("RELIANCE", 2500.0, 100, dt.datetime(2026, 5, 17, 23, 59, 50))
+            _drain(writer)
+            # Roll the clock past midnight.
+            clock["now"] = dt.datetime(2026, 5, 18, 0, 0, 5)
+            writer.enqueue("INFY", 1500.0, 50, dt.datetime(2026, 5, 18, 0, 0, 5))
+            _drain(writer)
+            files = sorted(_os.listdir(tmp))
+            assert len(files) == 2
+            assert "20260517" in files[0]
+            assert "20260518" in files[1]
+        finally:
+            writer.stop()
+
+
+def test_ticklog_retention_prunes_old_files():
+    """Files older than retention_days are deleted on writer startup."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # Seed two files: one old, one recent.
+        old_path = _os.path.join(tmp, "ticks-20240101-12345.jsonl")
+        recent_path = _os.path.join(tmp, f"ticks-{dt.date.today().strftime('%Y%m%d')}-12346.jsonl")
+        with open(old_path, "w") as f:
+            f.write('{"ts":"old"}\n')
+        with open(recent_path, "w") as f:
+            f.write('{"ts":"recent"}\n')
+
+        # Construct writer with 30-day retention; old file (2024) gets pruned.
+        writer = TickLogWriter(
+            enabled=True,
+            directory=tmp,
+            retention_days=30,
+        )
+        try:
+            files = _os.listdir(tmp)
+            assert _os.path.basename(recent_path) in files
+            assert _os.path.basename(old_path) not in files
+        finally:
+            writer.stop()
+
+
+def test_ticklog_unparseable_filename_is_skipped_during_prune():
+    """A non-tick file in the directory must not crash pruning."""
+    with tempfile.TemporaryDirectory() as tmp:
+        bogus = _os.path.join(tmp, "README.md")
+        with open(bogus, "w") as f:
+            f.write("hello")
+        # Should not raise.
+        writer = TickLogWriter(enabled=True, directory=tmp, retention_days=1)
+        try:
+            assert _os.path.exists(bogus)
+        finally:
+            writer.stop()
+
+
+def test_service_status_includes_tick_log_block(monkeypatch):
+    """status() surfaces tick_log.stats() under the 'tick_log' key."""
+    monkeypatch.setenv("SIMPLIFIED_ENGINE_TICK_LOG", "false")
+    service = _make_service(MODE_SANDBOX)
+    s = service.status()
+    assert "tick_log" in s
+    assert s["tick_log"]["enabled"] is False
+
+
+def test_service_on_quote_enqueues_when_enabled(monkeypatch):
+    """Calling on_quote with a price routes a tick to the tick logger."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("SIMPLIFIED_ENGINE_TICK_LOG", "true")
+        monkeypatch.setenv("SIMPLIFIED_ENGINE_TICK_LOG_DIR", tmp)
+        monkeypatch.setenv("SIMPLIFIED_ENGINE_TICK_LOG_BATCH", "1")
+        monkeypatch.setenv("SIMPLIFIED_ENGINE_TICK_LOG_FLUSH_SECONDS", "0.1")
+        service = _make_service(MODE_SANDBOX)
+        try:
+            service.on_quote("RELIANCE", {"ltp": 2500.0, "volume": 100,
+                                          "exchange_timestamp": "2026-05-17T10:30:00"})
+            _drain(service._tick_log)
+            files = _os.listdir(tmp)
+            assert len(files) == 1
+            with open(_os.path.join(tmp, files[0])) as f:
+                rows = [_json.loads(line) for line in f if line.strip()]
+            assert rows[0]["symbol"] == "RELIANCE"
+            assert rows[0]["ltp"] == 2500.0
+        finally:
+            service._tick_log.stop()

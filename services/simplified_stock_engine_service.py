@@ -24,6 +24,7 @@ from services.simplified_stock_engine_core import (
     TradeCharges,
     compute_zerodha_intraday_charges,
 )
+from services.simplified_stock_engine_ticklog import TickLogWriter
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -214,6 +215,17 @@ class SimplifiedStockEngineService:
         # funds-fetch only; failures leave the cache untouched so the next
         # entry triggers a re-fetch (fail-open-with-retry semantics).
         self._funds_cache: dict[str, tuple[float, float]] = {}
+        # Tick log writer (step 5). Off by default; opt in with
+        # SIMPLIFIED_ENGINE_TICK_LOG=true. Cheap no-op when disabled.
+        self._tick_log = TickLogWriter(
+            enabled=_env_bool("SIMPLIFIED_ENGINE_TICK_LOG", False),
+            directory=os.getenv("SIMPLIFIED_ENGINE_TICK_LOG_DIR", "tick_logs"),
+            max_queue=_env_int("SIMPLIFIED_ENGINE_TICK_LOG_QUEUE", 10000),
+            batch_size=_env_int("SIMPLIFIED_ENGINE_TICK_LOG_BATCH", 200),
+            flush_seconds=_env_float("SIMPLIFIED_ENGINE_TICK_LOG_FLUSH_SECONDS", 1.0),
+            compress=_env_bool("SIMPLIFIED_ENGINE_TICK_LOG_COMPRESS", False),
+            retention_days=_env_int("SIMPLIFIED_ENGINE_TICK_LOG_RETENTION_DAYS", 14),
+        )
         self._lock = threading.RLock()
         self._user_api_keys: dict[str, str] = {}
         self._strategy_by_symbol: dict[str, str] = {}
@@ -340,6 +352,9 @@ class SimplifiedStockEngineService:
         volume = self._extract_volume(quote, normalized)
         ts = self._extract_timestamp(quote)
 
+        # Off the hot path: enqueue is non-blocking and a no-op when disabled.
+        self._tick_log.enqueue(normalized, price, volume, ts)
+
         with self._lock:
             try:
                 self.builder.on_tick(normalized, price, volume, ts)
@@ -382,6 +397,7 @@ class SimplifiedStockEngineService:
                 if self._eod_summary_done_date
                 else None,
                 "completed_trades_today": len(self.engine.completed_trades),
+                "tick_log": self._tick_log.stats(),
                 "funds": funds_summary,
                 "direction_enabled": dict(self._direction_enabled),
                 "positions": {
