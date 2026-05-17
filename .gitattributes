@@ -1,0 +1,34 @@
+# Normalize all text files to LF in the repository.
+# Git will convert CRLF to LF on commit and (when core.autocrlf=true) back to
+# CRLF on checkout for Windows users. This prevents the working tree showing
+# every file as "modified" after checkout on Windows.
+* text=auto eol=lf
+
+# Windows-only files keep CRLF.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Treat known binary types explicitly so git never tries to munge them.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.svg       text
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.exe       binary
+*.dll       binary
+*.so        binary
+*.dylib     binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+*.eot       binary
+*.db        binary
+*.duckdb    binary
+*.sqlite    binary
+*.sqlite3   binary

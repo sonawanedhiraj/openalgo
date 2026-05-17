@@ -942,3 +942,128 @@ def webhook(webhook_id):
     except Exception as e:
         logger.exception(f"Error processing webhook: {str(e)}")
         return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@chartink_bp.route("/simplified-stock-engine/<webhook_id>", methods=["POST"])
+@limiter.limit(WEBHOOK_RATE_LIMIT)
+def simplified_stock_engine_webhook(webhook_id):
+    """Receive Chartink triggers for the migrated simplified stock engine.
+
+    This endpoint deliberately does not use the standard Chartink symbol mappings or
+    immediate order queue. It only arms the engine for BUY monitoring; the engine
+    places orders later after its 5-minute candle, ATR, and volume rules pass.
+    """
+    try:
+        strategy = get_strategy_by_webhook_id(webhook_id)
+        if not strategy:
+            logger.error("Strategy not found for simplified engine webhook ID: %s", webhook_id)
+            return jsonify({"status": "error", "error": "Invalid webhook ID"}), 404
+
+        if not strategy.is_active:
+            logger.info(
+                "Strategy %s is inactive, ignoring simplified engine webhook", strategy.id
+            )
+            return jsonify({"status": "success", "message": "Strategy is inactive"})
+
+        data = request.get_json()
+        if not data:
+            logger.error("No data received in simplified engine webhook for strategy %s", strategy.id)
+            return jsonify({"status": "error", "error": "No data received"}), 400
+
+        if strategy.is_intraday:
+            current_time = datetime.now(pytz.timezone("Asia/Kolkata")).time()
+            start_time = datetime.strptime(strategy.start_time, "%H:%M").time()
+            end_time = datetime.strptime(strategy.end_time, "%H:%M").time()
+            squareoff_time = datetime.strptime(strategy.squareoff_time, "%H:%M").time()
+
+            if current_time < start_time:
+                return jsonify(
+                    {"status": "error", "error": "Cannot arm engine before start time"}
+                ), 400
+            if current_time >= squareoff_time:
+                return jsonify(
+                    {"status": "error", "error": "Cannot arm engine after square off time"}
+                ), 400
+            if current_time >= end_time:
+                return jsonify(
+                    {"status": "error", "error": "Cannot arm new entries after end time"}
+                ), 400
+
+        from services.simplified_stock_engine_service import (
+            get_simplified_stock_engine_service,
+        )
+
+        service = get_simplified_stock_engine_service()
+        result = service.process_chartink_webhook(
+            user_id=strategy.user_id,
+            strategy_name=strategy.name,
+            payload=data,
+        )
+
+        status_code = 200 if result.get("status") in {"success", "ignored"} else 400
+        return jsonify(result), status_code
+
+    except Exception as e:
+        logger.exception("Error processing simplified stock engine webhook: %s", str(e))
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Simplified Stock Engine — UI control endpoints (session-authenticated)
+# ---------------------------------------------------------------------------
+
+
+@chartink_bp.route("/simplified-engine/api/status", methods=["GET"])
+@check_session_validity
+def simplified_engine_status():
+    """Return live status of the simplified stock engine (positions, toggles, etc)."""
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Session expired"}), 401
+
+    try:
+        from services.simplified_stock_engine_service import (
+            get_simplified_stock_engine_service,
+        )
+
+        service = get_simplified_stock_engine_service()
+        return jsonify({"status": "success", "data": service.status()})
+    except Exception as e:
+        logger.exception("simplified-engine status failed: %s", str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@chartink_bp.route("/simplified-engine/api/toggle", methods=["POST"])
+@check_session_validity
+@limiter.limit(STRATEGY_RATE_LIMIT)
+def simplified_engine_toggle():
+    """Toggle BUY or SELL strategy enabled/disabled."""
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Session expired"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    direction = str(payload.get("direction", "")).upper()
+    enabled = payload.get("enabled")
+    if direction not in ("BUY", "SELL") or not isinstance(enabled, bool):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Body must be {direction: 'BUY'|'SELL', enabled: true|false}",
+                }
+            ),
+            400,
+        )
+
+    try:
+        from services.simplified_stock_engine_service import (
+            get_simplified_stock_engine_service,
+        )
+
+        service = get_simplified_stock_engine_service()
+        flags = service.set_direction_enabled(direction, enabled)
+        return jsonify({"status": "success", "direction_enabled": flags})
+    except Exception as e:
+        logger.exception("simplified-engine toggle failed: %s", str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500

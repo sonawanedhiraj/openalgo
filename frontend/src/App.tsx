@@ -88,6 +88,9 @@ const NewChartinkStrategy = lazy(() => import('@/pages/chartink/NewChartinkStrat
 const ViewChartinkStrategy = lazy(() => import('@/pages/chartink/ViewChartinkStrategy'))
 const ConfigureChartinkSymbols = lazy(() => import('@/pages/chartink/ConfigureChartinkSymbols'))
 
+// Simplified Stock Engine
+const SimplifiedEngine = lazy(() => import('@/pages/SimplifiedEngine'))
+
 // Flow pages
 const FlowIndex = lazy(() => import('@/pages/flow/FlowIndex'))
 const FlowEditor = lazy(() => import('@/pages/flow/FlowEditor'))
@@ -231,6 +234,8 @@ function App() {
                   path="/chartink/:strategyId/configure"
                   element={<ConfigureChartinkSymbols />}
                 />
+                {/* Simplified Stock Engine */}
+                <Route path="/simplified-engine" element={<SimplifiedEngine />} />
                 {/* Flow Editor */}
                 <Route path="/flow" element={<FlowIndex />} />
                 <Route path="/flow/shortcuts" element={<FlowKeyboardShortcuts />} />
