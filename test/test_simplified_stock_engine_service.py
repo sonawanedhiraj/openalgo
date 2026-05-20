@@ -120,21 +120,16 @@ def test_resolve_mode_from_env_invalid_falls_back_to_sandbox(monkeypatch):
     assert _resolve_mode_from_env() == MODE_SANDBOX
 
 
-def test_resolve_mode_dry_run_true_maps_to_sandbox(monkeypatch):
+def test_resolve_mode_no_env_defaults_to_sandbox(monkeypatch):
     monkeypatch.delenv("SIMPLIFIED_ENGINE_MODE", raising=False)
-    monkeypatch.setenv("SIMPLIFIED_ENGINE_DRY_RUN", "true")
     assert _resolve_mode_from_env() == MODE_SANDBOX
 
 
-def test_resolve_mode_dry_run_false_maps_to_live(monkeypatch):
+def test_dry_run_env_is_ignored(monkeypatch):
+    """The legacy SIMPLIFIED_ENGINE_DRY_RUN env var must no longer affect mode."""
     monkeypatch.delenv("SIMPLIFIED_ENGINE_MODE", raising=False)
-    monkeypatch.setenv("SIMPLIFIED_ENGINE_DRY_RUN", "false")
-    assert _resolve_mode_from_env() == MODE_LIVE
-
-
-def test_resolve_mode_no_env_defaults_to_sandbox(monkeypatch):
-    monkeypatch.delenv("SIMPLIFIED_ENGINE_MODE", raising=False)
-    monkeypatch.delenv("SIMPLIFIED_ENGINE_DRY_RUN", raising=False)
+    monkeypatch.setenv("SIMPLIFIED_ENGINE_DRY_RUN", "false")  # would've been "live"
+    # Without MODE set, we get the sandbox default regardless of DRY_RUN.
     assert _resolve_mode_from_env() == MODE_SANDBOX
 
 

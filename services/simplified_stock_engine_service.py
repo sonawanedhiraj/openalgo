@@ -63,33 +63,26 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _resolve_mode_from_env() -> str:
-    """Resolve the engine routing mode from environment.
+    """Resolve the engine routing mode from SIMPLIFIED_ENGINE_MODE.
 
-    Preference order:
-    1. SIMPLIFIED_ENGINE_MODE explicitly set to disabled|sandbox|live.
-    2. Backward-compat: SIMPLIFIED_ENGINE_DRY_RUN. true -> sandbox, false -> live.
-       (A deprecation warning is logged when this fallback is used.)
-    3. Default: sandbox (safe -- never sends live orders without explicit opt-in).
+    Recognized values: disabled | sandbox | live. Anything else (or unset)
+    falls back to sandbox so an entry-typo never silently sends live orders.
+
+    Note: an earlier release honored SIMPLIFIED_ENGINE_DRY_RUN as a backward-
+    compat shim. That fallback has been removed; operators upgrading must
+    set SIMPLIFIED_ENGINE_MODE explicitly.
     """
     raw_mode = os.getenv("SIMPLIFIED_ENGINE_MODE")
-    if raw_mode is not None:
-        normalized = raw_mode.strip().lower()
-        if normalized in VALID_MODES:
-            return normalized
-        logger.warning(
-            "Invalid SIMPLIFIED_ENGINE_MODE=%r; expected one of %s. Falling back to sandbox.",
-            raw_mode,
-            VALID_MODES,
-        )
+    if raw_mode is None:
         return MODE_SANDBOX
-
-    raw_dry_run = os.getenv("SIMPLIFIED_ENGINE_DRY_RUN")
-    if raw_dry_run is not None:
-        logger.warning(
-            "SIMPLIFIED_ENGINE_DRY_RUN is deprecated; use SIMPLIFIED_ENGINE_MODE=sandbox or live instead."
-        )
-        return MODE_SANDBOX if raw_dry_run.strip().lower() in {"1", "true", "yes", "on"} else MODE_LIVE
-
+    normalized = raw_mode.strip().lower()
+    if normalized in VALID_MODES:
+        return normalized
+    logger.warning(
+        "Invalid SIMPLIFIED_ENGINE_MODE=%r; expected one of %s. Falling back to sandbox.",
+        raw_mode,
+        VALID_MODES,
+    )
     return MODE_SANDBOX
 
 

@@ -119,28 +119,141 @@ function DirectionCard({
 }
 
 function ModeBanner({ status }: { status: SimplifiedEngineStatus }) {
-  const tone =
-    status.mode === 'live'
-      ? 'destructive'
+  // engine_mode is the source of truth. status.mode is a display label:
+  // it may say 'analyze' even when engine_mode='live' if openalgo's global
+  // analyze_mode flag is on, since place_order would still route to sandbox.
+  const isLive = status.engine_mode === 'live' && status.mode === 'live'
+  const isDisabled = status.engine_mode === 'disabled'
+  const label = isLive
+    ? 'LIVE TRADING'
+    : isDisabled
+      ? 'DISABLED (NO ORDERS)'
       : status.mode === 'analyze'
-        ? 'default'
-        : 'default'
-  const label =
-    status.mode === 'live'
-      ? 'LIVE TRADING'
-      : status.mode === 'analyze'
-        ? 'ANALYZER (PAPER)'
-        : 'DRY RUN (NO ORDERS)'
+        ? 'ANALYZER OVERRIDE (sandbox)'
+        : status.engine_mode === 'sandbox'
+          ? 'SANDBOX (VIRTUAL CAPITAL)'
+          : status.mode.toUpperCase()
   return (
-    <Alert variant={tone === 'destructive' ? 'destructive' : 'default'}>
+    <Alert variant={isLive ? 'destructive' : 'default'}>
       <Activity className="h-4 w-4" />
       <AlertTitle>{label}</AlertTitle>
       <AlertDescription>
         Trades today: <strong>{status.trades_today}</strong> /{' '}
-        {status.max_trades_per_day}. Quote subscriptions:{' '}
+        {status.max_trades_per_day}. Round trips closed:{' '}
+        <strong>{status.completed_trades_today}</strong>. Quote subscriptions:{' '}
         <strong>{status.subscribed_symbols.length}</strong>.
       </AlertDescription>
     </Alert>
+  )
+}
+
+function EngineStateCard({ status }: { status: SimplifiedEngineStatus }) {
+  // Compact ops card showing post-step-5 status surface: funds gate, EOD
+  // markers, tick log. Each section is conditionally rendered so the card
+  // stays compact when nothing's interesting yet.
+  const funds = status.funds
+  const tick = status.tick_log
+  const fundsAge = funds ? new Date(funds.checked_at) : null
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-lg">Engine state</CardTitle>
+        <CardDescription>
+          Operational health -- funds reading, EOD progress, tick log.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-4 sm:grid-cols-2">
+        <div className="rounded-md border p-3">
+          <div className="text-xs font-medium uppercase text-muted-foreground mb-1">
+            Funds (live mode only)
+          </div>
+          {funds ? (
+            <div className="space-y-0.5 text-sm">
+              <div className="font-mono">
+                Available: <strong>{funds.available_cash.toFixed(2)}</strong>
+              </div>
+              <div className="font-mono text-muted-foreground">
+                Floor: {funds.floor.toFixed(2)}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                Checked: {fundsAge ? fundsAge.toLocaleTimeString() : '-'}
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-muted-foreground">
+              No funds check yet. Live-mode entry attempts populate this.
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-md border p-3">
+          <div className="text-xs font-medium uppercase text-muted-foreground mb-1">
+            EOD progress
+          </div>
+          <div className="space-y-0.5 text-sm">
+            <div>
+              Flatten:{' '}
+              <Badge variant={status.eod_flatten_done ? 'default' : 'secondary'}>
+                {status.eod_flatten_done ?? 'pending'}
+              </Badge>
+            </div>
+            <div>
+              Summary:{' '}
+              <Badge variant={status.eod_summary_done ? 'default' : 'secondary'}>
+                {status.eod_summary_done ?? 'pending'}
+              </Badge>
+            </div>
+            <div className="text-xs text-muted-foreground pt-1">
+              Both fire at the configured eod_exit_time (15:20 IST default).
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-md border p-3 sm:col-span-2">
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-xs font-medium uppercase text-muted-foreground">
+              Tick log
+            </div>
+            <Badge variant={tick.enabled ? 'default' : 'secondary'}>
+              {tick.enabled ? 'enabled' : 'disabled'}
+            </Badge>
+          </div>
+          {tick.enabled ? (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
+              <div>
+                <div className="text-xs text-muted-foreground">Queued</div>
+                <div className="font-mono">
+                  {tick.queued} / {tick.queue_max}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">Written today</div>
+                <div className="font-mono">{tick.written_today.toLocaleString()}</div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">Dropped today</div>
+                <div className="font-mono">{tick.dropped_today.toLocaleString()}</div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground">Bytes today</div>
+                <div className="font-mono">{tick.bytes_written_today.toLocaleString()}</div>
+              </div>
+              {tick.file && (
+                <div className="col-span-2 sm:col-span-4 text-xs text-muted-foreground truncate">
+                  File: <code className="bg-muted px-1 rounded">{tick.file}</code>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-xs text-muted-foreground">
+              Set <code className="bg-muted px-1 rounded">SIMPLIFIED_ENGINE_TICK_LOG=true</code>{' '}
+              to enable.
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -296,6 +409,8 @@ export default function SimplifiedEngine() {
       </div>
 
       <ModeBanner status={status} />
+
+      <EngineStateCard status={status} />
 
       <Alert>
         <Webhook className="h-4 w-4" />

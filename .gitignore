@@ -38,6 +38,7 @@ tmp/
 *.log
 *.jsonl
 *.tmp
+*.new
 checkpoint.txt
 checkpoints.json
 
