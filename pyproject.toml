@@ -200,6 +200,10 @@ packages = []
 testpaths = ["test"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+# Add the project root to sys.path so tests can do `from services.foo import bar`
+# without pytest having to rely on the legacy "prepend rootdir" import mode
+# (which Python 3.14 / newer pytest no longer applies the same way).
+pythonpath = ["."]
 addopts = "-v --timeout=60"
 filterwarnings = [
     "ignore::DeprecationWarning",
