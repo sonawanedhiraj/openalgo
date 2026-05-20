@@ -462,6 +462,29 @@ All error logging uses `logger.exception()` (not `logger.error()` + manual trace
 2. Delete `frontend/node_modules` and run `npm install`
 3. Check for TypeScript errors: `npm run build`
 
+## Simplified Stock Engine
+
+This project hosts the simplified stock engine — a Chartink-driven intraday
+strategy that arms long/short watches and fires market orders via 5-minute
+candle breakouts with ATR-based stop loss and RR trailing. The engine has its
+own mode flag (`SIMPLIFIED_ENGINE_MODE`) and is independent of the global
+`analyze_mode` toggle.
+
+For deep context — the integration plan, every design decision, env var
+reference, test status, and the work queue for picking it up fresh — see
+[docs/SIMPLIFIED_ENGINE_HANDOFF.md](docs/SIMPLIFIED_ENGINE_HANDOFF.md).
+
+Key files:
+- `services/simplified_stock_engine_core.py` — broker-agnostic engine.
+- `services/simplified_stock_engine_service.py` — openalgo integration.
+- `services/simplified_stock_engine_ticklog.py` — async tick log writer.
+- `blueprints/chartink.py:947+` — webhook, status, direction-toggle routes.
+- `test/test_simplified_stock_engine_*.py` — 68 tests.
+
+The default mode is `sandbox` — orders flow into `sandbox.db` (virtual ₹1Cr
+capital) regardless of the global analyze_mode flag. Flip to `live` only
+after running the test suite and the smoke-boot checklist in the hand-off doc.
+
 ## Claude Code Instructions
 
 ### Frontend Build Process
