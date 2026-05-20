@@ -3,6 +3,18 @@ from unittest.mock import patch
 
 import pytest
 
+# Pre-import the submodules that mock.patch needs to resolve as attributes of
+# the `services` package. The simplified-engine service does lazy imports of
+# these inside _dispatch_order / _check_live_funds / _flatten_for_api_key, so
+# the attribute isn't bound on the `services` package object until a dispatch
+# path actually runs. Without the eager import below, mock.patch hits:
+#   AttributeError: module 'services' has no attribute 'sandbox_service'
+# during attribute walk on the dotted path "services.sandbox_service.fn".
+import services.funds_service  # noqa: F401, E402
+import services.place_order_service  # noqa: F401, E402
+import services.positionbook_service  # noqa: F401, E402
+import services.sandbox_service  # noqa: F401, E402
+
 from services.simplified_stock_engine_core import (
     MODE_DISABLED,
     MODE_LIVE,
