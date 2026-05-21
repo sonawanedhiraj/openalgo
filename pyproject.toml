@@ -150,6 +150,7 @@ dependencies = [
   "WTForms==3.2.1",
   "zipp==3.23.1",
   "zmq==0.0.0",
+  "fastapi>=0.136.1",
 ]
 
 [build-system]

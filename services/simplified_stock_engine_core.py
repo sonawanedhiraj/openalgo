@@ -35,7 +35,7 @@ class SimplifiedEngineConfig:
     account_leverage: float = 5.0
     max_risk_per_trade: float = 500.0
     min_risk_per_share: float = 1.0
-    max_trades_per_day: int = 6
+    max_trades_per_day: int = 4
     exchange: str = "NSE"
     product: str = "MIS"
     order_pricetype: str = "MARKET"
@@ -47,7 +47,7 @@ class SimplifiedEngineConfig:
     history_market_cutoff: dt.time = dt.time(9, 30)
     reference_candle_expiry_seconds: int = 20 * 60
     atr_period: int = 14
-    atr_sl_mult: float = 1.2
+    atr_sl_mult: float = 1.5
     atr_entry_min_mult: float = 0.5
     volume_multiplier: float = 2.5
     trail_atr_mult: float = 0.5
@@ -56,6 +56,7 @@ class SimplifiedEngineConfig:
     lock_profit_pct: float = 0.95
     enable_global_profit_lock: bool = True
     sl_confirm_seconds: float = 3.0
+    cooldown_candles: int = 3
     # Routing mode for orders the engine emits. See MODE_* constants above.
     mode: str = MODE_SANDBOX
     # Minimum available cash (broker funds) required to arm a new opening
@@ -328,6 +329,10 @@ class SimplifiedStockEngine:
         # and consumed at EOD by the service to log the trading summary.
         # Cleared at the start of each new trading day (_reset_trade_day_if_needed).
         self.completed_trades: list[CompletedTrade] = []
+        # Cooldown tracking: symbol → candle bucket timestamp when a stop-loss
+        # exit occurred. Used by _is_entry_window_open to block re-entry for
+        # cooldown_candles candles after a stop-loss on the same symbol.
+        self._sl_cooldown: dict[str, dt.datetime] = {}
 
         self._tr_deques: dict[str, deque[float]] = {}
         self._atr_map: dict[str, float] = {}
@@ -515,6 +520,8 @@ class SimplifiedStockEngine:
         if exit_price is None:
             exit_price = float(position.stop_loss)
 
+        effective_reason = reason or (pending.reason if pending else None)
+
         record = CompletedTrade(
             symbol=symbol,
             qty=int(position.qty),
@@ -522,9 +529,15 @@ class SimplifiedStockEngine:
             exit_price=float(exit_price),
             entry_time=position.entry_time,
             exit_time=self.now_provider(),
-            exit_reason=reason or (pending.reason if pending else None),
+            exit_reason=effective_reason,
         )
         self.completed_trades.append(record)
+
+        # Record cooldown after a stop-loss exit so _is_entry_window_open
+        # blocks re-entry on the same symbol for cooldown_candles candles.
+        if effective_reason and "stop_loss" in effective_reason:
+            self._sl_cooldown[symbol] = FiveMinuteCandleBuilder.bucket(self.now_provider())
+
         return record
 
     def apply_simple_rr_trailing(self, symbol: str, current_price: float) -> None:
@@ -669,6 +682,22 @@ class SimplifiedStockEngine:
             return False
         if candle.elapsed_pct < self.config.elapsed_pct_entry:
             return False
+
+        # Same-symbol cooldown: block re-entry for cooldown_candles candles
+        # after a stop-loss exit on this symbol.
+        sl_bucket = self._sl_cooldown.get(symbol)
+        if sl_bucket is not None:
+            cooldown_seconds = self.config.cooldown_candles * self.config.candle_seconds
+            if (candle.ts - sl_bucket).total_seconds() < cooldown_seconds:
+                logger.info(
+                    "[SIMPLIFIED-COOLDOWN] %s blocked — %d/%d candles since SL",
+                    symbol,
+                    int((candle.ts - sl_bucket).total_seconds() // self.config.candle_seconds),
+                    self.config.cooldown_candles,
+                )
+                return False
+            # Cooldown expired — remove entry
+            del self._sl_cooldown[symbol]
 
         return True
 
@@ -832,6 +861,7 @@ class SimplifiedStockEngine:
             self.eod_done_date = None
             self.global_profit_actioned = False
             self.completed_trades.clear()
+            self._sl_cooldown.clear()
 
     @staticmethod
     def _normalize_bucket(ts: dt.datetime) -> dt.datetime:

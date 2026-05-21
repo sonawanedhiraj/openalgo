@@ -492,3 +492,49 @@ When building the React frontend locally:
 - Run `cd frontend && npm run build` (build only, no tests)
 - Tests are handled by CI/CD pipeline, not required for local builds
 - The `frontend/dist/` directory is gitignored and built by GitHub Actions
+
+## Cowork / AI Agent Operational Learnings
+
+For detailed session learnings including login flows, Zerodha quirks, API endpoints,
+webhook IDs, monitoring procedures, and daily workflow checklists, see:
+[docs/COWORK_SESSION_LEARNINGS.md](docs/COWORK_SESSION_LEARNINGS.md)
+
+**Key quick-reference from that doc:**
+- **Webhook ID**: `c7d08357-6fe1-4603-bd2a-be4c9f9e06ac` (strategy: `chartink_FnO_intraday_buy`)
+- **Simplified Engine POST**: `http://127.0.0.1:5000/chartink/simplified-stock-engine/<webhook_id>`
+- **Engine Status GET**: `http://127.0.0.1:5000/chartink/simplified-engine/api/status`
+- **Chartink Buy Screener**: `https://chartink.com/screener/fno-intraday-buy-20`
+- **Chartink Sell Screener**: `https://chartink.com/screener/alert-for-intraday-sell-fno`
+- Chrome extension cannot navigate to `kite.zerodha.com` — user must complete Zerodha login manually
+- Bash shell is sandboxed Linux — use `javascript_tool` in browser for localhost API calls
+- Zerodha tokens expire daily at 3 AM IST — re-login required each trading day
+- **Backtester**: `uv run python backtest/run_backtest.py --date YYYY-MM-DD --from-engine` — replays 5-min candles (or tick data with `--tick-data tick_logs`) through the engine in `disabled` mode (no DB writes). **Always use `--from-engine`** to fetch live config (atr_sl_mult, max_trades, cooldown) from the running engine API — without it, config may diverge from live and produce misleading results. Requires OpenAlgo running + active broker session. See Sections 11-12 of the learnings doc for full details, comparison analysis, and tick-data replay.
+
+## Cowork ↔ Claude Code Bridge Server
+
+A FastAPI bridge at `bridge/server.py` allows Cowork to invoke Claude Code CLI
+over HTTP for automated bug fixing, testing, and app restart.
+
+**Start**: `uv run python bridge/server.py` (runs on port 5001 alongside OpenAlgo on 5000)
+
+**Endpoints** (all at `http://127.0.0.1:5001`):
+- `POST /fix-bug` — Send error details, Claude Code fixes the code and runs tests
+- `POST /run-tests` — Run pytest, optionally auto-fix failures
+- `POST /run` — Run any custom prompt via Claude Code
+- `POST /restart-app` — Kill and restart OpenAlgo
+- `GET /status` — Check if bridge is idle/busy
+- `GET /read-errors` — Read last N entries from errors.jsonl
+- `GET /engine-status` — Proxy simplified engine status
+
+**How Cowork calls it** (via browser JS on any OpenAlgo tab):
+```javascript
+fetch('http://127.0.0.1:5001/fix-bug', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({
+    error_message: 'WebSocket connection failed',
+    traceback: '...',
+    file_path: 'services/simplified_stock_engine_service.py'
+  })
+}).then(r => r.json()).then(d => { window.__bridge_result = d; });
+```

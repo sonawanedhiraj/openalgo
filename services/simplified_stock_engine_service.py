@@ -92,7 +92,7 @@ def config_from_env() -> SimplifiedEngineConfig:
         account_leverage=_env_float("SIMPLIFIED_ENGINE_LEVERAGE", 5.0),
         max_risk_per_trade=_env_float("SIMPLIFIED_ENGINE_MAX_RISK_PER_TRADE", 500.0),
         min_risk_per_share=_env_float("SIMPLIFIED_ENGINE_MIN_RISK_PER_SHARE", 1.0),
-        max_trades_per_day=_env_int("SIMPLIFIED_ENGINE_MAX_TRADES_PER_DAY", 6),
+        max_trades_per_day=_env_int("SIMPLIFIED_ENGINE_MAX_TRADES_PER_DAY", 4),
         exchange=os.getenv("SIMPLIFIED_ENGINE_EXCHANGE", "NSE").upper(),
         product=os.getenv("SIMPLIFIED_ENGINE_PRODUCT", "MIS").upper(),
         no_new_openings_time=_parse_time_env(
@@ -100,11 +100,12 @@ def config_from_env() -> SimplifiedEngineConfig:
         ),
         eod_exit_time=_parse_time_env("SIMPLIFIED_ENGINE_EOD_EXIT_TIME", dt.time(15, 20)),
         atr_period=_env_int("SIMPLIFIED_ENGINE_ATR_PERIOD", 14),
-        atr_sl_mult=_env_float("SIMPLIFIED_ENGINE_ATR_SL_MULT", 1.2),
+        atr_sl_mult=_env_float("SIMPLIFIED_ENGINE_ATR_SL_MULT", 1.5),
         atr_entry_min_mult=_env_float("SIMPLIFIED_ENGINE_ATR_ENTRY_MIN_MULT", 0.5),
         volume_multiplier=_env_float("SIMPLIFIED_ENGINE_VOLUME_MULTIPLIER", 2.5),
         trail_atr_mult=_env_float("SIMPLIFIED_ENGINE_TRAIL_ATR_MULT", 0.5),
         sl_confirm_seconds=_env_float("SIMPLIFIED_ENGINE_SL_CONFIRM_SECONDS", 3.0),
+        cooldown_candles=_env_int("SIMPLIFIED_ENGINE_COOLDOWN_CANDLES", 3),
         enable_global_profit_lock=_env_bool("SIMPLIFIED_ENGINE_GLOBAL_PROFIT_LOCK", True),
         mode=_resolve_mode_from_env(),
         funds_floor=_resolve_funds_floor_from_env(),
@@ -410,6 +411,9 @@ class SimplifiedStockEngineService:
                 "sell_symbols": sell_symbols,
                 "trades_today": self.engine.trades_today,
                 "max_trades_per_day": self.config.max_trades_per_day,
+                "cooldown_candles": self.config.cooldown_candles,
+                "atr_sl_mult": self.config.atr_sl_mult,
+                "symbols_in_cooldown": list(self.engine._sl_cooldown.keys()),
                 "subscribed_symbols": [
                     {"user_id": user_id, "exchange": exchange, "symbol": symbol}
                     for user_id, exchange, symbol in self._subscribed_symbols
