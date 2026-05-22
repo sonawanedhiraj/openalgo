@@ -1,0 +1,108 @@
+{
+  "date": "2026-05-20",
+  "config": {
+    "capital": 20000.0,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500.0,
+    "atr_period": 14,
+    "atr_sl_mult": 1.2,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 6
+  },
+  "summary": {
+    "total_trades": 6,
+    "winners": 5,
+    "losers": 1,
+    "win_rate": 83.3,
+    "gross_pnl": 1029.36,
+    "total_charges": 324.64,
+    "net_pnl": 704.72,
+    "roi_pct": 3.52
+  },
+  "trades": [
+    {
+      "symbol": "POWERINDIA",
+      "direction": "LONG",
+      "qty": 2,
+      "entry_price": 33430.0,
+      "exit_price": 33608.35,
+      "entry_time": "09:49:59",
+      "exit_time": "09:59:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 356.7,
+      "charges": 48.03,
+      "net_pnl": 308.67,
+      "turnover": 134076.7
+    },
+    {
+      "symbol": "POWERINDIA",
+      "direction": "LONG",
+      "qty": 2,
+      "entry_price": 34195.0,
+      "exit_price": 34311.38,
+      "entry_time": "10:24:59",
+      "exit_time": "10:44:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 232.76,
+      "charges": 48.56,
+      "net_pnl": 184.2,
+      "turnover": 137012.76
+    },
+    {
+      "symbol": "SIEMENS",
+      "direction": "LONG",
+      "qty": 28,
+      "entry_price": 3536.4,
+      "exit_price": 3548.39,
+      "entry_time": "10:34:59",
+      "exit_time": "10:54:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 335.72,
+      "charges": 59.72,
+      "net_pnl": 276.0,
+      "turnover": 198374.12
+    },
+    {
+      "symbol": "CGPOWER",
+      "direction": "LONG",
+      "qty": 120,
+      "entry_price": 829.05,
+      "exit_price": 831.32,
+      "entry_time": "10:24:59",
+      "exit_time": "11:04:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 272.4,
+      "charges": 59.86,
+      "net_pnl": 212.54,
+      "turnover": 199244.4
+    },
+    {
+      "symbol": "POWERINDIA",
+      "direction": "LONG",
+      "qty": 2,
+      "entry_price": 34465.0,
+      "exit_price": 34578.14,
+      "entry_time": "11:24:59",
+      "exit_time": "11:34:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 226.28,
+      "charges": 48.74,
+      "net_pnl": 177.54,
+      "turnover": 138086.28
+    },
+    {
+      "symbol": "HINDPETRO",
+      "direction": "LONG",
+      "qty": 263,
+      "entry_price": 378.8,
+      "exit_price": 377.3,
+      "entry_time": "11:39:59",
+      "exit_time": "11:39:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -394.5,
+      "charges": 59.73,
+      "net_pnl": -454.23,
+      "turnover": 198854.3
+    }
+  ]
+}

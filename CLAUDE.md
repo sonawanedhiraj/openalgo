@@ -2,6 +2,19 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Cowork Objective (Read First)
+
+**Cowork is the brain of this project.** It does real-time market research, selects
+and tunes strategies, monitors execution, and drives continuous improvement through
+a daily learn→backtest→improve loop. For the full objective, role definition, and
+daily workflow, see [`COWORK_OBJECTIVE.md`](COWORK_OBJECTIVE.md).
+
+**Strategy files live in `strategies/<name>/`** — each strategy has its own
+`LEARNINGS.md`, `VERSION_LOG.md`, and `config_snapshot.json`. Always read the
+active strategy's learnings before making decisions. See
+[`strategies/simplified_engine/`](strategies/simplified_engine/) for the current
+active strategy.
+
 ## Overview
 
 OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It provides a unified API layer across 24+ Indian brokers, enabling seamless integration with TradingView, Amibroker, Excel, Python, and AI agents.
@@ -462,6 +475,19 @@ All error logging uses `logger.exception()` (not `logger.error()` + manual trace
 2. Delete `frontend/node_modules` and run `npm install`
 3. Check for TypeScript errors: `npm run build`
 
+## Strategy Architecture
+
+Strategies are versioned independently under `strategies/<name>/`. Each has:
+- `LEARNINGS.md` — cumulative knowledge (most important file for decision-making)
+- `VERSION_LOG.md` — parameter/logic changes with dates, rationale, backtest evidence
+- `config_snapshot.json` — current live config values
+- `README.md` — strategy overview and usage
+
+**Active strategy**: [`strategies/simplified_engine/`](strategies/simplified_engine/)
+
+The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
+Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
+
 ## Simplified Stock Engine
 
 This project hosts the simplified stock engine — a Chartink-driven intraday
@@ -473,6 +499,9 @@ own mode flag (`SIMPLIFIED_ENGINE_MODE`) and is independent of the global
 For deep context — the integration plan, every design decision, env var
 reference, test status, and the work queue for picking it up fresh — see
 [docs/SIMPLIFIED_ENGINE_HANDOFF.md](docs/SIMPLIFIED_ENGINE_HANDOFF.md).
+
+For strategy-specific learnings, parameter history, and daily results, see
+[`strategies/simplified_engine/LEARNINGS.md`](strategies/simplified_engine/LEARNINGS.md).
 
 Key files:
 - `services/simplified_stock_engine_core.py` — broker-agnostic engine.

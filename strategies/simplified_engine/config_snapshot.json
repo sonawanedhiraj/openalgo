@@ -1,0 +1,29 @@
+{
+  "strategy": "simplified_engine",
+  "snapshot_date": "2026-05-21",
+  "version": "v1.1",
+  "source": "SIMPLIFIED_ENGINE_* env vars",
+  "config": {
+    "mode": "sandbox",
+    "capital": 20000,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500,
+    "atr_period": 14,
+    "atr_sl_mult": 1.5,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 4,
+    "cooldown_candles": 3,
+    "no_new_entries_after": "15:10",
+    "eod_exit_time": "15:20",
+    "trail_atr_mult": 0.8,
+    "rr_trail_start_r": 1.5,
+    "sl_confirm_seconds": 0,
+    "enable_global_profit_lock": false,
+    "atr_entry_min_mult": 0.0
+  },
+  "screeners": {
+    "buy": "https://chartink.com/screener/fno-intraday-buy-20",
+    "sell": "https://chartink.com/screener/alert-for-intraday-sell-fno"
+  },
+  "webhook_id": "c7d08357-6fe1-4603-bd2a-be4c9f9e06ac"
+}

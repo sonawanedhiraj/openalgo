@@ -1,0 +1,108 @@
+{
+  "date": "2026-05-14",
+  "config": {
+    "capital": 20000.0,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500.0,
+    "atr_period": 14,
+    "atr_sl_mult": 1.2,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 6
+  },
+  "summary": {
+    "total_trades": 6,
+    "winners": 1,
+    "losers": 5,
+    "win_rate": 16.7,
+    "gross_pnl": -1267.76,
+    "total_charges": 357.69,
+    "net_pnl": -1625.45,
+    "roi_pct": -8.13
+  },
+  "trades": [
+    {
+      "symbol": "HDFCBANK",
+      "direction": "LONG",
+      "qty": 132,
+      "entry_price": 753.05,
+      "exit_price": 750.89,
+      "entry_time": "09:54:59",
+      "exit_time": "10:24:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -285.12,
+      "charges": 59.68,
+      "net_pnl": -344.8,
+      "turnover": 198520.08
+    },
+    {
+      "symbol": "BHARTIARTL",
+      "direction": "LONG",
+      "qty": 54,
+      "entry_price": 1840.5,
+      "exit_price": 1834.25,
+      "entry_time": "11:19:59",
+      "exit_time": "11:19:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -337.5,
+      "charges": 59.66,
+      "net_pnl": -397.16,
+      "turnover": 198436.5
+    },
+    {
+      "symbol": "SBIN",
+      "direction": "LONG",
+      "qty": 101,
+      "entry_price": 982.1,
+      "exit_price": 978.71,
+      "entry_time": "12:19:59",
+      "exit_time": "12:19:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -342.39,
+      "charges": 59.59,
+      "net_pnl": -401.98,
+      "turnover": 198041.81
+    },
+    {
+      "symbol": "ICICIBANK",
+      "direction": "LONG",
+      "qty": 79,
+      "entry_price": 1251.5,
+      "exit_price": 1254.49,
+      "entry_time": "13:04:59",
+      "exit_time": "13:44:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 236.21,
+      "charges": 59.65,
+      "net_pnl": 176.56,
+      "turnover": 197973.21
+    },
+    {
+      "symbol": "RELIANCE",
+      "direction": "LONG",
+      "qty": 72,
+      "entry_price": 1370.3,
+      "exit_price": 1366.87,
+      "entry_time": "13:44:59",
+      "exit_time": "13:54:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -246.96,
+      "charges": 59.42,
+      "net_pnl": -306.38,
+      "turnover": 197076.24
+    },
+    {
+      "symbol": "RELIANCE",
+      "direction": "LONG",
+      "qty": 73,
+      "entry_price": 1362.7,
+      "exit_price": 1358.7,
+      "entry_time": "15:04:59",
+      "exit_time": "15:09:59",
+      "exit_reason": "stop_loss",
+      "gross_pnl": -292.0,
+      "charges": 59.7,
+      "net_pnl": -351.7,
+      "turnover": 198662.2
+    }
+  ]
+}

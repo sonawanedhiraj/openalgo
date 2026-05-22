@@ -179,66 +179,83 @@ def load_tick_data(
 ) -> dict[str, list[dict]]:
     """Load tick-log JSONL files for a given date.
 
-    Tick logs are written by TickLogWriter as:
+    Tick logs are written by TickLogWriter with filename pattern:
+        <tick_dir>/ticks-YYYYMMDD-<pid>.jsonl  (or .jsonl.gz)
+    Each line: {"ts": "...", "symbol": "INFY", "ltp": 1234.5, "volume": 100}
+
+    Multiple PID files may exist for the same date (e.g. after app restart).
+    All matching files are loaded and merged.
+
+    Also supports the older format:
         <tick_dir>/ticks_YYYY-MM-DD.jsonl  (or .jsonl.gz)
-    Each line: {"symbol": "INFY", "price": 1234.5, "volume": 100, "ts": "2026-05-21T09:30:01.123"}
+    with field "price" instead of "ltp".
 
     Returns {symbol: [{"price": float, "volume": int, "ts": datetime}, ...]}
     sorted by timestamp.
     """
     result: dict[str, list[dict]] = {}
 
-    # Look for both compressed and uncompressed files
-    candidates = [
-        os.path.join(tick_dir, f"ticks_{date_str}.jsonl"),
-        os.path.join(tick_dir, f"ticks_{date_str}.jsonl.gz"),
-    ]
+    # The TickLogWriter uses: ticks-YYYYMMDD-<pid>.jsonl[.gz]
+    # We also support the older format: ticks_YYYY-MM-DD.jsonl[.gz]
+    date_compact = date_str.replace("-", "")  # "2026-05-21" → "20260521"
 
-    tick_file = None
-    for path in candidates:
-        if os.path.exists(path):
-            tick_file = path
-            break
+    tick_files: list[str] = []
 
-    if tick_file is None:
+    if os.path.isdir(tick_dir):
+        for name in os.listdir(tick_dir):
+            # Match writer format: ticks-YYYYMMDD-*.jsonl[.gz]
+            if name.startswith(f"ticks-{date_compact}-") and (
+                name.endswith(".jsonl") or name.endswith(".jsonl.gz")
+            ):
+                tick_files.append(os.path.join(tick_dir, name))
+            # Match legacy format: ticks_YYYY-MM-DD.jsonl[.gz]
+            elif name.startswith(f"ticks_{date_str}") and (
+                name.endswith(".jsonl") or name.endswith(".jsonl.gz")
+            ):
+                tick_files.append(os.path.join(tick_dir, name))
+
+    if not tick_files:
         return result
 
-    print(f"  Loading tick data from {tick_file} ...")
-    opener = gzip.open if tick_file.endswith(".gz") else open
+    print(f"  Loading tick data from {len(tick_files)} file(s): {', '.join(os.path.basename(f) for f in tick_files)}")
     line_count = 0
 
-    with opener(tick_file, "rt", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                sym = row.get("symbol", "").upper()
-                if symbols and sym not in symbols:
+    for tick_file in tick_files:
+        opener = gzip.open if tick_file.endswith(".gz") else open
+        with opener(tick_file, "rt", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
+                try:
+                    row = json.loads(line)
+                    sym = row.get("symbol", "").upper()
+                    if symbols and sym not in symbols:
+                        continue
 
-                ts_raw = row.get("ts") or row.get("timestamp")
-                if isinstance(ts_raw, str):
-                    ts = dt.datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                    ts = ts.replace(tzinfo=None)
-                elif isinstance(ts_raw, (int, float)):
-                    ts = dt.datetime.fromtimestamp(
-                        ts_raw / 1000 if ts_raw > 10_000_000_000 else ts_raw
-                    )
-                else:
+                    ts_raw = row.get("ts") or row.get("timestamp")
+                    if isinstance(ts_raw, str):
+                        ts = dt.datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                        ts = ts.replace(tzinfo=None)
+                    elif isinstance(ts_raw, (int, float)):
+                        ts = dt.datetime.fromtimestamp(
+                            ts_raw / 1000 if ts_raw > 10_000_000_000 else ts_raw
+                        )
+                    else:
+                        continue
+
+                    if sym not in result:
+                        result[sym] = []
+                    # TickLogWriter uses "ltp", legacy format uses "price"
+                    price = row.get("ltp") or row.get("price") or 0
+                    result[sym].append({
+                        "price": float(price),
+                        "volume": int(row.get("volume", 0) or 0),
+                        "ts": ts,
+                    })
+                    line_count += 1
+                except (json.JSONDecodeError, ValueError, KeyError):
                     continue
-
-                if sym not in result:
-                    result[sym] = []
-                result[sym].append({
-                    "price": float(row.get("price", 0)),
-                    "volume": int(row.get("volume", 0) or 0),
-                    "ts": ts,
-                })
-                line_count += 1
-            except (json.JSONDecodeError, ValueError, KeyError):
-                continue
 
     # Sort each symbol's ticks by timestamp
     for sym in result:
@@ -247,6 +264,51 @@ def load_tick_data(
     total_symbols = len(result)
     print(f"  Loaded {line_count} ticks across {total_symbols} symbols")
     return result
+
+
+def symbols_from_engine(base_url: str = "http://127.0.0.1:5000") -> list[str]:
+    """Fetch the stock list currently armed in the live engine.
+
+    Returns the union of buy_symbols and sell_symbols from the engine's
+    status endpoint. This lets ``--replay-symbols`` replay exactly the
+    stocks that were fed to the engine today.
+    """
+    url = f"{base_url}/chartink/simplified-engine/api/status"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            body = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"  [WARN] Could not reach engine for symbol list: {e}")
+        return []
+
+    data = body.get("data", {})
+    syms = list(data.get("active_symbols", {}).keys())
+    if not syms:
+        # Fallback: union of buy + sell lists
+        syms = list(set(data.get("buy_symbols", []) + data.get("sell_symbols", [])))
+    return syms
+
+
+def symbols_from_results(results_path: str) -> list[str]:
+    """Extract the unique stock list from a previous backtest results JSON.
+
+    Useful for replaying a past day after the engine has reset and no
+    longer has those symbols armed.
+    """
+    try:
+        with open(results_path, "r") as f:
+            data = json.load(f)
+        # Handle both single-report and multi-report format
+        trades = data.get("trades", [])
+        if not trades and "reports" in data:
+            trades = []
+            for r in data["reports"]:
+                trades.extend(r.get("trades", []))
+        syms = list(dict.fromkeys(t["symbol"] for t in trades))  # preserve order, dedupe
+        return syms
+    except Exception as e:
+        print(f"  [WARN] Could not load symbols from {results_path}: {e}")
+        return []
 
 
 def resolve_broker_auth() -> tuple[str | None, str | None, str | None]:
@@ -794,6 +856,19 @@ Config sourcing (pick one):
 Any CLI override (--capital, --atr-sl-mult, etc.) is applied ON TOP of
 whichever base config was loaded.
 
+Exact day replay (reproduce today's session):
+  --from-engine --replay-symbols --tick-data tick_logs --date 2026-05-22
+
+  This fetches the live config AND stock list from the running engine, then
+  replays tick-by-tick through the same engine logic. The closest you can
+  get to a perfect reproduction of the live trading day.
+
+Symbol sources (pick one):
+  --replay-symbols   Fetch stock list from the running engine (today's replay)
+  --from-results F   Load stock list from a previous results JSON file
+  --symbols S1,S2    Explicit comma-separated list
+  (none)             Use default FnO top gainers list
+
 Tick data replay:
   --tick-data DIR   Replay tick-log JSONL files from DIR instead of 5-min
                     candles. Produces higher-fidelity SL and trailing results.
@@ -808,8 +883,20 @@ Tick data replay:
     )
     parser.add_argument(
         "--symbols", "-s",
-        default=",".join(DEFAULT_STOCKS),
+        default=None,
         help=f"Comma-separated symbols. Default: {','.join(DEFAULT_STOCKS)}",
+    )
+    parser.add_argument(
+        "--replay-symbols",
+        action="store_true",
+        default=False,
+        help="Fetch the stock list from the running engine (exact day replay).",
+    )
+    parser.add_argument(
+        "--from-results",
+        default=None,
+        metavar="FILE",
+        help="Load stock list from a previous backtest results JSON file.",
     )
     parser.add_argument(
         "--direction",
@@ -869,7 +956,25 @@ Tick data replay:
     args = parser.parse_args()
 
     dates = args.date or [(dt.date.today() - dt.timedelta(days=1)).strftime("%Y-%m-%d")]
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    # Resolve symbols: --replay-symbols > --from-results > --symbols > defaults
+    if args.replay_symbols:
+        symbols = symbols_from_engine(args.engine_url)
+        if not symbols:
+            print("  [ERROR] --replay-symbols: no active symbols in engine. "
+                  "Use --symbols or --from-results instead.")
+            sys.exit(1)
+        print(f"  Symbols from engine: {', '.join(symbols)}")
+    elif args.from_results:
+        symbols = symbols_from_results(args.from_results)
+        if not symbols:
+            print(f"  [ERROR] --from-results: no symbols found in {args.from_results}")
+            sys.exit(1)
+        print(f"  Symbols from results file: {', '.join(symbols)}")
+    elif args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = DEFAULT_STOCKS[:]
 
     # ── Load base config ─────────────────────────────────────────────────
     print("\n" + "=" * 70)
@@ -968,6 +1073,7 @@ Tick data replay:
         # Generate JSON report
         report = generate_json_report(date_str, trades, config)
         report["replay_mode"] = runner._replay_mode
+        report["symbols_used"] = symbols
         all_reports.append(report)
 
     # Save JSON if requested — auto-save to backtest/ dir if not specified
