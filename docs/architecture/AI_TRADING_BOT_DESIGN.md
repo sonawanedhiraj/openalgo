@@ -3,7 +3,8 @@
 > **Status:** Design / implementation-ready
 > **Author:** Operator + Cowork (captured 2026-05-26)
 > **Scope:** Evolution of the OpenAlgo + Chartink F&O intraday rig into an AI-supervised
-> autonomous trading bot, across five stages, with the Stage 4 autonomous reasoning
+> autonomous trading bot, across a staged roadmap (now including an in-house scanner at
+> Stage 1.5), with the Stage 4 autonomous reasoning
 > agent and the real-time intelligence ingest layer specified in detail.
 > **Audience:** the single operator and the engineers who implement this.
 
@@ -128,7 +129,7 @@ fallback audit trail.
 
 **(d) Overloaded naming.** `engine_mode` (live ticks vs backtest replay — an in-process
 concept) collides conceptually with `mode` (broker routing — a DB/platform concept).
-Reading either name in code or logs is ambiguous without context. See the Glossary (§14).
+Reading either name in code or logs is ambiguous without context. See the Glossary (§15).
 
 **(e) No persistent scan audit trail.** There is no table recording each scan cycle: what
 symbols matched, what was posted, what the engine returned, whether it errored. The
@@ -147,7 +148,71 @@ conflated, so there is nothing to check the flags *against*.
 
 ---
 
-## 4. Five-Stage Roadmap
+## 4. Existing OpenAlgo Capabilities — Scanner Audit Findings
+
+A read-only repo audit on **2026-05-26** (full report:
+`outputs/openalgo_scanner_leverage_audit.md`) found the fork already provides
+**substantially more scanner-relevant infrastructure than originally assumed**. The
+expensive parts of an in-house scanner — a live data feed, broker adapters, the tradable
+universe, and the UI plumbing — already exist and are proven in production. This changes the
+reuse-vs-build calculus: building a scanner inside OpenAlgo is mostly *wiring together
+existing parts*, not greenfield. This finding is what justifies promoting the in-house
+scanner from far-future work to **Stage 1.5** (§5, detailed in §7.5).
+
+### 4.1 Reusable capabilities (reuse, don't rebuild)
+
+- **Live tick bus.** Broker WebSocket adapters (`broker/*/streaming/*_adapter.py`, reference
+  `broker/zerodha/streaming/zerodha_adapter.py`) normalise ticks and publish multipart
+  `[topic, json]` frames on a **ZeroMQ PUB socket at `127.0.0.1:5555`** (topic
+  `EXCHANGE_SYMBOL_MODE`). The unified proxy (`websocket_proxy/server.py`, WS on port
+  **8765**) already subscribes to all and fans out with O(1) routing. A scanner *subscribes*;
+  it does not build a feed.
+- **Historical bars.** `services/history_service.py:155`
+  (`get_history(symbol, exchange, interval, start_date, end_date, source=...)`) serves any
+  symbol/interval from the broker (`source='api'`) or the local **DuckDB cache at
+  `db/historify.duckdb`** (`source='db'`; 1m & D stored, 5m/15m/30m/1h computed on the fly).
+  `services/historify_scheduler_service.py` already refreshes it on a schedule, so backtest
+  backfill is free.
+- **Symbol master / universe.** `SymToken` (`database/symbol.py:25`) carries
+  symbol/exchange/expiry/strike/lotsize/instrumenttype. `enhanced_search_symbols(...)` and
+  `fno_search_symbols_db(...)` cover fuzzy search and F&O filtering; `token_db_enhanced` adds
+  a TTL cache. No need to build the master-contract layer.
+- **Outbound real-time to the React UI.** Anything published to a new ZMQ topic prefix
+  (e.g. `SCAN_*`) flows to UI clients of the 8765 proxy automatically, and Flask-SocketIO
+  events (the same rail the orders dashboard uses) let a scanner emit e.g. `scan_hit` to the
+  frontend with no protocol work.
+- **In-process event bus.** `utils/event_bus.py` — a singleton topic pub/sub
+  (`bus.subscribe(topic, cb)` / `bus.publish(Event)`, dispatched on a 10-worker thread pool),
+  already used to decouple order side-effects. Fine to extend for scanner→executor wiring.
+- **Freshness-aware last-tick cache.** `services/market_data_service.py:295` (singleton
+  `MarketDataService`) caches last-known values and exposes `get_ltp`/`get_quote`,
+  `is_data_fresh()`, `is_trade_management_safe()`. A scanner's "is this price stale?" guard
+  plugs straight in.
+
+### 4.2 Gaps to fill (genuinely new work)
+
+- **No generic tick→bar aggregator.** The only minute-bar builder is `FiveMinuteCandleBuilder`
+  buried in `services/simplified_stock_engine_core.py:304`, not reusable across N
+  watchlists / N intervals. Broker OHLC fields are the *daily* bar, not intraday.
+- **No scan-state tables.** There is no `scan_definitions`, no `scan_results`, no durable
+  `alerts` history — Flow's `PriceAlert` (`services/flow_price_monitor_service.py:39`) is
+  **RAM-only**. No `bars_live` ring buffer either; DuckDB holds historical bars only.
+- **No TA library.** `pyproject.toml` bundles no `talib`/`pandas_ta`/`stockstats`/`ta`. Only
+  ATR is hand-rolled (`_update_atr_wilder()` in the engine core). EMA/RSI/VWAP/MACD/etc. are
+  greenfield — pick a dependency or build `utils/indicators.py`.
+- **No sector/industry column on `SymToken`.** `name` is free-text only; sector-relative
+  criteria need a separate `sector_map` table or an external feed (NSE publishes free CSVs).
+- **No generic backtest harness.** `backtest/run_backtest.py` is hard-coupled to the
+  simplified engine — no portfolio-level, parameter-sweep, or walk-forward framework.
+- **Scheduler fragmentation.** APScheduler is wired in, but each consumer spins its own
+  `BackgroundScheduler` (flow, historify, strategy, python_strategy, chartink, sandbox
+  squareoff — 6+ instances). A new scanner can piggyback on `flow_scheduler` (already
+  persistent) or add a seventh; both are accepted patterns, but there is no single shared
+  scheduler to inherit.
+
+---
+
+## 5. Staged Roadmap
 
 Each stage has a hard gate. **Do not move on until the gate is met.**
 
@@ -171,10 +236,28 @@ is reviewing and in what mode).
 every veto decision is logged, and measured added latency stays within the 1–3 s budget
 with no missed entries attributable to the LLM call.
 
+### Stage 1.5 — In-House Scanner Build
+**Scope:** Build a scanner that lives *inside* OpenAlgo to replace the external Chartink
+dependency — subscribe to the existing ZMQ tick bus, aggregate bars with a shared
+aggregator, evaluate scan rules on bar close, and POST hits to the *existing* engine webhook.
+Run it in **shadow** alongside Chartink before any cutover. Detailed design in §7.5.
+**Dependencies:** Stage 0 (the durable `scan_results` audit reuses the Stage-0 persistence
+discipline, and effective-mode gating still applies). **Independent of the Stage 1 veto
+layer** — the two can proceed in parallel.
+**Effort:** **~10–15 working days** for the build — *not* the 4–8 weeks originally assumed,
+because the audit (§4) shows the data feed, broker adapters, universe, and UI rail already
+exist. This stage is mostly wiring, plus a tick→bar aggregator, scan tables, and a small
+indicator set.
+**Gate:** *Don't retire Chartink until* the in-house scanner has run in shadow for **4–6
+weeks** with **≥95% agreement** on shared signals **and** catches at least N novel valid
+signals/week that Chartink misses (cutover criteria in §7.5).
+
 ### Stage 2 — Reflective Trade Journal
 **Scope:** `trade_journal` table capturing every order with full context; a nightly Cowork
 reflection task that writes structured retrospectives to `journal_reflection` and opens
-rule-change PRs.
+rule-change PRs. Once Stage 1.5 lands, journal entries can also capture **in-house indicator
+snapshots** (ATR/EMA/RSI/volume at entry), making each nightly retrospective far richer than
+a Chartink rank alone — which raises Stage 2's value.
 **Dependencies:** Stage 1 (LLM reasoning is one of the journaled fields).
 **Effort:** ~1.5 weeks.
 **Gate:** *Don't move on until* the journal has captured a statistically useful run and the
@@ -182,8 +265,10 @@ nightly reflection has produced at least one actionable, reviewed retrospective.
 
 ### Stage 3 — Classical ML Signal Augmentation
 **Scope:** Feature pipeline over journal + market data → gradient boosting → walk-forward
-backtest → `/predict_success_probability` endpoint → ensemble with Chartink score.
-**Dependencies:** Stage 2 (needs the journal as labelled training data).
+backtest → `/predict_success_probability` endpoint → ensemble with the scan score.
+**Dependencies:** Stage 2 (needs the journal as labelled training data) **and** Stage 1.5 —
+the in-house scanner's bar/indicator pipeline (§7.5) supplies the feature inputs, so Stage 3
+no longer has to stand up its own data feed first.
 **Effort:** large, deferred — this is future work.
 **Gate:** *Don't move on until* **6 months of journal data** exist and the walk-forward
 backtest shows out-of-sample lift over the Chartink-only baseline.
@@ -192,10 +277,10 @@ backtest shows out-of-sample lift over the Chartink-only baseline.
 **Scope:** Event-driven supervisor built on the Claude Agent SDK. Reads all state from SQL,
 classifies situations (routine/anomaly/emergency), proposes/executes whitelisted
 non-monetary actions, escalates irreversible ones through a two-key approval inbox.
-Includes the real-time intelligence layer (§10).
+Includes the real-time intelligence layer (§11).
 **Dependencies:** Stages 0–2 (needs the full SQL state surface and journal). Can begin in
 read-only/advisory mode before ML (Stage 3) lands.
-**Effort:** large — the bulk of this document (§9).
+**Effort:** large — the bulk of this document (§10).
 **Gate:** *Don't move on until* the agent has run advisory-only (no write tools enabled)
 for a sustained period with operator-judged-correct classifications, and every guardrail
 ring has been exercised.
@@ -205,16 +290,16 @@ ring has been exercised.
 **Dependencies:** Stages 3 + 4 mature.
 **Effort:** open-ended, deferred.
 **Gate:** *Don't move on until* there is a validated edge under strict walk-forward
-discipline **and** a hard capital cap is enforced (see §11).
+discipline **and** a hard capital cap is enforced (see §12).
 
 ---
 
-## 5. Stage 0 Detailed Design — Operational Floor
+## 6. Stage 0 Detailed Design — Operational Floor
 
 All Stage-0 tables live in `db/openalgo.db` unless noted, with SQLAlchemy models added to
 `database/` (suggested new module `database/trading_ops_db.py`).
 
-### 5.1 `daily_intent` — operator's declared intent (source of truth)
+### 6.1 `daily_intent` — operator's declared intent (source of truth)
 
 ```sql
 CREATE TABLE daily_intent (
@@ -227,13 +312,13 @@ CREATE TABLE daily_intent (
 );
 ```
 
-**Monotonicity rule (OPEN QUESTION — confirm with operator, see §13):** intent may only
+**Monotonicity rule (OPEN QUESTION — confirm with operator, see §14):** intent may only
 move *down the risk ladder* automatically: `live → sandbox → skip`. The agent and system
 may **downgrade** at any time; only the operator may **upgrade** (`skip → sandbox → live`),
 and only while `locked = 0`. Proposed default: once the operator sets `live` and the first
 order fires, set `locked = 1` for the rest of the day to prevent mid-session whipsaw.
 
-### 5.2 `scan_cycle` — durable scan audit trail (problem (c), (e))
+### 6.2 `scan_cycle` — durable scan audit trail (problem (c), (e))
 
 ```sql
 CREATE TABLE scan_cycle (
@@ -253,7 +338,7 @@ This row is written by the **skill itself** (or a thin endpoint it calls) at the
 end of each cycle, independent of the bridge. `bridge_logged` is informational only — its
 value being 0 must never block persistence.
 
-### 5.3 `resolve_effective_mode()` — single source of truth (problem (a), (d))
+### 6.3 `resolve_effective_mode()` — single source of truth (problem (a), (d))
 
 New module **`services/mode_service.py`**:
 
@@ -297,7 +382,7 @@ The principle: **operator intent caps the risk; the flags can only make it safer
 riskier**. Any disagreement resolves to the safer mode and sets `conflict=True` so it
 surfaces in logs and to the agent.
 
-### 5.4 Cache TTL reduction for `get_analyze_mode()`
+### 6.4 Cache TTL reduction for `get_analyze_mode()`
 
 `database/settings_db.py:19` — drop the TTL from `3600` to `30`:
 
@@ -312,7 +397,7 @@ Rationale: a 1-hour cache means a mode flip can take up to an hour to be honoure
 while keeping the per-request DB-query reduction the cache exists for. `set_analyze_mode()`
 already invalidates the key on write (`:110`), so this only affects the stale-read ceiling.
 
-### 5.5 `/preflight` route (problem (b))
+### 6.5 `/preflight` route (problem (b))
 
 Added to `chartink_bp` (`blueprints/chartink.py`), e.g.
 `GET /chartink/simplified-engine/api/preflight`. The skill calls it **before** posting any
@@ -339,7 +424,7 @@ def simplified_engine_preflight():
             "effective_mode": res.effective.value, "reason": res.reason}
 ```
 
-### 5.6 `cycle_heartbeat` — missed-run detection
+### 6.6 `cycle_heartbeat` — missed-run detection
 
 ```sql
 CREATE TABLE cycle_heartbeat (
@@ -355,7 +440,7 @@ The skill writes one row at **each stage** of every run. Missed runs become triv
 queryable: a gap in `ts` ordered by stage, or an absence of a `complete` row for an
 expected 15-min slot, means the scheduler or skill silently failed.
 
-### 5.7 Atomic mode-toggle endpoint
+### 6.7 Atomic mode-toggle endpoint
 
 A single endpoint flips `daily_intent` **and** the underlying flags together, so they can
 never drift (problem (a)). Suggested: `POST /chartink/simplified-engine/api/set-mode`
@@ -381,13 +466,13 @@ def set_trading_mode(intent: str, set_by: str, reason: str) -> ModeResolution:
 
 ---
 
-## 6. Stage 1 Detailed Design — LLM Veto Layer
+## 7. Stage 1 Detailed Design — LLM Veto Layer
 
 New module **`services/signal_review_service.py`**. Wraps each candidate signal in one
 Claude call **between engine arming and order dispatch** — i.e. after the engine decides a
 breakout fired and built the order, but before `place_order_service` sends it.
 
-### 6.1 Input schema
+### 7.1 Input schema
 
 ```jsonc
 {
@@ -414,7 +499,7 @@ breakout fired and built the order, but before `place_order_service` sends it.
 }
 ```
 
-### 6.2 Output schema
+### 7.2 Output schema
 
 ```jsonc
 {
@@ -425,7 +510,7 @@ breakout fired and built the order, but before `place_order_service` sends it.
 }
 ```
 
-### 6.3 Placement, budget, and failure handling
+### 7.3 Placement, budget, and failure handling
 
 - **Placement:** inserted in `place_order_service` path (or a wrapper the engine calls
   just before it), gated on `effective_mode != disabled`. On `skip`, the order is not sent
@@ -442,9 +527,9 @@ breakout fired and built the order, but before `place_order_service` sends it.
 
 ---
 
-## 7. Stage 2 Detailed Design — Reflective Journal
+## 8. Stage 2 Detailed Design — Reflective Journal
 
-### 7.1 `trade_journal`
+### 8.1 `trade_journal`
 
 ```sql
 CREATE TABLE trade_journal (
@@ -469,7 +554,7 @@ CREATE TABLE trade_journal (
 );
 ```
 
-### 7.2 Reflection pipeline
+### 8.2 Reflection pipeline
 
 ```
 nightly Cowork task (after square-off)
@@ -498,7 +583,7 @@ CREATE TABLE journal_reflection (
 
 ---
 
-## 8. Stage 3 Detailed Design — ML Augmentation (sketch)
+## 9. Stage 3 Detailed Design — ML Augmentation (sketch)
 
 Deferred until the Stage 2 gate (**6 months of journal data**). Sketch only:
 
@@ -515,13 +600,13 @@ Deferred until the Stage 2 gate (**6 months of journal data**). Sketch only:
 
 ---
 
-## 9. Stage 4 Detailed Design — Autonomous Reasoning Agent
+## 10. Stage 4 Detailed Design — Autonomous Reasoning Agent
 
 This is the core of the design. The agent is an **AI supervisor**, not a trader: it reads
 state, reasons about it, classifies the situation, and acts only within a tightly
 whitelisted, non-monetary set of tools — escalating anything irreversible to the operator.
 
-### 9.1 Invocation model
+### 10.1 Invocation model
 
 **Event-driven supervisor.** The agent is not a long-running loop (that failure mode killed
 the old `daily-trading-pipeline`, problem (f)). Instead, **each invocation is a complete,
@@ -537,24 +622,24 @@ event, and torn down when it returns a decision. Three trigger types:
 Because no state lives in the LLM between invocations, sessions are cheap, crash-safe, and
 independently resumable — a dead session loses nothing.
 
-### 9.2 State: zero LLM in-memory persistence — everything in SQL
+### 10.2 State: zero LLM in-memory persistence — everything in SQL
 
 The agent holds **no** durable state in-context. Every fact it reasons over is read fresh
 from SQL at invocation time. Tables it reads:
 
-- `daily_intent` — operator's declared intent (§5.1)
-- `scan_cycle` — recent scan history (§5.2)
-- `trade_journal` — today's and historical trades (§7.1)
-- `agent_decision` — its own prior decisions (§9.3)
-- `cycle_heartbeat` — run health (§5.6)
-- `market_intel` — real-time intelligence (§10)
+- `daily_intent` — operator's declared intent (§6.1)
+- `scan_cycle` — recent scan history (§6.2)
+- `trade_journal` — today's and historical trades (§8.1)
+- `agent_decision` — its own prior decisions (§10.3)
+- `cycle_heartbeat` — run health (§6.6)
+- `market_intel` — real-time intelligence (§11)
 
 Plus a markdown directory **`agent_memory/`** (repo-relative, gitignored or versioned per
 operator choice) holding **cross-session learnings** — durable lessons distilled from many
 sessions (e.g. "CONCOR gaps hard on rail-budget days"). These are prose, not rows, and are
 loaded into the system prompt at invocation.
 
-### 9.3 `agent_decision`
+### 10.3 `agent_decision`
 
 ```sql
 CREATE TABLE agent_decision (
@@ -565,7 +650,7 @@ CREATE TABLE agent_decision (
     inputs_snapshot     TEXT,                 -- JSON: the exact state the agent read (for replay/audit)
     classification      TEXT NOT NULL CHECK (classification IN ('routine','anomaly','emergency')),
     reasoning           TEXT,                 -- the agent's chain of reasoning (prose)
-    actions             TEXT,                 -- JSON array of actions taken / proposed (see §9.8)
+    actions             TEXT,                 -- JSON array of actions taken / proposed (see §10.8)
     confidence          REAL,                 -- 0.0–1.0
     requires_human      BOOLEAN NOT NULL DEFAULT 0,
     message_to_operator TEXT,                 -- the Telegram ping text, if any
@@ -574,7 +659,7 @@ CREATE TABLE agent_decision (
 );
 ```
 
-### 9.4 `approval_inbox` (two-key rule)
+### 10.4 `approval_inbox` (two-key rule)
 
 ```sql
 CREATE TABLE approval_inbox (
@@ -595,10 +680,10 @@ Anything irreversible lands here as `pending`. A separate executor process only 
 rows the operator flips to `approved`. `expired` rows (operator never responded within a
 TTL) are never executed — silence is denial.
 
-### 9.5 Tool catalog (five groups)
+### 10.5 Tool catalog (five groups)
 
 Tools are exposed to the Agent SDK via MCP servers, one server per group, so the whitelist
-is enforced at the protocol boundary (§9.6 ring 1).
+is enforced at the protocol boundary (§10.6 ring 1).
 
 #### Group A — Read tools (no side effects)
 
@@ -615,11 +700,11 @@ def get_positions() -> list[dict]:
          'stop_loss': float|None, 'effective_mode': str}, ...]."""
 
 def get_today_journal() -> list[dict]:
-    """Return today's trade_journal rows (schema §7.1)."""
+    """Return today's trade_journal rows (schema §8.1)."""
 
 def get_recent_scans(minutes: int = 60) -> list[dict]:
     """Return scan_cycle rows started within the last `minutes`
-       (schema §5.2). Default 60."""
+       (schema §6.2). Default 60."""
 
 def get_broker_session_health() -> dict:
     """Return {'connected': bool, 'broker': str, 'token_valid': bool,
@@ -630,7 +715,7 @@ def get_broker_session_health() -> dict:
 
 ```python
 def get_market_news(symbols: list[str], hours: int = 6) -> list[dict]:
-    """Read market_intel (§10) for rows touching `symbols` in the last `hours`.
+    """Read market_intel (§11) for rows touching `symbols` in the last `hours`.
        Return [{'headline','summary','sentiment','source_name','fetched_at','confidence'}]."""
 
 def get_nifty_regime() -> dict:
@@ -679,7 +764,7 @@ def tighten_stop_loss(symbol: str, new_sl: float, reason: str) -> dict:
 def propose_code_change(file: str, diff: str, reason: str) -> dict:
     """Open Claude Code CLI (via bridge/server.py) on a NEW feature branch and apply
        `diff` to `file`. NEVER writes to main. Lands as a PR / pending approval, never
-       auto-merged. Subject to the bridge denied_paths config (§9.7).
+       auto-merged. Subject to the bridge denied_paths config (§10.7).
        Returns {'branch': str, 'pr_url': str|None, 'approval_inbox_id': int}."""
 ```
 
@@ -691,7 +776,7 @@ def propose_code_change(file: str, diff: str, reason: str) -> dict:
 > manual prerogative. The agent can tighten a stop, pause new entries, downgrade to
 > sandbox, and ping the human — but it cannot buy or sell real-money positions on its own.
 
-### 9.6 Three guardrail rings
+### 10.6 Three guardrail rings
 
 ```
    ┌──────────────────────────────────────────────────────────┐
@@ -721,7 +806,7 @@ def propose_code_change(file: str, diff: str, reason: str) -> dict:
    and any future destructive action) require explicit operator approval before the
    executor acts. Silence expires to denial.
 
-### 9.7 Bridge expansion
+### 10.7 Bridge expansion
 
 `bridge/server.py` gains a `denied_paths` config so the agent's `propose_code_change` can
 never touch safety-critical code:
@@ -738,7 +823,7 @@ DENIED_PATHS = [
 # All agent-driven writes go to a NEW feature branch. NEVER main. NEVER force-push.
 ```
 
-### 9.8 Decision schema (agent structured output)
+### 10.8 Decision schema (agent structured output)
 
 Every invocation returns exactly this JSON, which maps 1:1 onto an `agent_decision` row:
 
@@ -769,7 +854,7 @@ Every invocation returns exactly this JSON, which maps 1:1 onto an `agent_decisi
 }
 ```
 
-### 9.9 Worked example — the volatility-spike scenario
+### 10.9 Worked example — the volatility-spike scenario
 
 **Trigger (threshold):** OpenAlgo's metric watcher fires when India VIX jumps **14 → 17.5**
 inside 20 minutes. It emits an event; the FastAPI sidecar starts a fresh agent session.
@@ -805,7 +890,7 @@ failure).
 The decision row, the Telegram message, and the pending intent change are all written to
 SQL; if the session crashed mid-way, nothing is lost and the next trigger re-reads state.
 
-### 9.10 Cost estimate
+### 10.10 Cost estimate
 
 - **Per invocation:** ~5–15 K input tokens (state snapshot + system prompt + memory) +
   1–3 K output tokens.
@@ -813,7 +898,7 @@ SQL; if the session crashed mid-way, nothing is lost and the next trigger re-rea
 - **Daily API cost:** ~**₹40–80/day**. With prompt caching on the static system prompt and
   tool schemas, the marginal per-call input cost drops substantially.
 
-### 9.11 Stack
+### 10.11 Stack
 
 | Concern | Choice |
 |---|---|
@@ -822,10 +907,10 @@ SQL; if the session crashed mid-way, nothing is lost and the next trigger re-rea
 | Invocation surface | **FastAPI sidecar** exposing the agent-invocation endpoint + the approval inbox API |
 | Tools | **MCP servers, one per tool group** (A–E), enforcing Ring-1 whitelisting |
 | State store | **SQLite** (`db/openalgo.db` + new tables); migrate to **Postgres** as volume grows |
-| Operator notifications | **Telegram bot** (see §9.12) |
+| Operator notifications | **Telegram bot** (see §10.12) |
 | Dashboard | **Streamlit** (fast) or **Next.js** (richer), reading `agent_decision` + `approval_inbox` |
 
-### 9.12 Telegram bot setup
+### 10.12 Telegram bot setup
 
 - Create the bot via **@BotFather**, obtain the bot token.
 - Store the token in **`.env`** as `TELEGRAM_BOT_TOKEN` (and `TELEGRAM_OPERATOR_CHAT_ID`).
@@ -835,9 +920,9 @@ SQL; if the session crashed mid-way, nothing is lost and the next trigger re-rea
 
 ---
 
-## 10. Stage 4 Real-Time Intelligence Layer
+## 11. Stage 4 Real-Time Intelligence Layer
 
-### 10.1 Two-layer pattern
+### 11.1 Two-layer pattern
 
 The agent must not browse the open web on every tick — that is slow, costly, and noisy.
 Instead, **two layers**:
@@ -849,7 +934,7 @@ Instead, **two layers**:
    only when `market_intel` is empty for the symbols in question. It is a last-resort
    drill-down, rate-limited and tagged low-confidence.
 
-### 10.2 `market_intel`
+### 11.2 `market_intel`
 
 ```sql
 CREATE TABLE market_intel (
@@ -867,7 +952,7 @@ CREATE TABLE market_intel (
 );
 ```
 
-### 10.3 Ingest sidecar design
+### 11.3 Ingest sidecar design
 
 - **Language:** Python service using **`httpx`** (API/HTTP) + **`feedparser`** (RSS).
 - **Source whitelist:** Moneycontrol, ET Markets, LiveMint, BloombergQuint, **BSE/NSE
@@ -882,7 +967,7 @@ CREATE TABLE market_intel (
 - **Refresh interval:** **configurable, 5 min default** per source (corporate announcements
   can poll faster during market hours, slower after).
 
-### 10.4 `browse_for_anomaly` tool
+### 11.4 `browse_for_anomaly` tool
 
 ```python
 def browse_for_anomaly(query: str, urls_hint: list[str] | None = None,
@@ -896,7 +981,7 @@ def browse_for_anomaly(query: str, urls_hint: list[str] | None = None,
        at the tool boundary. Returns the rows written."""
 ```
 
-### 10.5 Hot-news drill-down pattern
+### 11.5 Hot-news drill-down pattern
 
 ```
 threshold trigger (e.g. single-name -8% move, or VIX spike)
@@ -911,7 +996,7 @@ threshold trigger (e.g. single-name -8% move, or VIX spike)
    make decision (classify, act within whitelist, escalate if needed)
 ```
 
-### 10.6 Explicit non-goals
+### 11.6 Explicit non-goals
 
 > **The agent does NOT browse to generate signals.** Browsing exists *only* to enrich the
 > response to an already-detected anomaly. Intelligence informs judgment about existing
@@ -920,7 +1005,7 @@ threshold trigger (e.g. single-name -8% move, or VIX spike)
 
 ---
 
-## 11. Stage 5 Sketch — Independent Signal Generation (deferred)
+## 12. Stage 5 Sketch — Independent Signal Generation (deferred)
 
 Eventually the bot could generate its own entry signals rather than only filtering
 Chartink's, fusing the Stage 3 ML model, regime context, and agent judgment into original
@@ -933,7 +1018,7 @@ size.
 
 ---
 
-## 12. Implementation Sequencing (Stage 0 + Stage 1)
+## 13. Implementation Sequencing (Stage 0 + Stage 1)
 
 These two are immediate. Roughly two sprints each; gates are hard.
 
@@ -957,7 +1042,7 @@ These two are immediate. Roughly two sprints each; gates are hard.
   demonstrably blocks a post.
 
 ### Sprint 3 — Stage 1a: veto service skeleton
-- Implement `services/signal_review_service.py` with the input/output schemas (§6),
+- Implement `services/signal_review_service.py` with the input/output schemas (§7),
   prompt-cached system prompt, and the fail-safe-to-`skip` failure path.
 - Wire it into the dispatch path behind a feature flag (default off), logging decisions to
   `scan_cycle`/journal without yet blocking orders (shadow mode).
@@ -971,11 +1056,11 @@ These two are immediate. Roughly two sprints each; gates are hard.
 
 ---
 
-## 13. Open Questions
+## 14. Open Questions
 
 From the 2026-05-26 architectural review:
 1. **`daily_intent` monotonicity** — confirm the downgrade-only rule and the auto-lock
-   semantics (§5.1). Specifically: should `live` auto-lock after the first fired order, and
+   semantics (§6.1). Specifically: should `live` auto-lock after the first fired order, and
    may the agent ever propose a re-upgrade for operator approval, or never?
 2. **`direction_enabled` persistence** — where should the per-day long/short enable flags
    live and how should they survive a restart? (Currently in-engine, in-memory.) Should
@@ -985,20 +1070,20 @@ From the 2026-05-26 architectural review:
    overlapping intent; confirm which is canonical and retire the other.
 
 Surfaced while drafting:
-4. **Telegram vs alternative** for operator notifications — Telegram is specified (§9.12),
+4. **Telegram vs alternative** for operator notifications — Telegram is specified (§10.12),
    but confirm it over alternatives (Signal, ntfy, email, dashboard-only) given the
    single-operator, IP-sensitive (SEBI static-IP) deployment.
 5. **Pre-market agent run** — should the agent run during the pre-open session to
    *recommend* the day's `daily_intent` (advisory only, operator confirms), or stay
    silent until market open?
 6. **`agent_decision` retention policy** — how long to keep decision rows (audit value vs
-   table growth), and when to migrate from SQLite to Postgres (§9.11). Proposed: keep
+   table growth), and when to migrate from SQLite to Postgres (§10.11). Proposed: keep
    indefinitely until row count forces the Postgres move; never auto-purge audit rows
    without an export.
 
 ---
 
-## 14. Glossary
+## 15. Glossary
 
 Overloaded terms, defined once:
 
