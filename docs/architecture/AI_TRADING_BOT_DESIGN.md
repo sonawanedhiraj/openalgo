@@ -232,6 +232,144 @@ scanner from far-future work to **Stage 1.5** (§5, detailed in §7.5).
 
 ---
 
+## 4.5 Upstream Capabilities (post-v2.0.1.1 merge)
+
+On **2026-05-27** this fork was merged with upstream OpenAlgo **v2.0.1.1** (merge commit
+`07036a97` on `docs/ai-architecture-design`, `eb210e99` on `feat/simplified-engine-integration`).
+The merge is **cumulative** — it brings every upstream release through v2.0.1.1 (v2.0.0.6 →
+v2.0.1.1). Five of those additions overlap this design's roadmap directly: the original design
+contemplated some of them as **greenfield** work, but they now ship from upstream and should be
+**leveraged, not rebuilt**. Each subsection below names the feature, the upstream release that
+introduced it, the concrete code that landed, where this design now consumes it, and what we still
+have to build on top. (The non-design-changing security/perf items from the same merge — v2.0.0.6
+credential hardening, v2.0.0.7 WebSocket subscribe batching, v2.0.1.1 per-install Fernet salt — are
+folded into §6 and §7 where they bear on a decision, not given their own subsection.)
+
+### 4.5.1 Symbol Search rewrite (upstream v2.0.1.0, issue #1326)
+
+Multi-exchange / multi-instrumenttype filtering, the 500-row hard cap lifted, exchange-only browse,
+CSV download, AmiBroker/TradingView/Python/Excel copy formats, and per-user search history.
+(v2.0.1.1 additionally surfaced FUT-only MCX underlyings, #1385.)
+
+- **Blueprint:** `blueprints/search.py` — `GET /search/api/search` → `api_search()` (`:133`/`:135`,
+  comma-separated exchanges + instrument types), `GET /search/api/expiries` (`:227`),
+  `GET /search/api/underlyings` (`:240`, `include_futures` param), HTML page `GET /search/` (`:25`).
+- **REST API:** `/api/v1/search` namespace (`restx_api/__init__.py:84`, `restx_api/search.py`),
+  backed by `enhanced_search_symbols()` / `fno_search_symbols()` over `SymToken`
+  (`database/symbol.py:25` — the same universe table §4.1 already inventoried).
+- **Frontend:** `frontend/src/pages/Search.tsx`.
+- **Leveraged by:** §7.7 (per-strategy universe selection — each `BaseStrategy` declares its tradable
+  universe through these multi-exchange / multi-instrumenttype filters rather than a hand-rolled
+  filter) and §7.5 / §7.7 Stage 1.7 `sector_rotation` (the search infra is the substrate for
+  resolving the sector-index constituents the relative-strength bucketing needs).
+- **Still to build:** the `sector_map` table / `sector` column (§4.2 gap) — Symbol Search filters the
+  existing universe but adds no sector dimension; and the per-strategy universe *spec* that calls it.
+
+### 4.5.2 Admin Diagnostics page + `errors.jsonl` browser (upstream v2.0.1.0)
+
+A `/admin` Diagnostics surface: live system info (Python/Flask/SQLAlchemy versions, the six DB sizes,
+broker session state), a paginated browser over `log/errors.jsonl` with stack traces + Flask request
+context, and a one-click env-redacted diagnostic bundle.
+
+- **Blueprint:** `blueprints/admin.py` — `_errors_file_path()` (`:717`, path-traversal-guarded),
+  `GET /admin/api/errors` → `api_errors_list()` (`:786`, paginated, level/query filters),
+  `GET /admin/api/errors/stats` (`:939`), `GET /admin/api/errors/groups` (`:1036`),
+  `POST /admin/api/errors/client` → `api_errors_client_report()` (`:880`, accepts browser-side error
+  reports and **writes them into `errors.jsonl`**), `POST /admin/api/system/diagnostics` →
+  `api_system_diagnostics()` (`:1600`, connectivity probes), `GET /admin/api/system/report`
+  (`:1789`, downloadable bundle).
+- **Write path:** `log/errors.jsonl` is produced by the centralized logger — `JSONErrorFormatter`
+  (`utils/logging.py:293`), handler wired at `utils/logging.py:419`, file resolved at `:404`. One
+  JSON object per line, ERROR+ only, with traceback + request context (per CLAUDE.md "read
+  errors.jsonl first"). The `POST /admin/api/errors/client` route means *application code can push a
+  structured error into the same browser* without a parallel store.
+- **Leveraged by:** §6 Stage 0 observability — `cycle_heartbeat` and preflight errors route into this
+  existing surface rather than a parallel one (see §6.5 / §6.6).
+- **Still to build:** the `cycle_heartbeat` table itself (application-stage telemetry the generic
+  error log does not model); the diagnostics page is a *read/visibility* layer, not a heartbeat store.
+
+### 4.5.3 Remote MCP with OAuth 2.1 + per-purpose TOTP (upstream v2.0.1.0; UI polish v2.0.1.1)
+
+A self-hosted OAuth 2.1 (PKCE-S256, Dynamic Client Registration, RS256 JWTs, refresh-token rotation
+with family revocation) HTTP/SSE MCP transport exposing the same **40 tools** as the local stdio MCP,
+**off by default**, with admin approval of clients, a kill switch, and per-purpose TOTP that can gate
+the `write:orders` consent independently of login.
+
+- **HTTP transport:** `blueprints/mcp_http.py` (`url_prefix=/mcp`, `:46`) — JSON-RPC dispatcher
+  `POST /mcp` (`:410`), SSE `GET /mcp` (`:671`), `/mcp/healthz` (`:717`); audit log `log/mcp.jsonl`.
+- **OAuth:** `blueprints/mcp_oauth.py` (`url_prefix=/oauth`, `:52`) — `/oauth/register` DCR (`:280`),
+  `/oauth/jwks.json` (`:261`), `/oauth/authorize` (`:664`), `/oauth/token` (`:884`),
+  `/oauth/revoke` (`:1028`), fresh-TOTP check `_is_fresh_totp()` (`:404`). Models in
+  `database/oauth_db.py` (`OAuthClient` `:75`, `OAuthRefreshToken`, `OAuthSigningKey`).
+- **Per-purpose TOTP:** `database/user_db.py:84–104` — `totp_enabled` plus
+  `totp_required_for_login` / `_for_mcp` / `_for_password_reset` columns and the
+  `is_totp_required_for(purpose)` helper. The MCP `write:orders` consent gate is
+  `is_totp_required_for("mcp")` + a fresh `_is_fresh_totp()`.
+- **Tool registry:** `utils/mcp_tool_registry.py` — `TOOL_SCOPES` (`:53`) maps all 40 tools to
+  `read:market` / `read:account` / `write:orders` (scope constants `:43–45`).
+- **Admin console:** `blueprints/admin.py` — `/api/oauth/clients` (`:1906`), approve (`:1950`) /
+  revoke (`:1989`), `/api/mcp/audit` (`:2044`), `/api/mcp/kill-switch` (`:2144`).
+- **Leveraged by:** §10.4 `approval_inbox` (per-purpose TOTP on `write:orders` is structurally the
+  same **two-key** pattern this design specifies for irreversible actions) and §10.5 (operator
+  consent). **Decision:** keep the **local stdio MCP** for the Stage 4 baseline (§10.5/§10.11);
+  evaluate Remote MCP only if a **hosted-AI deployment** ever becomes a need — see the new §14
+  question and the §10.5 migration note.
+- **Still to build:** the `approval_inbox` table + executor (§10.4) and the agent tool servers
+  (§10.5) — Remote MCP is a *consent + transport* precedent, not the agent's tool layer.
+
+### 4.5.4 GTT (Good-Till-Triggered) endpoints — Zerodha + Dhan pilot (upstream v2.0.0.8, #1322)
+
+Broker-side GTT orders that persist a trigger **at the broker**, so a stop survives an OpenAlgo
+crash/restart. Four endpoints, **Zerodha + Dhan only** in this pilot (other brokers planned upstream).
+
+- **REST:** `POST /api/v1/placegttorder`, `/modifygttorder`, `/cancelgttorder`, `/gttorderbook`
+  (namespaces `restx_api/__init__.py:102–105`; `restx_api/place_gtt_order.py` etc.).
+- **Services:** `services/place_gtt_order_service.py`, `modify_gtt_order_service.py`,
+  `cancel_gtt_order_service.py`, `gtt_orderbook_service.py`.
+- **Brokers:** `broker/zerodha/api/gtt_api.py` (+ `mapping/gtt_data.py`), `broker/dhan/api/gtt_api.py`
+  (+ `mapping/gtt_data.py`).
+- **DB:** `sandbox_gtt` + `sandbox_gtt_legs` (`database/sandbox_db.py`); **live** GTTs are held
+  broker-side, not in an OpenAlgo table.
+- **Two constraints that matter for this design:**
+  1. **Sandbox/analyze-mode GTT execution is not yet shipped** — "analyze mode currently returns
+     `501` for GTT calls until the in-progress sandbox integration ships" (v2.0.0.8 release notes,
+     Phase 3). Because this rig **defaults to `sandbox` mode** (`SIMPLIFIED_ENGINE_MODE=sandbox`,
+     CLAUDE.md), **a GTT-backed SL only works against a *live* Zerodha/Dhan session today** — not in
+     the sandbox book the rig usually arms into.
+  2. **Zerodha:** Kite GTTs cannot carry `MARKET`; the service auto-converts to an MPP-protected
+     `LIMIT`, and `MIS` is rejected.
+- **Leveraged by:** §7 Stage 1 (once the veto layer green-lights an order, a broker GTT can carry the
+  stop, so an in-process crash no longer orphans the SL) and §10.5 (`tighten_stop_loss` becomes
+  "modify the GTT" when the SL is GTT-backed).
+- **Still to build:** GTT-backed SL is an *option*, not the default path, until (a) the engine runs in
+  `live` mode and (b) upstream ships sandbox GTT execution. In-process ATR/RR trailing remains the SL
+  mechanism in sandbox.
+
+### 4.5.5 Sandbox events on the `analyzer_update` SocketIO channel (upstream v2.0.0.7)
+
+Real-time engine-state events pushed to the React UI over a SocketIO channel.
+
+- **Important correction:** the `analyzer_update` channel **predates v2.0.0.7** — it is the
+  analyze-mode order/position event rail. What v2.0.0.7 added (commit `3ff65a3f`) is that **sandbox**
+  engine-internal events — fills, auto-square-off, T+1 settlement — now *also* emit on it.
+- **Emit path:** `subscribers/socketio_subscriber.py` — `_emit_analyzer_update()` helper
+  (`:242–247`) called from ~17 handlers across the analyze + sandbox paths (e.g.
+  `on_sandbox_order_filled` / `_auto_squareoff` / `_t1_settlement` at `:227` / `:233` / `:239`);
+  sandbox event types in `events/sandbox_events.py`; also emitted from `services/openposition_service.py`
+  and `services/orderstatus_service.py`.
+- **Frontend:** `frontend/src/hooks/useSocket.ts` `socket.on('analyzer_update', …)` refreshes
+  OrderBook / TradeBook / Positions / Holdings / Dashboard; toast routing in
+  `frontend/src/stores/alertStore.ts`.
+- **Leveraged by:** §7.5 (the scanner's freshness/staleness signalling and `scan_hit` UI updates ride
+  this existing rail instead of bespoke health-emit logic) and §10.5 (`get_market_state()` and the
+  dashboard reading `agent_decision` **subscribe** to `analyzer_update` rather than polling
+  `/chartink/simplified-engine/api/status`).
+- **Still to build:** the engine does **not** yet emit our application-specific events (scan cycle,
+  agent decision, mode change) on this channel — we add those emitters; the channel + frontend
+  plumbing is what we reuse.
+
+---
+
 ## 5. Staged Roadmap
 
 Each stage has a hard gate. **Do not move on until the gate is met.**
