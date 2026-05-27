@@ -104,6 +104,20 @@ with a human as the second key for anything irreversible.
 These are two independent controls with overlapping but non-identical meaning. That
 overlap is the root of the redesign (see §3).
 
+### 2.3 Legacy and pending external components
+
+Two scripts under `pythonTradingAutomator\` predate this rig and are recorded here so they
+are not confused with live code:
+
+- **`pythonTradingAutomator\trending-stocks-buying-strategy\simplified_stock_engine.py`** —
+  the **OLD** standalone script. It has **already been ported** into OpenAlgo's simplified
+  engine (`services/simplified_stock_engine_core.py` + `_service.py`). Keep for **legacy
+  reference only**; do not extend it.
+- **A separate options-trading script** in `pythonTradingAutomator\` (exact filename **to be
+  confirmed**) is **pending port** into OpenAlgo. Planned as a future workstream — most
+  likely **after Stage 1.5 lands but before Stage 3** (timing is open question §14). It is
+  not yet represented anywhere else in this design.
+
 ---
 
 ## 3. Known Problems Driving the Redesign
@@ -1235,6 +1249,10 @@ Surfaced in the scanner audit (2026-05-26/27, §4 / §7.5):
    EMA, RSI, `volume_avg`, …) should the in-house scanner standardize on? Start hand-rolled
    and pull in `pandas-ta` only for breadth, or commit to the dependency up front?
    (§7.5.1 item 3.)
+8. **Options-script port timing** — when to schedule porting the pending
+   `pythonTradingAutomator\` options-trading script (§2.3) into OpenAlgo: as a **Stage 1.5
+   sibling** (sharing the scanner/aggregator work) or a **post-1.5 standalone** workstream
+   before Stage 3?
 
 ---
 
