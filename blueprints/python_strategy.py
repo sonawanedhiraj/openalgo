@@ -17,6 +17,7 @@ import sys
 import threading
 from datetime import date, datetime, time
 from pathlib import Path
+from time import monotonic, sleep
 
 import psutil
 import pytz
@@ -311,7 +312,7 @@ def format_ist_time(dt):
         if isinstance(dt, str):
             try:
                 dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-            except:
+            except Exception:
                 return dt
         if not dt.tzinfo:
             dt = IST.localize(dt)
@@ -466,7 +467,7 @@ def start_strategy_process(strategy_id):
                 try:
                     # Ensure log directory is writable
                     os.chmod(log_file.parent, 0o755)
-                except:
+                except Exception:
                     pass
 
             # Check if we can write to log directory
@@ -615,7 +616,7 @@ def stop_strategy_process(strategy_id):
                         STRATEGY_CONFIGS[strategy_id]["last_stopped"] = get_ist_time().isoformat()
                         save_configs()
                         return True, "Strategy stopped"
-                    except:
+                    except Exception:
                         pass
             return False, "Strategy not running"
 
@@ -728,8 +729,25 @@ def terminate_process_cross_platform(pid):
         # Terminate main process
         process.terminate()
 
-        # Wait and kill if necessary
-        gone, alive = psutil.wait_procs([process] + children, timeout=3)
+        # Wait up to 3s for graceful exit, then kill any survivors.
+        # Manual polling — psutil.wait_procs calls select.poll(), which
+        # eventlet's monkey-patched select does not expose on Linux
+        # (gunicorn-eventlet production deployment). Plain time.sleep is
+        # cooperatively patched under eventlet and is a no-op cost on
+        # Windows/Mac dev servers using standard threading.
+        all_procs = [process] + children
+        deadline = monotonic() + 3
+        alive = list(all_procs)
+        while alive and monotonic() < deadline:
+            sleep(0.1)
+            alive = []
+            for p in all_procs:
+                try:
+                    if p.is_running() and p.status() != psutil.STATUS_ZOMBIE:
+                        alive.append(p)
+                except psutil.NoSuchProcess:
+                    pass
+
         for p in alive:
             try:
                 p.kill()
@@ -803,7 +821,7 @@ def cleanup_dead_processes():
                     pid = info.get("pid")
                     if pid and not psutil.pid_exists(pid):
                         is_dead = True
-                except:
+                except Exception:
                     is_dead = True
 
             if is_dead:
@@ -1585,7 +1603,7 @@ def new_strategy():
             if not IS_WINDOWS:
                 try:
                     os.chmod(file_path, 0o755)
-                except:
+                except Exception:
                     pass
 
             # Get form data - sanitize strategy name
@@ -1998,7 +2016,7 @@ def clear_logs(strategy_id):
         for log_file in log_files:
             try:
                 total_size += log_file.stat().st_size
-            except:
+            except Exception:
                 pass
 
         # Strategy not running, safe to delete all log files
@@ -2621,7 +2639,7 @@ def cleanup_on_exit():
         for strategy_id in list(RUNNING_STRATEGIES.keys()):
             try:
                 stop_strategy_process(strategy_id)
-            except:
+            except Exception:
                 pass
     logger.info("Cleanup complete")
 

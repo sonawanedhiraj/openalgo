@@ -122,12 +122,17 @@ const AdminIndex = lazy(() => import('@/pages/admin/AdminIndex'))
 const FreezeQty = lazy(() => import('@/pages/admin/FreezeQty'))
 const Holidays = lazy(() => import('@/pages/admin/Holidays'))
 const MarketTimings = lazy(() => import('@/pages/admin/MarketTimings'))
+const Diagnostics = lazy(() => import('@/pages/admin/Diagnostics'))
+const RemoteMcp = lazy(() => import('@/pages/admin/RemoteMcp'))
 
 // Telegram pages
 const TelegramIndex = lazy(() => import('@/pages/telegram/TelegramIndex'))
 const TelegramConfig = lazy(() => import('@/pages/telegram/TelegramConfig'))
 const TelegramUsers = lazy(() => import('@/pages/telegram/TelegramUsers'))
 const TelegramAnalytics = lazy(() => import('@/pages/telegram/TelegramAnalytics'))
+
+// WhatsApp pages
+const WhatsAppIndex = lazy(() => import('@/pages/whatsapp/WhatsAppIndex'))
 
 // Logs & Monitoring pages
 const LogsIndex = lazy(() => import('@/pages/LogsIndex'))
@@ -246,11 +251,14 @@ function App() {
                 <Route path="/admin/freeze" element={<FreezeQty />} />
                 <Route path="/admin/holidays" element={<Holidays />} />
                 <Route path="/admin/timings" element={<MarketTimings />} />
+                <Route path="/admin/diagnostics" element={<Diagnostics />} />
+                <Route path="/admin/remote-mcp" element={<RemoteMcp />} />
                 {/* Phase 7: Telegram */}
                 <Route path="/telegram" element={<TelegramIndex />} />
                 <Route path="/telegram/config" element={<TelegramConfig />} />
                 <Route path="/telegram/users" element={<TelegramUsers />} />
                 <Route path="/telegram/analytics" element={<TelegramAnalytics />} />
+                <Route path="/whatsapp" element={<WhatsAppIndex />} />
                 {/* Phase 7: Logs & Monitoring */}
                 <Route path="/logs" element={<LogsIndex />} />
                 <Route path="/logs/live" element={<LiveLogs />} />
