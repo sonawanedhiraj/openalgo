@@ -1290,6 +1290,15 @@ Anything irreversible lands here as `pending`. A separate executor process only 
 rows the operator flips to `approved`. `expired` rows (operator never responded within a
 TTL) are never executed — silence is denial.
 
+**Upstream precedent — Remote MCP per-purpose TOTP (§4.5.3).** The two-key rule here is structurally
+the same consent gate upstream already ships for the Remote MCP `write:orders` scope: a privileged
+action requires a *fresh* second factor (`is_totp_required_for("mcp")` + `_is_fresh_totp()`,
+`blueprints/mcp_oauth.py:404`) on top of the session. We **keep our own `approval_inbox`** for the
+Stage 4 baseline — it is action-typed, auditable, and TTL-expiring in a way a one-shot TOTP prompt is
+not — but Remote MCP is the **migration path** if the agent is ever moved to a hosted-AI deployment,
+where the OAuth + per-purpose-TOTP consent flow would replace the local executor + Telegram
+approve/deny loop. See the new §14 question.
+
 ### 10.5 Tool catalog (five groups)
 
 Tools are exposed to the Agent SDK via MCP servers, one server per group, so the whitelist
@@ -1318,8 +1327,17 @@ def get_recent_scans(minutes: int = 60) -> list[dict]:
 
 def get_broker_session_health() -> dict:
     """Return {'connected': bool, 'broker': str, 'token_valid': bool,
-               'token_expires_at': iso8601, 'last_order_ok': bool}."""
+               'token_expires_at': iso8601, 'last_order_ok': bool}.
+       Reads session liveness via the platform's session layer (the same probe the
+       Admin Diagnostics page uses, §4.5.2) — never the encrypted credentials (§6.5)."""
 ```
+
+> **Real-time engine state — subscribe, don't poll (§4.5.5).** Where a read tool reflects live engine
+> state (positions, fills, mode changes), its backing data should come from the **`analyzer_update`**
+> SocketIO channel the platform already emits (`subscribers/socketio_subscriber.py:242`), **not** by
+> polling `/chartink/simplified-engine/api/status`. The sidecar keeps a fresh in-memory snapshot from
+> `analyzer_update` events and serves `get_market_state()` / `get_positions()` from it; the same
+> channel drives the §10.11 dashboard's live view of `agent_decision`.
 
 #### Group B — Analysis tools (read + external lookup)
 
@@ -1376,7 +1394,17 @@ def tighten_stop_loss(symbol: str, new_sl: float, reason: str,
     """Move a stop loss to `new_sl` (optionally scoped to `strategy_id` when a symbol
        is held by more than one strategy). HARD CONSTRAINT: new_sl must be TIGHTER
        (closer to LTP, smaller risk) than the current SL — never wider.
-       Rejected at the tool boundary if it would loosen risk. Returns the modified SL."""
+       Rejected at the tool boundary if it would loosen risk.
+
+       Backend depends on how the stop is held (§4.5.4):
+         - SL is broker GTT-backed (live Zerodha/Dhan) -> MODIFY THE GTT via
+           POST /api/v1/modifygttorder (`modify_gtt_order_service.py`), so the
+           tightened stop survives an OpenAlgo restart / crash window;
+         - SL is in-process (sandbox, or no GTT placed) -> update the engine's
+           in-memory trail, as today. NOTE: sandbox GTT returns 501 (§4.5.4),
+           so in sandbox this path is always the in-process trail.
+       Returns {'symbol': str, 'new_sl': float, 'backend': 'gtt'|'inprocess',
+                'gtt_id': str|None}."""
 ```
 
 #### Group E — Code-modifying tool (via bridge, human-gated)
@@ -1531,7 +1559,7 @@ SQL; if the session crashed mid-way, nothing is lost and the next trigger re-rea
 | Tools | **MCP servers, one per tool group** (A–E), enforcing Ring-1 whitelisting |
 | State store | **SQLite** (`db/openalgo.db` + new tables); migrate to **Postgres** as volume grows |
 | Operator notifications | **Telegram bot** (see §10.12) |
-| Dashboard | **Streamlit** (fast) or **Next.js** (richer), reading `agent_decision` + `approval_inbox` |
+| Dashboard | **Streamlit** (fast) or **Next.js** (richer), reading `agent_decision` + `approval_inbox`; subscribes to the **`analyzer_update`** SocketIO channel (§4.5.5) for live engine state instead of polling |
 
 ### 10.12 Telegram bot setup
 
