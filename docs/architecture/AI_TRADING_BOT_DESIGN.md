@@ -113,10 +113,14 @@ are not confused with live code:
   the **OLD** standalone script. It has **already been ported** into OpenAlgo's simplified
   engine (`services/simplified_stock_engine_core.py` + `_service.py`). Keep for **legacy
   reference only**; do not extend it.
-- **A separate options-trading script** in `pythonTradingAutomator\` (exact filename **to be
-  confirmed**) is **pending port** into OpenAlgo. Planned as a future workstream — most
-  likely **after Stage 1.5 lands but before Stage 3** (timing is open question §14). It is
-  not yet represented anywhere else in this design.
+- **`pythonTradingAutomator\src\optionBuyTradingEngine.py`** — a standalone Nifty
+  **options-buying** engine (ATM CE breakout after the 09:16–09:19 opening range, percentage
+  stop loss + RR trailing, monthly-expiry universe; ~700 lines, with both live-trading and
+  backtest `__main__` entry points). It is **pending port** into OpenAlgo as its **own
+  independent strategy workstream**, not folded into the equity engine — see the
+  multi-strategy architecture (§7.7) and the Stage 1.6 sequencing (§13). (An earlier,
+  smaller class-only formulation, `src\OptionBuyingStrategy.py`, is superseded by this
+  engine and kept for legacy reference only.)
 
 ---
 
@@ -262,9 +266,10 @@ layer** — the two can proceed in parallel.
 because the audit (§4) shows the data feed, broker adapters, universe, and UI rail already
 exist. This stage is mostly wiring, plus a tick→bar aggregator, scan tables, and a small
 indicator set.
-**Gate:** *Don't retire Chartink until* the in-house scanner has run in shadow for **4–6
-weeks** with **≥95% agreement** on shared signals **and** catches at least N novel valid
-signals/week that Chartink misses (cutover criteria in §7.5).
+**Gate:** *Don't retire Chartink until* the in-house scanner has run in shadow for **≥4 weeks**
+with **no major divergence the operator deems suspicious**, **and** the operator gives
+subjective sign-off after reviewing the shadow comparison report (qualitative cutover criteria
+in §7.5.3; the ~5-min Chartink update lag means parity alone justifies cutover).
 
 ### Stage 2 — Reflective Trade Journal
 **Scope:** `trade_journal` table capturing every order with full context; a nightly Cowork
@@ -545,9 +550,11 @@ breakout fired and built the order, but before `place_order_service` sends it.
 
 **Goal:** replace the external Chartink screener with a scanner that lives *inside* OpenAlgo,
 reusing the infrastructure inventoried in §4. The payoff: every signal becomes **backtestable**
-against the DuckDB history, **lower latency** (no 15-min scrape cycle — react on bar close),
-**custom criteria** the operator controls (not Chartink's fixed screener language), and the
-**elimination of an external dependency** and its scrape fragility (problems (b)/(c)).
+against the DuckDB history, **lower latency** (no 15-min scrape cycle — react on bar close;
+Chartink itself carries a **known ~5-minute screener update lag**, so the in-house scanner's
+react-on-bar-close latency is a tangible win **even at signal parity**), **custom criteria**
+the operator controls (not Chartink's fixed screener language), and the **elimination of an
+external dependency** and its scrape fragility (problems (b)/(c)).
 
 The migration is deliberately **non-disruptive**: the scanner POSTs to the *same* engine
 webhook Chartink posts to today, so no downstream code changes, and it runs in **shadow**
@@ -587,10 +594,12 @@ alongside Chartink for weeks before anything is cut over.
 
    `source` is what makes shadow validation (§7.5.2) a simple `GROUP BY`.
 
-3. **Add the indicator set.** Start **hand-rolled** in a new `utils/indicators.py` — only the
-   indicators the scan rules actually need: ATR (reuse the engine's Wilder smoothing), EMA,
-   RSI, `volume_avg`. Add **`pandas-ta`** as a dependency *only if* later rules need breadth
-   (supertrend, MACD, Bollinger, VWAP) beyond the hand-rolled set. (Open question §14.)
+3. **Add the indicator set via `pandas-ta`.** `pandas-ta` is the project's standard indicator
+   library (Decided 2026-05-26, §14 Q7) — add it as a dependency up front; do **not**
+   hand-roll. The new bar aggregator service (work item 1) computes **ATR, EMA, RSI, and
+   `volume_avg`** via `pandas-ta` for the scan rules, and the same dependency covers breadth
+   indicators (supertrend, MACD, Bollinger, VWAP) when later rules need them — no second
+   migration, one library across all strategies.
 
 4. **Scanner service subscribes to the live feed.** New **`services/scanner_service.py`** SUBs
    the existing ZMQ tick bus (`127.0.0.1:5555`, §4), aggregates ticks into bars via the shared
@@ -625,10 +634,16 @@ arm the engine during this window — the in-house ones are recorded but not act
 
 ### 7.5.3 Cutover criteria and sequence
 
-**Cutover criteria (both must hold):**
-- **≥95% agreement** on shared signals over the trailing shadow window, **and**
-- the in-house scanner catches at least **N novel valid signals per week** that Chartink
-  misses (N set by the operator; the validating evidence is the hypothetical-P&L scoring above).
+**Cutover criteria (Decided 2026-05-26 — qualitative, not a numeric threshold).** The earlier
+"≥95% agreement AND N novel signals/week" gate is dropped. Cut over to the in-house scanner
+**once it is ready and tested**, judged by:
+- **(a) a shadow run of ≥4 weeks** with **no major divergence the operator deems suspicious**
+  (the daily agreement / miss / hypothetical-P&L comparison of §7.5.2 is the evidence base);
+- **(b) operator subjective approval** after reviewing the shadow comparison report — the
+  operator signs off, rather than a number gating the switch; and
+- **(c) bonus motivation:** Chartink carries a **known ~5-minute screener update lag**, so the
+  in-house scanner's react-on-bar-close latency is a tangible win **even at signal parity** —
+  parity is reason enough to cut over, not a blocker.
 
 **Cutover sequence:**
 1. Flip the engine's **primary** subscription to the in-house scanner (`source='inhouse'`,
@@ -1163,8 +1178,10 @@ criterion of the prior stage's detailed design.
   trail; a preflight failure demonstrably blocks a post.
 - **Stage 1 → 1.5:** a full enforcing day with the veto layer in-path, every decision logged,
   latency within the 1–3 s budget, no missed entries attributable to the LLM.
-- **Stage 1.5 → Chartink retirement:** a 4–6 week shadow run at **≥95% agreement** plus N
-  novel valid signals/week (§7.5.3). Stage 2 may proceed *during* this shadow run.
+- **Stage 1.5 → Chartink retirement:** a **≥4 week** shadow run with no operator-flagged
+  divergence plus operator subjective sign-off on the shadow comparison report (qualitative
+  criteria, §7.5.3); the ~5-min Chartink update lag means parity alone justifies cutover.
+  Stage 2 may proceed *during* this shadow run.
 - **Stage 2 → 3:** the journal has a statistically useful run and ≥1 reviewed retrospective;
   Stage 3 additionally waits for **6 months** of journal data.
 - **Stage 3 → / Stage 4 maturity:** walk-forward out-of-sample lift over the rules-only
@@ -1249,10 +1266,21 @@ Surfaced in the scanner audit (2026-05-26/27, §4 / §7.5):
    EMA, RSI, `volume_avg`, …) should the in-house scanner standardize on? Start hand-rolled
    and pull in `pandas-ta` only for breadth, or commit to the dependency up front?
    (§7.5.1 item 3.)
+   **Decided 2026-05-26:** **`pandas-ta` is the standard** indicator library for this
+   project — commit to it up front, with **no** hand-rolled alternative. The new bar
+   aggregator service computes **ATR, EMA, RSI, and `volume_avg`** via `pandas-ta`, and the
+   same dependency covers breadth indicators (supertrend, MACD, Bollinger, VWAP) later with
+   no second migration. (§7.5.1 item 3.)
 8. **Options-script port timing** — when to schedule porting the pending
-   `pythonTradingAutomator\` options-trading script (§2.3) into OpenAlgo: as a **Stage 1.5
-   sibling** (sharing the scanner/aggregator work) or a **post-1.5 standalone** workstream
-   before Stage 3?
+   `pythonTradingAutomator\src\optionBuyTradingEngine.py` options-trading script (§2.3) into
+   OpenAlgo: as a **Stage 1.5 sibling** (sharing the scanner/aggregator work) or a **post-1.5
+   standalone** workstream before Stage 3?
+   **Decided 2026-05-26:** the options strategy is a **separate, independent strategy
+   workstream** — and the decision is bigger than timing. It motivates a **multi-strategy
+   architecture** (run multiple independent strategies, each activated only when favourable
+   to the current market regime), specified in the new **§7.7**. The port is sequenced as
+   **Stage 1.6** (§13): the options engine is ported as a second `BaseStrategy` implementation
+   after the Stage 1.5 refactor introduces the strategy-package shape.
 
 ---
 
