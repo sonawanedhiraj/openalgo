@@ -116,11 +116,13 @@ are not confused with live code:
 - **`pythonTradingAutomator\src\optionBuyTradingEngine.py`** — a standalone Nifty
   **options-buying** engine (ATM CE breakout after the 09:16–09:19 opening range, percentage
   stop loss + RR trailing, monthly-expiry universe; ~700 lines, with both live-trading and
-  backtest `__main__` entry points). It is **pending port** into OpenAlgo as its **own
-  independent strategy workstream**, not folded into the equity engine — see the
-  multi-strategy architecture (§7.7) and the Stage 1.6 sequencing (§13). (An earlier,
-  smaller class-only formulation, `src\OptionBuyingStrategy.py`, is superseded by this
-  engine and kept for legacy reference only.)
+  backtest `__main__` entry points). The script is **call-only** (bullish). It is **pending
+  port** into OpenAlgo as its **own independent strategy workstream**, not folded into the
+  equity engine — and it ports as **two mirror strategies**: `options_call_buy` (this script,
+  Stage 1.6a) and a new bearish mirror `options_put_buy` (Stage 1.6b), sharing an
+  `options_directional_breakout` base. See the multi-strategy architecture (§7.7) and the
+  Stage 1.6a/1.6b sequencing (§13). (An earlier, smaller class-only formulation,
+  `src\OptionBuyingStrategy.py`, is superseded by this engine and kept for legacy reference only.)
 
 ---
 
@@ -668,9 +670,10 @@ shadow run** as ongoing wall-clock (not engineering) time before cutover.
 ### 7.7.1 Motivation
 
 The operator runs **more than one strategy**: today the F&O **equity intraday** strategy
-(Chartink / in-house scanner → simplified engine); soon the **options-buying** engine
-(`optionBuyTradingEngine.py`, §2.3, ported in Stage 1.6); eventually more. Two problems follow
-that the current design cannot express:
+(Chartink / in-house scanner → simplified engine); soon the **options directional-breakout**
+engine (`optionBuyTradingEngine.py`, §2.3), which ports as a **call-buying** strategy and a
+mirror **put-buying** strategy (Stage 1.6a/1.6b); eventually more. Two problems follow that the
+current design cannot express:
 
 1. **The architecture treats "the strategy" as a singleton** — one engine, one mode flag, one
    webhook. Adding a second strategy by copy-paste does not scale and entangles their state.
@@ -718,7 +721,7 @@ tables)
 ```sql
 CREATE TABLE strategies (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    name           TEXT NOT NULL UNIQUE,        -- 'trending_equity_intraday', 'options_buy', ...
+    name           TEXT NOT NULL UNIQUE,        -- 'trending_equity_intraday', 'options_call_buy', 'options_put_buy', ...
     description    TEXT,
     module_path    TEXT NOT NULL,               -- import path to the Strategy class
     enabled        BOOLEAN NOT NULL DEFAULT 1,  -- master per-strategy switch (operator/activator)
@@ -778,8 +781,41 @@ class BaseStrategy(ABC):
 ```
 
 The existing **simplified-engine internals do not change** — they become *one implementation* of
-`BaseStrategy` for the trending-equity strategy. The options-buy engine (§2.3) is ported as a
-**second** implementation. The ABC is the only new contract both must satisfy.
+`BaseStrategy` for the trending-equity strategy. The options engine (§2.3) is ported as further
+implementations. The ABC is the only new contract every strategy must satisfy.
+
+**Sharing logic via inheritance.** Strategies with the same core mechanics (entry/exit pattern,
+position sizing) need not duplicate code — they can share a common implementation class and
+subclass it. The **canonical example is `options_call_buy` and `options_put_buy`**, which are the
+same ATM directional-breakout strategy run in opposite directions:
+
+- `strategies/options_directional_breakout/base.py` — an `OptionsDirectionalBreakout(BaseStrategy)`
+  holding the shared opening-range breakout, SL/RR-trailing, and sizing logic;
+- `strategies/options_call_buy/strategy.py` — a **thin subclass** flipping the direction-specific
+  parameters to the **CE / bullish** side (call strike, up-breakout, SL below);
+- `strategies/options_put_buy/strategy.py` — the mirror **thin subclass** for the **PE / bearish**
+  side (put strike, down-breakout, SL above).
+
+The two are **independent registered strategies** (separate `strategies` rows, separate enable
+flags) that differ almost entirely in **opposite regime profiles**:
+
+```jsonc
+// options_call_buy — bullish; explicitly NOT active in trending_down
+{ "trend": ["trending_up"], "volatility": ["normal", "elevated"],
+  "breadth": ["broad_bullish", "mixed"],
+  "sector_rotation": ["cyclicals_leading", "broad_strength"],
+  "time_of_day": ["opening", "mid_morning", "afternoon"] }
+
+// options_put_buy — bearish mirror; explicitly NOT active in trending_up
+{ "trend": ["trending_down"], "volatility": ["normal", "elevated"],
+  "breadth": ["broad_bearish", "mixed"],
+  "sector_rotation": ["defensives_leading", "broad_weakness"],
+  "time_of_day": ["opening", "mid_morning", "afternoon"] }
+```
+
+Because `trend` is `trending_up` for one and `trending_down` for the other, the activator
+(§7.7.7) **naturally enforces mutual exclusion** — at most one of the pair matches a given
+regime, so call-buy and put-buy are never both active at once.
 
 ### 7.7.5 Where it lives in the codebase
 
@@ -792,8 +828,12 @@ strategies/
   trending_equity_intraday/
     strategy.py                    # class Strategy(BaseStrategy) — wraps the refactored simplified engine
     LEARNINGS.md / VERSION_LOG.md  # (existing per-strategy docs convention, retained)
-  options_buy/
-    strategy.py                    # class Strategy(BaseStrategy) — the ported options engine
+  options_directional_breakout/
+    base.py                        # OptionsDirectionalBreakout(BaseStrategy) — shared options logic
+  options_call_buy/
+    strategy.py                    # class Strategy(OptionsDirectionalBreakout) — CE / bullish (the ported engine)
+  options_put_buy/
+    strategy.py                    # class Strategy(OptionsDirectionalBreakout) — PE / bearish mirror
 ```
 
 `strategies/__init__.py` is a **registry** that discovers and registers every strategy (each
@@ -859,28 +899,47 @@ written**:
 | Sub-stage | Scope | Behaviour change |
 |---|---|---|
 | **Stage 1.5 sibling** | Refactor the existing single-strategy code into the `strategies/` package shape with **one** strategy registered (`trending_equity_intraday`). Introduces `BaseStrategy` + the registry. | **Zero** behaviour change — pure refactor; existing engine tests stay green. |
-| **Stage 1.6** | Port the options-buy engine (§2.3) as a **second** `BaseStrategy`. Strategies run independently. | Both strategies run **unconditionally if enabled** — no regime gating yet. |
-| **Stage 1.7** | Introduce the **regime classifier + activator**. Strategies declare `regime_profile`s. | Activator gates each strategy's enable/disable on regime. |
+| **Stage 1.6a** | Port the options engine (§2.3) as `options_call_buy`, refactored onto a shared `options_directional_breakout` base (§7.7.4). | The call-buy strategy runs **unconditionally if enabled** alongside the equity strategy — no regime gating yet. |
+| **Stage 1.6b** | Add `options_put_buy` as a mirror — a thin subclass of the same base flipping CE→PE / breakout / SL direction. | A second options strategy registers; still no regime gating (both can be enabled). |
+| **Stage 1.7** | Introduce the **regime classifier + activator**. Strategies declare `regime_profile`s. | Activator gates each strategy's enable/disable on regime — and, via opposite `trend` profiles, makes call-buy/put-buy mutually exclusive. |
 | **Stage 4 update** | The autonomous agent gets **multi-strategy-aware tools** (`strategy_id` parameters; `pause_strategy_until`; propose-activation via `approval_inbox`). | Agent reasons per-strategy. |
 
 ### 7.7.10 Worked example
 
-It is **10:30 AM**. The regime classifier writes `market_regime` =
-`{trend: trending_down, volatility: elevated, breadth: broad_bearish, sector_rotation: broad_weakness,
-time_of_day: mid_morning}`. The activator reads it:
+Two regimes on the same day show the activator gating all five dimensions **and** keeping the
+call-buy / put-buy pair mutually exclusive.
 
-- **trending-stocks-BUY** declares `{trend: [trending_up], ...}` — `trending_down` is **not** in
-  its allowed set, so its profile **does not match** (`broad_weakness` is the wrong tape for it
-  besides). The activator writes
-  `strategy_activation(action='disable', decided_by='activator', reason='regime mismatch',
-  market_regime_id=…)`. The strategy stops arming new entries (open positions are untouched).
-- **options-buy** declares a **put** branch favourable in
-  `{trend: [trending_down], volatility: [elevated, extreme], sector_rotation: [broad_weakness,
-  defensives_leading], time_of_day: [opening, mid_morning, afternoon]}` — every dimension is in
-  range, so it **matches** and **remains active**.
-- The operator, watching, can **override** either decision (force-enable the equity strategy, or
-  force-sandbox the options one) via the per-strategy pin endpoint; the override is recorded with
-  `decided_by='operator'`.
+**Scenario A — bullish open.** At **09:40** the classifier writes `market_regime` =
+`{trend: trending_up, volatility: normal, breadth: broad_bullish, sector_rotation: cyclicals_leading,
+time_of_day: opening}`. The activator reads it:
+
+- **`trending_equity_intraday`** (BUY side) matches `{trend: [trending_up], ...}` → **enabled**;
+  BUY-side scans arm.
+- **`options_call_buy`** declares `{trend: [trending_up], volatility: [normal, elevated],
+  breadth: [broad_bullish, mixed], sector_rotation: [cyclicals_leading, broad_strength],
+  time_of_day: [opening, mid_morning, afternoon]}` — every dimension is in range → **enabled**.
+- **`options_put_buy`** requires `trend: trending_down` → mismatch → **stays disabled**. The
+  activator writes `strategy_activation(action='disable', decided_by='activator',
+  reason='regime mismatch: trend=trending_up', market_regime_id=…)`.
+- The operator can **override** any of these via the per-strategy pin endpoint
+  (`decided_by='operator'`).
+
+**Scenario B — late-session selloff.** At **14:10** the classifier writes `market_regime` =
+`{trend: trending_down, volatility: elevated, breadth: broad_bearish, sector_rotation: broad_weakness,
+time_of_day: afternoon}`. The activator re-evaluates:
+
+- **`options_call_buy`** now mismatches on `trend` (and `breadth`, and `sector_rotation`) →
+  **disabled** (`reason='regime mismatch: trend=trending_down'`).
+- **`options_put_buy`** declares the mirror `{trend: [trending_down], volatility: [normal, elevated],
+  breadth: [broad_bearish, mixed], sector_rotation: [defensives_leading, broad_weakness],
+  time_of_day: [opening, mid_morning, afternoon]}` — every dimension is in range → **enabled**.
+- **`trending_equity_intraday`** stays active for **SELL-side** scans (its profile admits the
+  bearish tape for shorts); only its BUY arming quiets.
+
+The two scenarios together show the mechanism doing real work: the opposite `trend` profiles of
+the call/put pair mean **at most one is ever active** (mutual exclusion is a property of the
+profiles, not a special case in the activator), while `sector_rotation` and `time_of_day` tighten
+each match beyond `trend` alone.
 
 ---
 
@@ -1249,7 +1308,7 @@ failure).
 
 **Action whitelist routing:**
 - `pause_strategy_until('trending_equity_intraday', '11:15', 'vol spike — hold new BUY entries')`
-  → **medium-risk, executed** (pauses only the equity strategy; the options strategy is
+  → **medium-risk, executed** (pauses only the equity strategy; the options strategies are
   untouched).
 - `tighten_stop_loss('CONCOR', 805.0, 'lock gains on short into vol spike')` → **medium-risk,
   executed** (805 is tighter than 818, so it passes the never-wider constraint).
@@ -1404,9 +1463,10 @@ criterion of the prior stage's detailed design.
 | 1–2   | Stage 0 — operational floor | — |
 | 3–4   | Stage 1 — LLM veto layer | — |
 | 5–7   | Stage 1.5 — in-house scanner build | refactor into the `strategies/` package (§7.7) |
-| 8–9   | Stage 1.6 — port options strategy as 2nd `BaseStrategy` | builds on the §7.7 package |
-| 10–11 | Stage 1.7 — regime classifier (rule-based) + activator | strategies declare regime profiles |
-| 5–11+ | Stage 2 — reflective journal | starts once the journal schema exists, in parallel with 1.5–1.7 |
+| 8–9   | Stage 1.6a — port options call-buy as 2nd `BaseStrategy` | builds on the §7.7 package |
+| 10    | Stage 1.6b — add options put-buy mirror strategy | shares the directional-breakout base |
+| 11–12 | Stage 1.7 — regime classifier (rule-based) + activator | strategies declare regime profiles |
+| 5–12+ | Stage 2 — reflective journal | starts once the journal schema exists, in parallel with 1.5–1.7 |
 | later | Stage 3 — ML augmentation | needs ≥6 mo journal data |
 | later | Stage 4 — autonomous agent | may start advisory-only earlier |
 | much later | Stage 5 — independent signals | — |
@@ -1423,8 +1483,12 @@ criterion of the prior stage's detailed design.
   Stage 2 may proceed *during* this shadow run.
 - **Stage 1.5 → 1.6:** the single strategy runs as a registered `BaseStrategy` in the
   `strategies/` package (§7.7) with **zero** behaviour change — existing engine tests green.
-- **Stage 1.6 → 1.7:** the options engine (§2.3) runs as a **second** independent
-  `BaseStrategy`; both strategies arm independently when enabled (no regime gating yet).
+- **Stage 1.6a → 1.6b:** the options engine (§2.3) runs as `options_call_buy`, a **second**
+  independent `BaseStrategy` refactored onto the shared `options_directional_breakout` base;
+  it arms independently of the equity strategy when enabled (no regime gating yet).
+- **Stage 1.6b → 1.7:** `options_put_buy` registers as the mirror strategy and arms independently
+  in sandbox on a falling tape; both options strategies and the equity strategy run when enabled
+  (still no regime gating).
 - **Stage 1.7 → onward:** the rule-based regime classifier writes `market_regime` rows on a
   5-min cadence and the activator gates each strategy's enable/disable on regime, with an
   operator override demonstrably pinning a strategy for the day.
@@ -1479,14 +1543,27 @@ criterion of the prior stage's detailed design.
 - **Gate:** the in-house scanner emits the same symbols Chartink would for a full day, writing
   `scan_results` rows tagged `shadow`; the 4–6 week shadow comparison (§7.5.2) begins.
 
-### Sprint 7 — Stage 1.6: port the options strategy
+### Sprint 7 — Stage 1.6a: port the options call-buy strategy
 - Port `pythonTradingAutomator\src\optionBuyTradingEngine.py` (§2.3) as a **second**
-  `BaseStrategy` implementation under `strategies/options_buy/` (§7.7.5).
+  `BaseStrategy` implementation, registered `options_call_buy` under
+  `strategies/options_call_buy/` (§7.7.5).
+- Refactor the shared opening-range-breakout / SL-RR-trailing / sizing logic into
+  `strategies/options_directional_breakout/base.py`; `options_call_buy` is a thin CE-side
+  subclass (§7.7.4).
 - Both strategies run independently when enabled; **no regime gating yet**.
-- **Gate:** the options strategy arms/monitors independently of the equity strategy in
+- **Gate:** `options_call_buy` arms/monitors independently of the equity strategy in
   sandbox, with its own `scan_results` / journal trail.
 
-### Sprint 8 — Stage 1.7: regime classifier + activator
+### Sprint 8 — Stage 1.6b: add the options put-buy mirror
+- Add `options_put_buy` (`strategies/options_put_buy/`) as a **thin subclass** of the same
+  `options_directional_breakout` base, flipping the direction-specific parameters: PE strike,
+  down-breakout, SL above (plus PE-side expiry/strike resolution).
+- Mostly a configuration flip — **expected to be the lightest week in the project** (~1 week).
+  Both options strategies and the equity strategy run when enabled; still no regime gating.
+- **Gate:** `options_put_buy` arms/monitors independently in sandbox on a falling tape, with
+  its own `scan_results` / journal trail.
+
+### Sprint 9 — Stage 1.7: regime classifier + activator
 - Add the `strategies` / `market_regime` / `strategy_activation` tables (§7.7.3).
 - Implement the rule-based regime classifier (NIFTY price action + India VIX bands + A/D
   ratio) on a 5-min APScheduler cadence (§7.7.6), and the activator (§7.7.7).
@@ -1544,8 +1621,10 @@ Surfaced in the scanner audit (2026-05-26/27, §4 / §7.5):
    workstream** — and the decision is bigger than timing. It motivates a **multi-strategy
    architecture** (run multiple independent strategies, each activated only when favourable
    to the current market regime), specified in the new **§7.7**. The port is sequenced as
-   **Stage 1.6** (§13): the options engine is ported as a second `BaseStrategy` implementation
-   after the Stage 1.5 refactor introduces the strategy-package shape.
+   **Stage 1.6a/1.6b** (§13): the call-only engine is ported as `options_call_buy` (Stage 1.6a)
+   after the Stage 1.5 refactor introduces the strategy-package shape, then mirrored as
+   `options_put_buy` (Stage 1.6b) — two mutually-exclusive strategies over a shared
+   `options_directional_breakout` base.
 
 ---
 
@@ -1583,6 +1662,11 @@ Overloaded terms, defined once:
   a unique id, a signal source, arming/exit logic, a regime profile, a sandbox/live mode
   inherited from `daily_intent`/`analyze_mode`, and an independent enable/disable switch.
   Implemented as a `BaseStrategy` subclass.
+- **Mirror strategy** — (§7.7.4) one of a pair of strategies that share a common implementation
+  base but flip direction-specific parameters and carry **opposite regime profiles**, so the
+  activator keeps them mutually exclusive. The canonical pair is `options_call_buy` (bullish, CE)
+  and `options_put_buy` (bearish, PE), both subclassing `options_directional_breakout`: when
+  `trend` is `trending_up` only the call-buy matches; when `trending_down` only the put-buy does.
 - **Market regime** — (§7.7) a categorical descriptor of current market conditions across five
   dimensions — **trend** (`trending_up`|`trending_down`|`choppy`), **volatility**
   (`low`|`normal`|`elevated`|`extreme`), **breadth** (`broad_bullish`|`broad_bearish`|`mixed`),
@@ -1603,5 +1687,6 @@ Overloaded terms, defined once:
   strategies are active given their regime profiles and toggles their enable flag, writing a
   `strategy_activation` row on any state change. Operator-overridable.
 - **`BaseStrategy`** — (§7.7) the abstract base class (`strategies/base.py`) every strategy
-  implements: `on_tick` / `on_bar` / `on_scan_hit` / `should_arm` / `should_exit`. The
-  simplified engine and the ported options engine are two implementations.
+  implements: `on_tick` / `on_bar` / `on_scan_hit` / `should_arm` / `should_exit`. The simplified
+  engine (`trending_equity_intraday`) and the two ported options mirror strategies
+  (`options_call_buy`, `options_put_buy`) are implementations.
