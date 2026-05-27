@@ -527,6 +527,110 @@ breakout fired and built the order, but before `place_order_service` sends it.
 
 ---
 
+## 7.5 Stage 1.5 Detailed Design — In-House Scanner Migration
+
+**Goal:** replace the external Chartink screener with a scanner that lives *inside* OpenAlgo,
+reusing the infrastructure inventoried in §4. The payoff: every signal becomes **backtestable**
+against the DuckDB history, **lower latency** (no 15-min scrape cycle — react on bar close),
+**custom criteria** the operator controls (not Chartink's fixed screener language), and the
+**elimination of an external dependency** and its scrape fragility (problems (b)/(c)).
+
+The migration is deliberately **non-disruptive**: the scanner POSTs to the *same* engine
+webhook Chartink posts to today, so no downstream code changes, and it runs in **shadow**
+alongside Chartink for weeks before anything is cut over.
+
+### 7.5.1 Work items
+
+1. **Extract a shared bar aggregator.** Lift `FiveMinuteCandleBuilder` out of
+   `services/simplified_stock_engine_core.py:304` into a new **`services/bar_aggregator.py`**
+   supporting configurable intervals (1m, 5m, 15m) across multiple symbols. Refactor the
+   simplified engine to consume the shared version — behaviour must stay identical, covered by
+   the existing engine tests. Every other work item depends on this one.
+
+2. **Add scan-state tables** (settings DB, `db/openalgo.db`; models in
+   `database/trading_ops_db.py` alongside the Stage-0 tables):
+
+   ```sql
+   CREATE TABLE scan_definitions (
+       id            INTEGER PRIMARY KEY AUTOINCREMENT,
+       name          TEXT NOT NULL UNIQUE,
+       screener_type TEXT NOT NULL CHECK (screener_type IN ('buy','sell')),
+       expression    TEXT NOT NULL,         -- rule expression (text DSL or JSON AST)
+       enabled       BOOLEAN NOT NULL DEFAULT 1,
+       created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+   );
+
+   CREATE TABLE scan_results (
+       id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+       scan_definition_id INTEGER NOT NULL,             -- FK -> scan_definitions.id
+       run_at             TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       symbols            TEXT NOT NULL,                -- JSON array of matched OpenAlgo symbols
+       source             TEXT NOT NULL CHECK (source IN ('chartink','inhouse','shadow')),
+       posted_to_engine   BOOLEAN NOT NULL DEFAULT 0
+   );
+   ```
+
+   `source` is what makes shadow validation (§7.5.2) a simple `GROUP BY`.
+
+3. **Add the indicator set.** Start **hand-rolled** in a new `utils/indicators.py` — only the
+   indicators the scan rules actually need: ATR (reuse the engine's Wilder smoothing), EMA,
+   RSI, `volume_avg`. Add **`pandas-ta`** as a dependency *only if* later rules need breadth
+   (supertrend, MACD, Bollinger, VWAP) beyond the hand-rolled set. (Open question §14.)
+
+4. **Scanner service subscribes to the live feed.** New **`services/scanner_service.py`** SUBs
+   the existing ZMQ tick bus (`127.0.0.1:5555`, §4), aggregates ticks into bars via the shared
+   `bar_aggregator`, evaluates each enabled `scan_definition` on **bar close**, and emits a
+   `scan_hit` Event into `utils/event_bus.py`. No new feed; no new scheduler if it keys off the
+   bar-close cadence.
+
+5. **Add `scan_hit` consumers.** Two subscribers on the event-bus topic:
+   - a **webhook-poster** that POSTs the matched symbols to the existing simplified-engine
+     webhook (`/chartink/simplified-stock-engine/<webhook_id>`) so the engine and all
+     downstream code are unchanged; it writes a `scan_results` row (`source='inhouse'` or
+     `'shadow'`) and sets `posted_to_engine`.
+   - a **SocketIO emitter** that pushes `scan_hit` to the React UI (same rail as
+     `order_update`, §4) so scanner activity is visible live.
+
+6. **(Optional) Sector/industry enrichment.** A small import job loading NSE's free
+   sector/industry CSVs into a new `sector_map` table keyed on symbol (or a `sector` column on
+   `SymToken`). **Defer** unless/until a scan rule needs sector-relative criteria.
+
+### 7.5.2 Shadow-validation methodology
+
+For **4–6 weeks**, run the in-house scanner **in parallel** with Chartink. Both write
+`scan_results` rows tagged by `source` (`chartink` vs `shadow`); only Chartink's hits actually
+arm the engine during this window — the in-house ones are recorded but not acted on
+(`posted_to_engine=0`). Compare **daily**:
+
+- **agreement rate** — fraction of runs where both produced the same symbol set;
+- **misses** — signals one caught that the other did not (both directions);
+- **who was right on disagreement** — for each divergent signal, score the *hypothetical*
+  P&L of the path not taken, to judge whether the in-house scanner's extra/missing signals
+  would have helped or hurt.
+
+### 7.5.3 Cutover criteria and sequence
+
+**Cutover criteria (both must hold):**
+- **≥95% agreement** on shared signals over the trailing shadow window, **and**
+- the in-house scanner catches at least **N novel valid signals per week** that Chartink
+  misses (N set by the operator; the validating evidence is the hypothetical-P&L scoring above).
+
+**Cutover sequence:**
+1. Flip the engine's **primary** subscription to the in-house scanner (`source='inhouse'`,
+   `posted_to_engine=1`).
+2. Let **Chartink ride as a confirmation check** — still scraped, still logged to
+   `scan_results`, but now it is the shadow.
+3. Once the in-house scanner has carried primary cleanly for a further period, **retire
+   Chartink entirely** (drop the scrape skill, remove the external dependency).
+
+### 7.5.4 Estimated effort
+
+**~10–15 working days** for the build (work items 1–5; item 6 deferred), then the **4–6 week
+shadow run** as ongoing wall-clock (not engineering) time before cutover.
+
+---
+
 ## 8. Stage 2 Detailed Design — Reflective Journal
 
 ### 8.1 `trade_journal`
@@ -588,15 +692,18 @@ CREATE TABLE journal_reflection (
 Deferred until the Stage 2 gate (**6 months of journal data**). Sketch only:
 
 - **Feature pipeline:** pull from `trade_journal` (outcomes as labels) + market data
-  (regime, VIX, breadth, time-of-day, sector, ATR percentile). Engineer per-signal feature
+  (regime, VIX, breadth, time-of-day, sector, ATR percentile). The in-house scanner's
+  bar/indicator pipeline (Stage 1.5, §7.5) already produces these features on every bar, so
+  Stage 3 reuses that feed rather than standing up its own. Engineer per-signal feature
   vectors. Land in a feature store table or parquet.
 - **Model:** gradient boosting (XGBoost / LightGBM) predicting P(trade succeeds | features).
 - **Validation:** **walk-forward** backtest (train on rolling window, test forward, never
   peek). Reuse `backtest/run_backtest.py` harness conventions.
 - **Deployment:** `POST /predict_success_probability` endpoint returning a calibrated score
   for a candidate signal.
-- **Ensemble:** combine Chartink rank + ML probability (e.g. weighted, or ML as a second
-  veto gate after Stage 1's LLM). Tune the blend on out-of-sample data only.
+- **Ensemble:** combine the scan score (Chartink rank, or its in-house successor from
+  Stage 1.5) + ML probability (e.g. weighted, or ML as a second veto gate after Stage 1's
+  LLM). Tune the blend on out-of-sample data only.
 
 ---
 
@@ -1018,9 +1125,38 @@ size.
 
 ---
 
-## 13. Implementation Sequencing (Stage 0 + Stage 1)
+## 13. Implementation Sequencing
 
-These two are immediate. Roughly two sprints each; gates are hard.
+The near-term work is concrete (Stage 0, Stage 1, and Stage 1.5 are sprint-sized);
+everything past Stage 1.5 is sketched. Gates between stages are **hard** — each is the exit
+criterion of the prior stage's detailed design.
+
+**Timeline at a glance:**
+
+| Weeks | Stage | Parallelism |
+|---|---|---|
+| 1–2   | Stage 0 — operational floor | — |
+| 3–4   | Stage 1 — LLM veto layer | — |
+| 5–7   | Stage 1.5 — in-house scanner build | runs alongside Stage 2 |
+| 5–7+  | Stage 2 — reflective journal | starts once the journal schema exists, in parallel with 1.5 |
+| later | Stage 3 — ML augmentation | needs ≥6 mo journal data |
+| later | Stage 4 — autonomous agent | may start advisory-only earlier |
+| much later | Stage 5 — independent signals | — |
+
+**Gates between stages (each must be met before the next begins):**
+- **Stage 0 → 1:** `resolve_effective_mode()` is the sole mode authority for new code; a full
+  day runs with the bridge **down** yet every cycle still has a `scan_cycle` + `cycle_heartbeat`
+  trail; a preflight failure demonstrably blocks a post.
+- **Stage 1 → 1.5:** a full enforcing day with the veto layer in-path, every decision logged,
+  latency within the 1–3 s budget, no missed entries attributable to the LLM.
+- **Stage 1.5 → Chartink retirement:** a 4–6 week shadow run at **≥95% agreement** plus N
+  novel valid signals/week (§7.5.3). Stage 2 may proceed *during* this shadow run.
+- **Stage 2 → 3:** the journal has a statistically useful run and ≥1 reviewed retrospective;
+  Stage 3 additionally waits for **6 months** of journal data.
+- **Stage 3 → / Stage 4 maturity:** walk-forward out-of-sample lift over the rules-only
+  baseline; the agent has run advisory-only (no write tools) with operator-judged-correct
+  classifications.
+- **→ Stage 5:** a validated edge under strict walk-forward **and** a hard capital cap (§12).
 
 ### Sprint 1 — Stage 0a: state foundation
 - Add `database/trading_ops_db.py` with `daily_intent`, `scan_cycle`, `cycle_heartbeat`
@@ -1054,6 +1190,19 @@ These two are immediate. Roughly two sprints each; gates are hard.
 - **Gate (Stage 1 exit):** a full enforcing day with no missed entries attributable to the
   LLM call, and every decision auditable.
 
+### Sprint 5–6 — Stage 1.5: in-house scanner build
+- Extract `services/bar_aggregator.py` from the engine core; refactor the engine onto it with
+  the existing tests staying green.
+- Add the `scan_definitions` / `scan_results` tables and `utils/indicators.py` (hand-rolled
+  ATR/EMA/RSI/`volume_avg`).
+- Stand up `services/scanner_service.py` on the ZMQ tick bus; wire `scan_hit` → webhook-poster
+  + SocketIO emitter.
+- **Gate:** the in-house scanner emits the same symbols Chartink would for a full day, writing
+  `scan_results` rows tagged `shadow`; the 4–6 week shadow comparison (§7.5.2) begins.
+
+> Stage 2 (reflective journal) can start as soon as its schema exists, overlapping the Stage
+> 1.5 build. Stages 3–5 are scheduled only when their gates above are in sight.
+
 ---
 
 ## 14. Open Questions
@@ -1081,6 +1230,12 @@ Surfaced while drafting:
    indefinitely until row count forces the Postgres move; never auto-purge audit rows
    without an export.
 
+Surfaced in the scanner audit (2026-05-26/27, §4 / §7.5):
+7. **In-house indicator set** — which exact `pandas-ta` indicators (or hand-rolled set: ATR,
+   EMA, RSI, `volume_avg`, …) should the in-house scanner standardize on? Start hand-rolled
+   and pull in `pandas-ta` only for breadth, or commit to the dependency up front?
+   (§7.5.1 item 3.)
+
 ---
 
 ## 15. Glossary
@@ -1103,3 +1258,13 @@ Overloaded terms, defined once:
 - **Analyze Mode** — the **UI label** (and analyzer/sandbox feature) for sandbox routing,
   i.e. the human-facing name for `analyze_mode = True`. Same concept as the DB flag, shown
   in the React frontend.
+- **in-house scanner** — the Stage 1.5 (§7.5) replacement for Chartink that lives inside
+  OpenAlgo, subscribing to the ZMQ tick bus and evaluating `scan_definition`s on bar close.
+- **`scan_definition`** — a row in the new `scan_definitions` table (§7.5.1): a named,
+  enable-able scan rule (`buy`/`sell`, an expression) the in-house scanner evaluates.
+- **`scan_result`** — a row in the new `scan_results` table (§7.5.1): the symbols a
+  `scan_definition` matched on one run, tagged by `source` (`chartink` | `inhouse` | `shadow`)
+  and whether it was posted to the engine.
+- **shadow validation** — running the in-house scanner *in parallel* with Chartink without
+  acting on its hits, comparing the two via `scan_results.source` for 4–6 weeks before cutover
+  (§7.5.2).
