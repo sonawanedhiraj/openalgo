@@ -691,16 +691,21 @@ when favourable to current market conditions**.
   (vi) a **sandbox/live mode**, *inherited* from `daily_intent` and the global `analyze_mode`
   (a strategy never sets its own money-routing); (vii) an independent **enable/disable** switch.
 - **Market regime** — a categorical descriptor of current conditions, produced by a **regime
-  classifier**. Initial dimensions:
+  classifier**. Five dimensions:
   - **trend** ∈ {`trending_up`, `trending_down`, `choppy`}
   - **volatility** ∈ {`low`, `normal`, `elevated`, `extreme`}
   - **breadth** ∈ {`broad_bullish`, `broad_bearish`, `mixed`}
+  - **sector_rotation** ∈ {`cyclicals_leading`, `defensives_leading`, `broad_strength`, `broad_weakness`, `mixed`}
+  - **time_of_day** ∈ {`pre_open`, `opening`, `mid_morning`, `lunch`, `afternoon`, `closing`, `post_close`}
 
   Each classification is one row in the new `market_regime` table (timestamp + dimension values).
 - **Regime profile** (per strategy) — a **declarative spec** of the regimes a strategy is
   favourable in, declared in code/config alongside the strategy. Example for trending-equity-BUY:
-  `{trend: [trending_up], volatility: [normal, elevated], breadth: [broad_bullish, mixed]}`. A
-  regime *matches* a profile when each dimension's current value is in the profile's allowed set.
+  `{trend: [trending_up], volatility: [normal, elevated], breadth: [broad_bullish, mixed],
+  sector_rotation: [cyclicals_leading, broad_strength], time_of_day: [opening, mid_morning, afternoon]}`.
+  A regime *matches* a profile when each dimension's current value is in the profile's allowed set.
+  Most intraday strategies omit `pre_open`/`lunch`/`post_close` from their `time_of_day` window, and
+  `sector_rotation` is an **optional** filter (a strategy may leave it unconstrained).
 - **Activator** — a process that, on each new regime classification, computes which strategies
   are active given their profiles and toggles their enable flag accordingly. The operator can
   override (force-enable, force-disable, force-sandbox).
@@ -717,7 +722,7 @@ CREATE TABLE strategies (
     description    TEXT,
     module_path    TEXT NOT NULL,               -- import path to the Strategy class
     enabled        BOOLEAN NOT NULL DEFAULT 1,  -- master per-strategy switch (operator/activator)
-    regime_profile TEXT NOT NULL,               -- JSON: {trend:[...], volatility:[...], breadth:[...]}
+    regime_profile TEXT NOT NULL,               -- JSON: {trend:[...], volatility:[...], breadth:[...], sector_rotation:[...], time_of_day:[...]}
     created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -728,8 +733,10 @@ CREATE TABLE market_regime (
     trend              TEXT NOT NULL CHECK (trend IN ('trending_up','trending_down','choppy')),
     volatility         TEXT NOT NULL CHECK (volatility IN ('low','normal','elevated','extreme')),
     breadth            TEXT NOT NULL CHECK (breadth IN ('broad_bullish','broad_bearish','mixed')),
+    sector_rotation    TEXT NOT NULL CHECK (sector_rotation IN ('cyclicals_leading','defensives_leading','broad_strength','broad_weakness','mixed')),
+    time_of_day        TEXT NOT NULL CHECK (time_of_day IN ('pre_open','opening','mid_morning','lunch','afternoon','closing','post_close')),
     classifier_version TEXT NOT NULL,           -- 'rules_v1' | 'ml_v1' | ... (provenance)
-    raw_inputs         TEXT                      -- JSON: NIFTY px action, India VIX, A/D ratio snapshot
+    raw_inputs         TEXT                      -- JSON: NIFTY px action, India VIX, A/D ratio, sector-index RS snapshot
 );
 
 CREATE TABLE strategy_activation (
@@ -756,7 +763,7 @@ from abc import ABC, abstractmethod
 
 class BaseStrategy(ABC):
     id: str                       # unique, matches strategies.name
-    regime_profile: dict          # {trend:[...], volatility:[...], breadth:[...]}
+    regime_profile: dict          # {trend:[...], volatility:[...], breadth:[...], sector_rotation:[...], time_of_day:[...]}
 
     @abstractmethod
     def on_tick(self, tick) -> None: ...
@@ -802,13 +809,23 @@ code is refactored from `services/simplified_stock_engine_*` into
 For **Stage 1, a simple rule-based classifier** is sufficient, driven by:
 - **NIFTY price action** (e.g. position vs intraday VWAP / opening range / short EMA) → `trend`;
 - **India VIX bands** (e.g. <12 low, 12–16 normal, 16–22 elevated, >22 extreme) → `volatility`;
-- **advance-decline ratio** → `breadth`.
+- **advance-decline ratio** → `breadth`;
+- **local clock at classification time** → `time_of_day` (trivial, no market data): `pre_open` <09:15,
+  `opening` 09:15–10:00, `mid_morning` 10:00–12:00, `lunch` 12:00–13:30, `afternoon` 13:30–15:00,
+  `closing` 15:00–15:30, `post_close` >15:30 (IST);
+- **sector-index 1-day relative strength** → `sector_rotation`: compare NIFTY BANK, NIFTY IT,
+  NIFTY AUTO, NIFTY FMCG, NIFTY PHARMA against NIFTY 50 and bucket the result
+  (`cyclicals_leading` | `defensives_leading` | `broad_strength` | `broad_weakness` | `mixed`).
+  This dimension needs sector-index price data, fetched by a **sidecar or APScheduler job**; for
+  Stage 1.7 a **simple 1-day relative-strength bucketing** across the five listed indices is enough.
 
 It writes one `market_regime` row per classification with `classifier_version='rules_v1'` and the
-`raw_inputs` snapshot. An **ML-based classifier is a Stage 3 enhancement**
-(`classifier_version='ml_v1'`), reusing the Stage-1.5 bar/indicator feed. The classifier runs on a
-**5-min cadence during market hours** via the existing APScheduler infrastructure (§4.2; can
-piggyback `flow_scheduler`).
+`raw_inputs` snapshot (now including the sector-index RS readings). `time_of_day` is pure clock
+arithmetic; `sector_rotation` is the only new data dependency, and refining its bucketing into a
+learned model is folded into the **Stage 3+** ML work. An **ML-based classifier is a Stage 3
+enhancement** (`classifier_version='ml_v1'`), reusing the Stage-1.5 bar/indicator feed. The
+classifier runs on a **5-min cadence during market hours** via the existing APScheduler
+infrastructure (§4.2; can piggyback `flow_scheduler`).
 
 ### 7.7.7 Activator behaviour
 
@@ -849,15 +866,18 @@ written**:
 ### 7.7.10 Worked example
 
 It is **10:30 AM**. The regime classifier writes `market_regime` =
-`{trend: trending_down, volatility: elevated, breadth: broad_bearish}`. The activator reads it:
+`{trend: trending_down, volatility: elevated, breadth: broad_bearish, sector_rotation: broad_weakness,
+time_of_day: mid_morning}`. The activator reads it:
 
 - **trending-stocks-BUY** declares `{trend: [trending_up], ...}` — `trending_down` is **not** in
-  its allowed set, so its profile **does not match**. The activator writes
+  its allowed set, so its profile **does not match** (`broad_weakness` is the wrong tape for it
+  besides). The activator writes
   `strategy_activation(action='disable', decided_by='activator', reason='regime mismatch',
   market_regime_id=…)`. The strategy stops arming new entries (open positions are untouched).
 - **options-buy** declares a **put** branch favourable in
-  `{trend: [trending_down], volatility: [elevated, extreme], ...}` — it **matches**, so it
-  **remains active**.
+  `{trend: [trending_down], volatility: [elevated, extreme], sector_rotation: [broad_weakness,
+  defensives_leading], time_of_day: [opening, mid_morning, afternoon]}` — every dimension is in
+  range, so it **matches** and **remains active**.
 - The operator, watching, can **override** either decision (force-enable the equity strategy, or
   force-sandbox the options one) via the per-strategy pin endpoint; the override is recorded with
   `decided_by='operator'`.
@@ -1563,10 +1583,20 @@ Overloaded terms, defined once:
   a unique id, a signal source, arming/exit logic, a regime profile, a sandbox/live mode
   inherited from `daily_intent`/`analyze_mode`, and an independent enable/disable switch.
   Implemented as a `BaseStrategy` subclass.
-- **Market regime** — (§7.7) a categorical descriptor of current market conditions across three
+- **Market regime** — (§7.7) a categorical descriptor of current market conditions across five
   dimensions — **trend** (`trending_up`|`trending_down`|`choppy`), **volatility**
-  (`low`|`normal`|`elevated`|`extreme`), **breadth** (`broad_bullish`|`broad_bearish`|`mixed`) —
-  produced by the regime classifier and stored in `market_regime`.
+  (`low`|`normal`|`elevated`|`extreme`), **breadth** (`broad_bullish`|`broad_bearish`|`mixed`),
+  **sector_rotation**, and **time_of_day** (both below) — produced by the regime classifier and
+  stored in `market_regime`.
+- **`sector_rotation`** — (§7.7) the market-regime dimension capturing which part of the market is
+  leading, ∈ {`cyclicals_leading`, `defensives_leading`, `broad_strength`, `broad_weakness`,
+  `mixed`}. Computed (Stage 1.7) from the 1-day relative strength of the sector indices
+  (NIFTY BANK / IT / AUTO / FMCG / PHARMA) versus NIFTY 50; ML refinement is Stage 3+.
+- **`time_of_day`** — (§7.7) the clock-driven market-regime dimension, ∈ {`pre_open` (<09:15),
+  `opening` (09:15–10:00), `mid_morning` (10:00–12:00), `lunch` (12:00–13:30), `afternoon`
+  (13:30–15:00), `closing` (15:00–15:30), `post_close` (>15:30)} (IST). Lets a strategy restrict
+  itself to the parts of the session where its edge holds (most intraday strategies sit out
+  `pre_open`/`lunch`/`post_close`).
 - **Regime profile** — (§7.7) a per-strategy declarative spec of which regimes a strategy is
   favourable in; the activator matches the current regime against it to decide activation.
 - **Activator** — (§7.7) the process that, on each new `market_regime` row, computes which
