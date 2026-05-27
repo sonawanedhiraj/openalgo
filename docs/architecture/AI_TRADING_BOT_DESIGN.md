@@ -660,6 +660,210 @@ shadow run** as ongoing wall-clock (not engineering) time before cutover.
 
 ---
 
+## 7.7 Multi-Strategy Architecture
+
+> Numbering note: §7.5 is the in-house scanner; §7.7 is multi-strategy. §7.6 is intentionally
+> skipped to leave room between the two scanner-adjacent sections.
+
+### 7.7.1 Motivation
+
+The operator runs **more than one strategy**: today the F&O **equity intraday** strategy
+(Chartink / in-house scanner → simplified engine); soon the **options-buying** engine
+(`optionBuyTradingEngine.py`, §2.3, ported in Stage 1.6); eventually more. Two problems follow
+that the current design cannot express:
+
+1. **The architecture treats "the strategy" as a singleton** — one engine, one mode flag, one
+   webhook. Adding a second strategy by copy-paste does not scale and entangles their state.
+2. **Not every strategy has an edge in every market.** A trend-following equity-long strategy
+   bleeds in a choppy, falling tape; an options-put strategy wants exactly that tape. The
+   operator wants the system to **activate only the strategies whose edge fits the current
+   market regime** — automatically, with an operator override.
+
+§7.7 generalises the rig from one strategy to **N independent strategies, each activated only
+when favourable to current market conditions**.
+
+### 7.7.2 Core concepts
+
+- **Strategy** — a self-contained **signal-generator + arming + monitoring pipeline**. Each
+  strategy declares: (i) a unique **id**; (ii) a **signal source** (a scanner subscription, an
+  external feed, or custom logic); (iii) an **arming logic** (when to enter); (iv) an **exit
+  logic** (SL / TP / time-based); (v) a **regime profile** (which market conditions favour it);
+  (vi) a **sandbox/live mode**, *inherited* from `daily_intent` and the global `analyze_mode`
+  (a strategy never sets its own money-routing); (vii) an independent **enable/disable** switch.
+- **Market regime** — a categorical descriptor of current conditions, produced by a **regime
+  classifier**. Initial dimensions:
+  - **trend** ∈ {`trending_up`, `trending_down`, `choppy`}
+  - **volatility** ∈ {`low`, `normal`, `elevated`, `extreme`}
+  - **breadth** ∈ {`broad_bullish`, `broad_bearish`, `mixed`}
+
+  Each classification is one row in the new `market_regime` table (timestamp + dimension values).
+- **Regime profile** (per strategy) — a **declarative spec** of the regimes a strategy is
+  favourable in, declared in code/config alongside the strategy. Example for trending-equity-BUY:
+  `{trend: [trending_up], volatility: [normal, elevated], breadth: [broad_bullish, mixed]}`. A
+  regime *matches* a profile when each dimension's current value is in the profile's allowed set.
+- **Activator** — a process that, on each new regime classification, computes which strategies
+  are active given their profiles and toggles their enable flag accordingly. The operator can
+  override (force-enable, force-disable, force-sandbox).
+
+### 7.7.3 Schema additions
+
+(in `db/openalgo.db`; models in `database/trading_ops_db.py` alongside the Stage-0 / Stage-1.5
+tables)
+
+```sql
+CREATE TABLE strategies (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,        -- 'trending_equity_intraday', 'options_buy', ...
+    description    TEXT,
+    module_path    TEXT NOT NULL,               -- import path to the Strategy class
+    enabled        BOOLEAN NOT NULL DEFAULT 1,  -- master per-strategy switch (operator/activator)
+    regime_profile TEXT NOT NULL,               -- JSON: {trend:[...], volatility:[...], breadth:[...]}
+    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE market_regime (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    classified_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    trend              TEXT NOT NULL CHECK (trend IN ('trending_up','trending_down','choppy')),
+    volatility         TEXT NOT NULL CHECK (volatility IN ('low','normal','elevated','extreme')),
+    breadth            TEXT NOT NULL CHECK (breadth IN ('broad_bullish','broad_bearish','mixed')),
+    classifier_version TEXT NOT NULL,           -- 'rules_v1' | 'ml_v1' | ... (provenance)
+    raw_inputs         TEXT                      -- JSON: NIFTY px action, India VIX, A/D ratio snapshot
+);
+
+CREATE TABLE strategy_activation (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id      INTEGER NOT NULL,          -- FK -> strategies.id
+    decided_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_by       TEXT NOT NULL CHECK (decided_by IN ('activator','operator','agent')),
+    action           TEXT NOT NULL CHECK (action IN ('enable','disable','force_sandbox')),
+    reason           TEXT,
+    market_regime_id INTEGER                     -- FK -> market_regime.id (NULL for operator/agent overrides)
+);
+```
+
+`strategy_activation` is an append-only audit of every enable/disable/force-sandbox decision and
+*why* — the regime that triggered it (activator) or the operator/agent who overrode it.
+
+### 7.7.4 Strategy lifecycle — the `BaseStrategy` ABC
+
+Each strategy is a Python module conforming to a `BaseStrategy` abstract base class:
+
+```python
+# strategies/base.py
+from abc import ABC, abstractmethod
+
+class BaseStrategy(ABC):
+    id: str                       # unique, matches strategies.name
+    regime_profile: dict          # {trend:[...], volatility:[...], breadth:[...]}
+
+    @abstractmethod
+    def on_tick(self, tick) -> None: ...
+    @abstractmethod
+    def on_bar(self, bar) -> None: ...
+    @abstractmethod
+    def on_scan_hit(self, hit) -> None: ...
+    @abstractmethod
+    def should_arm(self, candidate) -> bool: ...
+    @abstractmethod
+    def should_exit(self, position) -> "ExitDecision | None": ...
+```
+
+The existing **simplified-engine internals do not change** — they become *one implementation* of
+`BaseStrategy` for the trending-equity strategy. The options-buy engine (§2.3) is ported as a
+**second** implementation. The ABC is the only new contract both must satisfy.
+
+### 7.7.5 Where it lives in the codebase
+
+A new **`strategies/` package** alongside `services/`:
+
+```
+strategies/
+  base.py                          # BaseStrategy ABC (above)
+  __init__.py                      # registry: discovers + registers all Strategy classes
+  trending_equity_intraday/
+    strategy.py                    # class Strategy(BaseStrategy) — wraps the refactored simplified engine
+    LEARNINGS.md / VERSION_LOG.md  # (existing per-strategy docs convention, retained)
+  options_buy/
+    strategy.py                    # class Strategy(BaseStrategy) — the ported options engine
+```
+
+`strategies/__init__.py` is a **registry** that discovers and registers every strategy (each
+folder exposes a `Strategy` class). This *extends* the repo's existing `strategies/<name>/` docs
+convention (LEARNINGS.md, VERSION_LOG.md, config_snapshot.json — see CLAUDE.md) by adding the
+**code** (`strategy.py`) into the same per-strategy folder, so docs and implementation co-locate.
+The current `strategies/simplified_engine/` is the trending-equity strategy; under this design its
+code is refactored from `services/simplified_stock_engine_*` into
+`strategies/trending_equity_intraday/strategy.py`.
+
+### 7.7.6 Regime classifier
+
+For **Stage 1, a simple rule-based classifier** is sufficient, driven by:
+- **NIFTY price action** (e.g. position vs intraday VWAP / opening range / short EMA) → `trend`;
+- **India VIX bands** (e.g. <12 low, 12–16 normal, 16–22 elevated, >22 extreme) → `volatility`;
+- **advance-decline ratio** → `breadth`.
+
+It writes one `market_regime` row per classification with `classifier_version='rules_v1'` and the
+`raw_inputs` snapshot. An **ML-based classifier is a Stage 3 enhancement**
+(`classifier_version='ml_v1'`), reusing the Stage-1.5 bar/indicator feed. The classifier runs on a
+**5-min cadence during market hours** via the existing APScheduler infrastructure (§4.2; can
+piggyback `flow_scheduler`).
+
+### 7.7.7 Activator behaviour
+
+The **activator** re-evaluates strategy activation **whenever a new `market_regime` row is
+written**:
+- for each enabled strategy, test whether the new regime matches its `regime_profile`;
+- write a `strategy_activation` row **only if the state changes** (`decided_by='activator'`),
+  flipping the strategy's effective enable state and recording the `market_regime_id` and reason;
+- **operator overrides** via a `set_daily_intent`-style endpoint that **force-pins** a strategy's
+  state for the day (`decided_by='operator'`, `action ∈ {enable, disable, force_sandbox}`) — a
+  pinned strategy ignores the activator until the next day. The Stage 4 agent may **propose**
+  activation/deactivation (`decided_by='agent'`), gated through `approval_inbox` (§10.4).
+
+### 7.7.8 Interaction with existing concepts
+
+- **`daily_intent` remains the top-level gate** — `live` / `sandbox` / `skip` applies to **all**
+  strategies at once. A strategy can never be more live than the day's intent.
+- **Per-strategy enable/disable is finer-grained** — a strategy may be disabled (by regime or
+  operator) while `daily_intent` is `live`; the converse never *loosens* risk.
+- **`resolve_effective_mode()` extends to take a `strategy_id`** —
+  `resolve_effective_mode(trade_date, strategy_id) -> ModeResolution`, returning the effective
+  mode **for that strategy** under **most-conservative-wins** across `daily_intent`, global
+  `analyze_mode`, the per-strategy enable flag, and the regime activation. A disabled or
+  regime-mismatched strategy resolves to `DISABLED` regardless of the flags.
+- **The Stage 4 agent's `pause_trading_until` becomes `pause_strategy_until(strategy_id, ...)`** —
+  pausing is now per-strategy, so the agent can hold one strategy's new entries without touching
+  the others (see the §10.5 tool-catalog update).
+
+### 7.7.9 Phasing
+
+| Sub-stage | Scope | Behaviour change |
+|---|---|---|
+| **Stage 1.5 sibling** | Refactor the existing single-strategy code into the `strategies/` package shape with **one** strategy registered (`trending_equity_intraday`). Introduces `BaseStrategy` + the registry. | **Zero** behaviour change — pure refactor; existing engine tests stay green. |
+| **Stage 1.6** | Port the options-buy engine (§2.3) as a **second** `BaseStrategy`. Strategies run independently. | Both strategies run **unconditionally if enabled** — no regime gating yet. |
+| **Stage 1.7** | Introduce the **regime classifier + activator**. Strategies declare `regime_profile`s. | Activator gates each strategy's enable/disable on regime. |
+| **Stage 4 update** | The autonomous agent gets **multi-strategy-aware tools** (`strategy_id` parameters; `pause_strategy_until`; propose-activation via `approval_inbox`). | Agent reasons per-strategy. |
+
+### 7.7.10 Worked example
+
+It is **10:30 AM**. The regime classifier writes `market_regime` =
+`{trend: trending_down, volatility: elevated, breadth: broad_bearish}`. The activator reads it:
+
+- **trending-stocks-BUY** declares `{trend: [trending_up], ...}` — `trending_down` is **not** in
+  its allowed set, so its profile **does not match**. The activator writes
+  `strategy_activation(action='disable', decided_by='activator', reason='regime mismatch',
+  market_regime_id=…)`. The strategy stops arming new entries (open positions are untouched).
+- **options-buy** declares a **put** branch favourable in
+  `{trend: [trending_down], volatility: [elevated, extreme], ...}` — it **matches**, so it
+  **remains active**.
+- The operator, watching, can **override** either decision (force-enable the equity strategy, or
+  force-sandbox the options one) via the per-strategy pin endpoint; the override is recorded with
+  `decided_by='operator'`.
+
+---
+
 ## 8. Stage 2 Detailed Design — Reflective Journal
 
 ### 8.1 `trade_journal`
