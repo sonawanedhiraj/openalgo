@@ -217,7 +217,7 @@ scanner from far-future work to **Stage 1.5** (§5, detailed in §7.5).
   **RAM-only**. No `bars_live` ring buffer either; DuckDB holds historical bars only.
 - **No TA library.** `pyproject.toml` bundles no `talib`/`pandas_ta`/`stockstats`/`ta`. Only
   ATR is hand-rolled (`_update_atr_wilder()` in the engine core). EMA/RSI/VWAP/MACD/etc. are
-  greenfield — pick a dependency or build `utils/indicators.py`.
+  greenfield — standardize on **`pandas-ta`** (Decided 2026-05-26, §14 Q7; §7.5.1 item 3).
 - **No sector/industry column on `SymToken`.** `name` is free-text only; sector-relative
   criteria need a separate `sector_map` table or an external feed (NSE publishes free CSVs).
 - **No generic backtest harness.** `backtest/run_backtest.py` is hard-coupled to the
@@ -1006,7 +1006,7 @@ CREATE TABLE approval_inbox (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     proposed_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     agent_decision_id   INTEGER NOT NULL,     -- FK -> agent_decision.id
-    action_type         TEXT NOT NULL,        -- e.g. 'propose_code_change', 'pause_trading_until'
+    action_type         TEXT NOT NULL,        -- e.g. 'propose_code_change', 'pause_strategy_until', 'set_strategy_activation'
     action_params       TEXT,                 -- JSON payload describing exactly what would happen
     status              TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN ('pending','approved','denied','expired')),
@@ -1072,10 +1072,18 @@ def compare_to_historical_pattern(symbol: str, pattern_type: str) -> dict:
 
 ```python
 def set_daily_intent(intent: str, reason: str) -> dict:
-    """Change daily_intent. HARD CONSTRAINT: the agent can only DOWNGRADE
-       risk — to 'sandbox' or 'skip'. It can NEVER escalate to 'live'.
-       Attempting intent='live' is rejected at the tool boundary.
+    """Change daily_intent (day-level, applies to ALL strategies). HARD CONSTRAINT:
+       the agent can only DOWNGRADE risk — to 'sandbox' or 'skip'. It can NEVER
+       escalate to 'live'. Attempting intent='live' is rejected at the tool boundary.
        Returns the new ModeResolution."""
+
+def set_strategy_activation(strategy_id: str, action: str, reason: str) -> dict:
+    """Toggle a single strategy's activation (§7.7). HARD CONSTRAINT (mirrors
+       set_daily_intent): the agent may autonomously DOWNGRADE risk —
+       action ∈ {'disable','force_sandbox'} — but 'enable' is an UPGRADE and is
+       never executed autonomously; it lands in approval_inbox (§10.4) for the
+       operator. Writes a strategy_activation row (decided_by='agent', §7.7.3).
+       Returns the strategy's new effective state."""
 
 def add_journal_note(symbol: str, note: str) -> dict:
     """Append a freeform note (tag) to today's trade_journal row(s) for `symbol`."""
@@ -1088,12 +1096,15 @@ def request_operator_confirmation(action: str, reason: str) -> dict:
 #### Group D — Medium-risk tools (bounded, directional-only)
 
 ```python
-def pause_trading_until(timestamp: str, reason: str) -> dict:
-    """Stop arming new entries until `timestamp` (today only). Does NOT touch
-       open positions. Reversible by the operator. Returns {'paused_until': iso8601}."""
+def pause_strategy_until(strategy_id: str, timestamp: str, reason: str) -> dict:
+    """Stop arming new entries FOR ONE STRATEGY until `timestamp` (today only).
+       Does NOT touch open positions, and does NOT pause other strategies (§7.7).
+       Reversible by the operator. Returns {'strategy_id': str, 'paused_until': iso8601}."""
 
-def tighten_stop_loss(symbol: str, new_sl: float, reason: str) -> dict:
-    """Move a stop loss to `new_sl`. HARD CONSTRAINT: new_sl must be TIGHTER
+def tighten_stop_loss(symbol: str, new_sl: float, reason: str,
+                      strategy_id: str | None = None) -> dict:
+    """Move a stop loss to `new_sl` (optionally scoped to `strategy_id` when a symbol
+       is held by more than one strategy). HARD CONSTRAINT: new_sl must be TIGHTER
        (closer to LTP, smaller risk) than the current SL — never wider.
        Rejected at the tool boundary if it would loosen risk. Returns the modified SL."""
 ```
@@ -1179,11 +1190,11 @@ Every invocation returns exactly this JSON, which maps 1:1 onto an `agent_decisi
     "market_intel": [ "..." ]
   },
   "actions": [                                 // ordered list of tool calls performed/proposed
-    { "tool": "pause_trading_until",
-      "params": {"timestamp": "2026-05-26T11:15:00+05:30", "reason": "vol spike"},
+    { "tool": "pause_strategy_until",
+      "params": {"strategy_id": "trending_equity_intraday", "timestamp": "2026-05-26T11:15:00+05:30", "reason": "vol spike"},
       "status": "executed" },
     { "tool": "tighten_stop_loss",
-      "params": {"symbol": "CONCOR", "new_sl": 805.0, "reason": "protect short on vol spike"},
+      "params": {"symbol": "CONCOR", "new_sl": 805.0, "strategy_id": "trending_equity_intraday", "reason": "protect short on vol spike"},
       "status": "executed" },
     { "tool": "set_daily_intent",
       "params": {"intent": "sandbox", "reason": "ride out volatility in paper mode"},
@@ -1217,7 +1228,9 @@ are dangerous** to arm into a rising-VIX tape. No single-name news justifies an 
 failure).
 
 **Action whitelist routing:**
-- `pause_trading_until('11:15', 'vol spike — hold new BUY entries')` → **medium-risk, executed.**
+- `pause_strategy_until('trending_equity_intraday', '11:15', 'vol spike — hold new BUY entries')`
+  → **medium-risk, executed** (pauses only the equity strategy; the options strategy is
+  untouched).
 - `tighten_stop_loss('CONCOR', 805.0, 'lock gains on short into vol spike')` → **medium-risk,
   executed** (805 is tighter than 818, so it passes the never-wider constraint).
 - `set_daily_intent('sandbox', 'ride out volatility in paper mode')` → the agent *wants*
@@ -1360,8 +1373,8 @@ size.
 
 ## 13. Implementation Sequencing
 
-The near-term work is concrete (Stage 0, Stage 1, and Stage 1.5 are sprint-sized);
-everything past Stage 1.5 is sketched. Gates between stages are **hard** — each is the exit
+The near-term work is concrete (Stage 0 through Stage 1.7 are sprint-sized); everything past
+Stage 1.7 is sketched. Gates between stages are **hard** — each is the exit
 criterion of the prior stage's detailed design.
 
 **Timeline at a glance:**
@@ -1370,8 +1383,10 @@ criterion of the prior stage's detailed design.
 |---|---|---|
 | 1–2   | Stage 0 — operational floor | — |
 | 3–4   | Stage 1 — LLM veto layer | — |
-| 5–7   | Stage 1.5 — in-house scanner build | runs alongside Stage 2 |
-| 5–7+  | Stage 2 — reflective journal | starts once the journal schema exists, in parallel with 1.5 |
+| 5–7   | Stage 1.5 — in-house scanner build | refactor into the `strategies/` package (§7.7) |
+| 8–9   | Stage 1.6 — port options strategy as 2nd `BaseStrategy` | builds on the §7.7 package |
+| 10–11 | Stage 1.7 — regime classifier (rule-based) + activator | strategies declare regime profiles |
+| 5–11+ | Stage 2 — reflective journal | starts once the journal schema exists, in parallel with 1.5–1.7 |
 | later | Stage 3 — ML augmentation | needs ≥6 mo journal data |
 | later | Stage 4 — autonomous agent | may start advisory-only earlier |
 | much later | Stage 5 — independent signals | — |
@@ -1386,6 +1401,13 @@ criterion of the prior stage's detailed design.
   divergence plus operator subjective sign-off on the shadow comparison report (qualitative
   criteria, §7.5.3); the ~5-min Chartink update lag means parity alone justifies cutover.
   Stage 2 may proceed *during* this shadow run.
+- **Stage 1.5 → 1.6:** the single strategy runs as a registered `BaseStrategy` in the
+  `strategies/` package (§7.7) with **zero** behaviour change — existing engine tests green.
+- **Stage 1.6 → 1.7:** the options engine (§2.3) runs as a **second** independent
+  `BaseStrategy`; both strategies arm independently when enabled (no regime gating yet).
+- **Stage 1.7 → onward:** the rule-based regime classifier writes `market_regime` rows on a
+  5-min cadence and the activator gates each strategy's enable/disable on regime, with an
+  operator override demonstrably pinning a strategy for the day.
 - **Stage 2 → 3:** the journal has a statistically useful run and ≥1 reviewed retrospective;
   Stage 3 additionally waits for **6 months** of journal data.
 - **Stage 3 → / Stage 4 maturity:** walk-forward out-of-sample lift over the rules-only
@@ -1428,15 +1450,34 @@ criterion of the prior stage's detailed design.
 ### Sprint 5–6 — Stage 1.5: in-house scanner build
 - Extract `services/bar_aggregator.py` from the engine core; refactor the engine onto it with
   the existing tests staying green.
-- Add the `scan_definitions` / `scan_results` tables and `utils/indicators.py` (hand-rolled
-  ATR/EMA/RSI/`volume_avg`).
+- Add the `scan_definitions` / `scan_results` tables and the **`pandas-ta`-based** indicator set
+  (ATR/EMA/RSI/`volume_avg`) computed in the bar aggregator service (§7.5.1 item 3, §14 Q7).
 - Stand up `services/scanner_service.py` on the ZMQ tick bus; wire `scan_hit` → webhook-poster
   + SocketIO emitter.
+- (Stage 1.5 sibling, §7.7.9) refactor the single strategy into the `strategies/` package
+  shape — `BaseStrategy` ABC + registry, one strategy registered, **zero** behaviour change.
 - **Gate:** the in-house scanner emits the same symbols Chartink would for a full day, writing
   `scan_results` rows tagged `shadow`; the 4–6 week shadow comparison (§7.5.2) begins.
 
+### Sprint 7 — Stage 1.6: port the options strategy
+- Port `pythonTradingAutomator\src\optionBuyTradingEngine.py` (§2.3) as a **second**
+  `BaseStrategy` implementation under `strategies/options_buy/` (§7.7.5).
+- Both strategies run independently when enabled; **no regime gating yet**.
+- **Gate:** the options strategy arms/monitors independently of the equity strategy in
+  sandbox, with its own `scan_results` / journal trail.
+
+### Sprint 8 — Stage 1.7: regime classifier + activator
+- Add the `strategies` / `market_regime` / `strategy_activation` tables (§7.7.3).
+- Implement the rule-based regime classifier (NIFTY price action + India VIX bands + A/D
+  ratio) on a 5-min APScheduler cadence (§7.7.6), and the activator (§7.7.7).
+- Strategies declare their `regime_profile`s; an operator-override endpoint force-pins a
+  strategy's state for the day.
+- **Gate (Stage 1.7 exit):** a full day where the activator enables/disables strategies on
+  regime changes, every decision audited in `strategy_activation`, and an operator override
+  demonstrably pins a strategy.
+
 > Stage 2 (reflective journal) can start as soon as its schema exists, overlapping the Stage
-> 1.5 build. Stages 3–5 are scheduled only when their gates above are in sight.
+> 1.5–1.7 build. Stages 3–5 are scheduled only when their gates above are in sight.
 
 ---
 
@@ -1518,3 +1559,19 @@ Overloaded terms, defined once:
 - **shadow validation** — running the in-house scanner *in parallel* with Chartink without
   acting on its hits, comparing the two via `scan_results.source` for 4–6 weeks before cutover
   (§7.5.2).
+- **Strategy** — (§7.7) a self-contained signal-generator + arming + monitoring pipeline with
+  a unique id, a signal source, arming/exit logic, a regime profile, a sandbox/live mode
+  inherited from `daily_intent`/`analyze_mode`, and an independent enable/disable switch.
+  Implemented as a `BaseStrategy` subclass.
+- **Market regime** — (§7.7) a categorical descriptor of current market conditions across three
+  dimensions — **trend** (`trending_up`|`trending_down`|`choppy`), **volatility**
+  (`low`|`normal`|`elevated`|`extreme`), **breadth** (`broad_bullish`|`broad_bearish`|`mixed`) —
+  produced by the regime classifier and stored in `market_regime`.
+- **Regime profile** — (§7.7) a per-strategy declarative spec of which regimes a strategy is
+  favourable in; the activator matches the current regime against it to decide activation.
+- **Activator** — (§7.7) the process that, on each new `market_regime` row, computes which
+  strategies are active given their regime profiles and toggles their enable flag, writing a
+  `strategy_activation` row on any state change. Operator-overridable.
+- **`BaseStrategy`** — (§7.7) the abstract base class (`strategies/base.py`) every strategy
+  implements: `on_tick` / `on_bar` / `on_scan_hit` / `should_arm` / `should_exit`. The
+  simplified engine and the ported options engine are two implementations.
