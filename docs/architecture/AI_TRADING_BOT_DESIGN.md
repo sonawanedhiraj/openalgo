@@ -583,6 +583,15 @@ def simplified_engine_preflight():
             "effective_mode": res.effective.value, "reason": res.reason}
 ```
 
+**`broker_session_ok` defers to upstream session primitives (§4.5 framing, §4.5.2).** The
+`broker_session_healthy()` check must read session liveness through OpenAlgo's own
+session-management layer — the same broker-session state the Admin Diagnostics probe surfaces
+(`api_system_diagnostics`, §4.5.2) — and **never read raw broker credentials or tokens directly**.
+Post-v2.0.0.6, broker auth tokens are Fernet-encrypted at rest (`database/auth_db.py`; v2.0.1.1 adds a
+per-install salt), so any token/credentials health check goes through the decrypt-and-validate
+helpers, not the ciphertext. This rule extends to all Stage-4 agent tooling (§10): the agent reads
+*session health*, never secrets.
+
 ### 6.6 `cycle_heartbeat` — missed-run detection
 
 ```sql
@@ -598,6 +607,15 @@ CREATE TABLE cycle_heartbeat (
 The skill writes one row at **each stage** of every run. Missed runs become trivially
 queryable: a gap in `ts` ordered by stage, or an absence of a `complete` row for an
 expected 15-min slot, means the scheduler or skill silently failed.
+
+**Read path — reuse upstream's viewer, don't build a parallel one (§4.5.2).** `cycle_heartbeat` is our
+*own* table because it models application-stage telemetry the generic error log does not. But for
+operational *visibility* we route into upstream's existing surfaces rather than a second dashboard:
+errors that occur during a cycle are logged through the centralized logger so they land in
+`log/errors.jsonl` (`utils/logging.py:293`/`:419`) and show up in the Admin Diagnostics error browser
+(`GET /admin/api/errors`, §4.5.2) with no extra infra; a cycle stage that fails can additionally push
+a structured report via `POST /admin/api/errors/client`. We write the heartbeat *store*; upstream
+provides the *viewer*.
 
 ### 6.7 Atomic mode-toggle endpoint
 
@@ -684,6 +702,27 @@ breakout fired and built the order, but before `place_order_service` sends it.
   moment the LLM is flaky. Every fail-safe skip is logged distinctly (`reason="llm_unavailable"`)
   so flakiness is visible and not mistaken for a genuine veto.
 
+### 7.4 Upstream timing & stop-loss interactions (post-v2.0.1.1 merge)
+
+Two merge items bear on the veto layer's assumptions:
+
+- **The subscribe-latency window is narrower (v2.0.0.7 + v2.0.1.1).** The "price oscillates through the
+  trigger but the order never fires" class of bug — where ticks for a freshly-armed symbol never
+  reached the execution engine — was closed upstream by **WebSocket subscribe batching**. ⚠️ Accuracy
+  note: that batching landed for **Dhan / Fyers / Upstox** in v2.0.0.7, **not Zerodha** — *this* rig's
+  broker. The Zerodha-specific win came in **v2.0.1.1**, which removed a ~4 s sleep floor from
+  Zerodha's subscribe path (commits `659d53ab` / `cd4095eb`). Net for the veto layer: the
+  arm→first-tick window on Zerodha is now materially shorter, so the 1–3 s veto budget (§7.3) sits on
+  top of a smaller pre-existing latency, and the "armed but momentarily blind to fresh ticks" risk the
+  veto must reason around is reduced. The layer should still assume the engine fires **on bar close**.
+- **The stop-loss is no longer solely in-process (§4.5.4).** Once the veto green-lights an order, the
+  engine can place a broker **GTT** to carry the stop. Because the broker enforces a GTT even if
+  OpenAlgo crashes between fill and the first in-process trail, the veto layer's downside estimate can
+  be **less conservative** about crash-window risk — a hard stop already exists at the broker.
+  **Caveat:** this only holds in **live** mode against Zerodha/Dhan; sandbox/analyze GTT returns `501`
+  today (§4.5.4), and the rig defaults to sandbox, so for the common case the in-process ATR/RR trail
+  remains the only stop and the conservative downside estimate still applies.
+
 ---
 
 ## 7.5 Stage 1.5 Detailed Design — In-House Scanner Migration
@@ -753,11 +792,18 @@ alongside Chartink for weeks before anything is cut over.
      downstream code are unchanged; it writes a `scan_results` row (`source='inhouse'` or
      `'shadow'`) and sets `posted_to_engine`.
    - a **SocketIO emitter** that pushes `scan_hit` to the React UI (same rail as
-     `order_update`, §4) so scanner activity is visible live.
+     `order_update`, §4) so scanner activity is visible live. **(Post-merge, §4.5.5)** the scanner's
+     freshness/staleness signalling can ride the existing **`analyzer_update`** channel the frontend
+     already subscribes to (`useSocket.ts`) rather than standing up a separate health-emit path — we
+     add a `scan_hit`/staleness emitter onto the proven rail.
 
 6. **(Optional) Sector/industry enrichment.** A small import job loading NSE's free
    sector/industry CSVs into a new `sector_map` table keyed on symbol (or a `sector` column on
-   `SymToken`). **Defer** unless/until a scan rule needs sector-relative criteria.
+   `SymToken`). **Defer** unless/until a scan rule needs sector-relative criteria. **(Post-merge,
+   §4.5.1)** resolve and filter the universe to enrich through the upstream **Symbol Search API** —
+   its multi-exchange / multi-instrumenttype filtering over `SymToken` replaces any parallel universe
+   filter; only the sector *labels* are genuinely new work. The same Symbol Search substrate feeds the
+   §7.7 Stage 1.7 `sector_rotation` sector-index resolution.
 
 ### 7.5.2 Shadow-validation methodology
 
@@ -830,7 +876,10 @@ when favourable to current market conditions**.
   external feed, or custom logic); (iii) an **arming logic** (when to enter); (iv) an **exit
   logic** (SL / TP / time-based); (v) a **regime profile** (which market conditions favour it);
   (vi) a **sandbox/live mode**, *inherited* from `daily_intent` and the global `analyze_mode`
-  (a strategy never sets its own money-routing); (vii) an independent **enable/disable** switch.
+  (a strategy never sets its own money-routing); (vii) an independent **enable/disable** switch;
+  (viii) a **universe** — the symbols it trades, declared through the upstream **Symbol Search API**
+  (§4.5.1), whose multi-exchange / multi-instrumenttype filters make "NFO options on these underlyings"
+  or "NSE equity in this list" a first-class spec rather than a hand-rolled filter.
 - **Market regime** — a categorical descriptor of current conditions, produced by a **regime
   classifier**. Five dimensions:
   - **trend** ∈ {`trending_up`, `trending_down`, `choppy`}
@@ -1022,7 +1071,11 @@ written**:
 - **`daily_intent` remains the top-level gate** — `live` / `sandbox` / `skip` applies to **all**
   strategies at once. A strategy can never be more live than the day's intent.
 - **Per-strategy enable/disable is finer-grained** — a strategy may be disabled (by regime or
-  operator) while `daily_intent` is `live`; the converse never *loosens* risk.
+  operator) while `daily_intent` is `live`; the converse never *loosens* risk. **This per-strategy
+  mode/enable concept does not exist upstream** (audit confirmed — upstream has only the single global
+  `analyze_mode` toggle); the `strategies.enabled` flag + `strategy_activation` audit (§7.7.3) and the
+  `resolve_effective_mode(strategy_id)` extension below are entirely fork-local and remain ours to
+  build. See the new §14 question on whether to align this with upstream's `analyze_mode` pattern.
 - **`resolve_effective_mode()` extends to take a `strategy_id`** —
   `resolve_effective_mode(trade_date, strategy_id) -> ModeResolution`, returning the effective
   mode **for that strategy** under **most-conservative-wins** across `daily_intent`, global
@@ -1608,6 +1661,12 @@ criterion of the prior stage's detailed design.
 | later | Stage 3 — ML augmentation | needs ≥6 mo journal data |
 | later | Stage 4 — autonomous agent | may start advisory-only earlier |
 | much later | Stage 5 — independent signals | — |
+
+> **Post-merge note (2026-05-27, §4.5):** the **Stage 0** estimate above may run *lighter* than the
+> 1–2 weeks shown — the operational-visibility half of Stage 0 is partly upstream-provided. The Admin
+> Diagnostics page + `errors.jsonl` browser (§4.5.2) is the read path, so we build the `cycle_heartbeat`
+> *store* and route cycle errors into `errors.jsonl`, but we do **not** build a viewer. Timeline weeks
+> are left unchanged here pending a real Stage 0 build — this is a flag, not a recomputation.
 
 **Gates between stages (each must be met before the next begins):**
 - **Stage 0 → 1:** `resolve_effective_mode()` is the sole mode authority for new code; a full
