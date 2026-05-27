@@ -1820,6 +1820,12 @@ Surfaced while drafting:
 4. **Telegram vs alternative** for operator notifications — Telegram is specified (§10.12),
    but confirm it over alternatives (Signal, ntfy, email, dashboard-only) given the
    single-operator, IP-sensitive (SEBI static-IP) deployment.
+   **Update (2026-05-27, post-merge):** the *operator-confirmation / consent* half of this question
+   (the two-key approve/deny on irreversible actions) is now superseded by an upstream precedent — the
+   Remote MCP per-purpose-TOTP `write:orders` consent gate (§4.5.3, §10.4). If the agent ever migrates
+   to hosted-AI via Remote MCP (new Q10), that OAuth+TOTP flow becomes the consent channel. What
+   remains genuinely open is only the *outbound notification transport* (how the ping is pushed), where
+   Telegram still stands.
 5. **Pre-market agent run** — should the agent run during the pre-open session to
    *recommend* the day's `daily_intent` (advisory only, operator confirms), or stay
    silent until market open?
@@ -1850,6 +1856,18 @@ Surfaced in the scanner audit (2026-05-26/27, §4 / §7.5):
    after the Stage 1.5 refactor introduces the strategy-package shape, then mirrored as
    `options_put_buy` (Stage 1.6b) — two mutually-exclusive strategies over a shared
    `options_directional_breakout` base.
+
+Surfaced in the upstream v2.0.1.1 merge (2026-05-27, §4.5):
+9. **Per-strategy mode toggle — align with upstream `analyze_mode`, or stand alone?** The fork-local
+   per-strategy enable/mode concept (§7.7.8) has no upstream equivalent (upstream has only the single
+   global `analyze_mode`). Should `strategies.enabled` / `resolve_effective_mode(strategy_id)` be
+   designed to *mirror* upstream's `analyze_mode` shape — so a future upstream multi-strategy PR would
+   merge cleanly — or kept as a deliberately standalone fork-local concept optimized for this rig?
+10. **Stage 4 agent transport — migrate to Remote MCP OAuth, or stay local stdio MCP?** The baseline
+    keeps the local stdio MCP (§10.5/§10.11). Remote MCP + OAuth 2.1 + per-purpose TOTP (§4.5.3) is the
+    natural path *if* the agent is ever hosted off-box, and it subsumes the §10.4 two-key consent (and
+    the consent half of Q4). Decide whether hosted-AI is a real future need, or whether local stdio MCP
+    is the permanent answer.
 
 ---
 
@@ -1915,3 +1933,31 @@ Overloaded terms, defined once:
   implements: `on_tick` / `on_bar` / `on_scan_hit` / `should_arm` / `should_exit`. The simplified
   engine (`trending_equity_intraday`) and the two ported options mirror strategies
   (`options_call_buy`, `options_put_buy`) are implementations.
+
+Upstream capabilities (post-v2.0.1.1 merge, §4.5):
+
+- **GTT (Good-Till-Triggered) order** — (§4.5.4) a broker-side resting order that fires when a trigger
+  price is hit, persisting *at the broker* so it survives an OpenAlgo restart/crash. Upstream pilot is
+  Zerodha + Dhan (`POST /api/v1/placegttorder` / `modifygttorder` / `cancelgttorder` / `gttorderbook`);
+  sandbox/analyze execution is not yet shipped (returns `501`). Used as the optional crash-safe SL
+  backing for the veto layer (§7.4) and the `tighten_stop_loss` agent tool (§10.5).
+- **`analyzer_update` channel** — (§4.5.5) the platform's SocketIO event rail for analyze-mode and
+  (since v2.0.0.7) sandbox engine-internal events (fills, square-off, T+1); emitted from
+  `subscribers/socketio_subscriber.py:242`. This design subscribes to it for live engine state
+  (§7.5, §10.5) instead of polling the engine status endpoint.
+- **Remote MCP** — (§4.5.3) upstream's self-hosted OAuth 2.1 + HTTP/SSE MCP transport
+  (`blueprints/mcp_http.py`, `mcp_oauth.py`) exposing the 40 MCP tools to hosted AI clients, off by
+  default, with per-purpose TOTP gating the `write:orders` scope. The Stage 4 agent stays on the local
+  stdio MCP for now; Remote MCP is the documented hosted-AI migration path (§10.4, §14 Q10).
+- **Admin Diagnostics** — (§4.5.2) upstream's `/admin` operations page (`blueprints/admin.py`): system
+  info, the six DB sizes, broker session state, a paginated `errors.jsonl` browser, and a downloadable
+  env-redacted bundle. This design's operational visibility (§6.6) routes into it rather than a
+  parallel dashboard.
+- **`errors.jsonl`** — (§4.5.2) `log/errors.jsonl`, the structured JSON-Lines error log written by the
+  centralized logger's `JSONErrorFormatter` (`utils/logging.py:293`), one object per line (ERROR+,
+  with traceback + request context). Browsable from Admin Diagnostics; Stage-0 cycle errors are routed
+  here for visibility (§6.6).
+- **Symbol Search API** — (§4.5.1) upstream's rewritten symbol search (`blueprints/search.py`,
+  `/api/v1/search`) with multi-exchange / multi-instrumenttype filtering, no 500-row cap, and per-user
+  history, over the `SymToken` universe. This design uses it for per-strategy universe selection (§7.7)
+  and as the substrate for sector-index resolution (§7.5 / §7.7 Stage 1.7).
