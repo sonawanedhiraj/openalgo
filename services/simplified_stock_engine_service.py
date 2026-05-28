@@ -1137,6 +1137,14 @@ class SimplifiedStockEngineService:
             return MODE_SANDBOX
         # mode == MODE_LIVE: still surface whether the global toggle would
         # override us into sandbox.
+        #
+        # TODO(stage-0): this is a status-payload label only, not a routing
+        # decision — actual order routing in this engine goes through
+        # services.place_order which already uses resolve_effective_mode().
+        # Migrating the label to the resolver is intertwined with the engine's
+        # own mode flag (SIMPLIFIED_ENGINE_MODE) and the operator's
+        # daily_intent. Defer to the Stage 2/3 cleanup of the simplified
+        # engine's mode handling. See docs/SIMPLIFIED_ENGINE_HANDOFF.md.
         from database.settings_db import get_analyze_mode
 
         return "analyze" if get_analyze_mode() else MODE_LIVE
