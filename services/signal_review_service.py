@@ -142,6 +142,76 @@ def _safe_call(label: str, fn, *args, **kwargs):
         return None
 
 
+def _fetch_nifty_pct() -> float:
+    """Return today's % change in NIFTY 50, computed from ltp and prev_close.
+
+    Raises on any failure path so the caller's try/except records the gap.
+    """
+    from database.auth_db import get_first_available_api_key
+    from services.quotes_service import get_quotes
+
+    api_key = get_first_available_api_key()
+    if not api_key:
+        raise RuntimeError("no api key available")
+    success, response, _ = get_quotes(symbol="NIFTY", exchange="NSE_INDEX", api_key=api_key)
+    if not success:
+        raise RuntimeError(f"quote fetch failed: {response.get('message', 'unknown')}")
+    data = response.get("data") or {}
+    ltp = float(data.get("ltp") or 0.0)
+    prev_close = float(data.get("prev_close") or 0.0)
+    if prev_close == 0.0:
+        raise RuntimeError("prev_close is zero")
+    return (ltp - prev_close) / prev_close * 100.0
+
+
+def _fetch_india_vix() -> float:
+    """Return the current India VIX level (the LTP itself, not a % change)."""
+    from database.auth_db import get_first_available_api_key
+    from services.quotes_service import get_quotes
+
+    api_key = get_first_available_api_key()
+    if not api_key:
+        raise RuntimeError("no api key available")
+    success, response, _ = get_quotes(
+        symbol="INDIAVIX", exchange="NSE_INDEX", api_key=api_key
+    )
+    if not success:
+        raise RuntimeError(f"quote fetch failed: {response.get('message', 'unknown')}")
+    data = response.get("data") or {}
+    ltp = data.get("ltp")
+    if ltp is None:
+        raise RuntimeError("no ltp in vix quote")
+    return float(ltp)
+
+
+def _fetch_pnl_today() -> float:
+    """Return today's running P&L summed across all open positions.
+
+    Sources via ``positionbook_service.get_positionbook`` which is mode-routed
+    (sandbox vs live) by ``resolve_effective_mode()``. Sums the ``pnl`` field
+    on each position — that field is the broker-supplied MTM for today.
+    """
+    from database.auth_db import get_first_available_api_key
+    from services.positionbook_service import get_positionbook
+
+    api_key = get_first_available_api_key()
+    if not api_key:
+        raise RuntimeError("no api key available")
+    success, response, _ = get_positionbook(api_key=api_key)
+    if not success:
+        raise RuntimeError(f"positionbook fetch failed: {response.get('message', 'unknown')}")
+    data = response.get("data") or []
+    if not isinstance(data, list):
+        raise RuntimeError("positionbook payload is not a list")
+    total = 0.0
+    for pos in data:
+        value = pos.get("pnl")
+        if value is None:
+            continue
+        total += float(value)
+    return total
+
+
 def _build_context(override: dict[str, Any] | None) -> dict[str, Any]:
     """Assemble the operator + market context dict shipped to the bridge.
 
@@ -196,6 +266,26 @@ def _build_context(override: dict[str, Any] | None) -> dict[str, Any]:
         ctx["trades_today"] = trades_today
         ctx["max_trades_today"] = max_trades_today
         ctx["positions_summary"] = positions_summary
+
+    # Macro slots — each is wrapped in its own try/except so one failure
+    # doesn't blank the others.
+    try:
+        ctx["nifty_pct"] = _fetch_nifty_pct()
+    except Exception as exc:
+        logger.warning("signal_review: nifty_pct fetch failed: %s", exc)
+        ctx["nifty_pct"] = None
+
+    try:
+        ctx["india_vix"] = _fetch_india_vix()
+    except Exception as exc:
+        logger.warning("signal_review: india_vix fetch failed: %s", exc)
+        ctx["india_vix"] = None
+
+    try:
+        ctx["pnl_today"] = _fetch_pnl_today()
+    except Exception as exc:
+        logger.warning("signal_review: pnl_today fetch failed: %s", exc)
+        ctx["pnl_today"] = None
 
     return ctx
 

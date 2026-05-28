@@ -12,7 +12,13 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from bridge.server import _extract_decision_block, app
+from bridge.server import (
+    ReviewCandidate,
+    ReviewContext,
+    _extract_decision_block,
+    _format_review_prompt,
+    app,
+)
 
 
 @pytest.fixture
@@ -228,3 +234,39 @@ def test_review_signal_claude_cli_missing_returns_take(client):
     body = resp.json()
     assert body["decision"] == "take"
     assert body["reasoning"] == "claude_cli_missing"
+
+
+# ---------------------------------------------------------------------------
+# Prompt rendering — None handling on macro slots
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_renders_none_as_unavailable():
+    """nifty_pct / india_vix / pnl_today must render as 'unavailable', not 'None'.
+
+    Service-side these are best-effort live fetches; the LLM should treat their
+    absence as "data not retrievable" rather than literal Python ``None``.
+    """
+    candidate = ReviewCandidate(
+        symbol="RELIANCE",
+        source="chartink_buy_fno_intraday",
+        candidate_at="2026-05-28T10:15:00+05:30",
+    )
+    ctx = ReviewContext(
+        positions_count=1,
+        positions_summary="1 SHORT CONCOR",
+        pnl_today=None,
+        trades_today=2,
+        max_trades_today=4,
+        nifty_pct=None,
+        india_vix=None,
+    )
+
+    rendered = _format_review_prompt(candidate, ctx)
+
+    # The literal text 'None' must not appear in the rendered prompt.
+    assert "None" not in rendered
+    # The three macro fields specifically must render as 'unavailable'.
+    assert "NIFTY return: unavailable%" in rendered
+    assert "India VIX: unavailable" in rendered
+    assert "P&L today: ₹unavailable" in rendered

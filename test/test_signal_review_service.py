@@ -336,6 +336,14 @@ def test_context_builder_handles_engine_failure(fresh_signal_db, shadow_mode, mo
         "services.simplified_stock_engine_service.get_simplified_stock_engine_service",
         broken_import,
     )
+    # Also force the macro fetches to fail — this test asserts the engine-stat
+    # branch fails gracefully and isn't supposed to depend on live broker state.
+    def _boom():
+        raise RuntimeError("macro fetch unavailable in test")
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", _boom)
+    monkeypatch.setattr(srs, "_fetch_india_vix", _boom)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", _boom)
 
     ctx = srs._build_context(None)
     # All fields present, all None — reviewer is told nothing rather than blown up.
@@ -345,12 +353,143 @@ def test_context_builder_handles_engine_failure(fresh_signal_db, shadow_mode, mo
 
 
 def test_context_override_is_used_verbatim(fresh_signal_db, shadow_mode, monkeypatch):
-    """When the caller passes a context, _build_context returns it unchanged."""
-    from services.signal_review_service import _build_context
+    """When the caller passes a context, _build_context returns it unchanged.
+
+    Also confirms the macro fetches are NOT called — operator override is
+    authoritative and must short-circuit before any live data fetch.
+    """
+    from services import signal_review_service as srs
+
+    called: dict[str, int] = {"nifty": 0, "vix": 0, "pnl": 0}
+
+    def _spy_nifty():
+        called["nifty"] += 1
+        return -0.5
+
+    def _spy_vix():
+        called["vix"] += 1
+        return 18.0
+
+    def _spy_pnl():
+        called["pnl"] += 1
+        return 100.0
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", _spy_nifty)
+    monkeypatch.setattr(srs, "_fetch_india_vix", _spy_vix)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", _spy_pnl)
 
     override = {"positions_count": 99, "pnl_today": -1234.0, "extra_field": "preserved"}
-    out = _build_context(override)
+    out = srs._build_context(override)
     assert out == override
+    assert called == {"nifty": 0, "vix": 0, "pnl": 0}
+
+
+# ---------------------------------------------------------------------------
+# Macro context fetches (NIFTY %, India VIX, P&L today)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stub_engine_stats(monkeypatch):
+    """Short-circuit the engine_stats path so macro tests don't need the engine."""
+    from services import signal_review_service as srs
+
+    monkeypatch.setattr(
+        "services.simplified_stock_engine_service.get_simplified_stock_engine_service",
+        lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable for test")),
+    )
+    return srs
+
+
+def test_build_context_includes_nifty_pct_when_available(
+    fresh_signal_db, shadow_mode, stub_engine_stats, monkeypatch
+):
+    srs = stub_engine_stats
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: -0.3)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 14.2)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: 2300.0)
+
+    ctx = srs._build_context(None)
+    assert ctx["nifty_pct"] == -0.3
+
+
+def test_build_context_includes_india_vix_when_available(
+    fresh_signal_db, shadow_mode, stub_engine_stats, monkeypatch
+):
+    srs = stub_engine_stats
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.5)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 14.2)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: 0.0)
+
+    ctx = srs._build_context(None)
+    assert ctx["india_vix"] == 14.2
+
+
+def test_build_context_includes_pnl_today_when_available(
+    fresh_signal_db, shadow_mode, stub_engine_stats, monkeypatch
+):
+    srs = stub_engine_stats
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.1)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 13.0)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: 2300.0)
+
+    ctx = srs._build_context(None)
+    assert ctx["pnl_today"] == 2300.0
+
+
+def test_build_context_handles_nifty_fetch_failure(
+    fresh_signal_db, shadow_mode, stub_engine_stats, monkeypatch
+):
+    srs = stub_engine_stats
+
+    def _boom():
+        raise RuntimeError("quote service down")
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", _boom)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 14.2)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: 100.0)
+
+    ctx = srs._build_context(None)
+    assert ctx["nifty_pct"] is None
+    # Other slots stay populated — one failure mustn't blank the rest.
+    assert ctx["india_vix"] == 14.2
+    assert ctx["pnl_today"] == 100.0
+
+
+def test_build_context_handles_vix_fetch_failure(
+    fresh_signal_db, shadow_mode, stub_engine_stats, monkeypatch
+):
+    srs = stub_engine_stats
+
+    def _boom():
+        raise RuntimeError("INDIAVIX symbol not in master contract")
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: -0.4)
+    monkeypatch.setattr(srs, "_fetch_india_vix", _boom)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: -50.0)
+
+    ctx = srs._build_context(None)
+    assert ctx["india_vix"] is None
+    assert ctx["nifty_pct"] == -0.4
+    assert ctx["pnl_today"] == -50.0
+
+
+def test_build_context_handles_pnl_fetch_failure(
+    fresh_signal_db, shadow_mode, stub_engine_stats, monkeypatch
+):
+    srs = stub_engine_stats
+
+    def _boom():
+        raise RuntimeError("positionbook fetch failed")
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.8)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 12.5)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", _boom)
+
+    ctx = srs._build_context(None)
+    assert ctx["pnl_today"] is None
+    assert ctx["nifty_pct"] == 0.8
+    assert ctx["india_vix"] == 12.5
 
 
 # ---------------------------------------------------------------------------

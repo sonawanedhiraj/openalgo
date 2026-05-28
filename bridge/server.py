@@ -542,11 +542,23 @@ Respond with a short reasoning paragraph followed by a final JSON block. The JSO
 
 
 def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str:
-    """Interpolate the prompt template. Missing context fields become 'unknown'."""
+    """Interpolate the prompt template.
+
+    Operator-state fields (positions, trades) render missing values as
+    ``unknown``. The three macro/portfolio numbers (nifty_pct, india_vix,
+    pnl_today) instead render as ``unavailable`` — they're best-effort live
+    fetches and the LLM should treat their absence as "data not retrievable",
+    not "value is zero".
+    """
 
     def _or_unknown(value: Any) -> str:
         if value is None:
             return "unknown"
+        return str(value)
+
+    def _or_unavailable(value: Any) -> str:
+        if value is None:
+            return "unavailable"
         return str(value)
 
     return REVIEW_PROMPT_TEMPLATE.format(
@@ -555,11 +567,11 @@ def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str
         candidate_at=candidate.candidate_at,
         positions_count=_or_unknown(ctx.positions_count),
         positions_summary=_or_unknown(ctx.positions_summary),
-        pnl_today=_or_unknown(ctx.pnl_today),
+        pnl_today=_or_unavailable(ctx.pnl_today),
         trades_today=_or_unknown(ctx.trades_today),
         max_trades_today=_or_unknown(ctx.max_trades_today),
-        nifty_pct=_or_unknown(ctx.nifty_pct),
-        india_vix=_or_unknown(ctx.india_vix),
+        nifty_pct=_or_unavailable(ctx.nifty_pct),
+        india_vix=_or_unavailable(ctx.india_vix),
     )
 
 
