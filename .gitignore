@@ -26,6 +26,9 @@ config.ini
 # Temporary/debug files
 tmp/
 
+# Runtime / logs
+backtest/scans/
+
 # Numba/LLVMLITE cache directories (auto-created on Linux)
 .numba_cache/
 .llvm_tmp/
