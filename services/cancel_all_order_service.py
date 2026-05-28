@@ -3,8 +3,8 @@ import importlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
-from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, AllOrdersCancelledEvent, OrderFailedEvent
+from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -83,8 +83,33 @@ def cancel_all_orders_with_auth(
     if "apikey" in order_request_data:
         order_request_data.pop("apikey", None)
 
-    # If in analyze mode, route to sandbox for sandbox trading
-    if get_analyze_mode():
+    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    mode = resolve_effective_mode()
+
+    if mode is EffectiveMode.SKIP:
+        logger.info("Cancel-all rejected: daily_intent is 'skip' for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "operator_intent_skip",
+            "message": "Order rejected: daily intent is 'skip' for today.",
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.DISABLED:
+        logger.warning("Cancel-all rejected: no daily_intent declared for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "no_daily_intent",
+            "message": (
+                "Order rejected: no daily_intent row for today. "
+                "Set one via the helper before placing orders."
+            ),
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_cancel_all_orders
 
         api_key = original_data.get("apikey")
@@ -115,6 +140,7 @@ def cancel_all_orders_with_auth(
         ))
         return success, response_data, status_code
 
+    # mode is EffectiveMode.LIVE — proceed with actual broker cancel-all.
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
@@ -196,11 +222,11 @@ def cancel_all_orders(
     # Case 1: API-based authentication
     if api_key and not (auth_token and broker):
         # Check if user is in semi-auto mode (cancelallorder is blocked in semi-auto)
-        # BUT allow execution in analyze/sandbox mode (sandbox trading should always work)
+        # BUT allow execution in sandbox effective-mode (sandbox trading should always work).
+        # SKIP / DISABLED fall through to the with_auth call and reject there.
         from database.auth_db import get_order_mode, verify_api_key
 
-        # Check analyze mode first - if in analyze mode, allow execution
-        if not get_analyze_mode():
+        if resolve_effective_mode() is not EffectiveMode.SANDBOX:
             user_id = verify_api_key(api_key)
             if user_id:
                 order_mode = get_order_mode(user_id)

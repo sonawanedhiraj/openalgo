@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
-from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, BasketCompletedEvent, OrderFailedEvent
+from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -181,8 +181,33 @@ def process_basket_order_with_auth(
 
     api_key = basket_data.get("apikey")
 
-    # If in analyze mode, route each order to sandbox
-    if get_analyze_mode():
+    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    mode = resolve_effective_mode()
+
+    if mode is EffectiveMode.SKIP:
+        logger.info("Basket order rejected: daily_intent is 'skip' for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "operator_intent_skip",
+            "message": "Order rejected: daily intent is 'skip' for today.",
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.DISABLED:
+        logger.warning("Basket order rejected: no daily_intent declared for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "no_daily_intent",
+            "message": (
+                "Order rejected: no daily_intent row for today. "
+                "Set one via the helper before placing orders."
+            ),
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_place_order
 
         analyze_results = []
@@ -297,7 +322,7 @@ def process_basket_order_with_auth(
 
         return True, response_data, 200
 
-    # Live mode - process actual orders
+    # mode is EffectiveMode.LIVE — process actual broker orders.
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
