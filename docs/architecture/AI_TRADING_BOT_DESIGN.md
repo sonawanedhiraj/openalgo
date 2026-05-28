@@ -170,8 +170,8 @@ conflated, so there is nothing to check the flags *against*.
 
 ## 4. Existing OpenAlgo Capabilities — Scanner Audit Findings
 
-A read-only repo audit on **2026-05-26** (full report:
-`outputs/openalgo_scanner_leverage_audit.md`) found the fork already provides
+A read-only repo audit on **2026-05-26** (findings inlined in §4.1–§4.2 below;
+no separate audit file is maintained) found the fork already provides
 **substantially more scanner-relevant infrastructure than originally assumed**. The
 expensive parts of an in-house scanner — a live data feed, broker adapters, the tradable
 universe, and the UI plumbing — already exist and are proven in production. This changes the
