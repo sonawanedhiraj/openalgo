@@ -92,6 +92,7 @@ from database.auth_db import init_db as ensure_auth_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
+from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -608,6 +609,7 @@ def setup_environment(app):
                 ("Settings DB", ensure_settings_tables_exists),
                 ("Daily Intent DB", ensure_daily_intent_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
+                ("Signal Decision DB", ensure_signal_decision_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
