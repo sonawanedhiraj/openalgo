@@ -499,6 +499,19 @@ class SimplifiedStockEngineService:
                 self.engine.confirm_entry(signal.symbol, signal.reference_price)
             return
 
+        # Stage 1 — LLM veto layer. Returns (proceed, decision_id). In shadow
+        # mode the decision is recorded but always proceed=True. In active
+        # mode a 'skip' short-circuits before the order is dispatched. Off
+        # mode bypasses the reviewer entirely. decision_id may be None when
+        # persistence failed or the reviewer was skipped — the mark_*
+        # helper tolerates None.
+        proceed, decision_id = self._run_pre_order_review(signal, strategy_name)
+        if not proceed:
+            with self._lock:
+                self.engine.clear_pending_entry(signal.symbol)
+            self._mark_review_outcome(decision_id, taken=False)
+            return
+
         # Live-mode funds gate: refuse to send an opening order if the
         # broker's reported available cash is below the floor. Sandbox and
         # disabled modes don't hit this path -- they're handled above.
@@ -514,6 +527,7 @@ class SimplifiedStockEngineService:
                 )
                 with self._lock:
                     self.engine.clear_pending_entry(signal.symbol)
+                self._mark_review_outcome(decision_id, taken=False)
                 return
 
         payload = self._order_payload(signal, strategy_name)
@@ -522,6 +536,7 @@ class SimplifiedStockEngineService:
             logger.error("[SIMPLIFIED-ENTRY] Order failed for %s: %s", signal.symbol, response)
             with self._lock:
                 self.engine.clear_pending_entry(signal.symbol)
+            self._mark_review_outcome(decision_id, taken=False)
             return
 
         order_id = response.get("orderid")
@@ -535,6 +550,9 @@ class SimplifiedStockEngineService:
             )
             with self._lock:
                 self.engine.clear_pending_entry(signal.symbol)
+            # Order was sent to the broker even if we couldn't confirm the
+            # fill — flag actually_taken=True so the audit row reflects reality.
+            self._mark_review_outcome(decision_id, taken=True)
             return
 
         with self._lock:
@@ -542,6 +560,87 @@ class SimplifiedStockEngineService:
         logger.info(
             "[SIMPLIFIED-ENTRY] Position created (mode=%s): %s", self.mode, position
         )
+        self._mark_review_outcome(decision_id, taken=True)
+
+    def _run_pre_order_review(
+        self, signal: EntrySignal, strategy_name: str
+    ) -> tuple[bool, int | None]:
+        """Apply the Stage-1 LLM veto layer.
+
+        Returns ``(proceed, decision_id)``:
+
+        * ``mode='off'`` → ``(True, None)``. Reviewer is not called.
+        * ``mode='shadow'`` → ``(True, decision_id)`` regardless of the LLM's
+          answer. Decision is logged but never enforced.
+        * ``mode='active'`` and reviewer says ``skip`` → ``(False, decision_id)``;
+          ``actually_taken=False`` is recorded immediately.
+        * ``mode='active'`` and reviewer says ``take`` → ``(True, decision_id)``.
+
+        Any unexpected exception from the reviewer fails open: ``(True, None)``.
+        The reviewer's own fail-safe-to-take semantics mean this branch is
+        rare in practice — it's the safety net for "we couldn't even decide
+        whether to fail safely."
+        """
+        try:
+            from services import signal_review_service
+
+            mode = signal_review_service.get_veto_layer_mode()
+            if mode == "off":
+                return True, None
+
+            review = signal_review_service.review_signal(
+                symbol=signal.symbol,
+                source=strategy_name,
+            )
+        except Exception:
+            logger.exception(
+                "[SIMPLIFIED-ENTRY] Veto layer raised for %s; failing open",
+                signal.symbol,
+            )
+            return True, None
+
+        decision_id = review.get("id")
+        decision = review.get("decision")
+        reasoning = (review.get("reasoning") or "")[:80]
+
+        if mode == "shadow":
+            logger.info(
+                "[veto/shadow] %s %s -> %s (%s)",
+                signal.symbol,
+                strategy_name,
+                decision,
+                reasoning,
+            )
+            return True, decision_id
+
+        # mode == "active"
+        if decision == "skip":
+            logger.info("[veto/active] vetoed %s: %s", signal.symbol, reasoning)
+            return False, decision_id
+
+        logger.info(
+            "[veto/active] %s %s -> take (%s)", signal.symbol, strategy_name, reasoning
+        )
+        return True, decision_id
+
+    @staticmethod
+    def _mark_review_outcome(decision_id: int | None, *, taken: bool) -> None:
+        """Update the signal_decision row's ``actually_taken`` flag.
+
+        Best-effort: the order path must not fail because the audit hook
+        couldn't write. The downstream helper already tolerates ``None``.
+        """
+        if decision_id is None:
+            return
+        try:
+            from services import signal_review_service
+
+            signal_review_service.mark_actually_taken(decision_id, taken)
+        except Exception:
+            logger.exception(
+                "[SIMPLIFIED-ENTRY] Failed to mark_actually_taken for decision_id=%s",
+                decision_id,
+            )
 
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
         if self.mode == MODE_DISABLED:
