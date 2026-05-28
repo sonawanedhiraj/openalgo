@@ -151,11 +151,60 @@ def init_db():
 
     Creates the ``users`` table if it does not already exist,
     using the shared ``db_init_helper`` for consistent startup
-    logging.
+    logging. Also applies idempotent column-level migrations for
+    schemas that pre-date features added to the model.
     """
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "User DB", logger)
+
+    # Column-level migration for installs whose ``users`` table was
+    # created before the per-purpose 2FA flags landed. ``create_all``
+    # is a no-op when the table already exists, so without this the
+    # columns referenced by the ORM (totp_enabled etc.) stay missing
+    # and every query that touches them fails with
+    # ``no such column: users.totp_enabled``. Mirrors the standalone
+    # upgrade/add_totp_purpose_flags.py so both code paths converge.
+    _migrate_add_totp_purpose_columns()
+
+
+def _migrate_add_totp_purpose_columns():
+    """Add per-purpose 2FA flag columns to ``users`` if missing.
+
+    Idempotent: each ALTER is gated by an inspector check, so this is
+    safe to run on every startup. Defaults match the model
+    (``False``) so existing installs keep their previous
+    password-only login behavior until the operator opts in via the
+    settings UI.
+    """
+    try:
+        from sqlalchemy import inspect, text
+
+        inspector = inspect(engine)
+        if "users" not in inspector.get_table_names():
+            return
+
+        existing = {col["name"] for col in inspector.get_columns("users")}
+        columns_to_add = (
+            "totp_enabled",
+            "totp_required_for_login",
+            "totp_required_for_mcp",
+            "totp_required_for_password_reset",
+        )
+        pending = [c for c in columns_to_add if c not in existing]
+        if not pending:
+            return
+
+        with engine.begin() as conn:
+            for column in pending:
+                conn.execute(
+                    text(f"ALTER TABLE users ADD COLUMN {column} BOOLEAN NOT NULL DEFAULT 0")
+                )
+                logger.info(f"Migration: Added '{column}' column to users table")
+    except Exception as e:
+        # Log but don't crash startup — a column-already-exists race or
+        # other transient DB issue should not block the app boot.
+        logger.exception(f"Migration check for TOTP purpose columns failed: {e}")
 
 
 def add_user(username, email, password, is_admin=False):
