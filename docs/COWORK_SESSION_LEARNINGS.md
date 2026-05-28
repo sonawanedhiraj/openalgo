@@ -690,3 +690,47 @@ uv run python backtest/run_backtest.py --date 2026-05-21 --from-env
 
 ### Key Lesson
 **Always use `--from-engine` when backtesting.** Without it, the backtest may use different ATR multipliers, trade limits, and cooldowns than the live engine, producing misleading results. The May 21 comparison proved this: the same market day showed +₹621 profit live but -₹1,479 loss in backtest, entirely due to config divergence.
+
+---
+
+# Section 13: Scheduled Scan Cycle Learnings (May 22, 2026)
+
+## Bridge Calls in Scheduled Tasks — Use Navigate, Not Fetch
+
+The scan-cycle task template uses `fetch('http://127.0.0.1:5001/...')` from an OpenAlgo tab (port 5000) for Steps 3 and 6. This **always fails** due to CORS (port 5000 → port 5001 is cross-origin).
+
+### What works
+Use Chrome extension's `navigate` to go directly to the bridge endpoint, then `get_page_text` to read the JSON response:
+```
+navigate → http://127.0.0.1:5001/read-errors?n=5
+get_page_text → parse the JSON from the page body
+```
+
+### What doesn't work
+```javascript
+// From an OpenAlgo tab on port 5000 — CORS blocks this:
+fetch('http://127.0.0.1:5001/read-errors?n=5')  // → "Failed to fetch"
+```
+
+### What also doesn't work
+The sandbox bash shell (`mcp__workspace__bash`) runs in an isolated Linux VM — `curl http://127.0.0.1:5001` hits the VM's localhost, not the user's Windows machine. Bridge calls must go through the Chrome extension.
+
+### Recommended scan-cycle bridge pattern
+1. Open/reuse a tab → `navigate` to `http://127.0.0.1:5001/status`
+2. `get_page_text` → parse JSON
+3. `navigate` to `http://127.0.0.1:5001/read-errors?n=5`
+4. `get_page_text` → parse JSON
+5. Close tab when done
+
+### OpenAlgo API calls (port 5000) are fine from JS
+`fetch('http://127.0.0.1:5000/chartink/simplified-engine/api/status')` works from any tab on port 5000 — same-origin, no CORS issue. Only cross-port bridge calls need the navigate approach.
+
+## Scan Results — Empty Screeners Are Normal Early Morning
+
+At 09:33 IST (3 minutes after market open), both BUY and SELL Chartink screeners returned "No stock." This is expected — the screeners use technical conditions (candle patterns, volume, moving averages) that need several candles of data to trigger. Scans typically start producing results after 09:45–10:00 IST.
+
+## Error Log Context (May 22)
+
+- **Yesterday's errors** (May 21, 19:30): "Invalid openalgo apikey" on `/api/v1/optionsorder` — stale API key calls. Also "insufficient funds" for RELIANCE and a test-mock `RuntimeError: broker timeout` — the latter is from the test suite, not production.
+- **Today** (May 22, 08:45): Single SocketIO "Session is disconnected" from `engineio.server` — benign, happens when a browser tab disconnects.
+- No new production errors since app startup today.
