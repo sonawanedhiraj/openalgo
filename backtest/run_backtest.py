@@ -530,13 +530,15 @@ class BacktestRunner:
                         "risk_per_share": position.risk_per_share,
                     })
 
-            # Check for exits (stop-loss, trailing, EOD)
+            # Check for exits (stop-loss, trailing, EOD). on_price_update may
+            # return exits for OTHER symbols too (global profit-lock, EOD
+            # batch), so confirm each signal against its OWN symbol.
             exit_signals = self.engine.on_price_update(symbol, candle.close)
             for exit_sig in exit_signals:
                 exits_triggered += 1
-                trade = self.engine.confirm_exit(symbol, exit_sig.reference_price, exit_sig.reason)
+                trade = self.engine.confirm_exit(exit_sig.symbol, exit_sig.reference_price, exit_sig.reason)
                 if trade:
-                    self._log_event("EXIT", symbol, candle, {
+                    self._log_event("EXIT", exit_sig.symbol, candle, {
                         "entry_price": trade.entry_price,
                         "exit_price": trade.exit_price,
                         "qty": trade.qty,
@@ -590,11 +592,12 @@ class BacktestRunner:
     ) -> list[CompletedTrade]:
         """Tick-by-tick replay for higher-fidelity backtesting.
 
-        Each tick is fed through a FiveMinuteCandleBuilder. When a 5-min
-        candle completes, it's passed to on_new_candle(). Between candle
-        boundaries, each tick is passed to on_price_update() so stop-loss
-        and trailing logic reacts to actual price movement, not just candle
-        OHLC extremes.
+        Each tick is fed through a FiveMinuteCandleBuilder, which emits the
+        current (continuously-updating) 5-min candle on every tick — exactly
+        as the live service does. Each emitted candle is passed to
+        on_new_candle(), and each tick is also passed to on_price_update() so
+        stop-loss and trailing logic reacts to actual price movement, not just
+        candle OHLC extremes.
         """
         entries_triggered = 0
         exits_triggered = 0
@@ -604,8 +607,8 @@ class BacktestRunner:
         completed_candles: dict[str, list[Candle]] = {s: [] for s in self.symbols}
 
         def make_handler(sym: str):
-            def handler(candle: Candle):
-                completed_candles[sym].append(candle)
+            def handler(symbol: str, candle: Candle):
+                completed_candles[symbol].append(candle)
             return handler
 
         builders: dict[str, FiveMinuteCandleBuilder] = {}
@@ -633,8 +636,8 @@ class BacktestRunner:
             # Advance simulation clock
             self._sim_time = ts
 
-            # Feed tick to candle builder — may produce a completed candle
-            builders[sym].on_tick(price, volume, ts)
+            # Feed tick to candle builder — emits the current 5-min candle
+            builders[sym].on_tick(sym, price, volume, ts)
 
             # Process any newly completed candles
             while completed_candles[sym]:
@@ -651,13 +654,18 @@ class BacktestRunner:
                             "risk_per_share": position.risk_per_share,
                         })
 
-            # Feed every tick to on_price_update for SL/trailing checks
+            # Feed every tick to on_price_update for SL/trailing checks.
+            # on_price_update may return exits for OTHER symbols too (global
+            # profit-lock and the EOD batch close all open positions at once),
+            # so confirm each signal against its OWN symbol, not the tick's.
             exit_signals = self.engine.on_price_update(sym, price)
             for exit_sig in exit_signals:
                 exits_triggered += 1
-                trade = self.engine.confirm_exit(sym, exit_sig.reference_price, exit_sig.reason)
+                trade = self.engine.confirm_exit(
+                    exit_sig.symbol, exit_sig.reference_price, exit_sig.reason
+                )
                 if trade:
-                    self._log_event("EXIT_TICK", sym, None, {
+                    self._log_event("EXIT_TICK", exit_sig.symbol, None, {
                         "entry_price": trade.entry_price,
                         "exit_price": trade.exit_price,
                         "qty": trade.qty,
@@ -674,20 +682,26 @@ class BacktestRunner:
         return list(self.engine.completed_trades)
 
     def _force_eod_exits(self, target_date: dt.date):
-        """Force EOD exit for any remaining positions."""
+        """Force EOD exit for any remaining positions.
+
+        check_eod_exits() returns exit signals for ALL open positions in a
+        single call and then marks EOD done (subsequent calls return []), so
+        it must be called once — not per-symbol — and each signal confirmed
+        against its own symbol.
+        """
         self._sim_time = dt.datetime.combine(target_date, self.config.eod_exit_time)
-        for symbol in list(self.engine.positions.keys()):
-            exit_sigs = self.engine.check_eod_exits()
-            for exit_sig in exit_sigs:
-                trade = self.engine.confirm_exit(symbol, exit_sig.reference_price, "eod")
-                if trade:
-                    self._log_event("EXIT_EOD", symbol, None, {
-                        "entry_price": trade.entry_price,
-                        "exit_price": trade.exit_price,
-                        "qty": trade.qty,
-                        "gross_pnl": trade.gross_pnl,
-                        "reason": trade.exit_reason,
-                    })
+        for exit_sig in self.engine.check_eod_exits():
+            trade = self.engine.confirm_exit(
+                exit_sig.symbol, exit_sig.reference_price, "eod"
+            )
+            if trade:
+                self._log_event("EXIT_EOD", exit_sig.symbol, None, {
+                    "entry_price": trade.entry_price,
+                    "exit_price": trade.exit_price,
+                    "qty": trade.qty,
+                    "gross_pnl": trade.gross_pnl,
+                    "reason": trade.exit_reason,
+                })
 
     def _log_event(self, event_type: str, symbol: str, candle: Candle | None, details: dict):
         entry = {
