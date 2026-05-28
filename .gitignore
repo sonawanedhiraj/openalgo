@@ -29,6 +29,20 @@ tmp/
 # Runtime / logs
 backtest/scans/
 
+# Local launch scripts (operator-specific)
+launch.vbs
+launch_openalgo.hta
+run.ps1
+start_openalgo.bat
+start_openalgo_task.xml
+
+# Diagnostics and backtest results (transient)
+backtest/_diag_auth.py
+backtest/results_*.json
+
+# Outputs directory (transient)
+outputs/
+
 # Numba/LLVMLITE cache directories (auto-created on Linux)
 .numba_cache/
 .llvm_tmp/
