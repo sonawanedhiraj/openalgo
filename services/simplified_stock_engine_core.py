@@ -234,74 +234,12 @@ def compute_zerodha_intraday_charges(buy_value: float, sell_value: float) -> Tra
     )
 
 
-class FiveMinuteCandleBuilder:
-    def __init__(
-        self,
-        on_candle: Callable[[str, Candle], None],
-        candle_seconds: int = 300,
-    ):
-        self.on_candle = on_candle
-        self.candle_seconds = candle_seconds
-        self.current: dict[str, dict] = {}
-        self.last_cum_vol: dict[str, int] = {}
-
-    @staticmethod
-    def bucket(ts: dt.datetime) -> dt.datetime:
-        return ts.replace(minute=(ts.minute // 5) * 5, second=0, microsecond=0)
-
-    def on_tick(self, symbol: str, price: float, cumulative_volume: int, ts: dt.datetime) -> None:
-        bucket = self.bucket(ts)
-        price = float(price)
-        cumulative_volume = int(cumulative_volume or 0)
-
-        if symbol not in self.current:
-            self.current[symbol] = {
-                "bucket": bucket,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0,
-            }
-            self.last_cum_vol[symbol] = cumulative_volume
-            return
-
-        current = self.current[symbol]
-        if bucket != current["bucket"]:
-            self._emit(symbol, 1.0)
-            self.current[symbol] = {
-                "bucket": bucket,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0,
-            }
-            self.last_cum_vol[symbol] = cumulative_volume
-            return
-
-        delta = max(cumulative_volume - self.last_cum_vol.get(symbol, cumulative_volume), 0)
-        self.last_cum_vol[symbol] = cumulative_volume
-        current["high"] = max(current["high"], price)
-        current["low"] = min(current["low"], price)
-        current["close"] = price
-        current["volume"] += delta
-
-        elapsed = max((ts - current["bucket"]).total_seconds(), 0)
-        self._emit(symbol, min(elapsed / float(self.candle_seconds), 0.999))
-
-    def _emit(self, symbol: str, elapsed_pct: float) -> None:
-        current = self.current[symbol]
-        candle = Candle(
-            ts=current["bucket"],
-            open=current["open"],
-            high=current["high"],
-            low=current["low"],
-            close=current["close"],
-            volume=int(current["volume"]),
-            elapsed_pct=elapsed_pct,
-        )
-        self.on_candle(symbol, candle)
+# Re-exported from services.bar_aggregator. Kept importable from this module
+# so every existing caller (service layer, backtester, tests) continues to
+# work — including the static `FiveMinuteCandleBuilder.bucket()` calls
+# scattered through this file. Behavior is bit-identical to the previous
+# in-file definition; see services/bar_aggregator.py for the source.
+from services.bar_aggregator import FiveMinuteCandleBuilder  # noqa: E402
 
 
 class SimplifiedStockEngine:
