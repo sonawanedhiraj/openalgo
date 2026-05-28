@@ -3,8 +3,8 @@ import importlib
 from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
-from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, GTTFailedEvent, GTTPlacedEvent
+from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -51,8 +51,34 @@ def place_gtt_order_with_auth(
     order_request_data.pop("apikey", None)
     api_key = original_data.get("apikey", "")
 
-    # Analyze (sandbox) mode: not wired yet — clean 501 until Phase 3.
-    if get_analyze_mode():
+    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    mode = resolve_effective_mode()
+
+    if mode is EffectiveMode.SKIP:
+        logger.info("Place GTT rejected: daily_intent is 'skip' for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "operator_intent_skip",
+            "message": "Order rejected: daily intent is 'skip' for today.",
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.DISABLED:
+        logger.warning("Place GTT rejected: no daily_intent declared for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "no_daily_intent",
+            "message": (
+                "Order rejected: no daily_intent row for today. "
+                "Set one via the helper before placing orders."
+            ),
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.SANDBOX:
+        # Sandbox GTT not implemented yet — clean 501 until Phase 3.
         error_response = {
             "mode": "analyze",
             "status": "error",
@@ -60,7 +86,8 @@ def place_gtt_order_with_auth(
         }
         return False, error_response, 501
 
-    # Capability gate: if the broker does not ship a gtt_api module, 501.
+    # mode is EffectiveMode.LIVE — capability gate: if the broker does not ship
+    # a gtt_api module, 501.
     broker_module = import_broker_gtt_module(broker)
     if broker_module is None:
         message = f"GTT orders are not supported for broker '{broker}' yet"
