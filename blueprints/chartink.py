@@ -959,22 +959,50 @@ def simplified_stock_engine_webhook(webhook_id):
     This endpoint deliberately does not use the standard Chartink symbol mappings or
     immediate order queue. It only arms the engine for BUY monitoring; the engine
     places orders later after its 5-minute candle, ATR, and volume rules pass.
+
+    Stage-0 audit: every invocation is recorded in ``scan_cycle`` with
+    per-stage ``cycle_heartbeat`` rows, independent of the Cowork bridge. All
+    audit writes are fail-safe — a DB hiccup must NEVER prevent the engine
+    from receiving the trigger.
     """
+    from services import scan_cycle_service
+
+    cycle_id = scan_cycle_service.start_cycle("chartink")
     try:
         strategy = get_strategy_by_webhook_id(webhook_id)
         if not strategy:
             logger.error("Strategy not found for simplified engine webhook ID: %s", webhook_id)
+            scan_cycle_service.heartbeat(
+                cycle_id, "preflight", "error", f"unknown webhook_id={webhook_id}"
+            )
+            scan_cycle_service.complete_cycle(
+                cycle_id,
+                post_status="error",
+                error_payload={"error": "Invalid webhook ID"},
+            )
             return jsonify({"status": "error", "error": "Invalid webhook ID"}), 404
 
         if not strategy.is_active:
             logger.info(
                 "Strategy %s is inactive, ignoring simplified engine webhook", strategy.id
             )
+            scan_cycle_service.heartbeat(
+                cycle_id, "preflight", "skipped", f"strategy {strategy.id} inactive"
+            )
+            scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
             return jsonify({"status": "success", "message": "Strategy is inactive"})
 
         data = request.get_json()
         if not data:
             logger.error("No data received in simplified engine webhook for strategy %s", strategy.id)
+            scan_cycle_service.heartbeat(
+                cycle_id, "preflight", "error", "empty payload"
+            )
+            scan_cycle_service.complete_cycle(
+                cycle_id,
+                post_status="error",
+                error_payload={"error": "No data received"},
+            )
             return jsonify({"status": "error", "error": "No data received"}), 400
 
         if strategy.is_intraday:
@@ -984,23 +1012,64 @@ def simplified_stock_engine_webhook(webhook_id):
             squareoff_time = datetime.strptime(strategy.squareoff_time, "%H:%M").time()
 
             if current_time < start_time:
+                scan_cycle_service.heartbeat(
+                    cycle_id, "preflight", "skipped", "before start_time"
+                )
+                scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
                 return jsonify(
                     {"status": "error", "error": "Cannot arm engine before start time"}
                 ), 400
             if current_time >= squareoff_time:
+                scan_cycle_service.heartbeat(
+                    cycle_id, "preflight", "skipped", "after squareoff_time"
+                )
+                scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
                 return jsonify(
                     {"status": "error", "error": "Cannot arm engine after square off time"}
                 ), 400
             if current_time >= end_time:
+                scan_cycle_service.heartbeat(
+                    cycle_id, "preflight", "skipped", "after end_time"
+                )
+                scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
                 return jsonify(
                     {"status": "error", "error": "Cannot arm new entries after end time"}
                 ), 400
+
+        scan_cycle_service.heartbeat(cycle_id, "preflight", "ok")
+
+        # Parse symbols up-front for the audit. parse_chartink_symbols is the
+        # same normaliser the engine service uses, so the audit reflects what
+        # the engine will see — not the raw payload.
+        scan_cycle_service.heartbeat(cycle_id, "scan_buy", "started")
+        try:
+            from services.simplified_stock_engine_service import parse_chartink_symbols
+
+            buy_syms = parse_chartink_symbols(data) or []
+        except Exception as e:
+            logger.warning("scan_buy parse failed (non-fatal): %s", e)
+            buy_syms = []
+        scan_cycle_service.heartbeat(
+            cycle_id, "scan_buy", "ok", f"{len(buy_syms)} syms"
+        )
+
+        # Capture today's effective mode for the audit. Best-effort — if the
+        # resolver throws (e.g. DailyIntent table missing on an old install),
+        # we record None and continue. Order placement is unchanged by this.
+        try:
+            from services.mode_service import resolve_effective_mode
+
+            effective_mode = resolve_effective_mode().value
+        except Exception as e:
+            logger.warning("resolve_effective_mode failed (non-fatal): %s", e)
+            effective_mode = None
 
         from services.simplified_stock_engine_service import (
             get_simplified_stock_engine_service,
         )
 
         service = get_simplified_stock_engine_service()
+        scan_cycle_service.heartbeat(cycle_id, "post", "started")
         result = service.process_chartink_webhook(
             user_id=strategy.user_id,
             strategy_name=strategy.name,
@@ -1008,10 +1077,29 @@ def simplified_stock_engine_webhook(webhook_id):
         )
 
         status_code = 200 if result.get("status") in {"success", "ignored"} else 400
+        scan_cycle_service.heartbeat(
+            cycle_id,
+            "post",
+            "ok" if status_code == 200 else "error",
+            f"engine status={result.get('status')}",
+        )
+        scan_cycle_service.complete_cycle(
+            cycle_id,
+            post_status="ok" if status_code == 200 else "error",
+            screener_buy=buy_syms,
+            engine_response=result,
+            effective_mode=effective_mode,
+        )
         return jsonify(result), status_code
 
     except Exception as e:
         logger.exception("Error processing simplified stock engine webhook: %s", str(e))
+        scan_cycle_service.heartbeat(cycle_id, "error", "error", str(e))
+        scan_cycle_service.complete_cycle(
+            cycle_id,
+            post_status="error",
+            error_payload={"error": str(e), "type": type(e).__name__},
+        )
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
