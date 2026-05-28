@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from datetime import datetime
@@ -77,6 +78,10 @@ class OrderLatency(LatencyBase):
     ):
         """Log order execution latency"""
         try:
+            # Serialize error to string if it's a dict/list — the column is String(500)
+            if error is not None and not isinstance(error, str):
+                error = json.dumps(error, default=str)[:500]
+
             log = OrderLatency(
                 order_id=order_id,
                 user_id=user_id,

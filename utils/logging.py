@@ -164,16 +164,20 @@ class SensitiveDataFilter(logging.Filter):
             for pattern, replacement in SENSITIVE_PATTERNS:
                 record.msg = re.sub(pattern, replacement, str(record.msg), flags=re.IGNORECASE)
 
-            # Filter args if present
+            # Filter args if present — only replace args that actually
+            # contain sensitive data; preserve original types for others so
+            # %-style format specifiers like %d still work.
             if hasattr(record, "args") and record.args:
                 filtered_args = []
                 for arg in record.args:
-                    filtered_arg = str(arg)
+                    str_arg = str(arg)
+                    filtered = str_arg
                     for pattern, replacement in SENSITIVE_PATTERNS:
-                        filtered_arg = re.sub(
-                            pattern, replacement, filtered_arg, flags=re.IGNORECASE
+                        filtered = re.sub(
+                            pattern, replacement, filtered, flags=re.IGNORECASE
                         )
-                    filtered_args.append(filtered_arg)
+                    # Only replace with the string version if redaction changed it
+                    filtered_args.append(filtered if filtered != str_arg else arg)
                 record.args = tuple(filtered_args)
         except Exception:
             # If filtering fails, don't block the log message
