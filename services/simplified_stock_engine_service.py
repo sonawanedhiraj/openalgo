@@ -106,6 +106,7 @@ def config_from_env() -> SimplifiedEngineConfig:
         trail_atr_mult=_env_float("SIMPLIFIED_ENGINE_TRAIL_ATR_MULT", 0.5),
         sl_confirm_seconds=_env_float("SIMPLIFIED_ENGINE_SL_CONFIRM_SECONDS", 3.0),
         cooldown_candles=_env_int("SIMPLIFIED_ENGINE_COOLDOWN_CANDLES", 3),
+        same_day_stopout_block=_env_bool("RISK_SAME_DAY_STOPOUT_BLOCK", True),
         enable_global_profit_lock=_env_bool("SIMPLIFIED_ENGINE_GLOBAL_PROFIT_LOCK", True),
         mode=_resolve_mode_from_env(),
         funds_floor=_resolve_funds_floor_from_env(),
