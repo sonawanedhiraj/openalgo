@@ -120,8 +120,13 @@ def _check_recent_cycles(now: datetime) -> dict:
     Rules:
     * Outside market hours (or weekend) → always OK; the scheduler isn't
       expected to be running.
+    * Inside market hours with zero cycles today → OK (fresh-start; the
+      scheduler hasn't fired yet today, not stalled). This avoids the
+      chicken-and-egg deadlock on overnight-restart mornings where
+      preflight blocks the very first cycle of the day.
     * Inside market hours with no cycles yet AND current time before the
-      first-cycle grace cutoff → OK (we haven't had a chance to run yet).
+      first-cycle grace cutoff → OK (legacy guard, retained for cases where
+      cycles_since() can't be evaluated).
     * Inside market hours otherwise → require a cycle within the threshold.
     """
     threshold = _env_int("PREFLIGHT_STALE_CYCLE_MINUTES", 30)
@@ -160,6 +165,27 @@ def _check_recent_cycles(now: datetime) -> dict:
 
     if not in_market:
         return {**base, "ok": True, "reason": None}
+
+    # Fresh-start path: distinguish "no cycles at all today" (scheduler
+    # hasn't run yet — not stalled) from "cycles fired earlier today but
+    # last one is stale" (genuine scheduler stall). The legacy code aborted
+    # on both, which deadlocked the morning-of-restart skill at Step 0.
+    today_start_iso = now.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).isoformat()
+    cycles_today: int | None = None
+    try:
+        cycles_today = scan_cycle_service.cycles_since(today_start_iso)
+    except Exception as e:
+        # Read failure — fall through to legacy grace/staleness logic.
+        logger.warning("preflight: cycles_since failed: %s", e)
+
+    if cycles_today == 0:
+        return {
+            **base,
+            "ok": True,
+            "reason": "no cycles today — fresh-start (scheduler hasn't fired yet)",
+        }
 
     stale_reason = (
         f"no scan_cycle in last {threshold} minutes during market hours "

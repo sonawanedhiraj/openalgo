@@ -263,6 +263,92 @@ def test_first_cycle_grace_period(preflight_env):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Fresh-start day: zero cycles today, after grace → PASS
+# ---------------------------------------------------------------------------
+
+
+def test_recent_cycles_passes_when_zero_cycles_today_and_after_grace_window(
+    preflight_env,
+):
+    """Overnight-restart morning: scheduler was off, zero scan_cycle rows
+    exist for today. The first preflight call after the 09:30 grace window
+    must not deadlock the skill — it should PASS so the first scan cycle
+    can fire and populate the audit table.
+    """
+    from services import preflight_service
+
+    # 10:30 IST — past the 09:30 grace cutoff, still well inside market.
+    fresh_morning = IST.localize(dt.datetime(2026, 5, 28, 10, 30, 0))
+    preflight_env.monkeypatch.setattr(
+        "services.preflight_service._now_ist", lambda: fresh_morning
+    )
+    _set_intent("live")
+    # No scan_cycle rows for today (or any day) — this is the bug scenario.
+
+    result = preflight_service.run_preflight()
+
+    assert result["checks"]["recent_cycles"]["ok"] is True
+    assert result["checks"]["recent_cycles"]["last_cycle_at"] is None
+    assert "no cycles today" in result["checks"]["recent_cycles"]["reason"]
+    assert result["go_decision"] == "go"
+
+
+# ---------------------------------------------------------------------------
+# 6c. Stale day: cycles fired earlier today but last one is > threshold → ABORT
+# ---------------------------------------------------------------------------
+
+
+def test_recent_cycles_aborts_when_cycles_existed_but_stale(preflight_env):
+    """Genuine scheduler stall: cycles fired earlier today, but the most
+    recent one is past the staleness threshold. This is the case the gate
+    is meant to catch, and must keep aborting after the fresh-start fix.
+    """
+    from services import preflight_service
+
+    # 11:30 IST.
+    now = IST.localize(dt.datetime(2026, 5, 28, 11, 30, 0))
+    preflight_env.monkeypatch.setattr(
+        "services.preflight_service._now_ist", lambda: now
+    )
+    _set_intent("live")
+    # One cycle at 10:30 today — 60 min before fake_now 11:30, well past
+    # the 30 min threshold. (10:30 is also after the real-wall-clock 24h
+    # cutoff used by get_recent_cycles, so the row survives the read.)
+    earlier = IST.localize(dt.datetime(2026, 5, 28, 10, 30, 0))
+    _insert_cycle(preflight_env.scdb, earlier.isoformat())
+
+    result = preflight_service.run_preflight()
+
+    assert result["checks"]["recent_cycles"]["ok"] is False
+    assert result["checks"]["recent_cycles"]["minutes_since"] == 60
+    assert "scheduler may be stalled" in result["checks"]["recent_cycles"]["reason"]
+    assert result["go_decision"] == "abort"
+
+
+# ---------------------------------------------------------------------------
+# 6d. Recent cycle path — explicit focused assertion on recent_cycles only
+# ---------------------------------------------------------------------------
+
+
+def test_recent_cycles_passes_when_recent_cycle(preflight_env):
+    """One cycle 5 minutes ago — the normal mid-session state. Already
+    covered indirectly by ``test_all_checks_pass_yields_go``; this focuses
+    the assertion on the ``recent_cycles`` sub-check so a regression there
+    fails this test first."""
+    from services import preflight_service
+
+    _set_intent("live")
+    recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))  # 5 min ago
+    _insert_cycle(preflight_env.scdb, recent.isoformat())
+
+    result = preflight_service.run_preflight()
+
+    assert result["checks"]["recent_cycles"]["ok"] is True
+    assert result["checks"]["recent_cycles"]["minutes_since"] == 5
+    assert result["checks"]["recent_cycles"]["last_cycle_at"] == recent.isoformat()
+
+
+# ---------------------------------------------------------------------------
 # 7. Outside market hours → recent_cycles always OK
 # ---------------------------------------------------------------------------
 
