@@ -973,3 +973,49 @@ def test_recent_cycles_existing_recent_scan_cycle_still_passes_normally(
     assert "preflight_heartbeats_in_window" not in result["checks"]["recent_cycles"]
     assert result["checks"]["recent_cycles"]["reason"] is None
     assert result["go_decision"] == "go"
+
+
+# ---------------------------------------------------------------------------
+# Daily circuit breaker integration
+# ---------------------------------------------------------------------------
+
+
+def test_daily_circuit_breaker_trips_yields_abort(preflight_env):
+    """When risk_service trips, preflight must abort with a daily-limits reason."""
+    from services import preflight_service
+
+    _set_intent("live")
+    recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
+    _insert_cycle(preflight_env.scdb, recent.isoformat())
+
+    preflight_env.monkeypatch.setattr(
+        "services.risk_service.daily_circuit_breaker_tripped",
+        lambda: (True, "daily limits: 3 losses today (max 3)"),
+    )
+
+    result = preflight_service.run_preflight()
+
+    assert result["ok"] is False
+    assert result["go_decision"] == "abort"
+    assert result["checks"]["daily_circuit_breaker"]["ok"] is False
+    assert result["checks"]["daily_circuit_breaker"]["tripped"] is True
+    assert any("daily limits" in r for r in result["reasons"])
+
+
+def test_daily_circuit_breaker_clear_does_not_block(preflight_env):
+    """Happy-path fixture already has the breaker clear (no engine running).
+
+    Regression guard: the breaker check defaults to ok=True when the engine
+    is unavailable, so the preflight go-path must still resolve to go.
+    """
+    from services import preflight_service
+
+    _set_intent("live")
+    recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
+    _insert_cycle(preflight_env.scdb, recent.isoformat())
+
+    result = preflight_service.run_preflight()
+
+    assert result["go_decision"] == "go"
+    assert result["checks"]["daily_circuit_breaker"]["ok"] is True
+    assert result["checks"]["daily_circuit_breaker"]["tripped"] is False

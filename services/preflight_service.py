@@ -523,6 +523,26 @@ def _write_preflight_heartbeat(status: str, detail: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _check_daily_circuit_breaker() -> dict:
+    """Has today's realized P&L tripped the Stage-0 daily circuit breaker?
+
+    Delegates to :func:`services.risk_service.daily_circuit_breaker_tripped`.
+    That helper is fail-safe — a data read error returns ``(False, "")`` so
+    preflight is never blocked because the metric source is unavailable.
+    """
+    try:
+        from services.risk_service import daily_circuit_breaker_tripped
+
+        tripped, reason = daily_circuit_breaker_tripped()
+    except Exception as e:
+        logger.warning("preflight: circuit-breaker check raised: %s", e)
+        return {"ok": True, "tripped": False, "reason": None}
+
+    if tripped:
+        return {"ok": False, "tripped": True, "reason": reason}
+    return {"ok": True, "tripped": False, "reason": None}
+
+
 def run_preflight() -> dict:
     """Evaluate all preflight checks and return the structured response."""
     now = _now_ist()
@@ -533,6 +553,7 @@ def run_preflight() -> dict:
     recent_cycles = _check_recent_cycles(now)
     broker_session = _check_broker_session()
     recent_errors = _check_recent_errors(now)
+    daily_circuit_breaker = _check_daily_circuit_breaker()
 
     checks = {
         "intent": intent,
@@ -540,6 +561,7 @@ def run_preflight() -> dict:
         "recent_cycles": recent_cycles,
         "broker_session": broker_session,
         "recent_errors": recent_errors,
+        "daily_circuit_breaker": daily_circuit_breaker,
     }
 
     reasons = [c["reason"] for c in checks.values() if not c["ok"] and c.get("reason")]

@@ -488,6 +488,24 @@ class SimplifiedStockEngineService:
     def _place_entry_order(
         self, signal: EntrySignal, api_key: str, strategy_name: str
     ) -> None:
+        # Stage-0 daily circuit breaker. Sits *before* the disabled-mode
+        # short-circuit so disabled-mode tracing also respects the gate (so
+        # an operator can see "engine would have skipped this anyway").
+        # Fail-safe: a metric read error returns (False, "") and we proceed
+        # as if the gate is clear — see services/risk_service.py.
+        from services.risk_service import daily_circuit_breaker_tripped
+
+        tripped, reason = daily_circuit_breaker_tripped()
+        if tripped:
+            logger.warning(
+                "[SIMPLIFIED-RISK] Entry blocked for %s by daily circuit breaker: %s",
+                signal.symbol,
+                reason,
+            )
+            with self._lock:
+                self.engine.clear_pending_entry(signal.symbol)
+            return
+
         if self.mode == MODE_DISABLED:
             logger.info(
                 "[SIMPLIFIED-DISABLED] %s %s qty=%s ref=%.2f (no order sent)",
