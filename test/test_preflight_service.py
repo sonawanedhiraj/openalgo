@@ -720,3 +720,104 @@ def test_is_test_source_entry_helper_unit_cases():
 
     for entry, expected, label in cases:
         assert _is_test_source_entry(entry) is expected, label
+
+
+def test_excludes_synthetic_order_id_marker():
+    """``OID-\\d+`` in the message flags an entry as test-source.
+
+    Real broker order IDs are bare 16-digit numbers (e.g. ``250528000123``)
+    — the ``OID-`` prefix is only ever produced by test fixtures.
+    """
+    from services.preflight_service import _is_test_source_entry
+
+    e1 = {"logger": "services.engine", "message": "synthetic order OID-1 placed"}
+    e2 = {"logger": "services.engine", "message": "rejecting OID-42 in dry-run"}
+    assert _is_test_source_entry(e1) is True
+    assert _is_test_source_entry(e2) is True
+
+
+def test_excludes_python_locals_qualified_name():
+    """``<locals>.`` (with trailing dot) flags an entry as test-source.
+
+    Qualified names like ``test_foo.<locals>.<lambda>`` appear when a
+    function (often a lambda) is defined inside another function — the
+    canonical shape of a test fixture.
+    """
+    from services.preflight_service import _is_test_source_entry
+
+    in_message = {
+        "logger": "services.signal_review",
+        "message": "callback test_tradebook_falls_through.<locals>.<lambda> raised",
+    }
+    in_traceback = {
+        "logger": "services.signal_review",
+        "message": "unhandled exception",
+        "exception": [
+            "Traceback (most recent call last):\n",
+            '  File "x.py", line 1, in test_foo.<locals>.inner\n',
+            "RuntimeError\n",
+        ],
+    }
+    assert _is_test_source_entry(in_message) is True
+    assert _is_test_source_entry(in_traceback) is True
+
+
+def test_excludes_lambda_marker():
+    """``<lambda>`` in the message flags an entry as test-source.
+
+    Lambda mocks are an overwhelmingly test-suite construct; prod code
+    rarely surfaces ``<lambda>`` in error messages.
+    """
+    from services.preflight_service import _is_test_source_entry
+
+    entry = {
+        "logger": "services.engine",
+        "message": "callback <lambda> raised RuntimeError",
+    }
+    assert _is_test_source_entry(entry) is True
+
+
+def test_does_not_exclude_real_stock_symbols():
+    """Regression guard — real stock symbols in messages must NOT be filtered.
+
+    Symbol names like ``RELIANCE`` can appear in genuine prod errors;
+    excluding them would silently mask real failures.
+    """
+    from services.preflight_service import _is_test_source_entry
+
+    entry = {
+        "logger": "services.order_router",
+        "message": "RELIANCE order placement failed: insufficient funds",
+    }
+    assert _is_test_source_entry(entry) is False
+
+
+def test_does_not_exclude_real_broker_order_id():
+    """Regression guard — bare 16-digit broker order IDs must NOT be filtered.
+
+    Real broker order IDs (e.g. ``250528000123``) have no ``OID-`` prefix
+    and must remain visible to the preflight gate.
+    """
+    from services.preflight_service import _is_test_source_entry
+
+    entry = {
+        "logger": "broker.zerodha",
+        "message": "order 250528000123 rejected by exchange",
+    }
+    assert _is_test_source_entry(entry) is False
+
+
+def test_does_not_exclude_real_aggregator_failure():
+    """Regression guard — aggregator failures must NOT be filtered.
+
+    ``MultiIntervalAggregator on_bar_close raised for RELIANCE/5m`` could
+    happen in prod if a real callback raises; the preflight gate must
+    still surface it.
+    """
+    from services.preflight_service import _is_test_source_entry
+
+    entry = {
+        "logger": "services.aggregator",
+        "message": "MultiIntervalAggregator on_bar_close raised for RELIANCE/5m",
+    }
+    assert _is_test_source_entry(entry) is False

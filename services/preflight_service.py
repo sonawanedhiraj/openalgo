@@ -21,6 +21,7 @@ Design rules:
 
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from datetime import time as dtime
 from pathlib import Path
@@ -61,6 +62,20 @@ _TEST_MESSAGE_MARKERS = (
     "simulated downstream failure",
     "bogus-id",
 )
+
+# Additional unambiguously test-only markers. These are safe because:
+#   * ``OID-\d+`` — synthetic test order IDs. Real broker order IDs are bare
+#     digit strings (e.g. ``250528000123``); the ``OID-`` prefix never appears
+#     in legitimate prod errors.
+#   * ``<locals>.`` — Python qualified-name fragment emitted when a function
+#     is defined inside another function. The trailing dot distinguishes it
+#     from accidental matches; prod code does not nest functions in a way
+#     that surfaces this fragment in error messages, but test fixtures do
+#     (lambdas/closures defined inside test bodies).
+#   * ``<lambda>`` — test fixtures routinely use lambda mocks; prod code
+#     paths rarely surface ``<lambda>`` in error messages.
+_TEST_SYNTHETIC_OID_RE = re.compile(r"OID-\d+")
+_TEST_QUALNAME_MARKERS = ("<locals>.", "<lambda>")
 
 
 def _now_ist() -> datetime:
@@ -315,6 +330,10 @@ def _is_test_source_entry(entry: dict) -> bool:
         ``test_service`` are treated as real services, not tests
       * the message contains ``[pytest]`` or one of the known synthetic
         markers used by the regression suite
+      * the message matches ``OID-\\d+`` (synthetic test order id)
+      * the message or traceback contains ``<locals>.`` (Python qualified
+        name from a nested function — almost always a test fixture)
+      * the message contains ``<lambda>`` (lambda mock in a test fixture)
     """
     if not isinstance(entry, dict):
         return False
@@ -333,6 +352,9 @@ def _is_test_source_entry(entry: dict) -> bool:
         for marker in _TEST_TRACEBACK_MARKERS:
             if marker in tb_text:
                 return True
+        # ``<locals>.`` in a traceback frame is also a strong test signal.
+        if "<locals>." in tb_text:
+            return True
 
     logger_name = entry.get("logger") or ""
     if isinstance(logger_name, str):
@@ -348,6 +370,11 @@ def _is_test_source_entry(entry: dict) -> bool:
         for marker in _TEST_MESSAGE_MARKERS:
             if marker in message:
                 return True
+        for marker in _TEST_QUALNAME_MARKERS:
+            if marker in message:
+                return True
+        if _TEST_SYNTHETIC_OID_RE.search(message):
+            return True
 
     return False
 
