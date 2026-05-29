@@ -43,6 +43,25 @@ IST = pytz.timezone("Asia/Kolkata")
 # change.
 PREFLIGHT_CYCLE_ID_SENTINEL = 0
 
+# Default ceiling on ERROR-level entries in errors.jsonl per trailing hour.
+# Bumped 5 → 10 because real prod can occasionally throw under 10/hour
+# without being broken (e.g. transient broker hiccups). Configurable via
+# PREFLIGHT_MAX_ERRORS_LAST_HOUR.
+PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT = 10
+
+# Substring markers that flag an errors.jsonl entry as originating from the
+# test suite rather than a real production code path. Pytest runs land in
+# the same centralised errors.jsonl as prod errors, so the preflight rate
+# gate has to filter them out — otherwise a single test run can blow past
+# the threshold for the rest of the hour.
+_TEST_TRACEBACK_MARKERS = ("test/", "unittest/mock", "pytest")
+_TEST_MESSAGE_MARKERS = (
+    "[pytest]",
+    "engine blew up",
+    "simulated downstream failure",
+    "bogus-id",
+)
+
 
 def _now_ist() -> datetime:
     """Wall-clock now in IST. Monkeypatched by tests."""
@@ -281,8 +300,64 @@ def _parse_jsonl_ts(ts_raw: str) -> datetime | None:
         return None
 
 
+def _is_test_source_entry(entry: dict) -> bool:
+    """Heuristic: did this errors.jsonl entry come from the test suite?
+
+    Pytest runs land in the same centralised errors.jsonl as real prod
+    errors. We exclude entries whose traceback, logger, or message clearly
+    originated in tests so the preflight rate gate doesn't trip on test
+    noise.
+
+    Matches if ANY of:
+      * the traceback contains ``test/``, ``unittest/mock``, or ``pytest``
+      * the logger starts with ``test_`` and has at least two segments after
+        ``test_`` (e.g. ``test_signal_review``) — single-segment names like
+        ``test_service`` are treated as real services, not tests
+      * the message contains ``[pytest]`` or one of the known synthetic
+        markers used by the regression suite
+    """
+    if not isinstance(entry, dict):
+        return False
+
+    raw_tb = entry.get("exception")
+    if raw_tb is None:
+        raw_tb = entry.get("traceback")
+    if isinstance(raw_tb, list):
+        tb_text = "".join(str(s) for s in raw_tb)
+    elif isinstance(raw_tb, str):
+        tb_text = raw_tb
+    else:
+        tb_text = ""
+
+    if tb_text:
+        for marker in _TEST_TRACEBACK_MARKERS:
+            if marker in tb_text:
+                return True
+
+    logger_name = entry.get("logger") or ""
+    if isinstance(logger_name, str):
+        lname = logger_name.lower()
+        # Require at least two underscores total so single-segment service
+        # names ("test_service") aren't mistaken for pytest modules
+        # ("test_signal_review").
+        if lname.startswith("test_") and lname.count("_") >= 2:
+            return True
+
+    message = entry.get("message") or ""
+    if isinstance(message, str):
+        for marker in _TEST_MESSAGE_MARKERS:
+            if marker in message:
+                return True
+
+    return False
+
+
 def _count_recent_errors(errors_path: Path, now: datetime, window_minutes: int) -> int:
-    """Count entries in errors.jsonl whose ts is within the trailing window."""
+    """Count entries in errors.jsonl whose ts is within the trailing window.
+
+    Skips entries flagged by :func:`_is_test_source_entry` so the count
+    reflects production-relevant errors only.
+    """
     cutoff = now.replace(tzinfo=None) - timedelta(minutes=window_minutes)
     count = 0
     try:
@@ -295,14 +370,19 @@ def _count_recent_errors(errors_path: Path, now: datetime, window_minutes: int) 
                     obj = json.loads(line)
                 except (ValueError, json.JSONDecodeError):
                     continue
-                ts_raw = obj.get("ts") if isinstance(obj, dict) else None
+                if not isinstance(obj, dict):
+                    continue
+                ts_raw = obj.get("ts")
                 if not ts_raw:
                     continue
                 parsed = _parse_jsonl_ts(ts_raw)
                 if parsed is None:
                     continue
-                if parsed >= cutoff:
-                    count += 1
+                if parsed < cutoff:
+                    continue
+                if _is_test_source_entry(obj):
+                    continue
+                count += 1
     except OSError as e:
         logger.warning("preflight: errors.jsonl read failed (%s): %s", errors_path, e)
         return 0
@@ -311,7 +391,9 @@ def _count_recent_errors(errors_path: Path, now: datetime, window_minutes: int) 
 
 def _check_recent_errors(now: datetime) -> dict:
     """Is the ERROR rate in the last hour below threshold?"""
-    threshold = _env_int("PREFLIGHT_MAX_ERRORS_LAST_HOUR", 5)
+    threshold = _env_int(
+        "PREFLIGHT_MAX_ERRORS_LAST_HOUR", PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT
+    )
     log_dir = os.getenv("LOG_DIR", "log")
     errors_path = Path(log_dir) / "errors.jsonl"
 

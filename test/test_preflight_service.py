@@ -381,11 +381,11 @@ def test_recent_errors_threshold_breach(preflight_env):
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
-    # Write 6 errors within the last 60 min (threshold is 5).
+    # Write 11 errors within the last 60 min (default threshold is 10).
     # Note: errors.jsonl uses naive timestamps in the format
     # "YYYY-MM-DD HH:MM:SS" (local clock = IST on this host).
     entries = []
-    for minute in (0, 5, 10, 15, 20, 25):
+    for minute in (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 29):
         ts_naive = dt.datetime(2026, 5, 28, 11, minute, 0)
         entries.append({"ts": ts_naive.strftime("%Y-%m-%d %H:%M:%S"), "level": "ERROR"})
     _write_errors_jsonl(preflight_env.tmp_path, entries)
@@ -394,8 +394,8 @@ def test_recent_errors_threshold_breach(preflight_env):
 
     assert result["go_decision"] == "abort"
     assert result["checks"]["recent_errors"]["ok"] is False
-    assert result["checks"]["recent_errors"]["count_last_hour"] == 6
-    assert "6 errors in last hour" in result["checks"]["recent_errors"]["reason"]
+    assert result["checks"]["recent_errors"]["count_last_hour"] == 11
+    assert "11 errors in last hour" in result["checks"]["recent_errors"]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -499,3 +499,224 @@ def test_preflight_writes_error_heartbeat_on_abort(preflight_env):
     parsed = json.loads(rows[0].detail)
     assert parsed["go_decision"] == "abort"
     assert any("no daily_intent" in r for r in parsed["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# 11. Test-source entry filtering — keep pytest noise out of the rate gate
+# ---------------------------------------------------------------------------
+
+
+def _ts(minute: int) -> str:
+    """Naive ts string inside the last hour (fake_now is 11:30 IST)."""
+    return dt.datetime(2026, 5, 28, 11, minute, 0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_recent_errors_excludes_pytest_traceback_entries(preflight_env):
+    """Tracebacks pointing at ``test/test_*.py`` are excluded from the count."""
+    from services import preflight_service
+
+    prod = [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "broker.zerodha",
+            "message": "broker hiccup",
+        }
+        for m in (1, 7, 13)
+    ]
+    test_entries = [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "services.signal_review",
+            "message": "AssertionError",
+            "exception": [
+                "Traceback (most recent call last):\n",
+                f'  File "test/test_foo.py", line {m}, in test_thing\n',
+                "AssertionError\n",
+            ],
+        }
+        for m in (2, 3, 4, 5, 6, 8, 9, 10)
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, prod + test_entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["ok"] is True
+    assert result["count_last_hour"] == 3
+
+
+def test_recent_errors_excludes_unittest_mock_entries(preflight_env):
+    """Tracebacks routed through ``unittest/mock`` are excluded."""
+    from services import preflight_service
+
+    entries = [
+        {
+            "ts": _ts(1),
+            "level": "ERROR",
+            "logger": "services.engine",
+            "message": "real prod blowup",
+        }
+    ] + [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "services.engine",
+            "message": "mocked side effect",
+            "exception": [
+                "Traceback (most recent call last):\n",
+                '  File "unittest/mock.py", line 1, in __call__\n',
+                "RuntimeError: boom\n",
+            ],
+        }
+        for m in (2, 3, 4, 5)
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["ok"] is True
+    assert result["count_last_hour"] == 1
+
+
+def test_recent_errors_excludes_logger_starting_with_test_(preflight_env):
+    """Entries whose logger looks like a pytest module are excluded."""
+    from services import preflight_service
+
+    entries = [
+        {"ts": _ts(1), "level": "ERROR", "logger": "broker.zerodha", "message": "x"},
+        {"ts": _ts(2), "level": "ERROR", "logger": "services.flow", "message": "y"},
+    ] + [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "test_signal_review",
+            "message": "synthetic",
+        }
+        for m in (3, 4, 5)
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["ok"] is True
+    assert result["count_last_hour"] == 2
+
+
+def test_recent_errors_excludes_synthetic_test_markers_in_message(preflight_env):
+    """Synthetic marker phrases in the message also flag an entry as test-source."""
+    from services import preflight_service
+
+    entries = [
+        {
+            "ts": _ts(1),
+            "level": "ERROR",
+            "logger": "services.engine",
+            "message": "simulated downstream failure",
+        }
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["ok"] is True
+    assert result["count_last_hour"] == 0
+
+
+def test_recent_errors_default_threshold_is_now_10(preflight_env):
+    """Default threshold bumped 5 → 10."""
+    from services import preflight_service
+
+    # No env override — exercise the default path explicitly.
+    preflight_env.monkeypatch.delenv("PREFLIGHT_MAX_ERRORS_LAST_HOUR", raising=False)
+
+    assert preflight_service.PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT == 10
+
+    # 7 prod entries — would have aborted under old default of 5, must pass now.
+    entries = [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "broker.zerodha",
+            "message": "transient",
+        }
+        for m in (1, 5, 10, 15, 20, 25, 28)
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["threshold"] == 10
+    assert result["count_last_hour"] == 7
+    assert result["ok"] is True
+
+
+def test_is_test_source_entry_helper_unit_cases():
+    """Table-driven coverage of :func:`_is_test_source_entry`."""
+    from services.preflight_service import _is_test_source_entry
+
+    pytest_tb = {
+        "logger": "root",
+        "message": "AssertionError",
+        "exception": [
+            "Traceback (most recent call last):\n",
+            '  File "test/test_preflight_service.py", line 1, in test_x\n',
+        ],
+    }
+    unittest_tb = {
+        "logger": "services.engine",
+        "exception": [
+            "Traceback (most recent call last):\n",
+            '  File "unittest/mock.py", line 1, in __call__\n',
+        ],
+    }
+    pytest_in_tb = {
+        "logger": "root",
+        "exception": ["pytest: collected 1 item\n", "RuntimeError\n"],
+    }
+    prod_db_err = {
+        "logger": "database.user_db",
+        "message": "no such column",
+        "exception": [
+            "Traceback (most recent call last):\n",
+            '  File "database/user_db.py", line 224, in find_user_by_username\n',
+            "sqlite3.OperationalError\n",
+        ],
+    }
+    prod_broker_err = {
+        "logger": "zerodha_websocket",
+        "message": "WebSocket error: Handshake status 403 Forbidden",
+    }
+    test_logger_strict = {
+        "logger": "test_signal_review",
+        "message": "fixture failure",
+    }
+    test_logger_single_segment = {
+        "logger": "test_service",
+        "message": "this is a real production service called test_service",
+    }
+    synthetic_marker = {
+        "logger": "services.engine",
+        "message": "engine blew up while replaying bogus-id",
+    }
+    plain_error = {
+        "logger": "services.flow",
+        "message": "regular runtime error from a flow node",
+    }
+    not_a_dict = "not a dict"
+
+    cases = [
+        (pytest_tb, True, "pytest traceback path"),
+        (unittest_tb, True, "unittest/mock traceback path"),
+        (pytest_in_tb, True, "'pytest' marker in traceback"),
+        (prod_db_err, False, "real DB error from prod"),
+        (prod_broker_err, False, "real broker error from prod"),
+        (test_logger_strict, True, "test_<word>_<word> logger"),
+        (test_logger_single_segment, False, "test_service is a real service"),
+        (synthetic_marker, True, "synthetic 'engine blew up' marker"),
+        (plain_error, False, "ordinary production error"),
+        (not_a_dict, False, "non-dict input is safe"),
+    ]
+
+    for entry, expected, label in cases:
+        assert _is_test_source_entry(entry) is expected, label
