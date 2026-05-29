@@ -115,6 +115,27 @@ def _set_intent(intent: str, date_str: str = "2026-05-28", set_by: str = "operat
     return set_daily_intent_safe(intent, set_by=set_by, date_str=date_str)
 
 
+def _insert_preflight_heartbeat(scdb, ts_iso: str, status: str = "ok") -> None:
+    """Direct-insert a stage='preflight' heartbeat row at a given ts.
+
+    Mirrors what ``_write_preflight_heartbeat`` does in production, but
+    lets a test plant heartbeats at arbitrary past/future timestamps to
+    exercise the heartbeat-fallback gate.
+    """
+    from services.preflight_service import PREFLIGHT_CYCLE_ID_SENTINEL
+
+    row = scdb.CycleHeartbeat(
+        cycle_id=PREFLIGHT_CYCLE_ID_SENTINEL,
+        stage="preflight",
+        ts=ts_iso,
+        status=status,
+        detail=None,
+    )
+    scdb.db_session.add(row)
+    scdb.db_session.commit()
+    scdb.db_session.remove()
+
+
 def _write_errors_jsonl(tmp_path, entries: list[dict]) -> None:
     path = tmp_path / "errors.jsonl"
     with path.open("w", encoding="utf-8") as f:
@@ -821,3 +842,134 @@ def test_does_not_exclude_real_aggregator_failure():
         "message": "MultiIntervalAggregator on_bar_close raised for RELIANCE/5m",
     }
     assert _is_test_source_entry(entry) is False
+
+
+# ---------------------------------------------------------------------------
+# 12. Preflight-heartbeat fallback — scheduler-liveness evidence
+# ---------------------------------------------------------------------------
+#
+# These tests do NOT rely on the shared fixture's date for the
+# ``get_recent_cycles`` window. ``get_recent_cycles`` uses real wallclock
+# for its 24h cutoff (a pre-existing fixture quirk, flagged for separate
+# cleanup), so rows inserted at the fixture's 2026-05-28 ``fake_now`` get
+# filtered out whenever today's real date drifts past it. We patch
+# ``get_recent_cycles`` locally in each test to anchor the cutoff to
+# ``fake_now`` and keep these tests deterministic.
+
+
+def _patch_get_recent_cycles_for_fake_now(preflight_env):
+    """Local-only patch: make ``get_recent_cycles`` use fake_now's cutoff.
+
+    Keeps these tests independent of today's real wallclock. The fixture
+    itself is unchanged — the date-drift fix in the shared fixture is
+    intentionally deferred to a separate cleanup commit.
+    """
+    fake_now = preflight_env.fake_now
+    scdb = preflight_env.scdb
+
+    def _fake_get_recent_cycles(hours: int = 24):
+        cutoff = (fake_now - dt.timedelta(hours=hours)).isoformat()
+        sess = scdb.db_session
+        try:
+            rows = (
+                sess.query(scdb.ScanCycle)
+                .filter(scdb.ScanCycle.started_at >= cutoff)
+                .order_by(scdb.ScanCycle.started_at.desc())
+                .all()
+            )
+            return [scdb._cycle_to_dict(r) for r in rows]
+        finally:
+            sess.remove()
+
+    preflight_env.monkeypatch.setattr(
+        "services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles
+    )
+
+
+def test_recent_cycles_passes_when_preflight_heartbeats_exist_even_without_recent_scan_cycle(
+    preflight_env,
+):
+    """Empty-screener day: scheduler is firing every cycle but neither
+    BUY nor SELL produces a symbol, so no webhook POST and no scan_cycle
+    row gets written. The freshness gate must NOT abort — preflight
+    heartbeats are direct evidence the scheduler is alive.
+    """
+    from services import preflight_service
+
+    _patch_get_recent_cycles_for_fake_now(preflight_env)
+    _set_intent("live")
+    # Last scan_cycle 45 min ago — would normally trip the staleness gate.
+    stale = IST.localize(dt.datetime(2026, 5, 28, 10, 45, 0))
+    _insert_cycle(preflight_env.scdb, stale.isoformat())
+
+    # 3 preflight heartbeats inside the 30-min window (11:20, 11:25, 11:28).
+    for minute in (20, 25, 28):
+        ts = IST.localize(dt.datetime(2026, 5, 28, 11, minute, 0)).isoformat()
+        _insert_preflight_heartbeat(preflight_env.scdb, ts)
+
+    result = preflight_service.run_preflight()
+
+    assert result["checks"]["recent_cycles"]["ok"] is True
+    assert result["checks"]["recent_cycles"]["preflight_heartbeats_in_window"] == 3
+    assert (
+        "preflight heartbeats present"
+        in result["checks"]["recent_cycles"]["reason"]
+    )
+    # The stale scan_cycle is still reported in the diagnostic fields.
+    assert result["checks"]["recent_cycles"]["minutes_since"] == 45
+    assert result["go_decision"] == "go"
+
+
+def test_recent_cycles_aborts_when_no_scan_cycle_and_no_recent_preflight_heartbeats(
+    preflight_env,
+):
+    """Genuine scheduler death: last scan_cycle 45 min ago AND no preflight
+    heartbeats in the staleness window. With both liveness signals absent,
+    the gate must still abort — the fallback only bypasses when heartbeats
+    are actually present.
+    """
+    from services import preflight_service
+
+    _patch_get_recent_cycles_for_fake_now(preflight_env)
+    _set_intent("live")
+    # Stale scan_cycle 45 min ago.
+    stale = IST.localize(dt.datetime(2026, 5, 28, 10, 45, 0))
+    _insert_cycle(preflight_env.scdb, stale.isoformat())
+
+    # One preflight heartbeat 50 min ago — outside the 30-min window, so
+    # the fallback must not credit it as liveness evidence.
+    old_ts = IST.localize(dt.datetime(2026, 5, 28, 10, 40, 0)).isoformat()
+    _insert_preflight_heartbeat(preflight_env.scdb, old_ts)
+
+    result = preflight_service.run_preflight()
+
+    assert result["checks"]["recent_cycles"]["ok"] is False
+    assert result["checks"]["recent_cycles"]["minutes_since"] == 45
+    assert "scheduler may be stalled" in result["checks"]["recent_cycles"]["reason"]
+    assert "preflight_heartbeats_in_window" not in result["checks"]["recent_cycles"]
+    assert result["go_decision"] == "abort"
+
+
+def test_recent_cycles_existing_recent_scan_cycle_still_passes_normally(
+    preflight_env,
+):
+    """Regression guard: a fresh scan_cycle 5 min ago must pass via the
+    existing path (minutes_since < threshold), not via the heartbeat
+    fallback. ``preflight_heartbeats_in_window`` should NOT appear in the
+    response — the fallback only triggers on the stale branch.
+    """
+    from services import preflight_service
+
+    _patch_get_recent_cycles_for_fake_now(preflight_env)
+    _set_intent("live")
+    recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))  # 5 min ago
+    _insert_cycle(preflight_env.scdb, recent.isoformat())
+    # No preflight heartbeats inserted — recent scan_cycle alone must suffice.
+
+    result = preflight_service.run_preflight()
+
+    assert result["checks"]["recent_cycles"]["ok"] is True
+    assert result["checks"]["recent_cycles"]["minutes_since"] == 5
+    assert "preflight_heartbeats_in_window" not in result["checks"]["recent_cycles"]
+    assert result["checks"]["recent_cycles"]["reason"] is None
+    assert result["go_decision"] == "go"

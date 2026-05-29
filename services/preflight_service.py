@@ -161,6 +161,11 @@ def _check_recent_cycles(now: datetime) -> dict:
     * Inside market hours with no cycles yet AND current time before the
       first-cycle grace cutoff → OK (legacy guard, retained for cases where
       cycles_since() can't be evaluated).
+    * Inside market hours with a stale last cycle → consult preflight
+      heartbeats. The webhook only writes a scan_cycle row when at least
+      one symbol is found; an all-empty-screener day produces zero rows
+      even though the scheduler is firing on schedule. If preflight
+      heartbeats land within the window, the scheduler is alive — OK.
     * Inside market hours otherwise → require a cycle within the threshold.
     """
     threshold = _env_int("PREFLIGHT_STALE_CYCLE_MINUTES", 30)
@@ -233,6 +238,26 @@ def _check_recent_cycles(now: datetime) -> dict:
         return {**base, "ok": False, "reason": stale_reason}
 
     if minutes_since is None or minutes_since > threshold:
+        # The webhook only writes a scan_cycle row when at least one symbol
+        # is found, so an empty-screener day produces no rows even though
+        # the scheduler is alive. Fall back to preflight heartbeats — they
+        # land every cycle regardless of signal count.
+        window_start = (now - timedelta(minutes=threshold)).isoformat()
+        try:
+            hb_count = scan_cycle_service.preflight_heartbeats_since(window_start)
+        except Exception as e:
+            logger.warning("preflight: preflight_heartbeats_since failed: %s", e)
+            hb_count = 0
+        if hb_count > 0:
+            return {
+                **base,
+                "ok": True,
+                "preflight_heartbeats_in_window": hb_count,
+                "reason": (
+                    "preflight heartbeats present; scheduler alive but no "
+                    "signals matched"
+                ),
+            }
         return {**base, "ok": False, "reason": stale_reason}
 
     return {**base, "ok": True, "reason": None}

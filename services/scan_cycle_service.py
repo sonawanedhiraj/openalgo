@@ -217,3 +217,33 @@ def cycles_since(iso_ts: str) -> int:
         )
     finally:
         sess.remove()
+
+
+def preflight_heartbeats_since(iso_ts: str) -> int:
+    """Count ``cycle_heartbeat`` rows where stage='preflight' and ts >= iso_ts.
+
+    Used by the preflight freshness gate as a fallback liveness signal: an
+    empty-screener cycle never POSTs to the engine webhook and so never
+    writes a scan_cycle row, but preflight still fires every cycle. If
+    recent preflight heartbeats exist, the scheduler is alive — abort
+    would only mask a quiet market.
+
+    Fail-safe to 0 on DB error — preflight must never block because we
+    can't observe heartbeat state.
+    """
+    sess = _session()
+    try:
+        return (
+            sess.query(CycleHeartbeat)
+            .filter(CycleHeartbeat.stage == "preflight")
+            .filter(CycleHeartbeat.ts >= iso_ts)
+            .count()
+        )
+    except Exception as e:
+        logger.warning("scan_cycle.preflight_heartbeats_since failed: %s", e)
+        return 0
+    finally:
+        try:
+            sess.remove()
+        except Exception:
+            pass
