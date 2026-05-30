@@ -19,6 +19,15 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+# Pre-resolve the restx_api / services.place_order_service circular import
+# before any test does ``from services import place_order_service``. The
+# project-root conftest no longer eagerly loads restx_api (see conftest.py
+# for why), so the tests that participate in the cycle now take care of it
+# themselves. ``import sandbox`` in conftest already pinned the project-root
+# sandbox package, so this import still resolves submodules correctly even
+# after pytest has added test/ to sys.path.
+import restx_api  # noqa: E402, F401
+
 
 @pytest.fixture
 def fresh_intent_db(monkeypatch):

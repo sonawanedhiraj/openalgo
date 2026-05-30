@@ -9,6 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
+# Pre-resolve the restx_api / services.place_order_service circular import
+# before pulling in services.X below. Without this, services.place_order_service
+# imports restx_api.schemas which re-enters services.place_order_service via
+# services.options_multiorder_service and trips a partial-init ImportError.
+# See conftest.py for the full description of the cycle.
+import restx_api  # noqa: F401, E402
 import services.place_order_service  # noqa: F401 — eager bind for mock.patch
 import services.sandbox_service  # noqa: F401 — eager bind for mock.patch
 from services.simplified_stock_engine_core import (

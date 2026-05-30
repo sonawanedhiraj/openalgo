@@ -437,6 +437,7 @@ def test_broker_session_skip_when_no_primitive_available(monkeypatch):
     import sys
 
     import database
+    import database.auth_db  # noqa: F401 — ensure attr is bound before stubbing
     from services import preflight_service
 
     class _RaisingAuthModule:
@@ -453,9 +454,12 @@ def test_broker_session_skip_when_no_primitive_available(monkeypatch):
             raise RuntimeError(f"simulated: '{name}' unavailable")
 
     stub = _RaisingAuthModule()
-    # ``from database import auth_db`` resolves via the package attribute
-    # first (set by the conftest's eager import graph), so swap both that
-    # and sys.modules to be safe.
+    # ``from database import auth_db`` resolves via the package attribute,
+    # so swap both that and sys.modules to be safe. The eager
+    # ``import database.auth_db`` above guarantees the attribute exists on
+    # the ``database`` package object — needed since the project-root
+    # conftest no longer pre-imports the entire restx_api graph (which used
+    # to bind every services/database submodule as a side effect).
     monkeypatch.setattr(database, "auth_db", stub)
     monkeypatch.setitem(sys.modules, "database.auth_db", stub)
 
