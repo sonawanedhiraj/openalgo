@@ -94,6 +94,7 @@ from database.daily_intent_db import init_db as ensure_daily_intent_tables_exist
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
 from database.scanner_db import init_db as ensure_scanner_tables_exists
 from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
+from database.trade_journal_db import init_db as ensure_trade_journal_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -622,6 +623,7 @@ def setup_environment(app):
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),
+                ("Trade Journal DB", ensure_trade_journal_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
