@@ -37,6 +37,7 @@ from blueprints.broker_credentials import (
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
 from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
 from blueprints.preflight import preflight_bp  # Stage-0 go/no-go preflight gate
+from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
 from blueprints.core import core_bp
 from blueprints.dashboard import dashboard_bp
@@ -268,6 +269,7 @@ def create_app():
     app.register_blueprint(chartink_bp)
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
+    app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
     app.register_blueprint(traffic_bp)
     app.register_blueprint(latency_bp)
     app.register_blueprint(leverage_bp)  # Register Leverage blueprint
