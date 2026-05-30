@@ -556,6 +556,14 @@ class SimplifiedStockEngineService:
             with self._lock:
                 self.engine.clear_pending_entry(signal.symbol)
             self._mark_review_outcome(decision_id, taken=False)
+            self._notify_anomaly(
+                source="simplified_engine.entry_order",
+                message=(
+                    f"Entry order rejected for {signal.symbol} "
+                    f"({signal.action}): {response}"
+                ),
+                severity="error",
+            )
             return
 
         order_id = response.get("orderid")
@@ -591,6 +599,7 @@ class SimplifiedStockEngineService:
         )
         self._mark_review_outcome(decision_id, taken=True)
         self._journal_update_entry_fill(journal_id, entry_price=executed_price)
+        self._notify_trade_opened(signal, executed_price)
 
     def _run_pre_order_review(
         self, signal: EntrySignal, strategy_name: str
@@ -740,6 +749,117 @@ class SimplifiedStockEngineService:
                 journal_id,
             )
 
+    # ------------------------------------------------------------------
+    # Notification hooks (Stage 0/2 one-way Telegram). Every helper here
+    # MUST be fail-safe — a notification miss is recoverable; a missed
+    # exit isn't.
+    # ------------------------------------------------------------------
+
+    def _notify_trade_opened(self, signal: EntrySignal, executed_price: float) -> None:
+        try:
+            from services.notification_service import get_notification_service
+
+            direction = "LONG" if signal.action == DIRECTION_BUY else "SHORT"
+            get_notification_service().publish_trade_opened(
+                symbol=signal.symbol,
+                direction=direction,
+                quantity=int(signal.quantity),
+                entry_price=float(executed_price),
+                strategy=self.JOURNAL_STRATEGY_NAME,
+            )
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning(
+                "[SIMPLIFIED-ENTRY] notification publish failed for %s: %s",
+                signal.symbol, e,
+            )
+
+    def _notify_trade_closed(self, signal: ExitSignal, executed_price: float) -> None:
+        try:
+            from services import trade_journal_service
+            from services.notification_service import get_notification_service
+
+            # Re-read the row we just finalised so the notification carries
+            # the canonical entry_price / pnl / hold duration the journal
+            # service computed. Empty fields fall back to zeros — never
+            # raise on stale state.
+            recent = trade_journal_service.get_trades_for_symbol(
+                signal.symbol, days=1
+            )
+            row: dict = recent[0] if recent else {}
+            direction = (row.get("direction") or "").upper() or (
+                "LONG"
+                if str(getattr(signal, "action", "")).upper() in ("SELL",)
+                else "SHORT"
+            )
+            entry_price = float(row.get("entry_price") or 0.0)
+            pnl = float(row.get("pnl") or 0.0)
+            hold = int(row.get("hold_duration_seconds") or 0)
+            get_notification_service().publish_trade_closed(
+                symbol=signal.symbol,
+                direction=direction,
+                entry_price=entry_price,
+                exit_price=float(executed_price),
+                pnl=pnl,
+                exit_reason=str(signal.reason or "unknown"),
+                hold_duration_seconds=hold,
+            )
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning(
+                "[SIMPLIFIED-EXIT] notification publish failed for %s: %s",
+                signal.symbol, e,
+            )
+
+    def _notify_eod_summary(
+        self, trades_snapshot: list[CompletedTrade]
+    ) -> None:
+        try:
+            from services import trade_journal_service
+            from services.notification_service import get_notification_service
+
+            summary = trade_journal_service.get_today_summary()
+            if summary.get("count", 0) > 0:
+                get_notification_service().publish_eod_summary(
+                    trade_count=int(summary["count"]),
+                    winners=int(summary["winners"]),
+                    losers=int(summary["losers"]),
+                    net_pnl=float(summary["total_pnl"]),
+                    by_strategy=summary.get("by_strategy") or {},
+                )
+                return
+
+            # Journal read returned no rows. Fall back to the engine's
+            # in-memory ledger so the operator still gets a daily heartbeat.
+            net = sum(t.gross_pnl for t in trades_snapshot)
+            wins = sum(1 for t in trades_snapshot if t.gross_pnl > 0)
+            losses = sum(1 for t in trades_snapshot if t.gross_pnl < 0)
+            get_notification_service().publish_eod_summary(
+                trade_count=len(trades_snapshot),
+                winners=wins,
+                losers=losses,
+                net_pnl=float(net),
+                by_strategy={
+                    self.JOURNAL_STRATEGY_NAME: {
+                        "count": len(trades_snapshot),
+                        "pnl": float(net),
+                    }
+                },
+            )
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning("[SIMPLIFIED-EOD-SUMMARY] notification publish failed: %s", e)
+
+    def _notify_anomaly(self, *, source: str, message: str, severity: str) -> None:
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().publish_anomaly(
+                source=source, message=message, severity=severity
+            )
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning(
+                "[SIMPLIFIED-ANOMALY] notification publish failed (source=%s): %s",
+                source, e,
+            )
+
     def _journal_record_exit(
         self,
         symbol: str,
@@ -802,6 +922,14 @@ class SimplifiedStockEngineService:
             logger.error("[SIMPLIFIED-EXIT] Order failed for %s: %s", signal.symbol, response)
             with self._lock:
                 self.engine.clear_pending_exit(signal.symbol)
+            self._notify_anomaly(
+                source="simplified_engine.exit_order",
+                message=(
+                    f"Exit order rejected for {signal.symbol} "
+                    f"(reason={signal.reason}): {response}"
+                ),
+                severity="error",
+            )
             return
 
         order_id = response.get("orderid")
@@ -833,6 +961,7 @@ class SimplifiedStockEngineService:
             exit_order_id=order_id,
             exit_reason=signal.reason,
         )
+        self._notify_trade_closed(signal, executed_price)
 
     def _dispatch_order(
         self, payload: dict[str, Any], api_key: str, *, is_entry: bool
@@ -1125,6 +1254,13 @@ class SimplifiedStockEngineService:
         lines = self._build_eod_summary_lines(trades_snapshot, now.date())
         # Single multi-line log entry so it's easy to find in error.jsonl / files.
         logger.info("[SIMPLIFIED-EOD-SUMMARY]\n%s", "\n".join(lines))
+
+        # Fail-safe Telegram fan-out. The journal-derived aggregate is the
+        # canonical source of truth (handles partial fills, rejected exits,
+        # multi-leg trades) — the engine's in-memory completed_trades is just
+        # a hot-path mirror. If the journal read fails, fall back to a
+        # minimal payload built from the snapshot above.
+        self._notify_eod_summary(trades_snapshot)
 
     def _build_eod_summary_lines(
         self, trades: list[CompletedTrade], today: dt.date

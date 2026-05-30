@@ -580,4 +580,15 @@ def run_preflight() -> dict:
         {"go_decision": response["go_decision"], "reasons": reasons},
     )
 
+    # Fail-safe operator notification on abort. Never block the response on a
+    # notification failure — the skill must still see go_decision='abort' and
+    # bail cleanly even if Telegram is down.
+    if not go:
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().publish_preflight_abort(reasons)
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning("preflight: notification publish failed: %s", e)
+
     return response

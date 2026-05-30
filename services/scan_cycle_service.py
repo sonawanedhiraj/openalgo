@@ -118,9 +118,19 @@ def complete_cycle(
     error_payload: dict | None = None,
     effective_mode: str | None = None,
     operator_intent: str | None = None,
+    cycle_kind: str | None = None,
 ) -> None:
     """Finalise the cycle row. No-op on cycle_id=-1 or DB failure."""
     if cycle_id is None or cycle_id < 0:
+        # Notification still fires for sentinel cycles — operator wants to
+        # see every cycle outcome regardless of audit-row availability.
+        _notify_cycle_summary(
+            cycle_kind=cycle_kind,
+            screener_buy=screener_buy,
+            screener_sell=screener_sell,
+            effective_mode=effective_mode,
+            post_status=post_status,
+        )
         return
 
     sess = _session()
@@ -146,6 +156,8 @@ def complete_cycle(
             row.effective_mode = effective_mode
         if operator_intent is not None:
             row.operator_intent = operator_intent
+        if cycle_kind is None:
+            cycle_kind = row.cycle_kind
 
         sess.commit()
     except Exception as e:
@@ -159,6 +171,39 @@ def complete_cycle(
             pass
     finally:
         sess.remove()
+
+    # Publish a one-way notification AFTER the audit commit so a notification
+    # failure can never block the audit write. Always fail-safe.
+    _notify_cycle_summary(
+        cycle_kind=cycle_kind,
+        screener_buy=screener_buy,
+        screener_sell=screener_sell,
+        effective_mode=effective_mode,
+        post_status=post_status,
+    )
+
+
+def _notify_cycle_summary(
+    *,
+    cycle_kind: str | None,
+    screener_buy: list[str] | None,
+    screener_sell: list[str] | None,
+    effective_mode: str | None,
+    post_status: str,
+) -> None:
+    """Fan out the cycle-summary notification. Never raises."""
+    try:
+        from services.notification_service import get_notification_service
+
+        get_notification_service().publish_cycle_summary(
+            cycle_kind=cycle_kind or "unknown",
+            buy_count=len(screener_buy or []),
+            sell_count=len(screener_sell or []),
+            effective_mode=effective_mode or "unknown",
+            post_status=post_status,
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe by design
+        logger.warning("scan_cycle._notify_cycle_summary failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
