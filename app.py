@@ -111,6 +111,16 @@ from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
 from services.telegram_bot_service import telegram_bot_service
+
+# Stage 1.5: importing the package triggers self-registration of every
+# strategy declared under strategies/<name>/strategy.py. Today this is just
+# ``trending_equity_intraday`` (a thin adapter around the legacy
+# SimplifiedStockEngine — see strategies/__init__.py); future strategies
+# will land here too. The simplified engine itself is still instantiated
+# lazily via get_simplified_stock_engine_service(); this import only
+# populates the registry so callers (the upcoming multi-strategy router,
+# Stage 1.7's regime-profile reviewer) can enumerate available strategies.
+import strategies  # noqa: F401
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
 from utils.logging import (  # Import centralized logging
