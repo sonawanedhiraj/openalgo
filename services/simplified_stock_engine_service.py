@@ -559,6 +559,13 @@ class SimplifiedStockEngineService:
             return
 
         order_id = response.get("orderid")
+
+        # Stage 2 — write the trade-journal entry row now that the broker has
+        # accepted the order. Belt-and-braces try/except: the service layer
+        # is already fail-safe but the order path must never break on an
+        # audit miss.
+        journal_id = self._journal_record_entry(signal, decision_id, order_id)
+
         executed_price = self._wait_for_fill(api_key, strategy_name, order_id)
         if executed_price is None:
             logger.warning(
@@ -572,6 +579,9 @@ class SimplifiedStockEngineService:
             # Order was sent to the broker even if we couldn't confirm the
             # fill — flag actually_taken=True so the audit row reflects reality.
             self._mark_review_outcome(decision_id, taken=True)
+            # Stamp the fill-attempt timestamp so reflection can tell apart
+            # "order placed, fill never confirmed" from "order never sent."
+            self._journal_update_entry_fill(journal_id, entry_price=None)
             return
 
         with self._lock:
@@ -580,6 +590,7 @@ class SimplifiedStockEngineService:
             "[SIMPLIFIED-ENTRY] Position created (mode=%s): %s", self.mode, position
         )
         self._mark_review_outcome(decision_id, taken=True)
+        self._journal_update_entry_fill(journal_id, entry_price=executed_price)
 
     def _run_pre_order_review(
         self, signal: EntrySignal, strategy_name: str
@@ -661,6 +672,110 @@ class SimplifiedStockEngineService:
                 decision_id,
             )
 
+    # ------------------------------------------------------------------
+    # Stage 2 — trade-journal write hooks
+    #
+    # These wrap the trade_journal_service helpers (which are themselves
+    # fail-safe) in another try/except so a bug in the journal module can
+    # never block order placement or exit handling. The journal write is
+    # informational; trade execution is the source of truth.
+    #
+    # The engine's runtime identity for the journal is the registered
+    # strategy name (``trending_equity_intraday``). The chartink-supplied
+    # strategy label is kept on the broker order payload but not in the
+    # journal — reflection groups by the strategy implementation, not by
+    # the screener tag that armed it.
+    # ------------------------------------------------------------------
+
+    JOURNAL_STRATEGY_NAME = "trending_equity_intraday"
+
+    @staticmethod
+    def _normalize_exit_reason(reason: str | None) -> str:
+        """Map engine exit reasons to the journal's controlled vocabulary."""
+        if not reason:
+            return "other"
+        if reason == "eod":
+            return "eod_squareoff"
+        return reason
+
+    def _journal_record_entry(
+        self, signal: EntrySignal, decision_id: int | None, order_id: str | None
+    ) -> int:
+        """Best-effort journal entry insert. Returns the new row id (or 0)."""
+        try:
+            from services import trade_journal_service
+
+            return trade_journal_service.record_entry(
+                symbol=signal.symbol,
+                direction="LONG" if signal.action == DIRECTION_BUY else "SHORT",
+                quantity=int(signal.quantity),
+                strategy_name=self.JOURNAL_STRATEGY_NAME,
+                signal_source="chartink",
+                entry_price=float(signal.reference_price),
+                entry_order_id=str(order_id) if order_id else None,
+                signal_decision_id=decision_id,
+            )
+        except Exception:
+            logger.exception(
+                "[SIMPLIFIED-ENTRY] trade_journal.record_entry hook failed for %s",
+                signal.symbol,
+            )
+            return 0
+
+    def _journal_update_entry_fill(
+        self, journal_id: int, entry_price: float | None
+    ) -> None:
+        """Best-effort journal fill update."""
+        if not journal_id:
+            return
+        try:
+            from services import trade_journal_service
+
+            trade_journal_service.update_entry_fill(
+                journal_id, entry_price=entry_price
+            )
+        except Exception:
+            logger.exception(
+                "[SIMPLIFIED-ENTRY] trade_journal.update_entry_fill hook failed for jid=%s",
+                journal_id,
+            )
+
+    def _journal_record_exit(
+        self,
+        symbol: str,
+        *,
+        exit_price: float | None,
+        exit_order_id: str | None,
+        exit_reason: str | None,
+    ) -> None:
+        """Best-effort journal exit close-out. Looks up the open row for
+        ``symbol`` and stamps the exit columns.
+        """
+        try:
+            from services import trade_journal_service
+
+            journal_id = trade_journal_service.get_open_journal_id_for_symbol(symbol)
+            if not journal_id:
+                # Nothing to close out — likely the entry write was lost or
+                # the symbol was opened before journaling went live. Don't
+                # treat this as an error; just trace and move on.
+                logger.info(
+                    "[SIMPLIFIED-EXIT] No open journal row for %s; skipping exit write",
+                    symbol,
+                )
+                return
+            trade_journal_service.record_exit(
+                journal_id,
+                exit_price=exit_price,
+                exit_order_id=str(exit_order_id) if exit_order_id else None,
+                exit_reason=self._normalize_exit_reason(exit_reason),
+            )
+        except Exception:
+            logger.exception(
+                "[SIMPLIFIED-EXIT] trade_journal.record_exit hook failed for %s",
+                symbol,
+            )
+
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
         if self.mode == MODE_DISABLED:
             logger.info(
@@ -677,6 +792,8 @@ class SimplifiedStockEngineService:
                     exit_price=signal.reference_price,
                     reason=signal.reason,
                 )
+            # Disabled mode doesn't send an order, so no journal entry was
+            # written at entry time either — skip the exit write too.
             return
 
         payload = self._order_payload(signal, strategy_name)
@@ -708,6 +825,13 @@ class SimplifiedStockEngineService:
             signal.reason,
             executed_price,
             self.mode,
+        )
+        # Stage 2 — close out the matching journal row.
+        self._journal_record_exit(
+            signal.symbol,
+            exit_price=executed_price,
+            exit_order_id=order_id,
+            exit_reason=signal.reason,
         )
 
     def _dispatch_order(
