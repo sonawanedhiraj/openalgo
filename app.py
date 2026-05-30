@@ -676,6 +676,40 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
 
+            # Scanner service (Stage 1.5 item 5) — gated by SCANNER_ENABLED.
+            # Off by default. When enabled, it subscribes to the ZMQ tick bus
+            # and evaluates registered scan rules against incoming bars; it
+            # does NOT touch the engine's order path (item 6 wires the
+            # webhook poster as a scan_hit consumer).
+            try:
+                if os.environ.get("SCANNER_ENABLED", "false").lower() == "true":
+                    from services.scanner_service import ScannerService
+
+                    raw_symbols = os.environ.get("SCANNER_SYMBOLS", "")
+                    symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+                    if not symbols:
+                        logger.warning(
+                            "SCANNER_ENABLED=true but SCANNER_SYMBOLS is empty — "
+                            "scanner will idle (no symbols to watch)"
+                        )
+                    scanner_intervals = [
+                        i.strip()
+                        for i in os.environ.get("SCANNER_INTERVALS", "5m").split(",")
+                        if i.strip()
+                    ]
+                    app.scanner_service = ScannerService(
+                        symbols=symbols, intervals=scanner_intervals
+                    )
+                    app.scanner_service.start()
+                    logger.info(
+                        "Scanner service started (symbols=%d, intervals=%s)",
+                        len(symbols), scanner_intervals,
+                    )
+                else:
+                    logger.debug("Scanner service disabled (SCANNER_ENABLED!=true)")
+            except Exception as e:
+                logger.error(f"Failed to initialize Scanner service: {e}")
+
             # Auto-reconnect the WhatsApp bot if a paired session is persisted.
             # Without this, every server restart would leave is_ready()=False
             # and every /notify call would 409 "pair first" — even though the
