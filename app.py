@@ -710,6 +710,29 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Scanner service: {e}")
 
+            # Scan-hit webhook poster (Stage 1.5 item 6) — gated by
+            # SCAN_HIT_POSTER_ENABLED. Subscribes to ``scan_hit`` events
+            # emitted by the scanner above. Default mode is ``shadow`` —
+            # the consumer fires and logs but performs NO HTTP POST, so
+            # turning the scanner on does not by itself route signals into
+            # the engine. Operator flips to ``active`` via env + restart.
+            try:
+                if os.environ.get("SCAN_HIT_POSTER_ENABLED", "true").lower() == "true":
+                    from services.scan_hit_poster import ScanHitPoster
+
+                    app.scan_hit_poster = ScanHitPoster.from_env()
+                    app.scan_hit_poster.start()
+                    logger.info(
+                        "Scan-hit poster started (mode=%s)",
+                        app.scan_hit_poster.mode,
+                    )
+                else:
+                    logger.debug(
+                        "Scan-hit poster disabled (SCAN_HIT_POSTER_ENABLED!=true)"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to initialize Scan-hit poster: {e}")
+
             # Auto-reconnect the WhatsApp bot if a paired session is persisted.
             # Without this, every server restart would leave is_ready()=False
             # and every /notify call would 409 "pair first" — even though the

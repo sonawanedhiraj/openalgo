@@ -320,6 +320,10 @@ class ScanHitEvent(Event):
     symbol: str = ""
     interval: str = ""
     bar: dict[str, Any] = field(default_factory=dict)
+    # Row id of the freshly-written ``scan_results`` row (set by the scanner
+    # right after ``record_scan_result`` returns). 0 means the audit insert
+    # failed — consumers should treat that as "no row to update".
+    scan_result_id: int = 0
     topic: str = "scan_hit"
 
 
@@ -694,8 +698,9 @@ class ScannerService:
             if not matched:
                 continue
 
+            scan_result_id = 0
             try:
-                record_scan_result(
+                scan_result_id = record_scan_result(
                     scan_definition_id=int(definition["id"]),
                     symbols=[symbol],
                     source="inhouse",
@@ -717,6 +722,7 @@ class ScannerService:
                         symbol=symbol,
                         interval=interval,
                         bar=dict(bar),
+                        scan_result_id=int(scan_result_id or 0),
                     )
                 )
             except Exception:
