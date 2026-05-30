@@ -48,6 +48,27 @@ def app_with_preflight(monkeypatch, tmp_path):
     monkeypatch.setattr("services.preflight_service._now_ist", lambda: fake_now)
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
     monkeypatch.setenv("LOG_DIR", str(tmp_path))
+
+    # ``get_recent_cycles`` uses real wallclock for its 24h cutoff. Anchor it
+    # to fake_now so cycles inserted at the fixture date stay visible to the
+    # recent_cycles gate regardless of when this test runs.
+    def _fake_get_recent_cycles(hours: int = 24):
+        cutoff = (fake_now - dt.timedelta(hours=hours)).isoformat()
+        sess = scdb.db_session
+        try:
+            rows = (
+                sess.query(scdb.ScanCycle)
+                .filter(scdb.ScanCycle.started_at >= cutoff)
+                .order_by(scdb.ScanCycle.started_at.desc())
+                .all()
+            )
+            return [scdb._cycle_to_dict(r) for r in rows]
+        finally:
+            sess.remove()
+
+    monkeypatch.setattr(
+        "services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles
+    )
     monkeypatch.setattr(
         "services.preflight_service._check_broker_session",
         lambda: {

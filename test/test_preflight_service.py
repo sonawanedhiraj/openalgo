@@ -63,6 +63,29 @@ def preflight_env(monkeypatch, tmp_path):
     fake_now = IST.localize(dt.datetime(2026, 5, 28, 11, 30, 0))
     monkeypatch.setattr("services.preflight_service._now_ist", lambda: fake_now)
 
+    # ``get_recent_cycles`` uses real wallclock for its 24h cutoff, so cycles
+    # inserted at the fixture's fake_now get filtered out once the real date
+    # drifts past it. Anchor the cutoff to fake_now so the recent_cycles gate
+    # observes the rows the tests insert. Mirrors the prod read-path but
+    # against the in-memory engine bound above.
+    def _fake_get_recent_cycles(hours: int = 24):
+        cutoff = (fake_now - dt.timedelta(hours=hours)).isoformat()
+        sess = scdb.db_session
+        try:
+            rows = (
+                sess.query(scdb.ScanCycle)
+                .filter(scdb.ScanCycle.started_at >= cutoff)
+                .order_by(scdb.ScanCycle.started_at.desc())
+                .all()
+            )
+            return [scdb._cycle_to_dict(r) for r in rows]
+        finally:
+            sess.remove()
+
+    monkeypatch.setattr(
+        "services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles
+    )
+
     # Errors directory empty.
     monkeypatch.setenv("LOG_DIR", str(tmp_path))
 
@@ -851,43 +874,6 @@ def test_does_not_exclude_real_aggregator_failure():
 # ---------------------------------------------------------------------------
 # 12. Preflight-heartbeat fallback — scheduler-liveness evidence
 # ---------------------------------------------------------------------------
-#
-# These tests do NOT rely on the shared fixture's date for the
-# ``get_recent_cycles`` window. ``get_recent_cycles`` uses real wallclock
-# for its 24h cutoff (a pre-existing fixture quirk, flagged for separate
-# cleanup), so rows inserted at the fixture's 2026-05-28 ``fake_now`` get
-# filtered out whenever today's real date drifts past it. We patch
-# ``get_recent_cycles`` locally in each test to anchor the cutoff to
-# ``fake_now`` and keep these tests deterministic.
-
-
-def _patch_get_recent_cycles_for_fake_now(preflight_env):
-    """Local-only patch: make ``get_recent_cycles`` use fake_now's cutoff.
-
-    Keeps these tests independent of today's real wallclock. The fixture
-    itself is unchanged — the date-drift fix in the shared fixture is
-    intentionally deferred to a separate cleanup commit.
-    """
-    fake_now = preflight_env.fake_now
-    scdb = preflight_env.scdb
-
-    def _fake_get_recent_cycles(hours: int = 24):
-        cutoff = (fake_now - dt.timedelta(hours=hours)).isoformat()
-        sess = scdb.db_session
-        try:
-            rows = (
-                sess.query(scdb.ScanCycle)
-                .filter(scdb.ScanCycle.started_at >= cutoff)
-                .order_by(scdb.ScanCycle.started_at.desc())
-                .all()
-            )
-            return [scdb._cycle_to_dict(r) for r in rows]
-        finally:
-            sess.remove()
-
-    preflight_env.monkeypatch.setattr(
-        "services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles
-    )
 
 
 def test_recent_cycles_passes_when_preflight_heartbeats_exist_even_without_recent_scan_cycle(
@@ -900,7 +886,6 @@ def test_recent_cycles_passes_when_preflight_heartbeats_exist_even_without_recen
     """
     from services import preflight_service
 
-    _patch_get_recent_cycles_for_fake_now(preflight_env)
     _set_intent("live")
     # Last scan_cycle 45 min ago — would normally trip the staleness gate.
     stale = IST.localize(dt.datetime(2026, 5, 28, 10, 45, 0))
@@ -934,7 +919,6 @@ def test_recent_cycles_aborts_when_no_scan_cycle_and_no_recent_preflight_heartbe
     """
     from services import preflight_service
 
-    _patch_get_recent_cycles_for_fake_now(preflight_env)
     _set_intent("live")
     # Stale scan_cycle 45 min ago.
     stale = IST.localize(dt.datetime(2026, 5, 28, 10, 45, 0))
@@ -964,7 +948,6 @@ def test_recent_cycles_existing_recent_scan_cycle_still_passes_normally(
     """
     from services import preflight_service
 
-    _patch_get_recent_cycles_for_fake_now(preflight_env)
     _set_intent("live")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))  # 5 min ago
     _insert_cycle(preflight_env.scdb, recent.isoformat())
