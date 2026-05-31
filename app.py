@@ -90,6 +90,7 @@ from database.action_center_db import init_db as ensure_action_center_tables_exi
 from database.analyzer_db import init_db as ensure_analyzer_tables_exists
 from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.auth_db import init_db as ensure_auth_tables_exists
+from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
@@ -626,6 +627,7 @@ def setup_environment(app):
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),
                 ("Trade Journal DB", ensure_trade_journal_tables_exists),
+                ("Backtest DB", ensure_backtest_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
