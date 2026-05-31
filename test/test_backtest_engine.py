@@ -164,6 +164,8 @@ def test_run_backtest_records_entry_when_rule_matches(
         to_date="2026-05-25",
         interval="5m",
         slippage_model=_zero_slip(),
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) >= 1
@@ -209,6 +211,8 @@ def test_run_backtest_exits_on_stop_loss(
         interval="5m",
         atr_sl_mult=1.5,
         slippage_model=_zero_slip(),
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -251,6 +255,8 @@ def test_run_backtest_exits_on_target(
         atr_sl_mult=1.5,
         rr_target=1.5,
         slippage_model=_zero_slip(),
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -309,6 +315,8 @@ def test_run_backtest_eod_squareoff(
         interval="5m",
         eod_time_ist="11:05",
         slippage_model=_zero_slip(),
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -352,6 +360,8 @@ def test_run_backtest_same_day_cooldown_blocks_reentry(
         interval="5m",
         eod_time_ist="15:30",
         slippage_model=_zero_slip(),
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     # Despite the rule firing on bars 23..49, no second trade is recorded
@@ -456,6 +466,8 @@ def test_replay_with_default_slippage_produces_realistic_fills(
         to_date="2026-05-25",
         interval="5m",
         eod_time_ist="11:05",
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -496,6 +508,8 @@ def test_replay_zero_slippage_matches_mvp_behavior(
         to_date="2026-05-25",
         interval="5m",
         slippage_model=SlippageModel(slippage_bps=0.0, half_spread_bps=0.0),
+        scan_cadence_minutes=5,
+        entry_confirmation_bars=0,
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -504,3 +518,188 @@ def test_replay_zero_slippage_matches_mvp_behavior(
     # Hit target on bar 22; exit at exact target price.
     assert t["exit_reason"] == "target"
     assert t["exit_price"] == pytest.approx(t["target_price"])
+
+
+# ---------------------------------------------------------------------------
+# Cadence + watchlist arming tests (Commit 2).
+# ---------------------------------------------------------------------------
+
+
+def test_rule_evaluated_only_at_scan_boundaries(
+    fresh_backtest_db, monkeypatch, isolated_rule_registry
+):
+    """A rule that fires only at a non-boundary bar must not arm under
+    the default 15-min cadence: it would have armed under the per-bar MVP,
+    so a zero-trade outcome is direct evidence the scan was skipped.
+    """
+    from services import backtest_service, scanner_service
+
+    # Bars start at 09:15. First bar where the history is long enough for
+    # rule eval is bar idx=20 (the 21st bar, ts=10:55). That timestamp's
+    # minute (655) % 15 = 10, i.e. NOT a scan boundary.
+    @scanner_service.scan_rule(
+        "test_buy_non_boundary",
+        "buy",
+        "matches only when history is exactly 21 bars (a non-boundary moment)",
+    )
+    def _only_at_bar21(bars, indicators):  # noqa: ARG001
+        return len(bars) == 21
+
+    start = dt.datetime(2026, 5, 25, 9, 15)
+    bars = _warmup_bars(start, n=30, price=100.0)
+    _patch_replay(monkeypatch, {"X": bars})
+
+    run_id = backtest_service.run_backtest(
+        rule_names=["test_buy_non_boundary"],
+        symbols=["X"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        slippage_model=_zero_slip(),
+        # defaults: scan_cadence_minutes=15, entry_confirmation_bars=1.
+    )
+    trades = backtest_service.get_run_trades(run_id)
+    # Rule wanted to fire at bar 21 (non-boundary). With cadence=15m the
+    # scan never asks the rule at that bar, so no entry is queued. With
+    # cadence=5m the rule would have fired and we'd see one trade.
+    assert trades == []
+
+
+def test_armed_symbol_enters_on_next_confirming_bar(
+    fresh_backtest_db, monkeypatch, isolated_rule_registry
+):
+    """Scan at a boundary arms the symbol; an UP bar one step later
+    confirms; entry fires on the bar AFTER the confirming bar."""
+    from services import backtest_service, scanner_service
+
+    # Bar at ts=11:00 is the first scan boundary post-warmup (history len=22).
+    @scanner_service.scan_rule("test_buy_boundary", "buy", "matches at bar 22 (scan boundary)")
+    def _at_boundary(bars, indicators):  # noqa: ARG001
+        return len(bars) == 22
+
+    start = dt.datetime(2026, 5, 25, 9, 15)
+    bars = _warmup_bars(start, n=21, price=100.0)
+    # Bar 22 (idx=21, ts=11:00): flat — irrelevant to the rule which keys
+    # off history length.
+    bars.append(_bar(start + dt.timedelta(minutes=5 * 21), 100.0, 100.1, 99.9, 100.0))
+    # Bar 23 (ts=11:05): clear UP bar — confirms LONG.
+    bars.append(_bar(start + dt.timedelta(minutes=5 * 22), 100.0, 100.5, 99.95, 100.3))
+    # Bar 24 (ts=11:10): entry fires here at this bar's open.
+    bars.append(_bar(start + dt.timedelta(minutes=5 * 23), 100.4, 100.6, 100.3, 100.5))
+    # Hold until EOD so the trade closes deterministically.
+    bars.append(_bar(start + dt.timedelta(minutes=5 * 24), 100.5, 100.6, 100.4, 100.5))
+    _patch_replay(monkeypatch, {"X": bars})
+
+    run_id = backtest_service.run_backtest(
+        rule_names=["test_buy_boundary"],
+        symbols=["X"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        slippage_model=_zero_slip(),
+        # Defaults: cadence=15, confirmation=1.
+        eod_time_ist="11:15",  # bar 25 (ts=11:15) forces EOD exit
+    )
+    trades = backtest_service.get_run_trades(run_id)
+    assert len(trades) == 1
+    t = trades[0]
+    # Entry on bar 24 → ts=11:10, open=100.4.
+    assert t["entry_at"].endswith("11:10:00")
+    assert t["entry_price"] == pytest.approx(100.4)
+
+
+def test_armed_symbol_disarms_at_next_scan_if_rule_no_longer_matches(
+    fresh_backtest_db, monkeypatch, isolated_rule_registry
+):
+    """A symbol armed at scan T but dropped by the screener at scan T+1
+    (cadence step) leaves the watchlist with no entry, even though the
+    confirmation window had not yet expired.
+    """
+    from services import backtest_service, scanner_service
+
+    # Match only at bar 22 (the first scan boundary); after that the
+    # screener is silent on this symbol.
+    @scanner_service.scan_rule(
+        "test_buy_once_then_silent", "buy", "matches exactly at bar 22"
+    )
+    def _at_22(bars, indicators):  # noqa: ARG001
+        return len(bars) == 22
+
+    start = dt.datetime(2026, 5, 25, 9, 15)
+    bars = _warmup_bars(start, n=21, price=100.0)
+    # Bar 22 (11:00, scan boundary): rule matches → arm.
+    bars.append(_bar(start + dt.timedelta(minutes=5 * 21), 100.0, 100.1, 99.9, 100.0))
+    # Bars 23..26: flat-then-down bars that never give a LONG confirmation.
+    # Close strictly below open keeps `_confirms_direction` returning False.
+    for i in range(22, 27):
+        ts = start + dt.timedelta(minutes=5 * i)
+        bars.append(_bar(ts, 100.0, 100.05, 99.5, 99.6))
+    # Bar 27 (ts=11:30): next 15-min scan boundary. Rule no longer matches
+    # (len > 22) so the armed watch should be dropped — no entry possible.
+    bars.append(_bar(start + dt.timedelta(minutes=5 * 27), 99.5, 99.7, 99.4, 99.5))
+    _patch_replay(monkeypatch, {"X": bars})
+
+    run_id = backtest_service.run_backtest(
+        rule_names=["test_buy_once_then_silent"],
+        symbols=["X"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        slippage_model=_zero_slip(),
+        # entry_confirmation_bars=10 keeps the symbol armed past the next
+        # scan boundary so we can prove the disarm came from the scan
+        # re-eval, not from window expiry.
+        entry_confirmation_bars=10,
+    )
+    assert backtest_service.get_run_trades(run_id) == []
+
+
+def test_already_open_position_not_double_armed(
+    fresh_backtest_db, monkeypatch, isolated_rule_registry
+):
+    """While a position is open, scan boundaries should not call the rule.
+
+    We assert via a sidechannel call counter rather than via trade count
+    because a queued pending_entry during open positions would silently sit
+    until eventually voided by EOD — externally indistinguishable.
+    """
+    from services import backtest_service, scanner_service
+
+    call_log: list[int] = []
+
+    @scanner_service.scan_rule("test_buy_count_calls", "buy", "logs each eval")
+    def _count(bars, indicators):  # noqa: ARG001
+        call_log.append(len(bars))
+        # Match from bar 22 onward — the rule would keep flagging the
+        # symbol at every scan if we let it.
+        return len(bars) >= 22
+
+    start = dt.datetime(2026, 5, 25, 9, 15)
+    bars = _warmup_bars(start, n=21, price=100.0)
+    # Bar 22 (11:00, scan boundary): rule matches → arm + immediate pending
+    # (conf=0). Bar 23: entry. Subsequent bars hold the position open
+    # across the next two scan boundaries (11:15 and 11:30) so we can
+    # check that the rule was NOT called at those points.
+    for i in range(21, 30):
+        ts = start + dt.timedelta(minutes=5 * i)
+        # Tight intra-bar range avoids hitting SL/target accidentally.
+        bars.append(_bar(ts, 100.0, 100.05, 99.95, 100.0))
+    _patch_replay(monkeypatch, {"X": bars})
+
+    run_id = backtest_service.run_backtest(
+        rule_names=["test_buy_count_calls"],
+        symbols=["X"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        slippage_model=_zero_slip(),
+        entry_confirmation_bars=0,  # arm → pending → enter next bar
+        eod_time_ist="15:30",
+    )
+    trades = backtest_service.get_run_trades(run_id)
+    assert len(trades) == 1  # exactly the bar-23 entry, no re-arming
+
+    # 11:00 is the only scan boundary at which the rule should have been
+    # called: at 11:15 and 11:30 the position is still open, so the scan
+    # is suppressed. The call at 11:00 records history_len=22.
+    assert call_log == [22]

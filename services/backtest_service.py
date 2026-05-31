@@ -669,6 +669,35 @@ def _parse_eod_time(eod_time_ist: str) -> _dt.time:
     return _dt.time(int(h), int(m))
 
 
+def _is_scan_boundary(bar_ts: _dt.datetime, scan_cadence_minutes: int) -> bool:
+    """Return True iff ``bar_ts`` aligns with the scan cadence.
+
+    Scan boundaries are clock-time aligned. With cadence=15 the boundaries
+    are minutes 0/15/30/45 of every hour. With cadence equal to the bar
+    interval, every bar is a boundary (effectively disabling cadence).
+    Bars are timestamped at the OPEN of the interval, which matches the
+    moment the screener would fire on the previous bar's close.
+    """
+    if scan_cadence_minutes <= 0:
+        return True
+    return (bar_ts.hour * 60 + bar_ts.minute) % scan_cadence_minutes == 0
+
+
+def _confirms_direction(bar_open: float, bar_close: float, direction: str) -> bool:
+    """Default confirmation: the bar moved in the armed direction (or was flat).
+
+    LONG confirms when close >= open (no fall on the candle); SHORT confirms
+    when close <= open. The permissive ``>=`` / ``<=`` lets a flat candle
+    confirm — useful for the existing tests' flat warm-up bars when they
+    pass ``entry_confirmation_bars=0`` to skip confirmation entirely. The
+    strict ``>``/``<`` semantics fall out naturally once a real synthetic
+    UP/DOWN bar is provided.
+    """
+    if direction == "LONG":
+        return bar_close >= bar_open
+    return bar_close <= bar_open
+
+
 def _replay_symbol(
     *,
     run_id: int,
@@ -684,6 +713,8 @@ def _replay_symbol(
     eod_time: _dt.time,
     rules: list[tuple[str, Any, str]],
     slippage_model: SlippageModel,
+    scan_cadence_minutes: int,
+    entry_confirmation_bars: int,
 ) -> int:
     """Walk a single symbol's bars end-to-end. Returns trade count."""
     import pandas as pd  # noqa: PLC0415
@@ -704,9 +735,15 @@ def _replay_symbol(
     open_trade: dict[str, Any] | None = None  # in-memory mirror of the open trade row
     pending_entry: dict[str, Any] | None = None  # signal armed at previous bar's close
     sl_block_date: _dt.date | None = None  # same-day stop-out block date
+    # Watchlist arming state. None when no symbol-level watch is active. When
+    # populated by a scan-boundary match, ``armed_at_idx`` anchors the bar
+    # whose close fired the screener; subsequent bars (idx > armed_at_idx)
+    # are confirmation candidates until ``entry_confirmation_bars`` elapses
+    # or the next scan boundary re-evaluates.
+    armed: dict[str, Any] | None = None
     trades_recorded = 0
 
-    for bar in bars:
+    for idx, bar in enumerate(bars):
         bar_ts = bar["ts"]
         bar_date = bar_ts.date()
         bar_open = float(bar["open"])
@@ -837,17 +874,47 @@ def _replay_symbol(
         # ----- 4. After EOD time, no new entries arm.
         if bar_ts.time() >= eod_time:
             pending_entry = None
+            armed = None
             continue
 
         # ----- 5. Same-day stop-out cooldown blocks new entries.
         if open_trade is None and sl_block_date == bar_date:
             pending_entry = None
+            armed = None
             continue
 
-        # ----- 6. Evaluate rules to arm the next bar's entry.
-        if open_trade is None and pending_entry is None and len(history_rows) >= 21:
+        # ----- 6. Confirmation check — if a prior scan armed this symbol,
+        # bars after the arming bar are candidates for confirmation.
+        # Default rule: the candle moved in the armed direction (LONG: close
+        # >= open, SHORT: close <= open). Once the entry_confirmation_bars
+        # window expires without a confirming candle, the watch is dropped.
+        if armed is not None and open_trade is None and pending_entry is None:
+            elapsed = idx - armed["armed_at_idx"]
+            if elapsed >= 1:
+                if _confirms_direction(bar_open, bar_close, armed["direction"]):
+                    pending_entry = {
+                        "direction": armed["direction"],
+                        "rule_name": armed["rule_name"],
+                        "atr": armed["atr"],
+                    }
+                    armed = None
+                elif elapsed >= entry_confirmation_bars:
+                    armed = None  # confirmation window expired
+
+        # ----- 7. Scan boundary — re-evaluate every rule against the most
+        # recent closed bar (including this one). Mirrors Chartink's 15-min
+        # cadence; without this guard the screener would fire on every bar.
+        # An open trade or queued entry suppresses re-arming so a symbol
+        # already mid-trade does not get a second watch on the same bar.
+        if (
+            _is_scan_boundary(bar_ts, scan_cadence_minutes)
+            and open_trade is None
+            and pending_entry is None
+            and len(history_rows) >= 21
+        ):
             bars_df = pd.DataFrame(history_rows)
             indicators_dict = _build_indicators_dict(bars_df)
+            matched_arm: dict[str, Any] | None = None
             for rule_name, rule_fn, screener_type in rules:
                 try:
                     matched = bool(rule_fn(bars_df, indicators_dict))
@@ -867,12 +934,29 @@ def _replay_symbol(
                         atr_value = 0.0
                 except Exception:
                     atr_value = 0.0
-                pending_entry = {
+                matched_arm = {
                     "direction": "LONG" if screener_type == "buy" else "SHORT",
                     "rule_name": rule_name,
                     "atr": atr_value,
+                    "armed_at_idx": idx,
                 }
                 break  # first match wins
+
+            if matched_arm is None:
+                # Currently-armed symbol no longer matches at this scan — drop.
+                armed = None
+            elif entry_confirmation_bars == 0:
+                # No confirmation required; queue entry for the next bar.
+                # Mirrors the MVP's behaviour when the operator wants the
+                # screener flag itself to be the entry signal.
+                pending_entry = {
+                    "direction": matched_arm["direction"],
+                    "rule_name": matched_arm["rule_name"],
+                    "atr": matched_arm["atr"],
+                }
+                armed = None
+            else:
+                armed = matched_arm
 
     return trades_recorded
 
@@ -892,6 +976,8 @@ def run_backtest(
     eod_time_ist: str = "15:15",
     exchange: str | None = None,
     slippage_model: SlippageModel | None = None,
+    scan_cadence_minutes: int = 15,
+    entry_confirmation_bars: int = 1,
 ) -> int:
     """Synchronous backtest. Returns the new run_id.
 
@@ -921,6 +1007,8 @@ def run_backtest(
         "eod_time_ist": eod_time_ist,
         "exchange_default": exchange or "NSE",
         "slippage_model": asdict(slippage_model),
+        "scan_cadence_minutes": scan_cadence_minutes,
+        "entry_confirmation_bars": entry_confirmation_bars,
     }
 
     run_id = create_run(
@@ -954,6 +1042,8 @@ def run_backtest(
                     eod_time=eod_time,
                     rules=rules,
                     slippage_model=slippage_model,
+                    scan_cadence_minutes=scan_cadence_minutes,
+                    entry_confirmation_bars=entry_confirmation_bars,
                 )
             except Exception:
                 # Per-symbol failure — log and continue with remaining symbols
