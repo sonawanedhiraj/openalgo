@@ -82,8 +82,10 @@ def _patch_replay(monkeypatch, bars_by_symbol: dict[str, list[dict]]):
     """
     from services import backtest_service
 
-    def fake_fetch(symbol, exchange, from_date, to_date):
+    def fake_fetch(symbol, exchange, from_date, to_date, source="api", cache=None):
         # Returning non-empty so the empty-history short-circuit doesn't trigger.
+        # Accepts source/cache kwargs since real _fetch_bars now takes them
+        # (Commit 3); tests don't care which source is selected.
         return [{"timestamp": 0, "open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}]
 
     def fake_aggregate(bars_1m, interval):
@@ -703,3 +705,132 @@ def test_already_open_position_not_double_armed(
     # called: at 11:15 and 11:30 the position is still open, so the scan
     # is suppressed. The call at 11:00 records history_len=22.
     assert call_log == [22]
+
+
+# ---------------------------------------------------------------------------
+# Data source + cache tests (Commit 3).
+# ---------------------------------------------------------------------------
+
+
+def _stub_get_history(monkeypatch, payload_fn):
+    """Replace ``services.history_service.get_history`` with ``payload_fn``.
+
+    ``payload_fn(**kwargs)`` must return the same 3-tuple shape the real
+    function returns: ``(success: bool, payload: dict, status: int)``.
+    """
+    from services import history_service
+
+    monkeypatch.setattr(history_service, "get_history", payload_fn)
+
+
+def test_default_data_source_is_api(fresh_backtest_db, monkeypatch):
+    from services import backtest_service
+
+    calls: list[dict] = []
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        return False, {"data": []}, 404  # no bars → run completes empty
+
+    _stub_get_history(monkeypatch, fake)
+
+    backtest_service.run_backtest(
+        symbols=["TEST"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+    )
+    assert len(calls) == 1
+    assert calls[0]["source"] == "api"
+
+
+def test_data_source_db_passes_through(fresh_backtest_db, monkeypatch):
+    from services import backtest_service
+
+    calls: list[dict] = []
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        return False, {"data": []}, 404
+
+    _stub_get_history(monkeypatch, fake)
+
+    backtest_service.run_backtest(
+        symbols=["TEST"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        data_source="db",
+    )
+    assert len(calls) == 1
+    assert calls[0]["source"] == "db"
+
+
+def test_data_source_auto_falls_back_to_api_when_db_empty(
+    fresh_backtest_db, monkeypatch
+):
+    from services import backtest_service
+
+    sources_seen: list[str] = []
+
+    def fake(**kwargs):
+        src = kwargs["source"]
+        sources_seen.append(src)
+        if src == "db":
+            return False, {"data": []}, 404
+        # source == "api"
+        return True, {"data": []}, 200  # success but empty → harmless
+
+    _stub_get_history(monkeypatch, fake)
+
+    backtest_service.run_backtest(
+        symbols=["TEST"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        data_source="auto",
+    )
+    assert sources_seen == ["db", "api"]
+
+
+def test_in_process_cache_avoids_duplicate_history_calls(
+    fresh_backtest_db, monkeypatch
+):
+    """Symbols can repeat within one run (e.g. duplicates in the input list).
+
+    Without the cache the broker history API would be hit once per
+    replay. The in-process cache keys on (symbol, exchange, interval,
+    from_date, to_date) so a repeat within the same invocation reuses
+    the prior fetch.
+    """
+    from services import backtest_service
+
+    calls: list[dict] = []
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        return False, {"data": []}, 404
+
+    _stub_get_history(monkeypatch, fake)
+
+    backtest_service.run_backtest(
+        symbols=["DUPED", "DUPED", "DUPED"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+    )
+    # Three replays of the same symbol/window → exactly one history call.
+    assert len(calls) == 1
+
+
+def test_data_source_invalid_raises(fresh_backtest_db):
+    from services import backtest_service
+
+    with pytest.raises(ValueError):
+        backtest_service.run_backtest(
+            symbols=["TEST"],
+            from_date="2026-05-25",
+            to_date="2026-05-25",
+            interval="5m",
+            data_source="not-a-source",
+        )

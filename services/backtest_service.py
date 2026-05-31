@@ -585,26 +585,65 @@ def _aggregate_to_interval_ohlc(
     return [buckets[k] for k in order]
 
 
-def _fetch_bars(symbol: str, exchange: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
-    """Fetch 1m bars from Historify via ``services.history_service.get_history``.
+_VALID_DATA_SOURCES = ("api", "db", "auto")
 
-    Returns the raw record list, or ``[]`` when no data is available. Raises
-    only if get_history itself raises — caller catches and converts to a
-    per-symbol skip.
+
+def _fetch_bars(
+    symbol: str,
+    exchange: str,
+    from_date: str,
+    to_date: str,
+    source: str = "api",
+    cache: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch 1m bars via ``services.history_service.get_history``.
+
+    ``source`` controls the data origin:
+
+    * ``"api"`` — broker history API (live, requires an authenticated
+      broker session and is rate-limited at ~3 req/sec).
+    * ``"db"`` — DuckDB / Historify cache (fast, may be stale).
+    * ``"auto"`` — try DB first; fall back to the API on empty / failure.
+
+    ``cache`` is an optional dict used to memoise calls within a single
+    ``run_backtest`` invocation, keyed by
+    ``(symbol, exchange, "1m", from_date, to_date)``. Repeated calls for
+    the same window (e.g. a duplicated symbol) hit the cache instead of
+    spamming the broker. Cleared by the caller at the end of the run.
+
+    Returns the raw record list, or ``[]`` when no data is available.
+    Raises only if get_history itself raises — caller catches and converts
+    to a per-symbol skip.
     """
     from services.history_service import get_history  # noqa: PLC0415
 
-    success, payload, _status = get_history(
-        symbol=symbol,
-        exchange=exchange,
-        interval="1m",
-        start_date=from_date,
-        end_date=to_date,
-        source="db",
-    )
-    if not success:
-        return []
-    return list(payload.get("data") or [])
+    cache_key = (symbol, exchange, "1m", from_date, to_date)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    def _fetch(src: str) -> list[dict[str, Any]]:
+        success, payload, _status = get_history(
+            symbol=symbol,
+            exchange=exchange,
+            interval="1m",
+            start_date=from_date,
+            end_date=to_date,
+            source=src,
+        )
+        if not success:
+            return []
+        return list(payload.get("data") or [])
+
+    if source == "auto":
+        rows = _fetch("db")
+        if not rows:
+            rows = _fetch("api")
+    else:
+        rows = _fetch(source)
+
+    if cache is not None:
+        cache[cache_key] = rows
+    return rows
 
 
 def _build_indicators_dict(bars_df):
@@ -715,13 +754,17 @@ def _replay_symbol(
     slippage_model: SlippageModel,
     scan_cadence_minutes: int,
     entry_confirmation_bars: int,
+    data_source: str,
+    bar_cache: dict[tuple[str, str, str, str, str], list[dict[str, Any]]],
 ) -> int:
     """Walk a single symbol's bars end-to-end. Returns trade count."""
     import pandas as pd  # noqa: PLC0415
 
     from services import indicators as _ind  # noqa: PLC0415
 
-    bars_1m = _fetch_bars(symbol, exchange, from_date, to_date)
+    bars_1m = _fetch_bars(
+        symbol, exchange, from_date, to_date, source=data_source, cache=bar_cache
+    )
     if not bars_1m:
         logger.info("backtest: no 1m history for %s/%s, skipping", symbol, exchange)
         return 0
@@ -978,14 +1021,26 @@ def run_backtest(
     slippage_model: SlippageModel | None = None,
     scan_cadence_minutes: int = 15,
     entry_confirmation_bars: int = 1,
+    data_source: str = "api",
 ) -> int:
     """Synchronous backtest. Returns the new run_id.
 
-    For each symbol: fetches 1m bars from Historify, re-aggregates to
-    ``interval``, walks the bars through a simulated entry/exit state
-    machine that mirrors the live engine's SL / target / EOD / same-day
-    stop-out semantics. Records every trade to ``backtest_trades`` and
-    finalises summary metrics on completion.
+    For each symbol: fetches 1m bars (from the broker history API by
+    default, see ``data_source``), re-aggregates to ``interval``, and
+    walks the bars through a simulated entry/exit state machine that
+    mirrors the live engine's SL / target / EOD / same-day stop-out
+    semantics. Records every trade to ``backtest_trades`` and finalises
+    summary metrics on completion.
+
+    ``data_source`` (default ``"api"``):
+
+    * ``"api"`` — fetch from the broker's history API. Requires an active
+      broker session. The history call is rate-limited at ~3 req/sec, so
+      runs covering many symbols × months can be slow. For those workloads
+      pre-populate Historify and switch to ``"db"`` instead.
+    * ``"db"`` — read from the Historify / DuckDB cache. Faster but may
+      lag the broker on the current day's bars.
+    * ``"auto"`` — try the DB first; fall back to the API on empty/failure.
 
     Per-symbol failures (no history, get_history raises) are logged and
     skipped; the run still completes with whatever symbols succeeded. If
@@ -993,6 +1048,10 @@ def run_backtest(
     trades). The run is only marked ``error`` when the orchestrator
     itself crashes.
     """
+    if data_source not in _VALID_DATA_SOURCES:
+        raise ValueError(
+            f"data_source must be one of {_VALID_DATA_SOURCES}, got {data_source!r}"
+        )
     rules = _enabled_rules(rule_names)
     effective_rule_names = [name for name, _, _ in rules]
     eod_time = _parse_eod_time(eod_time_ist)
@@ -1009,7 +1068,13 @@ def run_backtest(
         "slippage_model": asdict(slippage_model),
         "scan_cadence_minutes": scan_cadence_minutes,
         "entry_confirmation_bars": entry_confirmation_bars,
+        "data_source": data_source,
     }
+
+    # In-process bar cache, shared across the symbols loop below. Cleared
+    # implicitly when this invocation returns. Keeps the broker history
+    # API from being hit twice for the same (symbol, exchange, window).
+    bar_cache: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
 
     run_id = create_run(
         strategy_name=strategy_name,
@@ -1044,6 +1109,8 @@ def run_backtest(
                     slippage_model=slippage_model,
                     scan_cadence_minutes=scan_cadence_minutes,
                     entry_confirmation_bars=entry_confirmation_bars,
+                    data_source=data_source,
+                    bar_cache=bar_cache,
                 )
             except Exception:
                 # Per-symbol failure — log and continue with remaining symbols
