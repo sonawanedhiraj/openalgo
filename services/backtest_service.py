@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import pytz
@@ -34,6 +35,59 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
+
+
+@dataclass
+class SlippageModel:
+    """Configurable model for realistic fill prices.
+
+    Defaults are sensible for NSE intraday equity. Operator can override
+    per-run by constructing a SlippageModel and passing it to ``run_backtest``.
+
+    All offsets are applied around the *mid* price the simulator passes in
+    (e.g. the next-bar open for an entry, the SL level for an SL exit, or
+    the EOD bar's close for a force-exit). For entries, LONG fills above
+    mid (you pay ask + slippage) and SHORT fills below mid (you sell bid -
+    slippage). Exits invert: LONG exit fills below mid, SHORT exit above.
+    The final price is rounded to the nearest tick.
+    """
+
+    tick_size: float = 0.05  # NSE equity standard
+    slippage_bps: float = 2.0  # adverse slippage in basis points (0.02% default)
+    half_spread_bps: float = 1.5  # half of typical bid-ask spread in bps
+
+    def round_to_tick(self, price: float) -> float:
+        """Round ``price`` to the nearest multiple of ``tick_size``."""
+        if self.tick_size <= 0:
+            return float(price)
+        ticks = round(float(price) / self.tick_size)
+        return round(ticks * self.tick_size, 4)
+
+    def _offset_price(self, price: float) -> float:
+        """Combined half-spread + slippage as an absolute price delta."""
+        return float(price) * (self.half_spread_bps + self.slippage_bps) / 10_000.0
+
+    def entry_fill(self, mid_price: float, direction: str) -> float:
+        """Realistic entry fill price.
+
+        LONG entry fills above mid (you pay the ask + slippage).
+        SHORT entry fills below mid (you sell at bid - slippage).
+        """
+        offset = self._offset_price(mid_price)
+        if direction == "LONG":
+            return self.round_to_tick(float(mid_price) + offset)
+        return self.round_to_tick(float(mid_price) - offset)
+
+    def exit_fill(self, mid_price: float, direction: str) -> float:
+        """Realistic exit fill price.
+
+        LONG exit fills below mid (you sell at bid - slippage).
+        SHORT exit fills above mid (you cover at ask + slippage).
+        """
+        offset = self._offset_price(mid_price)
+        if direction == "LONG":
+            return self.round_to_tick(float(mid_price) - offset)
+        return self.round_to_tick(float(mid_price) + offset)
 
 
 def _session():
@@ -629,6 +683,7 @@ def _replay_symbol(
     position_size: int,
     eod_time: _dt.time,
     rules: list[tuple[str, Any, str]],
+    slippage_model: SlippageModel,
 ) -> int:
     """Walk a single symbol's bars end-to-end. Returns trade count."""
     import pandas as pd  # noqa: PLC0415
@@ -665,9 +720,11 @@ def _replay_symbol(
 
         # ----- 1. Service any pending entry from the previous bar's close.
         if open_trade is None and pending_entry is not None:
-            entry_price = bar_open
-            atr = pending_entry["atr"]
             direction = pending_entry["direction"]
+            # Apply slippage / half-spread / tick rounding on top of the
+            # next-bar open. LONG fills above the open, SHORT fills below.
+            entry_price = slippage_model.entry_fill(bar_open, direction)
+            atr = pending_entry["atr"]
             risk_per_share = max(atr * atr_sl_mult, 0.01) if atr else 0.01
             if direction == "LONG":
                 sl_price = entry_price - risk_per_share
@@ -727,23 +784,31 @@ def _replay_symbol(
                 # the strategy). Matches how a real broker prices an
                 # ambiguous intrabar fill.
                 if bar_low <= open_trade["sl_price"]:
-                    exit_price = open_trade["sl_price"]
+                    exit_price = slippage_model.exit_fill(
+                        open_trade["sl_price"], direction
+                    )
                     exit_reason = "stop_loss"
                 elif bar_high >= open_trade["target_price"]:
-                    exit_price = open_trade["target_price"]
+                    exit_price = slippage_model.exit_fill(
+                        open_trade["target_price"], direction
+                    )
                     exit_reason = "target"
             else:  # SHORT
                 if bar_high >= open_trade["sl_price"]:
-                    exit_price = open_trade["sl_price"]
+                    exit_price = slippage_model.exit_fill(
+                        open_trade["sl_price"], direction
+                    )
                     exit_reason = "stop_loss"
                 elif bar_low <= open_trade["target_price"]:
-                    exit_price = open_trade["target_price"]
+                    exit_price = slippage_model.exit_fill(
+                        open_trade["target_price"], direction
+                    )
                     exit_reason = "target"
 
             # EOD squareoff: force-close at bar close (we are by definition
             # past the cutoff time at this bar's close).
             if exit_reason is None and bar_ts.time() >= eod_time:
-                exit_price = bar_close
+                exit_price = slippage_model.exit_fill(bar_close, direction)
                 exit_reason = "eod_squareoff"
 
             if exit_reason is not None:
@@ -826,6 +891,7 @@ def run_backtest(
     position_size: int = 500,
     eod_time_ist: str = "15:15",
     exchange: str | None = None,
+    slippage_model: SlippageModel | None = None,
 ) -> int:
     """Synchronous backtest. Returns the new run_id.
 
@@ -844,6 +910,8 @@ def run_backtest(
     rules = _enabled_rules(rule_names)
     effective_rule_names = [name for name, _, _ in rules]
     eod_time = _parse_eod_time(eod_time_ist)
+    if slippage_model is None:
+        slippage_model = SlippageModel()
 
     config = {
         "atr_period": atr_period,
@@ -852,6 +920,7 @@ def run_backtest(
         "position_size": position_size,
         "eod_time_ist": eod_time_ist,
         "exchange_default": exchange or "NSE",
+        "slippage_model": asdict(slippage_model),
     }
 
     run_id = create_run(
@@ -884,6 +953,7 @@ def run_backtest(
                     position_size=position_size,
                     eod_time=eod_time,
                     rules=rules,
+                    slippage_model=slippage_model,
                 )
             except Exception:
                 # Per-symbol failure — log and continue with remaining symbols

@@ -65,6 +65,17 @@ def _warmup_bars(start: dt.datetime, n: int = 22, price: float = 100.0) -> list[
     return out
 
 
+def _zero_slip():
+    """A SlippageModel that produces no slippage — keeps fills == bar prices.
+
+    Used by the older tests whose assertions assume the MVP behavior (entry
+    at the next bar's open, SL/target/EOD at the exact reference price).
+    """
+    from services.backtest_service import SlippageModel  # noqa: PLC0415
+
+    return SlippageModel(slippage_bps=0.0, half_spread_bps=0.0)
+
+
 def _patch_replay(monkeypatch, bars_by_symbol: dict[str, list[dict]]):
     """Patch the bar pipeline to feed ``bars_by_symbol`` directly to the
     replay loop. Bypasses Historify entirely.
@@ -152,6 +163,7 @@ def test_run_backtest_records_entry_when_rule_matches(
         from_date="2026-05-25",
         to_date="2026-05-25",
         interval="5m",
+        slippage_model=_zero_slip(),
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) >= 1
@@ -196,6 +208,7 @@ def test_run_backtest_exits_on_stop_loss(
         to_date="2026-05-25",
         interval="5m",
         atr_sl_mult=1.5,
+        slippage_model=_zero_slip(),
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -237,6 +250,7 @@ def test_run_backtest_exits_on_target(
         interval="5m",
         atr_sl_mult=1.5,
         rr_target=1.5,
+        slippage_model=_zero_slip(),
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -294,6 +308,7 @@ def test_run_backtest_eod_squareoff(
         to_date="2026-05-25",
         interval="5m",
         eod_time_ist="11:05",
+        slippage_model=_zero_slip(),
     )
     trades = backtest_service.get_run_trades(run_id)
     assert len(trades) == 1
@@ -336,6 +351,7 @@ def test_run_backtest_same_day_cooldown_blocks_reentry(
         to_date="2026-05-25",
         interval="5m",
         eod_time_ist="15:30",
+        slippage_model=_zero_slip(),
     )
     trades = backtest_service.get_run_trades(run_id)
     # Despite the rule firing on bars 23..49, no second trade is recorded
@@ -368,3 +384,123 @@ def test_run_backtest_handles_history_fetch_failure(fresh_backtest_db, monkeypat
     # Orchestrator survives per-symbol exceptions; run marks completed.
     assert row["status"] == "completed"
     assert row["total_trades"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Slippage model tests (Commit 1).
+# ---------------------------------------------------------------------------
+
+
+def test_slippage_model_round_to_tick():
+    from services.backtest_service import SlippageModel
+
+    m = SlippageModel(tick_size=0.05, slippage_bps=0.0, half_spread_bps=0.0)
+    # 100.03 → nearest tick is 100.05 (delta 0.02 vs 0.03 to 100.00).
+    assert m.round_to_tick(100.03) == pytest.approx(100.05)
+    # 100.07 → nearest tick is 100.05 (delta 0.02 vs 0.03 to 100.10).
+    assert m.round_to_tick(100.07) == pytest.approx(100.05)
+
+
+def test_slippage_long_entry_fills_above_mid():
+    from services.backtest_service import SlippageModel
+
+    m = SlippageModel(tick_size=0.01, slippage_bps=2.0, half_spread_bps=1.5)
+    # offset = 100 * (1.5 + 2.0) / 10000 = 0.035 → rounded to 0.01-tick = 0.04
+    fill = m.entry_fill(100.0, "LONG")
+    assert fill > 100.0
+    assert fill == pytest.approx(100.04)
+
+
+def test_slippage_short_entry_fills_below_mid():
+    from services.backtest_service import SlippageModel
+
+    m = SlippageModel(tick_size=0.01, slippage_bps=2.0, half_spread_bps=1.5)
+    fill = m.entry_fill(100.0, "SHORT")
+    assert fill < 100.0
+    assert fill == pytest.approx(99.96)
+
+
+def test_slippage_long_exit_fills_below_mid():
+    from services.backtest_service import SlippageModel
+
+    m = SlippageModel(tick_size=0.01, slippage_bps=2.0, half_spread_bps=1.5)
+    fill = m.exit_fill(100.0, "LONG")
+    assert fill < 100.0
+    assert fill == pytest.approx(99.96)
+
+
+def test_replay_with_default_slippage_produces_realistic_fills(
+    fresh_backtest_db, monkeypatch, isolated_rule_registry
+):
+    """Default slippage drags entries above the next-bar open for LONGs and
+    exits below the SL/target reference for LONGs."""
+    from services import backtest_service, scanner_service
+
+    @scanner_service.scan_rule("test_buy_default_slip", "buy", "fires on bar 21")
+    def _once(bars, indicators):  # noqa: ARG001
+        return len(bars) == 21
+
+    start = dt.datetime(2026, 5, 25, 9, 15)
+    bars = _warmup_bars(start, n=21, price=100.0)
+    entry_bar_ts = start + dt.timedelta(minutes=5 * 21)
+    # Bar 22 stays in-range so the trade survives until EOD squareoff.
+    bars.append(_bar(entry_bar_ts, 100.0, 100.2, 99.9, 100.05))
+    # Bar 23 lands past the 11:00 EOD cutoff.
+    bars.append(_bar(dt.datetime(2026, 5, 25, 11, 5), 100.05, 100.2, 99.95, 100.1))
+    _patch_replay(monkeypatch, {"X": bars})
+
+    run_id = backtest_service.run_backtest(
+        rule_names=["test_buy_default_slip"],
+        symbols=["X"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        eod_time_ist="11:05",
+    )
+    trades = backtest_service.get_run_trades(run_id)
+    assert len(trades) == 1
+    t = trades[0]
+    # Default total offset = 3.5 bps on price ~100 → 0.035, nearest 0.05-tick
+    # rounds the LONG entry to 100.05 (above) and the LONG EOD exit (on a mid
+    # of 100.10) to 100.10 - 0.035 → 100.05 nearest tick. Asserting both show
+    # the slippage drag.
+    assert t["entry_price"] > 100.0  # filled above bar 22's open of 100.0
+    assert t["exit_price"] < 100.1   # filled below bar 23's close of 100.1
+
+
+def test_replay_zero_slippage_matches_mvp_behavior(
+    fresh_backtest_db, monkeypatch, isolated_rule_registry
+):
+    """With slippage_bps=0 and half_spread_bps=0 the fills coincide exactly
+    with the bar prices the MVP used. Guarantees the default behavior is
+    additive — no silent change to the original arithmetic when the model
+    is zeroed out.
+    """
+    from services import backtest_service, scanner_service
+    from services.backtest_service import SlippageModel
+
+    @scanner_service.scan_rule("test_buy_zero_slip", "buy", "fires on bar 21")
+    def _once(bars, indicators):  # noqa: ARG001
+        return len(bars) == 21
+
+    start = dt.datetime(2026, 5, 25, 9, 15)
+    bars = _warmup_bars(start, n=21, price=100.0)
+    entry_bar_ts = start + dt.timedelta(minutes=5 * 21)
+    bars.append(_bar(entry_bar_ts, 100.0, 105.0, 99.9, 104.0))
+    _patch_replay(monkeypatch, {"X": bars})
+
+    run_id = backtest_service.run_backtest(
+        rule_names=["test_buy_zero_slip"],
+        symbols=["X"],
+        from_date="2026-05-25",
+        to_date="2026-05-25",
+        interval="5m",
+        slippage_model=SlippageModel(slippage_bps=0.0, half_spread_bps=0.0),
+    )
+    trades = backtest_service.get_run_trades(run_id)
+    assert len(trades) == 1
+    t = trades[0]
+    assert t["entry_price"] == pytest.approx(100.0)
+    # Hit target on bar 22; exit at exact target price.
+    assert t["exit_reason"] == "target"
+    assert t["exit_price"] == pytest.approx(t["target_price"])
