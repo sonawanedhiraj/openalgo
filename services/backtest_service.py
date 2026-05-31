@@ -372,3 +372,528 @@ def get_recent_runs(limit: int = 10) -> list[dict[str, Any]]:
             sess.remove()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Replay loop + simulated execution
+# ---------------------------------------------------------------------------
+#
+# The simulator walks per-symbol bars in chronological order. For each closed
+# 5-min bar it:
+#
+#   1. Updates a rolling pandas DataFrame of the last N bars (history window).
+#   2. If a position is open:
+#       a. Checks if the bar's high/low crosses SL or target — exits at the
+#          touched level, no slippage. Direction-aware (LONG: low<=SL or
+#          high>=target; SHORT: high>=SL or low<=target).
+#       b. If still open, checks EOD time — force-exits at bar close.
+#   3. If no position is open AND no same-day stop-out block is active:
+#       a. Builds indicators from the bar history.
+#       b. Evaluates every enabled rule via the scanner registry.
+#       c. On first match: arms an entry for the NEXT bar's open. The next
+#          bar's open is the first realistic price an order placed at the
+#          closing tick can fill at — entering on the closing bar would peek
+#          into the bar's own data.
+#
+# A stop_loss exit installs a same-day cooldown for that symbol: any rule
+# match on the same calendar day after a stop-out is ignored. Mirrors the
+# live engine's RISK_SAME_DAY_STOPOUT_BLOCK behaviour without dragging in
+# the full SimplifiedStockEngine state machine.
+
+# A modest history window is enough: the active rules (fno_intraday_buy_20
+# / sell_20) need at most 21 bars for the 20-bar volume average. ATR(14)
+# needs 14. 60 bars gives a comfortable margin without blowing memory on
+# long replays.
+_HISTORY_WINDOW = 60
+
+
+def _exchange_for_symbol(symbol: str, default: str = "NSE") -> str:
+    """Look up the canonical exchange for ``symbol`` from the symbol table.
+
+    Falls back to ``default`` when the lookup fails — the symbol either
+    isn't in the master contract yet or the lookup raised. Backtests
+    typically run against NSE equity, so the default is intentional.
+    """
+    try:
+        from database.token_db import get_symbol_info  # noqa: PLC0415
+
+        info = get_symbol_info(symbol)
+        if info is not None:
+            exch = getattr(info, "exchange", None) or (
+                info.get("exchange") if isinstance(info, dict) else None
+            )
+            if exch:
+                return str(exch)
+    except Exception:
+        pass
+    return default
+
+
+def _parse_bar_ts(raw: Any) -> _dt.datetime | None:
+    """Coerce a Historify timestamp (epoch int or datetime) to a naive datetime."""
+    if raw is None:
+        return None
+    if isinstance(raw, _dt.datetime):
+        return raw.replace(tzinfo=None)
+    try:
+        # Historify stores epoch seconds; tolerate epoch ms too.
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 10_000_000_000:
+        value = value / 1000.0
+    return _dt.datetime.fromtimestamp(value)
+
+
+def _aggregate_to_interval(
+    bars_1m: list[dict[str, Any]],
+    symbol: str,
+    interval: str,
+) -> list[dict[str, Any]]:
+    """Re-aggregate 1-minute bars into ``interval`` bars via ``BarBuilder``.
+
+    Each 1m bar is fed to the builder as a synthetic tick at the bar's close
+    (price=close, volume=running cumulative volume). The builder's natural
+    bucket-rollover semantics emit a closed bar when the next bucket starts.
+    A final ``close_current_bar`` call flushes the trailing bucket.
+    """
+    from services.bar_aggregator import BarBuilder  # noqa: PLC0415
+
+    closed: list[dict[str, Any]] = []
+    builder = BarBuilder(symbol, interval, on_bar=lambda bar: (
+        closed.append(bar) if bar.get("elapsed_pct", 0.0) >= 1.0 else None
+    ))
+
+    cum_vol = 0
+    for raw in bars_1m:
+        ts = _parse_bar_ts(raw.get("timestamp"))
+        if ts is None:
+            continue
+        cum_vol += int(raw.get("volume") or 0)
+        builder.on_tick({
+            "ts": ts,
+            "price": float(raw.get("close") or 0.0),
+            "cumulative_volume": cum_vol,
+        })
+
+    final_bar = builder.close_current_bar(forced=True)
+    if final_bar is not None and final_bar.get("elapsed_pct", 0.0) >= 1.0:
+        closed.append(final_bar)
+    return closed
+
+
+def _aggregate_to_interval_ohlc(
+    bars_1m: list[dict[str, Any]],
+    interval: str,
+) -> list[dict[str, Any]]:
+    """Aggregate 1m bars to ``interval`` preserving true OHLC + true volume.
+
+    The BarBuilder is tick-driven and only sees a single close-tick per 1m
+    bar, so it doesn't observe the 1m bar's actual high/low. The simulator
+    needs true intrabar high/low to evaluate SL/target hits. This helper
+    bucket-aggregates 1m bars into ``interval`` buckets and aggregates
+    open=first, high=max, low=min, close=last, volume=sum.
+    """
+    from services.bar_aggregator import bucket_for_interval, interval_to_seconds  # noqa: PLC0415
+
+    interval_seconds = interval_to_seconds(interval)
+
+    buckets: dict[_dt.datetime, dict[str, Any]] = {}
+    order: list[_dt.datetime] = []
+
+    for raw in bars_1m:
+        ts = _parse_bar_ts(raw.get("timestamp"))
+        if ts is None:
+            continue
+        bkey = bucket_for_interval(ts, interval_seconds)
+        cell = buckets.get(bkey)
+        o = float(raw.get("open") or 0.0)
+        h = float(raw.get("high") or 0.0)
+        l = float(raw.get("low") or 0.0)
+        c = float(raw.get("close") or 0.0)
+        v = int(raw.get("volume") or 0)
+        if cell is None:
+            buckets[bkey] = {
+                "ts": bkey,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": v,
+            }
+            order.append(bkey)
+        else:
+            cell["high"] = max(cell["high"], h)
+            cell["low"] = min(cell["low"], l)
+            cell["close"] = c
+            cell["volume"] += v
+
+    return [buckets[k] for k in order]
+
+
+def _fetch_bars(symbol: str, exchange: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
+    """Fetch 1m bars from Historify via ``services.history_service.get_history``.
+
+    Returns the raw record list, or ``[]`` when no data is available. Raises
+    only if get_history itself raises — caller catches and converts to a
+    per-symbol skip.
+    """
+    from services.history_service import get_history  # noqa: PLC0415
+
+    success, payload, _status = get_history(
+        symbol=symbol,
+        exchange=exchange,
+        interval="1m",
+        start_date=from_date,
+        end_date=to_date,
+        source="db",
+    )
+    if not success:
+        return []
+    return list(payload.get("data") or [])
+
+
+def _build_indicators_dict(bars_df):
+    """Mirror ``ScannerService._build_indicators`` — same NaN-safety envelope."""
+    from services import indicators as _ind  # noqa: PLC0415
+
+    try:
+        ema_20 = _ind.ema(bars_df["close"], period=20)
+    except Exception:
+        ema_20 = None
+    try:
+        atr_14 = _ind.atr(bars_df, period=14) if len(bars_df) >= 2 else None
+    except Exception:
+        atr_14 = None
+    try:
+        rsi_14 = _ind.rsi(bars_df["close"], period=14)
+    except Exception:
+        rsi_14 = None
+    try:
+        vol_avg_20 = _ind.volume_average(bars_df["volume"], period=20)
+    except Exception:
+        vol_avg_20 = None
+    return {
+        "ema_20": ema_20,
+        "atr_14": atr_14,
+        "rsi_14": rsi_14,
+        "volume_avg_20": vol_avg_20,
+    }
+
+
+def _enabled_rules(rule_names: list[str] | None) -> list[tuple[str, Any, str]]:
+    """Resolve rule names → (name, callable, screener_type) triples.
+
+    When ``rule_names`` is None / empty, returns every registered rule
+    (mirroring ScannerService.all_rules). Unknown names are silently
+    skipped — the rule registry may not have a callable for every DB
+    definition (e.g. legacy Chartink-only rows).
+    """
+    # Import the rule package so @scan_rule decorators self-register.
+    import services.scan_rules  # noqa: F401, PLC0415
+    from services import scanner_service  # noqa: PLC0415
+
+    all_rules = scanner_service.all_rules()
+    if not rule_names:
+        return [
+            (name, meta["fn"], meta.get("screener_type", "buy"))
+            for name, meta in all_rules.items()
+        ]
+
+    out: list[tuple[str, Any, str]] = []
+    for name in rule_names:
+        meta = all_rules.get(name)
+        if meta is None:
+            logger.warning("backtest: skipping unknown rule %r", name)
+            continue
+        out.append((name, meta["fn"], meta.get("screener_type", "buy")))
+    return out
+
+
+def _parse_eod_time(eod_time_ist: str) -> _dt.time:
+    h, m = eod_time_ist.split(":")
+    return _dt.time(int(h), int(m))
+
+
+def _replay_symbol(
+    *,
+    run_id: int,
+    symbol: str,
+    exchange: str,
+    from_date: str,
+    to_date: str,
+    interval: str,
+    atr_period: int,
+    atr_sl_mult: float,
+    rr_target: float,
+    position_size: int,
+    eod_time: _dt.time,
+    rules: list[tuple[str, Any, str]],
+) -> int:
+    """Walk a single symbol's bars end-to-end. Returns trade count."""
+    import pandas as pd  # noqa: PLC0415
+
+    from services import indicators as _ind  # noqa: PLC0415
+
+    bars_1m = _fetch_bars(symbol, exchange, from_date, to_date)
+    if not bars_1m:
+        logger.info("backtest: no 1m history for %s/%s, skipping", symbol, exchange)
+        return 0
+
+    bars = _aggregate_to_interval_ohlc(bars_1m, interval)
+    if not bars:
+        logger.info("backtest: no aggregated bars for %s/%s, skipping", symbol, exchange)
+        return 0
+
+    history_rows: list[dict[str, Any]] = []
+    open_trade: dict[str, Any] | None = None  # in-memory mirror of the open trade row
+    pending_entry: dict[str, Any] | None = None  # signal armed at previous bar's close
+    sl_block_date: _dt.date | None = None  # same-day stop-out block date
+    trades_recorded = 0
+
+    for bar in bars:
+        bar_ts = bar["ts"]
+        bar_date = bar_ts.date()
+        bar_open = float(bar["open"])
+        bar_high = float(bar["high"])
+        bar_low = float(bar["low"])
+        bar_close = float(bar["close"])
+
+        # New day → clear yesterday's same-day block.
+        if sl_block_date is not None and bar_date > sl_block_date:
+            sl_block_date = None
+
+        # ----- 1. Service any pending entry from the previous bar's close.
+        if open_trade is None and pending_entry is not None:
+            entry_price = bar_open
+            atr = pending_entry["atr"]
+            direction = pending_entry["direction"]
+            risk_per_share = max(atr * atr_sl_mult, 0.01) if atr else 0.01
+            if direction == "LONG":
+                sl_price = entry_price - risk_per_share
+                target_price = entry_price + (rr_target * risk_per_share)
+            else:
+                sl_price = entry_price + risk_per_share
+                target_price = entry_price - (rr_target * risk_per_share)
+
+            trade_id = record_trade(
+                run_id=run_id,
+                symbol=symbol,
+                direction=direction,
+                entry_at=bar_ts.isoformat(),
+                entry_price=entry_price,
+                entry_reason=pending_entry["rule_name"],
+                quantity=position_size,
+                atr_at_entry=atr,
+                sl_price=sl_price,
+                target_price=target_price,
+            )
+            if trade_id > 0:
+                open_trade = {
+                    "id": trade_id,
+                    "direction": direction,
+                    "entry_at": bar_ts,
+                    "entry_price": entry_price,
+                    "sl_price": sl_price,
+                    "target_price": target_price,
+                    "quantity": position_size,
+                    "rule_name": pending_entry["rule_name"],
+                }
+                trades_recorded += 1
+            pending_entry = None
+
+        # ----- 2. Append this bar to the rolling history window.
+        history_rows.append({
+            "ts": bar_ts,
+            "open": bar_open,
+            "high": bar_high,
+            "low": bar_low,
+            "close": bar_close,
+            "volume": float(bar.get("volume", 0) or 0),
+        })
+        if len(history_rows) > _HISTORY_WINDOW:
+            history_rows = history_rows[-_HISTORY_WINDOW:]
+
+        # ----- 3. Manage an open trade: check SL/target intra-bar, then EOD.
+        if open_trade is not None:
+            direction = open_trade["direction"]
+            exit_price: float | None = None
+            exit_reason: str | None = None
+
+            if direction == "LONG":
+                # Order matters when both levels are touched in a single bar:
+                # without tick-level data we cannot prove which hit first.
+                # Conservative choice: assume SL fills first (worst case for
+                # the strategy). Matches how a real broker prices an
+                # ambiguous intrabar fill.
+                if bar_low <= open_trade["sl_price"]:
+                    exit_price = open_trade["sl_price"]
+                    exit_reason = "stop_loss"
+                elif bar_high >= open_trade["target_price"]:
+                    exit_price = open_trade["target_price"]
+                    exit_reason = "target"
+            else:  # SHORT
+                if bar_high >= open_trade["sl_price"]:
+                    exit_price = open_trade["sl_price"]
+                    exit_reason = "stop_loss"
+                elif bar_low <= open_trade["target_price"]:
+                    exit_price = open_trade["target_price"]
+                    exit_reason = "target"
+
+            # EOD squareoff: force-close at bar close (we are by definition
+            # past the cutoff time at this bar's close).
+            if exit_reason is None and bar_ts.time() >= eod_time:
+                exit_price = bar_close
+                exit_reason = "eod_squareoff"
+
+            if exit_reason is not None:
+                qty = open_trade["quantity"]
+                entry_p = open_trade["entry_price"]
+                if direction == "LONG":
+                    pnl = (exit_price - entry_p) * qty
+                else:
+                    pnl = (entry_p - exit_price) * qty
+                denom = entry_p * qty
+                pnl_pct = (pnl / denom) if denom > 0 else 0.0
+                hold = int((bar_ts - open_trade["entry_at"]).total_seconds())
+                close_trade(
+                    trade_id=open_trade["id"],
+                    exit_at=bar_ts.isoformat(),
+                    exit_price=float(exit_price),
+                    exit_reason=exit_reason,
+                    pnl=float(pnl),
+                    pnl_pct=float(pnl_pct),
+                    hold_duration_seconds=hold,
+                )
+                if exit_reason == "stop_loss":
+                    sl_block_date = bar_date
+                open_trade = None
+
+        # ----- 4. After EOD time, no new entries arm.
+        if bar_ts.time() >= eod_time:
+            pending_entry = None
+            continue
+
+        # ----- 5. Same-day stop-out cooldown blocks new entries.
+        if open_trade is None and sl_block_date == bar_date:
+            pending_entry = None
+            continue
+
+        # ----- 6. Evaluate rules to arm the next bar's entry.
+        if open_trade is None and pending_entry is None and len(history_rows) >= 21:
+            bars_df = pd.DataFrame(history_rows)
+            indicators_dict = _build_indicators_dict(bars_df)
+            for rule_name, rule_fn, screener_type in rules:
+                try:
+                    matched = bool(rule_fn(bars_df, indicators_dict))
+                except Exception:
+                    logger.exception(
+                        "backtest: rule %r raised on %s @ %s",
+                        rule_name, symbol, bar_ts.isoformat(),
+                    )
+                    continue
+                if not matched:
+                    continue
+                # Compute ATR for sizing the stop. Use the value at this bar.
+                try:
+                    atr_series = _ind.atr(bars_df, period=atr_period)
+                    atr_value = float(atr_series.iloc[-1]) if atr_series is not None else 0.0
+                    if atr_value != atr_value:  # NaN check (NaN != NaN)
+                        atr_value = 0.0
+                except Exception:
+                    atr_value = 0.0
+                pending_entry = {
+                    "direction": "LONG" if screener_type == "buy" else "SHORT",
+                    "rule_name": rule_name,
+                    "atr": atr_value,
+                }
+                break  # first match wins
+
+    return trades_recorded
+
+
+def run_backtest(
+    *,
+    strategy_name: str = "trending_equity_intraday",
+    rule_names: list[str] | None = None,
+    symbols: list[str],
+    from_date: str,
+    to_date: str,
+    interval: str = "5m",
+    atr_period: int = 14,
+    atr_sl_mult: float = 1.5,
+    rr_target: float = 1.5,
+    position_size: int = 500,
+    eod_time_ist: str = "15:15",
+    exchange: str | None = None,
+) -> int:
+    """Synchronous backtest. Returns the new run_id.
+
+    For each symbol: fetches 1m bars from Historify, re-aggregates to
+    ``interval``, walks the bars through a simulated entry/exit state
+    machine that mirrors the live engine's SL / target / EOD / same-day
+    stop-out semantics. Records every trade to ``backtest_trades`` and
+    finalises summary metrics on completion.
+
+    Per-symbol failures (no history, get_history raises) are logged and
+    skipped; the run still completes with whatever symbols succeeded. If
+    every symbol fails the run is still marked ``completed`` (with zero
+    trades). The run is only marked ``error`` when the orchestrator
+    itself crashes.
+    """
+    rules = _enabled_rules(rule_names)
+    effective_rule_names = [name for name, _, _ in rules]
+    eod_time = _parse_eod_time(eod_time_ist)
+
+    config = {
+        "atr_period": atr_period,
+        "atr_sl_mult": atr_sl_mult,
+        "rr_target": rr_target,
+        "position_size": position_size,
+        "eod_time_ist": eod_time_ist,
+        "exchange_default": exchange or "NSE",
+    }
+
+    run_id = create_run(
+        strategy_name=strategy_name,
+        rule_names=effective_rule_names,
+        symbols=symbols,
+        from_date=from_date,
+        to_date=to_date,
+        interval=interval,
+        config=config,
+    )
+    if run_id <= 0:
+        logger.error("backtest: failed to create run row")
+        return 0
+
+    try:
+        for symbol in symbols:
+            sym_exchange = exchange or _exchange_for_symbol(symbol)
+            try:
+                _replay_symbol(
+                    run_id=run_id,
+                    symbol=symbol,
+                    exchange=sym_exchange,
+                    from_date=from_date,
+                    to_date=to_date,
+                    interval=interval,
+                    atr_period=atr_period,
+                    atr_sl_mult=atr_sl_mult,
+                    rr_target=rr_target,
+                    position_size=position_size,
+                    eod_time=eod_time,
+                    rules=rules,
+                )
+            except Exception:
+                # Per-symbol failure — log and continue with remaining symbols
+                # rather than poisoning the whole run.
+                logger.exception("backtest: replay failed for symbol %s", symbol)
+                continue
+    except Exception as e:
+        logger.exception("backtest: orchestrator crashed for run %s", run_id)
+        update_run_status(run_id, "error", error_message=str(e))
+        return run_id
+
+    finalize_run(run_id)
+    return run_id
