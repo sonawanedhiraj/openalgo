@@ -2,9 +2,31 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Cowork Objective (Read First)
+
+**Cowork is the brain of this project.** It does real-time market research, selects
+and tunes strategies, monitors execution, and drives continuous improvement through
+a daily learn→backtest→improve loop. For the full objective, role definition, and
+daily workflow, see [`COWORK_OBJECTIVE.md`](COWORK_OBJECTIVE.md).
+
+**Strategy files live in `strategies/<name>/`** — each strategy has its own
+`LEARNINGS.md`, `VERSION_LOG.md`, and `config_snapshot.json`. Always read the
+active strategy's learnings before making decisions. See
+[`strategies/simplified_engine/`](strategies/simplified_engine/) for the current
+active strategy.
+
 ## Overview
 
-OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It provides a unified API layer across 24+ Indian brokers, enabling seamless integration with TradingView, Amibroker, Excel, Python, and AI agents.
+OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It is **four products in one self-hosted instance**, all sharing a single broker session and WebSocket feed:
+
+| Surface | Route | Purpose |
+| --- | --- | --- |
+| **Unified Broker API** | `/api/v1/` | External platforms (TradingView, Amibroker, ChartInk, Excel, Python, MCP) |
+| **Python Strategy Host** | `/python` | In-browser CodeMirror editor — paste scripts, schedule on IST times, run parallel strategies with process isolation and live logs |
+| **Flow (No-Code Builder)** | `/flow` | Drag-and-drop nodes: market data → indicators → conditions → order execution; JSON import/export |
+| **Options Trading Suite** | `/tools` | 12 analytical tools: Strategy Builder, Option Chain, IV Smile, Max Pain, Vol Surface, GEX, OI Tracker, Straddle Chart, etc. |
+
+All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-aligned auto square-off) and support Telegram alerts.
 
 **Repository**: https://github.com/marketcalls/openalgo
 **Documentation**: https://docs.openalgo.in
@@ -38,10 +60,10 @@ cp .sample.env .env
 # Generate new APP_KEY and API_KEY_PEPPER:
 uv run python -c "import secrets; print(secrets.token_hex(32))"
 
-# Build React frontend (required - not tracked in git)
-cd frontend && npm install && npm run build && cd ..
-
-# Run application (uv automatically handles virtual env and dependencies)
+# Run application (uv automatically handles virtual env and dependencies).
+# frontend/dist is committed to the repo, so a fresh clone already has it
+# ready to serve. You only need to install Node and build locally if you
+# are actively editing React code.
 uv run app.py
 ```
 
@@ -99,7 +121,7 @@ npm run format
 - `app.py` - Main Flask application entry point
 - `blueprints/` - Flask route handlers (UI and webhooks)
 - `restx_api/` - REST API endpoints (`/api/v1/`)
-- `broker/` - Broker integrations (24+ brokers), each with `api/`, `database/`, `mapping/`, `streaming/`, `plugin.json`
+- `broker/` - Broker integrations (30+ brokers), each with `api/`, `database/`, `mapping/`, `streaming/`, `plugin.json`
 - `services/` - Business logic layer
 - `database/` - SQLAlchemy models and database utilities
 - `utils/` - Shared utilities and helpers
@@ -113,7 +135,7 @@ OpenAlgo uses **6 separate databases** for isolation:
 - `db/logs.db` - Traffic and API logs
 - `db/latency.db` - Latency monitoring data
 - `db/health.db` - Health monitoring data
-- `db/sandbox.db` - Analyzer/sandbox mode (isolated virtual trading)
+- `db/sandbox.db` - Sandbox trading mode (isolated from live trading)
 - `db/historify.duckdb` - Historical market data (DuckDB)
 
 Each database has its own initialization function in `/database/`.
@@ -134,7 +156,7 @@ Broker API calls use `httpx` with HTTP/2 connection pooling (`utils/httpx_client
 
 ### Broker Integration Pattern
 
-All 24+ brokers follow a standardized structure in `broker/{broker_name}/`:
+All 30+ brokers follow a standardized structure in `broker/{broker_name}/`:
 
 1. `api/auth_api.py` - OAuth2 or API key based authentication
 2. `api/order_api.py` - Place, modify, cancel orders
@@ -238,8 +260,10 @@ Most testing is currently manual via:
 
 ### Building for Production
 
+You typically do **not** need to build the frontend yourself for production deploys — see the CI/CD section below. Build only when actively editing React code:
+
 ```bash
-# Build React frontend
+# Build React frontend (only needed if editing React code)
 cd frontend
 npm run build
 
@@ -249,19 +273,14 @@ npm run build
 
 ### Important: Frontend Build (CI/CD)
 
-**`frontend/dist/` is NOT tracked in git.** The CI/CD pipeline builds it automatically on each push.
+frontend/dist is committed (upstream convention as of v2.0.1.1 merge);
+local rebuilds may produce dirty working trees — commit dist when shipping.
 
-For local development after cloning:
-```bash
-cd frontend
-npm install
-npm run build
-```
+Practical implications:
 
-This is required before running the application locally. The build artifacts are gitignored to:
-- Prevent merge conflicts on hash-named files
-- Keep the repository size smaller
-- Ensure fresh builds via CI/CD
+- **Production servers** (clients running OpenAlgo on Ubuntu/Docker/EC2) **do not need Node.js or npm.** A plain `git pull` already brings the latest committed UI artifacts. This is the canonical upgrade path documented at https://docs.openalgo.in/installation-guidelines/getting-started/upgrade.
+- **Backend-only local devs** (editing Python only, not React) also typically don't need to build — the committed dist serves the UI fine.
+- **React developers** run `cd frontend && npm install && npm run build` (or `npm run dev` for hot reload) to test their own changes; commit the rebuilt dist when shipping UI changes.
 
 ## Key Architectural Concepts
 
@@ -290,13 +309,25 @@ Orders can flow through two modes:
 
 Approval workflow in `database/action_center_db.py` and `services/action_center_service.py`
 
-### Analyzer Mode (Paper Trading)
+### Sandbox Trading Mode
 
-Separate database (`sandbox.db`) with ₹1 Crore virtual capital:
+Separate database (`sandbox.db`) with ₹1 Crore sandbox capital:
 - Realistic margin system with leverage
 - Auto square-off at exchange timings
 - Complete isolation from live trading
-- Toggle via `/analyzer` blueprint
+- Sandbox controls (capital, leverage, reset schedule) live at `/sandbox` (`blueprints/sandbox.py`); request/response inspection is at `/analyzer` (`blueprints/analyzer.py`)
+
+### Python Strategy Host
+
+In-browser Python editor (`blueprints/python_strategy.py`) powered by **APScheduler** (`services/historify_scheduler_service.py` and `services/flow_scheduler_service.py` share the same scheduler instance). Each strategy runs in a subprocess for process isolation. Logs stream to the UI via SocketIO. Strategy metadata is persisted in `openalgo.db` via `database/strategy_db.py`.
+
+### Flow (No-Code Builder)
+
+Node-based visual strategy builder (`blueprints/flow.py`). Flow definitions are stored as JSON in `database/flow_db.py`. At runtime, `services/flow_executor_service.py` interprets the node graph, `services/flow_price_monitor_service.py` watches live prices, and `services/flow_scheduler_service.py` manages scheduled triggers via APScheduler.
+
+### MCP Integration
+
+Two MCP endpoints exist: `blueprints/mcp_http.py` (streamable HTTP transport for MCP) and `blueprints/mcp_oauth.py` (OAuth2 authorization for remote MCP clients). OAuth state is stored in `database/oauth_db.py`. The stdio MCP server (`mcp/mcpserver.py`) remains local-only.
 
 ### Real-Time Communication (Event-Driven Architecture)
 
@@ -328,13 +359,77 @@ Critical variables to configure:
 - `MAX_SYMBOLS_PER_WEBSOCKET`: Symbol limit per connection
 - `FLASK_DEBUG`: Enable debug mode (development only)
 
+## Version Bumping
+
+There are **two independent versions** in this repo. Do not confuse them.
+
+### 1. Platform version (e.g. `2.0.1.0`)
+
+This is the OpenAlgo platform itself. Source of truth: `utils/version.py`. Bumping touches **two files** and regenerates the lockfile — **never** the requirements files.
+
+1. `utils/version.py` — `VERSION = "x.y.z.w"` (runtime source of truth, read by `get_version()`)
+2. `pyproject.toml` — `version = "x.y.z.w"` (line 4, package metadata)
+3. Run `uv sync` to regenerate `uv.lock` with the new version
+
+```bash
+# Example: bumping platform 2.0.1.0 → 2.0.1.1
+# 1. Edit utils/version.py     → VERSION = "2.0.1.1"
+# 2. Edit pyproject.toml line 4 → version = "2.0.1.1"
+# 3. Sync the lockfile
+uv sync
+
+# 4. Verify
+uv run python -c "from utils.version import get_version; print(get_version())"
+# → 2.0.1.1
+```
+
+The platform version surfaces in:
+- The UI footer / about page (via `get_version()`)
+- API responses that include version metadata
+- Docker image tags built by CI
+
+### 2. OpenAlgo Python SDK pin (e.g. `openalgo==1.0.49`)
+
+This is a **separate** client library published on PyPI ([`openalgo`](https://pypi.org/project/openalgo/)) that the platform uses internally. It has its own release cycle. Bumping the SDK pin touches the dependency lists, **not** `utils/version.py`:
+
+1. `pyproject.toml` — update `openalgo==X.Y.Z` in the `dependencies` list
+2. `requirements.txt` — update the `openalgo==X.Y.Z` line
+3. `requirements-nginx.txt` — update the `openalgo==X.Y.Z` line
+4. Run `uv sync` to regenerate `uv.lock`
+
+```bash
+# Example: bumping SDK 1.0.49 → 1.0.50
+# Edit the three files above, then:
+uv sync
+```
+
+**Rule of thumb:** if you are releasing OpenAlgo, bump #1. If a new SDK is on PyPI with a fix you need, bump #2. They are unrelated.
+
 ## Code Style and Conventions
 
 ### Python
-- Follow PEP 8 style guide
+
+The project uses **Ruff** for linting and formatting (configured in `pyproject.toml`):
+
+```bash
+uv run ruff check .          # lint (errors + warnings)
+uv run ruff check . --fix    # auto-fix safe issues
+uv run ruff format .         # format (replaces Black)
+```
+
+Ruff rules enabled: `E`, `F`, `W` (pycodestyle/pyflakes), `I` (isort), `B` (bugbear), `C4` (comprehensions), `UP` (pyupgrade). Line-length 100, target Python 3.12. Directories excluded: `.venv`, `frontend`, `db`, `log`, `strategies`.
+
 - Use 4 spaces for indentation
 - Use Google-style docstrings
 - Imports: Standard library → Third-party → Local
+
+Dev security tooling (in `dev` dependency group):
+
+```bash
+uv run --group dev bandit -r . -x .venv,frontend   # security scan
+uv run --group dev pip-audit                        # CVE check on deps
+uv run --group dev detect-secrets scan              # secret leak scan
+```
 
 ### React/TypeScript
 - Follow Biome.js linting rules (`frontend/biome.json`)
@@ -364,7 +459,7 @@ API keys are generated at `/apikey` and hashed with pepper before storage.
 
 ### Symbol Format
 
-OpenAlgo uses a standardized symbol format across all 24+ brokers. Broker-specific symbols are mapped via `broker/*/mapping/` modules and stored in the `SymToken` table.
+OpenAlgo uses a standardized symbol format across all 30+ brokers. Broker-specific symbols are mapped via `broker/*/mapping/` modules and stored in the `SymToken` table.
 
 **Equity:** Just the base symbol — `INFY`, `SBIN`, `TATAMOTORS`
 
@@ -372,7 +467,7 @@ OpenAlgo uses a standardized symbol format across all 24+ brokers. Broker-specif
 
 **Options:** `[BaseSymbol][ExpiryDate][Strike][CE/PE]` — `NIFTY28MAR2420800CE`, `VEDL25APR24292.5CE`
 
-**Exchange codes:** `NSE` (equity), `BSE` (equity), `NFO` (NSE F&O), `BFO` (BSE F&O), `CDS` (NSE currency), `BCD` (BSE currency), `MCX` (commodity), `NCDEX` (commodity), `NSE_INDEX` (indices), `BSE_INDEX` (indices)
+**Exchange codes:** `NSE` (equity), `BSE` (equity), `NFO` (NSE F&O), `BFO` (BSE F&O), `CDS` (NSE currency), `BCD` (BSE currency), `MCX` (commodity), `NCDEX` (commodity), `NCO` (NSE commodities — Zerodha only), `NSE_INDEX` (indices), `BSE_INDEX` (indices), `GLOBAL_INDEX` (global indices — Zerodha only, quote-only; includes US30/JAPAN225/HANGSENG and `GIFTNIFTY` from NSE IFSC)
 
 **Order constants:**
 - **Product:** `CNC` (cash & carry / delivery), `NRML` (futures & options carry), `MIS` (intraday square-off)
@@ -462,10 +557,97 @@ All error logging uses `logger.exception()` (not `logger.error()` + manual trace
 2. Delete `frontend/node_modules` and run `npm install`
 3. Check for TypeScript errors: `npm run build`
 
+## Strategy Architecture
+
+Strategies are versioned independently under `strategies/<name>/`. Each has:
+- `LEARNINGS.md` — cumulative knowledge (most important file for decision-making)
+- `VERSION_LOG.md` — parameter/logic changes with dates, rationale, backtest evidence
+- `config_snapshot.json` — current live config values
+- `README.md` — strategy overview and usage
+
+**Active strategy**: [`strategies/simplified_engine/`](strategies/simplified_engine/)
+
+The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
+Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
+
+## Simplified Stock Engine
+
+This project hosts the simplified stock engine — a Chartink-driven intraday
+strategy that arms long/short watches and fires market orders via 5-minute
+candle breakouts with ATR-based stop loss and RR trailing. The engine has its
+own mode flag (`SIMPLIFIED_ENGINE_MODE`) and is independent of the global
+`analyze_mode` toggle.
+
+For deep context — the integration plan, every design decision, env var
+reference, test status, and the work queue for picking it up fresh — see
+[docs/SIMPLIFIED_ENGINE_HANDOFF.md](docs/SIMPLIFIED_ENGINE_HANDOFF.md).
+
+For strategy-specific learnings, parameter history, and daily results, see
+[`strategies/simplified_engine/LEARNINGS.md`](strategies/simplified_engine/LEARNINGS.md).
+
+Key files:
+- `services/simplified_stock_engine_core.py` — broker-agnostic engine.
+- `services/simplified_stock_engine_service.py` — openalgo integration.
+- `services/simplified_stock_engine_ticklog.py` — async tick log writer.
+- `blueprints/chartink.py:947+` — webhook, status, direction-toggle routes.
+- `test/test_simplified_stock_engine_*.py` — 68 tests.
+
+The default mode is `sandbox` — orders flow into `sandbox.db` (virtual ₹1Cr
+capital) regardless of the global analyze_mode flag. Flip to `live` only
+after running the test suite and the smoke-boot checklist in the hand-off doc.
+
 ## Claude Code Instructions
 
 ### Frontend Build Process
-When building the React frontend locally:
-- Run `cd frontend && npm run build` (build only, no tests)
-- Tests are handled by CI/CD pipeline, not required for local builds
-- The `frontend/dist/` directory is gitignored and built by GitHub Actions
+When actively editing React code, run `cd frontend && npm run build` (build only,
+no tests — tests run in CI; not required for local iteration). A fresh clone
+already has `frontend/dist/` committed, so backend-only work needs no Node/npm.
+
+frontend/dist is committed (upstream convention as of v2.0.1.1 merge);
+local rebuilds may produce dirty working trees — commit dist when shipping.
+
+## Cowork / AI Agent Operational Learnings
+
+For detailed session learnings including login flows, Zerodha quirks, API endpoints,
+webhook IDs, monitoring procedures, and daily workflow checklists, see:
+[docs/COWORK_SESSION_LEARNINGS.md](docs/COWORK_SESSION_LEARNINGS.md)
+
+**Key quick-reference from that doc:**
+- **Webhook ID**: `c7d08357-6fe1-4603-bd2a-be4c9f9e06ac` (strategy: `chartink_FnO_intraday_buy`)
+- **Simplified Engine POST**: `http://127.0.0.1:5000/chartink/simplified-stock-engine/<webhook_id>`
+- **Engine Status GET**: `http://127.0.0.1:5000/chartink/simplified-engine/api/status`
+- **Chartink Buy Screener**: `https://chartink.com/screener/fno-intraday-buy-20`
+- **Chartink Sell Screener**: `https://chartink.com/screener/alert-for-intraday-sell-fno`
+- Chrome extension cannot navigate to `kite.zerodha.com` — user must complete Zerodha login manually
+- Bash shell is sandboxed Linux — use `javascript_tool` in browser for localhost API calls
+- Zerodha tokens expire daily at 3 AM IST — re-login required each trading day
+- **Backtester**: `uv run python backtest/run_backtest.py --date YYYY-MM-DD --from-engine` — replays 5-min candles (or tick data with `--tick-data tick_logs`) through the engine in `disabled` mode (no DB writes). **Always use `--from-engine`** to fetch live config (atr_sl_mult, max_trades, cooldown) from the running engine API — without it, config may diverge from live and produce misleading results. Requires OpenAlgo running + active broker session. See Sections 11-12 of the learnings doc for full details, comparison analysis, and tick-data replay.
+
+## Cowork ↔ Claude Code Bridge Server
+
+A FastAPI bridge at `bridge/server.py` allows Cowork to invoke Claude Code CLI
+over HTTP for automated bug fixing, testing, and app restart.
+
+**Start**: `uv run python bridge/server.py` (runs on port 5001 alongside OpenAlgo on 5000)
+
+**Endpoints** (all at `http://127.0.0.1:5001`):
+- `POST /fix-bug` — Send error details, Claude Code fixes the code and runs tests
+- `POST /run-tests` — Run pytest, optionally auto-fix failures
+- `POST /run` — Run any custom prompt via Claude Code
+- `POST /restart-app` — Kill and restart OpenAlgo
+- `GET /status` — Check if bridge is idle/busy
+- `GET /read-errors` — Read last N entries from errors.jsonl
+- `GET /engine-status` — Proxy simplified engine status
+
+**How Cowork calls it** (via browser JS on any OpenAlgo tab):
+```javascript
+fetch('http://127.0.0.1:5001/fix-bug', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify({
+    error_message: 'WebSocket connection failed',
+    traceback: '...',
+    file_path: 'services/simplified_stock_engine_service.py'
+  })
+}).then(r => r.json()).then(d => { window.__bridge_result = d; });
+```

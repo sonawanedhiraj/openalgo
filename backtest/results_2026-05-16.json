@@ -1,0 +1,23 @@
+{
+  "date": "2026-05-16",
+  "config": {
+    "capital": 20000.0,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500.0,
+    "atr_period": 14,
+    "atr_sl_mult": 1.2,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 6
+  },
+  "summary": {
+    "total_trades": 0,
+    "winners": 0,
+    "losers": 0,
+    "win_rate": 0,
+    "gross_pnl": 0.0,
+    "total_charges": 0.0,
+    "net_pnl": 0.0,
+    "roi_pct": 0.0
+  },
+  "trades": []
+}

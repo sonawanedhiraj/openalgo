@@ -47,6 +47,7 @@ from blueprints.historify import historify_bp  # Import the historify blueprint
 from blueprints.ivchart import ivchart_bp  # Import the IV chart blueprint
 from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
 from blueprints.straddle_chart import straddle_bp  # Import the straddle chart blueprint
+from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
 from blueprints.vol_surface import vol_surface_bp  # Import the vol surface blueprint
 from blueprints.latency import latency_bp  # Import the latency blueprint
@@ -77,6 +78,7 @@ from blueprints.system_permissions import (
 )
 from blueprints.telegram import telegram_bp  # Import the telegram blueprint
 from blueprints.traffic import traffic_bp  # Import the traffic blueprint
+from blueprints.whatsapp import whatsapp_bp  # Import the WhatsApp blueprint
 from blueprints.tv_json import tv_json_bp
 from blueprints.websocket_example import websocket_bp  # Import the websocket example blueprint
 from cors import cors  # Import the CORS instance
@@ -97,6 +99,9 @@ from database.symbol import init_db as ensure_master_contract_tables_exists
 from database.telegram_db import get_bot_config
 from database.traffic_db import init_logs_db as ensure_traffic_logs_exists
 from database.user_db import init_db as ensure_user_tables_exists
+from database.whatsapp_db import (
+    get_bot_config as get_whatsapp_bot_config,  # noqa: F401  (triggers module-level init_db)
+)
 from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
@@ -254,6 +259,7 @@ def create_app():
     app.register_blueprint(pnltracker_bp)  # Register PnL tracker blueprint
     app.register_blueprint(python_strategy_bp)  # Register Python strategy blueprint
     app.register_blueprint(telegram_bp)  # Register Telegram blueprint
+    app.register_blueprint(whatsapp_bp)  # Register WhatsApp blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint
     app.register_blueprint(sandbox_bp)  # Register Sandbox blueprint
     app.register_blueprint(playground_bp)  # Register API playground blueprint
@@ -263,6 +269,7 @@ def create_app():
     app.register_blueprint(ivchart_bp)  # Register IV chart blueprint
     app.register_blueprint(oitracker_bp)  # Register OI tracker blueprint
     app.register_blueprint(straddle_bp)  # Register straddle chart blueprint
+    app.register_blueprint(strategy_chart_bp)  # Register strategy chart blueprint
     app.register_blueprint(custom_straddle_bp)  # Register custom straddle blueprint
     app.register_blueprint(vol_surface_bp)  # Register vol surface blueprint
     app.register_blueprint(gex_bp)  # Register GEX blueprint
@@ -273,10 +280,96 @@ def create_app():
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
     app.register_blueprint(strategy_portfolio_bp)  # Register Strategy Portfolio blueprint
 
+    # Remote MCP (HTTP + OAuth) — opt-in via MCP_HTTP_ENABLED. Off by default.
+    # Pre-flight refusal: must NEVER coexist with FLASK_DEBUG=True (debug-mode
+    # tracebacks would leak bearer tokens). See docs/prd/remote-mcp.md.
+    if os.getenv("MCP_HTTP_ENABLED", "False").lower() == "true":
+        # Match Flask's own truthy parsing (Flask accepts "1"/"t"/"true").
+        # The narrow `== "true"` check we used to do let FLASK_DEBUG=1
+        # slip past this guard while still putting Flask in debug mode.
+        if os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t"):
+            raise RuntimeError(
+                "MCP_HTTP_ENABLED=True is not allowed with FLASK_DEBUG enabled. "
+                "Debug-mode tracebacks leak bearer tokens. Disable one of them."
+            )
+
+        # Hard requirement: MCP_PUBLIC_URL anchors the JWT iss/aud claims.
+        # Without it, tokens issued by two unconfigured instances would
+        # validate against each other (security review finding H-1).
+        if not os.getenv("MCP_PUBLIC_URL"):
+            raise RuntimeError(
+                "MCP_HTTP_ENABLED=True requires MCP_PUBLIC_URL to be set to "
+                "the canonical HTTPS origin (e.g. https://mcp.yourdomain.com). "
+                "Without it, JWT iss/aud claims collapse to empty strings and "
+                "tokens become portable across instances."
+            )
+
+        # Crucial ordering: set OPENALGO_MCP_HTTP_BOOT BEFORE importing the
+        # MCP HTTP blueprint. The blueprint transitively imports
+        # mcp.mcpserver, which checks this env var to skip the stdio
+        # argv requirement. Stdio launches never set this var, so their
+        # behavior is unaffected.
+        os.environ["OPENALGO_MCP_HTTP_BOOT"] = "1"
+
+        from blueprints.mcp_http import mcp_http_bp
+        from blueprints.mcp_oauth import mcp_oauth_bp, mcp_wellknown_bp
+        from database.oauth_db import init_db as init_oauth_db
+        from utils.oauth_keys import ensure_signing_key
+
+        # Idempotent: tables created if missing, signing key generated on
+        # first run. Ordering matters — ensure_signing_key writes a row
+        # to oauth_signing_keys, so the table must exist first.
+        init_oauth_db()
+        ensure_signing_key()
+
+        app.register_blueprint(mcp_oauth_bp)
+        app.register_blueprint(mcp_wellknown_bp)
+        app.register_blueprint(mcp_http_bp)
+
+        # Externally-facing OAuth endpoints and the MCP transport are
+        # called by hosted clients (claude.ai etc.) that have NO
+        # OpenAlgo session cookie. Flask-WTF's global CSRFProtect would
+        # 400 every request without these exemptions (security review
+        # finding C-1). Authentication on these endpoints is via
+        # Bearer token (transport) or client_secret + PKCE (token /
+        # revoke) — CSRF cookie protection doesn't apply.
+        # /oauth/authorize POST is intentionally NOT exempted: it's
+        # browser-driven from the OpenAlgo session and uses the
+        # rendered consent form's csrf_token field.
+        with app.app_context():
+            for endpoint in (
+                "mcp_oauth_bp.token_endpoint",
+                "mcp_oauth_bp.revoke_endpoint",
+                "mcp_oauth_bp.register_client",
+                "mcp_http_bp.mcp_dispatch",
+                "mcp_http_bp.mcp_sse",
+            ):
+                view = app.view_functions.get(endpoint)
+                if view is not None:
+                    csrf.exempt(view)
+
+        # Boot warnings for non-default security postures so an admin
+        # who flipped these months ago and forgot is reminded on every
+        # restart (security review finding L-3).
+        if os.getenv("MCP_OAUTH_WRITE_SCOPE_ENABLED", "True").lower() == "true":
+            logger.warning(
+                "[MCP] write:orders scope is ENABLED — MCP clients can place real orders."
+            )
+        if os.getenv("MCP_OAUTH_REQUIRE_APPROVAL", "False").lower() != "true":
+            logger.warning(
+                "[MCP] DCR auto-approval is ENABLED — any DCR registration "
+                "can immediately complete OAuth without admin review."
+            )
+
+        logger.info(
+            "Remote MCP blueprints registered (OAuth + JSON-RPC dispatch + SSE)."
+        )
+
     # Exempt webhook endpoints from CSRF protection after app initialization
     with app.app_context():
         # Exempt webhook endpoints from CSRF protection
         csrf.exempt(app.view_functions["chartink_bp.webhook"])
+        csrf.exempt(app.view_functions["chartink_bp.simplified_stock_engine_webhook"])
         csrf.exempt(app.view_functions["strategy_bp.webhook"])
         csrf.exempt(app.view_functions["flow.trigger_webhook"])
         csrf.exempt(app.view_functions["flow.trigger_webhook_with_symbol"])
@@ -561,6 +654,35 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
 
+            # Auto-reconnect the WhatsApp bot if a paired session is persisted.
+            # Without this, every server restart would leave is_ready()=False
+            # and every /notify call would 409 "pair first" — even though the
+            # encrypted session blob is sitting in openalgo.db ready to use.
+            # We do this on a background thread so a slow WhatsApp handshake
+            # never delays the Flask boot.
+            def _autostart_whatsapp_bot():
+                try:
+                    from database.whatsapp_db import get_bot_config
+                    from services.whatsapp_bot_service import whatsapp_bot_service
+
+                    if not get_bot_config().get("is_paired"):
+                        logger.debug("WhatsApp: no paired session, skipping auto-start")
+                        return
+                    ok, msg = whatsapp_bot_service.start_bot()
+                    if ok:
+                        logger.info("WhatsApp bot auto-started from persisted session")
+                    else:
+                        logger.warning("WhatsApp bot auto-start failed: %s", msg)
+                except Exception:
+                    logger.exception("WhatsApp bot auto-start crashed")
+
+            import threading as _threading
+            _threading.Thread(
+                target=_autostart_whatsapp_bot,
+                daemon=True,
+                name="WhatsAppAutoStart",
+            ).start()
+
             # Auto-start analyzer mode services (depends on DB being ready)
             try:
                 from database.settings_db import get_analyze_mode
@@ -743,7 +865,12 @@ if is_docker:
         "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
     )
 else:
-    logger.debug("Running in local/integrated mode - Starting WebSocket proxy in Flask")
+    # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
+    # (not a thread) so the WS asyncio loop never shares an eventlet hub with
+    # gunicorn — closes the greenlet.error cross-thread crash class entirely
+    # (including GitHub issue #1421). Under the dev server (no eventlet) it
+    # still uses a real OS thread, as before.
+    logger.debug("Starting WebSocket proxy")
     start_websocket_proxy(app)
 
 # Start Flask development server with SocketIO support if directly executed

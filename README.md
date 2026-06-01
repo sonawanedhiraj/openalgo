@@ -11,13 +11,25 @@
 </div>
 
 ## What is OpenAlgo?
-OpenAlgo is a free, open source, self hosted algorithmic trading platform that bridges your trading ideas with real execution. Built with Python Flask and a modern React frontend, it provides a unified API layer across 30+ Indian brokers, enabling seamless automation from Amibroker, TradingView, GoCharting, N8N, Python, Java, Go, .NET, Node.js, ChartInk, MetaTrader, Excel, and Google Sheets. Traders can also receive strategy alerts directly on Telegram, ensuring real time visibility and control.
 
-Beyond execution, OpenAlgo empowers traders to completely own their trading infrastructure. Traders can effortlessly build algorithmic strategies, indicators, and custom trading dashboards using AI agentic coding tools, connect with their favorite trading platforms, and deploy strategies without being tied to any single broker or vendor. By standardizing broker APIs into one consistent trading layer, OpenAlgo allows strategies to work the same way across brokers, making automation faster, scalable, and fully under the trader’s control.
+OpenAlgo is a free, open source, self-hosted **trading platform** — not just a broker bridge. Built on Python Flask + React 19, it gives traders a full-stack environment to **design, host, and execute strategies** across **30+ Indian brokers** through a single unified API. Whether you write Python, prefer drag-and-drop, or trade options exclusively, OpenAlgo gives you a first-class workflow without tying you to any single broker or vendor.
+
+OpenAlgo is no longer just "an API layer in front of your broker." Today it is **four products in one self-hosted instance** — sharing one broker session, one WebSocket feed, and one database — covering the complete journey from idea → backtest → live trade.
+
+## Four Ways to Trade with OpenAlgo
+
+| Surface | Route | Who it's for |
+| --- | --- | --- |
+| **Unified Broker API** | `/api/v1/` | External platforms — TradingView, Amibroker, ChartInk, Excel, Google Sheets, Python, Java, Go, .NET, Node.js, MetaTrader, GoCharting, N8N. One API, 30+ brokers. |
+| **Python Strategy Host** | `/python` | Traders who code — paste any Python script into the in-browser CodeMirror editor, schedule it on IST start/stop times, run multiple strategies in parallel with process isolation, watch real-time logs. No external server, no Docker, no cron. |
+| **Flow — No-Code Strategy Builder** | `/flow` | Traders who don't code — drag-and-drop nodes for market data, indicators, conditions, order execution, and notifications. Webhook triggers for TradingView and external signals built in. JSON import/export for sharing strategies. |
+| **Options Trading Suite** | `/tools` | Options traders — twelve built-in analytical tools (Strategy Builder with payoff diagrams & live Greeks, Option Chain, IV Smile, Max Pain, Vol Surface, GEX dashboard, OI Tracker, OI Profile, Straddle Chart, Straddle PnL simulator, Option Greeks history). Each one streams from your connected broker. |
+
+Every surface above runs on the same Sandbox engine (₹1 Crore sandbox capital, exchange-aligned auto square-off) so you can sandbox-trade *any* of these flows before going live. Real-time dashboards, PnL tracker, latency monitor, Telegram alerts, and the AI / MCP server work uniformly across all four.
 
 ## Video Tutorial
 
-[![What is OpenAlgo](https://img.youtube.com/vi/LhbXWlUtCcM/0.jpg)](https://www.youtube.com/watch?v=LhbXWlUtCcM)
+[![What is OpenAlgo](https://img.youtube.com/vi/S5myMo9WUdQ/0.jpg)](https://www.youtube.com/watch?v=S5myMo9WUdQ)
 
 ## Quick Links
 
@@ -87,16 +99,38 @@ A single, standardized API across all brokers with 30+ endpoints:
 - ZeroMQ-based message bus for high-performance data distribution
 - Automatic reconnection and failover handling
 
-### Flow Visual Strategy Builder
+### Flow Visual Strategy Builder (`/flow`)
 Build trading strategies visually without writing code:
 - **Node-based editor** powered by xyflow/React Flow
-- **Pre-built nodes**: Market data, conditions, order execution, notifications
+- **Pre-built nodes**: Market data, indicators, conditions, order execution, notifications
 - **Real-time execution** with live market data
 - **Webhook triggers** for TradingView and external signals
+- **Condition nodes** with `true/false` and `yes/no` edge handles, `{{var}}` interpolation with list indexing
+- **JSON import/export** for sharing strategies between traders
 - **Visual debugging** with execution flow highlighting
 
+### Options & Strategy Analytics Tools (`/tools`)
+A complete suite of twelve built-in analytical tools for options trading and market analysis — no external subscriptions required. Accessible from the **Tools** page in the sidebar:
+
+| Tool | Route | What it does |
+|------|-------|--------------|
+| **Strategy Builder** | `/strategybuilder` | Build multi-leg option strategies with live Greeks, payoff diagrams, what-if simulators, Strategy Chart, Multi Strike OI tabs, and basket order execution |
+| **Strategy Portfolio** | `/strategybuilder/portfolio` | Saved strategies across MyTrades and Simulation watchlists |
+| **Option Chain** | `/optionchain` | Real-time option chain with live Greeks, OI data, and quick order placement |
+| **Option Greeks** | `/ivchart` | Historical IV, Delta, Theta, Vega, and Gamma charts for ATM options |
+| **OI Tracker** | `/oitracker` | Open Interest analysis with CE/PE OI bars, PCR overlay, and ATM strike marker |
+| **Max Pain** | `/maxpain` | Max Pain strike calculation with visual pain distribution across strikes |
+| **Straddle Chart** | `/straddle` | Dynamic ATM Straddle chart with rolling strike, Spot, and Synthetic Futures overlay |
+| **Straddle PnL** | `/straddlepnl` | Simulated intraday ATM straddle P&L with automated N-point adjustments and trade log |
+| **Vol Surface** | `/volsurface` | 3D Implied Volatility surface across strikes and expiries using live option chain data |
+| **GEX Dashboard** | `/gex` | Gamma Exposure analysis with OI Walls, Net GEX per strike, and top gamma strikes |
+| **IV Smile** | `/ivsmile` | Implied Volatility smile with Call/Put IV curves, ATM IV, and skew analysis |
+| **OI Profile** | `/oiprofile` | Futures candlestick with OI butterfly and daily OI change across strikes |
+
+All tools stream live from your connected broker via the unified WebSocket feed and work identically across every supported broker.
+
 ### API Analyzer Mode
-Complete testing environment with ₹1 Crore virtual capital:
+Complete testing environment with ₹1 Crore sandbox capital:
 - Test strategies with real market data without risking money
 - Pre-deployment testing for strategy validation
 - Supports all order types (Market, Limit, SL, SL-M)
@@ -115,14 +149,14 @@ Order approval workflow for manual control:
 
 [Action Center Documentation](https://docs.openalgo.in/new-features/action-center)
 
-### Python Strategy Manager
-Host and run Python strategies directly on OpenAlgo:
-- Built-in code editor powered by **CodeMirror** with Python syntax highlighting
-- Run multiple strategies in parallel with process isolation
-- Automated scheduling with IST-based start/stop times
-- Secure environment variable management with encryption
-- Real-time logs and state persistence
-- No need for external servers or hosting
+### Python Strategy Host (`/python`)
+Host and run your Python strategies directly inside OpenAlgo — no separate VM, no cron, no Docker:
+- Built-in code editor powered by **CodeMirror** with Python syntax highlighting and themes
+- Run multiple strategies in parallel with **full process isolation**
+- Automated **IST-based scheduling** with start/stop times and per-day-of-week control
+- Secure environment variable management with Fernet encryption
+- Real-time logs streamed to the browser; state persists across restarts
+- Built-in `Python Strategy Guide` page walks first-time users from an empty editor to a scheduled, running strategy
 
 ### ChartInk Integration
 Direct webhook integration for scanner alerts:

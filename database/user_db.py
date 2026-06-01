@@ -64,8 +64,57 @@ class User(Base):
     username = Column(String(80), unique=True, nullable=False)
     email = Column(String(120), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)  # Increased length for Argon2 hash
-    totp_secret = Column(String(32), nullable=False)  # For TOTP-based password reset
+    # Widened from 32 -> 255 to fit Fernet ciphertext (~100 chars).
+    # SQLite ignores VARCHAR length so existing rows are unaffected; the
+    # change matters only on Postgres/MySQL.
+    totp_secret = Column(String(255), nullable=False)  # Fernet-encrypted at rest
     is_admin = Column(Boolean, default=False)
+
+    # ----- 2FA (TOTP) controls -----
+    # ``totp_enabled`` is the master switch. When False, every per-purpose
+    # flag below is ignored and the install behaves exactly as it did
+    # before this feature landed (password-only login, existing reset
+    # options, no extra MCP gate). When True, the user picks which
+    # purposes the second factor applies to.
+    #
+    # Defaults are False so existing installs are not silently locked out.
+    # The settings UI surfaces the three purpose toggles together when the
+    # master is on; flipping master off does NOT clear the purpose flags
+    # so the user's preferences are remembered if they re-enable later.
+    totp_enabled = Column(Boolean, default=False, nullable=False)
+    totp_required_for_login = Column(Boolean, default=False, nullable=False)
+    totp_required_for_mcp = Column(Boolean, default=False, nullable=False)
+    totp_required_for_password_reset = Column(Boolean, default=False, nullable=False)
+
+    def is_totp_required_for(self, purpose: str) -> bool:
+        """Return True if 2FA is enabled AND required for this purpose.
+
+        ``purpose`` must be one of: ``"login"``, ``"mcp"``,
+        ``"password_reset"``. Unknown purposes return False (fail-open
+        for purposes the caller hasn't explicitly opted in — defense
+        against drift between callers and config).
+        """
+        if not self.totp_enabled:
+            return False
+        flag = {
+            "login": self.totp_required_for_login,
+            "mcp": self.totp_required_for_mcp,
+            "password_reset": self.totp_required_for_password_reset,
+        }.get(purpose, False)
+        return bool(flag)
+
+    def get_totp_secret(self):
+        """Return the user's TOTP secret in plaintext.
+
+        Encrypted-at-rest with auth_db Fernet (PBKDF2 over API_KEY_PEPPER).
+        Pre-migration plaintext rows are transparently handled by
+        safe_decrypt_token's fallback. This is the only correct way to read
+        the secret — never use ``self.totp_secret`` directly outside this
+        class, since that returns the raw column value (ciphertext or stale
+        plaintext).
+        """
+        from database.auth_db import safe_decrypt_token
+        return safe_decrypt_token(self.totp_secret) or self.totp_secret
 
     def set_password(self, password):
         """Hash password using Argon2 with pepper"""
@@ -87,13 +136,13 @@ class User(Base):
 
     def get_totp_uri(self):
         """Get the TOTP URI for QR code generation"""
-        return pyotp.totp.TOTP(self.totp_secret).provisioning_uri(
+        return pyotp.totp.TOTP(self.get_totp_secret()).provisioning_uri(
             name=self.email, issuer_name="OpenAlgo"
         )
 
     def verify_totp(self, token):
         """Verify TOTP token"""
-        totp = pyotp.TOTP(self.totp_secret)
+        totp = pyotp.TOTP(self.get_totp_secret())
         return totp.verify(token)
 
 
@@ -102,11 +151,60 @@ def init_db():
 
     Creates the ``users`` table if it does not already exist,
     using the shared ``db_init_helper`` for consistent startup
-    logging.
+    logging. Also applies idempotent column-level migrations for
+    schemas that pre-date features added to the model.
     """
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "User DB", logger)
+
+    # Column-level migration for installs whose ``users`` table was
+    # created before the per-purpose 2FA flags landed. ``create_all``
+    # is a no-op when the table already exists, so without this the
+    # columns referenced by the ORM (totp_enabled etc.) stay missing
+    # and every query that touches them fails with
+    # ``no such column: users.totp_enabled``. Mirrors the standalone
+    # upgrade/add_totp_purpose_flags.py so both code paths converge.
+    _migrate_add_totp_purpose_columns()
+
+
+def _migrate_add_totp_purpose_columns():
+    """Add per-purpose 2FA flag columns to ``users`` if missing.
+
+    Idempotent: each ALTER is gated by an inspector check, so this is
+    safe to run on every startup. Defaults match the model
+    (``False``) so existing installs keep their previous
+    password-only login behavior until the operator opts in via the
+    settings UI.
+    """
+    try:
+        from sqlalchemy import inspect, text
+
+        inspector = inspect(engine)
+        if "users" not in inspector.get_table_names():
+            return
+
+        existing = {col["name"] for col in inspector.get_columns("users")}
+        columns_to_add = (
+            "totp_enabled",
+            "totp_required_for_login",
+            "totp_required_for_mcp",
+            "totp_required_for_password_reset",
+        )
+        pending = [c for c in columns_to_add if c not in existing]
+        if not pending:
+            return
+
+        with engine.begin() as conn:
+            for column in pending:
+                conn.execute(
+                    text(f"ALTER TABLE users ADD COLUMN {column} BOOLEAN NOT NULL DEFAULT 0")
+                )
+                logger.info(f"Migration: Added '{column}' column to users table")
+    except Exception as e:
+        # Log but don't crash startup — a column-already-exists race or
+        # other transient DB issue should not block the app boot.
+        logger.exception(f"Migration check for TOTP purpose columns failed: {e}")
 
 
 def add_user(username, email, password, is_admin=False):
@@ -126,9 +224,17 @@ def add_user(username, email, password, is_admin=False):
         if a user with the same username or email already exists.
     """
     try:
-        # Generate TOTP secret for the user
+        # Generate TOTP secret and store it encrypted at rest using the
+        # auth_db Fernet (same pattern used for broker tokens, API keys).
+        # See _totp_plaintext() for the read path.
+        from database.auth_db import encrypt_token
         totp_secret = pyotp.random_base32()
-        user = User(username=username, email=email, totp_secret=totp_secret, is_admin=is_admin)
+        user = User(
+            username=username,
+            email=email,
+            totp_secret=encrypt_token(totp_secret),
+            is_admin=is_admin,
+        )
         user.set_password(password)
         db_session.add(user)
         db_session.commit()
@@ -165,6 +271,13 @@ def find_user_by_email(email):
 def find_user_by_username():
     """Find admin user"""
     return User.query.filter_by(is_admin=True).first()
+
+
+def find_user_by_exact_username(username):
+    """Look up a user by exact username match. Returns None if not found."""
+    if not username:
+        return None
+    return User.query.filter_by(username=username).first()
 
 
 def rehash_all_passwords():

@@ -28,14 +28,27 @@ try:
 except ImportError:
     COLORAMA_AVAILABLE = False
 
-# Sensitive patterns to filter out
+# Sensitive patterns to filter out.
+#
+# The patterns must match the forms the codebase actually emits, not just
+# `key=value`. Python dict repr (`'apikey': 'X'`), JSON (`"apikey":"X"`),
+# and shell-style (`apikey="X"`) all need to redact. The character class on
+# the value side allows `\w \- . + / =` so JWTs and base64 tokens are fully
+# consumed; the surrounding quote (if any) is preserved by anchoring on the
+# prefix capture group.
 SENSITIVE_PATTERNS = [
-    (r"(api[_-]?key[\s]*[=:]\s*)[\w\-]+", r"\1[REDACTED]"),
-    (r"(password[\s]*[=:]\s*)[\w\-]+", r"\1[REDACTED]"),
-    (r"(token[\s]*[=:]\s*)[\w\-]+", r"\1[REDACTED]"),
-    (r"(secret[\s]*[=:]\s*)[\w\-]+", r"\1[REDACTED]"),
-    (r"(authorization[\s]*[=:]\s*)[\w\-]+", r"\1[REDACTED]"),
+    # Bearer header tokens — run first so the broader pattern below doesn't
+    # leave the bearer suffix exposed when wrapped in quotes.
     (r"(Bearer\s+)[\w\-\.]+", r"\1[REDACTED]"),
+    # Common credential keys in any of: key=val, key: val, 'key': 'val',
+    # "key":"val", key="val". Includes broker-token aliases the codebase
+    # actually logs (enctoken, feed_token, access_token, session_token).
+    # Value class is a negated set so passwords with symbols (@!#$ ...) are
+    # fully consumed; we stop at whitespace, quotes, and dict/JSON structure.
+    (
+        r"(['\"]?(?:api[_-]?key[_-]?pepper|api[_-]?key|app[_-]?key|password|access[_-]?token|enctoken|feed[_-]?token|session[_-]?token|auth[_-]?token|authorization|secret|pepper|token)['\"]?\s*[:=]\s*['\"]?)[^\s'\",;}\]]+",
+        r"\1[REDACTED]",
+    ),
 ]
 
 # Color mappings for different log levels
@@ -151,16 +164,20 @@ class SensitiveDataFilter(logging.Filter):
             for pattern, replacement in SENSITIVE_PATTERNS:
                 record.msg = re.sub(pattern, replacement, str(record.msg), flags=re.IGNORECASE)
 
-            # Filter args if present
+            # Filter args if present — only replace args that actually
+            # contain sensitive data; preserve original types for others so
+            # %-style format specifiers like %d still work.
             if hasattr(record, "args") and record.args:
                 filtered_args = []
                 for arg in record.args:
-                    filtered_arg = str(arg)
+                    str_arg = str(arg)
+                    filtered = str_arg
                     for pattern, replacement in SENSITIVE_PATTERNS:
-                        filtered_arg = re.sub(
-                            pattern, replacement, filtered_arg, flags=re.IGNORECASE
+                        filtered = re.sub(
+                            pattern, replacement, filtered, flags=re.IGNORECASE
                         )
-                    filtered_args.append(filtered_arg)
+                    # Only replace with the string version if redaction changed it
+                    filtered_args.append(filtered if filtered != str_arg else arg)
                 record.args = tuple(filtered_args)
         except Exception:
             # If filtering fails, don't block the log message
@@ -219,7 +236,7 @@ class ColoredFormatter(logging.Formatter):
                 )
                 if result.returncode == 0 and "VirtualTerminalLevel" in result.stdout:
                     return True
-            except:
+            except Exception:
                 pass
 
             # Check if running in Windows Terminal, VS Code, or similar

@@ -1,0 +1,108 @@
+{
+  "date": "2026-05-19",
+  "config": {
+    "capital": 20000.0,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500.0,
+    "atr_period": 14,
+    "atr_sl_mult": 1.2,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 6
+  },
+  "summary": {
+    "total_trades": 6,
+    "winners": 1,
+    "losers": 5,
+    "win_rate": 16.7,
+    "gross_pnl": -971.4,
+    "total_charges": 358.08,
+    "net_pnl": -1329.48,
+    "roi_pct": -6.65
+  },
+  "trades": [
+    {
+      "symbol": "KOTAKBANK",
+      "direction": "LONG",
+      "qty": 258,
+      "entry_price": 386.8,
+      "exit_price": 385.8,
+      "entry_time": "11:39:59",
+      "exit_time": "12:19:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -258.0,
+      "charges": 59.82,
+      "net_pnl": -317.82,
+      "turnover": 199330.8
+    },
+    {
+      "symbol": "RELIANCE",
+      "direction": "LONG",
+      "qty": 74,
+      "entry_price": 1337.6,
+      "exit_price": 1334.97,
+      "entry_time": "12:29:59",
+      "exit_time": "12:29:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -194.62,
+      "charges": 59.55,
+      "net_pnl": -254.17,
+      "turnover": 197770.18
+    },
+    {
+      "symbol": "ICICIBANK",
+      "direction": "LONG",
+      "qty": 80,
+      "entry_price": 1245.5,
+      "exit_price": 1242.79,
+      "entry_time": "12:29:59",
+      "exit_time": "12:29:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -216.8,
+      "charges": 59.79,
+      "net_pnl": -276.59,
+      "turnover": 199063.2
+    },
+    {
+      "symbol": "ICICIBANK",
+      "direction": "LONG",
+      "qty": 80,
+      "entry_price": 1244.5,
+      "exit_price": 1247.37,
+      "entry_time": "12:34:59",
+      "exit_time": "12:54:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 229.6,
+      "charges": 59.89,
+      "net_pnl": 169.71,
+      "turnover": 199349.6
+    },
+    {
+      "symbol": "KOTAKBANK",
+      "direction": "LONG",
+      "qty": 259,
+      "entry_price": 385.65,
+      "exit_price": 384.65,
+      "entry_time": "13:34:59",
+      "exit_time": "13:39:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -259.0,
+      "charges": 59.86,
+      "net_pnl": -318.86,
+      "turnover": 199507.7
+    },
+    {
+      "symbol": "TCS",
+      "direction": "LONG",
+      "qty": 42,
+      "entry_price": 2334.1,
+      "exit_price": 2327.61,
+      "entry_time": "13:14:59",
+      "exit_time": "13:44:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -272.58,
+      "charges": 59.18,
+      "net_pnl": -331.76,
+      "turnover": 195791.82
+    }
+  ]
+}

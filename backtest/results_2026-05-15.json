@@ -1,0 +1,108 @@
+{
+  "date": "2026-05-15",
+  "config": {
+    "capital": 20000.0,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500.0,
+    "atr_period": 14,
+    "atr_sl_mult": 1.2,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 6
+  },
+  "summary": {
+    "total_trades": 6,
+    "winners": 0,
+    "losers": 6,
+    "win_rate": 0.0,
+    "gross_pnl": -2043.76,
+    "total_charges": 357.98,
+    "net_pnl": -2401.74,
+    "roi_pct": -12.01
+  },
+  "trades": [
+    {
+      "symbol": "RELIANCE",
+      "direction": "LONG",
+      "qty": 74,
+      "entry_price": 1346.4,
+      "exit_price": 1341.29,
+      "entry_time": "09:54:59",
+      "exit_time": "09:54:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -378.14,
+      "charges": 59.73,
+      "net_pnl": -437.87,
+      "turnover": 198889.06
+    },
+    {
+      "symbol": "INFY",
+      "direction": "LONG",
+      "qty": 88,
+      "entry_price": 1128.5,
+      "exit_price": 1122.86,
+      "entry_time": "09:59:59",
+      "exit_time": "10:14:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -496.32,
+      "charges": 59.59,
+      "net_pnl": -555.91,
+      "turnover": 198119.68
+    },
+    {
+      "symbol": "HDFCBANK",
+      "direction": "LONG",
+      "qty": 128,
+      "entry_price": 780.2,
+      "exit_price": 777.15,
+      "entry_time": "10:24:59",
+      "exit_time": "11:09:59",
+      "exit_reason": "stop_loss",
+      "gross_pnl": -390.4,
+      "charges": 59.82,
+      "net_pnl": -450.22,
+      "turnover": 199340.8
+    },
+    {
+      "symbol": "ICICIBANK",
+      "direction": "LONG",
+      "qty": 79,
+      "entry_price": 1250.4,
+      "exit_price": 1246.1,
+      "entry_time": "10:04:59",
+      "exit_time": "11:09:59",
+      "exit_reason": "stop_loss",
+      "gross_pnl": -339.7,
+      "charges": 59.43,
+      "net_pnl": -399.13,
+      "turnover": 197223.5
+    },
+    {
+      "symbol": "RELIANCE",
+      "direction": "LONG",
+      "qty": 74,
+      "entry_price": 1337.0,
+      "exit_price": 1334.2,
+      "entry_time": "12:44:59",
+      "exit_time": "13:49:59",
+      "exit_reason": "stop_loss",
+      "gross_pnl": -207.2,
+      "charges": 59.53,
+      "net_pnl": -266.73,
+      "turnover": 197668.8
+    },
+    {
+      "symbol": "ICICIBANK",
+      "direction": "LONG",
+      "qty": 80,
+      "entry_price": 1248.9,
+      "exit_price": 1246.0,
+      "entry_time": "12:34:59",
+      "exit_time": "14:54:59",
+      "exit_reason": "stop_loss",
+      "gross_pnl": -232.0,
+      "charges": 59.89,
+      "net_pnl": -291.89,
+      "turnover": 199592.0
+    }
+  ]
+}

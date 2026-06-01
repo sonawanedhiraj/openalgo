@@ -1,0 +1,1963 @@
+# AI Trading Bot — Architecture & Design
+
+> **Status:** Design / implementation-ready
+> **Author:** Operator + Cowork (captured 2026-05-26)
+> **Scope:** Evolution of the OpenAlgo + Chartink F&O intraday rig into an AI-supervised
+> autonomous trading bot, across a staged roadmap (now including an in-house scanner at
+> Stage 1.5), with the Stage 4 autonomous reasoning
+> agent and the real-time intelligence ingest layer specified in detail.
+> **Audience:** the single operator and the engineers who implement this.
+
+This document is the single source of truth for the redesign. It is dense on purpose.
+Schemas are SQL/Python, signatures are real, file paths are repo-relative to the
+OpenAlgo root (`C:\workspace\ai-trade-agent\openalgo`).
+
+---
+
+## 1. Goal Statement
+
+This system is a **single-operator F&O intraday trading rig**. It begins as a thin
+scheduled-task orchestrator that polls Chartink screeners and forwards matched symbols
+to the OpenAlgo simplified stock engine, and it evolves — stage by stage, never in one
+leap — into an **AI-supervised autonomous trading bot**. The division of labour is fixed
+and deliberate: **Claude provides context and judgment** (regime reading, anomaly
+detection, veto/size decisions, reflective learning), **classical rules and ML provide
+signal generation** (Chartink screeners today, gradient-boosted success probabilities
+later), and **OpenAlgo + Zerodha provide execution** (order routing, broker session,
+sandbox isolation). No LLM ever places or closes a real-money order autonomously; the
+LLM's authority is bounded to reading state, enriching it, and proposing or vetoing —
+with a human as the second key for anything irreversible.
+
+---
+
+## 2. Current Architecture (as of 2026-05-26)
+
+### 2.1 Components
+
+| Component | Location | Role |
+|---|---|---|
+| **Chartink screener** | `chartink.com/screener/fno-intraday-buy-20` (buy), `.../alert-for-intraday-sell-fno` (sell) | External signal source. Produces symbol lists on screener match. |
+| **Scheduled task `fno-scan-cycle`** | `C:\Users\Dheeraj\OneDrive\Documents\Claude\Scheduled\fno-scan-cycle\SKILL.md` | Cowork scheduled skill, runs **every 15 min** during market hours. Scrapes the screeners and POSTs symbols to the engine webhook. |
+| **OpenAlgo Flask app** | `app.py`, `http://127.0.0.1:5000` | Main platform. Hosts the engine, order routing, settings DB, analyzer/sandbox. |
+| **Simplified stock engine** | `services/simplified_stock_engine_service.py` (integration), `services/simplified_stock_engine_core.py` (broker-agnostic), `services/simplified_stock_engine_ticklog.py` (tick log) | Arms long/short watches from Chartink symbols, fires market orders on 5-min candle breakout with ATR stop loss and RR trailing. Has its **own** mode flag (`SIMPLIFIED_ENGINE_MODE`). |
+| **Chartink blueprint** | `blueprints/chartink.py` (`chartink_bp`, `url_prefix="/chartink"`, line 55) | Webhook + status + toggle routes. Engine POST at `:947`, status at `:1016`, toggle at `:1036`. |
+| **`place_order_service`** | `services/place_order_service.py` | Final order dispatch. Routes to broker or sandbox based on `analyze_mode`. |
+| **`sandbox_service`** | `services/sandbox_service.py` | Virtual ₹1 Cr paper-trading book in `db/sandbox.db`. |
+| **Settings DB** | `db/openalgo.db`, model in `database/settings_db.py` | `settings.analyze_mode` (Boolean). `get_analyze_mode()` at `:79`, `set_analyze_mode(bool)` at `:99`, TTL cache at `:19`. |
+| **Claude Bridge** | `bridge/server.py`, FastAPI on `http://127.0.0.1:5001` | Lets Cowork invoke Claude Code CLI over HTTP for bug-fix/test/restart. Endpoints: `/fix-bug`, `/run-tests`, `/run`, `/restart-app`, `/status`, `/read-errors`, `/engine-status`. |
+| **Zerodha broker integration** | `broker/zerodha/` | OAuth session (expires daily ~3 AM IST), order placement, quotes, funds. |
+
+### 2.2 Data-flow diagram
+
+```
+                          (every 15 min)
+  ┌──────────────┐      ┌────────────────────────┐
+  │  Chartink     │ scrape│  Scheduled task         │
+  │  buy / sell   │◀──────│  fno-scan-cycle         │
+  │  screeners    │       │  (Cowork SKILL.md)      │
+  └──────────────┘       └───────────┬────────────┘
+                                      │ POST symbols
+                                      ▼
+                    http://127.0.0.1:5000/chartink/simplified-stock-engine/<webhook_id>
+                                      │
+                          ┌───────────▼────────────┐
+                          │  blueprints/chartink.py  │
+                          │  (chartink_bp :947)      │
+                          └───────────┬────────────┘
+                                      ▼
+                    ┌─────────────────────────────────────┐
+                    │ simplified_stock_engine_service.py    │
+                    │  arms watch → 5m breakout → fires      │
+                    │  FLAG ① SIMPLIFIED_ENGINE_MODE         │  ← .env, read once at startup
+                    │        (live | sandbox | disabled)     │     {live ticks vs backtest sense}
+                    └─────────────────┬───────────────────┘
+                                      ▼
+                          ┌───────────────────────┐
+                          │ place_order_service.py  │
+                          │  FLAG ② settings.        │  ← db/openalgo.db, TTL-cached 1 hr
+                          │  analyze_mode (bool)     │     {broker routing}
+                          └─────┬──────────────┬────┘
+                          live  │              │  analyze
+                                ▼              ▼
+                        ┌──────────────┐  ┌──────────────┐
+                        │  Zerodha      │  │ sandbox_service│
+                        │  broker (real)│  │  db/sandbox.db │
+                        └──────────────┘  └──────────────┘
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  Claude Bridge (bridge/server.py, FastAPI :5001)            │
+  │  out-of-band: bug-fix / run-tests / restart / engine-status │
+  │  optionally logs scan results for observability             │
+  └──────────────────────────────────────────────────────────┘
+```
+
+**Where the two mode flags live (critical):**
+
+- **FLAG ① `SIMPLIFIED_ENGINE_MODE`** — string in `.env` (`= 'live'` today). Read **once at
+  process startup**. Governs the engine's own routing intent (`live` | `sandbox` |
+  `disabled`). Default per CLAUDE.md is `sandbox`; current `.env` is `live`.
+- **FLAG ② `settings.analyze_mode`** — Boolean in `db/openalgo.db`. Read by
+  `place_order_service` via `get_analyze_mode()`, **TTL-cached for 1 hour**
+  (`database/settings_db.py:19`). Governs whether the *platform* routes orders to broker
+  (False = live) or sandbox (True = analyze).
+
+These are two independent controls with overlapping but non-identical meaning. That
+overlap is the root of the redesign (see §3).
+
+### 2.3 Legacy and pending external components
+
+Two scripts under `pythonTradingAutomator\` predate this rig and are recorded here so they
+are not confused with live code:
+
+- **`pythonTradingAutomator\trending-stocks-buying-strategy\simplified_stock_engine.py`** —
+  the **OLD** standalone script. It has **already been ported** into OpenAlgo's simplified
+  engine (`services/simplified_stock_engine_core.py` + `_service.py`). Keep for **legacy
+  reference only**; do not extend it.
+- **`pythonTradingAutomator\src\optionBuyTradingEngine.py`** — a standalone Nifty
+  **options-buying** engine (ATM CE breakout after the 09:16–09:19 opening range, percentage
+  stop loss + RR trailing, monthly-expiry universe; ~700 lines, with both live-trading and
+  backtest `__main__` entry points). The script is **call-only** (bullish). It is **pending
+  port** into OpenAlgo as its **own independent strategy workstream**, not folded into the
+  equity engine — and it ports as **two mirror strategies**: `options_call_buy` (this script,
+  Stage 1.6a) and a new bearish mirror `options_put_buy` (Stage 1.6b), sharing an
+  `options_directional_breakout` base. See the multi-strategy architecture (§7.7) and the
+  Stage 1.6a/1.6b sequencing (§13). (An earlier, smaller class-only formulation,
+  `src\OptionBuyingStrategy.py`, is superseded by this engine and kept for legacy reference only.)
+
+---
+
+## 3. Known Problems Driving the Redesign
+
+Documented during the 2026-05-26 review:
+
+**(a) Two mode controls with non-identical semantics and different invalidation.**
+`.env SIMPLIFIED_ENGINE_MODE` and DB `settings.analyze_mode` can disagree. The engine can
+think it is `live` while the platform's `analyze_mode=True` silently diverts to sandbox
+(or vice-versa). Worse, their invalidation models differ: `.env` is read **once at
+startup** (changing it requires a restart), while `analyze_mode` is **cached for 1 hour**
+in-process. So the same toggle takes effect on two different, unpredictable timelines.
+
+**(b) The skill is mode-agnostic — no preflight check.** `fno-scan-cycle` POSTs symbols
+with no awareness of what mode the system is actually in. It cannot tell whether it is
+arming live or sandbox, whether the broker session is alive, or whether the day was even
+meant to trade. It fires blind.
+
+**(c) Scan persistence depends on bridge availability.** Today the only durable record of
+a scan cycle is whatever the bridge happens to log. If `bridge/server.py` is down, scans
+still post and orders still fire, but **observability is silently lost** — there is no
+fallback audit trail.
+
+**(d) Overloaded naming.** `engine_mode` (live ticks vs backtest replay — an in-process
+concept) collides conceptually with `mode` (broker routing — a DB/platform concept).
+Reading either name in code or logs is ambiguous without context. See the Glossary (§15).
+
+**(e) No persistent scan audit trail.** There is no table recording each scan cycle: what
+symbols matched, what was posted, what the engine returned, whether it errored. The
+traffic log (`db/logs.db`) records request metadata but **no request bodies**, so the
+actual symbol payloads are unrecoverable after the fact.
+
+**(f) LLM-orchestrated chores are fragile.** The deprecated `daily-trading-pipeline`
+(a single long-running LLM task that tried to drive the whole day) **died on turn
+limits**. Long autonomous LLM sessions that hold state in-context are brittle: they hit
+context/turn ceilings, lose state on crash, and cannot be resumed cleanly.
+
+**(g) No record of operator intent separate from system state.** The system has flags
+(`analyze_mode`, `SIMPLIFIED_ENGINE_MODE`) but no first-class record of what the **operator
+decided to do today** — trade live, paper-trade, or sit out. Intent and mechanism are
+conflated, so there is nothing to check the flags *against*.
+
+---
+
+## 4. Existing OpenAlgo Capabilities — Scanner Audit Findings
+
+A read-only repo audit on **2026-05-26** (findings inlined in §4.1–§4.2 below;
+no separate audit file is maintained) found the fork already provides
+**substantially more scanner-relevant infrastructure than originally assumed**. The
+expensive parts of an in-house scanner — a live data feed, broker adapters, the tradable
+universe, and the UI plumbing — already exist and are proven in production. This changes the
+reuse-vs-build calculus: building a scanner inside OpenAlgo is mostly *wiring together
+existing parts*, not greenfield. This finding is what justifies promoting the in-house
+scanner from far-future work to **Stage 1.5** (§5, detailed in §7.5).
+
+### 4.1 Reusable capabilities (reuse, don't rebuild)
+
+- **Live tick bus.** Broker WebSocket adapters (`broker/*/streaming/*_adapter.py`, reference
+  `broker/zerodha/streaming/zerodha_adapter.py`) normalise ticks and publish multipart
+  `[topic, json]` frames on a **ZeroMQ PUB socket at `127.0.0.1:5555`** (topic
+  `EXCHANGE_SYMBOL_MODE`). The unified proxy (`websocket_proxy/server.py`, WS on port
+  **8765**) already subscribes to all and fans out with O(1) routing. A scanner *subscribes*;
+  it does not build a feed.
+- **Historical bars.** `services/history_service.py:155`
+  (`get_history(symbol, exchange, interval, start_date, end_date, source=...)`) serves any
+  symbol/interval from the broker (`source='api'`) or the local **DuckDB cache at
+  `db/historify.duckdb`** (`source='db'`; 1m & D stored, 5m/15m/30m/1h computed on the fly).
+  `services/historify_scheduler_service.py` already refreshes it on a schedule, so backtest
+  backfill is free.
+- **Symbol master / universe.** `SymToken` (`database/symbol.py:25`) carries
+  symbol/exchange/expiry/strike/lotsize/instrumenttype. `enhanced_search_symbols(...)` and
+  `fno_search_symbols_db(...)` cover fuzzy search and F&O filtering; `token_db_enhanced` adds
+  a TTL cache. No need to build the master-contract layer.
+- **Outbound real-time to the React UI.** Anything published to a new ZMQ topic prefix
+  (e.g. `SCAN_*`) flows to UI clients of the 8765 proxy automatically, and Flask-SocketIO
+  events (the same rail the orders dashboard uses) let a scanner emit e.g. `scan_hit` to the
+  frontend with no protocol work.
+- **In-process event bus.** `utils/event_bus.py` — a singleton topic pub/sub
+  (`bus.subscribe(topic, cb)` / `bus.publish(Event)`, dispatched on a 10-worker thread pool),
+  already used to decouple order side-effects. Fine to extend for scanner→executor wiring.
+- **Freshness-aware last-tick cache.** `services/market_data_service.py:295` (singleton
+  `MarketDataService`) caches last-known values and exposes `get_ltp`/`get_quote`,
+  `is_data_fresh()`, `is_trade_management_safe()`. A scanner's "is this price stale?" guard
+  plugs straight in.
+
+### 4.2 Gaps to fill (genuinely new work)
+
+- **No generic tick→bar aggregator.** The only minute-bar builder is `FiveMinuteCandleBuilder`
+  buried in `services/simplified_stock_engine_core.py:304`, not reusable across N
+  watchlists / N intervals. Broker OHLC fields are the *daily* bar, not intraday.
+- **No scan-state tables.** There is no `scan_definitions`, no `scan_results`, no durable
+  `alerts` history — Flow's `PriceAlert` (`services/flow_price_monitor_service.py:39`) is
+  **RAM-only**. No `bars_live` ring buffer either; DuckDB holds historical bars only.
+- **No TA library.** `pyproject.toml` bundles no `talib`/`pandas_ta`/`stockstats`/`ta`. Only
+  ATR is hand-rolled (`_update_atr_wilder()` in the engine core). EMA/RSI/VWAP/MACD/etc. are
+  greenfield — standardize on **`pandas-ta`** (Decided 2026-05-26, §14 Q7; §7.5.1 item 3).
+- **No sector/industry column on `SymToken`.** `name` is free-text only; sector-relative
+  criteria need a separate `sector_map` table or an external feed (NSE publishes free CSVs).
+- **No generic backtest harness.** `backtest/run_backtest.py` is hard-coupled to the
+  simplified engine — no portfolio-level, parameter-sweep, or walk-forward framework.
+- **Scheduler fragmentation.** APScheduler is wired in, but each consumer spins its own
+  `BackgroundScheduler` (flow, historify, strategy, python_strategy, chartink, sandbox
+  squareoff — 6+ instances). A new scanner can piggyback on `flow_scheduler` (already
+  persistent) or add a seventh; both are accepted patterns, but there is no single shared
+  scheduler to inherit.
+
+---
+
+## 4.5 Upstream Capabilities (post-v2.0.1.1 merge)
+
+On **2026-05-27** this fork was merged with upstream OpenAlgo **v2.0.1.1** (merge commit
+`07036a97` on `docs/ai-architecture-design`, `eb210e99` on `feat/simplified-engine-integration`).
+The merge is **cumulative** — it brings every upstream release through v2.0.1.1 (v2.0.0.6 →
+v2.0.1.1). Five of those additions overlap this design's roadmap directly: the original design
+contemplated some of them as **greenfield** work, but they now ship from upstream and should be
+**leveraged, not rebuilt**. Each subsection below names the feature, the upstream release that
+introduced it, the concrete code that landed, where this design now consumes it, and what we still
+have to build on top. (The non-design-changing security/perf items from the same merge — v2.0.0.6
+credential hardening, v2.0.0.7 WebSocket subscribe batching, v2.0.1.1 per-install Fernet salt — are
+folded into §6 and §7 where they bear on a decision, not given their own subsection.)
+
+### 4.5.1 Symbol Search rewrite (upstream v2.0.1.0, issue #1326)
+
+Multi-exchange / multi-instrumenttype filtering, the 500-row hard cap lifted, exchange-only browse,
+CSV download, AmiBroker/TradingView/Python/Excel copy formats, and per-user search history.
+(v2.0.1.1 additionally surfaced FUT-only MCX underlyings, #1385.)
+
+- **Blueprint:** `blueprints/search.py` — `GET /search/api/search` → `api_search()` (`:133`/`:135`,
+  comma-separated exchanges + instrument types), `GET /search/api/expiries` (`:227`),
+  `GET /search/api/underlyings` (`:240`, `include_futures` param), HTML page `GET /search/` (`:25`).
+- **REST API:** `/api/v1/search` namespace (`restx_api/__init__.py:84`, `restx_api/search.py`),
+  backed by `enhanced_search_symbols()` / `fno_search_symbols()` over `SymToken`
+  (`database/symbol.py:25` — the same universe table §4.1 already inventoried).
+- **Frontend:** `frontend/src/pages/Search.tsx`.
+- **Leveraged by:** §7.7 (per-strategy universe selection — each `BaseStrategy` declares its tradable
+  universe through these multi-exchange / multi-instrumenttype filters rather than a hand-rolled
+  filter) and §7.5 / §7.7 Stage 1.7 `sector_rotation` (the search infra is the substrate for
+  resolving the sector-index constituents the relative-strength bucketing needs).
+- **Still to build:** the `sector_map` table / `sector` column (§4.2 gap) — Symbol Search filters the
+  existing universe but adds no sector dimension; and the per-strategy universe *spec* that calls it.
+
+### 4.5.2 Admin Diagnostics page + `errors.jsonl` browser (upstream v2.0.1.0)
+
+A `/admin` Diagnostics surface: live system info (Python/Flask/SQLAlchemy versions, the six DB sizes,
+broker session state), a paginated browser over `log/errors.jsonl` with stack traces + Flask request
+context, and a one-click env-redacted diagnostic bundle.
+
+- **Blueprint:** `blueprints/admin.py` — `_errors_file_path()` (`:717`, path-traversal-guarded),
+  `GET /admin/api/errors` → `api_errors_list()` (`:786`, paginated, level/query filters),
+  `GET /admin/api/errors/stats` (`:939`), `GET /admin/api/errors/groups` (`:1036`),
+  `POST /admin/api/errors/client` → `api_errors_client_report()` (`:880`, accepts browser-side error
+  reports and **writes them into `errors.jsonl`**), `POST /admin/api/system/diagnostics` →
+  `api_system_diagnostics()` (`:1600`, connectivity probes), `GET /admin/api/system/report`
+  (`:1789`, downloadable bundle).
+- **Write path:** `log/errors.jsonl` is produced by the centralized logger — `JSONErrorFormatter`
+  (`utils/logging.py:293`), handler wired at `utils/logging.py:419`, file resolved at `:404`. One
+  JSON object per line, ERROR+ only, with traceback + request context (per CLAUDE.md "read
+  errors.jsonl first"). The `POST /admin/api/errors/client` route means *application code can push a
+  structured error into the same browser* without a parallel store.
+- **Leveraged by:** §6 Stage 0 observability — `cycle_heartbeat` and preflight errors route into this
+  existing surface rather than a parallel one (see §6.5 / §6.6).
+- **Still to build:** the `cycle_heartbeat` table itself (application-stage telemetry the generic
+  error log does not model); the diagnostics page is a *read/visibility* layer, not a heartbeat store.
+
+### 4.5.3 Remote MCP with OAuth 2.1 + per-purpose TOTP (upstream v2.0.1.0; UI polish v2.0.1.1)
+
+A self-hosted OAuth 2.1 (PKCE-S256, Dynamic Client Registration, RS256 JWTs, refresh-token rotation
+with family revocation) HTTP/SSE MCP transport exposing the same **40 tools** as the local stdio MCP,
+**off by default**, with admin approval of clients, a kill switch, and per-purpose TOTP that can gate
+the `write:orders` consent independently of login.
+
+- **HTTP transport:** `blueprints/mcp_http.py` (`url_prefix=/mcp`, `:46`) — JSON-RPC dispatcher
+  `POST /mcp` (`:410`), SSE `GET /mcp` (`:671`), `/mcp/healthz` (`:717`); audit log `log/mcp.jsonl`.
+- **OAuth:** `blueprints/mcp_oauth.py` (`url_prefix=/oauth`, `:52`) — `/oauth/register` DCR (`:280`),
+  `/oauth/jwks.json` (`:261`), `/oauth/authorize` (`:664`), `/oauth/token` (`:884`),
+  `/oauth/revoke` (`:1028`), fresh-TOTP check `_is_fresh_totp()` (`:404`). Models in
+  `database/oauth_db.py` (`OAuthClient` `:75`, `OAuthRefreshToken`, `OAuthSigningKey`).
+- **Per-purpose TOTP:** `database/user_db.py:84–104` — `totp_enabled` plus
+  `totp_required_for_login` / `_for_mcp` / `_for_password_reset` columns and the
+  `is_totp_required_for(purpose)` helper. The MCP `write:orders` consent gate is
+  `is_totp_required_for("mcp")` + a fresh `_is_fresh_totp()`.
+- **Tool registry:** `utils/mcp_tool_registry.py` — `TOOL_SCOPES` (`:53`) maps all 40 tools to
+  `read:market` / `read:account` / `write:orders` (scope constants `:43–45`).
+- **Admin console:** `blueprints/admin.py` — `/api/oauth/clients` (`:1906`), approve (`:1950`) /
+  revoke (`:1989`), `/api/mcp/audit` (`:2044`), `/api/mcp/kill-switch` (`:2144`).
+- **Leveraged by:** §10.4 `approval_inbox` (per-purpose TOTP on `write:orders` is structurally the
+  same **two-key** pattern this design specifies for irreversible actions) and §10.5 (operator
+  consent). **Decision:** keep the **local stdio MCP** for the Stage 4 baseline (§10.5/§10.11);
+  evaluate Remote MCP only if a **hosted-AI deployment** ever becomes a need — see the new §14
+  question and the §10.5 migration note.
+- **Still to build:** the `approval_inbox` table + executor (§10.4) and the agent tool servers
+  (§10.5) — Remote MCP is a *consent + transport* precedent, not the agent's tool layer.
+
+### 4.5.4 GTT (Good-Till-Triggered) endpoints — Zerodha + Dhan pilot (upstream v2.0.0.8, #1322)
+
+Broker-side GTT orders that persist a trigger **at the broker**, so a stop survives an OpenAlgo
+crash/restart. Four endpoints, **Zerodha + Dhan only** in this pilot (other brokers planned upstream).
+
+- **REST:** `POST /api/v1/placegttorder`, `/modifygttorder`, `/cancelgttorder`, `/gttorderbook`
+  (namespaces `restx_api/__init__.py:102–105`; `restx_api/place_gtt_order.py` etc.).
+- **Services:** `services/place_gtt_order_service.py`, `modify_gtt_order_service.py`,
+  `cancel_gtt_order_service.py`, `gtt_orderbook_service.py`.
+- **Brokers:** `broker/zerodha/api/gtt_api.py` (+ `mapping/gtt_data.py`), `broker/dhan/api/gtt_api.py`
+  (+ `mapping/gtt_data.py`).
+- **DB:** `sandbox_gtt` + `sandbox_gtt_legs` (`database/sandbox_db.py`); **live** GTTs are held
+  broker-side, not in an OpenAlgo table.
+- **Two constraints that matter for this design:**
+  1. **Sandbox/analyze-mode GTT execution is not yet shipped** — "analyze mode currently returns
+     `501` for GTT calls until the in-progress sandbox integration ships" (v2.0.0.8 release notes,
+     Phase 3). Because this rig **defaults to `sandbox` mode** (`SIMPLIFIED_ENGINE_MODE=sandbox`,
+     CLAUDE.md), **a GTT-backed SL only works against a *live* Zerodha/Dhan session today** — not in
+     the sandbox book the rig usually arms into.
+  2. **Zerodha:** Kite GTTs cannot carry `MARKET`; the service auto-converts to an MPP-protected
+     `LIMIT`, and `MIS` is rejected.
+- **Leveraged by:** §7 Stage 1 (once the veto layer green-lights an order, a broker GTT can carry the
+  stop, so an in-process crash no longer orphans the SL) and §10.5 (`tighten_stop_loss` becomes
+  "modify the GTT" when the SL is GTT-backed).
+- **Still to build:** GTT-backed SL is an *option*, not the default path, until (a) the engine runs in
+  `live` mode and (b) upstream ships sandbox GTT execution. In-process ATR/RR trailing remains the SL
+  mechanism in sandbox.
+
+### 4.5.5 Sandbox events on the `analyzer_update` SocketIO channel (upstream v2.0.0.7)
+
+Real-time engine-state events pushed to the React UI over a SocketIO channel.
+
+- **Important correction:** the `analyzer_update` channel **predates v2.0.0.7** — it is the
+  analyze-mode order/position event rail. What v2.0.0.7 added (commit `3ff65a3f`) is that **sandbox**
+  engine-internal events — fills, auto-square-off, T+1 settlement — now *also* emit on it.
+- **Emit path:** `subscribers/socketio_subscriber.py` — `_emit_analyzer_update()` helper
+  (`:242–247`) called from ~17 handlers across the analyze + sandbox paths (e.g.
+  `on_sandbox_order_filled` / `_auto_squareoff` / `_t1_settlement` at `:227` / `:233` / `:239`);
+  sandbox event types in `events/sandbox_events.py`; also emitted from `services/openposition_service.py`
+  and `services/orderstatus_service.py`.
+- **Frontend:** `frontend/src/hooks/useSocket.ts` `socket.on('analyzer_update', …)` refreshes
+  OrderBook / TradeBook / Positions / Holdings / Dashboard; toast routing in
+  `frontend/src/stores/alertStore.ts`.
+- **Leveraged by:** §7.5 (the scanner's freshness/staleness signalling and `scan_hit` UI updates ride
+  this existing rail instead of bespoke health-emit logic) and §10.5 (`get_market_state()` and the
+  dashboard reading `agent_decision` **subscribe** to `analyzer_update` rather than polling
+  `/chartink/simplified-engine/api/status`).
+- **Still to build:** the engine does **not** yet emit our application-specific events (scan cycle,
+  agent decision, mode change) on this channel — we add those emitters; the channel + frontend
+  plumbing is what we reuse.
+
+---
+
+## 5. Staged Roadmap
+
+Each stage has a hard gate. **Do not move on until the gate is met.**
+
+### Stage 0 — Operational Floor
+**Scope:** Fix the P0/P1 items from the architectural review (§3). Single source of truth
+for mode, durable scan audit trail, preflight gating, heartbeat, atomic mode toggle.
+**Dependencies:** none — this is the foundation everything else assumes.
+**Effort:** ~1.5–2 weeks.
+**Gate:** *Don't move on until* every scan cycle produces a `scan_cycle` row and a
+`cycle_heartbeat` trail **regardless of bridge state**, `resolve_effective_mode()` is the
+only thing any new code consults, and the skill refuses to post when `/preflight` fails.
+
+### Stage 1 — LLM Context / Veto Layer
+**Scope:** Insert a `signal_review_service.py` between engine arming and order dispatch.
+Each candidate signal is wrapped in one Claude call that can say `take | skip | size_down`
+with reasoning + confidence. Fail-safe to `skip`.
+**Dependencies:** Stage 0 (needs `scan_cycle` + effective-mode resolution to know what it
+is reviewing and in what mode).
+**Effort:** ~2 weeks.
+**Gate:** *Don't move on until* a full trading day runs with the veto layer in the path,
+every veto decision is logged, and measured added latency stays within the 1–3 s budget
+with no missed entries attributable to the LLM call.
+
+### Stage 1.5 — In-House Scanner Build
+**Scope:** Build a scanner that lives *inside* OpenAlgo to replace the external Chartink
+dependency — subscribe to the existing ZMQ tick bus, aggregate bars with a shared
+aggregator, evaluate scan rules on bar close, and POST hits to the *existing* engine webhook.
+Run it in **shadow** alongside Chartink before any cutover. Detailed design in §7.5.
+**Dependencies:** Stage 0 (the durable `scan_results` audit reuses the Stage-0 persistence
+discipline, and effective-mode gating still applies). **Independent of the Stage 1 veto
+layer** — the two can proceed in parallel.
+**Effort:** **~10–15 working days** for the build — *not* the 4–8 weeks originally assumed,
+because the audit (§4) shows the data feed, broker adapters, universe, and UI rail already
+exist. This stage is mostly wiring, plus a tick→bar aggregator, scan tables, and a small
+indicator set.
+**Gate:** *Don't retire Chartink until* the in-house scanner has run in shadow for **≥4 weeks**
+with **no major divergence the operator deems suspicious**, **and** the operator gives
+subjective sign-off after reviewing the shadow comparison report (qualitative cutover criteria
+in §7.5.3; the ~5-min Chartink update lag means parity alone justifies cutover).
+
+### Stage 2 — Reflective Trade Journal
+**Scope:** `trade_journal` table capturing every order with full context; a nightly Cowork
+reflection task that writes structured retrospectives to `journal_reflection` and opens
+rule-change PRs. Once Stage 1.5 lands, journal entries can also capture **in-house indicator
+snapshots** (ATR/EMA/RSI/volume at entry), making each nightly retrospective far richer than
+a Chartink rank alone — which raises Stage 2's value.
+**Dependencies:** Stage 1 (LLM reasoning is one of the journaled fields).
+**Effort:** ~1.5 weeks.
+**Gate:** *Don't move on until* the journal has captured a statistically useful run and the
+nightly reflection has produced at least one actionable, reviewed retrospective.
+
+### Stage 3 — Classical ML Signal Augmentation
+**Scope:** Feature pipeline over journal + market data → gradient boosting → walk-forward
+backtest → `/predict_success_probability` endpoint → ensemble with the scan score.
+**Dependencies:** Stage 2 (needs the journal as labelled training data) **and** Stage 1.5 —
+the in-house scanner's bar/indicator pipeline (§7.5) supplies the feature inputs, so Stage 3
+no longer has to stand up its own data feed first.
+**Effort:** large, deferred — this is future work.
+**Gate:** *Don't move on until* **6 months of journal data** exist and the walk-forward
+backtest shows out-of-sample lift over the Chartink-only baseline.
+
+### Stage 4 — Autonomous Reasoning Agent
+**Scope:** Event-driven supervisor built on the Claude Agent SDK. Reads all state from SQL,
+classifies situations (routine/anomaly/emergency), proposes/executes whitelisted
+non-monetary actions, escalates irreversible ones through a two-key approval inbox.
+Includes the real-time intelligence layer (§11).
+**Dependencies:** Stages 0–2 (needs the full SQL state surface and journal). Can begin in
+read-only/advisory mode before ML (Stage 3) lands.
+**Effort:** large — the bulk of this document (§10).
+**Gate:** *Don't move on until* the agent has run advisory-only (no write tools enabled)
+for a sustained period with operator-judged-correct classifications, and every guardrail
+ring has been exercised.
+
+### Stage 5 — Independent Signal Generation
+**Scope:** The bot generates its own signals rather than only filtering Chartink's.
+**Dependencies:** Stages 3 + 4 mature.
+**Effort:** open-ended, deferred.
+**Gate:** *Don't move on until* there is a validated edge under strict walk-forward
+discipline **and** a hard capital cap is enforced (see §12).
+
+---
+
+## 6. Stage 0 Detailed Design — Operational Floor
+
+All Stage-0 tables live in `db/openalgo.db` unless noted, with SQLAlchemy models added to
+`database/` (suggested new module `database/trading_ops_db.py`).
+
+### 6.1 `daily_intent` — operator's declared intent (source of truth)
+
+```sql
+CREATE TABLE daily_intent (
+    trade_date   DATE     PRIMARY KEY,                  -- one row per trading day
+    intent       TEXT     NOT NULL CHECK (intent IN ('live','sandbox','skip')),
+    set_by       TEXT     NOT NULL,                     -- 'operator' | 'agent' | 'system'
+    set_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked       BOOLEAN  NOT NULL DEFAULT 0,           -- once locked, only operator may change
+    notes        TEXT
+);
+```
+
+**Monotonicity rule (OPEN QUESTION — confirm with operator, see §14):** intent may only
+move *down the risk ladder* automatically: `live → sandbox → skip`. The agent and system
+may **downgrade** at any time; only the operator may **upgrade** (`skip → sandbox → live`),
+and only while `locked = 0`. Proposed default: once the operator sets `live` and the first
+order fires, set `locked = 1` for the rest of the day to prevent mid-session whipsaw.
+
+### 6.2 `scan_cycle` — durable scan audit trail (problem (c), (e))
+
+```sql
+CREATE TABLE scan_cycle (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at       TIMESTAMP NOT NULL,
+    completed_at     TIMESTAMP,
+    screener         TEXT NOT NULL CHECK (screener IN ('buy','sell')),
+    symbols          TEXT,            -- JSON array of matched symbols, verbatim
+    post_status      TEXT,            -- 'ok' | 'http_error' | 'engine_rejected' | 'skipped_preflight'
+    engine_response  TEXT,            -- JSON: full body returned by the engine webhook
+    error            TEXT,            -- JSON: {type, message, traceback} on failure, else NULL
+    bridge_logged    BOOLEAN NOT NULL DEFAULT 0   -- did the bridge also log it? (cross-check, not a dependency)
+);
+```
+
+This row is written by the **skill itself** (or a thin endpoint it calls) at the start and
+end of each cycle, independent of the bridge. `bridge_logged` is informational only — its
+value being 0 must never block persistence.
+
+### 6.3 `resolve_effective_mode()` — single source of truth (problem (a), (d))
+
+New module **`services/mode_service.py`**:
+
+```python
+# services/mode_service.py
+from enum import Enum
+from dataclasses import dataclass
+
+class EffectiveMode(str, Enum):
+    LIVE     = "live"      # real broker orders
+    SANDBOX  = "sandbox"   # virtual book only
+    DISABLED = "disabled"  # do not arm / do not trade
+
+@dataclass(frozen=True)
+class ModeResolution:
+    effective: EffectiveMode
+    intent: str            # from daily_intent
+    engine_flag: str       # SIMPLIFIED_ENGINE_MODE (.env)
+    analyze_mode: bool     # settings.analyze_mode (DB)
+    reason: str            # human-readable explanation of how this was composed
+    conflict: bool         # True if the two flags disagreed with intent
+
+def resolve_effective_mode(trade_date: "date | None" = None) -> ModeResolution:
+    """Compose daily_intent + SIMPLIFIED_ENGINE_MODE + settings.analyze_mode into ONE
+    authoritative answer. This is the ONLY function new code consults for routing.
+
+    Composition (most-conservative-wins):
+      1. If daily_intent.intent == 'skip'           -> DISABLED.
+      2. If daily_intent.intent == 'sandbox'         -> SANDBOX (regardless of flags).
+      3. If daily_intent.intent == 'live':
+           - if analyze_mode is True (platform diverts) -> SANDBOX, conflict=True.
+           - if SIMPLIFIED_ENGINE_MODE != 'live'        -> SANDBOX/DISABLED, conflict=True.
+           - else                                        -> LIVE.
+      4. If no daily_intent row for the date -> DISABLED, conflict=True
+         (refuse to trade with no declared intent — fixes problem (g)).
+    """
+    ...
+```
+
+The principle: **operator intent caps the risk; the flags can only make it safer, never
+riskier**. Any disagreement resolves to the safer mode and sets `conflict=True` so it
+surfaces in logs and to the agent.
+
+### 6.4 Cache TTL reduction for `get_analyze_mode()`
+
+`database/settings_db.py:19` — drop the TTL from `3600` to `30`:
+
+```python
+# database/settings_db.py:19
+# BEFORE: _settings_cache = TTLCache(maxsize=10, ttl=3600)  # 1 hour TTL
+_settings_cache = TTLCache(maxsize=10, ttl=30)  # 30s — mode changes must take effect promptly
+```
+
+Rationale: a 1-hour cache means a mode flip can take up to an hour to be honoured by
+`place_order_service` — unacceptable for a safety control. 30 s bounds the staleness window
+while keeping the per-request DB-query reduction the cache exists for. `set_analyze_mode()`
+already invalidates the key on write (`:110`), so this only affects the stale-read ceiling.
+
+### 6.5 `/preflight` route (problem (b))
+
+Added to `chartink_bp` (`blueprints/chartink.py`), e.g.
+`GET /chartink/simplified-engine/api/preflight`. The skill calls it **before** posting any
+symbols and aborts (writing `post_status='skipped_preflight'` to `scan_cycle`) on failure.
+
+Checks, all must pass:
+
+```python
+@chartink_bp.route("/simplified-engine/api/preflight", methods=["GET"])
+def simplified_engine_preflight():
+    """Returns {'ok': bool, 'checks': {...}, 'effective_mode': str, 'reason': str}."""
+    res = resolve_effective_mode()
+    checks = {
+        # 1. operator intent matches what the system will actually do
+        "intent_matches_effective": (res.intent == res.effective.value) and not res.conflict,
+        # 2. broker session healthy (only required when effective == live)
+        "broker_session_ok":  (res.effective != EffectiveMode.LIVE) or broker_session_healthy(),
+        # 3. funds above the configured floor (live only)
+        "funds_above_floor":   (res.effective != EffectiveMode.LIVE) or funds_ok(min_floor),
+        # 4. trades placed today below the daily max
+        "trades_under_max":    trades_today() < max_trades_per_day,
+    }
+    return {"ok": all(checks.values()), "checks": checks,
+            "effective_mode": res.effective.value, "reason": res.reason}
+```
+
+**`broker_session_ok` defers to upstream session primitives (§4.5 framing, §4.5.2).** The
+`broker_session_healthy()` check must read session liveness through OpenAlgo's own
+session-management layer — the same broker-session state the Admin Diagnostics probe surfaces
+(`api_system_diagnostics`, §4.5.2) — and **never read raw broker credentials or tokens directly**.
+Post-v2.0.0.6, broker auth tokens are Fernet-encrypted at rest (`database/auth_db.py`; v2.0.1.1 adds a
+per-install salt), so any token/credentials health check goes through the decrypt-and-validate
+helpers, not the ciphertext. This rule extends to all Stage-4 agent tooling (§10): the agent reads
+*session health*, never secrets.
+
+### 6.6 `cycle_heartbeat` — missed-run detection
+
+```sql
+CREATE TABLE cycle_heartbeat (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id  INTEGER,                 -- FK to scan_cycle.id (NULL for stages before a cycle row exists)
+    ts        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    stage     TEXT NOT NULL,           -- 'preflight' | 'scrape' | 'post' | 'engine_ack' | 'complete'
+    status    TEXT NOT NULL            -- 'ok' | 'warn' | 'error'
+);
+```
+
+The skill writes one row at **each stage** of every run. Missed runs become trivially
+queryable: a gap in `ts` ordered by stage, or an absence of a `complete` row for an
+expected 15-min slot, means the scheduler or skill silently failed.
+
+**Read path — reuse upstream's viewer, don't build a parallel one (§4.5.2).** `cycle_heartbeat` is our
+*own* table because it models application-stage telemetry the generic error log does not. But for
+operational *visibility* we route into upstream's existing surfaces rather than a second dashboard:
+errors that occur during a cycle are logged through the centralized logger so they land in
+`log/errors.jsonl` (`utils/logging.py:293`/`:419`) and show up in the Admin Diagnostics error browser
+(`GET /admin/api/errors`, §4.5.2) with no extra infra; a cycle stage that fails can additionally push
+a structured report via `POST /admin/api/errors/client`. We write the heartbeat *store*; upstream
+provides the *viewer*.
+
+### 6.7 Atomic mode-toggle endpoint
+
+A single endpoint flips `daily_intent` **and** the underlying flags together, so they can
+never drift (problem (a)). Suggested: `POST /chartink/simplified-engine/api/set-mode`
+`{intent: 'live'|'sandbox'|'skip', set_by, reason}`.
+
+```python
+def set_trading_mode(intent: str, set_by: str, reason: str) -> ModeResolution:
+    """Atomically: write daily_intent, set settings.analyze_mode, and (where the running
+    process allows) the engine's in-memory mode — in ONE transaction. Then return the
+    freshly resolved effective mode so the caller sees exactly what took effect.
+
+      intent='live'    -> daily_intent='live',    set_analyze_mode(False), engine->'live'
+      intent='sandbox' -> daily_intent='sandbox', set_analyze_mode(True),  engine->'sandbox'
+      intent='skip'    -> daily_intent='skip',                              engine->'disabled'
+
+    NOTE: SIMPLIFIED_ENGINE_MODE in .env is read once at startup; this endpoint updates the
+    engine's in-process state and records the desired .env value, but a process restart is
+    still required for the .env literal to match. resolve_effective_mode() reflects the live
+    in-process value, not the stale .env literal, so behaviour is correct without a restart.
+    """
+    ...
+```
+
+---
+
+## 7. Stage 1 Detailed Design — LLM Veto Layer
+
+New module **`services/signal_review_service.py`**. Wraps each candidate signal in one
+Claude call **between engine arming and order dispatch** — i.e. after the engine decides a
+breakout fired and built the order, but before `place_order_service` sends it.
+
+### 7.1 Input schema
+
+```jsonc
+{
+  "signal": {
+    "symbol": "CONCOR",
+    "direction": "BUY",                 // BUY | SELL
+    "source": "chartink:fno-intraday-buy-20",
+    "breakout_price": 812.4,
+    "atr_stop": 798.1,
+    "rr_target": 840.0,
+    "chartink_rank": 3,
+    "fired_at": "2026-05-26T10:31:00+05:30"
+  },
+  "positions": [                         // current open positions (from get_positions)
+    {"symbol": "TATASTEEL", "direction": "BUY", "qty": 400, "unrealized_pnl": 1250.0}
+  ],
+  "market_context": {                    // today's regime snapshot
+    "nifty_regime": "range_bound",
+    "india_vix": 14.2,
+    "trades_today": 2,
+    "max_trades": 6,
+    "effective_mode": "live"
+  }
+}
+```
+
+### 7.2 Output schema
+
+```jsonc
+{
+  "decision": "take",                    // take | skip | size_down
+  "size_multiplier": 1.0,                // 1.0 for take; e.g. 0.5 for size_down; ignored for skip
+  "reasoning": "Range-bound regime, VIX benign, 2/6 trades used, no correlated exposure. Standard entry.",
+  "confidence": 0.78                     // 0.0–1.0
+}
+```
+
+### 7.3 Placement, budget, and failure handling
+
+- **Placement:** inserted in `place_order_service` path (or a wrapper the engine calls
+  just before it), gated on `effective_mode != disabled`. On `skip`, the order is not sent
+  and the reason is written to `scan_cycle`/journal. On `size_down`, qty is multiplied by
+  `size_multiplier` (rounded to lot size).
+- **Latency / cost budget:** **1–3 s** added latency, **₹2–5 per call**. Use a fast model
+  with a tight, cached system prompt (the rules and schema are static — cache them).
+- **On LLM failure (timeout, error, malformed output): default to `skip` (fail-safe).**
+  Rationale: a missed trade costs an opportunity; a wrongly-taken trade costs real money. In
+  an intraday F&O context with a human-bounded risk appetite, never-trade-on-doubt is the
+  correct asymmetry. Pass-through (`take`) would defeat the entire purpose of the layer the
+  moment the LLM is flaky. Every fail-safe skip is logged distinctly (`reason="llm_unavailable"`)
+  so flakiness is visible and not mistaken for a genuine veto.
+
+### 7.4 Upstream timing & stop-loss interactions (post-v2.0.1.1 merge)
+
+Two merge items bear on the veto layer's assumptions:
+
+- **The subscribe-latency window is narrower (v2.0.0.7 + v2.0.1.1).** The "price oscillates through the
+  trigger but the order never fires" class of bug — where ticks for a freshly-armed symbol never
+  reached the execution engine — was closed upstream by **WebSocket subscribe batching**. ⚠️ Accuracy
+  note: that batching landed for **Dhan / Fyers / Upstox** in v2.0.0.7, **not Zerodha** — *this* rig's
+  broker. The Zerodha-specific win came in **v2.0.1.1**, which removed a ~4 s sleep floor from
+  Zerodha's subscribe path (commits `659d53ab` / `cd4095eb`). Net for the veto layer: the
+  arm→first-tick window on Zerodha is now materially shorter, so the 1–3 s veto budget (§7.3) sits on
+  top of a smaller pre-existing latency, and the "armed but momentarily blind to fresh ticks" risk the
+  veto must reason around is reduced. The layer should still assume the engine fires **on bar close**.
+- **The stop-loss is no longer solely in-process (§4.5.4).** Once the veto green-lights an order, the
+  engine can place a broker **GTT** to carry the stop. Because the broker enforces a GTT even if
+  OpenAlgo crashes between fill and the first in-process trail, the veto layer's downside estimate can
+  be **less conservative** about crash-window risk — a hard stop already exists at the broker.
+  **Caveat:** this only holds in **live** mode against Zerodha/Dhan; sandbox/analyze GTT returns `501`
+  today (§4.5.4), and the rig defaults to sandbox, so for the common case the in-process ATR/RR trail
+  remains the only stop and the conservative downside estimate still applies.
+
+---
+
+## 7.5 Stage 1.5 Detailed Design — In-House Scanner Migration
+
+**Goal:** replace the external Chartink screener with a scanner that lives *inside* OpenAlgo,
+reusing the infrastructure inventoried in §4. The payoff: every signal becomes **backtestable**
+against the DuckDB history, **lower latency** (no 15-min scrape cycle — react on bar close;
+Chartink itself carries a **known ~5-minute screener update lag**, so the in-house scanner's
+react-on-bar-close latency is a tangible win **even at signal parity**), **custom criteria**
+the operator controls (not Chartink's fixed screener language), and the **elimination of an
+external dependency** and its scrape fragility (problems (b)/(c)).
+
+The migration is deliberately **non-disruptive**: the scanner POSTs to the *same* engine
+webhook Chartink posts to today, so no downstream code changes, and it runs in **shadow**
+alongside Chartink for weeks before anything is cut over.
+
+### 7.5.1 Work items
+
+1. **Extract a shared bar aggregator.** Lift `FiveMinuteCandleBuilder` out of
+   `services/simplified_stock_engine_core.py:304` into a new **`services/bar_aggregator.py`**
+   supporting configurable intervals (1m, 5m, 15m) across multiple symbols. Refactor the
+   simplified engine to consume the shared version — behaviour must stay identical, covered by
+   the existing engine tests. Every other work item depends on this one.
+
+2. **Add scan-state tables** (settings DB, `db/openalgo.db`; models in
+   `database/trading_ops_db.py` alongside the Stage-0 tables):
+
+   ```sql
+   CREATE TABLE scan_definitions (
+       id            INTEGER PRIMARY KEY AUTOINCREMENT,
+       name          TEXT NOT NULL UNIQUE,
+       screener_type TEXT NOT NULL CHECK (screener_type IN ('buy','sell')),
+       expression    TEXT NOT NULL,         -- rule expression (text DSL or JSON AST)
+       enabled       BOOLEAN NOT NULL DEFAULT 1,
+       created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       updated_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+   );
+
+   CREATE TABLE scan_results (
+       id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+       scan_definition_id INTEGER NOT NULL,             -- FK -> scan_definitions.id
+       run_at             TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+       symbols            TEXT NOT NULL,                -- JSON array of matched OpenAlgo symbols
+       source             TEXT NOT NULL CHECK (source IN ('chartink','inhouse','shadow')),
+       posted_to_engine   BOOLEAN NOT NULL DEFAULT 0
+   );
+   ```
+
+   `source` is what makes shadow validation (§7.5.2) a simple `GROUP BY`.
+
+3. **Add the indicator set via `pandas-ta`.** `pandas-ta` is the project's standard indicator
+   library (Decided 2026-05-26, §14 Q7) — add it as a dependency up front; do **not**
+   hand-roll. The new bar aggregator service (work item 1) computes **ATR, EMA, RSI, and
+   `volume_avg`** via `pandas-ta` for the scan rules, and the same dependency covers breadth
+   indicators (supertrend, MACD, Bollinger, VWAP) when later rules need them — no second
+   migration, one library across all strategies.
+
+4. **Scanner service subscribes to the live feed.** New **`services/scanner_service.py`** SUBs
+   the existing ZMQ tick bus (`127.0.0.1:5555`, §4), aggregates ticks into bars via the shared
+   `bar_aggregator`, evaluates each enabled `scan_definition` on **bar close**, and emits a
+   `scan_hit` Event into `utils/event_bus.py`. No new feed; no new scheduler if it keys off the
+   bar-close cadence.
+
+5. **Add `scan_hit` consumers.** Two subscribers on the event-bus topic:
+   - a **webhook-poster** that POSTs the matched symbols to the existing simplified-engine
+     webhook (`/chartink/simplified-stock-engine/<webhook_id>`) so the engine and all
+     downstream code are unchanged; it writes a `scan_results` row (`source='inhouse'` or
+     `'shadow'`) and sets `posted_to_engine`.
+   - a **SocketIO emitter** that pushes `scan_hit` to the React UI (same rail as
+     `order_update`, §4) so scanner activity is visible live. **(Post-merge, §4.5.5)** the scanner's
+     freshness/staleness signalling can ride the existing **`analyzer_update`** channel the frontend
+     already subscribes to (`useSocket.ts`) rather than standing up a separate health-emit path — we
+     add a `scan_hit`/staleness emitter onto the proven rail.
+
+6. **(Optional) Sector/industry enrichment.** A small import job loading NSE's free
+   sector/industry CSVs into a new `sector_map` table keyed on symbol (or a `sector` column on
+   `SymToken`). **Defer** unless/until a scan rule needs sector-relative criteria. **(Post-merge,
+   §4.5.1)** resolve and filter the universe to enrich through the upstream **Symbol Search API** —
+   its multi-exchange / multi-instrumenttype filtering over `SymToken` replaces any parallel universe
+   filter; only the sector *labels* are genuinely new work. The same Symbol Search substrate feeds the
+   §7.7 Stage 1.7 `sector_rotation` sector-index resolution.
+
+### 7.5.2 Shadow-validation methodology
+
+For **4–6 weeks**, run the in-house scanner **in parallel** with Chartink. Both write
+`scan_results` rows tagged by `source` (`chartink` vs `shadow`); only Chartink's hits actually
+arm the engine during this window — the in-house ones are recorded but not acted on
+(`posted_to_engine=0`). Compare **daily**:
+
+- **agreement rate** — fraction of runs where both produced the same symbol set;
+- **misses** — signals one caught that the other did not (both directions);
+- **who was right on disagreement** — for each divergent signal, score the *hypothetical*
+  P&L of the path not taken, to judge whether the in-house scanner's extra/missing signals
+  would have helped or hurt.
+
+### 7.5.3 Cutover criteria and sequence
+
+**Cutover criteria (Decided 2026-05-26 — qualitative, not a numeric threshold).** The earlier
+"≥95% agreement AND N novel signals/week" gate is dropped. Cut over to the in-house scanner
+**once it is ready and tested**, judged by:
+- **(a) a shadow run of ≥4 weeks** with **no major divergence the operator deems suspicious**
+  (the daily agreement / miss / hypothetical-P&L comparison of §7.5.2 is the evidence base);
+- **(b) operator subjective approval** after reviewing the shadow comparison report — the
+  operator signs off, rather than a number gating the switch; and
+- **(c) bonus motivation:** Chartink carries a **known ~5-minute screener update lag**, so the
+  in-house scanner's react-on-bar-close latency is a tangible win **even at signal parity** —
+  parity is reason enough to cut over, not a blocker.
+
+**Cutover sequence:**
+1. Flip the engine's **primary** subscription to the in-house scanner (`source='inhouse'`,
+   `posted_to_engine=1`).
+2. Let **Chartink ride as a confirmation check** — still scraped, still logged to
+   `scan_results`, but now it is the shadow.
+3. Once the in-house scanner has carried primary cleanly for a further period, **retire
+   Chartink entirely** (drop the scrape skill, remove the external dependency).
+
+### 7.5.4 Estimated effort
+
+**~10–15 working days** for the build (work items 1–5; item 6 deferred), then the **4–6 week
+shadow run** as ongoing wall-clock (not engineering) time before cutover.
+
+---
+
+## 7.7 Multi-Strategy Architecture
+
+> Numbering note: §7.5 is the in-house scanner; §7.7 is multi-strategy. §7.6 is intentionally
+> skipped to leave room between the two scanner-adjacent sections.
+
+### 7.7.1 Motivation
+
+The operator runs **more than one strategy**: today the F&O **equity intraday** strategy
+(Chartink / in-house scanner → simplified engine); soon the **options directional-breakout**
+engine (`optionBuyTradingEngine.py`, §2.3), which ports as a **call-buying** strategy and a
+mirror **put-buying** strategy (Stage 1.6a/1.6b); eventually more. Two problems follow that the
+current design cannot express:
+
+1. **The architecture treats "the strategy" as a singleton** — one engine, one mode flag, one
+   webhook. Adding a second strategy by copy-paste does not scale and entangles their state.
+2. **Not every strategy has an edge in every market.** A trend-following equity-long strategy
+   bleeds in a choppy, falling tape; an options-put strategy wants exactly that tape. The
+   operator wants the system to **activate only the strategies whose edge fits the current
+   market regime** — automatically, with an operator override.
+
+§7.7 generalises the rig from one strategy to **N independent strategies, each activated only
+when favourable to current market conditions**.
+
+### 7.7.2 Core concepts
+
+- **Strategy** — a self-contained **signal-generator + arming + monitoring pipeline**. Each
+  strategy declares: (i) a unique **id**; (ii) a **signal source** (a scanner subscription, an
+  external feed, or custom logic); (iii) an **arming logic** (when to enter); (iv) an **exit
+  logic** (SL / TP / time-based); (v) a **regime profile** (which market conditions favour it);
+  (vi) a **sandbox/live mode**, *inherited* from `daily_intent` and the global `analyze_mode`
+  (a strategy never sets its own money-routing); (vii) an independent **enable/disable** switch;
+  (viii) a **universe** — the symbols it trades, declared through the upstream **Symbol Search API**
+  (§4.5.1), whose multi-exchange / multi-instrumenttype filters make "NFO options on these underlyings"
+  or "NSE equity in this list" a first-class spec rather than a hand-rolled filter.
+- **Market regime** — a categorical descriptor of current conditions, produced by a **regime
+  classifier**. Five dimensions:
+  - **trend** ∈ {`trending_up`, `trending_down`, `choppy`}
+  - **volatility** ∈ {`low`, `normal`, `elevated`, `extreme`}
+  - **breadth** ∈ {`broad_bullish`, `broad_bearish`, `mixed`}
+  - **sector_rotation** ∈ {`cyclicals_leading`, `defensives_leading`, `broad_strength`, `broad_weakness`, `mixed`}
+  - **time_of_day** ∈ {`pre_open`, `opening`, `mid_morning`, `lunch`, `afternoon`, `closing`, `post_close`}
+
+  Each classification is one row in the new `market_regime` table (timestamp + dimension values).
+- **Regime profile** (per strategy) — a **declarative spec** of the regimes a strategy is
+  favourable in, declared in code/config alongside the strategy. Example for trending-equity-BUY:
+  `{trend: [trending_up], volatility: [normal, elevated], breadth: [broad_bullish, mixed],
+  sector_rotation: [cyclicals_leading, broad_strength], time_of_day: [opening, mid_morning, afternoon]}`.
+  A regime *matches* a profile when each dimension's current value is in the profile's allowed set.
+  Most intraday strategies omit `pre_open`/`lunch`/`post_close` from their `time_of_day` window, and
+  `sector_rotation` is an **optional** filter (a strategy may leave it unconstrained).
+- **Activator** — a process that, on each new regime classification, computes which strategies
+  are active given their profiles and toggles their enable flag accordingly. The operator can
+  override (force-enable, force-disable, force-sandbox).
+
+### 7.7.3 Schema additions
+
+(in `db/openalgo.db`; models in `database/trading_ops_db.py` alongside the Stage-0 / Stage-1.5
+tables)
+
+```sql
+CREATE TABLE strategies (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,        -- 'trending_equity_intraday', 'options_call_buy', 'options_put_buy', ...
+    description    TEXT,
+    module_path    TEXT NOT NULL,               -- import path to the Strategy class
+    enabled        BOOLEAN NOT NULL DEFAULT 1,  -- master per-strategy switch (operator/activator)
+    regime_profile TEXT NOT NULL,               -- JSON: {trend:[...], volatility:[...], breadth:[...], sector_rotation:[...], time_of_day:[...]}
+    created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE market_regime (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    classified_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    trend              TEXT NOT NULL CHECK (trend IN ('trending_up','trending_down','choppy')),
+    volatility         TEXT NOT NULL CHECK (volatility IN ('low','normal','elevated','extreme')),
+    breadth            TEXT NOT NULL CHECK (breadth IN ('broad_bullish','broad_bearish','mixed')),
+    sector_rotation    TEXT NOT NULL CHECK (sector_rotation IN ('cyclicals_leading','defensives_leading','broad_strength','broad_weakness','mixed')),
+    time_of_day        TEXT NOT NULL CHECK (time_of_day IN ('pre_open','opening','mid_morning','lunch','afternoon','closing','post_close')),
+    classifier_version TEXT NOT NULL,           -- 'rules_v1' | 'ml_v1' | ... (provenance)
+    raw_inputs         TEXT                      -- JSON: NIFTY px action, India VIX, A/D ratio, sector-index RS snapshot
+);
+
+CREATE TABLE strategy_activation (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id      INTEGER NOT NULL,          -- FK -> strategies.id
+    decided_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_by       TEXT NOT NULL CHECK (decided_by IN ('activator','operator','agent')),
+    action           TEXT NOT NULL CHECK (action IN ('enable','disable','force_sandbox')),
+    reason           TEXT,
+    market_regime_id INTEGER                     -- FK -> market_regime.id (NULL for operator/agent overrides)
+);
+```
+
+`strategy_activation` is an append-only audit of every enable/disable/force-sandbox decision and
+*why* — the regime that triggered it (activator) or the operator/agent who overrode it.
+
+### 7.7.4 Strategy lifecycle — the `BaseStrategy` ABC
+
+Each strategy is a Python module conforming to a `BaseStrategy` abstract base class:
+
+```python
+# strategies/base.py
+from abc import ABC, abstractmethod
+
+class BaseStrategy(ABC):
+    id: str                       # unique, matches strategies.name
+    regime_profile: dict          # {trend:[...], volatility:[...], breadth:[...], sector_rotation:[...], time_of_day:[...]}
+
+    @abstractmethod
+    def on_tick(self, tick) -> None: ...
+    @abstractmethod
+    def on_bar(self, bar) -> None: ...
+    @abstractmethod
+    def on_scan_hit(self, hit) -> None: ...
+    @abstractmethod
+    def should_arm(self, candidate) -> bool: ...
+    @abstractmethod
+    def should_exit(self, position) -> "ExitDecision | None": ...
+```
+
+The existing **simplified-engine internals do not change** — they become *one implementation* of
+`BaseStrategy` for the trending-equity strategy. The options engine (§2.3) is ported as further
+implementations. The ABC is the only new contract every strategy must satisfy.
+
+**Sharing logic via inheritance.** Strategies with the same core mechanics (entry/exit pattern,
+position sizing) need not duplicate code — they can share a common implementation class and
+subclass it. The **canonical example is `options_call_buy` and `options_put_buy`**, which are the
+same ATM directional-breakout strategy run in opposite directions:
+
+- `strategies/options_directional_breakout/base.py` — an `OptionsDirectionalBreakout(BaseStrategy)`
+  holding the shared opening-range breakout, SL/RR-trailing, and sizing logic;
+- `strategies/options_call_buy/strategy.py` — a **thin subclass** flipping the direction-specific
+  parameters to the **CE / bullish** side (call strike, up-breakout, SL below);
+- `strategies/options_put_buy/strategy.py` — the mirror **thin subclass** for the **PE / bearish**
+  side (put strike, down-breakout, SL above).
+
+The two are **independent registered strategies** (separate `strategies` rows, separate enable
+flags) that differ almost entirely in **opposite regime profiles**:
+
+```jsonc
+// options_call_buy — bullish; explicitly NOT active in trending_down
+{ "trend": ["trending_up"], "volatility": ["normal", "elevated"],
+  "breadth": ["broad_bullish", "mixed"],
+  "sector_rotation": ["cyclicals_leading", "broad_strength"],
+  "time_of_day": ["opening", "mid_morning", "afternoon"] }
+
+// options_put_buy — bearish mirror; explicitly NOT active in trending_up
+{ "trend": ["trending_down"], "volatility": ["normal", "elevated"],
+  "breadth": ["broad_bearish", "mixed"],
+  "sector_rotation": ["defensives_leading", "broad_weakness"],
+  "time_of_day": ["opening", "mid_morning", "afternoon"] }
+```
+
+Because `trend` is `trending_up` for one and `trending_down` for the other, the activator
+(§7.7.7) **naturally enforces mutual exclusion** — at most one of the pair matches a given
+regime, so call-buy and put-buy are never both active at once.
+
+### 7.7.5 Where it lives in the codebase
+
+A new **`strategies/` package** alongside `services/`:
+
+```
+strategies/
+  base.py                          # BaseStrategy ABC (above)
+  __init__.py                      # registry: discovers + registers all Strategy classes
+  trending_equity_intraday/
+    strategy.py                    # class Strategy(BaseStrategy) — wraps the refactored simplified engine
+    LEARNINGS.md / VERSION_LOG.md  # (existing per-strategy docs convention, retained)
+  options_directional_breakout/
+    base.py                        # OptionsDirectionalBreakout(BaseStrategy) — shared options logic
+  options_call_buy/
+    strategy.py                    # class Strategy(OptionsDirectionalBreakout) — CE / bullish (the ported engine)
+  options_put_buy/
+    strategy.py                    # class Strategy(OptionsDirectionalBreakout) — PE / bearish mirror
+```
+
+`strategies/__init__.py` is a **registry** that discovers and registers every strategy (each
+folder exposes a `Strategy` class). This *extends* the repo's existing `strategies/<name>/` docs
+convention (LEARNINGS.md, VERSION_LOG.md, config_snapshot.json — see CLAUDE.md) by adding the
+**code** (`strategy.py`) into the same per-strategy folder, so docs and implementation co-locate.
+The current `strategies/simplified_engine/` is the trending-equity strategy; under this design its
+code is refactored from `services/simplified_stock_engine_*` into
+`strategies/trending_equity_intraday/strategy.py`.
+
+### 7.7.6 Regime classifier
+
+For **Stage 1, a simple rule-based classifier** is sufficient, driven by:
+- **NIFTY price action** (e.g. position vs intraday VWAP / opening range / short EMA) → `trend`;
+- **India VIX bands** (e.g. <12 low, 12–16 normal, 16–22 elevated, >22 extreme) → `volatility`;
+- **advance-decline ratio** → `breadth`;
+- **local clock at classification time** → `time_of_day` (trivial, no market data): `pre_open` <09:15,
+  `opening` 09:15–10:00, `mid_morning` 10:00–12:00, `lunch` 12:00–13:30, `afternoon` 13:30–15:00,
+  `closing` 15:00–15:30, `post_close` >15:30 (IST);
+- **sector-index 1-day relative strength** → `sector_rotation`: compare NIFTY BANK, NIFTY IT,
+  NIFTY AUTO, NIFTY FMCG, NIFTY PHARMA against NIFTY 50 and bucket the result
+  (`cyclicals_leading` | `defensives_leading` | `broad_strength` | `broad_weakness` | `mixed`).
+  This dimension needs sector-index price data, fetched by a **sidecar or APScheduler job**; for
+  Stage 1.7 a **simple 1-day relative-strength bucketing** across the five listed indices is enough.
+
+It writes one `market_regime` row per classification with `classifier_version='rules_v1'` and the
+`raw_inputs` snapshot (now including the sector-index RS readings). `time_of_day` is pure clock
+arithmetic; `sector_rotation` is the only new data dependency, and refining its bucketing into a
+learned model is folded into the **Stage 3+** ML work. An **ML-based classifier is a Stage 3
+enhancement** (`classifier_version='ml_v1'`), reusing the Stage-1.5 bar/indicator feed. The
+classifier runs on a **5-min cadence during market hours** via the existing APScheduler
+infrastructure (§4.2; can piggyback `flow_scheduler`).
+
+### 7.7.7 Activator behaviour
+
+The **activator** re-evaluates strategy activation **whenever a new `market_regime` row is
+written**:
+- for each enabled strategy, test whether the new regime matches its `regime_profile`;
+- write a `strategy_activation` row **only if the state changes** (`decided_by='activator'`),
+  flipping the strategy's effective enable state and recording the `market_regime_id` and reason;
+- **operator overrides** via a `set_daily_intent`-style endpoint that **force-pins** a strategy's
+  state for the day (`decided_by='operator'`, `action ∈ {enable, disable, force_sandbox}`) — a
+  pinned strategy ignores the activator until the next day. The Stage 4 agent may **propose**
+  activation/deactivation (`decided_by='agent'`), gated through `approval_inbox` (§10.4).
+
+### 7.7.8 Interaction with existing concepts
+
+- **`daily_intent` remains the top-level gate** — `live` / `sandbox` / `skip` applies to **all**
+  strategies at once. A strategy can never be more live than the day's intent.
+- **Per-strategy enable/disable is finer-grained** — a strategy may be disabled (by regime or
+  operator) while `daily_intent` is `live`; the converse never *loosens* risk. **This per-strategy
+  mode/enable concept does not exist upstream** (audit confirmed — upstream has only the single global
+  `analyze_mode` toggle); the `strategies.enabled` flag + `strategy_activation` audit (§7.7.3) and the
+  `resolve_effective_mode(strategy_id)` extension below are entirely fork-local and remain ours to
+  build. See the new §14 question on whether to align this with upstream's `analyze_mode` pattern.
+- **`resolve_effective_mode()` extends to take a `strategy_id`** —
+  `resolve_effective_mode(trade_date, strategy_id) -> ModeResolution`, returning the effective
+  mode **for that strategy** under **most-conservative-wins** across `daily_intent`, global
+  `analyze_mode`, the per-strategy enable flag, and the regime activation. A disabled or
+  regime-mismatched strategy resolves to `DISABLED` regardless of the flags.
+- **The Stage 4 agent's `pause_trading_until` becomes `pause_strategy_until(strategy_id, ...)`** —
+  pausing is now per-strategy, so the agent can hold one strategy's new entries without touching
+  the others (see the §10.5 tool-catalog update).
+
+### 7.7.9 Phasing
+
+| Sub-stage | Scope | Behaviour change |
+|---|---|---|
+| **Stage 1.5 sibling** | Refactor the existing single-strategy code into the `strategies/` package shape with **one** strategy registered (`trending_equity_intraday`). Introduces `BaseStrategy` + the registry. | **Zero** behaviour change — pure refactor; existing engine tests stay green. |
+| **Stage 1.6a** | Port the options engine (§2.3) as `options_call_buy`, refactored onto a shared `options_directional_breakout` base (§7.7.4). | The call-buy strategy runs **unconditionally if enabled** alongside the equity strategy — no regime gating yet. |
+| **Stage 1.6b** | Add `options_put_buy` as a mirror — a thin subclass of the same base flipping CE→PE / breakout / SL direction. | A second options strategy registers; still no regime gating (both can be enabled). |
+| **Stage 1.7** | Introduce the **regime classifier + activator**. Strategies declare `regime_profile`s. | Activator gates each strategy's enable/disable on regime — and, via opposite `trend` profiles, makes call-buy/put-buy mutually exclusive. |
+| **Stage 4 update** | The autonomous agent gets **multi-strategy-aware tools** (`strategy_id` parameters; `pause_strategy_until`; propose-activation via `approval_inbox`). | Agent reasons per-strategy. |
+
+### 7.7.10 Worked example
+
+Two regimes on the same day show the activator gating all five dimensions **and** keeping the
+call-buy / put-buy pair mutually exclusive.
+
+**Scenario A — bullish open.** At **09:40** the classifier writes `market_regime` =
+`{trend: trending_up, volatility: normal, breadth: broad_bullish, sector_rotation: cyclicals_leading,
+time_of_day: opening}`. The activator reads it:
+
+- **`trending_equity_intraday`** (BUY side) matches `{trend: [trending_up], ...}` → **enabled**;
+  BUY-side scans arm.
+- **`options_call_buy`** declares `{trend: [trending_up], volatility: [normal, elevated],
+  breadth: [broad_bullish, mixed], sector_rotation: [cyclicals_leading, broad_strength],
+  time_of_day: [opening, mid_morning, afternoon]}` — every dimension is in range → **enabled**.
+- **`options_put_buy`** requires `trend: trending_down` → mismatch → **stays disabled**. The
+  activator writes `strategy_activation(action='disable', decided_by='activator',
+  reason='regime mismatch: trend=trending_up', market_regime_id=…)`.
+- The operator can **override** any of these via the per-strategy pin endpoint
+  (`decided_by='operator'`).
+
+**Scenario B — late-session selloff.** At **14:10** the classifier writes `market_regime` =
+`{trend: trending_down, volatility: elevated, breadth: broad_bearish, sector_rotation: broad_weakness,
+time_of_day: afternoon}`. The activator re-evaluates:
+
+- **`options_call_buy`** now mismatches on `trend` (and `breadth`, and `sector_rotation`) →
+  **disabled** (`reason='regime mismatch: trend=trending_down'`).
+- **`options_put_buy`** declares the mirror `{trend: [trending_down], volatility: [normal, elevated],
+  breadth: [broad_bearish, mixed], sector_rotation: [defensives_leading, broad_weakness],
+  time_of_day: [opening, mid_morning, afternoon]}` — every dimension is in range → **enabled**.
+- **`trending_equity_intraday`** stays active for **SELL-side** scans (its profile admits the
+  bearish tape for shorts); only its BUY arming quiets.
+
+The two scenarios together show the mechanism doing real work: the opposite `trend` profiles of
+the call/put pair mean **at most one is ever active** (mutual exclusion is a property of the
+profiles, not a special case in the activator), while `sector_rotation` and `time_of_day` tighten
+each match beyond `trend` alone.
+
+---
+
+## 8. Stage 2 Detailed Design — Reflective Journal
+
+### 8.1 `trade_journal`
+
+```sql
+CREATE TABLE trade_journal (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id        TEXT,               -- broker/sandbox order id
+    trade_date      DATE NOT NULL,
+    symbol          TEXT NOT NULL,
+    direction       TEXT NOT NULL,      -- BUY | SELL
+    signal_source   TEXT NOT NULL,      -- 'chartink:...' | 'ml:...' | 'agent:...'
+    market_regime   TEXT,               -- snapshot label at entry (e.g. 'range_bound', 'high_vol')
+    llm_reasoning   TEXT,               -- Stage-1 veto reasoning if any, else NULL
+    llm_decision    TEXT,               -- take | size_down | (NULL if no review)
+    entry_price     REAL,
+    entry_at        TIMESTAMP,
+    exit_price      REAL,
+    exit_at         TIMESTAMP,
+    qty             INTEGER,
+    pnl             REAL,
+    pnl_pct         REAL,
+    effective_mode  TEXT,               -- live | sandbox at time of trade
+    tags            TEXT                -- JSON array: ['gap_up','sl_hit','trailed','reversal']
+);
+```
+
+### 8.2 Reflection pipeline
+
+```
+nightly Cowork task (after square-off)
+   │
+   ├─ read trade_journal for trade_date
+   ├─ read journal_reflection history (prior retrospectives, for trend)
+   ├─ Claude: structured retrospective
+   │     - what worked / what didn't, by regime and tag
+   │     - hypotheses for rule changes (e.g. "skip BUY entries when VIX > 17")
+   ▼
+   ├─ write journal_reflection row (structured)
+   └─ if a rule change is warranted -> open a PR via the bridge (feature branch, never main)
+```
+
+```sql
+CREATE TABLE journal_reflection (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date       DATE NOT NULL,
+    generated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    summary          TEXT,              -- prose retrospective
+    metrics          TEXT,              -- JSON: win_rate, avg_pnl, by_regime{}, by_tag{}
+    proposed_changes TEXT,              -- JSON array of {rule, rationale, evidence}
+    pr_url           TEXT               -- if a PR was opened, else NULL
+);
+```
+
+---
+
+## 9. Stage 3 Detailed Design — ML Augmentation (sketch)
+
+Deferred until the Stage 2 gate (**6 months of journal data**). Sketch only:
+
+- **Feature pipeline:** pull from `trade_journal` (outcomes as labels) + market data
+  (regime, VIX, breadth, time-of-day, sector, ATR percentile). The in-house scanner's
+  bar/indicator pipeline (Stage 1.5, §7.5) already produces these features on every bar, so
+  Stage 3 reuses that feed rather than standing up its own. Engineer per-signal feature
+  vectors. Land in a feature store table or parquet.
+- **Model:** gradient boosting (XGBoost / LightGBM) predicting P(trade succeeds | features).
+- **Validation:** **walk-forward** backtest (train on rolling window, test forward, never
+  peek). Reuse `backtest/run_backtest.py` harness conventions.
+- **Deployment:** `POST /predict_success_probability` endpoint returning a calibrated score
+  for a candidate signal.
+- **Ensemble:** combine the scan score (Chartink rank, or its in-house successor from
+  Stage 1.5) + ML probability (e.g. weighted, or ML as a second veto gate after Stage 1's
+  LLM). Tune the blend on out-of-sample data only.
+
+---
+
+## 10. Stage 4 Detailed Design — Autonomous Reasoning Agent
+
+This is the core of the design. The agent is an **AI supervisor**, not a trader: it reads
+state, reasons about it, classifies the situation, and acts only within a tightly
+whitelisted, non-monetary set of tools — escalating anything irreversible to the operator.
+
+### 10.1 Invocation model
+
+**Event-driven supervisor.** The agent is not a long-running loop (that failure mode killed
+the old `daily-trading-pipeline`, problem (f)). Instead, **each invocation is a complete,
+self-contained Claude Agent SDK session with its own fresh transcript**, started by an
+event, and torn down when it returns a decision. Three trigger types:
+
+| Trigger type | Source | Example |
+|---|---|---|
+| **scheduled** | APScheduler inside OpenAlgo | pre-open check, mid-session review, EOD wrap |
+| **threshold** | OpenAlgo emits an event when a metric crosses a bound | VIX jump, drawdown limit, consecutive SL hits, broker session drop |
+| **explicit** | operator or another service requests it | "review this position", "should I flip to sandbox?" |
+
+Because no state lives in the LLM between invocations, sessions are cheap, crash-safe, and
+independently resumable — a dead session loses nothing.
+
+### 10.2 State: zero LLM in-memory persistence — everything in SQL
+
+The agent holds **no** durable state in-context. Every fact it reasons over is read fresh
+from SQL at invocation time. Tables it reads:
+
+- `daily_intent` — operator's declared intent (§6.1)
+- `scan_cycle` — recent scan history (§6.2)
+- `trade_journal` — today's and historical trades (§8.1)
+- `agent_decision` — its own prior decisions (§10.3)
+- `cycle_heartbeat` — run health (§6.6)
+- `market_intel` — real-time intelligence (§11)
+
+Plus a markdown directory **`agent_memory/`** (repo-relative, gitignored or versioned per
+operator choice) holding **cross-session learnings** — durable lessons distilled from many
+sessions (e.g. "CONCOR gaps hard on rail-budget days"). These are prose, not rows, and are
+loaded into the system prompt at invocation.
+
+### 10.3 `agent_decision`
+
+```sql
+CREATE TABLE agent_decision (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoked_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    trigger_id          TEXT,                 -- correlates to the emitting event
+    trigger_type        TEXT NOT NULL CHECK (trigger_type IN ('scheduled','threshold','explicit')),
+    inputs_snapshot     TEXT,                 -- JSON: the exact state the agent read (for replay/audit)
+    classification      TEXT NOT NULL CHECK (classification IN ('routine','anomaly','emergency')),
+    reasoning           TEXT,                 -- the agent's chain of reasoning (prose)
+    actions             TEXT,                 -- JSON array of actions taken / proposed (see §10.8)
+    confidence          REAL,                 -- 0.0–1.0
+    requires_human      BOOLEAN NOT NULL DEFAULT 0,
+    message_to_operator TEXT,                 -- the Telegram ping text, if any
+    executed_at         TIMESTAMP,            -- when low/medium-risk actions were carried out
+    outcome             TEXT                  -- JSON: result of the actions, filled in after execution
+);
+```
+
+### 10.4 `approval_inbox` (two-key rule)
+
+```sql
+CREATE TABLE approval_inbox (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposed_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    agent_decision_id   INTEGER NOT NULL,     -- FK -> agent_decision.id
+    action_type         TEXT NOT NULL,        -- e.g. 'propose_code_change', 'pause_strategy_until', 'set_strategy_activation'
+    action_params       TEXT,                 -- JSON payload describing exactly what would happen
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','approved','denied','expired')),
+    decided_at          TIMESTAMP,
+    decided_by          TEXT,                 -- 'operator'
+    executor_completed_at TIMESTAMP           -- when the approved action actually finished executing
+);
+```
+
+Anything irreversible lands here as `pending`. A separate executor process only acts on
+rows the operator flips to `approved`. `expired` rows (operator never responded within a
+TTL) are never executed — silence is denial.
+
+**Upstream precedent — Remote MCP per-purpose TOTP (§4.5.3).** The two-key rule here is structurally
+the same consent gate upstream already ships for the Remote MCP `write:orders` scope: a privileged
+action requires a *fresh* second factor (`is_totp_required_for("mcp")` + `_is_fresh_totp()`,
+`blueprints/mcp_oauth.py:404`) on top of the session. We **keep our own `approval_inbox`** for the
+Stage 4 baseline — it is action-typed, auditable, and TTL-expiring in a way a one-shot TOTP prompt is
+not — but Remote MCP is the **migration path** if the agent is ever moved to a hosted-AI deployment,
+where the OAuth + per-purpose-TOTP consent flow would replace the local executor + Telegram
+approve/deny loop. See the new §14 question.
+
+### 10.5 Tool catalog (five groups)
+
+Tools are exposed to the Agent SDK via MCP servers, one server per group, so the whitelist
+is enforced at the protocol boundary (§10.6 ring 1).
+
+#### Group A — Read tools (no side effects)
+
+```python
+def get_market_state() -> dict:
+    """Return {'nifty': float, 'nifty_pct': float, 'india_vix': float,
+               'regime': str, 'advances': int, 'declines': int,
+               'session': 'pre_open'|'open'|'closed', 'as_of': iso8601}."""
+
+def get_positions() -> list[dict]:
+    """Return open positions:
+       [{'symbol': str, 'direction': 'BUY'|'SELL', 'qty': int,
+         'avg_price': float, 'ltp': float, 'unrealized_pnl': float,
+         'stop_loss': float|None, 'effective_mode': str}, ...]."""
+
+def get_today_journal() -> list[dict]:
+    """Return today's trade_journal rows (schema §8.1)."""
+
+def get_recent_scans(minutes: int = 60) -> list[dict]:
+    """Return scan_cycle rows started within the last `minutes`
+       (schema §6.2). Default 60."""
+
+def get_broker_session_health() -> dict:
+    """Return {'connected': bool, 'broker': str, 'token_valid': bool,
+               'token_expires_at': iso8601, 'last_order_ok': bool}.
+       Reads session liveness via the platform's session layer (the same probe the
+       Admin Diagnostics page uses, §4.5.2) — never the encrypted credentials (§6.5)."""
+```
+
+> **Real-time engine state — subscribe, don't poll (§4.5.5).** Where a read tool reflects live engine
+> state (positions, fills, mode changes), its backing data should come from the **`analyzer_update`**
+> SocketIO channel the platform already emits (`subscribers/socketio_subscriber.py:242`), **not** by
+> polling `/chartink/simplified-engine/api/status`. The sidecar keeps a fresh in-memory snapshot from
+> `analyzer_update` events and serves `get_market_state()` / `get_positions()` from it; the same
+> channel drives the §10.11 dashboard's live view of `agent_decision`.
+
+#### Group B — Analysis tools (read + external lookup)
+
+```python
+def get_market_news(symbols: list[str], hours: int = 6) -> list[dict]:
+    """Read market_intel (§11) for rows touching `symbols` in the last `hours`.
+       Return [{'headline','summary','sentiment','source_name','fetched_at','confidence'}]."""
+
+def get_nifty_regime() -> dict:
+    """Return {'regime': 'trending_up'|'trending_down'|'range_bound'|'high_vol',
+               'vix': float, 'vix_change_pct': float, 'rationale': str}."""
+
+def compare_to_historical_pattern(symbol: str, pattern_type: str) -> dict:
+    """Look up trade_journal history for `symbol` matching `pattern_type`
+       (e.g. 'gap_up', 'vol_spike', 'sl_hit'). Return base rates:
+       {'n': int, 'win_rate': float, 'avg_pnl': float, 'notes': str}."""
+```
+
+#### Group C — Low-risk write tools (reversible, non-monetary)
+
+```python
+def set_daily_intent(intent: str, reason: str) -> dict:
+    """Change daily_intent (day-level, applies to ALL strategies). HARD CONSTRAINT:
+       the agent can only DOWNGRADE risk — to 'sandbox' or 'skip'. It can NEVER
+       escalate to 'live'. Attempting intent='live' is rejected at the tool boundary.
+       Returns the new ModeResolution."""
+
+def set_strategy_activation(strategy_id: str, action: str, reason: str) -> dict:
+    """Toggle a single strategy's activation (§7.7). HARD CONSTRAINT (mirrors
+       set_daily_intent): the agent may autonomously DOWNGRADE risk —
+       action ∈ {'disable','force_sandbox'} — but 'enable' is an UPGRADE and is
+       never executed autonomously; it lands in approval_inbox (§10.4) for the
+       operator. Writes a strategy_activation row (decided_by='agent', §7.7.3).
+       Returns the strategy's new effective state."""
+
+def add_journal_note(symbol: str, note: str) -> dict:
+    """Append a freeform note (tag) to today's trade_journal row(s) for `symbol`."""
+
+def request_operator_confirmation(action: str, reason: str) -> dict:
+    """Send a Telegram ping asking the operator to confirm something.
+       Does NOT itself execute anything. Returns {'sent': bool, 'message_id': str}."""
+```
+
+#### Group D — Medium-risk tools (bounded, directional-only)
+
+```python
+def pause_strategy_until(strategy_id: str, timestamp: str, reason: str) -> dict:
+    """Stop arming new entries FOR ONE STRATEGY until `timestamp` (today only).
+       Does NOT touch open positions, and does NOT pause other strategies (§7.7).
+       Reversible by the operator. Returns {'strategy_id': str, 'paused_until': iso8601}."""
+
+def tighten_stop_loss(symbol: str, new_sl: float, reason: str,
+                      strategy_id: str | None = None) -> dict:
+    """Move a stop loss to `new_sl` (optionally scoped to `strategy_id` when a symbol
+       is held by more than one strategy). HARD CONSTRAINT: new_sl must be TIGHTER
+       (closer to LTP, smaller risk) than the current SL — never wider.
+       Rejected at the tool boundary if it would loosen risk.
+
+       Backend depends on how the stop is held (§4.5.4):
+         - SL is broker GTT-backed (live Zerodha/Dhan) -> MODIFY THE GTT via
+           POST /api/v1/modifygttorder (`modify_gtt_order_service.py`), so the
+           tightened stop survives an OpenAlgo restart / crash window;
+         - SL is in-process (sandbox, or no GTT placed) -> update the engine's
+           in-memory trail, as today. NOTE: sandbox GTT returns 501 (§4.5.4),
+           so in sandbox this path is always the in-process trail.
+       Returns {'symbol': str, 'new_sl': float, 'backend': 'gtt'|'inprocess',
+                'gtt_id': str|None}."""
+```
+
+#### Group E — Code-modifying tool (via bridge, human-gated)
+
+```python
+def propose_code_change(file: str, diff: str, reason: str) -> dict:
+    """Open Claude Code CLI (via bridge/server.py) on a NEW feature branch and apply
+       `diff` to `file`. NEVER writes to main. Lands as a PR / pending approval, never
+       auto-merged. Subject to the bridge denied_paths config (§10.7).
+       Returns {'branch': str, 'pr_url': str|None, 'approval_inbox_id': int}."""
+```
+
+#### Explicitly NOT in the toolset
+
+> **There is no tool — and there will never be a tool — that places or closes a
+> real-money order autonomously.** Entry and exit of live capital is exclusively the
+> engine's mechanical job (Chartink/ML signal → breakout → order) and the operator's
+> manual prerogative. The agent can tighten a stop, pause new entries, downgrade to
+> sandbox, and ping the human — but it cannot buy or sell real-money positions on its own.
+
+### 10.6 Three guardrail rings
+
+```
+   ┌──────────────────────────────────────────────────────────┐
+   │ Ring 3: two-key rule (approval_inbox)                       │
+   │   irreversible actions need operator approval to execute    │
+   │  ┌──────────────────────────────────────────────────────┐ │
+   │  │ Ring 2: host-process invariant guard                    │ │
+   │  │   sidecar tails agent_decision; kills/quarantines any   │ │
+   │  │   decision violating invariants (e.g. live escalation,  │ │
+   │  │   SL-loosening, order placement) before it can execute  │ │
+   │  │  ┌────────────────────────────────────────────────────┐│ │
+   │  │  │ Ring 1: tool-level whitelisting (MCP)               ││ │
+   │  │  │   agent can only call tools the MCP servers expose; ││ │
+   │  │  │   monetary order tools simply do not exist          ││ │
+   │  │  └────────────────────────────────────────────────────┘│ │
+   │  └──────────────────────────────────────────────────────┘ │
+   └──────────────────────────────────────────────────────────┘
+```
+
+1. **Tool-level whitelisting via MCP** — the agent literally cannot call what is not
+   exposed. The order-placement tools are absent from every MCP server.
+2. **Host-process invariant guard** — a separate process **tails `agent_decision`** and
+   enforces invariants independent of the LLM: no live escalation, no SL widening, no
+   order placement, no write to denied paths. A violating decision is quarantined and the
+   operator alerted; the executor never runs it.
+3. **Two-key rule via `approval_inbox`** — irreversible actions (`propose_code_change`,
+   and any future destructive action) require explicit operator approval before the
+   executor acts. Silence expires to denial.
+
+### 10.7 Bridge expansion
+
+`bridge/server.py` gains a `denied_paths` config so the agent's `propose_code_change` can
+never touch safety-critical code:
+
+```python
+# bridge config — paths the agent may NEVER modify
+DENIED_PATHS = [
+    "services/place_order_service.py",   # order dispatch
+    "database/settings_db.py",           # mode flag storage
+    "services/mode_service.py",          # effective-mode resolution
+    "broker/**",                         # broker integration / credentials
+    ".env", ".sample.env",
+]
+# All agent-driven writes go to a NEW feature branch. NEVER main. NEVER force-push.
+```
+
+### 10.8 Decision schema (agent structured output)
+
+Every invocation returns exactly this JSON, which maps 1:1 onto an `agent_decision` row:
+
+```jsonc
+{
+  "classification": "anomaly",                 // routine | anomaly | emergency
+  "confidence": 0.82,                          // 0.0–1.0
+  "reasoning": "VIX spiked 14→17.5 in 20 min; ...",
+  "inputs_snapshot": {                         // what the agent read (for replay)
+    "market_state": { "...": "..." },
+    "positions": [ "..." ],
+    "recent_scans": [ "..." ],
+    "market_intel": [ "..." ]
+  },
+  "actions": [                                 // ordered list of tool calls performed/proposed
+    { "tool": "pause_strategy_until",
+      "params": {"strategy_id": "trending_equity_intraday", "timestamp": "2026-05-26T11:15:00+05:30", "reason": "vol spike"},
+      "status": "executed" },
+    { "tool": "tighten_stop_loss",
+      "params": {"symbol": "CONCOR", "new_sl": 805.0, "strategy_id": "trending_equity_intraday", "reason": "protect short on vol spike"},
+      "status": "executed" },
+    { "tool": "set_daily_intent",
+      "params": {"intent": "sandbox", "reason": "ride out volatility in paper mode"},
+      "status": "proposed_to_operator" }
+  ],
+  "requires_human": true,
+  "message_to_operator": "VIX 14→17.5. Paused new BUY entries to 11:15, tightened CONCOR short SL to 805. Recommend flipping to sandbox — approve?"
+}
+```
+
+### 10.9 Worked example — the volatility-spike scenario
+
+**Trigger (threshold):** OpenAlgo's metric watcher fires when India VIX jumps **14 → 17.5**
+inside 20 minutes. It emits an event; the FastAPI sidecar starts a fresh agent session.
+
+**Read tools called (in order):**
+1. `get_market_state()` → confirms VIX 17.5, Nifty −0.6%, regime flipping `range_bound →
+   high_vol`.
+2. `get_positions()` → one open position: **CONCOR SHORT**, unrealized +₹900, SL currently
+   wide at 818.
+3. `get_recent_scans(minutes=30)` → two fresh **BUY** candidates just armed by the engine.
+4. `get_market_news(['CONCOR'], hours=3)` / reads `market_intel` → nothing material on
+   CONCOR; the VIX move looks macro (index-wide), not single-name.
+5. `get_nifty_regime()` → `high_vol`, vix_change_pct +25%, rationale "broad risk-off."
+
+**Reasoning:** Macro volatility spike, not a stock-specific event. The held **CONCOR SHORT
+benefits** from risk-off and should be protected, not closed. The fresh **BUY candidates
+are dangerous** to arm into a rising-VIX tape. No single-name news justifies an emergency.
+
+**Classification:** `anomaly` (not `emergency` — no position is bleeding, no session
+failure).
+
+**Action whitelist routing:**
+- `pause_strategy_until('trending_equity_intraday', '11:15', 'vol spike — hold new BUY entries')`
+  → **medium-risk, executed** (pauses only the equity strategy; the options strategies are
+  untouched).
+- `tighten_stop_loss('CONCOR', 805.0, 'lock gains on short into vol spike')` → **medium-risk,
+  executed** (805 is tighter than 818, so it passes the never-wider constraint).
+- `set_daily_intent('sandbox', 'ride out volatility in paper mode')` → the agent *wants*
+  this, but downgrading the whole day is consequential, so it routes it as
+  `request_operator_confirmation` / `proposed_to_operator` → Telegram ping. The operator
+  is the second key.
+- **No order is placed or closed.** The CONCOR short stays open under a tighter stop; the
+  BUY candidates are simply not armed.
+
+The decision row, the Telegram message, and the pending intent change are all written to
+SQL; if the session crashed mid-way, nothing is lost and the next trigger re-reads state.
+
+### 10.10 Cost estimate
+
+- **Per invocation:** ~5–15 K input tokens (state snapshot + system prompt + memory) +
+  1–3 K output tokens.
+- **Frequency:** ~10 invocations/day (scheduled checks + threshold events).
+- **Daily API cost:** ~**₹40–80/day**. With prompt caching on the static system prompt and
+  tool schemas, the marginal per-call input cost drops substantially.
+
+### 10.11 Stack
+
+| Concern | Choice |
+|---|---|
+| Agent runtime | **Claude Agent SDK (Python)** — one session per invocation |
+| Event source | **APScheduler inside OpenAlgo** emitting scheduled + threshold events |
+| Invocation surface | **FastAPI sidecar** exposing the agent-invocation endpoint + the approval inbox API |
+| Tools | **MCP servers, one per tool group** (A–E), enforcing Ring-1 whitelisting |
+| State store | **SQLite** (`db/openalgo.db` + new tables); migrate to **Postgres** as volume grows |
+| Operator notifications | **Telegram bot** (see §10.12) |
+| Dashboard | **Streamlit** (fast) or **Next.js** (richer), reading `agent_decision` + `approval_inbox`; subscribes to the **`analyzer_update`** SocketIO channel (§4.5.5) for live engine state instead of polling |
+
+### 10.12 Telegram bot setup
+
+- Create the bot via **@BotFather**, obtain the bot token.
+- Store the token in **`.env`** as `TELEGRAM_BOT_TOKEN` (and `TELEGRAM_OPERATOR_CHAT_ID`).
+- Set the bot **webhook to the FastAPI sidecar** (e.g. `POST /telegram/webhook`) so operator
+  replies (approve/deny on `approval_inbox` rows) flow back in real time.
+- The sidecar verifies the chat id matches the single operator and ignores everything else.
+
+---
+
+## 11. Stage 4 Real-Time Intelligence Layer
+
+### 11.1 Two-layer pattern
+
+The agent must not browse the open web on every tick — that is slow, costly, and noisy.
+Instead, **two layers**:
+
+1. **Continuous ingest sidecar** — a background service that polls a whitelist of news
+   sources on a schedule and writes normalized rows to **`market_intel`**. Always running,
+   cheap, no LLM.
+2. **Narrow `browse_for_anomaly` tool** — the agent calls this **only on triggers**, and
+   only when `market_intel` is empty for the symbols in question. It is a last-resort
+   drill-down, rate-limited and tagged low-confidence.
+
+### 11.2 `market_intel`
+
+```sql
+CREATE TABLE market_intel (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    fetched_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    source            TEXT NOT NULL CHECK (source IN ('RSS','api','agent_browse')),
+    source_url        TEXT,
+    source_name       TEXT,             -- 'Moneycontrol' | 'ET Markets' | ...
+    symbols_affected  TEXT,             -- JSON array of OpenAlgo symbols
+    headline          TEXT,
+    summary           TEXT,
+    sentiment         TEXT,             -- 'positive' | 'negative' | 'neutral'
+    confidence        TEXT,             -- 'high' | 'medium' | 'low' (agent_browse => always 'low')
+    raw_payload       TEXT              -- JSON: original item for audit / re-parse
+);
+```
+
+### 11.3 Ingest sidecar design
+
+- **Language:** Python service using **`httpx`** (API/HTTP) + **`feedparser`** (RSS).
+- **Source whitelist:** Moneycontrol, ET Markets, LiveMint, BloombergQuint, **BSE/NSE
+  corporate announcements**, and **NewsAPI**. No source outside this list is polled.
+- **Dedup logic:** hash `(source_name, headline)` (or a normalized title + publish date);
+  skip inserts whose hash already exists within a rolling window. Corporate announcements
+  also dedup on the exchange filing id.
+- **Symbol tagging:** map headline entities to OpenAlgo symbols (watchlist match + alias
+  table); rows that match no tracked symbol may still be stored but flagged.
+- **Error handling:** per-source try/except with `logger.exception`; one source failing
+  never blocks the others; backoff on repeated failure; never crashes the loop.
+- **Refresh interval:** **configurable, 5 min default** per source (corporate announcements
+  can poll faster during market hours, slower after).
+
+### 11.4 `browse_for_anomaly` tool
+
+```python
+def browse_for_anomaly(query: str, urls_hint: list[str] | None = None,
+                       max_pages: int = 3) -> list[dict]:
+    """Targeted, on-trigger web drill-down when market_intel has nothing for the
+       symbols under investigation. Fetches at most `max_pages` pages (optionally
+       starting from `urls_hint`), summarizes findings, and writes them back to
+       market_intel with source='agent_browse' and confidence='low'.
+
+       RATE LIMIT: at most 3 calls per agent invocation. Exceeding the limit raises
+       at the tool boundary. Returns the rows written."""
+```
+
+### 11.5 Hot-news drill-down pattern
+
+```
+threshold trigger (e.g. single-name -8% move, or VIX spike)
+   │
+   ├─ agent wakes (fresh session)
+   ├─ get_market_news(symbols, hours) -> reads market_intel
+   │     ├─ if rows found  -> reason over them, decide
+   │     └─ if EMPTY       -> browse_for_anomaly(query, urls_hint, max_pages<=3)
+   │                              -> writes low-confidence rows to market_intel
+   │                              -> reason over them, decide
+   ▼
+   make decision (classify, act within whitelist, escalate if needed)
+```
+
+### 11.6 Explicit non-goals
+
+> **The agent does NOT browse to generate signals.** Browsing exists *only* to enrich the
+> response to an already-detected anomaly. Intelligence informs judgment about existing
+> positions and pending entries; it never originates a trade idea. Signal generation stays
+> with Chartink (today) and ML (Stage 3).
+
+---
+
+## 12. Stage 5 Sketch — Independent Signal Generation (deferred)
+
+Eventually the bot could generate its own entry signals rather than only filtering
+Chartink's, fusing the Stage 3 ML model, regime context, and agent judgment into original
+ideas. **Deferred indefinitely.** Caveat: independent generation is where **overfitting risk
+is highest** — a model that invents its own setups can fit noise catastrophically and
+will look brilliant in-sample. Any Stage 5 work is gated behind a **hard capital cap** (a
+small fixed fraction of the book, enforced mechanically, never overridable by the agent)
+and strict walk-forward, out-of-sample validation before a single rupee of additional
+size.
+
+---
+
+## 13. Implementation Sequencing
+
+The near-term work is concrete (Stage 0 through Stage 1.7 are sprint-sized); everything past
+Stage 1.7 is sketched. Gates between stages are **hard** — each is the exit
+criterion of the prior stage's detailed design.
+
+**Timeline at a glance:**
+
+| Weeks | Stage | Parallelism |
+|---|---|---|
+| 1–2   | Stage 0 — operational floor | — |
+| 3–4   | Stage 1 — LLM veto layer | — |
+| 5–7   | Stage 1.5 — in-house scanner build | refactor into the `strategies/` package (§7.7) |
+| 8–9   | Stage 1.6a — port options call-buy as 2nd `BaseStrategy` | builds on the §7.7 package |
+| 10    | Stage 1.6b — add options put-buy mirror strategy | shares the directional-breakout base |
+| 11–12 | Stage 1.7 — regime classifier (rule-based) + activator | strategies declare regime profiles |
+| 5–12+ | Stage 2 — reflective journal | starts once the journal schema exists, in parallel with 1.5–1.7 |
+| later | Stage 3 — ML augmentation | needs ≥6 mo journal data |
+| later | Stage 4 — autonomous agent | may start advisory-only earlier |
+| much later | Stage 5 — independent signals | — |
+
+> **Post-merge note (2026-05-27, §4.5):** the **Stage 0** estimate above may run *lighter* than the
+> 1–2 weeks shown — the operational-visibility half of Stage 0 is partly upstream-provided. The Admin
+> Diagnostics page + `errors.jsonl` browser (§4.5.2) is the read path, so we build the `cycle_heartbeat`
+> *store* and route cycle errors into `errors.jsonl`, but we do **not** build a viewer. Timeline weeks
+> are left unchanged here pending a real Stage 0 build — this is a flag, not a recomputation.
+
+**Gates between stages (each must be met before the next begins):**
+- **Stage 0 → 1:** `resolve_effective_mode()` is the sole mode authority for new code; a full
+  day runs with the bridge **down** yet every cycle still has a `scan_cycle` + `cycle_heartbeat`
+  trail; a preflight failure demonstrably blocks a post.
+- **Stage 1 → 1.5:** a full enforcing day with the veto layer in-path, every decision logged,
+  latency within the 1–3 s budget, no missed entries attributable to the LLM.
+- **Stage 1.5 → Chartink retirement:** a **≥4 week** shadow run with no operator-flagged
+  divergence plus operator subjective sign-off on the shadow comparison report (qualitative
+  criteria, §7.5.3); the ~5-min Chartink update lag means parity alone justifies cutover.
+  Stage 2 may proceed *during* this shadow run.
+- **Stage 1.5 → 1.6:** the single strategy runs as a registered `BaseStrategy` in the
+  `strategies/` package (§7.7) with **zero** behaviour change — existing engine tests green.
+- **Stage 1.6a → 1.6b:** the options engine (§2.3) runs as `options_call_buy`, a **second**
+  independent `BaseStrategy` refactored onto the shared `options_directional_breakout` base;
+  it arms independently of the equity strategy when enabled (no regime gating yet).
+- **Stage 1.6b → 1.7:** `options_put_buy` registers as the mirror strategy and arms independently
+  in sandbox on a falling tape; both options strategies and the equity strategy run when enabled
+  (still no regime gating).
+- **Stage 1.7 → onward:** the rule-based regime classifier writes `market_regime` rows on a
+  5-min cadence and the activator gates each strategy's enable/disable on regime, with an
+  operator override demonstrably pinning a strategy for the day.
+- **Stage 2 → 3:** the journal has a statistically useful run and ≥1 reviewed retrospective;
+  Stage 3 additionally waits for **6 months** of journal data.
+- **Stage 3 → / Stage 4 maturity:** walk-forward out-of-sample lift over the rules-only
+  baseline; the agent has run advisory-only (no write tools) with operator-judged-correct
+  classifications.
+- **→ Stage 5:** a validated edge under strict walk-forward **and** a hard capital cap (§12).
+
+### Sprint 1 — Stage 0a: state foundation
+- Add `database/trading_ops_db.py` with `daily_intent`, `scan_cycle`, `cycle_heartbeat`
+  models + init.
+- Implement `services/mode_service.py` → `resolve_effective_mode()` + `set_trading_mode()`.
+- Reduce `get_analyze_mode()` cache TTL to 30 s (`database/settings_db.py:19`).
+- Unit tests: every composition branch of `resolve_effective_mode()`; conflict detection.
+- **Gate:** `resolve_effective_mode()` is the only mode authority new code calls; all
+  branches covered by tests.
+
+### Sprint 2 — Stage 0b: gating + audit + heartbeat
+- Add `/chartink/simplified-engine/api/preflight` and the atomic
+  `/chartink/simplified-engine/api/set-mode` routes.
+- Update the `fno-scan-cycle` SKILL to: call `/preflight` → abort on fail (write
+  `skipped_preflight`) → on pass, post symbols → write `scan_cycle` start/end + heartbeat at
+  each stage, **all independent of the bridge**.
+- **Gate (Stage 0 exit):** a full day runs where every cycle has a `scan_cycle` row + full
+  `cycle_heartbeat` trail with the bridge **intentionally down**, and a preflight failure
+  demonstrably blocks a post.
+
+### Sprint 3 — Stage 1a: veto service skeleton
+- Implement `services/signal_review_service.py` with the input/output schemas (§7),
+  prompt-cached system prompt, and the fail-safe-to-`skip` failure path.
+- Wire it into the dispatch path behind a feature flag (default off), logging decisions to
+  `scan_cycle`/journal without yet blocking orders (shadow mode).
+- **Gate:** shadow-mode decisions logged for a full day; latency measured within 1–3 s.
+
+### Sprint 4 — Stage 1b: enforce + measure
+- Flip the veto layer to enforcing (skip/size_down actually affect dispatch).
+- Add distinct `llm_unavailable` accounting so fail-safe skips are separable from real vetoes.
+- **Gate (Stage 1 exit):** a full enforcing day with no missed entries attributable to the
+  LLM call, and every decision auditable.
+
+### Sprint 5–6 — Stage 1.5: in-house scanner build
+- Extract `services/bar_aggregator.py` from the engine core; refactor the engine onto it with
+  the existing tests staying green.
+- Add the `scan_definitions` / `scan_results` tables and the **`pandas-ta`-based** indicator set
+  (ATR/EMA/RSI/`volume_avg`) computed in the bar aggregator service (§7.5.1 item 3, §14 Q7).
+- Stand up `services/scanner_service.py` on the ZMQ tick bus; wire `scan_hit` → webhook-poster
+  + SocketIO emitter.
+- (Stage 1.5 sibling, §7.7.9) refactor the single strategy into the `strategies/` package
+  shape — `BaseStrategy` ABC + registry, one strategy registered, **zero** behaviour change.
+- **Gate:** the in-house scanner emits the same symbols Chartink would for a full day, writing
+  `scan_results` rows tagged `shadow`; the 4–6 week shadow comparison (§7.5.2) begins.
+
+### Sprint 7 — Stage 1.6a: port the options call-buy strategy
+- Port `pythonTradingAutomator\src\optionBuyTradingEngine.py` (§2.3) as a **second**
+  `BaseStrategy` implementation, registered `options_call_buy` under
+  `strategies/options_call_buy/` (§7.7.5).
+- Refactor the shared opening-range-breakout / SL-RR-trailing / sizing logic into
+  `strategies/options_directional_breakout/base.py`; `options_call_buy` is a thin CE-side
+  subclass (§7.7.4).
+- Both strategies run independently when enabled; **no regime gating yet**.
+- **Gate:** `options_call_buy` arms/monitors independently of the equity strategy in
+  sandbox, with its own `scan_results` / journal trail.
+
+### Sprint 8 — Stage 1.6b: add the options put-buy mirror
+- Add `options_put_buy` (`strategies/options_put_buy/`) as a **thin subclass** of the same
+  `options_directional_breakout` base, flipping the direction-specific parameters: PE strike,
+  down-breakout, SL above (plus PE-side expiry/strike resolution).
+- Mostly a configuration flip — **expected to be the lightest week in the project** (~1 week).
+  Both options strategies and the equity strategy run when enabled; still no regime gating.
+- **Gate:** `options_put_buy` arms/monitors independently in sandbox on a falling tape, with
+  its own `scan_results` / journal trail.
+
+### Sprint 9 — Stage 1.7: regime classifier + activator
+- Add the `strategies` / `market_regime` / `strategy_activation` tables (§7.7.3).
+- Implement the rule-based regime classifier (NIFTY price action + India VIX bands + A/D
+  ratio) on a 5-min APScheduler cadence (§7.7.6), and the activator (§7.7.7).
+- Strategies declare their `regime_profile`s; an operator-override endpoint force-pins a
+  strategy's state for the day.
+- **Gate (Stage 1.7 exit):** a full day where the activator enables/disables strategies on
+  regime changes, every decision audited in `strategy_activation`, and an operator override
+  demonstrably pins a strategy.
+
+> Stage 2 (reflective journal) can start as soon as its schema exists, overlapping the Stage
+> 1.5–1.7 build. Stages 3–5 are scheduled only when their gates above are in sight.
+
+---
+
+## 14. Open Questions
+
+From the 2026-05-26 architectural review:
+1. **`daily_intent` monotonicity** — confirm the downgrade-only rule and the auto-lock
+   semantics (§6.1). Specifically: should `live` auto-lock after the first fired order, and
+   may the agent ever propose a re-upgrade for operator approval, or never?
+2. **`direction_enabled` persistence** — where should the per-day long/short enable flags
+   live and how should they survive a restart? (Currently in-engine, in-memory.) Should
+   they move into `daily_intent` or a sibling table so `resolve_effective_mode()` /
+   preflight can see them?
+3. **Double EOD summary intent** — there appear to be two end-of-day summary paths with
+   overlapping intent; confirm which is canonical and retire the other.
+
+Surfaced while drafting:
+4. **Telegram vs alternative** for operator notifications — Telegram is specified (§10.12),
+   but confirm it over alternatives (Signal, ntfy, email, dashboard-only) given the
+   single-operator, IP-sensitive (SEBI static-IP) deployment.
+   **Update (2026-05-27, post-merge):** the *operator-confirmation / consent* half of this question
+   (the two-key approve/deny on irreversible actions) is now superseded by an upstream precedent — the
+   Remote MCP per-purpose-TOTP `write:orders` consent gate (§4.5.3, §10.4). If the agent ever migrates
+   to hosted-AI via Remote MCP (new Q10), that OAuth+TOTP flow becomes the consent channel. What
+   remains genuinely open is only the *outbound notification transport* (how the ping is pushed), where
+   Telegram still stands.
+5. **Pre-market agent run** — should the agent run during the pre-open session to
+   *recommend* the day's `daily_intent` (advisory only, operator confirms), or stay
+   silent until market open?
+6. **`agent_decision` retention policy** — how long to keep decision rows (audit value vs
+   table growth), and when to migrate from SQLite to Postgres (§10.11). Proposed: keep
+   indefinitely until row count forces the Postgres move; never auto-purge audit rows
+   without an export.
+
+Surfaced in the scanner audit (2026-05-26/27, §4 / §7.5):
+7. **In-house indicator set** — which exact `pandas-ta` indicators (or hand-rolled set: ATR,
+   EMA, RSI, `volume_avg`, …) should the in-house scanner standardize on? Start hand-rolled
+   and pull in `pandas-ta` only for breadth, or commit to the dependency up front?
+   (§7.5.1 item 3.)
+   **Decided 2026-05-26:** **`pandas-ta` is the standard** indicator library for this
+   project — commit to it up front, with **no** hand-rolled alternative. The new bar
+   aggregator service computes **ATR, EMA, RSI, and `volume_avg`** via `pandas-ta`, and the
+   same dependency covers breadth indicators (supertrend, MACD, Bollinger, VWAP) later with
+   no second migration. (§7.5.1 item 3.)
+8. **Options-script port timing** — when to schedule porting the pending
+   `pythonTradingAutomator\src\optionBuyTradingEngine.py` options-trading script (§2.3) into
+   OpenAlgo: as a **Stage 1.5 sibling** (sharing the scanner/aggregator work) or a **post-1.5
+   standalone** workstream before Stage 3?
+   **Decided 2026-05-26:** the options strategy is a **separate, independent strategy
+   workstream** — and the decision is bigger than timing. It motivates a **multi-strategy
+   architecture** (run multiple independent strategies, each activated only when favourable
+   to the current market regime), specified in the new **§7.7**. The port is sequenced as
+   **Stage 1.6a/1.6b** (§13): the call-only engine is ported as `options_call_buy` (Stage 1.6a)
+   after the Stage 1.5 refactor introduces the strategy-package shape, then mirrored as
+   `options_put_buy` (Stage 1.6b) — two mutually-exclusive strategies over a shared
+   `options_directional_breakout` base.
+
+Surfaced in the upstream v2.0.1.1 merge (2026-05-27, §4.5):
+9. **Per-strategy mode toggle — align with upstream `analyze_mode`, or stand alone?** The fork-local
+   per-strategy enable/mode concept (§7.7.8) has no upstream equivalent (upstream has only the single
+   global `analyze_mode`). Should `strategies.enabled` / `resolve_effective_mode(strategy_id)` be
+   designed to *mirror* upstream's `analyze_mode` shape — so a future upstream multi-strategy PR would
+   merge cleanly — or kept as a deliberately standalone fork-local concept optimized for this rig?
+10. **Stage 4 agent transport — migrate to Remote MCP OAuth, or stay local stdio MCP?** The baseline
+    keeps the local stdio MCP (§10.5/§10.11). Remote MCP + OAuth 2.1 + per-purpose TOTP (§4.5.3) is the
+    natural path *if* the agent is ever hosted off-box, and it subsumes the §10.4 two-key consent (and
+    the consent half of Q4). Decide whether hosted-AI is a real future need, or whether local stdio MCP
+    is the permanent answer.
+
+---
+
+## 15. Glossary
+
+Overloaded terms, defined once:
+
+- **`mode`** — the **broker-routing flag** stored in `db/openalgo.db`
+  (`settings.analyze_mode`, Boolean). `False` = orders go to the real broker; `True` = orders
+  divert to sandbox. Read via `get_analyze_mode()` (`database/settings_db.py:79`).
+- **`engine_mode`** — the **simplified engine's own routing/run flag**, `SIMPLIFIED_ENGINE_MODE`
+  in `.env` (`live` | `sandbox` | `disabled`). Conceptually about *live ticks vs backtest/paper*
+  for the engine itself; read **once at process startup**. Independent of `analyze_mode`.
+- **`daily_intent`** — the **operator's declared intent for the day** (`live` | `sandbox` |
+  `skip`), stored in the new `daily_intent` table. **This is the source of truth**; the two
+  flags above can only make the day *safer* than the intent, never riskier.
+- **`effective_mode`** — the **single composed answer** returned by
+  `resolve_effective_mode()` (`services/mode_service.py`): the most-conservative resolution
+  of `daily_intent` + `engine_mode` + `analyze_mode`. **All new code consults this, not the
+  raw flags.**
+- **Analyze Mode** — the **UI label** (and analyzer/sandbox feature) for sandbox routing,
+  i.e. the human-facing name for `analyze_mode = True`. Same concept as the DB flag, shown
+  in the React frontend.
+- **in-house scanner** — the Stage 1.5 (§7.5) replacement for Chartink that lives inside
+  OpenAlgo, subscribing to the ZMQ tick bus and evaluating `scan_definition`s on bar close.
+- **`scan_definition`** — a row in the new `scan_definitions` table (§7.5.1): a named,
+  enable-able scan rule (`buy`/`sell`, an expression) the in-house scanner evaluates.
+- **`scan_result`** — a row in the new `scan_results` table (§7.5.1): the symbols a
+  `scan_definition` matched on one run, tagged by `source` (`chartink` | `inhouse` | `shadow`)
+  and whether it was posted to the engine.
+- **shadow validation** — running the in-house scanner *in parallel* with Chartink without
+  acting on its hits, comparing the two via `scan_results.source` for 4–6 weeks before cutover
+  (§7.5.2).
+- **Strategy** — (§7.7) a self-contained signal-generator + arming + monitoring pipeline with
+  a unique id, a signal source, arming/exit logic, a regime profile, a sandbox/live mode
+  inherited from `daily_intent`/`analyze_mode`, and an independent enable/disable switch.
+  Implemented as a `BaseStrategy` subclass.
+- **Mirror strategy** — (§7.7.4) one of a pair of strategies that share a common implementation
+  base but flip direction-specific parameters and carry **opposite regime profiles**, so the
+  activator keeps them mutually exclusive. The canonical pair is `options_call_buy` (bullish, CE)
+  and `options_put_buy` (bearish, PE), both subclassing `options_directional_breakout`: when
+  `trend` is `trending_up` only the call-buy matches; when `trending_down` only the put-buy does.
+- **Market regime** — (§7.7) a categorical descriptor of current market conditions across five
+  dimensions — **trend** (`trending_up`|`trending_down`|`choppy`), **volatility**
+  (`low`|`normal`|`elevated`|`extreme`), **breadth** (`broad_bullish`|`broad_bearish`|`mixed`),
+  **sector_rotation**, and **time_of_day** (both below) — produced by the regime classifier and
+  stored in `market_regime`.
+- **`sector_rotation`** — (§7.7) the market-regime dimension capturing which part of the market is
+  leading, ∈ {`cyclicals_leading`, `defensives_leading`, `broad_strength`, `broad_weakness`,
+  `mixed`}. Computed (Stage 1.7) from the 1-day relative strength of the sector indices
+  (NIFTY BANK / IT / AUTO / FMCG / PHARMA) versus NIFTY 50; ML refinement is Stage 3+.
+- **`time_of_day`** — (§7.7) the clock-driven market-regime dimension, ∈ {`pre_open` (<09:15),
+  `opening` (09:15–10:00), `mid_morning` (10:00–12:00), `lunch` (12:00–13:30), `afternoon`
+  (13:30–15:00), `closing` (15:00–15:30), `post_close` (>15:30)} (IST). Lets a strategy restrict
+  itself to the parts of the session where its edge holds (most intraday strategies sit out
+  `pre_open`/`lunch`/`post_close`).
+- **Regime profile** — (§7.7) a per-strategy declarative spec of which regimes a strategy is
+  favourable in; the activator matches the current regime against it to decide activation.
+- **Activator** — (§7.7) the process that, on each new `market_regime` row, computes which
+  strategies are active given their regime profiles and toggles their enable flag, writing a
+  `strategy_activation` row on any state change. Operator-overridable.
+- **`BaseStrategy`** — (§7.7) the abstract base class (`strategies/base.py`) every strategy
+  implements: `on_tick` / `on_bar` / `on_scan_hit` / `should_arm` / `should_exit`. The simplified
+  engine (`trending_equity_intraday`) and the two ported options mirror strategies
+  (`options_call_buy`, `options_put_buy`) are implementations.
+
+Upstream capabilities (post-v2.0.1.1 merge, §4.5):
+
+- **GTT (Good-Till-Triggered) order** — (§4.5.4) a broker-side resting order that fires when a trigger
+  price is hit, persisting *at the broker* so it survives an OpenAlgo restart/crash. Upstream pilot is
+  Zerodha + Dhan (`POST /api/v1/placegttorder` / `modifygttorder` / `cancelgttorder` / `gttorderbook`);
+  sandbox/analyze execution is not yet shipped (returns `501`). Used as the optional crash-safe SL
+  backing for the veto layer (§7.4) and the `tighten_stop_loss` agent tool (§10.5).
+- **`analyzer_update` channel** — (§4.5.5) the platform's SocketIO event rail for analyze-mode and
+  (since v2.0.0.7) sandbox engine-internal events (fills, square-off, T+1); emitted from
+  `subscribers/socketio_subscriber.py:242`. This design subscribes to it for live engine state
+  (§7.5, §10.5) instead of polling the engine status endpoint.
+- **Remote MCP** — (§4.5.3) upstream's self-hosted OAuth 2.1 + HTTP/SSE MCP transport
+  (`blueprints/mcp_http.py`, `mcp_oauth.py`) exposing the 40 MCP tools to hosted AI clients, off by
+  default, with per-purpose TOTP gating the `write:orders` scope. The Stage 4 agent stays on the local
+  stdio MCP for now; Remote MCP is the documented hosted-AI migration path (§10.4, §14 Q10).
+- **Admin Diagnostics** — (§4.5.2) upstream's `/admin` operations page (`blueprints/admin.py`): system
+  info, the six DB sizes, broker session state, a paginated `errors.jsonl` browser, and a downloadable
+  env-redacted bundle. This design's operational visibility (§6.6) routes into it rather than a
+  parallel dashboard.
+- **`errors.jsonl`** — (§4.5.2) `log/errors.jsonl`, the structured JSON-Lines error log written by the
+  centralized logger's `JSONErrorFormatter` (`utils/logging.py:293`), one object per line (ERROR+,
+  with traceback + request context). Browsable from Admin Diagnostics; Stage-0 cycle errors are routed
+  here for visibility (§6.6).
+- **Symbol Search API** — (§4.5.1) upstream's rewritten symbol search (`blueprints/search.py`,
+  `/api/v1/search`) with multi-exchange / multi-instrumenttype filtering, no 500-row cap, and per-user
+  history, over the `SymToken` universe. This design uses it for per-strategy universe selection (§7.7)
+  and as the substrate for sector-index resolution (§7.5 / §7.7 Stage 1.7).

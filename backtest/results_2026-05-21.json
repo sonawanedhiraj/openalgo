@@ -1,0 +1,108 @@
+{
+  "date": "2026-05-21",
+  "config": {
+    "capital": 20000.0,
+    "leverage": 5.0,
+    "max_risk_per_trade": 500.0,
+    "atr_period": 14,
+    "atr_sl_mult": 1.2,
+    "volume_multiplier": 2.5,
+    "max_trades_per_day": 6
+  },
+  "summary": {
+    "total_trades": 6,
+    "winners": 2,
+    "losers": 4,
+    "win_rate": 33.3,
+    "gross_pnl": -1188.45,
+    "total_charges": 290.8,
+    "net_pnl": -1479.25,
+    "roi_pct": -7.4
+  },
+  "trades": [
+    {
+      "symbol": "APOLLOHOSP",
+      "direction": "LONG",
+      "qty": 8,
+      "entry_price": 8322.0,
+      "exit_price": 8265.07,
+      "entry_time": "09:44:59",
+      "exit_time": "09:44:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -455.44,
+      "charges": 47.69,
+      "net_pnl": -503.13,
+      "turnover": 132696.56
+    },
+    {
+      "symbol": "SAMMAANCAP",
+      "direction": "LONG",
+      "qty": 260,
+      "entry_price": 157.15,
+      "exit_price": 155.23,
+      "entry_time": "10:19:59",
+      "exit_time": "10:34:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -499.2,
+      "charges": 38.32,
+      "net_pnl": -537.52,
+      "turnover": 81218.8
+    },
+    {
+      "symbol": "SAMMAANCAP",
+      "direction": "LONG",
+      "qty": 406,
+      "entry_price": 153.45,
+      "exit_price": 154.27,
+      "entry_time": "11:49:59",
+      "exit_time": "12:04:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 332.92,
+      "charges": 46.36,
+      "net_pnl": 286.56,
+      "turnover": 124934.32
+    },
+    {
+      "symbol": "POWERINDIA",
+      "direction": "LONG",
+      "qty": 2,
+      "entry_price": 36075.0,
+      "exit_price": 36191.77,
+      "entry_time": "11:24:59",
+      "exit_time": "12:04:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": 233.54,
+      "charges": 49.91,
+      "net_pnl": 183.63,
+      "turnover": 144533.54
+    },
+    {
+      "symbol": "SAMMAANCAP",
+      "direction": "LONG",
+      "qty": 464,
+      "entry_price": 155.2,
+      "exit_price": 154.12,
+      "entry_time": "12:49:59",
+      "exit_time": "12:49:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -501.12,
+      "charges": 49.65,
+      "net_pnl": -550.77,
+      "turnover": 143524.48
+    },
+    {
+      "symbol": "GRASIM",
+      "direction": "LONG",
+      "qty": 31,
+      "entry_price": 3134.4,
+      "exit_price": 3124.75,
+      "entry_time": "13:14:59",
+      "exit_time": "13:14:59",
+      "exit_reason": "stop_loss_intracandle",
+      "gross_pnl": -299.15,
+      "charges": 58.85,
+      "net_pnl": -358.0,
+      "turnover": 194033.65
+    }
+  ]
+}

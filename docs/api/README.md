@@ -37,6 +37,10 @@ Execute and manage trading orders across all supported exchanges.
 | [CancelOrder](./order-management/cancelorder.md) | Cancel a specific order |
 | [CancelAllOrder](./order-management/cancelallorder.md) | Cancel all open orders |
 | [ClosePosition](./order-management/closeposition.md) | Close all open positions |
+| [PlaceGTTOrder](./order-management/placegttorder.md) | Place a SINGLE or OCO GTT (Good Till Triggered) order |
+| [ModifyGTTOrder](./order-management/modifygttorder.md) | Modify an active GTT trigger |
+| [CancelGTTOrder](./order-management/cancelgttorder.md) | Cancel an active GTT trigger |
+| [GTTOrderBook](./order-management/gttorderbook.md) | List active GTT triggers |
 
 ### Order Information
 Query order status and position information.
@@ -115,6 +119,17 @@ Real-time market data streaming.
 | [Quote](./websocket-streaming/quote.md) | Subscribe to quote updates |
 | [Depth](./websocket-streaming/depth.md) | Subscribe to market depth |
 
+### WhatsApp Services
+Send trade alerts via WhatsApp. **Send-only** public surface — pairing,
+start/stop, config, users, broadcast, stats, and preferences are all
+admin-only and live behind the session-authed `/whatsapp` web UI. A
+leaked API key cannot create, mutate, or enumerate the device session.
+
+| Endpoint | Description |
+|----------|-------------|
+| [Overview](./whatsapp-services/README.md) | Architecture, security model, command reference |
+| [Notify](./whatsapp-services/notify.md) | Send text / image / document to self, one user, or up to 5 recipients |
+
 ## Order Constants
 
 ### Exchange Codes
@@ -127,8 +142,10 @@ Real-time market data streaming.
 | CDS | Currency Derivatives (NSE) |
 | BCD | Currency Derivatives (BSE) |
 | MCX | Multi Commodity Exchange |
+| NCO | NSE Commodities (futures + options, Zerodha only) |
 | NSE_INDEX | NSE Index (for options trading) |
 | BSE_INDEX | BSE Index (for options trading) |
+| GLOBAL_INDEX | Global indices (US30, JAPAN225, HANGSENG, GIFTNIFTY, etc.) — quote-only, Zerodha only |
 
 ### Product Types
 | Code | Description |

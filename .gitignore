@@ -26,6 +26,23 @@ config.ini
 # Temporary/debug files
 tmp/
 
+# Runtime / logs
+backtest/scans/
+
+# Local launch scripts (operator-specific)
+launch.vbs
+launch_openalgo.hta
+run.ps1
+start_openalgo.bat
+start_openalgo_task.xml
+
+# Diagnostics and backtest results (transient)
+backtest/_diag_auth.py
+backtest/results_*.json
+
+# Outputs directory (transient)
+outputs/
+
 # Numba/LLVMLITE cache directories (auto-created on Linux)
 .numba_cache/
 .llvm_tmp/
@@ -38,12 +55,16 @@ tmp/
 *.log
 *.jsonl
 *.tmp
+*.new
 checkpoint.txt
 checkpoints.json
 
 
 # Strategy encryption key
 db/strategy_encryption.key
+
+# DB backup files (created by upgrade/rotate_pepper.py and other migrations)
+db/backups/
 
 # CSV Files (except specific data files)
 *.csv
@@ -65,14 +86,11 @@ node_modules/
 **/node_modules/
 
 # Build output
-dist/
 build/
 .next/
 out/
 
 # Frontend specific
-# frontend/dist/ is built by CI/CD pipeline
-frontend/dist/
 frontend/.cache/
 *.local
 
@@ -84,7 +102,6 @@ frontend/.cache/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-#frontend/dist
 
 # Windows NUL file
 nul
