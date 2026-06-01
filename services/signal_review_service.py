@@ -458,6 +458,25 @@ def review_signal(
         raw_bridge_output=raw_output,
     )
 
+    # Fire a Telegram alert for fresh veto-skip decisions. This is the only
+    # path that fires alerts — cache hits (line ~335) and review_failed /
+    # bad_decision paths intentionally do not, to keep the operator's signal
+    # tied to fresh LLM blocks. The helper itself no-ops for decision != 'skip',
+    # so 'take' decisions are silently filtered there.
+    try:
+        from services.notification_service import publish_veto_decision_alert
+
+        publish_veto_decision_alert(
+            symbol=symbol,
+            decision=decision,
+            reasoning=reasoning,
+            confidence=float(confidence) if confidence is not None else None,
+            enforcement_mode=enforcement_mode,
+            source=source,
+        )
+    except Exception:
+        logger.exception("Failed to publish veto decision alert")
+
     fresh_result = {
         "id": decision_id,
         "decision": decision,
