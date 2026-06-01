@@ -3,6 +3,15 @@ from unittest.mock import patch
 
 import pytest
 
+# Pre-resolve the restx_api / services.place_order_service circular import
+# *before* pulling in any services.X module below. See conftest.py for the
+# full cycle description; in short, loading services.place_order_service
+# directly trips a partial-init ImportError because it pulls in
+# restx_api.schemas, which (transitively) re-enters services.place_order_service
+# from services.options_multiorder_service. Loading restx_api first lets
+# Python finish that walk in the right order.
+import restx_api  # noqa: F401, E402
+
 # Pre-import the submodules that mock.patch needs to resolve as attributes of
 # the `services` package. The simplified-engine service does lazy imports of
 # these inside _dispatch_order / _check_live_funds / _flatten_for_api_key, so

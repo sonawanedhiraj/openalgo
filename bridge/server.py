@@ -18,18 +18,19 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -150,6 +151,28 @@ class RestartAppRequest(BaseModel):
     kill_existing: bool = True
 
 
+# Stage 1: LLM veto layer — /review-signal request shape.
+class ReviewCandidate(BaseModel):
+    symbol: str
+    source: str
+    candidate_at: str
+
+
+class ReviewContext(BaseModel):
+    positions_count: Optional[int] = None
+    positions_summary: Optional[str] = None
+    pnl_today: Optional[float] = None
+    trades_today: Optional[int] = None
+    max_trades_today: Optional[int] = None
+    nifty_pct: Optional[float] = None
+    india_vix: Optional[float] = None
+
+
+class ReviewSignalRequest(BaseModel):
+    candidate: ReviewCandidate
+    context: ReviewContext = Field(default_factory=ReviewContext)
+
+
 # ---------------------------------------------------------------------------
 # Core: Run Claude Code CLI
 # ---------------------------------------------------------------------------
@@ -188,6 +211,23 @@ async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None 
     logger.info(f"Starting task: {task_name}")
     logger.info(f"Command: {' '.join(cmd[:4])}...")
 
+    # TODO(eod-watchdog P0): The /fix-bug + /run-tests prompts ask Claude to
+    # run `uv run pytest test/ -v`. The test suite, when run with the live
+    # DATABASE_URL inherited from this process, writes synthetic rows
+    # (live-1.., sbx-abc, RELIANCE @ 2502 etc.) into db/openalgo.db's
+    # trade_journal table. Those rows then poison the EOD watchdog +
+    # rehydrate logic (services/eod_watchdog_service.py,
+    # SimplifiedStockEngineService.rehydrate_positions_from_journal). On
+    # 2026-06-01 the bridge ran fix-bug at ~15:24 IST and wrote 12 fake rows
+    # while real NBCC LONG 500 was open. Cleaned up by hand; needs a real
+    # fix here.
+    #
+    # Right fix: spawn the claude subprocess with env={"DATABASE_URL":
+    # "sqlite:///db/openalgo_test.db", ...} (or :memory:) so any pytest run
+    # the agent kicks off targets an isolated DB. That requires regenerating
+    # the test DB on first use (run all init_db hooks) and verifying
+    # downstream services don't hard-code the production path. Deferred —
+    # tracked in the EOD watchdog hand-off note.
     try:
         # Run claude -p as subprocess
         process = await asyncio.create_subprocess_exec(
@@ -479,6 +519,241 @@ async def engine_status():
             return {"success": True, "data": data}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# /review-signal — Stage 1 LLM veto layer
+# ---------------------------------------------------------------------------
+
+# Hard wall-clock budget for one veto decision. The OpenAlgo-side service uses
+# a slightly larger timeout so the bridge wins the race on a hung Claude call.
+REVIEW_CLAUDE_TIMEOUT_SECONDS = 25.0
+
+
+REVIEW_PROMPT_TEMPLATE = """You are reviewing a candidate trading signal for an Indian F&O intraday strategy.
+
+CANDIDATE:
+- Symbol: {symbol}
+- Source: {source}
+- Time: {candidate_at}
+
+OPERATOR CONTEXT:
+- Current positions: {positions_count} ({positions_summary})
+- P&L today: ₹{pnl_today}
+- Trades today: {trades_today}/{max_trades_today}
+
+MARKET CONTEXT (today):
+- NIFTY return: {nifty_pct}%
+- India VIX: {india_vix}
+
+Decide whether the operator should take this signal. Be conservative: skip when the broader market regime conflicts with the signal direction (e.g., BUY signal on a -1% NIFTY day with elevated VIX), or when the operator is already near their daily trade limit.
+
+Respond with a short reasoning paragraph followed by a final JSON block. The JSON block must be the LAST thing in your response and must contain exactly these keys:
+
+{{
+  "decision": "take" | "skip",
+  "reasoning": "1-2 sentence summary",
+  "confidence": 0.0 to 1.0
+}}
+"""
+
+
+def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str:
+    """Interpolate the prompt template.
+
+    Operator-state fields (positions, trades) render missing values as
+    ``unknown``. The three macro/portfolio numbers (nifty_pct, india_vix,
+    pnl_today) instead render as ``unavailable`` — they're best-effort live
+    fetches and the LLM should treat their absence as "data not retrievable",
+    not "value is zero".
+    """
+
+    def _or_unknown(value: Any) -> str:
+        if value is None:
+            return "unknown"
+        return str(value)
+
+    def _or_unavailable(value: Any) -> str:
+        if value is None:
+            return "unavailable"
+        return str(value)
+
+    return REVIEW_PROMPT_TEMPLATE.format(
+        symbol=candidate.symbol,
+        source=candidate.source,
+        candidate_at=candidate.candidate_at,
+        positions_count=_or_unknown(ctx.positions_count),
+        positions_summary=_or_unknown(ctx.positions_summary),
+        pnl_today=_or_unavailable(ctx.pnl_today),
+        trades_today=_or_unknown(ctx.trades_today),
+        max_trades_today=_or_unknown(ctx.max_trades_today),
+        nifty_pct=_or_unavailable(ctx.nifty_pct),
+        india_vix=_or_unavailable(ctx.india_vix),
+    )
+
+
+def _extract_decision_block(text: str) -> Optional[dict]:
+    """Find the LAST balanced ``{...}`` block in ``text`` containing ``"decision"``.
+
+    Walks every ``{`` position, follows brace depth with quote/escape awareness,
+    and keeps the rightmost successfully-parsed block whose object has a
+    ``decision`` key. Returns ``None`` if no such block is present.
+    """
+    if not text:
+        return None
+
+    candidates: list[dict] = []
+    n = len(text)
+    for start_match in re.finditer(r"\{", text):
+        start = start_match.start()
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, n):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    block = text[start : i + 1]
+                    try:
+                        parsed = json.loads(block)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict) and "decision" in parsed:
+                        candidates.append(parsed)
+                    break
+    return candidates[-1] if candidates else None
+
+
+def _failsafe_response(
+    reasoning: str, started: float, session_id: str = "", raw: str = ""
+) -> dict:
+    """Build a ``decision='take'`` response used whenever review can't complete."""
+    return {
+        "decision": "take",
+        "reasoning": reasoning,
+        "confidence": 0.0,
+        "latency_ms": int((time.time() - started) * 1000),
+        "claude_session_id": session_id,
+        "raw_output": raw,
+    }
+
+
+async def _invoke_claude_for_review(prompt: str) -> tuple[str, str]:
+    """Run ``claude -p`` against the prompt and return ``(model_text, session_id)``.
+
+    ``model_text`` is the prose Claude emitted (the ``result`` field of the JSON
+    envelope, or raw stdout when the envelope can't be parsed). ``session_id``
+    is the Claude Code session id when available, else the empty string.
+
+    Raises ``asyncio.TimeoutError`` if the subprocess exceeds
+    ``REVIEW_CLAUDE_TIMEOUT_SECONDS`` — caller is responsible for fail-safe.
+    """
+    cmd = [
+        CLAUDE_CMD,
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(PROJECT_ROOT),
+    )
+    try:
+        stdout_bytes, _stderr_bytes = await asyncio.wait_for(
+            process.communicate(), timeout=REVIEW_CLAUDE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        raise
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    session_id = ""
+    model_text = stdout
+    try:
+        envelope = json.loads(stdout)
+        if isinstance(envelope, dict):
+            if "result" in envelope and isinstance(envelope["result"], str):
+                model_text = envelope["result"]
+            session_id = str(envelope.get("session_id", "") or "")
+    except json.JSONDecodeError:
+        pass
+
+    return model_text, session_id
+
+
+@app.post("/review-signal")
+async def review_signal(request: ReviewSignalRequest):
+    """Run a single LLM veto check against a candidate trading signal.
+
+    Fail-safe semantics: any error path (timeout, parse failure, validation
+    error, subprocess crash) returns ``decision='take'`` with a short
+    ``reasoning`` tag so the calling service can ship orders even when the
+    reviewer is unavailable. The OpenAlgo-side service is responsible for
+    enforcement (shadow vs active vs off).
+    """
+    started = time.time()
+    prompt = _format_review_prompt(request.candidate, request.context)
+
+    try:
+        model_text, session_id = await _invoke_claude_for_review(prompt)
+    except asyncio.TimeoutError:
+        return _failsafe_response("timeout", started)
+    except FileNotFoundError:
+        return _failsafe_response("claude_cli_missing", started)
+    except Exception as exc:
+        logger.exception("review-signal: subprocess failure")
+        return _failsafe_response(f"subprocess_error:{type(exc).__name__}", started)
+
+    decision_block = _extract_decision_block(model_text)
+    if decision_block is None:
+        return _failsafe_response("parse_failed", started, session_id, model_text)
+
+    decision = decision_block.get("decision")
+    reasoning = decision_block.get("reasoning", "")
+    confidence_raw = decision_block.get("confidence", 0.0)
+
+    if decision not in ("take", "skip"):
+        return _failsafe_response("parse_failed", started, session_id, model_text)
+
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        return _failsafe_response("parse_failed", started, session_id, model_text)
+
+    if not (0.0 <= confidence <= 1.0):
+        return _failsafe_response("parse_failed", started, session_id, model_text)
+
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+
+    return {
+        "decision": decision,
+        "reasoning": reasoning,
+        "confidence": confidence,
+        "latency_ms": int((time.time() - started) * 1000),
+        "claude_session_id": session_id,
+        "raw_output": model_text,
+    }
 
 
 # ---------------------------------------------------------------------------

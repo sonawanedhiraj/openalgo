@@ -132,7 +132,7 @@ Hooked into `on_quote()` after price/volume extraction; no-op when disabled.
 | `NO_NEW_ENTRIES_AFTER` | `15:10` | Cutoff for new entries |
 | `EOD_EXIT_TIME` | `15:20` | Engine-side EOD flatten + summary trigger |
 | `ATR_PERIOD` | `14` | Wilder ATR window |
-| `ATR_SL_MULT` | `1.2` | SL = ATR × this |
+| `ATR_SL_MULT` | `1.5` | SL = ATR × this |
 | `ATR_ENTRY_MIN_MULT` | `0.5` | Min candle range / ATR for entry |
 | `VOLUME_MULTIPLIER` | `2.5` | Required volume vs reference candle |
 | `TRAIL_ATR_MULT` | `0.5` | Trailing distance floor in ATR units |

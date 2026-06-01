@@ -30,11 +30,15 @@ from blueprints.admin import admin_bp  # Import the admin blueprint
 from blueprints.analyzer import analyzer_bp  # Import the analyzer blueprint
 from blueprints.apikey import api_key_bp
 from blueprints.auth import auth_bp
+from blueprints.backtest import backtest_bp  # MVP backtester endpoints
 from blueprints.brlogin import brlogin_bp
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
+from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
+from blueprints.preflight import preflight_bp  # Stage-0 go/no-go preflight gate
+from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
 from blueprints.core import core_bp
 from blueprints.dashboard import dashboard_bp
@@ -87,7 +91,13 @@ from database.action_center_db import init_db as ensure_action_center_tables_exi
 from database.analyzer_db import init_db as ensure_analyzer_tables_exists
 from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.auth_db import init_db as ensure_auth_tables_exists
+from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
+from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
+from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
+from database.scanner_db import init_db as ensure_scanner_tables_exists
+from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
+from database.trade_journal_db import init_db as ensure_trade_journal_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -106,6 +116,16 @@ from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
 from services.telegram_bot_service import telegram_bot_service
+
+# Stage 1.5: importing the package triggers self-registration of every
+# strategy declared under strategies/<name>/strategy.py. Today this is just
+# ``trending_equity_intraday`` (a thin adapter around the legacy
+# SimplifiedStockEngine — see strategies/__init__.py); future strategies
+# will land here too. The simplified engine itself is still instantiated
+# lazily via get_simplified_stock_engine_service(); this import only
+# populates the registry so callers (the upcoming multi-strategy router,
+# Stage 1.7's regime-profile reviewer) can enumerate available strategies.
+import strategies  # noqa: F401
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
 from utils.logging import (  # Import centralized logging
@@ -249,6 +269,10 @@ def create_app():
     app.register_blueprint(analyzer_bp)
     app.register_blueprint(settings_bp)
     app.register_blueprint(chartink_bp)
+    app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
+    app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
+    app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
+    app.register_blueprint(backtest_bp)  # MVP backtester trigger + inspection endpoints
     app.register_blueprint(traffic_bp)
     app.register_blueprint(latency_bp)
     app.register_blueprint(leverage_bp)  # Register Leverage blueprint
@@ -600,6 +624,12 @@ def setup_environment(app):
                 ("API Log DB", ensure_api_log_tables_exists),
                 ("Analyzer DB", ensure_analyzer_tables_exists),
                 ("Settings DB", ensure_settings_tables_exists),
+                ("Daily Intent DB", ensure_daily_intent_tables_exists),
+                ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
+                ("Scanner DB", ensure_scanner_tables_exists),
+                ("Signal Decision DB", ensure_signal_decision_tables_exists),
+                ("Trade Journal DB", ensure_trade_journal_tables_exists),
+                ("Backtest DB", ensure_backtest_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
@@ -653,6 +683,151 @@ def setup_environment(app):
                 logger.debug("Historify scheduler initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
+
+            # Scanner service (Stage 1.5 item 5) — gated by SCANNER_ENABLED.
+            # Off by default. When enabled, it subscribes to the ZMQ tick bus
+            # and evaluates registered scan rules against incoming bars; it
+            # does NOT touch the engine's order path (item 6 wires the
+            # webhook poster as a scan_hit consumer).
+            try:
+                if os.environ.get("SCANNER_ENABLED", "false").lower() == "true":
+                    from services.scanner_service import ScannerService
+
+                    raw_symbols = os.environ.get("SCANNER_SYMBOLS", "")
+                    symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+                    if not symbols:
+                        logger.warning(
+                            "SCANNER_ENABLED=true but SCANNER_SYMBOLS is empty — "
+                            "scanner will idle (no symbols to watch)"
+                        )
+                    scanner_intervals = [
+                        i.strip()
+                        for i in os.environ.get("SCANNER_INTERVALS", "5m").split(",")
+                        if i.strip()
+                    ]
+                    app.scanner_service = ScannerService(
+                        symbols=symbols, intervals=scanner_intervals
+                    )
+                    app.scanner_service.start()
+                    logger.info(
+                        "Scanner service started (symbols=%d, intervals=%s)",
+                        len(symbols), scanner_intervals,
+                    )
+
+                    # Pre-subscribe scanner symbols to the broker WebSocket so
+                    # ticks flow without waiting for a Chartink hit. Daemon
+                    # thread polls until WS is ready (up to 30s).
+                    def _pre_subscribe_scanner_symbols(syms):
+                        import time as _time
+                        from database.auth_db import (
+                            get_broker_name, get_first_available_api_key, verify_api_key,
+                        )
+                        from services.websocket_service import (
+                            get_websocket_connection, subscribe_to_symbols,
+                        )
+                        api_key = get_first_available_api_key()
+                        user_id = verify_api_key(api_key) if api_key else None
+                        if not user_id:
+                            logger.warning("Scanner pre-subscribe skipped: no active broker session")
+                            return
+                        broker = get_broker_name(api_key) or ""
+                        exchange = os.environ.get("SCANNER_EXCHANGE", "NSE").upper()
+                        deadline = _time.time() + 30
+                        while _time.time() < deadline and not get_websocket_connection(user_id)[0]:
+                            _time.sleep(1)
+                        if not get_websocket_connection(user_id)[0]:
+                            logger.warning("Scanner pre-subscribe: broker WS not ready after 30s")
+                            return
+                        succeeded = 0
+                        for s in syms:
+                            try:
+                                ok, resp, _ = subscribe_to_symbols(
+                                    user_id, broker, [{"exchange": exchange, "symbol": s}], mode="Quote",
+                                )
+                                if ok: succeeded += 1
+                                else: logger.warning("Scanner symbol pre-subscribe failed for %s: %s", s, resp)
+                            except Exception as _e:
+                                logger.warning("Scanner symbol pre-subscribe failed for %s: %s", s, _e)
+                        logger.info("Scanner pre-subscribed %d/%d symbols to broker WebSocket", succeeded, len(syms))
+                    if symbols:
+                        import threading as _t
+                        _t.Thread(target=_pre_subscribe_scanner_symbols, args=(list(symbols),),
+                                  daemon=True, name="ScannerPreSubscribe").start()
+                else:
+                    logger.debug("Scanner service disabled (SCANNER_ENABLED!=true)")
+            except Exception as e:
+                logger.error(f"Failed to initialize Scanner service: {e}")
+
+            # Scan-hit webhook poster (Stage 1.5 item 6) — gated by
+            # SCAN_HIT_POSTER_ENABLED. Subscribes to ``scan_hit`` events
+            # emitted by the scanner above. Default mode is ``shadow`` —
+            # the consumer fires and logs but performs NO HTTP POST, so
+            # turning the scanner on does not by itself route signals into
+            # the engine. Operator flips to ``active`` via env + restart.
+            try:
+                if os.environ.get("SCAN_HIT_POSTER_ENABLED", "true").lower() == "true":
+                    from services.scan_hit_poster import ScanHitPoster
+
+                    app.scan_hit_poster = ScanHitPoster.from_env()
+                    app.scan_hit_poster.start()
+                    logger.info(
+                        "Scan-hit poster started (mode=%s)",
+                        app.scan_hit_poster.mode,
+                    )
+                else:
+                    logger.debug(
+                        "Scan-hit poster disabled (SCAN_HIT_POSTER_ENABLED!=true)"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to initialize Scan-hit poster: {e}")
+
+            # P0 (2026-06-01 NBCC EOD incident): rehydrate the simplified
+            # engine's in-memory positions from today's open trade_journal
+            # rows BEFORE the EOD watchdog scheduler kicks in. A mid-day
+            # restart wipes the engine's `positions` dict; without this, the
+            # engine can't issue an EOD exit even when ticks resume, and the
+            # watchdog can only flatten via the broker (no engine-side
+            # cleanup). Pulling this in here also force-instantiates the
+            # engine singleton, which is what the watchdog needs to share an
+            # api_key map with the live order path.
+            try:
+                from services.simplified_stock_engine_service import (
+                    get_simplified_stock_engine_service,
+                )
+
+                _engine_svc = get_simplified_stock_engine_service()
+                rehydrated = _engine_svc.rehydrate_positions_from_journal()
+                logger.info(
+                    "Simplified engine rehydrate complete (positions_restored=%d)",
+                    rehydrated,
+                )
+            except Exception:
+                logger.exception("Simplified engine rehydrate failed at startup")
+
+            # EOD watchdog (P0 — 2026-06-01 NBCC fix). Schedules one cron job
+            # per intraday strategy at its declared eod_exit_time. Independent
+            # of the broker WebSocket tick stream — it's the safety net for
+            # the case where ticks die before EOD and the tick-driven
+            # `_maybe_flatten_eod` path can't fire. Must run AFTER the
+            # strategies registry is loaded (module import at top of file
+            # already did that) and AFTER DB tables exist (rehydrate above
+            # depends on trade_journal).
+            try:
+                from services.eod_watchdog_service import start_eod_watchdog
+
+                _wd_result = start_eod_watchdog()
+                if _wd_result.get("started"):
+                    logger.info(
+                        "EOD watchdog started (jobs=%d, skipped=%d)",
+                        len(_wd_result.get("jobs") or []),
+                        len(_wd_result.get("skipped") or []),
+                    )
+                else:
+                    logger.warning(
+                        "EOD watchdog did not start (already running or empty)"
+                    )
+            except Exception:
+                logger.exception("Failed to start EOD watchdog")
 
             # Auto-reconnect the WhatsApp bot if a paired session is persisted.
             # Without this, every server restart would leave is_ready()=False

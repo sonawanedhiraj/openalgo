@@ -2,7 +2,7 @@ import importlib
 from typing import Any, Dict, List, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
-from database.settings_db import get_analyze_mode
+from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -21,7 +21,10 @@ def import_broker_gtt_module(broker_name: str) -> Any | None:
 def get_gtt_orderbook_with_auth(
     auth_token: str, broker: str, original_data: dict[str, Any] | None = None
 ) -> tuple[bool, dict[str, Any], int]:
-    if get_analyze_mode() and original_data:
+    # Read path: SANDBOX → sandbox source (501 until Phase 3);
+    # LIVE / SKIP / DISABLED → broker source. SKIP/DISABLED are not order
+    # rejections for reads — users still want to see state.
+    if resolve_effective_mode() is EffectiveMode.SANDBOX and original_data:
         return (
             False,
             {

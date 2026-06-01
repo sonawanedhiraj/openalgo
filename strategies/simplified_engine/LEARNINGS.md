@@ -20,12 +20,12 @@ trailing. All positions flatten at 15:20 IST.
 
 ---
 
-## Current Live Config (as of May 21, 2026)
+## Current Live Config (as of May 29, 2026)
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| `atr_sl_mult` | 1.5 | Wider than default 1.2; reduces whipsaw exits |
-| `max_trades_per_day` | 4 | Conservative; prevents over-trading |
+| `atr_sl_mult` | 1.2 | Reverted to default; tighter stops |
+| `max_trades_per_day` | 6 | Increased from 4; more opportunities |
 | `cooldown_candles` | 3 | 15-min cooldown after a trade closes |
 | `capital` | 20,000 | Base capital |
 | `leverage` | 5.0 | Intraday leverage |
@@ -34,7 +34,7 @@ trailing. All positions flatten at 15:20 IST.
 | `atr_period` | 14 | Wilder's ATR lookback |
 | `no_new_entries_after` | 15:10 | No entries in last 20 min |
 | `eod_exit_time` | 15:20 | Force exit all positions |
-| `mode` | sandbox | Virtual trading in sandbox.db |
+| `mode` | live | Real trading via Zerodha |
 
 ---
 
@@ -122,6 +122,25 @@ trailing. All positions flatten at 15:20 IST.
 - **Funds**: Available cash ₹22,392.70 (floor ₹20,000)
 - **Errors**: Pre-login WebSocket 403s at 06:53–06:56 IST (benign, before Zerodha session).
   No trading-hour errors.
+
+### May 29, 2026 (Day 3 — First Live Trading Day)
+- **Market regime**: BUY-dominant; only BUY screener produced signals (GMRAIRPORT, NBCC). SELL screener empty.
+- **Engine mode**: `live` (first real-money day). Config changed from sandbox: atr_sl_mult 1.5→1.2, max_trades 4→6.
+- **Live result**: 3 trades, 1W/2L, net **-₹784.80**
+- **Win rate**: 33.3%
+- **Trade breakdown**:
+  - GMRAIRPORT LONG: BUY 500@102.96 (11:23) → SELL 500@103.50 (11:34), **+₹270**, 11min hold. Quick winner, trailing stop locked profit.
+  - NBCC LONG #1: BUY 500@102.13 (12:59) → SELL 500@101.10 (13:43), **-₹514.80**, 44min hold. Stopped out on pullback.
+  - NBCC LONG #2 (re-entry): BUY 500@101.50 (14:34) → SELL 500@100.42 (15:03), **-₹540**, 29min hold. Re-entry also stopped out; NBCC fading all afternoon.
+- **Notable observations**:
+  - Re-entry on NBCC (Trade 3) repeated the Learning #7 pattern — re-entering after an exit on a fading stock lost more. Both NBCC trades were losers.
+  - atr_sl_mult reverted to 1.2 (from 1.5) — the tighter stop may have contributed to the NBCC losses. Learning #1 warned that 1.2 produces more whipsaws.
+  - NBCC was in cooldown at close, suggesting the engine correctly applied cooldown after Trade 2 before allowing Trade 3.
+  - GMRAIRPORT remained armed at close with no re-entry — only 1 trade on the winner vs 2 on the loser.
+- **Tick log**: 35,185 ticks written, 2.92 MB, 0 drops (final EOD).
+- **Armed watches at close**: GMRAIRPORT (BUY), NBCC (BUY)
+- **Funds**: ₹22,081 available (floor ₹20,000)
+- **Errors**: 0 in last hour
 
 ---
 
@@ -211,7 +230,21 @@ trailing. All positions flatten at 15:20 IST.
 - **Sample size**: Only 1 day of data — need to track late vs early entry performance
   over more sessions before changing config.
 
-### 8. Config Mismatch is Dangerous
+### 12. Reverting atr_sl_mult to 1.2 on Live Hurts (May 29 Evidence)
+- First live day used atr_sl_mult=1.2 instead of the sandbox-proven 1.5.
+- Result: 33% win rate, -₹784.80 net. Both NBCC trades stopped out on pullbacks.
+- This mirrors the May 21 backtest finding (Learning #1): 1.2 produced 33% win rate vs 83% at 1.5.
+- **Strong signal across 2 data points**: atr_sl_mult=1.2 consistently underperforms 1.5 on this strategy.
+- **Action**: Consider reverting to 1.5 before next live session.
+- **Update (May 29 EOD)**: Reverted live engine to `atr_sl_mult=1.5` for Monday's
+  open. `.env`, `.sample.env`, and the Python default in
+  `SimplifiedEngineConfig` now agree on 1.5. Evidence basis: May 21 backtest
+  (1.2 → 33% win rate vs 1.5 → 83%) + May 29 live (1.2 → 33% / -₹784.80).
+  Regression-guarded by `test_default_atr_sl_mult_is_1_5` in
+  `test/test_simplified_stock_engine_core.py` so future config edits cannot
+  silently revert to 1.2 without a failing test.
+
+### 13. Config Mismatch is Dangerous
 - May 21 comparison proved that the backtester and live engine MUST use identical
   config. A 0.3 difference in one parameter caused a ₹2,100 P&L swing.
 - **Rule**: Always use `--from-engine` when backtesting. Never rely on defaults.

@@ -3,8 +3,8 @@ import importlib
 from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
-from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, GTTModifiedEvent, GTTModifyFailedEvent
+from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -48,7 +48,34 @@ def modify_gtt_order_with_auth(
     api_key = original_data.get("apikey", "")
     trigger_id = order_data.get("trigger_id", "")
 
-    if get_analyze_mode():
+    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    mode = resolve_effective_mode()
+
+    if mode is EffectiveMode.SKIP:
+        logger.info("Modify GTT rejected: daily_intent is 'skip' for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "operator_intent_skip",
+            "message": "Order rejected: daily intent is 'skip' for today.",
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.DISABLED:
+        logger.warning("Modify GTT rejected: no daily_intent declared for today.")
+        rejection = {
+            "status": "rejected",
+            "reason": "no_daily_intent",
+            "message": (
+                "Order rejected: no daily_intent row for today. "
+                "Set one via the helper before placing orders."
+            ),
+            "mode": "rejected",
+        }
+        return False, rejection, 200
+
+    if mode is EffectiveMode.SANDBOX:
+        # Sandbox GTT not implemented yet — clean 501 until Phase 3.
         error_response = {
             "mode": "analyze",
             "status": "error",
@@ -56,6 +83,7 @@ def modify_gtt_order_with_auth(
         }
         return False, error_response, 501
 
+    # mode is EffectiveMode.LIVE — proceed.
     broker_module = import_broker_gtt_module(broker)
     if broker_module is None:
         message = f"GTT orders are not supported for broker '{broker}' yet"
@@ -124,11 +152,12 @@ def modify_gtt_order(
     # API-based auth
     if api_key and not (auth_token and broker):
         # Semi-auto mode blocks GTT modify (parity with modify_order — stale queued
-        # actions against a triggered GTT are unsafe). Analyze mode would be handled
-        # here if sandbox was wired.
+        # actions against a triggered GTT are unsafe). Sandbox effective-mode
+        # bypasses semi-auto (parity with the other write services). SKIP/DISABLED
+        # fall through and reject inside with_auth.
         from database.auth_db import get_order_mode, verify_api_key
 
-        if not get_analyze_mode():
+        if resolve_effective_mode() is not EffectiveMode.SANDBOX:
             user_id = verify_api_key(api_key)
             if user_id:
                 order_mode = get_order_mode(user_id)

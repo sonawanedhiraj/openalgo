@@ -57,6 +57,15 @@ class SimplifiedEngineConfig:
     enable_global_profit_lock: bool = True
     sl_confirm_seconds: float = 3.0
     cooldown_candles: int = 3
+    # When True, a stop-loss exit on a symbol blocks re-entry on that symbol
+    # for the rest of the trading day (see same_day_block_end_time below). The
+    # existing cooldown_candles gate is unchanged; this is an additional
+    # longer-horizon block layered on top of it. Set via
+    # RISK_SAME_DAY_STOPOUT_BLOCK in .env.
+    same_day_stopout_block: bool = True
+    # End-of-session boundary for the same-day stop-out block. Defaults to
+    # 15:30 IST (NSE close). Once now() crosses this time the block lifts.
+    same_day_block_end_time: dt.time = dt.time(15, 30)
     # Routing mode for orders the engine emits. See MODE_* constants above.
     mode: str = MODE_SANDBOX
     # Minimum available cash (broker funds) required to arm a new opening
@@ -234,74 +243,12 @@ def compute_zerodha_intraday_charges(buy_value: float, sell_value: float) -> Tra
     )
 
 
-class FiveMinuteCandleBuilder:
-    def __init__(
-        self,
-        on_candle: Callable[[str, Candle], None],
-        candle_seconds: int = 300,
-    ):
-        self.on_candle = on_candle
-        self.candle_seconds = candle_seconds
-        self.current: dict[str, dict] = {}
-        self.last_cum_vol: dict[str, int] = {}
-
-    @staticmethod
-    def bucket(ts: dt.datetime) -> dt.datetime:
-        return ts.replace(minute=(ts.minute // 5) * 5, second=0, microsecond=0)
-
-    def on_tick(self, symbol: str, price: float, cumulative_volume: int, ts: dt.datetime) -> None:
-        bucket = self.bucket(ts)
-        price = float(price)
-        cumulative_volume = int(cumulative_volume or 0)
-
-        if symbol not in self.current:
-            self.current[symbol] = {
-                "bucket": bucket,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0,
-            }
-            self.last_cum_vol[symbol] = cumulative_volume
-            return
-
-        current = self.current[symbol]
-        if bucket != current["bucket"]:
-            self._emit(symbol, 1.0)
-            self.current[symbol] = {
-                "bucket": bucket,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0,
-            }
-            self.last_cum_vol[symbol] = cumulative_volume
-            return
-
-        delta = max(cumulative_volume - self.last_cum_vol.get(symbol, cumulative_volume), 0)
-        self.last_cum_vol[symbol] = cumulative_volume
-        current["high"] = max(current["high"], price)
-        current["low"] = min(current["low"], price)
-        current["close"] = price
-        current["volume"] += delta
-
-        elapsed = max((ts - current["bucket"]).total_seconds(), 0)
-        self._emit(symbol, min(elapsed / float(self.candle_seconds), 0.999))
-
-    def _emit(self, symbol: str, elapsed_pct: float) -> None:
-        current = self.current[symbol]
-        candle = Candle(
-            ts=current["bucket"],
-            open=current["open"],
-            high=current["high"],
-            low=current["low"],
-            close=current["close"],
-            volume=int(current["volume"]),
-            elapsed_pct=elapsed_pct,
-        )
-        self.on_candle(symbol, candle)
+# Re-exported from services.bar_aggregator. Kept importable from this module
+# so every existing caller (service layer, backtester, tests) continues to
+# work — including the static `FiveMinuteCandleBuilder.bucket()` calls
+# scattered through this file. Behavior is bit-identical to the previous
+# in-file definition; see services/bar_aggregator.py for the source.
+from services.bar_aggregator import FiveMinuteCandleBuilder  # noqa: E402
 
 
 class SimplifiedStockEngine:
@@ -333,6 +280,12 @@ class SimplifiedStockEngine:
         # exit occurred. Used by _is_entry_window_open to block re-entry for
         # cooldown_candles candles after a stop-loss on the same symbol.
         self._sl_cooldown: dict[str, dt.datetime] = {}
+        # Same-day stop-out block: symbol → datetime at which the block lifts
+        # (typically today's market close, 15:30 IST). Populated by
+        # confirm_exit when a stop-loss exit fires; consulted by
+        # _is_entry_window_open. Independent of _sl_cooldown — it adds a
+        # longer-horizon block that survives past the per-candle cooldown.
+        self._same_day_blocked_until: dict[str, dt.datetime] = {}
 
         self._tr_deques: dict[str, deque[float]] = {}
         self._atr_map: dict[str, float] = {}
@@ -537,6 +490,14 @@ class SimplifiedStockEngine:
         # blocks re-entry on the same symbol for cooldown_candles candles.
         if effective_reason and "stop_loss" in effective_reason:
             self._sl_cooldown[symbol] = FiveMinuteCandleBuilder.bucket(self.now_provider())
+            # Same-day re-entry block: set when configured. Independent of the
+            # candle cooldown above. Closes the NBCC-style re-entry hole where
+            # a stopped-out symbol could re-arm after cooldown_candles candles.
+            if self.config.same_day_stopout_block:
+                now = self.now_provider()
+                self._same_day_blocked_until[symbol] = dt.datetime.combine(
+                    now.date(), self.config.same_day_block_end_time
+                )
 
         return record
 
@@ -698,6 +659,24 @@ class SimplifiedStockEngine:
                 return False
             # Cooldown expired — remove entry
             del self._sl_cooldown[symbol]
+
+        # Same-day stop-out block: once a stop-loss fires on a symbol, refuse
+        # any new entry on that symbol until same_day_block_end_time. Honored
+        # only when same_day_stopout_block is True so operators can opt out.
+        if self.config.same_day_stopout_block:
+            blocked_until = self._same_day_blocked_until.get(symbol)
+            if blocked_until is not None:
+                if now < blocked_until:
+                    logger.info(
+                        "[SIMPLIFIED-SAME-DAY-BLOCK] %s blocked until %s "
+                        "(stop-out earlier today)",
+                        symbol,
+                        blocked_until.isoformat(),
+                    )
+                    return False
+                # Block has expired (we are past end-of-session); clear it so
+                # the symbol can re-arm on the next trading day's first signal.
+                del self._same_day_blocked_until[symbol]
 
         return True
 
@@ -862,6 +841,7 @@ class SimplifiedStockEngine:
             self.global_profit_actioned = False
             self.completed_trades.clear()
             self._sl_cooldown.clear()
+            self._same_day_blocked_until.clear()
 
     @staticmethod
     def _normalize_bucket(ts: dt.datetime) -> dt.datetime:

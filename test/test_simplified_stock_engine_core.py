@@ -7,6 +7,17 @@ from services.simplified_stock_engine_core import (
 )
 
 
+def test_default_atr_sl_mult_is_1_5():
+    """Regression guard for Learning #8 in strategies/simplified_engine/LEARNINGS.md.
+
+    May 21 backtest + May 29 live both showed 1.2 underperforms 1.5 sharply
+    (33% vs 83% win rate). The default was reverted to 1.5 on May 29 EOD; this
+    test fails if a future change silently drops it back without explicit
+    revisit.
+    """
+    assert SimplifiedEngineConfig().atr_sl_mult == 1.5
+
+
 class FixedClock:
     def __init__(self, now):
         self.now = now

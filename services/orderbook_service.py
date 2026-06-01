@@ -118,11 +118,12 @@ def get_orderbook_with_auth(
         - Response data (dict)
         - HTTP status code (int)
     """
-    # If in analyze mode AND we have original_data (API call), route to sandbox
-    # If original_data is None (internal call), use live broker
-    from database.settings_db import get_analyze_mode
+    # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
+    # SKIP/DISABLED are not order rejections for reads — operator still wants
+    # to see state. Internal calls (no original_data) use the live broker.
+    from services.mode_service import EffectiveMode, resolve_effective_mode
 
-    if get_analyze_mode() and original_data:
+    if resolve_effective_mode() is EffectiveMode.SANDBOX and original_data:
         from services.sandbox_service import sandbox_get_orderbook
 
         api_key = original_data.get("apikey")

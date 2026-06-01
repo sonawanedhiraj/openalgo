@@ -14,9 +14,12 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Settings cache - 1 hour TTL (settings rarely change)
-# This cache significantly reduces DB queries since get_analyze_mode() is called on every request
-_settings_cache = TTLCache(maxsize=10, ttl=3600)  # 1 hour TTL
+# Settings cache - 30 second TTL (analyze_mode is part of Stage-0 operational floor)
+# The 1-hour TTL we had before meant an operator flipping analyze_mode took up to
+# an hour to take effect — too long for the "most-conservative-wins" mode resolver
+# in services/mode_service.py to be trustworthy. Other settings here (SMTP,
+# security thresholds) change rarely so the extra DB hits are negligible.
+_settings_cache = TTLCache(maxsize=10, ttl=30)  # 30 second TTL
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 

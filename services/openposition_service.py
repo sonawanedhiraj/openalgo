@@ -5,8 +5,8 @@ from database.analyzer_db import async_log_analyzer
 from database.apilog_db import async_log_order
 from database.apilog_db import executor as log_executor
 from database.auth_db import get_auth_token_broker
-from database.settings_db import get_analyze_mode
 from extensions import socketio
+from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.logging import get_logger
 
 # Initialize logger
@@ -65,8 +65,10 @@ def get_open_position_with_auth(
     if "apikey" in request_data:
         request_data.pop("apikey", None)
 
-    # If in analyze mode, route to sandbox for real position data
-    if get_analyze_mode():
+    # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
+    # SKIP/DISABLED are not order rejections for reads — operator still wants
+    # to see state.
+    if resolve_effective_mode() is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_get_positions
 
         api_key = original_data.get("apikey")
