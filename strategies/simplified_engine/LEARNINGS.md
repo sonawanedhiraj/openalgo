@@ -142,6 +142,27 @@ trailing. All positions flatten at 15:20 IST.
 - **Funds**: ₹22,081 available (floor ₹20,000)
 - **Errors**: 0 in last hour
 
+### June 1, 2026 (Day 4 — Live, Monday)
+- **Market regime**: Mixed. BUY screener produced signals (NBCC seen in scans). SELL screener quiet. Engine ran in live mode with atr_sl_mult=1.5.
+- **Engine result**: **0 engine-managed trades**. Engine shows trades_today=0 at EOD — engine never subscribed to any symbols (tick log: 0 ticks, 0 bytes, 0 drops).
+- **Broker tradebook** (non-engine fills, likely from signal_review or manual):
+  - TCS LONG: BUY 42 @ ~2331.8 (12:09) → SELL 42 @ 2322.0 (13:24), **-₹411**, ~1h15m hold
+  - NBCC LONG: BUY 500 @ 104.94 (14:38) → SELL 500 @ 104.43 (15:25), **-₹255**, ~47m hold
+- **Net P&L (tradebook)**: **-₹666** (0W/2L, 0% win rate)
+- **Notable observations**:
+  - Engine had 0 trades despite being in live mode — scanned symbols didn't meet entry criteria (volume/breakout conditions), or scan cycles didn't successfully arm the engine.
+  - TCS and NBCC trades came from outside the engine (signal_review_service or manual). Both losers.
+  - NBCC continues its losing streak from Day 3 — now 3 consecutive losing trades across 2 days. Strong signal to avoid re-entering NBCC in current regime.
+  - `signal_review_service` repeatedly failed to persist decisions due to missing `signal_decision` table (DB migration gap, known since last session).
+  - `get_funds` API raised an error — engine failed open (continued without funds check).
+  - atr_sl_mult confirmed at 1.5 (matching Learning #8).
+- **Armed watches at close**: None (buy_symbols=[], sell_symbols=[])
+- **Tick log**: 0 ticks written, 0 bytes, 0 drops
+- **Errors**:
+  - `signal_decision` table missing (DB migration needed) — recurring, many entries today
+  - `get_funds` raised error in simplified_stock_engine_service — needs investigation
+  - Telegram bot placeholder token errors (known config issue)
+
 ---
 
 ## Key Learnings
