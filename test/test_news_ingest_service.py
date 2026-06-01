@@ -161,10 +161,10 @@ def test_get_existing_hashes_extracts_set_from_payloads():
 def test_run_ingest_cycle_writes_new_skips_dupes(monkeypatch):
     monkeypatch.delenv("NEWS_FEEDS", raising=False)
     # Pretend we have two feeds returning 2 + 1 items, one of which is a dupe.
-    h_dupe = nis._dedup_hash("moneycontrol_markets", "Sensex closes flat")
+    h_dupe = nis._dedup_hash("livemint_markets", "Sensex closes flat")
 
     def fake_fetch(url, label):
-        if label == "moneycontrol_markets":
+        if label == "livemint_markets":
             return [
                 {"title": "Sensex closes flat", "dedup_hash": h_dupe, "source": label},
                 {
@@ -196,7 +196,7 @@ def test_run_ingest_cycle_writes_new_skips_dupes(monkeypatch):
     assert summary["feeds"] == 2
     assert summary["total_fetched"] == 3
     assert summary["total_new"] == 2
-    assert summary["per_feed"]["moneycontrol_markets"] == {"fetched": 2, "new": 1}
+    assert summary["per_feed"]["livemint_markets"] == {"fetched": 2, "new": 1}
     assert summary["per_feed"]["et_markets"] == {"fetched": 1, "new": 1}
     assert {row["title"] for row in inserted} == {
         "Nifty banks rally",

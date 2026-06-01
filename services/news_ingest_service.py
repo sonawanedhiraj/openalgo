@@ -35,13 +35,23 @@ logger = get_logger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 # Default feed list — operator can override via NEWS_FEEDS env.
+#
+# Probed 2026-06-01: all Moneycontrol RSS endpoints (marketreports.xml,
+# MCtopnews.xml, marketsupdate.xml, results.xml, business.xml) are stale or
+# broken server-side — newest items 18,000h+ old or XML parse errors despite
+# HTTP 200. Swapped Moneycontrol for LiveMint Markets which returned 35 fresh
+# items (newest ~6h old) and adds a different publisher to the mix.
+#
+# Other fresh alternatives if operators want to extend via NEWS_FEEDS env:
+#   https://www.thehindubusinessline.com/markets/feeder/default.rss  (~60 items)
+#   https://feeds.feedburner.com/ndtvprofit-latest                   (~20 items)
+#   https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms
 DEFAULT_FEEDS: list[tuple[str, str]] = [
-    ("https://www.moneycontrol.com/rss/marketreports.xml", "moneycontrol_markets"),
+    ("https://www.livemint.com/rss/markets", "livemint_markets"),
     (
         "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
         "et_markets",
     ),
-    # Easy to add more later: livemint, bloombergquint, BSE/NSE corp announcements...
 ]
 
 _scheduler: BackgroundScheduler | None = None
