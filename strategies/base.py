@@ -14,15 +14,17 @@ drift. Specifically:
 * :meth:`seed_history` mirrors :meth:`load_historical_candles` for the
   morning warmup path.
 
-Stage 1.7's regime-profile layer will read from :meth:`regime_profile` to
-let the LLM veto reviewer make strategy-aware decisions; until then it
-defaults to an empty dict so existing strategies don't have to opt in.
+Stage 1.7's regime-profile layer reads from the :attr:`regime_profile`
+class attribute (a :class:`RegimeProfile` instance) to gate activation.
+Subclasses opt in by setting that attribute; the default ``None`` value
+means "matches every regime" — existing strategies keep running unchanged.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -31,6 +33,46 @@ if TYPE_CHECKING:
         EntrySignal,
         ExitSignal,
     )
+
+
+@dataclass(frozen=True)
+class RegimeProfile:
+    """Declarative regime constraint attached to a strategy class.
+
+    Each field is a set of acceptable category labels for that regime
+    dimension, or ``None`` to mean "any value is fine." A profile
+    matches a regime when every non-None field accepts the regime's
+    value for that dimension. ``sector_leaders`` is intentionally
+    omitted in v1 — the cardinality is too high for a useful
+    set-membership check; future iterations may add a leader-set or
+    concentration-threshold field.
+    """
+
+    trend: frozenset[str] | None = None
+    volatility: frozenset[str] | None = None
+    breadth: frozenset[str] | None = None
+    time_of_day: frozenset[str] | None = None
+
+    @staticmethod
+    def of(
+        *,
+        trend: set[str] | frozenset[str] | None = None,
+        volatility: set[str] | frozenset[str] | None = None,
+        breadth: set[str] | frozenset[str] | None = None,
+        time_of_day: set[str] | frozenset[str] | None = None,
+    ) -> RegimeProfile:
+        """Convenience constructor that freezes the supplied sets so the
+        resulting profile stays hashable / immutable."""
+
+        def _freeze(s):
+            return None if s is None else frozenset(s)
+
+        return RegimeProfile(
+            trend=_freeze(trend),
+            volatility=_freeze(volatility),
+            breadth=_freeze(breadth),
+            time_of_day=_freeze(time_of_day),
+        )
 
 
 class BaseStrategy(ABC):
@@ -60,6 +102,21 @@ class BaseStrategy(ABC):
     #: writers that need to roll earlier, etc.) declare their own cutoff.
     eod_exit_time: str = "15:20"
 
+    #: Stage 1.7 regime constraint. ``None`` (the default) means "matches
+    #: every regime" — the activator never blocks the strategy on regime
+    #: grounds. Subclasses opt in by assigning a :class:`RegimeProfile`
+    #: with the dimensions they care about, e.g.::
+    #:
+    #:     regime_profile = RegimeProfile.of(
+    #:         trend={"bullish"},
+    #:         volatility={"low", "medium"},
+    #:     )
+    #:
+    #: The activator (services/strategy_activator_service.py) reads this
+    #: attribute against the current :class:`~services.market_regime_service.MarketRegime`
+    #: to decide whether the strategy is allowed to take new entries.
+    regime_profile: RegimeProfile | None = None
+
     @abstractmethod
     def on_scan_hit(self, symbol: str, direction: str) -> None:
         """Called when a scanner (Chartink, custom screener, manual webhook)
@@ -68,19 +125,19 @@ class BaseStrategy(ABC):
         :mod:`services.simplified_stock_engine_core`."""
 
     @abstractmethod
-    def seed_history(self, symbol: str, candles: list["Candle"]) -> None:
+    def seed_history(self, symbol: str, candles: list[Candle]) -> None:
         """Populate ``symbol``'s history (typically the last N 5-minute
         candles) before live ticks start arriving. Used by the morning
         warmup path so the first live candle has a reference set."""
 
     @abstractmethod
-    def on_bar(self, symbol: str, candle: "Candle") -> "EntrySignal | None":
+    def on_bar(self, symbol: str, candle: Candle) -> EntrySignal | None:
         """Called when a new bar for ``symbol`` closes (or progresses past
         the elapsed-pct entry threshold). Returns an ``EntrySignal`` to
         schedule an entry, or ``None`` if no action is warranted."""
 
     @abstractmethod
-    def on_tick(self, symbol: str, price: float) -> list["ExitSignal"]:
+    def on_tick(self, symbol: str, price: float) -> list[ExitSignal]:
         """Called for every accepted price tick on ``symbol``. Returns the
         list of exits the strategy wants to schedule on the back of this
         tick — stop-loss hits, RR trailing exits, EOD flattens, etc."""
@@ -114,12 +171,6 @@ class BaseStrategy(ABC):
     # ------------------------------------------------------------------
     # Optional hooks with default implementations
     # ------------------------------------------------------------------
-
-    def regime_profile(self) -> dict[str, Any]:
-        """Return a strategy-specific regime profile for Stage 1.7's veto
-        reviewer. Defaults to an empty dict — strategies that haven't
-        opted in are simply scored against a neutral profile."""
-        return {}
 
     def now(self) -> dt.datetime:
         """Hook for strategies that need a controllable clock (e.g. for
