@@ -14,6 +14,7 @@ outcome are easier when they share a database.
 
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -47,6 +48,9 @@ else:
 db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
 Base = declarative_base()
 Base.query = db_session.query_property()
+
+_tables_ensured_for_engine = None
+_tables_ensured_lock = threading.Lock()
 
 
 class SignalDecision(Base):
@@ -83,9 +87,29 @@ class SignalDecision(Base):
 
 def init_db():
     """Create the signal_decision table if missing. Idempotent."""
+    global _tables_ensured_for_engine
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Signal Decision DB", logger)
+    with _tables_ensured_lock:
+        _tables_ensured_for_engine = engine
+
+
+def _ensure_tables() -> None:
+    # The veto layer can be exercised before app.py's parallel db init has
+    # reached this module — the scanner thread starts emitting signals as
+    # soon as the master contract loads. Guarantee the table exists before
+    # the first write, so a missed/late init can't turn into a hard error.
+    # The flag tracks engine identity so tests that monkeypatch ``engine``
+    # to a fresh in-memory SQLite re-trigger the create_all.
+    global _tables_ensured_for_engine
+    if _tables_ensured_for_engine is engine:
+        return
+    with _tables_ensured_lock:
+        if _tables_ensured_for_engine is engine:
+            return
+        Base.metadata.create_all(bind=engine)
+        _tables_ensured_for_engine = engine
 
 
 def _now_iso() -> str:
@@ -129,6 +153,7 @@ def insert_signal_decision(
     """Insert one decision row and return its id."""
     if candidate_at is None:
         candidate_at = _now_iso()
+    _ensure_tables()
     try:
         row = SignalDecision(
             candidate_at=candidate_at,
@@ -155,6 +180,7 @@ def insert_signal_decision(
 
 
 def get_signal_decision(decision_id: int) -> dict[str, Any] | None:
+    _ensure_tables()
     try:
         row = db_session.query(SignalDecision).filter_by(id=decision_id).first()
         return _row_to_dict(row) if row else None
@@ -168,6 +194,7 @@ def mark_actually_taken(decision_id: int, taken: bool) -> None:
     Silently no-ops if the id is unknown — the caller is in the order-placement
     path and shouldn't blow up on bookkeeping errors.
     """
+    _ensure_tables()
     try:
         row = db_session.query(SignalDecision).filter_by(id=decision_id).first()
         if row is None:
