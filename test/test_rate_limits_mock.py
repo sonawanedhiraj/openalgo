@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Mock test for rate limiting - simulates API calls without requiring a running server
+Mock test for rate limiting - simulates API calls without requiring a running server.
+
+Script-style file: its `test_*` functions take regular positional args (api,
+endpoint, expected_limit, description) rather than pytest fixtures, and the
+real entry point is `main()` / `if __name__ == "__main__"`. Skipped at module
+level so pytest doesn't try to discover the helpers as tests; run directly
+with `python test/test_rate_limits_mock.py`.
 """
+
+import pytest
+
+pytest.skip(
+    "Script-style test; helpers prefixed test_* take positional args, not "
+    "pytest fixtures. Run directly: python test/test_rate_limits_mock.py",
+    allow_module_level=True,
+)
 
 import os
 import sys

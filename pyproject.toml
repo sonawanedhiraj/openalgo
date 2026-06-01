@@ -207,6 +207,7 @@ python_functions = ["test_*"]
 # (which Python 3.14 / newer pytest no longer applies the same way).
 pythonpath = ["."]
 addopts = "-v --timeout=60 --import-mode=importlib"
+asyncio_mode = "auto"
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",
@@ -220,6 +221,7 @@ dev = [
     # Pulled in transitively via pip-api -> pip-audit; pinned here to satisfy
     # Dependabot's >=26.1 advisory on the lockfile.
     "pip>=26.1",
+    "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.4.0",
     "ruff>=0.14.14",
 ]

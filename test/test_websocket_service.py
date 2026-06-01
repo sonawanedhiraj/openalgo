@@ -1,7 +1,23 @@
 """
 Test script for WebSocket service layer
-Tests LTP, Quote, and Depth for RELIANCE and TCS
+Tests LTP, Quote, and Depth for RELIANCE and TCS.
+
+Script-style file: its `test_*` functions take regular positional args
+(client, symbols) rather than pytest fixtures, and the real entry point is
+`main()` / `if __name__ == "__main__"`. Requires a live OpenAlgo server with
+an authenticated broker session. Skipped at module level so pytest doesn't
+try to discover the helpers as tests; run directly with
+`python test/test_websocket_service.py`.
 """
+
+import pytest
+
+pytest.skip(
+    "Script-style test; helpers prefixed test_* take positional args, not "
+    "pytest fixtures. Requires a live OpenAlgo server. Run directly: "
+    "python test/test_websocket_service.py",
+    allow_module_level=True,
+)
 
 import json
 import os
