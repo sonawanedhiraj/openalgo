@@ -713,6 +713,46 @@ def setup_environment(app):
                         "Scanner service started (symbols=%d, intervals=%s)",
                         len(symbols), scanner_intervals,
                     )
+
+                    # Pre-subscribe scanner symbols to the broker WebSocket so
+                    # ticks flow without waiting for a Chartink hit. Daemon
+                    # thread polls until WS is ready (up to 30s).
+                    def _pre_subscribe_scanner_symbols(syms):
+                        import time as _time
+                        from database.auth_db import (
+                            get_broker_name, get_first_available_api_key, verify_api_key,
+                        )
+                        from services.websocket_service import (
+                            get_websocket_connection, subscribe_to_symbols,
+                        )
+                        api_key = get_first_available_api_key()
+                        user_id = verify_api_key(api_key) if api_key else None
+                        if not user_id:
+                            logger.warning("Scanner pre-subscribe skipped: no active broker session")
+                            return
+                        broker = get_broker_name(api_key) or ""
+                        exchange = os.environ.get("SCANNER_EXCHANGE", "NSE").upper()
+                        deadline = _time.time() + 30
+                        while _time.time() < deadline and not get_websocket_connection(user_id)[0]:
+                            _time.sleep(1)
+                        if not get_websocket_connection(user_id)[0]:
+                            logger.warning("Scanner pre-subscribe: broker WS not ready after 30s")
+                            return
+                        succeeded = 0
+                        for s in syms:
+                            try:
+                                ok, resp, _ = subscribe_to_symbols(
+                                    user_id, broker, [{"exchange": exchange, "symbol": s}], mode="Quote",
+                                )
+                                if ok: succeeded += 1
+                                else: logger.warning("Scanner symbol pre-subscribe failed for %s: %s", s, resp)
+                            except Exception as _e:
+                                logger.warning("Scanner symbol pre-subscribe failed for %s: %s", s, _e)
+                        logger.info("Scanner pre-subscribed %d/%d symbols to broker WebSocket", succeeded, len(syms))
+                    if symbols:
+                        import threading as _t
+                        _t.Thread(target=_pre_subscribe_scanner_symbols, args=(list(symbols),),
+                                  daemon=True, name="ScannerPreSubscribe").start()
                 else:
                     logger.debug("Scanner service disabled (SCANNER_ENABLED!=true)")
             except Exception as e:
