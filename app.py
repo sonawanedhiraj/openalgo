@@ -831,6 +831,19 @@ def setup_environment(app):
             except Exception:
                 logger.exception("Failed to start EOD watchdog")
 
+            # Phase A — News ingest sidecar (writes to market_intel; no
+            # consumers yet). Pure ingestion: every 5 min, 08:00–15:30 IST
+            # mon-fri. Boot-safe — failures here log and continue.
+            try:
+                from services.news_ingest_service import (
+                    start_news_ingest_scheduler,
+                )
+
+                _news_result = start_news_ingest_scheduler()
+                logger.info(f"News ingest scheduler: {_news_result}")
+            except Exception:
+                logger.exception("Failed to start news ingest scheduler")
+
             # Stage 2 part 2 — journal reflection (LLM-based pattern synthesis)
             # at 16:00 IST mon-fri, after EOD watchdog has flattened intraday
             # positions and the day's trade_journal rows are closed out.

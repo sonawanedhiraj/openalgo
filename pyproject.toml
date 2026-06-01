@@ -152,6 +152,7 @@ dependencies = [
   "fastapi>=0.136.1",
   "opengreeks>=0.1.0",
   "pandas-ta-classic>=0.6.20",
+  "feedparser>=6.0.12",
 ]
 
 [build-system]

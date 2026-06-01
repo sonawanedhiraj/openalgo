@@ -13,8 +13,9 @@ defer that to the next iteration. Until then, regime snapshots live in
 lands, the writer flips over and old rows stay queryable as legacy intel.
 """
 
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytz
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
@@ -91,3 +92,58 @@ def latest_intel(kind: str) -> dict | None:
         "kind": row.kind,
         "payload_json": row.payload_json,
     }
+
+
+def latest_intel_by_kind(
+    kind: str,
+    *,
+    limit: int = 50,
+    since_minutes: int | None = None,
+) -> list[dict]:
+    """Return the most recent rows of ``kind``, newest first.
+
+    The ``payload_json`` column is decoded if it is a JSON string;
+    rows that fail to decode keep the raw text under ``payload_json``.
+
+    ``since_minutes`` (optional) restricts the result to rows whose
+    ``captured_at`` lies within the last N minutes of "now in IST".
+    Rows with malformed timestamps are skipped when the filter is active.
+    """
+    query = (
+        db_session.query(MarketIntel)
+        .filter(MarketIntel.kind == kind)
+        .order_by(MarketIntel.id.desc())
+        .limit(limit)
+    )
+    rows = query.all()
+
+    cutoff = None
+    if since_minutes is not None:
+        cutoff = datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(
+            minutes=since_minutes
+        )
+
+    out: list[dict] = []
+    for row in rows:
+        if cutoff is not None:
+            try:
+                ts = datetime.fromisoformat(row.captured_at)
+            except (TypeError, ValueError):
+                continue
+            if ts.tzinfo is None:
+                ts = pytz.timezone("Asia/Kolkata").localize(ts)
+            if ts < cutoff:
+                continue
+        try:
+            payload = json.loads(row.payload_json)
+        except (TypeError, ValueError):
+            payload = row.payload_json
+        out.append(
+            {
+                "id": row.id,
+                "captured_at": row.captured_at,
+                "kind": row.kind,
+                "payload_json": payload,
+            }
+        )
+    return out
