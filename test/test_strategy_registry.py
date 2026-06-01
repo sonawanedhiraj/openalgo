@@ -239,12 +239,13 @@ def test_trending_equity_strategy_exposes_engine_via_property():
     assert strategy.engine is engine
 
 
-def test_regime_profile_defaults_to_empty():
-    """Subclasses that haven't opted in to Stage 1.7 should get an empty
-    profile rather than a NotImplementedError."""
+def test_regime_profile_defaults_to_none():
+    """Subclasses that haven't opted in to Stage 1.7 should expose the
+    default ``None`` class attribute. ``None`` is the activator's signal
+    for "matches every regime" — no gating applied."""
     from strategies.trending_equity_intraday.strategy import (
         TrendingEquityIntradayStrategy,
     )
 
-    strategy = TrendingEquityIntradayStrategy(MagicMock())
-    assert strategy.regime_profile() == {}
+    # Inspect the class attr directly so we don't need an engine instance.
+    assert TrendingEquityIntradayStrategy.regime_profile is None
