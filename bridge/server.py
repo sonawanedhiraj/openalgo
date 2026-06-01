@@ -813,6 +813,108 @@ async def review_signal(request: ReviewSignalRequest):
 
 
 # ---------------------------------------------------------------------------
+# /reflect — Stage 2 part 2 journal reflection
+# ---------------------------------------------------------------------------
+
+# Wall-clock budget for a single reflection call. Reflection is heavier than
+# /review-signal because it ships the day's full journal + screener + backtest
+# data, so the LLM has more to read before it answers. The OpenAlgo-side
+# service uses a slightly larger HTTP read timeout.
+REFLECT_CLAUDE_TIMEOUT_SECONDS = 180.0
+
+
+class ReflectRequest(BaseModel):
+    prompt: str
+    model: Optional[str] = None
+
+
+@app.post("/reflect")
+async def reflect(request: ReflectRequest):
+    """Relay a free-form reflection prompt to Claude Code and return the response.
+
+    Unlike ``/review-signal`` this endpoint does no JSON-block extraction;
+    the caller (services.journal_reflection_service) parses the reply itself.
+    The response shape is intentionally minimal: ``response`` is the prose the
+    model emitted, ``model`` is the model id when Claude reports one, and
+    ``latency_ms`` measures the bridge-side wall clock.
+
+    Errors surface as a non-200 status with a ``detail`` body so the caller
+    fails loudly. We do NOT fail-safe here — reflection is forensic, not
+    order-routing, so a silent fallback would just paper over a real outage.
+    """
+    started = time.time()
+    if not request.prompt or not request.prompt.strip():
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    cmd = [
+        CLAUDE_CMD,
+        "-p",
+        request.prompt,
+        "--output-format",
+        "json",
+    ]
+    if request.model:
+        cmd.extend(["--model", request.model])
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(PROJECT_ROOT),
+        )
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                process.communicate(), timeout=REFLECT_CLAUDE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            raise HTTPException(status_code=504, detail="claude_timeout")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="claude_cli_missing")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("reflect: subprocess failure")
+        raise HTTPException(
+            status_code=500, detail=f"subprocess_error:{type(exc).__name__}"
+        ) from exc
+
+    if process.returncode != 0:
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        raise HTTPException(
+            status_code=500,
+            detail=f"claude_returncode_{process.returncode}: {stderr[:300]}",
+        )
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    model_text = stdout
+    model_used = request.model or ""
+    try:
+        envelope = json.loads(stdout)
+        if isinstance(envelope, dict):
+            if "result" in envelope and isinstance(envelope["result"], str):
+                model_text = envelope["result"]
+            # Newer claude CLI reports model id under different keys; accept
+            # any of them.
+            for key in ("model", "model_id", "modelName"):
+                if envelope.get(key):
+                    model_used = str(envelope[key])
+                    break
+    except json.JSONDecodeError:
+        pass
+
+    return {
+        "response": model_text,
+        "model": model_used,
+        "latency_ms": int((time.time() - started) * 1000),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
