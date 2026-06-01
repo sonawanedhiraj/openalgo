@@ -1,6 +1,15 @@
 import os
 import unittest
 
+import pytest
+
+pytest.skip(
+    "Targets the PyPI `openalgo` SDK (which exposes `api`); this repo's local "
+    "`openalgo` package has a different shape. Run manually against a live "
+    "OpenAlgo server with the SDK installed in a separate venv.",
+    allow_module_level=True,
+)
+
 from dotenv import load_dotenv
 from openalgo import api as OAClient
 

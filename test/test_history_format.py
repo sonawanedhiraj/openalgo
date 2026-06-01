@@ -1,6 +1,15 @@
 import os
 import sys
 
+import pytest
+
+pytest.skip(
+    "Targets the PyPI `openalgo` SDK (which exposes `api`); this repo's local "
+    "`openalgo` package has a different shape. Run manually against a live "
+    "OpenAlgo server with the SDK installed in a separate venv.",
+    allow_module_level=True,
+)
+
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

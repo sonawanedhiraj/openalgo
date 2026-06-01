@@ -5,15 +5,18 @@ import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
+# eventlet is a prod-only dependency (Gunicorn worker class); skip when absent
+# from the dev venv to keep the suite green on developer workstations.
+eventlet = pytest.importorskip("eventlet")
+
 # Add project root to path to allow top-level imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # Set a dummy env var for db before other imports
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["APP_KEY"] = "test-key"
-
-# Monkey patch for eventlet simulation
-import eventlet
 
 eventlet.monkey_patch()
 
