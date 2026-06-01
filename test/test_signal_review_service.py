@@ -561,3 +561,51 @@ def test_mark_actually_taken_handles_none_id(fresh_signal_db, shadow_mode):
 
     # Must not raise — the engine passes None when persistence failed.
     mark_actually_taken(None, taken=True)
+
+
+# ---------------------------------------------------------------------------
+# Lazy table self-init (regression: signal_decision write before init_db ran)
+# ---------------------------------------------------------------------------
+
+
+def test_insert_self_inits_table_when_init_db_was_skipped(monkeypatch):
+    """If init_db() never ran (background-init race on a fresh process), the
+    first insert must still succeed by lazily creating the table.
+    """
+    from database import signal_decision_db as sdb
+
+    test_engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    test_session = scoped_session(
+        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    )
+    monkeypatch.setattr(sdb, "engine", test_engine)
+    monkeypatch.setattr(sdb, "db_session", test_session)
+    # Force the lazy-ensure flag to point at "no engine seen yet" so the test
+    # exercises the create_all path even if a prior test bound it to the real
+    # engine.
+    monkeypatch.setattr(sdb, "_tables_ensured_for_engine", None)
+    # Deliberately do NOT call init_db() and do NOT pre-create the table.
+
+    try:
+        new_id = sdb.insert_signal_decision(
+            symbol="TCS",
+            source="trend-up",
+            decision="take",
+            reasoning="lazy-init regression",
+            confidence=0.9,
+            enforcement_mode="shadow",
+            context_snapshot=None,
+            bridge_latency_ms=10,
+            bridge_session_id="sid",
+            raw_bridge_output="",
+        )
+        row = sdb.get_signal_decision(new_id)
+        assert row is not None
+        assert row["symbol"] == "TCS"
+        assert row["decision"] == "take"
+    finally:
+        test_session.remove()
+        test_engine.dispose()
