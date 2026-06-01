@@ -27,9 +27,14 @@ Data sources for v1
 * **breadth** — % of F&O universe symbols above their 20-day MA from
   the historify daily store. Without a configured universe we return
   ``mixed`` so the scaffold stays safe-by-default.
-* **sector_leaders** — empty list + 0.0 concentration in v1. A
-  follow-up will read NIFTY sector index closes (``NIFTYAUTO``,
-  ``NIFTYIT``, etc.) once they're added to the historify watchlist.
+* **sector_leaders** — top-3 NIFTY sector indices ranked by today's
+  % change. Data source priority is live broker REST quote (via
+  ``services.quotes_service.get_quotes``) → historify daily-bar
+  fallback → empty list. The tracked universe comes from
+  ``REGIME_SECTOR_SYMBOLS`` env (Zerodha-canonical names like
+  ``BANKNIFTY``, ``FINNIFTY``, ``NIFTYPSUBANK``). Concentration metric
+  is ``(top_pct - median_pct) / (|top_pct| + 0.01)`` — >0.5 ⇒ dominant
+  leader, <0.2 ⇒ broad rotation.
 * **time_of_day** — IST clock buckets per the design doc.
 
 Cache + persistence
@@ -317,23 +322,150 @@ def _default_breadth_bars_loader(symbol: str, exchange: str, interval: str):
 
 
 # ---------------------------------------------------------------------------
-# Sector rotation (stub for v1)
+# Sector rotation
 # ---------------------------------------------------------------------------
 
+_SECTOR_EXCHANGE = "NSE_INDEX"
 
-def _classify_sector_rotation() -> tuple[list[str], float, dict[str, Any]]:
-    """Return ``(leaders, concentration, raw)``.
 
-    v1 returns an empty leaderboard and ``0.0`` concentration — we
-    don't have sector index data subscribed yet.
+def _default_sector_symbols() -> list[str]:
+    """Comma-separated env override; default empty list (graceful degrade)."""
+    raw = os.getenv("REGIME_SECTOR_SYMBOLS", "").strip()
+    if not raw:
+        return []
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-    TODO(stage-1.7-followup): subscribe to the NIFTY sector indices
-    (NIFTYAUTO, NIFTYIT, NIFTYBANK, NIFTYFMCG, NIFTYPHARMA, etc.) and
-    rank by intraday % change. The concentration score is the share of
-    aggregate top-3 absolute % change vs the aggregate across all
-    tracked sectors — high concentration ⇒ leadership is narrow.
+
+def _live_sector_quote_pct(symbol: str) -> float | None:
+    """% change vs prev_close from a live broker REST quote.
+
+    Returns None on any failure (no api key, broker error, no prev_close).
+    Mirrors the pattern used by ``signal_review_service._fetch_nifty_pct``
+    so a single working broker session feeds both.
     """
-    return [], 0.0, {"source": "stub_v1"}
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_quotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            return None
+        success, response, _ = get_quotes(
+            symbol=symbol, exchange=_SECTOR_EXCHANGE, api_key=api_key
+        )
+        if not success:
+            return None
+        data = response.get("data") or {}
+        ltp = float(data.get("ltp") or 0.0)
+        prev_close = float(data.get("prev_close") or 0.0)
+        if prev_close == 0.0:
+            return None
+        return (ltp - prev_close) / prev_close * 100.0
+    except Exception as exc:
+        logger.debug("sector live quote failed for %s: %s", symbol, exc)
+        return None
+
+
+def _historify_sector_pct(symbol: str) -> float | None:
+    """% change between the last two daily closes from historify cache.
+
+    Useful at boot when WS hasn't connected yet — returns yesterday's
+    close-to-close change for the sector. Returns None when fewer than
+    two bars are available.
+    """
+    try:
+        from database.historify_db import get_ohlcv
+
+        df = get_ohlcv(symbol, _SECTOR_EXCHANGE, "D")
+        if df is None or df.empty or len(df) < 2:
+            return None
+        last = float(df["close"].iloc[-1])
+        prev = float(df["close"].iloc[-2])
+        if prev == 0.0:
+            return None
+        return (last - prev) / prev * 100.0
+    except Exception as exc:
+        logger.debug("sector historify fallback failed for %s: %s", symbol, exc)
+        return None
+
+
+def _classify_sector_rotation(
+    *,
+    symbols_loader=None,
+    live_quote_fn=None,
+    historify_fn=None,
+) -> tuple[list[str], float, dict[str, Any]]:
+    """Rank tracked NIFTY sector indices by % change and return the leaders.
+
+    Returns ``(sector_leaders, concentration, raw_metrics)``.
+
+    Data source priority per symbol:
+
+    1. Live broker REST quote (``services.quotes_service.get_quotes``)
+       — % change vs ``prev_close``.
+    2. Historify daily store — close-to-close % change between the two
+       most recent bars. Used at boot or when WS isn't up.
+    3. Omitted from the ranking if neither source has data.
+
+    Concentration metric:
+    ``max(0.0, top_pct - median_pct) / (|top_pct| + 0.01)``. Values >0.5
+    indicate a dominant leader; values <0.2 indicate broad rotation.
+    Empty when fewer than two sectors have data.
+
+    All loaders are injected for tests; production callers pass nothing.
+    """
+    symbols = (symbols_loader or _default_sector_symbols)()
+    raw: dict[str, Any] = {
+        "universe": symbols,
+        "live_count": 0,
+        "historify_count": 0,
+        "missing_count": 0,
+        "sector_pct": {},
+        "source_per_symbol": {},
+    }
+    if not symbols:
+        raw["reason"] = "empty_universe"
+        return [], 0.0, raw
+
+    live_fn = live_quote_fn or _live_sector_quote_pct
+    hist_fn = historify_fn or _historify_sector_pct
+
+    pct_by_symbol: dict[str, float] = {}
+    for sym in symbols:
+        pct = live_fn(sym)
+        if pct is not None:
+            pct_by_symbol[sym] = pct
+            raw["live_count"] += 1
+            raw["source_per_symbol"][sym] = "live"
+            continue
+        pct = hist_fn(sym)
+        if pct is not None:
+            pct_by_symbol[sym] = pct
+            raw["historify_count"] += 1
+            raw["source_per_symbol"][sym] = "historify"
+            continue
+        raw["missing_count"] += 1
+        raw["source_per_symbol"][sym] = "missing"
+
+    if not pct_by_symbol:
+        raw["reason"] = "no_data"
+        return [], 0.0, raw
+
+    raw["sector_pct"] = dict(pct_by_symbol)
+
+    ranked = sorted(pct_by_symbol.items(), key=lambda kv: kv[1], reverse=True)
+    leaders = [sym for sym, _ in ranked[:3]]
+
+    if len(ranked) >= 2:
+        top_pct = ranked[0][1]
+        median_pct = ranked[len(ranked) // 2][1]
+        concentration = max(0.0, top_pct - median_pct) / (abs(top_pct) + 0.01)
+    else:
+        concentration = 0.0
+
+    raw["leaders"] = leaders
+    raw["concentration"] = concentration
+    return leaders, concentration, raw
 
 
 # ---------------------------------------------------------------------------

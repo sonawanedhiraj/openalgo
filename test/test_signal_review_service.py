@@ -816,3 +816,183 @@ def test_insert_self_inits_table_when_init_db_was_skipped(monkeypatch):
     finally:
         test_session.remove()
         test_engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Stage 1.7 — regime_snapshot in veto context
+# ---------------------------------------------------------------------------
+
+
+def _make_regime_for_context(**overrides):
+    """Build a MarketRegime suitable for _fetch_regime_snapshot."""
+    from datetime import datetime
+
+    import pytz
+
+    from services.market_regime_service import MarketRegime
+
+    ist = pytz.timezone("Asia/Kolkata")
+    base = {
+        "timestamp": ist.localize(datetime(2026, 6, 1, 10, 30)),
+        "trend": "bullish",
+        "volatility": "medium",
+        "breadth": "wide",
+        "sector_leaders": ["NIFTYIT", "NIFTYAUTO", "NIFTYPHARMA"],
+        "sector_leader_concentration": 0.45,
+        "time_of_day": "mid_morning",
+        "raw_metrics": {
+            "sector_rotation": {
+                "sector_pct": {
+                    "NIFTYIT": 2.5,
+                    "NIFTYAUTO": 1.8,
+                    "NIFTYPHARMA": 1.2,
+                    "BANKNIFTY": 0.1,
+                    "FINNIFTY": -0.2,
+                    "NIFTYFMCG": -0.4,
+                    "NIFTYMETAL": -1.0,
+                }
+            }
+        },
+    }
+    base.update(overrides)
+    return MarketRegime(**base)
+
+
+def test_fetch_regime_snapshot_returns_compact_dict(monkeypatch):
+    from services import signal_review_service as srs
+
+    monkeypatch.setattr(
+        "services.market_regime_service.get_cached_regime",
+        lambda max_age_minutes=5: _make_regime_for_context(),
+    )
+
+    snap = srs._fetch_regime_snapshot()
+    assert snap is not None
+    assert snap["trend"] == "bullish"
+    assert snap["volatility"] == "medium"
+    assert snap["breadth"] == "wide"
+    assert snap["time_of_day"] == "mid_morning"
+    assert snap["sector_leaders"] == ["NIFTYIT", "NIFTYAUTO", "NIFTYPHARMA"]
+    assert snap["sector_leader_concentration"] == 0.45
+    # top_sector_pct should be trimmed to 5 entries ranked by abs(pct).
+    assert len(snap["top_sector_pct"]) == 5
+    # NIFTYIT (+2.5) and NIFTYMETAL (-1.0) both make the cut by absolute value.
+    assert "NIFTYIT" in snap["top_sector_pct"]
+    assert "NIFTYMETAL" in snap["top_sector_pct"]
+
+
+def test_fetch_regime_snapshot_returns_none_on_classifier_miss(monkeypatch):
+    from services import signal_review_service as srs
+
+    monkeypatch.setattr(
+        "services.market_regime_service.get_cached_regime",
+        lambda max_age_minutes=5: None,
+    )
+    assert srs._fetch_regime_snapshot() is None
+
+
+def test_fetch_regime_snapshot_handles_empty_sector_data(monkeypatch):
+    """When sector classifier returned [] + 0.0, snapshot still works."""
+    from services import signal_review_service as srs
+
+    empty_regime = _make_regime_for_context(
+        sector_leaders=[],
+        sector_leader_concentration=0.0,
+        raw_metrics={"sector_rotation": {}},
+    )
+    monkeypatch.setattr(
+        "services.market_regime_service.get_cached_regime",
+        lambda max_age_minutes=5: empty_regime,
+    )
+    snap = srs._fetch_regime_snapshot()
+    assert snap is not None
+    assert snap["sector_leaders"] == []
+    assert snap["sector_leader_concentration"] == 0.0
+    assert snap["top_sector_pct"] == {}
+
+
+def test_build_context_includes_regime_snapshot(monkeypatch):
+    """_build_context (override=None path) must populate regime_snapshot."""
+    from services import signal_review_service as srs
+
+    # Stub every other fetch to keep this test focused on regime.
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.5)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 14.0)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: 0.0)
+    monkeypatch.setattr(srs, "_safe_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "services.market_regime_service.get_cached_regime",
+        lambda max_age_minutes=5: _make_regime_for_context(),
+    )
+
+    ctx = srs._build_context(None)
+    assert "regime_snapshot" in ctx
+    assert ctx["regime_snapshot"] is not None
+    assert ctx["regime_snapshot"]["trend"] == "bullish"
+    assert ctx["regime_snapshot"]["sector_leaders"][0] == "NIFTYIT"
+
+
+def test_build_context_regime_failure_yields_none(monkeypatch):
+    """A failed regime fetch should leave regime_snapshot=None (no crash)."""
+    from services import signal_review_service as srs
+
+    def boom():
+        raise RuntimeError("regime down")
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.5)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 14.0)
+    monkeypatch.setattr(srs, "_fetch_pnl_today", lambda: 0.0)
+    monkeypatch.setattr(srs, "_safe_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(srs, "_fetch_regime_snapshot", boom)
+
+    ctx = srs._build_context(None)
+    assert ctx["regime_snapshot"] is None
+
+
+def test_review_signal_forwards_regime_snapshot_to_bridge(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """The HTTP request body sent to the bridge must include regime_snapshot."""
+    import services.signal_review_service as srs
+    from services.signal_review_service import review_signal
+
+    captured: dict = {}
+
+    class _StubResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "decision": "take",
+                "reasoning": "sector aligned",
+                "confidence": 0.7,
+                "latency_ms": 200,
+                "claude_session_id": "sid",
+                "raw_output": "",
+            }
+
+    def fake_post(url, json=None, timeout=None):  # noqa: ARG001
+        captured["body"] = json
+        return _StubResponse()
+
+    monkeypatch.setattr(srs.httpx, "post", fake_post)
+
+    ctx = _ctx_override()
+    ctx["regime_snapshot"] = {
+        "trend": "bullish",
+        "volatility": "medium",
+        "breadth": "wide",
+        "time_of_day": "mid_morning",
+        "sector_leaders": ["NIFTYIT", "NIFTYAUTO", "NIFTYPHARMA"],
+        "sector_leader_concentration": 0.45,
+        "top_sector_pct": {"NIFTYIT": 2.5, "NIFTYAUTO": 1.8},
+    }
+
+    review_signal("RELIANCE", "chartink_buy", context=ctx)
+
+    assert "regime_snapshot" in captured["body"]["context"]
+    assert (
+        captured["body"]["context"]["regime_snapshot"]["sector_leaders"][0]
+        == "NIFTYIT"
+    )

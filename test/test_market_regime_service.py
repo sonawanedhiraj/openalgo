@@ -152,7 +152,10 @@ def test_compute_current_regime_populates_every_dimension(monkeypatch):
     assert regime.breadth in {"wide", "mixed", "narrow"}
     assert regime.time_of_day == "mid_morning"
     assert isinstance(regime.sector_leaders, list)
-    assert 0.0 <= regime.sector_leader_concentration <= 1.0
+    # Concentration is (top - median) / (|top| + 0.01) — non-negative but
+    # not bounded above (can exceed 1.0 when laggards drift further than
+    # the leader). >0.5 = dominant, <0.2 = broad rotation.
+    assert regime.sector_leader_concentration >= 0.0
     # Raw metrics surface the underlying numbers for every dimension.
     assert set(regime.raw_metrics) >= {
         "trend",
