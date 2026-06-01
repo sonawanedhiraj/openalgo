@@ -19,6 +19,7 @@ from services.simplified_stock_engine_core import (
     EntrySignal,
     ExitSignal,
     FiveMinuteCandleBuilder,
+    Position,
     SimplifiedEngineConfig,
     SimplifiedStockEngine,
     TradeCharges,
@@ -1526,6 +1527,363 @@ class SimplifiedStockEngineService:
         from database.settings_db import get_analyze_mode
 
         return "analyze" if get_analyze_mode() else MODE_LIVE
+
+    # ------------------------------------------------------------------
+    # P0 — EOD safety net (services/eod_watchdog_service.py is the caller).
+    #
+    # rehydrate_positions_from_journal restores in-memory positions from
+    # today's open trade_journal rows. Without it, an OpenAlgo restart
+    # mid-session wipes the engine's view of what the broker actually owns,
+    # which is how NBCC got stranded past EOD on 2026-06-01.
+    # ------------------------------------------------------------------
+
+    def rehydrate_positions_from_journal(self) -> int:
+        """Restore the engine's in-memory ``positions`` dict from today's
+        open ``trade_journal`` rows.
+
+        Stops, ATR window, direction_state, RR trailing — none of these are
+        restored. They rebuild from ticks once the broker WebSocket starts
+        delivering quotes again. The only purpose of this rehydrate is to
+        keep the engine internally consistent with what the broker actually
+        holds, so subsequent ticks, the EOD watchdog, and manual operator
+        ops don't act on a phantom-empty state.
+
+        Skipped silently for symbols already present in ``engine.positions``
+        — the source of truth is what the engine itself recorded after a
+        live ``confirm_entry``. Returns the number of positions added.
+        """
+        try:
+            from services import trade_journal_service
+        except Exception:
+            logger.exception("[SIMPLIFIED-REHYDRATE] trade_journal_service import failed")
+            return 0
+
+        try:
+            rows = trade_journal_service.get_open_trades_today(
+                strategy_name=self.JOURNAL_STRATEGY_NAME
+            )
+        except Exception:
+            logger.exception("[SIMPLIFIED-REHYDRATE] get_open_trades_today raised")
+            return 0
+
+        added = 0
+        with self._lock:
+            for row in rows:
+                symbol = row.get("symbol")
+                direction = (row.get("direction") or "").upper()
+                qty_raw = row.get("quantity")
+                entry_price = row.get("entry_price")
+                if not symbol or direction not in ("LONG", "SHORT"):
+                    continue
+                if entry_price is None:
+                    # An entry whose fill never confirmed. Don't rehydrate — we
+                    # can't size a stop without a reference price, and the
+                    # row was already accounted for elsewhere (audit only).
+                    logger.warning(
+                        "[SIMPLIFIED-REHYDRATE] Skipping %s: journal row has no entry_price",
+                        symbol,
+                    )
+                    continue
+                try:
+                    qty = int(qty_raw)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "[SIMPLIFIED-REHYDRATE] Skipping %s: unparseable quantity=%r",
+                        symbol, qty_raw,
+                    )
+                    continue
+                if qty <= 0:
+                    continue
+
+                if symbol in self.engine.positions:
+                    # Engine already knows — its in-memory state wins.
+                    continue
+
+                signed_qty = qty if direction == "LONG" else -qty
+                entry_time = self._parse_entered_at(row.get("placed_at"))
+                pos = Position(
+                    symbol=symbol,
+                    entry_price=float(entry_price),
+                    qty=signed_qty,
+                    # Stop is not known here — set to entry_price so the
+                    # engine's tick-driven SL won't fire spuriously before
+                    # the first real tick arrives. The watchdog flatten path
+                    # ignores `stop_loss` entirely; tick-driven exits will
+                    # overwrite it once ATR rebuilds.
+                    stop_loss=float(entry_price),
+                    entry_time=entry_time,
+                    risk_per_share=0.0,
+                    max_rr=0.0,
+                )
+                self.engine.positions[symbol] = pos
+                added += 1
+                logger.info(
+                    "[SIMPLIFIED-REHYDRATE] %s %s qty=%s entry=%.2f (journal_id=%s)",
+                    self.JOURNAL_STRATEGY_NAME,
+                    f"LONG {symbol}" if signed_qty > 0 else f"SHORT {symbol}",
+                    abs(signed_qty),
+                    float(entry_price),
+                    row.get("id"),
+                )
+
+        if added:
+            logger.info(
+                "[SIMPLIFIED-REHYDRATE] Restored %d position(s) from trade_journal", added
+            )
+        return added
+
+    @staticmethod
+    def _parse_entered_at(raw: str | None) -> dt.datetime:
+        if not raw:
+            return dt.datetime.now()
+        try:
+            parsed = date_parser.parse(raw)
+            return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except (TypeError, ValueError):
+            return dt.datetime.now()
+
+
+# ----------------------------------------------------------------------
+# P0 — module-level EOD flatten entry point. The watchdog
+# (services/eod_watchdog_service.py) calls this; the order path here is
+# the in-process ``services.place_order_service.place_order`` so the
+# flatten still works even when the Flask app's tick stream is dead.
+# ----------------------------------------------------------------------
+
+
+def flatten_strategy_positions(
+    strategy_name: str, *, reason: str = "eod_watchdog"
+) -> dict[str, Any]:
+    """Flatten every open intraday position for ``strategy_name`` via the
+    place_order REST path.
+
+    Returns a summary::
+
+        {
+            "strategy": "<name>",
+            "reason": "<reason>",
+            "attempted": <int>,
+            "succeeded": <int>,
+            "failed": [{"symbol": ..., "error": ...}, ...],
+            "skipped": [{"symbol": ..., "reason": ...}, ...],
+        }
+
+    Failures are logged loudly and notified via the notification service;
+    successful flattens write an exit row to ``trade_journal`` via
+    ``record_exit`` so the row no longer reads as "open".
+
+    Note on side: the journal row carries the *original* direction
+    (``LONG``/``SHORT``). To close it we issue the opposite side (a LONG is
+    flattened by a ``SELL``, a SHORT by a ``BUY``). Always ``MARKET`` —
+    the watchdog is the EOD backstop, not a price-sensitive exit.
+    """
+    summary: dict[str, Any] = {
+        "strategy": strategy_name,
+        "reason": reason,
+        "attempted": 0,
+        "succeeded": 0,
+        "failed": [],
+        "skipped": [],
+    }
+
+    try:
+        from services import trade_journal_service
+    except Exception:
+        logger.exception("[EOD-FLATTEN] trade_journal_service import failed")
+        return summary
+
+    try:
+        rows = trade_journal_service.get_open_trades_today(strategy_name=strategy_name)
+    except Exception:
+        logger.exception("[EOD-FLATTEN] get_open_trades_today raised")
+        return summary
+
+    if not rows:
+        logger.info(
+            "[EOD-FLATTEN] %s: no open positions today; nothing to flatten",
+            strategy_name,
+        )
+        return summary
+
+    # Resolve a usable api_key. The engine's per-symbol map is the most
+    # accurate source — it's populated when the chartink webhook arms a
+    # symbol. Fallbacks (in priority order): the engine's user_api_keys,
+    # then the auth_db's first available api_key. If all three are empty,
+    # we can't dispatch — log and bail.
+    api_key = _resolve_api_key_for_flatten()
+    if not api_key:
+        logger.error(
+            "[EOD-FLATTEN] %s: no api_key available; %d positions left open",
+            strategy_name, len(rows),
+        )
+        for row in rows:
+            summary["failed"].append(
+                {"symbol": row.get("symbol"), "error": "no_api_key"}
+            )
+        _notify_watchdog_no_api_key(strategy_name, len(rows))
+        return summary
+
+    engine_service = get_simplified_stock_engine_service()
+    exchange = engine_service.config.exchange.upper()
+    product = engine_service.config.product.upper()
+
+    for row in rows:
+        symbol = row.get("symbol")
+        direction = (row.get("direction") or "").upper()
+        qty_raw = row.get("quantity")
+        journal_id = row.get("id")
+
+        if not symbol or direction not in ("LONG", "SHORT"):
+            summary["skipped"].append(
+                {"symbol": symbol, "reason": "bad_row"}
+            )
+            continue
+        try:
+            qty = int(qty_raw)
+        except (TypeError, ValueError):
+            summary["skipped"].append({"symbol": symbol, "reason": "bad_qty"})
+            continue
+        if qty <= 0:
+            summary["skipped"].append({"symbol": symbol, "reason": "zero_qty"})
+            continue
+
+        action = "SELL" if direction == "LONG" else "BUY"
+        payload = {
+            "strategy": strategy_name,
+            "symbol": symbol,
+            "exchange": exchange,
+            "action": action,
+            "quantity": qty,
+            "pricetype": "MARKET",
+            "product": product,
+            "price": 0,
+            "trigger_price": 0,
+            "disclosed_quantity": 0,
+        }
+
+        summary["attempted"] += 1
+        try:
+            from services.place_order_service import place_order
+
+            success, response, status_code = place_order(payload, api_key=api_key)
+        except Exception as e:
+            logger.exception(
+                "[EOD-FLATTEN] %s %s place_order raised", strategy_name, symbol
+            )
+            summary["failed"].append({"symbol": symbol, "error": f"exception:{e}"})
+            _notify_watchdog_exit_failure(strategy_name, symbol, str(e))
+            continue
+
+        if not success:
+            err = response.get("message") if isinstance(response, dict) else str(response)
+            logger.error(
+                "[EOD-FLATTEN] %s %s rejected status=%s response=%s",
+                strategy_name, symbol, status_code, response,
+            )
+            summary["failed"].append({"symbol": symbol, "error": err or "rejected"})
+            _notify_watchdog_exit_failure(strategy_name, symbol, err or "rejected")
+            continue
+
+        order_id = response.get("orderid") if isinstance(response, dict) else None
+        # The watchdog doesn't wait for the fill — markets are closing and
+        # AMO/auto-square-off semantics differ per broker. Stamp the journal
+        # row as exited with the flatten reason so the rehydrate path on next
+        # boot skips it; the actual fill price will be reconciled when the
+        # operator reviews the journal next morning.
+        try:
+            trade_journal_service.record_exit(
+                journal_id,
+                exit_price=None,
+                exit_order_id=str(order_id) if order_id else None,
+                exit_reason=reason,
+            )
+        except Exception:
+            logger.exception(
+                "[EOD-FLATTEN] record_exit failed for journal_id=%s symbol=%s",
+                journal_id, symbol,
+            )
+
+        # Also clear the engine's in-memory position so subsequent ticks
+        # don't re-trigger an exit against a now-flat broker.
+        try:
+            engine_service.engine.positions.pop(symbol, None)
+        except Exception:
+            pass
+
+        logger.warning(
+            "[EOD-FLATTEN] %s %s flattened: %s %s qty=%s orderid=%s",
+            strategy_name, symbol, action, symbol, qty, order_id,
+        )
+        summary["succeeded"] += 1
+
+    return summary
+
+
+def _resolve_api_key_for_flatten() -> str | None:
+    """Pick the api_key the watchdog should use for its flatten orders.
+
+    Order of preference:
+
+    1. The engine service's per-symbol map (most-recent symbol wins). This
+       is what every other engine-issued order has been using all day, so
+       reusing it keeps broker-side audit trails coherent.
+    2. The engine service's ``_user_api_keys`` dict (populated by the
+       chartink webhook path).
+    3. ``database.auth_db.get_first_available_api_key()`` — the same helper
+       the scanner pre-subscribe path uses. Last resort.
+
+    Returns ``None`` only when none of the three yield a key, in which case
+    the flatten cannot proceed and the watchdog reports failure.
+    """
+    try:
+        svc = get_simplified_stock_engine_service()
+        with svc._lock:
+            if svc._api_key_by_symbol:
+                # Most recently mapped key wins — dicts preserve insertion order.
+                return next(reversed(svc._api_key_by_symbol.values()))
+            if svc._user_api_keys:
+                return next(reversed(svc._user_api_keys.values()))
+    except Exception:
+        logger.exception("[EOD-FLATTEN] engine service lookup failed")
+
+    try:
+        from database.auth_db import get_first_available_api_key
+
+        return get_first_available_api_key()
+    except Exception:
+        logger.exception("[EOD-FLATTEN] get_first_available_api_key raised")
+        return None
+
+
+def _notify_watchdog_exit_failure(strategy_name: str, symbol: str, error: str) -> None:
+    try:
+        from services.notification_service import get_notification_service
+
+        get_notification_service().publish_eod_watchdog_failure(
+            strategy_name=strategy_name,
+            error=f"flatten {symbol}: {error}",
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe
+        logger.warning(
+            "[EOD-FLATTEN] watchdog failure notification failed: %s", e
+        )
+
+
+def _notify_watchdog_no_api_key(strategy_name: str, n_positions: int) -> None:
+    try:
+        from services.notification_service import get_notification_service
+
+        get_notification_service().publish_eod_watchdog_failure(
+            strategy_name=strategy_name,
+            error=(
+                f"No api_key available; {n_positions} open position(s) left "
+                "untouched. Manual intervention required."
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe
+        logger.warning(
+            "[EOD-FLATTEN] watchdog no-api-key notification failed: %s", e
+        )
 
 
 _service: SimplifiedStockEngineService | None = None

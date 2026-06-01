@@ -211,6 +211,23 @@ async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None 
     logger.info(f"Starting task: {task_name}")
     logger.info(f"Command: {' '.join(cmd[:4])}...")
 
+    # TODO(eod-watchdog P0): The /fix-bug + /run-tests prompts ask Claude to
+    # run `uv run pytest test/ -v`. The test suite, when run with the live
+    # DATABASE_URL inherited from this process, writes synthetic rows
+    # (live-1.., sbx-abc, RELIANCE @ 2502 etc.) into db/openalgo.db's
+    # trade_journal table. Those rows then poison the EOD watchdog +
+    # rehydrate logic (services/eod_watchdog_service.py,
+    # SimplifiedStockEngineService.rehydrate_positions_from_journal). On
+    # 2026-06-01 the bridge ran fix-bug at ~15:24 IST and wrote 12 fake rows
+    # while real NBCC LONG 500 was open. Cleaned up by hand; needs a real
+    # fix here.
+    #
+    # Right fix: spawn the claude subprocess with env={"DATABASE_URL":
+    # "sqlite:///db/openalgo_test.db", ...} (or :memory:) so any pytest run
+    # the agent kicks off targets an isolated DB. That requires regenerating
+    # the test DB on first use (run all init_db hooks) and verifying
+    # downstream services don't hard-code the production path. Deferred —
+    # tracked in the EOD watchdog hand-off note.
     try:
         # Run claude -p as subprocess
         process = await asyncio.create_subprocess_exec(

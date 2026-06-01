@@ -48,6 +48,18 @@ class BaseStrategy(ABC):
     #: instantiating.
     name: str = "base"
 
+    #: EOD policy. Intraday strategies are flattened at ``eod_exit_time`` by
+    #: the watchdog (services/eod_watchdog_service.py). Positional / overnight
+    #: strategies set ``intraday=False`` and are skipped by the watchdog.
+    intraday: bool = True
+
+    #: IST clock time ``HH:MM`` at which the EOD watchdog should fire for this
+    #: strategy. Only consulted when ``intraday`` is True. If unset / invalid,
+    #: callers fall back to ``SIMPLIFIED_ENGINE_EOD_EXIT_TIME`` from the env
+    #: (default 15:20). Per-strategy override lets future surfaces (options
+    #: writers that need to roll earlier, etc.) declare their own cutoff.
+    eod_exit_time: str = "15:20"
+
     @abstractmethod
     def on_scan_hit(self, symbol: str, direction: str) -> None:
         """Called when a scanner (Chartink, custom screener, manual webhook)

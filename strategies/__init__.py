@@ -64,6 +64,23 @@ def get_strategy(name: str) -> type["BaseStrategy"] | None:
     return _registry.get(name)
 
 
+def list_intraday_strategies() -> list[tuple[str, str]]:
+    """Return ``[(strategy_name, eod_exit_time), ...]`` for every registered
+    strategy whose ``intraday`` class attribute is True.
+
+    Consumed by :mod:`services.eod_watchdog_service` to schedule one daily
+    flatten job per intraday strategy. Positional / overnight strategies
+    (``intraday = False``) are filtered out — the watchdog is a backstop for
+    the tick-driven intraday EOD exit, not a generic position closer.
+    """
+    out: list[tuple[str, str]] = []
+    for name, cls in _registry.items():
+        if getattr(cls, "intraday", True):
+            eod = getattr(cls, "eod_exit_time", "15:20") or "15:20"
+            out.append((name, eod))
+    return out
+
+
 # Triggers self-registration on import. Keep this at the bottom so the
 # registry helpers above are fully bound before the strategy module pulls
 # them in.

@@ -781,6 +781,54 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Scan-hit poster: {e}")
 
+            # P0 (2026-06-01 NBCC EOD incident): rehydrate the simplified
+            # engine's in-memory positions from today's open trade_journal
+            # rows BEFORE the EOD watchdog scheduler kicks in. A mid-day
+            # restart wipes the engine's `positions` dict; without this, the
+            # engine can't issue an EOD exit even when ticks resume, and the
+            # watchdog can only flatten via the broker (no engine-side
+            # cleanup). Pulling this in here also force-instantiates the
+            # engine singleton, which is what the watchdog needs to share an
+            # api_key map with the live order path.
+            try:
+                from services.simplified_stock_engine_service import (
+                    get_simplified_stock_engine_service,
+                )
+
+                _engine_svc = get_simplified_stock_engine_service()
+                rehydrated = _engine_svc.rehydrate_positions_from_journal()
+                logger.info(
+                    "Simplified engine rehydrate complete (positions_restored=%d)",
+                    rehydrated,
+                )
+            except Exception:
+                logger.exception("Simplified engine rehydrate failed at startup")
+
+            # EOD watchdog (P0 — 2026-06-01 NBCC fix). Schedules one cron job
+            # per intraday strategy at its declared eod_exit_time. Independent
+            # of the broker WebSocket tick stream — it's the safety net for
+            # the case where ticks die before EOD and the tick-driven
+            # `_maybe_flatten_eod` path can't fire. Must run AFTER the
+            # strategies registry is loaded (module import at top of file
+            # already did that) and AFTER DB tables exist (rehydrate above
+            # depends on trade_journal).
+            try:
+                from services.eod_watchdog_service import start_eod_watchdog
+
+                _wd_result = start_eod_watchdog()
+                if _wd_result.get("started"):
+                    logger.info(
+                        "EOD watchdog started (jobs=%d, skipped=%d)",
+                        len(_wd_result.get("jobs") or []),
+                        len(_wd_result.get("skipped") or []),
+                    )
+                else:
+                    logger.warning(
+                        "EOD watchdog did not start (already running or empty)"
+                    )
+            except Exception:
+                logger.exception("Failed to start EOD watchdog")
+
             # Auto-reconnect the WhatsApp bot if a paired session is persisted.
             # Without this, every server restart would leave is_ready()=False
             # and every /notify call would 409 "pair first" — even though the

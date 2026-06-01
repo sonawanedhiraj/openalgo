@@ -303,6 +303,45 @@ def get_trades_for_symbol(symbol: str, days: int = 7) -> list[dict]:
             pass
 
 
+def get_open_trades_today(strategy_name: str | None = None) -> list[dict]:
+    """Return open journal rows entered today (IST), optionally filtered by
+    ``strategy_name``.
+
+    "Open" means ``exited_at IS NULL``; "today" is the calendar date in IST.
+    Newest first. Returns ``[]`` on DB failure.
+
+    Used by:
+
+    * :func:`services.eod_watchdog_service` — to flatten orphaned intraday
+      positions at the strategy's EOD cut-off, even when the broker tick
+      stream is dead and the engine's tick-driven exit can't fire.
+    * :meth:`SimplifiedStockEngineService.rehydrate_positions_from_journal` —
+      to restore the in-memory ``positions`` dict on engine startup so a
+      mid-day restart doesn't make the engine forget what the broker holds.
+    """
+    today_iso = dt.datetime.now(IST).date().isoformat()
+
+    sess = _session()
+    try:
+        q = (
+            sess.query(TradeJournal)
+            .filter(TradeJournal.exited_at.is_(None))
+            .filter(TradeJournal.placed_at >= today_iso)
+        )
+        if strategy_name:
+            q = q.filter(TradeJournal.strategy_name == strategy_name)
+        rows = q.order_by(TradeJournal.placed_at.desc()).all()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("trade_journal.get_open_trades_today failed: %s", e)
+        return []
+    finally:
+        try:
+            sess.remove()
+        except Exception:
+            pass
+
+
 def get_open_journal_id_for_symbol(symbol: str) -> int | None:
     """Returns the journal id of the most recent open entry on ``symbol``
     (i.e. ``exited_at IS NULL``). Used by the engine at exit time to find

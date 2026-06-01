@@ -44,6 +44,13 @@ class TrendingEquityIntradayStrategy(BaseStrategy):
     """
 
     name = _STRATEGY_NAME
+    intraday = True
+    # EOD flatten cut-off for this strategy. The watchdog
+    # (services/eod_watchdog_service.py) reads this attribute to schedule
+    # the daily safety-net flatten. Keep this aligned with the engine's
+    # SimplifiedEngineConfig.eod_exit_time (default 15:20 IST) — the
+    # watchdog is a backstop for the tick-driven exit, not a replacement.
+    eod_exit_time = "15:20"
 
     def __init__(self, engine: "SimplifiedStockEngine"):
         self._engine = engine

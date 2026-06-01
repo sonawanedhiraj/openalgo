@@ -43,6 +43,7 @@ _EVENT_TYPES = (
     "trade_closed",
     "eod_summary",
     "anomaly_alert",
+    "eod_watchdog",
 )
 
 _SEVERITY_PREFIX = {
@@ -101,6 +102,11 @@ class NotificationService:
             "trade_closed": _env_bool("NOTIFY_TRADE_CLOSED", default=True),
             "eod_summary": _env_bool("NOTIFY_EOD_SUMMARY", default=True),
             "anomaly_alert": _env_bool("NOTIFY_ANOMALY_ALERT", default=True),
+            # EOD watchdog summaries / failures default ON — the watchdog is
+            # a safety net and the operator wants to know whenever it ran or
+            # couldn't. Set NOTIFY_EOD_WATCHDOG=false only when intentionally
+            # going dark on watchdog telemetry (e.g. during scheduler dev).
+            "eod_watchdog": _env_bool("NOTIFY_EOD_WATCHDOG", default=True),
         }
 
     # ------------------------------------------------------------------
@@ -272,6 +278,84 @@ class NotificationService:
             self.notify("eod_summary", head, trade_count=trade_count)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_eod_summary failed: %s", e)
+
+    def publish_eod_watchdog_summary(
+        self, strategy_name: str, result: Mapping[str, Any]
+    ) -> None:
+        """One-line Telegram summary of a watchdog run.
+
+        Shape of ``result`` matches :func:`flatten_strategy_positions` —
+        keys: ``attempted``, ``succeeded``, ``failed`` (list), ``skipped``
+        (list), ``reason``. Missing keys are tolerated.
+
+        A "nothing to flatten" run (attempted=0) is still announced so the
+        operator gets a daily heartbeat confirming the watchdog ran. That's
+        the whole point — silence at 15:20 IST means *something is wrong*.
+        """
+        try:
+            attempted = int(result.get("attempted", 0) or 0)
+            succeeded = int(result.get("succeeded", 0) or 0)
+            failed = result.get("failed") or []
+            skipped = result.get("skipped") or []
+            reason = str(result.get("reason") or "eod_watchdog")
+
+            if attempted == 0 and not failed and not skipped:
+                text = (
+                    "🐕 *EOD watchdog*\n"
+                    f"├ Strategy: `{strategy_name}`\n"
+                    f"├ Reason: `{reason}`\n"
+                    "└ No open positions — nothing to flatten."
+                )
+            else:
+                lines = [
+                    "🐕 *EOD watchdog*",
+                    f"├ Strategy: `{strategy_name}`",
+                    f"├ Reason: `{reason}`",
+                    f"├ Attempted: {attempted}",
+                    f"├ Succeeded: {succeeded}",
+                    f"├ Failed: {len(failed)}",
+                    f"└ Skipped: {len(skipped)}",
+                ]
+                if failed:
+                    lines.append("\n*Failures*")
+                    for f in failed[:5]:
+                        sym = f.get("symbol") if isinstance(f, Mapping) else "?"
+                        err = f.get("error") if isinstance(f, Mapping) else str(f)
+                        lines.append(f"  • `{sym}` — {err}")
+                    if len(failed) > 5:
+                        lines.append(f"  • …and {len(failed) - 5} more")
+                text = "\n".join(lines)
+
+            self.notify(
+                "eod_watchdog", text,
+                strategy=strategy_name, attempted=attempted, failed=len(failed),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("publish_eod_watchdog_summary failed: %s", e)
+
+    def publish_eod_watchdog_failure(
+        self, strategy_name: str, error: str
+    ) -> None:
+        """Loud alert: the watchdog itself failed.
+
+        Distinct from per-position flatten failures (which are surfaced via
+        ``publish_eod_watchdog_summary``). This one means the safety net is
+        not safe — usually a missing api_key, a hung scheduler, or an
+        unexpected crash in the cron job body.
+        """
+        try:
+            text = (
+                "🚨 *EOD watchdog FAILED*\n"
+                f"├ Strategy: `{strategy_name}`\n"
+                f"├ Error: {error}\n"
+                "└ *Manual intervention required.*"
+            )
+            self.notify(
+                "eod_watchdog", text,
+                strategy=strategy_name, severity="critical",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("publish_eod_watchdog_failure failed: %s", e)
 
     def publish_anomaly(
         self,
