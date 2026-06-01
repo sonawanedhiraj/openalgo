@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -190,6 +191,71 @@ def build_claude_command(prompt: str, extra_tools: list[str] | None = None) -> l
     return cmd
 
 
+# Live openalgo.db gets cloned to this path before each subprocess spawn so
+# the subprocess inherits the schema + reference data but writes nowhere
+# near production. Pure :memory: doesn't work because some tests read from
+# auth/settings tables that no test fixture creates.
+_LIVE_DB_PATH = PROJECT_ROOT / "db" / "openalgo.db"
+_BRIDGE_TEST_DB_PATH = PROJECT_ROOT / "db" / "openalgo_test_bridge.db"
+_MEMORY_DB_URL = "sqlite:///:memory:"
+
+
+def _refresh_bridge_test_db() -> None:
+    """Clone the live openalgo.db into the bridge's throwaway test DB.
+
+    Uses SQLite's online backup API so the copy is consistent even if the
+    live DB is being written to. The destination is overwritten on every
+    call, which guarantees each /fix-bug or /run-tests run starts from a
+    clean state — no accumulated synthetic rows across runs.
+    """
+    if not _LIVE_DB_PATH.exists():
+        # Fresh checkout / first boot before the live DB has been
+        # initialised. Skip the copy; the subprocess will create the
+        # destination on demand via SQLAlchemy.
+        return
+    _BRIDGE_TEST_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if _BRIDGE_TEST_DB_PATH.exists():
+        _BRIDGE_TEST_DB_PATH.unlink()
+    src = sqlite3.connect(str(_LIVE_DB_PATH))
+    dst = sqlite3.connect(str(_BRIDGE_TEST_DB_PATH))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+def build_subprocess_env() -> dict[str, str]:
+    """Build an env dict for the spawned `claude -p` subprocess.
+
+    The bridge's /fix-bug + /run-tests prompts ask Claude to run
+    `uv run pytest …`. Many tests (notably test_simplified_stock_engine_service)
+    instantiate real services without monkeypatching the journal DB, so calls
+    like trade_journal_service.record_entry land in the live db/openalgo.db
+    via the module-level engine bound to DATABASE_URL at import time. On
+    2026-06-01 a fix-bug run wrote 12 synthetic rows into trade_journal while
+    real positions were open, poisoning the EOD watchdog + rehydrate logic.
+
+    Override DATABASE_URL to a throwaway clone of the live DB (refreshed on
+    every spawn) so the subprocess sees the live schema + reference data
+    but every write lands in the clone. Sandbox / latency / health get
+    :memory: — no test depends on their schema today, and it keeps the
+    clone footprint to one file.
+    """
+    env = os.environ.copy()
+    # Main openalgo.db — hosts trade_journal, signal_decision, daily_intent,
+    # auth, settings, orders, etc. Cloned per-spawn (see _refresh_bridge_test_db).
+    env["DATABASE_URL"] = f"sqlite:///{_BRIDGE_TEST_DB_PATH.as_posix()}"
+    # Sandbox virtual capital DB — routed to :memory: so sandbox tests
+    # don't leak virtual orders into db/sandbox.db.
+    env["SANDBOX_DATABASE_URL"] = _MEMORY_DB_URL
+    # Latency + health monitors fall back to db/latency.db and db/health.db;
+    # isolate those too for symmetry (no tests rely on them today).
+    env["LATENCY_DATABASE_URL"] = _MEMORY_DB_URL
+    env["HEALTH_DATABASE_URL"] = _MEMORY_DB_URL
+    return env
+
+
 async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None = None) -> dict:
     """
     Run Claude Code CLI and return structured result.
@@ -211,23 +277,12 @@ async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None 
     logger.info(f"Starting task: {task_name}")
     logger.info(f"Command: {' '.join(cmd[:4])}...")
 
-    # TODO(eod-watchdog P0): The /fix-bug + /run-tests prompts ask Claude to
-    # run `uv run pytest test/ -v`. The test suite, when run with the live
-    # DATABASE_URL inherited from this process, writes synthetic rows
-    # (live-1.., sbx-abc, RELIANCE @ 2502 etc.) into db/openalgo.db's
-    # trade_journal table. Those rows then poison the EOD watchdog +
-    # rehydrate logic (services/eod_watchdog_service.py,
-    # SimplifiedStockEngineService.rehydrate_positions_from_journal). On
-    # 2026-06-01 the bridge ran fix-bug at ~15:24 IST and wrote 12 fake rows
-    # while real NBCC LONG 500 was open. Cleaned up by hand; needs a real
-    # fix here.
-    #
-    # Right fix: spawn the claude subprocess with env={"DATABASE_URL":
-    # "sqlite:///db/openalgo_test.db", ...} (or :memory:) so any pytest run
-    # the agent kicks off targets an isolated DB. That requires regenerating
-    # the test DB on first use (run all init_db hooks) and verifying
-    # downstream services don't hard-code the production path. Deferred —
-    # tracked in the EOD watchdog hand-off note.
+    # Isolate the subprocess from live SQLite DBs — see build_subprocess_env()
+    # docstring for the full rationale. Without this, a fix-bug or run-tests
+    # invocation can write synthetic rows into db/openalgo.db's trade_journal
+    # and poison the EOD watchdog + position rehydrate logic.
+    _refresh_bridge_test_db()
+    subprocess_env = build_subprocess_env()
     try:
         # Run claude -p as subprocess
         process = await asyncio.create_subprocess_exec(
@@ -235,6 +290,7 @@ async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(PROJECT_ROOT),
+            env=subprocess_env,
         )
 
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
