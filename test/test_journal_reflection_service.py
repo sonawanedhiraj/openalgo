@@ -115,6 +115,57 @@ def test_render_reflection_prompt_includes_backtest_caveat_verbatim():
     assert "BACKTEST_TRADES" in prompt
 
 
+def test_render_reflection_prompt_swaps_caveat_for_screener_filtered():
+    """When every backtest row carries ``methodology='screener_filtered'``,
+    the prompt must drop the all-symbol caveat and emit the new
+    SCREENER_FILTERED_BACKTEST_NOTE verbatim instead."""
+    from services import journal_reflection_service as jrs
+
+    inputs = {
+        "reflection_date": "2026-06-01",
+        "window_days": 7,
+        "journal_trades": [],
+        "screener_hits": [],
+        "backtest_trades": [
+            {"symbol": "INFY", "pnl": 1.0, "methodology": "screener_filtered"},
+            {"symbol": "TCS", "pnl": -1.0, "methodology": "screener_filtered"},
+        ],
+        "counts": {"n_journal_trades": 0, "n_screener_hits": 0, "n_backtest_trades": 2},
+    }
+    prompt = jrs.render_reflection_prompt(inputs)
+
+    # New note is present verbatim.
+    assert jrs.SCREENER_FILTERED_BACKTEST_NOTE in prompt
+    # Old all-symbol caveat is gone.
+    assert jrs.BACKTEST_CAVEAT not in prompt
+    # Key phrases from the task spec.
+    assert "screener-filtered data" in prompt
+    assert "admitted-placeholder" in prompt
+    assert "scanner-gated, not all-symbol" in prompt
+
+
+def test_render_reflection_prompt_includes_both_caveats_when_mixed():
+    """If the window contains both legacy and screener-filtered rows,
+    both caveats must appear so the LLM applies each to its subset."""
+    from services import journal_reflection_service as jrs
+
+    inputs = {
+        "reflection_date": "2026-06-01",
+        "window_days": 7,
+        "journal_trades": [],
+        "screener_hits": [],
+        "backtest_trades": [
+            {"symbol": "INFY", "pnl": 1.0, "methodology": "screener_filtered"},
+            {"symbol": "TCS", "pnl": -1.0},  # legacy: no methodology
+        ],
+        "counts": {"n_journal_trades": 0, "n_screener_hits": 0, "n_backtest_trades": 2},
+    }
+    prompt = jrs.render_reflection_prompt(inputs)
+
+    assert jrs.SCREENER_FILTERED_BACKTEST_NOTE in prompt
+    assert jrs.BACKTEST_CAVEAT in prompt
+
+
 def test_render_reflection_prompt_includes_row_data():
     """Sample rows from each source must appear in the prompt body."""
     from services import journal_reflection_service as jrs

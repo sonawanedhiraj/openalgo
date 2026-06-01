@@ -58,6 +58,20 @@ BACKTEST_CAVEAT = (
     "filtered re-run is on the roadmap."
 )
 
+# Verbatim — used when the backtest rows in the window were produced by
+# the screener-filtered harness (services.backtest_screener_filtered_service).
+# Both notes can appear in a single prompt if the window straddles old and
+# new data; see render_reflection_prompt below.
+SCREENER_FILTERED_BACKTEST_NOTE = (
+    "NOTE on backtest data below: this is screener-filtered data — only "
+    "stocks that the in-house scanner rule WOULD have picked on each "
+    "historical day are included. Note that the scanner rule is admitted-"
+    "placeholder and not yet tuned against live Chartink output, so "
+    "quantitative conclusions about hit rate and P&L should still be "
+    "treated as directional, but the methodology is now consistent with "
+    "how the live engine takes positions (scanner-gated, not all-symbol)."
+)
+
 _DEFAULT_BRIDGE_URL = "http://127.0.0.1:5001/reflect"
 _DEFAULT_REQUEST_TIMEOUT = 200.0  # bridge wall-clock is 180s — leave a buffer.
 
@@ -236,7 +250,11 @@ def render_reflection_prompt(inputs: dict[str, Any]) -> str:
         f"window_days={inputs.get('window_days', 0)}"
     )
 
-    sections = [
+    backtest_rows = inputs.get("backtest_trades") or []
+    methodologies = _detect_backtest_methodologies(backtest_rows)
+    caveat_blocks = _select_backtest_caveats(methodologies)
+
+    sections: list[str] = [
         header,
         "",
         structure_note,
@@ -244,15 +262,66 @@ def render_reflection_prompt(inputs: dict[str, Any]) -> str:
         f"REFLECTION DATE: {inputs.get('reflection_date')}",
         counts_line,
         "",
-        BACKTEST_CAVEAT,
-        "",
+    ]
+    for block in caveat_blocks:
+        sections.append(block)
+        sections.append("")
+    sections.extend([
         journal_block,
         "",
         screener_block,
         "",
         backtest_block,
-    ]
+    ])
     return "\n".join(sections)
+
+
+def _detect_backtest_methodologies(rows: list[dict]) -> set[str]:
+    """Return the set of distinct methodology tags found in backtest rows.
+
+    Pre-migration rows have no methodology column and are bucketed as
+    ``"all_symbol"`` — the original (and only) methodology that produced
+    them. Anything else (today: ``"screener_filtered"``) is returned
+    verbatim.
+    """
+    tags: set[str] = set()
+    for row in rows or []:
+        tag = (row or {}).get("methodology")
+        if tag:
+            tags.add(str(tag))
+        else:
+            tags.add("all_symbol")
+    return tags
+
+
+def _select_backtest_caveats(methodologies: set[str]) -> list[str]:
+    """Pick the right caveat block(s) for the methodologies in the window.
+
+    * Only ``screener_filtered`` rows → emit
+      :data:`SCREENER_FILTERED_BACKTEST_NOTE`.
+    * Only ``all_symbol`` rows (legacy) → emit :data:`BACKTEST_CAVEAT`.
+    * Both present → emit both with a short framer so the LLM applies
+      each note to the appropriate subset.
+    * No backtest rows → emit the all-symbol caveat (it explains the
+      historic dataset shape even when nothing was loaded this run).
+    """
+    if not methodologies:
+        return [BACKTEST_CAVEAT]
+
+    has_screener = "screener_filtered" in methodologies
+    has_all_symbol = any(t != "screener_filtered" for t in methodologies)
+
+    if has_screener and has_all_symbol:
+        return [
+            "BACKTEST METHODOLOGY NOTES (data below contains BOTH old all-symbol "
+            "rows AND newer screener-filtered rows — apply each note to the "
+            "rows it describes; the methodology field on each row marks which):",
+            BACKTEST_CAVEAT,
+            SCREENER_FILTERED_BACKTEST_NOTE,
+        ]
+    if has_screener:
+        return [SCREENER_FILTERED_BACKTEST_NOTE]
+    return [BACKTEST_CAVEAT]
 
 
 def _format_block(heading: str, rows: list[dict]) -> str:
