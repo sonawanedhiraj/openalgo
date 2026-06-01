@@ -44,6 +44,7 @@ _EVENT_TYPES = (
     "eod_summary",
     "anomaly_alert",
     "eod_watchdog",
+    "veto_decision",
 )
 
 _SEVERITY_PREFIX = {
@@ -107,6 +108,10 @@ class NotificationService:
             # couldn't. Set NOTIFY_EOD_WATCHDOG=false only when intentionally
             # going dark on watchdog telemetry (e.g. during scheduler dev).
             "eod_watchdog": _env_bool("NOTIFY_EOD_WATCHDOG", default=True),
+            # LLM veto-layer skip alerts default ON — operator needs visibility
+            # into what the veto layer blocks (shadow: would-block, active:
+            # actual block) before flipping VETO_LAYER_MODE=active.
+            "veto_decision": _env_bool("NOTIFY_VETO_ALERTS", default=True),
         }
 
     # ------------------------------------------------------------------
@@ -395,3 +400,82 @@ def reset_notification_service_for_tests() -> None:
     """Clear the singleton so tests can re-read env vars on next access."""
     global _singleton
     _singleton = None
+
+
+# ---------------------------------------------------------------------------
+# LLM veto-layer skip alerts (module-level shim — called from signal_review).
+# ---------------------------------------------------------------------------
+
+
+def _format_confidence_pct(confidence: float | None) -> str:
+    if confidence is None:
+        return "—"
+    try:
+        return f"{int(round(float(confidence) * 100))}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def publish_veto_decision_alert(
+    *,
+    symbol: str,
+    decision: str,
+    reasoning: str,
+    confidence: float | None,
+    enforcement_mode: str,
+    source: str | None = None,
+) -> None:
+    """Send a Telegram alert when the veto layer decides to skip a signal.
+
+    Shadow mode → 🔬 [SHADOW] prefix (would-block, informational).
+    Active mode → 🚫 prefix (actually blocked, action taken).
+
+    No-op for ``decision != 'skip'``.
+    No-op when ``NOTIFY_VETO_ALERTS`` env var is 'false'.
+    No-op when ``NOTIFY_TELEGRAM_ENABLED`` master switch is false (enforced
+    inside :meth:`NotificationService.notify`).
+
+    Fail-safe: any exception is caught and logged — never raises.
+    """
+    try:
+        if decision != "skip":
+            return
+        if not _env_bool("NOTIFY_VETO_ALERTS", default=True):
+            return
+
+        confidence_pct = _format_confidence_pct(confidence)
+        source_str = source or "unknown"
+        reasoning_str = reasoning or "(no reasoning provided)"
+        mode = (enforcement_mode or "").lower()
+
+        if mode == "shadow":
+            text = (
+                f"🔬 [SHADOW] {symbol} ({source_str}) — veto would block\n\n"
+                f"Reason: {reasoning_str}\n"
+                f"Confidence: {confidence_pct}\n"
+                f"Mode: shadow (informational only)"
+            )
+        elif mode == "active":
+            text = (
+                f"🚫 {symbol} ({source_str}) — veto BLOCKED entry\n\n"
+                f"Reason: {reasoning_str}\n"
+                f"Confidence: {confidence_pct}\n"
+                f"Mode: active (trade not placed)"
+            )
+        else:
+            text = (
+                f"🔬 {symbol} ({source_str}) — veto decision: skip\n\n"
+                f"Reason: {reasoning_str}\n"
+                f"Confidence: {confidence_pct}\n"
+                f"Mode: {enforcement_mode}"
+            )
+
+        get_notification_service().notify(
+            "veto_decision",
+            text,
+            symbol=symbol,
+            decision=decision,
+            enforcement_mode=enforcement_mode,
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe by design
+        logger.warning("publish_veto_decision_alert failed: %s", e)

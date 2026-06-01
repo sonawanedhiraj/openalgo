@@ -568,6 +568,213 @@ def test_mark_actually_taken_handles_none_id(fresh_signal_db, shadow_mode):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Veto-decision Telegram alert wiring
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_skip_decision_fires_telegram_alert(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """A fresh bridge call returning skip must invoke publish_veto_decision_alert."""
+    from services.signal_review_service import review_signal
+
+    _mock_bridge_response(
+        monkeypatch,
+        {
+            "decision": "skip",
+            "reasoning": "vix elevated, breadth negative",
+            "confidence": 0.74,
+            "latency_ms": 9100,
+            "claude_session_id": "sess-x",
+            "raw_output": "prose...",
+        },
+    )
+
+    captured: list[dict] = []
+
+    def _spy(**kw):
+        captured.append(kw)
+
+    monkeypatch.setattr(
+        "services.notification_service.publish_veto_decision_alert", _spy
+    )
+
+    review_signal("INFY", "chartink_buy", context=_ctx_override())
+
+    assert len(captured) == 1
+    kw = captured[0]
+    assert kw["symbol"] == "INFY"
+    assert kw["decision"] == "skip"
+    assert kw["reasoning"] == "vix elevated, breadth negative"
+    assert kw["confidence"] == 0.74
+    assert kw["enforcement_mode"] == "shadow"
+    assert kw["source"] == "chartink_buy"
+
+
+def test_fresh_take_decision_calls_helper_but_helper_no_ops(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """A fresh take decision still invokes the helper — which itself no-ops.
+
+    The gate (decision != 'skip' → no broadcast) lives inside
+    publish_veto_decision_alert. We assert the wiring is consistent: helper is
+    called regardless of the decision, and the helper's own logic decides.
+    """
+    from services.signal_review_service import review_signal
+
+    _mock_bridge_response(
+        monkeypatch,
+        {
+            "decision": "take",
+            "reasoning": "regime aligned",
+            "confidence": 0.82,
+            "latency_ms": 1500,
+            "claude_session_id": "sess-y",
+            "raw_output": "",
+        },
+    )
+
+    captured: list[dict] = []
+
+    def _spy(**kw):
+        captured.append(kw)
+
+    monkeypatch.setattr(
+        "services.notification_service.publish_veto_decision_alert", _spy
+    )
+
+    review_signal("RELIANCE", "chartink_buy", context=_ctx_override())
+
+    assert len(captured) == 1
+    assert captured[0]["decision"] == "take"
+
+
+def test_cache_hit_does_not_fire_telegram_alert(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """Cache replays must NOT spam the operator with old decisions."""
+    from services.signal_review_service import review_signal
+
+    _mock_bridge_response(
+        monkeypatch,
+        {
+            "decision": "skip",
+            "reasoning": "fresh skip",
+            "confidence": 0.6,
+            "latency_ms": 100,
+            "claude_session_id": "sid",
+            "raw_output": "",
+        },
+    )
+
+    captured: list[dict] = []
+
+    def _spy(**kw):
+        captured.append(kw)
+
+    monkeypatch.setattr(
+        "services.notification_service.publish_veto_decision_alert", _spy
+    )
+
+    # First call — fresh, should fire.
+    review_signal("TCS", "chartink_buy", context=_ctx_override())
+    # Second call — cache hit, MUST NOT fire.
+    review_signal("TCS", "chartink_buy", context=_ctx_override())
+
+    assert len(captured) == 1
+    assert captured[0]["symbol"] == "TCS"
+
+
+def test_bridge_failure_does_not_fire_telegram_alert(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """review_failed rows must not produce a Telegram alert."""
+    from services.signal_review_service import review_signal
+
+    def fake_post(*args, **kwargs):  # noqa: ARG001
+        raise httpx.ConnectError("Connection refused")
+
+    import services.signal_review_service as srs
+
+    monkeypatch.setattr(srs.httpx, "post", fake_post)
+
+    captured: list[dict] = []
+
+    def _spy(**kw):
+        captured.append(kw)
+
+    monkeypatch.setattr(
+        "services.notification_service.publish_veto_decision_alert", _spy
+    )
+
+    review_signal("WIPRO", "chartink_buy", context=_ctx_override())
+
+    assert captured == []
+
+
+def test_bad_decision_does_not_fire_telegram_alert(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """Contract-violation responses must not produce a Telegram alert."""
+    from services.signal_review_service import review_signal
+
+    _mock_bridge_response(
+        monkeypatch,
+        {
+            "decision": "MAYBE",
+            "reasoning": "x",
+            "confidence": 0.5,
+            "latency_ms": 100,
+            "claude_session_id": "sid",
+            "raw_output": "",
+        },
+    )
+
+    captured: list[dict] = []
+
+    def _spy(**kw):
+        captured.append(kw)
+
+    monkeypatch.setattr(
+        "services.notification_service.publish_veto_decision_alert", _spy
+    )
+
+    review_signal("ITC", "chartink_buy", context=_ctx_override())
+
+    assert captured == []
+
+
+def test_alert_failure_does_not_break_review(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """A blow-up inside the alert helper must NOT propagate into review_signal."""
+    from services.signal_review_service import review_signal
+
+    _mock_bridge_response(
+        monkeypatch,
+        {
+            "decision": "skip",
+            "reasoning": "trigger boom",
+            "confidence": 0.7,
+            "latency_ms": 100,
+            "claude_session_id": "sid",
+            "raw_output": "",
+        },
+    )
+
+    def _boom(**kw):
+        raise RuntimeError("downstream notification failure")
+
+    monkeypatch.setattr(
+        "services.notification_service.publish_veto_decision_alert", _boom
+    )
+
+    # Must NOT raise — review_signal wraps the call in try/except.
+    result = review_signal("BOOM", "chartink_buy", context=_ctx_override())
+    assert result["decision"] == "skip"
+
+
 def test_insert_self_inits_table_when_init_db_was_skipped(monkeypatch):
     """If init_db() never ran (background-init race on a fresh process), the
     first insert must still succeed by lazily creating the table.
