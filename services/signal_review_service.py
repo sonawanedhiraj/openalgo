@@ -233,6 +233,7 @@ def _build_context(override: dict[str, Any] | None) -> dict[str, Any]:
         "max_trades_today": None,
         "nifty_pct": None,
         "india_vix": None,
+        "regime_snapshot": None,
     }
 
     # Engine state: trade counts come from the live simplified engine instance.
@@ -287,7 +288,54 @@ def _build_context(override: dict[str, Any] | None) -> dict[str, Any]:
         logger.warning("signal_review: pnl_today fetch failed: %s", exc)
         ctx["pnl_today"] = None
 
+    try:
+        ctx["regime_snapshot"] = _fetch_regime_snapshot()
+    except Exception as exc:
+        logger.warning("signal_review: regime_snapshot fetch failed: %s", exc)
+        ctx["regime_snapshot"] = None
+
     return ctx
+
+
+def _fetch_regime_snapshot() -> dict[str, Any] | None:
+    """Return a compact regime dict for the veto prompt.
+
+    Uses the cached regime (refreshed at most every 5 min by
+    ``market_regime_service.get_cached_regime``) so this call is cheap
+    even on a tight signal flow. Returns ``None`` if the classifier
+    failed (cache miss + recompute exception).
+
+    Trims ``raw_metrics['sector_rotation']['sector_pct']`` to the top-5
+    by absolute % change to keep the prompt size bounded — the LLM
+    can still reason about leaders + laggards without seeing every
+    tracked sector.
+    """
+    from services.market_regime_service import get_cached_regime
+
+    regime = get_cached_regime(max_age_minutes=5)
+    if regime is None:
+        return None
+
+    sector_raw = (regime.raw_metrics or {}).get("sector_rotation", {}) or {}
+    sector_pct = sector_raw.get("sector_pct") or {}
+    top_sectors: dict[str, float] = {}
+    if isinstance(sector_pct, dict) and sector_pct:
+        ranked = sorted(
+            sector_pct.items(),
+            key=lambda kv: abs(float(kv[1] or 0.0)),
+            reverse=True,
+        )
+        top_sectors = {sym: float(pct) for sym, pct in ranked[:5]}
+
+    return {
+        "trend": regime.trend,
+        "volatility": regime.volatility,
+        "breadth": regime.breadth,
+        "time_of_day": regime.time_of_day,
+        "sector_leaders": list(regime.sector_leaders),
+        "sector_leader_concentration": float(regime.sector_leader_concentration),
+        "top_sector_pct": top_sectors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +414,7 @@ def review_signal(
             "max_trades_today": snapshot.get("max_trades_today"),
             "nifty_pct": snapshot.get("nifty_pct"),
             "india_vix": snapshot.get("india_vix"),
+            "regime_snapshot": snapshot.get("regime_snapshot"),
         },
     }
 

@@ -167,6 +167,11 @@ class ReviewContext(BaseModel):
     max_trades_today: Optional[int] = None
     nifty_pct: Optional[float] = None
     india_vix: Optional[float] = None
+    # Stage 1.7: full 5-dim regime snapshot. Free-form dict so the
+    # bridge doesn't have to track every field the classifier might
+    # add — keys today are trend / volatility / breadth / time_of_day
+    # / sector_leaders / sector_leader_concentration / top_sector_pct.
+    regime_snapshot: Optional[dict] = None
 
 
 class ReviewSignalRequest(BaseModel):
@@ -602,7 +607,10 @@ MARKET CONTEXT (today):
 - NIFTY return: {nifty_pct}%
 - India VIX: {india_vix}
 
-Decide whether the operator should take this signal. Be conservative: skip when the broader market regime conflicts with the signal direction (e.g., BUY signal on a -1% NIFTY day with elevated VIX), or when the operator is already near their daily trade limit.
+REGIME SNAPSHOT:
+{regime_block}
+
+Decide whether the operator should take this signal. Be conservative: skip when the broader market regime conflicts with the signal direction (e.g., BUY signal on a -1% NIFTY day with elevated VIX, or BUY on a stock whose sector is bottom-3 today while leadership is concentrated elsewhere), or when the operator is already near their daily trade limit.
 
 Respond with a short reasoning paragraph followed by a final JSON block. The JSON block must be the LAST thing in your response and must contain exactly these keys:
 
@@ -612,6 +620,40 @@ Respond with a short reasoning paragraph followed by a final JSON block. The JSO
   "confidence": 0.0 to 1.0
 }}
 """
+
+
+def _format_regime_block(regime: Optional[dict]) -> str:
+    """Render the regime snapshot dict as a small bullet list.
+
+    Returns ``"- unavailable"`` when the classifier didn't return data
+    (cache miss or empty universe) so the LLM treats it as missing
+    rather than zero. Only includes fields that are actually populated.
+    """
+    if not regime or not isinstance(regime, dict):
+        return "- unavailable"
+    lines: list[str] = []
+    for key in ("trend", "volatility", "breadth", "time_of_day"):
+        val = regime.get(key)
+        if val:
+            lines.append(f"- {key}: {val}")
+    leaders = regime.get("sector_leaders") or []
+    if leaders:
+        lines.append(f"- sector_leaders (top 3): {', '.join(leaders)}")
+    concentration = regime.get("sector_leader_concentration")
+    if concentration is not None:
+        lines.append(
+            f"- sector_leader_concentration: {float(concentration):.2f} "
+            "(>0.5 dominant, <0.2 broad rotation)"
+        )
+    top_sector_pct = regime.get("top_sector_pct") or {}
+    if top_sector_pct:
+        rendered = ", ".join(
+            f"{sym} {float(pct):+.2f}%" for sym, pct in top_sector_pct.items()
+        )
+        lines.append(f"- top sectors today: {rendered}")
+    if not lines:
+        return "- unavailable"
+    return "\n".join(lines)
 
 
 def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str:
@@ -645,6 +687,7 @@ def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str
         max_trades_today=_or_unknown(ctx.max_trades_today),
         nifty_pct=_or_unavailable(ctx.nifty_pct),
         india_vix=_or_unavailable(ctx.india_vix),
+        regime_block=_format_regime_block(ctx.regime_snapshot),
     )
 
 

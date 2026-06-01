@@ -760,6 +760,83 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Scanner service: {e}")
 
+            # Stage 1.7 regime classifier — pre-subscribe NIFTY sector
+            # indices on NSE_INDEX so the sector-rotation classifier has
+            # live quotes (rather than falling back to historify EOD
+            # close-to-close). Mirrors the scanner pre-subscribe pattern:
+            # daemon thread polls until WS is ready (up to 30s) then
+            # subscribes one by one in Quote mode. Failures are warnings
+            # only — the classifier degrades gracefully.
+            try:
+                raw_sector_symbols = os.environ.get(
+                    "REGIME_SECTOR_SYMBOLS", ""
+                )
+                sector_symbols = [
+                    s.strip().upper()
+                    for s in raw_sector_symbols.split(",")
+                    if s.strip()
+                ]
+                if sector_symbols:
+                    def _pre_subscribe_regime_sectors(syms):
+                        import time as _time
+                        from database.auth_db import (
+                            get_broker_name, get_first_available_api_key, verify_api_key,
+                        )
+                        from services.websocket_service import (
+                            get_websocket_connection, subscribe_to_symbols,
+                        )
+                        api_key = get_first_available_api_key()
+                        user_id = verify_api_key(api_key) if api_key else None
+                        if not user_id:
+                            logger.warning(
+                                "Regime sector pre-subscribe skipped: no active broker session"
+                            )
+                            return
+                        broker = get_broker_name(api_key) or ""
+                        deadline = _time.time() + 30
+                        while _time.time() < deadline and not get_websocket_connection(user_id)[0]:
+                            _time.sleep(1)
+                        if not get_websocket_connection(user_id)[0]:
+                            logger.warning(
+                                "Regime sector pre-subscribe: broker WS not ready after 30s"
+                            )
+                            return
+                        succeeded = 0
+                        for s in syms:
+                            try:
+                                ok, resp, _ = subscribe_to_symbols(
+                                    user_id, broker,
+                                    [{"exchange": "NSE_INDEX", "symbol": s}],
+                                    mode="Quote",
+                                )
+                                if ok:
+                                    succeeded += 1
+                                else:
+                                    logger.warning(
+                                        "Regime sector pre-subscribe failed for %s: %s", s, resp
+                                    )
+                            except Exception as _e:
+                                logger.warning(
+                                    "Regime sector pre-subscribe failed for %s: %s", s, _e
+                                )
+                        logger.info(
+                            "Regime pre-subscribed %d/%d sector indices to broker WebSocket",
+                            succeeded, len(syms),
+                        )
+                    import threading as _t
+                    _t.Thread(
+                        target=_pre_subscribe_regime_sectors,
+                        args=(list(sector_symbols),),
+                        daemon=True,
+                        name="RegimeSectorPreSubscribe",
+                    ).start()
+                else:
+                    logger.debug(
+                        "Regime sector pre-subscribe skipped (REGIME_SECTOR_SYMBOLS empty)"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to schedule regime sector pre-subscribe: {e}")
+
             # Scan-hit webhook poster (Stage 1.5 item 6) — gated by
             # SCAN_HIT_POSTER_ENABLED. Subscribes to ``scan_hit`` events
             # emitted by the scanner above. Default mode is ``shadow`` —
