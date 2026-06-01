@@ -81,6 +81,12 @@ class BacktestRun(Base):
     max_drawdown = Column(Float, nullable=True)
     notes = Column(Text, nullable=True)
 
+    # Free-form tag identifying which backtest harness produced the run.
+    # Examples: ``"all_symbol"`` (legacy run_backtest) or
+    # ``"screener_filtered"`` (run_screener_filtered_backtest). NULL on
+    # pre-migration rows.
+    methodology = Column(String(32), nullable=True)
+
     __table_args__ = (
         Index("idx_backtest_runs_started", "started_at"),
     )
@@ -114,6 +120,14 @@ class BacktestTrade(Base):
     # Optional — a trailing-stop strategy may not pre-compute a fixed target.
     target_price = Column(Float, nullable=True)
 
+    # Same tag as the parent run; denormalised so the reflection bridge
+    # can filter trades by methodology without joining backtest_runs.
+    methodology = Column(String(32), nullable=True)
+    # ISO timestamp of the bar close at which the scanner rule fired and the
+    # symbol was added to the day's pick list. May be earlier than ``entry_at``
+    # when the strategy uses a multi-bar confirmation window.
+    scanner_hit_timestamp = Column(String(40), nullable=True)
+
     __table_args__ = (
         Index("idx_backtest_trades_run", "run_id"),
         Index("idx_backtest_trades_symbol", "symbol"),
@@ -121,10 +135,68 @@ class BacktestTrade(Base):
 
 
 def init_db():
-    """Create backtest_runs + backtest_trades tables if missing. Idempotent."""
+    """Create backtest_runs + backtest_trades tables if missing. Idempotent.
+
+    Also runs lightweight column migrations for backwards-compatible
+    additions (``methodology`` and ``scanner_hit_timestamp``) so that
+    existing deployments don't need to drop the tables when the schema
+    grows. Each ALTER TABLE is gated on ``information_schema`` so the
+    migration is a no-op on a fresh DB and is safe to run repeatedly.
+    """
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Backtest DB", logger)
+    _migrate_add_methodology_columns()
+
+
+def _migrate_add_methodology_columns() -> None:
+    """Idempotent ALTER TABLE migration.
+
+    Adds columns introduced after the initial schema landed:
+
+    * ``backtest_runs.methodology``
+    * ``backtest_trades.methodology``
+    * ``backtest_trades.scanner_hit_timestamp``
+
+    Uses PRAGMA-based introspection (works for SQLite — our only deployed
+    backing store for backtest_*) and silently skips on engines that don't
+    expose PRAGMA. Failures are logged but never raised so a stale schema
+    can never break import.
+    """
+    try:
+        with engine.connect() as conn:
+            for table, column, ddl in [
+                ("backtest_runs", "methodology", "VARCHAR(32)"),
+                ("backtest_trades", "methodology", "VARCHAR(32)"),
+                ("backtest_trades", "scanner_hit_timestamp", "VARCHAR(40)"),
+            ]:
+                if _column_exists(conn, table, column):
+                    continue
+                try:
+                    from sqlalchemy import text as _text
+
+                    conn.execute(_text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+                    if hasattr(conn, "commit"):
+                        conn.commit()
+                    logger.info("backtest_db: migrated %s.%s", table, column)
+                except Exception as e:
+                    logger.warning(
+                        "backtest_db: migration ALTER %s.%s failed: %s",
+                        table, column, e,
+                    )
+    except Exception as e:
+        logger.warning("backtest_db: migration introspection failed: %s", e)
+
+
+def _column_exists(conn, table: str, column: str) -> bool:
+    """Return True iff ``column`` already exists on ``table`` (SQLite-aware)."""
+    from sqlalchemy import text as _text
+
+    try:
+        rows = conn.execute(_text(f"PRAGMA table_info({table})")).fetchall()
+        return any(r[1] == column for r in rows)
+    except Exception:
+        return False
 
 
 def _now_iso() -> str:
@@ -152,6 +224,7 @@ def _run_to_dict(row: BacktestRun) -> dict[str, Any]:
         "win_rate": row.win_rate,
         "max_drawdown": row.max_drawdown,
         "notes": row.notes,
+        "methodology": row.methodology,
     }
 
 
@@ -174,4 +247,6 @@ def _trade_to_dict(row: BacktestTrade) -> dict[str, Any]:
         "atr_at_entry": row.atr_at_entry,
         "sl_price": row.sl_price,
         "target_price": row.target_price,
+        "methodology": row.methodology,
+        "scanner_hit_timestamp": row.scanner_hit_timestamp,
     }
