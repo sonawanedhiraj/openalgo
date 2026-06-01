@@ -2536,6 +2536,8 @@ class TelegramBotService:
 
     async def send_notification(self, telegram_id: int, message: str) -> bool:
         """Send a notification to a specific Telegram user."""
+        import telegram.error
+
         try:
             if not self.application or not self.is_running:
                 logger.error("Bot not initialized or not running")
@@ -2544,7 +2546,18 @@ class TelegramBotService:
             # Get the bot from the application
             bot = self.application.bot
 
-            await bot.send_message(chat_id=telegram_id, text=message, parse_mode="Markdown")
+            try:
+                await bot.send_message(chat_id=telegram_id, text=message, parse_mode="Markdown")
+            except telegram.error.BadRequest as e:
+                # Malformed Markdown (unbalanced *, _, `, [ etc.) — retry as plain text
+                # so the recipient still gets the message instead of nothing.
+                if "parse entities" in str(e).lower():
+                    logger.warning(
+                        f"Markdown parse failed for {telegram_id}, sending as plain text: {e}"
+                    )
+                    await bot.send_message(chat_id=telegram_id, text=message)
+                else:
+                    raise
             logger.debug(f"Notification sent to telegram_id: {telegram_id}")
             return True
         except Exception as e:
@@ -2553,6 +2566,8 @@ class TelegramBotService:
 
     async def broadcast_message(self, message: str, filters: dict = None) -> tuple[int, int]:
         """Broadcast a message to all or filtered users."""
+        import telegram.error
+
         try:
             if not self.application or not self.is_running:
                 logger.error("Bot not initialized or not running for broadcast")
@@ -2585,9 +2600,21 @@ class TelegramBotService:
                     telegram_id = user.get("telegram_id")
                     if telegram_id:
                         bot = self.application.bot
-                        await bot.send_message(
-                            chat_id=telegram_id, text=message, parse_mode="Markdown"
-                        )
+                        try:
+                            await bot.send_message(
+                                chat_id=telegram_id, text=message, parse_mode="Markdown"
+                            )
+                        except telegram.error.BadRequest as e:
+                            # Malformed Markdown — retry as plain text so the
+                            # recipient still gets the message.
+                            if "parse entities" in str(e).lower():
+                                logger.warning(
+                                    f"Markdown parse failed for {telegram_id}, "
+                                    f"sending as plain text: {e}"
+                                )
+                                await bot.send_message(chat_id=telegram_id, text=message)
+                            else:
+                                raise
                         success_count += 1
                         # Add small delay to avoid rate limits
                         await asyncio.sleep(0.1)
