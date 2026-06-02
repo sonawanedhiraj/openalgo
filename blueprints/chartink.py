@@ -1104,6 +1104,57 @@ def simplified_stock_engine_webhook(webhook_id):
 
 
 # ---------------------------------------------------------------------------
+# Aborted-cycle trace — leaves a row when a triggered run never reaches the
+# webhook (preflight abort, market closed, dead broker session, etc.).
+# ---------------------------------------------------------------------------
+
+
+@chartink_bp.route("/cycle/aborted", methods=["POST"])
+@limiter.limit(WEBHOOK_RATE_LIMIT)
+def record_aborted_cycle_endpoint():
+    """Record a scan_cycle row for a triggered-but-aborted run.
+
+    Lets the fno-scan-cycle SKILL.md leave a trace from the Cowork sandbox via
+    a single ``fetch``/``curl`` POST when it decides not to proceed, instead of
+    a silent gap. Without this, a preflight abort (or a session that dies
+    before POSTing) leaves no scan_cycle row — turning a 5-second SQL lookup
+    into an hour-long forensic.
+
+    Payload::
+
+        {
+          "abort_reason": "...",                              # required
+          "abort_stage": "preflight" | "scrape" | "post" | "market_closed" | "other",
+          "scan_name": "fno-scan-cycle",                      # optional
+          "cycle_kind": "chartink",                           # optional
+          "operator_intent": "live" | "sandbox" | null        # optional
+        }
+
+    Returns: ``{ "id": <cycle_id>, "post_status": "aborted_<stage>" }``.
+
+    No auth: this comes from local Cowork (127.0.0.1), matching the other
+    /chartink webhook routes which are CSRF-exempt and key-less.
+    """
+    from services import scan_cycle_service
+
+    data = request.get_json(silent=True) or {}
+    abort_reason = data.get("abort_reason")
+    if not abort_reason or not str(abort_reason).strip():
+        return jsonify({"status": "error", "error": "abort_reason is required"}), 400
+
+    abort_stage = str(data.get("abort_stage") or "other").strip() or "other"
+
+    result = scan_cycle_service.record_aborted_cycle(
+        scan_name=data.get("scan_name") or "fno-scan-cycle",
+        cycle_kind=data.get("cycle_kind") or "chartink",
+        abort_reason=str(abort_reason).strip(),
+        abort_stage=abort_stage,
+        operator_intent=data.get("operator_intent"),
+    )
+    return jsonify({"id": result.get("id"), "post_status": result.get("post_status")}), 200
+
+
+# ---------------------------------------------------------------------------
 # Simplified Stock Engine — UI control endpoints (session-authenticated)
 # ---------------------------------------------------------------------------
 
