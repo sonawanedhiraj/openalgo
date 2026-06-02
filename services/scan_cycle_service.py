@@ -183,6 +183,73 @@ def complete_cycle(
     )
 
 
+def record_aborted_cycle(
+    *,
+    scan_name: str = "fno-scan-cycle",
+    cycle_kind: str = "chartink",
+    abort_reason: str,
+    abort_stage: str = "preflight",  # preflight | scrape | post | other
+    operator_intent: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Record a scan_cycle row for a triggered-but-aborted run.
+
+    Used when the SKILL.md decides not to proceed (e.g. preflight abort,
+    daily_intent not set, broker session dead, market closed). Writes a row
+    with ``post_status='aborted_<stage>'`` so future investigations have a
+    trace instead of a silent gap.
+
+    The abort context (``abort_reason``, ``abort_stage``, ``scan_name`` and any
+    extra ``metadata``) is folded into the ``error_payload`` JSON column —
+    ``scan_cycle`` has no dedicated columns for it, and adding columns would
+    require a migration on live installs. ``operator_intent`` maps to its own
+    column.
+
+    The row is written as already-completed: an aborted cycle is terminal, so
+    ``started_at`` and ``completed_at`` are stamped to the same instant.
+
+    Fail-safe like the rest of this module — never raises. On DB failure the
+    returned dict carries ``id=-1`` so the caller can respond without 500ing.
+
+    Returns:
+        dict with the inserted row id, ``post_status`` and ``started_at``.
+    """
+    post_status = f"aborted_{abort_stage}"
+    payload: dict[str, Any] = {
+        "abort_reason": abort_reason,
+        "abort_stage": abort_stage,
+        "scan_name": scan_name,
+    }
+    if metadata:
+        payload["metadata"] = metadata
+
+    sess = _session()
+    try:
+        ts = _now_iso()
+        row = ScanCycle(
+            started_at=ts,
+            completed_at=ts,
+            cycle_kind=cycle_kind,
+            post_status=post_status,
+            operator_intent=operator_intent,
+            error_payload=_json_or_none(payload),
+        )
+        sess.add(row)
+        sess.commit()
+        result = {"id": row.id, "post_status": post_status, "started_at": ts}
+    except Exception as e:
+        logger.warning("scan_cycle.record_aborted_cycle audit write failed: %s", e)
+        try:
+            sess.rollback()
+        except Exception:
+            pass
+        result = {"id": -1, "post_status": post_status, "started_at": None}
+    finally:
+        sess.remove()
+
+    return result
+
+
 def _notify_cycle_summary(
     *,
     cycle_kind: str | None,

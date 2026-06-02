@@ -395,6 +395,7 @@ def create_app():
         # Exempt webhook endpoints from CSRF protection
         csrf.exempt(app.view_functions["chartink_bp.webhook"])
         csrf.exempt(app.view_functions["chartink_bp.simplified_stock_engine_webhook"])
+        csrf.exempt(app.view_functions["chartink_bp.record_aborted_cycle_endpoint"])
         csrf.exempt(app.view_functions["strategy_bp.webhook"])
         csrf.exempt(app.view_functions["flow.trigger_webhook"])
         csrf.exempt(app.view_functions["flow.trigger_webhook_with_symbol"])
