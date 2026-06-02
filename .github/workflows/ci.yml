@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read
@@ -15,6 +15,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Pre-merge gate: ruff (smoke scripts) + import-only smoke + engine tests.
+  # Blocks PRs to main/dev that fail `make gate`. Mirrors the local `make gate`
+  # bundle so a green local run predicts a green CI check. No running app /
+  # broker session required — smoke_boot is import-only.
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev
+      # smoke_boot imports app.py, which sys.exit(1)s without a .env. Provision
+      # one from the committed sample so the import-only smoke can construct the
+      # Flask app on a clean runner. Placeholder secrets are auto-rotated on
+      # first load; nothing here touches a real broker session.
+      - name: Provision .env for smoke
+        run: cp .sample.env .env
+      - name: Run pre-merge gate
+        run: make gate
+
   # Backend linting with Ruff
   backend-lint:
     runs-on: ubuntu-latest
