@@ -468,25 +468,6 @@ class WebSocketClient:
                 if data.get("status") == "success":
                     self.authenticated = True
                     logger.info("Authentication successful")
-                    # Event-driven re-subscribe: the broker WS is now confirmed
-                    # connected+authenticated (the proxy only sends auth-success
-                    # after the broker adapter connects). Fire any registered
-                    # connect callbacks so components re-establish their
-                    # subscriptions — on the first connect after the morning
-                    # login and on every mid-day reconnect. The user_id/broker
-                    # come straight from the proxy's auth-success payload. Fire
-                    # via the import-light registry module (no heavy DB imports;
-                    # also avoids a circular import with websocket_service).
-                    try:
-                        from services.ws_connect_callbacks import _fire_connect_callbacks
-
-                        _fire_connect_callbacks(
-                            data.get("user_id"), data.get("broker")
-                        )
-                    except Exception as cb_err:
-                        logger.exception(
-                            f"Error firing WS connect callbacks: {cb_err}"
-                        )
                 else:
                     logger.error(f"Authentication failed: {data.get('message')}")
 

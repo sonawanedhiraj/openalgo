@@ -5,21 +5,12 @@ without dealing with authentication or connection management.
 """
 
 import os
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from database.auth_db import get_auth_token, get_broker_name, verify_api_key
 from utils.logging import get_logger
 
 from .websocket_client import WebSocketClient, get_websocket_client
-
-# Connect-callback registry lives in its own import-light module (no DB/broker
-# imports) so it can be unit-tested without standing up the platform. Re-export
-# the public names here for callers that import them from this module.
-from .ws_connect_callbacks import (  # noqa: F401
-    _fire_connect_callbacks,
-    register_connect_callback,
-    unregister_connect_callback,
-)
 
 # Initialize logger
 logger = get_logger(__name__)
