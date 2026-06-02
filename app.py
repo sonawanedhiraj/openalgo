@@ -687,6 +687,70 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
 
+            # Event-driven broker-WebSocket pre-subscribe wiring shared by the
+            # scanner and the regime classifier. Replaces the old one-shot 30s
+            # boot poll (which lost the race against the morning Zerodha login,
+            # leaving the scanner with only engine-armed symbols). See
+            # services/scanner_presubscribe.py for the full rationale.
+            def _wire_pre_subscribe(callback_name, pre_subscriber, syms, *, thread_name):
+                import threading as _t
+                import time as _time
+
+                from database.auth_db import (
+                    get_broker_name,
+                    get_first_available_api_key,
+                    verify_api_key,
+                )
+                from services.websocket_service import (
+                    get_websocket_connection,
+                    register_connect_callback,
+                )
+
+                # Fire on every broker WS connect+auth — the first connect after
+                # the morning login and every mid-day reconnect. reset=True
+                # re-subscribes the full list, since a reconnect drops the
+                # broker-side subscriptions.
+                register_connect_callback(
+                    callback_name,
+                    lambda uid, brk: pre_subscriber.ensure(uid, brk, syms, reset=True),
+                )
+
+                # Boot retry: poke the connection until the broker WS is up
+                # (covers the case where the operator logs in AFTER boot), then
+                # do the initial subscribe. The connect callback covers all
+                # later (re)connects, so this thread exits once the WS is up.
+                def _establish():
+                    api_key = get_first_available_api_key()
+                    user_id = verify_api_key(api_key) if api_key else None
+                    if not user_id:
+                        logger.warning(
+                            "%s: no API key configured at boot; connect callback "
+                            "remains armed for when a session appears",
+                            callback_name,
+                        )
+                        return
+                    broker = get_broker_name(api_key) or ""
+                    interval = int(os.environ.get("PRESUBSCRIBE_RETRY_SEC", "15"))
+                    max_wait = int(os.environ.get("PRESUBSCRIBE_MAX_WAIT_SEC", "7200"))
+                    deadline = _time.time() + max_wait
+                    while _time.time() < deadline:
+                        if get_websocket_connection(user_id)[0]:
+                            pre_subscriber.ensure(user_id, broker, syms)
+                            logger.info(
+                                "%s: broker WS up — initial subscribe done",
+                                callback_name,
+                            )
+                            return
+                        _time.sleep(interval)
+                    logger.warning(
+                        "%s: broker WS not up after %ds at boot; connect callback "
+                        "remains armed for the next connect",
+                        callback_name,
+                        max_wait,
+                    )
+
+                _t.Thread(target=_establish, daemon=True, name=thread_name).start()
+
             # Scanner service (Stage 1.5 item 5) — gated by SCANNER_ENABLED.
             # Off by default. When enabled, it subscribes to the ZMQ tick bus
             # and evaluates registered scan rules against incoming bars; it
@@ -718,44 +782,24 @@ def setup_environment(app):
                     )
 
                     # Pre-subscribe scanner symbols to the broker WebSocket so
-                    # ticks flow without waiting for a Chartink hit. Daemon
-                    # thread polls until WS is ready (up to 30s).
-                    def _pre_subscribe_scanner_symbols(syms):
-                        import time as _time
-                        from database.auth_db import (
-                            get_broker_name, get_first_available_api_key, verify_api_key,
-                        )
-                        from services.websocket_service import (
-                            get_websocket_connection, subscribe_to_symbols,
-                        )
-                        api_key = get_first_available_api_key()
-                        user_id = verify_api_key(api_key) if api_key else None
-                        if not user_id:
-                            logger.warning("Scanner pre-subscribe skipped: no active broker session")
-                            return
-                        broker = get_broker_name(api_key) or ""
-                        exchange = os.environ.get("SCANNER_EXCHANGE", "NSE").upper()
-                        deadline = _time.time() + 30
-                        while _time.time() < deadline and not get_websocket_connection(user_id)[0]:
-                            _time.sleep(1)
-                        if not get_websocket_connection(user_id)[0]:
-                            logger.warning("Scanner pre-subscribe: broker WS not ready after 30s")
-                            return
-                        succeeded = 0
-                        for s in syms:
-                            try:
-                                ok, resp, _ = subscribe_to_symbols(
-                                    user_id, broker, [{"exchange": exchange, "symbol": s}], mode="Quote",
-                                )
-                                if ok: succeeded += 1
-                                else: logger.warning("Scanner symbol pre-subscribe failed for %s: %s", s, resp)
-                            except Exception as _e:
-                                logger.warning("Scanner symbol pre-subscribe failed for %s: %s", s, _e)
-                        logger.info("Scanner pre-subscribed %d/%d symbols to broker WebSocket", succeeded, len(syms))
+                    # ticks flow from market open without waiting for a Chartink
+                    # hit. Event-driven (see services/scanner_presubscribe.py):
+                    # a connect callback re-subscribes the full universe every
+                    # time the broker WS comes up — the first connect after the
+                    # morning Zerodha login and every mid-day reconnect — and a
+                    # short boot retry establishes the initial connection. The
+                    # 5 index symbols mixed into SCANNER_SYMBOLS (NIFTY,
+                    # BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50) are routed to
+                    # NSE_INDEX automatically by the subscriber.
                     if symbols:
-                        import threading as _t
-                        _t.Thread(target=_pre_subscribe_scanner_symbols, args=(list(symbols),),
-                                  daemon=True, name="ScannerPreSubscribe").start()
+                        from services.scanner_presubscribe import scanner_pre_subscriber
+
+                        _wire_pre_subscribe(
+                            "scanner_pre_subscribe",
+                            scanner_pre_subscriber,
+                            list(symbols),
+                            thread_name="ScannerPreSubscribe",
+                        )
                 else:
                     logger.debug("Scanner service disabled (SCANNER_ENABLED!=true)")
             except Exception as e:
@@ -764,10 +808,12 @@ def setup_environment(app):
             # Stage 1.7 regime classifier — pre-subscribe NIFTY sector
             # indices on NSE_INDEX so the sector-rotation classifier has
             # live quotes (rather than falling back to historify EOD
-            # close-to-close). Mirrors the scanner pre-subscribe pattern:
-            # daemon thread polls until WS is ready (up to 30s) then
-            # subscribes one by one in Quote mode. Failures are warnings
-            # only — the classifier degrades gracefully.
+            # close-to-close). Event-driven, same mechanism as the scanner
+            # pre-subscribe above: a connect callback re-subscribes on every
+            # broker WS connect+auth, with a short boot retry to establish the
+            # initial connection. All REGIME_SECTOR_SYMBOLS are indices, so the
+            # regime subscriber forces NSE_INDEX. Failures are warnings only —
+            # the classifier degrades gracefully to historify EOD data.
             try:
                 raw_sector_symbols = os.environ.get(
                     "REGIME_SECTOR_SYMBOLS", ""
@@ -778,59 +824,14 @@ def setup_environment(app):
                     if s.strip()
                 ]
                 if sector_symbols:
-                    def _pre_subscribe_regime_sectors(syms):
-                        import time as _time
-                        from database.auth_db import (
-                            get_broker_name, get_first_available_api_key, verify_api_key,
-                        )
-                        from services.websocket_service import (
-                            get_websocket_connection, subscribe_to_symbols,
-                        )
-                        api_key = get_first_available_api_key()
-                        user_id = verify_api_key(api_key) if api_key else None
-                        if not user_id:
-                            logger.warning(
-                                "Regime sector pre-subscribe skipped: no active broker session"
-                            )
-                            return
-                        broker = get_broker_name(api_key) or ""
-                        deadline = _time.time() + 30
-                        while _time.time() < deadline and not get_websocket_connection(user_id)[0]:
-                            _time.sleep(1)
-                        if not get_websocket_connection(user_id)[0]:
-                            logger.warning(
-                                "Regime sector pre-subscribe: broker WS not ready after 30s"
-                            )
-                            return
-                        succeeded = 0
-                        for s in syms:
-                            try:
-                                ok, resp, _ = subscribe_to_symbols(
-                                    user_id, broker,
-                                    [{"exchange": "NSE_INDEX", "symbol": s}],
-                                    mode="Quote",
-                                )
-                                if ok:
-                                    succeeded += 1
-                                else:
-                                    logger.warning(
-                                        "Regime sector pre-subscribe failed for %s: %s", s, resp
-                                    )
-                            except Exception as _e:
-                                logger.warning(
-                                    "Regime sector pre-subscribe failed for %s: %s", s, _e
-                                )
-                        logger.info(
-                            "Regime pre-subscribed %d/%d sector indices to broker WebSocket",
-                            succeeded, len(syms),
-                        )
-                    import threading as _t
-                    _t.Thread(
-                        target=_pre_subscribe_regime_sectors,
-                        args=(list(sector_symbols),),
-                        daemon=True,
-                        name="RegimeSectorPreSubscribe",
-                    ).start()
+                    from services.scanner_presubscribe import regime_pre_subscriber
+
+                    _wire_pre_subscribe(
+                        "regime_pre_subscribe",
+                        regime_pre_subscriber,
+                        list(sector_symbols),
+                        thread_name="RegimeSectorPreSubscribe",
+                    )
                 else:
                     logger.debug(
                         "Regime sector pre-subscribe skipped (REGIME_SECTOR_SYMBOLS empty)"
