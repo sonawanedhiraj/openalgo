@@ -1,3 +1,32 @@
+# === Live-DB isolation: rebind trade_journal_db BEFORE any import that may
+# reach it. The _place_entry_order tests below drive the real engine entry
+# path, which calls services.trade_journal_service.record_entry ->
+# database.trade_journal_db. Without this, every entry test writes a fake open
+# RELIANCE/INFY row (order ids like 'sbx-abc', 'live-1') into the operator's
+# real db/openalgo.db trade_journal, and the resulting record_entry warnings
+# spam errors.jsonl and trip the preflight recent_errors gate.
+#
+# We surgically rebind ONLY trade_journal_db to a shared default-pool in-memory
+# engine whose connection persists (the module engine uses NullPool, which
+# drops :memory: tables between operations). We do NOT set DATABASE_URL to
+# :memory: globally: the engine also makes read-only calls (e.g.
+# settings_db.get_analyze_mode) that need the live tables to exist, and reads
+# never pollute. trade_journal.record_entry resolves the module-level session
+# lazily on each call, so this rebind is what the write path sees.
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker
+
+import database.trade_journal_db as _tjdb
+
+_journal_engine = create_engine("sqlite:///:memory:")
+_journal_session = scoped_session(
+    sessionmaker(autocommit=False, autoflush=False, bind=_journal_engine)
+)
+_tjdb.engine = _journal_engine
+_tjdb.db_session = _journal_session
+_tjdb.Base.query = _journal_session.query_property()
+_tjdb.Base.metadata.create_all(_journal_engine)
+
 import datetime as dt
 from unittest.mock import patch
 

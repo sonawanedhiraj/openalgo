@@ -21,6 +21,29 @@ from this engine.
 
 from __future__ import annotations
 
+# === Live-DB isolation: rebind trade_journal_db to an in-memory engine.
+# Every test here installs a journal stub, so the engine's record_entry calls
+# normally never reach the DB. This block is defense-in-depth: it guarantees
+# that even an unstubbed path cannot write into the operator's real
+# db/openalgo.db trade_journal. We surgically rebind ONLY trade_journal_db (the
+# write path); DATABASE_URL is left on the live DB so the engine's read-only
+# calls keep working, and reads never pollute. The module engine uses NullPool,
+# which drops :memory: tables between operations, so we bind to a private
+# default-pool engine whose single connection persists the schema.
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker
+
+import database.trade_journal_db as _tjdb
+
+_journal_engine = create_engine("sqlite:///:memory:")
+_journal_session = scoped_session(
+    sessionmaker(autocommit=False, autoflush=False, bind=_journal_engine)
+)
+_tjdb.engine = _journal_engine
+_tjdb.db_session = _journal_session
+_tjdb.Base.query = _journal_session.query_property()
+_tjdb.Base.metadata.create_all(_journal_engine)
+
 import datetime as dt
 import sys
 
