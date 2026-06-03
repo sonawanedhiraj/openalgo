@@ -249,6 +249,151 @@ def test_publish_preflight_abort_lists_reasons(monkeypatch):
     assert "daily_intent is skip" in body
 
 
+# ---------------------------------------------------------------------------
+# Preflight-abort alert de-duplication (2026-06-03 incident: a 14s DNS blip
+# produced 14 identical "🛑 Preflight aborted" alerts).
+# ---------------------------------------------------------------------------
+
+
+def _clock(monkeypatch, start: float = 1000.0):
+    """Install a controllable monotonic clock; returns an advance() callable."""
+    import services.notification_service as ns
+
+    state = {"t": start}
+    monkeypatch.setattr(ns.time, "monotonic", lambda: state["t"])
+
+    def advance(seconds: float) -> None:
+        state["t"] += seconds
+
+    return advance
+
+
+def test_preflight_abort_burst_collapses_to_single_alert(monkeypatch):
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    _clock(monkeypatch)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    # Five rapid aborts with the SAME reason set, no time passing.
+    for _ in range(5):
+        svc.publish_preflight_abort(["3 errors in last hour"])
+
+    assert len(bot.sent) == 1  # only the first fires; the rest are suppressed
+    assert "Preflight aborted" in bot.sent[0][0]
+
+
+def test_preflight_abort_sliding_count_is_same_signature(monkeypatch):
+    """The rolling-hour count drifts each slot — must NOT re-alert."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    advance = _clock(monkeypatch)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.publish_preflight_abort(["14 errors in last hour"])
+    advance(60)
+    svc.publish_preflight_abort(["13 errors in last hour"])
+    advance(60)
+    svc.publish_preflight_abort(["12 errors in last hour"])
+
+    assert len(bot.sent) == 1  # digit-normalized signature is identical
+
+
+def test_preflight_abort_cooldown_expiry_re_alerts(monkeypatch):
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    advance = _clock(monkeypatch)
+    svc = _fresh_service(
+        monkeypatch,
+        NOTIFY_TELEGRAM_ENABLED="true",
+        NOTIFY_PREFLIGHT_ABORT_COOLDOWN_SEC="900",
+    )
+
+    svc.publish_preflight_abort(["3 errors in last hour"])
+    advance(600)  # inside cooldown
+    svc.publish_preflight_abort(["3 errors in last hour"])
+    assert len(bot.sent) == 1
+
+    advance(400)  # now 1000s total > 900s cooldown
+    svc.publish_preflight_abort(["3 errors in last hour"])
+    assert len(bot.sent) == 2  # cooldown reminder fires
+
+
+def test_preflight_abort_new_signature_bypasses_cooldown(monkeypatch):
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    advance = _clock(monkeypatch)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.publish_preflight_abort(["3 errors in last hour"])
+    advance(5)  # well inside cooldown
+    # A genuinely different failure joins — must alert immediately.
+    svc.publish_preflight_abort(
+        ["3 errors in last hour", "no active broker session"]
+    )
+
+    assert len(bot.sent) == 2
+    assert "broker session" in bot.sent[1][0]
+
+
+def test_preflight_clear_emits_once_after_abort(monkeypatch):
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    advance = _clock(monkeypatch)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.publish_preflight_abort(["3 errors in last hour"])
+    advance(300)  # 5 minutes of aborts
+    svc.publish_preflight_clear()
+    svc.publish_preflight_clear()  # second healthy slot — no duplicate clear
+
+    assert len(bot.sent) == 2  # one abort + one clear
+    clear_body = bot.sent[1][0]
+    assert "Preflight cleared" in clear_body
+    assert "5 min" in clear_body
+
+
+def test_preflight_clear_without_prior_abort_is_noop(monkeypatch):
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    _clock(monkeypatch)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.publish_preflight_clear()
+
+    assert bot.sent == []
+
+
+def test_preflight_abort_re_alerts_after_recovery_cycle(monkeypatch):
+    """abort → clear → abort: the post-recovery abort is a fresh episode."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    advance = _clock(monkeypatch)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.publish_preflight_abort(["3 errors in last hour"])
+    advance(60)
+    svc.publish_preflight_clear()
+    advance(60)
+    svc.publish_preflight_abort(["3 errors in last hour"])  # same reason, new episode
+
+    assert len(bot.sent) == 3  # abort, clear, abort — clear reset the signature
+
+
+def test_preflight_abort_fresh_instance_resets_dedup(monkeypatch):
+    """A process restart (fresh singleton) must alert again immediately."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    _clock(monkeypatch)
+
+    svc1 = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+    svc1.publish_preflight_abort(["3 errors in last hour"])
+
+    svc2 = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+    svc2.publish_preflight_abort(["3 errors in last hour"])
+
+    assert len(bot.sent) == 2  # each fresh instance fires once
+
+
 def test_publish_anomaly_includes_severity_prefix(monkeypatch):
     bot = _RecordingBot(is_running=True)
     _install_fake_bot(monkeypatch, bot)
