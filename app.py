@@ -1268,4 +1268,4 @@ if __name__ == "__main__":
             f"{C}{BL}{H*(_W-2)}{BR}{R}", "",
         ]), flush=True)
 
-    socketio.run(app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options)
+    socketio.run(app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options, allow_unsafe_werkzeug=True)
