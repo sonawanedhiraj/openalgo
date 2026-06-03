@@ -506,7 +506,7 @@ def _write_preflight_heartbeat(status: str, detail: Any) -> None:
         scdb.db_session.add(row)
         scdb.db_session.commit()
     except Exception as e:
-        logger.warning("preflight: heartbeat write failed: %s", e)
+        logger.exception("preflight: heartbeat write failed: %s", e)
         try:
             scdb.db_session.rollback()
         except Exception:

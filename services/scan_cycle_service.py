@@ -97,7 +97,7 @@ def heartbeat(
         sess.add(row)
         sess.commit()
     except Exception as e:
-        logger.warning(
+        logger.exception(
             "scan_cycle.heartbeat audit write failed (cycle=%s stage=%s): %s",
             cycle_id, stage, e,
         )

@@ -1063,6 +1063,12 @@ def setup_environment(app):
     threading.Thread(target=_init_databases_and_schedulers, daemon=True).start()
 
 
+# Refuse to boot a second concurrent instance before any Flask init — two
+# writers on the SQLite DBs corrupt them. See utils/singleton_guard.py.
+from utils.singleton_guard import check_singleton_or_abort as _check_singleton_or_abort
+
+_check_singleton_or_abort()
+
 app = create_app()
 
 # Explicitly call the setup environment function
