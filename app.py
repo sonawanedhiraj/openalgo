@@ -800,6 +800,32 @@ def setup_environment(app):
                             list(symbols),
                             thread_name="ScannerPreSubscribe",
                         )
+
+                    # Scanner WS liveness watchdog — recovers a stalled tick
+                    # stream (open socket, silent feed) during market hours via
+                    # soft (ws.close → reconnect) then hard (client re-init)
+                    # recovery. See services/scanner_ws_watchdog.py.
+                    if os.environ.get("SCANNER_WS_WATCHDOG_ENABLED", "true").lower() == "true":
+                        try:
+                            from database.auth_db import (
+                                get_first_available_api_key,
+                                verify_api_key,
+                            )
+                            from services.scanner_ws_watchdog import (
+                                start_scanner_ws_watchdog,
+                            )
+
+                            _wd_key = get_first_available_api_key()
+                            _wd_user = verify_api_key(_wd_key) if _wd_key else None
+                            if _wd_user:
+                                start_scanner_ws_watchdog(_wd_user, app=app)
+                            else:
+                                logger.warning(
+                                    "Scanner WS watchdog: no API key at boot; not "
+                                    "started (no session to monitor)"
+                                )
+                        except Exception as e:
+                            logger.error("Failed to start scanner WS watchdog: %s", e)
                 else:
                     logger.debug("Scanner service disabled (SCANNER_ENABLED!=true)")
             except Exception as e:
