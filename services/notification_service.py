@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import time
 from typing import Any, Mapping
 
 from utils.logging import get_logger
@@ -60,6 +62,29 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+def _env_int(name: str, *, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+# Collapse runs of digits to a single '#' so reasons whose only difference is
+# a sliding counter — e.g. "14 errors in last hour" vs "13 errors in last hour"
+# as the rolling-hour window drains — hash to the SAME preflight-abort
+# signature and don't each trigger a fresh alert. (2026-06-03 incident.)
+_DIGIT_RUN = re.compile(r"\d+")
+
+
+def _preflight_abort_signature(reasons: list[str] | None) -> str:
+    """Order-independent, count-insensitive signature of an abort reason set."""
+    normalized = sorted(_DIGIT_RUN.sub("#", r or "").strip() for r in (reasons or []))
+    return "\n".join(normalized)
 
 
 def _fmt_rupees(amount: float | None) -> str:
@@ -113,6 +138,18 @@ class NotificationService:
             # actual block) before flipping VETO_LAYER_MODE=active.
             "veto_decision": _env_bool("NOTIFY_VETO_ALERTS", default=True),
         }
+        # Preflight-abort alert de-duplication state (2026-06-03 incident: a
+        # 14s DNS blip produced 14 identical "🛑 Preflight aborted" alerts as
+        # every scan slot re-tripped the same rolling-hour error gate). All
+        # times are from time.monotonic() — immune to wall-clock skew/NTP
+        # jumps; reset to None on process restart (a fresh alert after a
+        # restart is desirable, not spam).
+        self._pf_abort_cooldown_sec: int = _env_int(
+            "NOTIFY_PREFLIGHT_ABORT_COOLDOWN_SEC", default=900
+        )
+        self._pf_last_signature: str | None = None
+        self._pf_last_alert_at: float | None = None
+        self._pf_episode_start: float | None = None
 
     # ------------------------------------------------------------------
     # Core publish — fail-safe, no exceptions ever bubble out.
@@ -194,7 +231,41 @@ class NotificationService:
             logger.warning("publish_cycle_summary failed: %s", e)
 
     def publish_preflight_abort(self, reasons: list[str]) -> None:
+        """Alert the operator that preflight aborted — de-duplicated.
+
+        While the same failure condition persists, repeated aborts (one per
+        scan slot) collapse to a single alert plus periodic cooldown reminders
+        instead of a flood. A genuinely *different* reason set (new signature)
+        re-alerts immediately so a newly-appeared failure is never masked. See
+        the 2026-06-03 incident write-up.
+        """
         try:
+            now = time.monotonic()
+            signature = _preflight_abort_signature(reasons)
+
+            if self._pf_episode_start is None:
+                # First abort after a healthy stretch (or after restart).
+                self._pf_episode_start = now
+
+            new_condition = signature != self._pf_last_signature
+            cooldown_elapsed = (
+                self._pf_last_alert_at is None
+                or (now - self._pf_last_alert_at) >= self._pf_abort_cooldown_sec
+            )
+
+            if not new_condition and not cooldown_elapsed:
+                # Same failure, still inside cooldown — suppress this alert.
+                logger.debug(
+                    "publish_preflight_abort: suppressed duplicate "
+                    "(signature unchanged, %ds into %ds cooldown)",
+                    int(now - (self._pf_last_alert_at or now)),
+                    self._pf_abort_cooldown_sec,
+                )
+                return
+
+            self._pf_last_signature = signature
+            self._pf_last_alert_at = now
+
             if not reasons:
                 bullet_block = "_no reasons given_"
             else:
@@ -203,6 +274,30 @@ class NotificationService:
             self.notify("preflight_abort", text, reason_count=len(reasons))
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_preflight_abort failed: %s", e)
+
+    def publish_preflight_clear(self) -> None:
+        """Alert the operator that preflight recovered — only after an abort.
+
+        No-op unless a prior abort episode is active. Called on every healthy
+        preflight; emits exactly one "✅ Preflight cleared" per failing→healthy
+        transition, then resets the de-dup state so the next abort alerts fresh.
+        """
+        try:
+            if self._pf_episode_start is None:
+                return  # never aborted — nothing to clear.
+
+            elapsed_min = max(0, int((time.monotonic() - self._pf_episode_start) // 60))
+            self._pf_episode_start = None
+            self._pf_last_signature = None
+            self._pf_last_alert_at = None
+
+            text = (
+                "✅ *Preflight cleared*\n"
+                f"Recovered after ~{elapsed_min} min of aborts."
+            )
+            self.notify("preflight_abort", text, recovered=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("publish_preflight_clear failed: %s", e)
 
     def publish_trade_opened(
         self,
