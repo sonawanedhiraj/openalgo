@@ -317,3 +317,18 @@ def test_alignment_postclose_uses_minus1(monkeypatch):
     ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
     _freeze(monkeypatch, 16, 0)
     assert rule(None, ind) is False
+
+
+# --------------------------------------------------------------------------- #
+# Env-var threshold override (CHARTINK_RULE_BUY_GAP_PCT, read at call time)
+# --------------------------------------------------------------------------- #
+def test_env_override_lowers_buy_gap(monkeypatch):
+    # ~2% gap-up (yest 2040 → today 2080): fails the default 3% gate-1, but passes
+    # once the env lowers the threshold to 1.5%. The read is inside rule(), so no
+    # restart is needed for the change to take effect.
+    daily = make_daily_bars(flat_close=2040.0, today_close=2080.0, today_open=2060.0)
+    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
+    monkeypatch.setenv("CHARTINK_RULE_BUY_GAP_PCT", "3.0")  # pin default vs ambient .env
+    assert rule(None, ind) is False
+    monkeypatch.setenv("CHARTINK_RULE_BUY_GAP_PCT", "1.5")
+    assert rule(None, ind) is True
