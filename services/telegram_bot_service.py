@@ -2549,15 +2549,31 @@ class TelegramBotService:
             try:
                 await bot.send_message(chat_id=telegram_id, text=message, parse_mode="Markdown")
             except telegram.error.BadRequest as e:
-                # Malformed Markdown (unbalanced *, _, `, [ etc.) — retry as plain text
-                # so the recipient still gets the message instead of nothing.
-                if "parse entities" in str(e).lower():
+                err_text = str(e).lower()
+                if "parse entities" in err_text:
+                    # Malformed Markdown (unbalanced *, _, `, [ etc.) — retry as plain text
+                    # so the recipient still gets the message instead of nothing.
                     logger.warning(
                         f"Markdown parse failed for {telegram_id}, sending as plain text: {e}"
                     )
                     await bot.send_message(chat_id=telegram_id, text=message)
+                elif "chat not found" in err_text:
+                    # Stale/placeholder chat_id (user never started the bot, chat
+                    # deleted, etc.). Soft-delete so we stop retrying every call.
+                    logger.warning(
+                        f"Telegram chat {telegram_id} not found; deactivating registration"
+                    )
+                    delete_telegram_user(telegram_id)
+                    return False
                 else:
                     raise
+            except telegram.error.Forbidden as e:
+                # User blocked the bot or chat was deactivated — same treatment.
+                logger.warning(
+                    f"Telegram chat {telegram_id} forbidden ({e}); deactivating registration"
+                )
+                delete_telegram_user(telegram_id)
+                return False
             logger.debug(f"Notification sent to telegram_id: {telegram_id}")
             return True
         except Exception as e:
@@ -2605,16 +2621,37 @@ class TelegramBotService:
                                 chat_id=telegram_id, text=message, parse_mode="Markdown"
                             )
                         except telegram.error.BadRequest as e:
-                            # Malformed Markdown — retry as plain text so the
-                            # recipient still gets the message.
-                            if "parse entities" in str(e).lower():
+                            err_text = str(e).lower()
+                            if "parse entities" in err_text:
+                                # Malformed Markdown — retry as plain text so the
+                                # recipient still gets the message.
                                 logger.warning(
                                     f"Markdown parse failed for {telegram_id}, "
                                     f"sending as plain text: {e}"
                                 )
                                 await bot.send_message(chat_id=telegram_id, text=message)
+                            elif "chat not found" in err_text:
+                                # Stale/placeholder chat_id (e.g. 123456789). Soft-
+                                # delete so we stop spamming errors.jsonl every
+                                # preflight/engine POST.
+                                logger.warning(
+                                    f"Telegram chat {telegram_id} not found; "
+                                    "deactivating registration"
+                                )
+                                delete_telegram_user(telegram_id)
+                                fail_count += 1
+                                continue
                             else:
                                 raise
+                        except telegram.error.Forbidden as e:
+                            # User blocked the bot or chat was deactivated.
+                            logger.warning(
+                                f"Telegram chat {telegram_id} forbidden ({e}); "
+                                "deactivating registration"
+                            )
+                            delete_telegram_user(telegram_id)
+                            fail_count += 1
+                            continue
                         success_count += 1
                         # Add small delay to avoid rate limits
                         await asyncio.sleep(0.1)
