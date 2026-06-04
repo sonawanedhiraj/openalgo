@@ -1038,19 +1038,30 @@ def simplified_stock_engine_webhook(webhook_id):
 
         scan_cycle_service.heartbeat(cycle_id, "preflight", "ok")
 
+        # The fno-scan-cycle scheduler POSTs both the BUY and SELL legs to this
+        # same webhook URL, distinguished only by the payload's scan_name
+        # (e.g. 'BUY FnO Intraday Buy 20' vs 'SELL FnO Intraday Sell'). Inspect
+        # it so the audit attributes symbols to the correct direction column.
+        # Default to BUY when scan_name is absent (backward compat with older
+        # scans that omit it). Engine processing is unaffected by this — the
+        # engine derives direction from its own logic.
+        scan_name = (data.get("scan_name") or "").strip()
+        is_sell_leg = "SELL" in scan_name.upper().split()
+        scan_stage = "scan_sell" if is_sell_leg else "scan_buy"
+
         # Parse symbols up-front for the audit. parse_chartink_symbols is the
         # same normaliser the engine service uses, so the audit reflects what
         # the engine will see — not the raw payload.
-        scan_cycle_service.heartbeat(cycle_id, "scan_buy", "started")
+        scan_cycle_service.heartbeat(cycle_id, scan_stage, "started")
         try:
             from services.simplified_stock_engine_service import parse_chartink_symbols
 
-            buy_syms = parse_chartink_symbols(data) or []
+            syms = parse_chartink_symbols(data) or []
         except Exception as e:
-            logger.warning("scan_buy parse failed (non-fatal): %s", e)
-            buy_syms = []
+            logger.warning("%s parse failed (non-fatal): %s", scan_stage, e)
+            syms = []
         scan_cycle_service.heartbeat(
-            cycle_id, "scan_buy", "ok", f"{len(buy_syms)} syms"
+            cycle_id, scan_stage, "ok", f"{len(syms)} syms"
         )
 
         # Capture today's effective mode for the audit. Best-effort — if the
@@ -1094,7 +1105,8 @@ def simplified_stock_engine_webhook(webhook_id):
         scan_cycle_service.complete_cycle(
             cycle_id,
             post_status=post_status,
-            screener_buy=buy_syms,
+            screener_buy=[] if is_sell_leg else syms,
+            screener_sell=syms if is_sell_leg else [],
             engine_response=result,
             effective_mode=effective_mode,
         )
