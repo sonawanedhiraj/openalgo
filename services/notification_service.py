@@ -37,6 +37,16 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Operator-facing triage icons keyed by scan-cycle post_status. Distinct glyphs
+# let the operator distinguish a clean cycle from an empty/aborted/failed one at
+# a glance. Unknown statuses fall back to the neutral cycle icon.
+_CYCLE_ICONS = {
+    "ok": "🔁",
+    "empty": "📭",
+    "aborted_preflight": "🛑",
+    "error": "❌",
+}
+
 
 _EVENT_TYPES = (
     "cycle_summary",
@@ -217,8 +227,9 @@ class NotificationService:
         post_status: str,
     ) -> None:
         try:
+            icon = _CYCLE_ICONS.get(post_status, "🔁")
             text = (
-                "🔁 *Scan cycle*\n"
+                f"{icon} *Scan cycle*\n"
                 f"├ Kind: `{cycle_kind}`\n"
                 f"├ Mode: `{effective_mode}`\n"
                 f"├ Status: `{post_status}`\n"

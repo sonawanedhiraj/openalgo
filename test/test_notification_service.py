@@ -197,6 +197,29 @@ def test_publish_cycle_summary_formats_message(monkeypatch):
     assert "sandbox" in body
     assert "ok" in body
     assert "3" in body and "1" in body
+    assert body.startswith("🔁")
+
+
+def test_publish_cycle_summary_icon_per_status(monkeypatch):
+    expected = {
+        "ok": "🔁",
+        "empty": "📭",
+        "aborted_preflight": "🛑",
+        "error": "❌",
+        "something_unexpected": "🔁",  # fallback
+    }
+    for status, icon in expected.items():
+        bot = _RecordingBot(is_running=True)
+        _install_fake_bot(monkeypatch, bot)
+        svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+        svc.publish_cycle_summary(
+            cycle_kind="chartink",
+            buy_count=0,
+            sell_count=0,
+            effective_mode="sandbox",
+            post_status=status,
+        )
+        assert bot.sent[0][0].startswith(icon), status
 
 
 def test_publish_trade_closed_formats_pnl_with_sign(monkeypatch):
