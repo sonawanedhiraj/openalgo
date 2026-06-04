@@ -157,6 +157,18 @@ def _make_service(mode: str) -> SimplifiedStockEngineService:
     return SimplifiedStockEngineService(config=config)
 
 
+def test_process_chartink_webhook_empty_returns_empty_status():
+    """Zero-stock screener result is 'empty', not 'error' (reserve error for failures)."""
+    service = _make_service(MODE_SANDBOX)
+    result = service.process_chartink_webhook(
+        user_id="test_user",
+        strategy_name="chartink_FnO_intraday_buy",
+        payload={"stocks": ""},
+    )
+    assert result["status"] == "empty"
+    assert result["message"] == "No symbols found"
+
+
 def test_resolve_mode_from_env_explicit_mode(monkeypatch):
     monkeypatch.setenv("SIMPLIFIED_ENGINE_MODE", "live")
     monkeypatch.delenv("SIMPLIFIED_ENGINE_DRY_RUN", raising=False)

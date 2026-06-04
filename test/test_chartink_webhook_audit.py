@@ -92,6 +92,13 @@ class _FakeEngineService:
         }
 
 
+class _EmptyEngineService:
+    """Mimics the engine when Chartink returns zero stocks."""
+
+    def process_chartink_webhook(self, user_id, strategy_name, payload):
+        return {"status": "empty", "message": "No symbols found", "processed": []}
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -146,6 +153,37 @@ def test_webhook_records_cycle_and_heartbeats(app_with_chartink, fresh_cycle_db,
     assert "preflight" in stages
     assert "scan_buy" in stages
     assert "post" in stages
+
+
+def test_webhook_empty_scan_records_empty(app_with_chartink, fresh_cycle_db, monkeypatch):
+    """Zero-stock screener result audits as 'empty' (200), not 'error'."""
+    from blueprints import chartink as chartink_module
+
+    monkeypatch.setattr(chartink_module, "get_strategy_by_webhook_id", lambda _id: _fake_strategy())
+    monkeypatch.setattr(
+        "services.simplified_stock_engine_service.get_simplified_stock_engine_service",
+        lambda: _EmptyEngineService(),
+    )
+
+    client = app_with_chartink.test_client()
+    resp = client.post(
+        "/chartink/simplified-stock-engine/test-webhook-id",
+        data=json.dumps({"stocks": ""}),
+        content_type="application/json",
+    )
+
+    assert resp.status_code == 200, resp.data
+    assert json.loads(resp.data)["status"] == "empty"
+
+    cycle = (
+        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
+        .filter_by(cycle_kind="chartink")
+        .first()
+    )
+    assert cycle is not None
+    assert cycle.post_status == "empty"
+    assert cycle.completed_at is not None
+    assert json.loads(cycle.engine_response)["status"] == "empty"
 
 
 def test_webhook_unknown_id_still_audits(app_with_chartink, fresh_cycle_db, monkeypatch):

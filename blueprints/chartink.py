@@ -1076,16 +1076,24 @@ def simplified_stock_engine_webhook(webhook_id):
             payload=data,
         )
 
-        status_code = 200 if result.get("status") in {"success", "ignored"} else 400
+        engine_status = result.get("status")
+        status_code = 200 if engine_status in {"success", "ignored", "empty"} else 400
+        # Distinguish "scan ran, no matches" (empty) from real failures (error)
+        if engine_status == "empty":
+            post_status = "empty"
+        elif status_code == 200:
+            post_status = "ok"
+        else:
+            post_status = "error"
         scan_cycle_service.heartbeat(
             cycle_id,
             "post",
-            "ok" if status_code == 200 else "error",
-            f"engine status={result.get('status')}",
+            post_status,
+            f"engine status={engine_status}",
         )
         scan_cycle_service.complete_cycle(
             cycle_id,
-            post_status="ok" if status_code == 200 else "error",
+            post_status=post_status,
             screener_buy=buy_syms,
             engine_response=result,
             effective_mode=effective_mode,
