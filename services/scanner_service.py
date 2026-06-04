@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import threading
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -40,7 +41,7 @@ from database.scanner_db import (
     _result_to_dict,
 )
 from services import indicators as _indicators
-from services.bar_aggregator import MultiIntervalAggregator
+from services.bar_aggregator import BarBuilder, MultiIntervalAggregator
 from utils.event_bus import Event
 from utils.event_bus import bus as _default_bus
 from utils.logging import get_logger
@@ -427,6 +428,47 @@ def _normalize_tick(market_data: dict[str, Any]) -> dict[str, Any] | None:
     return {"price": price, "cumulative_volume": cum_volume, "ts": ts}
 
 
+class _Rolling15mBars:
+    """Per-symbol 15-minute bar accumulator backed by a ``BarBuilder``.
+
+    ``BarBuilder`` (in ``services.bar_aggregator``) is single-symbol /
+    single-interval and only fires a callback per tick — it keeps no
+    history. We wrap one here, capture each *closed* 15m bar (elapsed_pct
+    >= 1.0) into a ``deque`` capped at ``maxlen`` rows (~50 is enough for
+    RSI(14) warm-up plus buffer), and expose ``get_recent_bars(n)`` for
+    rule evaluation. Memory is bounded by the deque maxlen, per symbol.
+    """
+
+    def __init__(self, symbol: str, maxlen: int = 50) -> None:
+        self.symbol = symbol
+        self._closed: deque[dict[str, Any]] = deque(maxlen=maxlen)
+        self._builder = BarBuilder(symbol, "15m", on_bar=self._on_bar)
+
+    def _on_bar(self, bar: dict[str, Any]) -> None:
+        if bar.get("elapsed_pct", 0.0) >= 1.0:
+            self._closed.append({
+                "ts": bar.get("ts"),
+                "open": bar.get("open"),
+                "high": bar.get("high"),
+                "low": bar.get("low"),
+                "close": bar.get("close"),
+                "volume": bar.get("volume"),
+            })
+
+    def on_tick(self, tick: dict[str, Any]) -> None:
+        self._builder.on_tick(tick)
+
+    def get_recent_bars(self, n: int = 50) -> pd.DataFrame:
+        """Return the most recent ``n`` closed 15m bars as a DataFrame.
+
+        Empty DataFrame (not None) when no 15m bar has closed yet.
+        """
+        rows = list(self._closed)
+        if n:
+            rows = rows[-n:]
+        return pd.DataFrame(rows)
+
+
 class ScannerService:
     """Subscribes to the ZMQ tick bus, builds bars per (symbol, interval),
     evaluates every enabled scan_definition at bar close, and emits
@@ -475,6 +517,23 @@ class ScannerService:
         # (symbol, interval) → rolling OHLCV frame, capped at history_size.
         self._bar_history: dict[tuple[str, str], pd.DataFrame] = {}
         self._history_lock = threading.Lock()
+
+        # Per-symbol rolling 15-minute bar accumulators. Fed the same ticks
+        # as the aggregator (see _ingest_message); memory bounded per symbol
+        # by the deque inside each _Rolling15mBars (50 bars).
+        self._bar_15m_history: dict[str, _Rolling15mBars] = {
+            sym: _Rolling15mBars(sym) for sym in self.symbols
+        }
+
+        # Daily/weekly OHLCV cache (Task 2/3) — singleton warmed at boot and
+        # refreshed at 16:00 IST. Constructed once here, not per tick.
+        try:
+            from services.scanner_history_provider import get_provider  # noqa: PLC0415
+
+            self._history_provider = get_provider()
+        except Exception:
+            logger.exception("ScannerService: failed to obtain history provider")
+            self._history_provider = None
 
         self._stop_event = threading.Event()
         self._subscriber_thread: threading.Thread | None = None
@@ -585,6 +644,9 @@ class ScannerService:
         if tick is None:
             return
         self.aggregator.on_tick(symbol, tick)
+        builder_15m = self._bar_15m_history.get(symbol)
+        if builder_15m is not None:
+            builder_15m.on_tick(tick)
 
     # -- per-bar evaluation -------------------------------------------------
 
@@ -597,7 +659,7 @@ class ScannerService:
         """
         try:
             bars = self._append_bar(symbol, interval, bar)
-            indicators_dict = self._build_indicators(bars)
+            indicators_dict = self._build_indicators(symbol, bars)
             self._evaluate_definitions(symbol, interval, bars, indicators_dict, bar)
         except Exception:
             logger.exception(
@@ -631,12 +693,20 @@ class ScannerService:
             self._bar_history[key] = combined
             return combined
 
-    def _build_indicators(self, bars: pd.DataFrame) -> dict[str, Any]:
-        """Pre-compute the standard indicator series rules can reach for.
+    def _build_indicators(self, symbol: str, bars: pd.DataFrame) -> dict[str, Any]:
+        """Pre-compute the per-symbol indicator bundle rules can reach for.
 
-        Returns a dict with ``ema_20``, ``atr_14``, ``rsi_14``, ``volume_avg_20``.
-        Each value is a ``pandas.Series`` aligned with ``bars`` (NaN during
-        warm-up). NaN-handling is the rule's responsibility.
+        Backward-compatible keys (5m-derived series, NaN during warm-up):
+        ``ema_20``, ``atr_14``, ``rsi_14``, ``volume_avg_20``. NaN-handling
+        is the rule's responsibility.
+
+        Multi-timeframe frames (Task 4):
+        * ``bars_5m`` — the 5m frame passed in (same object as ``bars``).
+        * ``bars_15m`` — rolling 15m frame for ``symbol`` (empty DataFrame
+          until the first 15m bar closes; ``None`` if the symbol is not
+          tracked).
+        * ``bars_daily`` / ``bars_weekly`` — from ``ScannerHistoryProvider``;
+          ``None`` when unavailable.
         """
         try:
             ema_20 = _indicators.ema(bars["close"], period=20)
@@ -654,11 +724,30 @@ class ScannerService:
             volume_avg_20 = _indicators.volume_average(bars["volume"], period=20)
         except Exception:
             volume_avg_20 = None
+
+        builder_15m = self._bar_15m_history.get(symbol)
+        bars_15m = builder_15m.get_recent_bars(50) if builder_15m is not None else None
+
+        bars_daily = None
+        bars_weekly = None
+        if self._history_provider is not None:
+            try:
+                bars_daily = self._history_provider.get_daily(symbol)
+                bars_weekly = self._history_provider.get_weekly(symbol)
+            except Exception:
+                logger.exception(
+                    "ScannerService: history provider lookup failed for %s", symbol
+                )
+
         return {
             "ema_20": ema_20,
             "atr_14": atr_14,
             "rsi_14": rsi_14,
             "volume_avg_20": volume_avg_20,
+            "bars_5m": bars,
+            "bars_15m": bars_15m,
+            "bars_daily": bars_daily,
+            "bars_weekly": bars_weekly,
         }
 
     def _evaluate_definitions(
