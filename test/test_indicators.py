@@ -181,3 +181,148 @@ def test_atr_parity_with_engine_implementation():
     # We intentionally do NOT assert diff > 0.01 because perfect alignment
     # on a flat-trend series can happen by coincidence on the tail of a
     # long sequence; we only assert the upper bound here.
+
+
+# ---------------------------------------------------------------------------
+# SMA tests
+# ---------------------------------------------------------------------------
+
+
+def test_sma_basic():
+    """SMA([1,2,3,4,5], period=3) == [NaN, NaN, 2, 3, 4]."""
+    out = indicators.sma(pd.Series([1.0, 2.0, 3.0, 4.0, 5.0]), period=3)
+    assert isinstance(out, pd.Series)
+    assert out.iloc[:2].isna().all()
+    expected = [2.0, 3.0, 4.0]
+    for got, exp in zip(out.iloc[2:].tolist(), expected):
+        assert math.isclose(got, exp, abs_tol=1e-9)
+
+
+def test_sma_period_larger_than_series():
+    """Period > len(series) → all NaN (no full window ever forms)."""
+    out = indicators.sma(pd.Series([1.0, 2.0, 3.0]), period=5)
+    assert len(out) == 3
+    assert out.isna().all()
+
+
+def test_sma_with_nan_entries():
+    """A NaN inside the window propagates to that window's mean."""
+    out = indicators.sma(pd.Series([1.0, float("nan"), 3.0, 4.0]), period=2)
+    assert out.iloc[0:1].isna().all()  # warmup
+    assert math.isnan(out.iloc[1])  # window [1, NaN] -> NaN
+    assert math.isnan(out.iloc[2])  # window [NaN, 3] -> NaN
+    assert math.isclose(out.iloc[3], 3.5, abs_tol=1e-9)  # window [3, 4]
+
+
+# ---------------------------------------------------------------------------
+# Supertrend tests
+# ---------------------------------------------------------------------------
+
+
+def test_supertrend_returns_aligned_frame():
+    bars = _build_ohlc([float(100 + i) for i in range(50)])
+    out = indicators.supertrend(bars, period=7, multiplier=3.0)
+    assert isinstance(out, pd.DataFrame)
+    assert list(out.columns) == ["line", "direction", "long_band", "short_band"]
+    assert out.index.equals(bars.index)
+    assert len(out) == len(bars)
+
+
+def test_supertrend_uptrend_direction_and_line():
+    """Clean monotonic uptrend → direction is +1 and line stays below close."""
+    prices = [float(100 + i) for i in range(100)]
+    bars = _build_ohlc(prices)
+    out = indicators.supertrend(bars, period=7, multiplier=3.0)
+    # Inspect the settled region (after warmup).
+    settled = out.iloc[20:]
+    assert (settled["direction"] == 1).all(), (
+        f"expected +1 throughout uptrend, got {settled['direction'].unique()}"
+    )
+    # The Supertrend line tracks below close in an uptrend.
+    close = bars["close"].iloc[20:]
+    assert (settled["line"] < close).all()
+
+
+def test_supertrend_flips_on_trend_reversal():
+    """Series that rises then falls → direction flips from +1 to -1."""
+    up = [float(100 + i) for i in range(40)]
+    # Sharp, sustained decline to force a flip through the long band.
+    down = [float(140 - 2 * i) for i in range(1, 41)]
+    bars = _build_ohlc(up + down)
+    out = indicators.supertrend(bars, period=7, multiplier=3.0)
+    # End of the uptrend leg is +1; end of the downtrend leg is -1.
+    assert out["direction"].iloc[35] == 1
+    assert out["direction"].iloc[-1] == -1
+
+
+def _hand_supertrend(
+    highs: list[float], lows: list[float], closes: list[float],
+    period: int = 7, multiplier: float = 3.0,
+) -> list[int]:
+    """Hand-rolled Supertrend direction using the textbook formula.
+
+    Bands: HL2 ± multiplier × ATR(period). ATR here uses pandas-ta-classic
+    so the parity test isolates the *band/flip* logic rather than re-testing
+    ATR seeding. Returns the per-bar direction (+1 / -1).
+    """
+    df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+    atr = indicators.atr(df, period=period)
+    hl2 = (df["high"] + df["low"]) / 2.0
+    upper = hl2 + multiplier * atr
+    lower = hl2 - multiplier * atr
+
+    final_upper = [float("nan")] * len(closes)
+    final_lower = [float("nan")] * len(closes)
+    direction = [1] * len(closes)
+
+    for i in range(len(closes)):
+        if i == 0 or math.isnan(atr.iloc[i]):
+            final_upper[i] = upper.iloc[i]
+            final_lower[i] = lower.iloc[i]
+            continue
+        prev_fu = final_upper[i - 1]
+        prev_fl = final_lower[i - 1]
+        if math.isnan(prev_fu):
+            final_upper[i] = upper.iloc[i]
+        else:
+            final_upper[i] = (
+                upper.iloc[i]
+                if (upper.iloc[i] < prev_fu or closes[i - 1] > prev_fu)
+                else prev_fu
+            )
+        if math.isnan(prev_fl):
+            final_lower[i] = lower.iloc[i]
+        else:
+            final_lower[i] = (
+                lower.iloc[i]
+                if (lower.iloc[i] > prev_fl or closes[i - 1] < prev_fl)
+                else prev_fl
+            )
+        # Direction flip logic.
+        if closes[i] > final_upper[i - 1]:
+            direction[i] = 1
+        elif closes[i] < final_lower[i - 1]:
+            direction[i] = -1
+        else:
+            direction[i] = direction[i - 1]
+    return direction
+
+
+def test_supertrend_parity_with_hand_formula():
+    """Wrapper direction matches a hand-computed Supertrend over a 20-bar set."""
+    prices = [
+        100.0, 101.5, 103.0, 102.0, 104.5, 106.0, 105.0, 107.5, 109.0,
+        108.0, 106.5, 104.0, 102.0, 100.5, 99.0, 101.0, 103.5, 105.0,
+        104.0, 106.5,
+    ]
+    highs = [p + 1.0 for p in prices]
+    lows = [p - 1.0 for p in prices]
+    bars = pd.DataFrame({"high": highs, "low": lows, "close": prices})
+    out = indicators.supertrend(bars, period=7, multiplier=3.0)
+    hand = _hand_supertrend(highs, lows, prices, period=7, multiplier=3.0)
+    # Compare directions where the wrapper's ATR has warmed up (period onward).
+    for i in range(7, len(prices)):
+        assert int(out["direction"].iloc[i]) == hand[i], (
+            f"direction mismatch at bar {i}: "
+            f"wrapper={out['direction'].iloc[i]} hand={hand[i]}"
+        )

@@ -47,3 +47,51 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 def volume_average(series: pd.Series, period: int = 20) -> pd.Series:
     """Simple rolling mean of volume — convenience alias for clarity at call sites."""
     return series.rolling(period).mean()
+
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    """Simple Moving Average — thin wrapper around ``series.rolling(period).mean()``.
+
+    Kept as a named helper so call sites (e.g. the Chartink BUY formula's
+    ``SMA(volume, 50)`` / ``SMA(volume, 200)`` gates) stay decoupled from the
+    raw pandas rolling idiom. ``volume_average`` is retained for backward
+    compatibility; new code should prefer ``sma``.
+    """
+    return series.rolling(period).mean()
+
+
+def supertrend(
+    bars: pd.DataFrame, period: int = 7, multiplier: float = 3.0
+) -> pd.DataFrame:
+    """Supertrend indicator (default 7, 3) backed by ``pandas-ta-classic``.
+
+    The Supertrend bands are built from the basic upper/lower bands
+    ``HL2 ± multiplier × ATR(period)`` (HL2 = (high + low) / 2), then made
+    "sticky" so the active band only tightens until price closes through it,
+    at which point the trend ``direction`` flips. See
+    https://www.tradingview.com/support/solutions/43000634738-supertrend/
+
+    ``bars`` must have columns ``high``, ``low``, ``close``.
+
+    Returns a DataFrame aligned to ``bars.index`` with stable column names,
+    insulating call sites from pandas-ta's ``SUPERT_{len}_{mult}`` naming:
+
+    * ``line``       — the Supertrend line (the active band)
+    * ``direction``  — trend direction, ``+1`` (up) or ``-1`` (down)
+    * ``long_band``  — lower band, populated while in an uptrend
+    * ``short_band`` — upper band, populated while in a downtrend
+    """
+    raw = ta.supertrend(
+        bars["high"], bars["low"], bars["close"], length=period, multiplier=multiplier
+    )
+    suffix = f"_{period}_{multiplier}"
+    out = pd.DataFrame(
+        {
+            "line": raw[f"SUPERT{suffix}"],
+            "direction": raw[f"SUPERTd{suffix}"],
+            "long_band": raw[f"SUPERTl{suffix}"],
+            "short_band": raw[f"SUPERTs{suffix}"],
+        },
+        index=bars.index,
+    )
+    return out
