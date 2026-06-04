@@ -192,3 +192,36 @@ def get_provider() -> ScannerHistoryProvider:
                 exchange = os.getenv("SCANNER_EXCHANGE", "NSE")
                 _default_provider = ScannerHistoryProvider(symbols, exchange=exchange)
     return _default_provider
+
+
+def run_boot_warmup() -> dict | None:
+    """Boot-time warm-up entry point (Task 3).
+
+    Gated by ``SCANNER_HISTORY_WARMUP_ENABLED`` (default ``true``). Bulk-loads
+    the daily/weekly cache via ``get_provider().refresh()`` so the first scan
+    does not pay per-symbol lazy-load latency. Designed to run on a daemon
+    thread; never raises — DuckDB/network failures are logged and swallowed so
+    boot is unaffected. Returns the refresh result dict, or ``None`` when
+    disabled or on failure.
+    """
+    if os.getenv("SCANNER_HISTORY_WARMUP_ENABLED", "true").lower() != "true":
+        logger.info(
+            "Scanner history warm-up disabled (SCANNER_HISTORY_WARMUP_ENABLED!=true)"
+        )
+        return None
+    try:
+        provider = get_provider()
+        logger.info(
+            "Scanner history warm-up starting: refreshing %d symbols",
+            len(provider.symbols),
+        )
+        result = provider.refresh()
+        logger.info(
+            "Scanner history warm-up complete: %d symbols loaded, %d errors",
+            result.get("symbols_loaded", 0),
+            len(result.get("errors", [])),
+        )
+        return result
+    except Exception as e:  # never let a warm-up failure affect boot
+        logger.exception(f"Scanner history warm-up failed: {e}")
+        return None

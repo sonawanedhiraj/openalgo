@@ -831,6 +831,25 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Scanner service: {e}")
 
+            # Scanner history cache warm-up (Task 3) — pre-load daily/weekly
+            # bars so the first scan does not pay per-symbol lazy-load latency.
+            # Gated by SCANNER_HISTORY_WARMUP_ENABLED (default true). Runs on a
+            # daemon thread so a slow/failed bulk DuckDB read never blocks boot;
+            # the scanner can serve with an empty cache and lazy-load on demand.
+            # Placed after the scanner pre-subscribe wiring above. See
+            # services/scanner_history_provider.py:run_boot_warmup.
+            try:
+                from services.scanner_history_provider import run_boot_warmup
+
+                _t.Thread(
+                    target=run_boot_warmup,
+                    daemon=True,
+                    name="ScannerHistoryWarmup",
+                ).start()
+                logger.info("Scanner history warm-up thread started")
+            except Exception as e:
+                logger.error(f"Failed to start scanner history warm-up: {e}")
+
             # Stage 1.7 regime classifier — pre-subscribe NIFTY sector
             # indices on NSE_INDEX so the sector-rotation classifier has
             # live quotes (rather than falling back to historify EOD
