@@ -270,18 +270,151 @@ def get_scan_results(hours: int = 24, source: str | None = None) -> list[dict[st
         sess.remove()
 
 
-def get_scan_comparison(date_iso: str) -> dict[str, Any]:
-    """Shadow validation stub — Stage 1.5 item 7 will implement this.
+def _symbol_set_from_json(blob: Any) -> set[str]:
+    """Parse a JSON-encoded list of symbols into a clean set.
 
-    Intended to diff Chartink-sourced symbols against in-house scanner output
-    for ``date_iso`` so we can quantify drift before promoting any in-house
-    rule from shadow to enforced.
+    Tolerant of ``None``, malformed JSON, and non-list payloads — returns an
+    empty set rather than raising, so a single bad audit row can't sink the
+    whole comparison.
     """
-    return {
-        "date": date_iso,
-        "implemented": False,
-        "note": "stub — Stage 1.5 item 7 will populate chartink vs inhouse diff",
+    if not blob:
+        return set()
+    try:
+        items = json.loads(blob)
+    except (ValueError, TypeError):
+        return set()
+    if not isinstance(items, list):
+        return set()
+    out: set[str] = set()
+    for s in items:
+        if s is None:
+            continue
+        sym = str(s).strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def get_scan_comparison(
+    date: str | None = None,
+    scan_name: str = "fno_intraday_buy_chartink",
+) -> dict[str, Any]:
+    """Return precision/recall + diff lists for in-house vs Chartink BUY for a single day.
+
+    Shadow-validation harness (Stage 1.5 item 7). Compares the in-house
+    scanner's BUY hits — ``scan_results`` rows with ``source='inhouse'`` whose
+    ``scan_definition.name == scan_name`` — against the live Chartink BUY hits
+    recorded in ``scan_cycle.screener_buy`` (rows with ``cycle_kind='chartink'``).
+    Only the BUY leg is counted; the paired SELL leg (``screener_sell``) is
+    ignored. Treating Chartink as ground truth, ``inhouse_only`` are false
+    positives and ``chartink_only`` are false negatives.
+
+    Both ``run_at`` and ``started_at`` are stored as IST ISO-8601 strings
+    (``datetime.now(Asia/Kolkata).isoformat()``), so a ``[:10]`` date-prefix
+    match is the correct IST day filter — no UTC conversion is applied.
+
+    Args:
+        date: ``'YYYY-MM-DD'`` IST. Defaults to today in IST.
+        scan_name: in-house scan definition name to compare (default the
+            Chartink BUY mirror).
+
+    Returns:
+        A dict with ``date``, ``scan_name``, the two side counts, the three
+        diff lists (sorted), ``precision`` / ``recall`` / ``f1`` (``None`` when
+        undefined), and an ``error`` key if a DB query failed.
+    """
+    if date is None:
+        import pytz
+
+        date = _dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+    result: dict[str, Any] = {
+        "date": date,
+        "scan_name": scan_name,
+        "inhouse_count": 0,
+        "chartink_count": 0,
+        "intersection": [],
+        "intersection_count": 0,
+        "inhouse_only": [],
+        "chartink_only": [],
+        "precision": None,
+        "recall": None,
+        "f1": None,
     }
+
+    # --- In-house side: scan_results (source='inhouse') joined to its definition.
+    inhouse_symbols: set[str] = set()
+    try:
+        sess = _session()
+        try:
+            rows = (
+                sess.query(ScanResult)
+                .join(ScanDefinition, ScanResult.scan_definition_id == ScanDefinition.id)
+                .filter(ScanDefinition.name == scan_name)
+                .filter(ScanResult.source == "inhouse")
+                .all()
+            )
+            for row in rows:
+                if (row.run_at or "")[:10] != date:
+                    continue
+                inhouse_symbols |= _symbol_set_from_json(row.symbols)
+        finally:
+            sess.remove()
+    except Exception as exc:
+        logger.exception("get_scan_comparison: in-house query failed")
+        result["error"] = f"inhouse query failed: {exc}"
+        return result
+
+    # --- Chartink side: scan_cycle BUY leg (cycle_kind='chartink'). Any other
+    # cycle_kind (incl. test/'trend-up' pollution) is excluded by the filter.
+    chartink_symbols: set[str] = set()
+    try:
+        from database import scan_cycle_db as scdb
+
+        csess = scdb.db_session
+        try:
+            rows = (
+                csess.query(scdb.ScanCycle)
+                .filter(scdb.ScanCycle.cycle_kind == "chartink")
+                .all()
+            )
+            for row in rows:
+                if (row.started_at or "")[:10] != date:
+                    continue
+                chartink_symbols |= _symbol_set_from_json(row.screener_buy)
+        finally:
+            csess.remove()
+    except Exception as exc:
+        logger.exception("get_scan_comparison: chartink query failed")
+        result["error"] = f"chartink query failed: {exc}"
+        return result
+
+    intersection = inhouse_symbols & chartink_symbols
+    n, m, k = len(inhouse_symbols), len(chartink_symbols), len(intersection)
+
+    precision = k / n if n else None
+    recall = k / m if m else None
+    if precision is None or recall is None:
+        f1 = None
+    elif precision + recall == 0:
+        f1 = 0.0
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+
+    result.update(
+        {
+            "inhouse_count": n,
+            "chartink_count": m,
+            "intersection": sorted(intersection),
+            "intersection_count": k,
+            "inhouse_only": sorted(inhouse_symbols - chartink_symbols),
+            "chartink_only": sorted(chartink_symbols - inhouse_symbols),
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
