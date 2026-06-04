@@ -72,6 +72,9 @@ class HistorifyScheduler:
                 # Restore schedules from database on startup
                 self._restore_schedules()
 
+                # Register the daily scanner-history cache refresh (Task 3)
+                self._register_scanner_history_job()
+
             except Exception as e:
                 logger.exception(f"Failed to initialize Historify Scheduler: {e}")
                 raise
@@ -482,6 +485,31 @@ class HistorifyScheduler:
             except Exception as e:
                 logger.warning(f"Failed to emit {event}: {e}")
 
+    def _register_scanner_history_job(self):
+        """Register the 16:00 IST scanner-history cache refresh job (Task 3).
+
+        Gated by ``SCANNER_HISTORY_SCHEDULED_REFRESH_ENABLED`` (default true).
+        Idempotent — ``replace_existing=True`` lets boot re-register cleanly
+        over the SQLAlchemy-persisted job.
+        """
+        if os.getenv("SCANNER_HISTORY_SCHEDULED_REFRESH_ENABLED", "true").lower() != "true":
+            logger.debug(
+                "Scanner history scheduled refresh disabled "
+                "(SCANNER_HISTORY_SCHEDULED_REFRESH_ENABLED!=true)"
+            )
+            return
+        try:
+            self.scheduler.add_job(
+                refresh_scanner_history,
+                trigger=CronTrigger(hour=16, minute=0, timezone="Asia/Kolkata"),
+                id="scanner_history_refresh",
+                replace_existing=True,
+                name="Scanner history cache refresh (16:00 IST)",
+            )
+            logger.info("Registered scanner_history_refresh job (16:00 IST daily)")
+        except Exception as e:
+            logger.exception(f"Failed to register scanner_history_refresh job: {e}")
+
     def shutdown(self):
         """Shutdown the scheduler"""
         if self._scheduler:
@@ -608,6 +636,25 @@ def execute_schedule(schedule_id: str, api_key: str = None):
             )
         update_schedule(schedule_id, status="idle", last_run_status="error")
         increment_schedule_run_counts(schedule_id, is_success=False)
+
+
+def refresh_scanner_history():
+    """APScheduler job (Task 3): refresh the scanner daily/weekly OHLCV cache.
+
+    Wired by ``HistorifyScheduler._register_scanner_history_job`` to run at
+    16:00 IST daily so the in-memory cache reflects the day's closing bars
+    after market close. Module-level so the SQLAlchemy jobstore can serialize
+    the function reference.
+    """
+    from services.scanner_history_provider import get_provider
+
+    logger.info("Scheduled scanner history refresh starting (16:00 IST)")
+    result = get_provider().refresh()
+    logger.info(
+        "Scheduled scanner history refresh complete: %d loaded, %d errors",
+        result.get("symbols_loaded", 0),
+        len(result.get("errors", [])),
+    )
 
 
 # Global scheduler instance
