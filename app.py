@@ -1188,8 +1188,43 @@ else:
     logger.debug("Starting WebSocket proxy")
     start_websocket_proxy(app)
 
+def _warn_if_dirty_working_tree():
+    """Log a WARNING at boot if the git working tree has uncommitted changes.
+
+    Catches code edits an operator (or an automated task) left behind without
+    committing. Non-blocking: never exits the process. Gated by
+    OPENALGO_BOOT_DIRTY_CHECK_ENABLED (default True) so it can be silenced if
+    it becomes noisy.
+    """
+    if os.getenv("OPENALGO_BOOT_DIRTY_CHECK_ENABLED", "True").lower() not in (
+        "true", "1", "t"
+    ):
+        return
+    try:
+        import subprocess
+
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        changes = result.stdout.strip()
+        if changes:
+            logger.warning(
+                "Dirty working tree detected at boot:\n%s\n"
+                "Operator: review any code changes that should have been committed.",
+                changes,
+            )
+    except Exception as e:
+        logger.debug(f"Dirty working tree check skipped (git unavailable?): {e}")
+
+
 # Start Flask development server with SocketIO support if directly executed
 if __name__ == "__main__":
+    _warn_if_dirty_working_tree()
     host_ip = os.getenv("FLASK_HOST_IP", "127.0.0.1")
     port = int(os.getenv("FLASK_PORT", 5000))
     debug = os.getenv("FLASK_DEBUG", "False").lower() in ("true", "1", "t")

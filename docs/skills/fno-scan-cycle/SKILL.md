@@ -251,3 +251,21 @@ Close any tabs opened during this cycle.
 - Tick log stats (ticks written, bytes)
 - Error summary (count, any actionable issues, fixes applied)
 - Learnings update confirmation (what was added/updated in LEARNINGS.md)
+
+---
+
+## Audit trail rules (code is read-only)
+
+- **Do NOT modify code** in `C:\workspace\ai-trade-agent\openalgo` or any file in that
+  workspace. The scheduled task is **read-only on code**.
+- If you observe a bug while scanning, **append a structured entry** to
+  `C:\workspace\ai-trade-agent\openalgo\audit\proposed_fixes.jsonl` and exit. The
+  operator reviews and decides whether to fix.
+- **All your actions touching the OpenAlgo repo must be append-only on
+  `audit/proposed_fixes.jsonl`.** Never edit code, never run `git add`, never commit.
+
+Schema for `proposed_fixes.jsonl` entries (one JSON object per line):
+
+```json
+{"timestamp": "<ISO with TZ>", "session_id": "<task session id>", "task_name": "fno-scan-cycle", "observation": "<what the task observed>", "file": "<path/to/file:line if known>", "suggested_fix": "<short description>"}
+```
