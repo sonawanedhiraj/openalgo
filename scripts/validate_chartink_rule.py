@@ -19,6 +19,7 @@ Run: ``uv run python scripts/validate_chartink_rule.py``
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -38,7 +39,88 @@ BASELINE_JSON = OUTPUTS / f"chartink_fno_baseline_{DATE}.json"
 NL_JSON = OUTPUTS / f"chartink_nl_scans_{DATE}.json"
 REPORT = OUTPUTS / f"chartink_rule_validation_{DATE}.md"
 DUCKDB_PATH = ROOT / "db" / "historify.duckdb"
+OPENALGO_DB = ROOT / "db" / "openalgo.db"
 EXCHANGE = "NSE"
+
+
+def get_chartink_buy_set_for_date(date_str: str) -> tuple[set[str], dict]:
+    """Return (unique_symbols_set, meta_dict) for the chartink BUY scan on date_str.
+
+    Canonical ground truth = the ``scan_cycle`` rows the chartink scheduled task
+    writes on every POST (``database/scan_cycle_db.py``). Unlike a live screener
+    scrape, these capture what Chartink actually fired at us throughout the day,
+    even after intraday matches have cleared.
+
+    Sourced from the ``scan_cycle`` table on ``db/openalgo.db``:
+      - ``cycle_kind = 'chartink'`` (the only chartink discriminator — the table
+        has no ``source``/``scan_name`` column; pytest rows use other kinds such
+        as ``'test'``/``'manual_bootstrap'``, so this also filters test noise)
+      - ``substr(started_at, 1, 10) = date_str`` (started_at is IST ISO-8601)
+      - ``screener_buy`` JSON unioned across all rows, then deduplicated.
+
+    Meta includes total_rows, firing_rows, unique_symbols, per_symbol_fire_count
+    ({sym: N rows it appeared in}), per_symbol_first/last (IST ts per symbol),
+    and first_fire_ts / last_fire_ts (firing window bounds).
+    """
+    con = sqlite3.connect(str(OPENALGO_DB))
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT started_at, screener_buy FROM scan_cycle "
+            "WHERE cycle_kind = 'chartink' "
+            "AND substr(started_at, 1, 10) = ? "
+            "ORDER BY started_at ASC",
+            [date_str],
+        ).fetchall()
+    finally:
+        con.close()
+
+    symbols: set[str] = set()
+    per_symbol_fire_count: dict[str, int] = {}
+    per_symbol_first: dict[str, str] = {}
+    per_symbol_last: dict[str, str] = {}
+    firing_rows = 0
+    first_fire_ts: str | None = None
+    last_fire_ts: str | None = None
+
+    for r in rows:
+        raw = r["screener_buy"]
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        row_syms: list[str] = []
+        for s in payload if isinstance(payload, list) else []:
+            sym = s.get("symbol") if isinstance(s, dict) else s
+            if sym:
+                row_syms.append(str(sym).upper())
+        if not row_syms:
+            continue
+        firing_rows += 1
+        ts = r["started_at"]
+        if first_fire_ts is None:
+            first_fire_ts = ts
+        last_fire_ts = ts
+        for sym in row_syms:
+            symbols.add(sym)
+            per_symbol_fire_count[sym] = per_symbol_fire_count.get(sym, 0) + 1
+            per_symbol_first.setdefault(sym, ts)
+            per_symbol_last[sym] = ts
+
+    meta = {
+        "source": "scan-cycle",
+        "total_rows": len(rows),
+        "firing_rows": firing_rows,
+        "unique_symbols": len(symbols),
+        "per_symbol_fire_count": per_symbol_fire_count,
+        "per_symbol_first": per_symbol_first,
+        "per_symbol_last": per_symbol_last,
+        "first_fire_ts": first_fire_ts,
+        "last_fire_ts": last_fire_ts,
+    }
+    return symbols, meta
 
 
 def _any_nan(*values: float) -> bool:
@@ -168,7 +250,25 @@ def fmt_list(symbols: set[str] | list[str], limit: int = 20) -> str:
 
 
 def main() -> None:
-    set_a, notes_a = load_set_a()
+    # --source scan-cycle (default) | live-screener
+    source = "scan-cycle"
+    if "--source" in sys.argv:
+        idx = sys.argv.index("--source")
+        if idx + 1 < len(sys.argv):
+            source = sys.argv[idx + 1]
+
+    meta_a: dict = {}
+    if source == "live-screener":
+        set_a, notes_a = load_set_a()
+    else:
+        set_a, meta_a = get_chartink_buy_set_for_date(DATE)
+        notes_a = [
+            f"Set A from scan_cycle (ground truth): {meta_a['total_rows']} chartink "
+            f"rows today, {meta_a['firing_rows']} non-empty, {meta_a['unique_symbols']} "
+            f"unique BUY symbols deduplicated across the day.",
+            f"Firing window (IST): {meta_a['first_fire_ts']} → {meta_a['last_fire_ts']}.",
+        ]
+
     set_b, notes_b = load_set_b()
     universe, notes_u = get_universe()
 
@@ -216,6 +316,23 @@ def main() -> None:
     if skip_reasons:
         for k, v in sorted(skip_reasons.items(), key=lambda kv: -kv[1]):
             lines.append(f"  - skip `{k}`: {v}")
+
+    if meta_a:
+        lines.append("\n## Chartink firing detail (scan_cycle ground truth)\n")
+        lines.append(
+            f"- Source: `scan_cycle` table — {meta_a['total_rows']} chartink rows "
+            f"today, {meta_a['firing_rows']} with non-empty BUY payloads.\n"
+            f"- Firing window (IST): **{meta_a['first_fire_ts']} → "
+            f"{meta_a['last_fire_ts']}**.\n"
+            "- Chartink re-alerts the same stock every scan cycle while it still "
+            "matches, so the per-symbol counts below are how many cycles each "
+            "symbol appeared in (1 unique stock can fire many times)."
+        )
+        pscf = meta_a["per_symbol_fire_count"]
+        for sym in sorted(pscf, key=lambda s: (-pscf[s], s)):
+            first = meta_a["per_symbol_first"].get(sym, "")[11:19]
+            last = meta_a["per_symbol_last"].get(sym, "")[11:19]
+            lines.append(f"  - **{sym}**: fired **{pscf[sym]}×** ({first} → {last} IST)")
 
     lines.append("\n## Set sizes\n")
     lines.append(f"- **Set A** (Chartink `fno-intraday-buy-20` BUY): **{len(set_a)}**")
@@ -286,6 +403,17 @@ def main() -> None:
     REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # ---- stdout summary ----
+    print(f"Set A source: {source}")
+    if meta_a:
+        pscf = meta_a["per_symbol_fire_count"]
+        print(
+            f"  scan_cycle: {meta_a['total_rows']} rows, {meta_a['firing_rows']} firing, "
+            f"window {meta_a['first_fire_ts']} -> {meta_a['last_fire_ts']}"
+        )
+        print(
+            "  per-symbol fire count: "
+            + ", ".join(f"{s}={pscf[s]}" for s in sorted(pscf, key=lambda s: (-pscf[s], s)))
+        )
     print(f"Set A (Chartink BUY): {len(set_a)}  -> {fmt_list(set_a, 10)}")
     print(f"Set B (NL union):     {len(set_b)}  -> {fmt_list(set_b, 10)}")
     print(f"Set C (daily gates):  {len(set_c)}  -> {fmt_list(set_c, 10)}")
