@@ -253,7 +253,7 @@ class SimplifiedStockEngineService:
     ) -> dict[str, Any]:
         symbols = parse_chartink_symbols(payload)
         if not symbols:
-            return {"status": "error", "message": "No symbols found", "processed": []}
+            return {"status": "empty", "message": "No symbols found", "processed": []}
 
         direction = (direction_override or self._infer_direction(payload)).upper()
         if direction not in (DIRECTION_BUY, DIRECTION_SELL):
