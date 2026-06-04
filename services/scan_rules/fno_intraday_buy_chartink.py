@@ -28,6 +28,7 @@ every indicator value is ``pd.isna``-checked before use.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, time as dtime
 
 import pandas as pd
@@ -106,8 +107,12 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     # Gate 12: daily close < 5000
     if today_d.close >= 5000:
         return False
-    # Gate 1: daily close > 1d-ago close * 1.03 (3% gap)
-    if today_d.close <= yest_d.close * 1.03:
+    # Gate 1: daily close > 1d-ago close * buy_mult (default 3% gap). Threshold is
+    # read at call time from CHARTINK_RULE_BUY_GAP_PCT so changes take effect
+    # without a restart and stay aligned with the Chartink screener formula.
+    buy_pct = float(os.environ.get("CHARTINK_RULE_BUY_GAP_PCT", "3.0"))
+    buy_mult = 1.0 + buy_pct / 100.0
+    if today_d.close <= yest_d.close * buy_mult:
         return False
     # Gate 9: daily open > 1d-ago close
     if today_d.open <= yest_d.close:
