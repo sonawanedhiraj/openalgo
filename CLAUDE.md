@@ -606,6 +606,19 @@ already has `frontend/dist/` committed, so backend-only work needs no Node/npm.
 frontend/dist is committed (upstream convention as of v2.0.1.1 merge);
 local rebuilds may produce dirty working trees — commit dist when shipping.
 
+## Scheduled Tasks Audit-Trail Policy
+
+Cowork's scheduled tasks (e.g. `fno-scan-cycle`, `scanner-vs-chartink-daily-comparison`)
+run **read-only on this repo's code**. They must never edit source files, run `git add`,
+or commit. When a scheduled task observes a probable bug during its normal work, it
+appends a single structured JSON line to [`audit/proposed_fixes.jsonl`](audit/proposed_fixes.jsonl)
+and exits; the operator reviews that log and decides whether to fix. The schema and rules
+live in [`audit/README.md`](audit/README.md). Tracked snapshots of the live (OneDrive)
+SKILL.md files are kept under [`docs/skills/`](docs/skills/) and carry the same
+"code is read-only" section. Relatedly, `app.py` logs a WARNING at boot if
+`git status --porcelain` is non-empty (gated by `OPENALGO_BOOT_DIRTY_CHECK_ENABLED`,
+default `True`) so uncommitted code edits surface on the next restart.
+
 ## Cowork / AI Agent Operational Learnings
 
 For detailed session learnings including login flows, Zerodha quirks, API endpoints,
