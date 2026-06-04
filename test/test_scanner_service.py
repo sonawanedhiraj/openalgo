@@ -347,19 +347,133 @@ def test_on_bar_close_skips_definition_with_unregistered_rule(fresh_scanner_db):
 # ---------------------------------------------------------------------------
 
 
+class _FakeProvider:
+    """Stand-in for ScannerHistoryProvider returning canned daily/weekly frames."""
+
+    def __init__(self, daily=None, weekly=None):
+        self._daily = daily
+        self._weekly = weekly
+
+    def get_daily(self, symbol):  # noqa: ARG002 — fixed canned frame
+        return self._daily
+
+    def get_weekly(self, symbol):  # noqa: ARG002
+        return self._weekly
+
+
 def test_indicators_dict_populated_with_expected_keys():
     svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    svc._history_provider = _FakeProvider()  # avoid DuckDB lazy-load in tests
     bars = _make_bars(
         closes=[100.0 + i * 0.5 for i in range(30)],
         volumes=[1000.0] * 30,
     )
-    result = svc._build_indicators(bars)
-    assert set(result.keys()) == {"ema_20", "atr_14", "rsi_14", "volume_avg_20"}
-    # All four should be Series of the same length as bars (NaN during warm-up).
+    result = svc._build_indicators("RELIANCE", bars)
+    # Backward-compat indicator keys plus the four Task-4 multi-timeframe keys.
+    assert set(result.keys()) == {
+        "ema_20", "atr_14", "rsi_14", "volume_avg_20",
+        "bars_5m", "bars_15m", "bars_daily", "bars_weekly",
+    }
+    # The four legacy series remain Series of the same length as bars.
     for name in ("ema_20", "atr_14", "rsi_14", "volume_avg_20"):
         series = result[name]
         assert series is not None, f"{name} unexpectedly None"
         assert len(series) == len(bars)
+    # bars_5m is the same frame passed in.
+    assert result["bars_5m"] is bars
+
+
+def test_build_indicators_daily_weekly_none_when_provider_returns_none():
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    svc._history_provider = _FakeProvider(daily=None, weekly=None)
+    bars = _make_bars(closes=[100.0] * 5, volumes=[1000.0] * 5)
+    result = svc._build_indicators("RELIANCE", bars)
+    assert result["bars_daily"] is None
+    assert result["bars_weekly"] is None
+
+
+def test_build_indicators_passes_through_daily_weekly_frames():
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    daily = _make_bars(closes=[100.0] * 3, volumes=[1.0] * 3)
+    weekly = _make_bars(closes=[200.0] * 2, volumes=[2.0] * 2)
+    svc._history_provider = _FakeProvider(daily=daily, weekly=weekly)
+    bars = _make_bars(closes=[100.0] * 5, volumes=[1000.0] * 5)
+    result = svc._build_indicators("RELIANCE", bars)
+    assert result["bars_daily"] is daily
+    assert result["bars_weekly"] is weekly
+
+
+def test_build_indicators_bars_15m_empty_when_no_history_yet():
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    svc._history_provider = _FakeProvider()
+    bars = _make_bars(closes=[100.0] * 5, volumes=[1000.0] * 5)
+    result = svc._build_indicators("RELIANCE", bars)
+    bars_15m = result["bars_15m"]
+    # A tracked symbol with no closed 15m bar yet → empty DataFrame (not None).
+    assert isinstance(bars_15m, pd.DataFrame)
+    assert bars_15m.empty
+
+
+def test_15m_bars_built_from_tick_stream():
+    """Ticks crossing 15-minute boundaries should close 15m bars that
+    ``_build_indicators`` then surfaces as a rolling frame."""
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    svc._history_provider = _FakeProvider()
+
+    base = dt.datetime(2026, 5, 30, 9, 15)
+    # Three distinct 15m buckets (09:15, 09:30, 09:45) — two closes expected
+    # by the time we reach the third bucket. One tick per 5 minutes.
+    cum_vol = 0
+    for i in range(7):  # 09:15 .. 09:45 in 5-min steps
+        ts = base + dt.timedelta(minutes=5 * i)
+        cum_vol += 100
+        payload = json.dumps({
+            "ltp": 100.0 + i,
+            "volume": cum_vol,
+            "timestamp": int(ts.timestamp()),
+        })
+        svc._ingest_message("NSE_RELIANCE_QUOTE", payload)
+
+    bars = _make_bars(closes=[100.0] * 5, volumes=[1000.0] * 5)
+    result = svc._build_indicators("RELIANCE", bars)
+    bars_15m = result["bars_15m"]
+    assert isinstance(bars_15m, pd.DataFrame)
+    # 09:15 and 09:30 buckets have closed; 09:45 is still in progress.
+    assert len(bars_15m) == 2
+    assert set(["ts", "open", "high", "low", "close", "volume"]).issubset(bars_15m.columns)
+
+
+def test_15m_bars_capped_at_50():
+    """The per-symbol 15m accumulator must bound memory to ~50 bars."""
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    builder = svc._bar_15m_history["RELIANCE"]
+    base = dt.datetime(2026, 5, 30, 9, 15)
+    # Feed 120 distinct 15m buckets (one tick each → forces a close on the next).
+    for i in range(120):
+        ts = base + dt.timedelta(minutes=15 * i)
+        builder.on_tick({"price": 100.0 + i, "cumulative_volume": 100 * i, "ts": ts})
+    frame = builder.get_recent_bars(50)
+    assert len(frame) <= 50
+
+
+def test_existing_rule_still_evaluates_against_new_indicators_dict():
+    """Regression: ``fno_intraday_buy_20`` reads only ``bars`` + ``ema_20`` and
+    must still evaluate cleanly against the enriched 8-key indicators dict."""
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    svc._history_provider = _FakeProvider()
+    rule = scanner_service.get_rule("fno_intraday_buy_20")
+    assert rule is not None
+
+    # 20 baseline bars + a final volume-surge bar above the EMA → should fire.
+    closes = [100.0 + i * 0.5 for i in range(20)] + [150.0]
+    volumes = [1000.0] * 20 + [5000.0]
+    bars = _make_bars(closes, volumes)
+    indicators = svc._build_indicators("RELIANCE", bars)
+    assert rule(bars, indicators) is True
+
+    # No surge → rule returns False, still no exception.
+    flat = _make_bars([100.0] * 21, [1000.0] * 21)
+    assert rule(flat, svc._build_indicators("RELIANCE", flat)) is False
 
 
 def test_history_rolls_off_old_bars():
