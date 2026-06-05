@@ -839,9 +839,11 @@ def setup_environment(app):
             # Placed after the scanner pre-subscribe wiring above. See
             # services/scanner_history_provider.py:run_boot_warmup.
             try:
+                import threading as _warmup_threading
+
                 from services.scanner_history_provider import run_boot_warmup
 
-                _t.Thread(
+                _warmup_threading.Thread(
                     target=run_boot_warmup,
                     daemon=True,
                     name="ScannerHistoryWarmup",
