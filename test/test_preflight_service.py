@@ -439,7 +439,7 @@ def test_recent_errors_threshold_breach(preflight_env):
     assert result["go_decision"] == "abort"
     assert result["checks"]["recent_errors"]["ok"] is False
     assert result["checks"]["recent_errors"]["count_last_hour"] == 11
-    assert "11 errors in last hour" in result["checks"]["recent_errors"]["reason"]
+    assert "11 errors in last" in result["checks"]["recent_errors"]["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -1006,3 +1006,66 @@ def test_daily_circuit_breaker_clear_does_not_block(preflight_env):
     assert result["go_decision"] == "go"
     assert result["checks"]["daily_circuit_breaker"]["ok"] is True
     assert result["checks"]["daily_circuit_breaker"]["tripped"] is False
+
+
+# ---------------------------------------------------------------------------
+# 13. Pre-market error filtering (before 09:15 IST) + configurable toggle
+# ---------------------------------------------------------------------------
+
+
+def _premarket_storm() -> list[dict]:
+    """50 ERROR entries at 08:xx IST — the morning WS-reconnect storm."""
+    return [
+        {
+            "ts": dt.datetime(2026, 5, 28, 8, m, 0).strftime("%Y-%m-%d %H:%M:%S"),
+            "level": "ERROR",
+            "logger": "zerodha_websocket",
+            "message": "WebSocket reconnect storm",
+        }
+        for m in range(50)
+    ]
+
+
+def _intraday_errors() -> list[dict]:
+    """5 ERROR entries at 11:2x IST — genuine intraday noise within window."""
+    return [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "broker.zerodha",
+            "message": "intraday hiccup",
+        }
+        for m in (25, 26, 27, 28, 29)
+    ]
+
+
+def test_premarket_errors_excluded_during_market_hours(preflight_env):
+    """50 pre-09:15 errors + 5 intraday → only the 5 count → ok (go).
+
+    A wide rolling window is set so the window alone wouldn't drop the 08:xx
+    storm — this isolates the pre-market filter as the thing excluding them.
+    """
+    from services import preflight_service
+
+    preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_WINDOW_MIN", "600")
+    preflight_env.monkeypatch.setenv("PREFLIGHT_IGNORE_PREMARKET_ERRORS", "1")
+    _write_errors_jsonl(preflight_env.tmp_path, _premarket_storm() + _intraday_errors())
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 5
+    assert result["ok"] is True  # 5 <= threshold 10 → contributes "go"
+
+
+def test_premarket_filter_disabled_via_env(preflight_env):
+    """With the filter off, all 55 errors count → over threshold → abort."""
+    from services import preflight_service
+
+    preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_WINDOW_MIN", "600")
+    preflight_env.monkeypatch.setenv("PREFLIGHT_IGNORE_PREMARKET_ERRORS", "0")
+    _write_errors_jsonl(preflight_env.tmp_path, _premarket_storm() + _intraday_errors())
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 55
+    assert result["ok"] is False  # 55 > threshold 10 → contributes "abort"
