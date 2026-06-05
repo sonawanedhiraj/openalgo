@@ -29,6 +29,44 @@ Quick checks:
 2. `mcp__session_info__list_sessions` + `read_transcript` on today's "Fno scan cycle" sessions
 3. Then errors.jsonl (filter pytest noise per memory)
 
+## Documentation discipline — change docs WITH code, not after
+
+When any architectural change ships, the matching documentation update ships in the SAME commit. Not in a follow-up. Doc drift starts the moment code lands.
+
+**Architectural changes that REQUIRE doc updates:**
+- New/removed/renamed database → update `docs/SYSTEM_MAP.md` databases section
+- New/removed/changed scheduled task → update `docs/SYSTEM_MAP.md` scheduled tasks table + this file's "Scheduled Tasks" section
+- New/removed bridge endpoint or significant side-effect change → update `docs/SYSTEM_MAP.md` bridge section
+- New process (daemon, port, sidecar) → update `docs/SYSTEM_MAP.md` processes section
+- Log structure change (paths, formats, retention) → update `docs/SYSTEM_MAP.md` logs table
+- Auth/security/mode-resolution change → update relevant sections of this file + `docs/SYSTEM_MAP.md`
+- New strategy under `strategies/<name>/` → mention in this file + create LEARNINGS.md scaffold
+- Request pipeline change (middleware order, CSRF, session) → update this file's "Request Processing Pipeline" section
+
+**Changes that do NOT need doc updates:**
+- Bug fixes that don't change behavior
+- Small feature additions within an existing module
+- Test additions, linting, formatting
+- Dependency version bumps that don't change the public API
+- Strategy parameter tuning (covered by `strategies/<name>/VERSION_LOG.md`, not architecture docs)
+
+**Before merging an architectural change, verify:**
+1. Does the diff make any line in `docs/SYSTEM_MAP.md` stale? If yes, update it in the same commit.
+2. Does the diff make any line in `CLAUDE.md` stale? If yes, update it in the same commit.
+3. Does the diff touch an active strategy? If yes, the strategy's `LEARNINGS.md` or `VERSION_LOG.md` may also need an entry.
+
+**When spawning child tasks for architectural work, include in the brief:**
+"Update `docs/SYSTEM_MAP.md` and `CLAUDE.md` if affected. Same commit. Verify by reading both before pushing."
+
+**Canonically tracked files** (the ones most likely to need updates):
+- `CLAUDE.md` — operational + coding guidance
+- `docs/SYSTEM_MAP.md` — process/log/DB map
+- `docs/architecture/AI_TRADING_BOT_DESIGN.md` — strategic roadmap
+- `strategies/<active>/LEARNINGS.md` — strategy-specific cumulative learning
+- `strategies/<active>/VERSION_LOG.md` — strategy parameter/logic history
+- `COWORK_OBJECTIVE.md` — strategic objective
+- `audit/README.md` — audit policy
+
 ## Overview
 
 OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It is **four products in one self-hosted instance**, all sharing a single broker session and WebSocket feed:
