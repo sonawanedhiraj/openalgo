@@ -15,6 +15,20 @@ active strategy's learnings before making decisions. See
 [`strategies/simplified_engine/`](strategies/simplified_engine/) for the current
 active strategy.
 
+## Operational awareness — START HERE for diagnostics
+
+Before investigating any unexpected mid-market behavior (preflight aborts,
+stray pytest runs, mystery restarts, dirty working trees), check the
+scheduled-task session inventory FIRST — not errors.jsonl. The fno-scan-cycle
+task can mutate code, run pytest, and restart OpenAlgo silently via its
+SKILL step 6 auto-fix flow. See [`docs/SYSTEM_MAP.md`](docs/SYSTEM_MAP.md)
+for the full process/log/DB map.
+
+Quick checks:
+1. `mcp__scheduled-tasks__list_scheduled_tasks`
+2. `mcp__session_info__list_sessions` + `read_transcript` on today's "Fno scan cycle" sessions
+3. Then errors.jsonl (filter pytest noise per memory)
+
 ## Overview
 
 OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It is **four products in one self-hosted instance**, all sharing a single broker session and WebSocket feed:
