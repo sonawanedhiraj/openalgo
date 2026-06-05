@@ -50,6 +50,17 @@ PREFLIGHT_CYCLE_ID_SENTINEL = 0
 # PREFLIGHT_MAX_ERRORS_LAST_HOUR.
 PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT = 10
 
+# Default rolling window (minutes) for the recent-errors rate gate. Shortened
+# 60 → 30 because real intraday problems surface fast; a long window just keeps
+# stale errors hanging around. Configurable via PREFLIGHT_ERROR_WINDOW_MIN.
+PREFLIGHT_ERROR_WINDOW_MIN_DEFAULT = 30
+
+# Pre-market errors (before today's 09:15 IST open) are structurally different
+# from intraday issues — e.g. the morning broker-token-rollover WS reconnect
+# storm. They shouldn't block an intraday liveness gate. Toggle via
+# PREFLIGHT_IGNORE_PREMARKET_ERRORS (default on).
+MARKET_OPEN_LOCAL = dtime(9, 15)
+
 # Substring markers that flag an errors.jsonl entry as originating from the
 # test suite rather than a real production code path. Pytest runs land in
 # the same centralised errors.jsonl as prod errors, so the preflight rate
@@ -91,6 +102,27 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _premarket_cutoff(now: datetime) -> datetime:
+    """Naive-IST datetime for today's 09:15 IST market open.
+
+    Returned naive (no tzinfo) to match the naive timestamps produced by
+    :func:`_parse_jsonl_ts`.
+    """
+    return now.replace(tzinfo=None).replace(
+        hour=MARKET_OPEN_LOCAL.hour,
+        minute=MARKET_OPEN_LOCAL.minute,
+        second=0,
+        microsecond=0,
+    )
 
 
 def _env_time(name: str, default: str) -> dtime:
@@ -404,13 +436,22 @@ def _is_test_source_entry(entry: dict) -> bool:
     return False
 
 
-def _count_recent_errors(errors_path: Path, now: datetime, window_minutes: int) -> int:
+def _count_recent_errors(
+    errors_path: Path,
+    now: datetime,
+    window_minutes: int,
+    premarket_cutoff: datetime | None = None,
+) -> int:
     """Count entries in errors.jsonl whose ts is within the trailing window.
 
     Skips entries flagged by :func:`_is_test_source_entry` so the count
-    reflects production-relevant errors only.
+    reflects production-relevant errors only. When ``premarket_cutoff`` is
+    given and later than the rolling-window cutoff, it tightens the floor so
+    pre-market errors (before today's 09:15 IST open) are excluded.
     """
     cutoff = now.replace(tzinfo=None) - timedelta(minutes=window_minutes)
+    if premarket_cutoff is not None and premarket_cutoff > cutoff:
+        cutoff = premarket_cutoff
     count = 0
     try:
         with errors_path.open("r", encoding="utf-8") as f:
@@ -442,9 +483,12 @@ def _count_recent_errors(errors_path: Path, now: datetime, window_minutes: int) 
 
 
 def _check_recent_errors(now: datetime) -> dict:
-    """Is the ERROR rate in the last hour below threshold?"""
+    """Is the ERROR rate in the recent rolling window below threshold?"""
     threshold = _env_int(
         "PREFLIGHT_MAX_ERRORS_LAST_HOUR", PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT
+    )
+    window_minutes = _env_int(
+        "PREFLIGHT_ERROR_WINDOW_MIN", PREFLIGHT_ERROR_WINDOW_MIN_DEFAULT
     )
     log_dir = os.getenv("LOG_DIR", "log")
     errors_path = Path(log_dir) / "errors.jsonl"
@@ -453,21 +497,37 @@ def _check_recent_errors(now: datetime) -> dict:
         return {
             "ok": True,
             "count_last_hour": 0,
+            "window_minutes": window_minutes,
             "threshold": threshold,
             "reason": "no errors.jsonl found",
         }
 
-    count = _count_recent_errors(errors_path, now, window_minutes=60)
+    premarket_cutoff: datetime | None = None
+    if _env_bool("PREFLIGHT_IGNORE_PREMARKET_ERRORS", True):
+        candidate = _premarket_cutoff(now)
+        # Before today's 09:15 open the cutoff is in the future — fall back to
+        # the plain rolling window so pre-market preflight calls still count.
+        if candidate <= now.replace(tzinfo=None):
+            premarket_cutoff = candidate
+
+    count = _count_recent_errors(
+        errors_path,
+        now,
+        window_minutes=window_minutes,
+        premarket_cutoff=premarket_cutoff,
+    )
     if count > threshold:
         return {
             "ok": False,
             "count_last_hour": count,
+            "window_minutes": window_minutes,
             "threshold": threshold,
-            "reason": f"{count} errors in last hour",
+            "reason": f"{count} errors in last {window_minutes} min",
         }
     return {
         "ok": True,
         "count_last_hour": count,
+        "window_minutes": window_minutes,
         "threshold": threshold,
         "reason": None,
     }
