@@ -1,0 +1,19 @@
+{
+  "version": "0.1.0",
+  "mode": "scaffold-only",
+  "deployable": false,
+  "universe": ["BANKBEES", "ITBEES", "PSUBNKBEES", "PHARMABEES", "METALIETF", "PVTBANIETF", "FMCGIETF", "AUTOBEES", "HEALTHIETF"],
+  "index_proxies": ["FINNIFTY", "NIFTYOILANDGAS"],
+  "momentum_lookback_days": 126,
+  "lowvol_lookback_days": 60,
+  "momentum_top_n": 3,
+  "lowvol_bottom_n": 3,
+  "weight_method": "risk_parity_inverse_vol",
+  "rebalance_frequency": "monthly_first_trading_day",
+  "capital_inr": 300000,
+  "max_position_inr": 50000,
+  "execution_window_ist": "11:00-12:00",
+  "broker": "zerodha",
+  "exchange": "NSE",
+  "product": "CNC"
+}
