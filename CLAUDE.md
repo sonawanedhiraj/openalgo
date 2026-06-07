@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Strategy Registry — Read First When User Mentions "Trading Strategy"
+
+The canonical record of every strategy tested in this project lives at
+[`strategies/STRATEGY_REGISTRY.md`](strategies/STRATEGY_REGISTRY.md). When the user
+references trading strategies — past, current, or proposed — Claude should READ
+THAT FILE FIRST. It contains the active deployable shortlist, every rejected
+strategy with WHY, in-flight experiments, the untested backlog, and the standard
+testing protocol that makes rounds comparable.
+
+The registry is a LIVING document. After every backtest round, Claude should add
+a new entry. After every live trading session, Claude should update the relevant
+`strategies/<name>/LEARNINGS.md`. The registry's `Active` and `In-Flight` rows
+should reflect current reality.
+
 ## Cowork Objective (Read First)
 
 **Cowork is the brain of this project.** It does real-time market research, selects
