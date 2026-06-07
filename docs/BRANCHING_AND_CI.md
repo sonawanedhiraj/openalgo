@@ -295,22 +295,57 @@ runner. The operator is overriding it — so the task is to make local CI safe
 | **L1** | `pre-push` hook → `scripts/ci.ps1` (wraps `make gate`); no Actions | Advisory only (GitHub sees no result) | **None** — no daemon |
 | **L2** | Self-hosted `[self-hosted, windows]` runner; push/PR reports status to GitHub | **Enforced** | Always-on executor running workflow YAML on the host with broker creds + live DBs |
 | **L3** | L1 hook **+** L2 runner | Enforced + fast local feedback | Same as L2 |
+| **L3-Docker** ✅ | L1 hook **+** self-hosted runner *inside a hardened Docker container* | Enforced + fast local feedback | **Contained** — no host mounts / socket / net; 1 CPU / 2 GB (see Isolation guarantees) |
 
 L2/L3 buy an *enforced* status check by putting an always-on agent that runs
 arbitrary workflow code onto the real-money host, and would need market-hours
 gating (Task Scheduler), below-normal process priority, a `db_test/` sandbox,
 and a secrets allow-list just to be tolerable.
 
-### Decision: **L1 — pure local hooks.**
+### Decision: **L3-with-Docker-isolation.**
 
-For a *solo* dev, "required status checks" guard against collaborators who
-don't exist — so L2/L3's enforced gate is marginal value, paid for by growing
-attack surface on the one host that trades real money. L1 is genuinely "CI on
-the local machine," runs **only when the operator types `git push`**
-(foreground, operator-timed — no daemon, no Task Scheduler), and adds nothing
-the box must defend. **The trade-off the operator accepts:** the gate is
-bypassable (`--no-verify`) and GitHub can't enforce it — *discipline replaces
-mechanism.* For one person, that's the right call.
+> **2026-06-07 update — supersedes the L1-only call below.** The operator now
+> wants an *enforced* GitHub status check, so we add a self-hosted runner on
+> this same box — accepting the runner risk **only because it runs inside a
+> hardened Docker container** (no host mounts, no Docker socket, no host
+> networking, 1 CPU / 2 GB, ephemeral per job). The L1-only reasoning is kept
+> below for posterity.
+
+L3 = the L1 `pre-push` hook (fast local feedback, unchanged — see *Market-hours
+contention* below) **plus** a self-hosted runner that reports `gate` /
+`backend-test` status to GitHub, so a red gate can *block* a merge instead of
+merely advising. The runner is the part that previously made L2/L3
+unacceptable; Docker isolation is what makes it tolerable on the trading box.
+
+**Why Docker flips the trade-off.** The original objection was an always-on
+executor running workflow code on the host with broker creds + live DBs. The
+container removes every leg: no host filesystem (no bind-mounts), no host Docker
+(no socket), no reach to OpenAlgo/bridge (no host networking), capped at 1 CPU /
+2 GB so it can't starve live trading, fresh container per job. Config lives in
+`ci/runner/docker-compose.yml`; bring-up in `scripts/install-runner.ps1`.
+
+**Residual risks (accepted):** the runner is a long-lived process (bounded by
+the caps + `unless-stopped`; stop it during sensitive windows); container escape
+is the theoretical worst case (mitigated by no socket / no privileged / no
+mounts / private repo); WSL2 carries a baseline RAM cost. None touch live DBs or
+broker creds.
+
+#### Isolation guarantees
+
+**CAN see:** the GitHub API / Actions service; public package mirrors (PyPI via
+`uv`, npm); the repo it clones fresh into its own `/runner/_work` each job.
+
+**CANNOT see** (hard guarantees from `ci/runner/docker-compose.yml`): the host's
+`db/*.db`, `.env`, broker credentials, `log/`, `audit/`, `bridge/`, or any host
+path outside its own work dir; the host Docker daemon (`/var/run/docker.sock` is
+**not** mounted); OpenAlgo on `localhost:5000` or the Cowork bridge on
+`localhost:5001` (default bridge network only — **no** `network_mode: host`,
+**no** `host.docker.internal` wiring).
+
+**Trust boundary:** the workflow YAML lives in the repo and the repo is private,
+so only the operator can push workflow code — there is no untrusted-contributor
+path that runs on the box. The token lives only in the gitignored
+`ci/runner/.env.runner`.
 
 ### Market-hours contention — how L1 stays safe
 
@@ -323,27 +358,29 @@ mechanism.* For one person, that's the right call.
   `smoke_boot.py`; does not start the app, open `db/*.db`, or read broker
   creds. Any future DB-touching step must point at `db_test/`.
 
-### Why we changed from GitHub-hosted (posterity)
+### Why the recommendation moved (posterity)
 
-The prior plan picked hosted ubuntu (free if public; ~480 of 2,000 free
-min/month if private) plus a local pre-push gate, and rejected a self-hosted
-runner because the only spare machine is the production box. The operator has
-since chosen local-first to keep the loop offline and under direct control.
-**GitHub-minute quotas are now N/A** (L1 consumes none). Hosted CI stays a
-clean future add-on (it would become L3) if an enforced gate ever justifies a
-runner on a *separate* host — see Open questions.
+The prior plan picked GitHub-hosted ubuntu, then pivoted to **L1 local-only**
+(rejecting any self-hosted runner because the only spare machine is the
+production box). The current plan keeps L1's local hook but **adds the runner
+back as L3-with-Docker-isolation** — Docker contains the exact risk that got it
+rejected, in exchange for an *enforced* GitHub status check. GitHub-minute
+quotas remain N/A: the self-hosted runner consumes none, and the trimmed hosted
+`ci.yml` is now `workflow_dispatch`-only (frontend checks, on demand).
 
 ## Branch Protection (GitHub Settings → Branches)
 
 For a solo dev, protection is a safety net against *yourself*, not a review
-gate — and under **L1 there is no GitHub-side status check to require** (CI
-runs locally; GitHub never sees a result). So protection here is the small
-set of settings that still help without a runner. On **`main`** (and
-optionally `dev`):
+gate — and under **L3-Docker the self-hosted runner now reports a real status
+check you can require** (the L1-only plan had none — CI ran locally and GitHub
+never saw a result). So protection can finally enforce a green gate. On
+**`main`** (and optionally `dev`):
 
-- ⚠️ **Required status checks — N/A under L1.** No CI job reports to GitHub;
-  the local `pre-push` hook is the gate, advisory at the GitHub layer. (If
-  L2/L3 is ever adopted, `ci-local / gate` becomes the one required check.)
+- ✅ **Required status checks — available under L3-Docker.** Enable *Require
+  status checks to pass* and select **`gate`** (add **`backend-test`** once
+  pytest markers land — see next steps; until then `-m unit` collects nothing
+  and that check would be perpetually red). The local `pre-push` hook stays the
+  fast first line of defence.
 - ✅ Require branches to be up to date before merging.
 - ❌ Require PR reviews / approvals — **off** (solo; no reviewers).
 - ✅ Require conversation resolution (cheap, catches self-notes).
@@ -381,13 +418,15 @@ hours).
 
 ## What we're NOT doing yet (and why)
 
-- **Self-hosted Actions runner on the trading box (L2/L3)** — rejected: an
-  always-on executor running workflow-level code on the host that holds
-  broker creds and live DBs. Reconsider only if a *separate* host appears.
-- **GitHub-hosted CI** — deferred in favour of local-first; still a clean
-  future add-on (it would be L3), and the inherited `ci.yml` can be trimmed
-  to a lean profile then. We don't publish images, so `docker-build` /
-  `docker-manifest` / `commit-dist` stay off regardless.
+- **Docker socket mount, host networking, or host bind-mounts on the runner**
+  — **non-negotiable: never.** The runner's safety rests entirely on the
+  container seeing none of `/var/run/docker.sock`, `network_mode: host`, or any
+  host path (`db/`, `.env`, `log/`, `audit/`, `bridge/`). Adding any one
+  re-opens the exact risk that kept a runner off this box.
+- **GitHub-hosted backend CI** — replaced by the self-hosted runner; the
+  trimmed `ci.yml` keeps only frontend checks and only on `workflow_dispatch`.
+  We don't publish images, so `docker-build` / `docker-manifest` /
+  `commit-dist` stay deleted regardless.
 - **Frontend e2e (Playwright) in CI** — heavy install, low solo ROI; run
   locally before UI ships.
 - **Deploy automation** — production is hand-managed precisely because
@@ -402,13 +441,16 @@ hours).
 2. **Codify pytest markers** — add `markers = ["unit", "integration",
    "live"]` to `[tool.pytest.ini_options]` and tag the fast tests `unit`,
    so the gate can run `pytest -m unit` instead of the hardcoded 5-file list.
-3. **Decide the fate of the inherited `.github/workflows/ci.yml`** — under L1
-   it still fires on every push. Either disable it (rename to
-   `*.yml.disabled`, or restrict triggers to `workflow_dispatch`), or keep it
-   as no-cost belt-and-braces if the fork is public. *(Operator decision —
-   see Open questions.)*
+3. **Stand up the L3-Docker runner** — create a fine-grained PAT
+   (Administration: read/write on `openalgo`), copy
+   `ci/runner/.env.runner.example` → `ci/runner/.env.runner`, paste it as
+   `ACCESS_TOKEN`, then run `pwsh scripts/install-runner.ps1`. Verify
+   **openalgo-laptop** shows *Idle* under repo Settings → Actions → Runners.
+   (`ci.yml` is already trimmed to `workflow_dispatch`-only; backend CI now
+   lives in `.github/workflows/ci-self-hosted.yml`.)
 4. **Configure branch protection + auto-delete head branches** in repo
-   Settings (status checks are advisory under L1).
+   Settings — enable *Require status checks to pass* and select **`gate`**
+   (add **`backend-test`** after pytest markers land, step 2).
 5. **Schedule the monthly branch-hygiene audit** as a read-only Cowork task.
 6. **Reconcile `main` with `dev`'s upstream base** — bring `main` up to the
    2026-05-26 upstream state `dev` already has, so the "sync into `main`

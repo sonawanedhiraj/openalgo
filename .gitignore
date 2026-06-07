@@ -105,3 +105,6 @@ yarn-error.log*
 
 # Windows NUL file
 nul
+
+# Self-hosted CI runner secret (PAT / registration token) — never commit
+ci/runner/.env.runner
