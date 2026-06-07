@@ -138,15 +138,137 @@ These exist specifically so the 47-branch incident cannot recur:
 - Only the operator pushes tags. Tagging is manual and deliberate, tied to
   a meaningful, tested state of `main`.
 
-## Upstream Sync (OpenAlgo `marketcalls/main` → our `main`)
+## Upstream Sync (OpenAlgo `marketcalls/main` → our fork)
 
-- **Cadence:** monthly, or when a needed upstream fix lands. Not per-commit.
-- **Procedure:** `git fetch upstream` → branch `sync/upstream-YYYY-MM-DD`
-  off our `main` → `git merge upstream/main` → resolve conflicts (watch
-  `frontend/dist`, `CLAUDE.md`, strategy dirs) → run the full local gate →
-  PR into `main` with a **merge commit** (attribution preserved).
-- After `main` absorbs upstream, fast-forward `dev` from `main` so daily
-  work builds on the latest base.
+The full step-by-step runbook lives in a sibling doc —
+[`docs/UPSTREAM_SYNC_PROCEDURE.md`](UPSTREAM_SYNC_PROCEDURE.md) — so this
+section stays strategic. Below is the *why*: the measured divergence, where
+conflicts actually live, and the structural rules that keep the next merge
+cheap.
+
+### Divergence snapshot (audited 2026-06-07)
+
+Audited against upstream HEAD `e4916a7d` (`chore: auto-build frontend dist`,
+2026-06-05).
+
+| Line | Merge-base w/ upstream | Fork commits ahead | Upstream commits to absorb | Both-edited (conflict surface) |
+| --- | --- | --- | --- | --- |
+| `main` | `4280d879` (2026-04-22) | **1** | **261** | **1** (`CLAUDE.md`) |
+| `dev` | `c3bb4436` (2026-05-26) | **173** | **47** | **4** |
+
+**Finding — the trunks are inverted.** `dev`'s merge-base (2026-05-26) is
+*newer* than `main`'s (2026-04-22): `dev` already absorbed the upstream
+"dev-stability foundation" merge, but `main` did not. The "sync into `main`
+first, then fast-forward `dev`" model below is therefore **not what
+happened** — upstream landed directly on `dev`. Before the next sync the
+operator must reconcile this (see Open question). All conflict analysis here
+uses the **`dev`** base, since that is where fork code actually lives.
+
+### Conflict-surface analysis (what will actually bite)
+
+The `dev`-vs-upstream conflict surface is only **4 files**:
+
+| File | Fork diff (lines) | Upstream diff (lines) | Nature | Resolution |
+| --- | --- | --- | --- | --- |
+| **`app.py`** | **453** | 46 | Fork boot wiring (preflight bp, scanner DB init, csrf exempts, scanner pre-subscribe boot-retry, engine rehydration) scattered inline vs upstream boot tweaks | **Hand-merge** — the chronic zone (see Isolation #1) |
+| `pyproject.toml` | ~10 | ~6 | Fork adds deps (`fastapi`, `pandas-ta-classic`, `feedparser`) + pytest config (`pythonpath`, `--import-mode=importlib`, `asyncio_mode`); upstream bumps version + `openalgo`/`starlette`/`idna` pins | **Hand-merge** — keep both (see procedure doc) |
+| `uv.lock` | regenerated | regenerated | Lockfile | **Take neither — regenerate** with `uv lock` after merging `pyproject.toml` |
+| `CLAUDE.md` | 7 commits | n/a | Operator notes vs upstream additions | **Hand-merge** — keep both |
+
+Everything else fast-forwards cleanly. Crucially, upstream's 47 commits are
+**frontend-dominated**: 662 `frontend/**` files, 58 `broker/**`, and only
+**2 `services/`** (`market_data_service.py`, `option_greeks_service.py`) and
+**3 `blueprints/`**. The fork edits *no* frontend files, so the 662-file
+frontend churn is a clean "take theirs + rebuild" — not a conflict.
+
+**Why the surface is so small:** nearly every chronic fork-edited file is
+**fork-only** — upstream has no copy to conflict with. Verified fork-only:
+`services/simplified_stock_engine_service.py` (16 fork commits),
+`services/preflight_service.py` (10), `services/scanner_service.py` (6),
+`services/scan_cycle_service.py` (5), `services/backtest_service.py` (5),
+`services/signal_review_service.py`, `services/notification_service.py`. The
+only chronic file upstream *does* have is **`blueprints/chartink.py`** — a
+**latent** conflict (upstream did not touch it in these 47 commits, but it
+is shared, so a future upstream edit will collide with our simplified-engine
+routes at `chartink.py:947+`).
+
+### Isolation patterns (keep new code fork-private)
+
+The audit shows isolation already works: upstream touches **0** files under
+`strategies/sector_rotation_etf/`, `services/sector_rotation_etf_*`,
+`bridge/`, `strategies/simplified_engine/`, and `services/simplified_stock_engine_*`.
+The two weak spots are files where fork logic was added *inline* to an
+upstream file. Concrete extraction recommendations, in ROI order:
+
+1. **Extract `app.py` boot wiring → `services/fork_bootstrap.py`** (highest
+   ROI). app.py is the fork's #1 churned file (28 commits) *and* the only
+   real conflict file. Move the ~453 lines of fork boot logic (preflight
+   blueprint registration, scanner DB init, csrf exempts, scanner
+   pre-subscribe boot-retry thread, simplified-engine rehydration) behind a
+   single `wire_fork(app, socketio)` call. This turns a 453-line scattered
+   diff into a **one-line addition** inside `create_app()` — which a
+   `# FORK-START`/`# FORK-END` marker pair makes trivially mergeable.
+2. **Move simplified-engine routes out of `blueprints/chartink.py` →
+   `blueprints/simplified_engine_routes.py`** (defuses the one latent
+   shared-file conflict). The webhook/status/direction-toggle routes at
+   `chartink.py:947+` are fork-only behavior bolted onto an upstream
+   blueprint; a dedicated fork blueprint registered via `wire_fork` keeps
+   `chartink.py` byte-identical to upstream.
+3. **Quarantine fork env vars in `.sample.env`** (13 fork commits). Not
+   currently a conflict, but it is a shared config file; wrap the fork keys
+   (`SIMPLIFIED_ENGINE_*`, `SCANNER_*`, `PREFLIGHT_*`, bridge keys) in a
+   clearly delimited `# === FORK CONFIG ===` block at the end so upstream
+   additions never interleave with ours.
+
+### Edit-in-place conventions (for upstream files we must touch)
+
+When a fork change genuinely cannot be isolated (e.g. the single
+`wire_fork` call in `app.py`, deps in `pyproject.toml`, notes in
+`CLAUDE.md`):
+
+- **Marker comments** around every fork block:
+  `# FORK-START: <one-line reason>` / `# FORK-END:`. A merge can then `grep`
+  for our edits and a reviewer can see at a glance what is ours.
+- **Bias to additions over modifications.** Appending a blueprint
+  registration merges cleanly; rewriting upstream's `create_app` body does
+  not. Never reorder or reformat upstream code we are not changing.
+- **Keep upstream's structure** even where we would organize differently —
+  structural drift is what turns a 3-way merge into a hand-rewrite.
+
+### Cadence (revised) + cherry-pick-vs-merge rule
+
+**Keep monthly for the full merge, but add a cherry-pick fast-path.**
+Evidence: upstream ran **261 commits in 44 days (~5.9/day)** since `main`'s
+base, **47 in ~10 days (~4.7/day)** since `dev`'s. That velocity sounds
+alarming for a monthly cadence, but it is **frontend-dominated and
+conflict-free for us** — a monthly merge absorbing ~120+ commits is fine
+because the backend conflict surface stays ~4 files regardless of commit
+count. Monthly stays.
+
+What the velocity *does* argue for is a **between-sync cherry-pick path** for
+anything urgent:
+
+- **Cherry-pick** (onto a `fix/` branch off `dev`) when you need **one
+  isolated upstream commit now** and don't want the whole frontend refresh:
+  e.g. (a) a `broker/zerodha/api/order_api.py` order-placement bugfix mid-month;
+  (b) an upstream auth/CSRF security fix you can't wait a month for.
+- **Full merge** (the monthly `sync/upstream-*` branch) when changes **move
+  as a coherent set**: e.g. (a) the 662-file `frontend/**` + `frontend/dist`
+  refresh — never cherry-pick generated `dist` piecemeal; (b) a
+  platform-version bump that spans `pyproject.toml` + `uv.lock` +
+  `requirements*.txt` together.
+
+Rule of thumb: **isolated + urgent → cherry-pick; coupled or generated →
+full merge.**
+
+### Tracking log
+
+Every sync appends one entry to
+[`docs/UPSTREAM_SYNC_LOG.md`](UPSTREAM_SYNC_LOG.md): date, upstream SHA
+before/after, fork base before/after, files hand-merged, and anything
+notable (dep bumps, migration reorders). This is the audit trail and
+satisfies the "docs change WITH code" rule in `CLAUDE.md` — the log entry
+ships in the same merge commit.
 
 ## Continuous Integration
 
@@ -251,7 +373,20 @@ in this plan.)
 5. **Configure branch protection + auto-delete head branches** in repo
    Settings.
 6. **Schedule the monthly branch-hygiene audit** as a read-only Cowork task.
-7. Link this doc from `CLAUDE.md` once enacted.
+7. **Reconcile `main` with `dev`'s upstream base** — bring `main` up to the
+   2026-05-26 upstream state `dev` already has, so the "sync into `main`
+   first" model is true before the next sync (see Upstream Sync finding).
+8. **Extract `app.py` fork boot wiring → `services/fork_bootstrap.py`**
+   (Upstream Sync, Isolation #1) — the single highest-leverage refactor for
+   cheap future merges. Wrap the call site in `# FORK-START`/`# FORK-END`.
+9. **Move simplified-engine routes out of `blueprints/chartink.py`** into a
+   fork-private `blueprints/simplified_engine_routes.py` (Isolation #2) to
+   defuse the one latent shared-file conflict.
+10. **Quarantine fork env vars** into a marked block in `.sample.env`
+    (Isolation #3).
+11. **Create `docs/UPSTREAM_SYNC_LOG.md`** (empty header + schema) so the
+    first sync has somewhere to record.
+12. Link this doc from `CLAUDE.md` once enacted.
 
 ---
 
@@ -365,9 +500,16 @@ For Windows, a `scripts/ci.ps1` with the same steps (`uv run` calls are
 identical; replace `make` targets with the underlying `uv run` commands or
 invoke `make` via Git Bash / WSL).
 
-## Open question for the operator
+## Open questions for the operator
 
-**Is `github.com/sonawanedhiraj/openalgo` public or private?** Forks of
-public repos default to public (→ unlimited free Actions). The CLI can't
-tell us. Confirm in Settings → General. The lean CI profile fits the free
-tier either way, so this changes urgency, not the plan.
+1. **Is `github.com/sonawanedhiraj/openalgo` public or private?** Forks of
+   public repos default to public (→ unlimited free Actions). The CLI can't
+   tell us. Confirm in Settings → General. The lean CI profile fits the free
+   tier either way, so this changes urgency, not the plan.
+2. **Trunk model is inverted for upstream sync.** `dev`'s upstream
+   merge-base (2026-05-26) is newer than `main`'s (2026-04-22) — upstream
+   landed on `dev`, not `main`. Should we (a) make `main` the canonical
+   upstream-sync target and back-fill it to `dev`'s level first, or (b)
+   accept that upstream lands on `dev` and adjust the two-tier model
+   accordingly? The procedure doc assumes (a). **Needs a decision before the
+   next sync.**
