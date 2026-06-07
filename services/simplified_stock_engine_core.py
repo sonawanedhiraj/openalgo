@@ -218,15 +218,17 @@ def compute_zerodha_intraday_charges(buy_value: float, sell_value: float) -> Tra
     - Stamp duty: 0.003% of buy value (paid by the buyer).
     """
     turnover = buy_value + sell_value
-    # Per-leg brokerage capped at Rs20.
-    per_leg_brokerage = min(20.0, 0.0003 * (buy_value if buy_value else 0.0)) + \
-        min(20.0, 0.0003 * (sell_value if sell_value else 0.0))
-    # The source computes brokerage as min(20, 0.03% turnover) for a single
-    # round trip rather than per leg. Reproduce that for fidelity.
-    brokerage = min(20.0, 0.0003 * turnover) if turnover else 0.0
-    # Per-leg cap is a less aggressive simplification kept as a comment for
-    # operators who want stricter accounting: per_leg_brokerage.
-    _ = per_leg_brokerage  # silence linter; kept for documentation
+    # Zerodha caps brokerage at Rs20 PER ORDER, not per round trip. Each leg is
+    # charged min(Rs20, 0.03% of that leg's turnover), rounded to paise the way
+    # Kite's /charges/orders endpoint reports each order, and the two legs are
+    # summed. The previous single-round-trip cap (min(20, 0.03% of turnover))
+    # under-reported cost whenever each leg's 0.03% exceeded Rs20 -- or, as in
+    # the NBCC reconciliation, when the round-trip cap clamped to Rs20 while the
+    # true per-leg charges summed to Rs32.15 (model Rs20.00 vs Kite Rs32.15,
+    # 37.8% under-reported).
+    brokerage_buy_leg = round(min(20.0, 0.0003 * buy_value) if buy_value else 0.0, 2)
+    brokerage_sell_leg = round(min(20.0, 0.0003 * sell_value) if sell_value else 0.0, 2)
+    brokerage = brokerage_buy_leg + brokerage_sell_leg
 
     stt = 0.00025 * sell_value
     exchange = 0.0000345 * turnover

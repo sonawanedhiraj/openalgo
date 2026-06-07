@@ -62,6 +62,11 @@ class TradeJournal(Base):
     entry_price = Column(Float, nullable=True)
     entry_order_id = Column(String(64), nullable=True)
     entry_fill_at = Column(String(40), nullable=True)
+    # LTP the engine observed at signal time (the decision price). Lets the
+    # nightly loop compute realized slippage = (fill_price - ltp_at_signal) /
+    # ltp_at_signal once live fills accumulate. Nullable on purpose: pre-existing
+    # rows predate the column, and signal-less exits (EOD flatten) have no LTP.
+    ltp_at_signal = Column(Float, nullable=True)
 
     # Context at entry — Stage 1.7 will fill these richer. nifty_pct + vix
     # are kept as top-level columns so the reflection loop can group/filter
@@ -98,10 +103,47 @@ class TradeJournal(Base):
 
 
 def init_db():
-    """Create the trade_journal table if missing. Idempotent."""
+    """Create the trade_journal table if missing, then add any columns that
+    post-date the original schema. Idempotent.
+
+    ``create_all`` only creates missing tables -- it never adds columns to a
+    table that already exists. New nullable columns are evolved here with a
+    guarded ``ALTER TABLE ... ADD COLUMN`` (mirrors upgrade/add_feed_token.py),
+    so an existing db/openalgo.db picks them up on the next boot.
+    """
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Trade Journal DB", logger)
+    _ensure_columns()
+
+
+def _ensure_columns():
+    """Add nullable columns introduced after the initial schema, if absent."""
+    from sqlalchemy import inspect, text
+
+    # ALTER TABLE ADD COLUMN clause keyed by column name. SQLite has no
+    # native bool/decimal types; REAL maps to the SQLAlchemy Float column.
+    pending = {"ltp_at_signal": "REAL"}
+    try:
+        inspector = inspect(engine)
+        existing = {col["name"] for col in inspector.get_columns("trade_journal")}
+    except Exception as e:
+        # Table may not exist yet on a brand-new db; create_all above handles
+        # that case, so a failure here is non-fatal.
+        logger.debug("trade_journal column inspection skipped: %s", e)
+        return
+
+    for name, sql_type in pending.items():
+        if name in existing:
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(f"ALTER TABLE trade_journal ADD COLUMN {name} {sql_type}")
+                )
+            logger.info("trade_journal: added column %s %s", name, sql_type)
+        except Exception as e:
+            logger.warning("trade_journal: failed adding column %s: %s", name, e)
 
 
 def _now_iso() -> str:
@@ -122,6 +164,7 @@ def _row_to_dict(row: TradeJournal) -> dict:
         "entry_price": row.entry_price,
         "entry_order_id": row.entry_order_id,
         "entry_fill_at": row.entry_fill_at,
+        "ltp_at_signal": row.ltp_at_signal,
         "regime_snapshot": row.regime_snapshot,
         "nifty_pct_at_entry": row.nifty_pct_at_entry,
         "india_vix_at_entry": row.india_vix_at_entry,

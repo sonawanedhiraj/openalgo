@@ -72,7 +72,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |

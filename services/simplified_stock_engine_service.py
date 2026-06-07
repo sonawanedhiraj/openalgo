@@ -722,6 +722,11 @@ class SimplifiedStockEngineService:
                 strategy_name=self.JOURNAL_STRATEGY_NAME,
                 signal_source="chartink",
                 entry_price=float(signal.reference_price),
+                # LTP the engine acted on. Captured before any fill so slippage
+                # can later be measured against the actual fill price. entry_price
+                # gets overwritten with the real fill via update_entry_fill;
+                # ltp_at_signal stays pinned to the decision price.
+                ltp_at_signal=float(signal.reference_price),
                 entry_order_id=str(order_id) if order_id else None,
                 signal_decision_id=decision_id,
             )
