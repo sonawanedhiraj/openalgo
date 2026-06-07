@@ -3,23 +3,49 @@
 .SYNOPSIS
   Bootstrap the OpenAlgo self-hosted GitHub Actions runner (Docker-isolated).
 .DESCRIPTION
-  Verifies Docker Desktop is running and ci/runner/.env.runner is configured,
+  Deploys the runner templates from the repo's ci/runner/ directory to the
+  active runtime location (default C:\actions-runner, outside the repo working
+  tree so the runner's file writes never collide with git operations on .git/).
+  Verifies Docker Desktop is running and <Target>\.env.runner is configured,
   then brings up the hardened runner container and tails its log so you can
   watch it register. Does NOT generate the token — see ci/runner/README.md.
+.PARAMETER Target
+  Runtime directory the runner runs from. Defaults to C:\actions-runner.
 .NOTES
   Run from anywhere:  pwsh scripts/install-runner.ps1
 #>
 [CmdletBinding()]
 param(
+    [string]$Target = 'C:\actions-runner',
     [int]$TailSeconds = 30
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot    = Split-Path -Parent $PSScriptRoot
-$composeFile = Join-Path $repoRoot 'ci/runner/docker-compose.yml'
-$envFile     = Join-Path $repoRoot 'ci/runner/.env.runner'
+$repoRoot       = Split-Path -Parent $PSScriptRoot
+$templateDir    = Join-Path $repoRoot 'ci/runner'
+$srcCompose     = Join-Path $templateDir 'docker-compose.yml'
+$srcEnvExample  = Join-Path $templateDir '.env.runner.example'
+$composeFile    = Join-Path $Target 'docker-compose.yml'
+$envFile        = Join-Path $Target '.env.runner'
 
 Write-Host '== OpenAlgo self-hosted runner bootstrap ==' -ForegroundColor Cyan
+Write-Host "    template dir : $templateDir" -ForegroundColor DarkGray
+Write-Host "    runtime dir  : $Target" -ForegroundColor DarkGray
+
+# 0. Ensure the runtime directory exists (outside the repo working tree).
+New-Item -ItemType Directory -Force -Path $Target | Out-Null
+
+# 0a. Deploy templates into the runtime dir (only if not already present, so a
+#     configured runtime is never clobbered).
+if (-not (Test-Path $composeFile)) {
+    Copy-Item $srcCompose $composeFile
+    Write-Host "[ok] Copied docker-compose.yml -> $composeFile" -ForegroundColor Green
+} else {
+    Write-Host "[ok] docker-compose.yml already present in $Target (left as-is)" -ForegroundColor Green
+}
+if (-not (Test-Path (Join-Path $Target '.env.runner.example'))) {
+    Copy-Item $srcEnvExample (Join-Path $Target '.env.runner.example')
+}
 
 # 1. Docker daemon reachable?
 try {
@@ -33,7 +59,7 @@ Write-Host '[ok] Docker daemon reachable' -ForegroundColor Green
 
 # 2. .env.runner present and a token set?
 if (-not (Test-Path $envFile)) {
-    Write-Error "Missing $envFile. Copy ci/runner/.env.runner.example to ci/runner/.env.runner and set ACCESS_TOKEN (see ci/runner/README.md)."
+    Write-Error "Missing $envFile. Copy $Target\.env.runner.example to $envFile and set ACCESS_TOKEN (see ci/runner/README.md)."
     exit 1
 }
 $hasAccess = Select-String -Path $envFile -Pattern '^\s*ACCESS_TOKEN\s*=\s*\S' -Quiet
@@ -66,4 +92,4 @@ Write-Host '== Next steps ==' -ForegroundColor Cyan
 Write-Host '  1. github.com/sonawanedhiraj/openalgo -> Settings -> Actions -> Runners'
 Write-Host '     -> confirm "openalgo-laptop" shows status "Idle".'
 Write-Host '  2. Open a PR to main/dev to trigger .github/workflows/ci-self-hosted.yml.'
-Write-Host '  3. Manage: docker compose -f ci/runner/docker-compose.yml [logs -f | stop | down]'
+Write-Host "  3. Manage: docker compose -f $composeFile [logs -f | stop | down]"

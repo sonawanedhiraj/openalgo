@@ -1,5 +1,10 @@
 # OpenAlgo self-hosted CI runner (Docker-isolated)
 
+> **Template directory.** These files are the canonical config for the L3 self-hosted runner,
+> but the active runtime lives at `C:\actions-runner\` (not in the repo). This avoids
+> overlapping disk I/O between git operations and the runner's working tree. Use
+> `scripts/install-runner.ps1` to deploy these templates to `C:\actions-runner\`.
+
 Everything needed to run a **GitHub Actions self-hosted runner** for
 `sonawanedhiraj/openalgo` inside a hardened Docker container on the operator's
 Windows production box. It backs the **L3-with-Docker-isolation** CI described
@@ -57,31 +62,39 @@ registration token from the "New self-hosted runner" page.
 
 ## 2. Configure
 
+`scripts/install-runner.ps1` deploys these templates to the runtime dir
+(`C:\actions-runner\` by default) and creates `.env.runner` **there**, not in
+the repo — so configure the token in the runtime copy:
+
 ```powershell
-Copy-Item ci/runner/.env.runner.example ci/runner/.env.runner
-# edit ci/runner/.env.runner and set:  ACCESS_TOKEN=github_pat_...
+# First run install-runner.ps1 once to copy the templates to C:\actions-runner\,
+# then create the token file alongside them:
+Copy-Item C:\actions-runner\.env.runner.example C:\actions-runner\.env.runner
+# edit C:\actions-runner\.env.runner and set:  ACCESS_TOKEN=github_pat_...
 ```
 
-`.env.runner` is **gitignored** — the token never gets committed.
+The runtime `.env.runner` lives **outside the repo**, so the token is never at
+risk of being committed (the in-repo `ci/runner/.env.runner` is also gitignored
+as a belt-and-braces guard).
 
 ## 3. Start
 
-From the repo root:
+From the repo root — this copies the templates to `C:\actions-runner\` and
+starts the container there:
 
 ```powershell
 pwsh scripts/install-runner.ps1
 ```
 
-or directly:
+To deploy to a different runtime dir, pass `-Target`:
 
 ```powershell
-cd ci/runner
-docker compose up -d
+pwsh scripts/install-runner.ps1 -Target D:\actions-runner
 ```
 
 ## 4. Verify
 
-- **Container:** `docker compose -f ci/runner/docker-compose.yml logs --tail=50`
+- **Container:** `docker compose -f C:\actions-runner\docker-compose.yml logs --tail=50`
   shows `Listening for Jobs`.
 - **GitHub:** `github.com/sonawanedhiraj/openalgo` → **Settings → Actions →
   Runners** lists **openalgo-laptop** with status **Idle** within ~60 s.
@@ -89,22 +102,22 @@ docker compose up -d
 ## Manage
 
 ```powershell
-docker compose -f ci/runner/docker-compose.yml stop            # pause
-docker compose -f ci/runner/docker-compose.yml start           # resume
-docker compose -f ci/runner/docker-compose.yml down            # remove container
-docker compose -f ci/runner/docker-compose.yml logs -f         # follow logs
+docker compose -f C:\actions-runner\docker-compose.yml stop            # pause
+docker compose -f C:\actions-runner\docker-compose.yml start           # resume
+docker compose -f C:\actions-runner\docker-compose.yml down            # remove container
+docker compose -f C:\actions-runner\docker-compose.yml logs -f         # follow logs
 ```
 
 ## Troubleshooting
 
 **Runner doesn't appear in GitHub after 60 s**
-1. `docker compose -f ci/runner/docker-compose.yml logs` — look for auth errors.
+1. `docker compose -f C:\actions-runner\docker-compose.yml logs` — look for auth errors.
 2. `401/403` → token wrong/expired or lacks **Administration: R/W**. Regenerate
    the PAT (step 1) and update `.env.runner`.
 3. `404` → check `REPO_URL` in `docker-compose.yml` matches the real repo.
 4. Confirm Docker Desktop is running (`docker version`).
 5. After fixing `.env.runner`, recreate the container:
-   `docker compose -f ci/runner/docker-compose.yml up -d --force-recreate`.
+   `docker compose -f C:\actions-runner\docker-compose.yml up -d --force-recreate`.
 
 **Jobs queue forever / "no runner matching labels"**
 The workflow targets `[self-hosted, linux, docker, openalgo-laptop]`; the

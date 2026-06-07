@@ -321,8 +321,11 @@ unacceptable; Docker isolation is what makes it tolerable on the trading box.
 executor running workflow code on the host with broker creds + live DBs. The
 container removes every leg: no host filesystem (no bind-mounts), no host Docker
 (no socket), no reach to OpenAlgo/bridge (no host networking), capped at 1 CPU /
-2 GB so it can't starve live trading, fresh container per job. Config lives in
-`ci/runner/docker-compose.yml`; bring-up in `scripts/install-runner.ps1`.
+2 GB so it can't starve live trading, fresh container per job. The canonical
+config **templates** live in the repo at `ci/runner/docker-compose.yml` +
+`ci/runner/.env.runner.example`, but the **active runtime is `C:\actions-runner\`,
+outside the repo working tree**; `scripts/install-runner.ps1` deploys the
+templates there and brings the container up from that location.
 
 **Residual risks (accepted):** the runner is a long-lived process (bounded by
 the caps + `unless-stopped`; stop it during sensitive windows); container escape
@@ -342,10 +345,17 @@ path outside its own work dir; the host Docker daemon (`/var/run/docker.sock` is
 `localhost:5001` (default bridge network only — **no** `network_mode: host`,
 **no** `host.docker.internal` wiring).
 
+**Runtime location:** the runner's runtime files (`docker-compose.yml`,
+`.env.runner`, and its `_work` clone tree) live at `C:\actions-runner\`,
+**outside the repo working tree**, so git operations on `.git/` cannot collide
+with the runner's file writes on the same volume. `ci/runner/` in the repo holds
+only the canonical templates that `scripts/install-runner.ps1` deploys there.
+
 **Trust boundary:** the workflow YAML lives in the repo and the repo is private,
 so only the operator can push workflow code — there is no untrusted-contributor
 path that runs on the box. The token lives only in the gitignored
-`ci/runner/.env.runner`.
+`.env.runner` at `C:\actions-runner\` (the in-repo `ci/runner/.env.runner` is
+also gitignored as a guard).
 
 ### Market-hours contention — how L1 stays safe
 
@@ -442,10 +452,11 @@ hours).
    "live"]` to `[tool.pytest.ini_options]` and tag the fast tests `unit`,
    so the gate can run `pytest -m unit` instead of the hardcoded 5-file list.
 3. **Stand up the L3-Docker runner** — create a fine-grained PAT
-   (Administration: read/write on `openalgo`), copy
-   `ci/runner/.env.runner.example` → `ci/runner/.env.runner`, paste it as
-   `ACCESS_TOKEN`, then run `pwsh scripts/install-runner.ps1`. Verify
-   **openalgo-laptop** shows *Idle* under repo Settings → Actions → Runners.
+   (Administration: read/write on `openalgo`), run `pwsh scripts/install-runner.ps1`
+   once to deploy the templates to `C:\actions-runner\`, copy
+   `C:\actions-runner\.env.runner.example` → `C:\actions-runner\.env.runner`,
+   paste the PAT as `ACCESS_TOKEN`, then re-run `pwsh scripts/install-runner.ps1`.
+   Verify **openalgo-laptop** shows *Idle* under repo Settings → Actions → Runners.
    (`ci.yml` is already trimmed to `workflow_dispatch`-only; backend CI now
    lives in `.github/workflows/ci-self-hosted.yml`.)
 4. **Configure branch protection + auto-delete head branches** in repo
