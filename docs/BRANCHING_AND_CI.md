@@ -1,9 +1,10 @@
 # Branching, Merge, and CI Strategy
 
-> Status: **first-pass plan** (2026-06-07). Captures the lessons from the
-> 47-stale-branch cleanup and the CI that arrived via the upstream
-> "dev-stability foundation" merge. Nothing here is enforced until the
-> "Next steps" section is executed and the operator approves.
+> Status: **first-pass plan** (2026-06-07; CI section revised same day to
+> local-first execution — see "Continuous Integration"). Captures the lessons
+> from the 47-stale-branch cleanup and the CI that arrived via the upstream
+> "dev-stability foundation" merge. Nothing here is enforced until the "Next
+> steps" section is executed and the operator approves.
 
 ## Goals
 
@@ -272,68 +273,84 @@ ships in the same merge commit.
 
 ## Continuous Integration
 
-### Decision: **(a) GitHub Actions, hosted ubuntu — but trimmed to a lean
-fork profile.** Plus **(c) a local `scripts/ci.sh` / `ci.ps1` pre-push
-gate** as the cheap first line of defense.
+> **2026-06-07 pivot — local CI is now primary.** The original plan picked
+> GitHub-hosted ubuntu; the operator has decided to **run CI on the local
+> machine instead**. This section is rewritten around that. The hosted
+> rationale is kept as a short note below for posterity.
 
-We do **not** self-hosted-runner this. The only spare machine is the
-production trading box; a runner there could contend for SQLite locks or
-CPU during market hours, and market-hours restarts are forbidden. Hosted
-ubuntu runners are isolated and free (see quotas).
+### The constraint we design around
 
-We **prune the inherited upstream CI**: drop `docker-build`,
-`docker-manifest` (no Docker Hub secrets, multi-arch is the biggest minute
-sink), `commit-dist` (we commit `dist` by hand per CLAUDE.md), and
-`frontend-e2e` (Playwright install ≈ 3–5 min/run for little solo value).
-Keep a lean backend-focused pipeline.
+The only available machine is **the production trading box** — one Windows
+host running OpenAlgo (persistent broker session, live SQLite DBs, Cowork
+scans every ~15 min during market hours). **Market-hours restarts are
+forbidden**; CI must never contend for CPU/SQLite locks, touch the live DBs,
+or read broker creds. That was the original reason to reject a self-hosted
+runner. The operator is overriding it — so the task is to make local CI safe
+*given* this is the only host.
 
-### Triggers
+### Options
 
-- **PR → `dev` and PR → `main`:** full lean pipeline (the real gate).
-- **Push → `main`:** lean pipeline (post-merge confirmation).
-- **Weekly schedule:** keep `security.yml` (bandit + pip-audit) as-is.
-- `concurrency` with `cancel-in-progress` (already in `ci.yml`) so rapid
-  re-pushes don't stack runs — important at 10 merges/week.
+| | What | GitHub gate | New risk on the box |
+| --- | --- | --- | --- |
+| **L1** | `pre-push` hook → `scripts/ci.ps1` (wraps `make gate`); no Actions | Advisory only (GitHub sees no result) | **None** — no daemon |
+| **L2** | Self-hosted `[self-hosted, windows]` runner; push/PR reports status to GitHub | **Enforced** | Always-on executor running workflow YAML on the host with broker creds + live DBs |
+| **L3** | L1 hook **+** L2 runner | Enforced + fast local feedback | Same as L2 |
 
-### Pipeline jobs (lean profile, est. wall-clock on ubuntu)
+L2/L3 buy an *enforced* status check by putting an always-on agent that runs
+arbitrary workflow code onto the real-money host, and would need market-hours
+gating (Task Scheduler), below-normal process priority, a `db_test/` sandbox,
+and a secrets allow-list just to be tolerable.
 
-| Job | Command | ~min |
-| --- | --- | --- |
-| gate | `make gate` (ruff smoke-scope + import smoke + engine tests) | 2–3 |
-| backend-lint | `ruff check .` + `ruff format --check .` (non-blocking) | 1–2 |
-| backend-test | `pytest -m unit` (once markers are codified) | 2–4 |
-| security-scan | `bandit -ll` + `pip-audit` (non-blocking) | 2–3 |
-| frontend-lint+build | `npm ci && npm run lint && npm run build` (only if `frontend/**` changed) | 3–5 |
+### Decision: **L1 — pure local hooks.**
 
-Total ≈ **6–10 min/run** with `uv` + npm caching, jobs in parallel.
+For a *solo* dev, "required status checks" guard against collaborators who
+don't exist — so L2/L3's enforced gate is marginal value, paid for by growing
+attack surface on the one host that trades real money. L1 is genuinely "CI on
+the local machine," runs **only when the operator types `git push`**
+(foreground, operator-timed — no daemon, no Task Scheduler), and adds nothing
+the box must defend. **The trade-off the operator accepts:** the gate is
+bypassable (`--no-verify`) and GitHub can't enforce it — *discipline replaces
+mechanism.* For one person, that's the right call.
 
-### Quotas — free-tier math
+### Market-hours contention — how L1 stays safe
 
-- **If the repo is PUBLIC** (forks of public repos default to public):
-  GitHub Actions on standard runners is **free and unlimited**. Cadence is
-  irrelevant. ✅
-- **If PRIVATE** (GitHub Free): **2,000 Linux min/month**. At ~30 PRs +
-  ~30 main pushes/month × ~8 min = **~480 min/month** for the lean profile
-  → comfortably under 2,000 (≈24% used). ✅ The *inherited* profile
-  (Docker multi-arch ≈ 20–30 min/run) would blow this — another reason to
-  trim. Marginal headroom only if we kept Docker; ample once trimmed.
+- **No daemon.** The hook fires only on an explicit `git push` — nothing
+  scheduled or webhook-driven. The operator picks the moment.
+- **Guard in `ci.ps1`.** 09:00–15:35 IST on weekdays → runs only the light
+  steps (ruff + import smoke; seconds, single-process), skipping
+  `test-engine`. `-Full` forces everything; `-Skip` aborts the push.
+- **Never touches live state.** Runs `make gate` + import-only
+  `smoke_boot.py`; does not start the app, open `db/*.db`, or read broker
+  creds. Any future DB-touching step must point at `db_test/`.
 
-**Verdict:** Free tier covers us either way **after trimming**. Confirm
-visibility, but no paid plan is needed.
+### Why we changed from GitHub-hosted (posterity)
+
+The prior plan picked hosted ubuntu (free if public; ~480 of 2,000 free
+min/month if private) plus a local pre-push gate, and rejected a self-hosted
+runner because the only spare machine is the production box. The operator has
+since chosen local-first to keep the loop offline and under direct control.
+**GitHub-minute quotas are now N/A** (L1 consumes none). Hosted CI stays a
+clean future add-on (it would become L3) if an enforced gate ever justifies a
+runner on a *separate* host — see Open questions.
 
 ## Branch Protection (GitHub Settings → Branches)
 
 For a solo dev, protection is a safety net against *yourself*, not a review
-gate. On **`main`** (and optionally `dev`):
+gate — and under **L1 there is no GitHub-side status check to require** (CI
+runs locally; GitHub never sees a result). So protection here is the small
+set of settings that still help without a runner. On **`main`** (and
+optionally `dev`):
 
-- ✅ Require status checks to pass before merging → select `gate`,
-  `backend-test`.
+- ⚠️ **Required status checks — N/A under L1.** No CI job reports to GitHub;
+  the local `pre-push` hook is the gate, advisory at the GitHub layer. (If
+  L2/L3 is ever adopted, `ci-local / gate` becomes the one required check.)
 - ✅ Require branches to be up to date before merging.
 - ❌ Require PR reviews / approvals — **off** (solo; no reviewers).
 - ✅ Require conversation resolution (cheap, catches self-notes).
 - ✅ *Automatically delete head branches* (repo-level — the anti-sprawl lever).
 - ❌ Do not allow force-push / deletion of `main`.
-- Allow yourself to bypass in a genuine market-hours emergency, but log it.
+- The real gate is the `pre-push` hook; the discipline is **don't
+  `--no-verify`** except the documented large-file merge case below.
 
 ## Pre-commit policy
 
@@ -342,17 +359,35 @@ going forward: **`--no-verify` is allowed only for merge commits that trip
 `check-added-large-files` on `frontend/dist`**, and that bypass must be
 mentioned in the commit body. Everything else fixes the hook failure.
 
-## Local pre-push gate
+## Local pre-push gate (the primary CI mechanism)
 
-Add `scripts/ci.sh` (+ `scripts/ci.ps1` for Windows) wrapping the same
-checks CI runs, so a green local run predicts green CI. This is the
-first-line defense — fast, no GitHub minutes. (Example below; not committed
-in this plan.)
+Under L1 this *is* the CI. `scripts/ci.ps1` (Windows-native, primary) and
+`scripts/ci.sh` (Git Bash / WSL fallback) wrap the same `make gate` checks; a
+tracked `scripts/git-hooks/pre-push` calls the script, and
+`scripts/install-hooks.ps1` copies it into the non-versioned `.git/hooks/`.
+Ready-to-use scripts are in Appendix A / B. Run manually with
+`pwsh scripts/ci.ps1` (add `-Full` to force the engine subset during market
+hours).
+
+**In operator terms:**
+
+- *When I `git push`* → the hook runs `ci.ps1` first; the push proceeds only
+  if it exits 0.
+- *When CI fails* → the push aborts and nothing leaves the box (the gate runs
+  *before* the network step — no remote state to roll back). Fix and re-push.
+- *When I'm mid-bug-fix on a market-open day* → push still works; the guard
+  runs only the light checks (seconds). Or `git push --no-verify` to skip,
+  then `pwsh scripts/ci.ps1 -Full` once the market closes.
 
 ## What we're NOT doing yet (and why)
 
-- **Docker-based CI / multi-arch / Docker Hub push** — we don't publish
-  images; pure minute waste. Removed from the lean profile.
+- **Self-hosted Actions runner on the trading box (L2/L3)** — rejected: an
+  always-on executor running workflow-level code on the host that holds
+  broker creds and live DBs. Reconsider only if a *separate* host appears.
+- **GitHub-hosted CI** — deferred in favour of local-first; still a clean
+  future add-on (it would be L3), and the inherited `ci.yml` can be trimmed
+  to a lean profile then. We don't publish images, so `docker-build` /
+  `docker-manifest` / `commit-dist` stay off regardless.
 - **Frontend e2e (Playwright) in CI** — heavy install, low solo ROI; run
   locally before UI ships.
 - **Deploy automation** — production is hand-managed precisely because
@@ -361,152 +396,136 @@ in this plan.)
 
 ## Next steps to implement (ordered)
 
-1. **Confirm repo visibility** (Settings → General) — determines whether
-   minutes are even a concern. *(Operator action.)*
+1. **Add the local gate (L1 core)** — `scripts/ci.ps1` + `scripts/ci.sh` +
+   `scripts/git-hooks/pre-push` (Appendix A / B), then run
+   `pwsh scripts/install-hooks.ps1` to install the hook into `.git/hooks/`.
 2. **Codify pytest markers** — add `markers = ["unit", "integration",
    "live"]` to `[tool.pytest.ini_options]` and tag the fast tests `unit`,
-   so CI can run `pytest -m unit` instead of the hardcoded 5-file list.
-3. **Add `scripts/ci.sh` + `scripts/ci.ps1`** (local pre-push gate).
-4. **Trim `.github/workflows/ci.yml`** to the lean profile (remove
-   `docker-build`, `docker-manifest`, `commit-dist`, `frontend-e2e`;
-   gate `frontend-*` on `paths: frontend/**`).
-5. **Configure branch protection + auto-delete head branches** in repo
-   Settings.
-6. **Schedule the monthly branch-hygiene audit** as a read-only Cowork task.
-7. **Reconcile `main` with `dev`'s upstream base** — bring `main` up to the
+   so the gate can run `pytest -m unit` instead of the hardcoded 5-file list.
+3. **Decide the fate of the inherited `.github/workflows/ci.yml`** — under L1
+   it still fires on every push. Either disable it (rename to
+   `*.yml.disabled`, or restrict triggers to `workflow_dispatch`), or keep it
+   as no-cost belt-and-braces if the fork is public. *(Operator decision —
+   see Open questions.)*
+4. **Configure branch protection + auto-delete head branches** in repo
+   Settings (status checks are advisory under L1).
+5. **Schedule the monthly branch-hygiene audit** as a read-only Cowork task.
+6. **Reconcile `main` with `dev`'s upstream base** — bring `main` up to the
    2026-05-26 upstream state `dev` already has, so the "sync into `main`
    first" model is true before the next sync (see Upstream Sync finding).
-8. **Extract `app.py` fork boot wiring → `services/fork_bootstrap.py`**
+7. **Extract `app.py` fork boot wiring → `services/fork_bootstrap.py`**
    (Upstream Sync, Isolation #1) — the single highest-leverage refactor for
    cheap future merges. Wrap the call site in `# FORK-START`/`# FORK-END`.
-9. **Move simplified-engine routes out of `blueprints/chartink.py`** into a
+8. **Move simplified-engine routes out of `blueprints/chartink.py`** into a
    fork-private `blueprints/simplified_engine_routes.py` (Isolation #2) to
    defuse the one latent shared-file conflict.
-10. **Quarantine fork env vars** into a marked block in `.sample.env`
-    (Isolation #3).
-11. **Create `docs/UPSTREAM_SYNC_LOG.md`** (empty header + schema) so the
+9. **Quarantine fork env vars** into a marked block in `.sample.env`
+   (Isolation #3).
+10. **Create `docs/UPSTREAM_SYNC_LOG.md`** (empty header + schema) so the
     first sync has somewhere to record.
-12. Link this doc from `CLAUDE.md` once enacted.
+11. Link this doc from `CLAUDE.md` once enacted.
 
 ---
 
-## Appendix A — example `.github/workflows/ci.yml` (lean profile)
+## Appendix A — L1 local gate (Windows-native, primary)
 
-*Not committed — review before replacing the inherited `ci.yml`.*
+*Not committed in this plan — review first. Three tracked files plus an
+installer. The `pre-push` hook is the gate; `ci.ps1` does the work, inlining
+`make gate`'s commands so it runs without `make` on Windows.*
 
-```yaml
-name: CI
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main, dev]
-permissions:
-  contents: read
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-jobs:
-  gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
-        with: { enable-cache: true, python-version: "3.12" }
-      - run: uv sync --dev
-      - name: Provision .env for smoke
-        run: cp .sample.env .env
-      - name: Pre-merge gate
-        run: make gate
+```powershell
+# scripts/ci.ps1 — local CI gate (primary). No GitHub minutes.
+#   -Full forces the engine subset; -Skip aborts (lets pre-push refuse a push).
+param([switch]$Full, [switch]$Skip)
+$ErrorActionPreference = 'Stop'
+if ($Skip) { Write-Host 'CI skipped by request'; exit 1 }
 
-  backend-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
-        with: { enable-cache: true, python-version: "3.12" }
-      - run: uv sync --dev
-      - name: Unit tests
-        run: uv run pytest -m unit --timeout=60   # after markers are codified
+# Market-hours guard: 09:00-15:35 IST Mon-Fri -> light checks unless -Full.
+$ist = [System.TimeZoneInfo]::ConvertTimeBySystemTimeZoneId(
+    (Get-Date), 'India Standard Time')
+$mkt = ($ist.DayOfWeek -in 'Monday','Tuesday','Wednesday','Thursday','Friday') `
+    -and ($ist.TimeOfDay -ge '09:00:00') -and ($ist.TimeOfDay -le '15:35:00')
 
-  backend-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
-        with: { enable-cache: true, python-version: "3.12" }
-      - run: uv sync --dev
-      - run: uv run ruff check .
-        continue-on-error: true     # ~1500 pre-existing legacy warnings
-      - run: uv run ruff format --check .
-        continue-on-error: true
+Write-Host '==> ruff lint (smoke scope)'
+uv run ruff check scripts/smoke_boot.py scripts/smoke_engine_live.py
+if ($LASTEXITCODE) { exit 1 }
+Write-Host '==> import smoke'; uv run python scripts/smoke_boot.py
+if ($LASTEXITCODE) { exit 1 }
 
-  security-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
-        with: { enable-cache: true, python-version: "3.12" }
-      - run: uv sync --dev
-      - run: uv run bandit -r . -x .venv,test,frontend,node_modules -ll -f txt
-        continue-on-error: true
-      - run: uv run pip-audit
-        continue-on-error: true
+if ($mkt -and -not $Full) {
+    Write-Host '==> MARKET HOURS: skipping test-engine (pass -Full to force)'
+} else {
+    Write-Host '==> engine + journal tests'
+    uv run pytest test/test_simplified_stock_engine_service.py `
+        test/test_engine_journal_integration.py `
+        test/test_eod_watchdog_service.py `
+        test/test_trade_journal_service.py -q
+    if ($LASTEXITCODE) { exit 1 }
+}
 
-  frontend:
-    runs-on: ubuntu-latest
-    # Gate on frontend changes only — most PRs are backend.
-    if: ${{ contains(github.event.pull_request.labels.*.name, 'frontend') || github.event_name == 'push' }}
-    defaults:
-      run:
-        working-directory: frontend
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with: { node-version: '22', cache: 'npm', cache-dependency-path: frontend/package-lock.json }
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run build
+Write-Host '==> bandit + detect-secrets (advisory, never block)'
+uv run --group dev bandit -r . -x .venv,test,frontend,node_modules -ll -q
+uv run --group dev detect-secrets scan --baseline .secrets.baseline | Out-Null
+Write-Host 'OK: local gate passed - safe to push'; exit 0
 ```
 
-> Keep `security.yml` and `dependabot.yml` as-is. Drop the `docker-build`,
-> `docker-manifest`, `commit-dist`, `frontend-e2e`, `frontend-test` jobs
-> from the inherited workflow (or gate the frontend ones on a `frontend`
-> label / `paths` filter as above).
+```bash
+# scripts/git-hooks/pre-push — tracked source (.git/hooks isn't versioned).
+# Install: pwsh scripts/install-hooks.ps1 . Bypass: git push --no-verify
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v pwsh >/dev/null 2>&1; then pwsh -NoProfile -File scripts/ci.ps1
+elif command -v powershell >/dev/null 2>&1; then powershell -NoProfile -File scripts/ci.ps1
+else bash scripts/ci.sh; fi   # Git Bash / WSL fallback
+```
 
-## Appendix B — example `scripts/ci.sh` (local pre-push gate)
+```powershell
+# scripts/install-hooks.ps1 — copy tracked hook into .git/hooks/.
+# Re-run after cloning or when scripts/git-hooks/* changes.
+$src = Join-Path $PSScriptRoot 'git-hooks\pre-push'
+$dst = Join-Path (git rev-parse --git-path hooks) 'pre-push'
+Copy-Item $src $dst -Force; Write-Host "Installed pre-push hook -> $dst"
+```
 
-*Not committed — review first. Mirrors the CI gate so a green local run
-predicts green CI. Run before every push: `bash scripts/ci.sh`.*
+## Appendix B — `scripts/ci.sh` (Git Bash / WSL fallback)
+
+*Same checks as `ci.ps1`, for environments without PowerShell.*
 
 ```bash
 #!/usr/bin/env bash
-# Local pre-push gate — fast, no GitHub minutes. Mirrors .github/workflows/ci.yml.
+# scripts/ci.sh — local gate fallback. Mirrors scripts/ci.ps1.
 set -euo pipefail
-echo "==> ruff format (check)"; uv run ruff format --check . || true
-echo "==> ruff lint (smoke scope)"; make lint
-echo "==> import smoke"; make smoke
-echo "==> engine + journal tests"; make test-engine
-echo "==> unit tests"; uv run pytest -m unit --timeout=60 || \
-  echo "  (no unit-marked tests yet — codify markers, see plan step 2)"
-echo "==> bandit (high severity only)"; \
-  uv run --group dev bandit -r . -x .venv,test,frontend,node_modules -ll -q || true
-echo "==> detect-secrets"; \
-  uv run --group dev detect-secrets scan --baseline .secrets.baseline || true
-echo "✓ local gate passed — safe to push"
+echo '==> ruff lint (smoke scope)'; make lint
+echo '==> import smoke';            make smoke
+# Market-hours guard (09:00-15:35 IST, Mon-Fri): skip engine subset unless FULL=1.
+dow=$(TZ=Asia/Kolkata date +%u); hm=$((10#$(TZ=Asia/Kolkata date +%H%M)))
+if [ "${FULL:-0}" != 1 ] && [ "$dow" -le 5 ] && (( hm >= 900 && hm <= 1535 )); then
+  echo '==> MARKET HOURS: skipping test-engine (FULL=1 to force)'
+else
+  echo '==> engine + journal tests'; make test-engine
+fi
+echo '==> bandit (high severity only)'    # advisory
+uv run --group dev bandit -r . -x .venv,test,frontend,node_modules -ll -q || true
+echo '==> detect-secrets'                 # advisory
+uv run --group dev detect-secrets scan --baseline .secrets.baseline || true
+echo 'OK: local gate passed - safe to push'
 ```
-
-For Windows, a `scripts/ci.ps1` with the same steps (`uv run` calls are
-identical; replace `make` targets with the underlying `uv run` commands or
-invoke `make` via Git Bash / WSL).
 
 ## Open questions for the operator
 
-1. **Is `github.com/sonawanedhiraj/openalgo` public or private?** Forks of
-   public repos default to public (→ unlimited free Actions). The CLI can't
-   tell us. Confirm in Settings → General. The lean CI profile fits the free
-   tier either way, so this changes urgency, not the plan.
-2. **Trunk model is inverted for upstream sync.** `dev`'s upstream
+1. **Do you have any other machine** — a laptop, an old PC, a cheap VPS —
+   you'd rather host CI on? If yes, **L3 becomes attractive**: the local hook
+   for fast feedback *plus* a self-hosted runner on *that* box gives enforced
+   GitHub status checks with **none** of the trading-box risk. This is the
+   single biggest lever on the recommendation — answer this first.
+2. **Fate of the inherited `.github/workflows/ci.yml`?** Under L1 it still
+   fires on every push. Disable it, or keep it as free belt-and-braces if the
+   fork is public? (Depends on visibility, below.)
+3. **Repo visibility — public or private?** *Downgraded:* no longer drives
+   cost (L1 uses zero GitHub minutes). Now matters only for whether the
+   inherited `ci.yml` runs free (public → unlimited) and for PR-badge /
+   branch-protection cosmetics. Confirm in Settings → General.
+4. **Trunk model is inverted for upstream sync.** `dev`'s upstream
    merge-base (2026-05-26) is newer than `main`'s (2026-04-22) — upstream
    landed on `dev`, not `main`. Should we (a) make `main` the canonical
    upstream-sync target and back-fill it to `dev`'s level first, or (b)
