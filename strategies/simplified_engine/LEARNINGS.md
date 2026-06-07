@@ -287,6 +287,27 @@ trailing. All positions flatten at 15:20 IST.
 
 ---
 
+## Cost model corrections (June 7, 2026)
+
+### Brokerage cap was per round trip, should be per order (Fixed)
+`compute_zerodha_intraday_charges` (`services/simplified_stock_engine_core.py`)
+capped brokerage at ₹20 for the whole round trip — but Zerodha caps ₹20 **per
+order**. NBCC reconciliation exposed it: model ₹20.00 vs Kite actual ₹32.15
+(37.8% under-reported). Each leg is now charged `min(₹20, 0.03% of that leg)`,
+rounded to paise the way Kite's `/charges/orders` reports each order, and summed
+(16.15 buy + 16.00 sell = 32.15, matching Kite exactly; model total ₹57.37 vs
+Kite ₹57.27, within ₹0.5 — residual is the exchange/SEBI rate approximations,
+not the cap). Regression test: `test/test_simplified_stock_engine_charges.py`.
+
+### Capturing LTP at signal time for slippage validation (New)
+Added `ltp_at_signal` (nullable REAL) to `trade_journal`. The engine writes the
+decision-time reference price at entry (`_journal_record_entry`), pinned even
+after `update_entry_fill` overwrites `entry_price` with the real fill. This lets
+the nightly loop compute `realized_slippage = (fill_price − ltp_at_signal) /
+ltp_at_signal` once live fills accumulate — directly addressing "No slippage"
+under Backtest Limitations above. Column evolves at boot via guarded
+`ALTER TABLE` in `trade_journal_db.init_db`.
+
 ## Bug Fixes & Improvements (May 22, 2026)
 
 ### Tick Log Loader Format Mismatch (Fixed)
