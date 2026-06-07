@@ -83,6 +83,51 @@ def test_record_entry_returns_positive_id(fresh_journal_db):
     assert row.pnl is None
 
 
+def test_record_entry_persists_ltp_at_signal(fresh_journal_db):
+    """ltp_at_signal is captured at entry and survives an entry-fill overwrite,
+    so realized slippage can later be computed against the actual fill price.
+    """
+    from services import trade_journal_service as tjs
+
+    jid = tjs.record_entry(
+        symbol="TATAMOTORS",
+        direction="LONG",
+        quantity=4,
+        strategy_name="simplified_stock_engine",
+        signal_source="chartink",
+        entry_price=950.0,
+        ltp_at_signal=950.0,
+        entry_order_id="ORD-LTP",
+    )
+    assert jid > 0
+
+    # Fill comes in at a worse price; ltp_at_signal must stay pinned.
+    tjs.update_entry_fill(jid, entry_price=951.10)
+
+    row = (
+        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
+        .filter_by(id=jid)
+        .first()
+    )
+    assert row.ltp_at_signal == 950.0
+    assert row.entry_price == 951.10
+
+    # ltp_at_signal is nullable: an entry that omits it stores NULL.
+    jid2 = tjs.record_entry(
+        symbol="SBIN",
+        direction="SHORT",
+        quantity=1,
+        strategy_name="simplified_stock_engine",
+        signal_source="manual",
+    )
+    row2 = (
+        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
+        .filter_by(id=jid2)
+        .first()
+    )
+    assert row2.ltp_at_signal is None
+
+
 def test_update_entry_fill_patches_row(fresh_journal_db):
     from services import trade_journal_service as tjs
 
