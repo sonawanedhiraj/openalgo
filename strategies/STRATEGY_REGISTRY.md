@@ -36,6 +36,27 @@ These parameters apply to ALL new strategy backtests unless overridden in the en
 | Hand-validation | At least 1 trade reconciled to-the-rupee manually before reporting positive |
 | Reporting | Save report at repo root as `BACKTEST_ROUND<N>_<NAME>_<DATE>.md`, also copy to `outputs/backtest_round<N>_<name>_<date>/REPORT.md` |
 
+## Cross-Cutting Findings
+
+### Long-gross-positive as a viability screen for intraday strategies (2026-06-07)
+
+After 28 rejected intraday rounds + the R28b breakdown analysis:
+
+Across the 10 intraday rounds with trade-level CSVs, longs beat shorts gross 7 of 10 times — but the actionable discriminant is NOT long-vs-short. It is whether the **long book has positive gross-before-costs**. Where long gross is positive, stripping shorts + correcting slippage to the platform's 0.035%/side default flips net green; where it is negative (R1, R2, R13 bull-flag, R15 mean-reversion, R28 v1), nothing rescues the round.
+
+**Re-examine under a "long-only + score-positive" lens:**
+- R3, R4, R5 (sector-engine variants — small samples, ~10-13 trades).
+- R28b v2 Sneaky Pivot (73-trade long book, +24k gross → +5k net at 0.035% slip, tightening to ~+2-3k net after this PR's brokerage cap fix).
+
+**Confirmed dead — long gross already negative:** R1, R2, R13, R15, R28 v1.
+
+**Caveats:**
+1. The per-leg brokerage cap fix in PR #2 adds ~25% cost on mid-size intraday trades; estimates above use the corrected formula.
+2. None of the re-examination candidates clear the deployable bar — they are statistical noise (+2 to +7k over 5 months). This is a screening rule, not a strategy.
+3. Slippage remains unverified; `ltp_at_signal` capture (this PR) enables validation once ~10 real trades accumulate.
+
+**Action for future intraday rounds:** report BOTH long-only and short-only gross/net in the trade summary so the long-gross sign is immediately visible.
+
 ## Active Deployable Strategies
 
 ### Sector Rotation ETF (Combined Momentum + Low-Vol)
