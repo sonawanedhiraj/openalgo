@@ -633,6 +633,24 @@ Strategies are versioned independently under `strategies/<name>/`. Each has:
 
 **Active strategy**: [`strategies/simplified_engine/`](strategies/simplified_engine/)
 
+**Scaffold strategy**: [`strategies/sector_rotation_etf/`](strategies/sector_rotation_etf/)
+— a monthly long-only ETF rebalance that rotates across Indian sector ETFs on a
+momentum sleeve (top-3 by 6M return) + low-vol sleeve (bottom-3 by 60d vol) with
+risk-parity inverse-vol weighting between legs. Backtest-validated (Sharpe 1.17,
+CAGR 14.8%, +34.8pp NIFTY alpha; see
+[`BACKTEST_ROUND26_ETF_COMBINED_REPORT_2026-06-06.md`](BACKTEST_ROUND26_ETF_COMBINED_REPORT_2026-06-06.md)).
+**SCAFFOLD ONLY — not live.** Signal computation lives in
+`services/sector_rotation_etf_service.py` (pure, read-only on `historify.duckdb`,
+emits recommended-orders JSON — never places orders). Entry point is the CLI
+`uv run python -m services.sector_rotation_etf_cli --asof YYYY-MM-DD --current-positions '{...}'`.
+**Not yet wired**: no scheduler job, no live mode (`mode: scaffold-only`,
+`deployable: false`), no order placement — the operator reviews orders manually.
+First sandbox rebalance planned for 2026-06-15 (moved up from 2026-07-01).
+Operator-manual workflow — see
+[`DEPLOYMENT_CHECKLIST_2026-06-15.md`](strategies/sector_rotation_etf/DEPLOYMENT_CHECKLIST_2026-06-15.md).
+Still `mode: scaffold-only`, `deployable: false`; date moved earlier only to get
+the operator hands-on sooner — no safety rails removed.
+
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
 

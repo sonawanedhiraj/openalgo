@@ -145,6 +145,11 @@ duplicated here. Quick reminder: API key goes in JSON body (`apikey`) or
 - `CLAUDE.md` — coding conventions, deployment specifics, version bumping
 - `COWORK_OBJECTIVE.md` — strategic objective
 - `strategies/simplified_engine/LEARNINGS.md` — strategy-specific daily learnings
+- `strategies/sector_rotation_etf/` — monthly ETF rotation strategy (**scaffold
+  only, not live**). Signal computation: `services/sector_rotation_etf_service.py`
+  (pure, read-only on `historify.duckdb`, emits recommended-orders JSON — no order
+  placement). CLI entry: `services/sector_rotation_etf_cli.py`. Not wired to any
+  scheduler; no live mode.
 - `docs/SIMPLIFIED_ENGINE_HANDOFF.md` — engine integration context
 - `docs/COWORK_SESSION_LEARNINGS.md` — Cowork-specific learnings, webhook IDs
 - `audit/README.md` — read-only scheduled-task policy + `proposed_fixes.jsonl` schema
