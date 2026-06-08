@@ -57,6 +57,18 @@ Across the 10 intraday rounds with trade-level CSVs, longs beat shorts gross 7 o
 
 **Action for future intraday rounds:** report BOTH long-only and short-only gross/net in the trade summary so the long-gross sign is immediately visible.
 
+### Options leverage-rescue does NOT save low-WR *intraday* strategies (2026-06-07)
+
+Tested the operator's hypothesis that a low-win-rate equity book (R29 v2: OOS WR 34%, payoff 1.10, net -45k) could be rescued by trading **ATM calls** instead of stock — the idea being that options' asymmetric payoff (capped premium loss, open upside via delta/gamma) makes low WR survivable if payoff clears ~2.33.
+
+**It made things worse.** Replaying all 90 signals as intraday ATM monthly calls (entry 9:45, exit 15:15, same day), priced from real NSE bhavcopy daily open/settle anchors with Black-Scholes intraday interpolation (87/90 mapped, calibration clean, median IV 30%, open-vs-settle IV spread 2%), the options book posts **OOS payoff 0.95 — below the 2.33 needed and below equity's own 1.10** — and is net negative at 10/25/50 bps (−97.6k/−102.2k/−109.8k). WR 32.8%, Sharpe −1.49.
+
+**Why:** an intraday ATM call (~0.5 delta) held ~5.5h captures only ~half of an already-small underlying move while paying full time premium and option-specific costs (STT on sell premium, slippage on premium). Convexity needs a *large* move to bend the payoff above linear; intraday wins here are ~0.3–0.5%. So the option just tracks spot at higher cost.
+
+**Rule:** options leverage cannot rescue an *intraday* signal with no gross edge — there is no time for gamma to work. **It CAN partially rescue a multi-day swing with real gross edge — but fragile.** Same test on **R8** (longs-only +4% swing, equity payoff 1.51, net +43k) replayed as ATM monthly calls (85/86 mapped): under faithful intraday execution the BS model lifts payoff 1.51→2.30 and net to +205k @25bps → **PROMISING** (just shy of the 2.33 DEPLOY bar). BUT a both-legs-real-EOD-settle cross-check collapses the hold≥1 edge to ≈₹0 — the result hinges on capturing premium at the *exact* intraday target instant plus constant-IV; theta/IV-path over a multi-day hold eats it otherwise. So the swing-vs-intraday distinction is the real finding (convexity needs a big move), but R8 options is execution-fragile, not deployable — needs ~10 real paper fills to measure intraday-exit slippage + IV crush before trusting the magnitude.
+
+New reusable asset: `fo_bhavcopy_eod` in `historify.duckdb` (4.7M expired-option EOD rows; 30-symbol R29 universe over 2024-01→2025-11 + 2026-01→05, plus all-symbol coverage on R8's 55 dates) recovers expired-contract daily prices that Kite's master cache purges. Pipeline: `outputs/r29v2_options_hybrid_2026-06-07/`.
+
 ## Active Deployable Strategies
 
 ### Sector Rotation ETF (Combined Momentum + Low-Vol)
@@ -117,6 +129,10 @@ Verdict legend: REJECT (no edge / loses) · INSUFFICIENT (sample too small to co
 | 24 | Low-vol diversifier + combined variants | 2022-2026 (index series) | 24a low-vol (bottom-3, 60d vol); 24c 50/50; 24d risk-parity inverse-vol | DEPLOY (candidate) | Low-vol Sharpe 1.04, corr 0.69 to momentum (genuine diversifier). Risk-parity 24d Sharpe 1.11, MaxDD -17.0% — best risk-adjusted on indices. Defensive vs momentum in 3 known crash months. Feeds Active. |
 | 25 | ETF / basket replication and tracking error | 2022-2026 | Map 15 sectors to tradable ETFs/baskets; measure corr, beta, TE, ADV | INFRA | Established the deployable instrument set: 8 liquid Tier-1 ETFs (TE <=4.5%), 1 thin Tier-2 (HEALTHIETF), 2 index proxies (FINNIFTY futures, OILGAS basket); excluded MEDIA/ENERGY/REALTY/CONSRDURBL. TE 3-6%/sector. Enabler for R26. |
 | 26 | ETF combined portfolio (4 variants), actual NAVs | 2022-08 -> 2026-06 (47 rebalances) | 26a low-vol, 26b momentum, 26c 50/50, 26d risk-parity — on real ETF NAV returns | DEPLOY | 26d Sharpe 1.17 / CAGR 14.8% / +69.8% (+34.8 pp vs NIFTY) / MaxDD -16.9%. Friction cliff did not materialize (dividend offset). Cleared the final gate -> promoted to Active (Sector Rotation ETF). |
+| 29 | Long-only + positive-sector-momentum gate (in-sample) | 2026-01 -> 05-29 (5 mo) | R8-style long setups gated to sectors with positive 5d return; ATR stop, RR trail; intraday | INSUFFICIENT | In-sample only: 20 trades, WR 60%, payoff 0.85, gross +4.8k but net ~breakeven (+0.9k @1.88bps -> -5.6k @10bps). 20 trades / 5 mo is below the 30-trade/6-mo bar. Required true OOS -> R29 v2. |
+| 29 v2 | Same gate, true 22-month OOS hold-out | 2024-01 -> 2025-11 (22 mo) | Identical gate/params replayed over 2024-25 hold-out, 70 trades | REJECT | OOS WR 34.3%, payoff 1.10, gross -31.8k, net -45.4k @1.88bps / -68.0k @10bps, Sharpe -1.53, MaxDD -8.57%. The in-sample edge did not generalize. |
+| 29 v2 Opt | Leverage-rescue: replay 90 signals as intraday ATM monthly calls | 2024-01 -> 2026-05 (in-sample + OOS) | bhavcopy daily anchors + Black-Scholes intraday interpolation; ATM CE, entry 9:45 exit 15:15 same day; 10/25/50 bps slip on premium | REJECT | Options WORSE than equity, not a rescue: OOS 67 trades, WR 32.8%, **payoff 0.95** (vs 2.33 required), net -97.6k/-102.2k/-109.8k @10/25/50 bps, Sharpe -1.49, edge ratio 0.47. Intraday holding gives gamma/convexity no time to work; an ATM call just tracks spot at higher cost. 96.7% signal-map rate; calibration clean (87/87, median IV 30%, open-vs-settle IV spread 2%). Report: `BACKTEST_R29V2_OPTIONS_HYBRID_REPORT_2026-06-07.md`. |
+| 8 Opt | Leverage-rescue on R8 swing (longs +4%) as ATM monthly calls | 2026-01 -> 05 (in-sample) | Same bhavcopy+BS method; multi-day hold (0-3d); buy at signal spot, sell at target/stop spot; 10/25/50 bps slip | PROMISING (fragile) | Rescue partially works on swing (unlike intraday R29): 85/86 mapped, BS payoff 1.51->2.30, net +211k/+205k/+196k @10/25/50 bps. BUT a both-legs-real-EOD-settle cross-check collapses the hold>=1 edge to ~0 — hinges on exact intraday-target execution + constant IV; theta/IV-path eats multi-day holds. Not deployable; needs ~10 real paper fills. Report appendix: `BACKTEST_R29V2_OPTIONS_HYBRID_REPORT_2026-06-07.md`. |
 
 ### Per-round metric detail (the four ETF finalists, Round 26)
 
@@ -200,5 +216,8 @@ And if the strategy has its own ongoing learnings, create `strategies/<name>/LEA
 | Round 24 — low-vol diversifier | `BACKTEST_ROUND24_LOW_VOL_REPORT_2026-06-06.md` |
 | Round 25 — ETF replication | `BACKTEST_ROUND25_ETF_REPLICATION_REPORT_2026-06-06.md` |
 | Round 26 — ETF combined (final gate) | `BACKTEST_ROUND26_ETF_COMBINED_REPORT_2026-06-06.md` |
+| Round 29 — long-only sector gate (in-sample) | `BACKTEST_ROUND29_LONG_ONLY_SECTOR_GATE_REPORT_2026-06-07.md` |
+| Round 29 v2 — long-only sector gate (OOS) | `BACKTEST_ROUND29V2_LONG_ONLY_SECTOR_GATE_OOS_REPORT_2026-06-07.md` |
+| Round 29 v2 Options Hybrid — bhavcopy+BS leverage-rescue test | `BACKTEST_R29V2_OPTIONS_HYBRID_REPORT_2026-06-07.md` |
 | Consolidated deployment plan | `SECTOR_ROTATION_DEPLOYMENT_PLAN_2026-06-06.md` |
 | Quick-reference summary table | `STRATEGY_SUMMARY_TABLE_2026-06-06.md` |

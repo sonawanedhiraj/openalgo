@@ -77,7 +77,18 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
 | `db/sandbox.db` | sandbox trading (₹1 Cr virtual capital) | Engine default target; isolated from live. Auto square-off at exchange close |
-| `db/historify.duckdb` | historical OHLC market data | DuckDB, not SQLite |
+| `db/historify.duckdb` | historical OHLC market data (`market_data`); **`fo_bhavcopy_eod`** = expired-contract F&O option EOD recovered from NSE bhavcopy | DuckDB, not SQLite |
+
+`fo_bhavcopy_eod` (cols: trade_date, symbol, expiry, strike, option_type, OHLC,
+settle, volume, oi, lot_size, source) is a **research/backtest artifact**, not
+written by the Flask app. Backfilled offline from NSE bhavcopy (UDiFF ≥2024-07-06,
+legacy before) by `outputs/r29v2_options_hybrid_2026-06-07/phase1_backfill.py` to
+recover daily prices for expired stock options that Kite's master cache purges
+(~4.7M rows: 30-symbol R29 universe over 2024-01→2025-11 + 2026-01→05, plus
+all-symbol coverage on R8's 55 swing dates). Used to replay equity signals as
+options (see `outputs/r29v2_options_hybrid_2026-06-07/`).
+Read-only for the app; short-lived
+DuckDB RW connections from the backfill coexist with the running app.
 
 All SQLite DBs use `NullPool` (fresh connection per op) — never `StaticPool`.
 Indian broker tokens expire ~03:00 IST daily; sandbox reset schedule is
