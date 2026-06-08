@@ -645,7 +645,11 @@ emits recommended-orders JSON — never places orders). Entry point is the CLI
 `uv run python -m services.sector_rotation_etf_cli --asof YYYY-MM-DD --current-positions '{...}'`.
 **Not yet wired**: no scheduler job, no live mode (`mode: scaffold-only`,
 `deployable: false`), no order placement — the operator reviews orders manually.
-First sandbox rebalance planned for 2026-07-01.
+First sandbox rebalance planned for 2026-06-15 (moved up from 2026-07-01).
+Operator-manual workflow — see
+[`DEPLOYMENT_CHECKLIST_2026-06-15.md`](strategies/sector_rotation_etf/DEPLOYMENT_CHECKLIST_2026-06-15.md).
+Still `mode: scaffold-only`, `deployable: false`; date moved earlier only to get
+the operator hands-on sooner — no safety rails removed.
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
