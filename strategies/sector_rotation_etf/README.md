@@ -52,4 +52,6 @@ orders.
 - No live mode — `mode: scaffold-only`, `deployable: false`.
 - FINNIFTY & NIFTYOILANDGAS are index proxies with no liquid ETF — excluded from
   the tradeable ETF universe until futures/basket execution is built.
-- First live sandbox entry planned for **2026-07-01** at ₹2–3L.
+- First live sandbox entry planned for **2026-06-15** (moved up from 2026-07-01)
+  at ₹3L — operator-manual seed entry. See
+  [`DEPLOYMENT_CHECKLIST_2026-06-15.md`](DEPLOYMENT_CHECKLIST_2026-06-15.md).

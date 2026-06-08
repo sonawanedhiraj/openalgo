@@ -4,6 +4,22 @@ Parameter and logic history. Newest first.
 
 ---
 
+## 2026-06-08 — First sandbox rebalance date moved 2026-07-01 → 2026-06-15
+
+**No parameter or logic change.** Config unchanged — still `mode: scaffold-only`,
+`deployable: false`, ₹3L capital, 9-ETF universe, operator-manual workflow.
+
+Only the **first sandbox rebalance target date** moved earlier: 2026-07-01 →
+**2026-06-15** (third Monday). Rationale: R28–R33 research confirms this is the
+highest-conviction strategy and external sources independently validate the
+methodology at Sharpe 1.0+; remaining uncertainty is execution, so get the
+operator hands-on sooner. Treated as a **mid-cycle seed entry** — the next
+rebalance re-aligns to the native `monthly_first_trading_day` (~2026-07-01).
+Deployment packet: `DEPLOYMENT_CHECKLIST_2026-06-15.md`. Dry-run preview captured
+in `LEARNINGS.md` and `outputs/sector_rotation_etf/rebalance_2026-06-08.json`.
+
+---
+
 ## 0.1.0 — 2026-06-06 — Scaffold
 
 **Status:** scaffold-only, `deployable: false`. Signal computation + recommended
