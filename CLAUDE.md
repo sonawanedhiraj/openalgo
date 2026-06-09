@@ -81,6 +81,28 @@ When any architectural change ships, the matching documentation update ships in 
 - `COWORK_OBJECTIVE.md` — strategic objective
 - `audit/README.md` — audit policy
 
+## Parameter changes ALWAYS go to dev directly
+
+Any change to a tunable parameter (env var, DB config row, threshold default in
+code, scheduler interval, etc.) MUST:
+
+1. Add an entry to [`docs/PARAMETER_LOG.md`](docs/PARAMETER_LOG.md) in the same commit
+2. Commit directly to `dev` — no feature branch, no PR, no batching with other work
+3. Pair the doc update with the actual change (`.env` edit, SQL UPDATE, code default change)
+
+**Why direct to dev:** every feature branch off dev inherits the latest log
+automatically. Parameter changes stuck on feature branches create silent drift
+where the live system disagrees with the documented intent. Direct-to-dev
+guarantees alignment.
+
+**When a feature branch adds a NEW tunable:** the PR description must propose
+the PARAMETER_LOG entry. The entry is added to dev as part of the merge or as
+an immediate follow-up direct commit.
+
+**Before any parameter-dependent work** (spawning a backtest, deploying a
+strategy, evaluating a rule): read PARAMETER_LOG AND verify against `.env`. The
+doc captures intent; the env captures reality. Mismatches are real bugs.
+
 ## Overview
 
 OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It is **four products in one self-hosted instance**, all sharing a single broker session and WebSocket feed:
