@@ -103,6 +103,35 @@ an immediate follow-up direct commit.
 strategy, evaluating a rule): read PARAMETER_LOG AND verify against `.env`. The
 doc captures intent; the env captures reality. Mismatches are real bugs.
 
+## Strategy registry updates ALWAYS go to dev directly
+
+Same pattern as the parameter log: `strategies/STRATEGY_REGISTRY.md` is reference
+documentation that informs every backtest, deployment, and "what should I try
+next" decision. Spawned tasks read it via CLAUDE.md's instruction "READ FIRST
+when user mentions strategy / backtest / round N".
+
+Every new backtest round MUST:
+1. Add an entry to [`strategies/STRATEGY_REGISTRY.md`](strategies/STRATEGY_REGISTRY.md)
+   in the same commit that closes the round
+2. Commit directly to `dev` — no feature branch, no PR, no batching with other work
+3. Cross-cutting structural findings (e.g. "BS pricing is systematically optimistic
+   for option buying", or "g13 5m-volume gate is the dominant killer in the
+   chartink mirror rule") get an entry in the "Cross-Cutting Findings" section,
+   same direct-commit pattern
+
+**Why direct to dev:** every feature branch off dev inherits the latest registry
+automatically. Registry entries stuck on feature branches create silent drift
+where the canonical "what was tested and why" record disagrees with the work
+that actually happened. Direct-to-dev guarantees alignment.
+
+**When a feature branch creates new strategy files** (e.g. `strategies/<name>/`):
+the PR description must propose the registry entry. The entry lands on dev as
+part of the merge or as an immediate follow-up direct commit.
+
+**Updating an active strategy's Status / Latest Note** after a live trading
+session: direct to dev too. The registry's "Status" column is intended to be
+fresh.
+
 ## Overview
 
 OpenAlgo is a production-ready algorithmic trading platform built with Flask (backend) and React 19 (frontend). It is **four products in one self-hosted instance**, all sharing a single broker session and WebSocket feed:

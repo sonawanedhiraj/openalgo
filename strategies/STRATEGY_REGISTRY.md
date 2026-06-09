@@ -73,10 +73,30 @@ New reusable asset: `fo_bhavcopy_eod` in `historify.duckdb` (4.7M expired-option
 
 Across R30–R34 every *single-signal* strategy carrying a real edge fails the strict monthly cash-flow bar for the same structural reason: edge-bearing Indian F&O signals are **lumpy by construction** (top-2/3 sectors, pyramided winners, episodic reversions). Widening the universe 4.7x (R31) did not raise trade frequency. Market-neutralizing (R33) stripped out the directional sector edge that made the signal worth trading. Mean-reversion (R32) has no structural single-name edge to begin with. The *only* thing that cleared the strict bar (R34 V_BLD_B, Sharpe 1.41 / 70% green) was **portfolio-layer blending of 4 uncorrelated lumpy sleeves** — monthly consistency is manufactured at the portfolio layer, not discovered in a better single signal. Next lever is portfolio-layer construction, not another signal hunt.
 
+### Synthetic Black-Scholes pricing is systematically OPTIMISTIC for option BUYING (R36-real, 2026-06-09)
+
+Real-data Sharpe was 0.4-1.1 worse than synthetic BS-pricing on every variant. Synthetic used IV=RV×1.10; real market IV runs above realized vol because of the implied-volatility floor, and buyers pay it. **Implication: any prior round that used synthetic BS pricing for option BUYING (R8 PROMISING, R29 v2, R35) needs an "optimistic-pricing" caveat until re-tested with real bhavcopy.** Premium SELLING (R37/R38) is unaffected — those tests used real bhavcopy throughout. Backfilled asset: `index_options_eod` in `historify.duckdb` (1.64M rows, NIFTY+BANKNIFTY, 2022-01 -> 2026-06).
+
+### Premium selling edge exists at trade level but dies at portfolio level due to entry-gate co-occurrence (R37, 2026-06-09)
+
+Iron condors with disciplined exits and tight strike selection produce real trade-level edge (un-breached condors hit 50% profit consistently). But the natural conjunction of entry conditions ("vix high AND range-bound AND fresh DTE window") fires far less often than the binding-evidence threshold requires (N=4 / 23 months). Weeklies / continuous-DTE / looser regime could fix it but become different strategies. SPAN margin (~5-15× max-loss) caps real-capital deployment regardless.
+
+### Delta-roll adjustments make defined-risk condors strictly worse, not nicer (R38, 2026-06-09)
+
+The textbook "roll the untested side when tested-delta hits 0.30" discipline manufactures a fresh directional breach risk (re-centered untested side, no longer delta-neutral). In whipsaw or vol-expansion, both sides breach → double-loss tail manufactured. Cosmetic-to-harmful on gap days specifically (0 of 13 gap-day prevents in audit). Net credit added by rolls is positive everywhere yet realized P&L falls.
+
+### Scanner rule validation must verify against live .env, not code defaults (2026-06-09)
+
+Historical validation of the `fno_intraday_buy_chartink` rule used the 3.0% code default for the gap-up gate; the actual `.env` value is 1.5% (`CHARTINK_RULE_BUY_GAP_PCT=1.5`). Diagnosis was wrong on a real axis. Same lesson is now codified in [`docs/PARAMETER_LOG.md`](../docs/PARAMETER_LOG.md). When a task evaluates a rule with parameterized thresholds, always read the env override before walking through the rule logic.
+
+### Scanner rule diagnosis — g13 5m-volume gate is the dominant filter (2026-06-09)
+
+Of the 12 gates in `fno_intraday_buy_chartink`, gate 13 (`5m vol > 2 × SMA(5m vol, 10)`) is the single biggest killer. TCS on 2026-06-02 passed 11 of 12 gates (gap +6.5%, RSI 76.8, all daily vol/trend) but failed g13 (5m vol 206k vs required 402k). Plus the gap gates (g1/g9/g10) use a COMPLETED daily candle while Chartink fires on LIVE intraday price — three symbols (NATIONALUM −5.2%, SAIL −3.2%, TRENT −0.03%) closed red daily but were green intraday at Chartink alert time (two real bugs in the transcription). Historical Jaccard 0.062 against Chartink's actual alerts confirms the rule is too tight on the wrong axes. Report: `outputs/screener_historical_validation_2026-06-09/REPORT.md`.
+
 ## Active Deployable Strategies
 
 ### Sector Rotation ETF (Combined Momentum + Low-Vol)
-- **Status:** SCAFFOLD COMPLETE — not yet live. First sandbox rebalance planned 2026-07-01.
+- **Status:** SCAFFOLD COMPLETE — not yet live. Live seed entry moved up to 2026-06-15 (operator-manual, per `strategies/sector_rotation_etf/DEPLOYMENT_CHECKLIST_2026-06-15.md`); first sandbox rebalance still planned 2026-07-01.
 - **Last validated:** 2026-06-06 (Round 26)
 - **Spec:** 50% momentum (top-3 sectors by trailing 6M return) + 50% low-vol (bottom-3 by trailing 60d return vol), risk-parity inverse-vol weighting between legs, monthly rebalance on the first trading day. Long-only, unleveraged, at most 6 sectors held. Equal-weight within each leg, no per-position stops — the monthly rebalance is the risk-recycling mechanism.
 - **Universe:** 11 sectors — 9 traded via NSE ETFs (BANKBEES, ITBEES, PSUBNKBEES, PHARMABEES, METALIETF, PVTBANIETF, FMCGIETF, AUTOBEES, HEALTHIETF) + 2 index proxies (FINNIFTY via futures, NIFTYOILANDGAS via RELIANCE/ONGC/IOC/BPCL/GAIL top-5 basket).
@@ -92,6 +112,10 @@ Across R30–R34 every *single-signal* strategy carrying a real edge fails the s
 - **Universe:** F&O stocks matching the buy/sell Chartink screeners.
 - **Why it exists:** Pre-existing operator strategy, integrated with the platform. Note: the standalone intraday breakout edge tested in the research sweep and Rounds 2-6 was structurally unprofitable on its own; the live engine is operated as an armed, screener-gated, sandbox-monitored system rather than a proven standalone alpha.
 - **Files:** `services/simplified_stock_engine_service.py`, `services/simplified_stock_engine_core.py`, `strategies/simplified_engine/LEARNINGS.md`. Handoff: `docs/SIMPLIFIED_ENGINE_HANDOFF.md`.
+
+### Deploy candidates queued (not yet live)
+- **V_BLD_B portfolio blend (R34)** remains DEPLOY_CANDIDATE — slated for sandbox paper-trade starting 2026-07-01 (Sharpe 1.41, 70% green months; promote to paper, not live). Report: `BACKTEST_R34_PORTFOLIO_BLEND_REPORT_2026-06-08.md`.
+- **Sector Rotation ETF** live seed entry 2026-06-15 per `strategies/sector_rotation_etf/DEPLOYMENT_CHECKLIST_2026-06-15.md` (operator-manual, see Active entry above).
 
 ## Currently Testing (In-Flight Experiments)
 
@@ -141,6 +165,11 @@ Verdict legend: REJECT (no edge / loses) · INSUFFICIENT (sample too small to co
 | 32 | Single-name mean reversion (Connors / Bollinger / sector RW) | OOS hold-out | 6 MR variants on Indian F&O large-caps | REJECT | All 6 reject; WR never crossed 50% (sub-50, not the hoped 55-70%). STT is not the killer; any apparent "winner" is concentrated momentum-dip-buying in defence/infra, not a reversion edge. No structural single-name mean-reversion edge in Indian large caps. Report: `BACKTEST_R32_MEAN_REVERSION_REPORT_2026-06-08.md`. |
 | 33 | Index reversion + market-neutral pairs + options income overlay | OOS hold-out | 6 variants: NIFTY Connors reversion, beta-hedged sector pairs, covered-call overlay | REJECT/MARGINAL | Market-neutrality KILLS the sector edge (V_PAIR_A perfectly neutral, beta -0.01, but zero alpha); covered-call overlay DEGRADES rotation by capping winners; NIFTY Connors V_IDX_A best monthly Sharpe (1.45) but tiny N. bhavcopy has NO index/ETF options to extend the overlay. Report: `BACKTEST_R33_INDEX_PAIRS_OPTIONS_REPORT_2026-06-08.md`. |
 | 34 | Portfolio blend of 4 validated uncorrelated components | 2024-01 -> 2025-11 (23 mo OOS) | 6 blend variants; V_BLD_B = inverse-vol blend of 4 sleeves (pairwise corr -0.01) | DEPLOY (candidate) | **V_BLD_B clears the strict bar — first since R26**: Sharpe 1.41, 70% green months, payoff 1.67, MaxDD -3.2%. Mechanism: blend 4 uncorrelated *lumpy* sleeves. Caveats: 23-mo window luck (dodges Sleeve A's -7% DD), vol-scalability assumption on small-N sleeves, low-corr partly a zero-padding artifact. Promote to PAPER-TRADE, not live. Report: `BACKTEST_R34_PORTFOLIO_BLEND_REPORT_2026-06-08.md`. |
+| 35 | Ankit Chaudhary BB Squeeze + highest-OI strike options (synthetic BS pricing) | OOS hold-out (27 dense F&O names) | 6 variants; BB squeeze entry, buy ATM vs highest-OI strike, synthetic BS premiums | REJECT | All 6 reject. Best V_ABCO_E (ATM control): Sharpe 0.76, 50% green, +₹427k OOS — but only 1 of 8 quarters carries it; lopsided. **The OI thesis is REFUTED:** ATM beats highest-OI strike on every metric (V_ABCO_E vs V_ABCO_A, same 558 trades, different strike → no order-flow/squeeze alpha). Data caveat: synthetic BS pricing was systematically optimistic for buying — see R36-real. Report: `BACKTEST_R35_BB_SQUEEZE_OI_OPTIONS_REPORT_2026-06-08.md`. |
+| 36 | Monthly directional index option buying (synthetic BS pricing) | OOS hold-out | 6 variants; NIFTY/BANKNIFTY monthly CE/PE, IV proxied by RV × 1.10, ₹5L cap + 1.5%/35% rule | REJECT | All 6 reject; Sharpe −0.91 to +0.59. Premiums 100% synthetic BS (`fo_bhavcopy_eod` had no index options); SENSEX dropped (no data). Tightening filters HURT (V_MIOB_D, N=4); loosening flips Sharpe negative. ITM vs ATM a wash on Sharpe, capital-efficiency favors ATM; partial booking caps the convex tail; ₹5L+rule lets only 1 of 8 entries fit. **All findings reopened in R36-real after backfilling actual NSE bhavcopy.** Report: `BACKTEST_R36_MONTHLY_INDEX_OPTIONS_REPORT_2026-06-08.md`. |
+| 36-real | Monthly index option buying with REAL NSE bhavcopy premiums | 2022-01-03 -> 2026-06-04 | Same 6 variants re-priced on backfilled `index_options_eod` (1.64M rows: NIFTY 918,895 + BANKNIFTY 718,604) | REJECT | All 6 still reject, decisively worse. **Headline: real premiums are uniformly 0.4-1.1 Sharpe worse than synthetic on every variant.** Mechanism: synthetic IV=RV×1.10=9.57% priced contracts ~38% cheaper than real market IV=15.5%; the IV floor above realized vol is structural, buyers pay it. Variants B/E/F flipped positive→negative; ITM vs ATM still a wash. Hand-validated to the rupee (NIFTY 2024-02-27 22100CE ₹513.30→₹250.50, net −₹17,285). **Downstream: R8's PROMISING (synthetic BS) needs an optimistic-pricing caveat.** Report: `BACKTEST_R36_REAL_MONTHLY_INDEX_OPTIONS_REPORT_2026-06-08.md`. |
+| 37 | Defined-risk monthly index premium selling (iron condors) | 23 OOS months | 6 variants; NIFTY+BANKNIFTY iron condors, VIX≥60th-pct gate, 0.15-0.30Δ shorts, 50% TP / 2× credit SL / DTE≤8 time stop; real bhavcopy | REJECT | All 6 reject. Best V_SELL_B/F (identical): Sharpe 0.25, WR 50%, **N=4 over 23 mo, only 8.7% green months**. **Binding constraint is FREQUENCY, not cost/pricing:** gate funnel (NIFTY 476d) vix≥60 →142 → range-bound →49 → 25-30 DTE window →9 → 6 positions; "high vol-pct AND range-bound AND ~6-day/mo DTE window" structurally don't co-occur. Trade-level edge IS real (un-breached condors hit 50% TP consistently; election vol-crush trade +₹6,816 hand-validated). Would need weeklies/continuous-DTE/looser regime (a different strategy); SPAN margin ~5-15× max-loss caps real-capital deployment. Report: `BACKTEST_R37_PREMIUM_SELLING_REPORT_2026-06-09.md`. |
+| 38 | Delta-roll adjustment module for R37 condors | 23 OOS months | 6 ON variants vs OFF; roll the untested side at 0.30Δ; real bhavcopy | REJECT | All 6 ON variants reject. **OFF (roll disabled) reproduces R37 bit-for-bit** (harness fidelity). Every ON variant LOSES Sharpe and return vs OFF and turns negative at 60bps where OFF was positive. **Counterintuitive: the roll makes it strictly worse.** `credit_added − roll_cost` is net-positive everywhere (E: +₹33k) but realized P&L FALLS — rolling re-centers the untested side closer to spot and assumes fresh directional breach risk; in whipsaw/vol-expansion both sides breach → double-loss tail. **Gap-day audit: roll prevented a gap loss in 0 of 13 cases.** N(ON)=N(OFF) for all 6 → cadence starvation intact. Report: `BACKTEST_R38_DELTA_ROLL_REPORT_2026-06-09.md`. |
 
 ### Per-round metric detail (the four ETF finalists, Round 26)
 
@@ -231,5 +260,11 @@ And if the strategy has its own ongoing learnings, create `strategies/<name>/LEA
 | R32 — single-name mean reversion | `BACKTEST_R32_MEAN_REVERSION_REPORT_2026-06-08.md` |
 | R33 — index reversion + market-neutral pairs + options income | `BACKTEST_R33_INDEX_PAIRS_OPTIONS_REPORT_2026-06-08.md` |
 | R34 — portfolio blend (V_BLD_B deploy candidate) | `BACKTEST_R34_PORTFOLIO_BLEND_REPORT_2026-06-08.md` |
+| R35 — BB squeeze + highest-OI strike options | `BACKTEST_R35_BB_SQUEEZE_OI_OPTIONS_REPORT_2026-06-08.md` |
+| R36 — monthly index option buying (synthetic BS) | `BACKTEST_R36_MONTHLY_INDEX_OPTIONS_REPORT_2026-06-08.md` |
+| R36-real — monthly index option buying (real bhavcopy) | `BACKTEST_R36_REAL_MONTHLY_INDEX_OPTIONS_REPORT_2026-06-08.md` |
+| R37 — defined-risk premium selling (iron condors) | `BACKTEST_R37_PREMIUM_SELLING_REPORT_2026-06-09.md` |
+| R38 — delta-roll adjustment module | `BACKTEST_R38_DELTA_ROLL_REPORT_2026-06-09.md` |
+| Screener historical validation (chartink rule) | `outputs/screener_historical_validation_2026-06-09/REPORT.md` |
 | Consolidated deployment plan | `SECTOR_ROTATION_DEPLOYMENT_PLAN_2026-06-06.md` |
 | Quick-reference summary table | `STRATEGY_SUMMARY_TABLE_2026-06-06.md` |
