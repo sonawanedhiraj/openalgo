@@ -48,6 +48,28 @@ the latest decisions automatically.
   `fno_intraday_sell_chartink` is registered (verified via `get_rule`). No restart
   required.
 
+### Scanner — legacy `_20` rule files removed
+
+#### services/scan_rules/fno_intraday_{buy,sell}_20.py
+- **Change:** removed (file deletion). Dropped the two import lines from
+  `services/scan_rules/__init__.py` so the package no longer registers them.
+- **Date:** 2026-06-10 (post-close)
+- **What:** deleted `services/scan_rules/fno_intraday_buy_20.py` and
+  `services/scan_rules/fno_intraday_sell_20.py` (the lenient placeholder rules:
+  volume surge ≥2× 20-bar avg + close vs 20-EMA).
+- **Why:** both were replaced earlier today by their Chartink-mirror equivalents
+  (`fno_intraday_buy_chartink` / `fno_intraday_sell_chartink`) and the live DB
+  `scan_definitions.id=1/2.rule_module` no longer points at either (see the BUY
+  and SELL rule entries above). The dead files were a source of confusion — a
+  registered-but-unused rule that looked active. No other production code
+  imported them (only the `scan_rules` package self-registration).
+- **Test coverage:** the chartink mirrors keep their dedicated tests
+  (`test/test_fno_intraday_{buy,sell}_chartink.py`). `test/test_scanner_service.py`
+  was decoupled to use self-contained test rules instead of the deleted `_20`
+  rules; `test/test_scan_rules.py` now covers only generic registry mechanics.
+- **Backout plan:** revert this commit — the rule files remain in git history at
+  their last commit on `dev`.
+
 ### sector_follow_cap5_vol — strategy
 
 #### SECTOR_FOLLOW_CAP5_VOL_MODE

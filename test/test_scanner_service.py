@@ -32,6 +32,51 @@ from services import scanner_service
 from utils.event_bus import Event
 
 # ---------------------------------------------------------------------------
+# Test-local reference rules
+#
+# The scanner-service contract tests below need a rule whose predicate fires on
+# simple synthetic seed data (volume surge + price vs EMA20). The production
+# ``fno_intraday_*_chartink`` rules require multi-timeframe daily/weekly frames
+# and 200+ daily bars, so we register self-contained test rules here rather than
+# coupling these service tests to a production rule's predicate.
+# ---------------------------------------------------------------------------
+
+
+@scanner_service.scan_rule(
+    "_test_buy_surge_ema", "buy", "test-only: vol surge >=2x AND close above EMA20"
+)
+def _test_buy_surge_ema(bars, indicators):
+    if len(bars) < 21:
+        return False
+    vol_avg = bars["volume"].rolling(20).mean().iloc[-2]
+    if pd.isna(vol_avg) or vol_avg <= 0:
+        return False
+    if bars["volume"].iloc[-1] / vol_avg < 2.0:
+        return False
+    ema20 = indicators.get("ema_20")
+    if ema20 is None or len(ema20) == 0 or pd.isna(ema20.iloc[-1]):
+        return False
+    return bool(bars["close"].iloc[-1] > ema20.iloc[-1])
+
+
+@scanner_service.scan_rule(
+    "_test_sell_surge_ema", "sell", "test-only: vol surge >=2x AND close below EMA20"
+)
+def _test_sell_surge_ema(bars, indicators):
+    if len(bars) < 21:
+        return False
+    vol_avg = bars["volume"].rolling(20).mean().iloc[-2]
+    if pd.isna(vol_avg) or vol_avg <= 0:
+        return False
+    if bars["volume"].iloc[-1] / vol_avg < 2.0:
+        return False
+    ema20 = indicators.get("ema_20")
+    if ema20 is None or len(ema20) == 0 or pd.isna(ema20.iloc[-1]):
+        return False
+    return bool(bars["close"].iloc[-1] < ema20.iloc[-1])
+
+
+# ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
 
@@ -164,13 +209,13 @@ def test_normalize_tick_returns_none_without_price():
 # ---------------------------------------------------------------------------
 
 
-def _enable_buy_definition(name: str = "fno_intraday_buy_20") -> int:
+def _enable_buy_definition(name: str = "_test_buy_surge_ema") -> int:
     """Insert an enabled BUY scan_definition that points at the example rule."""
     return scanner_service.create_scan_definition(
         name=name,
         screener_type="buy",
         expression_json=None,
-        rule_module="fno_intraday_buy_20",  # name registered by the rule module
+        rule_module="_test_buy_surge_ema",  # name registered by the rule module
         enabled=True,
     )
 
@@ -252,14 +297,14 @@ def test_on_bar_close_evaluates_all_enabled_definitions(fresh_scanner_db):
         name="buy_def",
         screener_type="buy",
         expression_json=None,
-        rule_module="fno_intraday_buy_20",
+        rule_module="_test_buy_surge_ema",
         enabled=True,
     )
     sell_id = scanner_service.create_scan_definition(
         name="sell_def",
         screener_type="sell",
         expression_json=None,
-        rule_module="fno_intraday_sell_20",
+        rule_module="_test_sell_surge_ema",
         enabled=True,
     )
 
@@ -298,7 +343,7 @@ def test_on_bar_close_skips_disabled_definitions(fresh_scanner_db):
         name="buy_disabled",
         screener_type="buy",
         expression_json=None,
-        rule_module="fno_intraday_buy_20",
+        rule_module="_test_buy_surge_ema",
         enabled=False,
     )
 
@@ -457,11 +502,11 @@ def test_15m_bars_capped_at_50():
 
 
 def test_existing_rule_still_evaluates_against_new_indicators_dict():
-    """Regression: ``fno_intraday_buy_20`` reads only ``bars`` + ``ema_20`` and
+    """Regression: ``_test_buy_surge_ema`` reads only ``bars`` + ``ema_20`` and
     must still evaluate cleanly against the enriched 8-key indicators dict."""
     svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
     svc._history_provider = _FakeProvider()
-    rule = scanner_service.get_rule("fno_intraday_buy_20")
+    rule = scanner_service.get_rule("_test_buy_surge_ema")
     assert rule is not None
 
     # 20 baseline bars + a final volume-surge bar above the EMA → should fire.

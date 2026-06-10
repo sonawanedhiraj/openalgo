@@ -58,7 +58,7 @@ def test_create_run_and_get(fresh_backtest_db):
 
     run_id = backtest_service.create_run(
         strategy_name="trending_equity_intraday",
-        rule_names=["fno_intraday_buy_20"],
+        rule_names=["fno_intraday_buy_chartink"],
         symbols=["SBIN", "INFY"],
         from_date="2026-01-01",
         to_date="2026-01-15",
@@ -73,7 +73,7 @@ def test_create_run_and_get(fresh_backtest_db):
     assert row["from_date"] == "2026-01-01"
     assert row["to_date"] == "2026-01-15"
     assert row["interval"] == "5m"
-    assert json.loads(row["rule_names"]) == ["fno_intraday_buy_20"]
+    assert json.loads(row["rule_names"]) == ["fno_intraday_buy_chartink"]
     assert json.loads(row["symbols"]) == ["SBIN", "INFY"]
     cfg = json.loads(row["config"])
     assert cfg["atr_sl_mult"] == 1.5

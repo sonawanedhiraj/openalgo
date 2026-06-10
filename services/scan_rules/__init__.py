@@ -17,8 +17,6 @@ The scanner service evaluates rules whose name matches the
 """
 
 from services.scan_rules import (  # noqa: F401 — imports trigger registration
-    fno_intraday_buy_20,
     fno_intraday_buy_chartink,
-    fno_intraday_sell_20,
     fno_intraday_sell_chartink,
 )

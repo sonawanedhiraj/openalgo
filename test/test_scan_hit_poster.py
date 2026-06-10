@@ -74,7 +74,7 @@ def _insert_scan_result_row(scan_def_id: int = 1, symbol: str = "RELIANCE") -> i
         name=f"def_{scan_def_id}",
         screener_type="buy",
         expression_json=None,
-        rule_module="fno_intraday_buy_20",
+        rule_module="fno_intraday_buy_chartink",
         enabled=True,
     )
     return scanner_service.record_scan_result(

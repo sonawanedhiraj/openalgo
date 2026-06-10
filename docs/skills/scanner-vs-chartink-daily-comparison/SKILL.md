@@ -11,7 +11,7 @@ You are running a daily post-market comparison of the in-house scanner (Stage 1.
 - The operator's trading repo is at `C:\workspace\ai-trade-agent\openalgo` on Windows.
 - OpenAlgo runs at http://127.0.0.1:5000; bridge at http://127.0.0.1:5001.
 - DB: `db/openalgo.db` (SQLite).
-- The in-house scanner writes hits to `scan_results` with `source='inhouse'`. Each row: id, scan_definition_id, symbol, source, posted_to_engine (0 in shadow mode), scan_at (timestamp). Scan definitions: `fno_intraday_buy_20` (buy) and `fno_intraday_sell_20` (sell), distinguishable via the scan_definition_id → name join or via screener_type column on scan_definitions.
+- The in-house scanner writes hits to `scan_results` with `source='inhouse'`. Each row: id, scan_definition_id, symbol, source, posted_to_engine (0 in shadow mode), scan_at (timestamp). Scan definitions: `fno_intraday_buy_chartink` (buy) and `fno_intraday_sell_chartink` (sell), distinguishable via the scan_definition_id → name join or via screener_type column on scan_definitions.
 - Chartink hits arrive via webhook POSTs to `/chartink/simplified-stock-engine/<webhook_id>`. They land in `scan_cycle` rows (cycle_kind='chartink'). The actual symbol list for each chartink cycle is in the `payload_json` column (or similar — column name might be `payload`, `request_body`, or `stocks_json`; check schema).
 - Today is whatever date the cron fired. Use Asia/Kolkata timezone.
 - The in-house rule is admitted-placeholder and known to fire too often (~324 hits/day in backtest vs Chartink's typical 5-20). Today is one data point in tuning toward parity.
