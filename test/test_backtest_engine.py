@@ -147,7 +147,7 @@ def test_run_backtest_records_entry_when_rule_matches(
     fresh_backtest_db, monkeypatch, isolated_rule_registry
 ):
     """Use a synthetic always-match rule so we can assert entry mechanics
-    without coupling the test to fno_intraday_buy_20's exact thresholds.
+    without coupling the test to fno_intraday_buy_chartink's exact thresholds.
     """
     from services import backtest_service, scanner_service
 

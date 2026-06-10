@@ -99,7 +99,7 @@ def _build_day_bars(
         if surge_minute is not None and i == surge_minute:
             # Make the surge bar move strongly in the rule direction so
             # close-vs-EMA passes too. The volume bump alone is not
-            # enough — fno_intraday_buy_20 also needs close > EMA.
+            # enough — fno_intraday_buy_chartink also needs close > EMA.
             if direction == "up":
                 close_px = open_px + 2.0
                 high_px = close_px + 0.1
