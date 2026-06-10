@@ -754,6 +754,51 @@ The default mode is `sandbox` — orders flow into `sandbox.db` (virtual ₹1Cr
 capital) regardless of the global analyze_mode flag. Flip to `live` only
 after running the test suite and the smoke-boot checklist in the hand-off doc.
 
+## Unified strategy daily intent (`strategy_daily_intent`)
+
+The single per-strategy control surface for both the simplified engine and
+sector_follow is the `strategy_daily_intent` table in `db/openalgo.db`. It
+replaces the legacy simplified-engine `daily_intent` table and sector_follow's
+in-memory pause flag as the canonical *pre-market* control. One row per
+`(strategy_name, intent_date)`:
+
+- **`mode`** ∈ `live` / `sandbox` / `skip` — HOW orders route (broker /
+  sandbox.db / no orders).
+- **`intent`** ∈ `run` / `pause` / `halt` — WHETHER to act. `pause` blocks new
+  entries but lets exits / MTM / EOD continue; `halt` skips everything including
+  exits.
+- **`daily_capital_cap`** — optional override of the strategy's default daily
+  capital (caps the position-slot count).
+
+The single read path is
+`services.mode_service.resolve_strategy_mode(strategy_name, date=None)`, which
+returns an `EffectiveDecision(mode, intent, daily_capital_cap, source)`. It is a
+**separate** function from the load-bearing legacy global
+`resolve_effective_mode()` (an enum used by `place_order_service` /
+`/mode/status`) — see `docs/design/strategy_daily_intent.md` for why.
+
+**Fall-through (flag on):** unified row → legacy `daily_intent` (simplified
+only) → env mode flag (`SIMPLIFIED_ENGINE_MODE` / `SECTOR_FOLLOW_CAP5_VOL_MODE`)
+→ `sandbox/run` default. **Deploy is a no-op** until the operator inserts a row;
+each strategy stays on its existing env/legacy behavior until then.
+
+**Feature flag:** `STRATEGY_DAILY_INTENT_ENABLED` (env, default `true`). Set
+`false` for pure legacy behavior. **Migration:** legacy `daily_intent` rows are
+backfilled into the unified table once at boot (idempotent, `updated_by=
+'migration'`, `intent='run'`).
+
+**Where the gate lives:** in the engines (at job-entry / order-dispatch), NOT in
+`place_order_service` — the simplified engine's sandbox path bypasses
+`place_order_service`, and entry-vs-exit is only knowable in the engine. The
+shared `place_order_service` global resolver is unchanged. The
+`/sector_follow_cap5_vol/api/pause|resume` REST endpoints remain as **runtime
+emergency overrides** (in-memory `manual_pause`); pre-market planning uses the
+table.
+
+To opt a strategy in: `set_intent(strategy_name, date, mode, intent, cap,
+updated_by, notes)` in `database/strategy_daily_intent_db.py` (SQL or the future
+Telegram bot). To roll one back: delete its row → instant env fall-through.
+
 ## Claude Code Instructions
 
 ### Frontend Build Process

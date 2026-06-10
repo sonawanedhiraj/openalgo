@@ -70,6 +70,16 @@ def _make_service(metrics=None, **overrides):
     # injects a real one (keeps non-MTM tests hermetic — no broker call).
     mode = overrides.pop("mode", "scaffold")
     price_fetcher = overrides.pop("price_fetcher", lambda symbol, exchange: None)
+    # Unified daily-intent: default to an injected run/env decision so tests stay
+    # hermetic (no real strategy_daily_intent DB read). Tests exercising the
+    # intent gate pass their own ``intent_resolver``.
+    intent_resolver = overrides.pop("intent_resolver", None)
+    if intent_resolver is None:
+        from services.mode_service import EffectiveDecision
+
+        intent_resolver = lambda: EffectiveDecision(  # noqa: E731
+            mode="sandbox", intent="run", daily_capital_cap=None, source="env"
+        )
     cfg = _config(**overrides)
     svc = SectorFollowService(
         config=cfg,
@@ -81,6 +91,7 @@ def _make_service(metrics=None, **overrides):
         notifier=lambda msg: None,
         trade_recorder=fake_recorder,
         now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
+        intent_resolver=intent_resolver,
     )
     svc._test_placed = placed_orders
     svc._test_journal = journal
@@ -532,3 +543,96 @@ def test_run_eod_summary_file_failure_does_not_block_telegram(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# --------------------------------------------------------------------------- #
+# Unified daily-intent gate (pause / halt / daily_capital_cap / mode override)
+# --------------------------------------------------------------------------- #
+def _decision(mode="sandbox", intent="run", cap=None, source="unified"):
+    from services.mode_service import EffectiveDecision
+
+    return EffectiveDecision(
+        mode=mode, intent=intent, daily_capital_cap=cap, source=source
+    )
+
+
+def _open_pos(svc, symbol="ZZZ", entry_date="2026-06-09"):
+    from services.sector_follow_service import PaperPosition
+
+    svc.paper_book[symbol] = PaperPosition(
+        symbol=symbol, quantity=10, entry_price=100.0, entry_date=entry_date, vol_ratio=2.0
+    )
+
+
+def test_intent_pause_blocks_entries():
+    svc = _make_service(
+        metrics={"AAA": _hit(), "BBB": _hit()},
+        mode="sandbox",
+        intent_resolver=lambda: _decision(intent="pause"),
+    )
+    placed = svc.run_entry()
+    assert placed == []
+    assert svc._test_placed == []  # no orders dispatched
+
+
+def test_intent_pause_still_runs_exits():
+    svc = _make_service(mode="sandbox", intent_resolver=lambda: _decision(intent="pause"))
+    _open_pos(svc)  # entered yesterday → eligible for T+1 exit
+    exited = svc.run_exit()
+    assert [e["symbol"] for e in exited] == ["ZZZ"]
+    assert any(o[1]["action"] == "SELL" for o in svc._test_placed)
+
+
+def test_intent_halt_blocks_entries():
+    svc = _make_service(
+        metrics={"AAA": _hit()},
+        mode="sandbox",
+        intent_resolver=lambda: _decision(intent="halt"),
+    )
+    assert svc.run_entry() == []
+    assert svc._test_placed == []
+
+
+def test_intent_halt_blocks_exits():
+    svc = _make_service(mode="sandbox", intent_resolver=lambda: _decision(intent="halt"))
+    _open_pos(svc)
+    assert svc.run_exit() == []
+    assert svc._test_placed == []  # halt blocks the T+1 exit too
+
+
+def test_daily_capital_cap_limits_slots():
+    # cap = 50_000 and max_position_inr = 50_000 → exactly 1 slot, so only the
+    # top vol_ratio candidate is entered even though two pass the gates.
+    svc = _make_service(
+        metrics={"AAA": _hit(vol=1.5), "BBB": _hit(vol=3.0)},
+        mode="sandbox",
+        intent_resolver=lambda: _decision(intent="run", cap=50000.0),
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert placed[0]["symbol"] == "BBB"  # higher vol_ratio wins the single slot
+
+
+def test_unified_mode_override_changes_routing():
+    # Service constructed scaffold; a unified row with mode='sandbox' overrides
+    # it so the entry actually dispatches an order.
+    svc = _make_service(
+        metrics={"AAA": _hit()},
+        mode="scaffold",
+        intent_resolver=lambda: _decision(mode="sandbox", intent="run", source="unified"),
+    )
+    svc.run_entry()
+    assert svc.mode == "sandbox"
+    assert any(o[1]["symbol"] == "AAA" for o in svc._test_placed)
+
+
+def test_env_source_does_not_override_mode():
+    # source='env' must NOT mutate self.mode — back-compat fall-through.
+    svc = _make_service(
+        metrics={"AAA": _hit()},
+        mode="scaffold",
+        intent_resolver=lambda: _decision(mode="sandbox", intent="run", source="env"),
+    )
+    svc.run_entry()
+    assert svc.mode == "scaffold"  # unchanged
+    assert svc._test_placed == []  # scaffold places no orders

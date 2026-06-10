@@ -317,6 +317,17 @@ def production_price_fetcher(symbol: str, exchange: str) -> float | None:
     return float(ltp) if ltp else None
 
 
+def production_intent_resolver():
+    """Resolve the unified {mode, intent} decision for this strategy.
+
+    Thin wrapper around ``services.mode_service.resolve_strategy_mode`` so the
+    service can inject a fake in tests. Lazily imported so importing this module
+    never pulls the mode/settings stack."""
+    from services.mode_service import resolve_strategy_mode
+
+    return resolve_strategy_mode("sector_follow_cap5_vol")
+
+
 def telegram_notifier(message: str) -> None:
     """Best-effort Telegram broadcast; silent when the bot is disabled/unconfigured."""
     try:
@@ -376,6 +387,7 @@ class SectorFollowService:
         trade_recorder: Callable[..., object] | None = None,
         open_positions_loader: Callable[[], set[str]] | None = None,
         now: Callable[[], datetime] | None = None,
+        intent_resolver: Callable[[], object] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -392,6 +404,7 @@ class SectorFollowService:
         self._notify = notifier or telegram_notifier
         self._record_trade = trade_recorder or self._default_trade_recorder
         self._open_positions_loader = open_positions_loader
+        self._intent_resolver = intent_resolver or production_intent_resolver
         self._now = now or (lambda: datetime.now(_IST))
         # Where the Day-N EOD markdown report is written. Hardcoded default;
         # tests override this attribute to point at a tmp dir.
@@ -681,12 +694,64 @@ class SectorFollowService:
         self.paper_book.pop(symbol, None)
         return {"symbol": symbol, "quantity": position.quantity, "order_id": order_id}
 
+    # ----- unified daily intent (mode + intent gate) --------------------- #
+    def _resolve_decision(self):
+        """Resolve today's unified {mode, intent, daily_capital_cap, source}.
+
+        Fail-open: any resolver error yields an env-default ``run`` decision so a
+        scheduled job is never killed by the lookup."""
+        try:
+            return self._intent_resolver()
+        except Exception:
+            logger.debug("sector_follow intent resolve failed; defaulting to run", exc_info=True)
+            from services.mode_service import EffectiveDecision
+
+            return EffectiveDecision(
+                mode="sandbox", intent="run", daily_capital_cap=None, source="default"
+            )
+
+    def _apply_mode_override(self, decision) -> None:
+        """Honor an explicit unified-row mode by mapping it onto the service's
+        native routing mode. Env/legacy/default sources leave ``self.mode`` as the
+        env value (so deploy is a no-op until the operator inserts a row).
+        Unified ``skip`` maps to ``scaffold`` (compute + log, no orders)."""
+        if getattr(decision, "source", None) != "unified":
+            return
+        mapped = {"skip": "scaffold", "sandbox": "sandbox", "live": "live"}.get(decision.mode)
+        if mapped and mapped != self.mode:
+            logger.warning(
+                "sector_follow mode override %s -> %s (unified intent row)", self.mode, mapped
+            )
+            self.mode = mapped
+
+    def _effective_max_concurrent(self, decision) -> int:
+        """Apply an optional ``daily_capital_cap`` to the position-slot count.
+
+        With a cap set, the max concurrent positions is the lesser of the config
+        default and ``floor(cap / max_position_inr)``. NULL cap = config default."""
+        base = self.config.max_concurrent_positions
+        cap = getattr(decision, "daily_capital_cap", None)
+        if cap is None or self.config.max_position_inr <= 0:
+            return base
+        slots = int(cap // self.config.max_position_inr)
+        return max(0, min(base, slots))
+
     # ----- scheduled job bodies ------------------------------------------ #
     def run_entry(self) -> list[dict]:
-        """15:20 IST: evaluate, select, place entries (subject to kill switch + caps)."""
+        """15:20 IST: evaluate, select, place entries (subject to intent gate,
+        kill switch + caps)."""
+        decision = self._resolve_decision()
+        if decision.intent in ("pause", "halt"):
+            logger.info(
+                "sector_follow entry skipped (intent=%s, source=%s)",
+                decision.intent, decision.source,
+            )
+            return []
+        self._apply_mode_override(decision)
         candidates = self.evaluate_candidates()
         open_syms = self.open_position_symbols()
-        entries = select_entries(candidates, open_syms, self.config.max_concurrent_positions)
+        max_concurrent = self._effective_max_concurrent(decision)
+        entries = select_entries(candidates, open_syms, max_concurrent)
         placed = [r for r in (self.place_entry(c) for c in entries) if r]
         logger.info("sector_follow entry job placed %d order(s) [mode=%s]", len(placed), self.mode)
         if placed:
@@ -697,7 +762,14 @@ class SectorFollowService:
         return placed
 
     def run_exit(self) -> list[dict]:
-        """15:25 IST: square off everything opened on a prior trading day (T+1)."""
+        """15:25 IST: square off everything opened on a prior trading day (T+1).
+
+        Intent ``halt`` skips exits entirely; ``pause`` does NOT block exits."""
+        decision = self._resolve_decision()
+        if decision.intent == "halt":
+            logger.info("sector_follow exit skipped (intent=halt, source=%s)", decision.source)
+            return []
+        self._apply_mode_override(decision)
         today = self._now().date().isoformat()
         to_exit = [p for p in list(self.paper_book.values()) if p.entry_date != today]
         exited = [r for r in (self.place_exit(p) for p in to_exit) if r]

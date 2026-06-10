@@ -119,7 +119,7 @@ need no external scheduler.
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
@@ -180,9 +180,27 @@ SectorFollowService singleton; they return `503` if the service isn't initialise
 |---|---|---|
 | `/sector_follow_cap5_vol/api/status` | GET | Read-only: mode, kill switch, today's entries/exits, open book + live MTM |
 | `/sector_follow_cap5_vol/api/positions` | GET | Read-only: open positions (with MTM) + today's entries/exits |
-| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1 |
+| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1. Runtime emergency override; for pre-market planning use the `strategy_daily_intent` table instead |
 | `/sector_follow_cap5_vol/api/resume` | POST | Clears manual pause **and** the kill switch |
 | `/sector_follow_cap5_vol/api/close_all` | POST | **Emergency square-off of every open position** (mode-aware; not blocked by kill switch). Requires body `{"confirm":"yes"}` |
+
+### Unified daily intent (`strategy_daily_intent`)
+
+The pre-market control surface for BOTH the simplified engine and sector_follow
+is the `strategy_daily_intent` table (`db/openalgo.db`). One row per
+`(strategy_name, intent_date)` declares `mode` (`live`/`sandbox`/`skip` — HOW
+orders route) and `intent` (`run`/`pause`/`halt` — WHETHER to act), plus an
+optional `daily_capital_cap`. The engines consult
+`services/mode_service.resolve_strategy_mode(strategy_name)` at job-entry:
+`pause` blocks new entries (exits still run), `halt` blocks everything including
+exits. Fall-through when no row exists (flag on): legacy `daily_intent`
+(simplified only) → env mode flag → `sandbox/run` default — so deploy is a no-op
+until the operator inserts a row. Feature-flagged by
+`STRATEGY_DAILY_INTENT_ENABLED` (default `true`). `place_order_service` is
+deliberately NOT wired through this — its global `resolve_effective_mode` floor
+is unchanged; the gate lives in the engines (the simplified engine's sandbox
+dispatch bypasses `place_order_service` entirely). Full design:
+`docs/design/strategy_daily_intent.md`.
 
 `sector_follow_trades` columns (`database/sector_follow_db.py`): `id`, `strategy_id`,
 `mode`, `side` (BUY/SELL), `symbol`, `exchange`, `product`, `quantity`, `price`

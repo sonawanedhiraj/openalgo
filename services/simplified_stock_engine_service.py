@@ -197,6 +197,12 @@ class SimplifiedStockEngineService:
         )
         # Order routing mode: disabled | sandbox | live. See MODE_* in core.
         self.mode = self.config.mode
+        # Unified daily-intent resolver (services.mode_service). Injectable for
+        # tests; default consults resolve_strategy_mode('simplified_engine').
+        # See docs/design/strategy_daily_intent.md — the gate lives here (order
+        # dispatch) rather than in place_order_service because the engine's own
+        # _dispatch_order bypasses that path in sandbox mode.
+        self._intent_resolver: Any | None = None
         self.history_source = os.getenv("SIMPLIFIED_ENGINE_HISTORY_SOURCE", "api")
         self.history_lookback_days = _env_int("SIMPLIFIED_ENGINE_HISTORY_LOOKBACK_DAYS", 3)
         self.order_poll_attempts = _env_int("SIMPLIFIED_ENGINE_ORDER_POLL_ATTEMPTS", 5)
@@ -486,9 +492,43 @@ class SimplifiedStockEngineService:
         finally:
             self._sl_timers.pop(signal.symbol, None)
 
+    def _intent_blocks(self, *, is_entry: bool) -> bool:
+        """Consult the unified daily-intent resolver. True iff this action is
+        blocked today: ``halt`` blocks everything; ``pause`` blocks entries but
+        allows exits. Fail-open — any resolver error returns False (not blocked)
+        so a lookup failure never silently halts trading. Back-compat: with no
+        unified row the resolver falls through to env (intent='run') → not
+        blocked."""
+        try:
+            resolver = self._intent_resolver
+            if resolver is None:
+                from services.mode_service import resolve_strategy_mode
+
+                decision = resolve_strategy_mode("simplified_engine")
+            else:
+                decision = resolver()
+            intent = getattr(decision, "intent", "run")
+        except Exception:
+            logger.debug("simplified intent resolve failed; not blocking", exc_info=True)
+            return False
+        if intent == "halt":
+            return True
+        if intent == "pause" and is_entry:
+            return True
+        return False
+
     def _place_entry_order(
         self, signal: EntrySignal, api_key: str, strategy_name: str
     ) -> None:
+        # Unified daily-intent gate (pause/halt block new entries).
+        if self._intent_blocks(is_entry=True):
+            logger.info(
+                "[SIMPLIFIED-INTENT] Entry blocked for %s by daily intent (pause/halt)",
+                signal.symbol,
+            )
+            with self._lock:
+                self.engine.clear_pending_entry(signal.symbol)
+            return
         # Stage-0 daily circuit breaker. Sits *before* the disabled-mode
         # short-circuit so disabled-mode tracing also respects the gate (so
         # an operator can see "engine would have skipped this anyway").
@@ -903,6 +943,17 @@ class SimplifiedStockEngineService:
             )
 
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
+        # Unified daily-intent gate (only ``halt`` blocks exits; ``pause`` lets
+        # open positions run to their stop/exit).
+        if self._intent_blocks(is_entry=False):
+            logger.info(
+                "[SIMPLIFIED-INTENT] Exit blocked for %s by daily intent (halt)",
+                signal.symbol,
+            )
+            with self._lock:
+                self.engine.clear_pending_exit(signal.symbol)
+            return
+
         if self.mode == MODE_DISABLED:
             logger.info(
                 "[SIMPLIFIED-DISABLED] %s %s qty=%s reason=%s ref=%.2f (no order sent)",
