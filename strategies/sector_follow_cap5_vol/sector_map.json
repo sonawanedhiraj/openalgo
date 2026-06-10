@@ -1,0 +1,53 @@
+{
+  "_meta": {
+    "strategy": "sector_follow_cap5_vol",
+    "created": "2026-06-10",
+    "phase": "Phase 0 Deliverable A",
+    "universe": "R40 top-30 F&O by full-window (2024-01..2026-06) traded value",
+    "classification_source": "NSE Industry/Sector classification (NIC) + index constituent membership; only indices with full 2022-2026 daily history in db/historify.duckdb are used",
+    "available_sector_indices": [
+      "NIFTYPVTBANK", "NIFTYPSUBANK", "BANKNIFTY", "FINNIFTY", "NIFTYIT",
+      "NIFTYAUTO", "NIFTYMETAL", "NIFTYFMCG", "NIFTYPHARMA", "NIFTYHEALTHCARE",
+      "NIFTYENERGY", "NIFTYOILANDGAS", "NIFTYCONSRDURBL", "NIFTYREALTY",
+      "NIFTYMEDIA", "NIFTY"
+    ],
+    "absent_indices_that_would_have_helped": [
+      "NIFTYINFRA (LT/RVNL)", "NIFTYPSE / defence (HAL/MAZDOCK/BEL)",
+      "telecom (BHARTIARTL/IDEA)", "aviation (INDIGO)", "retail/consumption (TRENT/ETERNAL)"
+    ],
+    "summary": "19 of 30 mapped to a real sectoral index; 11 fall back to broad_market NIFTY because no representative sectoral index exists in our data.",
+    "vs_r40": "R40 hand-mapped only 14 (and JIOFIN was mis-tagged NIFTYPVTBANK). This map adds real sectors for RELIANCE, INFY, TCS, M&M, MARUTI, AXISBANK, INDUSINDBK, BSE, BAJFINANCE, DIXON and re-tags JIOFIN -> FINNIFTY."
+  },
+  "map": {
+    "HDFCBANK":   {"index": "NIFTYPVTBANK",    "type": "sector", "reason": "Private-sector bank"},
+    "ICICIBANK":  {"index": "NIFTYPVTBANK",    "type": "sector", "reason": "Private-sector bank"},
+    "AXISBANK":   {"index": "NIFTYPVTBANK",    "type": "sector", "reason": "Private-sector bank"},
+    "KOTAKBANK":  {"index": "NIFTYPVTBANK",    "type": "sector", "reason": "Private-sector bank"},
+    "INDUSINDBK": {"index": "NIFTYPVTBANK",    "type": "sector", "reason": "Private-sector bank"},
+    "SBIN":       {"index": "NIFTYPSUBANK",    "type": "sector", "reason": "PSU bank"},
+    "INFY":       {"index": "NIFTYIT",         "type": "sector", "reason": "IT services, top NIFTYIT constituent"},
+    "TCS":        {"index": "NIFTYIT",         "type": "sector", "reason": "IT services, top NIFTYIT constituent"},
+    "TMPV":       {"index": "NIFTYAUTO",       "type": "sector", "reason": "Tata Motors PV - automobile OEM"},
+    "M&M":        {"index": "NIFTYAUTO",       "type": "sector", "reason": "Automobile OEM"},
+    "MARUTI":     {"index": "NIFTYAUTO",       "type": "sector", "reason": "Automobile OEM"},
+    "VEDL":       {"index": "NIFTYMETAL",      "type": "sector", "reason": "Diversified metals & mining"},
+    "TATASTEEL":  {"index": "NIFTYMETAL",      "type": "sector", "reason": "Steel"},
+    "ITC":        {"index": "NIFTYFMCG",       "type": "sector", "reason": "FMCG, top NIFTYFMCG constituent"},
+    "RELIANCE":   {"index": "NIFTY", "type": "broad_market", "reason": "Phase 3: NIFTYOILANDGAS has NO 1m feed (daily only) so the intraday sector gate could never fire — re-mapped to broad-market NIFTY. RIL was the dominant (~30%) NIFTYOILANDGAS weight; revisit if/when that index gets a 1m feed."},
+    "DIXON":      {"index": "NIFTY", "type": "broad_market", "reason": "Phase 3: NIFTYCONSRDURBL has NO 1m feed (daily only) so the intraday sector gate could never fire — re-mapped to broad-market NIFTY. Was NSE Consumer Durables (consumer electronics / EMS); revisit if/when that index gets a 1m feed."},
+    "BSE":        {"index": "FINNIFTY",        "type": "sector", "reason": "Stock exchange / capital markets = Financial Services"},
+    "BAJFINANCE": {"index": "FINNIFTY",        "type": "sector", "reason": "NBFC, top-3 NIFTY Financial Services constituent"},
+    "JIOFIN":     {"index": "FINNIFTY",        "type": "sector", "reason": "Financial-services holding/NBFC (NOT a bank; R40 mis-tagged as NIFTYPVTBANK)"},
+    "ETERNAL":    {"index": "NIFTY", "type": "broad_market", "reason": "Internet/food-delivery (ex-Zomato) - no sectoral index in our data"},
+    "BHARTIARTL": {"index": "NIFTY", "type": "broad_market", "reason": "Telecom - no NIFTY telecom index in our data"},
+    "IDEA":       {"index": "NIFTY", "type": "broad_market", "reason": "Telecom - no NIFTY telecom index in our data"},
+    "LT":         {"index": "NIFTY", "type": "broad_market", "reason": "Infra/capital goods - NIFTYINFRA absent from our data"},
+    "HAL":        {"index": "NIFTY", "type": "broad_market", "reason": "Defence PSU - no defence/PSE index in our data"},
+    "MAZDOCK":    {"index": "NIFTY", "type": "broad_market", "reason": "Defence shipbuilding PSU - no defence/PSE index in our data"},
+    "BEL":        {"index": "NIFTY", "type": "broad_market", "reason": "Defence electronics PSU - no defence/PSE index in our data"},
+    "INDIGO":     {"index": "NIFTY", "type": "broad_market", "reason": "Aviation - no transport/aviation index in our data"},
+    "RVNL":       {"index": "NIFTY", "type": "broad_market", "reason": "Railway/infra PSU - NIFTYINFRA absent; thematic, not in any available index"},
+    "TRENT":      {"index": "NIFTY", "type": "broad_market", "reason": "Apparel retail - no retail/consumption index in our data"},
+    "IRFC":       {"index": "NIFTY", "type": "broad_market", "reason": "Railway-finance PSU. By NIC it is Financial Services, but FINNIFTY is private-financial-heavy and a poor proxy for this PSU/railway-capex driven name; broad market is the more honest signal"}
+  }
+}

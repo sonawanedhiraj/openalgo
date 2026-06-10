@@ -58,7 +58,7 @@ def test_post_run_with_mocked_orchestrator(app_with_backtest, monkeypatch):
             "to_date": "2026-05-15",
             "interval": "5m",
             "atr_sl_mult": 1.5,
-            "rule_names": ["fno_intraday_buy_20"],
+            "rule_names": ["fno_intraday_buy_chartink"],
         },
     )
     assert resp.status_code == 200
@@ -70,7 +70,7 @@ def test_post_run_with_mocked_orchestrator(app_with_backtest, monkeypatch):
     assert captured["from_date"] == "2026-05-01"
     assert captured["interval"] == "5m"
     assert captured["atr_sl_mult"] == 1.5
-    assert captured["rule_names"] == ["fno_intraday_buy_20"]
+    assert captured["rule_names"] == ["fno_intraday_buy_chartink"]
 
 
 def test_post_run_missing_required_fields_returns_400(app_with_backtest):
@@ -103,7 +103,7 @@ def test_get_run_details(app_with_backtest):
 
     run_id = backtest_service.create_run(
         strategy_name="trending_equity_intraday",
-        rule_names=["fno_intraday_buy_20"],
+        rule_names=["fno_intraday_buy_chartink"],
         symbols=["SBIN"],
         from_date="2026-05-01",
         to_date="2026-05-15",
@@ -144,7 +144,7 @@ def test_get_run_trades(app_with_backtest):
         direction="LONG",
         entry_at="2026-05-01T09:30:00+05:30",
         entry_price=600.0,
-        entry_reason="fno_intraday_buy_20",
+        entry_reason="fno_intraday_buy_chartink",
         quantity=10,
         atr_at_entry=0.5,
         sl_price=599.0,
@@ -159,7 +159,7 @@ def test_get_run_trades(app_with_backtest):
     assert len(data["trades"]) == 1
     t = data["trades"][0]
     assert t["symbol"] == "SBIN"
-    assert t["entry_reason"] == "fno_intraday_buy_20"
+    assert t["entry_reason"] == "fno_intraday_buy_chartink"
     assert t["quantity"] == 10
 
 

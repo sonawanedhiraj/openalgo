@@ -454,8 +454,8 @@ def get_recent_runs(limit: int = 10) -> list[dict[str, Any]]:
 # live engine's RISK_SAME_DAY_STOPOUT_BLOCK behaviour without dragging in
 # the full SimplifiedStockEngine state machine.
 
-# A modest history window is enough: the active rules (fno_intraday_buy_20
-# / sell_20) need at most 21 bars for the 20-bar volume average. ATR(14)
+# A modest history window is enough: the active rules (fno_intraday_buy_chartink
+# / sell_chartink) need at most 21 bars for the 20-bar volume average. ATR(14)
 # needs 14. 60 bars gives a comfortable margin without blowing memory on
 # long replays.
 _HISTORY_WINDOW = 60

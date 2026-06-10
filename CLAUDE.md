@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Strategy Registry — Read First When User Mentions "Trading Strategy"
+
+The canonical record of every strategy tested in this project lives at
+[`strategies/STRATEGY_REGISTRY.md`](strategies/STRATEGY_REGISTRY.md). When the user
+references trading strategies — past, current, or proposed — Claude should READ
+THAT FILE FIRST. It contains the active deployable shortlist, every rejected
+strategy with WHY, in-flight experiments, the untested backlog, and the standard
+testing protocol that makes rounds comparable.
+
+The registry is a LIVING document. After every backtest round, Claude should add
+a new entry. After every live trading session, Claude should update the relevant
+`strategies/<name>/LEARNINGS.md`. The registry's `Active` and `In-Flight` rows
+should reflect current reality.
+
 ## Cowork Objective (Read First)
 
 **Cowork is the brain of this project.** It does real-time market research, selects
@@ -66,6 +80,57 @@ When any architectural change ships, the matching documentation update ships in 
 - `strategies/<active>/VERSION_LOG.md` — strategy parameter/logic history
 - `COWORK_OBJECTIVE.md` — strategic objective
 - `audit/README.md` — audit policy
+
+## Parameter changes ALWAYS go to dev directly
+
+Any change to a tunable parameter (env var, DB config row, threshold default in
+code, scheduler interval, etc.) MUST:
+
+1. Add an entry to [`docs/PARAMETER_LOG.md`](docs/PARAMETER_LOG.md) in the same commit
+2. Commit directly to `dev` — no feature branch, no PR, no batching with other work
+3. Pair the doc update with the actual change (`.env` edit, SQL UPDATE, code default change)
+
+**Why direct to dev:** every feature branch off dev inherits the latest log
+automatically. Parameter changes stuck on feature branches create silent drift
+where the live system disagrees with the documented intent. Direct-to-dev
+guarantees alignment.
+
+**When a feature branch adds a NEW tunable:** the PR description must propose
+the PARAMETER_LOG entry. The entry is added to dev as part of the merge or as
+an immediate follow-up direct commit.
+
+**Before any parameter-dependent work** (spawning a backtest, deploying a
+strategy, evaluating a rule): read PARAMETER_LOG AND verify against `.env`. The
+doc captures intent; the env captures reality. Mismatches are real bugs.
+
+## Strategy registry updates ALWAYS go to dev directly
+
+Same pattern as the parameter log: `strategies/STRATEGY_REGISTRY.md` is reference
+documentation that informs every backtest, deployment, and "what should I try
+next" decision. Spawned tasks read it via CLAUDE.md's instruction "READ FIRST
+when user mentions strategy / backtest / round N".
+
+Every new backtest round MUST:
+1. Add an entry to [`strategies/STRATEGY_REGISTRY.md`](strategies/STRATEGY_REGISTRY.md)
+   in the same commit that closes the round
+2. Commit directly to `dev` — no feature branch, no PR, no batching with other work
+3. Cross-cutting structural findings (e.g. "BS pricing is systematically optimistic
+   for option buying", or "g13 5m-volume gate is the dominant killer in the
+   chartink mirror rule") get an entry in the "Cross-Cutting Findings" section,
+   same direct-commit pattern
+
+**Why direct to dev:** every feature branch off dev inherits the latest registry
+automatically. Registry entries stuck on feature branches create silent drift
+where the canonical "what was tested and why" record disagrees with the work
+that actually happened. Direct-to-dev guarantees alignment.
+
+**When a feature branch creates new strategy files** (e.g. `strategies/<name>/`):
+the PR description must propose the registry entry. The entry lands on dev as
+part of the merge or as an immediate follow-up direct commit.
+
+**Updating an active strategy's Status / Latest Note** after a live trading
+session: direct to dev too. The registry's "Status" column is intended to be
+fresh.
 
 ## Overview
 
@@ -631,7 +696,32 @@ emits recommended-orders JSON — never places orders). Entry point is the CLI
 `uv run python -m services.sector_rotation_etf_cli --asof YYYY-MM-DD --current-positions '{...}'`.
 **Not yet wired**: no scheduler job, no live mode (`mode: scaffold-only`,
 `deployable: false`), no order placement — the operator reviews orders manually.
-First sandbox rebalance planned for 2026-07-01.
+First sandbox rebalance planned for 2026-06-15 (moved up from 2026-07-01).
+Operator-manual workflow — see
+[`DEPLOYMENT_CHECKLIST_2026-06-15.md`](strategies/sector_rotation_etf/DEPLOYMENT_CHECKLIST_2026-06-15.md).
+Still `mode: scaffold-only`, `deployable: false`; date moved earlier only to get
+the operator hands-on sooner — no safety rails removed.
+
+**Scaffold strategy**: [`strategies/sector_follow_cap5_vol/`](strategies/sector_follow_cap5_vol/)
+— an intraday sector-follow strategy (spawned from R40 winner `V_SF_CAP5_VOL`):
+at 15:20 IST it buys ≤5 names whose mapped sector index is up >1% intraday AND the
+stock is up >0.5% AND volume >1× its 20d average (vol-ratio tiebreaker), holds to a
+T+1 15:25 MARKET exit, with a 3%-of-capital daily kill switch. Universe is the
+Phase-0.5 `LOCK_STATIC_30` set; ₹2.5L capital, ₹50k/position.
+**SCAFFOLD ONLY — not live** (`mode: scaffold-only`, `deployable: false`). Unlike
+sector_rotation_etf, this strategy IS wired into the runtime: `SectorFollowService`
+(`services/sector_follow_service.py`) is built at boot and registers 4 APScheduler
+jobs (entry 15:20 / exit 15:25 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
+default `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` places **no orders** — it computes
+signals, logs, and writes the `sector_follow_trades` journal only. Flip to
+`sandbox` / `live` is operator-only. Key files:
+`services/sector_follow_service.py` (evaluator + scheduler glue),
+`blueprints/sector_follow.py` (control API at `/sector_follow_cap5_vol/api/*` —
+status/positions/pause/resume/close_all),
+`database/sector_follow_db.py` (`sector_follow_trades` journal),
+`services/sector_follow_index_backfill.py` (daily 16:05 IST sector-index 1m
+refresh, gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`). Plan + locked operator
+decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follow_cap5_vol/PLAN.md).
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.

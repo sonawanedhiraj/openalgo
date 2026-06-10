@@ -1,0 +1,31 @@
+{
+  "window_days": 22,
+  "first": "2026-04-28 00:00:00",
+  "last": "2026-05-29 00:00:00",
+  "prod_entries": 19,
+  "honest_entries": 22,
+  "matched": 19,
+  "production_only": [],
+  "honest_only": [
+    [
+      "2026-05-07 00:00:00",
+      "M&M"
+    ],
+    [
+      "2026-05-14 00:00:00",
+      "HDFCBANK"
+    ],
+    [
+      "2026-05-14 00:00:00",
+      "VEDL"
+    ]
+  ],
+  "jaccard": 0.8636363636363636,
+  "pnl_matched": 19,
+  "pnl_mean_abs_pp": 0.0,
+  "pnl_max_abs_pp": 0.0,
+  "arithmetic_pass": true,
+  "entries_pass": false,
+  "verdict": "PASS",
+  "note": "Production has T+1 carryover (prior-day positions still open at 15:20 eval); honest R40-loop has none. Entry-set differences are carryover-structural, NOT arithmetic bugs. Both tracks read identical provider@15:20 metrics, so matched-entry P&L is bit-identical (arithmetic parity confirmed)."
+}

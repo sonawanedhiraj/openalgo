@@ -1,0 +1,89 @@
+name: CI (self-hosted)
+
+# Runs on the operator's Docker-isolated self-hosted runner (see ci/runner/).
+# Targets ONLY our hardened runner via its full label set, so no GitHub-hosted
+# job and no other runner can pick these up.
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Pre-merge gate: ruff (smoke scripts) + import-only smoke + engine tests.
+  # Mirrors the local `make gate` bundle. No running app / broker session
+  # needed — smoke_boot is import-only. Candidate REQUIRED status check.
+  gate:
+    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev
+      # smoke_boot imports app.py, which sys.exit(1)s without a .env. Provision
+      # one from the committed sample; placeholder secrets auto-rotate on load
+      # and nothing here touches a real broker session.
+      - name: Provision .env for import-only smoke
+        run: cp .sample.env .env
+      - name: Run pre-merge gate
+        run: make gate
+
+  # Fast unit tests. NOTE: depends on pytest markers being codified
+  # (plan next-step #2: add markers = ["unit","integration","live"] to
+  # pyproject.toml and tag the fast tests `unit`). Until then `-m unit`
+  # collects nothing and the job errors — keep it OUT of required checks in
+  # branch protection until the markers land. Candidate required check after.
+  backend-test:
+    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev
+      - name: Run unit tests
+        run: uv run pytest -m unit -v --timeout=60
+
+  # Lint — advisory (pre-existing warnings in vendored broker modules).
+  backend-lint:
+    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev
+      - name: Ruff lint
+        run: uv run ruff check .
+        continue-on-error: true
+      - name: Ruff format check
+        run: uv run ruff format --check .
+        continue-on-error: true
+
+  # Security scan — advisory.
+  security-scan:
+    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --dev
+      - name: Bandit
+        run: uv run bandit -r . -x .venv,test,frontend,node_modules -ll -f txt
+        continue-on-error: true
+      - name: pip-audit
+        run: uv run pip-audit
+        continue-on-error: true

@@ -1,0 +1,42 @@
+# OpenAlgo self-hosted GitHub Actions runner — Docker-isolated.
+#
+# Hardening contract (see ci/runner/README.md and docs/BRANCHING_AND_CI.md):
+#   - NO host filesystem bind-mounts. The runner clones the repo fresh into its
+#     own /runner/_work each job; it cannot see db/, .env, log/, audit/,
+#     bridge/, broker creds, or anything else on the host.
+#   - NO Docker socket mount. The container cannot drive the host's Docker.
+#   - NO host networking. Default bridge only; it cannot reach OpenAlgo on
+#     localhost:5000 or the Cowork bridge on localhost:5001.
+#   - Strict resource caps: 1 CPU, 2 GB RAM — leaves headroom for live trading.
+#   - EPHEMERAL: a fresh container per job, de-registered after each run.
+#
+# Start:  cd ci/runner && docker compose up -d   (or: pwsh scripts/install-runner.ps1)
+# Stop:   docker compose -f ci/runner/docker-compose.yml down
+services:
+  gh-runner:
+    image: myoung34/github-runner:latest
+    container_name: openalgo-gh-runner
+    restart: unless-stopped
+    env_file: .env.runner            # holds the token (gitignored, operator-supplied)
+    environment:
+      RUNNER_NAME: openalgo-laptop
+      RUNNER_WORKDIR: /runner/_work
+      LABELS: self-hosted,linux,docker,openalgo-laptop
+      REPO_URL: https://github.com/sonawanedhiraj/openalgo
+      EPHEMERAL: "true"              # fresh container per job — large safety win
+      DISABLE_AUTO_UPDATE: "false"
+    # Resource caps. `deploy.resources.limits` is honored by `docker compose up`
+    # under Compose v2 (Docker Desktop). The top-level cpus/mem_limit keys are
+    # the legacy equivalents kept for older engines — both mean 1 CPU / 2 GB.
+    cpus: 1.0
+    mem_limit: 2g
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    # ── Guardrails — do NOT add any of the following ──────────────────────
+    #   volumes:            (no host bind-mounts: no db/, .env, log/, audit/…)
+    #   /var/run/docker.sock (no Docker socket: can't touch host Docker)
+    #   network_mode: host  (default bridge only: can't reach :5000 / :5001)
+    #   privileged: true    (never)

@@ -1,0 +1,952 @@
+"""Sector Follow CAP5_VOL strategy service.
+
+Entry rule (15:20 IST eval): sector index >+1% intraday AND stock >+0.5% intraday
+AND volume >1x 20d avg. Buy at MARKET ~15:20-15:25. Exit T+1 at 15:25 close MARKET.
+Max 5 concurrent positions; tiebreaker = volume ratio descending.
+
+Mode flag (env): SECTOR_FOLLOW_CAP5_VOL_MODE = scaffold | sandbox | live
+  scaffold: compute signals, log, NO orders (default)
+  sandbox: orders to sandbox.db only
+  live: real broker orders
+
+Plan / decisions: strategies/sector_follow_cap5_vol/ (LEARNINGS.md, config_snapshot.json,
+sector_map.json, data_coverage.md, strategy_id_design.md).
+
+Testability: all I/O (market-data metrics, order placement, notifications, trade
+journal) is injected with production defaults, mirroring the policy-injection
+pattern in services/scanner_ws_watchdog.py — unit tests drive the pure decision
+logic without a live broker or DuckDB.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import threading
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+_STRATEGY_DIR = Path(__file__).resolve().parents[1] / "strategies" / "sector_follow_cap5_vol"
+_DEFAULT_CONFIG_PATH = _STRATEGY_DIR / "config_snapshot.json"
+_DEFAULT_SECTOR_MAP_PATH = _STRATEGY_DIR / "sector_map.json"
+
+VALID_MODES = ("scaffold", "sandbox", "live")
+
+
+# --------------------------------------------------------------------------- #
+# Config + universe loaders
+# --------------------------------------------------------------------------- #
+@dataclass
+class SectorFollowConfig:
+    """Strategy configuration. Mirrors config_snapshot.json (scaffold defaults)."""
+
+    capital_inr: float = 250000.0
+    max_position_inr: float = 50000.0
+    max_concurrent_positions: int = 5
+    gate_sector_pct: float = 1.0  # sector index intraday return gate, in percent
+    gate_stock_pct: float = 0.5  # stock intraday return gate, in percent
+    gate_vol_mult: float = 1.0  # volume / 20d-avg gate
+    daily_loss_kill_pct: float = 3.0
+    tiebreaker: str = "volume_ratio_desc"
+    cost_pct_round_trip: float = 0.0857
+    vol_avg_lookback_days: int = 20
+    broker: str = "zerodha"
+    exchange: str = "NSE"
+    product: str = "CNC"
+    universe: list[str] = field(default_factory=list)
+    strategy_id: int | None = None
+
+    @property
+    def gate_sector_ret(self) -> float:
+        """Sector gate as a fraction (1.0% -> 0.01)."""
+        return self.gate_sector_pct / 100.0
+
+    @property
+    def gate_stock_ret(self) -> float:
+        """Stock gate as a fraction (0.5% -> 0.005)."""
+        return self.gate_stock_pct / 100.0
+
+
+def load_config(path: str | Path = _DEFAULT_CONFIG_PATH) -> SectorFollowConfig:
+    """Load config_snapshot.json into a SectorFollowConfig (missing keys -> defaults)."""
+    with open(path, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    return SectorFollowConfig(
+        capital_inr=float(raw.get("capital_inr", 250000.0)),
+        max_position_inr=float(raw.get("max_position_inr", 50000.0)),
+        max_concurrent_positions=int(raw.get("max_concurrent_positions", 5)),
+        gate_sector_pct=float(raw.get("gate_sector_pct", 1.0)),
+        gate_stock_pct=float(raw.get("gate_stock_pct", 0.5)),
+        gate_vol_mult=float(raw.get("gate_vol_mult", 1.0)),
+        daily_loss_kill_pct=float(raw.get("daily_loss_kill_pct", 3.0)),
+        tiebreaker=str(raw.get("tiebreaker", "volume_ratio_desc")),
+        cost_pct_round_trip=float(raw.get("cost_pct_round_trip", 0.0857)),
+        vol_avg_lookback_days=int(raw.get("vol_avg_lookback_days", 20)),
+        broker=str(raw.get("broker", "zerodha")),
+        exchange=str(raw.get("exchange", "NSE")),
+        product=str(raw.get("product", "CNC")),
+        universe=list(raw.get("universe", [])),
+        strategy_id=raw.get("strategy_id"),
+    )
+
+
+def load_sector_map(path: str | Path = _DEFAULT_SECTOR_MAP_PATH) -> dict[str, str]:
+    """Load sector_map.json -> {stock_symbol: index_symbol} (locked-static-30)."""
+    with open(path, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    return {sym: entry["index"] for sym, entry in raw.get("map", {}).items()}
+
+
+# --------------------------------------------------------------------------- #
+# Pure decision logic
+# --------------------------------------------------------------------------- #
+def passes_gates(metrics: dict, config: SectorFollowConfig) -> bool:
+    """True iff all three entry gates are met.
+
+    metrics: {sector_ret, stock_ret, vol_ratio} as fractions/ratios. A missing or
+    None value fails closed (no entry).
+    """
+    sector_ret = metrics.get("sector_ret")
+    stock_ret = metrics.get("stock_ret")
+    vol_ratio = metrics.get("vol_ratio")
+    if sector_ret is None or stock_ret is None or vol_ratio is None:
+        return False
+    return (
+        sector_ret > config.gate_sector_ret
+        and stock_ret > config.gate_stock_ret
+        and vol_ratio > config.gate_vol_mult
+    )
+
+
+def select_entries(
+    candidates: list[dict], open_positions: set[str], max_concurrent: int
+) -> list[dict]:
+    """Pick entries from gate-passing candidates.
+
+    - Drop any symbol already open.
+    - Sort by vol_ratio descending (tiebreaker), then symbol ascending for stability.
+    - Take at most (max_concurrent - len(open_positions)) names.
+    """
+    slots = max_concurrent - len(open_positions)
+    if slots <= 0:
+        return []
+    fresh = [c for c in candidates if c["symbol"] not in open_positions]
+    fresh.sort(key=lambda c: (-c.get("vol_ratio", 0.0), c["symbol"]))
+    return fresh[:slots]
+
+
+def compute_qty(max_position_inr: float, price: float) -> int:
+    """Integer shares: floor(max_position_inr / price). Backtest used 1-unit equal
+    weight; real money needs whole shares. Non-positive price -> 0 (skip)."""
+    if price is None or price <= 0:
+        return 0
+    return int(math.floor(max_position_inr / price))
+
+
+# --------------------------------------------------------------------------- #
+# Production market-data metrics provider (read-only on historify.duckdb)
+# --------------------------------------------------------------------------- #
+def _ist_date(epoch: float) -> date:
+    return datetime.fromtimestamp(epoch, _IST).date()
+
+
+def _series_metrics(bars: list[tuple], as_of_epoch: float, as_of_date: date, lookback: int):
+    """Compute intraday return + volume ratio from 1m (timestamp, close, volume) bars.
+
+    bars: ascending by timestamp. Returns (today_close, ret, vol_ratio) or
+    (None, None, None) when there is insufficient history.
+    """
+    by_day: dict[date, list[tuple]] = {}
+    for ts, close, vol in bars:
+        if ts > as_of_epoch:
+            continue
+        d = _ist_date(ts)
+        by_day.setdefault(d, []).append((ts, float(close), float(vol or 0.0)))
+
+    today = by_day.get(as_of_date)
+    prior_days = sorted(d for d in by_day if d < as_of_date)
+    if not today or not prior_days:
+        return None, None, None
+
+    today_close = today[-1][1]
+    prior_close = by_day[prior_days[-1]][-1][1]
+    if prior_close <= 0:
+        return None, None, None
+    ret = today_close / prior_close - 1.0
+
+    today_vol = sum(v for _, _, v in today)
+    recent = prior_days[-lookback:]
+    daily_vols = [sum(v for _, _, v in by_day[d]) for d in recent]
+    avg_vol = sum(daily_vols) / len(daily_vols) if daily_vols else 0.0
+    vol_ratio = (today_vol / avg_vol) if avg_vol > 0 else None
+    return today_close, ret, vol_ratio
+
+
+def duckdb_metrics_provider(
+    as_of: datetime,
+    universe: list[str],
+    sector_map: dict[str, str],
+    config: SectorFollowConfig,
+    db_path: str = "db/historify.duckdb",
+) -> dict[str, dict]:
+    """Read-only intraday metrics for every universe stock from historify.duckdb.
+
+    Derives daily from 1m (stored daily for stocks is the sparse 63-bar set —
+    see strategies/sector_follow_cap5_vol/data_coverage.md). Sector return uses
+    the mapped index's 1m; if an index has no 1m bars, sector_ret is None and the
+    stock fails the gate (fail-closed). Returns
+    {symbol: {sector_ret, stock_ret, vol_ratio, current_price}}.
+    """
+    import duckdb
+
+    as_of_epoch = as_of.timestamp()
+    as_of_date = as_of.astimezone(_IST).date()
+    window_start = as_of_epoch - (config.vol_avg_lookback_days + 15) * 86400
+
+    index_syms = sorted({sector_map.get(s, "NIFTY") for s in universe})
+    all_syms = sorted(set(universe) | set(index_syms))
+
+    raw: dict[str, list[tuple]] = {s: [] for s in all_syms}
+    con = duckdb.connect(db_path, read_only=True)
+    try:
+        placeholders = ", ".join(["?"] * len(all_syms))
+        rows = con.execute(
+            f"""
+            SELECT symbol, timestamp, close, volume
+            FROM market_data
+            WHERE symbol IN ({placeholders})
+              AND interval = '1m'
+              AND timestamp >= ?
+            ORDER BY symbol, timestamp ASC
+            """,
+            [*all_syms, window_start],
+        ).fetchall()
+    finally:
+        con.close()
+
+    for symbol, ts, close, vol in rows:
+        if symbol in raw:
+            raw[symbol].append((ts, close, vol))
+
+    lookback = config.vol_avg_lookback_days
+    index_metrics: dict[str, float | None] = {}
+    for idx in index_syms:
+        _, idx_ret, _ = _series_metrics(raw.get(idx, []), as_of_epoch, as_of_date, lookback)
+        index_metrics[idx] = idx_ret
+
+    out: dict[str, dict] = {}
+    for sym in universe:
+        price, stock_ret, vol_ratio = _series_metrics(
+            raw.get(sym, []), as_of_epoch, as_of_date, lookback
+        )
+        idx = sector_map.get(sym, "NIFTY")
+        out[sym] = {
+            "sector_ret": index_metrics.get(idx),
+            "stock_ret": stock_ret,
+            "vol_ratio": vol_ratio,
+            "current_price": price,
+        }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Production order placer (mode-aware) — injected default
+# --------------------------------------------------------------------------- #
+def production_order_placer(mode: str, order: dict) -> dict:
+    """Route an order according to mode. Returns {status, orderid, ...}.
+
+    scaffold: never reaches here (place_entry/exit short-circuit). sandbox/live
+    both go through services.place_order_service.place_order — sandbox relies on
+    the platform's analyze/daily-intent dispatch to land in sandbox.db, live
+    places a real broker order. Kept thin and lazily-imported so importing this
+    module never pulls the order stack.
+    """
+    from database.auth_db import get_first_available_api_key
+    from services.place_order_service import place_order
+
+    api_key = get_first_available_api_key()
+    if not api_key:
+        return {"status": "error", "message": "no api key available"}
+    payload = {
+        "apikey": api_key,
+        "strategy": "sector_follow_cap5_vol",
+        "symbol": order["symbol"],
+        "exchange": order["exchange"],
+        "action": order["action"],
+        "product": order["product"],
+        "pricetype": "MARKET",
+        "quantity": str(order["quantity"]),
+    }
+    success, response, _ = place_order(payload, api_key=api_key)
+    response = dict(response or {})
+    response.setdefault("status", "success" if success else "error")
+    return response
+
+
+def production_price_fetcher(symbol: str, exchange: str) -> float | None:
+    """Current LTP for one symbol via the broker quote API. None on any failure.
+
+    Lazily imported so importing this module never pulls the quote/auth stack.
+    Used by ``SectorFollowService._compute_mtm`` for live MTM in the status
+    endpoint; never on the order path.
+    """
+    from database.auth_db import get_first_available_api_key
+    from services.quotes_service import get_quotes
+
+    api_key = get_first_available_api_key()
+    if not api_key:
+        return None
+    success, resp, _ = get_quotes(symbol, exchange, api_key=api_key)
+    if not success:
+        return None
+    data = (resp or {}).get("data") or {}
+    ltp = data.get("ltp") or data.get("last_price") or data.get("close")
+    return float(ltp) if ltp else None
+
+
+def telegram_notifier(message: str) -> None:
+    """Best-effort Telegram broadcast; silent when the bot is disabled/unconfigured."""
+    try:
+        from services.telegram_bot_service import telegram_bot_service as svc
+
+        if svc is None or not getattr(svc, "is_running", False):
+            return
+        # Run the async broadcast on a real thread (eventlet-safe — see
+        # telegram_bot_service._render_plotly_png for the pattern).
+        import asyncio
+
+        def _run():
+            try:
+                asyncio.run(svc.broadcast_message(message))
+            except Exception:
+                logger.debug("telegram broadcast skipped", exc_info=True)
+
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception:
+        logger.debug("telegram notifier unavailable", exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# Service
+# --------------------------------------------------------------------------- #
+@dataclass
+class PaperPosition:
+    """An open position tracked in-memory across all modes."""
+
+    symbol: str
+    quantity: int
+    entry_price: float
+    entry_date: str
+    vol_ratio: float
+    order_id: str | None = None
+
+
+class SectorFollowService:
+    """Sector-follow CAP5_VOL evaluator + scheduler glue.
+
+    All external effects are injected (with production defaults) so the decision
+    logic is unit-testable without a broker or DuckDB.
+    """
+
+    def __init__(
+        self,
+        app=None,
+        scheduler=None,
+        *,
+        config: SectorFollowConfig | None = None,
+        sector_map: dict[str, str] | None = None,
+        mode: str | None = None,
+        metrics_provider: Callable[..., dict[str, dict]] | None = None,
+        order_placer: Callable[[str, dict], dict] | None = None,
+        price_fetcher: Callable[[str, str], float | None] | None = None,
+        notifier: Callable[[str], None] | None = None,
+        trade_recorder: Callable[..., object] | None = None,
+        open_positions_loader: Callable[[], set[str]] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ):
+        self.app = app
+        self.scheduler = scheduler
+        self.config = config if config is not None else load_config()
+        self.sector_map = sector_map if sector_map is not None else load_sector_map()
+        self.mode = (mode or os.getenv("SECTOR_FOLLOW_CAP5_VOL_MODE", "scaffold")).lower()
+        if self.mode not in VALID_MODES:
+            logger.warning("Unknown SECTOR_FOLLOW_CAP5_VOL_MODE=%s — forcing scaffold", self.mode)
+            self.mode = "scaffold"
+
+        self._metrics_provider = metrics_provider or duckdb_metrics_provider
+        self._order_placer = order_placer or production_order_placer
+        self._price_fetcher = price_fetcher or production_price_fetcher
+        self._notify = notifier or telegram_notifier
+        self._record_trade = trade_recorder or self._default_trade_recorder
+        self._open_positions_loader = open_positions_loader
+        self._now = now or (lambda: datetime.now(_IST))
+
+        # Mutable runtime state.
+        self.paper_book: dict[str, PaperPosition] = {}
+        self.kill_switch_active = False
+        self.kill_switch_reason: str | None = None
+        self.manual_pause = False  # operator-set; halts new entries, exits still run
+        self.daily_pnl = 0.0
+        # Intraday journals for observability + EOD summary (reset at 09:00 IST).
+        self.today_entries: list[dict] = []
+        self.today_exits: list[dict] = []
+        self.strategy_id: int | None = self.config.strategy_id
+
+    # ----- strategy DB seeding ------------------------------------------- #
+    def seed_strategy(self, user_id: str = "internal") -> int | None:
+        """Idempotently register the strategy in the `strategies` table; return its id.
+
+        Looks up by the stable natural key name='sector_follow_cap5_vol' and only
+        creates if absent, so restarts reuse the same auto-increment id.
+        """
+        try:
+            from database.sector_follow_db import init_db as _init_journal
+            from database.strategy_db import create_strategy, get_all_strategies
+
+            _init_journal()  # ensure the trade-journal table exists
+
+            for s in get_all_strategies():
+                if s.name == "sector_follow_cap5_vol":
+                    self.strategy_id = s.id
+                    return s.id
+
+            strat = create_strategy(
+                name="sector_follow_cap5_vol",
+                webhook_id=str(uuid.uuid4()),
+                user_id=user_id,
+                is_intraday=False,  # T+1 hold, not same-day square-off
+                trading_mode="LONG",
+                start_time="15:20",
+                end_time="15:25",
+                squareoff_time="15:25",
+                platform="internal",
+            )
+            if strat is not None:
+                # Keep scaffold strategies inactive until the operator flips mode.
+                self.strategy_id = strat.id
+                return strat.id
+        except Exception as e:
+            logger.exception(f"Failed to seed sector_follow strategy row: {e}")
+        return None
+
+    def _default_trade_recorder(self, **kwargs):
+        from database.sector_follow_db import record_trade
+
+        return record_trade(strategy_id=self.strategy_id, mode=self.mode, **kwargs)
+
+    # ----- open-position view -------------------------------------------- #
+    def open_position_symbols(self) -> set[str]:
+        if self._open_positions_loader is not None:
+            return set(self._open_positions_loader())
+        return set(self.paper_book.keys())
+
+    # ----- evaluation ---------------------------------------------------- #
+    def evaluate_candidates(self, as_of: datetime | None = None) -> list[dict]:
+        """Return gate-passing candidates at as_of (default: now IST)."""
+        as_of = as_of or self._now()
+        metrics = self._metrics_provider(
+            as_of, self.config.universe, self.sector_map, self.config
+        )
+        candidates: list[dict] = []
+        for symbol, m in metrics.items():
+            if passes_gates(m, self.config):
+                candidates.append(
+                    {
+                        "symbol": symbol,
+                        "vol_ratio": m["vol_ratio"],
+                        "stock_ret": m["stock_ret"],
+                        "sector_ret": m["sector_ret"],
+                        "current_price": m["current_price"],
+                    }
+                )
+        logger.info(
+            "sector_follow eval @ %s: %d/%d candidates passed gates",
+            as_of.isoformat(),
+            len(candidates),
+            len(self.config.universe),
+        )
+        return candidates
+
+    # ----- kill switch --------------------------------------------------- #
+    def update_daily_pnl(self, realized_today: float, open_mtm: float) -> bool:
+        """Recompute daily P&L and the kill switch. Returns kill_switch_active.
+
+        Fires when daily_pnl / capital < -kill_pct/100. Once tripped it stays
+        tripped for the session (new entries blocked; existing positions hold to
+        their scheduled T+1 exit).
+        """
+        self.daily_pnl = realized_today + open_mtm
+        threshold = -(self.config.daily_loss_kill_pct / 100.0) * self.config.capital_inr
+        if not self.kill_switch_active and self.daily_pnl < threshold:
+            self.kill_switch_active = True
+            self.kill_switch_reason = (
+                f"daily P&L ₹{self.daily_pnl:,.0f} breached "
+                f"{self.config.daily_loss_kill_pct}% of capital"
+            )
+            logger.error(
+                "sector_follow KILL SWITCH fired: daily_pnl=%.0f < %.0f (%.1f%% of capital)",
+                self.daily_pnl,
+                threshold,
+                self.config.daily_loss_kill_pct,
+            )
+            self._notify(
+                f"🛑 sector_follow_cap5_vol kill switch fired — daily P&L "
+                f"₹{self.daily_pnl:,.0f} breached {self.config.daily_loss_kill_pct}% of capital. "
+                "New entries blocked; open positions hold to scheduled exit."
+            )
+        return self.kill_switch_active
+
+    def reset_daily_state(self) -> None:
+        """09:00 IST reset: clear kill switch + daily P&L and the intraday journals.
+
+        Does NOT clear ``manual_pause`` — an operator pause persists across the
+        daily reset until the operator explicitly resumes. Existing open positions
+        in paper_book survive (they hold to their scheduled T+1 exit)."""
+        self.kill_switch_active = False
+        self.kill_switch_reason = None
+        self.daily_pnl = 0.0
+        self.today_entries = []
+        self.today_exits = []
+        logger.info("sector_follow daily state reset (kill switch cleared, pnl=0)")
+
+    # ----- operator manual controls -------------------------------------- #
+    def pause(self) -> dict:
+        """Operator pause: halt new entries. Open positions hold to T+1 exit."""
+        self.manual_pause = True
+        logger.warning("sector_follow MANUALLY PAUSED — new entries halted (exits still run)")
+        return {"status": "success", "manual_pause": True}
+
+    def resume(self) -> dict:
+        """Operator resume: clear both manual pause and the kill switch."""
+        self.manual_pause = False
+        self.kill_switch_active = False
+        self.kill_switch_reason = None
+        logger.info("sector_follow RESUMED — manual pause + kill switch cleared")
+        return {"status": "success", "manual_pause": False, "kill_switch_active": False}
+
+    # ----- order placement (mode-aware) ---------------------------------- #
+    def place_entry(self, candidate: dict, entry_date: str | None = None) -> dict | None:
+        """Place (or paper-record) a single entry. Honors the kill switch.
+
+        scaffold: log + in-memory paper book only, no order.
+        sandbox/live: route via the injected order placer.
+        All modes: write a trade-journal row.
+        """
+        if self.kill_switch_active:
+            logger.info("sector_follow entry skipped (kill switch active): %s", candidate["symbol"])
+            return None
+        if self.manual_pause:
+            logger.info("sector_follow entry skipped (manual pause): %s", candidate["symbol"])
+            return None
+
+        symbol = candidate["symbol"]
+        price = candidate["current_price"]
+        qty = compute_qty(self.config.max_position_inr, price)
+        if qty <= 0:
+            logger.warning("sector_follow entry skipped (qty=0): %s @ %s", symbol, price)
+            return None
+
+        entry_date = entry_date or self._now().date().isoformat()
+        order_id = None
+        if self.mode == "scaffold":
+            logger.info(
+                "[scaffold] sector_follow ENTRY %s qty=%d @ %.2f (vol_ratio=%.2f) — NO ORDER",
+                symbol, qty, price, candidate.get("vol_ratio", 0.0),
+            )
+        else:
+            resp = self._order_placer(
+                self.mode,
+                {
+                    "symbol": symbol,
+                    "exchange": self.config.exchange,
+                    "action": "BUY",
+                    "product": self.config.product,
+                    "quantity": qty,
+                },
+            )
+            order_id = (resp or {}).get("orderid")
+            logger.info(
+                "[%s] sector_follow ENTRY %s qty=%d @ %.2f order_id=%s",
+                self.mode, symbol, qty, price, order_id,
+            )
+
+        self.paper_book[symbol] = PaperPosition(
+            symbol=symbol,
+            quantity=qty,
+            entry_price=price,
+            entry_date=entry_date,
+            vol_ratio=candidate.get("vol_ratio", 0.0),
+            order_id=order_id,
+        )
+        self._record_trade(
+            side="BUY",
+            symbol=symbol,
+            quantity=qty,
+            price=price,
+            entry_date=entry_date,
+            exchange=self.config.exchange,
+            product=self.config.product,
+            vol_ratio=candidate.get("vol_ratio"),
+            stock_ret=candidate.get("stock_ret"),
+            sector_ret=candidate.get("sector_ret"),
+            order_id=order_id,
+        )
+        self.today_entries.append(
+            {
+                "symbol": symbol,
+                "entry_time": self._now().isoformat(),
+                "entry_price": price,
+                "qty": qty,
+                "vol_ratio": candidate.get("vol_ratio"),
+            }
+        )
+        return {"symbol": symbol, "quantity": qty, "price": price, "order_id": order_id}
+
+    def place_exit(self, position: PaperPosition, price: float | None = None) -> dict | None:
+        """Square off one position (mode-aware). Exits are NOT blocked by the kill
+        switch — open positions always run to their scheduled T+1 exit."""
+        symbol = position.symbol
+        exit_price = price if price is not None else position.entry_price
+        order_id = None
+        if self.mode == "scaffold":
+            logger.info(
+                "[scaffold] sector_follow EXIT %s qty=%d @ %.2f — NO ORDER",
+                symbol, position.quantity, exit_price,
+            )
+        else:
+            resp = self._order_placer(
+                self.mode,
+                {
+                    "symbol": symbol,
+                    "exchange": self.config.exchange,
+                    "action": "SELL",
+                    "product": self.config.product,
+                    "quantity": position.quantity,
+                },
+            )
+            order_id = (resp or {}).get("orderid")
+            logger.info(
+                "[%s] sector_follow EXIT %s qty=%d @ %.2f order_id=%s",
+                self.mode, symbol, position.quantity, exit_price, order_id,
+            )
+
+        self._record_trade(
+            side="SELL",
+            symbol=symbol,
+            quantity=position.quantity,
+            price=exit_price,
+            entry_date=position.entry_date,
+            exchange=self.config.exchange,
+            product=self.config.product,
+            order_id=order_id,
+            note="t+1_exit",
+        )
+        pnl_pct = (
+            (exit_price / position.entry_price - 1.0) * 100.0
+            if position.entry_price else 0.0
+        )
+        pnl_net = (exit_price - position.entry_price) * position.quantity
+        self.today_exits.append(
+            {
+                "symbol": symbol,
+                "exit_time": self._now().isoformat(),
+                "exit_price": exit_price,
+                "entry_date": position.entry_date,
+                "qty": position.quantity,
+                "pnl_pct": pnl_pct,
+                "pnl_net": pnl_net,
+            }
+        )
+        self.paper_book.pop(symbol, None)
+        return {"symbol": symbol, "quantity": position.quantity, "order_id": order_id}
+
+    # ----- scheduled job bodies ------------------------------------------ #
+    def run_entry(self) -> list[dict]:
+        """15:20 IST: evaluate, select, place entries (subject to kill switch + caps)."""
+        candidates = self.evaluate_candidates()
+        open_syms = self.open_position_symbols()
+        entries = select_entries(candidates, open_syms, self.config.max_concurrent_positions)
+        placed = [r for r in (self.place_entry(c) for c in entries) if r]
+        logger.info("sector_follow entry job placed %d order(s) [mode=%s]", len(placed), self.mode)
+        if placed:
+            self._notify(
+                f"📈 sector_follow_cap5_vol [{self.mode}] entries: "
+                + ", ".join(f"{p['symbol']}x{p['quantity']}" for p in placed)
+            )
+        return placed
+
+    def run_exit(self) -> list[dict]:
+        """15:25 IST: square off everything opened on a prior trading day (T+1)."""
+        today = self._now().date().isoformat()
+        to_exit = [p for p in list(self.paper_book.values()) if p.entry_date != today]
+        exited = [r for r in (self.place_exit(p) for p in to_exit) if r]
+        logger.info("sector_follow exit job squared off %d position(s)", len(exited))
+        if exited:
+            self._notify(
+                f"📉 sector_follow_cap5_vol [{self.mode}] T+1 exits: "
+                + ", ".join(p["symbol"] for p in exited)
+            )
+        return exited
+
+    def run_daily_reset(self) -> None:
+        """09:00 IST: reset kill switch + daily P&L."""
+        self.reset_daily_state()
+
+    # ----- observability + EOD summary ----------------------------------- #
+    def _config_view(self) -> dict:
+        """A small, JSON-safe subset of config for the status endpoint."""
+        c = self.config
+        return {
+            "capital_inr": c.capital_inr,
+            "max_position_inr": c.max_position_inr,
+            "max_concurrent_positions": c.max_concurrent_positions,
+            "gate_sector_pct": c.gate_sector_pct,
+            "gate_stock_pct": c.gate_stock_pct,
+            "gate_vol_mult": c.gate_vol_mult,
+            "daily_loss_kill_pct": c.daily_loss_kill_pct,
+            "exchange": c.exchange,
+            "product": c.product,
+            "universe_size": len(c.universe),
+        }
+
+    def _compute_mtm(self, position: PaperPosition) -> dict:
+        """Live mark-to-market for one open position.
+
+        Fetches the current price via the injected price fetcher and returns
+        ``{current_price, mtm_pnl_gross, mtm_pnl_net, mtm_error}``. ``gross`` is
+        ``(current - entry) * qty``; ``net`` subtracts the round-trip cost
+        (``cost_pct_round_trip`` is already the combined both-legs rate, charged
+        once on the entry notional). Fully defensive: any price-fetch failure
+        leaves every P&L field None and sets ``mtm_error`` — never raises."""
+        try:
+            price = self._price_fetcher(position.symbol, self.config.exchange)
+        except Exception as e:
+            logger.debug("mtm price fetch raised for %s: %s", position.symbol, e)
+            price = None
+        if price is None or price <= 0:
+            return {
+                "current_price": None,
+                "mtm_pnl_gross": None,
+                "mtm_pnl_net": None,
+                "mtm_error": "price_unavailable",
+            }
+        gross = (price - position.entry_price) * position.quantity
+        costs = (self.config.cost_pct_round_trip / 100.0) * position.entry_price * position.quantity
+        return {
+            "current_price": price,
+            "mtm_pnl_gross": gross,
+            "mtm_pnl_net": gross - costs,
+            "mtm_error": None,
+        }
+
+    def open_positions_view(self) -> list[dict]:
+        """Open positions as JSON dicts, each with live MTM (gross + net).
+
+        ``mtm_pnl`` is kept as a legacy alias of ``mtm_pnl_net``. A per-position
+        ``mtm_error`` flags a price-fetch failure (P&L fields None) so the caller
+        can tell "flat" from "couldn't price it"."""
+        out: list[dict] = []
+        for p in self.paper_book.values():
+            mtm = self._compute_mtm(p)
+            out.append(
+                {
+                    "symbol": p.symbol,
+                    "entry_date": p.entry_date,
+                    "entry_price": p.entry_price,
+                    "qty": p.quantity,
+                    "vol_ratio": p.vol_ratio,
+                    "order_id": p.order_id,
+                    "current_price": mtm["current_price"],
+                    "mtm_pnl_gross": mtm["mtm_pnl_gross"],
+                    "mtm_pnl_net": mtm["mtm_pnl_net"],
+                    "mtm_pnl": mtm["mtm_pnl_net"],  # legacy alias
+                    "mtm_error": mtm["mtm_error"],
+                }
+            )
+        return out
+
+    def get_status(self) -> dict:
+        """Current strategy state for the observability endpoint.
+
+        ``today_pnl_net`` is realized (closed exits) + unrealized (live MTM net of
+        open positions); positions that fail to price contribute 0 to the sum."""
+        open_positions = self.open_positions_view()
+        realized_net = sum(e.get("pnl_net", 0.0) for e in self.today_exits)
+        unrealized_net = sum(
+            p["mtm_pnl_net"] for p in open_positions if p.get("mtm_pnl_net") is not None
+        )
+        return {
+            "mode": self.mode,
+            "strategy_id": self.strategy_id,
+            "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reason": self.kill_switch_reason,
+            "manual_pause": self.manual_pause,
+            "today_entries": list(self.today_entries),
+            "today_exits": list(self.today_exits),
+            "open_positions": open_positions,
+            "today_pnl_net": realized_net + unrealized_net,
+            "today_pnl_realized_net": realized_net,
+            "today_pnl_unrealized_net": unrealized_net,
+            "capital_inr": self.config.capital_inr,
+            "config": self._config_view(),
+        }
+
+    def close_all_positions(self) -> list[dict]:
+        """Emergency square-off of every open position (mode-aware). Exits use the
+        last known entry price as a reference when no live price is supplied —
+        the actual fill is MARKET. Not blocked by the kill switch / pause."""
+        results: list[dict] = []
+        for pos in list(self.paper_book.values()):
+            try:
+                r = self.place_exit(pos)
+                results.append(
+                    {"symbol": pos.symbol, "status": "success" if r else "error",
+                     "order_id": (r or {}).get("order_id")}
+                )
+            except Exception as e:
+                logger.exception("close_all failed for %s: %s", pos.symbol, e)
+                results.append({"symbol": pos.symbol, "status": "error", "message": str(e)})
+        logger.warning("sector_follow close_all squared %d position(s)", len(results))
+        return results
+
+    def build_eod_summary(self, as_of: datetime | None = None) -> str:
+        """Format the 15:30 IST EOD Telegram summary string."""
+        as_of = as_of or self._now()
+        entries = self.today_entries
+        exits = self.today_exits
+        open_pos = list(self.paper_book.values())
+        today_pnl_net = sum(e.get("pnl_net", 0.0) for e in exits)
+
+        entry_syms = ", ".join(e["symbol"] for e in entries) or "—"
+        if exits:
+            by_date: dict[str, list[str]] = {}
+            for x in exits:
+                tag = f"{x['symbol']} {x['pnl_pct']:+.2f}%"
+                by_date.setdefault(x.get("entry_date", "?"), []).append(tag)
+            exit_str = "; ".join(
+                f"entered {d[5:] if len(d) >= 10 else d}: " + ", ".join(tags)
+                for d, tags in sorted(by_date.items())
+            )
+        else:
+            exit_str = "—"
+
+        next_day = (as_of.date() + timedelta(days=1)).isoformat()
+        ks = (
+            f"active ({self.kill_switch_reason})" if self.kill_switch_active else "inactive"
+        )
+        pause = " · PAUSED" if self.manual_pause else ""
+        return (
+            f"📊 sector_follow_cap5_vol EOD {as_of.date().isoformat()}\n"
+            f"Mode: {self.mode}{pause}\n"
+            f"Entries: {len(entries)} ({entry_syms})\n"
+            f"Exits: {len(exits)} ({exit_str})\n"
+            f"Open EOD: {len(open_pos)} (T+1 exit {next_day})\n"
+            f"Net PnL today: ₹{today_pnl_net:+,.0f}\n"
+            f"Kill switch: {ks}"
+        )
+
+    def run_eod_summary(self) -> str:
+        """15:30 IST: broadcast the EOD summary (best-effort; silent if TG off)."""
+        msg = self.build_eod_summary()
+        self._notify(msg)
+        logger.info("sector_follow EOD summary emitted")
+        return msg
+
+    # ----- scheduler registration ---------------------------------------- #
+    def register_jobs(self, scheduler=None) -> None:
+        """Register entry/exit/reset jobs on the shared APScheduler instance.
+
+        Uses module-level job bodies (serializable for the SQLAlchemy jobstore),
+        which resolve the live singleton at fire time. All replace_existing.
+        """
+        sched = scheduler or self.scheduler
+        if sched is None:
+            from services.historify_scheduler_service import get_historify_scheduler
+
+            sched = get_historify_scheduler().scheduler
+
+        from apscheduler.triggers.cron import CronTrigger
+
+        global _SINGLETON
+        _SINGLETON = self
+        if self.strategy_id is None:
+            self.seed_strategy()
+
+        sched.add_job(
+            _entry_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=20,
+                                            timezone="Asia/Kolkata"),
+            id="sector_follow_entry", replace_existing=True,
+            name="Sector Follow CAP5_VOL entry (15:20 IST)",
+        )
+        sched.add_job(
+            _exit_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=25,
+                                           timezone="Asia/Kolkata"),
+            id="sector_follow_exit", replace_existing=True,
+            name="Sector Follow CAP5_VOL T+1 exit (15:25 IST)",
+        )
+        sched.add_job(
+            _daily_reset_job, trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0,
+                                                  timezone="Asia/Kolkata"),
+            id="sector_follow_daily_reset", replace_existing=True,
+            name="Sector Follow CAP5_VOL daily reset (09:00 IST)",
+        )
+        sched.add_job(
+            _eod_summary_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=30,
+                                                  timezone="Asia/Kolkata"),
+            id="sector_follow_eod_summary", replace_existing=True,
+            name="Sector Follow CAP5_VOL EOD summary (15:30 IST)",
+        )
+        logger.info(
+            "sector_follow jobs registered (mode=%s, strategy_id=%s)",
+            self.mode, self.strategy_id,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Module-level scheduler entry points + singleton (serializable for jobstore)
+# --------------------------------------------------------------------------- #
+_SINGLETON: SectorFollowService | None = None
+
+
+def get_service() -> SectorFollowService | None:
+    return _SINGLETON
+
+
+def _entry_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_entry()
+
+
+def _exit_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_exit()
+
+
+def _daily_reset_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_daily_reset()
+
+
+def _eod_summary_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_eod_summary()
+
+
+def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:
+    """Build the singleton and register its scheduler jobs. Default mode=scaffold
+    so loading this module changes no live trading behavior."""
+    svc = SectorFollowService(app=app, scheduler=scheduler)
+    svc.register_jobs(scheduler)
+    if app is not None:
+        app.sector_follow_service = svc
+    return svc

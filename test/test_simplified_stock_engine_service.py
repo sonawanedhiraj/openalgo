@@ -1053,11 +1053,18 @@ def test_zerodha_charges_long_round_trip():
     assert charges.total > 0
 
 
-def test_zerodha_charges_brokerage_caps_at_twenty():
-    """Big turnover -> brokerage caps at Rs20."""
-    # 0.0003 * turnover >= 20 -> turnover >= 66,666.67
-    charges = compute_zerodha_intraday_charges(50_000.0, 50_000.0)  # turnover 100k
-    assert charges.brokerage == 20.0
+def test_zerodha_charges_brokerage_caps_at_twenty_per_leg():
+    """Zerodha caps brokerage at Rs20 PER ORDER, not per round trip.
+
+    100k turnover split 50k/50k -> each leg's 0.03% is Rs15 (under the cap), so
+    brokerage is Rs30, NOT the Rs20 a (buggy) round-trip cap would give. A leg
+    only caps once its own 0.03% exceeds Rs20 (leg turnover > Rs66,666.67).
+    """
+    charges = compute_zerodha_intraday_charges(50_000.0, 50_000.0)  # 15 + 15
+    assert abs(charges.brokerage - 30.0) < 0.01
+    # Each leg above the per-order cap -> Rs20 + Rs20 = Rs40.
+    capped = compute_zerodha_intraday_charges(100_000.0, 100_000.0)
+    assert abs(capped.brokerage - 40.0) < 0.01
 
 
 def test_zerodha_charges_zero_turnover():

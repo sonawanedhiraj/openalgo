@@ -27,8 +27,8 @@ This module **never** writes to live tables. It uses the same
 ``backtest_*`` tables as the all-symbol harness, distinguished only by
 the ``methodology`` tag on both ``backtest_runs`` and ``backtest_trades``.
 
-The scanner rule (``services.scan_rules.fno_intraday_buy_20`` and
-``fno_intraday_sell_20``) is an admitted placeholder — operators will
+The scanner rule (``services.scan_rules.fno_intraday_buy_chartink`` and
+``fno_intraday_sell_chartink``) is an admitted placeholder — operators will
 tune the thresholds against shadow-mode output before any rule is
 promoted. Until then, quantitative conclusions from this harness are
 directional, not predictive.

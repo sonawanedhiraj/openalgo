@@ -67,4 +67,29 @@ Sharpe worse, not better).
 
 ## Live Learnings
 
-_(empty — populate after the first sandbox rebalance on 2026-07-01)_
+### 2026-06-08 — First sandbox rebalance target moved 2026-07-01 → 2026-06-15
+
+First sandbox rebalance target moved from 2026-07-01 → 2026-06-15. Reason: 4
+months of research (R28–R33) confirms this is our highest-conviction strategy;
+multiple external sources independently validate the sector rotation methodology
+at the Sharpe 1.0+ range. No further validation needed — execution risk is the
+only remaining uncertainty. Deployment packet:
+[`DEPLOYMENT_CHECKLIST_2026-06-15.md`](DEPLOYMENT_CHECKLIST_2026-06-15.md).
+
+**Dry-run preview (asof 2026-06-08, fresh start, ₹3L):**
+- Momentum (top-3 6M): METALIETF +28.7%, PHARMABEES +5.9%, HEALTHIETF +3.1%.
+- Low-vol (bottom-3 60d): PHARMABEES, HEALTHIETF, FMCGIETF.
+- Leg weights: momentum 46.18% / low-vol 53.82%. 99.9% deployed, no missing data.
+
+**Flags surfaced for the operator (all in the checklist):**
+1. **Cadence:** 2026-06-15 is the 3rd Monday, not the `monthly_first_trading_day`.
+   Treat as a mid-cycle **seed entry**; next rebalance snaps back to ~2026-07-01.
+2. **Concentration:** PHARMABEES + HEALTHIETF land in BOTH baskets → 66.7%
+   (₹2.0L/₹3.0L) in pharma + healthcare (correlated). In-character for a weak
+   defensive tape, but a concentrated book — accept consciously or cap overlap.
+3. **Weak momentum:** only 3 of 9 ETFs positive over 6M; FMCG bought into low-vol
+   despite −12.8% momentum (calmest, not strongest — by design).
+4. Cost: round-trip ≈ ₹540 (~18 bps), inside the backtest's ~0.107%/rebalance
+   model, offset by ETF dividend capture. Not a blocker.
+
+_(populate with actual fills after the 2026-06-15 entry)_
