@@ -293,6 +293,27 @@ def production_order_placer(mode: str, order: dict) -> dict:
     return response
 
 
+def production_price_fetcher(symbol: str, exchange: str) -> float | None:
+    """Current LTP for one symbol via the broker quote API. None on any failure.
+
+    Lazily imported so importing this module never pulls the quote/auth stack.
+    Used by ``SectorFollowService._compute_mtm`` for live MTM in the status
+    endpoint; never on the order path.
+    """
+    from database.auth_db import get_first_available_api_key
+    from services.quotes_service import get_quotes
+
+    api_key = get_first_available_api_key()
+    if not api_key:
+        return None
+    success, resp, _ = get_quotes(symbol, exchange, api_key=api_key)
+    if not success:
+        return None
+    data = (resp or {}).get("data") or {}
+    ltp = data.get("ltp") or data.get("last_price") or data.get("close")
+    return float(ltp) if ltp else None
+
+
 def telegram_notifier(message: str) -> None:
     """Best-effort Telegram broadcast; silent when the bot is disabled/unconfigured."""
     try:
@@ -347,6 +368,7 @@ class SectorFollowService:
         mode: str | None = None,
         metrics_provider: Callable[..., dict[str, dict]] | None = None,
         order_placer: Callable[[str, dict], dict] | None = None,
+        price_fetcher: Callable[[str, str], float | None] | None = None,
         notifier: Callable[[str], None] | None = None,
         trade_recorder: Callable[..., object] | None = None,
         open_positions_loader: Callable[[], set[str]] | None = None,
@@ -363,6 +385,7 @@ class SectorFollowService:
 
         self._metrics_provider = metrics_provider or duckdb_metrics_provider
         self._order_placer = order_placer or production_order_placer
+        self._price_fetcher = price_fetcher or production_price_fetcher
         self._notify = notifier or telegram_notifier
         self._record_trade = trade_recorder or self._default_trade_recorder
         self._open_positions_loader = open_positions_loader
@@ -696,25 +719,72 @@ class SectorFollowService:
             "universe_size": len(c.universe),
         }
 
-    def open_positions_view(self) -> list[dict]:
-        """Open positions as JSON dicts. ``mtm_pnl`` is None (live MTM needs a
-        price fetch — deferred to Phase 3/4); included for schema stability."""
-        return [
-            {
-                "symbol": p.symbol,
-                "entry_date": p.entry_date,
-                "entry_price": p.entry_price,
-                "qty": p.quantity,
-                "vol_ratio": p.vol_ratio,
-                "order_id": p.order_id,
-                "mtm_pnl": None,
+    def _compute_mtm(self, position: PaperPosition) -> dict:
+        """Live mark-to-market for one open position.
+
+        Fetches the current price via the injected price fetcher and returns
+        ``{current_price, mtm_pnl_gross, mtm_pnl_net, mtm_error}``. ``gross`` is
+        ``(current - entry) * qty``; ``net`` subtracts the round-trip cost
+        (``cost_pct_round_trip`` is already the combined both-legs rate, charged
+        once on the entry notional). Fully defensive: any price-fetch failure
+        leaves every P&L field None and sets ``mtm_error`` — never raises."""
+        try:
+            price = self._price_fetcher(position.symbol, self.config.exchange)
+        except Exception as e:
+            logger.debug("mtm price fetch raised for %s: %s", position.symbol, e)
+            price = None
+        if price is None or price <= 0:
+            return {
+                "current_price": None,
+                "mtm_pnl_gross": None,
+                "mtm_pnl_net": None,
+                "mtm_error": "price_unavailable",
             }
-            for p in self.paper_book.values()
-        ]
+        gross = (price - position.entry_price) * position.quantity
+        costs = (self.config.cost_pct_round_trip / 100.0) * position.entry_price * position.quantity
+        return {
+            "current_price": price,
+            "mtm_pnl_gross": gross,
+            "mtm_pnl_net": gross - costs,
+            "mtm_error": None,
+        }
+
+    def open_positions_view(self) -> list[dict]:
+        """Open positions as JSON dicts, each with live MTM (gross + net).
+
+        ``mtm_pnl`` is kept as a legacy alias of ``mtm_pnl_net``. A per-position
+        ``mtm_error`` flags a price-fetch failure (P&L fields None) so the caller
+        can tell "flat" from "couldn't price it"."""
+        out: list[dict] = []
+        for p in self.paper_book.values():
+            mtm = self._compute_mtm(p)
+            out.append(
+                {
+                    "symbol": p.symbol,
+                    "entry_date": p.entry_date,
+                    "entry_price": p.entry_price,
+                    "qty": p.quantity,
+                    "vol_ratio": p.vol_ratio,
+                    "order_id": p.order_id,
+                    "current_price": mtm["current_price"],
+                    "mtm_pnl_gross": mtm["mtm_pnl_gross"],
+                    "mtm_pnl_net": mtm["mtm_pnl_net"],
+                    "mtm_pnl": mtm["mtm_pnl_net"],  # legacy alias
+                    "mtm_error": mtm["mtm_error"],
+                }
+            )
+        return out
 
     def get_status(self) -> dict:
-        """Current strategy state for the observability endpoint."""
-        today_pnl_net = sum(e.get("pnl_net", 0.0) for e in self.today_exits)
+        """Current strategy state for the observability endpoint.
+
+        ``today_pnl_net`` is realized (closed exits) + unrealized (live MTM net of
+        open positions); positions that fail to price contribute 0 to the sum."""
+        open_positions = self.open_positions_view()
+        realized_net = sum(e.get("pnl_net", 0.0) for e in self.today_exits)
+        unrealized_net = sum(
+            p["mtm_pnl_net"] for p in open_positions if p.get("mtm_pnl_net") is not None
+        )
         return {
             "mode": self.mode,
             "strategy_id": self.strategy_id,
@@ -723,8 +793,10 @@ class SectorFollowService:
             "manual_pause": self.manual_pause,
             "today_entries": list(self.today_entries),
             "today_exits": list(self.today_exits),
-            "open_positions": self.open_positions_view(),
-            "today_pnl_net": today_pnl_net,
+            "open_positions": open_positions,
+            "today_pnl_net": realized_net + unrealized_net,
+            "today_pnl_realized_net": realized_net,
+            "today_pnl_unrealized_net": unrealized_net,
             "capital_inr": self.config.capital_inr,
             "config": self._config_view(),
         }

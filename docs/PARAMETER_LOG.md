@@ -91,6 +91,16 @@ the latest decisions automatically.
 
 #### SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED
 - Env var (default `true`) gating the daily 16:05 IST sector-index 1m refresh job. Introduced on the Phase 3 branch — full entry lands with that merge.
+### sector_follow_cap5_vol — sector-index 1m refresh
+
+#### SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env (not in `.sample.env`; read in `services/historify_scheduler_service.py._register_sector_follow_index_job`)
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables)
+- **Effect:** gates registration of the daily 16:05 IST `sector_follow_index_backfill` APScheduler job, which keeps the strategy's mapped sector-index 1m feed fresh in `db/historify.duckdb`. Disabling it leaves the index feed to go stale → the 15:20 signal fails-closed at the sector gate (no entries).
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-09 (Phase 3):** Introduced with the sector-index feed wiring (`feat/sector_follow_cap5_vol_phase3`, commit `3bfa4a08`). Default `true` so a fresh deploy keeps the feed current without extra config.
 
 ## Other tunables (placeholder — populate as discovered)
 

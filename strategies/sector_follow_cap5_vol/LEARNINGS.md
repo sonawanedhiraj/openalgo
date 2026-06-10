@@ -160,3 +160,118 @@ this add/rename a table, job, endpoint, env var, or process? → update the thre
 canonical docs in THIS commit" is non-optional. Note also: the brief described the
 service as registering 3 jobs; it actually registers 4 (an EOD-summary job at 15:30
 IST was added) — the docs now reflect the code, which is the source of truth.
+## 2026-06-10 — Phase 3: data feed wiring + live MTM shipped on feat/sector_follow_cap5_vol_phase3
+
+- Wired sector indices into the daily 1m backfill: new `_register_sector_follow_index_job`
+  in `services/historify_scheduler_service.py` (~33-line additive method + a 4-line
+  call in `init()`) registers an APScheduler job at **16:05 IST** (after the 16:00
+  scanner refresh + market close). Gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`
+  (default true), `replace_existing=True`. Additive — routes index 1m through the
+  same `create_and_start_job` pipeline as the stock backfill; never touches the
+  watchlist schedules.
+- One-shot catch-up script: `services/sector_follow_index_backfill.py` —
+  `uv run python -m services.sector_follow_index_backfill --from 2026-05-29 --to 2026-06-10`.
+  Symbol set = unique `sector_map.json` index values UNIONed with the two known
+  1m-missing indices (defensive — feed populates automatically if the broker ever
+  returns them). Exchange `NSE_INDEX`.
+- Re-mapped **DIXON, RELIANCE -> NIFTY** (broad_market) in `sector_map.json`.
+  Rationale: NIFTYCONSRDURBL + NIFTYOILANDGAS have NO 1m feed (daily only), so the
+  intraday sector gate could never fire for those two stocks — fail-closed forever.
+  Option A (PLAN). Backtest-neutral: Phase 0.5 showed completing the map was a slight
+  drag (Sharpe 2.37->2.19) because more stocks correctly fail the sector gate;
+  re-mapping 2 names back to NIFTY does not materially change strategy economics.
+  Revisit if those indices ever get a 1m feed.
+- Live MTM in the status endpoint: `production_price_fetcher` (broker quote LTP) +
+  injectable `price_fetcher` + `_compute_mtm()` in `services/sector_follow_service.py`.
+  `open_positions_view()` now returns `mtm_pnl_gross` / `mtm_pnl_net` (net charges the
+  0.0857% round-trip once on entry notional — the rate is already both-legs) /
+  `current_price` / `mtm_error`; `mtm_pnl` kept as a legacy alias of net.
+  `get_status().today_pnl_net` = realized (closed exits) + unrealized (open MTM net),
+  with `today_pnl_realized_net` / `today_pnl_unrealized_net` broken out. Defensive:
+  a price-fetch failure leaves P&L None + sets `mtm_error`, never crashes the endpoint.
+- Tests: 4 added (total 28). All pass.
+
+Phase 4 ready: shadow-replay last 30 trading days against R40 backtest. Parity
+target: Sharpe 2.19, payoff 1.44, EV 0.454%/trade.
+
+Open question: how often does the operator run the one-shot index backfill?
+Recommend: once now (catch up the ~12-day gap), then trust the 16:05 daily
+scheduler. After the re-map no stock depends on NIFTYCONSRDURBL/NIFTYOILANDGAS, so
+the broker failing to deliver their 1m affects nothing. The new 16:05 job is an
+in-app APScheduler job (like scanner_history_refresh) — not tracked in SYSTEM_MAP
+(that table is host-side Cowork tasks only).
+
+## 2026-06-10 — Phase 4: shadow-replay parity check
+
+Window: last 30 trading days, 2026-05-05 .. 2026-06-08 (30 days).
+Harness: `outputs/sector_follow_cap5_vol_phase4_2026-06-10/run_phase4.py` (force-added;
+CSVs gitignored). Production track = real `duckdb_metrics_provider`/`passes_gates`/
+`select_entries` at 15:20 IST with T+1 carryover; R40 track = backtest full-day gate
+screen + top-5 vol_ratio, no carryover. Both use post-Phase-3 sector_map + static-30.
+
+Entries: Jaccard 0.50 (production-only 2, r40-only 13, matched 15)
+P&L: mean abs diff 0.0000pp on 15 matched trades, max diff 0.0000pp
+Verdict: NEEDS_INVESTIGATION
+
+Production CODE is sound — exact P&L parity, correct gates + carryover. The 15
+entry mismatches attribute to: 10x **backtest look-ahead** (R40 evaluates gates on
+the realized full-day CLOSE; the live design + production evaluate at 15:20, before
+the final ~10min — DIXON -0.18%@15:20 -> +4.23%@close flips the gate; KOTAKBANK
++1.6%@15:20 -> -0.5%@close is the false-positive flip side); 3x **NIFTYIT 1m gap** on
+2026-06-01/06-02 (production sector_ret=None -> fail-closed, skips TCS/INFY; backtest
+used daily-native NIFTYIT which had data — same failure mode as the RELIANCE/DIXON
+re-map); 1x T+1 carryover (M&M re-entry suppressed correctly); 1x vol-avg lookback
+window edge (IRFC).
+
+**Phase 5 go-live NOT cleared.** Blocker is the parity TARGET, not the code: the
+Sharpe-2.19 baseline was computed with closing-print look-ahead and overstates the
+live 15:20 edge (~10/28 backtest entries/30d would not fire at 15:20). Before go-live:
+(1) re-derive the backtest baseline with 15:20-snapshot gates for an honest expected
+Sharpe/EV; (2) confirm the 1m index feed (esp. NIFTYIT) is current each session +
+monitor `sector_ret is None`. No production code changes recommended. See
+`outputs/sector_follow_cap5_vol_phase4_2026-06-10/REPORT.md`.
+
+## 2026-06-10 — Phase 4.5: honest 15:20-snapshot baseline (NEW OFFICIAL BASELINE)
+
+Harness: `outputs/sector_follow_cap5_vol_phase4_5_2026-06-10/run_phase4_5.py`
+(force-added; CSVs gitignored). Built the honest baseline by calling the
+**production provider** per day (gates+entry @15:20; R40 look-ahead snapshot
+@15:30; exit = T+1 full close). Used the provider — not an independent
+reimplementation — because the 1m `timestamp` column has an inconsistent epoch
+convention that splits a single IST session across naive `(ts+19800)/86400`
+day-buckets (2026-05-29 diverged on all 30 symbols), so naive daily grouping
+mis-aggregates. The provider's `fromtimestamp(ts,IST).date()` + `ts<=as_of` is
+authoritative and is what live trading sees. **Flag for a data-integrity pass on
+the 1m timestamp column before scaling capital.**
+
+**HONEST BASELINE — this replaces R40's 2.19 for all future references.**
+NIFTY-1m window (2025-12-02..2026-05-29, 120 eval days, 76 trades):
+Sharpe(d) **1.70**, Sharpe(m) 1.71, payoff **1.42**, EV **+0.248%/trade**,
+MaxDD −4.65%, win **48.7%**. Sector-1m window (22 days, all 30 names, 22 trades):
+Sharpe(d) 1.77, payoff 1.56, EV +0.051%, win 40.9%.
+
+**Look-ahead delta (15:20 vs 15:30, same days/structure):** SMALL and FAVOURS
+15:20 (Sharpe +0.34, EV +0.137pp, win +4.6pp) — entering before the closing
+run-up is a cheaper fill. Phase 4's "Sharpe 2.19 is look-ahead-inflated" thesis
+is only partly right: the snapshot-timing component is minor; the **dominant** gap
+2.19→~1.5 is the SAMPLE WINDOW. R40's 625 trades span 2.4y using **daily** index
+data; the production 15:20 path only has index 1m from 2025-12-01 (NIFTY/FINNIFTY)
+/ 2026-04-27 (sectoral), so at most ~76 trades / ~6 months are honestly
+evaluable. **2.19 is unreproducible intraday and is NOT a deployable target.**
+
+**Production parity vs honest baseline (last 22 sector days):** matched-entry P&L
+**0.000000pp** (bit-identical arithmetic), `production_only=0` (production ⊆
+no-carryover baseline), Jaccard 0.864. The 3 `honest_only` names (M&M 05-07,
+HDFCBANK/VEDL 05-14) are 100% **T+1 carryover** (prior-day positions occupying
+slots at 15:20), NOT bugs. **Verdict: PASS** — production matches the honest
+baseline exactly once carryover is accounted for. No code changes needed.
+
+**Phase 5 readiness — GREEN LIGHT, small & exploratory.** Code is correct/safe;
+edge MAGNITUDE is unvalidated (thin sample; sector sleeve has ~22 days of intraday
+history only). Treat the paper-trade as the real validation that accrues sector-
+index 1m history. **Updated Phase 5 targets (honest, provisional):** Sharpe(d)
+~1.5–1.7, payoff ~1.4, EV ~+0.20–0.25%/trade, win ~48%, tolerate MaxDD ~−6%,
+~12–15 trades/mo (broad; sector sparse). Open items: monitor `sector_ret is None`
+(~82% of days now), data-integrity pass on 1m timestamps, accumulate ≥3mo
+sectoral 1m before judging the sector sleeve. See
+`outputs/sector_follow_cap5_vol_phase4_5_2026-06-10/REPORT.md`.

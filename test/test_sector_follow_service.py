@@ -64,9 +64,12 @@ def _make_service(metrics=None, **overrides):
     def fake_metrics_provider(as_of, universe, sector_map, config):
         return {s: metrics.get(s, _miss()) for s in universe}
 
-    # `mode` is a service constructor arg (env-driven), not a config field —
-    # strip it from overrides before building the SectorFollowConfig.
+    # `mode` and `price_fetcher` are service constructor args (not config fields) —
+    # strip them from overrides before building the SectorFollowConfig. Default
+    # price fetcher returns None so positions price as "unavailable" unless a test
+    # injects a real one (keeps non-MTM tests hermetic — no broker call).
     mode = overrides.pop("mode", "scaffold")
+    price_fetcher = overrides.pop("price_fetcher", lambda symbol, exchange: None)
     cfg = _config(**overrides)
     svc = SectorFollowService(
         config=cfg,
@@ -74,6 +77,7 @@ def _make_service(metrics=None, **overrides):
         mode=mode,
         metrics_provider=fake_metrics_provider,
         order_placer=fake_placer,
+        price_fetcher=price_fetcher,
         notifier=lambda msg: None,
         trade_recorder=fake_recorder,
         now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
@@ -355,6 +359,75 @@ def test_eod_summary_formats_telegram_message_correctly():
     assert "HDFCBANK +0.42%" in msg
     assert "Open EOD: 1 (T+1 exit 2026-06-11)" in msg
     assert "Kill switch: inactive" in msg
+
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — live MTM + sector-index feed wiring
+# --------------------------------------------------------------------------- #
+def test_mtm_compute_returns_gross_and_net():
+    from services.sector_follow_service import PaperPosition
+
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 110.0)
+    pos = PaperPosition("AAA", 100, 100.0, "2026-06-09", 2.0)
+    mtm = svc._compute_mtm(pos)
+    # gross = (110 - 100) * 100 = 1000
+    assert mtm["mtm_pnl_gross"] == 1000.0
+    # cost = 0.0857% * 100 * 100 = 8.57 ; net = 1000 - 8.57
+    assert mtm["mtm_pnl_net"] == pytest.approx(1000.0 - 8.57)
+    assert mtm["current_price"] == 110.0
+    assert mtm["mtm_error"] is None
+
+
+def test_mtm_handles_price_fetch_failure():
+    from services.sector_follow_service import PaperPosition
+
+    def boom(symbol, exchange):
+        raise RuntimeError("broker quote API down")
+
+    svc = _make_service(mode="sandbox", price_fetcher=boom)
+    pos = PaperPosition("AAA", 10, 100.0, "2026-06-09", 2.0)
+    mtm = svc._compute_mtm(pos)
+    assert mtm["mtm_pnl_gross"] is None
+    assert mtm["mtm_pnl_net"] is None
+    assert mtm["current_price"] is None
+    assert mtm["mtm_error"] is not None
+
+
+def test_status_includes_mtm_when_positions_open():
+    svc = _make_service(
+        metrics={"AAA": _hit(price=100.0)}, mode="sandbox",
+        price_fetcher=lambda s, e: 105.0,
+    )
+    svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    status = svc.get_status()
+    op = status["open_positions"][0]
+    assert op["symbol"] == "AAA"
+    assert op["current_price"] == 105.0
+    assert op["mtm_pnl_gross"] is not None
+    assert op["mtm_pnl_net"] is not None
+    assert op["mtm_pnl"] == op["mtm_pnl_net"]  # legacy alias populated
+    # No closed exits -> today_pnl_net is purely the open position's unrealized net.
+    assert status["today_pnl_net"] == pytest.approx(op["mtm_pnl_net"])
+    assert status["today_pnl_unrealized_net"] == pytest.approx(op["mtm_pnl_net"])
+
+
+def test_sector_index_subscription_includes_all_mapped():
+    import json as _json
+    from pathlib import Path
+
+    from services.sector_follow_index_backfill import sector_index_symbols
+    from services.sector_follow_service import _DEFAULT_SECTOR_MAP_PATH
+
+    subs = set(sector_index_symbols())
+    raw = _json.loads(Path(_DEFAULT_SECTOR_MAP_PATH).read_text(encoding="utf-8"))
+    mapped = {entry["index"] for entry in raw["map"].values()}
+    # Every index referenced by the live map is kept fresh.
+    assert mapped <= subs
+    # The two known 1m-missing indices are always attempted defensively, even
+    # though the Phase 3 re-map (DIXON, RELIANCE -> NIFTY) no longer references them.
+    assert {"NIFTYCONSRDURBL", "NIFTYOILANDGAS"} <= subs
+    # NIFTY broad-market fallback is in the set.
+    assert "NIFTY" in subs
 
 
 if __name__ == "__main__":

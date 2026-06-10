@@ -75,6 +75,9 @@ class HistorifyScheduler:
                 # Register the daily scanner-history cache refresh (Task 3)
                 self._register_scanner_history_job()
 
+                # Register the daily sector_follow_cap5_vol index 1m refresh
+                self._register_sector_follow_index_job()
+
             except Exception as e:
                 logger.exception(f"Failed to initialize Historify Scheduler: {e}")
                 raise
@@ -509,6 +512,38 @@ class HistorifyScheduler:
             logger.info("Registered scanner_history_refresh job (16:00 IST daily)")
         except Exception as e:
             logger.exception(f"Failed to register scanner_history_refresh job: {e}")
+
+    def _register_sector_follow_index_job(self):
+        """Register the 16:05 IST sector_follow_cap5_vol index 1m refresh job.
+
+        Keeps the mapped sector indices' 1m bars current so the strategy's 15:20
+        signal isn't reading a stale index feed (see
+        ``strategies/sector_follow_cap5_vol/index_data_coverage.md``). Additive —
+        downloads index 1m through the same job pipeline as the stock backfill,
+        never touching the watchlist schedules. Runs at 16:05 IST (after the
+        16:00 scanner refresh and after market close). Gated by
+        ``SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`` (default true); idempotent via
+        ``replace_existing=True``.
+        """
+        if os.getenv("SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED", "true").lower() != "true":
+            logger.debug(
+                "sector_follow index backfill disabled "
+                "(SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED!=true)"
+            )
+            return
+        try:
+            from services.sector_follow_index_backfill import refresh_sector_follow_indices
+
+            self.scheduler.add_job(
+                refresh_sector_follow_indices,
+                trigger=CronTrigger(hour=16, minute=5, timezone="Asia/Kolkata"),
+                id="sector_follow_index_backfill",
+                replace_existing=True,
+                name="Sector Follow CAP5_VOL index 1m refresh (16:05 IST)",
+            )
+            logger.info("Registered sector_follow_index_backfill job (16:05 IST daily)")
+        except Exception as e:
+            logger.exception(f"Failed to register sector_follow_index_backfill job: {e}")
 
     def shutdown(self):
         """Shutdown the scheduler"""

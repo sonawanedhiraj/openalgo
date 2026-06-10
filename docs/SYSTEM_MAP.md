@@ -96,6 +96,19 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 - **Status:** scaffold-only, `deployable: false` — see
   `strategies/sector_follow_cap5_vol/PLAN.md`. A companion 16:05 index-refresh job
   (added on the Phase 3 branch) keeps its sector-index 1m feed fresh.
+## In-process APScheduler jobs (OpenAlgo worker)
+
+These cron jobs run **inside** the single eventlet worker on the shared
+APScheduler instance (`services/historify_scheduler_service.py`). They are NOT
+Cowork host tasks (§3 above) — they live and die with the OpenAlgo process and
+need no external scheduler.
+
+| Job id | Cron (IST) | What it does | Gating / writes |
+|---|---|---|---|
+| `sector_follow_index_backfill` | `5 16 * * 1-5` (16:05, after close) | 1m backfill of the sector indices mapped in `strategies/sector_follow_cap5_vol/sector_map.json` (+ 2 defensive 1m-missing indices), so the strategy's 15:20 signal reads a fresh index feed rather than a stale one. Incremental, 4-day lookback; self-heals a missed run/weekend. Additive — routes through the same `historify_service.create_and_start_job` pipeline as the stock backfill, never touching watchlist schedules. | Gated by env `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED` (default `true`); writes 1m bars to `db/historify.duckdb` `market_data`. Body: `services/sector_follow_index_backfill.refresh_sector_follow_indices` (registered by `_register_sector_follow_index_job`). One-shot CLI: `uv run python -m services.sector_follow_index_backfill --from YYYY-MM-DD --to YYYY-MM-DD`. |
+
+> The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
+> EOD jobs on this same scheduler — see the SectorFollowService process entry.
 
 ## Databases
 
