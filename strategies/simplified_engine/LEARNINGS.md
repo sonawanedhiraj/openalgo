@@ -355,3 +355,23 @@ Symbol sources (priority): `--replay-symbols` > `--from-results` > `--symbols` >
 - [ ] Test with `mode=live` after 2 weeks of profitable sandbox results.
 - [ ] Save the engine's armed stock list to a daily log file so past days can be
       replayed exactly even after the engine resets.
+
+---
+
+## 2026-06-10 — Pre-market intent now resolves via unified table
+
+Prior: pre-market intent for simplified_engine was a date-keyed mode-of-execution row
+in `daily_intent` table (live/sandbox/skip), surfaced only via `/mode/status` and not
+wired into the order path. Engine ran on `SIMPLIFIED_ENGINE_MODE` env var.
+
+Now: `services/mode_service.resolve_strategy_mode('simplified_engine', today)` is the
+single read path. Fall-through order: unified `strategy_daily_intent` row → legacy
+`daily_intent` row (auto-migrated at boot) → `SIMPLIFIED_ENGINE_MODE` env → default
+`sandbox/run`.
+
+Operator can set today's intent via SQL (`set_intent(...)`) or — once
+`TELEGRAM_INBOUND_ENABLED=true` — by texting the bot (`/intent simplified pause`,
+inline keyboard at 08:45 IST, etc.). Mode flips (sandbox/live) stay laptop-only.
+
+See `docs/design/strategy_daily_intent.md` and `docs/design/telegram_inbound.md` for
+full architecture.
