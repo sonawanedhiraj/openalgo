@@ -64,10 +64,14 @@ def _make_service(metrics=None, **overrides):
     def fake_metrics_provider(as_of, universe, sector_map, config):
         return {s: metrics.get(s, _miss()) for s in universe}
 
+    # `mode` is a service constructor arg (env-driven), not a config field —
+    # strip it from overrides before building the SectorFollowConfig.
+    mode = overrides.pop("mode", "scaffold")
+    cfg = _config(**overrides)
     svc = SectorFollowService(
-        config=_config(**overrides),
-        sector_map={s: "NIFTY" for s in _config(**overrides).universe},
-        mode=overrides.get("mode", "scaffold"),
+        config=cfg,
+        sector_map={s: "NIFTY" for s in cfg.universe},
+        mode=mode,
         metrics_provider=fake_metrics_provider,
         order_placer=fake_placer,
         notifier=lambda msg: None,
