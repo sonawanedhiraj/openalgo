@@ -796,8 +796,44 @@ emergency overrides** (in-memory `manual_pause`); pre-market planning uses the
 table.
 
 To opt a strategy in: `set_intent(strategy_name, date, mode, intent, cap,
-updated_by, notes)` in `database/strategy_daily_intent_db.py` (SQL or the future
-Telegram bot). To roll one back: delete its row → instant env fall-through.
+updated_by, notes)` in `database/strategy_daily_intent_db.py` (SQL or the
+Telegram inbound bot below). To roll one back: delete its row → instant env
+fall-through.
+
+## Telegram daily intent control (Phase 6)
+
+The unified `strategy_daily_intent` table can be set **from the phone** via the
+inbound Telegram bot (`services/telegram_inbound_service.py`), the INBOUND
+counterpart to the send-only outbound `telegram_bot_service`. Full design:
+[`docs/design/telegram_inbound.md`](docs/design/telegram_inbound.md).
+
+**Feature-flagged off by default** (`TELEGRAM_INBOUND_ENABLED`, default `false`):
+deploying the module starts no poller. When enabled, it polls Telegram on a real
+OS thread (eventlet-safe, like the outbound bot), registers an **08:45 IST**
+morning-prompt APScheduler job, and writes the intent table.
+
+**Commands:** `/status`, `/intent <strategy> <run|pause|halt>`,
+`/intent <strategy> cap <amount>`, `/intent <strategy> clear`,
+`/pause`/`/resume`/`/halt <strategy>`, `/morning`. Free-text replies
+(`pause sector_follow`) and inline morning-keyboard buttons work too. Strategy
+aliases accepted (`simplified`, `sector`/`sf`).
+
+**Safety rails (load-bearing — do not relax):**
+- **Mode flips are NOT exposed.** Only the *intent* axis (run/pause/halt) and the
+  capital cap are settable from Telegram; `live`/`sandbox`/`skip` (HOW orders
+  route) replies *"Mode changes require laptop access for safety."* Setting an
+  intent **preserves** the row's existing mode.
+- **chat_id allowlist** in `bot_config.telegram_chat_ids` (comma-separated);
+  unauthorized chats are silently ignored.
+- **Halt always two-step:** a halt-triggering input arms a 30-second "reply YES"
+  confirmation before the row is written.
+- **Audit:** every change writes `updated_by=telegram:<chat_id>:<message_id>`.
+- **One poller per bot token:** don't run the full interactive outbound bot's
+  poller on the same token while this is enabled (Telegram getUpdates Conflict).
+
+**Operator activation:** `UPDATE bot_config SET telegram_chat_ids='<chat_id>'
+WHERE id=1;` (or `database.telegram_db.add_authorized_chat_id`), set
+`TELEGRAM_INBOUND_ENABLED=true`, restart.
 
 ## Claude Code Instructions
 

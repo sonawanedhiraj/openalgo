@@ -128,6 +128,11 @@ class BotConfig(Base):
     max_message_length = Column(Integer, default=4096)
     rate_limit_per_minute = Column(Integer, default=30)
     broadcast_enabled = Column(Boolean, default=True)
+    # Comma-separated Telegram chat_ids authorized to drive the INBOUND intent
+    # bot (services/telegram_inbound_service.py). Distinct from the
+    # telegram_users link table: the inbound bot is operator-only and gates on
+    # this allowlist, never on linked-user records. Empty/NULL = nobody.
+    telegram_chat_ids = Column(Text)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -194,6 +199,22 @@ def init_db():
         from database.db_init_helper import init_db_with_logging
 
         init_db_with_logging(Base, engine, "Telegram DB", logger)
+
+        # Idempotent lightweight migration: add bot_config.telegram_chat_ids on
+        # databases created before the inbound-intent bot existed. create_all
+        # never ALTERs an existing table, so we add the column by hand if absent.
+        try:
+            from sqlalchemy import inspect as _sa_inspect
+            from sqlalchemy import text as _sa_text
+
+            insp = _sa_inspect(engine)
+            cols = {c["name"] for c in insp.get_columns("bot_config")}
+            if "telegram_chat_ids" not in cols:
+                with engine.begin() as conn:
+                    conn.execute(_sa_text("ALTER TABLE bot_config ADD COLUMN telegram_chat_ids TEXT"))
+                logger.info("Telegram DB: added bot_config.telegram_chat_ids column")
+        except Exception as e:
+            logger.debug(f"Telegram DB: telegram_chat_ids migration skipped: {e}")
 
         # Create default bot config if not exists
         config = db_session.query(BotConfig).filter_by(id=1).first()
@@ -474,6 +495,7 @@ def get_bot_config() -> dict:
                 "max_message_length": config.max_message_length,
                 "rate_limit_per_minute": config.rate_limit_per_minute,
                 "broadcast_enabled": config.broadcast_enabled,
+                "telegram_chat_ids": getattr(config, "telegram_chat_ids", None),
                 "created_at": config.created_at,
                 "updated_at": config.updated_at,
             }
@@ -487,6 +509,7 @@ def get_bot_config() -> dict:
             "max_message_length": 4096,
             "rate_limit_per_minute": 30,
             "broadcast_enabled": True,
+            "telegram_chat_ids": None,
         }
 
     except Exception as e:
@@ -523,6 +546,70 @@ def update_bot_config(config: dict) -> bool:
 
     except Exception as e:
         logger.exception(f"Failed to update bot config: {str(e)}")
+        db_session.rollback()
+        return False
+    finally:
+        db_session.remove()
+
+
+# Inbound-bot chat_id allowlist
+# --------------------------------------------------------------------------- #
+# The INBOUND intent bot (services/telegram_inbound_service.py) authorizes on a
+# comma-separated chat_id allowlist stored in bot_config.telegram_chat_ids.
+# Unauthorized chat_ids are silently ignored by the bot (no reply, no log spam).
+
+
+def get_authorized_chat_ids() -> set[int]:
+    """Return the set of chat_ids allowed to drive the inbound intent bot.
+
+    Parses the comma-separated ``bot_config.telegram_chat_ids`` column. Malformed
+    entries are skipped. Empty/NULL → empty set (nobody authorized)."""
+    try:
+        config = db_session.query(BotConfig).filter_by(id=1).first()
+        raw = getattr(config, "telegram_chat_ids", None) if config else None
+        if not raw:
+            return set()
+        out: set[int] = set()
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.add(int(part))
+            except ValueError:
+                logger.debug("Ignoring malformed chat_id allowlist entry: %r", part)
+        return out
+    except Exception as e:
+        logger.exception(f"Failed to read authorized chat_ids: {e}")
+        return set()
+    finally:
+        db_session.remove()
+
+
+def add_authorized_chat_id(chat_id: int) -> bool:
+    """Add a chat_id to the inbound-bot allowlist (idempotent). Returns True on
+    success. Convenience for operator onboarding without hand-editing SQL."""
+    try:
+        config = db_session.query(BotConfig).filter_by(id=1).first()
+        if not config:
+            config = BotConfig(id=1)
+            db_session.add(config)
+        current = set()
+        if config.telegram_chat_ids:
+            for part in str(config.telegram_chat_ids).split(","):
+                part = part.strip()
+                if part:
+                    try:
+                        current.add(int(part))
+                    except ValueError:
+                        pass
+        current.add(int(chat_id))
+        config.telegram_chat_ids = ",".join(str(c) for c in sorted(current))
+        db_session.commit()
+        logger.info("Added chat_id %s to inbound-bot allowlist", chat_id)
+        return True
+    except Exception as e:
+        logger.exception(f"Failed to add authorized chat_id: {e}")
         db_session.rollback()
         return False
     finally:

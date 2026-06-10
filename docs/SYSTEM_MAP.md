@@ -111,9 +111,38 @@ need no external scheduler.
 | Job id | Cron (IST) | What it does | Gating / writes |
 |---|---|---|---|
 | `sector_follow_index_backfill` | `5 16 * * 1-5` (16:05, after close) | 1m backfill of the sector indices mapped in `strategies/sector_follow_cap5_vol/sector_map.json` (+ 2 defensive 1m-missing indices), so the strategy's 15:20 signal reads a fresh index feed rather than a stale one. Incremental, 4-day lookback; self-heals a missed run/weekend. Additive — routes through the same `historify_service.create_and_start_job` pipeline as the stock backfill, never touching watchlist schedules. | Gated by env `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED` (default `true`); writes 1m bars to `db/historify.duckdb` `market_data`. Body: `services/sector_follow_index_backfill.refresh_sector_follow_indices` (registered by `_register_sector_follow_index_job`). One-shot CLI: `uv run python -m services.sector_follow_index_backfill --from YYYY-MM-DD --to YYYY-MM-DD`. |
+| `telegram_inbound_morning_prompt` | `45 8 * * 1-5` (08:45, pre-open) | Sends the morning intent prompt (inline Run/Pause/Halt keyboard per strategy) to every allowlisted chat_id, so the operator can set today's intent from the phone. No-op when the inbound bot isn't running. | Registered ONLY when `TELEGRAM_INBOUND_ENABLED=true`; body `services/telegram_inbound_service._morning_prompt_job`. See the Telegram inbound bot process entry below. |
 
 > The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
 > EOD jobs on this same scheduler — see the SectorFollowService process entry.
+
+### Telegram inbound intent bot (Phase 6)
+
+- **Process:** `services/telegram_inbound_service.py` — a `python-telegram-bot`
+  poller running on a **real OS thread** with its own asyncio event loop (same
+  eventlet-bypass pattern as `telegram_bot_service`). Started from `app.py` boot
+  ONLY when `TELEGRAM_INBOUND_ENABLED=true` (default `false` → no-op on deploy).
+- **What it does:** polls Telegram for operator commands, gates on the
+  `bot_config.telegram_chat_ids` allowlist, and writes the unified
+  `strategy_daily_intent` table (`run`/`pause`/`halt` + capital cap). It is the
+  INBOUND counterpart to the send-only outbound bot. **Mode flips are not
+  exposed** (laptop-only); intent changes preserve the existing routing mode.
+  Audit trail: `updated_by=telegram:<chat_id>:<message_id>`.
+- **Single poller per token:** Telegram permits one `getUpdates` consumer per bot
+  token — do not run the full interactive `telegram_bot_service` poller on the
+  same token while this is enabled.
+- **DB written:** `db/openalgo.db` → `strategy_daily_intent` (+ reads
+  `bot_config`). A lightweight idempotent migration adds the
+  `bot_config.telegram_chat_ids` column on older DBs.
+- **Design:** [`docs/design/telegram_inbound.md`](design/telegram_inbound.md).
+
+### E2E test suite
+
+- `test/e2e/test_critical_flows.py` — cross-component seam tests (mode resolution
+  fall-through, the unified intent gate as the engines read it, the sector_follow
+  entry→exit cycle + kill switch + EOD file sink, and the Phase-6 Telegram inbound
+  bot end-to-end). The DB layer is real but bound to a temp SQLite (no production
+  DB touched); broker/Telegram boundaries are mocked. Run: `uv run pytest test/e2e/ -v`.
 
 ## Databases
 

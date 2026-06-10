@@ -713,6 +713,18 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
 
+            # Telegram INBOUND intent bot (Phase 6). Gated by
+            # TELEGRAM_INBOUND_ENABLED (default false), so this is a no-op on
+            # deploy until the operator flips the flag — it then polls Telegram
+            # for /intent commands and writes strategy_daily_intent. Registers an
+            # 08:45 IST morning-prompt job. See services/telegram_inbound_service.py.
+            try:
+                from services.telegram_inbound_service import init_telegram_inbound_service
+
+                init_telegram_inbound_service(app=app)
+            except Exception as e:
+                logger.error(f"Failed to initialize Telegram inbound service: {e}")
+
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
             # scanner and the regime classifier. Replaces the old one-shot 30s
             # boot poll (which lost the race against the morning Zerodha login,

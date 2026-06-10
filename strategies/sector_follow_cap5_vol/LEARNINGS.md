@@ -305,3 +305,19 @@ through to `SECTOR_FOLLOW_CAP5_VOL_MODE` (env) → behavior is unchanged, so the
 emergency overrides** (in-memory `manual_pause`), not the planning surface. The
 service takes an injectable `intent_resolver` for hermetic tests. Design:
 `docs/design/strategy_daily_intent.md`.
+
+## Telegram pause/resume from phone (Phase 6, added 2026-06-10)
+
+The same `strategy_daily_intent` row can now be set **from the phone** via the
+inbound Telegram bot (`services/telegram_inbound_service.py`):
+`/pause sector_follow`, `/resume sector_follow`, `/halt sector_follow` (halt asks
+for a `YES` confirmation), `/intent sector cap <amount>`, or the 08:45 IST
+morning-prompt buttons. The bot writes the unified table that `run_entry`/
+`run_exit` already gate on, so a phone command takes effect on the next scheduled
+job with no engine change. **Mode flips are NOT available from Telegram** — only
+the intent axis (run/pause/halt) + capital cap; a Telegram intent change
+**preserves** the row's existing `mode`, so routing never changes silently from
+the phone. The bot is feature-flagged off (`TELEGRAM_INBOUND_ENABLED=false`) until
+the operator adds their chat_id to `bot_config.telegram_chat_ids` and flips the
+flag. The runtime `/sector_follow_cap5_vol/api/pause|resume` endpoints remain the
+in-session emergency override. Design: `docs/design/telegram_inbound.md`.
