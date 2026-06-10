@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "mode": "scaffold-only",
+  "deployable": false,
+  "universe_method": "top_30_by_traded_value",
+  "universe_rerank": "pending_phase_0_5_validation",
+  "capital_inr": 250000,
+  "max_position_inr": 50000,
+  "max_concurrent_positions": 5,
+  "entry_window_ist": "15:20-15:25",
+  "exit_time_ist": "15:25_next_trading_day",
+  "gate_sector_pct": 1.0,
+  "gate_stock_pct": 0.5,
+  "gate_vol_mult": 1.0,
+  "tiebreaker": "volume_ratio_desc",
+  "daily_loss_kill_pct": 3.0,
+  "cooldown_days": 0,
+  "cost_pct_round_trip": 0.0857,
+  "broker": "zerodha",
+  "exchange": "NSE",
+  "product": "CNC",
+  "backtest_reference": "outputs/r40_sector_follow_capped_2026-06-10/v_sf_cap5_vol/"
+}

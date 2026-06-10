@@ -110,6 +110,16 @@ Conditional-edge per-asset framing died on n+Bonferroni (R39): the per-stock con
 - **Files:** `strategies/sector_rotation_etf/`, `services/sector_rotation_etf_service.py`, `services/sector_rotation_etf_cli.py`. Reports: `BACKTEST_ROUND21B_SECTOR_4YEAR_REPORT_2026-06-06.md`, `BACKTEST_ROUND24_LOW_VOL_REPORT_2026-06-06.md`, `BACKTEST_ROUND25_ETF_REPLICATION_REPORT_2026-06-06.md`, `BACKTEST_ROUND26_ETF_COMBINED_REPORT_2026-06-06.md`. Consolidated plan: `SECTOR_ROTATION_DEPLOYMENT_PLAN_2026-06-06.md`.
 - **Latest LEARNINGS:** `strategies/sector_rotation_etf/LEARNINGS.md`
 
+### Sector Follow (Cap-5, Volume-Tiebreaker)
+- **Status:** Phase 0 — Plan locked 2026-06-10 (scaffold-only, `deployable: false`). Deployable extract of the R40 winner `V_SF_CAP5_VOL`; full delivery plan + operator decisions in `strategies/sector_follow_cap5_vol/PLAN.md`.
+- **Last validated:** 2026-06-10 (Round 40)
+- **Spec:** Daily long-only intraday-confirmation, T+1 overnight hold. Entry at close when sector index >+1% intraday AND stock >+0.5% intraday AND volume >1× 20d avg; exit next-day close. Max 5 concurrent positions, tiebreaker = volume ratio descending. Cost 0.0857%/round-trip.
+- **Universe:** top-30 F&O stocks by traded value (static vs monthly re-rank pending Phase 0.5 validation). Capital ₹2.5L (₹50k × 5). Daily-loss kill switch 3.0%, no post-loss cooldown, signal eval 15:20 IST.
+- **Backtest (R40 `V_SF_CAP5_VOL`):** Sharpe 2.37 daily / 1.92 monthly, payoff 1.39, EV +0.63%/trade, MaxDD −8.76%, 434 trades over 2.4 yr, 2026-YTD +12.9%, max concurrent = 5 (vs 30 uncapped → real-capital deployable).
+- **Verdict tier:** ADD_AS_5TH_SLEEVE in `V_BLD5_B` (R41). Standalone ships first; sleeve integration is a separate later plan after sandbox validation.
+- **Files:** `strategies/sector_follow_cap5_vol/`. Reports: `outputs/r40_sector_follow_capped_2026-06-10/REPORT.md`, `outputs/r41_5sleeve_blend_2026-06-10/REPORT.md`.
+- **Latest LEARNINGS:** `strategies/sector_follow_cap5_vol/LEARNINGS.md`
+
 ### Simplified Stock Engine (Chartink-driven Intraday)
 - **Status:** LIVE in sandbox mode (orders flow to `sandbox.db`, virtual INR 1 Cr). Operational since 2026-Q2.
 - **Spec:** Chartink screener-driven intraday breakout system — armed by webhook, fires market orders on 5-min candle breakouts, ATR-based stop loss, RR trailing. Independent mode flag `SIMPLIFIED_ENGINE_MODE`.
