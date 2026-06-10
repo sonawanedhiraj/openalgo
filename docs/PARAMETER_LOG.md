@@ -73,7 +73,7 @@ the latest decisions automatically.
 ### sector_follow_cap5_vol — strategy
 
 #### SECTOR_FOLLOW_CAP5_VOL_MODE
-- **Current value:** `scaffold` (`.sample.env` line `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold`)
+- **Current value:** `sandbox` (operator `.env`; `.sample.env` still ships `scaffold` default)
 - **Set in:** env; read in `services/sector_follow_service.py` (`SectorFollowService.__init__`)
 - **Values:** `scaffold` | `sandbox` | `live`
   - `scaffold` (default): compute signals, log, write trade journal — **NO orders placed**
@@ -83,6 +83,7 @@ the latest decisions automatically.
 - **Who flips:** **operator only** — the strategy ships scaffold; `sandbox`/`live` is a deliberate operator decision, never automated.
 - **History:**
   - **2026-06-10 (Phase 1+2, merged `3266858f`):** Introduced with the SectorFollowService core + observability endpoints. Default `scaffold` so wiring the service into boot changes no live trading behavior.
+  - **2026-06-10 (Phase 5 kickoff):** Operator flipped `scaffold → sandbox` in `.env` (not committed; `.env` is gitignored). Orders now route to `db/sandbox.db` (virtual ₹1Cr) — no live broker orders. First scheduled fire: 2026-06-11 15:20 IST. No engine config changed.
 
 #### config_snapshot.json (locked Phase-0.5 decisions)
 - **File:** `strategies/sector_follow_cap5_vol/config_snapshot.json` — canonical source for the strategy's non-env tunables. Loaded by `load_config()`; the `SectorFollowConfig` dataclass mirrors it.
