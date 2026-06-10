@@ -70,6 +70,10 @@ def _make_service(metrics=None, **overrides):
     # injects a real one (keeps non-MTM tests hermetic — no broker call).
     mode = overrides.pop("mode", "scaffold")
     price_fetcher = overrides.pop("price_fetcher", lambda symbol, exchange: None)
+    # Optional injections for the data-freshness gate tests. Default checker None
+    # (gate skipped — keeps every existing test hermetic).
+    notifier = overrides.pop("notifier", lambda msg: None)
+    data_health_checker = overrides.pop("data_health_checker", None)
     # Unified daily-intent: default to an injected run/env decision so tests stay
     # hermetic (no real strategy_daily_intent DB read). Tests exercising the
     # intent gate pass their own ``intent_resolver``.
@@ -88,10 +92,11 @@ def _make_service(metrics=None, **overrides):
         metrics_provider=fake_metrics_provider,
         order_placer=fake_placer,
         price_fetcher=price_fetcher,
-        notifier=lambda msg: None,
+        notifier=notifier,
         trade_recorder=fake_recorder,
         now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
         intent_resolver=intent_resolver,
+        data_health_checker=data_health_checker,
     )
     svc._test_placed = placed_orders
     svc._test_journal = journal
@@ -636,3 +641,53 @@ def test_env_source_does_not_override_mode():
     svc.run_entry()
     assert svc.mode == "scaffold"  # unchanged
     assert svc._test_placed == []  # scaffold places no orders
+
+
+# --------------------------------------------------------------------------- #
+# Data-freshness gate (run_entry aborts on stale; run_exit still processes)
+# --------------------------------------------------------------------------- #
+def test_run_entry_aborts_on_stale_data():
+    alerts = []
+    stale_details = {
+        "AAA": {"ok": False, "last_date": "2026-05-29", "staleness_days": 9, "kind": "stock"},
+        "NIFTY": {"ok": False, "last_date": "2026-05-29", "staleness_days": 9, "kind": "index"},
+    }
+    svc = _make_service(
+        metrics={"AAA": _hit(), "BBB": _hit()},
+        mode="sandbox",
+        intent_resolver=lambda: _decision(mode="sandbox", intent="run"),
+        notifier=lambda msg: alerts.append(msg),
+        data_health_checker=lambda name, date, index_only=False: (False, stale_details),
+    )
+    placed = svc.run_entry()
+    assert placed == []
+    assert svc._test_placed == []  # no orders dispatched
+    assert any("ABORTED" in a for a in alerts)  # operator alerted
+
+
+def test_run_entry_proceeds_when_data_fresh():
+    svc = _make_service(
+        metrics={"AAA": _hit()},
+        mode="sandbox",
+        intent_resolver=lambda: _decision(mode="sandbox", intent="run"),
+        data_health_checker=lambda name, date, index_only=False: (True, {}),
+    )
+    placed = svc.run_entry()
+    assert [p["symbol"] for p in placed] == ["AAA"]
+
+
+def test_run_exit_proceeds_despite_stale_index_data():
+    # Exits must NOT be blocked by a stale index feed — a held T+1 position is
+    # riskier than squaring off on a slightly stale read.
+    svc = _make_service(
+        mode="sandbox",
+        intent_resolver=lambda: _decision(intent="run"),
+        data_health_checker=lambda name, date, index_only=False: (
+            False, {"NIFTY": {"ok": False, "last_date": "2026-05-29",
+                              "staleness_days": 9, "kind": "index"}}
+        ),
+    )
+    _open_pos(svc)  # entered yesterday → eligible for T+1 exit
+    exited = svc.run_exit()
+    assert [e["symbol"] for e in exited] == ["ZZZ"]
+    assert any(o[1]["action"] == "SELL" for o in svc._test_placed)

@@ -96,6 +96,7 @@ from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
 from database.strategy_daily_intent_db import init_db as ensure_strategy_daily_intent_tables_exists
+from database.data_health_db import init_db as ensure_data_health_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
 from database.scanner_db import init_db as ensure_scanner_tables_exists
 from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
@@ -631,6 +632,7 @@ def setup_environment(app):
                 ("Settings DB", ensure_settings_tables_exists),
                 ("Daily Intent DB", ensure_daily_intent_tables_exists),
                 ("Strategy Daily Intent DB", ensure_strategy_daily_intent_tables_exists),
+                ("Data Health DB", ensure_data_health_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),

@@ -396,3 +396,68 @@ class TestChatAllowlist:
     def test_bot_config_exposes_chat_ids(self, telegram_db_temp):
         telegram_db_temp.add_authorized_chat_id(555)
         assert "555" in (telegram_db_temp.get_bot_config().get("telegram_chat_ids") or "")
+
+
+# --------------------------------------------------------------------------- #
+# Data-freshness validation: stale feed → health row + alert + tomorrow's pause
+# --------------------------------------------------------------------------- #
+class TestDataFreshnessValidation:
+    def test_stale_feed_writes_health_row_and_auto_pauses_tomorrow(
+        self, intent_db, data_health_db, clean_env, monkeypatch
+    ):
+        import services.data_freshness_service as dfs
+
+        # Force the 16:30 check to see a stale feed (index 12 days behind).
+        stale_details = {
+            "NIFTY": {"ok": False, "last_date": "2026-05-29", "staleness_days": 9, "kind": "index"},
+            "AAA": {"ok": True, "last_date": "2026-06-09", "staleness_days": 1, "kind": "stock"},
+        }
+        monkeypatch.setattr(
+            dfs, "check_strategy_data_ready",
+            lambda name, date=None, **kw: (False, stale_details),
+        )
+
+        alerts: list[str] = []
+        svc = _make_sector_service({}, now=lambda: _now_at(16, 30))
+        svc._notify = lambda m: alerts.append(m)
+
+        ok, _ = svc.run_data_health_check()
+
+        # 1. Verdict is "not ready".
+        assert ok is False
+        # 2. Operator was alerted.
+        assert any("STALE" in a for a in alerts)
+        # 3. A data_health_check row was persisted (not ok, alert sent, NIFTY listed).
+        latest = data_health_db.get_latest_check(SF)
+        assert latest is not None
+        assert latest["overall_ok"] is False
+        assert latest["alert_sent"] is True
+        assert "NIFTY" in latest["stale_symbols"]
+        # 4. Tomorrow's intent was auto-paused (operator can override).
+        tomorrow = (datetime.now(_ISTPZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+        row = intent_db.get_intent(SF, tomorrow)
+        assert row is not None
+        assert row["intent"] == "pause"
+        assert row["updated_by"] == "data_health:auto-pause"
+
+    def test_fresh_feed_no_alert_no_pause(
+        self, intent_db, data_health_db, clean_env, monkeypatch
+    ):
+        import services.data_freshness_service as dfs
+
+        monkeypatch.setattr(
+            dfs, "check_strategy_data_ready",
+            lambda name, date=None, **kw: (True, {"NIFTY": {"ok": True, "last_date":
+                "2026-06-10", "staleness_days": 0, "kind": "index"}}),
+        )
+        alerts: list[str] = []
+        svc = _make_sector_service({}, now=lambda: _now_at(16, 30))
+        svc._notify = lambda m: alerts.append(m)
+
+        ok, _ = svc.run_data_health_check()
+        assert ok is True
+        assert alerts == []
+        latest = data_health_db.get_latest_check(SF)
+        assert latest["overall_ok"] is True and latest["alert_sent"] is False
+        tomorrow = (datetime.now(_ISTPZ) + timedelta(days=1)).strftime("%Y-%m-%d")
+        assert intent_db.get_intent(SF, tomorrow) is None  # no auto-pause

@@ -321,3 +321,46 @@ the phone. The bot is feature-flagged off (`TELEGRAM_INBOUND_ENABLED=false`) unt
 the operator adds their chat_id to `bot_config.telegram_chat_ids` and flips the
 flag. The runtime `/sector_follow_cap5_vol/api/pause|resume` endpoints remain the
 in-session emergency override. Design: `docs/design/telegram_inbound.md`.
+
+## 2026-06-10 — Data-feed staleness incident + durable validation layer
+
+**Incident.** The night before the first sandbox run, a backtest revealed the
+sector-index 1m feed in `historify.duckdb` ended **2026-05-29** — 12 days stale.
+Root cause was NOT a silently-failing job: the daily 16:05 IST
+`sector_follow_index_backfill` job *did not exist* until that same day's Phase 3
+commit (`3bfa4a08`, committed 15:41 IST). The index feed had only ever been a
+one-off manual backfill; nothing refreshed it for 12 days because the refresh
+mechanism wasn't built yet. The running process (started 22:18 IST) now has the
+16:05 job registered, but its first fire was tomorrow — *after* the 15:20 entry.
+
+**Second finding (caught by the new validation).** While building the freshness
+checker, it surfaced that the **30 universe stocks** were also stale (last bar
+2026-06-08). The task brief only flagged the indices; the validation layer
+immediately caught the stock gap too — exactly the environmental-regression class
+the hermetic E2E suite can't see.
+
+**Immediate fix (both feeds, via the historify pipeline).** Index 1m:
+`uv run python -m services.sector_follow_index_backfill --from 2026-05-29 --to 2026-06-10`
+(8 mapped indices → 06-10 15:29; the 2 ETF-less indices fail as designed). Stock
+1m: a `historify_service.create_and_start_job` over the 30-name universe
+(`exchange=NSE`, `interval=1m`, `incremental=True`, 06-08→06-10; 30/30 success).
+Both feeds verified current to **2026-06-10 15:29 IST**. Broker session was alive
+(operator had restarted the app), so the catch-up succeeded tonight rather than
+waiting for the morning re-login + 16:05 job.
+
+**Durable layer shipped** (see CLAUDE.md "Data freshness validation" + SYSTEM_MAP):
+`services/data_freshness_service.py` (pure, business-day-aware staleness),
+`database/data_health_db.py` (`data_health_check` table), a daily **16:30 IST**
+`sector_follow_data_health` job (alert + auto-pause tomorrow on stale data), a
+**pre-entry gate** in `run_entry` (aborts on stale index OR stock feed; `run_exit`
+only warns — exits never block), and `GET /sector_follow_cap5_vol/api/data_health`.
+Flag `DATA_FRESHNESS_VALIDATION_ENABLED` (default true), threshold
+`MAX_STALENESS_BUSINESS_DAYS` (default 1 = "yesterday's close acceptable", which
+is the realistic state at 15:20 before the after-close backfill). Tests: 12
+freshness-service + 3 sector-follow gate + 2 e2e.
+
+**Lesson.** A scaffold's data pipeline is part of its readiness — wire the
+*refresh* job in the same phase as the *consume* path, not after. Hermetic tests
+prove logic; they do not prove the feed is fresh. The 1-business-day threshold is
+deliberate: it tolerates the pre-backfill state at 15:20 yet catches any multi-day
+gap loudly the next morning.

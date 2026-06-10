@@ -102,6 +102,40 @@ the latest decisions automatically.
 - **History:**
   - **2026-06-09 (Phase 3):** Introduced with the sector-index feed wiring (`feat/sector_follow_cap5_vol_phase3`, commit `3bfa4a08`). Default `true` so a fresh deploy keeps the feed current without extra config.
 
+### Data-freshness validation (sector_follow_cap5_vol)
+
+#### DATA_FRESHNESS_VALIDATION_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env; read in `services/sector_follow_service.py.data_freshness_enabled()`
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables)
+- **Effect:** master switch for the freshness layer — the daily 16:30 IST
+  `sector_follow_data_health` APScheduler job (alert + auto-pause on stale data),
+  the pre-entry gate in `run_entry` (aborts entries on stale data), and the
+  exit-job staleness warning. When `false`, all three are no-ops (pure legacy
+  behavior). The `/sector_follow_cap5_vol/api/data_health` endpoint always works
+  (it just queries, never gates).
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-10:** Introduced after the 2026-05-29→06-10 index-feed staleness
+    incident (the daily index backfill job did not exist until that day's Phase 3
+    commit, so the feed silently sat 12 days stale). Default `true` — ships hot,
+    behavior additive (read + alert; auto-pause only on confirmed staleness).
+
+#### MAX_STALENESS_BUSINESS_DAYS
+- **Current value:** unset → code default `1`
+- **Set in:** env; read in
+  `services/data_freshness_service.py.default_max_staleness_business_days()`
+- **Values:** non-negative integer. `1` == "yesterday's close is acceptable" (the
+  realistic state at 15:20 IST, before today's after-close backfill runs);
+  day-before-yesterday is stale.
+- **Effect:** the per-symbol staleness threshold (business days behind the
+  reference trading day) above which a symbol is flagged stale. Weekend-aware;
+  market holidays are NOT modelled (a mid-week holiday inflates measured staleness
+  by one business day — the default-1 threshold absorbs the common case).
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-10:** Introduced with `DATA_FRESHNESS_VALIDATION_ENABLED`. Default 1.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

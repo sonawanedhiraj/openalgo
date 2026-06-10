@@ -85,11 +85,18 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   | `sector_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1 exit). Exits are **never** blocked by the kill switch |
   | `sector_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
   | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) **+** writes a Day-N markdown report to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` (independent sinks — one failing never blocks the other) |
+  | `sector_follow_data_health` | 16:30 | **Market-data freshness check** (after the 16:05 index backfill should have landed). Validates the 8 sector indices + 30 universe stocks via `data_freshness_service.check_strategy_data_ready`; writes a `data_health_check` row. On stale data: Telegram-alerts the operator **and** auto-pauses tomorrow's `strategy_daily_intent` (`updated_by='data_health:auto-pause'`, operator-overridable). Gated by `DATA_FRESHNESS_VALIDATION_ENABLED` (default `true`) |
 
+- **Pre-entry freshness gate:** `run_entry` aborts (places no orders, alerts) when
+  the index OR stock feed is stale beyond `MAX_STALENESS_BUSINESS_DAYS` (default 1).
+  `run_exit` only *warns* on stale index data — exits are never blocked. Both gated
+  by `DATA_FRESHNESS_VALIDATION_ENABLED`.
 - **Kill switch:** trips when day P&L < −`daily_loss_kill_pct`% of capital (default 3%);
   blocks new entries for the session, open positions still run to their T+1 exit.
 - **DBs written:** `db/openalgo.db` → `sector_follow_trades` (trade journal, all
-  modes) and `strategies` (one seeded row, natural key `name='sector_follow_cap5_vol'`).
+  modes), `strategies` (one seeded row, natural key `name='sector_follow_cap5_vol'`),
+  `data_health_check` (one row per 16:30 freshness check), and
+  `strategy_daily_intent` (tomorrow's auto-pause row on stale data).
 - **File output:** `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` —
   one markdown file per trading day, written by the 15:30 IST `sector_follow_eod_summary`
   APScheduler job. Mirrors the Telegram EOD summary content (date/mode, signals,
@@ -148,7 +155,7 @@ need no external scheduler.
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
@@ -208,6 +215,7 @@ SectorFollowService singleton; they return `503` if the service isn't initialise
 | Endpoint | Method | Side effect |
 |---|---|---|
 | `/sector_follow_cap5_vol/api/status` | GET | Read-only: mode, kill switch, today's entries/exits, open book + live MTM |
+| `/sector_follow_cap5_vol/api/data_health` | GET | Read-only: live market-data freshness for the 8 indices + 30 stocks (`overall_ok`, `checked_at`, per-symbol `last_ts`/`staleness_days`/`ok`). Queries only — does not write the `data_health_check` row (that's the 16:30 job) |
 | `/sector_follow_cap5_vol/api/positions` | GET | Read-only: open positions (with MTM) + today's entries/exits |
 | `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1. Runtime emergency override; for pre-market planning use the `strategy_daily_intent` table instead |
 | `/sector_follow_cap5_vol/api/resume` | POST | Clears manual pause **and** the kill switch |
@@ -266,8 +274,8 @@ dispatch bypasses `place_order_service` entirely). Full design:
   scheduler; no live mode.
 - `strategies/sector_follow_cap5_vol/` — intraday sector-follow strategy, cap-5
   positions, volume tiebreaker (**scaffold-only, `deployable: false`**). Daemon-style
-  SectorFollowService (`services/sector_follow_service.py`) registers 4 APScheduler
-  jobs (entry/exit/reset/EOD); control API at `/sector_follow_cap5_vol/api/*`;
+  SectorFollowService (`services/sector_follow_service.py`) registers 5 APScheduler
+  jobs (entry/exit/reset/EOD/data-health); control API at `/sector_follow_cap5_vol/api/*`;
   trade journal in `db/openalgo.db` `sector_follow_trades`. Sector-index 1m feed
   kept fresh by the `sector_follow_index_backfill` job. Plan/decisions: `PLAN.md`.
 - `docs/SIMPLIFIED_ENGINE_HANDOFF.md` — engine integration context

@@ -351,6 +351,34 @@ def telegram_notifier(message: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Data-freshness gate — injected default
+# --------------------------------------------------------------------------- #
+def data_freshness_enabled() -> bool:
+    """``DATA_FRESHNESS_VALIDATION_ENABLED`` env flag (default true)."""
+    return os.getenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true").lower() == "true"
+
+
+def production_data_health_checker(
+    strategy_name: str, date: str | None = None, index_only: bool = False
+):
+    """Production freshness checker injected into the live singleton.
+
+    Thin wrapper over ``services.data_freshness_service.check_strategy_data_ready``.
+    Fully defensive: any infrastructure failure (DuckDB unreadable, import error)
+    fails OPEN — returns ``(True, {})`` — because a read error here must not block
+    all trading; the strategy's own metrics provider already fails closed on a
+    bad feed, and the daily 16:30 job is the durable safety net.
+    """
+    try:
+        from services.data_freshness_service import check_strategy_data_ready
+
+        return check_strategy_data_ready(strategy_name, date, index_only=index_only)
+    except Exception:
+        logger.exception("data-health checker failed (failing open)")
+        return True, {}
+
+
+# --------------------------------------------------------------------------- #
 # Service
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -388,6 +416,7 @@ class SectorFollowService:
         open_positions_loader: Callable[[], set[str]] | None = None,
         now: Callable[[], datetime] | None = None,
         intent_resolver: Callable[[], object] | None = None,
+        data_health_checker: Callable[..., tuple] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -405,6 +434,10 @@ class SectorFollowService:
         self._record_trade = trade_recorder or self._default_trade_recorder
         self._open_positions_loader = open_positions_loader
         self._intent_resolver = intent_resolver or production_intent_resolver
+        # Data-freshness gate. Left None in unit tests (gate skipped, hermetic);
+        # the live singleton injects ``production_data_health_checker`` so the gate
+        # is active in production. New tests inject a stub to drive abort/allow.
+        self._data_health_checker = data_health_checker
         self._now = now or (lambda: datetime.now(_IST))
         # Where the Day-N EOD markdown report is written. Hardcoded default;
         # tests override this attribute to point at a tmp dir.
@@ -747,6 +780,11 @@ class SectorFollowService:
                 decision.intent, decision.source,
             )
             return []
+        # Data-freshness gate: a stale feed (the 2026-05-29 index-backfill gap)
+        # would silently produce fail-closed or wrong signals. Abort entries —
+        # both index AND stock feeds must be current.
+        if not self._data_is_fresh_for_entry():
+            return []
         self._apply_mode_override(decision)
         candidates = self.evaluate_candidates()
         open_syms = self.open_position_symbols()
@@ -769,6 +807,10 @@ class SectorFollowService:
         if decision.intent == "halt":
             logger.info("sector_follow exit skipped (intent=halt, source=%s)", decision.source)
             return []
+        # Exits only need the index feed current (stocks supply last_close, and
+        # the square-off price comes from the broker). Warn on staleness but NEVER
+        # block — leaving a T+1 position open is riskier than a stale-feed exit.
+        self._warn_if_stale_for_exit()
         self._apply_mode_override(decision)
         today = self._now().date().isoformat()
         to_exit = [p for p in list(self.paper_book.values()) if p.entry_date != today]
@@ -780,6 +822,145 @@ class SectorFollowService:
                 + ", ".join(p["symbol"] for p in exited)
             )
         return exited
+
+    # ----- data-freshness gate ------------------------------------------- #
+    def _data_is_fresh_for_entry(self) -> bool:
+        """True iff the index+stock feeds are fresh enough to place entries.
+
+        Skips (returns True) when no checker is injected (unit tests) or the
+        feature flag is off. On staleness: logs, alerts, returns False so
+        ``run_entry`` aborts before evaluating candidates."""
+        if self._data_health_checker is None or not data_freshness_enabled():
+            return True
+        today = self._now().date().isoformat()
+        ok, details = self._data_health_checker("sector_follow_cap5_vol", today)
+        if ok:
+            return True
+        stale = sorted(s for s, d in details.items() if not d.get("ok", True))
+        logger.error("sector_follow ENTRY ABORTED — stale data: %s", stale)
+        try:
+            self._notify(
+                f"🚫 sector_follow_cap5_vol ENTRY ABORTED — stale data ({today}): "
+                + ", ".join(stale)
+            )
+        except Exception:
+            logger.exception("sector_follow stale-entry alert failed")
+        return False
+
+    def _warn_if_stale_for_exit(self) -> None:
+        """Non-blocking index-only freshness warning for the exit job."""
+        if self._data_health_checker is None or not data_freshness_enabled():
+            return
+        today = self._now().date().isoformat()
+        try:
+            ok, details = self._data_health_checker(
+                "sector_follow_cap5_vol", today, index_only=True
+            )
+        except Exception:
+            logger.exception("sector_follow exit freshness check raised (ignored)")
+            return
+        if not ok:
+            stale = sorted(s for s, d in details.items() if not d.get("ok", True))
+            logger.warning(
+                "sector_follow exits proceeding despite stale index data: %s", stale
+            )
+
+    def run_data_health_check(self) -> tuple[bool, dict]:
+        """16:30 IST: validate the feed, persist the verdict, alert + auto-pause.
+
+        Runs after the 16:05 backfill should have landed today's bars. On a stale
+        feed it (1) Telegram-alerts the operator, (2) auto-pauses tomorrow's intent
+        so the 15:20 run won't fire against bad data, and (3) records the verdict in
+        ``data_health_check``. Feature-flagged; fail-open on infra error (does not
+        auto-pause on our own bug)."""
+        if not data_freshness_enabled():
+            logger.debug("data-health check skipped (DATA_FRESHNESS_VALIDATION_ENABLED!=true)")
+            return True, {}
+        from services.data_freshness_service import (
+            check_strategy_data_ready,
+            format_freshness_report,
+        )
+
+        strat = "sector_follow_cap5_vol"
+        today = self._now().date().isoformat()
+        try:
+            ok, details = check_strategy_data_ready(strat, today)
+        except Exception as e:
+            logger.exception("sector_follow data-health check failed: %s", e)
+            return True, {}
+
+        stale = sorted(s for s, d in details.items() if not d.get("ok", True))
+        alert_sent = 0
+        if not ok:
+            report = format_freshness_report(strat, details)
+            msg = (
+                f"🚨 sector_follow_cap5_vol DATA STALE ({today})\n"
+                f"Backfill likely failed; tomorrow 15:20 IST will fire-closed "
+                f"unless fixed.\nAuto-pausing tomorrow's intent (override via "
+                f"Telegram/SQL).\n\n" + report
+            )
+            try:
+                self._notify(msg)
+                alert_sent = 1
+            except Exception:
+                logger.exception("sector_follow data-health alert failed")
+            self._auto_pause_tomorrow(today)
+
+        try:
+            from database.data_health_db import insert_check
+
+            insert_check(
+                strategy_name=strat,
+                overall_ok=ok,
+                stale_symbols=stale,
+                details=details,
+                alert_sent=alert_sent,
+            )
+        except Exception:
+            logger.exception("sector_follow data-health insert_check failed")
+
+        logger.info(
+            "sector_follow data-health check: ok=%s stale=%d", ok, len(stale)
+        )
+        return ok, details
+
+    def _auto_pause_tomorrow(self, today_iso: str) -> None:
+        """Write tomorrow's intent=pause (mode preserved) on confirmed staleness."""
+        try:
+            from database.strategy_daily_intent_db import get_intent, set_intent
+
+            strat = "sector_follow_cap5_vol"
+            tomorrow = (self._now().date() + timedelta(days=1)).isoformat()
+            existing = get_intent(strat, tomorrow)
+            if existing and existing.get("intent") in ("pause", "halt"):
+                return  # already non-run — don't clobber an operator decision
+            if existing:
+                mode = existing.get("mode") or "sandbox"
+                cap = existing.get("daily_capital_cap")
+            else:
+                mode, cap = "sandbox", None
+                try:
+                    from services.mode_service import resolve_strategy_mode
+
+                    dec = resolve_strategy_mode(strat)
+                    mode = getattr(dec, "mode", "sandbox") or "sandbox"
+                    cap = getattr(dec, "daily_capital_cap", None)
+                except Exception:
+                    logger.debug("auto-pause mode resolve failed; default sandbox", exc_info=True)
+            # strategy_daily_intent only accepts live/sandbox/skip — map anything
+            # else (e.g. the env 'scaffold' mode) onto sandbox.
+            if mode not in ("live", "sandbox", "skip"):
+                mode = "sandbox"
+            set_intent(
+                strat, tomorrow, mode=mode, intent="pause", daily_capital_cap=cap,
+                updated_by="data_health:auto-pause",
+                notes=f"Auto-paused due to stale data on {today_iso}",
+            )
+            logger.warning(
+                "sector_follow auto-paused %s (stale data on %s)", tomorrow, today_iso
+            )
+        except Exception:
+            logger.exception("sector_follow auto-pause failed")
 
     def run_daily_reset(self) -> None:
         """09:00 IST: reset kill switch + daily P&L."""
@@ -1153,6 +1334,12 @@ class SectorFollowService:
             id="sector_follow_eod_summary", replace_existing=True,
             name="Sector Follow CAP5_VOL EOD summary (15:30 IST)",
         )
+        sched.add_job(
+            _data_health_job, trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=30,
+                                                  timezone="Asia/Kolkata"),
+            id="sector_follow_data_health", replace_existing=True,
+            name="Sector Follow CAP5_VOL data freshness check (16:30 IST)",
+        )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
             self.mode, self.strategy_id,
@@ -1189,10 +1376,17 @@ def _eod_summary_job() -> None:
         _SINGLETON.run_eod_summary()
 
 
+def _data_health_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_data_health_check()
+
+
 def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:
     """Build the singleton and register its scheduler jobs. Default mode=scaffold
     so loading this module changes no live trading behavior."""
-    svc = SectorFollowService(app=app, scheduler=scheduler)
+    svc = SectorFollowService(
+        app=app, scheduler=scheduler, data_health_checker=production_data_health_checker
+    )
     svc.register_jobs(scheduler)
     if app is not None:
         app.sector_follow_service = svc

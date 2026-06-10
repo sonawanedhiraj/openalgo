@@ -725,6 +725,42 @@ decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follo
 Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
 at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
 
+## Data freshness validation (sector_follow_cap5_vol)
+
+A durable guard against the class of failure that produced the 2026-05-29→06-10
+incident: the sector-index 1m feed sat **12 days stale** because the daily
+backfill job did not exist yet, and the hermetic (mocked-data) E2E suite never
+noticed an *environmental* regression. The validation layer makes feed staleness
+fail loud and fail safe.
+
+- **Pure service** `services/data_freshness_service.py` — read-only on
+  `historify.duckdb`. `check_strategy_data_ready(strategy, date,
+  max_staleness_business_days=1)` returns `(ok, per-symbol details)`;
+  business-day aware (weekend gap ≠ stale; holidays NOT modelled). For
+  sector_follow it checks the 8 mapped indices + 30 universe stocks.
+- **Table** `data_health_check` in `db/openalgo.db`
+  (`database/data_health_db.py`) — one row per check: `check_at`, `overall_ok`,
+  `stale_symbols` (JSON), `details_json`, `alert_sent`.
+- **Daily 16:30 IST job** `sector_follow_data_health` (runs after the 16:05
+  backfill). On stale data: Telegram-alerts the operator AND auto-pauses
+  *tomorrow's* `strategy_daily_intent` (`intent='pause'`, mode preserved,
+  `updated_by='data_health:auto-pause'` — operator can override via Telegram/SQL).
+- **Pre-entry gate** in `run_entry` (after the intent gate): aborts entries +
+  alerts on a stale index OR stock feed. `run_exit` only *warns* on stale index
+  data — exits are never blocked (a held T+1 position is riskier).
+- **HTTP** `GET /sector_follow_cap5_vol/api/data_health` — live per-symbol
+  freshness (read-only; never writes the row).
+- **Feature flag** `DATA_FRESHNESS_VALIDATION_ENABLED` (default `true`) +
+  threshold `MAX_STALENESS_BUSINESS_DAYS` (default `1`). See
+  `docs/PARAMETER_LOG.md`. The gate/job are no-ops when the flag is off; the
+  HTTP endpoint always works.
+
+**Manual catch-up** for a stale feed (both feeds route through the same historify
+pipeline): index 1m via `uv run python -m services.sector_follow_index_backfill
+--from YYYY-MM-DD --to YYYY-MM-DD`; stock 1m via a
+`historify_service.create_and_start_job` call over the universe (`exchange=NSE`,
+`interval=1m`, `incremental=True`).
+
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
 

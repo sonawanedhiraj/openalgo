@@ -62,6 +62,15 @@ def intent_db(monkeypatch, tmp_db_dir):
 
 
 @pytest.fixture
+def data_health_db(monkeypatch, tmp_db_dir):
+    """Real ``data_health_db`` bound to a temp SQLite. Yields the module."""
+    import database.data_health_db as dhd
+
+    _rebind(dhd, dhd.Base, monkeypatch, tmp_db_dir, "data_health.db")
+    return dhd
+
+
+@pytest.fixture
 def telegram_db_temp(monkeypatch, tmp_db_dir):
     """Real ``telegram_db`` bound to a temp SQLite (bot_config + users). Yields it."""
     import database.telegram_db as tdb
