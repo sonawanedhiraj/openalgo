@@ -36,6 +36,7 @@ from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
+from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
 from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
 from blueprints.preflight import preflight_bp  # Stage-0 go/no-go preflight gate
 from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
@@ -270,6 +271,7 @@ def create_app():
     app.register_blueprint(analyzer_bp)
     app.register_blueprint(settings_bp)
     app.register_blueprint(chartink_bp)
+    app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
@@ -686,6 +688,18 @@ def setup_environment(app):
                 logger.debug("Historify scheduler initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
+
+            # Sector Follow CAP5_VOL strategy (R40 deployable variant). Default
+            # mode=scaffold means loading this changes ZERO live trading behavior
+            # — it only registers 15:20/15:25/09:00 IST jobs that compute + log.
+            # See strategies/sector_follow_cap5_vol/ and SECTOR_FOLLOW_CAP5_VOL_MODE.
+            try:
+                from services.sector_follow_service import init_sector_follow_service
+
+                init_sector_follow_service(app=app)
+                logger.debug("Sector Follow CAP5_VOL service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Sector Follow service: {e}")
 
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
             # scanner and the regime classifier. Replaces the old one-shot 30s
