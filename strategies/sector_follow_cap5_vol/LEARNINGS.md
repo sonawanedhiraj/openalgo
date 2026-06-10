@@ -141,3 +141,44 @@ build-out is scope creep.
 Phase 3 ready: risk + monitoring (much of which Phase 1 + Phase 2 already cover —
 kill switch, pause/resume, EOD summary all shipped). Phase 3 likely = Telegram polish,
 operator dashboard, and wiring the index-1m daily backfill surfaced above.
+
+## 2026-06-10 — Phase 3: data feed wiring + live MTM shipped on feat/sector_follow_cap5_vol_phase3
+
+- Wired sector indices into the daily 1m backfill: new `_register_sector_follow_index_job`
+  in `services/historify_scheduler_service.py` (~33-line additive method + a 4-line
+  call in `init()`) registers an APScheduler job at **16:05 IST** (after the 16:00
+  scanner refresh + market close). Gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`
+  (default true), `replace_existing=True`. Additive — routes index 1m through the
+  same `create_and_start_job` pipeline as the stock backfill; never touches the
+  watchlist schedules.
+- One-shot catch-up script: `services/sector_follow_index_backfill.py` —
+  `uv run python -m services.sector_follow_index_backfill --from 2026-05-29 --to 2026-06-10`.
+  Symbol set = unique `sector_map.json` index values UNIONed with the two known
+  1m-missing indices (defensive — feed populates automatically if the broker ever
+  returns them). Exchange `NSE_INDEX`.
+- Re-mapped **DIXON, RELIANCE -> NIFTY** (broad_market) in `sector_map.json`.
+  Rationale: NIFTYCONSRDURBL + NIFTYOILANDGAS have NO 1m feed (daily only), so the
+  intraday sector gate could never fire for those two stocks — fail-closed forever.
+  Option A (PLAN). Backtest-neutral: Phase 0.5 showed completing the map was a slight
+  drag (Sharpe 2.37->2.19) because more stocks correctly fail the sector gate;
+  re-mapping 2 names back to NIFTY does not materially change strategy economics.
+  Revisit if those indices ever get a 1m feed.
+- Live MTM in the status endpoint: `production_price_fetcher` (broker quote LTP) +
+  injectable `price_fetcher` + `_compute_mtm()` in `services/sector_follow_service.py`.
+  `open_positions_view()` now returns `mtm_pnl_gross` / `mtm_pnl_net` (net charges the
+  0.0857% round-trip once on entry notional — the rate is already both-legs) /
+  `current_price` / `mtm_error`; `mtm_pnl` kept as a legacy alias of net.
+  `get_status().today_pnl_net` = realized (closed exits) + unrealized (open MTM net),
+  with `today_pnl_realized_net` / `today_pnl_unrealized_net` broken out. Defensive:
+  a price-fetch failure leaves P&L None + sets `mtm_error`, never crashes the endpoint.
+- Tests: 4 added (total 28). All pass.
+
+Phase 4 ready: shadow-replay last 30 trading days against R40 backtest. Parity
+target: Sharpe 2.19, payoff 1.44, EV 0.454%/trade.
+
+Open question: how often does the operator run the one-shot index backfill?
+Recommend: once now (catch up the ~12-day gap), then trust the 16:05 daily
+scheduler. After the re-map no stock depends on NIFTYCONSRDURBL/NIFTYOILANDGAS, so
+the broker failing to deliver their 1m affects nothing. The new 16:05 job is an
+in-app APScheduler job (like scanner_history_refresh) — not tracked in SYSTEM_MAP
+(that table is host-side Cowork tasks only).
