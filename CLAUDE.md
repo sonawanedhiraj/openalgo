@@ -702,6 +702,27 @@ Operator-manual workflow — see
 Still `mode: scaffold-only`, `deployable: false`; date moved earlier only to get
 the operator hands-on sooner — no safety rails removed.
 
+**Scaffold strategy**: [`strategies/sector_follow_cap5_vol/`](strategies/sector_follow_cap5_vol/)
+— an intraday sector-follow strategy (spawned from R40 winner `V_SF_CAP5_VOL`):
+at 15:20 IST it buys ≤5 names whose mapped sector index is up >1% intraday AND the
+stock is up >0.5% AND volume >1× its 20d average (vol-ratio tiebreaker), holds to a
+T+1 15:25 MARKET exit, with a 3%-of-capital daily kill switch. Universe is the
+Phase-0.5 `LOCK_STATIC_30` set; ₹2.5L capital, ₹50k/position.
+**SCAFFOLD ONLY — not live** (`mode: scaffold-only`, `deployable: false`). Unlike
+sector_rotation_etf, this strategy IS wired into the runtime: `SectorFollowService`
+(`services/sector_follow_service.py`) is built at boot and registers 4 APScheduler
+jobs (entry 15:20 / exit 15:25 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
+default `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` places **no orders** — it computes
+signals, logs, and writes the `sector_follow_trades` journal only. Flip to
+`sandbox` / `live` is operator-only. Key files:
+`services/sector_follow_service.py` (evaluator + scheduler glue),
+`blueprints/sector_follow.py` (control API at `/sector_follow_cap5_vol/api/*` —
+status/positions/pause/resume/close_all),
+`database/sector_follow_db.py` (`sector_follow_trades` journal),
+`services/sector_follow_index_backfill.py` (daily 16:05 IST sector-index 1m
+refresh, gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`). Plan + locked operator
+decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follow_cap5_vol/PLAN.md).
+
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
 

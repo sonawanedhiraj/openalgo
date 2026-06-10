@@ -141,3 +141,22 @@ build-out is scope creep.
 Phase 3 ready: risk + monitoring (much of which Phase 1 + Phase 2 already cover —
 kill switch, pause/resume, EOD summary all shipped). Phase 3 likely = Telegram polish,
 operator dashboard, and wiring the index-1m daily backfill surfaced above.
+
+### 2026-06-10 — Discipline miss: architecture docs lagged the Phase 1+2 merge
+
+Phase 1+2 (`3266858f`) shipped a new strategy, a new `sector_follow_trades` DB
+table, a new service with 4 APScheduler jobs, a new `/sector_follow_cap5_vol/api/*`
+blueprint, and a new `SECTOR_FOLLOW_CAP5_VOL_MODE` env var — **without** the
+matching updates to `docs/SYSTEM_MAP.md`, `CLAUDE.md`, and `docs/PARAMETER_LOG.md`
+that `CLAUDE.md` "Documentation discipline — change docs WITH code, not after"
+requires in the **same** commit. Caught and back-filled the next day (this commit,
+direct to dev), with the Phase 3 index-backfill docs landing on the Phase 3 branch.
+
+**Lesson:** for this strategy specifically, an architecture surface (DB table /
+scheduled job / endpoint / env var / new service) is added in almost every phase —
+so the SYSTEM_MAP + CLAUDE.md + PARAMETER_LOG triplet must be part of each phase's
+diff, not a follow-up. When opening the next phase's PR, the checklist item "does
+this add/rename a table, job, endpoint, env var, or process? → update the three
+canonical docs in THIS commit" is non-optional. Note also: the brief described the
+service as registering 3 jobs; it actually registers 4 (an EOD-summary job at 15:30
+IST was added) — the docs now reflect the code, which is the source of truth.

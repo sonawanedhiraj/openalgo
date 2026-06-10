@@ -68,11 +68,40 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 | `scanner-vs-chartink-daily-comparison` | `45 15 * * 1-5` (15:45 IST) | Read-only comparison; appends to `audit/proposed_fixes.jsonl` |
 | `daily-trading-pipeline` | `30 9 * * 1-5` | DISABLED (deprecated) |
 
+### 4. SectorFollowService (in-process, OpenAlgo eventlet worker)
+- **Entry:** `services/sector_follow_service.py` — built + wired at boot by
+  `init_sector_follow_service(app, scheduler)` (called from `app.py`). Lives inside
+  the single OpenAlgo worker; it is **not** a separate process or a Cowork host task.
+- **Mode flag:** env `SECTOR_FOLLOW_CAP5_VOL_MODE` = `scaffold` (default) | `sandbox`
+  | `live`. **`scaffold` places NO orders** — it computes signals, logs, and writes
+  the trade journal only. `sandbox` routes to `db/sandbox.db`; `live` places real
+  broker orders. An unknown value force-falls-back to `scaffold`.
+- **Registers 4 APScheduler jobs** on the shared scheduler (all `mon-fri`
+  `Asia/Kolkata`, `replace_existing`):
+
+  | Job id | Cron (IST) | What it does |
+  |---|---|---|
+  | `sector_follow_entry` | 15:20 | Evaluate 30-name universe, select ≤5 gate-passers (vol-ratio tiebreaker), place/paper BUYs (mode-aware; honors kill switch + manual pause) |
+  | `sector_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1 exit). Exits are **never** blocked by the kill switch |
+  | `sector_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
+  | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) |
+
+- **Kill switch:** trips when day P&L < −`daily_loss_kill_pct`% of capital (default 3%);
+  blocks new entries for the session, open positions still run to their T+1 exit.
+- **DBs written:** `db/openalgo.db` → `sector_follow_trades` (trade journal, all
+  modes) and `strategies` (one seeded row, natural key `name='sector_follow_cap5_vol'`).
+- **Logs:** standard `log/openalgo_YYYY-MM-DD.log` + `log/errors.jsonl` (no
+  dedicated log file).
+- **Control API:** see "Strategy control endpoints" below.
+- **Status:** scaffold-only, `deployable: false` — see
+  `strategies/sector_follow_cap5_vol/PLAN.md`. A companion 16:05 index-refresh job
+  (added on the Phase 3 branch) keeps its sector-index 1m feed fresh.
+
 ## Databases
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
@@ -122,6 +151,26 @@ See `CLAUDE.md` → "Symbol Format" and "API Authentication" sections. Not
 duplicated here. Quick reminder: API key goes in JSON body (`apikey`) or
 `X-API-KEY` header; equity symbols are the bare base symbol.
 
+## Strategy control endpoints (sector_follow_cap5_vol)
+
+Blueprint `blueprints/sector_follow.py`, URL prefix `/sector_follow_cap5_vol`.
+**API-key authenticated** (`X-API-KEY` header, or `apikey` in JSON body / query
+string — same model as `/api/v1`). All read/control the in-process
+SectorFollowService singleton; they return `503` if the service isn't initialised.
+
+| Endpoint | Method | Side effect |
+|---|---|---|
+| `/sector_follow_cap5_vol/api/status` | GET | Read-only: mode, kill switch, today's entries/exits, open book + live MTM |
+| `/sector_follow_cap5_vol/api/positions` | GET | Read-only: open positions (with MTM) + today's entries/exits |
+| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1 |
+| `/sector_follow_cap5_vol/api/resume` | POST | Clears manual pause **and** the kill switch |
+| `/sector_follow_cap5_vol/api/close_all` | POST | **Emergency square-off of every open position** (mode-aware; not blocked by kill switch). Requires body `{"confirm":"yes"}` |
+
+`sector_follow_trades` columns (`database/sector_follow_db.py`): `id`, `strategy_id`,
+`mode`, `side` (BUY/SELL), `symbol`, `exchange`, `product`, `quantity`, `price`
+(reference price at decision time), `entry_date`, `vol_ratio`, `stock_ret`,
+`sector_ret`, `order_id`, `note`, `created_at`. Append-only; no retention/pruning job.
+
 ## Known recurring patterns
 
 - **Morning Zerodha token rollover** ~02:00–03:00 IST → WS reconnect burst
@@ -150,6 +199,12 @@ duplicated here. Quick reminder: API key goes in JSON body (`apikey`) or
   (pure, read-only on `historify.duckdb`, emits recommended-orders JSON — no order
   placement). CLI entry: `services/sector_rotation_etf_cli.py`. Not wired to any
   scheduler; no live mode.
+- `strategies/sector_follow_cap5_vol/` — intraday sector-follow strategy, cap-5
+  positions, volume tiebreaker (**scaffold-only, `deployable: false`**). Daemon-style
+  SectorFollowService (`services/sector_follow_service.py`) registers 4 APScheduler
+  jobs (entry/exit/reset/EOD); control API at `/sector_follow_cap5_vol/api/*`;
+  trade journal in `db/openalgo.db` `sector_follow_trades`. Sector-index 1m feed
+  kept fresh by the `sector_follow_index_backfill` job. Plan/decisions: `PLAN.md`.
 - `docs/SIMPLIFIED_ENGINE_HANDOFF.md` — engine integration context
 - `docs/COWORK_SESSION_LEARNINGS.md` — Cowork-specific learnings, webhook IDs
 - `audit/README.md` — read-only scheduled-task policy + `proposed_fixes.jsonl` schema
