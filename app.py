@@ -687,6 +687,18 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
 
+            # Sector Follow CAP5_VOL strategy (R40 deployable variant). Default
+            # mode=scaffold means loading this changes ZERO live trading behavior
+            # — it only registers 15:20/15:25/09:00 IST jobs that compute + log.
+            # See strategies/sector_follow_cap5_vol/ and SECTOR_FOLLOW_CAP5_VOL_MODE.
+            try:
+                from services.sector_follow_service import init_sector_follow_service
+
+                init_sector_follow_service(app=app)
+                logger.debug("Sector Follow CAP5_VOL service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Sector Follow service: {e}")
+
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
             # scanner and the regime classifier. Replaces the old one-shot 30s
             # boot poll (which lost the race against the morning Zerodha login,
