@@ -182,3 +182,33 @@ scheduler. After the re-map no stock depends on NIFTYCONSRDURBL/NIFTYOILANDGAS, 
 the broker failing to deliver their 1m affects nothing. The new 16:05 job is an
 in-app APScheduler job (like scanner_history_refresh) — not tracked in SYSTEM_MAP
 (that table is host-side Cowork tasks only).
+
+## 2026-06-10 — Phase 4: shadow-replay parity check
+
+Window: last 30 trading days, 2026-05-05 .. 2026-06-08 (30 days).
+Harness: `outputs/sector_follow_cap5_vol_phase4_2026-06-10/run_phase4.py` (force-added;
+CSVs gitignored). Production track = real `duckdb_metrics_provider`/`passes_gates`/
+`select_entries` at 15:20 IST with T+1 carryover; R40 track = backtest full-day gate
+screen + top-5 vol_ratio, no carryover. Both use post-Phase-3 sector_map + static-30.
+
+Entries: Jaccard 0.50 (production-only 2, r40-only 13, matched 15)
+P&L: mean abs diff 0.0000pp on 15 matched trades, max diff 0.0000pp
+Verdict: NEEDS_INVESTIGATION
+
+Production CODE is sound — exact P&L parity, correct gates + carryover. The 15
+entry mismatches attribute to: 10x **backtest look-ahead** (R40 evaluates gates on
+the realized full-day CLOSE; the live design + production evaluate at 15:20, before
+the final ~10min — DIXON -0.18%@15:20 -> +4.23%@close flips the gate; KOTAKBANK
++1.6%@15:20 -> -0.5%@close is the false-positive flip side); 3x **NIFTYIT 1m gap** on
+2026-06-01/06-02 (production sector_ret=None -> fail-closed, skips TCS/INFY; backtest
+used daily-native NIFTYIT which had data — same failure mode as the RELIANCE/DIXON
+re-map); 1x T+1 carryover (M&M re-entry suppressed correctly); 1x vol-avg lookback
+window edge (IRFC).
+
+**Phase 5 go-live NOT cleared.** Blocker is the parity TARGET, not the code: the
+Sharpe-2.19 baseline was computed with closing-print look-ahead and overstates the
+live 15:20 edge (~10/28 backtest entries/30d would not fire at 15:20). Before go-live:
+(1) re-derive the backtest baseline with 15:20-snapshot gates for an honest expected
+Sharpe/EV; (2) confirm the 1m index feed (esp. NIFTYIT) is current each session +
+monitor `sector_ret is None`. No production code changes recommended. See
+`outputs/sector_follow_cap5_vol_phase4_2026-06-10/REPORT.md`.
