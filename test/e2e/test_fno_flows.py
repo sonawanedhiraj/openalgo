@@ -385,10 +385,11 @@ class TestVetoDirectionConsistency:
         m_rev.assert_called_once()
         assert m_rev.call_args.kwargs["symbol"] == "RELIANCE"
 
-    def test_veto_source_is_buy_string_for_sell_today(self, monkeypatch):
-        """Characterize the CURRENT (buggy) contract: a SELL signal is reviewed
-        with source='chartink_FnO_intraday_buy' and NO direction kwarg. If a fix
-        changes this, this test flips and signals the contract moved (good)."""
+    def test_veto_receives_explicit_sell_direction(self, monkeypatch):
+        """The fixed contract (TATAELXSI fix): a SELL signal is reviewed with the
+        source string STILL carrying "buy" (one webhook for both legs), but the
+        actual side now rides an explicit direction='SELL' kwarg so the reviewer
+        never has to infer it from the misleading source."""
         monkeypatch.setenv("VETO_LAYER_MODE", "shadow")
         eng = _sell_engine()
         svc = _service(eng, monkeypatch, veto_off=False)
@@ -408,15 +409,9 @@ class TestVetoDirectionConsistency:
             svc._place_entry_order(sig, api_key="k",
                                    strategy_name="chartink_FnO_intraday_buy")
         kw = m_rev.call_args.kwargs
-        assert kw["source"] == "chartink_FnO_intraday_buy"  # carries "buy"
-        assert "direction" not in kw  # the bug: direction is dropped
+        assert kw["source"] == "chartink_FnO_intraday_buy"  # still carries "buy"
+        assert kw["direction"] == "SELL"  # but the true side is now explicit
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason="TATAELXSI bug: veto receives only source='..._buy' with no "
-        "direction, so a SELL signal is framed as a BUY. Auto-passes once the "
-        "surfaced fix (pass signal.action as direction) lands.",
-    )
     def test_sell_signal_veto_is_not_framed_as_buy(self, monkeypatch):
         monkeypatch.setenv("VETO_LAYER_MODE", "shadow")
         eng = _sell_engine()

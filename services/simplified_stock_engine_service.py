@@ -671,6 +671,7 @@ class SimplifiedStockEngineService:
             review = signal_review_service.review_signal(
                 symbol=signal.symbol,
                 source=strategy_name,
+                direction=signal.action,
             )
         except Exception:
             logger.exception(

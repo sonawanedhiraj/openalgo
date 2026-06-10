@@ -478,6 +478,12 @@ def test_publish_eod_summary_renders_by_strategy(monkeypatch):
     assert "End-of-day summary" in body
     assert "+₹1,200.50" in body
     assert "trending_equity_intraday" in body
+    # The P&L line must be self-describing: gross, closed-only, single-strategy
+    # scope — and point the operator at /mypnl for the net account figure. This
+    # is the A1 mismatch relabel (Telegram ≠ /mypnl by construction).
+    assert "Realized (closed, gross, simplified-engine only)" in body
+    assert "/mypnl" in body
+    assert "Net P&L" not in body  # the old misleading label is gone
 
 
 # ---------------------------------------------------------------------------

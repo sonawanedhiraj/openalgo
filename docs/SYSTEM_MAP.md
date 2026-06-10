@@ -37,7 +37,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 | `/run-tests` | POST | Spawns Claude Code subprocess → also runs `uv run pytest {test_target} -v` (`server.py:449,456`) |
 | `/restart-app` | POST | Kills PID on port 5000 via PowerShell `Stop-Process -Force` → respawns `uv run app.py` (`server.py:494-516`) |
 | `/run` | POST | Arbitrary Claude Code prompt — may mutate files |
-| `/review-signal`, `/reflect` | POST | LLM calls; review/journal helpers |
+| `/review-signal`, `/reflect` | POST | LLM calls; review/journal helpers. `/review-signal` candidate now carries an explicit `direction` (`BUY`/`SELL`) so the veto prompt frames the side correctly instead of inferring it from the `source` string |
 | `/status`, `/read-errors`, `/engine-status` | GET | Read-only |
 
 - **Busy lock:** all task endpoints 409 if `state.status == BUSY`. A wedged task
@@ -153,18 +153,20 @@ need no external scheduler.
 - `test/e2e/test_fno_flows.py` — simplified-engine FnO + LLM veto critical flows
   (21 tests): BUY/SELL breakout→sandbox order, journal entry/exit pairing, veto
   shadow-vs-active enforcement, **veto direction consistency** (the TATAELXSI
-  regression anchor — an `xfail` that documents the SELL-reviewed-as-BUY bug until
-  the surfaced fix lands), ATR stop, RR trailing, daily kill switch, trade-limit
+  regression anchor — now PASSING after the 2026-06-11 fix that passes
+  `signal.action` through as an explicit `direction` kwarg; the SELL-reviewed-as-BUY
+  bug is closed), ATR stop, RR trailing, daily kill switch, trade-limit
   and cooldown gates, EOD square-off, and the Telegram EOD-summary semantics
   (gross / realized / closed-only — the anchor for the Telegram-vs-`/mypnl`
-  mismatch). Same hermetic pattern (temp/in-memory SQLite, mocked broker + veto,
+  mismatch; the Telegram line is now self-describing: "Realized (closed, gross,
+  simplified-engine only) … see /mypnl for net account P&L"). Same hermetic pattern (temp/in-memory SQLite, mocked broker + veto,
   injected clock, no network). Investigation: `outputs/fno_eod_veto_investigation_2026-06-10/`.
 
 ## Databases
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job), **signal_decision** (Stage-1 LLM veto-layer audit — one row per candidate review; `direction` TEXT column (`BUY`/`SELL`, nullable) records the side the engine armed, added 2026-06-11 via idempotent boot-time `ALTER TABLE` in `signal_decision_db._migrate_add_direction_column`; previously the side was unrecoverable because the chartink `source` string carries "buy" for both legs) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |

@@ -156,6 +156,11 @@ class RestartAppRequest(BaseModel):
 class ReviewCandidate(BaseModel):
     symbol: str
     source: str
+    # Side the engine armed: 'BUY' (long) | 'SELL' (short). Optional for
+    # backward compatibility with callers that predate the field — the prompt
+    # renders 'unknown' when absent. The ``source`` string can't be trusted to
+    # imply direction (both chartink legs carry "...intraday_buy").
+    direction: Optional[str] = None
     candidate_at: str
 
 
@@ -596,6 +601,7 @@ REVIEW_PROMPT_TEMPLATE = """You are reviewing a candidate trading signal for an 
 CANDIDATE:
 - Symbol: {symbol}
 - Source: {source}
+- Direction: {direction}        # BUY = long entry | SELL = short entry
 - Time: {candidate_at}
 
 OPERATOR CONTEXT:
@@ -610,7 +616,7 @@ MARKET CONTEXT (today):
 REGIME SNAPSHOT:
 {regime_block}
 
-Decide whether the operator should take this signal. Be conservative: skip when the broader market regime conflicts with the signal direction (e.g., BUY signal on a -1% NIFTY day with elevated VIX, or BUY on a stock whose sector is bottom-3 today while leadership is concentrated elsewhere), or when the operator is already near their daily trade limit.
+Decide whether the operator should take this signal. Use the stated Direction above — do NOT infer it from the Source string. Be conservative: skip when the broader market regime conflicts with the signal's stated Direction. For a BUY (long): skip on a -1% NIFTY day with elevated VIX, or when the stock's sector is bottom-3 today while leadership is concentrated elsewhere. For a SELL (short) the conflict is inverted: a strongly bullish regime / broad green breadth works against a short, while a weak/bearish regime is favourable for it. Also skip when the operator is already near their daily trade limit.
 
 Respond with a short reasoning paragraph followed by a final JSON block. The JSON block must be the LAST thing in your response and must contain exactly these keys:
 
@@ -679,6 +685,7 @@ def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str
     return REVIEW_PROMPT_TEMPLATE.format(
         symbol=candidate.symbol,
         source=candidate.source,
+        direction=_or_unknown(candidate.direction),
         candidate_at=candidate.candidate_at,
         positions_count=_or_unknown(ctx.positions_count),
         positions_summary=_or_unknown(ctx.positions_summary),

@@ -151,6 +151,91 @@ def test_review_signal_writes_signal_decision_row(
     assert snapshot["nifty_pct"] == -0.3
 
 
+def test_review_signal_includes_direction_in_request_body(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """TATAELXSI fix: the explicit ``direction`` rides the bridge request body
+    AND lands on the audit row, so a SELL candidate is never framed as a BUY."""
+    import services.signal_review_service as srs
+    from database.signal_decision_db import get_signal_decision
+
+    captured: dict = {}
+
+    class _StubResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "decision": "skip",
+                "reasoning": "bullish regime conflicts with the short",
+                "confidence": 0.7,
+                "latency_ms": 1200,
+                "claude_session_id": "sess-dir",
+                "raw_output": "...",
+            }
+
+    def fake_post(url, json=None, timeout=None):  # noqa: A002, ARG001
+        captured["body"] = json
+        return _StubResponse()
+
+    monkeypatch.setattr(srs.httpx, "post", fake_post)
+
+    result = srs.review_signal(
+        "TATAELXSI", "chartink_FnO_intraday_buy",
+        direction="SELL", context=_ctx_override(),
+    )
+
+    # 1. Direction is in the request body the bridge receives.
+    assert captured["body"]["candidate"]["direction"] == "SELL"
+    assert captured["body"]["candidate"]["source"] == "chartink_FnO_intraday_buy"
+    # 2. Direction is persisted on the audit row.
+    row = get_signal_decision(result["id"])
+    assert row["direction"] == "SELL"
+
+
+def test_review_signal_direction_in_cache_key(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """A BUY and a SELL on the same (symbol, source) must NOT collide in the
+    cache — direction is part of the key, so each side gets its own review."""
+    import services.signal_review_service as srs
+
+    calls: list[str | None] = []
+
+    class _StubResponse:
+        status_code = 200
+
+        def __init__(self, decision):
+            self._decision = decision
+
+        def json(self):
+            return {
+                "decision": self._decision,
+                "reasoning": "r",
+                "confidence": 0.5,
+                "latency_ms": 1,
+                "claude_session_id": "s",
+                "raw_output": "",
+            }
+
+    def fake_post(url, json=None, timeout=None):  # noqa: A002, ARG001
+        direction = json["candidate"]["direction"]
+        calls.append(direction)
+        # BUY → take, SELL → skip, so a collision would surface as the wrong one.
+        return _StubResponse("take" if direction == "BUY" else "skip")
+
+    monkeypatch.setattr(srs.httpx, "post", fake_post)
+
+    buy = srs.review_signal("SBIN", "chartink_FnO_intraday_buy",
+                            direction="BUY", context=_ctx_override())
+    sell = srs.review_signal("SBIN", "chartink_FnO_intraday_buy",
+                             direction="SELL", context=_ctx_override())
+
+    assert buy["decision"] == "take"
+    assert sell["decision"] == "skip"
+    assert calls == ["BUY", "SELL"]  # both hit the bridge; no cross-direction reuse
+
+
 # ---------------------------------------------------------------------------
 # Cache behaviour
 # ---------------------------------------------------------------------------
