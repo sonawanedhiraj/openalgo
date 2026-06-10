@@ -18,6 +18,40 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Strategy control — unified daily intent
+
+#### STRATEGY_DAILY_INTENT_ENABLED
+- **Current value:** `true` (default; ships hot)
+- **Set in:** env var (not yet in `.sample.env` — operator WIP held that file;
+  add `STRATEGY_DAILY_INTENT_ENABLED=true` there at next convenient edit). Read
+  with a safe default in `services/mode_service.py:_flag_enabled` (default
+  `true`).
+- **Code default:** `true` (`services/mode_service._flag_enabled`)
+- **What it gates:** when `true`, `resolve_strategy_mode(strategy_name)` consults
+  the new `strategy_daily_intent` table (`db/openalgo.db`) first, then falls
+  through to the legacy `daily_intent` table (simplified only) → env mode flag
+  (`SIMPLIFIED_ENGINE_MODE` / `SECTOR_FOLLOW_CAP5_VOL_MODE`) → `sandbox/run`
+  default. When `false`, the unified-row step is skipped (pure legacy behavior).
+- **History:**
+  - **2026-06-10:** Introduced with the unified `{mode, intent}` control surface
+    (feat/sector-rotation-etf → `206a5d14`). Default `true`, but **deploy is a
+    no-op**: with no `strategy_daily_intent` row for `(strategy, today)` the
+    resolver falls through to each strategy's existing env/legacy behavior. The
+    operator opts a strategy in by inserting a row (`set_intent`); rolls back by
+    deleting it. Migration backfills legacy `daily_intent` rows into the unified
+    table once at boot (idempotent, `updated_by='migration'`, `intent='run'`).
+    `place_order_service`'s global `resolve_effective_mode()` floor is unchanged
+    — the intent gate lives in the engines. Design:
+    `docs/design/strategy_daily_intent.md`.
+- **Related state:** `db/openalgo.db` → `strategy_daily_intent` table
+  (`strategy_name`, `intent_date`, `mode` live/sandbox/skip, `intent`
+  run/pause/halt, `daily_capital_cap`). Live env at time of ship:
+  `SECTOR_FOLLOW_CAP5_VOL_MODE=sandbox`, `SIMPLIFIED_ENGINE_MODE=live`.
+- **Test coverage:** `test/test_strategy_daily_intent.py` (flag-on/off,
+  fall-through, migration), plus intent-gate tests in
+  `test/test_sector_follow_service.py` and
+  `test/test_simplified_stock_engine_service.py`.
+
 ### Scanner — Chartink BUY rule
 
 #### CHARTINK_RULE_BUY_GAP_PCT
