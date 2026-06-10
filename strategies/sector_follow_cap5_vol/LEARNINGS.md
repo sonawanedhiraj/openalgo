@@ -212,3 +212,48 @@ live 15:20 edge (~10/28 backtest entries/30d would not fire at 15:20). Before go
 Sharpe/EV; (2) confirm the 1m index feed (esp. NIFTYIT) is current each session +
 monitor `sector_ret is None`. No production code changes recommended. See
 `outputs/sector_follow_cap5_vol_phase4_2026-06-10/REPORT.md`.
+
+## 2026-06-10 — Phase 4.5: honest 15:20-snapshot baseline (NEW OFFICIAL BASELINE)
+
+Harness: `outputs/sector_follow_cap5_vol_phase4_5_2026-06-10/run_phase4_5.py`
+(force-added; CSVs gitignored). Built the honest baseline by calling the
+**production provider** per day (gates+entry @15:20; R40 look-ahead snapshot
+@15:30; exit = T+1 full close). Used the provider — not an independent
+reimplementation — because the 1m `timestamp` column has an inconsistent epoch
+convention that splits a single IST session across naive `(ts+19800)/86400`
+day-buckets (2026-05-29 diverged on all 30 symbols), so naive daily grouping
+mis-aggregates. The provider's `fromtimestamp(ts,IST).date()` + `ts<=as_of` is
+authoritative and is what live trading sees. **Flag for a data-integrity pass on
+the 1m timestamp column before scaling capital.**
+
+**HONEST BASELINE — this replaces R40's 2.19 for all future references.**
+NIFTY-1m window (2025-12-02..2026-05-29, 120 eval days, 76 trades):
+Sharpe(d) **1.70**, Sharpe(m) 1.71, payoff **1.42**, EV **+0.248%/trade**,
+MaxDD −4.65%, win **48.7%**. Sector-1m window (22 days, all 30 names, 22 trades):
+Sharpe(d) 1.77, payoff 1.56, EV +0.051%, win 40.9%.
+
+**Look-ahead delta (15:20 vs 15:30, same days/structure):** SMALL and FAVOURS
+15:20 (Sharpe +0.34, EV +0.137pp, win +4.6pp) — entering before the closing
+run-up is a cheaper fill. Phase 4's "Sharpe 2.19 is look-ahead-inflated" thesis
+is only partly right: the snapshot-timing component is minor; the **dominant** gap
+2.19→~1.5 is the SAMPLE WINDOW. R40's 625 trades span 2.4y using **daily** index
+data; the production 15:20 path only has index 1m from 2025-12-01 (NIFTY/FINNIFTY)
+/ 2026-04-27 (sectoral), so at most ~76 trades / ~6 months are honestly
+evaluable. **2.19 is unreproducible intraday and is NOT a deployable target.**
+
+**Production parity vs honest baseline (last 22 sector days):** matched-entry P&L
+**0.000000pp** (bit-identical arithmetic), `production_only=0` (production ⊆
+no-carryover baseline), Jaccard 0.864. The 3 `honest_only` names (M&M 05-07,
+HDFCBANK/VEDL 05-14) are 100% **T+1 carryover** (prior-day positions occupying
+slots at 15:20), NOT bugs. **Verdict: PASS** — production matches the honest
+baseline exactly once carryover is accounted for. No code changes needed.
+
+**Phase 5 readiness — GREEN LIGHT, small & exploratory.** Code is correct/safe;
+edge MAGNITUDE is unvalidated (thin sample; sector sleeve has ~22 days of intraday
+history only). Treat the paper-trade as the real validation that accrues sector-
+index 1m history. **Updated Phase 5 targets (honest, provisional):** Sharpe(d)
+~1.5–1.7, payoff ~1.4, EV ~+0.20–0.25%/trade, win ~48%, tolerate MaxDD ~−6%,
+~12–15 trades/mo (broad; sector sparse). Open items: monitor `sector_ret is None`
+(~82% of days now), data-integrity pass on 1m timestamps, accumulate ≥3mo
+sectoral 1m before judging the sector sleeve. See
+`outputs/sector_follow_cap5_vol_phase4_5_2026-06-10/REPORT.md`.
