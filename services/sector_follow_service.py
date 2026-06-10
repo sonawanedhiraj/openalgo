@@ -371,7 +371,12 @@ class SectorFollowService:
         # Mutable runtime state.
         self.paper_book: dict[str, PaperPosition] = {}
         self.kill_switch_active = False
+        self.kill_switch_reason: str | None = None
+        self.manual_pause = False  # operator-set; halts new entries, exits still run
         self.daily_pnl = 0.0
+        # Intraday journals for observability + EOD summary (reset at 09:00 IST).
+        self.today_entries: list[dict] = []
+        self.today_exits: list[dict] = []
         self.strategy_id: int | None = self.config.strategy_id
 
     # ----- strategy DB seeding ------------------------------------------- #
@@ -461,6 +466,10 @@ class SectorFollowService:
         threshold = -(self.config.daily_loss_kill_pct / 100.0) * self.config.capital_inr
         if not self.kill_switch_active and self.daily_pnl < threshold:
             self.kill_switch_active = True
+            self.kill_switch_reason = (
+                f"daily P&L ₹{self.daily_pnl:,.0f} breached "
+                f"{self.config.daily_loss_kill_pct}% of capital"
+            )
             logger.error(
                 "sector_follow KILL SWITCH fired: daily_pnl=%.0f < %.0f (%.1f%% of capital)",
                 self.daily_pnl,
@@ -475,11 +484,32 @@ class SectorFollowService:
         return self.kill_switch_active
 
     def reset_daily_state(self) -> None:
-        """09:00 IST reset: clear kill switch + daily P&L; drop ghost paper rows
-        that have no scheduled exit owner (defensive — exits normally clear them)."""
+        """09:00 IST reset: clear kill switch + daily P&L and the intraday journals.
+
+        Does NOT clear ``manual_pause`` — an operator pause persists across the
+        daily reset until the operator explicitly resumes. Existing open positions
+        in paper_book survive (they hold to their scheduled T+1 exit)."""
         self.kill_switch_active = False
+        self.kill_switch_reason = None
         self.daily_pnl = 0.0
+        self.today_entries = []
+        self.today_exits = []
         logger.info("sector_follow daily state reset (kill switch cleared, pnl=0)")
+
+    # ----- operator manual controls -------------------------------------- #
+    def pause(self) -> dict:
+        """Operator pause: halt new entries. Open positions hold to T+1 exit."""
+        self.manual_pause = True
+        logger.warning("sector_follow MANUALLY PAUSED — new entries halted (exits still run)")
+        return {"status": "success", "manual_pause": True}
+
+    def resume(self) -> dict:
+        """Operator resume: clear both manual pause and the kill switch."""
+        self.manual_pause = False
+        self.kill_switch_active = False
+        self.kill_switch_reason = None
+        logger.info("sector_follow RESUMED — manual pause + kill switch cleared")
+        return {"status": "success", "manual_pause": False, "kill_switch_active": False}
 
     # ----- order placement (mode-aware) ---------------------------------- #
     def place_entry(self, candidate: dict, entry_date: str | None = None) -> dict | None:
@@ -491,6 +521,9 @@ class SectorFollowService:
         """
         if self.kill_switch_active:
             logger.info("sector_follow entry skipped (kill switch active): %s", candidate["symbol"])
+            return None
+        if self.manual_pause:
+            logger.info("sector_follow entry skipped (manual pause): %s", candidate["symbol"])
             return None
 
         symbol = candidate["symbol"]
@@ -545,6 +578,15 @@ class SectorFollowService:
             sector_ret=candidate.get("sector_ret"),
             order_id=order_id,
         )
+        self.today_entries.append(
+            {
+                "symbol": symbol,
+                "entry_time": self._now().isoformat(),
+                "entry_price": price,
+                "qty": qty,
+                "vol_ratio": candidate.get("vol_ratio"),
+            }
+        )
         return {"symbol": symbol, "quantity": qty, "price": price, "order_id": order_id}
 
     def place_exit(self, position: PaperPosition, price: float | None = None) -> dict | None:
@@ -586,6 +628,22 @@ class SectorFollowService:
             order_id=order_id,
             note="t+1_exit",
         )
+        pnl_pct = (
+            (exit_price / position.entry_price - 1.0) * 100.0
+            if position.entry_price else 0.0
+        )
+        pnl_net = (exit_price - position.entry_price) * position.quantity
+        self.today_exits.append(
+            {
+                "symbol": symbol,
+                "exit_time": self._now().isoformat(),
+                "exit_price": exit_price,
+                "entry_date": position.entry_date,
+                "qty": position.quantity,
+                "pnl_pct": pnl_pct,
+                "pnl_net": pnl_net,
+            }
+        )
         self.paper_book.pop(symbol, None)
         return {"symbol": symbol, "quantity": position.quantity, "order_id": order_id}
 
@@ -620,6 +678,117 @@ class SectorFollowService:
     def run_daily_reset(self) -> None:
         """09:00 IST: reset kill switch + daily P&L."""
         self.reset_daily_state()
+
+    # ----- observability + EOD summary ----------------------------------- #
+    def _config_view(self) -> dict:
+        """A small, JSON-safe subset of config for the status endpoint."""
+        c = self.config
+        return {
+            "capital_inr": c.capital_inr,
+            "max_position_inr": c.max_position_inr,
+            "max_concurrent_positions": c.max_concurrent_positions,
+            "gate_sector_pct": c.gate_sector_pct,
+            "gate_stock_pct": c.gate_stock_pct,
+            "gate_vol_mult": c.gate_vol_mult,
+            "daily_loss_kill_pct": c.daily_loss_kill_pct,
+            "exchange": c.exchange,
+            "product": c.product,
+            "universe_size": len(c.universe),
+        }
+
+    def open_positions_view(self) -> list[dict]:
+        """Open positions as JSON dicts. ``mtm_pnl`` is None (live MTM needs a
+        price fetch — deferred to Phase 3/4); included for schema stability."""
+        return [
+            {
+                "symbol": p.symbol,
+                "entry_date": p.entry_date,
+                "entry_price": p.entry_price,
+                "qty": p.quantity,
+                "vol_ratio": p.vol_ratio,
+                "order_id": p.order_id,
+                "mtm_pnl": None,
+            }
+            for p in self.paper_book.values()
+        ]
+
+    def get_status(self) -> dict:
+        """Current strategy state for the observability endpoint."""
+        today_pnl_net = sum(e.get("pnl_net", 0.0) for e in self.today_exits)
+        return {
+            "mode": self.mode,
+            "strategy_id": self.strategy_id,
+            "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reason": self.kill_switch_reason,
+            "manual_pause": self.manual_pause,
+            "today_entries": list(self.today_entries),
+            "today_exits": list(self.today_exits),
+            "open_positions": self.open_positions_view(),
+            "today_pnl_net": today_pnl_net,
+            "capital_inr": self.config.capital_inr,
+            "config": self._config_view(),
+        }
+
+    def close_all_positions(self) -> list[dict]:
+        """Emergency square-off of every open position (mode-aware). Exits use the
+        last known entry price as a reference when no live price is supplied —
+        the actual fill is MARKET. Not blocked by the kill switch / pause."""
+        results: list[dict] = []
+        for pos in list(self.paper_book.values()):
+            try:
+                r = self.place_exit(pos)
+                results.append(
+                    {"symbol": pos.symbol, "status": "success" if r else "error",
+                     "order_id": (r or {}).get("order_id")}
+                )
+            except Exception as e:
+                logger.exception("close_all failed for %s: %s", pos.symbol, e)
+                results.append({"symbol": pos.symbol, "status": "error", "message": str(e)})
+        logger.warning("sector_follow close_all squared %d position(s)", len(results))
+        return results
+
+    def build_eod_summary(self, as_of: datetime | None = None) -> str:
+        """Format the 15:30 IST EOD Telegram summary string."""
+        as_of = as_of or self._now()
+        entries = self.today_entries
+        exits = self.today_exits
+        open_pos = list(self.paper_book.values())
+        today_pnl_net = sum(e.get("pnl_net", 0.0) for e in exits)
+
+        entry_syms = ", ".join(e["symbol"] for e in entries) or "—"
+        if exits:
+            by_date: dict[str, list[str]] = {}
+            for x in exits:
+                tag = f"{x['symbol']} {x['pnl_pct']:+.2f}%"
+                by_date.setdefault(x.get("entry_date", "?"), []).append(tag)
+            exit_str = "; ".join(
+                f"entered {d[5:] if len(d) >= 10 else d}: " + ", ".join(tags)
+                for d, tags in sorted(by_date.items())
+            )
+        else:
+            exit_str = "—"
+
+        next_day = (as_of.date() + timedelta(days=1)).isoformat()
+        ks = (
+            f"active ({self.kill_switch_reason})" if self.kill_switch_active else "inactive"
+        )
+        pause = " · PAUSED" if self.manual_pause else ""
+        return (
+            f"📊 sector_follow_cap5_vol EOD {as_of.date().isoformat()}\n"
+            f"Mode: {self.mode}{pause}\n"
+            f"Entries: {len(entries)} ({entry_syms})\n"
+            f"Exits: {len(exits)} ({exit_str})\n"
+            f"Open EOD: {len(open_pos)} (T+1 exit {next_day})\n"
+            f"Net PnL today: ₹{today_pnl_net:+,.0f}\n"
+            f"Kill switch: {ks}"
+        )
+
+    def run_eod_summary(self) -> str:
+        """15:30 IST: broadcast the EOD summary (best-effort; silent if TG off)."""
+        msg = self.build_eod_summary()
+        self._notify(msg)
+        logger.info("sector_follow EOD summary emitted")
+        return msg
 
     # ----- scheduler registration ---------------------------------------- #
     def register_jobs(self, scheduler=None) -> None:
@@ -659,6 +828,12 @@ class SectorFollowService:
             id="sector_follow_daily_reset", replace_existing=True,
             name="Sector Follow CAP5_VOL daily reset (09:00 IST)",
         )
+        sched.add_job(
+            _eod_summary_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=30,
+                                                  timezone="Asia/Kolkata"),
+            id="sector_follow_eod_summary", replace_existing=True,
+            name="Sector Follow CAP5_VOL EOD summary (15:30 IST)",
+        )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
             self.mode, self.strategy_id,
@@ -688,6 +863,11 @@ def _exit_job() -> None:
 def _daily_reset_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.run_daily_reset()
+
+
+def _eod_summary_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_eod_summary()
 
 
 def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:

@@ -256,5 +256,102 @@ def test_run_entry_caps_and_records():
     assert {p["symbol"] for p in placed} == {"FFF", "EEE", "DDD", "CCC", "BBB"}
 
 
+# --------------------------------------------------------------------------- #
+# Phase 2 — observability + operator controls
+# --------------------------------------------------------------------------- #
+def test_get_status_returns_required_keys():
+    svc = _make_service(metrics={"AAA": _hit()}, mode="sandbox")
+    svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    status = svc.get_status()
+    required = {
+        "mode", "kill_switch_active", "kill_switch_reason", "manual_pause",
+        "today_entries", "today_exits", "open_positions", "today_pnl_net",
+        "capital_inr", "config",
+    }
+    assert required <= set(status)
+    assert status["mode"] == "sandbox"
+    assert status["capital_inr"] == 250000.0
+    assert len(status["today_entries"]) == 1
+    assert len(status["open_positions"]) == 1
+    assert status["open_positions"][0]["symbol"] == "AAA"
+
+
+def test_manual_pause_halts_new_entries_but_not_exits():
+    from services.sector_follow_service import PaperPosition
+
+    svc = _make_service(metrics={"AAA": _hit()}, mode="sandbox")
+    svc.pause()
+    assert svc.manual_pause is True
+    # New entry is blocked while paused.
+    blocked = svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    assert blocked is None
+    assert svc._test_placed == []
+    # A scheduled exit still runs while paused.
+    pos = PaperPosition(
+        symbol="BBB", quantity=10, entry_price=100.0, entry_date="2026-06-09", vol_ratio=2.0
+    )
+    exited = svc.place_exit(pos, price=102.0)
+    assert exited is not None
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["action"] == "SELL"
+
+
+def test_resume_clears_kill_switch():
+    svc = _make_service()
+    svc.kill_switch_active = True
+    svc.kill_switch_reason = "forced for test"
+    svc.manual_pause = True
+    result = svc.resume()
+    assert svc.kill_switch_active is False
+    assert svc.kill_switch_reason is None
+    assert svc.manual_pause is False
+    assert result["kill_switch_active"] is False
+
+
+def test_close_all_squares_open_positions():
+    from services.sector_follow_service import PaperPosition
+
+    svc = _make_service(mode="sandbox")
+    svc.paper_book = {
+        "AAA": PaperPosition("AAA", 10, 100.0, "2026-06-09", 2.0),
+        "BBB": PaperPosition("BBB", 5, 200.0, "2026-06-09", 1.5),
+    }
+    closed = svc.close_all_positions()
+    assert len(closed) == 2
+    assert {c["symbol"] for c in closed} == {"AAA", "BBB"}
+    assert all(c["status"] == "success" for c in closed)
+    assert svc.paper_book == {}  # book emptied
+    # Both squared off via SELL orders.
+    assert len(svc._test_placed) == 2
+    assert all(o[1]["action"] == "SELL" for o in svc._test_placed)
+
+
+def test_eod_summary_formats_telegram_message_correctly():
+    from services.sector_follow_service import PaperPosition
+
+    svc = _make_service(mode="sandbox")
+    # Two entries today.
+    svc.today_entries = [
+        {"symbol": "TMPV", "entry_time": "t", "entry_price": 100.0, "qty": 10},
+        {"symbol": "BEL", "entry_time": "t", "entry_price": 50.0, "qty": 20},
+    ]
+    # One exit from a prior session.
+    svc.place_exit(
+        PaperPosition("HDFCBANK", 10, 1000.0, "2026-06-09", 2.0), price=1004.2
+    )
+    # One position still open.
+    svc.paper_book["TMPV"] = PaperPosition("TMPV", 10, 100.0, "2026-06-10", 2.0)
+
+    msg = svc.build_eod_summary()
+    assert "📊 sector_follow_cap5_vol EOD 2026-06-10" in msg
+    assert "Mode: sandbox" in msg
+    assert "Entries: 2 (TMPV, BEL)" in msg
+    assert "Exits: 1" in msg
+    assert "entered 06-09" in msg
+    assert "HDFCBANK +0.42%" in msg
+    assert "Open EOD: 1 (T+1 exit 2026-06-11)" in msg
+    assert "Kill switch: inactive" in msg
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

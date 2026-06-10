@@ -36,6 +36,7 @@ from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
+from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
 from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
 from blueprints.preflight import preflight_bp  # Stage-0 go/no-go preflight gate
 from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
@@ -270,6 +271,7 @@ def create_app():
     app.register_blueprint(analyzer_bp)
     app.register_blueprint(settings_bp)
     app.register_blueprint(chartink_bp)
+    app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
