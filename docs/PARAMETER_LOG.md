@@ -29,6 +29,25 @@ the latest decisions automatically.
 - **Related state:** `db/openalgo.db scan_definitions.id=1.rule_module = fno_intraday_buy_chartink` (set 2026-06-09; was `fno_intraday_buy_20` placeholder)
 - **Test coverage:** `test/test_fno_intraday_buy_chartink.py` covers both 1.5 and 3.0 thresholds via monkeypatch
 
+### Scanner — Chartink SELL rule
+
+#### scan_definitions.id=2.rule_module
+- **Old value:** `fno_intraday_sell_20` (placeholder rule)
+- **New value:** `fno_intraday_sell_chartink`
+- **Set in:** `db/openalgo.db scan_definitions.id=2.rule_module` (DB row, not env)
+- **Date:** 2026-06-10 (post-close, ~17:08 IST)
+- **Why:** Today's scanner-vs-Chartink comparison showed the in-house SELL leg
+  fired on 209 of ~220 F&O stocks vs Chartink's 5 (Jaccard 0.024) — the
+  `fno_intraday_sell_20` placeholder is far too lenient. Swap to the
+  Chartink-equivalent mirror rule `fno_intraday_sell_chartink`. Mirror of the
+  BUY-side fix applied this morning (id=1 → `fno_intraday_buy_chartink`).
+- **Effective:** immediately. `ScannerService._evaluate_definitions`
+  (`services/scanner_service.py:901`) calls `get_scan_definitions(enabled_only=True)`
+  on every bar evaluation, and `get_scan_definitions` opens a fresh DB session
+  per call (`scanner_service.py:199`) — no boot cache. Rule
+  `fno_intraday_sell_chartink` is registered (verified via `get_rule`). No restart
+  required.
+
 ### sector_follow_cap5_vol — strategy
 
 #### SECTOR_FOLLOW_CAP5_VOL_MODE
