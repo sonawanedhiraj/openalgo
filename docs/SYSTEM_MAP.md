@@ -143,6 +143,33 @@ need no external scheduler.
   `bot_config.telegram_chat_ids` column on older DBs.
 - **Design:** [`docs/design/telegram_inbound.md`](design/telegram_inbound.md).
 
+### Simplified-engine EOD journal reconciliation
+
+- **Module:** `services/engine_eod_reconciliation_service.py`
+  (`reconcile_engine_journal(date=None, *, strategy_name, dry_run)`).
+- **Why:** the engine only writes a `trade_journal` exit row when *it* fires an
+  exit (stop/target/trailing/its own EOD flatten). Positions still open at the
+  close are flattened by **sandbox's own MIS auto-square-off**, which the engine
+  never journaled — so the Telegram EOD summary under-counted trades and P&L
+  (confirmed 2026-06-10: 4 entries, 1 journaled exit, 3 invisible square-offs;
+  +₹352 shown vs +₹8,327 real).
+- **What it does:** for each open journal row on the day, reads `sandbox.db`
+  (`sandbox_positions` flat-check + `sandbox_trades` closing fills, **read-only**)
+  and stamps the matching exit columns on the open row with
+  `exit_reason='sandbox_eod_squareoff'` and gross P&L. Multiple partial close
+  fills are summed into one exit row (qty-weighted avg price). Idempotent (the
+  `exited_at IS NULL` filter is the dedup key); mid-day safe (skips non-flat
+  positions); strategy-scoped so T+1/positional rows are never force-closed.
+- **Ordering (load-bearing):** the engine's `_maybe_log_eod_summary` calls
+  `_maybe_reconcile_eod_journal(today)` **first**, then reads the journal
+  aggregate and fires the Telegram EOD summary — so reconcile → summarize, and an
+  all-square-off day (empty in-memory ledger) still summarizes from the journal.
+- **Flag:** `ENGINE_EOD_RECONCILIATION_ENABLED` (default `true`; sandbox-mode
+  only) — see `docs/PARAMETER_LOG.md`.
+- **Backfill (operator-run, not wired):**
+  `services/engine_eod_reconciliation_backfill.py` runs reconciliation over a
+  date range; **dry-run by default**, writes only with `--apply`.
+
 ### E2E test suite
 
 - `test/e2e/test_critical_flows.py` — cross-component seam tests (mode resolution
@@ -161,6 +188,12 @@ need no external scheduler.
   mismatch; the Telegram line is now self-describing: "Realized (closed, gross,
   simplified-engine only) … see /mypnl for net account P&L"). Same hermetic pattern (temp/in-memory SQLite, mocked broker + veto,
   injected clock, no network). Investigation: `outputs/fno_eod_veto_investigation_2026-06-10/`.
+- `test/e2e/test_engine_eod_reconciliation.py` — EOD reconciliation (8 tests):
+  engine-exit no-op, sandbox square-off journaled, the full 2026-06-10 mixed-day
+  scenario (1 engine exit + 3 square-offs → 4 trades, correct total P&L),
+  idempotency, mid-day still-open no-op, multiple partial close fills summed into
+  one exit row, orphan-fill (no entry created), and past-date backfill. Both
+  `trade_journal_db` and `sandbox_db` rebound to temp SQLite — fully hermetic.
 
 ## Databases
 

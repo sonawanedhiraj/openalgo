@@ -136,6 +136,28 @@ the latest decisions automatically.
 - **History:**
   - **2026-06-10:** Introduced with `DATA_FRESHNESS_VALIDATION_ENABLED`. Default 1.
 
+### Simplified engine — EOD journal reconciliation
+
+#### ENGINE_EOD_RECONCILIATION_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env; read in
+  `services/simplified_stock_engine_service.py.SimplifiedStockEngineService._maybe_reconcile_eod_journal`
+  (via `_env_bool`)
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables)
+- **Effect:** master switch for the EOD reconciliation step. When `true` (and the
+  engine is in `sandbox` mode), the engine — right before it fires the Telegram
+  EOD summary — calls
+  `services/engine_eod_reconciliation_service.reconcile_engine_journal(today)`,
+  which closes any open `trade_journal` row whose sandbox position was already
+  flattened by sandbox's MIS auto-square-off (writing the missing exit row with
+  `exit_reason='sandbox_eod_squareoff'`). When `false`, the step is a no-op and
+  the journal under-reports square-off closures (the 2026-06-10 bug). Read-only on
+  `sandbox.db`; idempotent. No effect outside sandbox mode (live/disabled skip it).
+- **Who flips:** operator only (rollback lever — leave `true` for correct Telegram
+  EOD counts).
+- **History:**
+  - **2026-06-11:** Introduced. Default `true`.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

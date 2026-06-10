@@ -1305,20 +1305,67 @@ class SimplifiedStockEngineService:
             trades_snapshot = list(self.engine.completed_trades)
             self._eod_summary_done_date = now.date()
 
-        if not trades_snapshot:
+        # Reconcile sandbox MIS auto-square-off closures into the journal BEFORE
+        # summarizing, so the Telegram count + P&L include positions the engine
+        # never journaled (it only writes exits it fired itself). No-op outside
+        # sandbox mode and when no open rows remain. Must run before the
+        # empty-snapshot early-return below: a day where the engine fired *zero*
+        # exits (all closures via square-off) has an empty in-memory ledger but a
+        # journal that reconciliation can still complete.
+        self._maybe_reconcile_eod_journal(now.date())
+
+        # Did reconciliation (or the engine) leave anything to report? Read the
+        # journal aggregate so an all-square-off day still summarizes even though
+        # the in-memory snapshot is empty.
+        journal_count = 0
+        try:
+            from services import trade_journal_service
+
+            journal_count = int(trade_journal_service.get_today_summary().get("count", 0))
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning("[SIMPLIFIED-EOD-SUMMARY] journal count read failed: %s", e)
+
+        if not trades_snapshot and not journal_count:
             logger.info("[SIMPLIFIED-EOD-SUMMARY] No completed trades today (mode=%s)", self.mode)
             return
 
-        lines = self._build_eod_summary_lines(trades_snapshot, now.date())
-        # Single multi-line log entry so it's easy to find in error.jsonl / files.
-        logger.info("[SIMPLIFIED-EOD-SUMMARY]\n%s", "\n".join(lines))
+        if trades_snapshot:
+            lines = self._build_eod_summary_lines(trades_snapshot, now.date())
+            # Single multi-line log entry so it's easy to find in error.jsonl / files.
+            logger.info("[SIMPLIFIED-EOD-SUMMARY]\n%s", "\n".join(lines))
 
         # Fail-safe Telegram fan-out. The journal-derived aggregate is the
         # canonical source of truth (handles partial fills, rejected exits,
-        # multi-leg trades) — the engine's in-memory completed_trades is just
-        # a hot-path mirror. If the journal read fails, fall back to a
-        # minimal payload built from the snapshot above.
+        # multi-leg trades, AND sandbox square-offs reconciled just above) — the
+        # engine's in-memory completed_trades is just a hot-path mirror. If the
+        # journal read fails, fall back to a minimal payload from the snapshot.
         self._notify_eod_summary(trades_snapshot)
+
+    def _maybe_reconcile_eod_journal(self, today: dt.date) -> None:
+        """Pull sandbox EOD square-off closures into the journal. Fail-safe.
+
+        Only meaningful in sandbox mode (it reads ``sandbox.db``); a no-op in
+        live/disabled. Gated by ``ENGINE_EOD_RECONCILIATION_ENABLED`` (default
+        on) so the operator can roll it back without code changes. Idempotent —
+        safe to call repeatedly within the once-per-day EOD-summary guard.
+        """
+        if self.mode != MODE_SANDBOX:
+            return
+        if not _env_bool("ENGINE_EOD_RECONCILIATION_ENABLED", True):
+            return
+        try:
+            from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+            result = reconcile_engine_journal(
+                today, strategy_name=self.JOURNAL_STRATEGY_NAME
+            )
+            logger.info(
+                "[SIMPLIFIED-EOD-RECONCILE] checked=%d added=%d skipped=%d",
+                result.entries_checked, result.exits_added, len(result.skipped),
+            )
+        except Exception as e:  # noqa: BLE001 — fail-safe; a missed reconcile
+            # only under-reports, it never corrupts execution.
+            logger.warning("[SIMPLIFIED-EOD-RECONCILE] reconciliation failed: %s", e)
 
     def _build_eod_summary_lines(
         self, trades: list[CompletedTrade], today: dt.date

@@ -783,12 +783,28 @@ Key files:
 - `services/simplified_stock_engine_core.py` — broker-agnostic engine.
 - `services/simplified_stock_engine_service.py` — openalgo integration.
 - `services/simplified_stock_engine_ticklog.py` — async tick log writer.
+- `services/engine_eod_reconciliation_service.py` — EOD reconciliation (below).
 - `blueprints/chartink.py:947+` — webhook, status, direction-toggle routes.
 - `test/test_simplified_stock_engine_*.py` — 68 tests.
 
 The default mode is `sandbox` — orders flow into `sandbox.db` (virtual ₹1Cr
 capital) regardless of the global analyze_mode flag. Flip to `live` only
 after running the test suite and the smoke-boot checklist in the hand-off doc.
+
+**EOD journal reconciliation.** The engine only writes a `trade_journal` exit row
+when *it* fires an exit (stop/target/trailing/its own EOD flatten). In sandbox
+mode, positions still open at the close are flattened by sandbox's own MIS
+auto-square-off, which the engine never journaled — so the Telegram EOD summary
+under-counted trades and P&L (the 2026-06-10 bug: +₹352 shown vs +₹8,327 real).
+`services/engine_eod_reconciliation_service.reconcile_engine_journal()` closes
+that gap: before the Telegram EOD summary fires, `_maybe_log_eod_summary` calls
+`_maybe_reconcile_eod_journal(today)` (reconcile → summarize), which reads
+`sandbox.db` **read-only** and stamps the missing exit rows
+(`exit_reason='sandbox_eod_squareoff'`, gross P&L). Idempotent, mid-day safe,
+sandbox-only, gated by `ENGINE_EOD_RECONCILIATION_ENABLED` (default true). A
+past-date operator backfill lives in
+`services/engine_eod_reconciliation_backfill.py` (dry-run by default; `--apply`
+to write) and is **not** wired into the runtime.
 
 ## Unified strategy daily intent (`strategy_daily_intent`)
 

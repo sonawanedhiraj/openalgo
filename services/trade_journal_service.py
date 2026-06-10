@@ -344,6 +344,38 @@ def get_open_trades_today(strategy_name: str | None = None) -> list[dict]:
             pass
 
 
+def get_open_trades_for_date(date_iso: str, strategy_name: str | None = None) -> list[dict]:
+    """Return open journal rows entered on a specific IST calendar date.
+
+    Same shape as :func:`get_open_trades_today` but for an arbitrary
+    ``date_iso`` (``YYYY-MM-DD``) instead of "today". Used by EOD reconciliation
+    (today for the live job, a past date for the operator backfill) so a
+    historical day's still-open rows can be found even though they predate the
+    current IST date. "Open" means ``exited_at IS NULL``. Newest first. Returns
+    ``[]`` on DB failure.
+    """
+    sess = _session()
+    try:
+        q = (
+            sess.query(TradeJournal)
+            .filter(TradeJournal.exited_at.is_(None))
+            .filter(TradeJournal.placed_at >= date_iso)
+            .filter(TradeJournal.placed_at < date_iso + "~")  # ASCII '~' > digits/'T'
+        )
+        if strategy_name:
+            q = q.filter(TradeJournal.strategy_name == strategy_name)
+        rows = q.order_by(TradeJournal.placed_at.desc()).all()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as e:
+        logger.warning("trade_journal.get_open_trades_for_date failed: %s", e)
+        return []
+    finally:
+        try:
+            sess.remove()
+        except Exception:
+            pass
+
+
 def get_open_journal_id_for_symbol(symbol: str) -> int | None:
     """Returns the journal id of the most recent open entry on ``symbol``
     (i.e. ``exited_at IS NULL``). Used by the engine at exit time to find
