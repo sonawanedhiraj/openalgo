@@ -150,6 +150,15 @@ need no external scheduler.
   entry→exit cycle + kill switch + EOD file sink, and the Phase-6 Telegram inbound
   bot end-to-end). The DB layer is real but bound to a temp SQLite (no production
   DB touched); broker/Telegram boundaries are mocked. Run: `uv run pytest test/e2e/ -v`.
+- `test/e2e/test_fno_flows.py` — simplified-engine FnO + LLM veto critical flows
+  (21 tests): BUY/SELL breakout→sandbox order, journal entry/exit pairing, veto
+  shadow-vs-active enforcement, **veto direction consistency** (the TATAELXSI
+  regression anchor — an `xfail` that documents the SELL-reviewed-as-BUY bug until
+  the surfaced fix lands), ATR stop, RR trailing, daily kill switch, trade-limit
+  and cooldown gates, EOD square-off, and the Telegram EOD-summary semantics
+  (gross / realized / closed-only — the anchor for the Telegram-vs-`/mypnl`
+  mismatch). Same hermetic pattern (temp/in-memory SQLite, mocked broker + veto,
+  injected clock, no network). Investigation: `outputs/fno_eod_veto_investigation_2026-06-10/`.
 
 ## Databases
 
