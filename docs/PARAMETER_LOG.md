@@ -52,6 +52,35 @@ the latest decisions automatically.
   `test/test_sector_follow_service.py` and
   `test/test_simplified_stock_engine_service.py`.
 
+#### TELEGRAM_INBOUND_ENABLED
+- **Current value:** `false` (default; ships cold)
+- **Set in:** env var (not yet in `.sample.env` — operator WIP held that file;
+  add `TELEGRAM_INBOUND_ENABLED=false` there at next convenient edit). Read with
+  a safe default in `services/telegram_inbound_service.py:_inbound_enabled`
+  (default `false`).
+- **Code default:** `false` (`services/telegram_inbound_service._inbound_enabled`)
+- **What it gates:** when `true`, `init_telegram_inbound_service` (called at boot
+  from `app.py`) starts the Phase-6 INBOUND Telegram poller and registers the
+  08:45 IST `telegram_inbound_morning_prompt` APScheduler job. The bot lets the
+  operator set the unified `strategy_daily_intent` row (run/pause/halt + capital
+  cap) from the phone. When `false` (default) the whole module is a no-op — no
+  poller, no scheduler job. **Mode flips are never exposed via Telegram** (intent
+  axis + cap only); a Telegram intent change preserves the row's existing routing
+  mode. Authorization gates on the `bot_config.telegram_chat_ids` allowlist.
+- **History:**
+  - **2026-06-10:** Introduced with the Phase-6 inbound bot
+    (feat/sector-rotation-etf → `00737983`). Default `false` so deploy starts no
+    poller; operator opts in by adding their chat_id to
+    `bot_config.telegram_chat_ids` (or `add_authorized_chat_id`) and flipping the
+    flag to `true`, then restarting. Single-poller-per-token caveat: do not run
+    the full interactive `telegram_bot_service` poller on the same bot token
+    while this is enabled. Design: `docs/design/telegram_inbound.md`.
+- **Related state:** `db/openalgo.db` → `bot_config.telegram_chat_ids` (new column,
+  comma-separated allowlist; idempotent ALTER-TABLE migration adds it) and the
+  reused Fernet-encrypted `bot_config.token`; writes `strategy_daily_intent`.
+- **Test coverage:** `test/e2e/test_critical_flows.py`
+  (`TestTelegramInboundEndToEnd`, `TestChatAllowlist`).
+
 ### Scanner — Chartink BUY rule
 
 #### CHARTINK_RULE_BUY_GAP_PCT
