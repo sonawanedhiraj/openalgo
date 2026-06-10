@@ -108,3 +108,6 @@ nul
 
 # Self-hosted CI runner secret (PAT / registration token) — never commit
 ci/runner/.env.runner
+
+# sector_follow_cap5_vol Day-N EOD reports — observational, not source
+strategies/sector_follow_cap5_vol/eod_reports/

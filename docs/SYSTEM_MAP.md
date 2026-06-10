@@ -84,12 +84,17 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   | `sector_follow_entry` | 15:20 | Evaluate 30-name universe, select ≤5 gate-passers (vol-ratio tiebreaker), place/paper BUYs (mode-aware; honors kill switch + manual pause) |
   | `sector_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1 exit). Exits are **never** blocked by the kill switch |
   | `sector_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
-  | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) |
+  | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) **+** writes a Day-N markdown report to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` (independent sinks — one failing never blocks the other) |
 
 - **Kill switch:** trips when day P&L < −`daily_loss_kill_pct`% of capital (default 3%);
   blocks new entries for the session, open positions still run to their T+1 exit.
 - **DBs written:** `db/openalgo.db` → `sector_follow_trades` (trade journal, all
   modes) and `strategies` (one seeded row, natural key `name='sector_follow_cap5_vol'`).
+- **File output:** `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` —
+  one markdown file per trading day, written by the 15:30 IST `sector_follow_eod_summary`
+  APScheduler job. Mirrors the Telegram EOD summary content (date/mode, signals,
+  capital deployed, P&L, sector breakdown, per-position table, kill-switch state).
+  Git-ignored (observational, not source); path hardcoded (no env var).
 - **Logs:** standard `log/openalgo_YYYY-MM-DD.log` + `log/errors.jsonl` (no
   dedicated log file).
 - **Control API:** see "Strategy control endpoints" below.

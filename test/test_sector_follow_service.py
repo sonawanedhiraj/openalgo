@@ -430,5 +430,105 @@ def test_sector_index_subscription_includes_all_mapped():
     assert "NIFTY" in subs
 
 
+# --------------------------------------------------------------------------- #
+# Phase 5 — EOD markdown report file sink (alongside Telegram summary)
+# --------------------------------------------------------------------------- #
+def _eod_service_with_activity(mode="sandbox"):
+    """A service seeded with one open position + one closed exit for EOD tests."""
+    from services.sector_follow_service import PaperPosition
+
+    svc = _make_service(mode=mode)
+    svc.today_entries = [
+        {
+            "symbol": "AAA", "entry_time": "t", "entry_price": 100.0, "qty": 50,
+            "vol_ratio": 2.0, "sector": "NIFTY", "sector_ret": 0.018, "stock_ret": 0.009,
+        },
+    ]
+    # A prior-session position squared off today -> populates today_exits.
+    svc.place_exit(PaperPosition("BBB", 10, 1000.0, "2026-06-09", 2.0), price=1010.0)
+    # A position still open at EOD.
+    svc.paper_book["AAA"] = PaperPosition("AAA", 50, 100.0, "2026-06-10", 2.0)
+    return svc
+
+
+def test_format_eod_report_markdown_has_expected_sections():
+    svc = _eod_service_with_activity()
+    report = svc._format_eod_report_markdown(
+        journal_rows=list(svc.today_entries) + list(svc.today_exits),
+        positions=svc.open_positions_view(),
+        kill_switch_state={"active": False, "reason": None, "daily_pnl": 0.0},
+    )
+    # Header + mode.
+    assert "# sector_follow_cap5_vol — EOD Report 2026-06-10" in report
+    assert "- **Mode:** sandbox" in report
+    # Required sections.
+    for heading in ("## Summary", "## Sector breakdown", "## Positions",
+                    "## Kill switch (EOD)", "## Note — expected vs R40 baseline"):
+        assert heading in report
+    # Summary content.
+    assert "Signals fired / positions opened: 1" in report
+    assert "Open at EOD: 1 (T+1 exit 2026-06-11)" in report
+    assert "Exits today: 1" in report
+    # Sector breakdown shows the index + intraday %.
+    assert "NIFTY" in report
+    assert "+1.80%" in report
+    # Per-position table: open row (AAA) and closed row (BBB) with exact realized P&L.
+    assert "| AAA | NIFTY |" in report
+    assert "OPEN" in report
+    assert "CLOSED" in report
+    # BBB: (1010-1000)*10 = +100 realized; entry recovered as 1,000.00.
+    assert "+100" in report
+    assert "1,000.00" in report
+    assert "1,010.00" in report
+    # Kill switch + baseline note.
+    assert "State: inactive" in report
+    assert "Sharpe ~2.19" in report
+
+
+def test_eod_report_file_sink_writes_expected_path_and_content(tmp_path):
+    svc = _eod_service_with_activity()
+    svc.eod_reports_dir = tmp_path / "eod_reports"
+    out_path = svc._write_eod_report()
+    expected = tmp_path / "eod_reports" / "2026-06-10.md"
+    assert out_path == expected
+    assert expected.exists()
+    content = expected.read_text(encoding="utf-8")
+    assert "# sector_follow_cap5_vol — EOD Report 2026-06-10" in content
+    assert "## Positions" in content
+
+
+def test_run_eod_summary_telegram_failure_does_not_block_file_sink(tmp_path):
+    notified = []
+
+    def boom_notifier(msg):
+        notified.append(msg)
+        raise RuntimeError("telegram down")
+
+    svc = _make_service(mode="sandbox")
+    svc._notify = boom_notifier
+    svc.eod_reports_dir = tmp_path / "eod_reports"
+    # Should not raise despite the Telegram failure.
+    svc.run_eod_summary()
+    # File still written.
+    assert (tmp_path / "eod_reports" / "2026-06-10.md").exists()
+    # Telegram was still attempted.
+    assert len(notified) == 1
+
+
+def test_run_eod_summary_file_failure_does_not_block_telegram(tmp_path):
+    notified = []
+    svc = _make_service(mode="sandbox")
+    svc._notify = lambda msg: notified.append(msg)
+    # Point the report dir at a path whose parent is a FILE -> mkdir fails.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir", encoding="utf-8")
+    svc.eod_reports_dir = blocker / "eod_reports"
+    # Should not raise despite the file-sink failure.
+    svc.run_eod_summary()
+    # Telegram still delivered.
+    assert len(notified) == 1
+    assert "sector_follow_cap5_vol EOD" in notified[0]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

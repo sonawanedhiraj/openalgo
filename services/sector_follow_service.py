@@ -39,6 +39,9 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 _STRATEGY_DIR = Path(__file__).resolve().parents[1] / "strategies" / "sector_follow_cap5_vol"
 _DEFAULT_CONFIG_PATH = _STRATEGY_DIR / "config_snapshot.json"
 _DEFAULT_SECTOR_MAP_PATH = _STRATEGY_DIR / "sector_map.json"
+# Day-N EOD markdown reports (mirror of the 15:30 IST Telegram summary). Path is
+# hardcoded (no env var); the instance attribute below lets tests redirect it.
+_EOD_REPORTS_DIR = _STRATEGY_DIR / "eod_reports"
 
 VALID_MODES = ("scaffold", "sandbox", "live")
 
@@ -390,6 +393,9 @@ class SectorFollowService:
         self._record_trade = trade_recorder or self._default_trade_recorder
         self._open_positions_loader = open_positions_loader
         self._now = now or (lambda: datetime.now(_IST))
+        # Where the Day-N EOD markdown report is written. Hardcoded default;
+        # tests override this attribute to point at a tmp dir.
+        self.eod_reports_dir = _EOD_REPORTS_DIR
 
         # Mutable runtime state.
         self.paper_book: dict[str, PaperPosition] = {}
@@ -608,6 +614,11 @@ class SectorFollowService:
                 "entry_price": price,
                 "qty": qty,
                 "vol_ratio": candidate.get("vol_ratio"),
+                # Sector context for the EOD report's sector breakdown (observability
+                # only — not read by any trading-decision path).
+                "sector": self.sector_map.get(symbol, "NIFTY"),
+                "sector_ret": candidate.get("sector_ret"),
+                "stock_ret": candidate.get("stock_ret"),
             }
         )
         return {"symbol": symbol, "quantity": qty, "price": price, "order_id": order_id}
@@ -855,10 +866,174 @@ class SectorFollowService:
             f"Kill switch: {ks}"
         )
 
+    def _format_eod_report_markdown(
+        self, journal_rows: list, positions: list, kill_switch_state: dict
+    ) -> str:
+        """Build the Day-N markdown EOD report mirroring the Telegram summary.
+
+        Args:
+            journal_rows: the day's journal — ``today_entries`` + ``today_exits``
+                concatenated. Entry rows carry an ``entry_time`` key; exit rows
+                carry an ``exit_time`` key, which is how they are told apart.
+            positions: open positions as ``open_positions_view()`` dicts (each
+                with live MTM net).
+            kill_switch_state: ``{active, reason, daily_pnl}`` at EOD.
+
+        Returns:
+            A markdown string. Pure formatting — no I/O, never raises on empty
+            inputs.
+        """
+        as_of = self._now()
+        date_str = as_of.date().isoformat()
+        next_day = (as_of.date() + timedelta(days=1)).isoformat()
+
+        entries = [r for r in journal_rows if "exit_time" not in r]
+        exits = [r for r in journal_rows if "exit_time" in r]
+
+        realized_pnl = sum(x.get("pnl_net", 0.0) for x in exits)
+        capital_deployed = sum(
+            (e.get("entry_price") or 0.0) * (e.get("qty") or 0) for e in entries
+        )
+
+        ks_active = kill_switch_state.get("active", False)
+        ks_reason = kill_switch_state.get("reason")
+        ks_line = f"active ({ks_reason})" if ks_active else "inactive"
+
+        lines: list[str] = []
+        lines.append(f"# sector_follow_cap5_vol — EOD Report {date_str}")
+        lines.append("")
+        lines.append(f"- **Mode:** {self.mode}")
+        lines.append(f"- **Generated:** {as_of.isoformat()}")
+        if self.manual_pause:
+            lines.append("- **Manual pause:** active")
+        lines.append("")
+
+        lines.append("## Summary")
+        lines.append("")
+        lines.append(f"- Signals fired / positions opened: {len(entries)}")
+        lines.append(f"- Open at EOD: {len(positions)} (T+1 exit {next_day})")
+        lines.append(f"- Exits today: {len(exits)}")
+        lines.append(f"- Capital deployed (entry notional): ₹{capital_deployed:,.0f}")
+        if exits:
+            lines.append(f"- Realized net P&L: ₹{realized_pnl:+,.0f}")
+        else:
+            lines.append("- Realized net P&L: — (no exits today)")
+        lines.append("")
+
+        lines.append("## Sector breakdown")
+        lines.append("")
+        if entries:
+            lines.append("| Sector index | Stocks | Sector intraday % |")
+            lines.append("| --- | --- | --- |")
+            by_sector: dict[str, dict] = {}
+            for e in entries:
+                sym = e.get("symbol")
+                sector = e.get("sector") or self.sector_map.get(sym, "NIFTY")
+                bucket = by_sector.setdefault(
+                    sector, {"syms": [], "sector_ret": e.get("sector_ret")}
+                )
+                bucket["syms"].append(sym)
+                if bucket["sector_ret"] is None:
+                    bucket["sector_ret"] = e.get("sector_ret")
+            for sector, info in sorted(by_sector.items()):
+                sr = info["sector_ret"]
+                sr_str = f"{sr * 100:+.2f}%" if isinstance(sr, (int, float)) else "—"
+                lines.append(f"| {sector} | {', '.join(info['syms'])} | {sr_str} |")
+        else:
+            lines.append("_No entries today._")
+        lines.append("")
+
+        lines.append("## Positions")
+        lines.append("")
+        lines.append("| Symbol | Sector | Entry ₹ | Qty | Status | Exit ₹ | P&L ₹ |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for p in positions:
+            sym = p.get("symbol")
+            sector = self.sector_map.get(sym, "NIFTY")
+            entry = p.get("entry_price")
+            qty = p.get("qty")
+            mtm = p.get("mtm_pnl_net")
+            entry_str = f"{entry:,.2f}" if isinstance(entry, (int, float)) else "—"
+            pnl_str = (
+                f"{mtm:+,.0f} (unrl)" if isinstance(mtm, (int, float)) else "— (unrl)"
+            )
+            lines.append(f"| {sym} | {sector} | {entry_str} | {qty} | OPEN | — | {pnl_str} |")
+        for x in exits:
+            sym = x.get("symbol")
+            sector = self.sector_map.get(sym, "NIFTY")
+            qty = x.get("qty") or 0
+            exit_price = x.get("exit_price")
+            pnl = x.get("pnl_net", 0.0)
+            # today_exits doesn't store the entry price; recover it exactly from
+            # the realized P&L: entry = exit - pnl/qty.
+            entry = (exit_price - pnl / qty) if (qty and exit_price is not None) else None
+            entry_str = f"{entry:,.2f}" if entry is not None else "—"
+            exit_str = f"{exit_price:,.2f}" if isinstance(exit_price, (int, float)) else "—"
+            lines.append(
+                f"| {sym} | {sector} | {entry_str} | {qty} | CLOSED | {exit_str} | {pnl:+,.0f} |"
+            )
+        if not positions and not exits:
+            lines.append("| _none_ | | | | | | |")
+        lines.append("")
+
+        lines.append("## Kill switch (EOD)")
+        lines.append("")
+        lines.append(f"- State: {ks_line}")
+        if isinstance(kill_switch_state.get("daily_pnl"), (int, float)):
+            lines.append(f"- Daily P&L tracked: ₹{kill_switch_state['daily_pnl']:+,.0f}")
+        lines.append(
+            f"- Daily-loss kill threshold: {self.config.daily_loss_kill_pct:.1f}% of capital"
+        )
+        lines.append("")
+
+        lines.append("## Note — expected vs R40 baseline")
+        lines.append("")
+        lines.append(
+            "> R40 (`V_SF_CAP5_VOL`) backtest baseline was Sharpe ~2.19; the honest "
+            "15:20-snapshot baseline is ~1.70 (see LEARNINGS.md). This report is "
+            "observational — it does NOT recompute Sharpe or compare statistically."
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _write_eod_report(self) -> Path:
+        """Write the Day-N markdown report to ``eod_reports/YYYY-MM-DD.md``.
+
+        Returns the path written. Raises on I/O failure — the caller
+        (``run_eod_summary``) wraps this best-effort so a write failure never
+        blocks the Telegram summary.
+        """
+        report = self._format_eod_report_markdown(
+            journal_rows=list(self.today_entries) + list(self.today_exits),
+            positions=self.open_positions_view(),
+            kill_switch_state={
+                "active": self.kill_switch_active,
+                "reason": self.kill_switch_reason,
+                "daily_pnl": self.daily_pnl,
+            },
+        )
+        out_dir = Path(self.eod_reports_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{self._now().date().isoformat()}.md"
+        out_path.write_text(report, encoding="utf-8")
+        logger.info("sector_follow EOD report written to %s", out_path)
+        return out_path
+
     def run_eod_summary(self) -> str:
-        """15:30 IST: broadcast the EOD summary (best-effort; silent if TG off)."""
+        """15:30 IST: write the Day-N markdown report to disk AND broadcast the
+        Telegram summary. The two sinks are independent — one failing is logged
+        but never blocks the other (best-effort)."""
         msg = self.build_eod_summary()
-        self._notify(msg)
+        # File sink (markdown Day-N report mirror of the Telegram summary).
+        try:
+            self._write_eod_report()
+        except Exception as e:
+            logger.exception("sector_follow EOD report file sink failed: %s", e)
+        # Telegram summary (unchanged content/format).
+        try:
+            self._notify(msg)
+        except Exception as e:
+            logger.exception("sector_follow EOD Telegram summary failed: %s", e)
         logger.info("sector_follow EOD summary emitted")
         return msg
 

@@ -722,6 +722,8 @@ status/positions/pause/resume/close_all),
 `services/sector_follow_index_backfill.py` (daily 16:05 IST sector-index 1m
 refresh, gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`). Plan + locked operator
 decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follow_cap5_vol/PLAN.md).
+Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
+at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
