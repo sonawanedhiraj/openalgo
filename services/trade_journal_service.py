@@ -28,6 +28,24 @@ logger = get_logger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def _alert_operator(message: str) -> None:
+    """Best-effort operator escalation for a journal-write failure that follows
+    a placed order. Fully fail-safe — a missing/failed alert path must never
+    break the (already fail-safe) journal write. Lazily imported to avoid an
+    import cycle and to keep this module dependency-light.
+    """
+    try:
+        from services.notification_service import get_notification_service
+
+        get_notification_service().publish_anomaly(
+            source="trade_journal_service",
+            message=message,
+            severity="error",
+        )
+    except Exception:  # noqa: BLE001 — alert must never raise
+        pass
+
+
 def _session():
     """Resolve the live session from the DB module on each call.
 
@@ -45,7 +63,7 @@ def _json_or_none(value: Any) -> str | None:
     try:
         return json.dumps(value, default=str)
     except (TypeError, ValueError) as e:
-        logger.warning("trade_journal: failed to JSON-encode field: %s", e)
+        logger.exception("trade_journal: failed to JSON-encode field: %s", e)
         return None
 
 
@@ -107,7 +125,15 @@ def record_entry(
         sess.commit()
         return int(row.id)
     except Exception as e:
-        logger.warning("trade_journal.record_entry failed: %s", e)
+        # A journal-write failure here follows a broker-accepted order — the
+        # order is live but untracked. Escalate to errors.jsonl + operator
+        # (silent-drop audit P1-4). Keep the fail-safe 0 return so order flow
+        # never breaks on an audit miss.
+        logger.exception("trade_journal.record_entry failed: %s", e)
+        _alert_operator(
+            f"Journal record_entry failed for {symbol} {direction} "
+            f"(order={entry_order_id}) — order may be live but unjournaled; reconcile."
+        )
         try:
             sess.rollback()
         except Exception:
@@ -137,7 +163,7 @@ def update_entry_fill(
     try:
         row = sess.query(TradeJournal).filter_by(id=journal_id).first()
         if row is None:
-            logger.warning(
+            logger.error(
                 "trade_journal.update_entry_fill: journal_id=%s not found", journal_id
             )
             return
@@ -147,8 +173,11 @@ def update_entry_fill(
         row.updated_at = _now_iso()
         sess.commit()
     except Exception as e:
-        logger.warning(
+        logger.exception(
             "trade_journal.update_entry_fill failed (id=%s): %s", journal_id, e
+        )
+        _alert_operator(
+            f"Journal update_entry_fill failed (id={journal_id}) — reconcile fill price."
         )
         try:
             sess.rollback()
@@ -185,7 +214,7 @@ def record_exit(
     try:
         row = sess.query(TradeJournal).filter_by(id=journal_id).first()
         if row is None:
-            logger.warning(
+            logger.error(
                 "trade_journal.record_exit: journal_id=%s not found", journal_id
             )
             return
@@ -238,7 +267,10 @@ def record_exit(
         row.updated_at = now_iso
         sess.commit()
     except Exception as e:
-        logger.warning("trade_journal.record_exit failed (id=%s): %s", journal_id, e)
+        logger.exception("trade_journal.record_exit failed (id=%s): %s", journal_id, e)
+        _alert_operator(
+            f"Journal record_exit failed (id={journal_id}) — exit not recorded; reconcile."
+        )
         try:
             sess.rollback()
         except Exception:
@@ -272,7 +304,7 @@ def get_recent_trades(hours: int = 24) -> list[dict]:
         )
         return [_row_to_dict(r) for r in rows]
     except Exception as e:
-        logger.warning("trade_journal.get_recent_trades failed: %s", e)
+        logger.exception("trade_journal.get_recent_trades failed: %s", e)
         return []
     finally:
         try:
@@ -296,7 +328,7 @@ def get_trades_for_symbol(symbol: str, days: int = 7) -> list[dict]:
         )
         return [_row_to_dict(r) for r in rows]
     except Exception as e:
-        logger.warning("trade_journal.get_trades_for_symbol failed: %s", e)
+        logger.exception("trade_journal.get_trades_for_symbol failed: %s", e)
         return []
     finally:
         try:
@@ -335,7 +367,7 @@ def get_open_trades_today(strategy_name: str | None = None) -> list[dict]:
         rows = q.order_by(TradeJournal.placed_at.desc()).all()
         return [_row_to_dict(r) for r in rows]
     except Exception as e:
-        logger.warning("trade_journal.get_open_trades_today failed: %s", e)
+        logger.exception("trade_journal.get_open_trades_today failed: %s", e)
         return []
     finally:
         try:
@@ -367,7 +399,7 @@ def get_open_trades_for_date(date_iso: str, strategy_name: str | None = None) ->
         rows = q.order_by(TradeJournal.placed_at.desc()).all()
         return [_row_to_dict(r) for r in rows]
     except Exception as e:
-        logger.warning("trade_journal.get_open_trades_for_date failed: %s", e)
+        logger.exception("trade_journal.get_open_trades_for_date failed: %s", e)
         return []
     finally:
         try:
@@ -395,7 +427,7 @@ def get_open_journal_id_for_symbol(symbol: str) -> int | None:
         )
         return int(row.id) if row else None
     except Exception as e:
-        logger.warning(
+        logger.exception(
             "trade_journal.get_open_journal_id_for_symbol failed: %s", e
         )
         return None
@@ -442,7 +474,7 @@ def get_today_summary() -> dict:
             .all()
         )
     except Exception as e:
-        logger.warning("trade_journal.get_today_summary failed: %s", e)
+        logger.exception("trade_journal.get_today_summary failed: %s", e)
         return empty
     finally:
         try:

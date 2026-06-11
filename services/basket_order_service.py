@@ -138,8 +138,14 @@ def place_single_order(
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
         if res.status == 200:
-            # No per-order event emission - a summary event is emitted at the end of all orders
-            return {"symbol": order_data["symbol"], "status": "success", "orderid": order_id}
+            # Genuine per-order success (broker returned 200) — a SINGLE-order result, not
+            # the multi-order aggregation envelope the guard targets. The basket-level status
+            # is computed from these per-order results below (silent-drop audit P0-1).
+            return {  # nosemgrep: hardcoded-success-envelope -- benign per-order success
+                "symbol": order_data["symbol"],
+                "status": "success",
+                "orderid": order_id,
+            }
         else:
             message = (
                 response_data.get("message", "Failed to place order")
@@ -283,8 +289,11 @@ def process_basket_order_with_auth(
             )
 
             if success:
+                # Genuine per-order success — a single order, not the multi-order
+                # aggregation envelope the guard targets. The basket-level status is
+                # computed from these results below (silent-drop audit P0-1).
                 analyze_results.append(
-                    {
+                    {  # nosemgrep: hardcoded-success-envelope -- benign per-order success
                         "symbol": order.get("symbol", "Unknown"),
                         "status": "success",
                         "orderid": response.get("orderid"),
@@ -301,13 +310,28 @@ def process_basket_order_with_auth(
                     }
                 )
 
-        response_data = {"mode": "analyze", "status": "success", "results": analyze_results}
+        # Reflect the actual per-order outcome in the top-level status rather
+        # than hardcoding "success" (silent-drop audit P0-1, analyze path).
+        successful_orders = sum(1 for r in analyze_results if r.get("status") == "success")
+        if successful_orders == 0:
+            overall_status = "error"
+        elif successful_orders < total_orders:
+            overall_status = "partial"
+        else:
+            overall_status = "success"
+        response_data = {
+            "mode": "analyze",
+            "status": overall_status,
+            "successful_orders": successful_orders,
+            "failed_orders": total_orders - successful_orders,
+            "total_orders": total_orders,
+            "results": analyze_results,
+        }
 
         # Store complete request data without apikey
         analyzer_request = basket_request_data.copy()
         analyzer_request["api_type"] = "basketorder"
 
-        successful_orders = sum(1 for r in analyze_results if r.get("status") == "success")
         bus.publish(BasketCompletedEvent(
             mode="analyze",
             api_type="basketorder",
@@ -376,10 +400,30 @@ def process_basket_order_with_auth(
                 if result:
                     results.append(result)
 
-    # Log the basket order results
-    response_data = {"status": "success", "results": results}
-
+    # Log the basket order results. The top-level status must reflect the
+    # actual per-order outcome, not a hardcoded "success" — a basket where the
+    # broker rejected every order must NOT report success to the caller
+    # (silent-drop audit P0-1, basket_order_service:380).
     successful_orders = sum(1 for r in results if r.get("status") == "success")
+    n_total = len(results)
+    if successful_orders == 0:
+        overall_status = "error"
+        overall_message = "All orders failed"
+    elif successful_orders < n_total:
+        overall_status = "partial"
+        overall_message = f"{successful_orders}/{n_total} orders succeeded"
+    else:
+        overall_status = "success"
+        overall_message = "All orders placed"
+    response_data = {
+        "status": overall_status,
+        "message": overall_message,
+        "successful_orders": successful_orders,
+        "failed_orders": n_total - successful_orders,
+        "total_orders": n_total,
+        "results": results,
+    }
+
     bus.publish(BasketCompletedEvent(
         mode="live",
         api_type="basketorder",

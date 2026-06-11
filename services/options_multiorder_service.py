@@ -167,7 +167,9 @@ def place_single_split_order_for_leg(
         )
 
         if success:
-            return {
+            # Genuine per-sub-order success — a single split sub-order, not the
+            # leg/spread aggregation envelope the guard targets (silent-drop audit P1-3).
+            return {  # nosemgrep: hardcoded-success-envelope -- benign per-sub-order success
                 "order_num": order_num,
                 "quantity": int(order_data["quantity"]),
                 "status": "success",
@@ -323,9 +325,43 @@ def resolve_and_place_leg(
                 )
                 split_results.append(result)
 
-            # Determine overall status
+            # Determine overall status. A leg with split sub-orders is only
+            # fully filled when ALL sub-orders succeed — reporting success on
+            # >=1 fill masks an under-filled (directionally-naked) leg
+            # (silent-drop audit P1-3, options_multiorder_service:328).
             successful_orders = sum(1 for r in split_results if r.get("status") == "success")
-            overall_status = "success" if successful_orders > 0 else "error"
+            n_splits = len(split_results)
+            if successful_orders == 0:
+                overall_status = "error"
+            elif successful_orders < n_splits:
+                overall_status = "partial"
+                # A partially-filled leg is a real risk (unbalanced spread).
+                # Log at ERROR so it reaches errors.jsonl, and escalate.
+                logger.error(
+                    "Partial split fill on leg %s (%s %s): %s/%s sub-orders filled "
+                    "— leg may be under-filled / spread unbalanced",
+                    leg_index + 1,
+                    resolved_symbol,
+                    leg_data.get("action", "").upper(),
+                    successful_orders,
+                    n_splits,
+                )
+                try:
+                    from services.notification_service import get_notification_service
+
+                    get_notification_service().publish_anomaly(
+                        source="options_multiorder_service.split_leg",
+                        message=(
+                            f"Partial split fill: leg {leg_index + 1} {resolved_symbol} "
+                            f"{leg_data.get('action', '').upper()} — "
+                            f"{successful_orders}/{n_splits} sub-orders filled"
+                        ),
+                        severity="error",
+                    )
+                except Exception:  # noqa: BLE001 — alert must never break order flow
+                    pass
+            else:
+                overall_status = "success"
 
             return {
                 "leg": leg_index + 1,
@@ -335,6 +371,8 @@ def resolve_and_place_leg(
                 "option_type": leg_data.get("option_type", "").upper(),
                 "action": leg_data.get("action", "").upper(),
                 "status": overall_status,
+                "successful_orders": successful_orders,
+                "total_split_orders": n_splits,
                 "total_quantity": total_quantity,
                 "split_size": splitsize,
                 "split_results": split_results,
@@ -372,7 +410,9 @@ def resolve_and_place_leg(
         )
 
         if success:
-            result = {
+            # Genuine per-leg success (single non-split order filled) — not the
+            # spread aggregation envelope the guard targets (silent-drop audit P1-3).
+            result = {  # nosemgrep: hardcoded-success-envelope -- benign per-leg success
                 "leg": leg_index + 1,
                 "symbol": resolved_symbol,
                 "exchange": resolved_exchange,
@@ -532,10 +572,23 @@ def process_multiorder_with_auth(
     successful_legs = sum(1 for r in results if r.get("status") == "success")
     failed_legs = len(results) - successful_legs
 
-    # Build response
+    # Build response. The top-level status must reflect the actual per-leg
+    # outcome — a spread where every leg was rejected must NOT report success,
+    # and a spread with some legs filled/partial is "partial" (silent-drop
+    # audit P0/P1 aggregation class — same shape as basket_order_service:380).
     mode = "analyze" if get_analyze_mode() else "live"
+    total_legs_done = len(results)
+    if successful_legs == 0:
+        overall_status = "error"
+    elif successful_legs < total_legs_done:
+        overall_status = "partial"
+    else:
+        overall_status = "success"
     response_data = {
-        "status": "success",
+        "status": overall_status,
+        "successful_legs": successful_legs,
+        "failed_legs": failed_legs,
+        "total_legs": total_legs_done,
         "underlying": common_data.get("underlying"),
         "underlying_ltp": underlying_ltp,
         "results": results,

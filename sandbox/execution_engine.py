@@ -383,9 +383,13 @@ class ExecutionEngine:
             order.pending_quantity = 0
             order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
 
-            db_session.commit()
-
-            # Update position
+            # Update position FIRST, in the same open transaction. Do NOT commit
+            # the trade row / order='complete' before this: _update_position
+            # commits once at the end, so a single atomic commit covers the
+            # trade row, the order update, and the position. If _update_position
+            # raises, its rollback discards the not-yet-committed trade row and
+            # order update too — preventing a banked fill with no matching
+            # position (silent-drop audit P1-2, execution_engine:386).
             self._update_position(order, execution_price)
 
             logger.info(f"Order {order.orderid} executed successfully. Trade ID: {tradeid}")

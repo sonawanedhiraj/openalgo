@@ -190,6 +190,81 @@ def test_basket_rejects_when_disabled(fresh_intent_db, monkeypatch):
     broker_place.assert_not_called()
 
 
+def _multi_basket(symbols):
+    return {
+        "apikey": "test-api-key",
+        "strategy": "ut",
+        "orders": [
+            {
+                "symbol": s,
+                "exchange": "NSE",
+                "action": "BUY",
+                "quantity": 1,
+                "pricetype": "MARKET",
+                "product": "MIS",
+            }
+            for s in symbols
+        ],
+    }
+
+
+def test_basket_all_orders_failed_reports_error(fresh_intent_db, monkeypatch):
+    """Silent-drop P0-1: a basket where the broker rejects EVERY order must
+    NOT report top-level status="success"."""
+    from services import basket_order_service
+    from services.mode_service import set_daily_intent
+
+    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
+    _patch_modes(monkeypatch)
+
+    def _reject(order_data, auth_token):
+        return SimpleNamespace(status=400), {"message": "rejected"}, None
+
+    monkeypatch.setattr(
+        basket_order_service, "import_broker_module",
+        lambda _b: SimpleNamespace(place_order_api=_reject),
+    )
+
+    basket = _multi_basket(["INFY", "SBIN"])
+    success, response, status = basket_order_service.process_basket_order_with_auth(
+        basket, auth_token="dummy", broker="zerodha", original_data=basket,
+    )
+
+    assert response["status"] == "error"
+    assert response["successful_orders"] == 0
+    assert response["failed_orders"] == 2
+    assert response["total_orders"] == 2
+
+
+def test_basket_partial_fill_reports_partial(fresh_intent_db, monkeypatch):
+    """Silent-drop P0-1: a basket where some orders fill and some are rejected
+    must report top-level status="partial"."""
+    from services import basket_order_service
+    from services.mode_service import set_daily_intent
+
+    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
+    _patch_modes(monkeypatch)
+
+    def _mixed(order_data, auth_token):
+        if order_data["symbol"] == "INFY":
+            return SimpleNamespace(status=200), {"status": "ok"}, "OID-1"
+        return SimpleNamespace(status=400), {"message": "rejected"}, None
+
+    monkeypatch.setattr(
+        basket_order_service, "import_broker_module",
+        lambda _b: SimpleNamespace(place_order_api=_mixed),
+    )
+
+    basket = _multi_basket(["INFY", "SBIN", "TCS"])
+    success, response, status = basket_order_service.process_basket_order_with_auth(
+        basket, auth_token="dummy", broker="zerodha", original_data=basket,
+    )
+
+    assert response["status"] == "partial"
+    assert response["successful_orders"] == 1
+    assert response["failed_orders"] == 2
+
+
 def test_basket_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
     from services import basket_order_service
     from services.mode_service import set_daily_intent

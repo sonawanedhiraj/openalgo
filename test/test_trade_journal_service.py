@@ -432,6 +432,51 @@ def test_record_exit_failure_does_not_raise(fresh_journal_db, monkeypatch):
     tjs.record_exit(jid, exit_price=110.0, exit_reason="target")
 
 
+def test_record_entry_failure_escalates_to_exception_and_alert(monkeypatch, caplog):
+    """Silent-drop P1-4: a journal-write failure AFTER a placed order must
+    escalate to logger.exception (-> errors.jsonl) AND alert the operator,
+    not log a swallowed warning."""
+    import logging
+
+    from database import trade_journal_db as tjdb
+    from services import trade_journal_service as tjs
+
+    class _BrokenSession:
+        def add(self, *a, **kw):
+            raise RuntimeError("simulated DB outage")
+
+        def commit(self):
+            raise RuntimeError("simulated DB outage")
+
+        def rollback(self):
+            return None
+
+        def remove(self):
+            return None
+
+    monkeypatch.setattr(tjdb, "db_session", _BrokenSession())
+
+    alerts = []
+    monkeypatch.setattr(tjs, "_alert_operator", lambda msg: alerts.append(msg))
+
+    with caplog.at_level(logging.ERROR):
+        jid = tjs.record_entry(
+            symbol="X",
+            direction="LONG",
+            quantity=1,
+            strategy_name="simplified_stock_engine",
+            signal_source="chartink",
+            entry_order_id="OID-9",
+        )
+
+    # Fail-safe sentinel preserved (order flow never breaks).
+    assert jid == 0
+    # Escalated at ERROR+ (logger.exception), so it reaches errors.jsonl.
+    assert any(rec.levelno >= logging.ERROR for rec in caplog.records)
+    # Operator was alerted with the order id for reconciliation.
+    assert alerts and "OID-9" in alerts[0]
+
+
 def test_read_helpers_return_empty_on_failure(monkeypatch):
     """When the DB is broken, read helpers must produce empty containers."""
     from database import trade_journal_db as tjdb
