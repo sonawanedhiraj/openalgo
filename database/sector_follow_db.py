@@ -62,14 +62,53 @@ class SectorFollowTrade(Base):
     stock_ret = Column(Float, nullable=True)
     sector_ret = Column(Float, nullable=True)
     order_id = Column(String(64), nullable=True)  # broker/sandbox order id if placed
+    # Order outcome so a failed/rejected attempt is never silently dropped:
+    #   placed   — order accepted (orderid present or broker status=success)
+    #   rejected — broker/sandbox returned an error response
+    #   exception — order placement raised
+    #   scaffold — scaffold mode, no order routed
+    status = Column(String(12), nullable=False, default="placed")
+    error_message = Column(String(255), nullable=True)  # broker/exception message on failure
     note = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+def _ensure_columns():
+    """Idempotently add columns introduced after the table's first creation.
+
+    ``Base.metadata.create_all`` only creates *new* tables — it never alters an
+    existing one. ``status``/``error_message`` were added after the table shipped,
+    so back-fill them on existing DBs via SQLite ``ALTER TABLE ADD COLUMN`` (a
+    constant DEFAULT is allowed). No-op when the columns already exist.
+    """
+    from sqlalchemy import text
+
+    wanted = {
+        "status": "VARCHAR(12) NOT NULL DEFAULT 'placed'",
+        "error_message": "VARCHAR(255)",
+    }
+    try:
+        with engine.connect() as conn:
+            existing = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(sector_follow_trades)"))
+            }
+            for col, ddl in wanted.items():
+                if col not in existing:
+                    conn.execute(
+                        text(f"ALTER TABLE sector_follow_trades ADD COLUMN {col} {ddl}")
+                    )
+                    logger.info("sector_follow_trades: added column %s", col)
+            conn.commit()
+    except Exception as e:
+        logger.exception(f"Failed to ensure sector_follow_trades columns: {e}")
 
 
 def init_db():
     """Create the sector_follow_trades table if it does not exist (idempotent)."""
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_columns()
         logger.info("sector_follow_trades table ready")
     except Exception as e:
         logger.exception(f"Failed to init sector_follow_trades table: {e}")
@@ -90,6 +129,8 @@ def record_trade(
     stock_ret=None,
     sector_ret=None,
     order_id=None,
+    status="placed",
+    error_message=None,
     note=None,
 ):
     """Insert one trade-journal row. Returns the row id, or None on failure."""
@@ -108,6 +149,8 @@ def record_trade(
             stock_ret=stock_ret,
             sector_ret=sector_ret,
             order_id=order_id,
+            status=status,
+            error_message=error_message,
             note=note,
         )
         db_session.add(row)

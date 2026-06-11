@@ -610,27 +610,70 @@ class SectorFollowService:
 
         entry_date = entry_date or self._now().date().isoformat()
         order_id = None
+        status = "scaffold"
+        error_message = None
         if self.mode == "scaffold":
             logger.info(
                 "[scaffold] sector_follow ENTRY %s qty=%d @ %.2f (vol_ratio=%.2f) — NO ORDER",
                 symbol, qty, price, candidate.get("vol_ratio", 0.0),
             )
         else:
-            resp = self._order_placer(
-                self.mode,
-                {
-                    "symbol": symbol,
-                    "exchange": self.config.exchange,
-                    "action": "BUY",
-                    "product": self.config.product,
-                    "quantity": qty,
-                },
-            )
-            order_id = (resp or {}).get("orderid")
-            logger.info(
-                "[%s] sector_follow ENTRY %s qty=%d @ %.2f order_id=%s",
-                self.mode, symbol, qty, price, order_id,
-            )
+            # Order placement can both throw AND return an error response. Treat
+            # either as a failed attempt: journal it (so the operator sees what was
+            # tried) but DO NOT create a phantom open position. An exception here
+            # must not abort the rest of the entry batch either.
+            try:
+                resp = self._order_placer(
+                    self.mode,
+                    {
+                        "symbol": symbol,
+                        "exchange": self.config.exchange,
+                        "action": "BUY",
+                        "product": self.config.product,
+                        "quantity": qty,
+                    },
+                )
+            except Exception as e:
+                logger.exception("sector_follow ENTRY placement raised: %s", symbol)
+                resp = {"status": "error", "message": str(e)}
+                status = "exception"
+            resp = resp or {}
+            order_id = resp.get("orderid")
+            if status != "exception":
+                status = (
+                    "placed" if str(resp.get("status", "")).lower() == "success" else "rejected"
+                )
+            if status == "placed":
+                logger.info(
+                    "[%s] sector_follow ENTRY %s qty=%d @ %.2f order_id=%s",
+                    self.mode, symbol, qty, price, order_id,
+                )
+            else:
+                error_message = str(
+                    resp.get("message") or resp.get("status") or "order placement failed"
+                )[:255]
+                logger.error(
+                    "[%s] sector_follow ENTRY %s %s qty=%d @ %.2f — %s",
+                    self.mode, status.upper(), symbol, qty, price, error_message,
+                )
+                # Journal the failed attempt; no paper_book / today_entries row —
+                # nothing actually opened.
+                self._record_trade(
+                    side="BUY",
+                    symbol=symbol,
+                    quantity=qty,
+                    price=price,
+                    entry_date=entry_date,
+                    exchange=self.config.exchange,
+                    product=self.config.product,
+                    vol_ratio=candidate.get("vol_ratio"),
+                    stock_ret=candidate.get("stock_ret"),
+                    sector_ret=candidate.get("sector_ret"),
+                    order_id=None,
+                    status=status,
+                    error_message=error_message,
+                )
+                return None
 
         self.paper_book[symbol] = PaperPosition(
             symbol=symbol,
@@ -652,6 +695,7 @@ class SectorFollowService:
             stock_ret=candidate.get("stock_ret"),
             sector_ret=candidate.get("sector_ret"),
             order_id=order_id,
+            status=status,
         )
         self.today_entries.append(
             {
@@ -675,27 +719,51 @@ class SectorFollowService:
         symbol = position.symbol
         exit_price = price if price is not None else position.entry_price
         order_id = None
+        status = "scaffold"
+        error_message = None
         if self.mode == "scaffold":
             logger.info(
                 "[scaffold] sector_follow EXIT %s qty=%d @ %.2f — NO ORDER",
                 symbol, position.quantity, exit_price,
             )
         else:
-            resp = self._order_placer(
-                self.mode,
-                {
-                    "symbol": symbol,
-                    "exchange": self.config.exchange,
-                    "action": "SELL",
-                    "product": self.config.product,
-                    "quantity": position.quantity,
-                },
-            )
-            order_id = (resp or {}).get("orderid")
-            logger.info(
-                "[%s] sector_follow EXIT %s qty=%d @ %.2f order_id=%s",
-                self.mode, symbol, position.quantity, exit_price, order_id,
-            )
+            # As with entries, a thrown or error-response placement must not abort
+            # the rest of the exit batch and must still be journaled with its status.
+            try:
+                resp = self._order_placer(
+                    self.mode,
+                    {
+                        "symbol": symbol,
+                        "exchange": self.config.exchange,
+                        "action": "SELL",
+                        "product": self.config.product,
+                        "quantity": position.quantity,
+                    },
+                )
+            except Exception as e:
+                logger.exception("sector_follow EXIT placement raised: %s", symbol)
+                resp = {"status": "error", "message": str(e)}
+                status = "exception"
+            resp = resp or {}
+            order_id = resp.get("orderid")
+            if status != "exception":
+                status = (
+                    "placed" if str(resp.get("status", "")).lower() == "success" else "rejected"
+                )
+            if status == "placed":
+                logger.info(
+                    "[%s] sector_follow EXIT %s qty=%d @ %.2f order_id=%s",
+                    self.mode, symbol, position.quantity, exit_price, order_id,
+                )
+            else:
+                error_message = str(
+                    resp.get("message") or resp.get("status") or "order placement failed"
+                )[:255]
+                logger.error(
+                    "[%s] sector_follow EXIT %s %s qty=%d @ %.2f — %s",
+                    self.mode, status.upper(), symbol, position.quantity, exit_price,
+                    error_message,
+                )
 
         self._record_trade(
             side="SELL",
@@ -706,6 +774,8 @@ class SectorFollowService:
             exchange=self.config.exchange,
             product=self.config.product,
             order_id=order_id,
+            status=status,
+            error_message=error_message,
             note="t+1_exit",
         )
         pnl_pct = (

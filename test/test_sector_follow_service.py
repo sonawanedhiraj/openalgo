@@ -691,3 +691,76 @@ def test_run_exit_proceeds_despite_stale_index_data():
     exited = svc.run_exit()
     assert [e["symbol"] for e in exited] == ["ZZZ"]
     assert any(o[1]["action"] == "SELL" for o in svc._test_placed)
+
+
+# --------------------------------------------------------------------------- #
+# Order product + failure journaling (Fix A verify / Fix B)
+# --------------------------------------------------------------------------- #
+def test_entry_order_payload_uses_cnc_product():
+    # Fix A verification: CNC (delivery) is NOT subject to the sandbox 15:15 MIS
+    # square-off rejection, so the 15:20 entry is safe. Guard the product here so a
+    # silent flip to MIS would fail this test.
+    svc = _make_service(metrics={"AAA": _hit()}, mode="sandbox")
+    svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    assert len(svc._test_placed) == 1
+    _, order = svc._test_placed[0]
+    assert order["product"] == "CNC"
+
+
+def test_entry_rejection_is_journaled_and_no_phantom_position():
+    svc = _make_service(metrics={"AAA": _hit()}, mode="sandbox")
+    svc._order_placer = lambda mode, order: {"status": "error", "message": "insufficient margin"}
+    result = svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    assert result is None  # not counted as placed
+    assert "AAA" not in svc.paper_book  # no phantom open position
+    assert svc.today_entries == []  # nothing actually opened
+    assert len(svc._test_journal) == 1  # but the attempt IS journaled
+    row = svc._test_journal[0]
+    assert row["status"] == "rejected"
+    assert "insufficient margin" in row["error_message"]
+    assert row["order_id"] is None
+
+
+def test_entry_exception_is_journaled_and_batch_continues():
+    svc = _make_service(metrics={"AAA": _hit(vol=3.0), "BBB": _hit(vol=2.0)}, mode="sandbox")
+
+    def flaky(mode, order):
+        if order["symbol"] == "AAA":
+            raise RuntimeError("broker timeout")
+        return {"status": "success", "orderid": "OID-BBB"}
+
+    svc._order_placer = flaky
+    # AAA (higher vol_ratio) is attempted first and raises; BBB must still place.
+    placed = svc.run_entry()
+    assert [p["symbol"] for p in placed] == ["BBB"]
+    assert "BBB" in svc.paper_book and "AAA" not in svc.paper_book
+    by_sym = {r["symbol"]: r for r in svc._test_journal}
+    assert by_sym["AAA"]["status"] == "exception"
+    assert "broker timeout" in by_sym["AAA"]["error_message"]
+    assert by_sym["BBB"]["status"] == "placed"
+
+
+def test_entry_success_journaled_as_placed():
+    svc = _make_service(metrics={"AAA": _hit()}, mode="sandbox")
+    svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    assert svc._test_journal[0]["status"] == "placed"
+
+
+def test_scaffold_entry_journaled_as_scaffold():
+    svc = _make_service(metrics={"AAA": _hit()}, mode="scaffold")
+    svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
+    assert svc._test_journal[0]["status"] == "scaffold"
+    assert "AAA" in svc.paper_book  # scaffold still paper-records the position
+
+
+def test_exit_rejection_is_journaled():
+    from services.sector_follow_service import PaperPosition
+
+    svc = _make_service(mode="sandbox")
+    svc._order_placer = lambda mode, order: {"status": "error", "message": "no holdings"}
+    pos = PaperPosition("AAA", 10, 100.0, "2026-06-09", 2.0)
+    svc.place_exit(pos, price=101.0)
+    row = svc._test_journal[0]
+    assert row["side"] == "SELL"
+    assert row["status"] == "rejected"
+    assert "no holdings" in row["error_message"]
