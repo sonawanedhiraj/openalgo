@@ -302,6 +302,12 @@ arbitrary workflow code onto the real-money host, and would need market-hours
 gating (Task Scheduler), below-normal process priority, a `db_test/` sandbox,
 and a secrets allow-list just to be tolerable.
 
+> **2026-06-12 — runner is LIVE.** `openalgo-laptop` (runner id 41,
+> `myoung34/github-runner`, runtime at `C:\actions-runner\`) is online and
+> *Idle*, registered to `sonawanedhiraj/openalgo`, `EPHEMERAL=true` (fresh
+> container per job), `restart: unless-stopped`. Validated by a smoke PR — see
+> the run URL recorded below. Plan next-step #3 is complete.
+
 ### Decision: **L3-with-Docker-isolation.**
 
 > **2026-06-07 update — supersedes the L1-only call below.** The operator now
