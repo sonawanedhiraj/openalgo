@@ -990,6 +990,11 @@ def setup_environment(app):
                         len(_wd_result.get("jobs") or []),
                         len(_wd_result.get("skipped") or []),
                     )
+                elif _wd_result.get("disabled"):
+                    logger.info(
+                        "EOD watchdog disabled via "
+                        "SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED"
+                    )
                 else:
                     logger.warning(
                         "EOD watchdog did not start (already running or empty)"

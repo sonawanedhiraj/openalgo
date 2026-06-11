@@ -806,6 +806,19 @@ past-date operator backfill lives in
 `services/engine_eod_reconciliation_backfill.py` (dry-run by default; `--apply`
 to write) and is **not** wired into the runtime.
 
+**EOD flatten has three layers of defense.** (1) tick-driven `_maybe_flatten_eod`
+(primary — fires intra-tick after `eod_exit_time`, but can't run if the broker
+tick stream dies before close); (2) the APScheduler **EOD watchdog**
+(`services/eod_watchdog_service.py`) — a tick-independent backstop that flattens
+open `trade_journal` rows via `place_order`, gated by
+`SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED` (default true); (3) the 15:30
+reconciliation above, which catches anything the first two missed. The watchdog
+fires at **15:14 IST** (`min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)`,
+default cap 15:14) — deliberately **before** the 15:15 sandbox/broker MIS
+auto-square-off. This is load-bearing: sandbox *rejects* MIS orders placed at/after
+15:15, so a watchdog at the old declared 15:20 was always too late (the 2026-06-10
+OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
+
 ## Unified strategy daily intent (`strategy_daily_intent`)
 
 The single per-strategy control surface for both the simplified engine and

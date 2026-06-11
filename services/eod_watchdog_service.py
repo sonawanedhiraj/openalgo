@@ -11,7 +11,14 @@ On 2026-06-01 a real NBCC LONG 500 was stranded past 15:20 IST EOD because:
 
 This module schedules one daily cron job per registered intraday strategy
 that calls :func:`services.simplified_stock_engine_service.flatten_strategy_positions`
-at the strategy's declared ``eod_exit_time``. The flatten path goes through
+at ``min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)`` — the
+cap (default ``15:14`` IST) guarantees the watchdog fires *before* the venue's
+15:15 MIS auto-square-off, which rejects MIS orders placed after it (the
+2026-06-10 OIL/HINDZINC/TATAELXSI orphans were caused by the watchdog firing at
+the declared 15:20, after sandbox had already force-closed and started blocking
+flatten orders). The whole watchdog is gated by
+``SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED`` (default ``true``). The flatten path
+goes through
 ``services.place_order_service.place_order`` (an in-process REST call), so it
 works even when the broker tick stream is dead — as long as the broker's
 order endpoint is up.
@@ -36,6 +43,7 @@ loud log are the right escalation.
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
@@ -49,6 +57,29 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 IST = pytz.timezone("Asia/Kolkata")
+
+# The watchdog must fire BEFORE the venue's MIS auto-square-off, not after.
+# In sandbox the NSE/BSE/NFO/BFO square-off is 15:15 IST
+# (``nse_bse_square_off_time``, see sandbox/squareoff_manager.py) and the
+# sandbox order_manager *rejects* MIS orders placed at/after that time
+# ("MIS orders cannot be placed after square-off time"). The engine's own
+# tick-driven exit and this watchdog both keyed off the strategy's declared
+# ``eod_exit_time`` (15:20) — five minutes too late — so on 2026-06-10 the
+# watchdog's 15:20 flatten orders for OIL/HINDZINC/TATAELXSI were blocked by
+# sandbox and the positions fell to sandbox MIS auto-square-off instead
+# (only reconciled into the journal at 15:30). We cap the watchdog fire time
+# so it always runs at least one minute before the venue closes MIS.
+_WATCHDOG_CAP_TIME = "15:14"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean env var. Mirrors the helper in
+    simplified_stock_engine_service (kept local to avoid an import cycle —
+    this module is imported at app boot before the engine service)."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 # Module-level singleton — there's only ever one watchdog per process. We use
 # a lock around start/stop so a (theoretical) concurrent restart can't race
@@ -74,6 +105,12 @@ def start_eod_watchdog() -> dict[str, Any]:
     * ``bad_time`` — strategy's ``eod_exit_time`` doesn't parse as ``HH:MM``.
     """
     global _scheduler
+
+    if not _env_bool("SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED", True):
+        logger.info(
+            "[EOD-WATCHDOG] disabled via SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED — not starting"
+        )
+        return {"started": False, "jobs": [], "skipped": [], "disabled": True}
 
     with _lock:
         if _scheduler is not None and _scheduler.running:
@@ -109,6 +146,17 @@ def start_eod_watchdog() -> dict[str, Any]:
         logger.exception("[EOD-WATCHDOG] registry enumeration failed")
         return {"started": False, "jobs": [], "skipped": []}
 
+    # Resolve the fire-time cap once. The watchdog never fires later than this
+    # so it always beats the venue MIS square-off (see _WATCHDOG_CAP_TIME).
+    cap = _parse_hhmm(os.getenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", _WATCHDOG_CAP_TIME))
+    if cap is None:
+        logger.error(
+            "[EOD-WATCHDOG] invalid SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME — "
+            "falling back to %s",
+            _WATCHDOG_CAP_TIME,
+        )
+        cap = _parse_hhmm(_WATCHDOG_CAP_TIME)
+
     for strategy_name, eod_time in intraday:
         parsed = _parse_hhmm(eod_time)
         if parsed is None:
@@ -118,7 +166,11 @@ def start_eod_watchdog() -> dict[str, Any]:
             )
             skipped.append({"strategy": strategy_name, "reason": "bad_time"})
             continue
-        hh, mm = parsed
+
+        # Fire at min(declared eod_exit_time, cap): honor an earlier
+        # strategy cut-off, but never run after the venue square-off.
+        hh, mm = min(parsed, cap)
+        fire_time = f"{hh:02d}:{mm:02d}"
 
         _scheduler.add_job(
             _run_strategy_eod_flatten,
@@ -133,10 +185,16 @@ def start_eod_watchdog() -> dict[str, Any]:
             replace_existing=True,
             misfire_grace_time=300,
         )
-        jobs.append({"strategy": strategy_name, "eod_exit_time": eod_time})
+        jobs.append(
+            {
+                "strategy": strategy_name,
+                "eod_exit_time": eod_time,
+                "fire_time": fire_time,
+            }
+        )
         logger.info(
-            "[EOD-WATCHDOG] Scheduled %s daily at %02d:%02d IST (mon-fri)",
-            strategy_name, hh, mm,
+            "[EOD-WATCHDOG] Scheduled %s daily at %s IST (mon-fri; declared=%s)",
+            strategy_name, fire_time, eod_time,
         )
 
     if not jobs:

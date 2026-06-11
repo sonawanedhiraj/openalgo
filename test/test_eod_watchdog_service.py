@@ -186,6 +186,91 @@ def test_start_eod_watchdog_schedules_one_job_per_intraday_strategy(stopped_watc
     assert len(sched.get_jobs()) == 2
 
 
+def test_watchdog_caps_fire_time_before_venue_square_off(stopped_watchdog, monkeypatch):
+    """A strategy declaring eod_exit_time=15:20 must be scheduled at the
+    15:14 cap — BEFORE the 15:15 sandbox MIS square-off. This is the
+    2026-06-10 OIL/HINDZINC/TATAELXSI fix: the watchdog used to fire at the
+    declared 15:20, after sandbox had already force-closed and started
+    rejecting flatten orders."""
+    from services import eod_watchdog_service
+
+    monkeypatch.delenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", raising=False)
+    monkeypatch.delenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED", raising=False)
+
+    with patch(
+        "services.eod_watchdog_service.list_intraday_strategies",
+        return_value=[("strat_a", "15:20")],
+    ), patch(
+        "services.eod_watchdog_service.registered_strategies",
+        return_value={"strat_a": object()},
+    ):
+        result = eod_watchdog_service.start_eod_watchdog()
+
+    assert result["jobs"][0]["fire_time"] == "15:14"
+    assert result["jobs"][0]["eod_exit_time"] == "15:20"  # declared time preserved
+    # The actual cron trigger must carry the capped minute.
+    sched = eod_watchdog_service.get_scheduler()
+    trig = str(sched.get_job("eod_watchdog_strat_a").trigger)
+    assert "hour='15'" in trig and "minute='14'" in trig
+
+
+def test_watchdog_honors_earlier_strategy_time(stopped_watchdog, monkeypatch):
+    """If a strategy's declared exit is earlier than the cap, honor it
+    (the cap is a ceiling, not a fixed time)."""
+    from services import eod_watchdog_service
+
+    monkeypatch.delenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", raising=False)
+
+    with patch(
+        "services.eod_watchdog_service.list_intraday_strategies",
+        return_value=[("strat_early", "14:00")],
+    ), patch(
+        "services.eod_watchdog_service.registered_strategies",
+        return_value={"strat_early": object()},
+    ):
+        result = eod_watchdog_service.start_eod_watchdog()
+
+    assert result["jobs"][0]["fire_time"] == "14:00"
+
+
+def test_watchdog_cap_time_is_env_configurable(stopped_watchdog, monkeypatch):
+    """Operators can move the cap via SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME."""
+    from services import eod_watchdog_service
+
+    monkeypatch.setenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", "15:10")
+
+    with patch(
+        "services.eod_watchdog_service.list_intraday_strategies",
+        return_value=[("strat_a", "15:20")],
+    ), patch(
+        "services.eod_watchdog_service.registered_strategies",
+        return_value={"strat_a": object()},
+    ):
+        result = eod_watchdog_service.start_eod_watchdog()
+
+    assert result["jobs"][0]["fire_time"] == "15:10"
+
+
+def test_watchdog_disabled_by_feature_flag(stopped_watchdog, monkeypatch):
+    """SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED=false is a hard off switch —
+    no scheduler, no jobs."""
+    from services import eod_watchdog_service
+
+    monkeypatch.setenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED", "false")
+
+    with patch(
+        "services.eod_watchdog_service.list_intraday_strategies",
+        return_value=[("strat_a", "15:20")],
+    ), patch(
+        "services.eod_watchdog_service.registered_strategies",
+        return_value={"strat_a": object()},
+    ):
+        result = eod_watchdog_service.start_eod_watchdog()
+
+    assert result == {"started": False, "jobs": [], "skipped": [], "disabled": True}
+    assert eod_watchdog_service.get_scheduler() is None
+
+
 def test_start_eod_watchdog_is_idempotent(stopped_watchdog):
     """Calling start twice must not stack jobs or raise."""
     from services import eod_watchdog_service
@@ -497,6 +582,43 @@ def test_flatten_strategy_positions_handles_place_order_failure(fresh_journal_db
     assert row.exited_at is None
 
     mock_ns.return_value.publish_eod_watchdog_failure.assert_called_once()
+
+
+def test_flatten_strategy_positions_isolates_per_symbol_failure(fresh_journal_db):
+    """If flatten of symbol A fails, symbol B must still be flattened — one
+    rejection cannot strand the rest of the book."""
+    from services import simplified_stock_engine_service as ses
+
+    _seed_open_row(
+        fresh_journal_db, symbol="FAILS", strategy="trending_equity_intraday"
+    )
+    _seed_open_row(
+        fresh_journal_db, symbol="SUCCEEDS", strategy="trending_equity_intraday"
+    )
+
+    # Reject the FAILS symbol regardless of processing order; fill the rest.
+    def _po(payload, *args, **kwargs):
+        if payload["symbol"] == "FAILS":
+            return (False, {"message": "rejected"}, 400)
+        return (True, {"orderid": "OK"}, 200)
+
+    svc = _make_svc_mock()
+    with _patched_engine_service(svc), patch(
+        "services.place_order_service.place_order", side_effect=_po
+    ), patch("services.notification_service.get_notification_service"):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    assert result["attempted"] == 2
+    assert result["succeeded"] == 1
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["symbol"] == "FAILS"
+
+    rows = {
+        r.symbol: r
+        for r in fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).all()
+    }
+    assert rows["SUCCEEDS"].exited_at is not None  # B flattened
+    assert rows["FAILS"].exited_at is None  # A left open for retry/operator
 
 
 def test_flatten_strategy_positions_handles_no_api_key(fresh_journal_db):
