@@ -95,6 +95,8 @@ from database.auth_db import init_db as ensure_auth_tables_exists
 from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
+from database.strategy_daily_intent_db import init_db as ensure_strategy_daily_intent_tables_exists
+from database.data_health_db import init_db as ensure_data_health_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
 from database.scanner_db import init_db as ensure_scanner_tables_exists
 from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
@@ -629,6 +631,8 @@ def setup_environment(app):
                 ("Analyzer DB", ensure_analyzer_tables_exists),
                 ("Settings DB", ensure_settings_tables_exists),
                 ("Daily Intent DB", ensure_daily_intent_tables_exists),
+                ("Strategy Daily Intent DB", ensure_strategy_daily_intent_tables_exists),
+                ("Data Health DB", ensure_data_health_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),
@@ -662,6 +666,16 @@ def setup_environment(app):
 
             db_init_time = (time.time() - db_init_start) * 1000
             logger.debug(f"All databases initialized in parallel ({db_init_time:.0f}ms)")
+
+            # Backfill the legacy daily_intent table into the unified
+            # strategy_daily_intent table (idempotent; runs after both tables
+            # exist). See docs/design/strategy_daily_intent.md.
+            try:
+                from database.strategy_daily_intent_db import migrate_legacy_daily_intent
+
+                migrate_legacy_daily_intent()
+            except Exception as e:
+                logger.error(f"strategy_daily_intent migration skipped: {e}")
 
             # Signal that DB tables are ready (unblocks cache restoration)
             app.db_ready.set()
@@ -700,6 +714,18 @@ def setup_environment(app):
                 logger.debug("Sector Follow CAP5_VOL service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
+
+            # Telegram INBOUND intent bot (Phase 6). Gated by
+            # TELEGRAM_INBOUND_ENABLED (default false), so this is a no-op on
+            # deploy until the operator flips the flag — it then polls Telegram
+            # for /intent commands and writes strategy_daily_intent. Registers an
+            # 08:45 IST morning-prompt job. See services/telegram_inbound_service.py.
+            try:
+                from services.telegram_inbound_service import init_telegram_inbound_service
+
+                init_telegram_inbound_service(app=app)
+            except Exception as e:
+                logger.error(f"Failed to initialize Telegram inbound service: {e}")
 
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
             # scanner and the regime classifier. Replaces the old one-shot 30s
@@ -963,6 +989,11 @@ def setup_environment(app):
                         "EOD watchdog started (jobs=%d, skipped=%d)",
                         len(_wd_result.get("jobs") or []),
                         len(_wd_result.get("skipped") or []),
+                    )
+                elif _wd_result.get("disabled"):
+                    logger.info(
+                        "EOD watchdog disabled via "
+                        "SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED"
                     )
                 else:
                     logger.warning(

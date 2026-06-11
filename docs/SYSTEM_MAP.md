@@ -37,7 +37,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 | `/run-tests` | POST | Spawns Claude Code subprocess → also runs `uv run pytest {test_target} -v` (`server.py:449,456`) |
 | `/restart-app` | POST | Kills PID on port 5000 via PowerShell `Stop-Process -Force` → respawns `uv run app.py` (`server.py:494-516`) |
 | `/run` | POST | Arbitrary Claude Code prompt — may mutate files |
-| `/review-signal`, `/reflect` | POST | LLM calls; review/journal helpers |
+| `/review-signal`, `/reflect` | POST | LLM calls; review/journal helpers. `/review-signal` candidate now carries an explicit `direction` (`BUY`/`SELL`) so the veto prompt frames the side correctly instead of inferring it from the `source` string |
 | `/status`, `/read-errors`, `/engine-status` | GET | Read-only |
 
 - **Busy lock:** all task endpoints 409 if `state.status == BUSY`. A wedged task
@@ -84,12 +84,24 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   | `sector_follow_entry` | 15:20 | Evaluate 30-name universe, select ≤5 gate-passers (vol-ratio tiebreaker), place/paper BUYs (mode-aware; honors kill switch + manual pause) |
   | `sector_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1 exit). Exits are **never** blocked by the kill switch |
   | `sector_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
-  | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) |
+  | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) **+** writes a Day-N markdown report to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` (independent sinks — one failing never blocks the other) |
+  | `sector_follow_data_health` | 16:30 | **Market-data freshness check** (after the 16:05 index backfill should have landed). Validates the 8 sector indices + 30 universe stocks via `data_freshness_service.check_strategy_data_ready`; writes a `data_health_check` row. On stale data: Telegram-alerts the operator **and** auto-pauses tomorrow's `strategy_daily_intent` (`updated_by='data_health:auto-pause'`, operator-overridable). Gated by `DATA_FRESHNESS_VALIDATION_ENABLED` (default `true`) |
 
+- **Pre-entry freshness gate:** `run_entry` aborts (places no orders, alerts) when
+  the index OR stock feed is stale beyond `MAX_STALENESS_BUSINESS_DAYS` (default 1).
+  `run_exit` only *warns* on stale index data — exits are never blocked. Both gated
+  by `DATA_FRESHNESS_VALIDATION_ENABLED`.
 - **Kill switch:** trips when day P&L < −`daily_loss_kill_pct`% of capital (default 3%);
   blocks new entries for the session, open positions still run to their T+1 exit.
 - **DBs written:** `db/openalgo.db` → `sector_follow_trades` (trade journal, all
-  modes) and `strategies` (one seeded row, natural key `name='sector_follow_cap5_vol'`).
+  modes), `strategies` (one seeded row, natural key `name='sector_follow_cap5_vol'`),
+  `data_health_check` (one row per 16:30 freshness check), and
+  `strategy_daily_intent` (tomorrow's auto-pause row on stale data).
+- **File output:** `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` —
+  one markdown file per trading day, written by the 15:30 IST `sector_follow_eod_summary`
+  APScheduler job. Mirrors the Telegram EOD summary content (date/mode, signals,
+  capital deployed, P&L, sector breakdown, per-position table, kill-switch state).
+  Git-ignored (observational, not source); path hardcoded (no env var).
 - **Logs:** standard `log/openalgo_YYYY-MM-DD.log` + `log/errors.jsonl` (no
   dedicated log file).
 - **Control API:** see "Strategy control endpoints" below.
@@ -106,15 +118,89 @@ need no external scheduler.
 | Job id | Cron (IST) | What it does | Gating / writes |
 |---|---|---|---|
 | `sector_follow_index_backfill` | `5 16 * * 1-5` (16:05, after close) | 1m backfill of the sector indices mapped in `strategies/sector_follow_cap5_vol/sector_map.json` (+ 2 defensive 1m-missing indices), so the strategy's 15:20 signal reads a fresh index feed rather than a stale one. Incremental, 4-day lookback; self-heals a missed run/weekend. Additive — routes through the same `historify_service.create_and_start_job` pipeline as the stock backfill, never touching watchlist schedules. | Gated by env `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED` (default `true`); writes 1m bars to `db/historify.duckdb` `market_data`. Body: `services/sector_follow_index_backfill.refresh_sector_follow_indices` (registered by `_register_sector_follow_index_job`). One-shot CLI: `uv run python -m services.sector_follow_index_backfill --from YYYY-MM-DD --to YYYY-MM-DD`. |
+| `telegram_inbound_morning_prompt` | `45 8 * * 1-5` (08:45, pre-open) | Sends the morning intent prompt (inline Run/Pause/Halt keyboard per strategy) to every allowlisted chat_id, so the operator can set today's intent from the phone. No-op when the inbound bot isn't running. | Registered ONLY when `TELEGRAM_INBOUND_ENABLED=true`; body `services/telegram_inbound_service._morning_prompt_job`. See the Telegram inbound bot process entry below. |
+| `eod_watchdog_<strategy>` | `mon-fri` at `min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)` — default **15:14** for `trending_equity_intraday` | Safety-net EOD flatten for the simplified engine. One cron job per registered intraday strategy; calls `flatten_strategy_positions` (open `trade_journal` rows → opposite-side MARKET via `place_order`, mode-aware sandbox/live). Backstop for the tick-driven `_maybe_flatten_eod`, which can't fire when the broker tick stream dies before close. **Fires at 15:14, one minute before the 15:15 sandbox/broker MIS auto-square-off** — the cap is the 2026-06-10 fix: the watchdog used to fire at the declared 15:20, *after* sandbox had force-closed and started rejecting flatten orders, stranding OIL/HINDZINC/TATAELXSI. Belt to the 15:30 EOD reconciliation suspenders. | Runs on a **dedicated `BackgroundScheduler`** (not the shared instance), `services/eod_watchdog_service.py`. Gated by env `SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED` (default `true`); cap via `SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME` (default `15:14`). `misfire_grace_time=300`. Started from `app.py` boot after journal rehydrate. |
 
 > The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
 > EOD jobs on this same scheduler — see the SectorFollowService process entry.
+
+### Telegram inbound intent bot (Phase 6)
+
+- **Process:** `services/telegram_inbound_service.py` — a `python-telegram-bot`
+  poller running on a **real OS thread** with its own asyncio event loop (same
+  eventlet-bypass pattern as `telegram_bot_service`). Started from `app.py` boot
+  ONLY when `TELEGRAM_INBOUND_ENABLED=true` (default `false` → no-op on deploy).
+- **What it does:** polls Telegram for operator commands, gates on the
+  `bot_config.telegram_chat_ids` allowlist, and writes the unified
+  `strategy_daily_intent` table (`run`/`pause`/`halt` + capital cap). It is the
+  INBOUND counterpart to the send-only outbound bot. **Mode flips are not
+  exposed** (laptop-only); intent changes preserve the existing routing mode.
+  Audit trail: `updated_by=telegram:<chat_id>:<message_id>`.
+- **Single poller per token:** Telegram permits one `getUpdates` consumer per bot
+  token — do not run the full interactive `telegram_bot_service` poller on the
+  same token while this is enabled.
+- **DB written:** `db/openalgo.db` → `strategy_daily_intent` (+ reads
+  `bot_config`). A lightweight idempotent migration adds the
+  `bot_config.telegram_chat_ids` column on older DBs.
+- **Design:** [`docs/design/telegram_inbound.md`](design/telegram_inbound.md).
+
+### Simplified-engine EOD journal reconciliation
+
+- **Module:** `services/engine_eod_reconciliation_service.py`
+  (`reconcile_engine_journal(date=None, *, strategy_name, dry_run)`).
+- **Why:** the engine only writes a `trade_journal` exit row when *it* fires an
+  exit (stop/target/trailing/its own EOD flatten). Positions still open at the
+  close are flattened by **sandbox's own MIS auto-square-off**, which the engine
+  never journaled — so the Telegram EOD summary under-counted trades and P&L
+  (confirmed 2026-06-10: 4 entries, 1 journaled exit, 3 invisible square-offs;
+  +₹352 shown vs +₹8,327 real).
+- **What it does:** for each open journal row on the day, reads `sandbox.db`
+  (`sandbox_positions` flat-check + `sandbox_trades` closing fills, **read-only**)
+  and stamps the matching exit columns on the open row with
+  `exit_reason='sandbox_eod_squareoff'` and gross P&L. Multiple partial close
+  fills are summed into one exit row (qty-weighted avg price). Idempotent (the
+  `exited_at IS NULL` filter is the dedup key); mid-day safe (skips non-flat
+  positions); strategy-scoped so T+1/positional rows are never force-closed.
+- **Ordering (load-bearing):** the engine's `_maybe_log_eod_summary` calls
+  `_maybe_reconcile_eod_journal(today)` **first**, then reads the journal
+  aggregate and fires the Telegram EOD summary — so reconcile → summarize, and an
+  all-square-off day (empty in-memory ledger) still summarizes from the journal.
+- **Flag:** `ENGINE_EOD_RECONCILIATION_ENABLED` (default `true`; sandbox-mode
+  only) — see `docs/PARAMETER_LOG.md`.
+- **Backfill (operator-run, not wired):**
+  `services/engine_eod_reconciliation_backfill.py` runs reconciliation over a
+  date range; **dry-run by default**, writes only with `--apply`.
+
+### E2E test suite
+
+- `test/e2e/test_critical_flows.py` — cross-component seam tests (mode resolution
+  fall-through, the unified intent gate as the engines read it, the sector_follow
+  entry→exit cycle + kill switch + EOD file sink, and the Phase-6 Telegram inbound
+  bot end-to-end). The DB layer is real but bound to a temp SQLite (no production
+  DB touched); broker/Telegram boundaries are mocked. Run: `uv run pytest test/e2e/ -v`.
+- `test/e2e/test_fno_flows.py` — simplified-engine FnO + LLM veto critical flows
+  (21 tests): BUY/SELL breakout→sandbox order, journal entry/exit pairing, veto
+  shadow-vs-active enforcement, **veto direction consistency** (the TATAELXSI
+  regression anchor — now PASSING after the 2026-06-11 fix that passes
+  `signal.action` through as an explicit `direction` kwarg; the SELL-reviewed-as-BUY
+  bug is closed), ATR stop, RR trailing, daily kill switch, trade-limit
+  and cooldown gates, EOD square-off, and the Telegram EOD-summary semantics
+  (gross / realized / closed-only — the anchor for the Telegram-vs-`/mypnl`
+  mismatch; the Telegram line is now self-describing: "Realized (closed, gross,
+  simplified-engine only) … see /mypnl for net account P&L"). Same hermetic pattern (temp/in-memory SQLite, mocked broker + veto,
+  injected clock, no network). Investigation: `outputs/fno_eod_veto_investigation_2026-06-10/`.
+- `test/e2e/test_engine_eod_reconciliation.py` — EOD reconciliation (8 tests):
+  engine-exit no-op, sandbox square-off journaled, the full 2026-06-10 mixed-day
+  scenario (1 engine exit + 3 square-offs → 4 trades, correct total P&L),
+  idempotency, mid-day still-open no-op, multiple partial close fills summed into
+  one exit row, orphan-fill (no entry created), and past-date backfill. Both
+  `trade_journal_db` and `sandbox_db` rebound to temp SQLite — fully hermetic.
 
 ## Databases
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job), **signal_decision** (Stage-1 LLM veto-layer audit — one row per candidate review; `direction` TEXT column (`BUY`/`SELL`, nullable) records the side the engine armed, added 2026-06-11 via idempotent boot-time `ALTER TABLE` in `signal_decision_db._migrate_add_direction_column`; previously the side was unrecoverable because the chartink `source` string carries "buy" for both legs) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
@@ -174,10 +260,29 @@ SectorFollowService singleton; they return `503` if the service isn't initialise
 | Endpoint | Method | Side effect |
 |---|---|---|
 | `/sector_follow_cap5_vol/api/status` | GET | Read-only: mode, kill switch, today's entries/exits, open book + live MTM |
+| `/sector_follow_cap5_vol/api/data_health` | GET | Read-only: live market-data freshness for the 8 indices + 30 stocks (`overall_ok`, `checked_at`, per-symbol `last_ts`/`staleness_days`/`ok`). Queries only — does not write the `data_health_check` row (that's the 16:30 job) |
 | `/sector_follow_cap5_vol/api/positions` | GET | Read-only: open positions (with MTM) + today's entries/exits |
-| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1 |
+| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1. Runtime emergency override; for pre-market planning use the `strategy_daily_intent` table instead |
 | `/sector_follow_cap5_vol/api/resume` | POST | Clears manual pause **and** the kill switch |
 | `/sector_follow_cap5_vol/api/close_all` | POST | **Emergency square-off of every open position** (mode-aware; not blocked by kill switch). Requires body `{"confirm":"yes"}` |
+
+### Unified daily intent (`strategy_daily_intent`)
+
+The pre-market control surface for BOTH the simplified engine and sector_follow
+is the `strategy_daily_intent` table (`db/openalgo.db`). One row per
+`(strategy_name, intent_date)` declares `mode` (`live`/`sandbox`/`skip` — HOW
+orders route) and `intent` (`run`/`pause`/`halt` — WHETHER to act), plus an
+optional `daily_capital_cap`. The engines consult
+`services/mode_service.resolve_strategy_mode(strategy_name)` at job-entry:
+`pause` blocks new entries (exits still run), `halt` blocks everything including
+exits. Fall-through when no row exists (flag on): legacy `daily_intent`
+(simplified only) → env mode flag → `sandbox/run` default — so deploy is a no-op
+until the operator inserts a row. Feature-flagged by
+`STRATEGY_DAILY_INTENT_ENABLED` (default `true`). `place_order_service` is
+deliberately NOT wired through this — its global `resolve_effective_mode` floor
+is unchanged; the gate lives in the engines (the simplified engine's sandbox
+dispatch bypasses `place_order_service` entirely). Full design:
+`docs/design/strategy_daily_intent.md`.
 
 `sector_follow_trades` columns (`database/sector_follow_db.py`): `id`, `strategy_id`,
 `mode`, `side` (BUY/SELL), `symbol`, `exchange`, `product`, `quantity`, `price`
@@ -214,8 +319,8 @@ SectorFollowService singleton; they return `503` if the service isn't initialise
   scheduler; no live mode.
 - `strategies/sector_follow_cap5_vol/` — intraday sector-follow strategy, cap-5
   positions, volume tiebreaker (**scaffold-only, `deployable: false`**). Daemon-style
-  SectorFollowService (`services/sector_follow_service.py`) registers 4 APScheduler
-  jobs (entry/exit/reset/EOD); control API at `/sector_follow_cap5_vol/api/*`;
+  SectorFollowService (`services/sector_follow_service.py`) registers 5 APScheduler
+  jobs (entry/exit/reset/EOD/data-health); control API at `/sector_follow_cap5_vol/api/*`;
   trade journal in `db/openalgo.db` `sector_follow_trades`. Sector-index 1m feed
   kept fresh by the `sector_follow_index_backfill` job. Plan/decisions: `PLAN.md`.
 - `docs/SIMPLIFIED_ENGINE_HANDOFF.md` — engine integration context

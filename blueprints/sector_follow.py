@@ -76,6 +76,34 @@ def status():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@sector_follow_bp.route("/api/data_health", methods=["GET"])
+def data_health():
+    """Live market-data freshness for the strategy's index + stock feeds.
+
+    Read-only on historify.duckdb — does not write the data_health_check row (that
+    is the 16:30 IST job's job). Returns per-symbol last-timestamp + staleness."""
+    if not _authed():
+        return _unauthorized()
+    try:
+        from datetime import datetime, timezone, timedelta
+
+        from services.data_freshness_service import check_strategy_data_ready
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        checked_at = datetime.now(ist).isoformat()
+        ok, details = check_strategy_data_ready("sector_follow_cap5_vol")
+        return jsonify(
+            {
+                "overall_ok": ok,
+                "checked_at": checked_at,
+                "details": details,
+            }
+        )
+    except Exception as e:
+        logger.exception("sector_follow data_health failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @sector_follow_bp.route("/api/positions", methods=["GET"])
 def positions():
     """Open positions + today's closed exits in full detail."""

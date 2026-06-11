@@ -201,6 +201,62 @@ the latest decisions automatically.
   - **2026-06-11:** Introduced. Default `15:14` — fixes the 15:20 → post-square-off
     race for the simplified engine's intraday EOD flatten.
 
+### Data-freshness validation (sector_follow_cap5_vol)
+
+#### DATA_FRESHNESS_VALIDATION_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env; read in `services/sector_follow_service.py.data_freshness_enabled()`
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables)
+- **Effect:** master switch for the freshness layer — the daily 16:30 IST
+  `sector_follow_data_health` APScheduler job (alert + auto-pause on stale data),
+  the pre-entry gate in `run_entry` (aborts entries on stale data), and the
+  exit-job staleness warning. When `false`, all three are no-ops (pure legacy
+  behavior). The `/sector_follow_cap5_vol/api/data_health` endpoint always works
+  (it just queries, never gates).
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-10:** Introduced after the 2026-05-29→06-10 index-feed staleness
+    incident (the daily index backfill job did not exist until that day's Phase 3
+    commit, so the feed silently sat 12 days stale). Default `true` — ships hot,
+    behavior additive (read + alert; auto-pause only on confirmed staleness).
+
+#### MAX_STALENESS_BUSINESS_DAYS
+- **Current value:** unset → code default `1`
+- **Set in:** env; read in
+  `services/data_freshness_service.py.default_max_staleness_business_days()`
+- **Values:** non-negative integer. `1` == "yesterday's close is acceptable" (the
+  realistic state at 15:20 IST, before today's after-close backfill runs);
+  day-before-yesterday is stale.
+- **Effect:** the per-symbol staleness threshold (business days behind the
+  reference trading day) above which a symbol is flagged stale. Weekend-aware;
+  market holidays are NOT modelled (a mid-week holiday inflates measured staleness
+  by one business day — the default-1 threshold absorbs the common case).
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-10:** Introduced with `DATA_FRESHNESS_VALIDATION_ENABLED`. Default 1.
+
+### Simplified engine — EOD journal reconciliation
+
+#### ENGINE_EOD_RECONCILIATION_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env; read in
+  `services/simplified_stock_engine_service.py.SimplifiedStockEngineService._maybe_reconcile_eod_journal`
+  (via `_env_bool`)
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables)
+- **Effect:** master switch for the EOD reconciliation step. When `true` (and the
+  engine is in `sandbox` mode), the engine — right before it fires the Telegram
+  EOD summary — calls
+  `services/engine_eod_reconciliation_service.reconcile_engine_journal(today)`,
+  which closes any open `trade_journal` row whose sandbox position was already
+  flattened by sandbox's MIS auto-square-off (writing the missing exit row with
+  `exit_reason='sandbox_eod_squareoff'`). When `false`, the step is a no-op and
+  the journal under-reports square-off closures (the 2026-06-10 bug). Read-only on
+  `sandbox.db`; idempotent. No effect outside sandbox mode (live/disabled skip it).
+- **Who flips:** operator only (rollback lever — leave `true` for correct Telegram
+  EOD counts).
+- **History:**
+  - **2026-06-11:** Introduced. Default `true`.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

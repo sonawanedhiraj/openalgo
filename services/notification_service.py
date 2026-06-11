@@ -372,7 +372,10 @@ class NotificationService:
                 f"├ Trades: {int(trade_count)}\n"
                 f"├ Winners: {int(winners)}\n"
                 f"├ Losers: {int(losers)}\n"
-                f"└ Net P&L: {_fmt_rupees(net_pnl)}"
+                f"└ Realized (closed, gross, simplified-engine only): "
+                f"{_fmt_rupees(net_pnl)}\n"
+                "  _excludes open-position MTM & charges — see /mypnl for "
+                "net account P&L_"
             )
             if by_strategy:
                 rows = []

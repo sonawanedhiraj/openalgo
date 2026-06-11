@@ -87,19 +87,24 @@ def _request_timeout_seconds() -> float:
 # ---------------------------------------------------------------------------
 
 _cache_lock = threading.Lock()
-_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 
-def _cache_key(symbol: str, source: str) -> tuple[str, str]:
-    return (symbol.upper(), source.lower())
+def _cache_key(symbol: str, source: str, direction: str | None = None) -> tuple[str, str, str]:
+    # Direction is part of the key: the BUY and SELL legs share the same
+    # ``source`` string (both chartink legs POST to one webhook), so without
+    # it a long review could be reused for the opposite-side short candidate.
+    return (symbol.upper(), source.lower(), (direction or "").upper())
 
 
-def get_review_cache(symbol: str, source: str) -> dict[str, Any] | None:
-    """Return a cached decision dict for (symbol, source) if still fresh, else None."""
+def get_review_cache(
+    symbol: str, source: str, direction: str | None = None
+) -> dict[str, Any] | None:
+    """Return a cached decision dict for (symbol, source, direction) if fresh, else None."""
     ttl = _cache_ttl_seconds()
     if ttl <= 0:
         return None
-    key = _cache_key(symbol, source)
+    key = _cache_key(symbol, source, direction)
     with _cache_lock:
         entry = _cache.get(key)
         if entry is None:
@@ -111,8 +116,10 @@ def get_review_cache(symbol: str, source: str) -> dict[str, Any] | None:
         return dict(decision)
 
 
-def _store_in_cache(symbol: str, source: str, decision: dict[str, Any]) -> None:
-    key = _cache_key(symbol, source)
+def _store_in_cache(
+    symbol: str, source: str, decision: dict[str, Any], direction: str | None = None
+) -> None:
+    key = _cache_key(symbol, source, direction)
     with _cache_lock:
         _cache[key] = (time.time(), dict(decision))
 
@@ -361,9 +368,16 @@ def _failsafe_decision(reason: str) -> dict[str, Any]:
 def review_signal(
     symbol: str,
     source: str,
+    direction: str | None = None,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ask the LLM whether the operator should take this signal.
+
+    ``direction`` (``'BUY'``/``'SELL'``, i.e. ``EntrySignal.action``) is the
+    actual side the engine armed. It is passed explicitly because the ``source``
+    string is the same for both chartink legs ("...intraday_buy") — without an
+    explicit direction the reviewer cannot tell a short candidate from a long
+    one. It rides the request body, the cache key, and the audit row.
 
     Returns a dict with ``decision`` (``'take' | 'skip'``), ``reasoning``,
     ``confidence``, ``id`` (signal_decision row id), ``enforcement_mode``, and
@@ -375,14 +389,16 @@ def review_signal(
     """
     enforcement_mode = get_veto_layer_mode()
 
-    # Cache check — same (symbol, source) within TTL reuses the prior decision.
-    cached = get_review_cache(symbol, source)
+    # Cache check — same (symbol, source, direction) within TTL reuses the prior
+    # decision.
+    cached = get_review_cache(symbol, source, direction)
     if cached is not None:
         # Still record an audit row so we can see cache hits in the table,
         # but tag the reasoning so it's distinguishable from a fresh review.
         decision_id = _persist_decision(
             symbol=symbol,
             source=source,
+            direction=direction,
             decision=cached["decision"],
             reasoning=f"cache_hit: {cached.get('reasoning', '')}",
             confidence=cached.get("confidence", 0.0),
@@ -404,6 +420,7 @@ def review_signal(
         "candidate": {
             "symbol": symbol,
             "source": source,
+            "direction": direction,
             "candidate_at": _now_ist_iso(),
         },
         "context": {
@@ -447,6 +464,7 @@ def review_signal(
         decision_id = _persist_decision(
             symbol=symbol,
             source=source,
+            direction=direction,
             decision="review_failed",
             reasoning=failure_reason or "review_failed",
             confidence=0.0,
@@ -479,6 +497,7 @@ def review_signal(
         decision_id = _persist_decision(
             symbol=symbol,
             source=source,
+            direction=direction,
             decision="review_failed",
             reasoning=f"bad_decision:{decision!r}",
             confidence=0.0,
@@ -497,6 +516,7 @@ def review_signal(
     decision_id = _persist_decision(
         symbol=symbol,
         source=source,
+        direction=direction,
         decision=decision,
         reasoning=reasoning,
         confidence=float(confidence) if confidence is not None else None,
@@ -550,6 +570,7 @@ def review_signal(
             "confidence": fresh_result["confidence"],
             "claude_session_id": session_id,
         },
+        direction,
     )
 
     return fresh_result
@@ -559,6 +580,7 @@ def _persist_decision(
     *,
     symbol: str,
     source: str,
+    direction: str | None = None,
     decision: str,
     reasoning: str | None,
     confidence: float | None,
@@ -577,6 +599,7 @@ def _persist_decision(
         return signal_decision_db.insert_signal_decision(
             symbol=symbol,
             source=source,
+            direction=direction,
             decision=decision,
             reasoning=reasoning,
             confidence=confidence,

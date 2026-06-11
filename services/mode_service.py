@@ -13,6 +13,8 @@ via the read-only ``/mode/status`` endpoint so the operator and Cowork can
 inspect what the resolver would return.
 """
 
+import os
+from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
@@ -25,9 +27,11 @@ from database.settings_db import get_analyze_mode
 
 __all__ = [
     "EffectiveMode",
+    "EffectiveDecision",
     "get_daily_intent",
     "set_daily_intent",
     "resolve_effective_mode",
+    "resolve_strategy_mode",
 ]
 
 
@@ -82,3 +86,106 @@ def set_daily_intent_safe(
 ) -> dict:
     """Thin pass-through wrapper kept for symmetry with the DB layer."""
     return set_daily_intent(intent, set_by, notes=notes, date_str=date_str, locked=locked)
+
+
+# --------------------------------------------------------------------------- #
+# Unified per-strategy {mode, intent} resolver
+# --------------------------------------------------------------------------- #
+# This is the single per-strategy read path. It is intentionally a SEPARATE
+# function from the legacy global ``resolve_effective_mode`` (which returns the
+# ``EffectiveMode`` enum and is load-bearing for place_order_service and
+# /mode/status). See docs/design/strategy_daily_intent.md for the naming
+# rationale and the full fall-through contract.
+
+
+@dataclass(frozen=True)
+class EffectiveDecision:
+    """Resolved {mode, intent} for one strategy on one IST day.
+
+    mode:   'live' | 'sandbox' | 'skip'   — HOW orders route.
+    intent: 'run'  | 'pause'   | 'halt'   — WHETHER to act.
+    daily_capital_cap: optional override of the strategy's default daily capital.
+    source: 'unified' | 'legacy' | 'env' | 'default' — where the decision came
+            from, for attribution/logging.
+    """
+
+    mode: str
+    intent: str
+    daily_capital_cap: float | None
+    source: str
+
+
+def _flag_enabled() -> bool:
+    """STRATEGY_DAILY_INTENT_ENABLED, default true (ships hot)."""
+    raw = os.getenv("STRATEGY_DAILY_INTENT_ENABLED", "true").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _env_decision(strategy_name: str) -> EffectiveDecision:
+    """Map a strategy's env mode flag onto the unified {mode, intent} axes.
+
+    The env vocabularies differ per engine; both map onto the unified ``mode``:
+      * simplified_engine: SIMPLIFIED_ENGINE_MODE disabled→skip / sandbox / live
+        (unset → sandbox, matching the engine's own fail-safe default).
+      * sector_follow_cap5_vol: SECTOR_FOLLOW_CAP5_VOL_MODE scaffold→skip /
+        sandbox / live (unset → skip, since scaffold places no orders).
+    Any unrecognized value fails safe to 'skip'. intent is always 'run' from env.
+    """
+    if strategy_name == "simplified_engine":
+        raw = (os.getenv("SIMPLIFIED_ENGINE_MODE") or "sandbox").strip().lower()
+        mode = {"disabled": "skip", "sandbox": "sandbox", "live": "live"}.get(raw, "sandbox")
+    elif strategy_name == "sector_follow_cap5_vol":
+        raw = (os.getenv("SECTOR_FOLLOW_CAP5_VOL_MODE") or "scaffold").strip().lower()
+        mode = {"scaffold": "skip", "sandbox": "sandbox", "live": "live"}.get(raw, "skip")
+    else:
+        mode = "sandbox"
+    return EffectiveDecision(mode=mode, intent="run", daily_capital_cap=None, source="env")
+
+
+def resolve_strategy_mode(strategy_name: str, date: str | None = None) -> EffectiveDecision:
+    """Resolve the effective {mode, intent} for one strategy.
+
+    Fall-through (flag on): unified row → legacy daily_intent (simplified only) →
+    env mode flag → default(sandbox, run). With the flag off, the unified-row
+    step is skipped — i.e. exactly today's behavior. Never raises: any DB error
+    falls through to the env/default decision so a job is never killed by the
+    resolver.
+    """
+    if date is None:
+        date = _today_ist_str()
+
+    if _flag_enabled():
+        try:
+            from database.strategy_daily_intent_db import get_intent
+
+            row = get_intent(strategy_name, date)
+            if row is not None:
+                return EffectiveDecision(
+                    mode=row["mode"],
+                    intent=row["intent"],
+                    daily_capital_cap=row["daily_capital_cap"],
+                    source="unified",
+                )
+        except Exception:
+            # Fail open to the legacy/env path; never block a job on a DB read.
+            pass
+
+    # Legacy daily_intent table only describes the simplified engine.
+    if strategy_name == "simplified_engine":
+        try:
+            legacy = get_daily_intent(date)
+            if legacy is not None and legacy["intent"] in ("live", "sandbox", "skip"):
+                return EffectiveDecision(
+                    mode=legacy["intent"],
+                    intent="run",
+                    daily_capital_cap=None,
+                    source="legacy",
+                )
+        except Exception:
+            pass
+
+    # Env mode flag (per-engine vocabulary).
+    if strategy_name in ("simplified_engine", "sector_follow_cap5_vol"):
+        return _env_decision(strategy_name)
+
+    return EffectiveDecision(mode="sandbox", intent="run", daily_capital_cap=None, source="default")

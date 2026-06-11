@@ -197,6 +197,12 @@ class SimplifiedStockEngineService:
         )
         # Order routing mode: disabled | sandbox | live. See MODE_* in core.
         self.mode = self.config.mode
+        # Unified daily-intent resolver (services.mode_service). Injectable for
+        # tests; default consults resolve_strategy_mode('simplified_engine').
+        # See docs/design/strategy_daily_intent.md — the gate lives here (order
+        # dispatch) rather than in place_order_service because the engine's own
+        # _dispatch_order bypasses that path in sandbox mode.
+        self._intent_resolver: Any | None = None
         self.history_source = os.getenv("SIMPLIFIED_ENGINE_HISTORY_SOURCE", "api")
         self.history_lookback_days = _env_int("SIMPLIFIED_ENGINE_HISTORY_LOOKBACK_DAYS", 3)
         self.order_poll_attempts = _env_int("SIMPLIFIED_ENGINE_ORDER_POLL_ATTEMPTS", 5)
@@ -486,9 +492,43 @@ class SimplifiedStockEngineService:
         finally:
             self._sl_timers.pop(signal.symbol, None)
 
+    def _intent_blocks(self, *, is_entry: bool) -> bool:
+        """Consult the unified daily-intent resolver. True iff this action is
+        blocked today: ``halt`` blocks everything; ``pause`` blocks entries but
+        allows exits. Fail-open — any resolver error returns False (not blocked)
+        so a lookup failure never silently halts trading. Back-compat: with no
+        unified row the resolver falls through to env (intent='run') → not
+        blocked."""
+        try:
+            resolver = self._intent_resolver
+            if resolver is None:
+                from services.mode_service import resolve_strategy_mode
+
+                decision = resolve_strategy_mode("simplified_engine")
+            else:
+                decision = resolver()
+            intent = getattr(decision, "intent", "run")
+        except Exception:
+            logger.debug("simplified intent resolve failed; not blocking", exc_info=True)
+            return False
+        if intent == "halt":
+            return True
+        if intent == "pause" and is_entry:
+            return True
+        return False
+
     def _place_entry_order(
         self, signal: EntrySignal, api_key: str, strategy_name: str
     ) -> None:
+        # Unified daily-intent gate (pause/halt block new entries).
+        if self._intent_blocks(is_entry=True):
+            logger.info(
+                "[SIMPLIFIED-INTENT] Entry blocked for %s by daily intent (pause/halt)",
+                signal.symbol,
+            )
+            with self._lock:
+                self.engine.clear_pending_entry(signal.symbol)
+            return
         # Stage-0 daily circuit breaker. Sits *before* the disabled-mode
         # short-circuit so disabled-mode tracing also respects the gate (so
         # an operator can see "engine would have skipped this anyway").
@@ -631,6 +671,7 @@ class SimplifiedStockEngineService:
             review = signal_review_service.review_signal(
                 symbol=signal.symbol,
                 source=strategy_name,
+                direction=signal.action,
             )
         except Exception:
             logger.exception(
@@ -903,6 +944,17 @@ class SimplifiedStockEngineService:
             )
 
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
+        # Unified daily-intent gate (only ``halt`` blocks exits; ``pause`` lets
+        # open positions run to their stop/exit).
+        if self._intent_blocks(is_entry=False):
+            logger.info(
+                "[SIMPLIFIED-INTENT] Exit blocked for %s by daily intent (halt)",
+                signal.symbol,
+            )
+            with self._lock:
+                self.engine.clear_pending_exit(signal.symbol)
+            return
+
         if self.mode == MODE_DISABLED:
             logger.info(
                 "[SIMPLIFIED-DISABLED] %s %s qty=%s reason=%s ref=%.2f (no order sent)",
@@ -1253,20 +1305,67 @@ class SimplifiedStockEngineService:
             trades_snapshot = list(self.engine.completed_trades)
             self._eod_summary_done_date = now.date()
 
-        if not trades_snapshot:
+        # Reconcile sandbox MIS auto-square-off closures into the journal BEFORE
+        # summarizing, so the Telegram count + P&L include positions the engine
+        # never journaled (it only writes exits it fired itself). No-op outside
+        # sandbox mode and when no open rows remain. Must run before the
+        # empty-snapshot early-return below: a day where the engine fired *zero*
+        # exits (all closures via square-off) has an empty in-memory ledger but a
+        # journal that reconciliation can still complete.
+        self._maybe_reconcile_eod_journal(now.date())
+
+        # Did reconciliation (or the engine) leave anything to report? Read the
+        # journal aggregate so an all-square-off day still summarizes even though
+        # the in-memory snapshot is empty.
+        journal_count = 0
+        try:
+            from services import trade_journal_service
+
+            journal_count = int(trade_journal_service.get_today_summary().get("count", 0))
+        except Exception as e:  # noqa: BLE001 — fail-safe
+            logger.warning("[SIMPLIFIED-EOD-SUMMARY] journal count read failed: %s", e)
+
+        if not trades_snapshot and not journal_count:
             logger.info("[SIMPLIFIED-EOD-SUMMARY] No completed trades today (mode=%s)", self.mode)
             return
 
-        lines = self._build_eod_summary_lines(trades_snapshot, now.date())
-        # Single multi-line log entry so it's easy to find in error.jsonl / files.
-        logger.info("[SIMPLIFIED-EOD-SUMMARY]\n%s", "\n".join(lines))
+        if trades_snapshot:
+            lines = self._build_eod_summary_lines(trades_snapshot, now.date())
+            # Single multi-line log entry so it's easy to find in error.jsonl / files.
+            logger.info("[SIMPLIFIED-EOD-SUMMARY]\n%s", "\n".join(lines))
 
         # Fail-safe Telegram fan-out. The journal-derived aggregate is the
         # canonical source of truth (handles partial fills, rejected exits,
-        # multi-leg trades) — the engine's in-memory completed_trades is just
-        # a hot-path mirror. If the journal read fails, fall back to a
-        # minimal payload built from the snapshot above.
+        # multi-leg trades, AND sandbox square-offs reconciled just above) — the
+        # engine's in-memory completed_trades is just a hot-path mirror. If the
+        # journal read fails, fall back to a minimal payload from the snapshot.
         self._notify_eod_summary(trades_snapshot)
+
+    def _maybe_reconcile_eod_journal(self, today: dt.date) -> None:
+        """Pull sandbox EOD square-off closures into the journal. Fail-safe.
+
+        Only meaningful in sandbox mode (it reads ``sandbox.db``); a no-op in
+        live/disabled. Gated by ``ENGINE_EOD_RECONCILIATION_ENABLED`` (default
+        on) so the operator can roll it back without code changes. Idempotent —
+        safe to call repeatedly within the once-per-day EOD-summary guard.
+        """
+        if self.mode != MODE_SANDBOX:
+            return
+        if not _env_bool("ENGINE_EOD_RECONCILIATION_ENABLED", True):
+            return
+        try:
+            from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+            result = reconcile_engine_journal(
+                today, strategy_name=self.JOURNAL_STRATEGY_NAME
+            )
+            logger.info(
+                "[SIMPLIFIED-EOD-RECONCILE] checked=%d added=%d skipped=%d",
+                result.entries_checked, result.exits_added, len(result.skipped),
+            )
+        except Exception as e:  # noqa: BLE001 — fail-safe; a missed reconcile
+            # only under-reports, it never corrupts execution.
+            logger.warning("[SIMPLIFIED-EOD-RECONCILE] reconciliation failed: %s", e)
 
     def _build_eod_summary_lines(
         self, trades: list[CompletedTrade], today: dt.date

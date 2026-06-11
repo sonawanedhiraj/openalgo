@@ -1526,3 +1526,107 @@ def test_service_on_quote_enqueues_when_enabled(monkeypatch):
             assert rows[0]["ltp"] == 2500.0
         finally:
             service._tick_log.stop()
+
+
+# --------------------------------------------------------------------------- #
+# Unified daily-intent gate (pause / halt) — gate lives at order dispatch.
+# --------------------------------------------------------------------------- #
+def _decision(intent="run", mode="sandbox", source="unified"):
+    from services.mode_service import EffectiveDecision
+
+    return EffectiveDecision(mode=mode, intent=intent, daily_capital_cap=None, source=source)
+
+
+def test_intent_pause_blocks_entry_order():
+    service = _make_service(MODE_SANDBOX)
+    service._intent_resolver = lambda: _decision(intent="pause")
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    with (
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+        patch("services.place_order_service.place_order") as mock_live,
+    ):
+        service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
+
+    mock_sandbox.assert_not_called()
+    mock_live.assert_not_called()
+    assert signal.symbol not in service.engine.pending_entries  # pending cleared
+
+
+def test_intent_halt_blocks_entry_order():
+    service = _make_service(MODE_SANDBOX)
+    service._intent_resolver = lambda: _decision(intent="halt")
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    with (
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+        patch("services.place_order_service.place_order") as mock_live,
+    ):
+        service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
+
+    mock_sandbox.assert_not_called()
+    mock_live.assert_not_called()
+
+
+def test_intent_pause_allows_exit_order():
+    """pause must NOT block exits — open positions run to their stop/exit."""
+    service = _make_service(MODE_SANDBOX)
+    service._intent_resolver = lambda: _decision(intent="pause")
+    signal = _make_exit_signal()
+    service.engine.pending_exits[signal.symbol] = signal
+    from services.simplified_stock_engine_core import Position
+
+    service.engine.positions[signal.symbol] = Position(
+        symbol=signal.symbol, entry_price=2500.0, qty=10, stop_loss=2490.0,
+        entry_time=dt.datetime(2026, 5, 17, 10, 30), risk_per_share=10.0,
+    )
+    sandbox_response = (True, {"orderid": "sbx-exit", "status": "success"}, 200)
+    with (
+        patch("services.sandbox_service.sandbox_place_order",
+              return_value=sandbox_response) as mock_sandbox,
+        patch("services.place_order_service.place_order") as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2489.0),
+    ):
+        service._place_exit_order(signal, api_key="test-key", strategy_name="trend-up")
+
+    mock_live.assert_not_called()
+    mock_sandbox.assert_called_once()
+
+
+def test_intent_halt_blocks_exit_order():
+    service = _make_service(MODE_SANDBOX)
+    service._intent_resolver = lambda: _decision(intent="halt")
+    signal = _make_exit_signal()
+    service.engine.pending_exits[signal.symbol] = signal
+
+    with (
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+        patch("services.place_order_service.place_order") as mock_live,
+    ):
+        service._place_exit_order(signal, api_key="test-key", strategy_name="trend-up")
+
+    mock_sandbox.assert_not_called()
+    mock_live.assert_not_called()
+    assert signal.symbol not in service.engine.pending_exits
+
+
+def test_intent_run_allows_entry_backcompat():
+    """source='env', intent='run' (the no-row fall-through) lets entries proceed."""
+    service = _make_service(MODE_SANDBOX)
+    service._intent_resolver = lambda: _decision(intent="run", source="env")
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    sandbox_response = (True, {"orderid": "sbx-abc", "status": "success"}, 200)
+    with (
+        patch("services.sandbox_service.sandbox_place_order",
+              return_value=sandbox_response) as mock_sandbox,
+        patch("services.place_order_service.place_order") as mock_live,
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2501.5),
+    ):
+        service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
+
+    mock_live.assert_not_called()
+    mock_sandbox.assert_called_once()

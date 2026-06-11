@@ -27,6 +27,8 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -62,6 +64,10 @@ class SignalDecision(Base):
     symbol = Column(String(32), nullable=False)
     # Free-form source tag (e.g. 'chartink_buy_fno_intraday').
     source = Column(String(64), nullable=False)
+    # Side the engine actually armed: 'BUY' (long) | 'SELL' (short). Nullable
+    # so the legacy rows written before this column existed read back as None.
+    # The ``source`` string alone can't disambiguate the two chartink legs.
+    direction = Column(String(8), nullable=True)
     # 'take' | 'skip' | 'review_failed'. review_failed is recorded so we can
     # tell apart "reviewer said take" from "reviewer was down and we defaulted".
     decision = Column(String(16), nullable=False)
@@ -91,8 +97,32 @@ def init_db():
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Signal Decision DB", logger)
+    _migrate_add_direction_column()
     with _tables_ensured_lock:
         _tables_ensured_for_engine = engine
+
+
+def _migrate_add_direction_column() -> None:
+    """Add the ``direction`` column to a pre-existing table. Idempotent.
+
+    ``create_all`` only creates missing tables — it never alters an existing
+    one — so a DB that predates this column needs an explicit ``ALTER TABLE``.
+    Guarded by an inspector check so re-running is a no-op, and wrapped in
+    try/except so a benign race (two threads adding at once) can't crash boot.
+    """
+    try:
+        inspector = inspect(engine)
+        if "signal_decision" not in inspector.get_table_names():
+            return  # create_all will build it fresh with the column already present
+        columns = {col["name"] for col in inspector.get_columns("signal_decision")}
+        if "direction" in columns:
+            return
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE signal_decision ADD COLUMN direction VARCHAR(8)"))
+        logger.info("signal_decision: added 'direction' column via migration")
+    except Exception:
+        # Most likely a concurrent ALTER that already landed (duplicate column).
+        logger.debug("signal_decision: direction-column migration skipped", exc_info=True)
 
 
 def _ensure_tables() -> None:
@@ -109,6 +139,7 @@ def _ensure_tables() -> None:
         if _tables_ensured_for_engine is engine:
             return
         Base.metadata.create_all(bind=engine)
+        _migrate_add_direction_column()
         _tables_ensured_for_engine = engine
 
 
@@ -122,6 +153,7 @@ def _row_to_dict(row: SignalDecision) -> dict[str, Any]:
         "candidate_at": row.candidate_at,
         "symbol": row.symbol,
         "source": row.source,
+        "direction": row.direction,
         "decision": row.decision,
         "reasoning": row.reasoning,
         "confidence": row.confidence,
@@ -141,6 +173,7 @@ def insert_signal_decision(
     symbol: str,
     source: str,
     decision: str,
+    direction: str | None = None,
     reasoning: str | None,
     confidence: float | None,
     enforcement_mode: str,
@@ -159,6 +192,7 @@ def insert_signal_decision(
             candidate_at=candidate_at,
             symbol=symbol,
             source=source,
+            direction=direction,
             decision=decision,
             reasoning=reasoning,
             confidence=confidence,

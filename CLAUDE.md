@@ -722,6 +722,44 @@ status/positions/pause/resume/close_all),
 `services/sector_follow_index_backfill.py` (daily 16:05 IST sector-index 1m
 refresh, gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`). Plan + locked operator
 decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follow_cap5_vol/PLAN.md).
+Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
+at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
+
+## Data freshness validation (sector_follow_cap5_vol)
+
+A durable guard against the class of failure that produced the 2026-05-29→06-10
+incident: the sector-index 1m feed sat **12 days stale** because the daily
+backfill job did not exist yet, and the hermetic (mocked-data) E2E suite never
+noticed an *environmental* regression. The validation layer makes feed staleness
+fail loud and fail safe.
+
+- **Pure service** `services/data_freshness_service.py` — read-only on
+  `historify.duckdb`. `check_strategy_data_ready(strategy, date,
+  max_staleness_business_days=1)` returns `(ok, per-symbol details)`;
+  business-day aware (weekend gap ≠ stale; holidays NOT modelled). For
+  sector_follow it checks the 8 mapped indices + 30 universe stocks.
+- **Table** `data_health_check` in `db/openalgo.db`
+  (`database/data_health_db.py`) — one row per check: `check_at`, `overall_ok`,
+  `stale_symbols` (JSON), `details_json`, `alert_sent`.
+- **Daily 16:30 IST job** `sector_follow_data_health` (runs after the 16:05
+  backfill). On stale data: Telegram-alerts the operator AND auto-pauses
+  *tomorrow's* `strategy_daily_intent` (`intent='pause'`, mode preserved,
+  `updated_by='data_health:auto-pause'` — operator can override via Telegram/SQL).
+- **Pre-entry gate** in `run_entry` (after the intent gate): aborts entries +
+  alerts on a stale index OR stock feed. `run_exit` only *warns* on stale index
+  data — exits are never blocked (a held T+1 position is riskier).
+- **HTTP** `GET /sector_follow_cap5_vol/api/data_health` — live per-symbol
+  freshness (read-only; never writes the row).
+- **Feature flag** `DATA_FRESHNESS_VALIDATION_ENABLED` (default `true`) +
+  threshold `MAX_STALENESS_BUSINESS_DAYS` (default `1`). See
+  `docs/PARAMETER_LOG.md`. The gate/job are no-ops when the flag is off; the
+  HTTP endpoint always works.
+
+**Manual catch-up** for a stale feed (both feeds route through the same historify
+pipeline): index 1m via `uv run python -m services.sector_follow_index_backfill
+--from YYYY-MM-DD --to YYYY-MM-DD`; stock 1m via a
+`historify_service.create_and_start_job` call over the universe (`exchange=NSE`,
+`interval=1m`, `incremental=True`).
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
@@ -745,12 +783,122 @@ Key files:
 - `services/simplified_stock_engine_core.py` — broker-agnostic engine.
 - `services/simplified_stock_engine_service.py` — openalgo integration.
 - `services/simplified_stock_engine_ticklog.py` — async tick log writer.
+- `services/engine_eod_reconciliation_service.py` — EOD reconciliation (below).
 - `blueprints/chartink.py:947+` — webhook, status, direction-toggle routes.
 - `test/test_simplified_stock_engine_*.py` — 68 tests.
 
 The default mode is `sandbox` — orders flow into `sandbox.db` (virtual ₹1Cr
 capital) regardless of the global analyze_mode flag. Flip to `live` only
 after running the test suite and the smoke-boot checklist in the hand-off doc.
+
+**EOD journal reconciliation.** The engine only writes a `trade_journal` exit row
+when *it* fires an exit (stop/target/trailing/its own EOD flatten). In sandbox
+mode, positions still open at the close are flattened by sandbox's own MIS
+auto-square-off, which the engine never journaled — so the Telegram EOD summary
+under-counted trades and P&L (the 2026-06-10 bug: +₹352 shown vs +₹8,327 real).
+`services/engine_eod_reconciliation_service.reconcile_engine_journal()` closes
+that gap: before the Telegram EOD summary fires, `_maybe_log_eod_summary` calls
+`_maybe_reconcile_eod_journal(today)` (reconcile → summarize), which reads
+`sandbox.db` **read-only** and stamps the missing exit rows
+(`exit_reason='sandbox_eod_squareoff'`, gross P&L). Idempotent, mid-day safe,
+sandbox-only, gated by `ENGINE_EOD_RECONCILIATION_ENABLED` (default true). A
+past-date operator backfill lives in
+`services/engine_eod_reconciliation_backfill.py` (dry-run by default; `--apply`
+to write) and is **not** wired into the runtime.
+
+**EOD flatten has three layers of defense.** (1) tick-driven `_maybe_flatten_eod`
+(primary — fires intra-tick after `eod_exit_time`, but can't run if the broker
+tick stream dies before close); (2) the APScheduler **EOD watchdog**
+(`services/eod_watchdog_service.py`) — a tick-independent backstop that flattens
+open `trade_journal` rows via `place_order`, gated by
+`SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED` (default true); (3) the 15:30
+reconciliation above, which catches anything the first two missed. The watchdog
+fires at **15:14 IST** (`min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)`,
+default cap 15:14) — deliberately **before** the 15:15 sandbox/broker MIS
+auto-square-off. This is load-bearing: sandbox *rejects* MIS orders placed at/after
+15:15, so a watchdog at the old declared 15:20 was always too late (the 2026-06-10
+OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
+
+## Unified strategy daily intent (`strategy_daily_intent`)
+
+The single per-strategy control surface for both the simplified engine and
+sector_follow is the `strategy_daily_intent` table in `db/openalgo.db`. It
+replaces the legacy simplified-engine `daily_intent` table and sector_follow's
+in-memory pause flag as the canonical *pre-market* control. One row per
+`(strategy_name, intent_date)`:
+
+- **`mode`** ∈ `live` / `sandbox` / `skip` — HOW orders route (broker /
+  sandbox.db / no orders).
+- **`intent`** ∈ `run` / `pause` / `halt` — WHETHER to act. `pause` blocks new
+  entries but lets exits / MTM / EOD continue; `halt` skips everything including
+  exits.
+- **`daily_capital_cap`** — optional override of the strategy's default daily
+  capital (caps the position-slot count).
+
+The single read path is
+`services.mode_service.resolve_strategy_mode(strategy_name, date=None)`, which
+returns an `EffectiveDecision(mode, intent, daily_capital_cap, source)`. It is a
+**separate** function from the load-bearing legacy global
+`resolve_effective_mode()` (an enum used by `place_order_service` /
+`/mode/status`) — see `docs/design/strategy_daily_intent.md` for why.
+
+**Fall-through (flag on):** unified row → legacy `daily_intent` (simplified
+only) → env mode flag (`SIMPLIFIED_ENGINE_MODE` / `SECTOR_FOLLOW_CAP5_VOL_MODE`)
+→ `sandbox/run` default. **Deploy is a no-op** until the operator inserts a row;
+each strategy stays on its existing env/legacy behavior until then.
+
+**Feature flag:** `STRATEGY_DAILY_INTENT_ENABLED` (env, default `true`). Set
+`false` for pure legacy behavior. **Migration:** legacy `daily_intent` rows are
+backfilled into the unified table once at boot (idempotent, `updated_by=
+'migration'`, `intent='run'`).
+
+**Where the gate lives:** in the engines (at job-entry / order-dispatch), NOT in
+`place_order_service` — the simplified engine's sandbox path bypasses
+`place_order_service`, and entry-vs-exit is only knowable in the engine. The
+shared `place_order_service` global resolver is unchanged. The
+`/sector_follow_cap5_vol/api/pause|resume` REST endpoints remain as **runtime
+emergency overrides** (in-memory `manual_pause`); pre-market planning uses the
+table.
+
+To opt a strategy in: `set_intent(strategy_name, date, mode, intent, cap,
+updated_by, notes)` in `database/strategy_daily_intent_db.py` (SQL or the
+Telegram inbound bot below). To roll one back: delete its row → instant env
+fall-through.
+
+## Telegram daily intent control (Phase 6)
+
+The unified `strategy_daily_intent` table can be set **from the phone** via the
+inbound Telegram bot (`services/telegram_inbound_service.py`), the INBOUND
+counterpart to the send-only outbound `telegram_bot_service`. Full design:
+[`docs/design/telegram_inbound.md`](docs/design/telegram_inbound.md).
+
+**Feature-flagged off by default** (`TELEGRAM_INBOUND_ENABLED`, default `false`):
+deploying the module starts no poller. When enabled, it polls Telegram on a real
+OS thread (eventlet-safe, like the outbound bot), registers an **08:45 IST**
+morning-prompt APScheduler job, and writes the intent table.
+
+**Commands:** `/status`, `/intent <strategy> <run|pause|halt>`,
+`/intent <strategy> cap <amount>`, `/intent <strategy> clear`,
+`/pause`/`/resume`/`/halt <strategy>`, `/morning`. Free-text replies
+(`pause sector_follow`) and inline morning-keyboard buttons work too. Strategy
+aliases accepted (`simplified`, `sector`/`sf`).
+
+**Safety rails (load-bearing — do not relax):**
+- **Mode flips are NOT exposed.** Only the *intent* axis (run/pause/halt) and the
+  capital cap are settable from Telegram; `live`/`sandbox`/`skip` (HOW orders
+  route) replies *"Mode changes require laptop access for safety."* Setting an
+  intent **preserves** the row's existing mode.
+- **chat_id allowlist** in `bot_config.telegram_chat_ids` (comma-separated);
+  unauthorized chats are silently ignored.
+- **Halt always two-step:** a halt-triggering input arms a 30-second "reply YES"
+  confirmation before the row is written.
+- **Audit:** every change writes `updated_by=telegram:<chat_id>:<message_id>`.
+- **One poller per bot token:** don't run the full interactive outbound bot's
+  poller on the same token while this is enabled (Telegram getUpdates Conflict).
+
+**Operator activation:** `UPDATE bot_config SET telegram_chat_ids='<chat_id>'
+WHERE id=1;` (or `database.telegram_db.add_authorized_chat_id`), set
+`TELEGRAM_INBOUND_ENABLED=true`, restart.
 
 ## Claude Code Instructions
 
