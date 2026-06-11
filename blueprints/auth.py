@@ -31,7 +31,7 @@ from utils.email_debug import debug_smtp_connection
 from utils.email_utils import send_password_reset_email, send_test_email
 from utils.ip_helper import get_real_ip
 from utils.logging import get_logger
-from utils.session import check_session_validity
+from utils.session import check_session_validity, is_session_valid, revoke_user_tokens
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -78,7 +78,9 @@ def _clear_pending_totp() -> None:
 
 @auth_bp.errorhandler(429)
 def ratelimit_handler(e):
-    return jsonify(status="error", message="Too many login attempts. Please wait a minute and try again."), 429
+    return jsonify(
+        status="error", message="Too many login attempts. Please wait a minute and try again."
+    ), 429
 
 
 @auth_bp.route("/csrf-token", methods=["GET"])
@@ -134,6 +136,50 @@ def check_setup_required():
     return jsonify({"status": "success", "needs_setup": needs_setup})
 
 
+def _broker_validation_failure_reason(funds_data):
+    """Return a reason string when a broker funds payload signals auth/API failure.
+
+    ``get_margin_data`` returns ``{}`` on failure for some brokers (e.g. Zerodha),
+    but others (Dhan, Angel, etc.) return a *structured* error dict such as
+    ``{"status": "error", "message": "token expired"}``. That dict is non-empty and
+    therefore truthy — a bare ``if not funds_data:`` check would treat it as a valid
+    session and resume on an expired token. This helper detects the structured-error
+    shape so the caller can reject it. Returns ``None`` when the payload looks valid.
+    """
+    if not funds_data:
+        return "empty funds response"
+
+    if not isinstance(funds_data, dict):
+        return None
+
+    status = str(funds_data.get("status", "")).lower()
+    if status in {"error", "failed", "failure"}:
+        return str(
+            funds_data.get("message")
+            or funds_data.get("errorMessage")
+            or funds_data.get("errors")
+            or funds_data.get("error")
+            or "broker returned error status"
+        )
+
+    # Reject on any broker error-code/message key, including the snake/lower
+    # variants (errcode/error_code) some brokers use in addition to upstream's set.
+    for key in (
+        "errorType",
+        "errorCode",
+        "errorMessage",
+        "errors",
+        "error",
+        "errcode",
+        "error_code",
+    ):
+        value = funds_data.get(key)
+        if value:
+            return str(value)
+
+    return None
+
+
 def _try_resume_broker_session(username):
     """
     Check if the user has an existing valid broker session in the DB.
@@ -161,12 +207,24 @@ def _try_resume_broker_session(username):
 
         # Validate token with a lightweight broker API call (funds)
         import importlib
+
         try:
             broker_module = importlib.import_module(f"broker.{broker}.api.funds")
+            # Preferred path: brokers that expose a dedicated auth probe
+            # (e.g. Dhan's test_auth_token) report expiry without a funds call.
+            if hasattr(broker_module, "test_auth_token"):
+                is_valid, error_message = broker_module.test_auth_token(auth_token)
+                if not is_valid:
+                    logger.info(f"Broker token expired or invalid for {username}: {error_message}")
+                    return None
             funds_data = broker_module.get_margin_data(auth_token)
-            # get_margin_data returns {} on failure (doesn't raise) — treat empty as invalid
-            if not funds_data:
-                logger.info(f"Broker token expired or invalid for {username} (empty funds response)")
+            # get_margin_data returns {} on failure for some brokers, but others
+            # return a structured {"status":"error",...} dict that is truthy — a
+            # bare `if not funds_data` would resume on an expired-token error. Detect
+            # both via the failure-reason helper.
+            failure_reason = _broker_validation_failure_reason(funds_data)
+            if failure_reason:
+                logger.info(f"Broker token expired or invalid for {username}: {failure_reason}")
                 return None
         except Exception as e:
             logger.info(f"Broker token validation failed for {username}: {e}")
@@ -176,6 +234,7 @@ def _try_resume_broker_session(username):
         logger.info(f"Resuming existing broker session for {username} (broker: {broker})")
 
         from utils.auth_utils import handle_auth_success
+
         # Call handle_auth_success for its side effects (session setup, DB upsert,
         # master contract loading) but ignore its response format — the login
         # endpoint must always return JSON for the React frontend's fetch() call.
@@ -196,12 +255,14 @@ def _try_resume_broker_session(username):
             return None
 
         logger.info(f"Session resume complete for {username}, redirecting to dashboard")
-        return jsonify({
-            "status": "success",
-            "message": "Broker session resumed",
-            "redirect": "/dashboard",
-            "broker": broker,
-        }), 200
+        return jsonify(
+            {
+                "status": "success",
+                "message": "Broker session resumed",
+                "redirect": "/dashboard",
+                "broker": broker,
+            }
+        ), 200
 
     except Exception as e:
         logger.error(f"Error trying to resume broker session: {e}", exc_info=True)
@@ -214,8 +275,12 @@ def _try_resume_broker_session(username):
 def login():
     # Handle POST requests first (for React SPA / AJAX login)
     if request.method == "POST":
-        logger.info(f"[LOGIN] POST from IP={get_real_ip()}, UA={request.headers.get('User-Agent', '')[:80]}")
-        logger.info(f"[LOGIN] Session state: user={session.get('user')}, logged_in={session.get('logged_in')}, broker={session.get('broker')}")
+        logger.info(
+            f"[LOGIN] POST from IP={get_real_ip()}, UA={request.headers.get('User-Agent', '')[:80]}"
+        )
+        logger.info(
+            f"[LOGIN] Session state: user={session.get('user')}, logged_in={session.get('logged_in')}, broker={session.get('broker')}"
+        )
 
         # Check if setup is required
         if find_user_by_username() is None:
@@ -231,13 +296,18 @@ def login():
         # Check if already logged in (check logged_in first — it means
         # broker auth is complete; "user" alone means only password was done)
         if session.get("logged_in"):
-            logger.info(f"[LOGIN] Already fully logged in, redirecting to /dashboard")
-            return jsonify(
-                {"status": "success", "message": "Already logged in", "redirect": "/dashboard"}
-            ), 200
+            if is_session_valid():
+                logger.info("[LOGIN] Already fully logged in, redirecting to /dashboard")
+                return jsonify(
+                    {"status": "success", "message": "Already logged in", "redirect": "/dashboard"}
+                ), 200
+
+            logger.info("[LOGIN] Existing session expired; clearing before password login")
+            revoke_user_tokens()
+            session.clear()
 
         if "user" in session:
-            logger.info(f"[LOGIN] User in session but not logged_in, redirecting to /broker")
+            logger.info("[LOGIN] User in session but not logged_in, redirecting to /broker")
             return jsonify(
                 {"status": "success", "message": "Already logged in", "redirect": "/broker"}
             ), 200
@@ -263,43 +333,67 @@ def login():
                 session["pending_totp_started_at"] = _utcnow_iso()
                 logger.info(f"[LOGIN] TOTP required for: {username}; awaiting second factor")
                 return jsonify(
-                    {"status": "totp_required", "message": "Enter the 6-digit code from your authenticator app."}
+                    {
+                        "status": "totp_required",
+                        "message": "Enter the 6-digit code from your authenticator app.",
+                    }
                 ), 200
 
             session["user"] = username  # Set the username in the session
 
             # Try to resume existing broker session (skip OAuth if token still valid)
             resumed = _try_resume_broker_session(username)
-            logger.info(f"[LOGIN] Resume result: {resumed is not None}, type={type(resumed).__name__ if resumed else 'None'}")
+            logger.info(
+                f"[LOGIN] Resume result: {resumed is not None}, type={type(resumed).__name__ if resumed else 'None'}"
+            )
             if resumed:
-                logger.info(f"[LOGIN] Returning resume response to frontend")
+                logger.info("[LOGIN] Returning resume response to frontend")
                 from database.auth_db import log_login_attempt
-                log_login_attempt(username, ip, ua, status="success",
-                                  login_type="resume", broker=session.get("broker"))
+
+                log_login_attempt(
+                    username,
+                    ip,
+                    ua,
+                    status="success",
+                    login_type="resume",
+                    broker=session.get("broker"),
+                )
                 return resumed
 
             # No valid broker session — redirect to broker login
-            logger.info(f"[LOGIN] No valid broker session, redirecting to /broker")
+            logger.info("[LOGIN] No valid broker session, redirecting to /broker")
             from database.auth_db import log_login_attempt
+
             log_login_attempt(username, ip, ua, status="success", login_type="password")
             return jsonify({"status": "success"}), 200
         else:
             from database.auth_db import log_login_attempt
-            log_login_attempt(username, get_real_ip(),
-                              request.headers.get("User-Agent", ""),
-                              status="failed", login_type="password",
-                              failure_reason="invalid_credentials")
+
+            log_login_attempt(
+                username,
+                get_real_ip(),
+                request.headers.get("User-Agent", ""),
+                status="failed",
+                login_type="password",
+                failure_reason="invalid_credentials",
+            )
             return jsonify({"status": "error", "message": "Invalid credentials"}), 401
 
     # Handle GET requests - redirect to React frontend
     if find_user_by_username() is None:
         return redirect("/setup")
 
+    if session.get("logged_in"):
+        if is_session_valid():
+            return redirect("/dashboard")
+
+        # Stale full session (token revoked / expired) — clear it so the user
+        # lands on a clean login instead of bouncing to a dead dashboard.
+        revoke_user_tokens()
+        session.clear()
+
     if "user" in session:
         return redirect("/broker")
-
-    if session.get("logged_in"):
-        return redirect("/dashboard")
 
     return redirect("/login")
 
@@ -370,8 +464,12 @@ def login_totp():
     resumed = _try_resume_broker_session(pending_username)
     if resumed:
         log_login_attempt(
-            pending_username, ip, ua, status="success",
-            login_type="totp_resume", broker=session.get("broker"),
+            pending_username,
+            ip,
+            ua,
+            status="success",
+            login_type="totp_resume",
+            broker=session.get("broker"),
         )
         return resumed
 
@@ -412,7 +510,9 @@ def two_factor_configure():
     data = request.get_json(silent=True) or {}
     totp_code = (data.get("totp_code") or "").strip()
     if not totp_code:
-        return jsonify({"status": "error", "message": "TOTP code is required to change 2FA settings."}), 400
+        return jsonify(
+            {"status": "error", "message": "TOTP code is required to change 2FA settings."}
+        ), 400
 
     user = find_user_by_exact_username(session["user"])
     if user is None:
@@ -610,10 +710,14 @@ def reset_password():
             # could prove control of the email/TOTP, not because every
             # logged-in browser is theirs. Force re-login everywhere.
             from database.auth_db import clear_user_sessions
+
             clear_user_sessions(user.username)
-            socketio.emit("force_logout", {
-                "message": "Your password was reset. Please log in again with the new password.",
-            })
+            socketio.emit(
+                "force_logout",
+                {
+                    "message": "Your password was reset. Please log in again with the new password.",
+                },
+            )
 
             # Clear reset session data for security
             session.pop("reset_token", None)
@@ -710,10 +814,14 @@ def change_password():
             # in again with the new password. This prevents an attacker
             # who already has a valid cookie from continuing to hold it.
             from database.auth_db import clear_user_sessions
+
             clear_user_sessions(username)
-            socketio.emit("force_logout", {
-                "message": "Your password was changed. Please log in again with the new password.",
-            })
+            socketio.emit(
+                "force_logout",
+                {
+                    "message": "Your password was changed. Please log in again with the new password.",
+                },
+            )
             session.clear()
 
             return jsonify(
@@ -865,7 +973,12 @@ def get_session_status():
         # Return 200 with authenticated: false instead of 401
         # This prevents unnecessary console errors in the browser
         return jsonify(
-            {"status": "success", "message": "Not authenticated", "authenticated": False, "logged_in": False}
+            {
+                "status": "success",
+                "message": "Not authenticated",
+                "authenticated": False,
+                "logged_in": False,
+            }
         ), 200
 
     # If session claims to be logged in with broker, validate the auth token exists
@@ -880,7 +993,12 @@ def get_session_status():
             # Clear the stale session
             session.clear()
             return jsonify(
-                {"status": "success", "message": "Session expired", "authenticated": False, "logged_in": False}
+                {
+                    "status": "success",
+                    "message": "Session expired",
+                    "authenticated": False,
+                    "logged_in": False,
+                }
             ), 200
 
         # Get API key for the user
@@ -888,6 +1006,7 @@ def get_session_status():
 
         # Include active session count
         from database.auth_db import get_active_sessions
+
         active_count = len(get_active_sessions(session.get("user")))
 
         return jsonify(
@@ -904,6 +1023,7 @@ def get_session_status():
 
     # Include active session count
     from database.auth_db import get_active_sessions
+
     active_count = len(get_active_sessions(session.get("user")))
 
     return jsonify(
@@ -926,15 +1046,18 @@ def active_sessions():
         return jsonify({"status": "error", "message": "Not authenticated"}), 401
 
     from database.auth_db import get_active_sessions
+
     sessions = get_active_sessions(session["user"])
     current_session_id = session.get("session_id")
 
-    return jsonify({
-        "status": "success",
-        "count": len(sessions),
-        "current_session_id": current_session_id,
-        "sessions": sessions,
-    })
+    return jsonify(
+        {
+            "status": "success",
+            "count": len(sessions),
+            "current_session_id": current_session_id,
+            "sessions": sessions,
+        }
+    )
 
 
 @auth_bp.route("/app-info", methods=["GET"])
@@ -1126,18 +1249,25 @@ def logout():
 
         # Clear ALL sessions for this user (logout means all devices)
         from database.auth_db import clear_user_sessions
+
         clear_user_sessions(username)
 
         # Notify all connected devices to logout immediately
-        socketio.emit("force_logout", {
-            "message": "You have been logged out from another device.",
-        })
+        socketio.emit(
+            "force_logout",
+            {
+                "message": "You have been logged out from another device.",
+            },
+        )
 
         # Update session count to 0
-        socketio.emit("active_sessions_update", {
-            "count": 0,
-            "sessions": [],
-        })
+        socketio.emit(
+            "active_sessions_update",
+            {
+                "count": 0,
+                "sessions": [],
+            },
+        )
 
         # Clear entire session to ensure complete logout
         session.clear()
@@ -1256,10 +1386,14 @@ def change_password_api():
         # again with the new password — typical 5-second flow — and any
         # attacker holding a stolen cookie is kicked out at the same moment.
         from database.auth_db import clear_user_sessions
+
         clear_user_sessions(username)
-        socketio.emit("force_logout", {
-            "message": "Your password was changed. Please log in again with the new password.",
-        })
+        socketio.emit(
+            "force_logout",
+            {
+                "message": "Your password was changed. Please log in again with the new password.",
+            },
+        )
         session.clear()
 
         return jsonify({"status": "success", "message": "Password changed successfully"})
