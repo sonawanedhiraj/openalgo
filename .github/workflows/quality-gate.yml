@@ -1,0 +1,47 @@
+name: Quality gate
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      # The OpenAlgo runtime requires Python 3.12 (eventlet has no 3.14 wheels;
+      # see memory py314-eventlet-werkzeug-boot-fail). Pin CI to 3.12.
+      - name: Setup Python 3.12
+        run: uv python install 3.12
+
+      - name: Install deps
+        run: uv sync --group dev
+
+      - name: Ruff (lint — blocking)
+        run: uv run ruff check .
+
+      # Bandit is non-blocking initially (|| true) — it has known noise on this
+      # codebase. Tighten to blocking once the baseline is triaged.
+      - name: Bandit (security — non-blocking)
+        run: uv run --group dev bandit -r . -x .venv,frontend,test || true
+
+      # Custom silent-drop rules. semgrep runs via uvx (isolated tool env) — it
+      # is NOT in the project lockfile (dependency conflict). ERROR-severity
+      # rules (the 4 confirmed P0/P1 findings) are BLOCKING.
+      - name: Semgrep custom rules (ERROR — blocking)
+        run: uvx semgrep --config .semgrep/silent-drops.yml --severity ERROR --error services/ blueprints/ sandbox/ restx_api/
+
+      # WARNING-severity heuristics — informational, never block.
+      - name: Semgrep custom rules (WARNING — informational)
+        run: uvx semgrep --config .semgrep/silent-drops.yml services/ blueprints/ sandbox/ restx_api/ || true
+
+      # Public Semgrep rulesets — best effort, non-blocking (avoids blocking on
+      # third-party false positives).
+      - name: Semgrep public rulesets (best effort)
+        run: uvx semgrep --config=auto --severity=ERROR --error services/ blueprints/ sandbox/ restx_api/ || true

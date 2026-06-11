@@ -307,6 +307,22 @@ dispatch bypasses `place_order_service` entirely). Full design:
   Chartink (scanner passively reads ZMQ), not scanner bugs
   (memory `inhouse-scanner-starved-no-self-subscribe`).
 
+## CI / code-quality gate
+
+- **GitHub Action** `.github/workflows/quality-gate.yml` — runs on PRs to
+  `dev`/`main` and pushes to `dev`. Steps: ruff (blocking), bandit
+  (`|| true`, non-blocking), Semgrep custom rules ERROR (blocking) + WARNING
+  (informational), public Semgrep `--config=auto` (best-effort). CI pins Python
+  3.12 (no 3.14 eventlet wheels).
+- **Custom Semgrep rules** `.semgrep/silent-drops.yml` (6 rules) — silent-drop /
+  partial-success anti-patterns. Rule catalog: `audit/silent_drop_audit_2026-06-11.md`.
+  Run locally via `uvx semgrep` (NOT in the uv lockfile — version conflict; see
+  CLAUDE.md "Code-quality gates"). 3 ERROR rules block; 3 WARNING rules inform.
+- **Pre-commit** `.pre-commit-config.yaml` — ruff, bandit, semgrep (ERROR-only),
+  detect-secrets, biome on staged files. Enable: `uv pip install pre-commit &&
+  pre-commit install`.
+- Branch protection on `dev`/`main` is operator-enabled via the GitHub UI.
+
 ## Cross-references
 
 - `CLAUDE.md` — coding conventions, deployment specifics, version bumping

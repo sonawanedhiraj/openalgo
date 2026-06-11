@@ -1,0 +1,187 @@
+# Custom Semgrep rules — silent-drop / partial-success anti-patterns.
+#
+# Rule catalog derived from audit/silent_drop_audit_2026-06-11.md.
+# Each rule references the audit finding it encodes. ERROR-severity rules are
+# the 4 confirmed P0/P1 findings (high-confidence, intended to block);
+# WARNING-severity rules are the cross-cutting heuristics the audit flagged as
+# "warn, not block — these have legitimate uses".
+#
+# Run:   uvx semgrep --config .semgrep/silent-drops.yml services/ blueprints/ sandbox/ restx_api/
+# Block: add --error (any finding -> exit 1) and/or --severity ERROR (only ERROR rules run).
+
+rules:
+  # --- P0-1: basket envelope hardcodes top-level success -------------------
+  # audit/silent_drop_audit_2026-06-11.md#p0-findings
+  # services/basket_order_service.py:380 (live), :304 (analyze)
+  # A literal {"status": "success", ...} built unconditionally after the order
+  # loop reports success even when every constituent order was rejected.
+  # The safe pattern uses a *variable* status ("status": status) computed from
+  # the per-leg results — that does NOT match this literal-only rule, so the
+  # simplified engine arm response is intentionally not flagged here.
+  - id: hardcoded-success-envelope
+    languages: [python]
+    pattern: |
+      {..., "status": "success", ...}
+    paths:
+      # Scoped to the multi-order / basket aggregation paths only. Single-order
+      # REST endpoints (restx_api/) legitimately return a success envelope after
+      # a checked place_order — including them here floods the blocking gate with
+      # false positives. The audit's P0/cross-cutting-#1 concern is specifically
+      # the multi-order envelope that aggregates >1 constituent order.
+      include:
+        - "**/services/basket_order_service.py"
+        - "**/services/*multiorder*_service.py"
+    message: >-
+      Hardcoded literal {"status": "success"} envelope. A multi-order/basket
+      response must reflect the actual per-order outcome (success only on ALL
+      filled, "partial" on some, "error" on none) and carry counts. See
+      audit/silent_drop_audit_2026-06-11.md#p0-findings (basket_order_service:380).
+    severity: ERROR
+
+  # --- P1-3: options multi-order leg masks partial split fills -------------
+  # services/options_multiorder_service.py:328
+  # `overall_status = "success" if successful_orders > 0 else "error"` —
+  # one filled split out of N marks the whole leg successful, masking an
+  # under-filled (directionally-naked) options leg.
+  - id: success-if-any-aggregation
+    languages: [python]
+    pattern: $STATUS = "success" if $N > 0 else $ELSE
+    paths:
+      include:
+        - "**/services/*order*_service.py"
+        - "**/services/*multiorder*.py"
+        - "**/services/basket_*.py"
+    message: >-
+      "success-if-any" aggregation: reporting success because >=1 leg/sub-order
+      succeeded masks partial fills. Report "partial" when 0 < n < total and
+      surface filled vs total quantity. See
+      audit/silent_drop_audit_2026-06-11.md#p1-findings (options_multiorder_service:328).
+    severity: ERROR
+
+  # --- P1-2: sandbox commit-then-mutate rollback gap -----------------------
+  # sandbox/execution_engine.py:386-389
+  # The fill (SandboxTrades row + order_status="complete") is committed, THEN
+  # _update_position runs and can raise — leaving a banked fill with no
+  # matching position. Commit once, last, after every dependent write succeeds.
+  - id: commit-then-mutate
+    languages: [python]
+    patterns:
+      - pattern: |
+          $SESS.commit()
+          ...
+          self._update_position(...)
+    paths:
+      include:
+        - "**/sandbox/execution_engine.py"
+    message: >-
+      commit() before a subsequent state-mutating call (_update_position) that
+      can raise -> rollback gap (banked fill, no position). Order must be
+      validate -> mutate -> commit once. See
+      audit/silent_drop_audit_2026-06-11.md#p1-findings (execution_engine:386).
+    severity: WARNING
+
+  # --- P1-4: post-order journal-write failure is WARNING-only --------------
+  # services/trade_journal_service.py:110 (record_entry), same shape in
+  # record_exit / update_*. A DB failure after a broker-accepted order returns
+  # the 0 sentinel and logs at logger.warning, which does NOT route to
+  # errors.jsonl (ERROR+) or Telegram -> a live-but-unjournaled order is silent.
+  - id: journal-failure-warning-only
+    languages: [python]
+    patterns:
+      - pattern: logger.warning(...)
+      - pattern-either:
+          - pattern-inside: |
+              try:
+                  ...
+              except $EXC:
+                  ...
+          - pattern-inside: |
+              try:
+                  ...
+              except $EXC as $V:
+                  ...
+    paths:
+      include:
+        - "**/services/trade_journal_service.py"
+    message: >-
+      Journal-write failure after a placed order logged at logger.warning —
+      WARNING does not reach errors.jsonl or Telegram, so a live-but-unjournaled
+      order is invisible. Use logger.exception (keep the fail-safe return). See
+      audit/silent_drop_audit_2026-06-11.md#p1-findings (trade_journal_service:110).
+    severity: ERROR
+
+  # --- Cross-cutting #4: bare/Exception swallow on the order path ----------
+  # audit/silent_drop_audit_2026-06-11.md#recommended-pre-commit-hook-checks (#4)
+  # Allowlisted narrow exceptions (queue.Empty, JSONDecodeError, NoSuchProcess,
+  # ProcessLookupError) are intentional fallbacks and excluded.
+  - id: bare-except-swallow
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: |
+              try:
+                  ...
+              except:
+                  pass
+          - pattern: |
+              try:
+                  ...
+              except Exception:
+                  pass
+      - pattern-not: |
+          try:
+              ...
+          except (queue.Empty, json.JSONDecodeError):
+              pass
+      - pattern-not: |
+          try:
+              ...
+          except json.JSONDecodeError:
+              pass
+      - pattern-not: |
+          try:
+              ...
+          except queue.Empty:
+              pass
+    paths:
+      include:
+        - "**/services/"
+        - "**/blueprints/"
+        - "**/sandbox/"
+      exclude:
+        - "**/test/"
+        - "**/backtest/"
+    message: >-
+      Bare/Exception `except: pass` silently drops errors. On order/execution/
+      journal paths this hides real failures. If intentional, allowlist the
+      specific narrow exception. See
+      audit/silent_drop_audit_2026-06-11.md#recommended-pre-commit-hook-checks (#4).
+    severity: WARNING
+
+  # --- Cross-cutting #5: downgraded severity inside an except handler ------
+  # logger.debug / logger.info for a failure inside an except block hides it
+  # from errors.jsonl (ERROR+) and Telegram. Post-order failures deserve
+  # logger.exception. Heuristic — review and upgrade where the except guards an
+  # operation that follows a placed order.
+  - id: severity-downgrade-in-except
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: logger.debug(...)
+          - pattern: logger.info(...)
+      - pattern-inside: |
+          try:
+              ...
+          except $EXC:
+              ...
+    paths:
+      include:
+        - "**/services/basket_order_service.py"
+        - "**/services/options_multiorder_service.py"
+        - "**/services/*order_service.py"
+        - "**/sandbox/execution_engine.py"
+    message: >-
+      Failure logged at logger.debug/info inside an except handler on an order
+      path — does not reach errors.jsonl or Telegram. Use logger.exception. See
+      audit/silent_drop_audit_2026-06-11.md#recommended-pre-commit-hook-checks (#5).
+    severity: WARNING

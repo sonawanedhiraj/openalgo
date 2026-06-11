@@ -559,6 +559,59 @@ uv run --group dev detect-secrets scan              # secret leak scan
 - `docs:` Documentation changes
 - `refactor:` Code refactoring
 
+## Code-quality gates
+
+Three static-analysis tools form the mandatory pre-commit / CI gate. Their
+canonical rule catalog for the project-specific rules is
+[`audit/silent_drop_audit_2026-06-11.md`](audit/silent_drop_audit_2026-06-11.md)
+(14 findings: P0=1, P1=3, P2=4, NOT-A-BUG=6) — every custom Semgrep rule cites the
+finding it encodes.
+
+| Tool | Scope | Blocking? | How to run |
+| --- | --- | --- | --- |
+| **ruff** | lint + format (`E,F,W,I,B,C4,UP`, line-length 100) | yes | `uv run ruff check .` / `uv run ruff format .` |
+| **bandit** | security scan | non-blocking initially | `uv run --group dev bandit -r . -x .venv,frontend,test` |
+| **Semgrep (custom)** | silent-drop / partial-success anti-patterns | ERROR rules block; WARNING rules informational | `uvx semgrep --config .semgrep/silent-drops.yml services/ blueprints/ sandbox/ restx_api/` |
+
+**Why Semgrep runs via `uvx`, not the uv lockfile:** semgrep cannot be added to
+`pyproject.toml` — every version conflicts with an existing pin (semgrep <1.146
+needs `tomli<2.1` vs `pip-audit`'s `tomli>=2.2.1`; semgrep ≥1.146 needs
+`mcp==1.23.3` vs the project's `mcp==1.27.0`). `uvx semgrep` runs it in an
+isolated ephemeral tool environment, and the pre-commit hook manages its own env
+— both sidestep the lockfile entirely. The local dev env is Python 3.14; CI pins
+3.12 (eventlet has no 3.14 wheels — see the boot-fail memory).
+
+**Custom rules** live in [`.semgrep/silent-drops.yml`](.semgrep/silent-drops.yml)
+(6 rules — 3 ERROR, 3 WARNING). The 4 confirmed P0/P1 findings map to 4 rules
+(3 ERROR + the sandbox `commit-then-mutate` heuristic kept WARNING, per the
+audit's own classification):
+- `hardcoded-success-envelope` (**ERROR**) — literal `{"status": "success", ...}`
+  in basket/multiorder responses (P0-1, `basket_order_service.py:380`).
+- `success-if-any-aggregation` (**ERROR**) — `"success" if n > 0 else ...` masks
+  partial fills (P1-3, `options_multiorder_service.py:328`).
+- `journal-failure-warning-only` (**ERROR**) — post-order journal failure at
+  `logger.warning` (P1-4, `trade_journal_service.py:110`).
+- `commit-then-mutate` (**WARNING**) — `commit()` before a mutation that can
+  raise (P1-2, `execution_engine.py:386`).
+
+The 3 **WARNING** rules (`bare-except-swallow`, `severity-downgrade-in-except`,
+and `commit-then-mutate`) are the cross-cutting heuristics the audit flagged as
+"warn, not block — these have legitimate uses". A literal-`"success"` rule does
+**not** fire on the safe variable-status pattern (`"status": status` computed
+from results) — the simplified-engine arm response is intentionally not flagged.
+
+**Pre-commit** ([`.pre-commit-config.yaml`](.pre-commit-config.yaml)): ruff +
+bandit + semgrep (ERROR-only) + detect-secrets + biome run on staged files.
+Enable locally: `uv pip install pre-commit && pre-commit install`.
+
+**CI** ([`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml)):
+runs on PRs to `dev`/`main` and pushes to `dev`. Ruff blocks; bandit and the
+public Semgrep rulesets (`--config=auto`) are best-effort (`|| true`); the custom
+ERROR rules block. **The custom-rule gate is RED until the 4 P0/P1 findings are
+fixed** (firing on them is the proof the rules work) — fix them, or run with
+`--baseline-commit <sha>` to defer to new violations only. Branch protection on
+`dev`/`main` is enabled via the GitHub UI (cannot be automated from the CLI).
+
 ## Common Patterns and Utilities
 
 ### API Authentication
