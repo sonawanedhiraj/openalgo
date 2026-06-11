@@ -10,11 +10,7 @@ import pathlib
 
 import pytest
 
-_MODULE_PATH = (
-    pathlib.Path(__file__).resolve().parent.parent
-    / "websocket_proxy"
-    / "mode_utils.py"
-)
+_MODULE_PATH = pathlib.Path(__file__).resolve().parent.parent / "websocket_proxy" / "mode_utils.py"
 
 
 def _load_mode_utils():
@@ -27,6 +23,9 @@ def _load_mode_utils():
 _mod = _load_mode_utils()
 normalize_mode = _mod.normalize_mode
 normalize_mode_or_none = _mod.normalize_mode_or_none
+
+# Lightweight mode_utils, loaded by path — no broker/DB. (plan item #3)
+pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize(
@@ -87,8 +86,8 @@ def test_normalize_mode_rejects_invalid_inputs(value):
     [
         None,
         1.5,
-        2.0,        # float lookalike — must reject (we only accept int/str)
-        True,       # bool subclass of int — must reject explicitly
+        2.0,  # float lookalike — must reject (we only accept int/str)
+        True,  # bool subclass of int — must reject explicitly
         False,
         ["LTP"],
         {"mode": 1},

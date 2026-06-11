@@ -209,6 +209,16 @@ python_functions = ["test_*"]
 pythonpath = ["."]
 addopts = "-v --timeout=60 --import-mode=importlib"
 asyncio_mode = "auto"
+# Test markers (codified per 2026-06-11 retrospective plan item #3). Defining
+# them here makes `pytest -m unit` actually collect (and silences
+# PytestUnknownMarkWarning). `unit` = fast, deterministic, no DB/network/broker;
+# `integration` = touches DB/services/multiple modules; `live` = requires a
+# running OpenAlgo / broker session (never run in CI).
+markers = [
+    "unit: fast deterministic test, no DB/network/broker (safe for `pytest -m unit`)",
+    "integration: touches DB, services, or multiple modules together",
+    "live: requires a running OpenAlgo instance or live broker session",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::PendingDeprecationWarning",

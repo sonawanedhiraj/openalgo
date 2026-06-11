@@ -20,6 +20,9 @@ import pytest
 
 from services import indicators
 
+# Pure-function indicator wrappers — no DB/network/broker. (plan item #3)
+pytestmark = pytest.mark.unit
+
 
 def _build_ohlc(prices: list[float]) -> pd.DataFrame:
     """Build a small OHLC frame from a close-price sequence.
@@ -53,9 +56,7 @@ def test_atr_first_n_values_are_nan():
     out = indicators.atr(bars, period=14)
     # period - 1 warmup is the most lenient assertion that still
     # catches a wrapper that bypasses warmup entirely.
-    assert out.iloc[:13].isna().all(), (
-        f"expected first 13 values NaN, got {out.iloc[:13].tolist()}"
-    )
+    assert out.iloc[:13].isna().all(), f"expected first 13 values NaN, got {out.iloc[:13].tolist()}"
     # The tail must be populated — otherwise warmup never ends.
     assert not math.isnan(out.iloc[-1])
 
@@ -112,7 +113,7 @@ def _engine_style_atr(
     prev_close: float | None = None
     prev_atr: float | None = None
 
-    for h, low, c in zip(highs, lows, closes):
+    for h, low, c in zip(highs, lows, closes, strict=False):
         pc = prev_close if prev_close is not None else c
         tr = max(h - low, abs(h - pc), abs(low - pc))
         tr_deque.append(float(tr))
@@ -142,10 +143,36 @@ def test_atr_parity_with_engine_implementation():
     # Use an irregular price series so the difference between SMA seed
     # and immediate-RMA actually manifests in the numbers.
     prices = [
-        100.0, 102.0, 101.5, 103.0, 104.0, 102.5, 105.0, 106.5, 104.0,
-        107.0, 108.0, 106.0, 109.0, 110.5, 108.0, 111.0, 112.5, 110.0,
-        113.0, 114.0, 112.0, 115.0, 116.5, 114.0, 117.0, 118.5, 116.0,
-        119.0, 120.0, 118.5,
+        100.0,
+        102.0,
+        101.5,
+        103.0,
+        104.0,
+        102.5,
+        105.0,
+        106.5,
+        104.0,
+        107.0,
+        108.0,
+        106.0,
+        109.0,
+        110.5,
+        108.0,
+        111.0,
+        112.5,
+        110.0,
+        113.0,
+        114.0,
+        112.0,
+        115.0,
+        116.5,
+        114.0,
+        117.0,
+        118.5,
+        116.0,
+        119.0,
+        120.0,
+        118.5,
     ]
     highs = [p + 1.0 for p in prices]
     lows = [p - 1.0 for p in prices]
@@ -194,7 +221,7 @@ def test_sma_basic():
     assert isinstance(out, pd.Series)
     assert out.iloc[:2].isna().all()
     expected = [2.0, 3.0, 4.0]
-    for got, exp in zip(out.iloc[2:].tolist(), expected):
+    for got, exp in zip(out.iloc[2:].tolist(), expected, strict=False):
         assert math.isclose(got, exp, abs_tol=1e-9)
 
 
@@ -235,9 +262,9 @@ def test_supertrend_uptrend_direction_and_line():
     out = indicators.supertrend(bars, period=7, multiplier=3.0)
     # Inspect the settled region (after warmup).
     settled = out.iloc[20:]
-    assert (settled["direction"] == 1).all(), (
-        f"expected +1 throughout uptrend, got {settled['direction'].unique()}"
-    )
+    assert (
+        settled["direction"] == 1
+    ).all(), f"expected +1 throughout uptrend, got {settled['direction'].unique()}"
     # The Supertrend line tracks below close in an uptrend.
     close = bars["close"].iloc[20:]
     assert (settled["line"] < close).all()
@@ -256,8 +283,11 @@ def test_supertrend_flips_on_trend_reversal():
 
 
 def _hand_supertrend(
-    highs: list[float], lows: list[float], closes: list[float],
-    period: int = 7, multiplier: float = 3.0,
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int = 7,
+    multiplier: float = 3.0,
 ) -> list[int]:
     """Hand-rolled Supertrend direction using the textbook formula.
 
@@ -286,17 +316,13 @@ def _hand_supertrend(
             final_upper[i] = upper.iloc[i]
         else:
             final_upper[i] = (
-                upper.iloc[i]
-                if (upper.iloc[i] < prev_fu or closes[i - 1] > prev_fu)
-                else prev_fu
+                upper.iloc[i] if (upper.iloc[i] < prev_fu or closes[i - 1] > prev_fu) else prev_fu
             )
         if math.isnan(prev_fl):
             final_lower[i] = lower.iloc[i]
         else:
             final_lower[i] = (
-                lower.iloc[i]
-                if (lower.iloc[i] > prev_fl or closes[i - 1] < prev_fl)
-                else prev_fl
+                lower.iloc[i] if (lower.iloc[i] > prev_fl or closes[i - 1] < prev_fl) else prev_fl
             )
         # Direction flip logic.
         if closes[i] > final_upper[i - 1]:
@@ -311,9 +337,26 @@ def _hand_supertrend(
 def test_supertrend_parity_with_hand_formula():
     """Wrapper direction matches a hand-computed Supertrend over a 20-bar set."""
     prices = [
-        100.0, 101.5, 103.0, 102.0, 104.5, 106.0, 105.0, 107.5, 109.0,
-        108.0, 106.5, 104.0, 102.0, 100.5, 99.0, 101.0, 103.5, 105.0,
-        104.0, 106.5,
+        100.0,
+        101.5,
+        103.0,
+        102.0,
+        104.5,
+        106.0,
+        105.0,
+        107.5,
+        109.0,
+        108.0,
+        106.5,
+        104.0,
+        102.0,
+        100.5,
+        99.0,
+        101.0,
+        103.5,
+        105.0,
+        104.0,
+        106.5,
     ]
     highs = [p + 1.0 for p in prices]
     lows = [p - 1.0 for p in prices]
@@ -322,7 +365,6 @@ def test_supertrend_parity_with_hand_formula():
     hand = _hand_supertrend(highs, lows, prices, period=7, multiplier=3.0)
     # Compare directions where the wrapper's ATR has warmed up (period onward).
     for i in range(7, len(prices)):
-        assert int(out["direction"].iloc[i]) == hand[i], (
-            f"direction mismatch at bar {i}: "
-            f"wrapper={out['direction'].iloc[i]} hand={hand[i]}"
-        )
+        assert (
+            int(out["direction"].iloc[i]) == hand[i]
+        ), f"direction mismatch at bar {i}: wrapper={out['direction'].iloc[i]} hand={hand[i]}"

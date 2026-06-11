@@ -27,6 +27,9 @@ from services.bar_aggregator import (
 )
 from services.simplified_stock_engine_core import Candle
 
+# Pure candle-aggregation logic with mocked event bus — no DB/network. (plan item #3)
+pytestmark = pytest.mark.unit
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -37,7 +40,9 @@ def _ts(h: int, m: int, s: int = 0) -> dt.datetime:
     return dt.datetime(2026, 5, 22, h, m, s)
 
 
-def _legacy_ticks_to_bars(ticks: list[tuple[str, float, int, dt.datetime]]) -> list[tuple[str, Candle]]:
+def _legacy_ticks_to_bars(
+    ticks: list[tuple[str, float, int, dt.datetime]],
+) -> list[tuple[str, Candle]]:
     """Drive the legacy FiveMinuteCandleBuilder and collect every emitted (symbol, candle)."""
     out: list[tuple[str, Candle]] = []
     builder = FiveMinuteCandleBuilder(lambda s, c: out.append((s, c)))
@@ -72,12 +77,12 @@ def test_bar_builder_constructs_5m_bar_from_ticks_value_parity_with_existing():
     ticks = [
         # 09:15 bucket — first tick initializes state, no callback.
         (sym, 100.0, 1_000, _ts(9, 15, 5)),
-        (sym, 101.5, 1_100, _ts(9, 16, 0)),   # high update, vol delta 100
-        (sym,  99.5, 1_100, _ts(9, 17, 30)),  # low update, no vol delta
-        (sym, 100.0, 1_050, _ts(9, 18, 0)),   # cumvol DROPPED — must clamp to 0
+        (sym, 101.5, 1_100, _ts(9, 16, 0)),  # high update, vol delta 100
+        (sym, 99.5, 1_100, _ts(9, 17, 30)),  # low update, no vol delta
+        (sym, 100.0, 1_050, _ts(9, 18, 0)),  # cumvol DROPPED — must clamp to 0
         (sym, 102.0, 1_300, _ts(9, 19, 59)),  # close of 09:15 bucket
         # 09:20 bucket — bucket transition; new bucket OHLC = new tick, vol=0.
-        (sym,  98.0, 1_400, _ts(9, 20, 30)),
+        (sym, 98.0, 1_400, _ts(9, 20, 30)),
         (sym, 105.0, 1_600, _ts(9, 22, 0)),
         (sym, 103.0, 1_800, _ts(9, 24, 59)),
         # 09:25 bucket — final tick.
@@ -88,9 +93,7 @@ def test_bar_builder_constructs_5m_bar_from_ticks_value_parity_with_existing():
     new = _new_ticks_to_bars(ticks)
 
     # Same number of emits, in the same order.
-    assert len(legacy) == len(new), (
-        f"emit count drift: legacy={len(legacy)} new={len(new)}"
-    )
+    assert len(legacy) == len(new), f"emit count drift: legacy={len(legacy)} new={len(new)}"
 
     for i, ((sym_legacy, candle), bar) in enumerate(zip(legacy, new, strict=True)):
         # Sanity: legacy emits (symbol, Candle); new emits a dict.
@@ -116,7 +119,9 @@ def test_bar_builder_constructs_5m_bar_from_ticks_value_parity_with_existing():
 def test_bar_builder_1m_interval():
     """1-minute interval closes on every minute boundary."""
     closes: list[dict] = []
-    builder = BarBuilder("INFY", "1m", on_bar=lambda b: closes.append(b) if b["elapsed_pct"] == 1.0 else None)
+    builder = BarBuilder(
+        "INFY", "1m", on_bar=lambda b: closes.append(b) if b["elapsed_pct"] == 1.0 else None
+    )
 
     # 09:15 bucket: init + one in-bucket update.
     builder.on_tick({"price": 100.0, "cumulative_volume": 0, "ts": _ts(9, 15, 10)})
@@ -136,7 +141,9 @@ def test_bar_builder_1m_interval():
 def test_bar_builder_15m_interval():
     """15-minute interval closes on :00 / :15 / :30 / :45 boundaries."""
     closes: list[dict] = []
-    builder = BarBuilder("HDFC", "15m", on_bar=lambda b: closes.append(b) if b["elapsed_pct"] == 1.0 else None)
+    builder = BarBuilder(
+        "HDFC", "15m", on_bar=lambda b: closes.append(b) if b["elapsed_pct"] == 1.0 else None
+    )
 
     # 09:15–09:29 bucket.
     builder.on_tick({"price": 100.0, "cumulative_volume": 0, "ts": _ts(9, 16)})
@@ -300,7 +307,8 @@ def test_multi_interval_aggregator_subscribe_unsubscribe_dynamic():
 def test_multi_interval_aggregator_unknown_symbol_ignored():
     closes: list = []
     agg = MultiIntervalAggregator(
-        symbols=["RELIANCE"], intervals=["5m"],
+        symbols=["RELIANCE"],
+        intervals=["5m"],
         on_bar_close=lambda s, i, b: closes.append((s, i, b)),
     )
 
@@ -328,8 +336,12 @@ def test_multi_interval_publishes_bar_ready_event_when_enabled():
     )
 
     agg.on_tick("TCS", {"price": 3500.0, "cumulative_volume": 0, "ts": _ts(9, 15)})
-    agg.on_tick("TCS", {"price": 3510.0, "cumulative_volume": 100, "ts": _ts(9, 17)})  # mid-bar — no publish
-    agg.on_tick("TCS", {"price": 3520.0, "cumulative_volume": 200, "ts": _ts(9, 20)})  # closes 09:15 — publishes
+    agg.on_tick(
+        "TCS", {"price": 3510.0, "cumulative_volume": 100, "ts": _ts(9, 17)}
+    )  # mid-bar — no publish
+    agg.on_tick(
+        "TCS", {"price": 3520.0, "cumulative_volume": 200, "ts": _ts(9, 20)}
+    )  # closes 09:15 — publishes
 
     assert mock_bus.publish.call_count == 1, "expected exactly one publish on bar close"
     event = mock_bus.publish.call_args.args[0]
@@ -339,7 +351,9 @@ def test_multi_interval_publishes_bar_ready_event_when_enabled():
     assert event.interval == "5m"
     assert event.bar["ts"] == _ts(9, 15)
     assert event.bar["open"] == 3500.0
-    assert event.bar["close"] == 3510.0  # close is the LAST in-bucket price, not the boundary-crossing tick
+    assert (
+        event.bar["close"] == 3510.0
+    )  # close is the LAST in-bucket price, not the boundary-crossing tick
     assert event.bar["elapsed_pct"] == 1.0
 
 
@@ -370,7 +384,9 @@ def test_multi_interval_on_bar_close_exception_does_not_kill_aggregator():
         raise RuntimeError("simulated downstream failure")
 
     agg = MultiIntervalAggregator(
-        symbols=["INFY"], intervals=["5m"], on_bar_close=angry_cb,
+        symbols=["INFY"],
+        intervals=["5m"],
+        on_bar_close=angry_cb,
     )
 
     agg.on_tick("INFY", {"price": 100.0, "cumulative_volume": 0, "ts": _ts(9, 15)})
