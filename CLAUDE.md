@@ -612,6 +612,44 @@ fixed** (firing on them is the proof the rules work) — fix them, or run with
 `--baseline-commit <sha>` to defer to new violations only. Branch protection on
 `dev`/`main` is enabled via the GitHub UI (cannot be automated from the CLI).
 
+## Test DB isolation — pytest can NEVER write to the live databases
+
+Every `database/*.py` module binds its SQLAlchemy `engine` to
+`os.getenv("DATABASE_URL")` (and `LOGS_/LATENCY_/HEALTH_/SANDBOX_DATABASE_URL`,
+`HISTORIFY_DATABASE_PATH`) **at import time**, and `.env` points `DATABASE_URL` at
+the live `db/openalgo.db`. The single load-bearing guard that stops pytest from
+ever touching those live DBs is **[`test/conftest.py`](test/conftest.py)**. Do not
+weaken it.
+
+It is the structural replacement for the old *per-file opt-in* isolation (each
+test had to copy a `_rebind` fixture). That was the root cause of two separate
+phantom-row pollution incidents — the second when `test/e2e/test_fno_flows.py`
+shipped without the rebind and wrote real `trade_journal` rows to the live DB.
+Full write-up: [`outputs/2026-06-11_retrospective_and_plan.md`](outputs/2026-06-11_retrospective_and_plan.md)
+(Section 4).
+
+Three layers, all in `test/conftest.py`:
+1. **Unconditional env redirect** at module top — every DB env var is repointed to
+   a throwaway per-process `tempfile.mkdtemp()` dir *before* any `database.*`
+   import binds its engine. **Ordering is load-bearing:** `utils.config`'s
+   import-time `load_dotenv(override=True)` is forced to run *first* (via
+   `importlib.import_module`) so it cannot later clobber the redirect back to the
+   live path; the caller's pre-dotenv `DATABASE_URL` is captured *before* that for
+   the tripwire.
+2. **`init_db()` on the temp DBs** (`_isolate_databases`, session-autouse) — creates
+   every table in the redirected DBs. This is the `settings_db` "tables don't
+   exist" breakage that kept isolation per-file last time; fixing it here is what
+   lets the redirect be global.
+3. **Tripwire** (`pytest_configure`) — aborts collection with a loud `pytest.exit`
+   (returncode 2) if `DATABASE_URL` ever resolves to the live `db/openalgo.db`, or
+   if the caller explicitly aimed pytest at it (`DATABASE_URL=sqlite:///db/openalgo.db
+   pytest`). A run can no longer *start* against the live DB even if layer 1 regresses.
+
+Subdir conftests (e.g. `test/e2e/conftest.py`) may still `monkeypatch`-rebind
+individual modules to per-test temp DBs; that layers cleanly on top and is
+reverted per test. **Adding a new engine-path test no longer requires any
+isolation boilerplate** — the global guard covers it.
+
 ## Common Patterns and Utilities
 
 ### API Authentication
@@ -619,7 +657,7 @@ fixed** (firing on them is the proof the rules work) — fix them, or run with
 All `/api/v1/` endpoints require API key:
 ```python
 # In request body (recommended):
-{"apikey": "YOUR_API_KEY", "symbol": "SBIN", ...}
+{"apikey": "YOUR_API_KEY", "symbol": "SBIN", ...}  # pragma: allowlist secret
 
 # Or in headers:
 X-API-KEY: YOUR_API_KEY
