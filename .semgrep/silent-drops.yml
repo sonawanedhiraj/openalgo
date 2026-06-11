@@ -158,6 +158,60 @@ rules:
       audit/silent_drop_audit_2026-06-11.md#recommended-pre-commit-hook-checks (#4).
     severity: WARNING
 
+  # --- Failure 2 (2026-06-11): silent notification drop on liveness-only gate
+  # 2026-06-11 retrospective plan item #5. The incident: notification_service
+  # .notify() gated *every* send on a single liveness boolean
+  # (`telegram_bot_service.is_running`); when Phase 6 deliberately stopped the
+  # legacy bot to free the token, the not-running branch logged at
+  # logger.warning and `return`ed — dropping every alert (including the
+  # preflight-abort alerts that would have surfaced Failure 1) with no fallback
+  # and no ERROR-level trace. Fixed in 60a466f8 by guarding the *positive* send
+  # path, falling through to the inbound bot, and escalating real failures via
+  # logger.exception.
+  #
+  # The bad shape this rule encodes: a guard whose condition is a NEGATIVE
+  # liveness check (`not ...is_running`) and whose body is `logger.warning(...)`
+  # immediately followed by `return` — i.e. a delivery path that drops on a
+  # single liveness boolean, warning-only, with no fallback before the return.
+  # The fixed code does NOT match: its condition is the positive
+  # `loop is not None and getattr(..., "is_running", False)` (send path), and
+  # the only liveness-false `return` (in _notify_via_inbound) returns a sentinel
+  # the caller checks rather than logging+dropping. Verified 0 fires across
+  # services/ blueprints/ sandbox/ restx_api/ on the post-fix tree, 1 fire on
+  # 60a466f8^:services/notification_service.py (the original drop).
+  # E2E proof: scripts/verify_semgrep_silent_notify.sh.
+  - id: silent-notification-on-liveness-only
+    languages: [python]
+    patterns:
+      - pattern: |
+          if $COND:
+              ...
+              logger.warning(...)
+              return
+      - metavariable-pattern:
+          metavariable: $COND
+          patterns:
+            - pattern-either:
+                - pattern: not getattr($OBJ, "is_running", ...)
+                - pattern: $A or not getattr($OBJ, "is_running", ...)
+                - pattern: not getattr($OBJ, "is_running", ...) or $A
+                - pattern: not $OBJ.is_running
+                - pattern: $A or not $OBJ.is_running
+                - pattern: not $OBJ.is_running or $A
+    paths:
+      include:
+        - "**/services/"
+        - "**/blueprints/"
+    message: >-
+      Silent-notification drop: a delivery path gated on a single liveness
+      boolean (not ...is_running) logs at logger.warning and returns with no
+      fallback — the Failure 2 shape (2026-06-11, fixed in 60a466f8). A dropped
+      operator alert must either fall through to an alternate transport or
+      escalate via logger.exception (errors.jsonl), never warning-and-drop. See
+      audit/silent_drop_audit_2026-06-11.md and the 2026-06-11 retrospective
+      (plan item #5).
+    severity: ERROR
+
   # --- Cross-cutting #5: downgraded severity inside an except handler ------
   # logger.debug / logger.info for a failure inside an except block hides it
   # from errors.jsonl (ERROR+) and Telegram. Post-order failures deserve
