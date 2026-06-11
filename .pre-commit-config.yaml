@@ -26,19 +26,24 @@ repos:
         files: \.py$
 
   # Custom silent-drop rules — see .semgrep/silent-drops.yml +
-  # audit/silent_drop_audit_2026-06-11.md. semgrep manages its own isolated env
-  # here, so it's independent of the project's uv lockfile (semgrep cannot be
-  # added to the lockfile — it pins tomli<2.1 / mcp==1.23.3, which conflict with
-  # pip-audit and the project's mcp==1.27.0). --severity=ERROR: only the 4
-  # confirmed P0/P1 rules block a commit; the cross-cutting WARNING heuristics
-  # surface in CI but don't block local commits.
-  - repo: https://github.com/returntocorp/semgrep
-    rev: v1.85.0
+  # audit/silent_drop_audit_2026-06-11.md. Run via `uvx semgrep` (an isolated,
+  # ephemeral tool env) rather than the pip-based returntocorp/semgrep repo hook:
+  # the local dev .venv is Python 3.14, which has no semgrep wheels, so the
+  # pip-built hook env failed to install ("py_env-python3.14 python.EXE not
+  # found") and aborted every commit. `uvx semgrep` picks a compatible Python on
+  # its own and is the exact invocation CLAUDE.md documents as canonical — see
+  # the "Code-quality gates" section (semgrep cannot be added to the uv lockfile
+  # because it pins tomli<2.1 / mcp==1.23.3, which conflict with pip-audit and
+  # the project's mcp==1.27.0). --severity=ERROR: only the confirmed P0/P1 rules
+  # block a commit; the cross-cutting WARNING heuristics surface in CI only.
+  - repo: local
     hooks:
       - id: semgrep
         name: semgrep (silent-drop custom rules — ERROR only)
-        args: ["--config", ".semgrep/silent-drops.yml", "--severity=ERROR", "--error", "--quiet"]
+        entry: uvx semgrep --config .semgrep/silent-drops.yml --severity=ERROR --error --quiet
+        language: system
         files: \.py$
+        pass_filenames: true
 
   # Secrets detection
   - repo: https://github.com/Yelp/detect-secrets
