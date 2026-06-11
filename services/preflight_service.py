@@ -31,7 +31,7 @@ import pytz
 
 from database.daily_intent_db import get_daily_intent
 from services import scan_cycle_service
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import resolve_strategy_mode
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -88,6 +88,34 @@ _TEST_MESSAGE_MARKERS = (
 _TEST_SYNTHETIC_OID_RE = re.compile(r"OID-\d+")
 _TEST_QUALNAME_MARKERS = ("<locals>.", "<lambda>")
 
+# Defense-in-depth for Failure 4 (2026-06-11), OPT-IN via
+# PREFLIGHT_REQUIRE_PRODUCTION_LOGGER (default off). When enabled, the
+# recent-errors gate counts an entry only if its logger names a known OpenAlgo
+# production namespace (loggers are created via get_logger(__name__)). A burst
+# whose entries carry a non-production logger — e.g. a no-traceback
+# ``logging.getLogger("test_x").error(...)`` that evades the test-origin markers
+# — then can't push the gate past its abort threshold, so a polluted errors.jsonl
+# can't brick preflight even if test DB isolation ever regresses. Default OFF
+# because some legitimate prod errors log under non-namespace names (e.g.
+# ``zerodha_websocket``); enabling trades that recall for stronger noise
+# immunity. An entry with NO logger field is treated as unknown and still
+# counted (conservative — real prod entries always carry a logger).
+_PRODUCTION_LOGGER_PREFIXES = (
+    "services",
+    "blueprints",
+    "database",
+    "broker",
+    "restx_api",
+    "websocket_proxy",
+    "sandbox",
+    "utils",
+    "app",
+    "extensions",
+    "limiter",
+    "cors",
+    "csp",
+)
+
 
 def _now_ist() -> datetime:
     """Wall-clock now in IST. Monkeypatched by tests."""
@@ -140,44 +168,137 @@ def _env_time(name: str, default: str) -> dtime:
 # ---------------------------------------------------------------------------
 
 
+# The strategy whose pre-market intent gates the scan cycle. The simplified
+# engine is the cycle's order-placing strategy, so its row is the source of
+# truth for whether the cycle is armed today.
+_PREFLIGHT_STRATEGY = "simplified_engine"
+
+
+def _resolve_strategy_decision(today_str: str):
+    """Resolve the unified {mode, intent, source} for the cycle strategy.
+
+    Single source of truth for both the intent-presence and effective-mode
+    gates. Reads ``strategy_daily_intent`` via
+    :func:`services.mode_service.resolve_strategy_mode`, which falls through
+    unified-row → legacy ``daily_intent`` → env mode flag → default. This is the
+    Failure-1 fix (2026-06-11): today's intent lived in the *unified* table but
+    preflight read the *legacy* table, so every cycle aborted all day with no
+    alert. ``resolve_strategy_mode`` never raises — any DB error falls through to
+    the env/default decision.
+    """
+    return resolve_strategy_mode(_PREFLIGHT_STRATEGY, date=today_str)
+
+
 def _check_intent(today_str: str) -> dict:
-    """Is there any daily_intent on record for today (IST)?"""
-    row = get_daily_intent(today_str)
-    if row is None:
+    """Is there any daily_intent on record for today (IST)?
+
+    Recognizes BOTH the unified ``strategy_daily_intent`` table and the legacy
+    ``daily_intent`` table (Failure-1 fix). A *declared* intent is one the
+    resolver sourced from the unified row or the legacy row; an ``env``/
+    ``default`` fall-through is NOT a declaration, so a day the operator never
+    armed still aborts — the "refuse to trade with no declared intent" floor is
+    preserved. The legacy row's value/set_by are surfaced unchanged on
+    legacy-only days for back-compat.
+    """
+    legacy = get_daily_intent(today_str)
+    try:
+        decision = _resolve_strategy_decision(today_str)
+    except Exception as e:  # never let resolution break the gate
+        logger.exception("preflight: intent resolution failed: %s", e)
+        decision = None
+
+    declared = legacy is not None or (
+        decision is not None and decision.source in ("unified", "legacy")
+    )
+    if not declared:
         return {
             "ok": False,
             "value": None,
             "set_by": None,
+            "source": decision.source if decision else None,
             "reason": "no daily_intent declared for today",
         }
+
+    if legacy is not None:
+        return {
+            "ok": True,
+            "value": legacy.get("intent"),
+            "set_by": legacy.get("set_by"),
+            "source": "legacy",
+            "reason": None,
+        }
+    # Declared only in the unified table (no legacy row) — the Failure-1 case.
     return {
         "ok": True,
-        "value": row.get("intent"),
-        "set_by": row.get("set_by"),
+        "value": decision.mode,
+        "set_by": f"unified:{decision.intent}",
+        "source": decision.source,
         "reason": None,
     }
 
 
 def _check_effective_mode(today_str: str) -> dict:
-    """Is the resolved effective mode actionable (not 'skip')?
+    """Is the resolved effective mode actionable (not 'skip' / 'halt')?
 
-    Note: DISABLED is captured by the intent check; this check only fails on
-    SKIP — an explicit operator decision to sit the day out.
+    Sources the decision from the unified ``strategy_daily_intent`` table via
+    :func:`_resolve_strategy_decision` (unified → legacy → env → default) — the
+    Failure-1 fix. ``DISABLED``/no-intent is captured by the intent check; this
+    check fails only on an explicit sit-out: ``mode='skip'`` or ``intent='halt'``.
+
+    The legacy ``analyze_mode`` overlay is preserved as a conservative belt: a
+    ``live`` decision with the global analyzer on is reported as ``sandbox``
+    (paper), matching the old ``resolve_effective_mode`` most-conservative-wins
+    rule.
     """
     try:
-        mode = resolve_effective_mode(today_str)
+        decision = _resolve_strategy_decision(today_str)
     except Exception as e:
         logger.exception("preflight: effective_mode resolution failed: %s", e)
         return {
             "ok": False,
             "value": None,
+            "source": None,
             "reason": f"effective_mode resolution failed: {e}",
         }
 
-    if mode == EffectiveMode.SKIP:
-        return {"ok": False, "value": "skip", "reason": "daily_intent is skip"}
+    if decision.mode == "skip":
+        return {
+            "ok": False,
+            "value": "skip",
+            "source": decision.source,
+            "intent": decision.intent,
+            "reason": "daily_intent is skip",
+        }
+    if decision.intent == "halt":
+        return {
+            "ok": False,
+            "value": decision.mode,
+            "source": decision.source,
+            "intent": decision.intent,
+            "reason": "daily_intent is halt",
+        }
 
-    return {"ok": True, "value": mode.value, "reason": None}
+    value = decision.mode
+    # Conservative analyze_mode overlay (legacy parity): the global analyzer
+    # being on downgrades a live decision to sandbox (paper) for this gate.
+    # Read through services.mode_service so it tracks the same get_analyze_mode
+    # that resolve_effective_mode uses (and that tests monkeypatch).
+    if value == "live":
+        try:
+            from services.mode_service import get_analyze_mode
+
+            if get_analyze_mode():
+                value = "sandbox"
+        except Exception:
+            logger.exception("preflight: analyze_mode read failed")
+
+    return {
+        "ok": True,
+        "value": value,
+        "source": decision.source,
+        "intent": decision.intent,
+        "reason": None,
+    }
 
 
 def _check_recent_cycles(now: datetime) -> dict:
@@ -241,9 +362,7 @@ def _check_recent_cycles(now: datetime) -> dict:
     # hasn't run yet — not stalled) from "cycles fired earlier today but
     # last one is stale" (genuine scheduler stall). The legacy code aborted
     # on both, which deadlocked the morning-of-restart skill at Step 0.
-    today_start_iso = now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).isoformat()
+    today_start_iso = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     cycles_today: int | None = None
     try:
         cycles_today = scan_cycle_service.cycles_since(today_start_iso)
@@ -286,8 +405,7 @@ def _check_recent_cycles(now: datetime) -> dict:
                 "ok": True,
                 "preflight_heartbeats_in_window": hb_count,
                 "reason": (
-                    "preflight heartbeats present; scheduler alive but no "
-                    "signals matched"
+                    "preflight heartbeats present; scheduler alive but no " "signals matched"
                 ),
             }
         return {**base, "ok": False, "reason": stale_reason}
@@ -406,11 +524,19 @@ def _is_test_source_entry(entry: dict) -> bool:
         tb_text = ""
 
     if tb_text:
+        # Normalize Windows path separators before matching the (forward-slash)
+        # markers. Without this, a Windows traceback frame like
+        # ``...\test\test_x.py`` never matches the ``test/`` marker, so pytest
+        # noise is counted toward the abort threshold and a single test run
+        # bricks the live gate for the rest of the window (Failure 4,
+        # 2026-06-11). _parse_jsonl_ts / the markers are platform-neutral after
+        # this normalization.
+        tb_norm = tb_text.replace("\\", "/")
         for marker in _TEST_TRACEBACK_MARKERS:
-            if marker in tb_text:
+            if marker in tb_norm:
                 return True
         # ``<locals>.`` in a traceback frame is also a strong test signal.
-        if "<locals>." in tb_text:
+        if "<locals>." in tb_norm:
             return True
 
     logger_name = entry.get("logger") or ""
@@ -436,6 +562,20 @@ def _is_test_source_entry(entry: dict) -> bool:
     return False
 
 
+def _has_production_logger(entry: dict) -> bool:
+    """True iff the entry's logger names a known OpenAlgo production namespace.
+
+    A missing/empty logger returns False (caller decides whether absence counts).
+    Used only when ``PREFLIGHT_REQUIRE_PRODUCTION_LOGGER`` is enabled — see
+    :data:`_PRODUCTION_LOGGER_PREFIXES`.
+    """
+    name = entry.get("logger")
+    if not isinstance(name, str) or not name.strip():
+        return False
+    head = name.strip().split(".", 1)[0].lower()
+    return head in _PRODUCTION_LOGGER_PREFIXES
+
+
 def _count_recent_errors(
     errors_path: Path,
     now: datetime,
@@ -448,7 +588,14 @@ def _count_recent_errors(
     reflects production-relevant errors only. When ``premarket_cutoff`` is
     given and later than the rolling-window cutoff, it tightens the floor so
     pre-market errors (before today's 09:15 IST open) are excluded.
+
+    When ``PREFLIGHT_REQUIRE_PRODUCTION_LOGGER`` is enabled (default off), an
+    entry that carries a logger field which is NOT a production namespace is
+    also skipped (Failure-4 defense-in-depth). An entry with no logger field is
+    still counted — real prod entries always carry a logger, so absence is
+    treated as unknown rather than as noise.
     """
+    require_prod_logger = _env_bool("PREFLIGHT_REQUIRE_PRODUCTION_LOGGER", False)
     cutoff = now.replace(tzinfo=None) - timedelta(minutes=window_minutes)
     if premarket_cutoff is not None and premarket_cutoff > cutoff:
         cutoff = premarket_cutoff
@@ -475,6 +622,10 @@ def _count_recent_errors(
                     continue
                 if _is_test_source_entry(obj):
                     continue
+                # Opt-in defense-in-depth: a present-but-non-production logger is
+                # treated as noise. A missing logger is left to count.
+                if require_prod_logger and obj.get("logger") and not _has_production_logger(obj):
+                    continue
                 count += 1
     except OSError as e:
         logger.warning("preflight: errors.jsonl read failed (%s): %s", errors_path, e)
@@ -484,12 +635,8 @@ def _count_recent_errors(
 
 def _check_recent_errors(now: datetime) -> dict:
     """Is the ERROR rate in the recent rolling window below threshold?"""
-    threshold = _env_int(
-        "PREFLIGHT_MAX_ERRORS_LAST_HOUR", PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT
-    )
-    window_minutes = _env_int(
-        "PREFLIGHT_ERROR_WINDOW_MIN", PREFLIGHT_ERROR_WINDOW_MIN_DEFAULT
-    )
+    threshold = _env_int("PREFLIGHT_MAX_ERRORS_LAST_HOUR", PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT)
+    window_minutes = _env_int("PREFLIGHT_ERROR_WINDOW_MIN", PREFLIGHT_ERROR_WINDOW_MIN_DEFAULT)
     log_dir = os.getenv("LOG_DIR", "log")
     errors_path = Path(log_dir) / "errors.jsonl"
 
@@ -551,7 +698,7 @@ def _write_preflight_heartbeat(status: str, detail: Any) -> None:
     from database import scan_cycle_db as scdb
 
     try:
-        if isinstance(detail, (dict, list)):
+        if isinstance(detail, dict | list):
             detail_str: str | None = json.dumps(detail, default=str)
         else:
             detail_str = detail

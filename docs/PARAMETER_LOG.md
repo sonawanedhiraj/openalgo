@@ -257,6 +257,36 @@ the latest decisions automatically.
 - **History:**
   - **2026-06-11:** Introduced. Default `true`.
 
+### Preflight — recent-errors gate noise immunity
+
+#### PREFLIGHT_REQUIRE_PRODUCTION_LOGGER
+- **Current value:** unset → code default `false`
+- **Set in:** env; read in
+  `services/preflight_service.py._count_recent_errors` (via `_env_bool`)
+- **Values:** `true` / `false` (default `false`)
+- **Effect:** opt-in defense-in-depth for the `recent_errors` preflight gate
+  (Failure 4, 2026-06-11). When `true`, an errors.jsonl entry is counted toward
+  the abort threshold only if its `logger` field names a known OpenAlgo
+  production namespace (`_PRODUCTION_LOGGER_PREFIXES`: services, blueprints,
+  database, broker, restx_api, websocket_proxy, sandbox, utils, app, …). An entry
+  with a present-but-non-production logger is treated as noise and ignored; an
+  entry with no logger field is still counted (real prod entries always carry a
+  logger). This makes a pytest-polluted errors.jsonl unable to brick preflight
+  even if test DB isolation regresses. When `false` (default) the gate behaves
+  exactly as before — every non-test-origin ERROR counts.
+- **Caveat:** some legitimate prod errors log under non-namespace names (e.g.
+  `zerodha_websocket`); enabling this trades catching those against stronger
+  noise immunity. Leave `false` unless a pollution incident recurs.
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-11:** Introduced. Default `false`. (`.sample.env` doc line deferred —
+    that file was operator WIP at commit time; add the documented default there in
+    a follow-up.)
+
+> Note: the separator-agnostic fix in the same gate (Windows `\test\` traceback
+> paths now match the `test/` marker) is **not** a tunable — it is an always-on
+> correctness fix in `_is_test_source_entry`, so it has no PARAMETER_LOG knob.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

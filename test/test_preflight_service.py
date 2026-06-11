@@ -35,23 +35,15 @@ def preflight_env(monkeypatch, tmp_path):
     from database import scan_cycle_db as scdb
 
     # Daily intent in-memory DB
-    di_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    di_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=di_engine)
-    )
+    di_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    di_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=di_engine))
     monkeypatch.setattr(dim, "engine", di_engine)
     monkeypatch.setattr(dim, "db_session", di_session)
     dim.Base.metadata.create_all(di_engine)
 
     # Scan cycle in-memory DB
-    sc_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    sc_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=sc_engine)
-    )
+    sc_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sc_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=sc_engine))
     monkeypatch.setattr(scdb, "engine", sc_engine)
     monkeypatch.setattr(scdb, "db_session", sc_session)
     scdb.Base.metadata.create_all(sc_engine)
@@ -82,9 +74,7 @@ def preflight_env(monkeypatch, tmp_path):
         finally:
             sess.remove()
 
-    monkeypatch.setattr(
-        "services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles
-    )
+    monkeypatch.setattr("services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles)
 
     # Errors directory empty.
     monkeypatch.setenv("LOG_DIR", str(tmp_path))
@@ -248,9 +238,7 @@ def test_skip_intent_yields_abort(preflight_env):
 def test_live_with_analyze_on_still_passes_effective_check(preflight_env):
     from services import preflight_service
 
-    preflight_env.monkeypatch.setattr(
-        "services.mode_service.get_analyze_mode", lambda: True
-    )
+    preflight_env.monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: True)
     _set_intent("live")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(preflight_env.scdb, recent.isoformat())
@@ -293,9 +281,7 @@ def test_first_cycle_grace_period(preflight_env):
 
     # Move clock to 09:20 IST — inside market, inside grace window.
     grace_now = IST.localize(dt.datetime(2026, 5, 28, 9, 20, 0))
-    preflight_env.monkeypatch.setattr(
-        "services.preflight_service._now_ist", lambda: grace_now
-    )
+    preflight_env.monkeypatch.setattr("services.preflight_service._now_ist", lambda: grace_now)
     _set_intent("live")
     # No scan_cycle rows.
 
@@ -323,9 +309,7 @@ def test_recent_cycles_passes_when_zero_cycles_today_and_after_grace_window(
 
     # 10:30 IST — past the 09:30 grace cutoff, still well inside market.
     fresh_morning = IST.localize(dt.datetime(2026, 5, 28, 10, 30, 0))
-    preflight_env.monkeypatch.setattr(
-        "services.preflight_service._now_ist", lambda: fresh_morning
-    )
+    preflight_env.monkeypatch.setattr("services.preflight_service._now_ist", lambda: fresh_morning)
     _set_intent("live")
     # No scan_cycle rows for today (or any day) — this is the bug scenario.
 
@@ -351,9 +335,7 @@ def test_recent_cycles_aborts_when_cycles_existed_but_stale(preflight_env):
 
     # 11:30 IST.
     now = IST.localize(dt.datetime(2026, 5, 28, 11, 30, 0))
-    preflight_env.monkeypatch.setattr(
-        "services.preflight_service._now_ist", lambda: now
-    )
+    preflight_env.monkeypatch.setattr("services.preflight_service._now_ist", lambda: now)
     _set_intent("live")
     # One cycle at 10:30 today — 60 min before fake_now 11:30, well past
     # the 30 min threshold. (10:30 is also after the real-wall-clock 24h
@@ -402,9 +384,7 @@ def test_outside_market_hours_does_not_require_cycles(preflight_env):
 
     # 16:00 IST — past 15:30 close.
     after_hours = IST.localize(dt.datetime(2026, 5, 28, 16, 0, 0))
-    preflight_env.monkeypatch.setattr(
-        "services.preflight_service._now_ist", lambda: after_hours
-    )
+    preflight_env.monkeypatch.setattr("services.preflight_service._now_ist", lambda: after_hours)
     _set_intent("live")
 
     result = preflight_service.run_preflight()
@@ -900,10 +880,7 @@ def test_recent_cycles_passes_when_preflight_heartbeats_exist_even_without_recen
 
     assert result["checks"]["recent_cycles"]["ok"] is True
     assert result["checks"]["recent_cycles"]["preflight_heartbeats_in_window"] == 3
-    assert (
-        "preflight heartbeats present"
-        in result["checks"]["recent_cycles"]["reason"]
-    )
+    assert "preflight heartbeats present" in result["checks"]["recent_cycles"]["reason"]
     # The stale scan_cycle is still reported in the diagnostic fields.
     assert result["checks"]["recent_cycles"]["minutes_since"] == 45
     assert result["go_decision"] == "go"
@@ -1069,3 +1046,216 @@ def test_premarket_filter_disabled_via_env(preflight_env):
 
     assert result["count_last_hour"] == 55
     assert result["ok"] is False  # 55 > threshold 10 → contributes "abort"
+
+
+# ===========================================================================
+# 2026-06-11 retrospective — item #2 (unified intent table) + item #4
+# (separator- and logger-name-aware noise filter). Added by the morning-
+# failure-plan execution; the fixtures/helpers above are reused unchanged.
+# ===========================================================================
+
+
+def _rebind_unified_intent(preflight_env):
+    """Rebind ``database.strategy_daily_intent_db`` to a fresh in-memory DB.
+
+    The ``preflight_env`` fixture isolates the legacy daily_intent + scan_cycle
+    DBs but not the unified table; this gives each unified-intent test its own
+    clean ``strategy_daily_intent`` table so ``resolve_strategy_mode`` reads
+    exactly what the test writes. Returns the rebound module.
+    """
+    from database import strategy_daily_intent_db as sdi
+
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
+    preflight_env.monkeypatch.setattr(sdi, "engine", engine)
+    preflight_env.monkeypatch.setattr(sdi, "db_session", session)
+    sdi.Base.metadata.create_all(engine)
+    # The unified resolver is on by default; pin it so the test is explicit.
+    preflight_env.monkeypatch.setenv("STRATEGY_DAILY_INTENT_ENABLED", "true")
+    return sdi
+
+
+def test_effective_mode_sourced_from_unified_intent_table(preflight_env):
+    """Item #2 / Failure-1 fix: an intent set ONLY in the unified
+    strategy_daily_intent table (no legacy daily_intent row) arms the cycle.
+    run_preflight() goes, and BOTH the intent and effective_mode checks are
+    attributed to source='unified'. Before the fix preflight read the legacy
+    table, found nothing, and aborted every cycle all day.
+    """
+    from services import preflight_service
+
+    sdi = _rebind_unified_intent(preflight_env)
+    # No legacy _set_intent() — the row lives only in the unified table.
+    sdi.set_intent(
+        "simplified_engine", "2026-05-28", mode="live", intent="run", updated_by="operator"
+    )
+    recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
+    _insert_cycle(preflight_env.scdb, recent.isoformat())
+
+    result = preflight_service.run_preflight()
+
+    assert result["go_decision"] == "go"
+    assert result["reasons"] == []
+    assert result["checks"]["intent"]["ok"] is True
+    assert result["checks"]["intent"]["source"] == "unified"
+    assert result["checks"]["effective_mode"]["ok"] is True
+    assert result["checks"]["effective_mode"]["value"] == "live"
+    assert result["checks"]["effective_mode"]["source"] == "unified"
+
+
+def test_unified_intent_works_without_any_legacy_row(preflight_env):
+    """Belt-and-braces for Failure 1: confirm the legacy daily_intent table is
+    genuinely empty in this scenario, so the 'go' above came purely from the
+    unified source and not a stray legacy row.
+    """
+    from services import preflight_service
+
+    sdi = _rebind_unified_intent(preflight_env)
+    sdi.set_intent(
+        "simplified_engine", "2026-05-28", mode="sandbox", intent="run", updated_by="operator"
+    )
+    # Legacy table is empty (no _set_intent()).
+    assert preflight_env.dim.get_daily_intent("2026-05-28") is None
+    _insert_cycle(
+        preflight_env.scdb,
+        IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
+    )
+
+    result = preflight_service.run_preflight()
+
+    assert result["go_decision"] == "go"
+    assert result["checks"]["effective_mode"]["value"] == "sandbox"
+    assert result["checks"]["effective_mode"]["source"] == "unified"
+
+
+def test_unified_skip_intent_aborts(preflight_env):
+    """A unified row with mode='skip' aborts via the effective_mode gate,
+    attributed to the unified source (the intent check still passes — a skip is
+    a declared intent)."""
+    from services import preflight_service
+
+    sdi = _rebind_unified_intent(preflight_env)
+    sdi.set_intent(
+        "simplified_engine", "2026-05-28", mode="skip", intent="run", updated_by="operator"
+    )
+    _insert_cycle(
+        preflight_env.scdb,
+        IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
+    )
+
+    result = preflight_service.run_preflight()
+
+    assert result["go_decision"] == "abort"
+    assert result["checks"]["intent"]["ok"] is True
+    assert result["checks"]["effective_mode"]["ok"] is False
+    assert result["checks"]["effective_mode"]["value"] == "skip"
+    assert result["checks"]["effective_mode"]["source"] == "unified"
+    assert result["checks"]["effective_mode"]["reason"] == "daily_intent is skip"
+
+
+def test_unified_halt_intent_aborts(preflight_env):
+    """intent='halt' on a unified row aborts even when mode is actionable."""
+    from services import preflight_service
+
+    sdi = _rebind_unified_intent(preflight_env)
+    sdi.set_intent(
+        "simplified_engine", "2026-05-28", mode="live", intent="halt", updated_by="operator"
+    )
+    _insert_cycle(
+        preflight_env.scdb,
+        IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
+    )
+
+    result = preflight_service.run_preflight()
+
+    assert result["go_decision"] == "abort"
+    assert result["checks"]["effective_mode"]["ok"] is False
+    assert result["checks"]["effective_mode"]["intent"] == "halt"
+    assert result["checks"]["effective_mode"]["reason"] == "daily_intent is halt"
+
+
+def test_recent_errors_ignores_windows_backslash_test_tracebacks(preflight_env):
+    """Item #4 / Failure-4 fix (separator-agnostic): a burst of pytest-noise
+    entries whose tracebacks use Windows backslash paths
+    (``...\\test\\test_x.py``) must be excluded from the recent-errors count.
+    Before the fix the forward-slash 'test/' marker never matched a backslash
+    path, so a single Windows pytest run bricked the live gate for the window.
+    """
+    from services import preflight_service
+
+    entries = [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "services.engine",
+            "message": "AssertionError",
+            "exception": [
+                "Traceback (most recent call last):\n",
+                '  File "C:\\workspace\\ai-trade-agent\\openalgo\\test\\test_engine.py",'
+                " line 1, in test_x\n",
+                "AssertionError\n",
+            ],
+        }
+        for m in range(15)  # well past the default threshold of 10
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 0, "Windows-path pytest tracebacks must be filtered"
+    assert result["ok"] is True
+
+
+def test_recent_errors_production_logger_filter_opt_in(preflight_env):
+    """Item #4 defense-in-depth: with PREFLIGHT_REQUIRE_PRODUCTION_LOGGER on, a
+    burst of entries whose logger is present but NOT a production namespace is
+    ignored; with the flag off (default) they are counted. This makes a polluted
+    errors.jsonl unable to brick preflight even if test isolation regresses.
+    """
+    from services import preflight_service
+
+    entries = [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "some_random_harness",  # present, non-production namespace
+            "message": "boom",
+        }
+        for m in range(15)
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    # Default (flag off): these count toward the threshold and abort.
+    preflight_env.monkeypatch.delenv("PREFLIGHT_REQUIRE_PRODUCTION_LOGGER", raising=False)
+    off = preflight_service._check_recent_errors(preflight_env.fake_now)
+    assert off["count_last_hour"] == 15
+    assert off["ok"] is False
+
+    # Flag on: ignored (no production logger).
+    preflight_env.monkeypatch.setenv("PREFLIGHT_REQUIRE_PRODUCTION_LOGGER", "1")
+    on = preflight_service._check_recent_errors(preflight_env.fake_now)
+    assert on["count_last_hour"] == 0
+    assert on["ok"] is True
+
+
+def test_recent_errors_production_logger_filter_keeps_real_prod_entries(preflight_env):
+    """The opt-in filter must NOT over-filter: entries from a real production
+    namespace still count when the flag is on."""
+    from services import preflight_service
+
+    entries = [
+        {
+            "ts": _ts(m),
+            "level": "ERROR",
+            "logger": "services.engine",
+            "message": "real production failure",
+        }
+        for m in range(15)
+    ]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    preflight_env.monkeypatch.setenv("PREFLIGHT_REQUIRE_PRODUCTION_LOGGER", "1")
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 15
+    assert result["ok"] is False
