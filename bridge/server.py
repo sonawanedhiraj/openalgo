@@ -24,11 +24,13 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from datetime import time as dtime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+import pytz
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
@@ -42,16 +44,39 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OPENALGO_APP = PROJECT_ROOT / "app.py"
 LOG_DIR = PROJECT_ROOT / "log"
 ERRORS_LOG = LOG_DIR / "errors.jsonl"
+# Per-request audit trail (2026-06-11 retrospective item #6). One JSON line per
+# request: timestamp, endpoint, body summary, response status. The bridge can
+# mutate code, run pytest, and restart OpenAlgo — every invocation must leave a
+# trace so a surprise mid-market edit/restart can be traced to its trigger.
+ACCESS_LOG = LOG_DIR / "bridge_access.jsonl"
+
+# Market-hours guard (2026-06-11 retrospective item #6). /fix-bug and
+# /restart-app are refused (409) during the NSE/BSE continuous session
+# (09:15–15:30 IST, weekdays). Auto-fix on the live host during market hours is
+# what triggered the 2026-06-11 pytest-pollution + high-risk mid-session restart.
+IST = pytz.timezone("Asia/Kolkata")
+MARKET_OPEN_IST = dtime(9, 15)
+MARKET_CLOSE_IST = dtime(15, 30)
 
 # Claude CLI command — adjust if claude is installed elsewhere
 CLAUDE_CMD = "claude"
 
 # Default tools Claude Code is allowed to use without prompting
 ALLOWED_TOOLS = [
-    "Read", "Write", "Edit", "Glob", "Grep",
-    "Bash(uv run *)", "Bash(cd *)", "Bash(python *)",
-    "Bash(pytest *)", "Bash(npm *)", "Bash(cat *)",
-    "Bash(head *)", "Bash(tail *)", "Bash(ls *)",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "Bash(uv run *)",
+    "Bash(cd *)",
+    "Bash(python *)",
+    "Bash(pytest *)",
+    "Bash(npm *)",
+    "Bash(cat *)",
+    "Bash(head *)",
+    "Bash(tail *)",
+    "Bash(ls *)",
     "Bash(git *)",
 ]
 
@@ -79,8 +104,8 @@ class BridgeStatus(str, Enum):
 class BridgeState:
     def __init__(self):
         self.status: BridgeStatus = BridgeStatus.IDLE
-        self.current_task: Optional[str] = None
-        self.started_at: Optional[float] = None
+        self.current_task: str | None = None
+        self.started_at: float | None = None
         self.history: list[dict] = []  # last 20 results
 
     def start_task(self, task_name: str):
@@ -124,6 +149,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    """Write one audit line per request to log/bridge_access.jsonl (item #6).
+
+    Captures timestamp, endpoint, a short body summary, and the response status.
+    Reading the body here caches it on the request, so downstream handlers still
+    parse it normally. Audit failures never affect the request/response.
+    """
+    started = time.time()
+    body_summary: Any = None
+    try:
+        raw = await request.body()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    # Summarize keys + truncated values; bridge bodies are small
+                    # localhost JSON, but keep it bounded regardless.
+                    body_summary = {
+                        k: (v if not isinstance(v, str) else v[:120])
+                        for k, v in list(parsed.items())[:12]
+                    }
+                else:
+                    body_summary = {"_type": type(parsed).__name__, "_len": len(raw)}
+            except json.JSONDecodeError:
+                body_summary = {"_bytes": len(raw)}
+    except Exception:  # noqa: BLE001 — never block the request on summary failure
+        body_summary = {"_error": "body-read-failed"}
+
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        _write_access_log(
+            {
+                "ts": datetime.now(IST).isoformat(),
+                "method": request.method,
+                "endpoint": request.url.path,
+                "query": str(request.url.query) or None,
+                "client": request.client.host if request.client else None,
+                "body_summary": body_summary,
+                "status": status_code,
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+        )
+
+
 # ---------------------------------------------------------------------------
 # Request/Response models
 # ---------------------------------------------------------------------------
@@ -131,21 +206,21 @@ app.add_middleware(
 
 class FixBugRequest(BaseModel):
     error_message: str
-    log_lines: Optional[str] = None
-    file_path: Optional[str] = None
-    traceback: Optional[str] = None
-    additional_context: Optional[str] = None
+    log_lines: str | None = None
+    file_path: str | None = None
+    traceback: str | None = None
+    additional_context: str | None = None
 
 
 class RunTestsRequest(BaseModel):
-    test_path: Optional[str] = "test/"
-    specific_test: Optional[str] = None
+    test_path: str | None = "test/"
+    specific_test: str | None = None
     fix_failures: bool = False
 
 
 class RunCommandRequest(BaseModel):
     prompt: str
-    allowed_tools: Optional[list[str]] = None
+    allowed_tools: list[str] | None = None
 
 
 class RestartAppRequest(BaseModel):
@@ -160,23 +235,23 @@ class ReviewCandidate(BaseModel):
     # backward compatibility with callers that predate the field — the prompt
     # renders 'unknown' when absent. The ``source`` string can't be trusted to
     # imply direction (both chartink legs carry "...intraday_buy").
-    direction: Optional[str] = None
+    direction: str | None = None
     candidate_at: str
 
 
 class ReviewContext(BaseModel):
-    positions_count: Optional[int] = None
-    positions_summary: Optional[str] = None
-    pnl_today: Optional[float] = None
-    trades_today: Optional[int] = None
-    max_trades_today: Optional[int] = None
-    nifty_pct: Optional[float] = None
-    india_vix: Optional[float] = None
+    positions_count: int | None = None
+    positions_summary: str | None = None
+    pnl_today: float | None = None
+    trades_today: int | None = None
+    max_trades_today: int | None = None
+    nifty_pct: float | None = None
+    india_vix: float | None = None
     # Stage 1.7: full 5-dim regime snapshot. Free-form dict so the
     # bridge doesn't have to track every field the classifier might
     # add — keys today are trend / volatility / breadth / time_of_day
     # / sector_leaders / sector_leader_concentration / top_sector_pct.
-    regime_snapshot: Optional[dict] = None
+    regime_snapshot: dict | None = None
 
 
 class ReviewSignalRequest(BaseModel):
@@ -194,9 +269,12 @@ def build_claude_command(prompt: str, extra_tools: list[str] | None = None) -> l
     tools = ALLOWED_TOOLS + (extra_tools or [])
     cmd = [
         CLAUDE_CMD,
-        "-p", prompt,
-        "--output-format", "json",
-        "--allowedTools", ",".join(tools),
+        "-p",
+        prompt,
+        "--output-format",
+        "json",
+        "--allowedTools",
+        ",".join(tools),
     ]
     return cmd
 
@@ -264,6 +342,115 @@ def build_subprocess_env() -> dict[str, str]:
     env["LATENCY_DATABASE_URL"] = _MEMORY_DB_URL
     env["HEALTH_DATABASE_URL"] = _MEMORY_DB_URL
     return env
+
+
+# ---------------------------------------------------------------------------
+# Market-hours guard (item #6)
+# ---------------------------------------------------------------------------
+
+
+def _now_ist() -> datetime:
+    """Current time in IST. Indirected so tests can monkeypatch the clock."""
+    return datetime.now(IST)
+
+
+def _is_market_hours(now: datetime | None = None) -> bool:
+    """True iff ``now`` (default: live IST) is inside the cash session.
+
+    09:15–15:30 IST inclusive, Monday–Friday. Holidays are NOT modelled — the
+    guard errs on the side of refusing (a holiday weekday still blocks), which
+    is the safe direction for a destructive auto-fix / restart.
+    """
+    now = now or _now_ist()
+    if now.tzinfo is None:
+        now = IST.localize(now)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return MARKET_OPEN_IST <= now.timetz().replace(tzinfo=None) <= MARKET_CLOSE_IST
+
+
+def _assert_not_market_hours(endpoint: str) -> None:
+    """Raise HTTPException(409) if called during market hours."""
+    if _is_market_hours():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{endpoint} is refused during market hours "
+                f"(09:15–15:30 IST, weekdays). Code edits, pytest, and app "
+                f"restarts on the live trading host must wait until the close. "
+                f"See the 2026-06-11 retrospective (plan item #6)."
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scoped pytest for /fix-bug (item #6)
+# ---------------------------------------------------------------------------
+
+_PY_PATH_RE = re.compile(r"[\w./\\-]+\.py")
+
+
+def _relevant_test_files(request: "FixBugRequest") -> list[str]:
+    """Best-effort map from the reported error to the test files that cover it.
+
+    Scans ``file_path`` and any ``.py`` paths in the traceback. For a source
+    file ``services/foo_service.py`` it looks for ``test/test_foo_service.py``
+    (and ``test/test_foo_service*.py``); a referenced test file is included
+    directly. Returns existing repo-relative paths only, deduped and capped.
+    """
+    raw_paths: list[str] = []
+    if request.file_path:
+        raw_paths.append(request.file_path)
+    if request.traceback:
+        raw_paths.extend(_PY_PATH_RE.findall(request.traceback))
+
+    found: list[str] = []
+    seen: set[str] = set()
+    test_dir = PROJECT_ROOT / "test"
+    for raw in raw_paths:
+        stem = Path(raw.replace("\\", "/")).stem
+        if not stem:
+            continue
+        if stem.startswith("test_"):
+            # A test file was referenced directly — run it if it exists.
+            matches = list(test_dir.rglob(f"{stem}.py"))
+        else:
+            matches = list(test_dir.rglob(f"test_{stem}.py"))
+            matches += list(test_dir.rglob(f"test_{stem}_*.py"))
+        for m in matches:
+            rel = m.relative_to(PROJECT_ROOT).as_posix()
+            if rel not in seen:
+                seen.add(rel)
+                found.append(rel)
+    return found[:10]
+
+
+def _scoped_pytest_command(request: "FixBugRequest") -> str:
+    """The pytest invocation embedded in the /fix-bug verify step.
+
+    Never the full ``pytest test/`` suite (2026-06-11 item #6: a full-suite run
+    on the live host is what polluted trade_journal). Prefer the test files that
+    cover the reported error; fall back to the fast deterministic unit marker.
+    """
+    targets = _relevant_test_files(request)
+    if targets:
+        return "uv run pytest " + " ".join(targets) + " -q --maxfail=5"
+    return "uv run pytest -m unit -q --maxfail=5"
+
+
+# ---------------------------------------------------------------------------
+# Access-log audit trail (item #6)
+# ---------------------------------------------------------------------------
+
+
+def _write_access_log(entry: dict) -> None:
+    """Append one JSON line to log/bridge_access.jsonl. Best-effort, never raises."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with ACCESS_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, default=str) + "\n")
+    except Exception:  # noqa: BLE001 — audit logging must never break a request
+        logger.warning("bridge access-log write failed", exc_info=True)
 
 
 async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None = None) -> dict:
@@ -337,7 +524,7 @@ async def run_claude(prompt: str, task_name: str, extra_tools: list[str] | None 
         state.finish_task(result)
         return result
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         result = {
             "success": False,
             "error": "Claude Code timed out after 5 minutes",
@@ -406,6 +593,9 @@ async def fix_bug(request: FixBugRequest):
     Claude Code will read the relevant files, understand the error,
     edit the code to fix it, and optionally run tests.
     """
+    # Item #6: never auto-fix the live host during the cash session.
+    _assert_not_market_hours("/fix-bug")
+
     # Build a rich prompt with all available context
     prompt_parts = [
         f"Fix this bug in the OpenAlgo project at {PROJECT_ROOT}.",
@@ -424,12 +614,18 @@ async def fix_bug(request: FixBugRequest):
     if request.additional_context:
         prompt_parts.append(f"\nAdditional context: {request.additional_context}")
 
+    # Item #6: scope the verify step to the test files that cover the reported
+    # error (or the fast `-m unit` marker), never the full `pytest test/` suite
+    # — a full-suite run on the live host is what polluted trade_journal.
+    scoped_pytest = _scoped_pytest_command(request)
     prompt_parts.append(
         "\nInstructions:"
         "\n1. Read the CLAUDE.md for project context"
         "\n2. Read the failing file and understand the bug"
         "\n3. Fix the code"
-        "\n4. Run relevant tests to verify: uv run pytest test/ -v"
+        f"\n4. Run ONLY the relevant scoped tests to verify: {scoped_pytest}"
+        "\n   Do NOT run the full `pytest test/` suite — it is slow and, on the"
+        "\n   live host, risks writing to the live databases."
         "\n5. Summarize what you changed and why"
     )
 
@@ -490,6 +686,12 @@ async def restart_app(request: RestartAppRequest):
     Kills existing process (if requested) and starts fresh.
     Note: This runs uv run app.py in the background.
     """
+    # Item #6: a restart wipes in-memory engine state (open positions, stops,
+    # EOD timers). Refuse during the cash session — the 2026-06-11 mid-market
+    # restart was high-risk and only tolerable because both strategies were
+    # in sandbox that day.
+    _assert_not_market_hours("/restart-app")
+
     if state.status == BridgeStatus.BUSY:
         raise HTTPException(status_code=409, detail="Bridge is busy")
 
@@ -500,7 +702,8 @@ async def restart_app(request: RestartAppRequest):
             # Kill any existing OpenAlgo process on port 5000
             try:
                 kill_result = await asyncio.create_subprocess_exec(
-                    "powershell", "-Command",
+                    "powershell",
+                    "-Command",
                     "Get-NetTCPConnection -LocalPort 5000 -ErrorAction SilentlyContinue | "
                     "ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }",
                     stdout=asyncio.subprocess.PIPE,
@@ -514,7 +717,9 @@ async def restart_app(request: RestartAppRequest):
 
         # Start OpenAlgo in background
         process = await asyncio.create_subprocess_exec(
-            "uv", "run", "app.py",
+            "uv",
+            "run",
+            "app.py",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=str(PROJECT_ROOT),
@@ -628,7 +833,7 @@ Respond with a short reasoning paragraph followed by a final JSON block. The JSO
 """
 
 
-def _format_regime_block(regime: Optional[dict]) -> str:
+def _format_regime_block(regime: dict | None) -> str:
     """Render the regime snapshot dict as a small bullet list.
 
     Returns ``"- unavailable"`` when the classifier didn't return data
@@ -653,9 +858,7 @@ def _format_regime_block(regime: Optional[dict]) -> str:
         )
     top_sector_pct = regime.get("top_sector_pct") or {}
     if top_sector_pct:
-        rendered = ", ".join(
-            f"{sym} {float(pct):+.2f}%" for sym, pct in top_sector_pct.items()
-        )
+        rendered = ", ".join(f"{sym} {float(pct):+.2f}%" for sym, pct in top_sector_pct.items())
         lines.append(f"- top sectors today: {rendered}")
     if not lines:
         return "- unavailable"
@@ -698,7 +901,7 @@ def _format_review_prompt(candidate: ReviewCandidate, ctx: ReviewContext) -> str
     )
 
 
-def _extract_decision_block(text: str) -> Optional[dict]:
+def _extract_decision_block(text: str) -> dict | None:
     """Find the LAST balanced ``{...}`` block in ``text`` containing ``"decision"``.
 
     Walks every ``{`` position, follows brace depth with quote/escape awareness,
@@ -744,9 +947,7 @@ def _extract_decision_block(text: str) -> Optional[dict]:
     return candidates[-1] if candidates else None
 
 
-def _failsafe_response(
-    reasoning: str, started: float, session_id: str = "", raw: str = ""
-) -> dict:
+def _failsafe_response(reasoning: str, started: float, session_id: str = "", raw: str = "") -> dict:
     """Build a ``decision='take'`` response used whenever review can't complete."""
     return {
         "decision": "take",
@@ -785,7 +986,7 @@ async def _invoke_claude_for_review(prompt: str) -> tuple[str, str]:
         stdout_bytes, _stderr_bytes = await asyncio.wait_for(
             process.communicate(), timeout=REVIEW_CLAUDE_TIMEOUT_SECONDS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         try:
             process.kill()
         except ProcessLookupError:
@@ -822,7 +1023,7 @@ async def review_signal(request: ReviewSignalRequest):
 
     try:
         model_text, session_id = await _invoke_claude_for_review(prompt)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return _failsafe_response("timeout", started)
     except FileNotFoundError:
         return _failsafe_response("claude_cli_missing", started)
@@ -875,7 +1076,7 @@ REFLECT_CLAUDE_TIMEOUT_SECONDS = 180.0
 
 class ReflectRequest(BaseModel):
     prompt: str
-    model: Optional[str] = None
+    model: str | None = None
 
 
 @app.post("/reflect")
@@ -917,14 +1118,14 @@ async def reflect(request: ReflectRequest):
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
                 process.communicate(), timeout=REFLECT_CLAUDE_TIMEOUT_SECONDS
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
-            raise HTTPException(status_code=504, detail="claude_timeout")
+            raise HTTPException(status_code=504, detail="claude_timeout") from None
     except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="claude_cli_missing")
+        raise HTTPException(status_code=500, detail="claude_cli_missing") from None
     except HTTPException:
         raise
     except Exception as exc:
@@ -971,7 +1172,7 @@ async def reflect(request: ReflectRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info(f"Starting OpenAlgo Claude Bridge on port 5001")
+    logger.info("Starting OpenAlgo Claude Bridge on port 5001")
     logger.info(f"Project root: {PROJECT_ROOT}")
     logger.info(f"Claude CLI: {CLAUDE_CMD}")
     logger.info(f"Allowed tools: {len(ALLOWED_TOOLS)} pre-approved")
