@@ -166,6 +166,41 @@ the latest decisions automatically.
 - **History:**
   - **2026-06-09 (Phase 3):** Introduced with the sector-index feed wiring (`feat/sector_follow_cap5_vol_phase3`, commit `3bfa4a08`). Default `true` so a fresh deploy keeps the feed current without extra config.
 
+### Simplified engine — EOD watchdog timing
+
+#### SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env; read in `services/eod_watchdog_service.py.start_eod_watchdog`
+  (via local `_env_bool`)
+- **Values:** `true` / `false` (any value other than `1/true/yes/on`, case-insensitive, disables)
+- **Effect:** master on/off switch for the APScheduler EOD watchdog (the
+  tick-independent backstop that flattens open `trade_journal` rows at end of day
+  via `place_order`). When `false`, `start_eod_watchdog` returns early and
+  registers no jobs (app boot logs the disable). When `true` (default), one daily
+  mon-fri job is registered per intraday strategy. Belt to the tick-driven
+  `_maybe_flatten_eod` and the 15:30 reconciliation.
+- **Who flips:** operator only (leave `true` — disabling re-opens the
+  stranded-position risk the watchdog exists to cover).
+- **History:**
+  - **2026-06-11:** Introduced alongside the fire-time cap. Default `true`.
+
+#### SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME
+- **Current value:** unset → code default `15:14` (IST, `HH:MM`)
+- **Set in:** env; read in `services/eod_watchdog_service.py.start_eod_watchdog`
+- **Values:** `HH:MM` 24h IST. Invalid values log an error and fall back to `15:14`.
+- **Effect:** caps each strategy's watchdog fire time. The job fires at
+  `min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)` — it honors an
+  earlier declared cut-off but never runs later than the cap. The default `15:14`
+  is deliberately **one minute before** the 15:15 sandbox/broker MIS
+  auto-square-off: sandbox *rejects* MIS orders placed at/after 15:15, so the old
+  behavior of firing at the declared `eod_exit_time` (15:20) was always too late
+  and stranded positions (the 2026-06-10 OIL/HINDZINC/TATAELXSI orphans, only
+  recovered by the 15:30 reconciliation). **Do not set ≥15:15.**
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-11:** Introduced. Default `15:14` — fixes the 15:20 → post-square-off
+    race for the simplified engine's intraday EOD flatten.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
