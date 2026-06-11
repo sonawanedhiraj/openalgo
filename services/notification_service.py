@@ -148,6 +148,10 @@ class NotificationService:
             # into what the veto layer blocks (shadow: would-block, active:
             # actual block) before flipping VETO_LAYER_MODE=active.
             "veto_decision": _env_bool("NOTIFY_VETO_ALERTS", default=True),
+            # Daily in-house-scanner-vs-Chartink EOD comparison summary. Default
+            # ON — the operator wants the parity verdict each trading day. See
+            # services/scanner_comparison_eod_service.py.
+            "scanner_comparison": _env_bool("NOTIFY_SCANNER_COMPARISON", default=True),
         }
         # Preflight-abort alert de-duplication state (2026-06-03 incident: a
         # 14s DNS blip produced 14 identical "🛑 Preflight aborted" alerts as

@@ -26,6 +26,15 @@ mimetypes.add_type("application/font-woff2", ".woff2")
 from flask import Flask, session
 from flask_wtf.csrf import CSRFProtect  # Import CSRF protection
 
+# Stage 1.5: importing the package triggers self-registration of every
+# strategy declared under strategies/<name>/strategy.py. Today this is just
+# ``trending_equity_intraday`` (a thin adapter around the legacy
+# SimplifiedStockEngine — see strategies/__init__.py); future strategies
+# will land here too. The simplified engine itself is still instantiated
+# lazily via get_simplified_stock_engine_service(); this import only
+# populates the registry so callers (the upcoming multi-strategy router,
+# Stage 1.7's regime-profile reviewer) can enumerate available strategies.
+import strategies  # noqa: F401
 from blueprints.admin import admin_bp  # Import the admin blueprint
 from blueprints.analyzer import analyzer_bp  # Import the analyzer blueprint
 from blueprints.apikey import api_key_bp
@@ -36,38 +45,34 @@ from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
-from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
-from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
-from blueprints.preflight import preflight_bp  # Stage-0 go/no-go preflight gate
-from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
-from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
 from blueprints.core import core_bp
+from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
 from blueprints.dashboard import dashboard_bp
 from blueprints.flow import flow_bp  # Import the flow blueprint
 from blueprints.gc_json import gc_json_bp
 from blueprints.gex import gex_bp  # Import the GEX blueprint
-from blueprints.ivsmile import ivsmile_bp  # Import the IV Smile blueprint
-from blueprints.oiprofile import oiprofile_bp  # Import the OI Profile blueprint
+from blueprints.health import health_bp  # Import the health monitoring blueprint
 from blueprints.historify import historify_bp  # Import the historify blueprint
 from blueprints.ivchart import ivchart_bp  # Import the IV chart blueprint
-from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
-from blueprints.straddle_chart import straddle_bp  # Import the straddle chart blueprint
-from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
-from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
-from blueprints.vol_surface import vol_surface_bp  # Import the vol surface blueprint
+from blueprints.ivsmile import ivsmile_bp  # Import the IV Smile blueprint
+from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
 from blueprints.latency import latency_bp  # Import the latency blueprint
 from blueprints.leverage import leverage_bp  # Import the leverage blueprint
-from blueprints.health import health_bp  # Import the health monitoring blueprint
 from blueprints.log import log_bp
 from blueprints.logging import logging_bp  # Import the logging blueprint
 from blueprints.master_contract_status import (
     master_contract_status_bp,  # Import the master contract status blueprint
 )
+from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
+from blueprints.oiprofile import oiprofile_bp  # Import the OI Profile blueprint
+from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
 from blueprints.orders import orders_bp
 from blueprints.platforms import platforms_bp
 from blueprints.playground import playground_bp  # Import the API playground blueprint
 from blueprints.pnltracker import pnltracker_bp  # Import the pnl tracker blueprint
-from blueprints.python_strategy import python_strategy_bp, initialize_with_app_context as init_python_strategy  # Import the python strategy blueprint
+from blueprints.preflight import preflight_bp  # Stage-0 go/no-go preflight gate
+from blueprints.python_strategy import initialize_with_app_context as init_python_strategy
+from blueprints.python_strategy import python_strategy_bp  # Import the python strategy blueprint
 from blueprints.react_app import (  # Import React frontend blueprint
     is_react_frontend_available,
     react_bp,
@@ -75,17 +80,22 @@ from blueprints.react_app import (  # Import React frontend blueprint
 )
 from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
 from blueprints.search import search_bp
+from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
 from blueprints.security import security_bp  # Import the security blueprint
 from blueprints.settings import settings_bp  # Import the settings blueprint
+from blueprints.straddle_chart import straddle_bp  # Import the straddle chart blueprint
 from blueprints.strategy import strategy_bp  # Import the strategy blueprint
+from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
+from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
 from blueprints.system_permissions import (
     system_permissions_bp,  # Import the system permissions blueprint
 )
 from blueprints.telegram import telegram_bp  # Import the telegram blueprint
 from blueprints.traffic import traffic_bp  # Import the traffic blueprint
-from blueprints.whatsapp import whatsapp_bp  # Import the WhatsApp blueprint
 from blueprints.tv_json import tv_json_bp
+from blueprints.vol_surface import vol_surface_bp  # Import the vol surface blueprint
 from blueprints.websocket_example import websocket_bp  # Import the websocket example blueprint
+from blueprints.whatsapp import whatsapp_bp  # Import the WhatsApp blueprint
 from cors import cors  # Import the CORS instance
 from csp import apply_csp_middleware  # Import the CSP middleware
 from database.action_center_db import init_db as ensure_action_center_tables_exists
@@ -95,22 +105,25 @@ from database.auth_db import init_db as ensure_auth_tables_exists
 from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
-from database.strategy_daily_intent_db import init_db as ensure_strategy_daily_intent_tables_exists
 from database.data_health_db import init_db as ensure_data_health_tables_exists
-from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
-from database.scanner_db import init_db as ensure_scanner_tables_exists
-from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
-from database.trade_journal_db import init_db as ensure_trade_journal_tables_exists
-from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
+from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
+from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
+from database.scanner_comparison_db import (
+    init_db as ensure_scanner_comparison_tables_exists,
+)
+from database.scanner_db import init_db as ensure_scanner_tables_exists
 from database.settings_db import init_db as ensure_settings_tables_exists
+from database.signal_decision_db import init_db as ensure_signal_decision_tables_exists
+from database.strategy_daily_intent_db import init_db as ensure_strategy_daily_intent_tables_exists
 from database.strategy_db import init_db as ensure_strategy_tables_exists
 from database.symbol import init_db as ensure_master_contract_tables_exists
 from database.telegram_db import get_bot_config
+from database.trade_journal_db import init_db as ensure_trade_journal_tables_exists
 from database.traffic_db import init_logs_db as ensure_traffic_logs_exists
 from database.user_db import init_db as ensure_user_tables_exists
 from database.whatsapp_db import (
@@ -120,18 +133,8 @@ from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
 from services.telegram_bot_service import telegram_bot_service
-
-# Stage 1.5: importing the package triggers self-registration of every
-# strategy declared under strategies/<name>/strategy.py. Today this is just
-# ``trending_equity_intraday`` (a thin adapter around the legacy
-# SimplifiedStockEngine — see strategies/__init__.py); future strategies
-# will land here too. The simplified engine itself is still instantiated
-# lazily via get_simplified_stock_engine_service(); this import only
-# populates the registry so callers (the upcoming multi-strategy router,
-# Stage 1.7's regime-profile reviewer) can enumerate available strategies.
-import strategies  # noqa: F401
-from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
+from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.logging import (  # Import centralized logging
     get_logger,
     highlight_url,
@@ -390,9 +393,7 @@ def create_app():
                 "can immediately complete OAuth without admin review."
             )
 
-        logger.info(
-            "Remote MCP blueprints registered (OAuth + JSON-RPC dispatch + SSE)."
-        )
+        logger.info("Remote MCP blueprints registered (OAuth + JSON-RPC dispatch + SSE).")
 
     # Exempt webhook endpoints from CSRF protection after app initialization
     with app.app_context():
@@ -439,10 +440,7 @@ def create_app():
         from flask import request
 
         # Static assets don't need DB
-        if (
-            request.path.startswith("/static/")
-            or request.path.startswith("/assets/")
-        ):
+        if request.path.startswith("/static/") or request.path.startswith("/assets/"):
             return
 
         # Wait up to 30s for DB init (typically ~3.5s)
@@ -529,9 +527,15 @@ def create_app():
 
         # Skip tracking for common browser/crawler requests that are not attack probes
         safe_prefixes = (
-            "/favicon", "/robots.txt", "/sitemap", "/manifest",
-            "/sw.js", "/.well-known", "/apple-touch-icon",
-            "/service-worker", "/workbox",
+            "/favicon",
+            "/robots.txt",
+            "/sitemap",
+            "/manifest",
+            "/sw.js",
+            "/.well-known",
+            "/apple-touch-icon",
+            "/service-worker",
+            "/workbox",
         )
 
         if not is_authenticated and not path.startswith(safe_prefixes):
@@ -572,7 +576,7 @@ def create_app():
 
     @app.context_processor
     def inject_version():
-        return dict(version=get_version())
+        return {"version": get_version()}
 
     @app.route("/api/config/host")
     def get_host_config():
@@ -635,6 +639,7 @@ def setup_environment(app):
                 ("Data Health DB", ensure_data_health_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
+                ("Scanner Comparison DB", ensure_scanner_comparison_tables_exists),
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),
                 ("Trade Journal DB", ensure_trade_journal_tables_exists),
                 ("Journal Reflection DB", ensure_journal_reflection_tables_exists),
@@ -714,6 +719,22 @@ def setup_environment(app):
                 logger.debug("Sector Follow CAP5_VOL service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
+
+            # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
+            # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
+            # single 15:45 IST mon-fri job that compares the in-house scanner's
+            # BUY/SELL hits against the Chartink webhook lists, writes a
+            # scanner_comparison row, and Telegrams the verdict. Read-only on every
+            # DB except its own table; gated per-fire by SCANNER_COMPARISON_EOD_ENABLED.
+            try:
+                from services.scanner_comparison_eod_service import (
+                    init_scanner_comparison_eod_service,
+                )
+
+                init_scanner_comparison_eod_service()
+                logger.debug("Scanner comparison EOD job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Scanner comparison EOD job: {e}")
 
             # Telegram INBOUND intent bot (Phase 6). Gated by
             # TELEGRAM_INBOUND_ENABLED (default false), so this is a no-op on
@@ -818,7 +839,8 @@ def setup_environment(app):
                     app.scanner_service.start()
                     logger.info(
                         "Scanner service started (symbols=%d, intervals=%s)",
-                        len(symbols), scanner_intervals,
+                        len(symbols),
+                        scanner_intervals,
                     )
 
                     # Pre-subscribe scanner symbols to the broker WebSocket so
@@ -902,13 +924,9 @@ def setup_environment(app):
             # regime subscriber forces NSE_INDEX. Failures are warnings only —
             # the classifier degrades gracefully to historify EOD data.
             try:
-                raw_sector_symbols = os.environ.get(
-                    "REGIME_SECTOR_SYMBOLS", ""
-                )
+                raw_sector_symbols = os.environ.get("REGIME_SECTOR_SYMBOLS", "")
                 sector_symbols = [
-                    s.strip().upper()
-                    for s in raw_sector_symbols.split(",")
-                    if s.strip()
+                    s.strip().upper() for s in raw_sector_symbols.split(",") if s.strip()
                 ]
                 if sector_symbols:
                     from services.scanner_presubscribe import regime_pre_subscriber
@@ -943,9 +961,7 @@ def setup_environment(app):
                         app.scan_hit_poster.mode,
                     )
                 else:
-                    logger.debug(
-                        "Scan-hit poster disabled (SCAN_HIT_POSTER_ENABLED!=true)"
-                    )
+                    logger.debug("Scan-hit poster disabled (SCAN_HIT_POSTER_ENABLED!=true)")
             except Exception as e:
                 logger.error(f"Failed to initialize Scan-hit poster: {e}")
 
@@ -992,13 +1008,10 @@ def setup_environment(app):
                     )
                 elif _wd_result.get("disabled"):
                     logger.info(
-                        "EOD watchdog disabled via "
-                        "SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED"
+                        "EOD watchdog disabled via " "SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED"
                     )
                 else:
-                    logger.warning(
-                        "EOD watchdog did not start (already running or empty)"
-                    )
+                    logger.warning("EOD watchdog did not start (already running or empty)")
             except Exception:
                 logger.exception("Failed to start EOD watchdog")
 
@@ -1052,6 +1065,7 @@ def setup_environment(app):
                     logger.exception("WhatsApp bot auto-start crashed")
 
             import threading as _threading
+
             _threading.Thread(
                 target=_autostart_whatsapp_bot,
                 daemon=True,
@@ -1076,6 +1090,7 @@ def setup_environment(app):
 
                     def run_catchup():
                         from sandbox.position_manager import catchup_missed_settlements
+
                         catchup_missed_settlements()
                         return ("catchup_settlement", True, "Completed")
 
@@ -1090,14 +1105,22 @@ def setup_environment(app):
                                 service_name, success, message = future.result()
                                 if service_name == "execution_engine":
                                     if success:
-                                        logger.debug("Execution engine auto-started (Analyzer mode is ON)")
+                                        logger.debug(
+                                            "Execution engine auto-started (Analyzer mode is ON)"
+                                        )
                                     else:
-                                        logger.warning(f"Failed to auto-start execution engine: {message}")
+                                        logger.warning(
+                                            f"Failed to auto-start execution engine: {message}"
+                                        )
                                 elif service_name == "squareoff_scheduler":
                                     if success:
-                                        logger.debug("Square-off scheduler auto-started (Analyzer mode is ON)")
+                                        logger.debug(
+                                            "Square-off scheduler auto-started (Analyzer mode is ON)"
+                                        )
                                     else:
-                                        logger.warning(f"Failed to auto-start square-off scheduler: {message}")
+                                        logger.warning(
+                                            f"Failed to auto-start square-off scheduler: {message}"
+                                        )
                                 elif service_name == "catchup_settlement":
                                     logger.debug("Catch-up settlement check completed on startup")
                             except Exception as e:
@@ -1143,7 +1166,9 @@ def setup_environment(app):
                             if success:
                                 success, message = telegram_bot_service.start_bot()
                                 if success:
-                                    logger.debug(f"Telegram bot auto-started successfully: {message}")
+                                    logger.debug(
+                                        f"Telegram bot auto-started successfully: {message}"
+                                    )
                                 else:
                                     logger.error(f"Failed to auto-start Telegram bot: {message}")
                             else:
@@ -1170,6 +1195,7 @@ setup_environment(app)
 # Restore caches from database in background (not needed until first trade/lookup)
 import threading
 
+
 def _restore_caches_background():
     # Wait for DB tables to be created before querying
     app.db_ready.wait()
@@ -1183,9 +1209,12 @@ def _restore_caches_background():
                 symbol_count = cache_result["symbol_cache"].get("symbols_loaded", 0)
                 auth_count = cache_result["auth_cache"].get("tokens_loaded", 0)
                 if symbol_count > 0 or auth_count > 0:
-                    logger.debug(f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens")
+                    logger.debug(
+                        f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens"
+                    )
         except Exception as e:
             logger.debug(f"Cache restoration skipped: {e}")
+
 
 threading.Thread(target=_restore_caches_background, daemon=True).start()
 
@@ -1225,6 +1254,7 @@ def shutdown_database_sessions(exception=None):
     for module_name, session_attr in _sessions:
         try:
             import importlib
+
             mod = importlib.import_module(module_name)
             session = getattr(mod, session_attr, None)
             if session is not None:
@@ -1254,6 +1284,7 @@ else:
     logger.debug("Starting WebSocket proxy")
     start_websocket_proxy(app)
 
+
 def _warn_if_dirty_working_tree():
     """Log a WARNING at boot if the git working tree has uncommitted changes.
 
@@ -1262,9 +1293,7 @@ def _warn_if_dirty_working_tree():
     OPENALGO_BOOT_DIRTY_CHECK_ENABLED (default True) so it can be silenced if
     it becomes noisy.
     """
-    if os.getenv("OPENALGO_BOOT_DIRTY_CHECK_ENABLED", "True").lower() not in (
-        "true", "1", "t"
-    ):
+    if os.getenv("OPENALGO_BOOT_DIRTY_CHECK_ENABLED", "True").lower() not in ("true", "1", "t"):
         return
     try:
         import subprocess
@@ -1303,7 +1332,9 @@ if __name__ == "__main__":
     # FLASK_DEBUG_ALLOW_EXTERNAL=true to opt out of this guard.
     _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", ""}
     _allow_external_debug = os.getenv("FLASK_DEBUG_ALLOW_EXTERNAL", "False").lower() in (
-        "true", "1", "t"
+        "true",
+        "1",
+        "t",
     )
     if debug and host_ip not in _LOOPBACK_HOSTS and not _allow_external_debug:
         sys.stderr.write(
@@ -1345,16 +1376,19 @@ if __name__ == "__main__":
     }
     # Suppress Flask/Werkzeug's default startup banner — our banner replaces it
     import flask.cli
+
     flask.cli.show_server_banner = lambda *_: None
 
     # Print startup banner NOW — right before the server starts accepting connections.
     # When the user sees this banner, the portal is ready to load.
     if not debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
         from utils.version import get_version as _get_ver
+
         _ver = _get_ver()
         _dip = host_ip
         if host_ip == "0.0.0.0":
             import socket as _sk
+
             try:
                 _s = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
                 _s.connect(("8.8.8.8", 80))
@@ -1365,12 +1399,32 @@ if __name__ == "__main__":
         _wu = f"http://{_dip}:{port}"
         _wsu = f"ws://{_dip}:{os.getenv('WEBSOCKET_PORT', 8765)}"
         _du = "https://docs.openalgo.in"
-        G, C, M, W, Y, R, BD, DM = "\033[92m", "\033[96m", "\033[95m", "\033[97m", "\033[93m", "\033[0m", "\033[1m", "\033[2m"
+        G, C, M, W, Y, R, BD, DM = (
+            "\033[92m",
+            "\033[96m",
+            "\033[95m",
+            "\033[97m",
+            "\033[93m",
+            "\033[0m",
+            "\033[1m",
+            "\033[2m",
+        )
         _ae = re.compile(r"\x1B\[[0-9;]*m")
-        def _vl(t): return len(_ae.sub("", t))
+
+        def _vl(t):
+            return len(_ae.sub("", t))
+
         _t = f" OpenAlgo v{_ver} "
         _sl = "Your Personal Algo Trading Platform"
-        _samps = ["", _sl, f"{W}{BD}Endpoints{R}", f"{W}Web App{R}    {C}{_wu}{R}", f"{W}WebSocket{R}  {M}{_wsu}{R}", f"{W}Docs{R}       {Y}{_du}{R}", f"{W}Status{R}     {G}{BD}Ready{R}"]
+        _samps = [
+            "",
+            _sl,
+            f"{W}{BD}Endpoints{R}",
+            f"{W}Web App{R}    {C}{_wu}{R}",
+            f"{W}WebSocket{R}  {M}{_wsu}{R}",
+            f"{W}Docs{R}       {Y}{_du}{R}",
+            f"{W}Status{R}     {G}{BD}Ready{R}",
+        ]
         _iw = max(50, max((_vl(s) for s in _samps), default=0))
         _W = max(_iw + 4, len(_t) + 5)
         _enc = getattr(sys.stdout, "encoding", None) or "utf-8"
@@ -1379,21 +1433,41 @@ if __name__ == "__main__":
             TL, TR, BL, BR, H, V = "\u256d", "\u256e", "\u2570", "\u256f", "\u2500", "\u2502"
         except Exception:
             TL, TR, BL, BR, H, V = "+", "+", "+", "+", "-", "|"
+
         def _ml(t=""):
             p = max(_W - 4 - _vl(t), 0)
             return f"{C}{V}{R} {t}{' '*p} {C}{V}{R}"
+
         _slp = max((_W - 4 - _vl(_sl)) // 2, 0)
         _srp = max(_W - 4 - _vl(_sl) - _slp, 0)
         _td = max(0, _W - 5 - len(_t))
-        print("\n".join(["",
-            f"{C}{TL}{H*3}{G}{BD}{_t}{R}{C}{H*_td}{TR}{R}",
-            _ml(), f"{C}{V}{R} {' '*_slp}{DM}{_sl}{R}{' '*_srp} {C}{V}{R}", _ml(),
-            _ml(f"{W}{BD}Endpoints{R}"),
-            _ml(f"{W}Web App{R}    {C}{_wu}{R}"),
-            _ml(f"{W}WebSocket{R}  {M}{_wsu}{R}"),
-            _ml(f"{W}Docs{R}       {Y}{_du}{R}"), _ml(),
-            _ml(f"{W}Status{R}     {G}{BD}Ready{R}"), _ml(),
-            f"{C}{BL}{H*(_W-2)}{BR}{R}", "",
-        ]), flush=True)
+        print(
+            "\n".join(
+                [
+                    "",
+                    f"{C}{TL}{H*3}{G}{BD}{_t}{R}{C}{H*_td}{TR}{R}",
+                    _ml(),
+                    f"{C}{V}{R} {' '*_slp}{DM}{_sl}{R}{' '*_srp} {C}{V}{R}",
+                    _ml(),
+                    _ml(f"{W}{BD}Endpoints{R}"),
+                    _ml(f"{W}Web App{R}    {C}{_wu}{R}"),
+                    _ml(f"{W}WebSocket{R}  {M}{_wsu}{R}"),
+                    _ml(f"{W}Docs{R}       {Y}{_du}{R}"),
+                    _ml(),
+                    _ml(f"{W}Status{R}     {G}{BD}Ready{R}"),
+                    _ml(),
+                    f"{C}{BL}{H*(_W-2)}{BR}{R}",
+                    "",
+                ]
+            ),
+            flush=True,
+        )
 
-    socketio.run(app, host=host_ip, port=port, debug=debug, reloader_options=reloader_options, allow_unsafe_werkzeug=True)
+    socketio.run(
+        app,
+        host=host_ip,
+        port=port,
+        debug=debug,
+        reloader_options=reloader_options,
+        allow_unsafe_werkzeug=True,
+    )

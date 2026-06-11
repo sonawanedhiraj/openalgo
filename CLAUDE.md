@@ -855,6 +855,39 @@ pipeline): index 1m via `uv run python -m services.sector_follow_index_backfill
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
 
+## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
+
+A daily in-process APScheduler job (**15:45 IST mon-fri**) that scores how the
+in-house scanner's BUY/SELL hits matched the Chartink lists posted via webhook.
+It is the durable replacement for the retired Cowork-side
+`scanner-vs-chartink-daily-comparison` scheduled task, which ran read-only but
+silently failed in the sandbox (no repo/folder access). Moving it inside OpenAlgo
+— where both sides' data already live — means the result is written AND
+Telegrammed every trading day.
+
+- **Service** `services/scanner_comparison_eod_service.py` — read-only on every
+  DB except its own table. `compute_comparison(date)` unions the Chartink side
+  (`scan_cycle`, `cycle_kind='chartink'` → `screener_buy`/`screener_sell`) and the
+  in-house side (`scan_results`, `source='inhouse'`, grouped by the joined
+  `scan_definition.screener_type`), then computes per-side counts, intersection,
+  Jaccard, recall ratio, top diff names, and a one-line tuning verdict.
+  `run_comparison_for_date(date)` persists + Telegrams.
+- **Table** `scanner_comparison` in `db/openalgo.db`
+  (`database/scanner_comparison_db.py`) — one row per `(date, screener_side)`;
+  idempotent delete-then-insert per date+side, so re-running the day overwrites.
+- **Telegram** routes through `notification_service.notify("scanner_comparison", …)`
+  so the Phase 6 inbound-bot fallback delivers; toggle `NOTIFY_SCANNER_COMPARISON`
+  (default `true`).
+- **Flags** `SCANNER_COMPARISON_EOD_ENABLED` (default `true`, per-fire gate) +
+  `SCANNER_COMPARISON_EOD_TIME` (default `15:45`). See `docs/PARAMETER_LOG.md`.
+- **Caveat:** the in-house side reflects the *live tick-driven* scanner, which only
+  sees ticks the engine subscribed (the "in-house scanner starved" learning) — a
+  fully-disjoint result usually means tick starvation, not a threshold mismatch.
+  The tuning verdict calls this out.
+
+Registered at boot in `app.py` next to `init_sector_follow_service`. One-shot
+backfill / re-run for a past day: `run_comparison_for_date(date='YYYY-MM-DD')`.
+
 ## Simplified Stock Engine
 
 This project hosts the simplified stock engine — a Chartink-driven intraday

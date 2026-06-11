@@ -133,6 +133,48 @@ the latest decisions automatically.
 - **Backout plan:** revert this commit — the rule files remain in git history at
   their last commit on `dev`.
 
+### Scanner — EOD Chartink-vs-inhouse comparison job
+
+#### SCANNER_COMPARISON_EOD_ENABLED
+- **Current value:** `true` (default; ships hot)
+- **Set in:** env var (not yet in `.sample.env` — operator WIP held that file;
+  add at next convenient edit). Read with a safe default in
+  `services/scanner_comparison_eod_service._eod_comparison_job`.
+- **Code default:** `true`
+- **What it gates:** the per-fire body of the `scanner_comparison_eod`
+  APScheduler job (15:45 IST mon-fri). When `true`, the job computes the
+  in-house-scanner-vs-Chartink comparison for the day, writes one
+  `scanner_comparison` row per side, and Telegrams the verdict. When `false`,
+  the job is registered but the body is a no-op (so flipping the flag needs only
+  a restart, not a re-registration).
+- **History:**
+  - **2026-06-12:** Introduced with the EOD comparison job that retires the
+    Cowork-side `scanner-vs-chartink-daily-comparison` scheduled task (which ran
+    read-only but silently failed in the sandbox — no repo/folder access). The
+    in-process job is durable: it persists a row AND Telegrams every trading day.
+
+#### SCANNER_COMPARISON_EOD_TIME
+- **Current value:** `15:45` (default)
+- **Set in:** env var; read in
+  `services/scanner_comparison_eod_service.register_jobs` at boot.
+- **Code default:** `15:45` (matches the retired Cowork task's cron)
+- **What it controls:** the `HH:MM` IST fire time of the `scanner_comparison_eod`
+  cron job. Junk values fall back to the default. Changing it requires a restart
+  (the trigger is built at registration).
+- **History:**
+  - **2026-06-12:** Introduced alongside `SCANNER_COMPARISON_EOD_ENABLED`.
+
+#### NOTIFY_SCANNER_COMPARISON
+- **Current value:** `true` (default)
+- **Set in:** env var; snapshotted at `NotificationService` construction
+  (`services/notification_service.py`), so a change needs a process restart.
+- **Code default:** `true`
+- **What it controls:** whether the `scanner_comparison` notification event is
+  delivered to Telegram. When `false`, `notify("scanner_comparison", …)` no-ops
+  (the DB row is still written; only the Telegram send is suppressed).
+- **History:**
+  - **2026-06-12:** Introduced with the EOD comparison job's Telegram summary.
+
 ### sector_follow_cap5_vol — strategy
 
 #### SECTOR_FOLLOW_CAP5_VOL_MODE
