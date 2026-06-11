@@ -186,7 +186,17 @@ After computing the trade recap, update the active strategy's LEARNINGS.md file 
 
 **Important**: Keep entries factual and data-driven. Every claim should reference specific trades, numbers, or comparisons. Flag observations with small sample sizes explicitly.
 
-## Step 6: Check for errors and auto-fix via bridge
+## Step 6: Check for errors and PROPOSE fixes (read-only — NO auto-fix)
+
+> **Changed 2026-06-12 — code is read-only from this scheduled task.** This step
+> used to call the bridge `/fix-bug` (which runs **full `pytest test/ -v` + restart
+> OpenAlgo**) and `/restart-app`. That was the direct cause of the pytest live-DB
+> pollution loops and the ~45-minute mid-market preflight lockup. A scheduled task
+> must **never mutate code, run pytest, or restart the app.** It scans, classifies,
+> and **proposes** — the operator decides whether to fix. This matches the
+> "Audit trail rules (code is read-only)" section at the bottom of this file and the
+> policy in `audit/README.md`. **Do NOT call `/fix-bug` or `/restart-app` — ever.**
+
 **CORS rule**: Do NOT fetch port 5001 from a port 5000 tab. Instead:
 1. Navigate a tab to `http://127.0.0.1:5001/read-errors?n=5`
 2. Use `get_page_text` to read the JSON response
@@ -200,48 +210,32 @@ If the bridge is unreachable (navigate fails or page is empty), skip the rest of
 - Ignore `engineio.server` session-disconnected warnings — these are benign.
 - If there are **no actionable new errors today**, skip to Step 7.
 
-### 6b: Auto-fix via bridge
-For each actionable error (up to 2 per cycle to avoid overload):
-1. Navigate the bridge tab to `http://127.0.0.1:5001/status` to set origin
-2. Use `javascript_tool` on THAT tab (same-origin) to POST to `/fix-bug`:
-   ```javascript
-   fetch('/fix-bug', {
-     method: 'POST',
-     headers: {'Content-Type': 'application/json'},
-     body: JSON.stringify({
-       error_message: '<THE ERROR MESSAGE>',
-       traceback: '<THE TRACEBACK STRING>',
-       file_path: '<THE FILE PATH FROM THE ERROR>'
-     })
-   }).then(r=>r.json()).then(d=>{window.__fixResult=d})
-   ```
-3. Wait 5 seconds, then read `window.__fixResult` to check the outcome.
-4. If the fix was applied successfully (`status: "completed"` or similar), record it for the summary.
+### 6b: Propose fixes via the audit trail (NOT via the bridge)
+For each actionable error (up to 2 per cycle to avoid noise), **append one
+structured JSON line** to `C:\workspace\ai-trade-agent\openalgo\audit\proposed_fixes.jsonl`
+and continue. Do **not** edit any code, run any tests, restart the app, `git add`,
+or commit. The schema and rules are in the "Audit trail rules (code is read-only)"
+section at the bottom of this file (and `audit/README.md`):
 
-### 6c: Restart app if fixes were applied
-If at least one fix was applied in step 6b, restart the app so changes take effect:
-1. Use `javascript_tool` on the bridge tab (same-origin) to POST to `/restart-app`:
-   ```javascript
-   fetch('/restart-app', {
-     method: 'POST',
-     headers: {'Content-Type': 'application/json'},
-     body: JSON.stringify({})
-   }).then(r=>r.json()).then(d=>{window.__restartResult=d})
-   ```
-2. Wait 10 seconds for the app to come back up.
-3. Verify OpenAlgo is running by navigating to `http://127.0.0.1:5000` and checking it loads.
+```json
+{"timestamp": "<ISO with TZ>", "session_id": "<task session id>", "task_name": "fno-scan-cycle", "observation": "<the error message + 1-line context>", "file": "<file:line from the traceback>", "suggested_fix": "<short description of the likely fix>"}
+```
 
-**Safety guardrails**:
-- Only fix up to **2 errors per cycle** — don't go on a fixing spree.
-- If the bridge returns `status: "busy"`, skip fixing — another job is running.
-- Never fix errors that involve core trading logic (`order_router_service`, `place_order_service`) — only fix infrastructure bugs (DB errors, serialization, logging, etc.). Report trading-logic errors in the summary for manual review.
-- If `restart-app` fails or OpenAlgo doesn't come back within 30 seconds, report it prominently in the summary.
+- Skip errors that involve core trading logic (`order_router_service`,
+  `place_order_service`) — still log the observation, but flag it `manual-review`
+  in `suggested_fix`; never propose an automated change to the order path.
+- Record what you proposed (count + one-line each) for the cycle summary.
+
+### 6c: (removed) — no restart
+There is no restart step. The task never restarts OpenAlgo. If a proposed fix is
+worth applying, the operator applies it and restarts manually. Surface anything
+urgent prominently in the cycle summary instead.
 
 ## Step 7: Cleanup
 Close any tabs opened during this cycle.
 
 ## Output
-**During market hours (full cycle):** Summarize in 3-5 lines: time, BUY symbols found, SELL symbols found, POST results, engine status, errors found, fixes applied (if any), restart status (if applicable).
+**During market hours (full cycle):** Summarize in 3-5 lines: time, BUY symbols found, SELL symbols found, POST results, engine status, errors found, fixes **proposed** to `audit/proposed_fixes.jsonl` (if any). No fixes are applied and the app is never restarted by this task.
 
 **EOD Summary Mode (3:15–4:30 PM):** Provide an end-of-day report including:
 - Engine mode and total trades completed today
@@ -249,7 +243,7 @@ Close any tabs opened during this cycle.
 - Net P&L and win rate
 - Armed watches and cooldown symbols at close
 - Tick log stats (ticks written, bytes)
-- Error summary (count, any actionable issues, fixes applied)
+- Error summary (count, any actionable issues, fixes **proposed** to `audit/proposed_fixes.jsonl`)
 - Learnings update confirmation (what was added/updated in LEARNINGS.md)
 
 ---
