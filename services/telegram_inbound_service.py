@@ -207,11 +207,17 @@ class TelegramInboundService:
         mode = existing["mode"] if existing else self._resolved_mode(strategy)
         cap = existing["daily_capital_cap"] if existing else None
         self._set_intent(
-            strategy, None, mode, intent, cap,
+            strategy,
+            None,
+            mode,
+            intent,
+            cap,
             updated_by=self._audit(chat_id, message_id),
             notes="set via telegram inbound bot",
         )
-        logger.info("telegram intent set: %s -> %s (mode=%s) by chat=%s", strategy, intent, mode, chat_id)
+        logger.info(
+            "telegram intent set: %s -> %s (mode=%s) by chat=%s", strategy, intent, mode, chat_id
+        )
         return f"✅ {strategy}: intent={intent} (mode={mode}, unchanged) for today."
 
     def _apply_cap(self, strategy: str, amount: float, chat_id, message_id) -> str:
@@ -219,7 +225,11 @@ class TelegramInboundService:
         mode = existing["mode"] if existing else self._resolved_mode(strategy)
         intent = existing["intent"] if existing else "run"
         self._set_intent(
-            strategy, None, mode, intent, float(amount),
+            strategy,
+            None,
+            mode,
+            intent,
+            float(amount),
             updated_by=self._audit(chat_id, message_id),
             notes="cap set via telegram inbound bot",
         )
@@ -228,7 +238,9 @@ class TelegramInboundService:
 
     def _apply_clear(self, strategy: str, chat_id, message_id) -> str:
         removed = self._delete_intent(strategy)
-        logger.info("telegram intent cleared: %s (removed=%s) by chat=%s", strategy, removed, chat_id)
+        logger.info(
+            "telegram intent cleared: %s (removed=%s) by chat=%s", strategy, removed, chat_id
+        )
         if removed:
             return f"✅ {strategy}: today's intent row cleared — reverting to fall-through (legacy/env default)."
         return f"ℹ️ {strategy}: no intent row for today (already on fall-through)."
@@ -396,11 +408,13 @@ class TelegramInboundService:
         rows = []
         for strat in INTENT_STRATEGIES:
             short = _short(strat)
-            rows.append([
-                (f"▶ {short} Run", f"intent:{strat}:run"),
-                (f"⏸ {short} Pause", f"intent:{strat}:pause"),
-                (f"⏹ {short} Halt", f"intent:{strat}:halt"),
-            ])
+            rows.append(
+                [
+                    (f"▶ {short} Run", f"intent:{strat}:run"),
+                    (f"⏸ {short} Pause", f"intent:{strat}:pause"),
+                    (f"⏹ {short} Halt", f"intent:{strat}:halt"),
+                ]
+            )
         return rows
 
     def _build_markup(self):
@@ -413,10 +427,7 @@ class TelegramInboundService:
         return InlineKeyboardMarkup(rows)
 
     def morning_text(self) -> str:
-        return (
-            "🌅 Good morning. Set today's intent:\n"
-            + self.status_text()
-        )
+        return "🌅 Good morning. Set today's intent:\n" + self.status_text()
 
     # ------------------------------------------------------------------ #
     # PTB async handlers (thin wrappers over the pure logic)
@@ -477,6 +488,33 @@ class TelegramInboundService:
             except Exception as e:
                 logger.exception(f"morning prompt to {cid} failed: {e}")
         logger.info("morning intent prompt sent to %d chat(s)", sent)
+        return sent
+
+    def send_message_to_all(self, text: str) -> int:
+        """Send a plain-text message to every authorized chat_id.
+
+        The outbound counterpart of :meth:`send_morning_prompt_to_all`, exposed
+        so the one-way :mod:`services.notification_service` can reuse this live
+        poller's bot loop when the legacy ``telegram_bot_service`` is inactive
+        (Phase 6 freed the bot token to this poller). Returns the number of
+        chats targeted; a no-op (returns 0) when the bot isn't running. Never
+        raises — a send failure for one chat is logged and the rest proceed.
+        """
+        if not self.is_running or self.bot_loop is None or self.application is None:
+            return 0
+        import asyncio
+
+        chats = self._authorized_chat_ids()
+        sent = 0
+        for cid in chats:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.application.bot.send_message(chat_id=cid, text=text),
+                    self.bot_loop,
+                )
+                sent += 1
+            except Exception as e:
+                logger.exception(f"inbound send to {cid} failed: {e}")
         return sent
 
     # ------------------------------------------------------------------ #

@@ -953,6 +953,16 @@ aliases accepted (`simplified`, `sector`/`sf`).
 WHERE id=1;` (or `database.telegram_db.add_authorized_chat_id`), set
 `TELEGRAM_INBOUND_ENABLED=true`, restart.
 
+**Outbound alerts route through the inbound poller when the legacy bot is
+inactive.** Activating Phase 6 frees the Telegram token to the inbound poller,
+which means `bot_config.is_active=0` and the legacy `telegram_bot_service` stops
+running — so one-way operator alerts would otherwise be silently dropped.
+`services/notification_service.notify()` now falls through to
+`telegram_inbound_service.send_message_to_all()` (same `telegram_chat_ids`
+allowlist) when the legacy bot is down. Legacy stays primary when it's running
+(purely additive); the inbound fallback escalates any send failure via
+`logger.exception` rather than dropping silently.
+
 ## Claude Code Instructions
 
 ### Frontend Build Process

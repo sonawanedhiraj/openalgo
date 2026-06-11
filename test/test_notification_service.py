@@ -25,7 +25,6 @@ from typing import Any
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Recording fake for telegram_bot_service.
 # ---------------------------------------------------------------------------
@@ -152,13 +151,87 @@ def test_notify_failsafe_on_telegram_error(monkeypatch, caplog):
 def test_notify_no_op_when_bot_not_running(monkeypatch, caplog):
     bot = _RecordingBot(is_running=False)
     _install_fake_bot(monkeypatch, bot)
+    # No inbound bot available either → final dropped-notification warning.
+    _install_fake_inbound(monkeypatch, None)
     svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
 
     with caplog.at_level(logging.WARNING):
         svc.notify("cycle_summary", "drop me")
 
     assert bot.sent == []
-    assert any("telegram bot not running" in rec.message for rec in caplog.records)
+    assert any("no live telegram bot" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 inbound-bot fallback: when the legacy outbound bot is inactive
+# (bot_config.is_active=0, e.g. token freed to the inbound poller), notify()
+# routes through the inbound bot's live send path instead of dropping.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingInbound:
+    """Stand-in for the Phase 6 inbound poller singleton."""
+
+    def __init__(self, *, is_running: bool = True, sent_count: int = 1) -> None:
+        self.is_running = is_running
+        self.sent: list[str] = []
+        self._sent_count = sent_count
+
+    def send_message_to_all(self, text: str) -> int:
+        self.sent.append(text)
+        return self._sent_count
+
+
+def _install_fake_inbound(monkeypatch, inbound) -> None:
+    """Patch services.telegram_inbound_service.get_service to return ``inbound``."""
+    import services.telegram_inbound_service as tis
+
+    monkeypatch.setattr(tis, "get_service", lambda: inbound, raising=False)
+
+
+def test_notify_falls_through_to_inbound_when_legacy_inactive(monkeypatch):
+    """Legacy bot down + inbound running + chats configured → inbound sends."""
+    legacy = _RecordingBot(is_running=False)
+    _install_fake_bot(monkeypatch, legacy)
+    inbound = _RecordingInbound(is_running=True, sent_count=1)
+    _install_fake_inbound(monkeypatch, inbound)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.notify("cycle_summary", "via inbound")
+
+    assert legacy.sent == []  # legacy never used
+    assert inbound.sent == ["via inbound"]  # inbound carried it
+
+
+def test_notify_inbound_no_chats_returns_gracefully(monkeypatch, caplog):
+    """Inbound running but 0 chats → no crash, logs the dropped warning."""
+    legacy = _RecordingBot(is_running=False)
+    _install_fake_bot(monkeypatch, legacy)
+    inbound = _RecordingInbound(is_running=True, sent_count=0)
+    _install_fake_inbound(monkeypatch, inbound)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    with caplog.at_level(logging.WARNING):
+        svc.notify("cycle_summary", "no chats")
+
+    assert inbound.sent == ["no chats"]  # attempted
+    assert any("0 chats targeted" in rec.message for rec in caplog.records)
+    assert any("no live telegram bot" in rec.message for rec in caplog.records)
+
+
+def test_notify_legacy_primary_when_running(monkeypatch):
+    """Regression: legacy bot running → inbound path is never touched."""
+    legacy = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, legacy)
+    inbound = _RecordingInbound(is_running=True, sent_count=1)
+    _install_fake_inbound(monkeypatch, inbound)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    svc.notify("cycle_summary", "legacy first")
+
+    assert len(legacy.sent) == 1
+    assert legacy.sent[0][0] == "legacy first"
+    assert inbound.sent == []  # inbound untouched
 
 
 def test_notify_unknown_event_type_logs_warning(monkeypatch, caplog):
@@ -261,9 +334,7 @@ def test_publish_preflight_abort_lists_reasons(monkeypatch):
     _install_fake_bot(monkeypatch, bot)
     svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
 
-    svc.publish_preflight_abort(
-        ["no daily_intent declared for today", "daily_intent is skip"]
-    )
+    svc.publish_preflight_abort(["no daily_intent declared for today", "daily_intent is skip"])
 
     assert len(bot.sent) == 1
     body = bot.sent[0][0]
@@ -350,9 +421,7 @@ def test_preflight_abort_new_signature_bypasses_cooldown(monkeypatch):
     svc.publish_preflight_abort(["3 errors in last hour"])
     advance(5)  # well inside cooldown
     # A genuinely different failure joins — must alert immediately.
-    svc.publish_preflight_abort(
-        ["3 errors in last hour", "no active broker session"]
-    )
+    svc.publish_preflight_abort(["3 errors in last hour", "no active broker session"])
 
     assert len(bot.sent) == 2
     assert "broker session" in bot.sent[1][0]
@@ -445,12 +514,18 @@ def test_publish_trade_opened_includes_arrow_by_direction(monkeypatch):
     svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
 
     svc.publish_trade_opened(
-        symbol="TCS", direction="LONG", quantity=10,
-        entry_price=3450.5, strategy="trending_equity_intraday",
+        symbol="TCS",
+        direction="LONG",
+        quantity=10,
+        entry_price=3450.5,
+        strategy="trending_equity_intraday",
     )
     svc.publish_trade_opened(
-        symbol="HDFC", direction="SHORT", quantity=5,
-        entry_price=1620.0, strategy="trending_equity_intraday",
+        symbol="HDFC",
+        direction="SHORT",
+        quantity=5,
+        entry_price=1620.0,
+        strategy="trending_equity_intraday",
     )
 
     long_body, short_body = bot.sent[0][0], bot.sent[1][0]
@@ -643,6 +718,4 @@ def test_engine_entry_notification_is_failsafe(patched_notifier, monkeypatch, ca
             signal,
             100.0,
         )
-    assert any(
-        "notification publish failed" in rec.message for rec in caplog.records
-    )
+    assert any("notification publish failed" in rec.message for rec in caplog.records)

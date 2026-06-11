@@ -31,7 +31,8 @@ import asyncio
 import os
 import re
 import time
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from utils.logging import get_logger
 
@@ -194,24 +195,63 @@ class NotificationService:
             from services.telegram_bot_service import telegram_bot_service
 
             loop = getattr(telegram_bot_service, "bot_loop", None)
-            if loop is None or not getattr(telegram_bot_service, "is_running", False):
-                logger.warning(
-                    "notification_service.notify: telegram bot not running "
-                    "(event=%s) — dropping notification",
-                    event_type,
+            if loop is not None and getattr(telegram_bot_service, "is_running", False):
+                coro = telegram_bot_service.broadcast_message(
+                    message,
+                    filters={"notifications_enabled": True},
                 )
+                asyncio.run_coroutine_threadsafe(coro, loop)
                 return
 
-            coro = telegram_bot_service.broadcast_message(
-                message,
-                filters={"notifications_enabled": True},
-            )
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except Exception as e:  # noqa: BLE001 — fail-safe by design
+            # Legacy outbound bot inactive (e.g. Phase 6 freed the Telegram
+            # token to the inbound poller — bot_config.is_active=0). Fall
+            # through to the inbound bot's live send path so outbound alerts
+            # are not silently dropped. Additive: legacy stays primary above.
+            if self._notify_via_inbound(event_type, message):
+                return
+
             logger.warning(
-                "notification_service.notify: send failed (event=%s): %s",
-                event_type, e,
+                "notification_service.notify: no live telegram bot "
+                "(legacy inactive, inbound unavailable/no chats; event=%s) "
+                "— dropping notification",
+                event_type,
             )
+        except Exception:  # noqa: BLE001 — fail-safe by design
+            logger.exception(
+                "notification_service.notify: send failed (event=%s)",
+                event_type,
+            )
+
+    def _notify_via_inbound(self, event_type: str, message: str) -> bool:
+        """Send via the Phase 6 inbound poller's bot loop.
+
+        Returns True when the message was scheduled to at least one chat, False
+        when the inbound bot is unavailable or no chats are configured. Failures
+        are escalated via ``logger.exception`` (never a silent drop) and surface
+        as a False return so the caller logs the final dropped-notification
+        warning.
+        """
+        try:
+            from services.telegram_inbound_service import get_service
+
+            inbound = get_service()
+            if inbound is None or not getattr(inbound, "is_running", False):
+                return False
+            sent = inbound.send_message_to_all(message)
+            if sent > 0:
+                return True
+            logger.warning(
+                "notification_service: inbound bot running but 0 chats "
+                "targeted (event=%s) — check bot_config.telegram_chat_ids",
+                event_type,
+            )
+            return False
+        except Exception:  # noqa: BLE001 — fail-safe by design
+            logger.exception(
+                "notification_service: inbound send failed (event=%s)",
+                event_type,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Convenience publishers — typed event_type + structured formatting.
@@ -236,8 +276,7 @@ class NotificationService:
                 f"├ Buy hits: {int(buy_count)}\n"
                 f"└ Sell hits: {int(sell_count)}"
             )
-            self.notify("cycle_summary", text,
-                        cycle_kind=cycle_kind, post_status=post_status)
+            self.notify("cycle_summary", text, cycle_kind=cycle_kind, post_status=post_status)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_cycle_summary failed: %s", e)
 
@@ -302,10 +341,7 @@ class NotificationService:
             self._pf_last_signature = None
             self._pf_last_alert_at = None
 
-            text = (
-                "✅ *Preflight cleared*\n"
-                f"Recovered after ~{elapsed_min} min of aborts."
-            )
+            text = "✅ *Preflight cleared*\n" f"Recovered after ~{elapsed_min} min of aborts."
             self.notify("preflight_abort", text, recovered=True)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_preflight_clear failed: %s", e)
@@ -384,18 +420,14 @@ class NotificationService:
                         continue
                     count = bucket.get("count", 0)
                     pnl = bucket.get("pnl", 0.0)
-                    rows.append(
-                        f"  • `{strat}` — {int(count)} trades, {_fmt_rupees(float(pnl))}"
-                    )
+                    rows.append(f"  • `{strat}` — {int(count)} trades, {_fmt_rupees(float(pnl))}")
                 if rows:
                     head += "\n\n*By strategy*\n" + "\n".join(rows)
             self.notify("eod_summary", head, trade_count=trade_count)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_eod_summary failed: %s", e)
 
-    def publish_eod_watchdog_summary(
-        self, strategy_name: str, result: Mapping[str, Any]
-    ) -> None:
+    def publish_eod_watchdog_summary(self, strategy_name: str, result: Mapping[str, Any]) -> None:
         """One-line Telegram summary of a watchdog run.
 
         Shape of ``result`` matches :func:`flatten_strategy_positions` —
@@ -441,15 +473,16 @@ class NotificationService:
                 text = "\n".join(lines)
 
             self.notify(
-                "eod_watchdog", text,
-                strategy=strategy_name, attempted=attempted, failed=len(failed),
+                "eod_watchdog",
+                text,
+                strategy=strategy_name,
+                attempted=attempted,
+                failed=len(failed),
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_eod_watchdog_summary failed: %s", e)
 
-    def publish_eod_watchdog_failure(
-        self, strategy_name: str, error: str
-    ) -> None:
+    def publish_eod_watchdog_failure(self, strategy_name: str, error: str) -> None:
         """Loud alert: the watchdog itself failed.
 
         Distinct from per-position flatten failures (which are surfaced via
@@ -465,8 +498,10 @@ class NotificationService:
                 "└ *Manual intervention required.*"
             )
             self.notify(
-                "eod_watchdog", text,
-                strategy=strategy_name, severity="critical",
+                "eod_watchdog",
+                text,
+                strategy=strategy_name,
+                severity="critical",
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_eod_watchdog_failure failed: %s", e)
@@ -480,11 +515,7 @@ class NotificationService:
         try:
             sev_key = (severity or "warning").lower()
             prefix = _SEVERITY_PREFIX.get(sev_key, "⚠️")
-            text = (
-                f"{prefix} *Anomaly [{sev_key}]*\n"
-                f"├ Source: `{source}`\n"
-                f"└ {message}"
-            )
+            text = f"{prefix} *Anomaly [{sev_key}]*\n" f"├ Source: `{source}`\n" f"└ {message}"
             self.notify("anomaly_alert", text, source=source, severity=sev_key)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_anomaly failed: %s", e)
