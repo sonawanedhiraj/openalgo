@@ -85,16 +85,24 @@ _HALT_CONFIRM_WINDOW_SEC = 30
 
 _MODE_DENIED_MSG = "Mode changes require laptop access for safety."
 
+# Mode-only architecture (2026-06-12): the per-day intent control (run/pause/halt
+# + capital cap) is retired. Strategies run continuously in their configured
+# persistent mode (strategy_mode). The only daily input from Telegram is gone;
+# every intent-setting command now returns this deprecation notice. Emergency
+# pause is the sector_follow /api/pause REST endpoint (reachable over WireGuard/SSH).
+_DEPRECATED_MSG = (
+    "⚠️ This control was retired (mode-only architecture).\n"
+    "Strategies run continuously in their configured mode — there is no daily "
+    "run/pause/halt to set.\n"
+    "• Mode changes (live/sandbox) require laptop access for safety.\n"
+    "• For an emergency pause use the /api/pause REST endpoint over WireGuard/SSH.\n"
+    "Use /status to see each strategy's current mode."
+)
+
 _USAGE = (
     "Usage:\n"
-    "/status — show today's intent\n"
-    "/intent <strategy> <run|pause|halt>\n"
-    "/intent <strategy> cap <amount>\n"
-    "/intent <strategy> clear\n"
-    "/pause <strategy> · /resume <strategy> · /halt <strategy>\n"
-    "/morning — intent buttons\n"
-    f"Strategies: {', '.join(INTENT_STRATEGIES)}\n"
-    "(Mode flips are laptop-only.)"
+    "/status — show each strategy's current mode\n"
+    "(The /intent, /pause, /resume, /halt commands are retired — see /status.)"
 )
 
 
@@ -273,18 +281,26 @@ class TelegramInboundService:
         return strategy
 
     def status_text(self) -> str:
-        today = self._now().strftime("%Y-%m-%d")
-        lines = [f"📋 Daily intent — {today} IST"]
+        """Mode-only: report each strategy's current persistent mode + an active
+        runtime-override (pause/kill_switch) if one is holding entries."""
+        lines = ["📋 Strategy modes (mode-only)"]
         for strat in INTENT_STRATEGIES:
             try:
                 d = self._resolve(strat)
-                cap = f" · cap ₹{d.daily_capital_cap:,.0f}" if d.daily_capital_cap else ""
-                lines.append(f"• {strat}: {d.mode}/{d.intent}{cap}  ({d.source})")
+                note = ""
+                try:
+                    from database.strategy_runtime_override_db import is_entry_blocked
+
+                    blocked, ov = is_entry_blocked(strat)
+                    if blocked and ov:
+                        note = f"  ⏸ entries held ({ov.get('override_type')}: {ov.get('reason')})"
+                except Exception:
+                    pass
+                lines.append(f"• {strat}: {d.mode}  ({d.source}){note}")
             except Exception:
                 lines.append(f"• {strat}: (unavailable)")
         lines.append("")
-        lines.append("Reply: pause/resume/halt <strategy>, or /intent …")
-        lines.append("Mode flips are laptop-only.")
+        lines.append("Mode flips are laptop-only. Emergency pause: /api/pause (REST).")
         return "\n".join(lines)
 
     def handle_text(self, chat_id, message_id, text: str) -> str | None:
@@ -299,44 +315,35 @@ class TelegramInboundService:
 
         raw = (text or "").strip()
 
-        # Halt confirmation has priority: a pending YES applies; anything else
-        # cancels the pending and is then parsed as a fresh command.
-        if int(chat_id) in self._pending_halt:
-            if raw.upper() == "YES":
-                strategy = self._consume_pending_halt(chat_id)
-                if strategy is None:
-                    return "⌛ Halt confirmation expired. Send /halt again."
-                return self._apply_intent(strategy, "halt", chat_id, message_id)
-            # Not YES → drop the pending and continue parsing this message.
-            self._pending_halt.pop(int(chat_id), None)
-
         if not raw:
             return _USAGE
 
         tokens = raw.split()
         head = tokens[0].lower()
 
-        # Slash commands.
+        # Live commands (mode-only): only status/help remain.
         if head in ("/start", "/status", "start", "status"):
             return self.status_text()
         if head in ("/help", "help"):
             return _USAGE
-        if head in ("/intent", "intent"):
-            return self._cmd_intent(tokens[1:], chat_id, message_id)
-        if head in ("/pause", "pause"):
-            return self._cmd_simple(tokens[1:], "pause", chat_id, message_id)
-        if head in ("/resume", "resume"):
-            return self._cmd_simple(tokens[1:], "run", chat_id, message_id)
-        if head in ("/halt", "halt"):
-            return self._cmd_halt(tokens[1:], chat_id, message_id)
-        if head in ("/morning",):
-            # PTB layer sends the keyboard; nothing to do in the pure path.
-            return None
 
-        # Unknown slash command.
-        if head.startswith("/"):
-            return _USAGE
+        # RETIRED intent-setting commands + their free-text forms → deprecation
+        # notice. The run/pause/halt + capital-cap daily control is gone; mode is
+        # the persistent operator knob (laptop-only), emergency pause is /api/pause.
+        if head in (
+            "/intent",
+            "intent",
+            "/pause",
+            "pause",
+            "/resume",
+            "resume",
+            "/halt",
+            "halt",
+            "/morning",
+        ):
+            return _DEPRECATED_MSG
 
+        # Any other slash command or free-text → usage (points at /status).
         return _USAGE
 
     def _cmd_intent(self, args: list[str], chat_id, message_id) -> str:
@@ -383,20 +390,12 @@ class TelegramInboundService:
         return self._arm_halt_confirm(strategy, chat_id)
 
     def handle_callback(self, chat_id, message_id, data: str) -> str | None:
-        """Apply an inline-button press. ``data`` is ``intent:<strategy>:<word>``.
-        Halt arms the YES-confirmation flow; run/pause apply immediately."""
+        """Inline-button presses are retired (mode-only). The morning intent
+        keyboard no longer ships; any stale button press returns the deprecation
+        notice."""
         if not self.is_authorized(chat_id):
             return None
-        parts = (data or "").split(":")
-        if len(parts) != 3 or parts[0] != "intent":
-            return "❓ Unrecognized button."
-        strategy = _canonical_strategy(parts[1])
-        word = parts[2].lower()
-        if strategy is None or word not in _INTENT_WORDS:
-            return "❓ Unrecognized button."
-        if word == "halt":
-            return self._arm_halt_confirm(strategy, chat_id)
-        return self._apply_intent(strategy, word, chat_id, message_id)
+        return _DEPRECATED_MSG
 
     # ------------------------------------------------------------------ #
     # Morning prompt (inline keyboard)
@@ -622,27 +621,31 @@ class TelegramInboundService:
             logger.debug(f"inbound shutdown error: {e}")
 
     # ------------------------------------------------------------------ #
-    # Scheduler registration (08:45 IST morning prompt)
+    # Scheduler registration
     # ------------------------------------------------------------------ #
     def register_jobs(self, scheduler=None) -> None:
-        sched = scheduler or self.scheduler
-        if sched is None:
-            from services.historify_scheduler_service import get_historify_scheduler
-
-            sched = get_historify_scheduler().scheduler
-
-        from apscheduler.triggers.cron import CronTrigger
-
+        """Mode-only: the 08:45 IST morning intent-prompt job is RETIRED — there
+        is no per-day intent to prompt for. This is now a no-op beyond pinning
+        the singleton, kept so boot wiring (``init_telegram_inbound_service``)
+        need not change. As a safety net it also removes any stale
+        ``telegram_inbound_morning_prompt`` job left in a persistent scheduler."""
         global _SINGLETON
         _SINGLETON = self
-        sched.add_job(
-            _morning_prompt_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=8, minute=45, timezone="Asia/Kolkata"),
-            id="telegram_inbound_morning_prompt",
-            replace_existing=True,
-            name="Telegram inbound morning intent prompt (08:45 IST)",
-        )
-        logger.info("telegram inbound morning-prompt job registered (08:45 IST)")
+        sched = scheduler or self.scheduler
+        if sched is None:
+            try:
+                from services.historify_scheduler_service import get_historify_scheduler
+
+                sched = get_historify_scheduler().scheduler
+            except Exception:
+                sched = None
+        if sched is not None:
+            try:
+                sched.remove_job("telegram_inbound_morning_prompt")
+                logger.info("removed stale telegram_inbound_morning_prompt job (retired)")
+            except Exception:
+                pass  # not registered — expected
+        logger.info("telegram inbound: morning-prompt job retired (mode-only)")
 
 
 # --------------------------------------------------------------------------- #

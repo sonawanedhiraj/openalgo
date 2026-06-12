@@ -1031,6 +1031,18 @@ fall-through.
 
 ## Telegram daily intent control (Phase 6)
 
+> **RETIRED by the mode-only architecture (B5, 2026-06-12).** There is no per-day
+> intent to set from the phone anymore — strategies run continuously in their
+> persistent `strategy_mode`. In `services/telegram_inbound_service.py` the
+> `/intent`, `/pause`, `/resume`, `/halt`, capital-cap, free-text intent forms, and
+> the inline morning-keyboard buttons all now return a single deprecation notice
+> (mode flips stay laptop-only; emergency pause is the sector_follow `/api/pause`
+> REST endpoint over WireGuard/SSH). **The 08:45 IST `telegram_inbound_morning_prompt`
+> APScheduler job is removed** (`register_jobs` is a no-op that also clears any
+> stale instance). Only `/status` remains — it now reports each strategy's current
+> mode (and any active `strategy_runtime_override`). The section below describes the
+> retired control surface, kept for historical context.
+
 The unified `strategy_daily_intent` table can be set **from the phone** via the
 inbound Telegram bot (`services/telegram_inbound_service.py`), the INBOUND
 counterpart to the send-only outbound `telegram_bot_service`. Full design:

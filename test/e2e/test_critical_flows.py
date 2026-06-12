@@ -36,9 +36,24 @@ from services.mode_service import EffectiveDecision, resolve_strategy_mode
 from services.sector_follow_service import SectorFollowConfig, SectorFollowService
 from services.telegram_inbound_service import TelegramInboundService
 
+# RETIRED by the mode-only architecture (B2–B6, 2026-06-12). This e2e suite is
+# built on the removed {mode, intent, daily_capital_cap} model: it asserts the
+# unified strategy_daily_intent table as the resolver source, run/pause/halt
+# engine gating, and Telegram commands writing intent rows. Mode-only is now
+# covered at the UNIT level by test_strategy_mode / test_mode_service /
+# test_strategy_runtime_override / test_simplified_stock_engine_service /
+# test_sector_follow_service / test_preflight_service, plus
+# test_telegram_inbound_deprecation. A mode-only cross-component e2e rewrite is a
+# tracked follow-up; skipped (not silently passing) until then.
+pytestmark = pytest.mark.skip(
+    reason="retired by mode-only architecture (2026-06-12); e2e rewrite tracked — "
+    "see module docstring / unit coverage"
+)
+
 _IST = timezone(timedelta(hours=5, minutes=30))
 _ISTPZ = pytz.timezone("Asia/Kolkata")
 SF = "sector_follow_cap5_vol"
+
 
 # The engines resolve intent against the REAL current IST date (the production
 # resolver / set_intent default to today), so the cross-component tests below
@@ -91,9 +106,11 @@ def _make_sector_service(metrics, *, now=None, use_production_resolver=True, **o
         return {"status": "success", "orderid": f"OID-{order['symbol']}"}
 
     def fake_metrics(as_of, universe, sector_map, config):
-        return {s: metrics.get(s) or {"sector_ret": None, "stock_ret": None,
-                                       "vol_ratio": None, "current_price": None}
-                for s in universe}
+        return {
+            s: metrics.get(s)
+            or {"sector_ret": None, "stock_ret": None, "vol_ratio": None, "current_price": None}
+            for s in universe
+        }
 
     mode = ov.pop("mode", "scaffold")
     price_fetcher = ov.pop("price_fetcher", lambda s, e: None)
@@ -183,8 +200,9 @@ class TestIntentGatesEndToEnd:
     def test_capital_cap_reduces_concurrency(self, intent_db, clean_env):
         # cap 100k / 50k per slot => 2 concurrent max, even with 5 candidates.
         intent_db.set_intent(SF, _today(), "sandbox", "run", 100000.0, updated_by="op")
-        svc = _make_sector_service({s: _hit(vol=1.0 + i * 0.1)
-                                    for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])})
+        svc = _make_sector_service(
+            {s: _hit(vol=1.0 + i * 0.1) for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])}
+        )
         placed = svc.run_entry()
         assert len(placed) == 2
 
@@ -202,8 +220,9 @@ class TestIntentGatesEndToEnd:
 class TestSectorFollowFullCycle:
     def test_entry_then_next_day_exit(self, intent_db, clean_env):
         intent_db.set_intent(SF, _today(), "sandbox", "run", None, updated_by="op")
-        svc = _make_sector_service({s: _hit(vol=1.1 + i * 0.1)
-                                    for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])})
+        svc = _make_sector_service(
+            {s: _hit(vol=1.1 + i * 0.1) for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE"])}
+        )
         placed = svc.run_entry()
         assert len(placed) == 5  # capped at max_concurrent
         assert svc.mode == "sandbox"  # unified row mapped scaffold→sandbox
@@ -255,8 +274,13 @@ class TestEODReport:
         path = os.path.join(tmp_db_dir, f"{_now_at(15, 30).strftime('%Y-%m-%d')}.md")
         assert os.path.exists(path)
         body = open(path, encoding="utf-8").read()
-        for section in ("# sector_follow_cap5_vol — EOD Report", "## Summary",
-                        "## Sector breakdown", "## Positions", "## Kill switch"):
+        for section in (
+            "# sector_follow_cap5_vol — EOD Report",
+            "## Summary",
+            "## Sector breakdown",
+            "## Positions",
+            "## Kill switch",
+        ):
             assert section in body
         assert "EOD" in msg
 
@@ -272,7 +296,9 @@ class TestEODReport:
         svc.run_eod_summary()
         import os
 
-        assert os.path.exists(os.path.join(tmp_db_dir, f"{_now_at(15, 30).strftime('%Y-%m-%d')}.md"))
+        assert os.path.exists(
+            os.path.join(tmp_db_dir, f"{_now_at(15, 30).strftime('%Y-%m-%d')}.md")
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -413,7 +439,8 @@ class TestDataFreshnessValidation:
             "AAA": {"ok": True, "last_date": "2026-06-09", "staleness_days": 1, "kind": "stock"},
         }
         monkeypatch.setattr(
-            dfs, "check_strategy_data_ready",
+            dfs,
+            "check_strategy_data_ready",
             lambda name, date=None, **kw: (False, stale_details),
         )
 
@@ -440,15 +467,23 @@ class TestDataFreshnessValidation:
         assert row["intent"] == "pause"
         assert row["updated_by"] == "data_health:auto-pause"
 
-    def test_fresh_feed_no_alert_no_pause(
-        self, intent_db, data_health_db, clean_env, monkeypatch
-    ):
+    def test_fresh_feed_no_alert_no_pause(self, intent_db, data_health_db, clean_env, monkeypatch):
         import services.data_freshness_service as dfs
 
         monkeypatch.setattr(
-            dfs, "check_strategy_data_ready",
-            lambda name, date=None, **kw: (True, {"NIFTY": {"ok": True, "last_date":
-                "2026-06-10", "staleness_days": 0, "kind": "index"}}),
+            dfs,
+            "check_strategy_data_ready",
+            lambda name, date=None, **kw: (
+                True,
+                {
+                    "NIFTY": {
+                        "ok": True,
+                        "last_date": "2026-06-10",
+                        "staleness_days": 0,
+                        "kind": "index",
+                    }
+                },
+            ),
         )
         alerts: list[str] = []
         svc = _make_sector_service({}, now=lambda: _now_at(16, 30))
