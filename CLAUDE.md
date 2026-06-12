@@ -945,6 +945,17 @@ OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 
 ## Unified strategy daily intent (`strategy_daily_intent`)
 
+> **Mode-only migration in progress (2026-06-12).** A new `strategy_mode` table
+> (`database/strategy_mode_db.py`) is becoming the single *persistent* per-strategy
+> operator control — `mode ∈ {live, sandbox}`, default `sandbox`. It supersedes the
+> `{mode, intent, daily_capital_cap}` model below: the `intent` (run/pause/halt) axis
+> is moving to a separate self-expiring `strategy_runtime_override` table written only
+> by automated safety guards (data-health auto-pause, daily kill-switch, sector_follow
+> `/api/pause`), and `resolve_mode` replaces `resolve_strategy_mode`. The migration
+> script `scripts/migrate_strategy_daily_intent_to_strategy_mode.py` carries the latest
+> mode forward (drops intent/cap; `skip` → `sandbox`). The sections below describe the
+> table being retired; they are rewritten progressively as the refactor lands.
+
 The single per-strategy control surface for both the simplified engine and
 sector_follow is the `strategy_daily_intent` table in `db/openalgo.db`. It
 replaces the legacy simplified-engine `daily_intent` table and sector_follow's
