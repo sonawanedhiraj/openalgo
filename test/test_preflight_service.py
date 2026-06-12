@@ -164,7 +164,8 @@ def _write_errors_jsonl(tmp_path, entries: list[dict]) -> None:
 def test_all_checks_pass_yields_go(preflight_env):
     from services import preflight_service
 
-    _set_intent("live")
+    sm = _rebind_strategy_mode(preflight_env)
+    sm.set_mode("simplified_engine", "live", updated_by="operator")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))  # 5 min ago
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
@@ -173,11 +174,10 @@ def test_all_checks_pass_yields_go(preflight_env):
     assert result["ok"] is True
     assert result["go_decision"] == "go"
     assert result["reasons"] == []
-    assert result["checks"]["intent"]["ok"] is True
-    assert result["checks"]["intent"]["value"] == "live"
-    assert result["checks"]["intent"]["set_by"] == "operator"
+    assert result["checks"]["intent"]["ok"] is True  # informational, never aborts
     assert result["checks"]["effective_mode"]["ok"] is True
     assert result["checks"]["effective_mode"]["value"] == "live"
+    assert result["checks"]["effective_mode"]["source"] == "strategy_mode"
     assert result["checks"]["recent_cycles"]["ok"] is True
     assert result["checks"]["recent_cycles"]["minutes_since"] == 5
     assert result["checks"]["broker_session"]["ok"] is True
@@ -514,11 +514,21 @@ def test_preflight_writes_heartbeat(preflight_env):
 
 
 def test_preflight_writes_error_heartbeat_on_abort(preflight_env):
-    """A failed preflight should still write a heartbeat — status='error'."""
+    """A failed preflight should still write a heartbeat — status='error'.
+
+    Mode-only: intent/mode no longer abort, so we trigger the abort via a real
+    still-gating check — no active broker session."""
     from services import preflight_service
     from services.preflight_service import PREFLIGHT_CYCLE_ID_SENTINEL
 
-    # No intent → abort.
+    preflight_env.monkeypatch.setattr(
+        "services.preflight_service._check_broker_session",
+        lambda: {"ok": False, "broker": None, "user": None, "reason": "no active broker session"},
+    )
+    _insert_cycle(
+        preflight_env.scdb,
+        IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
+    )
 
     preflight_service.run_preflight()
 
@@ -531,7 +541,7 @@ def test_preflight_writes_error_heartbeat_on_abort(preflight_env):
     assert rows[0].status == "error"
     parsed = json.loads(rows[0].detail)
     assert parsed["go_decision"] == "abort"
-    assert any("no daily_intent" in r for r in parsed["reasons"])
+    assert any("broker session" in r for r in parsed["reasons"])
 
 
 # ---------------------------------------------------------------------------

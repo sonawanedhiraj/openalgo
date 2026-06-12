@@ -580,7 +580,9 @@ class SectorFollowService:
     def _utc_naive(self, ist_dt) -> datetime:
         """IST-aware datetime → naive UTC (strategy_runtime_override stores and
         compares naive UTC)."""
-        return ist_dt.astimezone(datetime.UTC).replace(tzinfo=None)
+        # NB: `timezone` here is the imported class, not the datetime module — so
+        # `timezone.utc` is correct and `datetime.UTC` would be an AttributeError.
+        return ist_dt.astimezone(timezone.utc).replace(tzinfo=None)  # noqa: UP017
 
     def _end_of_today_ist(self):
         """Today 23:59 IST — same-day expiry for an intraday hold (the in-memory
