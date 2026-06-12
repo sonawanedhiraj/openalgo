@@ -955,6 +955,15 @@ OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 > script `scripts/migrate_strategy_daily_intent_to_strategy_mode.py` carries the latest
 > mode forward (drops intent/cap; `skip` → `sandbox`). The sections below describe the
 > table being retired; they are rewritten progressively as the refactor lands.
+>
+> **Global order-gate default changed (B2, 2026-06-12):** `resolve_effective_mode()`
+> — the external `/api/v1` place/cancel/close gate used by `place_order_service` &
+> friends — **no longer returns `DISABLED` when nothing is configured; it returns
+> `SANDBOX`.** Unconfigured external callers route to the virtual ₹1Cr book instead
+> of being refused. Live external orders require an explicit persistent `strategy_mode`
+> row for the reserved `__global__` key (and `analyze_mode` off); the `analyze_mode`
+> conservative overlay is preserved. The change only ever makes the path *more*
+> sandboxy, never more live. See `docs/PARAMETER_LOG.md` (mode-only architecture).
 
 The single per-strategy control surface for both the simplified engine and
 sector_follow is the `strategy_daily_intent` table in `db/openalgo.db`. It

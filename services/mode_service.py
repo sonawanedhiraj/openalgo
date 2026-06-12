@@ -1,22 +1,25 @@
-"""Resolve the effective trade mode for any given moment.
+"""Resolve the effective trade mode for any strategy or the global order path.
 
-Stage-0 floor: the operator declares a ``daily_intent`` (``live`` / ``sandbox``
-/ ``skip``) at the start of each trading day. That intent is combined with the
-legacy global ``settings.analyze_mode`` flag using a most-conservative-wins
-rule. A missing daily_intent row resolves to ``DISABLED`` — we refuse to trade
-with no declared intent, which closes the historical gap where the engine
-could fire orders on a day the operator never armed it.
+**Mode-only architecture.** The single persistent control is ``mode`` ∈
+{``live``, ``sandbox``} per strategy, stored in the ``strategy_mode`` table.
+There is no ``intent`` axis and no daily date key — automated, self-expiring
+safety guards live in ``strategy_runtime_override`` (read at engine job-entry),
+not here.
 
-The helper here is read-only against the legacy flag. Wiring it into
-``place_order_service`` is a deliberate follow-up step; for now it is exposed
-via the read-only ``/mode/status`` endpoint so the operator and Cowork can
-inspect what the resolver would return.
+Resolution (``resolve_mode``): persistent ``strategy_mode`` row → env mode flag
+→ ``sandbox`` default. **Default is sandbox everywhere** — both per-strategy and
+on the global external-order gate. ``live`` is an explicit operator opt-in via a
+persistent row; nothing is ever *refused* for lack of configuration (it routes
+to the virtual sandbox book instead).
+
+``resolve_strategy_mode`` and ``resolve_effective_mode`` are retained as
+DEPRECATED back-compat shims over ``resolve_mode`` (see their docstrings). New
+code should call ``resolve_mode`` directly.
 """
 
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
 
 from database.daily_intent_db import (
     _today_ist_str,
@@ -28,85 +31,111 @@ from database.settings_db import get_analyze_mode
 __all__ = [
     "EffectiveMode",
     "EffectiveDecision",
+    "ResolvedMode",
+    "resolve_mode",
     "get_daily_intent",
     "set_daily_intent",
     "resolve_effective_mode",
     "resolve_strategy_mode",
+    "GLOBAL_MODE_KEY",
+    "_today_ist_str",
 ]
 
 
 class EffectiveMode(str, Enum):
     LIVE = "live"
     SANDBOX = "sandbox"
-    # Operator explicitly told us to sit the day out.
+    # Retained for back-compat with the order services (close/cancel/basket),
+    # which still branch on them defensively. The mode-only resolver never
+    # returns SKIP or DISABLED — the global gate fails to SANDBOX, never refuses.
     SKIP = "skip"
-    # No intent on record — refuse to trade.
     DISABLED = "disabled"
 
 
-def resolve_effective_mode(date_str: str | None = None) -> EffectiveMode:
-    """Combine ``daily_intent`` and ``analyze_mode`` into a single decision.
+# Reserved strategy key for the GLOBAL external-order path (the /api/v1
+# place/close/cancel family). An operator opts the external path into live by
+# setting a strategy_mode row for this key; with no row it defaults to sandbox.
+GLOBAL_MODE_KEY = "__global__"
 
-    Resolution rules (most-conservative-wins):
 
-    * No daily_intent row for ``date_str`` (defaults to today IST) → DISABLED.
-    * ``intent='skip'`` → SKIP, regardless of analyze_mode.
-    * ``intent='sandbox'`` → SANDBOX.
-    * ``intent='live'`` AND ``analyze_mode is True`` → SANDBOX (analyze on
-      means the operator wants paper-trade across the platform; honour that
-      even if today's intent is live).
-    * ``intent='live'`` AND ``analyze_mode is False`` → LIVE.
+# --------------------------------------------------------------------------- #
+# Canonical resolver
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class ResolvedMode:
+    """Resolved persistent mode for one strategy (or the global key).
+
+    mode:   'live' | 'sandbox'
+    source: 'strategy_mode' | 'env' | 'default'
     """
-    if date_str is None:
-        date_str = _today_ist_str()
 
-    intent_row = get_daily_intent(date_str)
-    if intent_row is None:
-        return EffectiveMode.DISABLED
-
-    intent = intent_row["intent"]
-    if intent == "skip":
-        return EffectiveMode.SKIP
-    if intent == "sandbox":
-        return EffectiveMode.SANDBOX
-    if intent == "live":
-        return EffectiveMode.SANDBOX if get_analyze_mode() else EffectiveMode.LIVE
-
-    # Unknown intent value — refuse to trade. Validation at the write side
-    # should already prevent this, but the resolver fails closed.
-    return EffectiveMode.DISABLED
+    mode: str
+    source: str
 
 
-def set_daily_intent_safe(
-    intent: Literal["live", "sandbox", "skip"],
-    set_by: str,
-    notes: str | None = None,
-    date_str: str | None = None,
-    locked: bool = False,
-) -> dict:
-    """Thin pass-through wrapper kept for symmetry with the DB layer."""
-    return set_daily_intent(intent, set_by, notes=notes, date_str=date_str, locked=locked)
+# Per-engine env vocabularies, collapsed onto the mode-only {live, sandbox}
+# axis. Any "no orders" sentinel (disabled / scaffold / skip) maps to the
+# conservative ``sandbox`` — never to ``live``.
+_ENV_VAR = {
+    "simplified_engine": "SIMPLIFIED_ENGINE_MODE",
+    "sector_follow_cap5_vol": "SECTOR_FOLLOW_CAP5_VOL_MODE",
+}
+_ENV_VALUE_MAP = {
+    "live": "live",
+    "sandbox": "sandbox",
+    "disabled": "sandbox",
+    "scaffold": "sandbox",
+    "skip": "sandbox",
+}
+
+
+def _env_mode(strategy_name: str) -> str | None:
+    """Map a strategy's env mode flag onto {live, sandbox}, or None if unset."""
+    var = _ENV_VAR.get(strategy_name)
+    if not var:
+        return None
+    raw = os.getenv(var)
+    if raw is None:
+        return None
+    return _ENV_VALUE_MAP.get(raw.strip().lower(), "sandbox")
+
+
+def resolve_mode(strategy_name: str) -> ResolvedMode:
+    """Resolve the persistent mode for ``strategy_name``.
+
+    Fall-through: persistent ``strategy_mode`` row → env mode flag → ``sandbox``.
+    Never raises — any DB error falls through to env/default so a trading job is
+    never killed by the resolver.
+    """
+    try:
+        from database.strategy_mode_db import get_mode
+
+        row = get_mode(strategy_name)
+        if row is not None and row["mode"] in ("live", "sandbox"):
+            return ResolvedMode(mode=row["mode"], source="strategy_mode")
+    except Exception:
+        # Fail open to env/default; never block a job on a DB read.
+        pass
+
+    env = _env_mode(strategy_name)
+    if env is not None:
+        return ResolvedMode(mode=env, source="env")
+
+    return ResolvedMode(mode="sandbox", source="default")
 
 
 # --------------------------------------------------------------------------- #
-# Unified per-strategy {mode, intent} resolver
+# DEPRECATED back-compat shims
 # --------------------------------------------------------------------------- #
-# This is the single per-strategy read path. It is intentionally a SEPARATE
-# function from the legacy global ``resolve_effective_mode`` (which returns the
-# ``EffectiveMode`` enum and is load-bearing for place_order_service and
-# /mode/status). See docs/design/strategy_daily_intent.md for the naming
-# rationale and the full fall-through contract.
 
 
 @dataclass(frozen=True)
 class EffectiveDecision:
-    """Resolved {mode, intent} for one strategy on one IST day.
-
-    mode:   'live' | 'sandbox' | 'skip'   — HOW orders route.
-    intent: 'run'  | 'pause'   | 'halt'   — WHETHER to act.
-    daily_capital_cap: optional override of the strategy's default daily capital.
-    source: 'unified' | 'legacy' | 'env' | 'default' — where the decision came
-            from, for attribution/logging.
+    """DEPRECATED legacy shape. ``intent`` is always ``'run'`` in mode-only —
+    the run/pause/halt axis was retired (safety guards moved to
+    ``strategy_runtime_override``). ``daily_capital_cap`` is always None.
     """
 
     mode: str
@@ -115,77 +144,76 @@ class EffectiveDecision:
     source: str
 
 
-def _flag_enabled() -> bool:
-    """STRATEGY_DAILY_INTENT_ENABLED, default true (ships hot)."""
-    raw = os.getenv("STRATEGY_DAILY_INTENT_ENABLED", "true").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _env_decision(strategy_name: str) -> EffectiveDecision:
-    """Map a strategy's env mode flag onto the unified {mode, intent} axes.
-
-    The env vocabularies differ per engine; both map onto the unified ``mode``:
-      * simplified_engine: SIMPLIFIED_ENGINE_MODE disabled→skip / sandbox / live
-        (unset → sandbox, matching the engine's own fail-safe default).
-      * sector_follow_cap5_vol: SECTOR_FOLLOW_CAP5_VOL_MODE scaffold→skip /
-        sandbox / live (unset → skip, since scaffold places no orders).
-    Any unrecognized value fails safe to 'skip'. intent is always 'run' from env.
-    """
-    if strategy_name == "simplified_engine":
-        raw = (os.getenv("SIMPLIFIED_ENGINE_MODE") or "sandbox").strip().lower()
-        mode = {"disabled": "skip", "sandbox": "sandbox", "live": "live"}.get(raw, "sandbox")
-    elif strategy_name == "sector_follow_cap5_vol":
-        raw = (os.getenv("SECTOR_FOLLOW_CAP5_VOL_MODE") or "scaffold").strip().lower()
-        mode = {"scaffold": "skip", "sandbox": "sandbox", "live": "live"}.get(raw, "skip")
-    else:
-        mode = "sandbox"
-    return EffectiveDecision(mode=mode, intent="run", daily_capital_cap=None, source="env")
-
-
 def resolve_strategy_mode(strategy_name: str, date: str | None = None) -> EffectiveDecision:
-    """Resolve the effective {mode, intent} for one strategy.
+    """DEPRECATED shim over :func:`resolve_mode`.
 
-    Fall-through (flag on): unified row → legacy daily_intent (simplified only) →
-    env mode flag → default(sandbox, run). With the flag off, the unified-row
-    step is skipped — i.e. exactly today's behavior. Never raises: any DB error
-    falls through to the env/default decision so a job is never killed by the
-    resolver.
+    Returns the legacy ``EffectiveDecision`` shape so existing callers keep
+    working, but ``intent`` is hard-wired to ``'run'`` and ``daily_capital_cap``
+    to ``None`` — those axes no longer exist. ``date`` is ignored (mode is not
+    date-keyed). New code should call :func:`resolve_mode` and read
+    ``strategy_runtime_override`` for any pause/kill state.
     """
-    if date is None:
-        date = _today_ist_str()
+    rm = resolve_mode(strategy_name)
+    return EffectiveDecision(mode=rm.mode, intent="run", daily_capital_cap=None, source=rm.source)
 
-    if _flag_enabled():
+
+def _legacy_global_mode(date_str: str | None = None) -> str | None:
+    """Back-compat fall-through for the global gate: the legacy date-keyed
+    ``daily_intent`` table, collapsed onto {live, sandbox}.
+
+    Returns 'live' / 'sandbox' for a present legacy row (``skip`` → ``sandbox``,
+    since 'skip' is retired), or None when no legacy row exists. This mirrors the
+    documented phased retirement of ``daily_intent`` — ``strategy_mode`` is the
+    primary control; legacy is consulted only while external-API workflows
+    migrate. Never raises.
+    """
+    try:
+        row = get_daily_intent(date_str if date_str is not None else _today_ist_str())
+    except Exception:
+        return None
+    if not row:
+        return None
+    intent = row.get("intent")
+    if intent == "live":
+        return "live"
+    if intent in ("sandbox", "skip"):
+        return "sandbox"
+    return None
+
+
+def resolve_effective_mode(date_str: str | None = None) -> EffectiveMode:
+    """DEPRECATED shim — the GLOBAL external-order gate, now mode-only.
+
+    Resolution order:
+
+    1. ``strategy_mode['__global__']`` row — the operator's persistent global
+       knob (primary control). Set it to enable live external-API orders.
+    2. Legacy ``daily_intent`` table — documented back-compat fall-through while
+       the daily_intent retirement completes (``skip`` collapses to sandbox).
+    3. ``SANDBOX`` default (was ``DISABLED``). External callers are never
+       refused for lack of configuration — orders route to the virtual ₹1Cr
+       sandbox book. This is the authorized "default sandbox globally" policy;
+       the change only ever makes the path *more* sandboxy, never live.
+
+    A resolved ``live`` is downgraded to ``SANDBOX`` whenever the platform-wide
+    ``analyze_mode`` is ON (legacy conservative overlay). Never returns ``SKIP``
+    or ``DISABLED``.
+    """
+    rm = resolve_mode(GLOBAL_MODE_KEY)
+    mode = rm.mode
+    if rm.source != "strategy_mode":
+        # No explicit global strategy_mode row — consult legacy daily_intent
+        # before falling to the sandbox default.
+        legacy = _legacy_global_mode(date_str)
+        if legacy is not None:
+            mode = legacy
+
+    if mode == "live":
         try:
-            from database.strategy_daily_intent_db import get_intent
-
-            row = get_intent(strategy_name, date)
-            if row is not None:
-                return EffectiveDecision(
-                    mode=row["mode"],
-                    intent=row["intent"],
-                    daily_capital_cap=row["daily_capital_cap"],
-                    source="unified",
-                )
+            if get_analyze_mode():
+                return EffectiveMode.SANDBOX
         except Exception:
-            # Fail open to the legacy/env path; never block a job on a DB read.
-            pass
-
-    # Legacy daily_intent table only describes the simplified engine.
-    if strategy_name == "simplified_engine":
-        try:
-            legacy = get_daily_intent(date)
-            if legacy is not None and legacy["intent"] in ("live", "sandbox", "skip"):
-                return EffectiveDecision(
-                    mode=legacy["intent"],
-                    intent="run",
-                    daily_capital_cap=None,
-                    source="legacy",
-                )
-        except Exception:
-            pass
-
-    # Env mode flag (per-engine vocabulary).
-    if strategy_name in ("simplified_engine", "sector_follow_cap5_vol"):
-        return _env_decision(strategy_name)
-
-    return EffectiveDecision(mode="sandbox", intent="run", daily_capital_cap=None, source="default")
+            # If the analyzer flag can't be read, fail to the safer paper mode.
+            return EffectiveMode.SANDBOX
+        return EffectiveMode.LIVE
+    return EffectiveMode.SANDBOX

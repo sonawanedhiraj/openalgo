@@ -52,6 +52,40 @@ the latest decisions automatically.
   `test/test_sector_follow_service.py` and
   `test/test_simplified_stock_engine_service.py`.
 
+#### Mode-only architecture (`strategy_mode` + `strategy_runtime_override`) — 2026-06-12
+- **What changed:** the per-strategy control collapses from `{mode, intent,
+  daily_capital_cap}` to a single **persistent `mode ∈ {live, sandbox}`** (table
+  `strategy_mode`, `database/strategy_mode_db.py`), **default `sandbox`**. The
+  run/pause/halt intent axis and the daily-capital cap are retired; automated,
+  self-expiring safety guards move to `strategy_runtime_override`
+  (`database/strategy_runtime_override_db.py`).
+- **Resolver:** `services.mode_service.resolve_mode(strategy_name)` →
+  `(mode, source)` with fall-through **`strategy_mode` row → env flag → `sandbox`**.
+  `resolve_strategy_mode` / `resolve_effective_mode` remain as **deprecated shims**.
+- **Global-gate default change (behavioral):** `resolve_effective_mode()` (the
+  external `/api/v1` place/cancel/close gate) **no longer returns `DISABLED` when
+  no config exists — it returns `SANDBOX`.** External callers with no setup route
+  to the virtual ₹1Cr book instead of being refused. Live external orders now
+  require an explicit persistent `strategy_mode` row for the reserved
+  `__global__` key (+ `analyze_mode` off). The change only ever makes the path
+  *more* sandboxy, never more live. Authorized by the operator ("apply the same
+  default-sandbox policy globally").
+- **Defaults to know:** `strategy_mode.mode` default `sandbox`; `resolve_mode`
+  fall-through default `sandbox`; legacy `mode='skip'` migrates to `sandbox`.
+- **Migration:** `scripts/migrate_strategy_daily_intent_to_strategy_mode.py`
+  (idempotent; ran on the live DB 2026-06-12 → `simplified_engine=sandbox`).
+- **`STRATEGY_DAILY_INTENT_ENABLED`** (above) is superseded — `resolve_mode` does
+  not consult it; it is slated for removal as the engines migrate (B3).
+- **Test coverage:** `test/test_strategy_mode.py`, `test/test_strategy_runtime_override.py`,
+  `test/test_mode_service.py` (mode-only resolver + shim + global-gate-default tests).
+- **Ops note — Windows Defender exclusion:** on this dev host, Defender real-time
+  scanning intermittently stalls loads of SQLAlchemy's Cython extensions
+  (`.venv/.../sqlalchemy/cyextension/*.pyd`), which hangs `pytest` and pre-commit
+  hooks. Add a Defender exclusion (elevated PowerShell) to prevent recurrence:
+  `Add-MpPreference -ExclusionPath "C:\workspace\ai-trade-agent\openalgo\.venv"`
+  (and optionally `-ExclusionExtension pyd`). Not a code parameter — recorded
+  here so the operator can configure it.
+
 #### TELEGRAM_INBOUND_ENABLED
 - **Current value:** `false` (default; ships cold)
 - **Set in:** env var (not yet in `.sample.env` — operator WIP held that file;

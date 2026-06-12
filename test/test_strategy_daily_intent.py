@@ -51,8 +51,13 @@ def test_get_returns_none_when_no_row(fresh_db):
 def test_set_get_roundtrip(fresh_db):
     sdi, _, _ = fresh_db
     sdi.set_intent(
-        "sector_follow_cap5_vol", "2026-06-10", "sandbox", "pause",
-        daily_capital_cap=100000.0, updated_by="cli", notes="hi",
+        "sector_follow_cap5_vol",
+        "2026-06-10",
+        "sandbox",
+        "pause",
+        daily_capital_cap=100000.0,
+        updated_by="cli",
+        notes="hi",
     )
     row = sdi.get_intent("sector_follow_cap5_vol", "2026-06-10")
     assert row["mode"] == "sandbox"
@@ -110,10 +115,24 @@ def test_delete_intent(fresh_db):
 def test_migration_backfills_legacy_rows(fresh_db):
     sdi, dim, sess = fresh_db
     # Seed legacy rows directly on the shared engine via the patched session.
-    sess.add(dim.DailyIntent(date="2026-06-08", intent="live", set_by="operator",
-                             set_at="2026-06-08T09:00:00", locked=0))
-    sess.add(dim.DailyIntent(date="2026-06-09", intent="sandbox", set_by="agent",
-                             set_at="2026-06-09T09:00:00", locked=0))
+    sess.add(
+        dim.DailyIntent(
+            date="2026-06-08",
+            intent="live",
+            set_by="operator",
+            set_at="2026-06-08T09:00:00",
+            locked=0,
+        )
+    )
+    sess.add(
+        dim.DailyIntent(
+            date="2026-06-09",
+            intent="sandbox",
+            set_by="agent",
+            set_at="2026-06-09T09:00:00",
+            locked=0,
+        )
+    )
     sess.commit()
     sess.remove()
 
@@ -130,8 +149,15 @@ def test_migration_backfills_legacy_rows(fresh_db):
 
 def test_migration_is_idempotent(fresh_db):
     sdi, dim, sess = fresh_db
-    sess.add(dim.DailyIntent(date="2026-06-08", intent="live", set_by="operator",
-                             set_at="2026-06-08T09:00:00", locked=0))
+    sess.add(
+        dim.DailyIntent(
+            date="2026-06-08",
+            intent="live",
+            set_by="operator",
+            set_at="2026-06-08T09:00:00",
+            locked=0,
+        )
+    )
     sess.commit()
     sess.remove()
 
@@ -144,8 +170,15 @@ def test_migration_does_not_clobber_operator_edits(fresh_db):
     sdi, dim, sess = fresh_db
     # Operator already set an explicit unified row for that date.
     sdi.set_intent("simplified_engine", "2026-06-08", "skip", "halt", updated_by="operator")
-    sess.add(dim.DailyIntent(date="2026-06-08", intent="live", set_by="operator",
-                             set_at="2026-06-08T09:00:00", locked=0))
+    sess.add(
+        dim.DailyIntent(
+            date="2026-06-08",
+            intent="live",
+            set_by="operator",
+            set_at="2026-06-08T09:00:00",
+            locked=0,
+        )
+    )
     sess.commit()
     sess.remove()
 
@@ -158,20 +191,29 @@ def test_migration_does_not_clobber_operator_edits(fresh_db):
 # --------------------------------------------------------------------------- #
 # resolve_strategy_mode fall-through
 # --------------------------------------------------------------------------- #
-def test_resolver_unified_hit(fresh_db, monkeypatch):
+def test_resolver_ignores_legacy_intent_table(fresh_db, monkeypatch):
+    """Mode-only: resolve_strategy_mode reads the strategy_mode table, NOT the
+    retired strategy_daily_intent table. A unified-intent row is ignored — the
+    resolver falls through to env/default and always reports intent='run'."""
     sdi, _, _ = fresh_db
-    monkeypatch.setenv("STRATEGY_DAILY_INTENT_ENABLED", "true")
+    monkeypatch.delenv("SECTOR_FOLLOW_CAP5_VOL_MODE", raising=False)
     today = sdi._today_ist_str()
-    sdi.set_intent("sector_follow_cap5_vol", today, "live", "pause",
-                   daily_capital_cap=75000.0, updated_by="cli")
+    # This row used to drive the resolver; it must now be ignored.
+    sdi.set_intent(
+        "sector_follow_cap5_vol",
+        today,
+        "live",
+        "pause",
+        daily_capital_cap=75000.0,
+        updated_by="cli",
+    )
 
     from services.mode_service import resolve_strategy_mode
 
     d = resolve_strategy_mode("sector_follow_cap5_vol")
-    assert d.source == "unified"
-    assert d.mode == "live"
-    assert d.intent == "pause"
-    assert d.daily_capital_cap == 75000.0
+    assert d.source != "unified"  # the intent table is no longer a source
+    assert d.intent == "run"  # intent axis retired
+    assert d.daily_capital_cap is None
 
 
 def test_resolver_env_fallthrough_when_no_row(fresh_db, monkeypatch):

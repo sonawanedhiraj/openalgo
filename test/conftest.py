@@ -149,6 +149,8 @@ _INIT_TARGETS = [
     ("database.trade_journal_db", "init_db"),  # today's polluter
     ("database.sandbox_db", "init_db"),
     ("database.strategy_daily_intent_db", "init_db"),
+    ("database.strategy_mode_db", "init_db"),
+    ("database.strategy_runtime_override_db", "init_db"),
     ("database.daily_intent_db", "init_db"),
     ("database.data_health_db", "init_db"),
     ("database.signal_decision_db", "init_db"),
