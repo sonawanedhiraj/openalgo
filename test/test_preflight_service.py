@@ -189,21 +189,24 @@ def test_all_checks_pass_yields_go(preflight_env):
 # ---------------------------------------------------------------------------
 
 
-def test_no_intent_yields_abort_with_reason(preflight_env):
+def test_no_config_yields_go_mode_only(preflight_env):
+    """Mode-only: with no config the cycle is NOT refused — it resolves to the
+    sandbox default and goes (was: abort with 'no daily_intent'). The intent
+    check is now informational and never aborts."""
     from services import preflight_service
 
-    # No _set_intent() call — daily_intent table is empty.
+    _rebind_strategy_mode(preflight_env)  # empty strategy_mode + no env → sandbox
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
     result = preflight_service.run_preflight()
 
-    assert result["ok"] is False
-    assert result["go_decision"] == "abort"
-    assert result["checks"]["intent"]["ok"] is False
-    assert result["checks"]["intent"]["value"] is None
-    assert "no daily_intent" in result["checks"]["intent"]["reason"]
-    assert any("no daily_intent" in r for r in result["reasons"])
+    assert result["go_decision"] == "go"
+    assert result["checks"]["intent"]["ok"] is True
+    assert result["checks"]["intent"]["reason"] is None
+    assert result["checks"]["effective_mode"]["ok"] is True
+    assert result["checks"]["effective_mode"]["value"] == "sandbox"
+    assert not any("daily_intent" in (r or "") for r in result["reasons"])
 
 
 # ---------------------------------------------------------------------------
@@ -211,23 +214,25 @@ def test_no_intent_yields_abort_with_reason(preflight_env):
 # ---------------------------------------------------------------------------
 
 
-def test_skip_intent_yields_abort(preflight_env):
+def test_legacy_skip_intent_no_longer_aborts(preflight_env):
+    """Mode-only: 'skip' is retired. A legacy daily_intent='skip' row no longer
+    affects preflight (it reads strategy_mode via resolve_mode), so the cycle
+    goes instead of aborting. To halt entries, the operator uses a runtime
+    override (enforced in the engine, not preflight)."""
     from services import preflight_service
 
-    _set_intent("skip")
+    _rebind_strategy_mode(preflight_env)  # empty → sandbox
+    _set_intent("skip")  # legacy row — now ignored by the mode-only resolver
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
     result = preflight_service.run_preflight()
 
-    assert result["go_decision"] == "abort"
-    # intent itself is on record — that check passes.
+    assert result["go_decision"] == "go"
     assert result["checks"]["intent"]["ok"] is True
-    assert result["checks"]["intent"]["value"] == "skip"
-    # effective_mode is the one that fails.
-    assert result["checks"]["effective_mode"]["ok"] is False
-    assert result["checks"]["effective_mode"]["value"] == "skip"
-    assert result["checks"]["effective_mode"]["reason"] == "daily_intent is skip"
+    assert result["checks"]["effective_mode"]["ok"] is True
+    assert result["checks"]["effective_mode"]["value"] == "sandbox"
+    assert result["checks"]["effective_mode"].get("reason") is None
 
 
 # ---------------------------------------------------------------------------
@@ -1055,40 +1060,34 @@ def test_premarket_filter_disabled_via_env(preflight_env):
 # ===========================================================================
 
 
-def _rebind_unified_intent(preflight_env):
-    """Rebind ``database.strategy_daily_intent_db`` to a fresh in-memory DB.
+def _rebind_strategy_mode(preflight_env):
+    """Rebind ``database.strategy_mode_db`` to a fresh in-memory DB (mode-only).
 
     The ``preflight_env`` fixture isolates the legacy daily_intent + scan_cycle
-    DBs but not the unified table; this gives each unified-intent test its own
-    clean ``strategy_daily_intent`` table so ``resolve_strategy_mode`` reads
-    exactly what the test writes. Returns the rebound module.
-    """
-    from database import strategy_daily_intent_db as sdi
+    DBs but not the strategy_mode table; this gives each mode test its own clean
+    ``strategy_mode`` table so ``resolve_mode`` reads exactly what the test
+    writes. Also clears the env mode flag so an empty table resolves to the
+    sandbox default deterministically. Returns the rebound module."""
+    from database import strategy_mode_db as sm
 
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-    preflight_env.monkeypatch.setattr(sdi, "engine", engine)
-    preflight_env.monkeypatch.setattr(sdi, "db_session", session)
-    sdi.Base.metadata.create_all(engine)
-    # The unified resolver is on by default; pin it so the test is explicit.
-    preflight_env.monkeypatch.setenv("STRATEGY_DAILY_INTENT_ENABLED", "true")
-    return sdi
+    preflight_env.monkeypatch.setattr(sm, "engine", engine)
+    preflight_env.monkeypatch.setattr(sm, "db_session", session)
+    sm.Base.query = session.query_property()
+    sm.Base.metadata.create_all(engine)
+    preflight_env.monkeypatch.delenv("SIMPLIFIED_ENGINE_MODE", raising=False)
+    return sm
 
 
-def test_effective_mode_sourced_from_unified_intent_table(preflight_env):
-    """Item #2 / Failure-1 fix: an intent set ONLY in the unified
-    strategy_daily_intent table (no legacy daily_intent row) arms the cycle.
-    run_preflight() goes, and BOTH the intent and effective_mode checks are
-    attributed to source='unified'. Before the fix preflight read the legacy
-    table, found nothing, and aborted every cycle all day.
-    """
+def test_effective_mode_sourced_from_strategy_mode(preflight_env):
+    """Mode-only: a strategy_mode row for simplified_engine drives the reported
+    effective_mode, attributed to source='strategy_mode'. The cycle goes (mode
+    never aborts)."""
     from services import preflight_service
 
-    sdi = _rebind_unified_intent(preflight_env)
-    # No legacy _set_intent() — the row lives only in the unified table.
-    sdi.set_intent(
-        "simplified_engine", "2026-05-28", mode="live", intent="run", updated_by="operator"
-    )
+    sm = _rebind_strategy_mode(preflight_env)
+    sm.set_mode("simplified_engine", "live", updated_by="operator")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
@@ -1097,25 +1096,18 @@ def test_effective_mode_sourced_from_unified_intent_table(preflight_env):
     assert result["go_decision"] == "go"
     assert result["reasons"] == []
     assert result["checks"]["intent"]["ok"] is True
-    assert result["checks"]["intent"]["source"] == "unified"
+    assert result["checks"]["intent"]["source"] == "strategy_mode"
     assert result["checks"]["effective_mode"]["ok"] is True
     assert result["checks"]["effective_mode"]["value"] == "live"
-    assert result["checks"]["effective_mode"]["source"] == "unified"
+    assert result["checks"]["effective_mode"]["source"] == "strategy_mode"
 
 
-def test_unified_intent_works_without_any_legacy_row(preflight_env):
-    """Belt-and-braces for Failure 1: confirm the legacy daily_intent table is
-    genuinely empty in this scenario, so the 'go' above came purely from the
-    unified source and not a stray legacy row.
-    """
+def test_strategy_mode_sandbox_resolves(preflight_env):
+    """A strategy_mode row of 'sandbox' reports effective_mode=sandbox and goes."""
     from services import preflight_service
 
-    sdi = _rebind_unified_intent(preflight_env)
-    sdi.set_intent(
-        "simplified_engine", "2026-05-28", mode="sandbox", intent="run", updated_by="operator"
-    )
-    # Legacy table is empty (no _set_intent()).
-    assert preflight_env.dim.get_daily_intent("2026-05-28") is None
+    sm = _rebind_strategy_mode(preflight_env)
+    sm.set_mode("simplified_engine", "sandbox", updated_by="operator")
     _insert_cycle(
         preflight_env.scdb,
         IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
@@ -1125,19 +1117,17 @@ def test_unified_intent_works_without_any_legacy_row(preflight_env):
 
     assert result["go_decision"] == "go"
     assert result["checks"]["effective_mode"]["value"] == "sandbox"
-    assert result["checks"]["effective_mode"]["source"] == "unified"
+    assert result["checks"]["effective_mode"]["source"] == "strategy_mode"
 
 
-def test_unified_skip_intent_aborts(preflight_env):
-    """A unified row with mode='skip' aborts via the effective_mode gate,
-    attributed to the unified source (the intent check still passes — a skip is
-    a declared intent)."""
+def test_mode_only_never_aborts_on_mode_or_intent(preflight_env):
+    """Mode-only: there is no skip/halt axis, so neither the intent nor the
+    effective_mode check can ever force an abort. A live strategy_mode row with
+    a healthy environment goes (replaces the retired skip/halt-abort tests)."""
     from services import preflight_service
 
-    sdi = _rebind_unified_intent(preflight_env)
-    sdi.set_intent(
-        "simplified_engine", "2026-05-28", mode="skip", intent="run", updated_by="operator"
-    )
+    sm = _rebind_strategy_mode(preflight_env)
+    sm.set_mode("simplified_engine", "live", updated_by="operator")
     _insert_cycle(
         preflight_env.scdb,
         IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
@@ -1145,33 +1135,11 @@ def test_unified_skip_intent_aborts(preflight_env):
 
     result = preflight_service.run_preflight()
 
-    assert result["go_decision"] == "abort"
+    assert result["go_decision"] == "go"
     assert result["checks"]["intent"]["ok"] is True
-    assert result["checks"]["effective_mode"]["ok"] is False
-    assert result["checks"]["effective_mode"]["value"] == "skip"
-    assert result["checks"]["effective_mode"]["source"] == "unified"
-    assert result["checks"]["effective_mode"]["reason"] == "daily_intent is skip"
-
-
-def test_unified_halt_intent_aborts(preflight_env):
-    """intent='halt' on a unified row aborts even when mode is actionable."""
-    from services import preflight_service
-
-    sdi = _rebind_unified_intent(preflight_env)
-    sdi.set_intent(
-        "simplified_engine", "2026-05-28", mode="live", intent="halt", updated_by="operator"
-    )
-    _insert_cycle(
-        preflight_env.scdb,
-        IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
-    )
-
-    result = preflight_service.run_preflight()
-
-    assert result["go_decision"] == "abort"
-    assert result["checks"]["effective_mode"]["ok"] is False
-    assert result["checks"]["effective_mode"]["intent"] == "halt"
-    assert result["checks"]["effective_mode"]["reason"] == "daily_intent is halt"
+    assert result["checks"]["effective_mode"]["ok"] is True
+    # No skip/halt reason strings anywhere.
+    assert not any("skip" in (r or "") or "halt" in (r or "") for r in result["reasons"])
 
 
 def test_recent_errors_ignores_windows_backslash_test_tracebacks(preflight_env):

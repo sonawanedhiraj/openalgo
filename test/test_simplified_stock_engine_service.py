@@ -117,7 +117,6 @@ def test_history_row_to_candle_accepts_datetime_string():
     assert candle.ts == dt.datetime(2026, 4, 29, 10, 15)
 
 
-
 # ---------------------------------------------------------------------------
 # Mode resolution + dispatch tests
 # ---------------------------------------------------------------------------
@@ -231,9 +230,7 @@ def test_sandbox_mode_routes_entry_to_sandbox_place_order():
             return_value=sandbox_response,
         ) as mock_sandbox,
         patch("services.place_order_service.place_order") as mock_live,
-        patch.object(
-            SimplifiedStockEngineService, "_wait_for_fill", return_value=2501.5
-        ),
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2501.5),
     ):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 
@@ -262,13 +259,9 @@ def test_live_mode_routes_entry_to_place_order():
 
     live_response = (True, {"orderid": "live-xyz", "status": "success"}, 200)
     with (
-        patch(
-            "services.place_order_service.place_order", return_value=live_response
-        ) as mock_live,
+        patch("services.place_order_service.place_order", return_value=live_response) as mock_live,
         patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
-        patch.object(
-            SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0
-        ),
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2502.0),
     ):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 
@@ -301,9 +294,7 @@ def test_sandbox_mode_routes_exit_to_sandbox_place_order():
             return_value=sandbox_response,
         ) as mock_sandbox,
         patch("services.place_order_service.place_order") as mock_live,
-        patch.object(
-            SimplifiedStockEngineService, "_wait_for_fill", return_value=2489.0
-        ),
+        patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2489.0),
     ):
         service._place_exit_order(signal, api_key="test-key", strategy_name="trend-up")
 
@@ -323,9 +314,7 @@ def test_sandbox_rejection_clears_pending_entry():
         {"status": "error", "message": "insufficient funds"},
         400,
     )
-    with patch(
-        "services.sandbox_service.sandbox_place_order", return_value=sandbox_response
-    ):
+    with patch("services.sandbox_service.sandbox_place_order", return_value=sandbox_response):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 
     # Pending entry must be cleared so the engine does not get stuck.
@@ -340,7 +329,6 @@ def test_mode_label_reflects_engine_mode():
     assert _make_service(MODE_SANDBOX)._mode_label() == "sandbox"
     # Live mode's label depends on the global analyze_mode flag; we do not
     # exercise that here to avoid touching the live settings DB.
-
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +663,6 @@ def test_eod_flatten_handles_positionbook_fetch_failure(monkeypatch):
     mock_dispatch.assert_not_called()
 
 
-
 # ---------------------------------------------------------------------------
 # Funds-gate tests (step 3)
 # ---------------------------------------------------------------------------
@@ -954,7 +941,6 @@ def test_status_surfaces_funds_summary_after_check():
     assert "checked_at" in s["funds"]
 
 
-
 # ---------------------------------------------------------------------------
 # EOD trading summary tests (step 4)
 # ---------------------------------------------------------------------------
@@ -1137,9 +1123,7 @@ def test_eod_summary_logs_once_per_day(monkeypatch, caplog=None):
         calls.append((list(trades), today))
         return ["spy-output"]
 
-    monkeypatch.setattr(
-        SimplifiedStockEngineService, "_build_eod_summary_lines", _spy
-    )
+    monkeypatch.setattr(SimplifiedStockEngineService, "_build_eod_summary_lines", _spy)
 
     service._maybe_log_eod_summary()
     service._maybe_log_eod_summary()
@@ -1177,9 +1161,7 @@ def test_eod_summary_skipped_before_eod_time(monkeypatch):
         calls.append(today)
         return []
 
-    monkeypatch.setattr(
-        SimplifiedStockEngineService, "_build_eod_summary_lines", _spy
-    )
+    monkeypatch.setattr(SimplifiedStockEngineService, "_build_eod_summary_lines", _spy)
 
     service._maybe_log_eod_summary()
     assert calls == []
@@ -1230,9 +1212,11 @@ def test_eod_summary_runs_in_disabled_mode(monkeypatch):
     monkeypatch.setattr(svc_mod.dt, "datetime", _AfterEodDateTime)
 
     built = []
+
     def _spy(self, trades, today):
         built.append(len(trades))
         return ["row"]
+
     monkeypatch.setattr(SimplifiedStockEngineService, "_build_eod_summary_lines", _spy)
 
     service._maybe_log_eod_summary()
@@ -1242,14 +1226,19 @@ def test_eod_summary_runs_in_disabled_mode(monkeypatch):
 def test_status_exposes_eod_summary_state():
     """status() surfaces the eod_summary_done flag + completed trades count."""
     service = _make_service(MODE_SANDBOX)
-    service.engine.completed_trades.extend([
-        CompletedTrade("A", 1, 1.0, 2.0, dt.datetime(2026, 5, 17, 10), dt.datetime(2026, 5, 17, 11)),
-        CompletedTrade("B", 1, 1.0, 2.0, dt.datetime(2026, 5, 17, 12), dt.datetime(2026, 5, 17, 13)),
-    ])
+    service.engine.completed_trades.extend(
+        [
+            CompletedTrade(
+                "A", 1, 1.0, 2.0, dt.datetime(2026, 5, 17, 10), dt.datetime(2026, 5, 17, 11)
+            ),
+            CompletedTrade(
+                "B", 1, 1.0, 2.0, dt.datetime(2026, 5, 17, 12), dt.datetime(2026, 5, 17, 13)
+            ),
+        ]
+    )
     s = service.status()
     assert s["completed_trades_today"] == 2
     assert s["eod_summary_done"] is None  # not yet logged
-
 
 
 # ---------------------------------------------------------------------------
@@ -1515,8 +1504,10 @@ def test_service_on_quote_enqueues_when_enabled(monkeypatch):
         monkeypatch.setenv("SIMPLIFIED_ENGINE_TICK_LOG_FLUSH_SECONDS", "0.1")
         service = _make_service(MODE_SANDBOX)
         try:
-            service.on_quote("RELIANCE", {"ltp": 2500.0, "volume": 100,
-                                          "exchange_timestamp": "2026-05-17T10:30:00"})
+            service.on_quote(
+                "RELIANCE",
+                {"ltp": 2500.0, "volume": 100, "exchange_timestamp": "2026-05-17T10:30:00"},
+            )
             _drain(service._tick_log)
             files = _os.listdir(tmp)
             assert len(files) == 1
@@ -1529,21 +1520,20 @@ def test_service_on_quote_enqueues_when_enabled(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Unified daily-intent gate (pause / halt) — gate lives at order dispatch.
+# Mode-only runtime-override gate (pause / kill_switch) — entry-only, at
+# dispatch. Replaces the retired daily-intent (pause/halt) gate. The engine
+# reads strategy_runtime_override.is_entry_blocked; we patch it directly.
 # --------------------------------------------------------------------------- #
-def _decision(intent="run", mode="sandbox", source="unified"):
-    from services.mode_service import EffectiveDecision
-
-    return EffectiveDecision(mode=mode, intent=intent, daily_capital_cap=None, source=source)
+_OV = {"override_type": "pause", "reason": "stale_feed:X", "expires_at": "2026-05-29T15:30"}
 
 
-def test_intent_pause_blocks_entry_order():
+def test_runtime_override_blocks_entry_order():
     service = _make_service(MODE_SANDBOX)
-    service._intent_resolver = lambda: _decision(intent="pause")
     signal = _make_entry_signal()
     service.engine.pending_entries[signal.symbol] = signal
 
     with (
+        patch("database.strategy_runtime_override_db.is_entry_blocked", return_value=(True, _OV)),
         patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
         patch("services.place_order_service.place_order") as mock_live,
     ):
@@ -1554,38 +1544,34 @@ def test_intent_pause_blocks_entry_order():
     assert signal.symbol not in service.engine.pending_entries  # pending cleared
 
 
-def test_intent_halt_blocks_entry_order():
+def test_runtime_override_never_blocks_exit_order():
+    """An active override holds new entries but exits must ALWAYS run — a held
+    position must be allowed to square off."""
     service = _make_service(MODE_SANDBOX)
-    service._intent_resolver = lambda: _decision(intent="halt")
-    signal = _make_entry_signal()
-    service.engine.pending_entries[signal.symbol] = signal
-
-    with (
-        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
-        patch("services.place_order_service.place_order") as mock_live,
-    ):
-        service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
-
-    mock_sandbox.assert_not_called()
-    mock_live.assert_not_called()
-
-
-def test_intent_pause_allows_exit_order():
-    """pause must NOT block exits — open positions run to their stop/exit."""
-    service = _make_service(MODE_SANDBOX)
-    service._intent_resolver = lambda: _decision(intent="pause")
     signal = _make_exit_signal()
     service.engine.pending_exits[signal.symbol] = signal
     from services.simplified_stock_engine_core import Position
 
     service.engine.positions[signal.symbol] = Position(
-        symbol=signal.symbol, entry_price=2500.0, qty=10, stop_loss=2490.0,
-        entry_time=dt.datetime(2026, 5, 17, 10, 30), risk_per_share=10.0,
+        symbol=signal.symbol,
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
     )
     sandbox_response = (True, {"orderid": "sbx-exit", "status": "success"}, 200)
     with (
-        patch("services.sandbox_service.sandbox_place_order",
-              return_value=sandbox_response) as mock_sandbox,
+        patch(
+            "database.strategy_runtime_override_db.is_entry_blocked",
+            return_value=(
+                True,
+                {"override_type": "kill_switch", "reason": "loss", "expires_at": "x"},
+            ),
+        ),
+        patch(
+            "services.sandbox_service.sandbox_place_order", return_value=sandbox_response
+        ) as mock_sandbox,
         patch("services.place_order_service.place_order") as mock_live,
         patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2489.0),
     ):
@@ -1595,34 +1581,18 @@ def test_intent_pause_allows_exit_order():
     mock_sandbox.assert_called_once()
 
 
-def test_intent_halt_blocks_exit_order():
+def test_no_override_allows_entry():
+    """No active override → entries proceed normally (mode-only default)."""
     service = _make_service(MODE_SANDBOX)
-    service._intent_resolver = lambda: _decision(intent="halt")
-    signal = _make_exit_signal()
-    service.engine.pending_exits[signal.symbol] = signal
-
-    with (
-        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
-        patch("services.place_order_service.place_order") as mock_live,
-    ):
-        service._place_exit_order(signal, api_key="test-key", strategy_name="trend-up")
-
-    mock_sandbox.assert_not_called()
-    mock_live.assert_not_called()
-    assert signal.symbol not in service.engine.pending_exits
-
-
-def test_intent_run_allows_entry_backcompat():
-    """source='env', intent='run' (the no-row fall-through) lets entries proceed."""
-    service = _make_service(MODE_SANDBOX)
-    service._intent_resolver = lambda: _decision(intent="run", source="env")
     signal = _make_entry_signal()
     service.engine.pending_entries[signal.symbol] = signal
 
     sandbox_response = (True, {"orderid": "sbx-abc", "status": "success"}, 200)
     with (
-        patch("services.sandbox_service.sandbox_place_order",
-              return_value=sandbox_response) as mock_sandbox,
+        patch("database.strategy_runtime_override_db.is_entry_blocked", return_value=(False, None)),
+        patch(
+            "services.sandbox_service.sandbox_place_order", return_value=sandbox_response
+        ) as mock_sandbox,
         patch("services.place_order_service.place_order") as mock_live,
         patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=2501.5),
     ):

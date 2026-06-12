@@ -964,6 +964,19 @@ OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 > row for the reserved `__global__` key (and `analyze_mode` off); the `analyze_mode`
 > conservative overlay is preserved. The change only ever makes the path *more*
 > sandboxy, never more live. See `docs/PARAMETER_LOG.md` (mode-only architecture).
+>
+> **Engines + preflight wired to runtime_override (B3, 2026-06-12):** both engines
+> now consult `strategy_runtime_override.is_entry_blocked(strategy)` at job-entry
+> instead of the retired `intent` axis. An active `pause`/`kill_switch` override
+> holds **new entries only**; **exits and EOD are never gated** (a held position
+> must always be allowed to square off — the simplified engine's `_place_exit_order`
+> and sector_follow's `run_exit` no longer have an intent gate). The simplified
+> engine's `_intent_blocks` is replaced by `_entry_held_by_override`; sector_follow's
+> `run_entry` calls `_entry_held_by_override`; `_apply_mode_override` now fires on a
+> persistent `strategy_mode` row (`source='strategy_mode'`) rather than a `unified`
+> intent row. Preflight's `intent`/`effective_mode` checks are now **informational
+> and never abort** (mode-only has no skip/halt; the "refuse with no declared
+> intent" floor is removed — unconfigured resolves to sandbox).
 
 The single per-strategy control surface for both the simplified engine and
 sector_follow is the `strategy_daily_intent` table in `db/openalgo.db`. It

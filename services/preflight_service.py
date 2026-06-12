@@ -31,7 +31,7 @@ import pytz
 
 from database.daily_intent_db import get_daily_intent
 from services import scan_cycle_service
-from services.mode_service import resolve_strategy_mode
+from services.mode_service import resolve_mode
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -175,114 +175,57 @@ _PREFLIGHT_STRATEGY = "simplified_engine"
 
 
 def _resolve_strategy_decision(today_str: str):
-    """Resolve the unified {mode, intent, source} for the cycle strategy.
+    """Resolve the persistent {mode, source} for the cycle strategy (mode-only).
 
-    Single source of truth for both the intent-presence and effective-mode
-    gates. Reads ``strategy_daily_intent`` via
-    :func:`services.mode_service.resolve_strategy_mode`, which falls through
-    unified-row → legacy ``daily_intent`` → env mode flag → default. This is the
-    Failure-1 fix (2026-06-11): today's intent lived in the *unified* table but
-    preflight read the *legacy* table, so every cycle aborted all day with no
-    alert. ``resolve_strategy_mode`` never raises — any DB error falls through to
-    the env/default decision.
-    """
-    return resolve_strategy_mode(_PREFLIGHT_STRATEGY, date=today_str)
+    Reads the ``strategy_mode`` table via
+    :func:`services.mode_service.resolve_mode` (strategy_mode row → env mode flag
+    → ``sandbox`` default). ``today_str`` is accepted for signature stability but
+    unused — mode is not date-keyed. Never raises (``resolve_mode`` fails open to
+    env/default)."""
+    return resolve_mode(_PREFLIGHT_STRATEGY)
 
 
 def _check_intent(today_str: str) -> dict:
-    """Is there any daily_intent on record for today (IST)?
+    """Mode-only: there is no per-day intent to *declare*, so this never aborts.
 
-    Recognizes BOTH the unified ``strategy_daily_intent`` table and the legacy
-    ``daily_intent`` table (Failure-1 fix). A *declared* intent is one the
-    resolver sourced from the unified row or the legacy row; an ``env``/
-    ``default`` fall-through is NOT a declaration, so a day the operator never
-    armed still aborts — the "refuse to trade with no declared intent" floor is
-    preserved. The legacy row's value/set_by are surfaced unchanged on
-    legacy-only days for back-compat.
-    """
+    The legacy "refuse to trade with no declared intent → abort" floor is
+    removed: the strategy always has a resolved persistent mode (strategy_mode
+    row → env → ``sandbox`` default), and an unconfigured day routes to the
+    virtual sandbox book — never live without an explicit row. Reported
+    informationally; a legacy ``daily_intent`` value is surfaced if present for
+    back-compat. Whether *entries* are held today is a separate runtime concern
+    (``strategy_runtime_override``), enforced in the engine, not here."""
     legacy = get_daily_intent(today_str)
     try:
         decision = _resolve_strategy_decision(today_str)
     except Exception as e:  # never let resolution break the gate
-        logger.exception("preflight: intent resolution failed: %s", e)
+        logger.exception("preflight: mode resolution failed: %s", e)
         decision = None
 
-    declared = legacy is not None or (
-        decision is not None and decision.source in ("unified", "legacy")
-    )
-    if not declared:
-        return {
-            "ok": False,
-            "value": None,
-            "set_by": None,
-            "source": decision.source if decision else None,
-            "reason": "no daily_intent declared for today",
-        }
-
-    if legacy is not None:
-        return {
-            "ok": True,
-            "value": legacy.get("intent"),
-            "set_by": legacy.get("set_by"),
-            "source": "legacy",
-            "reason": None,
-        }
-    # Declared only in the unified table (no legacy row) — the Failure-1 case.
     return {
         "ok": True,
-        "value": decision.mode,
-        "set_by": f"unified:{decision.intent}",
-        "source": decision.source,
+        "value": decision.mode if decision else None,
+        "set_by": legacy.get("set_by") if legacy else None,
+        "source": decision.source if decision else None,
         "reason": None,
     }
 
 
 def _check_effective_mode(today_str: str) -> dict:
-    """Is the resolved effective mode actionable (not 'skip' / 'halt')?
+    """Mode-only: the resolved mode is always actionable (``live`` / ``sandbox``)
+    — no ``skip``/``halt`` axis — so this never aborts.
 
-    Sources the decision from the unified ``strategy_daily_intent`` table via
-    :func:`_resolve_strategy_decision` (unified → legacy → env → default) — the
-    Failure-1 fix. ``DISABLED``/no-intent is captured by the intent check; this
-    check fails only on an explicit sit-out: ``mode='skip'`` or ``intent='halt'``.
-
-    The legacy ``analyze_mode`` overlay is preserved as a conservative belt: a
-    ``live`` decision with the global analyzer on is reported as ``sandbox``
-    (paper), matching the old ``resolve_effective_mode`` most-conservative-wins
-    rule.
-    """
+    The conservative ``analyze_mode`` overlay is preserved: a ``live`` mode with
+    the global analyzer on is reported as ``sandbox`` (paper)."""
     try:
         decision = _resolve_strategy_decision(today_str)
     except Exception as e:
         logger.exception("preflight: effective_mode resolution failed: %s", e)
-        return {
-            "ok": False,
-            "value": None,
-            "source": None,
-            "reason": f"effective_mode resolution failed: {e}",
-        }
-
-    if decision.mode == "skip":
-        return {
-            "ok": False,
-            "value": "skip",
-            "source": decision.source,
-            "intent": decision.intent,
-            "reason": "daily_intent is skip",
-        }
-    if decision.intent == "halt":
-        return {
-            "ok": False,
-            "value": decision.mode,
-            "source": decision.source,
-            "intent": decision.intent,
-            "reason": "daily_intent is halt",
-        }
+        return {"ok": True, "value": None, "source": None, "reason": None}
 
     value = decision.mode
     # Conservative analyze_mode overlay (legacy parity): the global analyzer
-    # being on downgrades a live decision to sandbox (paper) for this gate.
-    # Read through services.mode_service so it tracks the same get_analyze_mode
-    # that resolve_effective_mode uses (and that tests monkeypatch).
+    # being on downgrades a live mode to sandbox (paper) for this report.
     if value == "live":
         try:
             from services.mode_service import get_analyze_mode
@@ -296,7 +239,6 @@ def _check_effective_mode(today_str: str) -> dict:
         "ok": True,
         "value": value,
         "source": decision.source,
-        "intent": decision.intent,
         "reason": None,
     }
 
@@ -378,8 +320,7 @@ def _check_recent_cycles(now: datetime) -> dict:
         }
 
     stale_reason = (
-        f"no scan_cycle in last {threshold} minutes during market hours "
-        "— scheduler may be stalled"
+        f"no scan_cycle in last {threshold} minutes during market hours — scheduler may be stalled"
     )
 
     if last_cycle_at is None:
@@ -404,9 +345,7 @@ def _check_recent_cycles(now: datetime) -> dict:
                 **base,
                 "ok": True,
                 "preflight_heartbeats_in_window": hb_count,
-                "reason": (
-                    "preflight heartbeats present; scheduler alive but no " "signals matched"
-                ),
+                "reason": ("preflight heartbeats present; scheduler alive but no signals matched"),
             }
         return {**base, "ok": False, "reason": stale_reason}
 

@@ -35,11 +35,27 @@ __all__ = [
     "resolve_mode",
     "get_daily_intent",
     "set_daily_intent",
+    "set_daily_intent_safe",
     "resolve_effective_mode",
     "resolve_strategy_mode",
     "GLOBAL_MODE_KEY",
     "_today_ist_str",
 ]
+
+
+def set_daily_intent_safe(
+    intent: str,
+    set_by: str,
+    notes: str | None = None,
+    date_str: str | None = None,
+    locked: bool = False,
+) -> dict:
+    """Back-compat thin pass-through to the legacy ``daily_intent`` DB writer.
+
+    Retained for callers/tests that still write the legacy table directly. The
+    legacy table is being retired; new code should set the persistent mode via
+    ``database.strategy_mode_db.set_mode``."""
+    return set_daily_intent(intent, set_by, notes=notes, date_str=date_str, locked=locked)
 
 
 class EffectiveMode(str, Enum):

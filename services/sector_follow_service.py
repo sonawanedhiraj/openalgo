@@ -506,9 +506,7 @@ class SectorFollowService:
     def evaluate_candidates(self, as_of: datetime | None = None) -> list[dict]:
         """Return gate-passing candidates at as_of (default: now IST)."""
         as_of = as_of or self._now()
-        metrics = self._metrics_provider(
-            as_of, self.config.universe, self.sector_map, self.config
-        )
+        metrics = self._metrics_provider(as_of, self.config.universe, self.sector_map, self.config)
         candidates: list[dict] = []
         for symbol, m in metrics.items():
             if passes_gates(m, self.config):
@@ -615,7 +613,10 @@ class SectorFollowService:
         if self.mode == "scaffold":
             logger.info(
                 "[scaffold] sector_follow ENTRY %s qty=%d @ %.2f (vol_ratio=%.2f) — NO ORDER",
-                symbol, qty, price, candidate.get("vol_ratio", 0.0),
+                symbol,
+                qty,
+                price,
+                candidate.get("vol_ratio", 0.0),
             )
         else:
             # Order placement can both throw AND return an error response. Treat
@@ -646,7 +647,11 @@ class SectorFollowService:
             if status == "placed":
                 logger.info(
                     "[%s] sector_follow ENTRY %s qty=%d @ %.2f order_id=%s",
-                    self.mode, symbol, qty, price, order_id,
+                    self.mode,
+                    symbol,
+                    qty,
+                    price,
+                    order_id,
                 )
             else:
                 error_message = str(
@@ -654,7 +659,12 @@ class SectorFollowService:
                 )[:255]
                 logger.error(
                     "[%s] sector_follow ENTRY %s %s qty=%d @ %.2f — %s",
-                    self.mode, status.upper(), symbol, qty, price, error_message,
+                    self.mode,
+                    status.upper(),
+                    symbol,
+                    qty,
+                    price,
+                    error_message,
                 )
                 # Journal the failed attempt; no paper_book / today_entries row —
                 # nothing actually opened.
@@ -724,7 +734,9 @@ class SectorFollowService:
         if self.mode == "scaffold":
             logger.info(
                 "[scaffold] sector_follow EXIT %s qty=%d @ %.2f — NO ORDER",
-                symbol, position.quantity, exit_price,
+                symbol,
+                position.quantity,
+                exit_price,
             )
         else:
             # As with entries, a thrown or error-response placement must not abort
@@ -753,7 +765,11 @@ class SectorFollowService:
             if status == "placed":
                 logger.info(
                     "[%s] sector_follow EXIT %s qty=%d @ %.2f order_id=%s",
-                    self.mode, symbol, position.quantity, exit_price, order_id,
+                    self.mode,
+                    symbol,
+                    position.quantity,
+                    exit_price,
+                    order_id,
                 )
             else:
                 error_message = str(
@@ -761,7 +777,11 @@ class SectorFollowService:
                 )[:255]
                 logger.error(
                     "[%s] sector_follow EXIT %s %s qty=%d @ %.2f — %s",
-                    self.mode, status.upper(), symbol, position.quantity, exit_price,
+                    self.mode,
+                    status.upper(),
+                    symbol,
+                    position.quantity,
+                    exit_price,
                     error_message,
                 )
 
@@ -778,10 +798,7 @@ class SectorFollowService:
             error_message=error_message,
             note="t+1_exit",
         )
-        pnl_pct = (
-            (exit_price / position.entry_price - 1.0) * 100.0
-            if position.entry_price else 0.0
-        )
+        pnl_pct = (exit_price / position.entry_price - 1.0) * 100.0 if position.entry_price else 0.0
         pnl_net = (exit_price - position.entry_price) * position.quantity
         self.today_exits.append(
             {
@@ -813,17 +830,40 @@ class SectorFollowService:
                 mode="sandbox", intent="run", daily_capital_cap=None, source="default"
             )
 
+    def _entry_held_by_override(self) -> bool:
+        """Mode-only: True iff a non-expired ``pause``/``kill_switch`` row in
+        ``strategy_runtime_override`` is holding new entries for this strategy.
+        Fail-open on a read error (never kill a job on a lookup failure)."""
+        try:
+            from database.strategy_runtime_override_db import is_entry_blocked
+
+            blocked, ov = is_entry_blocked("sector_follow_cap5_vol")
+            if blocked and ov:
+                logger.info(
+                    "sector_follow entry held by %s (reason=%s, expires=%s)",
+                    ov.get("override_type"),
+                    ov.get("reason"),
+                    ov.get("expires_at"),
+                )
+            return blocked
+        except Exception:
+            logger.debug(
+                "sector_follow runtime-override resolve failed; not blocking", exc_info=True
+            )
+            return False
+
     def _apply_mode_override(self, decision) -> None:
-        """Honor an explicit unified-row mode by mapping it onto the service's
-        native routing mode. Env/legacy/default sources leave ``self.mode`` as the
-        env value (so deploy is a no-op until the operator inserts a row).
-        Unified ``skip`` maps to ``scaffold`` (compute + log, no orders)."""
-        if getattr(decision, "source", None) != "unified":
+        """Mode-only: honor the persistent ``strategy_mode`` row by mapping its
+        mode onto the service's native routing mode. Env/default sources leave
+        ``self.mode`` as the env value (so with no row the strategy keeps its
+        scaffold/no-orders default — deploy is a no-op until the operator sets a
+        ``strategy_mode`` row)."""
+        if getattr(decision, "source", None) != "strategy_mode":
             return
-        mapped = {"skip": "scaffold", "sandbox": "sandbox", "live": "live"}.get(decision.mode)
+        mapped = {"sandbox": "sandbox", "live": "live"}.get(decision.mode)
         if mapped and mapped != self.mode:
             logger.warning(
-                "sector_follow mode override %s -> %s (unified intent row)", self.mode, mapped
+                "sector_follow mode override %s -> %s (strategy_mode row)", self.mode, mapped
             )
             self.mode = mapped
 
@@ -844,11 +884,11 @@ class SectorFollowService:
         """15:20 IST: evaluate, select, place entries (subject to intent gate,
         kill switch + caps)."""
         decision = self._resolve_decision()
-        if decision.intent in ("pause", "halt"):
-            logger.info(
-                "sector_follow entry skipped (intent=%s, source=%s)",
-                decision.intent, decision.source,
-            )
+        # Mode-only safety gate: an active runtime override (pause/kill_switch,
+        # set by automated guards — data-health auto-pause, daily kill-switch, or
+        # the /api/pause emergency override) holds new entries. Exits are never
+        # blocked. Fail-open on a read error.
+        if self._entry_held_by_override():
             return []
         # Data-freshness gate: a stale feed (the 2026-05-29 index-backfill gap)
         # would silently produce fail-closed or wrong signals. Abort entries —
@@ -872,11 +912,9 @@ class SectorFollowService:
     def run_exit(self) -> list[dict]:
         """15:25 IST: square off everything opened on a prior trading day (T+1).
 
-        Intent ``halt`` skips exits entirely; ``pause`` does NOT block exits."""
+        Mode-only: exits are NEVER gated. Runtime overrides hold entries only —
+        a held T+1 position must always be allowed to square off."""
         decision = self._resolve_decision()
-        if decision.intent == "halt":
-            logger.info("sector_follow exit skipped (intent=halt, source=%s)", decision.source)
-            return []
         # Exits only need the index feed current (stocks supply last_close, and
         # the square-off price comes from the broker). Warn on staleness but NEVER
         # block — leaving a T+1 position open is riskier than a stale-feed exit.
@@ -931,9 +969,7 @@ class SectorFollowService:
             return
         if not ok:
             stale = sorted(s for s, d in details.items() if not d.get("ok", True))
-            logger.warning(
-                "sector_follow exits proceeding despite stale index data: %s", stale
-            )
+            logger.warning("sector_follow exits proceeding despite stale index data: %s", stale)
 
     def run_data_health_check(self) -> tuple[bool, dict]:
         """16:30 IST: validate the feed, persist the verdict, alert + auto-pause.
@@ -989,9 +1025,7 @@ class SectorFollowService:
         except Exception:
             logger.exception("sector_follow data-health insert_check failed")
 
-        logger.info(
-            "sector_follow data-health check: ok=%s stale=%d", ok, len(stale)
-        )
+        logger.info("sector_follow data-health check: ok=%s stale=%d", ok, len(stale))
         return ok, details
 
     def _auto_pause_tomorrow(self, today_iso: str) -> None:
@@ -1022,13 +1056,15 @@ class SectorFollowService:
             if mode not in ("live", "sandbox", "skip"):
                 mode = "sandbox"
             set_intent(
-                strat, tomorrow, mode=mode, intent="pause", daily_capital_cap=cap,
+                strat,
+                tomorrow,
+                mode=mode,
+                intent="pause",
+                daily_capital_cap=cap,
                 updated_by="data_health:auto-pause",
                 notes=f"Auto-paused due to stale data on {today_iso}",
             )
-            logger.warning(
-                "sector_follow auto-paused %s (stale data on %s)", tomorrow, today_iso
-            )
+            logger.warning("sector_follow auto-paused %s (stale data on %s)", tomorrow, today_iso)
         except Exception:
             logger.exception("sector_follow auto-pause failed")
 
@@ -1144,8 +1180,11 @@ class SectorFollowService:
             try:
                 r = self.place_exit(pos)
                 results.append(
-                    {"symbol": pos.symbol, "status": "success" if r else "error",
-                     "order_id": (r or {}).get("order_id")}
+                    {
+                        "symbol": pos.symbol,
+                        "status": "success" if r else "error",
+                        "order_id": (r or {}).get("order_id"),
+                    }
                 )
             except Exception as e:
                 logger.exception("close_all failed for %s: %s", pos.symbol, e)
@@ -1175,9 +1214,7 @@ class SectorFollowService:
             exit_str = "—"
 
         next_day = (as_of.date() + timedelta(days=1)).isoformat()
-        ks = (
-            f"active ({self.kill_switch_reason})" if self.kill_switch_active else "inactive"
-        )
+        ks = f"active ({self.kill_switch_reason})" if self.kill_switch_active else "inactive"
         pause = " · PAUSED" if self.manual_pause else ""
         return (
             f"📊 sector_follow_cap5_vol EOD {as_of.date().isoformat()}\n"
@@ -1214,9 +1251,7 @@ class SectorFollowService:
         exits = [r for r in journal_rows if "exit_time" in r]
 
         realized_pnl = sum(x.get("pnl_net", 0.0) for x in exits)
-        capital_deployed = sum(
-            (e.get("entry_price") or 0.0) * (e.get("qty") or 0) for e in entries
-        )
+        capital_deployed = sum((e.get("entry_price") or 0.0) * (e.get("qty") or 0) for e in entries)
 
         ks_active = kill_switch_state.get("active", False)
         ks_reason = kill_switch_state.get("reason")
@@ -1277,9 +1312,7 @@ class SectorFollowService:
             qty = p.get("qty")
             mtm = p.get("mtm_pnl_net")
             entry_str = f"{entry:,.2f}" if isinstance(entry, (int, float)) else "—"
-            pnl_str = (
-                f"{mtm:+,.0f} (unrl)" if isinstance(mtm, (int, float)) else "— (unrl)"
-            )
+            pnl_str = f"{mtm:+,.0f} (unrl)" if isinstance(mtm, (int, float)) else "— (unrl)"
             lines.append(f"| {sym} | {sector} | {entry_str} | {qty} | OPEN | — | {pnl_str} |")
         for x in exits:
             sym = x.get("symbol")
@@ -1381,38 +1414,44 @@ class SectorFollowService:
             self.seed_strategy()
 
         sched.add_job(
-            _entry_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=20,
-                                            timezone="Asia/Kolkata"),
-            id="sector_follow_entry", replace_existing=True,
+            _entry_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"),
+            id="sector_follow_entry",
+            replace_existing=True,
             name="Sector Follow CAP5_VOL entry (15:20 IST)",
         )
         sched.add_job(
-            _exit_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=25,
-                                           timezone="Asia/Kolkata"),
-            id="sector_follow_exit", replace_existing=True,
+            _exit_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"),
+            id="sector_follow_exit",
+            replace_existing=True,
             name="Sector Follow CAP5_VOL T+1 exit (15:25 IST)",
         )
         sched.add_job(
-            _daily_reset_job, trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0,
-                                                  timezone="Asia/Kolkata"),
-            id="sector_follow_daily_reset", replace_existing=True,
+            _daily_reset_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone="Asia/Kolkata"),
+            id="sector_follow_daily_reset",
+            replace_existing=True,
             name="Sector Follow CAP5_VOL daily reset (09:00 IST)",
         )
         sched.add_job(
-            _eod_summary_job, trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=30,
-                                                  timezone="Asia/Kolkata"),
-            id="sector_follow_eod_summary", replace_existing=True,
+            _eod_summary_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone="Asia/Kolkata"),
+            id="sector_follow_eod_summary",
+            replace_existing=True,
             name="Sector Follow CAP5_VOL EOD summary (15:30 IST)",
         )
         sched.add_job(
-            _data_health_job, trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=30,
-                                                  timezone="Asia/Kolkata"),
-            id="sector_follow_data_health", replace_existing=True,
+            _data_health_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone="Asia/Kolkata"),
+            id="sector_follow_data_health",
+            replace_existing=True,
             name="Sector Follow CAP5_VOL data freshness check (16:30 IST)",
         )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
-            self.mode, self.strategy_id,
+            self.mode,
+            self.strategy_id,
         )
 
 

@@ -11,6 +11,7 @@ post-close to verify before merging to dev.
 """
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -272,7 +273,9 @@ def test_entry_qty_uses_max_position_inr():
 # End-to-end entry job
 # --------------------------------------------------------------------------- #
 def test_run_entry_caps_and_records():
-    metrics = {s: _hit(vol=float(i + 1)) for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"])}
+    metrics = {
+        s: _hit(vol=float(i + 1)) for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"])
+    }
     svc = _make_service(metrics=metrics, mode="scaffold")
     placed = svc.run_entry()
     assert len(placed) == 5  # capped at max_concurrent
@@ -288,9 +291,16 @@ def test_get_status_returns_required_keys():
     svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
     status = svc.get_status()
     required = {
-        "mode", "kill_switch_active", "kill_switch_reason", "manual_pause",
-        "today_entries", "today_exits", "open_positions", "today_pnl_net",
-        "capital_inr", "config",
+        "mode",
+        "kill_switch_active",
+        "kill_switch_reason",
+        "manual_pause",
+        "today_entries",
+        "today_exits",
+        "open_positions",
+        "today_pnl_net",
+        "capital_inr",
+        "config",
     }
     assert required <= set(status)
     assert status["mode"] == "sandbox"
@@ -360,9 +370,7 @@ def test_eod_summary_formats_telegram_message_correctly():
         {"symbol": "BEL", "entry_time": "t", "entry_price": 50.0, "qty": 20},
     ]
     # One exit from a prior session.
-    svc.place_exit(
-        PaperPosition("HDFCBANK", 10, 1000.0, "2026-06-09", 2.0), price=1004.2
-    )
+    svc.place_exit(PaperPosition("HDFCBANK", 10, 1000.0, "2026-06-09", 2.0), price=1004.2)
     # One position still open.
     svc.paper_book["TMPV"] = PaperPosition("TMPV", 10, 100.0, "2026-06-10", 2.0)
 
@@ -411,7 +419,8 @@ def test_mtm_handles_price_fetch_failure():
 
 def test_status_includes_mtm_when_positions_open():
     svc = _make_service(
-        metrics={"AAA": _hit(price=100.0)}, mode="sandbox",
+        metrics={"AAA": _hit(price=100.0)},
+        mode="sandbox",
         price_fetcher=lambda s, e: 105.0,
     )
     svc.place_entry({"symbol": "AAA", "current_price": 100.0, "vol_ratio": 2.0})
@@ -456,8 +465,14 @@ def _eod_service_with_activity(mode="sandbox"):
     svc = _make_service(mode=mode)
     svc.today_entries = [
         {
-            "symbol": "AAA", "entry_time": "t", "entry_price": 100.0, "qty": 50,
-            "vol_ratio": 2.0, "sector": "NIFTY", "sector_ret": 0.018, "stock_ret": 0.009,
+            "symbol": "AAA",
+            "entry_time": "t",
+            "entry_price": 100.0,
+            "qty": 50,
+            "vol_ratio": 2.0,
+            "sector": "NIFTY",
+            "sector_ret": 0.018,
+            "stock_ret": 0.009,
         },
     ]
     # A prior-session position squared off today -> populates today_exits.
@@ -478,8 +493,13 @@ def test_format_eod_report_markdown_has_expected_sections():
     assert "# sector_follow_cap5_vol — EOD Report 2026-06-10" in report
     assert "- **Mode:** sandbox" in report
     # Required sections.
-    for heading in ("## Summary", "## Sector breakdown", "## Positions",
-                    "## Kill switch (EOD)", "## Note — expected vs R40 baseline"):
+    for heading in (
+        "## Summary",
+        "## Sector breakdown",
+        "## Positions",
+        "## Kill switch (EOD)",
+        "## Note — expected vs R40 baseline",
+    ):
         assert heading in report
     # Summary content.
     assert "Signals fired / positions opened: 1" in report
@@ -551,14 +571,16 @@ if __name__ == "__main__":
 
 
 # --------------------------------------------------------------------------- #
-# Unified daily-intent gate (pause / halt / daily_capital_cap / mode override)
+# Mode-only: runtime-override gate (entry-only) + persistent strategy_mode
+# override. Replaces the retired daily-intent (pause/halt) gate. The engine
+# reads strategy_runtime_override.is_entry_blocked; we patch it directly. The
+# cap + mode-override tests inject a resolver decision (intent is vestigial).
 # --------------------------------------------------------------------------- #
-def _decision(mode="sandbox", intent="run", cap=None, source="unified"):
+def _decision(mode="sandbox", cap=None, source="strategy_mode"):
     from services.mode_service import EffectiveDecision
 
-    return EffectiveDecision(
-        mode=mode, intent=intent, daily_capital_cap=cap, source=source
-    )
+    # intent is vestigial in mode-only (always 'run') — kept for shape only.
+    return EffectiveDecision(mode=mode, intent="run", daily_capital_cap=cap, source=source)
 
 
 def _open_pos(svc, symbol="ZZZ", entry_date="2026-06-09"):
@@ -569,62 +591,62 @@ def _open_pos(svc, symbol="ZZZ", entry_date="2026-06-09"):
     )
 
 
-def test_intent_pause_blocks_entries():
-    svc = _make_service(
-        metrics={"AAA": _hit(), "BBB": _hit()},
-        mode="sandbox",
-        intent_resolver=lambda: _decision(intent="pause"),
-    )
-    placed = svc.run_entry()
+def test_runtime_override_blocks_entries():
+    svc = _make_service(metrics={"AAA": _hit(), "BBB": _hit()}, mode="sandbox")
+    with patch(
+        "database.strategy_runtime_override_db.is_entry_blocked",
+        return_value=(
+            True,
+            {"override_type": "pause", "reason": "stale_feed:X", "expires_at": "x"},
+        ),
+    ):
+        placed = svc.run_entry()
     assert placed == []
     assert svc._test_placed == []  # no orders dispatched
 
 
-def test_intent_pause_still_runs_exits():
-    svc = _make_service(mode="sandbox", intent_resolver=lambda: _decision(intent="pause"))
+def test_runtime_override_does_not_block_exits():
+    """An active override holds entries but a T+1 exit must always square off."""
+    svc = _make_service(mode="sandbox")
     _open_pos(svc)  # entered yesterday → eligible for T+1 exit
-    exited = svc.run_exit()
+    with patch(
+        "database.strategy_runtime_override_db.is_entry_blocked",
+        return_value=(True, {"override_type": "kill_switch", "reason": "loss", "expires_at": "x"}),
+    ):
+        exited = svc.run_exit()
     assert [e["symbol"] for e in exited] == ["ZZZ"]
     assert any(o[1]["action"] == "SELL" for o in svc._test_placed)
 
 
-def test_intent_halt_blocks_entries():
-    svc = _make_service(
-        metrics={"AAA": _hit()},
-        mode="sandbox",
-        intent_resolver=lambda: _decision(intent="halt"),
-    )
-    assert svc.run_entry() == []
-    assert svc._test_placed == []
-
-
-def test_intent_halt_blocks_exits():
-    svc = _make_service(mode="sandbox", intent_resolver=lambda: _decision(intent="halt"))
-    _open_pos(svc)
-    assert svc.run_exit() == []
-    assert svc._test_placed == []  # halt blocks the T+1 exit too
+def test_no_override_runs_entries():
+    """With no active override (empty table), entries proceed normally."""
+    svc = _make_service(metrics={"AAA": _hit()}, mode="sandbox")
+    svc.run_entry()
+    assert any(o[1]["symbol"] == "AAA" for o in svc._test_placed)
 
 
 def test_daily_capital_cap_limits_slots():
     # cap = 50_000 and max_position_inr = 50_000 → exactly 1 slot, so only the
     # top vol_ratio candidate is entered even though two pass the gates.
+    # (cap is injected via the resolver; the real resolver no longer carries it,
+    # but _effective_max_concurrent still honors a present cap.)
     svc = _make_service(
         metrics={"AAA": _hit(vol=1.5), "BBB": _hit(vol=3.0)},
         mode="sandbox",
-        intent_resolver=lambda: _decision(intent="run", cap=50000.0),
+        intent_resolver=lambda: _decision(cap=50000.0),
     )
     placed = svc.run_entry()
     assert len(placed) == 1
     assert placed[0]["symbol"] == "BBB"  # higher vol_ratio wins the single slot
 
 
-def test_unified_mode_override_changes_routing():
-    # Service constructed scaffold; a unified row with mode='sandbox' overrides
-    # it so the entry actually dispatches an order.
+def test_strategy_mode_override_changes_routing():
+    # Service constructed scaffold; a persistent strategy_mode row with
+    # mode='sandbox' overrides it so the entry actually dispatches an order.
     svc = _make_service(
         metrics={"AAA": _hit()},
         mode="scaffold",
-        intent_resolver=lambda: _decision(mode="sandbox", intent="run", source="unified"),
+        intent_resolver=lambda: _decision(mode="sandbox", source="strategy_mode"),
     )
     svc.run_entry()
     assert svc.mode == "sandbox"
@@ -632,11 +654,12 @@ def test_unified_mode_override_changes_routing():
 
 
 def test_env_source_does_not_override_mode():
-    # source='env' must NOT mutate self.mode — back-compat fall-through.
+    # source='env' must NOT mutate self.mode — keeps the scaffold/no-orders
+    # default until the operator sets a strategy_mode row.
     svc = _make_service(
         metrics={"AAA": _hit()},
         mode="scaffold",
-        intent_resolver=lambda: _decision(mode="sandbox", intent="run", source="env"),
+        intent_resolver=lambda: _decision(mode="sandbox", source="env"),
     )
     svc.run_entry()
     assert svc.mode == "scaffold"  # unchanged
@@ -683,8 +706,15 @@ def test_run_exit_proceeds_despite_stale_index_data():
         mode="sandbox",
         intent_resolver=lambda: _decision(intent="run"),
         data_health_checker=lambda name, date, index_only=False: (
-            False, {"NIFTY": {"ok": False, "last_date": "2026-05-29",
-                              "staleness_days": 9, "kind": "index"}}
+            False,
+            {
+                "NIFTY": {
+                    "ok": False,
+                    "last_date": "2026-05-29",
+                    "staleness_days": 9,
+                    "kind": "index",
+                }
+            },
         ),
     )
     _open_pos(svc)  # entered yesterday → eligible for T+1 exit
