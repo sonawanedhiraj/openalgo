@@ -682,6 +682,22 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"strategy_daily_intent migration skipped: {e}")
 
+            # Mode-only architecture (2026-06-12): ensure the persistent
+            # strategy_mode knob and the ephemeral strategy_runtime_override
+            # safety-guard table exist on every boot. Without this, the engines'
+            # runtime-override reads and the safety guards' override writes would
+            # hit a missing table (and silently fail-open / fail-safe).
+            try:
+                from database.strategy_mode_db import init_db as _init_strategy_mode
+                from database.strategy_runtime_override_db import (
+                    init_db as _init_strategy_runtime_override,
+                )
+
+                _init_strategy_mode()
+                _init_strategy_runtime_override()
+            except Exception as e:
+                logger.error(f"strategy_mode/runtime_override table init skipped: {e}")
+
             # Signal that DB tables are ready (unblocks cache restoration)
             app.db_ready.set()
 
