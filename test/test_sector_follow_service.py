@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker
 
 from services.sector_follow_service import (
     SectorFollowConfig,
@@ -24,6 +26,25 @@ from services.sector_follow_service import (
 )
 
 _IST = timezone(timedelta(hours=5, minutes=30))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_override(monkeypatch):
+    """Mode-only: pause()/resume()/kill-switch/auto-pause now write the shared
+    strategy_runtime_override table. Rebind it to a fresh in-memory DB per test
+    so override writes never leak between tests (the engine reads it via a lazy
+    import, so monkeypatching the module's engine/session is sufficient)."""
+    from database import strategy_runtime_override_db as sro
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(sro, "engine", eng)
+    monkeypatch.setattr(sro, "db_session", sess)
+    sro.Base.query = sess.query_property()
+    sro.Base.metadata.create_all(eng)
+    yield
+    sess.remove()
+    eng.dispose()
 
 
 def _config(**overrides) -> SectorFollowConfig:
@@ -226,6 +247,53 @@ def test_daily_reset_clears_kill_switch():
     svc.reset_daily_state()
     assert svc.kill_switch_active is False
     assert svc.daily_pnl == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Mode-only: automated safety guards mirror to strategy_runtime_override so the
+# engine job-entry gate honors them durably (B6).
+# --------------------------------------------------------------------------- #
+def _active_overrides(svc):
+    """Active overrides evaluated against the service's own (test) clock — the
+    row's expiry is relative to that clock, not real wall-time."""
+    from database import strategy_runtime_override_db as sro
+
+    return sro.get_active_overrides("sector_follow_cap5_vol", now=svc._utc_naive(svc._now()))
+
+
+def test_pause_writes_runtime_override():
+    svc = _make_service()
+    svc.pause()
+    active = _active_overrides(svc)
+    assert [o["override_type"] for o in active] == ["pause"]
+    assert svc.manual_pause is True  # in-memory flag still set too
+
+
+def test_resume_clears_runtime_override():
+    from database import strategy_runtime_override_db as sro
+
+    svc = _make_service()
+    svc.pause()
+    svc.resume()
+    assert sro.list_overrides(include_expired=True) == []  # row removed
+    assert svc.manual_pause is False
+
+
+def test_kill_switch_writes_runtime_override():
+    svc = _make_service()
+    svc.update_daily_pnl(realized_today=-7501.0, open_mtm=0.0)
+    active = _active_overrides(svc)
+    assert any(o["override_type"] == "kill_switch" for o in active)
+
+
+def test_auto_pause_writes_pause_override_for_tomorrow():
+    svc = _make_service()
+    svc._auto_pause_tomorrow("2026-06-09")
+    active = _active_overrides(svc)
+    assert len(active) == 1
+    assert active[0]["override_type"] == "pause"
+    assert "stale_feed" in active[0]["reason"]
+    assert active[0]["set_by"] == "sector_follow"
 
 
 # --------------------------------------------------------------------------- #

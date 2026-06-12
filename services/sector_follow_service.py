@@ -554,6 +554,13 @@ class SectorFollowService:
                 f"₹{self.daily_pnl:,.0f} breached {self.config.daily_loss_kill_pct}% of capital. "
                 "New entries blocked; open positions hold to scheduled exit."
             )
+            # Durable mirror: hold entries via the engine's runtime-override gate
+            # (same-day expiry; the 09:00 reset clears the in-memory flag).
+            self._set_runtime_override(
+                "kill_switch",
+                self._end_of_today_ist(),
+                self.kill_switch_reason or "daily loss kill",
+            )
         return self.kill_switch_active
 
     def reset_daily_state(self) -> None:
@@ -569,10 +576,50 @@ class SectorFollowService:
         self.today_exits = []
         logger.info("sector_follow daily state reset (kill switch cleared, pnl=0)")
 
+    # ----- runtime-override durability (mode-only safety guards) ---------- #
+    def _utc_naive(self, ist_dt) -> datetime:
+        """IST-aware datetime → naive UTC (strategy_runtime_override stores and
+        compares naive UTC)."""
+        return ist_dt.astimezone(datetime.UTC).replace(tzinfo=None)
+
+    def _end_of_today_ist(self):
+        """Today 23:59 IST — same-day expiry for an intraday hold (the in-memory
+        flag still persists this session; this just makes the hold durable +
+        visible to the engine gate and /status until the daily reset)."""
+        return self._now().replace(hour=23, minute=59, second=0, microsecond=0)
+
+    def _set_runtime_override(self, override_type: str, expires_ist, reason: str) -> None:
+        """Durably record a safety hold in ``strategy_runtime_override`` so the
+        engine's job-entry gate (and /status) see it across restarts. Fail-safe —
+        a DB error never breaks the guard; the in-memory flag still blocks this
+        session."""
+        try:
+            from database.strategy_runtime_override_db import set_override
+
+            set_override(
+                "sector_follow_cap5_vol",
+                override_type,
+                self._utc_naive(expires_ist),
+                reason=reason,
+                set_by="sector_follow",
+            )
+        except Exception:
+            logger.exception("sector_follow: failed to write %s runtime override", override_type)
+
+    def _clear_runtime_override(self) -> None:
+        try:
+            from database.strategy_runtime_override_db import clear_override
+
+            clear_override("sector_follow_cap5_vol")
+        except Exception:
+            logger.exception("sector_follow: failed to clear runtime overrides")
+
     # ----- operator manual controls -------------------------------------- #
     def pause(self) -> dict:
         """Operator pause: halt new entries. Open positions hold to T+1 exit."""
         self.manual_pause = True
+        # Durable mirror so the engine job-entry gate honors it across a restart.
+        self._set_runtime_override("pause", self._end_of_today_ist(), "operator manual pause")
         logger.warning("sector_follow MANUALLY PAUSED — new entries halted (exits still run)")
         return {"status": "success", "manual_pause": True}
 
@@ -581,6 +628,7 @@ class SectorFollowService:
         self.manual_pause = False
         self.kill_switch_active = False
         self.kill_switch_reason = None
+        self._clear_runtime_override()
         logger.info("sector_follow RESUMED — manual pause + kill switch cleared")
         return {"status": "success", "manual_pause": False, "kill_switch_active": False}
 
@@ -1029,42 +1077,30 @@ class SectorFollowService:
         return ok, details
 
     def _auto_pause_tomorrow(self, today_iso: str) -> None:
-        """Write tomorrow's intent=pause (mode preserved) on confirmed staleness."""
+        """Mode-only: on confirmed stale data, hold tomorrow's entries by writing
+        a ``pause`` runtime override that expires after tomorrow's 15:20 entry
+        window (15:30 IST). The persistent ``strategy_mode`` is untouched — only
+        *entries* are held; exits/EOD still run. The engine's job-entry gate
+        (``_entry_held_by_override``) enforces it. Self-expiring, so a one-off
+        stale day never silently disables the strategy beyond tomorrow.
+
+        Idempotent against an operator override: if a longer-lived pause/kill is
+        already active for tomorrow's window, this no-ops (set_override upserts,
+        but we keep the existing reason if it's already a hold)."""
         try:
-            from database.strategy_daily_intent_db import get_intent, set_intent
-
-            strat = "sector_follow_cap5_vol"
-            tomorrow = (self._now().date() + timedelta(days=1)).isoformat()
-            existing = get_intent(strat, tomorrow)
-            if existing and existing.get("intent") in ("pause", "halt"):
-                return  # already non-run — don't clobber an operator decision
-            if existing:
-                mode = existing.get("mode") or "sandbox"
-                cap = existing.get("daily_capital_cap")
-            else:
-                mode, cap = "sandbox", None
-                try:
-                    from services.mode_service import resolve_strategy_mode
-
-                    dec = resolve_strategy_mode(strat)
-                    mode = getattr(dec, "mode", "sandbox") or "sandbox"
-                    cap = getattr(dec, "daily_capital_cap", None)
-                except Exception:
-                    logger.debug("auto-pause mode resolve failed; default sandbox", exc_info=True)
-            # strategy_daily_intent only accepts live/sandbox/skip — map anything
-            # else (e.g. the env 'scaffold' mode) onto sandbox.
-            if mode not in ("live", "sandbox", "skip"):
-                mode = "sandbox"
-            set_intent(
-                strat,
-                tomorrow,
-                mode=mode,
-                intent="pause",
-                daily_capital_cap=cap,
-                updated_by="data_health:auto-pause",
-                notes=f"Auto-paused due to stale data on {today_iso}",
+            tomorrow_ist = self._now() + timedelta(days=1)
+            expires_ist = tomorrow_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+            self._set_runtime_override(
+                "pause",
+                expires_ist,
+                f"stale_feed: data health failed on {today_iso}",
             )
-            logger.warning("sector_follow auto-paused %s (stale data on %s)", tomorrow, today_iso)
+            logger.warning(
+                "sector_follow auto-paused tomorrow's entries via runtime override "
+                "(stale data on %s, expires %s IST)",
+                today_iso,
+                expires_ist.isoformat(),
+            )
         except Exception:
             logger.exception("sector_follow auto-pause failed")
 

@@ -834,8 +834,13 @@ fail loud and fail safe.
   `stale_symbols` (JSON), `details_json`, `alert_sent`.
 - **Daily 16:30 IST job** `sector_follow_data_health` (runs after the 16:05
   backfill). On stale data: Telegram-alerts the operator AND auto-pauses
-  *tomorrow's* `strategy_daily_intent` (`intent='pause'`, mode preserved,
-  `updated_by='data_health:auto-pause'` — operator can override via Telegram/SQL).
+  *tomorrow's* entries by writing a **`strategy_runtime_override`** row
+  (mode-only, B6: `override_type='pause'`, `expires_at=` tomorrow 15:30 IST,
+  `reason='stale_feed: …'`, `set_by='sector_follow'`). The engine's job-entry
+  gate (`_entry_held_by_override`) enforces it; the persistent `strategy_mode` is
+  untouched and **only entries** are held (exits/EOD run). Self-expiring, so a
+  one-off stale day never silently disables the strategy beyond tomorrow. (Was:
+  `strategy_daily_intent` `intent='pause'` — the intent axis is retired.)
 - **Pre-entry gate** in `run_entry` (after the intent gate): aborts entries +
   alerts on a stale index OR stock feed. `run_exit` only *warns* on stale index
   data — exits are never blocked (a held T+1 position is riskier).

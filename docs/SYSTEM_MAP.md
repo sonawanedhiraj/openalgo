@@ -85,7 +85,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   | `sector_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1 exit). Exits are **never** blocked by the kill switch |
   | `sector_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
   | `sector_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary (silent if TG off) **+** writes a Day-N markdown report to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md` (independent sinks — one failing never blocks the other) |
-  | `sector_follow_data_health` | 16:30 | **Market-data freshness check** (after the 16:05 index backfill should have landed). Validates the 8 sector indices + 30 universe stocks via `data_freshness_service.check_strategy_data_ready`; writes a `data_health_check` row. On stale data: Telegram-alerts the operator **and** auto-pauses tomorrow's `strategy_daily_intent` (`updated_by='data_health:auto-pause'`, operator-overridable). Gated by `DATA_FRESHNESS_VALIDATION_ENABLED` (default `true`) |
+  | `sector_follow_data_health` | 16:30 | **Market-data freshness check** (after the 16:05 index backfill should have landed). Validates the 8 sector indices + 30 universe stocks via `data_freshness_service.check_strategy_data_ready`; writes a `data_health_check` row. On stale data: Telegram-alerts the operator **and** auto-pauses tomorrow's *entries* by writing a self-expiring `strategy_runtime_override` row (mode-only B6: `override_type='pause'`, `expires_at=`tomorrow 15:30 IST, `set_by='sector_follow'`) — the engine job-entry gate honors it; mode untouched, exits/EOD still run. Gated by `DATA_FRESHNESS_VALIDATION_ENABLED` (default `true`) |
 
 - **Pre-entry freshness gate:** `run_entry` aborts (places no orders, alerts) when
   the index OR stock feed is stale beyond `MAX_STALENESS_BUSINESS_DAYS` (default 1).
@@ -263,7 +263,7 @@ SectorFollowService singleton; they return `503` if the service isn't initialise
 | `/sector_follow_cap5_vol/api/status` | GET | Read-only: mode, kill switch, today's entries/exits, open book + live MTM |
 | `/sector_follow_cap5_vol/api/data_health` | GET | Read-only: live market-data freshness for the 8 indices + 30 stocks (`overall_ok`, `checked_at`, per-symbol `last_ts`/`staleness_days`/`ok`). Queries only — does not write the `data_health_check` row (that's the 16:30 job) |
 | `/sector_follow_cap5_vol/api/positions` | GET | Read-only: open positions (with MTM) + today's entries/exits |
-| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` — halts new entries; open positions still exit T+1. Runtime emergency override; for pre-market planning use the `strategy_daily_intent` table instead |
+| `/sector_follow_cap5_vol/api/pause` | POST | Sets in-memory `manual_pause` **and** writes a durable `strategy_runtime_override` `pause` row (same-day expiry, mode-only B6) so the hold survives a restart and the engine job-entry gate honors it. Halts new entries; open positions still exit T+1. `/api/resume` clears both. Mode flips are laptop-only (`strategy_mode`) |
 | `/sector_follow_cap5_vol/api/resume` | POST | Clears manual pause **and** the kill switch |
 | `/sector_follow_cap5_vol/api/close_all` | POST | **Emergency square-off of every open position** (mode-aware; not blocked by kill switch). Requires body `{"confirm":"yes"}` |
 
