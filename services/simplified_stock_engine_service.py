@@ -652,7 +652,10 @@ class SimplifiedStockEngineService:
         try:
             from services import signal_review_service
 
-            mode = signal_review_service.get_veto_layer_mode()
+            # Mode-aware veto default: sandbox enforces ('active') by default so
+            # the layer is exercised on the virtual book; live is unchanged
+            # ('shadow'). VETO_LAYER_MODE env overrides in every mode.
+            mode = signal_review_service.get_veto_layer_mode(self.mode)
             if mode == "off":
                 return True, None
 

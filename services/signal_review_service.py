@@ -60,14 +60,29 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def get_veto_layer_mode() -> str:
-    raw = _env("VETO_LAYER_MODE", "shadow").lower()
-    if raw not in VALID_VETO_MODES:
-        logger.warning(
-            "signal_review: unknown VETO_LAYER_MODE=%r; falling back to 'shadow'", raw
-        )
-        return "shadow"
-    return raw
+def get_veto_layer_mode(effective_mode: str | None = None) -> str:
+    """Resolve the veto-layer enforcement mode (``off`` / ``shadow`` / ``active``).
+
+    The ``VETO_LAYER_MODE`` env var, when explicitly set, is the single override
+    and wins in every mode (set it to ``off`` for an emergency disable).
+
+    When the env var is unset, the default is **mode-aware** (mode-only
+    architecture, 2026-06-12): a strategy routing to ``sandbox`` defaults to
+    ``active`` — the LLM veto *enforces* on the virtual ₹1Cr book, so the layer
+    is exercised for real before it ever gates live money. Any other mode
+    (``live`` / unknown / not provided) defaults to ``shadow`` (observe-only) —
+    live behavior is unchanged. Callers that know the strategy's effective mode
+    pass it in; callers without that context get the safe ``shadow`` default."""
+    raw = os.getenv("VETO_LAYER_MODE")
+    if raw is not None and raw.strip() != "":
+        val = raw.strip().lower()
+        if val in VALID_VETO_MODES:
+            return val
+        logger.warning("signal_review: unknown VETO_LAYER_MODE=%r; falling back to default", raw)
+    # Env unset (or invalid) → mode-aware default.
+    if (effective_mode or "").strip().lower() == "sandbox":
+        return "active"
+    return "shadow"
 
 
 def _bridge_url() -> str:
@@ -179,9 +194,7 @@ def _fetch_india_vix() -> float:
     api_key = get_first_available_api_key()
     if not api_key:
         raise RuntimeError("no api key available")
-    success, response, _ = get_quotes(
-        symbol="INDIAVIX", exchange="NSE_INDEX", api_key=api_key
-    )
+    success, response, _ = get_quotes(symbol="INDIAVIX", exchange="NSE_INDEX", api_key=api_key)
     if not success:
         raise RuntimeError(f"quote fetch failed: {response.get('message', 'unknown')}")
     data = response.get("data") or {}

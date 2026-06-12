@@ -23,9 +23,7 @@ def fresh_signal_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(sdb, "engine", test_engine)
     monkeypatch.setattr(sdb, "db_session", test_session)
@@ -88,9 +86,7 @@ def _mock_bridge_response(monkeypatch, payload: dict, status_code: int = 200):
 # ---------------------------------------------------------------------------
 
 
-def test_review_signal_returns_take_in_happy_path(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_returns_take_in_happy_path(fresh_signal_db, shadow_mode, monkeypatch):
     from services.signal_review_service import review_signal
 
     _mock_bridge_response(
@@ -115,9 +111,7 @@ def test_review_signal_returns_take_in_happy_path(
     assert result["cache_hit"] is False
 
 
-def test_review_signal_writes_signal_decision_row(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_writes_signal_decision_row(fresh_signal_db, shadow_mode, monkeypatch):
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
@@ -181,8 +175,10 @@ def test_review_signal_includes_direction_in_request_body(
     monkeypatch.setattr(srs.httpx, "post", fake_post)
 
     result = srs.review_signal(
-        "TATAELXSI", "chartink_FnO_intraday_buy",
-        direction="SELL", context=_ctx_override(),
+        "TATAELXSI",
+        "chartink_FnO_intraday_buy",
+        direction="SELL",
+        context=_ctx_override(),
     )
 
     # 1. Direction is in the request body the bridge receives.
@@ -193,9 +189,7 @@ def test_review_signal_includes_direction_in_request_body(
     assert row["direction"] == "SELL"
 
 
-def test_review_signal_direction_in_cache_key(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_direction_in_cache_key(fresh_signal_db, shadow_mode, monkeypatch):
     """A BUY and a SELL on the same (symbol, source) must NOT collide in the
     cache — direction is part of the key, so each side gets its own review."""
     import services.signal_review_service as srs
@@ -226,10 +220,12 @@ def test_review_signal_direction_in_cache_key(
 
     monkeypatch.setattr(srs.httpx, "post", fake_post)
 
-    buy = srs.review_signal("SBIN", "chartink_FnO_intraday_buy",
-                            direction="BUY", context=_ctx_override())
-    sell = srs.review_signal("SBIN", "chartink_FnO_intraday_buy",
-                             direction="SELL", context=_ctx_override())
+    buy = srs.review_signal(
+        "SBIN", "chartink_FnO_intraday_buy", direction="BUY", context=_ctx_override()
+    )
+    sell = srs.review_signal(
+        "SBIN", "chartink_FnO_intraday_buy", direction="SELL", context=_ctx_override()
+    )
 
     assert buy["decision"] == "take"
     assert sell["decision"] == "skip"
@@ -241,9 +237,7 @@ def test_review_signal_direction_in_cache_key(
 # ---------------------------------------------------------------------------
 
 
-def test_review_signal_cache_hit_skips_bridge(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_cache_hit_skips_bridge(fresh_signal_db, shadow_mode, monkeypatch):
     """Second call within TTL must NOT hit the bridge."""
     from services.signal_review_service import review_signal
 
@@ -280,9 +274,7 @@ def test_review_signal_cache_hit_skips_bridge(
     assert second["decision"] == "take"
 
 
-def test_review_signal_cache_ttl_zero_disables_caching(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_cache_ttl_zero_disables_caching(fresh_signal_db, shadow_mode, monkeypatch):
     """VETO_CACHE_TTL_SECONDS=0 should mean every call hits the bridge."""
     from services.signal_review_service import review_signal
 
@@ -323,9 +315,7 @@ def test_review_signal_cache_ttl_zero_disables_caching(
 # ---------------------------------------------------------------------------
 
 
-def test_review_signal_bridge_unreachable_returns_take(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_bridge_unreachable_returns_take(fresh_signal_db, shadow_mode, monkeypatch):
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
@@ -377,9 +367,7 @@ def test_review_signal_timeout_returns_take(fresh_signal_db, shadow_mode, monkey
     assert row["decision"] == "review_failed"
 
 
-def test_review_signal_bridge_returns_garbage_decision(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_review_signal_bridge_returns_garbage_decision(fresh_signal_db, shadow_mode, monkeypatch):
     """Bridge contract violation — decision not in {take, skip} — must fail-safe."""
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
@@ -421,6 +409,7 @@ def test_context_builder_handles_engine_failure(fresh_signal_db, shadow_mode, mo
         "services.simplified_stock_engine_service.get_simplified_stock_engine_service",
         broken_import,
     )
+
     # Also force the macro fetches to fail — this test asserts the engine-stat
     # branch fails gracefully and isn't supposed to depend on live broker state.
     def _boom():
@@ -610,6 +599,31 @@ def test_get_veto_layer_mode_accepts_off(monkeypatch):
     assert get_veto_layer_mode() == "off"
 
 
+# Mode-aware default (mode-only architecture, 2026-06-12) ---------------------
+def test_get_veto_layer_mode_sandbox_defaults_to_active(monkeypatch):
+    """No env override + sandbox routing → veto ENFORCES by default."""
+    monkeypatch.delenv("VETO_LAYER_MODE", raising=False)
+    from services.signal_review_service import get_veto_layer_mode
+
+    assert get_veto_layer_mode("sandbox") == "active"
+
+
+def test_get_veto_layer_mode_live_defaults_to_shadow(monkeypatch):
+    """No env override + live routing → veto observes only (live unchanged)."""
+    monkeypatch.delenv("VETO_LAYER_MODE", raising=False)
+    from services.signal_review_service import get_veto_layer_mode
+
+    assert get_veto_layer_mode("live") == "shadow"
+
+
+def test_get_veto_layer_mode_env_overrides_mode_aware_default(monkeypatch):
+    """An explicit VETO_LAYER_MODE wins even in sandbox (emergency disable)."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "off")
+    from services.signal_review_service import get_veto_layer_mode
+
+    assert get_veto_layer_mode("sandbox") == "off"
+
+
 # ---------------------------------------------------------------------------
 # mark_actually_taken
 # ---------------------------------------------------------------------------
@@ -658,9 +672,7 @@ def test_mark_actually_taken_handles_none_id(fresh_signal_db, shadow_mode):
 # ---------------------------------------------------------------------------
 
 
-def test_fresh_skip_decision_fires_telegram_alert(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_fresh_skip_decision_fires_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
     """A fresh bridge call returning skip must invoke publish_veto_decision_alert."""
     from services.signal_review_service import review_signal
 
@@ -681,9 +693,7 @@ def test_fresh_skip_decision_fires_telegram_alert(
     def _spy(**kw):
         captured.append(kw)
 
-    monkeypatch.setattr(
-        "services.notification_service.publish_veto_decision_alert", _spy
-    )
+    monkeypatch.setattr("services.notification_service.publish_veto_decision_alert", _spy)
 
     review_signal("INFY", "chartink_buy", context=_ctx_override())
 
@@ -725,9 +735,7 @@ def test_fresh_take_decision_calls_helper_but_helper_no_ops(
     def _spy(**kw):
         captured.append(kw)
 
-    monkeypatch.setattr(
-        "services.notification_service.publish_veto_decision_alert", _spy
-    )
+    monkeypatch.setattr("services.notification_service.publish_veto_decision_alert", _spy)
 
     review_signal("RELIANCE", "chartink_buy", context=_ctx_override())
 
@@ -735,9 +743,7 @@ def test_fresh_take_decision_calls_helper_but_helper_no_ops(
     assert captured[0]["decision"] == "take"
 
 
-def test_cache_hit_does_not_fire_telegram_alert(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_cache_hit_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
     """Cache replays must NOT spam the operator with old decisions."""
     from services.signal_review_service import review_signal
 
@@ -758,9 +764,7 @@ def test_cache_hit_does_not_fire_telegram_alert(
     def _spy(**kw):
         captured.append(kw)
 
-    monkeypatch.setattr(
-        "services.notification_service.publish_veto_decision_alert", _spy
-    )
+    monkeypatch.setattr("services.notification_service.publish_veto_decision_alert", _spy)
 
     # First call — fresh, should fire.
     review_signal("TCS", "chartink_buy", context=_ctx_override())
@@ -771,9 +775,7 @@ def test_cache_hit_does_not_fire_telegram_alert(
     assert captured[0]["symbol"] == "TCS"
 
 
-def test_bridge_failure_does_not_fire_telegram_alert(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_bridge_failure_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
     """review_failed rows must not produce a Telegram alert."""
     from services.signal_review_service import review_signal
 
@@ -789,18 +791,14 @@ def test_bridge_failure_does_not_fire_telegram_alert(
     def _spy(**kw):
         captured.append(kw)
 
-    monkeypatch.setattr(
-        "services.notification_service.publish_veto_decision_alert", _spy
-    )
+    monkeypatch.setattr("services.notification_service.publish_veto_decision_alert", _spy)
 
     review_signal("WIPRO", "chartink_buy", context=_ctx_override())
 
     assert captured == []
 
 
-def test_bad_decision_does_not_fire_telegram_alert(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_bad_decision_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
     """Contract-violation responses must not produce a Telegram alert."""
     from services.signal_review_service import review_signal
 
@@ -821,18 +819,14 @@ def test_bad_decision_does_not_fire_telegram_alert(
     def _spy(**kw):
         captured.append(kw)
 
-    monkeypatch.setattr(
-        "services.notification_service.publish_veto_decision_alert", _spy
-    )
+    monkeypatch.setattr("services.notification_service.publish_veto_decision_alert", _spy)
 
     review_signal("ITC", "chartink_buy", context=_ctx_override())
 
     assert captured == []
 
 
-def test_alert_failure_does_not_break_review(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
+def test_alert_failure_does_not_break_review(fresh_signal_db, shadow_mode, monkeypatch):
     """A blow-up inside the alert helper must NOT propagate into review_signal."""
     from services.signal_review_service import review_signal
 
@@ -851,9 +845,7 @@ def test_alert_failure_does_not_break_review(
     def _boom(**kw):
         raise RuntimeError("downstream notification failure")
 
-    monkeypatch.setattr(
-        "services.notification_service.publish_veto_decision_alert", _boom
-    )
+    monkeypatch.setattr("services.notification_service.publish_veto_decision_alert", _boom)
 
     # Must NOT raise — review_signal wraps the call in try/except.
     result = review_signal("BOOM", "chartink_buy", context=_ctx_override())
@@ -870,9 +862,7 @@ def test_insert_self_inits_table_when_init_db_was_skipped(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
     monkeypatch.setattr(sdb, "engine", test_engine)
     monkeypatch.setattr(sdb, "db_session", test_session)
     # Force the lazy-ensure flag to point at "no engine seen yet" so the test
@@ -1077,7 +1067,4 @@ def test_review_signal_forwards_regime_snapshot_to_bridge(
     review_signal("RELIANCE", "chartink_buy", context=ctx)
 
     assert "regime_snapshot" in captured["body"]["context"]
-    assert (
-        captured["body"]["context"]["regime_snapshot"]["sector_leaders"][0]
-        == "NIFTYIT"
-    )
+    assert captured["body"]["context"]["regime_snapshot"]["sector_leaders"][0] == "NIFTYIT"

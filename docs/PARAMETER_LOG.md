@@ -86,6 +86,27 @@ the latest decisions automatically.
   (and optionally `-ExclusionExtension pyd`). Not a code parameter — recorded
   here so the operator can configure it.
 
+#### VETO_LAYER_MODE — mode-aware default (B4, 2026-06-12)
+- **Current value:** unset → **mode-aware default**: `active` (enforce) when the
+  strategy routes to `sandbox`; `shadow` (observe-only) when `live`.
+- **Set in:** env var (optional). Read in `services/signal_review_service.get_veto_layer_mode(effective_mode)`.
+- **What it gates:** the Stage-1 LLM veto layer that reviews each entry candidate
+  before order dispatch (`off` = skip the reviewer; `shadow` = log the verdict
+  but always take; `active` = a `skip` verdict blocks the entry).
+- **Change:** previously a flat default of `shadow` in every mode. Now, with the
+  env var unset, **sandbox enforces by default** so the veto is exercised for
+  real on the virtual ₹1Cr book before it ever gates live money; **live is
+  unchanged** (`shadow`). An explicit `VETO_LAYER_MODE` wins in every mode and is
+  the single emergency disable (`VETO_LAYER_MODE=off`). The simplified engine
+  passes its routing mode to `get_veto_layer_mode(self.mode)`; callers without
+  mode context still get the safe `shadow` default.
+- **Test coverage:** `test/test_signal_review_service.py`
+  (`*_sandbox_defaults_to_active`, `*_live_defaults_to_shadow`,
+  `*_env_overrides_mode_aware_default`, plus the existing off/shadow/active env tests).
+- **.sample.env:** not added (operator WIP holds that file); document
+  `VETO_LAYER_MODE` there at the next convenient edit. The mode-aware default
+  needs no env entry to function.
+
 #### TELEGRAM_INBOUND_ENABLED
 - **Current value:** `false` (default; ships cold)
 - **Set in:** env var (not yet in `.sample.env` — operator WIP held that file;

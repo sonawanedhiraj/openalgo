@@ -977,6 +977,13 @@ OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 > intent row. Preflight's `intent`/`effective_mode` checks are now **informational
 > and never abort** (mode-only has no skip/halt; the "refuse with no declared
 > intent" floor is removed — unconfigured resolves to sandbox).
+>
+> **LLM veto enforces in sandbox by default (B4, 2026-06-12):** `VETO_LAYER_MODE`
+> is now mode-aware in `services/signal_review_service.get_veto_layer_mode(effective_mode)`.
+> With the env var unset, a `sandbox` strategy defaults to `active` (the Stage-1
+> veto *enforces* — a `skip` verdict blocks the entry on the virtual book), while
+> `live` is unchanged (`shadow`, observe-only). An explicit `VETO_LAYER_MODE` wins
+> everywhere and is the single emergency disable (`=off`). See `docs/PARAMETER_LOG.md`.
 
 The single per-strategy control surface for both the simplified engine and
 sector_follow is the `strategy_daily_intent` table in `db/openalgo.db`. It
