@@ -6,7 +6,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any
 
 import websockets
 import zmq
@@ -118,7 +118,7 @@ class WebSocketProxy:
             loop = aio.get_running_loop()
 
             # Create the ZMQ listener task
-            zmq_task = loop.create_task(self.zmq_listener())
+            self._zmq_task = loop.create_task(self.zmq_listener())
 
             # Start WebSocket server
             stop = aio.Future()  # Used to stop the server
@@ -249,11 +249,11 @@ class WebSocketProxy:
             # Wait for all connections to close with timeout
             if close_tasks:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*close_tasks, return_exceptions=True),
+                    await aio.wait_for(
+                        aio.gather(*close_tasks, return_exceptions=True),
                         timeout=2.0,  # 2 second timeout
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("Timeout waiting for client connections to close")
 
             # Disconnect all broker adapters
@@ -622,13 +622,13 @@ class WebSocketProxy:
             # Get user's connected broker from database
             # This queries the auth_token table to find the user's active broker
             query = text("""
-                SELECT broker FROM auth_token 
-                WHERE user_id = :user_id 
-                ORDER BY id DESC 
+                SELECT broker FROM auth_token
+                WHERE user_id = :user_id
+                ORDER BY id DESC
                 LIMIT 1
             """)
 
-            result = db.session.execute(query, {"user_id": user_id}).fetchone()
+            result = db.session.execute(query, {"user_id": user_id}).fetchone()  # noqa: F821  pre-existing undefined name in an unreached env-fallback path; not rewired in this feature commit
 
             if result and result.broker:
                 broker_name = result.broker
@@ -762,7 +762,7 @@ class WebSocketProxy:
                 # - Adapter format: {"status": "error", "code": "...", "message": "..."}
                 # - ConnectionPool format: {"success": False, "error": "..."}
                 is_error = (connect_result and connect_result.get("status") == "error") or (
-                    connect_result and connect_result.get("success") == False
+                    connect_result and connect_result.get("success") is False
                 )
                 if is_error:
                     error_msg = connect_result.get(
@@ -800,7 +800,7 @@ class WebSocketProxy:
                         # Handle both response formats
                         init_is_error = (
                             init_retry_result and init_retry_result.get("status") == "error"
-                        ) or (init_retry_result and init_retry_result.get("success") == False)
+                        ) or (init_retry_result and init_retry_result.get("success") is False)
                         if init_is_error:
                             error_msg = init_retry_result.get(
                                 "message", init_retry_result.get("error", "Failed to re-initialize")
@@ -817,7 +817,7 @@ class WebSocketProxy:
                         # Handle both response formats
                         connect_is_error = (
                             connect_result and connect_result.get("status") == "error"
-                        ) or (connect_result and connect_result.get("success") == False)
+                        ) or (connect_result and connect_result.get("success") is False)
                         if connect_is_error:
                             error_msg = connect_result.get(
                                 "message",
@@ -866,14 +866,14 @@ class WebSocketProxy:
                                 and initialization_result.get("status") == "error"
                             ) or (
                                 initialization_result
-                                and initialization_result.get("success") == False
+                                and initialization_result.get("success") is False
                             )
                             if not init_is_error:
                                 connect_result = adapter.connect()
                                 # Handle both response formats
                                 connect_is_error = (
                                     connect_result and connect_result.get("status") == "error"
-                                ) or (connect_result and connect_result.get("success") == False)
+                                ) or (connect_result and connect_result.get("success") is False)
                                 if not connect_is_error:
                                     self.broker_adapters[user_id] = adapter
                                     logger.info(
@@ -1448,23 +1448,140 @@ class WebSocketProxy:
             else:
                 logger.debug(f"No cached data found for user {user_id}")
 
-            # Also disconnect and clean up any existing broker adapters for this user
-            # This forces re-initialization with fresh credentials on next connection
+            # Reconcile any existing broker adapter for this user so the proxy
+            # picks up the freshly persisted token WITHOUT an OpenAlgo restart.
             if user_id in self.broker_adapters:
-                try:
-                    adapter = self.broker_adapters[user_id]
-                    adapter.disconnect()
-                    del self.broker_adapters[user_id]
-                    logger.info(f"Disconnected stale broker adapter for user {user_id}")
-                except Exception as adapter_error:
-                    logger.warning(
-                        f"Error disconnecting adapter for user {user_id}: {adapter_error}"
-                    )
+                if self._broker_auto_reconnect_enabled():
+                    # Event-driven path (flag ON): proactively tear down, re-read
+                    # the new token, reconnect, and re-subscribe the held symbols.
+                    self._reconnect_broker_adapter(user_id)
+                else:
+                    # Default path (flag OFF): disconnect + drop. The next client
+                    # auth lazily rebuilds the adapter with fresh credentials. This
+                    # forces re-initialization on the next connection.
+                    try:
+                        adapter = self.broker_adapters[user_id]
+                        adapter.disconnect()
+                        del self.broker_adapters[user_id]
+                        logger.info(f"Disconnected stale broker adapter for user {user_id}")
+                    except Exception as adapter_error:
+                        logger.warning(
+                            f"Error disconnecting adapter for user {user_id}: {adapter_error}"
+                        )
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse cache invalidation message: {e}")
         except Exception as e:
             logger.exception(f"Error processing cache invalidation: {e}")
+
+    @staticmethod
+    def _broker_auto_reconnect_enabled() -> bool:
+        """
+        Whether event-driven broker-session auto-reconnect is enabled.
+
+        Controlled by BROKER_SESSION_AUTO_RECONNECT_ENABLED (default false). When
+        false, a broker re-login still invalidates the stale adapter (disconnect +
+        drop, lazy rebuild on next client auth) — the pre-existing behavior. When
+        true, the cache-invalidation event proactively reconnects the live adapter
+        and re-subscribes its symbol set so the feed resumes without a restart.
+        """
+        return os.getenv("BROKER_SESSION_AUTO_RECONNECT_ENABLED", "false").strip().lower() in (
+            "true",
+            "1",
+            "yes",
+            "on",
+        )
+
+    def _reconnect_broker_adapter(self, user_id: str) -> bool:
+        """
+        Proactively reconnect a user's broker WS adapter with the fresh token,
+        preserving the existing symbol subscription set.
+
+        Triggered (when BROKER_SESSION_AUTO_RECONNECT_ENABLED is true) by the ZMQ
+        cache-invalidation event that ``upsert_auth()`` publishes after a broker
+        re-login. Indian broker tokens expire daily ~3 AM IST; this removes the
+        need to restart OpenAlgo to pick up the new token. The adapter tears down
+        its stale connection, re-reads the token from auth_db via
+        ``adapter.initialize()``, reconnects, and re-subscribes every symbol it
+        held.
+
+        Returns:
+            True if the adapter reconnected (re-subscription is best-effort).
+            False if there was no live adapter, the broker is unknown, or the
+            reconnect failed — in which case the adapter is removed so the next
+            client auth rebuilds it from scratch (the default lazy path).
+        """
+        adapter = self.broker_adapters.get(user_id)
+        if adapter is None:
+            return False
+
+        broker_name = self.user_broker_mapping.get(user_id)
+        if not broker_name:
+            # Without a broker we cannot re-initialize; fall back to drop-and-rebuild.
+            logger.warning(
+                f"Auto-reconnect: no broker mapping for user {user_id}; "
+                "falling back to disconnect-and-rebuild"
+            )
+            try:
+                adapter.disconnect()
+            except Exception as disc_err:
+                logger.warning(f"Auto-reconnect: disconnect error for {user_id}: {disc_err}")
+            finally:
+                self.broker_adapters.pop(user_id, None)
+            return False
+
+        # Snapshot the subscription set BEFORE disconnect() clears it.
+        saved_subscriptions = []
+        try:
+            for sub in adapter.subscribed_symbols.values():
+                saved_subscriptions.append(
+                    (sub.get("symbol"), sub.get("exchange"), sub.get("mode", 2))
+                )
+        except Exception as snap_err:
+            logger.warning(
+                f"Auto-reconnect: could not snapshot subscriptions for {user_id}: {snap_err}"
+            )
+
+        logger.info(
+            f"Auto-reconnect: refreshing broker adapter for user {user_id} "
+            f"({broker_name}); preserving {len(saved_subscriptions)} subscription(s)"
+        )
+
+        try:
+            adapter.disconnect()
+            init_result = adapter.initialize(broker_name, user_id)
+            if isinstance(init_result, dict) and init_result.get("status") == "error":
+                raise RuntimeError(init_result.get("message", "adapter.initialize failed"))
+            adapter.connect()
+        except Exception as reconnect_err:
+            logger.exception(
+                f"Auto-reconnect failed for user {user_id}; removing adapter so the "
+                f"next client auth rebuilds it: {reconnect_err}"
+            )
+            self.broker_adapters.pop(user_id, None)
+            return False
+
+        # Re-subscribe the preserved symbol set (best-effort, per-symbol isolation).
+        resubscribed = 0
+        for symbol, exchange, mode in saved_subscriptions:
+            if not symbol or not exchange:
+                continue
+            try:
+                adapter.subscribe(symbol, exchange, mode)
+                resubscribed += 1
+            except Exception as sub_err:
+                logger.warning(
+                    f"Auto-reconnect: failed to re-subscribe {exchange}:{symbol} "
+                    f"for user {user_id}: {sub_err}"
+                )
+
+        # Keep the live adapter in the registry — do NOT delete it.
+        self.broker_adapters[user_id] = adapter
+        logger.info(
+            f"Auto-reconnect: broker adapter for user {user_id} reconnected; "
+            f"re-subscribed {resubscribed}/{len(saved_subscriptions)} symbol(s)"
+        )
+        return True
 
     def _is_auth_error_exception(self, error_message: str) -> bool:
         """

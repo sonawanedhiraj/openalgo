@@ -296,6 +296,8 @@ Real-time market data flows through a three-layer pipeline:
 
 3. **Unified WebSocket Proxy Server** (`websocket_proxy/server.py`, port 8765): Subscribes to ZeroMQ, manages client WebSocket connections, handles symbol subscriptions/unsubscriptions, and delivers filtered ticks to each connected client. Includes per-symbol throttling to prevent flooding slow clients.
 
+**Broker re-login → WS reinit (event-driven, no restart).** Indian broker tokens expire daily ~3 AM IST. The WS proxy runs as a **separate subprocess** from the Flask app, so a Flask SocketIO event cannot reach it — the cross-process signal is the ZMQ `CACHE_INVALIDATE` event that `database.auth_db.upsert_auth()` publishes on every re-login. `WebSocketProxy._handle_cache_invalidation` consumes it. By default it disconnects + drops the stale adapter (lazy rebuild on next client auth). With `BROKER_SESSION_AUTO_RECONNECT_ENABLED=true` (default `false`, see `docs/PARAMETER_LOG.md`) it instead calls `_reconnect_broker_adapter(user_id)`: snapshots the held symbol subscriptions, re-reads the fresh token via `adapter.initialize()`, reconnects, and re-subscribes — so the feed resumes **without an OpenAlgo restart**. Flag-gated off; enable + restart once to load it, then daily re-logins need no further restart.
+
 ### Request Processing Pipeline
 
 WSGI middleware wraps in reverse order — last registered is outermost. The request flows:

@@ -384,6 +384,36 @@ the latest decisions automatically.
 > paths now match the `test/` marker) is **not** a tunable — it is an always-on
 > correctness fix in `_is_test_source_entry`, so it has no PARAMETER_LOG knob.
 
+### Broker WebSocket — event-driven session reconnect
+
+#### BROKER_SESSION_AUTO_RECONNECT_ENABLED
+- **Current value:** `false` (default; ships cold — pure no-op until the operator opts in)
+- **Set in:** env var. Read in `websocket_proxy/server.py:WebSocketProxy._broker_auto_reconnect_enabled`
+  (accepts `true`/`1`/`yes`/`on`, case-insensitive; anything else is off).
+- **Code default:** `false`
+- **What it gates:** the WebSocket proxy's reaction to the ZMQ `CACHE_INVALIDATE`
+  event that `database.auth_db.upsert_auth()` already publishes after every broker
+  re-login. **When `false` (default):** the pre-existing behavior is preserved —
+  the proxy disconnects + drops the stale broker adapter, and the next client auth
+  lazily rebuilds it with the fresh token (the feed only resumes once a client
+  reconnects). **When `true`:** `_reconnect_broker_adapter(user_id)` runs instead —
+  it snapshots the adapter's current symbol subscriptions, disconnects, re-reads the
+  new token via `adapter.initialize()`, reconnects, and re-subscribes the held symbol
+  set, so the market-data feed resumes **without an OpenAlgo restart**. On reconnect
+  failure the adapter is removed (falls back to the lazy-rebuild path). Indian broker
+  tokens expire daily ~3 AM IST; this is what lets a morning Zerodha re-login restore
+  the WS feed without bouncing the process.
+- **Why flag-gated off:** ships behavior-neutral. The reconnect runs synchronously
+  on the ZMQ listener loop (mirrors the existing synchronous disconnect), so the
+  operator enables it deliberately after a live test. No restart-path change until
+  `=true`.
+- **History:**
+  - **2026-06-13:** Introduced with event-driven WS reinit
+    (`feat(broker): event-driven WS reinit on Zerodha session refresh`). Default
+    `false` — the cache-invalidation handler keeps its disconnect+drop behavior
+    until the operator sets `BROKER_SESSION_AUTO_RECONNECT_ENABLED=true` and
+    restarts once to load the new code.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
