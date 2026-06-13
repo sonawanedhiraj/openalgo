@@ -5,6 +5,28 @@ code-quality gates (`quality-gate.yml`, `ci.yml`, `ci-self-hosted.yml`,
 `security.yml`); see `docs/SYSTEM_MAP.md` → "CI / code-quality gate" for the gate
 catalog.
 
+## `quality-gate.yml` — two-job split (silent-drops + quality)
+
+Runs on PRs to `dev`/`main` and direct pushes to `dev`. As of 2026-06-14 it is
+split into **two jobs** because GitHub gates required status checks at the *job*
+level, not the step level:
+
+- **`silent-drops`** — the only job intended to be a **required check on `main`**
+  today. Deliberately minimal (checkout + uv + `uvx semgrep`) so it stays green
+  and fast; runs only the custom ERROR rules
+  (`.semgrep/silent-drops.yml --severity ERROR --error`) and blocks on any
+  finding. These are the 4 confirmed P0/P1 silent-drop findings.
+- **`quality`** — everything else (ruff, bandit, the WARNING heuristics, the
+  public `--config=auto` rulesets), currently **informational**. Ruff still
+  carries pre-existing debt, so this job is red on ruff; it will be **promoted
+  to required on `main` once the ruff debt clears** and the job is reliably
+  green. bandit and the public rulesets stay best-effort (`|| true`).
+
+The split was needed because the ruff debt kept the original single combined
+job red, which would have made the otherwise-green silent-drops check
+un-requireable. Both jobs fire on the same triggers — the split is purely about
+job granularity for branch protection, not about when the workflow runs.
+
 ## `code-direct-push-guard.yml` — direct-to-dev alert
 
 `dev` intentionally accepts direct pushes (parameter-log updates, the strategy

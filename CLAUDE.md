@@ -614,17 +614,33 @@ bandit + semgrep (ERROR-only) + detect-secrets + biome run on staged files.
 Enable locally: `uv pip install pre-commit && pre-commit install`.
 
 **CI** ([`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml)):
-runs on PRs to `dev`/`main` and pushes to `dev`. Ruff blocks; bandit and the
-public Semgrep rulesets (`--config=auto`) are best-effort (`|| true`); the custom
-ERROR rules block. **The custom-rule gate is now GREEN as of 2026-06-11
+runs on PRs to `dev`/`main` and pushes to `dev`. As of 2026-06-14 the workflow
+is split into **two jobs** because GitHub gates required status checks at the
+*job* level, not the step level:
+
+- **`silent-drops`** — the lone job intended to be a **required check on `main`**
+  today. Minimal by design (checkout + uv + `uvx semgrep`) so it stays green and
+  fast: it runs *only* the custom ERROR rules (`uvx semgrep --config
+  .semgrep/silent-drops.yml --severity ERROR --error services/ blueprints/
+  sandbox/ restx_api/`) and blocks on any finding.
+- **`quality`** — everything else (ruff, bandit, the WARNING heuristics, the
+  public `--config=auto` rulesets), currently **informational**. Ruff still
+  carries pre-existing debt from the 1535-error backlog, so this job is red on
+  ruff; it will be **promoted to a required check on `main` once the ruff debt
+  clears** and the job is reliably green. Within it, bandit and the public
+  Semgrep rulesets remain best-effort (`|| true`).
+
+The split was needed precisely because the ruff debt kept the single combined
+job red, which would have made the otherwise-green silent-drops check
+un-requireable. **The custom-rule gate is GREEN as of 2026-06-11
 (commit `5d27bd5d6`)** — all 4 P0/P1 findings are fixed (the rules' firing on
 the pre-fix tree was the proof they work; see
 [`audit/silent_drop_audit_2026-06-11.md`](audit/silent_drop_audit_2026-06-11.md),
 each finding marked RESOLVED). `uvx semgrep --config .semgrep/silent-drops.yml
 services/ blueprints/ sandbox/ restx_api/ --severity ERROR` returns 0 findings,
-so required-status-checks can be enabled on `main`'s branch protection. Branch
-protection on `dev`/`main` is configured via the GitHub UI (cannot be automated
-from the CLI).
+so the `silent-drops` required-status-check can be enabled on `main`'s branch
+protection. Branch protection on `dev`/`main` is configured via the GitHub UI
+(cannot be automated from the CLI).
 
 GitHub Actions guard `code-direct-push-guard.yml` alerts on direct-to-dev code
 pushes — alert-only, no block. See `.github/workflows/README.md`.

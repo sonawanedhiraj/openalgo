@@ -408,10 +408,13 @@ in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.p
 ## CI / code-quality gate
 
 - **GitHub Action** `.github/workflows/quality-gate.yml` — runs on PRs to
-  `dev`/`main` and pushes to `dev`. Steps: ruff (blocking), bandit
-  (`|| true`, non-blocking), Semgrep custom rules ERROR (blocking) + WARNING
-  (informational), public Semgrep `--config=auto` (best-effort). CI pins Python
-  3.12 (no 3.14 eventlet wheels).
+  `dev`/`main` and pushes to `dev`. **Two jobs (split 2026-06-14):**
+  `silent-drops` (minimal — only the custom Semgrep ERROR rules; the **lone job
+  to be required on `main`**) and `quality` (ruff blocking + bandit `|| true` +
+  Semgrep WARNING informational + public `--config=auto` best-effort —
+  **informational** for now, promoted to required once ruff debt clears). Split
+  because GitHub gates required checks at the job level, and ruff debt keeps
+  `quality` red. CI pins Python 3.12 (no 3.14 eventlet wheels).
 - **Custom Semgrep rules** `.semgrep/silent-drops.yml` (6 rules) — silent-drop /
   partial-success anti-patterns. Rule catalog: `audit/silent_drop_audit_2026-06-11.md`.
   Run locally via `uvx semgrep` (NOT in the uv lockfile — version conflict; see

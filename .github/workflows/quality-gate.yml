@@ -1,5 +1,25 @@
 name: Quality gate
 
+# Two-job split (2026-06-14):
+#
+#   silent-drops — the custom Semgrep ERROR rules (the 4 confirmed P0/P1
+#     silent-drop findings). This is the ONLY job intended to be a REQUIRED
+#     status check on `main`'s branch protection today. It is kept deliberately
+#     minimal (checkout + uv + uvx semgrep) so it stays green and fast: GitHub
+#     gates status checks at the JOB level, not the step level, so the blocking
+#     rules need their own job to be required independently.
+#
+#   quality — everything else (ruff, bandit, the WARNING heuristics, the public
+#     Semgrep rulesets). INFORMATIONAL for now: ruff still has pre-existing debt
+#     from the 1535-error backlog (Phase 1-4 cleanup landed but did not finish
+#     it), so this job is currently red on ruff. It will be PROMOTED to a
+#     required check on `main` once the ruff debt is fully clear and the job is
+#     reliably green.
+#
+# Both jobs fire on the same triggers (PRs to dev/main, direct pushes to dev) —
+# the split is about job granularity for branch protection, not about when the
+# workflow runs.
+
 on:
   pull_request:
     branches: [dev, main]
@@ -7,7 +27,24 @@ on:
     branches: [dev]
 
 jobs:
+  silent-drops:
+    # The ONLY job that's required (or to-be-required) on main today.
+    # Stays minimal so it stays green: install uv, run the silent-drops ERROR
+    # rules via uvx semgrep (isolated tool env — semgrep is NOT in the project
+    # lockfile due to a dependency conflict).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Semgrep silent-drop rules (ERROR — blocking)
+        run: uvx semgrep --config .semgrep/silent-drops.yml --severity ERROR --error services/ blueprints/ sandbox/ restx_api/
+
   quality:
+    # Everything else — informational. Will be promoted to a required check on
+    # main once the ruff debt clears and this job is reliably green.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,12 +67,6 @@ jobs:
       # codebase. Tighten to blocking once the baseline is triaged.
       - name: Bandit (security — non-blocking)
         run: uv run --group dev bandit -r . -x .venv,frontend,test || true
-
-      # Custom silent-drop rules. semgrep runs via uvx (isolated tool env) — it
-      # is NOT in the project lockfile (dependency conflict). ERROR-severity
-      # rules (the 4 confirmed P0/P1 findings) are BLOCKING.
-      - name: Semgrep custom rules (ERROR — blocking)
-        run: uvx semgrep --config .semgrep/silent-drops.yml --severity ERROR --error services/ blueprints/ sandbox/ restx_api/
 
       # WARNING-severity heuristics — informational, never block.
       - name: Semgrep custom rules (WARNING — informational)
