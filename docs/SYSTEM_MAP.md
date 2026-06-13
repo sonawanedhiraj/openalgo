@@ -392,6 +392,13 @@ in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.p
 - **Pre-commit** `.pre-commit-config.yaml` — ruff, bandit, semgrep (ERROR-only),
   detect-secrets, biome on staged files. Enable: `uv pip install pre-commit &&
   pre-commit install`.
+- **GitHub Action** `.github/workflows/code-direct-push-guard.yml` — Telegram-alerts
+  the operator on a **direct** (non-PR-merge) push to `dev` that touches a runtime
+  code path (`services/`, `broker/`, `restx_api/`, `database/`, `blueprints/`,
+  `utils/`, `mcp/`, `websocket_proxy/`, `sandbox/`, `frontend/src/`, top-level
+  `app.py`, `bridge/`). **Alert-only — never blocks.** Doc/test/CI-only pushes and
+  PR-merge commits are exempt. Needs repo secrets `TELEGRAM_BOT_TOKEN` /
+  `TELEGRAM_CHAT_ID`. Details: `.github/workflows/README.md`.
 - Branch protection on `dev`/`main` is operator-enabled via the GitHub UI.
 
 ## Cross-references

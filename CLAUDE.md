@@ -621,6 +621,9 @@ fixed** (firing on them is the proof the rules work) — fix them, or run with
 `--baseline-commit <sha>` to defer to new violations only. Branch protection on
 `dev`/`main` is enabled via the GitHub UI (cannot be automated from the CLI).
 
+GitHub Actions guard `code-direct-push-guard.yml` alerts on direct-to-dev code
+pushes — alert-only, no block. See `.github/workflows/README.md`.
+
 ## Test DB isolation — pytest can NEVER write to the live databases
 
 Every `database/*.py` module binds its SQLAlchemy `engine` to
