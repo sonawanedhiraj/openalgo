@@ -594,6 +594,13 @@ passes the `CI (self-hosted)` workflow. Each entry follows a real PR run.
 - **2026-06-13** — Re-verified after fixing the CI env-var gates (dev
   `2707d824e`): `gate` was aborting on the default `REDIRECT_URL` placeholder
   copied from `.sample.env`, and `backend-test` was erroring at pytest
-  collection on an unset `API_KEY_PEPPER`. With both fixed, runner pickup and
-  the full self-hosted pipeline were validated via PR
-  [#5](https://github.com/sonawanedhiraj/openalgo/pull/5) (`chore/runner-smoke-2`).
+  collection on an unset `API_KEY_PEPPER`. A latent
+  `master_contract_status_db` dir-less-path crash (surfaced once the pepper
+  error cleared) was also fixed. With all three fixed, runner pickup and the
+  full self-hosted pipeline were validated via PR
+  [#5](https://github.com/sonawanedhiraj/openalgo/pull/5) (`chore/runner-smoke-2`,
+  squash-merged as `03bef6380`). Green self-hosted run:
+  [27456443198](https://github.com/sonawanedhiraj/openalgo/actions/runs/27456443198)
+  — `gate`, `backend-test`, `backend-lint`, `security-scan` all pass. (The
+  separate GitHub-hosted `Quality gate` workflow remains red on the pre-existing
+  repo-wide ruff / Semgrep debt — tracked as its own cleanup, out of scope here.)
