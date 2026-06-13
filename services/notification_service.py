@@ -58,6 +58,7 @@ _EVENT_TYPES = (
     "anomaly_alert",
     "eod_watchdog",
     "veto_decision",
+    "task_complete",
 )
 
 _SEVERITY_PREFIX = {
@@ -152,6 +153,14 @@ class NotificationService:
             # ON — the operator wants the parity verdict each trading day. See
             # services/scanner_comparison_eod_service.py.
             "scanner_comparison": _env_bool("NOTIFY_SCANNER_COMPARISON", default=True),
+            # Generic "background code task finished" push. Default ON — used by
+            # spawned code tasks to confirm completion to the operator. Routes
+            # through the same Telegram path (no batching); the caller supplies
+            # the already-formatted terse summary as the message. Registering it
+            # here is what stops notify("task_complete", …) from being dropped at
+            # the unknown-event-type gate (the prior warn-and-drop behavior that
+            # forced tasks to fall back to direct Bot API calls).
+            "task_complete": _env_bool("NOTIFY_TASK_COMPLETE", default=True),
         }
         # Preflight-abort alert de-duplication state (2026-06-03 incident: a
         # 14s DNS blip produced 14 identical "🛑 Preflight aborted" alerts as

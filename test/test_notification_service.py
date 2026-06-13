@@ -247,6 +247,53 @@ def test_notify_unknown_event_type_logs_warning(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# task_complete event type: spawned code tasks push a completion summary via
+# notify("task_complete", …). Before registration it hit the unknown-event
+# gate and was dropped (forcing tasks to fall back to direct Bot API calls).
+# ---------------------------------------------------------------------------
+
+
+def test_notify_task_complete_routes_through_telegram(monkeypatch, caplog):
+    """task_complete is registered → it sends, never warns-and-drops."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    with caplog.at_level(logging.WARNING):
+        svc.notify("task_complete", "all follow-ups landed")
+
+    assert len(bot.sent) == 1
+    message, filters = bot.sent[0]
+    assert "all follow-ups landed" in message
+    assert filters == {"notifications_enabled": True}
+    # The defining bug: it must NOT trip the unknown-event-type drop path.
+    assert not any("unknown event_type" in rec.message for rec in caplog.records)
+
+
+def test_notify_task_complete_enabled_by_default(monkeypatch):
+    """With no NOTIFY_TASK_COMPLETE override, the per-event toggle defaults ON."""
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+    assert svc.per_event["task_complete"] is True
+
+
+def test_notify_task_complete_respects_per_event_toggle(monkeypatch):
+    """NOTIFY_TASK_COMPLETE=false silences task_complete without affecting others."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(
+        monkeypatch,
+        NOTIFY_TELEGRAM_ENABLED="true",
+        NOTIFY_TASK_COMPLETE="false",
+    )
+
+    svc.notify("task_complete", "should be silent")
+    svc.notify("cycle_summary", "should fire")
+
+    assert len(bot.sent) == 1
+    assert "should fire" in bot.sent[0][0]
+
+
+# ---------------------------------------------------------------------------
 # Convenience-publisher formatting
 # ---------------------------------------------------------------------------
 

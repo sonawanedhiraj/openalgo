@@ -39,6 +39,28 @@ the latest decisions automatically.
   `allow_unsafe_werkzeug` or Py3.12. `pyproject.toml` already requires
   `>=3.12`; this file makes uv's default match that floor.
 
+### Notifications — task_complete event
+
+#### NOTIFY_TASK_COMPLETE
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_TASK_COMPLETE", default=True)`)
+- **Code default:** `true`
+- **What it gates:** the per-event toggle for the `task_complete` notification
+  event. When `true`, `notify("task_complete", summary)` routes through the same
+  Telegram path as other events (legacy outbound bot → Phase 6 inbound fallback);
+  when `false`, those pushes are silently suppressed (master switch
+  `NOTIFY_TELEGRAM_ENABLED` still applies on top).
+- **Why (2026-06-13):** `task_complete` was never a registered event type, so
+  every `notify("task_complete", …)` hit the unknown-event-type gate and was
+  warned-and-dropped — forcing spawned code tasks to fall back to direct Telegram
+  Bot API calls. Registering the event type (with this toggle, default ON) makes
+  the documented completion-push path actually deliver.
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_task_complete_routes_through_telegram`,
+  `test_notify_task_complete_enabled_by_default`,
+  `test_notify_task_complete_respects_per_event_toggle`).
+
 ### Strategy control — unified daily intent
 
 #### STRATEGY_DAILY_INTENT_ENABLED
