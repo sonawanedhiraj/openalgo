@@ -5,7 +5,10 @@
 import os
 
 from broker.deltaexchange.api.baseurl import BASE_URL, get_auth_headers
-from broker.deltaexchange.mapping.margin_data import parse_margin_response, transform_margin_positions
+from broker.deltaexchange.mapping.margin_data import (
+    parse_margin_response,
+    transform_margin_positions,
+)
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
@@ -167,7 +170,7 @@ def calculate_margin_api(positions, auth):
             failed.append(str(product_id))
 
     if ok_count == 0:
-        msg = f"Margin calculation failed for all positions."
+        msg = "Margin calculation failed for all positions."
         if failed:
             msg += f" Failed product_ids: {', '.join(failed)}"
         return MockResponse(500), {"status": "error", "message": msg}

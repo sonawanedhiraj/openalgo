@@ -43,7 +43,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # one's socket. Both connect() and _on_close funnel through
         # _start_reconnect, which respects this flag.
         self._reconnecting = False
-        self._reconnect_thread: Optional[threading.Thread] = None
+        self._reconnect_thread: threading.Thread | None = None
         # Interruptible-sleep handle for the retry backoff. disconnect()
         # sets this so we don't keep retrying for up to 60s after the
         # adapter has been asked to shut down.
@@ -62,8 +62,8 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # which drains the queue and sends one JSON-array frame to Paytm.
         # This cuts wire chatter when many symbols are subscribed in quick
         # succession (e.g. a watchlist load).
-        self.subscription_queue: List[dict] = []
-        self.batch_timer: Optional[threading.Timer] = None
+        self.subscription_queue: list[dict] = []
+        self.batch_timer: threading.Timer | None = None
         self.batch_delay = 0.5  # seconds
 
     def initialize(

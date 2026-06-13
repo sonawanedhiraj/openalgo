@@ -14,17 +14,17 @@ Architecture:
 """
 import json
 import logging
+import os
+
+# Import the Nubra protobuf definitions (copied from SDK)
+import sys
 import threading
 import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import websocket
-
 from google.protobuf.any_pb2 import Any as ProtoAny
 
-# Import the Nubra protobuf definitions (copied from SDK)
-import sys
-import os
 # Add broker/nubra to sys.path so protos package is importable
 _nubra_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if _nubra_dir not in sys.path:
@@ -67,19 +67,19 @@ class NubraWebSocket:
         self.bt = auth_token
         self.device_id = device_id
         self.url = WS_URL
-        self.ws: Optional[websocket.WebSocketApp] = None
-        
+        self.ws: websocket.WebSocketApp | None = None
+
         # Thread management
-        self.wst: Optional[threading.Thread] = None
+        self.wst: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
-        
+
         # Data caches (thread-safe by GIL)
-        self.last_quotes: Dict[Tuple[str, str], dict] = {}
-        self.last_depth: Dict[int, dict] = {}
-        
+        self.last_quotes: dict[tuple[str, str], dict] = {}
+        self.last_depth: dict[int, dict] = {}
+
         # Track subscriptions for reconnect
-        self.subscriptions_batch: Set[Tuple] = set()
+        self.subscriptions_batch: set[tuple] = set()
 
     @property
     def is_connected(self) -> bool:
@@ -170,9 +170,9 @@ class NubraWebSocket:
                 symbols = item[0]
                 data_type = item[1]
                 exchange = item[2]
-                
+
                 symbols_list = list(symbols)
-                
+
                 if data_type == "index":
                     self._send_subscribe_batch(
                         data_type="index",
@@ -231,22 +231,22 @@ class NubraWebSocket:
         try:
             wrapper = ProtoAny()
             wrapper.ParseFromString(raw)
-            
+
             inner = ProtoAny()
             inner.ParseFromString(wrapper.value)
-            
+
             logger.info(f"Received Protobuf Message: {inner.type_url}")
 
             if inner.type_url.endswith("BatchWebSocketIndexMessage"):
                 msg = nubrafrontend_pb2.BatchWebSocketIndexMessage()
                 inner.Unpack(msg)
                 self._process_index_batch(msg)
-                
+
             elif inner.type_url.endswith("BatchWebSocketOrderbookMessage"):
                 msg = nubrafrontend_pb2.BatchWebSocketOrderbookMessage()
                 inner.Unpack(msg)
                 self._process_orderbook_batch(msg)
-            
+
             elif inner.type_url.endswith("BatchWebSocketIndexBucketMessage"):
                 msg = nubrafrontend_pb2.BatchWebSocketIndexBucketMessage()
                 inner.Unpack(msg)
@@ -263,7 +263,7 @@ class NubraWebSocket:
     def _process_index_batch(self, msg):
         if len(msg.indexes) > 0:
             logger.info(f"Received {len(msg.indexes)} index updates: {[i.indexname for i in msg.indexes]}")
-        
+
         for obj in msg.indexes:
             self._cache_index_data(obj)
         for obj in msg.instruments:
@@ -274,15 +274,15 @@ class NubraWebSocket:
         name = obj.indexname if obj.indexname else ""
         if not name:
             return
-        
+
         # Normalize name to upercase for consistent caching
         name = name.upper()
-        
+
         # Apply standard mapping (e.g. "NIFTY 50" -> "NIFTY")
         # Because we subscribe with "NIFTY" but receive data as "Nifty 50"
         if name in INDEX_NAME_MAP:
             name = INDEX_NAME_MAP[name]
-        
+
         if "NIFTY" in name:
              logger.info(f"Caching index: name={name}, exch={exchange}, val={obj.index_value}")
 
@@ -316,7 +316,7 @@ class NubraWebSocket:
         ref_id = obj.ref_id if obj.ref_id else 0
         inst_id = obj.inst_id if obj.inst_id else 0
         logger.info(f"Orderbook data received: inst_id={inst_id}, ref_id={ref_id}, bids={len(obj.bids)}, asks={len(obj.asks)}, ltp={obj.ltp}")
-        
+
         if not ref_id:
             if inst_id:
                 logger.warning(f"ref_id is 0, using inst_id={inst_id} as key")
@@ -383,7 +383,7 @@ class NubraWebSocket:
         """Process OHLVC candles (IndexBucket) and update quotes."""
         if len(msg.indexes) > 0:
              logger.info(f"Received {len(msg.indexes)} OHLVC updates")
-        
+
         for obj in msg.indexes:
             self._cache_ohlcv_data(obj)
         for obj in msg.instruments:
@@ -430,37 +430,37 @@ class NubraWebSocket:
 
     # ─── Public Methods ──────────────────────────────────────────────────
 
-    def subscribe_ohlcv(self, symbols: List[str], interval: str, exchange: str = "NSE") -> bool:
+    def subscribe_ohlcv(self, symbols: list[str], interval: str, exchange: str = "NSE") -> bool:
         """Subscribe to index_bucket (OHLVC) channel."""
         if not self.is_connected:
             return False
-            
+
         key = (tuple(symbols), "ohlcv", exchange, interval)
         self.subscriptions_batch.add(key)
-        
+
         return self._send_subscribe_batch("ohlcv", index_symbol=symbols, exchange=exchange, interval=interval)
 
-    def unsubscribe_ohlcv(self, symbols: List[str], interval: str, exchange: str = "NSE") -> bool:
+    def unsubscribe_ohlcv(self, symbols: list[str], interval: str, exchange: str = "NSE") -> bool:
         """Unsubscribe from index_bucket channel."""
         if not self.is_connected:
             return False
-            
+
         key = (tuple(symbols), "ohlcv", exchange, interval)
         self.subscriptions_batch.discard(key)
-        
+
         return self._send_unsubscribe_batch("ohlcv", index_symbol=symbols, exchange=exchange, interval=interval)
 
-    def subscribe_index(self, symbols: List[str], exchange: str = "NSE") -> bool:
+    def subscribe_index(self, symbols: list[str], exchange: str = "NSE") -> bool:
         """Subscribe to index channel."""
         if not self.is_connected:
             return False
-            
+
         key = (tuple(symbols), "index", exchange)
         self.subscriptions_batch.add(key)
-        
+
         return self._send_subscribe_batch("index", index_symbol=symbols, exchange=exchange)
 
-    def unsubscribe_index(self, symbols: List[str], exchange: str = "NSE") -> bool:
+    def unsubscribe_index(self, symbols: list[str], exchange: str = "NSE") -> bool:
         """Unsubscribe from index channel."""
         if not self.is_connected:
             return False
@@ -477,17 +477,17 @@ class NubraWebSocket:
 
         return self._send_unsubscribe_batch("index", index_symbol=symbols, exchange=exchange)
 
-    def subscribe_orderbook(self, ref_ids: List[int]) -> bool:
+    def subscribe_orderbook(self, ref_ids: list[int]) -> bool:
         """Subscribe to orderbook channel."""
         if not self.is_connected:
             return False
-            
+
         key = (tuple(str(r) for r in ref_ids), "orderbook", None)
         self.subscriptions_batch.add(key)
-        
+
         return self._send_subscribe_batch("orderbook", ref_ids=ref_ids)
 
-    def unsubscribe_orderbook(self, ref_ids: List[int]) -> bool:
+    def unsubscribe_orderbook(self, ref_ids: list[int]) -> bool:
         """Unsubscribe from orderbook channel."""
         if not self.is_connected:
             return False
@@ -497,7 +497,7 @@ class NubraWebSocket:
 
         return self._send_unsubscribe_batch("orderbook", ref_ids=ref_ids)
 
-    def subscribe_greeks(self, ref_ids: List[int]) -> bool:
+    def subscribe_greeks(self, ref_ids: list[int]) -> bool:
         """Subscribe to greeks channel (provides OI, IV, Greeks for options)."""
         if not self.is_connected:
             return False
@@ -507,7 +507,7 @@ class NubraWebSocket:
 
         return self._send_subscribe_batch("greeks", ref_ids=ref_ids)
 
-    def unsubscribe_greeks(self, ref_ids: List[int]) -> bool:
+    def unsubscribe_greeks(self, ref_ids: list[int]) -> bool:
         """Unsubscribe from greeks channel."""
         if not self.is_connected:
             return False
@@ -517,7 +517,7 @@ class NubraWebSocket:
 
         return self._send_unsubscribe_batch("greeks", ref_ids=ref_ids)
 
-    def get_quote(self, exchange: str, symbol: str) -> Optional[dict]:
+    def get_quote(self, exchange: str, symbol: str) -> dict | None:
         # Normalize symbol to upper
         symbol = symbol.upper()
         res = self.last_quotes.get((exchange, symbol))
@@ -525,7 +525,7 @@ class NubraWebSocket:
              logger.debug(f"get_quote failed for {exchange}:{symbol}. Available keys: {list(self.last_quotes.keys())}")
         return res
 
-    def get_market_depth(self, ref_id: int) -> Optional[dict]:
+    def get_market_depth(self, ref_id: int) -> dict | None:
         return self.last_depth.get(ref_id)
 
     def close(self):

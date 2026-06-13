@@ -1,8 +1,8 @@
 import json
 import os
-from tokenize import Token
 import threading
 import time
+from tokenize import Token
 
 import httpx
 

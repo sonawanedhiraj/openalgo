@@ -92,7 +92,7 @@ def _get_ticker(symbol: str) -> dict:
     result = data.get("result")
     if result is None:
         result = {}
-        
+
     # Guard: single-symbol endpoint must return a dict
     if not isinstance(result, dict):
         raise Exception(
@@ -433,7 +433,8 @@ class BrokerData:
             br_symbol  = self._get_br_symbol(symbol, exchange)
 
             # Normalize: accept datetime.date/datetime or str, avoid string roundtrip
-            from datetime import date as _date, time as _time
+            from datetime import date as _date
+            from datetime import time as _time
             if isinstance(start_date, str):
                 start_dt = datetime.strptime(start_date, "%Y-%m-%d")
             else:

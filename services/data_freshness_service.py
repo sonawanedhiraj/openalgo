@@ -101,7 +101,7 @@ def get_data_freshness(
         return {}
     import duckdb
 
-    out: dict[str, int | None] = {s: None for s in symbols}
+    out: dict[str, int | None] = dict.fromkeys(symbols)
     con = duckdb.connect(duckdb_path, read_only=True)
     try:
         placeholders = ", ".join(["?"] * len(symbols))

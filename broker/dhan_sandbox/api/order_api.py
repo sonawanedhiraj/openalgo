@@ -1,9 +1,9 @@
 import json
 import os
-
-import httpx
 import threading
 import time
+
+import httpx
 
 from broker.dhan_sandbox.api.baseurl import get_url
 from broker.dhan_sandbox.mapping.transform_data import (
@@ -220,7 +220,7 @@ def place_order_api(data, auth):
     }
     if client_id:
         headers["client-id"] = client_id
-        
+
     payload = json.dumps(newdata)
 
     logger.info(
@@ -419,7 +419,7 @@ def cancel_order(orderid, auth):
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    
+
     client_id = _get_dhan_client_id()
     if client_id:
         headers["client-id"] = client_id

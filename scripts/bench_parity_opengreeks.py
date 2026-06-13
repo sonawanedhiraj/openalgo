@@ -6,12 +6,11 @@ so we get apples-to-apples library timing and bit-level error metrics.
 """
 import json
 import time
-from typing import Callable
-
-import py_vollib.black.greeks.analytical as pyvg
-from py_vollib.black.implied_volatility import implied_volatility as pyv_iv
+from collections.abc import Callable
 
 import opengreeks.black76 as ogb
+import py_vollib.black.greeks.analytical as pyvg
+from py_vollib.black.implied_volatility import implied_volatility as pyv_iv
 
 BASELINE = "docs/benchmarks/greeks_baseline_pyvollib.json"
 OUT_JSON = "docs/benchmarks/greeks_parity_opengreeks.json"
@@ -95,11 +94,11 @@ def run_parity():
             ]:
                 try:
                     g_pyv = py_fn(flag, F, K, t, r, sigma)
-                except Exception as e:
+                except Exception:
                     g_pyv = None
                 try:
                     g_og = og_fn(flag, F, K, t, r, sigma)
-                except Exception as e:
+                except Exception:
                     g_og = None
                 row["greeks"][name] = {
                     "pyvollib": g_pyv,
@@ -227,7 +226,7 @@ def main():
     for r in speedup:
         print(f"{r['function']:<22}{r['pyvollib_us']:>16.3f}{r['opengreeks_us']:>18.3f}{r['speedup']:>11.1f}x")
 
-    print(f"\n=== chain refresh (40 options, IV+5 Greeks) ===")
+    print("\n=== chain refresh (40 options, IV+5 Greeks) ===")
     print(f"py_vollib  : {chain['pyvollib_median_ms']:.3f} ms")
     print(f"opengreeks : {chain['opengreeks_median_ms']:.3f} ms")
     print(f"speedup    : {chain['speedup']:.1f}x")

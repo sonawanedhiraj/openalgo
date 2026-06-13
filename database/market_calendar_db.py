@@ -711,7 +711,7 @@ def get_market_timings_for_date(query_date: date) -> list[dict[str, Any]]:
         return []
 
 
-def get_special_session(query_date: date, exchange: str) -> Optional[Dict[str, Any]]:
+def get_special_session(query_date: date, exchange: str) -> dict[str, Any] | None:
     """
     Return the SPECIAL_SESSION window for (date, exchange) if one exists and
     the exchange is marked open. Returns None otherwise.
@@ -767,7 +767,7 @@ def get_special_session(query_date: date, exchange: str) -> Optional[Dict[str, A
 
 def get_holiday_exchange_window(
     query_date: date, exchange: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Return the open-window for (date, exchange) when a TRADING_HOLIDAY row
     explicitly leaves this exchange open with custom timings (e.g., MCX
@@ -822,7 +822,7 @@ def get_holiday_exchange_window(
 
 def get_effective_session_window(
     query_date: date, exchange: str
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Single source of truth for "what is the trading window for <exchange> on
     <date>?".

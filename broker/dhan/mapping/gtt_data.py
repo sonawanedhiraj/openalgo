@@ -9,7 +9,6 @@ from broker.dhan.mapping.transform_data import (
 )
 from database.token_db import get_oa_symbol, get_token
 
-
 # Dhan Forever Order status → OpenAlgo GTT status.
 _STATUS_MAP = {
     "TRANSIT": "active",

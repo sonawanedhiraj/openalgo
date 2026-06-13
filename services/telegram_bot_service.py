@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from database.auth_db import get_username_by_apikey, get_broker_name
+from database.auth_db import get_broker_name, get_username_by_apikey
 
 # Database imports
 from database.telegram_db import (
@@ -135,7 +135,7 @@ class TelegramBotService:
         """
         import queue as _queue
 
-        result_q: "_queue.Queue[tuple[str, object]]" = _queue.Queue()
+        result_q: _queue.Queue[tuple[str, object]] = _queue.Queue()
 
         def _worker() -> None:
             try:
@@ -2425,7 +2425,7 @@ class TelegramBotService:
         # Handle mode toggle
         if callback_data in ("mode_live", "mode_analyze"):
             try:
-                from database.settings_db import set_analyze_mode, get_analyze_mode
+                from database.settings_db import get_analyze_mode, set_analyze_mode
 
                 new_mode = callback_data == "mode_analyze"
                 loop = asyncio.get_event_loop()

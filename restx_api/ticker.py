@@ -1,6 +1,7 @@
 import importlib
 import os
-from datetime import UTC, datetime, timedelta, timezone, date
+from datetime import UTC, date, datetime, timedelta, timezone
+from types import ModuleType
 
 import pandas as pd
 import pytz
@@ -13,10 +14,6 @@ from limiter import limiter
 from utils.logging import get_logger
 
 from .data_schemas import TickerSchema
-
-from types import ModuleType
-
-
 
 API_RATE_LIMIT = os.getenv("API_RATE_LIMIT", "10 per second")
 api = Namespace("ticker", description="Stock Ticker Data API")

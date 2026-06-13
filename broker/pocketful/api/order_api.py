@@ -1,8 +1,8 @@
 import json
-
-from flask import session
 import threading
 import time
+
+from flask import session
 
 from broker.pocketful.mapping.transform_data import (
     map_product_type,

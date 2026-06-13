@@ -1,7 +1,11 @@
 # Mapping OpenAlgo API Request https://openalgo.in/docs
 # RMoney XTS Margin Calculator API mappings
 
-from broker.rmoney.mapping.transform_data import map_exchange_numeric, map_order_type, map_product_type
+from broker.rmoney.mapping.transform_data import (
+    map_exchange_numeric,
+    map_order_type,
+    map_product_type,
+)
 from database.token_db import get_token
 from utils.logging import get_logger
 

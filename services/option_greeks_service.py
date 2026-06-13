@@ -282,10 +282,20 @@ def calculate_greeks(
         try:
             from opengreeks.black76 import (
                 delta as black_delta,
+            )
+            from opengreeks.black76 import (
                 gamma as black_gamma,
+            )
+            from opengreeks.black76 import (
                 implied_volatility as black_iv,
+            )
+            from opengreeks.black76 import (
                 rho as black_rho,
+            )
+            from opengreeks.black76 import (
                 theta as black_theta,
+            )
+            from opengreeks.black76 import (
                 vega as black_vega,
             )
         except ImportError:

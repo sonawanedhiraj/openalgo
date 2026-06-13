@@ -1,10 +1,10 @@
+import hashlib
 import json
 import logging
 import random
+import re
 import threading
 import time
-import re
-import hashlib
 from typing import Any, Dict
 
 from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
@@ -27,7 +27,7 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.running = False
         self._mock_thread = None
         self.lock = threading.Lock()
-        
+
         # State to keep track of current mock LTP for each symbol
         # so it fluctuates naturally instead of jumping wildly
         self._current_prices = {}
@@ -139,15 +139,15 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             self.running = True
             self.connected = True
-            
+
             # Start background thread to push mock market data
             self._mock_thread = threading.Thread(
-                target=self._mock_streaming_loop, 
+                target=self._mock_streaming_loop,
                 daemon=True,
                 name="DhanSandboxMockWS"
             )
             self._mock_thread.start()
-            
+
             logger.info("Mock WebSocket connected and streaming thread started")
 
     def disconnect(self) -> None:
@@ -157,19 +157,19 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         with self.lock:
             self.running = False
             self.connected = False
-            
-            # Note: The background daemon thread will naturally exit 
+
+            # Note: The background daemon thread will naturally exit
             # when self.running becomes False without needing join()
             self._mock_thread = None
             logger.info("Mock WebSocket disconnected")
-            
-    def subscribe(self, symbol: str, exchange: str, mode: int = 2, depth_level: int = 5) -> Dict[str, Any]:
+
+    def subscribe(self, symbol: str, exchange: str, mode: int = 2, depth_level: int = 5) -> dict[str, Any]:
         """
         Subscribe to market data for a symbol.
         """
         with self.lock:
             sub_key = f"{exchange}_{symbol}"
-            
+
             # Store subscription info (mimicking base behavior)
             self.subscriptions[sub_key] = {
                 "symbol": symbol,
@@ -177,34 +177,34 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 "mode": mode,
                 "depth_level": depth_level
             }
-            
+
             # Initialize a starting price if we haven't seen this symbol yet
             if sub_key not in self._current_prices:
                 self._current_prices[sub_key] = self._derive_reference_price(symbol)
-                
+
             logger.info(f"Mock Subscribed to {symbol} (Exchange: {exchange}, Mode: {mode})")
-            
+
             # Standard response format
             return {
                 "status": "success",
                 "message": f"Subscribed to {symbol}",
                 "broker": self.broker_name,
                 "exchange": exchange,
-                "supported_depth": 5, 
+                "supported_depth": 5,
                 "fallback_depth": 5
             }
 
-    def unsubscribe(self, symbol: str, exchange: str, mode: int = None) -> Dict[str, Any]:
+    def unsubscribe(self, symbol: str, exchange: str, mode: int = None) -> dict[str, Any]:
         """
         Unsubscribe from market data for a symbol.
         """
         with self.lock:
             sub_key = f"{exchange}_{symbol}"
-            
+
             if sub_key in self.subscriptions:
                 del self.subscriptions[sub_key]
                 logger.info(f"Mock Unsubscribed from {symbol} ({exchange})")
-                
+
             return {
                 "status": "success",
                 "message": f"Unsubscribed from {symbol}"
@@ -220,9 +220,9 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 # Iterate over a copy to avoid dictionary changed size during iteration
                 with self.lock:
                     subs = list(self.subscriptions.values())
-                
+
                 now_ms = int(time.time() * 1000)
-                
+
                 for sub in subs:
                     symbol = sub["symbol"]
                     exchange = sub["exchange"]
@@ -257,9 +257,9 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             max(current_price * 0.0025, 0.05),
                         )
                         new_price = max(0.05, current_price + step)
-                        
+
                     self._current_prices[sub_key] = new_price
-                    
+
                     # Create mock data object matching OpenAlgo normalized format
                     market_data = {
                         "symbol": symbol,
@@ -269,7 +269,7 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         "ltp": round(new_price, 2),
                         "ltt": now_ms,
                     }
-                    
+
                     # Add extra fields for quote/depth modes
                     if mode >= 2:
                         market_data.update({
@@ -284,7 +284,7 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             "total_buy_quantity": random.randint(5000, 100000),
                             "total_sell_quantity": random.randint(5000, 100000)
                         })
-                    
+
                     # Add depth for depth mode
                     if mode >= 3:
                         market_data["depth"] = {
@@ -295,16 +295,16 @@ class Dhan_sandboxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                                 {"price": round(new_price + (0.05 * i), 2), "quantity": random.randint(10, 500), "orders": random.randint(1, 10)} for i in range(1, 6)
                             ]
                         }
-                    
+
                     # Generate topic matching broker format
                     mode_str = {1: "LTP", 2: "QUOTE", 3: "DEPTH", 4: "DEPTH", 5: "DEPTH"}.get(mode, "QUOTE")
                     topic = f"{exchange}_{symbol}_{mode_str}"
-                    
+
                     # Publish data using BaseBrokerWebSocketAdapter method
                     self.publish_market_data(topic, market_data)
-                    
+
             except Exception as e:
                 logger.error(f"Error in mock streaming loop: {e}", exc_info=True)
-                
+
             # Sleep 1 second before generating next tick
             time.sleep(1.0)

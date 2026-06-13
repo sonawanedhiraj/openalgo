@@ -511,6 +511,7 @@ def active_sessions_list():
     """Get all active sessions for the security dashboard."""
     try:
         from flask import session
+
         from database.auth_db import get_active_sessions
 
         username = session.get("user")

@@ -291,7 +291,7 @@ def process_zebu_nfo_data(output_path):
 
     # Apply the expiry date format
     #  df["expiry"] = df["expiry"].apply(format_expiry_date)
-    
+
     # First convert string to datetime object using the original format '15-APR-2026'
     df['expiry'] = pd.to_datetime(df['expiry'], format='%d-%b-%Y', errors='coerce')
     # Format the datetime object to the desired format '15-APR-26'
@@ -413,7 +413,7 @@ def process_zebu_cds_data(output_path):
 
     # Apply the expiry date format
     #  df["expiry"] = df["expiry"].apply(format_expiry_date)
-    
+
     # First convert string to datetime object using the original format '15-APR-2026'
     df['expiry'] = pd.to_datetime(df['expiry'], format='%d-%b-%Y', errors='coerce')
     # Format the datetime object to the desired format '15-APR-26'
@@ -537,7 +537,7 @@ def process_zebu_mcx_data(output_path):
 
     # Apply the expiry date format
     #  df["expiry"] = df["expiry"].apply(format_expiry_date)
-    
+
     # First convert string to datetime object using the original format '15-APR-2026'
     df['expiry'] = pd.to_datetime(df['expiry'], format='%d-%b-%Y', errors='coerce')
     # Format the datetime object to the desired format '15-APR-26'

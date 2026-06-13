@@ -6,10 +6,10 @@ from marshmallow import ValidationError
 
 from database.settings_db import get_analyze_mode
 from events import OrderFailedEvent
-from utils.event_bus import bus
 from limiter import limiter
 from restx_api.schemas import ClosePositionSchema
 from services.close_position_service import close_position, emit_analyzer_error
+from utils.event_bus import bus
 from utils.logging import get_logger
 
 API_RATE_LIMIT = os.getenv("API_RATE_LIMIT", "10 per second")

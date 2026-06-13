@@ -205,7 +205,7 @@ class BrokerSymbolCache:
             ist_today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
             # Tiny memo for repeated expiry strings (~thousands of FUT rows share
             # a few dozen distinct dates); strptime is cheap but not free.
-            _expiry_date_cache: dict[str, "datetime.date | None"] = {}
+            _expiry_date_cache: dict[str, datetime.date | None] = {}
 
             def _exp_to_date(exp_str):
                 if not exp_str:

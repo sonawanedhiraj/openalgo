@@ -152,14 +152,15 @@ def get_order_book(auth):
     """Fetch all orders for today (open + history) for UI display."""
     try:
         from datetime import datetime
+
         import pytz
-        
+
         # Get today's date in IST
         ist = pytz.timezone("Asia/Kolkata")
         today_date = datetime.now(ist).date()
-        
+
         all_orders = []
-        
+
         # 1. Fetch open orders
         open_result = get_api_response("/v2/orders", auth, method="GET", params={"state": "open"})
         logger.debug(f"[DeltaExchange] /v2/orders (open) count={len(open_result.get('result', []))}")
@@ -171,7 +172,7 @@ def get_order_book(auth):
         logger.debug(f"[DeltaExchange] /v2/orders/history count={len(hist_result.get('result', []))}")
         if hist_result.get("success"):
             all_orders.extend(hist_result.get("result", []))
-            
+
         # Filter for today's orders only
         today_orders = []
         for order in all_orders:
@@ -185,7 +186,7 @@ def get_order_book(auth):
                         today_orders.append(order)
                 except Exception as e:
                     logger.warning(f"Error parsing date {created_at}: {e}")
-                    
+
         return today_orders
     except Exception as e:
         logger.error(f"[DeltaExchange] Exception in get_order_book: {e}")
@@ -196,12 +197,13 @@ def get_trade_book(auth):
     """Fetch closed / filled orders (fills) for today only."""
     try:
         from datetime import datetime
+
         import pytz
-        
+
         # Get today's date in IST
         ist = pytz.timezone("Asia/Kolkata")
         today_date = datetime.now(ist).date()
-        
+
         result = get_api_response("/v2/fills", auth, method="GET")
         logger.debug(f"[DeltaExchange] /v2/fills count={len(result.get('result', []))}")
         if result.get("success"):
@@ -219,7 +221,7 @@ def get_trade_book(auth):
                     except Exception as e:
                         logger.warning(f"Error parsing date {created_at}: {e}")
             return today_trades
-            
+
         logger.warning(f"[DeltaExchange] get_trade_book unexpected response: {result}")
         return []
     except Exception as e:

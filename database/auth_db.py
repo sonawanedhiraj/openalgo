@@ -260,6 +260,7 @@ class LoginAttempt(Base):
 def _now_ist():
     """Get current time in IST."""
     from datetime import datetime
+
     import pytz
     return datetime.now(pytz.timezone("Asia/Kolkata"))
 

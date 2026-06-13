@@ -24,8 +24,9 @@ from __future__ import annotations
 import os
 import secrets
 import time
+from collections.abc import Iterable
 from datetime import datetime, timedelta
-from typing import Iterable, NamedTuple
+from typing import NamedTuple
 
 from joserfc import jwt
 from joserfc.errors import JoseError

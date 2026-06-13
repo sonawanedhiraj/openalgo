@@ -31,7 +31,6 @@ from services.scan_hit_poster import (
 )
 from services.scanner_service import ScanHitEvent
 
-
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------

@@ -15,6 +15,11 @@ rule. The full tick→aggregator path is exercised elsewhere
 
 from __future__ import annotations
 
+# Reuse the happy/short synthetic frame builders from the Task 6 suite. The
+# test dir has no __init__, so load the sibling module by path rather than
+# relying on a particular pytest import mode.
+import importlib.util as _ilu
+import os as _os
 from datetime import datetime as _RealDateTime
 from unittest.mock import MagicMock, patch
 
@@ -23,12 +28,6 @@ import pytest
 import services.scan_rules.fno_intraday_buy_chartink as rulemod
 from services.scan_rules.fno_intraday_buy_chartink import rule
 from services.scanner_service import ScannerService
-
-# Reuse the happy/short synthetic frame builders from the Task 6 suite. The
-# test dir has no __init__, so load the sibling module by path rather than
-# relying on a particular pytest import mode.
-import importlib.util as _ilu
-import os as _os
 
 _bld_path = _os.path.join(_os.path.dirname(__file__), "test_fno_intraday_buy_chartink.py")
 _spec = _ilu.spec_from_file_location("_chartink_builders", _bld_path)

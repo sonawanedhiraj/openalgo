@@ -32,16 +32,15 @@ from utils.logging import get_logger
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
 
-from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
-
-from .nubra_mapping import NubraCapabilityRegistry, NubraExchangeMapper
-
 # Import the existing working Nubra WebSocket client
 from broker.nubra.api.nubrawebsocket import (
     INDEX_NAME_MAP,
     SUBSCRIPTION_MAP,
     NubraWebSocket,
 )
+from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter
+
+from .nubra_mapping import NubraCapabilityRegistry, NubraExchangeMapper
 
 logger = get_logger(__name__)
 
@@ -102,26 +101,26 @@ class NubraWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.lock = threading.Lock()
 
         # Subscription tracking
-        self.subscribed_symbols: Dict[str, dict] = {}  # "exchange:symbol" -> info
+        self.subscribed_symbols: dict[str, dict] = {}  # "exchange:symbol" -> info
 
         # Reverse maps for incoming data routing
         # Index channel: maps uppercased subscription name -> (symbol, exchange)
-        self.index_name_to_sub: Dict[str, Tuple[str, str]] = {}
+        self.index_name_to_sub: dict[str, tuple[str, str]] = {}
         # Orderbook channel: maps ref_id -> (symbol, exchange)
-        self.ref_id_to_symbol: Dict[int, Tuple[str, str]] = {}
+        self.ref_id_to_symbol: dict[int, tuple[str, str]] = {}
 
         # Track which modes each symbol is subscribed to
-        self.symbol_modes: Dict[str, Set[int]] = {}  # "exchange:symbol" -> {mode_ints}
+        self.symbol_modes: dict[str, set[int]] = {}  # "exchange:symbol" -> {mode_ints}
 
         # Track whether index channel is already subscribed per symbol
-        self.index_channel_subscribed: Set[str] = set()  # "exchange:symbol"
+        self.index_channel_subscribed: set[str] = set()  # "exchange:symbol"
         # Track whether orderbook channel is already subscribed per ref_id
-        self.orderbook_subscribed: Set[int] = set()  # ref_ids
+        self.orderbook_subscribed: set[int] = set()  # ref_ids
         # Track OHLCV subscriptions per nubra exchange
-        self.ohlcv_channel_subscribed: Set[str] = set()  # "exchange:symbol"
+        self.ohlcv_channel_subscribed: set[str] = set()  # "exchange:symbol"
 
         # Cache OHLCV open values keyed by uppercased symbol name
-        self.ohlcv_cache: Dict[str, dict] = {}  # "NAME" -> {"open": ..., "close": ...}
+        self.ohlcv_cache: dict[str, dict] = {}  # "NAME" -> {"open": ..., "close": ...}
 
         # Subscribe coalescing queue (issue #1366) — collects per-symbol
         # subscribe() calls into a 500ms window and dispatches batched SDK

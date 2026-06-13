@@ -317,7 +317,7 @@ class UpstoxWebSocketClient:
         """Process binary (protobuf) message"""
         try:
             data = self._decode_protobuf_to_dict(message)
-            self.logger.debug(f"Decoded protobuf message")
+            self.logger.debug("Decoded protobuf message")
             if self.callbacks.get("on_message"):
                 self.callbacks["on_message"](data)
         except Exception as e:
@@ -329,7 +329,7 @@ class UpstoxWebSocketClient:
             if isinstance(message, bytes):
                 message = message.decode("utf-8")
             data = json.loads(message)
-            self.logger.debug(f"Received JSON message")
+            self.logger.debug("Received JSON message")
 
             if data.get("status") == "failed" and data.get("error"):
                 method = data.get("method", "unknown")
@@ -366,7 +366,7 @@ class UpstoxWebSocketClient:
                 self.logger.error("No WebSocket URL in auth response")
                 return None
         except requests.Timeout:
-            self.logger.error(f"Timeout getting WebSocket authorization")
+            self.logger.error("Timeout getting WebSocket authorization")
             return None
         except Exception as e:
             self.logger.error(f"Failed to get WebSocket authorization: {e}")

@@ -3,7 +3,7 @@ import importlib
 from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
-from events import AnalyzerErrorEvent, OrderCancelledEvent, OrderCancelFailedEvent
+from events import AnalyzerErrorEvent, OrderCancelFailedEvent, OrderCancelledEvent
 from services.mode_service import EffectiveMode, resolve_effective_mode
 from utils.event_bus import bus
 from utils.logging import get_logger

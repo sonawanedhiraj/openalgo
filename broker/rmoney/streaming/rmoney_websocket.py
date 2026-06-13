@@ -404,7 +404,7 @@ class RMoneyWebSocketClient:
             self._http_session.close()
             self.logger.info("[CLEANUP] HTTP session closed")
 
-    def subscribe(self, correlation_id: str, mode: int, instruments: List[Dict]) -> None:
+    def subscribe(self, correlation_id: str, mode: int, instruments: list[dict]) -> None:
         """
         Subscribe to market data using XTS HTTP API.
 
@@ -488,7 +488,7 @@ class RMoneyWebSocketClient:
                     error_msg = f"[SUBSCRIBE] Failed - Status: {response.status_code}, Response: {response.text}"
                     # "Instrument Already Subscribed" is non-fatal (expected after reconnect)
                     if "Already Subscribed" in response.text or "e-session-0002" in response.text:
-                        self.logger.info(f"[SUBSCRIBE] Instrument already subscribed (non-fatal)")
+                        self.logger.info("[SUBSCRIBE] Instrument already subscribed (non-fatal)")
                         return
                     # Handle Invalid Token by re-authenticating and retrying once.
                     # This happens when data.py refreshes the feed token, which creates
@@ -545,7 +545,7 @@ class RMoneyWebSocketClient:
             self.logger.error(f"[SUBSCRIBE] Exception: {e}")
             raise
 
-    def unsubscribe(self, correlation_id: str, mode: int, instruments: List[Dict]) -> bool:
+    def unsubscribe(self, correlation_id: str, mode: int, instruments: list[dict]) -> bool:
         """
         Unsubscribe from market data using XTS HTTP API.
 

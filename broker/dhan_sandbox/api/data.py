@@ -1,10 +1,10 @@
+import hashlib
 import json
 import os
+import re
 import time
 import urllib.parse
 from datetime import datetime, timedelta
-import hashlib
-import re
 
 import httpx
 import jwt
@@ -599,7 +599,7 @@ class BrokerData:
                                     "volume": raw_vol,
                                     "oi": raw_oi,
                                 }
-                                
+
                                 # Inject mathematically sound realism so the Greeks engine (opengreeks) doesn't crash in standard services
                                 realistic_quote = self._apply_sandbox_mock_realism(
                                     symbol,
@@ -766,7 +766,7 @@ class BrokerData:
         day_low = min(valid_lows) if valid_lows else 0
         # Total volume = sum of all candle volumes
         total_volume = sum(int(float(v)) for v in volumes if v) if volumes else 0
-        
+
         # Deterministic dummy OI based on security_id for sandbox
         dummy_oi = int(hashlib.md5(str(security_id).encode()).hexdigest()[:8], 16) % 100000 + 1000
 
@@ -1005,7 +1005,7 @@ class BrokerData:
                 "ask": 0,
                 "prev_close": 0,
             }
-            
+
             # Inject mathematically sound realism so the Greeks engine (opengreeks) doesn't crash in standard services
             quote_seed = str(int(time.time() // 60))
             return self._apply_sandbox_mock_realism(symbol, quote, seed=quote_seed)

@@ -67,7 +67,7 @@ def calculate_margin_api(positions, auth):
 
         # Add status attribute for compatibility with the existing codebase
         response.status = response.status_code
-        
+
         # Log raw response for debugging
         logger.debug(f"Nubra margin raw response: {response.text}")
 

@@ -44,9 +44,9 @@ runs and unrelated tests never trigger the heavy import.
 
 # Pin the project-root sandbox package in sys.modules — see docstring (1).
 # Must happen at conftest module load, before pytest adds test/ to sys.path.
-import sandbox  # noqa: F401, E402
-
 import pytest
+
+import sandbox  # noqa: F401, E402
 
 
 @pytest.fixture(scope="session")

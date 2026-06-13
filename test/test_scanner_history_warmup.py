@@ -18,7 +18,6 @@ from services.historify_scheduler_service import (
     refresh_scanner_history,
 )
 
-
 # --------------------------------------------------------------- boot warm-up
 
 def test_run_boot_warmup_calls_refresh_once(monkeypatch):

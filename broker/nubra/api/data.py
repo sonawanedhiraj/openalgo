@@ -366,7 +366,7 @@ class BrokerData:
 
             # Get token (ref_id) for the symbol
             token = get_token(symbol, exchange)
-            
+
             if not token:
                 logger.warning(f"Could not find token for symbol {symbol} on {exchange}")
                 return None
@@ -382,10 +382,10 @@ class BrokerData:
             response = get_api_response(
                 f"/orderbooks/{token}?levels=1", self.auth_token, "GET"
             )
-            
+
             # Extract orderBook data from response
             orderbook = response.get("orderBook", {})
-            
+
             if not orderbook:
                 logger.warning(f"Empty orderbook response for {symbol} on {exchange}")
                 return None
@@ -394,7 +394,7 @@ class BrokerData:
             # Prices are in paise, need to convert to rupees (divide by 100)
             bids = orderbook.get("bid", [])
             asks = orderbook.get("ask", [])
-            
+
             bid_price = float(bids[0].get("p", 0)) / 100 if bids else 0
             ask_price = float(asks[0].get("p", 0)) / 100 if asks else 0
             ltp = float(orderbook.get("ltp", 0)) / 100
@@ -415,7 +415,7 @@ class BrokerData:
             # Propagate authentication errors
             if "Authentication failed" in str(e):
                 raise
-            
+
             logger.error(f"REST quote error for {symbol} on {exchange}: {str(e)}")
             return None
 
@@ -709,7 +709,7 @@ class BrokerData:
 
                 # Set start time to market open (09:15 IST -> 03:45 UTC)
                 chunk_start = current_start.replace(hour=3, minute=45, second=0, microsecond=0)
-                
+
                 # Set end time
                 current_time = pd.Timestamp.now()
                 if current_end.date() == current_time.date():
@@ -1028,7 +1028,7 @@ class BrokerData:
                 return None
 
             token = get_token(symbol, exchange)
-            
+
             if not token:
                 logger.warning(f"Could not find token for symbol {symbol} on {exchange}")
                 return None
@@ -1054,7 +1054,7 @@ class BrokerData:
             # Nubra format: {"p": price in paise, "q": quantity, "o": num_orders}
             bid_orders = orderbook.get("bid", [])
             ask_orders = orderbook.get("ask", [])
-            
+
             bids = []
             asks = []
 
@@ -1080,7 +1080,7 @@ class BrokerData:
 
             totalbuyqty = sum(bid.get("q", 0) for bid in bid_orders)
             totalsellqty = sum(ask.get("q", 0) for ask in ask_orders)
-            
+
             ltp = float(orderbook.get("ltp", 0)) / 100
             ltq = int(orderbook.get("ltq", 0))
             volume = int(orderbook.get("volume", 0))

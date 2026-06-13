@@ -35,7 +35,7 @@ def transform_margin_positions(positions):
     """
     transformed_orders = []
     skipped_positions = []
-    
+
     # We need to determine the exchange for the payload.
     # Assuming all positions in the basket are for the same exchange segment for now.
     # If mixed, we'll take the first one found.
@@ -45,10 +45,10 @@ def transform_margin_positions(positions):
         try:
             symbol = position["symbol"]
             exchange = position["exchange"]
-            
+
             if not primary_exchange:
                 primary_exchange = exchange
-            
+
             # Get the token for the symbol
             token = get_token(symbol, exchange)
 
@@ -64,7 +64,7 @@ def transform_margin_positions(positions):
                 logger.warning(f"Invalid token format for {symbol} ({exchange}): '{token_str}'")
                 skipped_positions.append(f"{symbol} ({exchange}) - invalid token: {token_str}")
                 continue
-                
+
             ref_id = int(float(token_str))
 
             # Map fields
@@ -73,7 +73,7 @@ def transform_margin_positions(positions):
             pricetype = position.get("pricetype", "MARKET")
             price_type = map_price_type(pricetype)
             order_type = map_order_type(pricetype)
-            
+
             price = float(position.get("price", 0))
             price_in_paise = int(round(price * 100)) if price else 0
 
@@ -109,7 +109,7 @@ def transform_margin_positions(positions):
 
     # Get default basket parameters from first order
     first_order = transformed_orders[0]
-    
+
     # Construct the final Nubra payload structure
     payload_data = {
         "with_portfolio": True,  # Critical for accurate calculation
@@ -127,7 +127,7 @@ def transform_margin_positions(positions):
             }
         }
     }
-    
+
     return payload_data
 
 
@@ -197,7 +197,7 @@ def parse_margin_response(response_data):
     try:
         if not response_data or not isinstance(response_data, dict):
             return {"status": "error", "message": "Invalid response from broker"}
-        
+
         # Nubra sometimes returns error code in response
         if response_data.get("code"):
              return {
@@ -211,7 +211,7 @@ def parse_margin_response(response_data):
         total_margin_required = float(response_data.get("total_margin", 0))
         span_margin = float(response_data.get("span", 0))
         exposure_margin = float(response_data.get("exposure", 0))
-        
+
         # Return standardized format match OpenAlgo API specification
         return {
             "status": "success",

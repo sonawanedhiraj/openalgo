@@ -189,11 +189,11 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
     positions = []
     if isinstance(positions_data, dict):
         portfolio = positions_data.get("portfolio", positions_data)
-        
+
         stock_positions = portfolio.get("stock_positions") or []
         fut_positions = portfolio.get("fut_positions") or []
         opt_positions = portfolio.get("opt_positions") or []
-        
+
         positions = stock_positions + fut_positions + opt_positions
     elif isinstance(positions_data, list):
         positions = positions_data
@@ -202,7 +202,7 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
         pos_exchange = position.get("exchange", "")
         pos_symbol = position.get("symbol", position.get("display_name", ""))
         ref_id = str(position.get("ref_id", ""))
-        
+
         # Map product type from Nubra format
         product = position.get("product", "")
         if product == "ORDER_DELIVERY_TYPE_CNC":
@@ -213,12 +213,12 @@ def get_open_position(tradingsymbol, exchange, producttype, auth):
             pos_producttype = "NRML"
         else:
             pos_producttype = product
-        
+
         # Check for matching position
         if pos_exchange == exchange and pos_producttype == producttype:
             # Match by symbol or ref_id
             symbol_from_db = get_symbol(ref_id, pos_exchange)
-            
+
             if symbol_from_db == tradingsymbol or pos_symbol == tradingsymbol:
                 # Nubra uses 'qty' for position quantity
                 qty = position.get("qty", position.get("quantity", 0)) or 0
@@ -238,24 +238,24 @@ def place_order_api(data, auth):
     """
     AUTH_TOKEN = auth
     device_id = "OPENALGO"  # Fixed device ID, same as auth_api.py
-    
+
     # Get token (ref_id) for the symbol
     token = get_token(data["symbol"], data["exchange"])
-    
+
     logger.info(f"Nubra order - Symbol: {data['symbol']}, Exchange: {data['exchange']}, Token: {token}")
-    
+
     # Transform OpenAlgo data to Nubra format
     nubra_data = transform_data(data, token)
-    
+
     headers = {
         "Authorization": f"Bearer {AUTH_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "x-device-id": device_id,
     }
-    
+
     payload = json.dumps(nubra_data)
-    
+
     logger.info(f"Nubra place order payload: {payload}")
 
     # Get the shared httpx client with connection pooling
@@ -307,7 +307,7 @@ def place_order_api(data, auth):
         orderid = None
         response_data["status"] = False
         response.status = response.status_code
-        
+
     return response, response_data, orderid
 
 
@@ -412,21 +412,21 @@ def close_all_positions(current_api_key, auth):
     AUTH_TOKEN = auth
 
     positions_response = get_positions(AUTH_TOKEN)
-    
+
     logger.info(f"Nubra positions response: {positions_response}")
 
     # Handle Nubra's response format - portfolio contains stock_positions, fut_positions, opt_positions
     positions = []
     if isinstance(positions_response, dict):
         portfolio = positions_response.get("portfolio", positions_response)
-        
+
         # Collect positions from all position types
         stock_positions = portfolio.get("stock_positions") or []
         fut_positions = portfolio.get("fut_positions") or []
         opt_positions = portfolio.get("opt_positions") or []
-        
+
         positions = stock_positions + fut_positions + opt_positions
-        
+
         if positions_response.get("error"):
             logger.warning(f"Nubra positions error: {positions_response}")
             return {"message": "Failed to fetch positions"}, 500
@@ -442,7 +442,7 @@ def close_all_positions(current_api_key, auth):
     for position in positions:
         # Get quantity - Nubra uses 'qty' in position data
         qty = int(position.get("qty", position.get("quantity", 0)) or 0)
-        
+
         # Skip if quantity is zero
         if qty == 0:
             continue
@@ -455,16 +455,16 @@ def close_all_positions(current_api_key, auth):
 
         # Get exchange from position
         exchange = position.get("exchange", "NSE")
-        
+
         # Get symbol from position - use 'symbol' field
         symbol = position.get("symbol", position.get("display_name", ""))
         ref_id = str(position.get("ref_id", ""))
-        
+
         # Try to get OpenAlgo symbol from database using ref_id
         oa_symbol = get_symbol(ref_id, exchange)
         if oa_symbol:
             symbol = oa_symbol
-        
+
         logger.info(f"Closing position - Symbol: {symbol}, Exchange: {exchange}, Qty: {quantity}, Action: {action}")
 
         # Map product type - Nubra uses 'product' like ORDER_DELIVERY_TYPE_CNC
@@ -592,10 +592,10 @@ def modify_order(data, auth):
     # Transform OpenAlgo data to Nubra modify order format
     # Note: token/ref_id is not needed for modify order
     transformed_data = transform_modify_order_data(data, None)
-    
+
     # Get order_id from the data
     orderid = data.get("orderid", "")
-    
+
     # Set up the request headers
     headers = {
         "Authorization": f"Bearer {AUTH_TOKEN}",
@@ -604,7 +604,7 @@ def modify_order(data, auth):
         "x-device-id": device_id,
     }
     payload = json.dumps(transformed_data)
-    
+
     logger.info(f"Nubra modify order payload: {payload}")
 
     # Make the POST request with 429 retry
@@ -674,7 +674,7 @@ def cancel_all_orders_api(data, auth):
 
     order_book_response = get_order_book(AUTH_TOKEN)
     # logger.info(f"{order_book_response}")
-    
+
     # Nubra returns a list directly, or could return error dict
     if isinstance(order_book_response, dict):
         if order_book_response.get("error"):
@@ -691,11 +691,11 @@ def cancel_all_orders_api(data, auth):
     # Filter orders that are in 'open' or 'pending' state
     # Nubra uses ORDER_STATUS_OPEN, ORDER_STATUS_PENDING
     open_statuses = [
-        "ORDER_STATUS_OPEN", 
+        "ORDER_STATUS_OPEN",
         "ORDER_STATUS_PENDING",
         "ORDER_STATUS_TRIGGER_PENDING",
     ]
-    
+
     orders_to_cancel = [
         order
         for order in orders

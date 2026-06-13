@@ -337,7 +337,7 @@ def run_tests(db_url, broker_name):
             print(f"  [FAIL] '{sym}' appears {count} times")
             total_fail += 1
     else:
-        print(f"  [PASS] No duplicate NSE_INDEX symbols")
+        print("  [PASS] No duplicate NSE_INDEX symbols")
         total_pass += 1
 
     # Test 5: Extra NSE_INDEX symbols - transformation detection
@@ -345,7 +345,7 @@ def run_tests(db_url, broker_name):
     extra_nse = nse_symbols - EXPECTED_NSE_INDEX_SYMBOLS
     if extra_nse:
         print(f"  Found {len(extra_nse)} extra symbols (not in OpenAlgo doc)")
-        print(f"  Checking if unlisted symbols were preserved (only basic cleanup applied):\n")
+        print("  Checking if unlisted symbols were preserved (only basic cleanup applied):\n")
         nse_transformed = []
         nse_preserved = []
         for sym in sorted(extra_nse):
@@ -430,7 +430,7 @@ def run_tests(db_url, broker_name):
             print(f"  [FAIL] '{sym}' appears {count} times")
             total_fail += 1
     else:
-        print(f"  [PASS] No duplicate BSE_INDEX symbols")
+        print("  [PASS] No duplicate BSE_INDEX symbols")
         total_pass += 1
 
     # Test 10: Extra BSE_INDEX symbols - transformation detection
@@ -438,7 +438,7 @@ def run_tests(db_url, broker_name):
     extra_bse = bse_symbols - EXPECTED_BSE_INDEX_SYMBOLS
     if extra_bse:
         print(f"  Found {len(extra_bse)} extra symbols (not in OpenAlgo doc)")
-        print(f"  Checking if unlisted symbols were preserved (only basic cleanup applied):\n")
+        print("  Checking if unlisted symbols were preserved (only basic cleanup applied):\n")
         bse_transformed = []
         bse_preserved = []
         for sym in sorted(extra_bse):
@@ -523,7 +523,7 @@ def run_tests(db_url, broker_name):
     elif total_warn > 0:
         print(f"  RESULT: PASSED with warnings ({total_warn} missing optional symbols)")
     else:
-        print(f"  RESULT: ALL PASSED")
+        print("  RESULT: ALL PASSED")
 
     return total_fail == 0
 

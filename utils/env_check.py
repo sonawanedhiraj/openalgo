@@ -79,7 +79,7 @@ def check_tmp_noexec() -> None:
         return
 
     try:
-        with open('/proc/mounts', 'r') as f:
+        with open('/proc/mounts') as f:
             for line in f:
                 parts = line.split()
                 if len(parts) >= 4 and parts[1] == '/tmp':
@@ -98,7 +98,7 @@ def check_tmp_noexec() -> None:
                         print("   2. Or set NUMBA_DISABLE_JIT=1 in your .env file")
                         print("=" * 70 + "\n")
                     return
-    except (OSError, IOError):
+    except OSError:
         pass  # Can't read /proc/mounts, skip the check
 
 
@@ -303,7 +303,7 @@ def _atomic_rewrite_dotenv(env_path: str, pairs: list) -> None:
             file lock on Windows, permission denied, etc.). Caller surfaces
             this with a manual-rotation instruction.
     """
-    with open(env_path, "r", encoding="utf-8", newline="") as f:
+    with open(env_path, encoding="utf-8", newline="") as f:
         content = f.read()
     for old, new in pairs:
         content = content.replace(old, new)
@@ -525,7 +525,7 @@ def _ensure_fernet_salt(env_path: str) -> None:
 
     # Read the .env so we can decide based on placement, not just env value.
     try:
-        with open(env_path, "r", encoding="utf-8", newline="") as f:
+        with open(env_path, encoding="utf-8", newline="") as f:
             content = f.read()
     except OSError:
         return
@@ -605,6 +605,7 @@ def _ensure_fernet_salt(env_path: str) -> None:
     # confirming the DB doesn't look like a previous-rotation orphan.
     try:
         import base64
+
         from cryptography.fernet import Fernet, InvalidToken
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
@@ -774,6 +775,7 @@ def _migrate_fernet_db(env_path: str, pepper: str, new_salt: str) -> None:
     """
     try:
         import base64
+
         from cryptography.fernet import Fernet, InvalidToken
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC

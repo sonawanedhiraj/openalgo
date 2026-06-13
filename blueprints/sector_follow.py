@@ -85,7 +85,7 @@ def data_health():
     if not _authed():
         return _unauthorized()
     try:
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta, timezone
 
         from services.data_freshness_service import check_strategy_data_ready
 

@@ -7,10 +7,10 @@ from marshmallow import ValidationError
 
 from database.settings_db import get_analyze_mode
 from events import OrderFailedEvent
-from utils.event_bus import bus
 from limiter import limiter
 from restx_api.schemas import BasketOrderSchema
 from services.basket_order_service import emit_analyzer_error, place_basket_order
+from utils.event_bus import bus
 from utils.logging import get_logger
 
 API_RATE_LIMIT = os.getenv("API_RATE_LIMIT", "10 per second")

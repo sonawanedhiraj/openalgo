@@ -13,21 +13,21 @@ Authentication:
 
 import json
 import logging
+import os
+import sys
 import threading
 import time
 from typing import Any
 
-from broker.deltaexchange.streaming.delta_websocket import DeltaWebSocket
 from broker.deltaexchange.streaming.delta_mapping import (
     DeltaCapabilityRegistry,
     DeltaExchangeMapper,
     DeltaModeMapper,
 )
+from broker.deltaexchange.streaming.delta_websocket import DeltaWebSocket
 from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol
 
-import sys
-import os
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../../"))
 
 from websocket_proxy.base_adapter import BaseBrokerWebSocketAdapter

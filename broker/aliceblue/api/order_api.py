@@ -1,9 +1,9 @@
 import json
 import os
-
-import httpx
 import threading
 import time
+
+import httpx
 
 from broker.aliceblue.mapping.order_data import (
     normalize_holding,

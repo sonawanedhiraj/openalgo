@@ -19,7 +19,6 @@ import logging
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Recording fake (mirrors test_notification_service._RecordingBot).
 # ---------------------------------------------------------------------------

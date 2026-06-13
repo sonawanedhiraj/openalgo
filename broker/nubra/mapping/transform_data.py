@@ -28,12 +28,12 @@ def transform_data(data, token):
     # Convert price from rupees to paise (multiply by 100)
     price = float(data.get("price", 0))
     price_in_paise = int(round(price * 100)) if price else 0
-    
+
     trigger_price = float(data.get("trigger_price", 0))
     trigger_price_in_paise = int(round(trigger_price * 100)) if trigger_price else 0
-    
+
     pricetype = data.get("pricetype", "MARKET")
-    
+
     # Determine validity type based on price type
     # MARKET and SL-M orders require IOC (Immediate or Cancel)
     # LIMIT and SL orders use DAY validity
@@ -41,7 +41,7 @@ def transform_data(data, token):
         validity_type = "IOC"
     else:
         validity_type = "DAY"
-    
+
     # Build the transformed data structure for Nubra API
     transformed = {
         "ref_id": int(token),  # Instrument reference ID from token
@@ -54,7 +54,7 @@ def transform_data(data, token):
         "order_price": price_in_paise,
         "tag": data.get("strategy", "openalgo"),
     }
-    
+
     # Add algo_params for stoploss orders
     if pricetype in ["SL", "SL-M"]:
         transformed["algo_params"] = {
@@ -65,7 +65,7 @@ def transform_data(data, token):
         # actual execution happens at market price since price_type is MARKET
         if pricetype == "SL-M" and not price_in_paise:
             transformed["order_price"] = trigger_price_in_paise
-    
+
     return transformed
 
 
@@ -82,12 +82,12 @@ def transform_modify_order_data(data, token):
     """
     price = float(data.get("price", 0))
     price_in_paise = int(round(price * 100)) if price else 0
-    
+
     trigger_price = float(data.get("trigger_price", 0))
     trigger_price_in_paise = int(round(trigger_price * 100)) if trigger_price else 0
-    
+
     pricetype = data.get("pricetype", "MARKET")
-    
+
     # Build payload per Nubra API requirements
     # order_id is passed in URL, not in payload
     transformed = {
@@ -96,13 +96,13 @@ def transform_modify_order_data(data, token):
         "exchange": data["exchange"],  # Compulsory field
         "order_type": map_order_type(pricetype),
     }
-    
+
     # Add algo_params for stoploss orders (trigger_price is compulsory for stoploss)
     if pricetype in ["SL", "SL-M"]:
         transformed["algo_params"] = {
             "trigger_price": trigger_price_in_paise
         }
-    
+
     return transformed
 
 

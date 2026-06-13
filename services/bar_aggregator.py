@@ -28,7 +28,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from utils.event_bus import Event, bus as _default_bus
+from utils.event_bus import Event
+from utils.event_bus import bus as _default_bus
 from utils.logging import get_logger
 
 logger = get_logger(__name__)

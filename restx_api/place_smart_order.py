@@ -6,10 +6,10 @@ from marshmallow import ValidationError
 
 from database.settings_db import get_analyze_mode
 from events import OrderFailedEvent
-from utils.event_bus import bus
 from limiter import limiter
 from restx_api.schemas import SmartOrderSchema
 from services.place_smart_order_service import emit_analyzer_error, place_smart_order
+from utils.event_bus import bus
 from utils.logging import get_logger
 
 SMART_ORDER_RATE_LIMIT = os.getenv("SMART_ORDER_RATE_LIMIT", "10 per second")

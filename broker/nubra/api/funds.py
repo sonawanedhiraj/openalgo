@@ -52,7 +52,7 @@ def get_margin_data(auth_token):
         # Map Nubra fields to OpenAlgo standard format
         try:
             # Nubra API returns values in paise, convert to rupees by dividing by 100
-            
+
             # Available cash - using net_margin_available as available funds
             availablecash = float(data.get("net_margin_available", 0) or 0) / 100
 

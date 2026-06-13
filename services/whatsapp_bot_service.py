@@ -907,10 +907,12 @@ class WhatsAppBotService:
         cfg = get_bot_config()
         if cfg.get("own_jid"):
             return
-        from database.whatsapp_db import save_session_blob  # local to avoid cycle
         # We don't want to re-encrypt the blob — there's no API for
         # "update identity only". Cheapest path: a tiny dedicated DB helper.
-        from database.whatsapp_db import _persist_owner_identity  # noqa: E501
+        from database.whatsapp_db import (
+            _persist_owner_identity,  # noqa: E501
+            save_session_blob,  # local to avoid cycle
+        )
 
         try:
             _persist_owner_identity(sender_jid, jid_to_phone(sender_jid))

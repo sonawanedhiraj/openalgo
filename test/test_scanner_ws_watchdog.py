@@ -8,8 +8,8 @@ broker, WebSocket, or wall-clock dependency.
 from datetime import datetime
 
 from services.scanner_ws_watchdog import (
-    ScannerWsWatchdog,
     _IST,
+    ScannerWsWatchdog,
     _default_market_open,
 )
 

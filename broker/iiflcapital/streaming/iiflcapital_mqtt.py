@@ -141,7 +141,7 @@ class IiflMqttClient:
 
         # Callbacks. All are optional; missing ones are simply skipped.
         self.on_connect: Callable[[int, str], None] | None = None
-        self.on_disconnect: Callable[[Optional[Exception]], None] | None = None
+        self.on_disconnect: Callable[[Exception | None], None] | None = None
         self.on_message: Callable[[str, bytes], None] | None = None
         self.on_subscribe: Callable[[int, list[int]], None] | None = None
         self.on_unsubscribe: Callable[[int], None] | None = None

@@ -30,14 +30,14 @@ from database.historify_db import (
 )
 from database.historify_db import add_to_watchlist as db_add_to_watchlist
 from database.historify_db import bulk_add_to_watchlist as db_bulk_add_to_watchlist
+from database.historify_db import bulk_delete_market_data as db_bulk_delete_market_data
+from database.historify_db import bulk_remove_from_watchlist as db_bulk_remove_from_watchlist
 from database.historify_db import export_to_csv as db_export_to_csv
 from database.historify_db import get_data_catalog as db_get_data_catalog
 from database.historify_db import get_watchlist as db_get_watchlist
 from database.historify_db import import_from_csv as db_import_from_csv
 from database.historify_db import import_from_parquet as db_import_from_parquet
 from database.historify_db import remove_from_watchlist as db_remove_from_watchlist
-from database.historify_db import bulk_remove_from_watchlist as db_bulk_remove_from_watchlist
-from database.historify_db import bulk_delete_market_data as db_bulk_delete_market_data
 from database.token_db_enhanced import get_symbol_info
 from services.history_service import get_history
 from services.intervals_service import get_intervals

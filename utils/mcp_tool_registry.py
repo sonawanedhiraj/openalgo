@@ -30,7 +30,7 @@ Drift check:
 
 from __future__ import annotations
 
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 from utils.logging import get_logger
 
@@ -149,7 +149,7 @@ def _load_mcpserver_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules["openalgo_mcp_server"] = module  # so its decorators bind
     spec.loader.exec_module(module)
-    setattr(_load_mcpserver_module, "_module", module)
+    _load_mcpserver_module._module = module
     return module
 
 

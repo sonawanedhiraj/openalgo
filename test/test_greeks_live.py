@@ -102,7 +102,7 @@ if __name__ == "__main__":
     if rate_limited:
         print(f"  WARNING: {len(rate_limited)} symbols hit 429!")
     else:
-        print(f"  No 429 errors!")
+        print("  No 429 errors!")
 
     # Show ATM and nearby
     successful = [d for d in data if d.get("status") == "success"]
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         ]:
             match = "OK" if abs(sv - mv) < 1.0 else "DIFF"
             print(f"  {name:>12s} {sv:>12.4f} {mv:>12.4f} {match:>8s}")
-        print(f"\n  Note: Small differences expected due to LTP changes between calls")
+        print("\n  Note: Small differences expected due to LTP changes between calls")
     else:
         print(f"  Single: {s_result.get('status')} | Multi: {m_result.get('status')}")
 

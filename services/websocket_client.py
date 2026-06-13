@@ -199,7 +199,7 @@ class WebSocketClient:
             # Outer timeout slightly longer than the inner ack timeout so the
             # asyncio.wait_for fires first and produces a clean error.
             ack = future.result(timeout=12)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             logger.warning(
                 f"Subscribe timed out waiting for proxy ack (mode={mode}, "
                 f"symbols={len(symbols)})"
@@ -267,7 +267,7 @@ class WebSocketClient:
                 self.loop,
             )
             ack = future.result(timeout=12)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             logger.warning(
                 f"Unsubscribe timed out waiting for proxy ack (mode={mode}, "
                 f"symbols={len(symbols)})"

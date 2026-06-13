@@ -22,6 +22,8 @@ from .base_adapter import BaseBrokerWebSocketAdapter
 from .broker_factory import create_broker_adapter
 from .mode_utils import (
     MODE_BY_UPPER_LABEL as _MODE_BY_UPPER_LABEL,
+)
+from .mode_utils import (
     normalize_mode,
     normalize_mode_or_none,
 )

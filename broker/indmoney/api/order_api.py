@@ -1,9 +1,9 @@
 import json
 import os
-
-import httpx
 import threading
 import time
+
+import httpx
 
 from broker.indmoney.api.baseurl import get_url
 from broker.indmoney.mapping.transform_data import (

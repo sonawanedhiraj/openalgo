@@ -97,7 +97,7 @@ def get_margin_data(auth_token):
             float(item.get("collateralMargin", 0))
         )
         processed_margin_data["m2munrealized"] = "0.00"
-        processed_margin_data["m2mrealized"] = "{:.2f}".format(realized_pnl)
+        processed_margin_data["m2mrealized"] = f"{realized_pnl:.2f}"
         processed_margin_data["utiliseddebits"] = "{:.2f}".format(
             float(item.get("utilizedMargin", 0))
         )

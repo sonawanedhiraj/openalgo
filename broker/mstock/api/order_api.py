@@ -1,9 +1,9 @@
 import json
 import os
-
-import httpx
 import threading
 import time
+
+import httpx
 
 from broker.mstock.mapping.transform_data import (
     get_mstock_symbol,

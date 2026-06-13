@@ -4,7 +4,6 @@ from broker.iiflcapital.mapping.transform_data import (
 )
 from database.token_db import get_symbol
 
-
 # Fields that indicate a dict is an actual order/trade/position/holding row,
 # not a status/metadata wrapper. Used to avoid fabricating phantom UI rows
 # when IIFL returns an empty book wrapped as `{"result": {...wrapper...}}`.

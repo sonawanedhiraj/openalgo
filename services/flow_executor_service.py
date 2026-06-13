@@ -751,7 +751,7 @@ class NodeExecutor:
         exchange = self.get_str(node_data, "exchange", "NSE")
         self.log(f"Getting depth for: {symbol}")
         result = self.client.get_depth(symbol=symbol, exchange=exchange)
-        self.log(f"Depth result received")
+        self.log("Depth result received")
         self.store_output(node_data, result)
         return result
 
@@ -792,7 +792,7 @@ class NodeExecutor:
             start_date=start_date,
             end_date=end_date,
         )
-        self.log(f"History data received")
+        self.log("History data received")
         self.store_output(node_data, result)
         return result
 
@@ -800,7 +800,7 @@ class NodeExecutor:
         """Execute OrderBook node"""
         self.log("Fetching order book")
         result = self.client.orderbook()
-        self.log(f"Order book received")
+        self.log("Order book received")
         self.store_output(node_data, result)
         return result
 
@@ -808,7 +808,7 @@ class NodeExecutor:
         """Execute TradeBook node"""
         self.log("Fetching trade book")
         result = self.client.tradebook()
-        self.log(f"Trade book received")
+        self.log("Trade book received")
         self.store_output(node_data, result)
         return result
 
@@ -816,7 +816,7 @@ class NodeExecutor:
         """Execute PositionBook node"""
         self.log("Fetching position book")
         result = self.client.positionbook()
-        self.log(f"Position book received")
+        self.log("Position book received")
         self.store_output(node_data, result)
         return result
 
@@ -824,7 +824,7 @@ class NodeExecutor:
         """Execute Holdings node"""
         self.log("Fetching holdings")
         result = self.client.holdings()
-        self.log(f"Holdings received")
+        self.log("Holdings received")
         self.store_output(node_data, result)
         return result
 
@@ -832,7 +832,7 @@ class NodeExecutor:
         """Execute Funds node"""
         self.log("Fetching funds")
         result = self.client.funds()
-        self.log(f"Funds received")
+        self.log("Funds received")
         self.store_output(node_data, result)
         return result
 
@@ -919,7 +919,7 @@ class NodeExecutor:
             expiry_date=expiry_date,
             strike_count=strike_count,
         )
-        self.log(f"Option chain result received")
+        self.log("Option chain result received")
         self.store_output(node_data, result)
         return result
 
@@ -943,7 +943,7 @@ class NodeExecutor:
         exchange = self.get_str(node_data, "exchange", "NSE")
         self.log(f"Fetching holidays for exchange: {exchange}")
         result = self.client.holidays(exchange=exchange)
-        self.log(f"Holidays result received")
+        self.log("Holidays result received")
         self.store_output(node_data, result)
         return result
 

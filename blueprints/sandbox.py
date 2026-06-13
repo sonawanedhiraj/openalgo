@@ -3,7 +3,17 @@ import io
 import os
 from datetime import datetime
 
-from flask import Blueprint, Response, flash, jsonify, redirect, render_template, request, session, url_for
+from flask import (
+    Blueprint,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 from database.sandbox_db import (
     SandboxFunds,

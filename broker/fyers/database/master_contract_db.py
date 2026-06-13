@@ -491,7 +491,7 @@ def process_fyers_cds_json(path):
     logger.info("Processing Fyers CDS JSON Data")
     file_path = f"{path}/NSE_CD.json"
 
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         data = json.load(f)
 
     # Convert dict-of-dicts to DataFrame
@@ -625,7 +625,7 @@ def process_fyers_mcx_json(path):
     logger.info("Processing Fyers MCX JSON Data")
     file_path = f"{path}/MCX_COM.json"
 
-    with open(file_path, "r") as f:
+    with open(file_path) as f:
         data = json.load(f)
 
     # Convert dict-of-dicts to DataFrame

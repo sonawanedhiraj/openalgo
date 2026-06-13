@@ -35,7 +35,7 @@ def load_broker_capabilities(broker_directory="broker"):
             continue
 
         try:
-            with open(plugin_file, "r") as f:
+            with open(plugin_file) as f:
                 plugin_data = json.load(f)
 
             # Only include brokers with the new capability fields
@@ -46,7 +46,7 @@ def load_broker_capabilities(broker_directory="broker"):
                     "supported_exchanges": plugin_data.get("supported_exchanges", []),
                     "leverage_config": plugin_data.get("leverage_config", False),
                 }
-        except (json.JSONDecodeError, IOError) as e:
+        except (OSError, json.JSONDecodeError) as e:
             logger.error(f"Error reading plugin.json for {broker_name}: {e}")
 
     _broker_capabilities = capabilities

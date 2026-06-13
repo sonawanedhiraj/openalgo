@@ -40,7 +40,8 @@ value is ``pd.isna``-checked before use.
 from __future__ import annotations
 
 import os
-from datetime import datetime, time as dtime
+from datetime import datetime
+from datetime import time as dtime
 
 import pandas as pd
 import pytz

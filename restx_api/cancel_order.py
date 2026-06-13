@@ -6,10 +6,10 @@ from marshmallow import ValidationError
 
 from database.settings_db import get_analyze_mode
 from events import OrderFailedEvent
-from utils.event_bus import bus
 from limiter import limiter
 from restx_api.schemas import CancelOrderSchema
 from services.cancel_order_service import cancel_order, emit_analyzer_error
+from utils.event_bus import bus
 from utils.logging import get_logger
 
 ORDER_RATE_LIMIT = os.getenv("ORDER_RATE_LIMIT", "10 per second")

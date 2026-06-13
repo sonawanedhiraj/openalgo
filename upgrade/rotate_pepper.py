@@ -142,7 +142,7 @@ def _atomic_rewrite_env_pepper(env_path: str, old_pepper: str, new_pepper: str) 
     """Replace API_KEY_PEPPER in .env atomically, preserving all other
     content and line endings. Same pattern as utils/env_check.py.
     """
-    with open(env_path, "r", encoding="utf-8", newline="") as f:
+    with open(env_path, encoding="utf-8", newline="") as f:
         content = f.read()
 
     if old_pepper not in content:

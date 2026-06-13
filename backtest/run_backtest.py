@@ -73,7 +73,6 @@ from services.simplified_stock_engine_core import (
     compute_zerodha_intraday_charges,
 )
 
-
 # ── Default stocks: FnO Top Gainers from May 20, 2026 ──────────────────────
 DEFAULT_STOCKS = [
     "POWERINDIA", "ABB", "CGPOWER", "SIEMENS",
@@ -296,7 +295,7 @@ def symbols_from_results(results_path: str) -> list[str]:
     longer has those symbols armed.
     """
     try:
-        with open(results_path, "r") as f:
+        with open(results_path) as f:
             data = json.load(f)
         # Handle both single-report and multi-report format
         trades = data.get("trades", [])
@@ -419,7 +418,7 @@ def _row_to_candle(row: dict) -> Candle | None:
             volume=int(row.get("volume", row.get("v", 0)) or 0),
             elapsed_pct=1.0,
         )
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -487,7 +486,7 @@ class BacktestRunner:
             return self._run_tick_replay(date_str, target_date, all_candles, tick_data)
         else:
             self._replay_mode = "candle"
-            print(f"\n  Replay mode: CANDLE (5-min bars)")
+            print("\n  Replay mode: CANDLE (5-min bars)")
             return self._run_candle_replay(date_str, target_date, all_candles)
 
     def _run_candle_replay(
