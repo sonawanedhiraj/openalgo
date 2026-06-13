@@ -172,6 +172,16 @@ exclude = [
     "db",
     "log",
     "strategies",
+    # --- Phase 1 additions (all zero-risk: generated / sample / untracked / dead) ---
+    "examples",            # sample scripts, never shipped              (-84)
+    "**/*_pb2.py",         # machine-generated protobuf                 (part of -50)
+    "broker/*/protos",     # machine-generated protobuf package         (part of -50)
+    "_*.py",               # untracked root scratch/diagnostic scripts  (-75)
+    # Dead duplicates of the live services/telegram_bot_service.py.
+    # Excluded from lint now; recommend DELETING in a follow-up commit
+    # (committed but superseded — verify no import references first).
+    "services/telegram_bot_service_fixed.py",   # (-43)
+    "services/telegram_bot_service_v2.py",       # (-41)
 ]
 
 [tool.ruff.lint]
