@@ -189,12 +189,13 @@ def test_place_order_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db,
 
 
 # ---------------------------------------------------------------------------
-# SKIP path
+# SKIP path (mode-only: 'skip' is retired — legacy intent collapses to SANDBOX)
 # ---------------------------------------------------------------------------
 
 
-def test_place_order_rejects_when_skip(fresh_intent_db, monkeypatch):
-    """daily_intent='skip' → rejection with reason='operator_intent_skip'."""
+def test_place_order_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2, 2026-06-12): a legacy daily_intent='skip' no longer rejects
+    — it collapses to SANDBOX. External callers are never refused for config."""
     from services import place_order_service
     from services.mode_service import set_daily_intent
 
@@ -202,9 +203,11 @@ def test_place_order_rejects_when_skip(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
     monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
-    sandbox_mock = MagicMock()
-    broker_mock = MagicMock()
+    sandbox_mock = MagicMock(
+        return_value=(True, {"status": "success", "orderid": "SBX-SKIP", "mode": "analyze"}, 200)
+    )
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
+    broker_mock = MagicMock()
     monkeypatch.setattr(
         place_order_service,
         "import_broker_module",
@@ -220,31 +223,31 @@ def test_place_order_rejects_when_skip(fresh_intent_db, monkeypatch):
         emit_event=False,
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
-    assert "skip" in response["message"].lower()
+    assert success is True
+    assert response["status"] == "success"
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# DISABLED path
+# No-config path (mode-only: no row → SANDBOX default, never a DISABLED reject)
 # ---------------------------------------------------------------------------
 
 
-def test_place_order_rejects_when_disabled(fresh_intent_db, monkeypatch):
-    """No daily_intent row → rejection with reason='no_daily_intent'."""
+def test_place_order_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
     from services import place_order_service
 
     # NO set_daily_intent call — table is empty.
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
     monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
-    sandbox_mock = MagicMock()
-    broker_mock = MagicMock()
+    sandbox_mock = MagicMock(
+        return_value=(True, {"status": "success", "orderid": "SBX-DFLT", "mode": "analyze"}, 200)
+    )
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
+    broker_mock = MagicMock()
     monkeypatch.setattr(
         place_order_service,
         "import_broker_module",
@@ -260,34 +263,33 @@ def test_place_order_rejects_when_disabled(fresh_intent_db, monkeypatch):
         emit_event=False,
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
-    assert "daily_intent" in response["message"]
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Response shape: rejection must match existing 3-tuple convention so callers
-# don't need to special-case it.
+# Response shape: sandbox and live returns share the 3-tuple convention so
+# callers don't need to special-case either path.
 # ---------------------------------------------------------------------------
 
 
 def test_place_order_reject_response_shape_matches_existing_convention(
     fresh_intent_db, monkeypatch
 ):
-    """Both success and rejection return (bool, dict, int) — same outer shape."""
+    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import place_order_service
     from services.mode_service import set_daily_intent
 
     monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
 
-    # ---- shape for SKIP rejection ----
+    # ---- shape for the SANDBOX path (skip collapses to sandbox in mode-only) ----
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(
+        return_value=(True, {"status": "success", "orderid": "SBX", "mode": "analyze"}, 200)
+    )
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
         place_order_service,
@@ -296,7 +298,7 @@ def test_place_order_reject_response_shape_matches_existing_convention(
     )
 
     payload = _order_payload()
-    reject_result = place_order_service.place_order_with_auth(
+    sandbox_result = place_order_service.place_order_with_auth(
         payload,
         auth_token="dummy-token",
         broker="zerodha",
@@ -324,8 +326,8 @@ def test_place_order_reject_response_shape_matches_existing_convention(
     )
 
     # Same outer shape: tuple of length 3, (bool, dict, int).
-    assert isinstance(reject_result, tuple) and len(reject_result) == 3
-    assert isinstance(success_result, tuple) and len(success_result) == 3
-    assert isinstance(reject_result[0], bool) and isinstance(success_result[0], bool)
-    assert isinstance(reject_result[1], dict) and isinstance(success_result[1], dict)
-    assert isinstance(reject_result[2], int) and isinstance(success_result[2], int)
+    for result in (sandbox_result, success_result):
+        assert isinstance(result, tuple) and len(result) == 3
+        assert isinstance(result[0], bool)
+        assert isinstance(result[1], dict)
+        assert isinstance(result[2], int)

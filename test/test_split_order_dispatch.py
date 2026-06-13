@@ -139,14 +139,15 @@ def test_split_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
     broker_place.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_split_rejects_when_skip(fresh_intent_db, monkeypatch):
+def test_split_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
     from services import split_order_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
@@ -154,6 +155,9 @@ def test_split_rejects_when_skip(fresh_intent_db, monkeypatch):
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
 
     success, response, status = split_order_service.split_order_with_auth(
         _split_payload(),
@@ -162,20 +166,19 @@ def test_split_rejects_when_skip(fresh_intent_db, monkeypatch):
         original_data=_split_payload(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called()
     broker_place.assert_not_called()
 
 
-def test_split_rejects_when_disabled(fresh_intent_db, monkeypatch):
+def test_split_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
     from services import split_order_service
 
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
@@ -183,6 +186,9 @@ def test_split_rejects_when_disabled(fresh_intent_db, monkeypatch):
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
 
     success, response, status = split_order_service.split_order_with_auth(
         _split_payload(),
@@ -191,26 +197,31 @@ def test_split_rejects_when_disabled(fresh_intent_db, monkeypatch):
         original_data=_split_payload(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called()
     broker_place.assert_not_called()
 
 
 def test_split_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import split_order_service
     from services.mode_service import set_daily_intent
 
     _patch_modes(monkeypatch)
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", MagicMock())
+    monkeypatch.setattr(
+        "services.sandbox_service.sandbox_place_order",
+        MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200)),
+    )
     monkeypatch.setattr(
         split_order_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
     reject_result = split_order_service.split_order_with_auth(
         _split_payload(),
         auth_token="dummy",

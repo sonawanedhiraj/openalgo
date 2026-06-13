@@ -1,8 +1,11 @@
 """Tests for Stage-0 resolver wired into the read services.
 
-For reads, SKIP and DISABLED are NOT rejections — the operator still wants
-to see state. Only SANDBOX routes to the sandbox source; LIVE / SKIP /
-DISABLED all fall through to the broker source.
+Mode-only (B2, 2026-06-12): the resolver only ever returns LIVE or SANDBOX —
+there is no SKIP / DISABLED axis. A legacy intent of 'skip' collapses to SANDBOX
+and an unconfigured day defaults to SANDBOX, so reads route to the sandbox source
+in those cases (consistent with "default sandbox globally": if orders default to
+the virtual book, the read endpoints must show that same book). Only an explicit
+LIVE config (or live + analyze_mode off) reads from the broker.
 
 Tested services:
 - orderbook
@@ -114,26 +117,19 @@ def test_orderbook_reads_from_sandbox_when_sandbox_intent(fresh_intent_db, monke
     broker_get.assert_not_called()
 
 
-def test_orderbook_reads_from_broker_when_skip(fresh_intent_db, monkeypatch):
-    """SKIP must NOT block read — operator still wants to see state."""
+def test_orderbook_reads_from_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX — reads the
+    sandbox book, not the broker."""
     from services import orderbook_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    broker_get = MagicMock(return_value=[])
-    _patch_orderbook(
-        monkeypatch,
-        {
-            "get_order_book": broker_get,
-            "map_order_data": lambda order_data: [],
-            "calculate_order_statistics": lambda x: {},
-            "transform_order_data": lambda x: [],
-        },
-    )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": []}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_orderbook", sandbox_mock)
+    broker_get = MagicMock()
+    _patch_orderbook(monkeypatch, {"get_order_book": broker_get})
 
     success, _, status = orderbook_service.get_orderbook_with_auth(
         auth_token="dummy",
@@ -143,28 +139,20 @@ def test_orderbook_reads_from_broker_when_skip(fresh_intent_db, monkeypatch):
 
     assert success is True
     assert status == 200
-    broker_get.assert_called_once()
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
+    broker_get.assert_not_called()
 
 
-def test_orderbook_reads_from_broker_when_disabled(fresh_intent_db, monkeypatch):
-    """DISABLED (no intent) must NOT block read."""
+def test_orderbook_reads_from_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no intent row → SANDBOX default — reads the sandbox book."""
     from services import orderbook_service
 
     _patch_modes(monkeypatch)
 
-    broker_get = MagicMock(return_value=[])
-    _patch_orderbook(
-        monkeypatch,
-        {
-            "get_order_book": broker_get,
-            "map_order_data": lambda order_data: [],
-            "calculate_order_statistics": lambda x: {},
-            "transform_order_data": lambda x: [],
-        },
-    )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": []}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_orderbook", sandbox_mock)
+    broker_get = MagicMock()
+    _patch_orderbook(monkeypatch, {"get_order_book": broker_get})
 
     success, _, status = orderbook_service.get_orderbook_with_auth(
         auth_token="dummy",
@@ -174,8 +162,8 @@ def test_orderbook_reads_from_broker_when_disabled(fresh_intent_db, monkeypatch)
 
     assert success is True
     assert status == 200
-    broker_get.assert_called_once()
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
+    broker_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -209,24 +197,21 @@ def test_positionbook_routes_by_resolver(fresh_intent_db, monkeypatch):
     broker_get.assert_not_called()
 
 
-def test_positionbook_skip_falls_through_to_broker(fresh_intent_db, monkeypatch):
+def test_positionbook_skip_routes_to_sandbox(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX."""
     from services import positionbook_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    broker_get = MagicMock(return_value=[])
+    broker_get = MagicMock()
     monkeypatch.setattr(
         positionbook_service,
         "import_broker_module",
-        lambda _b: {
-            "get_positions": broker_get,
-            "map_position_data": lambda x: [],
-            "transform_positions_data": lambda x: [],
-        },
+        lambda _b: {"get_positions": broker_get},
     )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": []}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_positions", sandbox_mock)
 
     positionbook_service.get_positionbook_with_auth(
@@ -234,8 +219,8 @@ def test_positionbook_skip_falls_through_to_broker(fresh_intent_db, monkeypatch)
         broker="zerodha",
         original_data={"apikey": "test"},
     )
-    broker_get.assert_called_once()
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
+    broker_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -268,22 +253,19 @@ def test_tradebook_routes_by_resolver(fresh_intent_db, monkeypatch):
     broker_get.assert_not_called()
 
 
-def test_tradebook_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch):
+def test_tradebook_no_intent_routes_to_sandbox(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no intent row → SANDBOX default."""
     from services import tradebook_service
 
     _patch_modes(monkeypatch)
 
-    broker_get = MagicMock(return_value=[])
+    broker_get = MagicMock()
     monkeypatch.setattr(
         tradebook_service,
         "import_broker_module",
-        lambda _b: {
-            "get_trade_book": broker_get,
-            "map_trade_data": lambda x: [],
-            "transform_tradebook_data": lambda x: [],
-        },
+        lambda _b: {"get_trade_book": broker_get},
     )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": []}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_tradebook", sandbox_mock)
 
     tradebook_service.get_tradebook_with_auth(
@@ -291,8 +273,8 @@ def test_tradebook_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch
         broker="zerodha",
         original_data={"apikey": "test"},
     )
-    broker_get.assert_called_once()
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
+    broker_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -325,25 +307,21 @@ def test_holdings_routes_by_resolver(fresh_intent_db, monkeypatch):
     broker_get.assert_not_called()
 
 
-def test_holdings_skip_falls_through_to_broker(fresh_intent_db, monkeypatch):
+def test_holdings_skip_routes_to_sandbox(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX."""
     from services import holdings_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    broker_get = MagicMock(return_value=[])
+    broker_get = MagicMock()
     monkeypatch.setattr(
         holdings_service,
         "import_broker_module",
-        lambda _b: {
-            "get_holdings": broker_get,
-            "map_portfolio_data": lambda x: [],
-            "calculate_portfolio_statistics": lambda x: {},
-            "transform_holdings_data": lambda x: [],
-        },
+        lambda _b: {"get_holdings": broker_get},
     )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": []}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_holdings", sandbox_mock)
 
     holdings_service.get_holdings_with_auth(
@@ -351,8 +329,8 @@ def test_holdings_skip_falls_through_to_broker(fresh_intent_db, monkeypatch):
         broker="zerodha",
         original_data={"apikey": "test"},
     )
-    broker_get.assert_called_once()
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
+    broker_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -385,18 +363,19 @@ def test_funds_routes_by_resolver(fresh_intent_db, monkeypatch):
     broker_get.assert_not_called()
 
 
-def test_funds_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch):
+def test_funds_no_intent_routes_to_sandbox(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no intent row → SANDBOX default."""
     from services import funds_service
 
     _patch_modes(monkeypatch)
 
-    broker_get = MagicMock(return_value={"cash": 10000.0})
+    broker_get = MagicMock()
     monkeypatch.setattr(
         funds_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(get_margin_data=broker_get),
     )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": {}}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_funds", sandbox_mock)
 
     success, _, status = funds_service.get_funds_with_auth(
@@ -406,8 +385,8 @@ def test_funds_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch):
     )
     assert success is True
     assert status == 200
-    broker_get.assert_called_once()
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
+    broker_get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +421,21 @@ def test_openposition_routes_to_sandbox_when_sandbox(fresh_intent_db, monkeypatc
     sandbox_mock.assert_called_once()
 
 
-def test_openposition_skip_falls_through_to_positionbook(fresh_intent_db, monkeypatch):
+def test_openposition_skip_routes_to_sandbox(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX — reads sandbox
+    positions, not the broker positionbook fall-through."""
     from services import openposition_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "data": []}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_positions", sandbox_mock)
+    monkeypatch.setattr(
+        "services.openposition_service.socketio.start_background_task",
+        lambda *a, **kw: None,
+    )
 
     fake_pb = MagicMock(return_value=(True, {"data": []}, 200))
     monkeypatch.setattr("services.positionbook_service.get_positionbook", fake_pb)
@@ -463,8 +448,8 @@ def test_openposition_skip_falls_through_to_positionbook(fresh_intent_db, monkey
     )
 
     assert success is True
-    sandbox_mock.assert_not_called()
-    fake_pb.assert_called_once()
+    sandbox_mock.assert_called_once()
+    fake_pb.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -493,15 +478,16 @@ def test_orderstatus_routes_to_sandbox_when_sandbox(fresh_intent_db, monkeypatch
     sandbox_mock.assert_called_once()
 
 
-def test_orderstatus_skip_falls_through_to_orderbook(fresh_intent_db, monkeypatch):
-    """SKIP must fall through to live orderbook for status read."""
+def test_orderstatus_skip_routes_to_sandbox(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX — order status is
+    read from the sandbox book, not the broker orderbook fall-through."""
     from services import orderstatus_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success"}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_get_order_status", sandbox_mock)
 
     fake_ob = MagicMock(return_value=(False, {"message": "stub"}, 500))
@@ -514,5 +500,5 @@ def test_orderstatus_skip_falls_through_to_orderbook(fresh_intent_db, monkeypatc
         original_data={"apikey": "test", "orderid": "OID-1"},
     )
 
-    sandbox_mock.assert_not_called()
-    fake_ob.assert_called_once()
+    sandbox_mock.assert_called_once()
+    fake_ob.assert_not_called()

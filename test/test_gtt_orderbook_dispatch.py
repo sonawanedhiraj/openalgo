@@ -85,8 +85,9 @@ def test_gtt_orderbook_returns_501_when_sandbox_intent(fresh_intent_db, monkeypa
     broker_get.assert_not_called()
 
 
-def test_gtt_orderbook_reads_from_broker_when_skip_or_disabled(fresh_intent_db, monkeypatch):
-    """For reads, SKIP and DISABLED fall through to the broker (no order rejection)."""
+def test_gtt_orderbook_routes_to_sandbox_when_skip_or_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): 'skip' and no-config both collapse to SANDBOX — GTT is not
+    implemented in sandbox, so the read surfaces 501 (it does NOT hit the broker)."""
     from services import gtt_orderbook_service
     from services.mode_service import set_daily_intent
 
@@ -99,23 +100,25 @@ def test_gtt_orderbook_reads_from_broker_when_skip_or_disabled(fresh_intent_db, 
         lambda _b: SimpleNamespace(get_gtt_book=broker_get),
     )
 
-    # DISABLED (no intent row)
-    success, _, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
+    # No intent row → SANDBOX default
+    success, response, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
         auth_token="dummy",
         broker="zerodha",
         original_data={"apikey": "test"},
     )
-    assert success is True
-    assert status == 200
-    assert broker_get.call_count == 1
+    assert success is False
+    assert status == 501
+    assert response["mode"] == "analyze"
+    broker_get.assert_not_called()
 
-    # SKIP
+    # Legacy intent 'skip' → SANDBOX
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    success, _, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
+    success, response, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
         auth_token="dummy",
         broker="zerodha",
         original_data={"apikey": "test"},
     )
-    assert success is True
-    assert status == 200
-    assert broker_get.call_count == 2
+    assert success is False
+    assert status == 501
+    assert response["mode"] == "analyze"
+    broker_get.assert_not_called()

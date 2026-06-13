@@ -126,7 +126,8 @@ def test_cancel_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
     broker_called.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_cancel_rejects_when_skip(fresh_intent_db, monkeypatch):
+def test_cancel_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
     from services import cancel_order_service
     from services.mode_service import set_daily_intent
 
@@ -134,7 +135,7 @@ def test_cancel_rejects_when_skip(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
     monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "mode": "analyze"}, 200))
     broker_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", sandbox_mock)
     monkeypatch.setattr(
@@ -150,22 +151,20 @@ def test_cancel_rejects_when_skip(fresh_intent_db, monkeypatch):
         original_data=_original_data(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
-    assert "skip" in response["message"].lower()
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_mock.assert_not_called()
 
 
-def test_cancel_rejects_when_disabled(fresh_intent_db, monkeypatch):
+def test_cancel_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
     from services import cancel_order_service
 
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
     monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "mode": "analyze"}, 200))
     broker_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", sandbox_mock)
     monkeypatch.setattr(
@@ -181,31 +180,33 @@ def test_cancel_rejects_when_disabled(fresh_intent_db, monkeypatch):
         original_data=_original_data(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
-    assert "daily_intent" in response["message"]
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_mock.assert_not_called()
 
 
 def test_cancel_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import cancel_order_service
     from services.mode_service import set_daily_intent
 
     monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
 
+    # ---- sandbox shape (skip collapses to sandbox in mode-only) ----
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", MagicMock())
+    monkeypatch.setattr(
+        "services.sandbox_service.sandbox_cancel_order",
+        MagicMock(return_value=(True, {"status": "success", "mode": "analyze"}, 200)),
+    )
     monkeypatch.setattr(
         cancel_order_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=MagicMock()),
     )
 
-    reject_result = cancel_order_service.cancel_order_with_auth(
+    sandbox_result = cancel_order_service.cancel_order_with_auth(
         "TEST-OID-1",
         auth_token="dummy",
         broker="zerodha",
@@ -226,8 +227,8 @@ def test_cancel_reject_response_shape_matches_existing_convention(fresh_intent_d
         original_data=_original_data(),
     )
 
-    assert isinstance(reject_result, tuple) and len(reject_result) == 3
-    assert isinstance(success_result, tuple) and len(success_result) == 3
-    assert isinstance(reject_result[0], bool) and isinstance(success_result[0], bool)
-    assert isinstance(reject_result[1], dict) and isinstance(success_result[1], dict)
-    assert isinstance(reject_result[2], int) and isinstance(success_result[2], int)
+    for result in (sandbox_result, success_result):
+        assert isinstance(result, tuple) and len(result) == 3
+        assert isinstance(result[0], bool)
+        assert isinstance(result[1], dict)
+        assert isinstance(result[2], int)

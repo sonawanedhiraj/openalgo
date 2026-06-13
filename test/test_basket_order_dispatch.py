@@ -150,14 +150,15 @@ def test_basket_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
     broker_place.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_basket_rejects_when_skip(fresh_intent_db, monkeypatch):
+def test_basket_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
     from services import basket_order_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
@@ -165,6 +166,9 @@ def test_basket_rejects_when_skip(fresh_intent_db, monkeypatch):
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
 
     success, response, status = basket_order_service.process_basket_order_with_auth(
         _basket(),
@@ -173,20 +177,19 @@ def test_basket_rejects_when_skip(fresh_intent_db, monkeypatch):
         original_data=_basket(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called()
     broker_place.assert_not_called()
 
 
-def test_basket_rejects_when_disabled(fresh_intent_db, monkeypatch):
+def test_basket_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
     from services import basket_order_service
 
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
@@ -194,6 +197,9 @@ def test_basket_rejects_when_disabled(fresh_intent_db, monkeypatch):
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
 
     success, response, status = basket_order_service.process_basket_order_with_auth(
         _basket(),
@@ -202,11 +208,9 @@ def test_basket_rejects_when_disabled(fresh_intent_db, monkeypatch):
         original_data=_basket(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called()
     broker_place.assert_not_called()
 
 
@@ -299,12 +303,18 @@ def test_basket_reject_response_shape_matches_existing_convention(fresh_intent_d
 
     _patch_modes(monkeypatch)
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", MagicMock())
+    monkeypatch.setattr(
+        "services.sandbox_service.sandbox_place_order",
+        MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200)),
+    )
     monkeypatch.setattr(
         basket_order_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
     reject_result = basket_order_service.process_basket_order_with_auth(
         _basket(),
         auth_token="dummy",

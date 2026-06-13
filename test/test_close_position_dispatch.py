@@ -120,14 +120,15 @@ def test_close_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
     broker_close.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_close_rejects_when_skip(fresh_intent_db, monkeypatch):
+def test_close_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
     from services import close_position_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success"}, 200))
     broker_close = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
     monkeypatch.setattr(
@@ -143,20 +144,19 @@ def test_close_rejects_when_skip(fresh_intent_db, monkeypatch):
         original_data=_payload(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_close.assert_not_called()
 
 
-def test_close_rejects_when_disabled(fresh_intent_db, monkeypatch):
+def test_close_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
     from services import close_position_service
 
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"status": "success"}, 200))
     broker_close = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
     monkeypatch.setattr(
@@ -172,21 +172,23 @@ def test_close_rejects_when_disabled(fresh_intent_db, monkeypatch):
         original_data=_payload(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_close.assert_not_called()
 
 
 def test_close_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import close_position_service
     from services.mode_service import set_daily_intent
 
     _patch_modes(monkeypatch)
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.sandbox_service.sandbox_close_position", MagicMock())
+    monkeypatch.setattr(
+        "services.sandbox_service.sandbox_close_position",
+        MagicMock(return_value=(True, {"status": "success"}, 200)),
+    )
     monkeypatch.setattr(
         close_position_service,
         "import_broker_module",

@@ -54,7 +54,7 @@ def test_cancel_all_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
 
     success, _, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
@@ -83,7 +83,7 @@ def test_cancel_all_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monke
     )
 
     cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
@@ -110,7 +110,7 @@ def test_cancel_all_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, 
     )
 
     cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
@@ -120,14 +120,15 @@ def test_cancel_all_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, 
     broker_api.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_cancel_all_rejects_when_skip(fresh_intent_db, monkeypatch):
+def test_cancel_all_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
     from services import cancel_all_order_service
     from services.mode_service import set_daily_intent
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
     broker_api = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     monkeypatch.setattr(
@@ -137,27 +138,25 @@ def test_cancel_all_rejects_when_skip(fresh_intent_db, monkeypatch):
     )
 
     success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
-    assert "skip" in response["message"].lower()
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_api.assert_not_called()
 
 
-def test_cancel_all_rejects_when_disabled(fresh_intent_db, monkeypatch):
+def test_cancel_all_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
     from services import cancel_all_order_service
 
     _patch_modes(monkeypatch)
 
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
     broker_api = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     monkeypatch.setattr(
@@ -167,27 +166,29 @@ def test_cancel_all_rejects_when_disabled(fresh_intent_db, monkeypatch):
     )
 
     success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
     )
 
-    assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
+    assert success is True
     assert status == 200
-    sandbox_mock.assert_not_called()
+    sandbox_mock.assert_called_once()
     broker_api.assert_not_called()
 
 
 def test_cancel_all_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import cancel_all_order_service
     from services.mode_service import set_daily_intent
 
     _patch_modes(monkeypatch)
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", MagicMock())
+    monkeypatch.setattr(
+        "services.sandbox_service.sandbox_cancel_all_orders",
+        MagicMock(return_value=(True, {"canceled_count": 1}, 200)),
+    )
     monkeypatch.setattr(
         cancel_all_order_service,
         "import_broker_module",
@@ -195,7 +196,7 @@ def test_cancel_all_reject_response_shape_matches_existing_convention(fresh_inte
     )
 
     reject_result = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
@@ -209,7 +210,7 @@ def test_cancel_all_reject_response_shape_matches_existing_convention(fresh_inte
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
     success_result = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},
+        {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),

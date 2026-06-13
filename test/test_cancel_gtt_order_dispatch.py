@@ -114,7 +114,9 @@ def test_cancel_gtt_returns_501_when_live_but_analyze_on(fresh_intent_db, monkey
     broker_cancel.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_cancel_gtt_rejects_when_skip(fresh_intent_db, monkeypatch):
+def test_cancel_gtt_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX — GTT is not
+    implemented in sandbox, so it surfaces 501 (not a rejection)."""
     from services import cancel_gtt_order_service
     from services.mode_service import set_daily_intent
 
@@ -136,13 +138,12 @@ def test_cancel_gtt_rejects_when_skip(fresh_intent_db, monkeypatch):
     )
 
     assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "operator_intent_skip"
-    assert status == 200
+    assert status == 501
     broker_cancel.assert_not_called()
 
 
-def test_cancel_gtt_rejects_when_disabled(fresh_intent_db, monkeypatch):
+def test_cancel_gtt_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
+    """Mode-only (B2): no daily_intent row → SANDBOX default; GTT surfaces 501."""
     from services import cancel_gtt_order_service
 
     _patch_modes(monkeypatch)
@@ -162,9 +163,7 @@ def test_cancel_gtt_rejects_when_disabled(fresh_intent_db, monkeypatch):
     )
 
     assert success is False
-    assert response["status"] == "rejected"
-    assert response["reason"] == "no_daily_intent"
-    assert status == 200
+    assert status == 501
     broker_cancel.assert_not_called()
 
 
