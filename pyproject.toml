@@ -199,6 +199,14 @@ ignore = [
     "B008",   # function call in default argument
     "E402",   # module level import not at top of file
     "F401",   # imported but unused (sometimes intentional)
+    # --- Phase 3: typing-modernization rules are stylistic only ---
+    # Target is py312, so `list[x]` / `X | None` syntax is already available and
+    # used in new code. These rules only flag *legacy* typing imports in older
+    # modules; rewriting them is churn with no runtime benefit. Single-operator
+    # project doesn't need typing-import style enforcement. (drops ~358)
+    "UP035",  # deprecated typing import (e.g. typing.List -> list)
+    "UP006",  # use of typing.List/Dict where builtin generics work
+    "UP045",  # Optional[X] -> X | None
 ]
 
 [tool.ruff.lint.isort]
