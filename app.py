@@ -741,6 +741,26 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow backfill convergence: {e}")
 
+            # In-house scanner SCANNER_SYMBOLS universe feed convergence (both 1m
+            # AND daily). The scanner-side sibling of the sector_follow service
+            # above — it closes the two supply bugs the 2026-06-13 Friday replay
+            # surfaced (the scanner universe was never backfilled; the stored-D
+            # interval was universally stale). On boot — after a broker session
+            # appears — it reads MAX(timestamp) per symbol for each interval from
+            # historify.duckdb and catches up only the stale tail, then a periodic
+            # loop re-checks during the post-close publish window (15:30..17:00
+            # IST). Non-blocking daemon thread. See
+            # services/scanner_backfill_scheduler.py.
+            try:
+                from services.scanner_backfill_scheduler import (
+                    init_scanner_backfill_scheduler,
+                )
+
+                init_scanner_backfill_scheduler(app=app)
+                logger.debug("Scanner backfill convergence initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Scanner backfill convergence: {e}")
+
             # Sector Follow CAP5_VOL strategy (R40 deployable variant). Default
             # mode=scaffold means loading this changes ZERO live trading behavior
             # — it only registers 15:20/15:25/09:00 IST jobs that compute + log.

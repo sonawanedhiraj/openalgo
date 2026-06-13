@@ -869,13 +869,18 @@ fail loud and fail safe.
   `docs/PARAMETER_LOG.md`. The gate/job are no-ops when the flag is off; the
   HTTP endpoint always works.
 
-Both the index AND the 30 universe stock feeds are refreshed by a **boot-time +
-periodic state-convergence check** (`services/sector_follow_backfill_scheduler.py`,
-wired in `app.py` via `init_sector_follow_backfill`). This **supersedes the
-16:05/16:10 IST cron jobs** from commit `5c2a06eff` and earlier — those were
-removed from `historify_scheduler_service.py`. Per the directive: *"start once
-OpenAlgo starts every time and start the task based on the last backfill timestamp
-only if required, for index and stocks both, instead of dependency on a scheduler."*
+Two independent universes are kept fresh by **boot-time + periodic
+state-convergence checks**: (1) `sector_follow_cap5_vol`'s index + 30-stock 1m
+feeds (`services/sector_follow_backfill_scheduler.py`, wired via
+`init_sector_follow_backfill`), and (2) the **in-house scanner's
+`SCANNER_SYMBOLS` F&O universe in BOTH `1m` AND daily (`D`)**
+(`services/scanner_backfill_scheduler.py`, wired via
+`init_scanner_backfill_scheduler` — see the dedicated subsection below). The
+sector_follow check **supersedes the 16:05/16:10 IST cron jobs** from commit
+`5c2a06eff` and earlier — those were removed from `historify_scheduler_service.py`.
+Per the directive: *"start once OpenAlgo starts every time and start the task
+based on the last backfill timestamp only if required, for index and stocks both,
+instead of dependency on a scheduler."*
 
 How it works:
 - Each backfill service exposes **`check_and_refresh_if_stale(today)`** — reads
@@ -905,6 +910,71 @@ YYYY-MM-DD`; stock 1m `uv run python -m services.sector_follow_stock_backfill
 --from YYYY-MM-DD --to YYYY-MM-DD`. With the convergence check, the CLI is now
 only needed to backfill a multi-day outage beyond the small lookback window — the
 boot+periodic path handles routine staleness automatically.
+
+### Scanner-universe feed convergence (`scanner_backfill_scheduler`)
+
+The scanner-side sibling of the sector_follow convergence above. It is the
+durable fix for the two **data-supply** bugs the 2026-06-13 Friday-screener
+replay surfaced (see
+`docs/research/strategy/screener/2026-06-13_friday_replay_with_backfilled_data.md`),
+which the sector_follow service does NOT cover because the two universes are
+disjoint:
+
+- **Bug A — the scanner universe was never backfilled.** The sector_follow
+  convergence refreshes only its locked-static-30 stocks + 8 indices; the
+  in-house screener mirrors Chartink across the full `SCANNER_SYMBOLS` F&O list
+  (~200 names). Friday 1m existed for only 38/238 historify symbols, so a replay
+  could reconstruct only 1 of Chartink's 8 Friday hits.
+- **Bug B — the stored daily (`D`) interval was universally stale** (ending
+  2026-06-04 for 229 symbols). `ScannerHistoryProvider` reads stored `D` via
+  `historify_db.get_ohlcv(interval='D')` for its daily gap/volume gates, so the
+  live scanner evaluated against ~6-trading-day-old daily bars on any day,
+  independent of tick health.
+
+`services/scanner_backfill_scheduler.py` (+ `services/scanner_universe_backfill.py`)
+closes both, mirroring the sector_follow pattern exactly but over **both storage
+intervals** (`1m` AND `D`):
+
+- **Symbol set** is derived live from the `SCANNER_SYMBOLS` env var (the same
+  source `ScannerHistoryProvider` / `scanner_presubscribe` read), so it tracks
+  the scanner config automatically. Each symbol routes to `NSE` or `NSE_INDEX`
+  via `scanner_presubscribe.resolve_exchange_for_symbol` (the universe interleaves
+  a few indices), and the download goes through the same incremental
+  `historify_service.create_and_start_job` pipeline.
+- **`check_and_refresh_if_stale(today, interval=...)`** reads `MAX(timestamp)` per
+  symbol for the interval from `historify.duckdb` (via
+  `data_freshness_service.compute_stale_symbols`, which already accepts an
+  `interval` argument) and fetches **only the symbols behind today's close**.
+  Idempotent (fresh → no-op), fail-graceful (a dead-token fetch is logged into
+  `errors`, never raised), empty-universe-safe (no-op when `SCANNER_SYMBOLS` is
+  unset).
+- **Boot hook + periodic loop** identical in shape to sector_follow: a daemon
+  thread waits for a broker session, runs the 1m then `D` convergence once
+  (never blocks boot), then a periodic daemon re-checks every
+  `SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN` minutes (default 30) inside
+  `15:30`..`SCANNER_BACKFILL_PERIODIC_END_TIME` (default `17:00`) IST on trading
+  days, backing off until tomorrow once both intervals report fresh.
+- **Health rows**: each interval check writes a `data_health_check` row
+  (`strategy_name='scanner_universe_1m'` / `'scanner_universe_D'`) via the
+  existing `database/data_health_db.insert_check` — no schema change, so
+  `get_latest_check` / the existing query + alerting paths keep working and
+  scanner coverage is directly queryable.
+- **Flags**: `SCANNER_BACKFILL_ENABLED` (master, default `true`),
+  `SCANNER_BACKFILL_PERIODIC_CHECK_ENABLED` (default `true`),
+  `SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN` (default `30`),
+  `SCANNER_BACKFILL_PERIODIC_END_TIME` (default `17:00`),
+  `SCANNER_BACKFILL_INTERVALS` (default `1m,D` — drop one arm to reduce broker
+  load). See `docs/PARAMETER_LOG.md`.
+- **Manual catch-up** for a deep historical gap — notably the one-time initial
+  deep 1m backfill for the ~200 never-fetched scanner symbols, which is beyond
+  the small lookback window — uses the CLI (needs an active broker session):
+  `uv run python -m services.scanner_universe_backfill --from YYYY-MM-DD --to
+  YYYY-MM-DD --interval 1m` (or `--interval D`).
+- **Daily-D approach (Approach 1):** the `D` arm fetches fresh daily bars
+  directly through the historify pipeline. A future task may migrate to deriving
+  daily by resampling the continuous stored 1m series (Approach 2, single source
+  of truth) — that only becomes viable once the full-universe 1m deep backfill
+  has landed.
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.

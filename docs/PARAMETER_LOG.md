@@ -370,6 +370,72 @@ fetches only the symbols behind today's expected 15:30 IST close. See
 - **History:**
   - **2026-06-13:** Introduced with the state-convergence refactor.
 
+### Scanner universe — boot+periodic feed convergence (1m + daily)
+
+The scanner-side analogue of the sector_follow convergence above, fixing the two
+supply bugs the 2026-06-13 Friday-screener replay surfaced (the `SCANNER_SYMBOLS`
+F&O universe was never backfilled; the stored `D` interval was universally stale).
+On boot (after a broker session appears) and periodically in the post-close
+window, it reads `MAX(timestamp)` per symbol for each interval from
+`db/historify.duckdb` and incrementally fetches only the symbols behind today's
+close — for BOTH `1m` and daily (`D`). See
+`services/scanner_backfill_scheduler.py` (+ `services/scanner_universe_backfill.py`),
+wired in `app.py` via `init_scanner_backfill_scheduler`.
+
+#### SCANNER_BACKFILL_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env (not in `.sample.env`); read in
+  `services/scanner_backfill_scheduler._backfill_enabled`.
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables).
+- **Effect:** master gate for the whole scanner convergence (boot hook AND periodic
+  loop). When `false`, `init_scanner_backfill_scheduler` is a no-op — the scanner
+  universe is not auto-refreshed and the operator must use the CLI. Default-on so a
+  fresh deploy self-heals.
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-13:** Introduced (worktree branch; FF to `dev`).
+
+#### SCANNER_BACKFILL_PERIODIC_CHECK_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env; read in `services/scanner_backfill_scheduler._periodic_enabled`.
+- **Values:** `true` / `false`.
+- **Effect:** gate for the **periodic** re-check daemon thread only. When `false`,
+  only the boot-time convergence runs (the boot check is never gated). Mirrors
+  `SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED`.
+- **History:**
+  - **2026-06-13:** Introduced.
+
+#### SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN
+- **Current value:** unset → code default `30` (minutes)
+- **Set in:** env; read in `services/scanner_backfill_scheduler._interval_seconds`
+  (clamped to a 60s floor).
+- **Effect:** how often the periodic loop re-checks staleness inside the post-close
+  window. 30 min covers Zerodha's current-day historical lag without hammering the
+  broker's 3 req/sec limit (the larger ~200-symbol universe × 2 intervals takes
+  longer per pass than sector_follow's 38).
+- **History:**
+  - **2026-06-13:** Introduced.
+
+#### SCANNER_BACKFILL_PERIODIC_END_TIME
+- **Current value:** unset → code default `17:00` (IST, `HH:MM`)
+- **Set in:** env; read in `services/scanner_backfill_scheduler._end_time`.
+- **Effect:** close of the periodic re-check window (opens at the fixed `15:30` IST
+  market close). After this the loop backs off until tomorrow's window.
+- **History:**
+  - **2026-06-13:** Introduced.
+
+#### SCANNER_BACKFILL_INTERVALS
+- **Current value:** unset → code default `1m,D`
+- **Set in:** env; read in `services/scanner_backfill_scheduler._intervals`.
+- **Values:** comma-separated subset of `1m,D`. Unknown tokens are dropped; an
+  empty/garbage value falls back to both.
+- **Effect:** which storage intervals the convergence keeps fresh. Default refreshes
+  both the intraday tape (`1m`) and the daily gates (`D`). Set to `1m` only to drop
+  the daily arm if the `D` download adds undesirable broker load (the daily gates
+  would then revert to whatever else refreshes stored `D`).
+- **History:**
+  - **2026-06-13:** Introduced.
+
 ### Simplified engine — EOD watchdog timing
 
 #### SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED
