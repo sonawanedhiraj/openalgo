@@ -1,23 +1,25 @@
-"""Mocked E2E for ``GET /mode/status`` after the Phase-B unified migration.
+"""Mocked E2E for ``GET /mode/status`` after the mode-only migration (B2,
+2026-06-12).
 
-The endpoint historically read the effective mode via the legacy global
-``resolve_effective_mode`` (date-keyed ``daily_intent`` table). Phase B
-(2026-06-11) migrated it to the unified path
-``mode_service.resolve_strategy_mode('simplified_engine')`` which honours the
-``strategy_daily_intent`` table with the documented fall-through
-``unified row → legacy daily_intent → env flag → default``.
+The endpoint reads the effective mode via ``mode_service.resolve_strategy_mode``
+(a back-compat shim over the mode-only ``resolve_mode``) scoped to
+``simplified_engine``. Resolution is now ``strategy_mode row → env flag →
+sandbox default`` — the retired ``strategy_daily_intent``/legacy ``daily_intent``
+tables and the run/pause/halt ``intent`` axis no longer drive it (``intent`` is
+hard-wired to ``'run'`` and ``daily_capital_cap`` to ``None`` in the shim).
 
-Two cases prove the migration:
+Two cases prove the mode-only resolution:
 
-* a unified ``strategy_daily_intent`` row drives the response and is attributed
-  ``source='unified'``;
-* with NO unified row, the documented fall-through to the legacy ``daily_intent``
-  table still works and is attributed ``source='legacy'``.
+* a persistent ``strategy_mode`` row drives the response, attributed
+  ``source='strategy_mode'``;
+* with NO ``strategy_mode`` row, resolution falls through to the env mode flag,
+  attributed ``source='env'``.
 
-Fully hermetic: ``strategy_daily_intent_db`` and ``daily_intent_db`` are rebound
-to temp SQLite files; ``is_session_valid`` and ``get_analyze_mode`` are
-monkeypatched so no real session / settings DB is needed. The global
-``test/conftest.py`` redirect + tripwire are an additional safety net.
+Fully hermetic: ``strategy_mode_db``, ``strategy_daily_intent_db`` and
+``daily_intent_db`` are rebound to temp SQLite files; ``is_session_valid`` and
+``get_analyze_mode`` are monkeypatched so no real session / settings DB is
+needed. The global ``test/conftest.py`` redirect + tripwire are an additional
+safety net.
 """
 
 from __future__ import annotations
@@ -45,16 +47,16 @@ def _rebind(module, monkeypatch, tmp_path, fname):
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
-    """Bare Flask app with mode_status_bp mounted + isolated intent DBs."""
+    """Bare Flask app with mode_status_bp mounted + isolated mode/intent DBs."""
     import database.daily_intent_db as didb
     import database.strategy_daily_intent_db as sdidb
+    import database.strategy_mode_db as smdb
     from blueprints.mode_status import mode_status_bp
 
     didb_sess = _rebind(didb, monkeypatch, tmp_path, "daily_intent.db")
     sdidb_sess = _rebind(sdidb, monkeypatch, tmp_path, "strategy_daily_intent.db")
+    smdb_sess = _rebind(smdb, monkeypatch, tmp_path, "strategy_mode.db")
 
-    # Unified flag on (its default) — the unified row must be consulted first.
-    monkeypatch.setenv("STRATEGY_DAILY_INTENT_ENABLED", "true")
     # Bypass the auth decorator and the settings DB read.
     monkeypatch.setattr("utils.session.is_session_valid", lambda: True)
     monkeypatch.setattr("blueprints.mode_status.get_analyze_mode", lambda: False)
@@ -63,10 +65,11 @@ def client(monkeypatch, tmp_path):
     app.config["TESTING"] = True
     app.register_blueprint(mode_status_bp)
 
-    yield app.test_client(), didb, sdidb
+    yield app.test_client(), didb, sdidb, smdb
 
     didb_sess.remove()
     sdidb_sess.remove()
+    smdb_sess.remove()
 
 
 def _today(didb):
@@ -74,32 +77,26 @@ def _today(didb):
 
 
 # --------------------------------------------------------------------------- #
-# 1. A unified strategy_daily_intent row drives the response (source='unified').
+# 1. A persistent strategy_mode row drives the response (source='strategy_mode').
 # --------------------------------------------------------------------------- #
 
 
-def test_mode_status_sources_from_unified_row(client):
-    test_client, didb, sdidb = client
+def test_mode_status_sources_from_strategy_mode_row(client):
+    test_client, didb, sdidb, smdb = client
     today = _today(didb)
 
-    sdidb.set_intent(
-        "simplified_engine",
-        today,
-        mode="live",
-        intent="pause",
-        daily_capital_cap=75000.0,
-        updated_by="test",
-    )
+    smdb.set_mode("simplified_engine", "live", updated_by="test")
 
     resp = test_client.get("/mode/status")
     assert resp.status_code == 200
     data = resp.get_json()
 
-    assert data["source"] == "unified"
+    assert data["source"] == "strategy_mode"
     assert data["effective_mode"] == "live"
-    assert data["intent"] == "pause"
-    assert data["daily_capital_cap"] == pytest.approx(75000.0)
-    assert data["effective"]["source"] == "unified"
+    # Mode-only: the intent axis is retired — the shim hard-wires these.
+    assert data["intent"] == "run"
+    assert data["daily_capital_cap"] is None
+    assert data["effective"]["source"] == "strategy_mode"
     # Backward-compatible keys are still present.
     assert data["today"] == today
     assert "daily_intent" in data
@@ -107,24 +104,21 @@ def test_mode_status_sources_from_unified_row(client):
 
 
 # --------------------------------------------------------------------------- #
-# 2. No unified row → documented fall-through to legacy daily_intent works.
+# 2. No strategy_mode row → fall-through to the env mode flag (source='env').
 # --------------------------------------------------------------------------- #
 
 
-def test_mode_status_falls_through_to_legacy(client):
-    test_client, didb, sdidb = client
-    today = _today(didb)
+def test_mode_status_falls_through_to_env(client, monkeypatch):
+    test_client, didb, sdidb, smdb = client
 
-    # No unified row inserted. Only a legacy daily_intent row exists.
-    didb.set_daily_intent("sandbox", set_by="test", date_str=today)
+    # No strategy_mode row inserted — resolution falls through to the env flag.
+    monkeypatch.setenv("SIMPLIFIED_ENGINE_MODE", "sandbox")
 
     resp = test_client.get("/mode/status")
     assert resp.status_code == 200
     data = resp.get_json()
 
-    assert data["source"] == "legacy"
+    assert data["source"] == "env"
     assert data["effective_mode"] == "sandbox"
-    assert data["intent"] == "run"  # legacy rows always map to intent='run'
-    # The legacy row is also surfaced for observability.
-    assert data["daily_intent"] is not None
-    assert data["daily_intent"]["intent"] == "sandbox"
+    assert data["intent"] == "run"  # mode-only: always 'run'
+    assert data["daily_capital_cap"] is None

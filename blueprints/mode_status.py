@@ -6,22 +6,20 @@ the intent is intentionally NOT exposed over HTTP in this pass — flips happen
 via the unified ``strategy_daily_intent`` table (direct DB call / Telegram bot).
 The point of this surface is observability, not control.
 
-**Mode resolution source (2026-06-11 migration — Phase B).** This endpoint now
-reads the effective mode via the **unified** path
+**Mode resolution source (mode-only architecture — B2, 2026-06-12).** This
+endpoint reads the effective mode via
 :func:`services.mode_service.resolve_strategy_mode` (scoped to
-``simplified_engine``), which honours the ``strategy_daily_intent`` table with
-the documented fall-through ``unified row → legacy daily_intent → env flag →
-default``. It previously used the legacy global
-:func:`resolve_effective_mode`, which only read the date-keyed ``daily_intent``
-table — that was the last surviving legacy reader (see
-``outputs/2026-06-11_migration_audit.md``). The legacy ``daily_intent`` row is
-still surfaced under ``daily_intent`` for observability/back-compat, but no
-longer drives ``effective_mode``.
+``simplified_engine``) — a back-compat shim over the mode-only
+:func:`resolve_mode`. Resolution is ``strategy_mode row → env mode flag →
+sandbox default``; the retired ``strategy_daily_intent``/legacy ``daily_intent``
+tables and the run/pause/halt ``intent`` axis no longer drive it. The legacy
+``daily_intent`` row is still surfaced under ``daily_intent`` for
+observability/back-compat, but no longer affects ``effective_mode``.
 
 Response shape is backward compatible: the historical keys ``today``,
 ``daily_intent``, ``analyze_mode`` and ``effective_mode`` (a mode string) are all
-preserved; the unified attribution (``intent``, ``daily_capital_cap``,
-``source``) is added alongside.
+preserved; ``source`` reflects the mode-only resolution and ``intent`` is always
+``'run'`` / ``daily_capital_cap`` always ``None`` (those axes are retired).
 """
 
 from flask import Blueprint, jsonify
