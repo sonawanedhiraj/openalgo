@@ -853,11 +853,21 @@ fail loud and fail safe.
   `docs/PARAMETER_LOG.md`. The gate/job are no-ops when the flag is off; the
   HTTP endpoint always works.
 
+Both the index AND the 30 universe stock feeds are now refreshed by **daily
+APScheduler jobs**: `sector_follow_index_backfill` at 16:05 IST and
+`sector_follow_stock_backfill` at 16:10 IST mon-fri (5 min later). The stock
+backfill closing the long-standing manual gap is the 2026-06-13 fix — before it,
+the stock 1m refresh was operator-manual and a missed catch-up held all entries
+on 2026-06-12 (every universe stock 2 business days stale).
+
 **Manual catch-up** for a stale feed (both feeds route through the same historify
-pipeline): index 1m via `uv run python -m services.sector_follow_index_backfill
---from YYYY-MM-DD --to YYYY-MM-DD`; stock 1m via a
-`historify_service.create_and_start_job` call over the universe (`exchange=NSE`,
-`interval=1m`, `incremental=True`).
+pipeline, and both need an active broker session — historical fetch fails on an
+expired daily Zerodha token): index 1m via `uv run python -m
+services.sector_follow_index_backfill --from YYYY-MM-DD --to YYYY-MM-DD`; stock 1m
+via `uv run python -m services.sector_follow_stock_backfill --from YYYY-MM-DD --to
+YYYY-MM-DD` (NSE 1m incremental over the locked-static-30 universe). The daily
+16:10 job means a manual stock catch-up is now only needed to backfill a
+historical gap (e.g. after a multi-day outage), not as routine maintenance.
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.

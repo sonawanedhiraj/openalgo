@@ -263,6 +263,30 @@ the latest decisions automatically.
 - **History:**
   - **2026-06-09 (Phase 3):** Introduced with the sector-index feed wiring (`feat/sector_follow_cap5_vol_phase3`, commit `3bfa4a08`). Default `true` so a fresh deploy keeps the feed current without extra config.
 
+#### sector_follow_stock_backfill (daily 16:10 IST job — NO env flag)
+- **Current value:** always on — **no feature flag** (deliberate; the job is
+  additive and harmless when the feed is already fresh, so there is no
+  `*_ENABLED` gate, unlike the index job).
+- **Set in:** registered unconditionally in
+  `services/historify_scheduler_service.py._register_sector_follow_stock_job`.
+  Cron `10 16 * * mon-fri` (16:10 IST), `replace_existing=True`,
+  `coalesce=True`, `misfire_grace_time=300` (from scheduler `job_defaults`).
+- **Effect:** keeps the 30 `LOCK_STATIC_30` universe stocks' 1m feed fresh in
+  `db/historify.duckdb`, the stock-side companion to the 16:05 index job. Without
+  it the stock feed goes stale → the 15:20 signal and the data-freshness gate
+  fail-closed (no entries). Body
+  `services/sector_follow_stock_backfill.refresh_sector_follow_stocks`
+  (4-day incremental lookback). One-shot CLI:
+  `uv run python -m services.sector_follow_stock_backfill --from … --to …`.
+- **Who flips:** N/A (no flag). To disable, an operator would remove the
+  registration call — but doing so reopens the manual-backfill gap.
+- **History:**
+  - **2026-06-13:** Introduced to close the manual-backfill gap (directly to
+    `dev`). Before this, only the sector **indices** had a daily refresh; the 30
+    universe **stocks** relied on a manual `create_and_start_job` catch-up, and a
+    missed catch-up held all entries on 2026-06-12 (every stock 2 business days
+    stale). No flag, per the additive-and-harmless rationale.
+
 ### Simplified engine — EOD watchdog timing
 
 #### SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED

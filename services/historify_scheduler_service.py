@@ -7,7 +7,7 @@ Handles scheduled historical data downloads using APScheduler (Flask/sync versio
 import os
 import threading
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -77,6 +77,9 @@ class HistorifyScheduler:
 
                 # Register the daily sector_follow_cap5_vol index 1m refresh
                 self._register_sector_follow_index_job()
+
+                # Register the daily sector_follow_cap5_vol universe-stock 1m refresh
+                self._register_sector_follow_stock_job()
 
             except Exception as e:
                 logger.exception(f"Failed to initialize Historify Scheduler: {e}")
@@ -543,6 +546,36 @@ class HistorifyScheduler:
             logger.info("Registered sector_follow_index_backfill job (16:05 IST daily)")
         except Exception as e:
             logger.exception(f"Failed to register sector_follow_index_backfill job: {e}")
+
+    def _register_sector_follow_stock_job(self):
+        """Register the 16:10 IST sector_follow_cap5_vol universe-stock 1m refresh.
+
+        Mirrors ``_register_sector_follow_index_job`` for the 30 universe **stocks**
+        (the index job covers only the mapped sector indices). Keeps each stock's
+        1m bars current so the strategy's 15:20 signal — and its data-freshness
+        gate — isn't reading a stale stock feed. Before this job the stock backfill
+        was manual, and the gap held all entries on 2026-06-12 (every stock 2
+        business days stale). Additive — downloads stock 1m through the same job
+        pipeline as the index backfill, never touching the watchlist schedules.
+        Runs at 16:10 IST mon-fri (5 min after the 16:05 index refresh). Idempotent
+        via ``replace_existing=True``. No feature flag — additive and harmless when
+        the feed is already fresh.
+        """
+        try:
+            from services.sector_follow_stock_backfill import refresh_sector_follow_stocks
+
+            self.scheduler.add_job(
+                refresh_sector_follow_stocks,
+                trigger=CronTrigger(
+                    hour=16, minute=10, day_of_week="mon-fri", timezone="Asia/Kolkata"
+                ),
+                id="sector_follow_stock_backfill",
+                replace_existing=True,
+                name="Sector Follow CAP5_VOL stock 1m refresh (16:10 IST mon-fri)",
+            )
+            logger.info("Registered sector_follow_stock_backfill job (16:10 IST mon-fri)")
+        except Exception as e:
+            logger.exception(f"Failed to register sector_follow_stock_backfill job: {e}")
 
     def shutdown(self):
         """Shutdown the scheduler"""
