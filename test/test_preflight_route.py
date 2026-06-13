@@ -94,10 +94,16 @@ def _set_intent(intent: str, date_str: str = "2026-05-28"):
     return set_daily_intent_safe(intent, set_by="operator", date_str=date_str)
 
 
-def test_preflight_route_returns_200_with_go(app_with_preflight):
-    """Happy path — every check passes, route returns 200 with go_decision='go'."""
+def test_preflight_route_returns_200_with_go(app_with_preflight, monkeypatch):
+    """Happy path — every check passes, route returns 200 with go_decision='go'.
+
+    Mode-only (B2/B3): the intent check is informational and never aborts; its
+    ``value`` is the resolved persistent mode (strategy_mode → env → sandbox
+    default). With no strategy_mode row, it resolves to the env default
+    ``sandbox``.
+    """
     app, dim, scdb, _ = app_with_preflight
-    _set_intent("live")
+    monkeypatch.setenv("SIMPLIFIED_ENGINE_MODE", "sandbox")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(scdb, recent.isoformat())
 
@@ -109,18 +115,26 @@ def test_preflight_route_returns_200_with_go(app_with_preflight):
     assert data["ok"] is True
     assert data["go_decision"] == "go"
     assert data["reasons"] == []
-    assert data["checks"]["intent"]["value"] == "live"
+    # Mode-only: intent never aborts; its value is the resolved mode.
+    assert data["checks"]["intent"]["value"] == "sandbox"
     assert "checked_at" in data
 
 
-def test_preflight_route_returns_200_with_abort(app_with_preflight):
+def test_preflight_route_returns_200_with_abort(app_with_preflight, monkeypatch):
     """Failed checks must NOT produce a 4xx — the route is informational.
 
-    No daily_intent on record, so intent fails → go_decision='abort', but
-    the HTTP response is still 200.
+    Mode-only (B3) removed the "no declared intent → abort" floor, so the abort
+    here is driven by a real failing gate (broker session down). The HTTP
+    response must still be 200; the caller distinguishes via ``go_decision``.
     """
     app, dim, scdb, _ = app_with_preflight
-    # No _set_intent() and no cycles inserted.
+    # Drive an abort via a genuinely-failing gate: broker session unavailable.
+    monkeypatch.setattr(
+        "services.preflight_service._check_broker_session",
+        lambda: {"ok": False, "broker": None, "user": None, "reason": "no active broker session"},
+    )
+    recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
+    _insert_cycle(scdb, recent.isoformat())
 
     client = app.test_client()
     resp = client.get("/preflight")
@@ -130,4 +144,4 @@ def test_preflight_route_returns_200_with_abort(app_with_preflight):
     assert data["ok"] is False
     assert data["go_decision"] == "abort"
     assert len(data["reasons"]) >= 1
-    assert any("no daily_intent" in r for r in data["reasons"])
+    assert any("broker session" in r for r in data["reasons"])
