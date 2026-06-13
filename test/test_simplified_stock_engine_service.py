@@ -225,6 +225,12 @@ def test_sandbox_mode_routes_entry_to_sandbox_place_order():
 
     sandbox_response = (True, {"orderid": "sbx-abc", "status": "success", "mode": "analyze"}, 200)
     with (
+        # B4 makes the LLM veto enforce ('active') in sandbox by default; this
+        # test exercises order routing, not the veto, so bypass it with a 'take'.
+        patch(
+            "services.signal_review_service.review_signal",
+            return_value={"id": None, "decision": "take", "reasoning": "test-bypass"},
+        ),
         patch(
             "services.sandbox_service.sandbox_place_order",
             return_value=sandbox_response,
@@ -1590,6 +1596,12 @@ def test_no_override_allows_entry():
     sandbox_response = (True, {"orderid": "sbx-abc", "status": "success"}, 200)
     with (
         patch("database.strategy_runtime_override_db.is_entry_blocked", return_value=(False, None)),
+        # B4 veto enforces in sandbox by default; this test covers entry gating,
+        # not the veto, so bypass it with a 'take' no-op.
+        patch(
+            "services.signal_review_service.review_signal",
+            return_value={"id": None, "decision": "take", "reasoning": "test-bypass"},
+        ),
         patch(
             "services.sandbox_service.sandbox_place_order", return_value=sandbox_response
         ) as mock_sandbox,
