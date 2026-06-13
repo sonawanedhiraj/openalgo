@@ -616,10 +616,15 @@ Enable locally: `uv pip install pre-commit && pre-commit install`.
 **CI** ([`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml)):
 runs on PRs to `dev`/`main` and pushes to `dev`. Ruff blocks; bandit and the
 public Semgrep rulesets (`--config=auto`) are best-effort (`|| true`); the custom
-ERROR rules block. **The custom-rule gate is RED until the 4 P0/P1 findings are
-fixed** (firing on them is the proof the rules work) — fix them, or run with
-`--baseline-commit <sha>` to defer to new violations only. Branch protection on
-`dev`/`main` is enabled via the GitHub UI (cannot be automated from the CLI).
+ERROR rules block. **The custom-rule gate is now GREEN as of 2026-06-11
+(commit `5d27bd5d6`)** — all 4 P0/P1 findings are fixed (the rules' firing on
+the pre-fix tree was the proof they work; see
+[`audit/silent_drop_audit_2026-06-11.md`](audit/silent_drop_audit_2026-06-11.md),
+each finding marked RESOLVED). `uvx semgrep --config .semgrep/silent-drops.yml
+services/ blueprints/ sandbox/ restx_api/ --severity ERROR` returns 0 findings,
+so required-status-checks can be enabled on `main`'s branch protection. Branch
+protection on `dev`/`main` is configured via the GitHub UI (cannot be automated
+from the CLI).
 
 GitHub Actions guard `code-direct-push-guard.yml` alerts on direct-to-dev code
 pushes — alert-only, no block. See `.github/workflows/README.md`.
