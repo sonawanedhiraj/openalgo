@@ -391,11 +391,11 @@ def process_indmoney_csv(path):
 
         # Apply exchange and instrument type mapping
         df[["exchange", "brexchange", "instrumenttype"]] = df.apply(
-            lambda row: assign_values(row, segment), axis=1, result_type="expand"
+            lambda row, segment=segment: assign_values(row, segment), axis=1, result_type="expand"
         )
 
         # Generate OpenAlgo formatted symbol
-        df["symbol"] = df.apply(lambda row: reformat_symbol(row, segment), axis=1)
+        df["symbol"] = df.apply(lambda row, segment=segment: reformat_symbol(row, segment), axis=1)
 
         # Handle special cases
         df["symbol"] = df["symbol"].replace(

@@ -460,10 +460,6 @@ def modify_order(data, auth):
     except Exception as e:
         logger.exception("Unexpected error during order modification")
         return {"status": "error", "message": f"General error: {e}"}, 500
-    except Exception as e:
-        error_msg = f"Error during order modification: {str(e)}"
-        logger.error(error_msg)
-        return {"status": "error", "message": error_msg}, 500
 
 
 def cancel_all_orders_api(data, auth):
