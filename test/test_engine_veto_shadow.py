@@ -251,8 +251,10 @@ def test_review_exception_fails_open_to_take(monkeypatch):
     mock_mark.assert_not_called()
 
 
-def test_unknown_veto_mode_falls_back_to_shadow(monkeypatch):
-    """VETO_LAYER_MODE=garbage should resolve to shadow (never enforce)."""
+def test_unknown_veto_mode_falls_back_to_active_in_sandbox(monkeypatch):
+    """Mode-only (B4): an unknown VETO_LAYER_MODE is treated as unset, and a
+    sandbox-mode strategy defaults to 'active' — so a 'skip' verdict is enforced
+    (sandbox order NOT placed)."""
     monkeypatch.setenv("VETO_LAYER_MODE", "yolo")
     service = _make_service()
     signal = _make_entry_signal()
@@ -263,7 +265,7 @@ def test_unknown_veto_mode_falls_back_to_shadow(monkeypatch):
             "services.signal_review_service.review_signal",
             return_value=_stub_review("skip"),
         ) as mock_review,
-        patch("services.signal_review_service.mark_actually_taken"),
+        patch("services.signal_review_service.mark_actually_taken") as mock_mark,
         patch(
             "services.sandbox_service.sandbox_place_order",
             return_value=_sandbox_success_response(),
@@ -272,13 +274,17 @@ def test_unknown_veto_mode_falls_back_to_shadow(monkeypatch):
     ):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 
-    # Reviewer was called (shadow mode), but the skip was not enforced.
+    # Reviewer was consulted, and the skip WAS enforced (active default in sandbox).
     mock_review.assert_called_once()
-    mock_sandbox.assert_called_once()
+    mock_sandbox.assert_not_called()
+    assert signal.symbol not in service.engine.pending_entries
+    assert signal.symbol not in service.engine.positions
+    mock_mark.assert_called_with(42, False)
 
 
-def test_default_veto_mode_is_shadow(monkeypatch):
-    """No VETO_LAYER_MODE env at all → shadow by default, never blocks."""
+def test_default_veto_mode_is_active_in_sandbox(monkeypatch):
+    """Mode-only (B4): no VETO_LAYER_MODE env at all → the sandbox-mode default is
+    'active' (enforce), so a 'skip' verdict blocks the sandbox order."""
     monkeypatch.delenv("VETO_LAYER_MODE", raising=False)
     service = _make_service()
     signal = _make_entry_signal()
@@ -289,7 +295,7 @@ def test_default_veto_mode_is_shadow(monkeypatch):
             "services.signal_review_service.review_signal",
             return_value=_stub_review("skip"),
         ),
-        patch("services.signal_review_service.mark_actually_taken"),
+        patch("services.signal_review_service.mark_actually_taken") as mock_mark,
         patch(
             "services.sandbox_service.sandbox_place_order",
             return_value=_sandbox_success_response(),
@@ -298,7 +304,10 @@ def test_default_veto_mode_is_shadow(monkeypatch):
     ):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 
-    mock_sandbox.assert_called_once()
+    mock_sandbox.assert_not_called()
+    assert signal.symbol not in service.engine.pending_entries
+    assert signal.symbol not in service.engine.positions
+    mock_mark.assert_called_with(42, False)
 
 
 # ---------------------------------------------------------------------------
