@@ -17,9 +17,14 @@ repos:
         files: ^frontend/src/.*\.(ts|tsx|js|jsx)$
         pass_filenames: false
 
-  # Security scan — bandit (own isolated env, scans changed .py only)
+  # Security scan — bandit (own isolated env, scans changed .py only).
+  # Pinned 1.8.6 (was 1.7.9): bandit ≤1.7.x calls the `ast.Num` node which
+  # Python 3.14 removed, so the hook crashed with `AttributeError: module 'ast'
+  # has no attribute 'Num'` on the local 3.14 dev env (zero findings — a pure
+  # tooling crash). 1.8.0+ switched to `ast.Constant`. Same class of Py3.14
+  # pre-commit friction as the semgrep→uvx note below.
   - repo: https://github.com/PyCQA/bandit
-    rev: 1.7.9
+    rev: 1.8.6
     hooks:
       - id: bandit
         args: ["-x", ".venv,frontend,test"]

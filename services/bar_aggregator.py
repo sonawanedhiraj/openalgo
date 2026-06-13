@@ -209,6 +209,10 @@ class BarBuilder:
         self.on_bar = on_bar
         self._current: dict | None = None
         self._last_cum_vol: int | None = None
+        # Source-bar timestamps already folded in via replay_bars(). Used to make
+        # replay idempotent: a bar whose ts is already here is skipped, so calling
+        # replay_bars with overlapping data never double-counts volume.
+        self._replayed_ts: set[dt.datetime] = set()
 
     def _bucket(self, ts: dt.datetime) -> dt.datetime:
         return bucket_for_interval(ts, self.interval_seconds)
@@ -276,6 +280,69 @@ class BarBuilder:
         self._current = None
         self._last_cum_vol = None
         return bar
+
+    def replay_bars(self, bars: list[dict]) -> int:
+        """Seed rolling state from historical OHLCV bars (e.g. WS-reconnect catch-up).
+
+        Each entry in ``bars`` is a discrete OHLCV record (NOT a tick) with keys
+        ``open``/``high``/``low``/``close``/``volume``/``ts`` — exactly the shape
+        the broker historical API returns for 1m bars. Records are folded into the
+        interval buckets in timestamp order; whenever a bucket completes, the
+        closing bar fires ``on_bar`` with ``elapsed_pct=1.0`` (same contract as a
+        natural close), so a scanner consuming closed bars sees the bars it missed
+        during the WS gap. The trailing (in-progress) bucket stays open for live
+        ticks to finish.
+
+        Idempotent: a bar whose ``ts`` was already replayed is skipped, so calling
+        this with bars that overlap existing state never double-counts volume.
+
+        Volume here is the bar's own per-interval volume (summed across the
+        bucket), unlike :meth:`on_tick` which derives a delta from cumulative
+        volume — historical bars carry absolute per-bar volume.
+
+        Returns:
+            The number of bars actually folded in (excludes skipped duplicates).
+        """
+        replayed = 0
+        for bar in sorted(bars, key=lambda b: b["ts"]):
+            ts = bar["ts"]
+            if ts in self._replayed_ts:
+                continue
+            self._replayed_ts.add(ts)
+
+            bucket = self._bucket(ts)
+            o = float(bar["open"])
+            h = float(bar["high"])
+            low = float(bar["low"])
+            c = float(bar["close"])
+            v = int(bar.get("volume") or 0)
+
+            if self._current is None:
+                self._current = {
+                    "bucket": bucket,
+                    "open": o,
+                    "high": h,
+                    "low": low,
+                    "close": c,
+                    "volume": v,
+                }
+            elif bucket != self._current["bucket"]:
+                self._emit(1.0)
+                self._current = {
+                    "bucket": bucket,
+                    "open": o,
+                    "high": h,
+                    "low": low,
+                    "close": c,
+                    "volume": v,
+                }
+            else:
+                self._current["high"] = max(self._current["high"], h)
+                self._current["low"] = min(self._current["low"], low)
+                self._current["close"] = c
+                self._current["volume"] += v
+            replayed += 1
+        return replayed
 
     def _emit(self, elapsed_pct: float) -> None:
         if self.on_bar is None:
@@ -362,6 +429,27 @@ class MultiIntervalAggregator:
         for (sym, _ival), builder in self._builders.items():
             if sym == symbol:
                 builder.on_tick(tick)
+
+    def replay_bars(self, symbol: str, bars: list[dict]) -> int:
+        """Fan ``bars`` into every interval builder tracked for ``symbol``.
+
+        Used by the WS-reconnect recovery path to seed the rolling 5m/15m state
+        from freshly-fetched historical 1m bars so the scanner does not have to
+        warm up from scratch after a feed gap. Each interval builder dedups
+        independently (see :meth:`BarBuilder.replay_bars`), so the whole call is
+        idempotent. Unknown symbols (none of our builders) replay nothing.
+
+        Returns:
+            The number of source bars replayed for the symbol (each builder folds
+            in the same set, so this is the per-builder count, not the sum across
+            intervals).
+        """
+        counts = [
+            builder.replay_bars(bars)
+            for (sym, _ival), builder in self._builders.items()
+            if sym == symbol
+        ]
+        return max(counts) if counts else 0
 
     def current_bar(self, symbol: str, interval: str) -> dict | None:
         builder = self._builders.get((symbol, interval))

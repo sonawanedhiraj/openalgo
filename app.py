@@ -909,6 +909,21 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Scanner service: {e}")
 
+            # WS-reconnect recovery (Fix B-prime) — on every broker session
+            # refresh (the broker_session_refreshed event from the Task 2
+            # event-driven WS reinit), fetch the 1m bars missed during the feed
+            # gap and replay them into the scanner aggregator so the scanner does
+            # not silently warm up from scratch (the tick-starvation gap). No flag;
+            # listens on the in-process event bus for the life of the process. See
+            # services/ws_recovery_service.py.
+            try:
+                from services.ws_recovery_service import init_ws_recovery_service
+
+                init_ws_recovery_service(app)
+                logger.info("WS recovery service registered")
+            except Exception as e:
+                logger.error(f"Failed to initialize WS recovery service: {e}")
+
             # Scanner history cache warm-up (Task 3) — pre-load daily/weekly
             # bars so the first scan does not pay per-symbol lazy-load latency.
             # Gated by SCANNER_HISTORY_WARMUP_ENABLED (default true). Runs on a

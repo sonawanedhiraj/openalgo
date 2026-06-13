@@ -377,6 +377,19 @@ def notify_broker_session_refreshed(username, broker):
         # Never block or fail a login because a UI notification could not be sent.
         logger.exception("Failed to emit broker_session_refreshed event")
 
+    # In-process fan-out (separate from the browser-only SocketIO emit above):
+    # the WS-reconnect recovery service subscribes to this event on the event bus
+    # to fetch the bars missed during the feed gap and seed the scanner aggregator
+    # (see services/ws_recovery_service.py). Wrapped so a recovery hiccup can never
+    # block or fail a login.
+    try:
+        from services.ws_recovery_service import BrokerSessionRefreshedEvent
+        from utils.event_bus import bus
+
+        bus.publish(BrokerSessionRefreshedEvent(username=username, broker=broker))
+    except Exception:
+        logger.exception("Failed to publish broker_session_refreshed to event bus")
+
 
 def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, user_id=None):
     """

@@ -437,6 +437,30 @@ the latest decisions automatically.
     required, no flag)`). No migration needed; nothing read the env var in
     production yet.
 
+### WS-reconnect historical replay (Fix B-prime)
+
+#### WS_RECOVERY_LOOKBACK_MIN
+- **Current value:** `20` (default; not in `.sample.env` — operator WIP holds that
+  file. Add `WS_RECOVERY_LOOKBACK_MIN=20` at the next convenient edit.)
+- **Set in:** env var. Read with a safe default in
+  `services/ws_recovery_service.WSRecoveryService.__init__`
+  (`int(os.getenv("WS_RECOVERY_LOOKBACK_MIN", 20))`).
+- **Code default:** `20` (minutes of 1m bars fetched per symbol on a WS reconnect).
+- **What it controls:** how many minutes of 1m history the WS-reconnect recovery
+  service (`ws_recovery_service.py`) pulls per tracked symbol from the broker
+  historical API before folding them into the live scanner aggregator via
+  `MultiIntervalAggregator.replay_bars`. 20 min comfortably covers a typical WS
+  hiccup while staying inside one 1m page. Larger values lengthen the catch-up
+  (broker 3 req/sec limit → ~85s for ~250 symbols already).
+- **No feature flag for the service itself** — recovery always registers at boot;
+  this is the only tunable. The behavior goes live on the next OpenAlgo restart.
+- **History:**
+  - **2026-06-13:** Introduced with Fix B-prime
+    (`feat(broker): historical-API replay on WS reconnect…`, builds on the
+    event-driven WS reinit `c5f88a8cf`). Closes the scanner tick-starvation gap
+    (the 2026-06-11/12 "1944→7 hits/day" collapse) by replaying the bars missed
+    while the socket was down. Test: `test/test_ws_recovery_service.py`.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

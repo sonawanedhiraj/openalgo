@@ -325,6 +325,21 @@ SocketIO — in-process to Flask + browser clients — cannot reach it. ZMQ is t
 in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.py`
 (hermetic; builds the proxy via `WebSocketProxy.__new__`).
 
+5. **Scanner bar-gap recovery (in-process)** — `services/ws_recovery_service.py`
+   (`WSRecoveryService`, registered at boot via `init_ws_recovery_service(app)`).
+   `notify_broker_session_refreshed` additionally publishes an in-process
+   `BrokerSessionRefreshedEvent` on `utils/event_bus`; the recovery service
+   subscribes (topic `broker_session_refreshed`) and, per tracked symbol (scanner
+   `SCANNER_SYMBOLS` + sector_follow locked-static-30 stocks + mapped sector
+   indices), fetches the last `WS_RECOVERY_LOOKBACK_MIN` min of 1m bars via
+   `history_service.get_history` and folds them into the live scanner aggregator
+   via `MultiIntervalAggregator.replay_bars` — closing the tick-starvation gap
+   without an OpenAlgo restart. Idempotent (per-`BarBuilder` timestamp dedup),
+   best-effort (per-symbol failures logged + skipped, callback never raises),
+   Telegram-summarized. Limitation: Zerodha current-day history lags ~5-15 min, so
+   the most-recent bars may be unavailable on a fast reconnect (reported, caught up
+   next refresh). No flag. Test: `test/test_ws_recovery_service.py`.
+
 ## Known recurring patterns
 
 - **Morning Zerodha token rollover** ~02:00–03:00 IST → WS reconnect burst
