@@ -5,10 +5,12 @@ Tests the edit functionality with running and stopped states
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
+import pytest
 import requests
 
 # Configuration
@@ -21,20 +23,20 @@ import random
 def main():
     """Test strategy for editor functionality"""
     print("Test strategy started")
-    
+
     while True:
         # Simulate trading logic
         price = random.uniform(100, 200)
         print(f"Current price: {price:.2f}")
-        
+
         # Sleep for a bit
         time.sleep(5)
-        
+
         # Check for stop condition
         if random.random() < 0.1:
             print("Strategy stopping...")
             break
-    
+
     print("Strategy completed")
 
 if __name__ == "__main__":
@@ -43,7 +45,21 @@ if __name__ == "__main__":
 
 
 def test_editor_functionality():
-    """Test the editor with running and stopped states"""
+    """Test the editor with running and stopped states.
+
+    This is a MANUAL integration script: it talks to a live, authenticated
+    OpenAlgo instance on port 5000 and creates/starts/deletes a real strategy
+    (which writes to the live ``openalgo.db``). It is therefore NOT a hermetic
+    unit test and must not run in automated/CI pytest collection — without an
+    authenticated session the upload returns a non-JSON error page (the historic
+    JSONDecodeError failure), and a "fixed" run would pollute the live DB. Opt in
+    explicitly with ``OPENALGO_LIVE_INTEGRATION=1`` to run it against a live,
+    logged-in server.
+    """
+    if os.getenv("OPENALGO_LIVE_INTEGRATION") != "1":
+        pytest.skip(
+            "manual live-server integration test; set OPENALGO_LIVE_INTEGRATION=1 to run"
+        )
 
     print("Python Strategy Editor Test")
     print("-" * 50)
