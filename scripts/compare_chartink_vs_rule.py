@@ -161,9 +161,7 @@ def gate_table(res: dict) -> list[str]:
     rows = ["| Gate | Check | Value | Threshold | Result |", "|---|---|---|---|---|"]
     for g in res["gates"]:
         mark = "✅" if g["passed"] else "❌"
-        rows.append(
-            f"| {g['name']} | {g['desc']} | {g['value']} | {g['threshold']} | {mark} |"
-        )
+        rows.append(f"| {g['name']} | {g['desc']} | {g['value']} | {g['threshold']} | {mark} |")
     return rows
 
 
@@ -220,7 +218,9 @@ def main() -> None:
     L.append("**Intersections**")
     L.append(f"- A ∩ C = {len(set_a & set_c)}")
     L.append(f"- B ∩ C = {len(set_b & set_c)}")
-    L.append(f"- B ∩ universe = {len(set_b & universe)} (rest are cash-segment, not in our F&O bars)")
+    L.append(
+        f"- B ∩ universe = {len(set_b & universe)} (rest are cash-segment, not in our F&O bars)"
+    )
     L.append(f"- C: {', '.join(sorted(set_c)) or '(none)'}")
     L.append("")
 

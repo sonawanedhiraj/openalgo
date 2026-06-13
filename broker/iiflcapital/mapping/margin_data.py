@@ -35,12 +35,16 @@ def transform_margin_positions(positions):
                 continue
 
             if action not in {"BUY", "SELL"}:
-                logger.warning(f"Invalid action for margin position {symbol} ({exchange}): {action}")
+                logger.warning(
+                    f"Invalid action for margin position {symbol} ({exchange}): {action}"
+                )
                 skipped_positions.append(f"{symbol} ({exchange}) - invalid action: {action}")
                 continue
 
             if quantity <= 0:
-                logger.warning(f"Invalid quantity for margin position {symbol} ({exchange}): {quantity}")
+                logger.warning(
+                    f"Invalid quantity for margin position {symbol} ({exchange}): {quantity}"
+                )
                 skipped_positions.append(f"{symbol} ({exchange}) - invalid quantity: {quantity}")
                 continue
 

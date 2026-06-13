@@ -115,9 +115,7 @@ def required_scope(tool_name: str) -> str | None:
 def list_tools_for_scopes(granted_scopes: Iterable[str]) -> list[str]:
     """Tool names callable under at least one of the granted scopes."""
     granted = set(granted_scopes)
-    return sorted(
-        name for name, scope in TOOL_SCOPES.items() if scope in granted
-    )
+    return sorted(name for name, scope in TOOL_SCOPES.items() if scope in granted)
 
 
 def _load_mcpserver_module():

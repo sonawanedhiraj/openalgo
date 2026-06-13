@@ -103,7 +103,9 @@ def calculate_single_margin(position_data, auth, client_id):
         logger.debug(
             "Margin calculation response status=%s keys=%s",
             response.status_code,
-            list(response_data.keys()) if isinstance(response_data, dict) else type(response_data).__name__,
+            list(response_data.keys())
+            if isinstance(response_data, dict)
+            else type(response_data).__name__,
         )
 
         # Parse and standardize the response
@@ -147,11 +149,7 @@ def calculate_multi_margin(positions, auth, client_id):
         headers["client-id"] = client_id
 
     # Build multi-margin payload
-    payload = {
-        "includePosition": True,
-        "includeOrders": True,
-        "scripts": positions
-    }
+    payload = {"includePosition": True, "includeOrders": True, "scripts": positions}
 
     payload_json = json.dumps(payload)
     logger.info("Multi-margin request scripts_count=%s", len(positions))
@@ -173,7 +171,9 @@ def calculate_multi_margin(positions, auth, client_id):
         logger.debug(
             "Multi-margin response status=%s keys=%s",
             response.status_code,
-            list(response_data.keys()) if isinstance(response_data, dict) else type(response_data).__name__,
+            list(response_data.keys())
+            if isinstance(response_data, dict)
+            else type(response_data).__name__,
         )
 
         # Use multi-margin parser

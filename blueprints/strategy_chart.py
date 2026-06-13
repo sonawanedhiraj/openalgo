@@ -66,9 +66,7 @@ def strategy_chart_data():
                 {"status": "error", "message": "underlying and exchange are required"}
             ), 400
         if not isinstance(legs, list) or len(legs) == 0:
-            return jsonify(
-                {"status": "error", "message": "At least one leg is required"}
-            ), 400
+            return jsonify({"status": "error", "message": "At least one leg is required"}), 400
 
         success, response, status_code = get_strategy_chart_data(
             underlying=underlying,
@@ -125,9 +123,7 @@ def multi_strike_oi_data():
                 {"status": "error", "message": "underlying and exchange are required"}
             ), 400
         if not isinstance(legs, list) or len(legs) == 0:
-            return jsonify(
-                {"status": "error", "message": "At least one leg is required"}
-            ), 400
+            return jsonify({"status": "error", "message": "At least one leg is required"}), 400
 
         success, response, status_code = get_multi_strike_oi_data(
             underlying=underlying,

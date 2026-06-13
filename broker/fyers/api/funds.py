@@ -178,8 +178,7 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
                     "backoff_seconds": backoff,
                 }
             logger.warning(
-                f"Fyers API rate limited (429). Backing off for {backoff}s. "
-                f"Serving cached data."
+                f"Fyers API rate limited (429). Backing off for {backoff}s. Serving cached data."
             )
             return user_cache["data"] if user_cache["data"] else default_response
         logger.error(f"HTTP error {e.response.status_code} fetching Fyers funds: {e.response.text}")

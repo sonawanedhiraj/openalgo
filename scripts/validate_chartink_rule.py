@@ -312,7 +312,9 @@ def main() -> None:
     lines.append("\n### Data notes\n")
     for n in notes_a + notes_b + notes_u:
         lines.append(f"- {n}")
-    lines.append(f"- Universe symbols evaluated: {evaluated}; skipped (insufficient/NaN): {skipped}")
+    lines.append(
+        f"- Universe symbols evaluated: {evaluated}; skipped (insufficient/NaN): {skipped}"
+    )
     if skip_reasons:
         for k, v in sorted(skip_reasons.items(), key=lambda kv: -kv[1]):
             lines.append(f"  - skip `{k}`: {v}")
@@ -342,8 +344,12 @@ def main() -> None:
     lines.append("\n## Intersections\n")
     lines.append(f"- **A ∩ C** = {len(a_and_c)} → {fmt_list(a_and_c)}")
     lines.append(f"- **B ∩ C** = {len(b_and_c)} → {fmt_list(b_and_c)}")
-    lines.append(f"- **C − (A ∪ B)** = {len(c_only)} (rule fires, no Chartink scan caught) → {fmt_list(c_only)}")
-    lines.append(f"- **(A ∪ B) − C** = {len(ab_not_c)} (Chartink fires, daily gates miss) → {fmt_list(ab_not_c)}")
+    lines.append(
+        f"- **C − (A ∪ B)** = {len(c_only)} (rule fires, no Chartink scan caught) → {fmt_list(c_only)}"
+    )
+    lines.append(
+        f"- **(A ∪ B) − C** = {len(ab_not_c)} (Chartink fires, daily gates miss) → {fmt_list(ab_not_c)}"
+    )
 
     lines.append("\n## Per-set symbol lists (first 20)\n")
     lines.append(f"- **Set A**: {fmt_list(set_a)}")
@@ -417,10 +423,7 @@ def main() -> None:
     print(f"Set A (Chartink BUY): {len(set_a)}  -> {fmt_list(set_a, 10)}")
     print(f"Set B (NL union):     {len(set_b)}  -> {fmt_list(set_b, 10)}")
     print(f"Set C (daily gates):  {len(set_c)}  -> {fmt_list(set_c, 10)}")
-    print(
-        f"A&C={len(a_and_c)}  B&C={len(b_and_c)}  "
-        f"C-(A|B)={len(c_only)}  (A|B)-C={len(ab_not_c)}"
-    )
+    print(f"A&C={len(a_and_c)}  B&C={len(b_and_c)}  C-(A|B)={len(c_only)}  (A|B)-C={len(ab_not_c)}")
     print(f"Universe evaluated={evaluated} skipped={skipped}")
     print(f"Report: {REPORT}")
 

@@ -4,6 +4,7 @@ Captures response + latency for later parity check against opengreeks.
 
 Spot: NIFTY ~23659  Expiry: 26MAY26 (NFO)
 """
+
 import json
 import os
 import sys
@@ -18,27 +19,50 @@ EXPIRY = "26MAY26"
 SPOT = 23659.0
 
 STRIKES = [
-    21000, 21500, 22000, 22500,
-    23000, 23200, 23300, 23400, 23500,
-    23600, 23650, 23700,
-    23800, 23900, 24000, 24200, 24500,
-    25000, 25500, 26000,
+    21000,
+    21500,
+    22000,
+    22500,
+    23000,
+    23200,
+    23300,
+    23400,
+    23500,
+    23600,
+    23650,
+    23700,
+    23800,
+    23900,
+    24000,
+    24200,
+    24500,
+    25000,
+    25500,
+    26000,
 ]
 
 
 def classify(strike: float, spot: float, opt_type: str) -> str:
     diff = strike - spot
     if opt_type == "CE":
-        if diff <= -1000: return "DEEP ITM"
-        if diff < -100:   return "ITM"
-        if abs(diff) <= 100: return "ATM"
-        if diff < 1000:   return "OTM"
+        if diff <= -1000:
+            return "DEEP ITM"
+        if diff < -100:
+            return "ITM"
+        if abs(diff) <= 100:
+            return "ATM"
+        if diff < 1000:
+            return "OTM"
         return "DEEP OTM"
     else:  # PE
-        if diff >= 1000:  return "DEEP ITM"
-        if diff > 100:    return "ITM"
-        if abs(diff) <= 100: return "ATM"
-        if diff > -1000:  return "OTM"
+        if diff >= 1000:
+            return "DEEP ITM"
+        if diff > 100:
+            return "ITM"
+        if abs(diff) <= 100:
+            return "ATM"
+        if diff > -1000:
+            return "OTM"
         return "DEEP OTM"
 
 
@@ -62,22 +86,28 @@ def run():
             symbol = f"NIFTY{EXPIRY}{k}{opt_type}"
             resp, dt_ms = call_greeks(symbol)
             cls = classify(k, SPOT, opt_type)
-            rows.append({
-                "type": opt_type,
-                "strike": k,
-                "moneyness": cls,
-                "symbol": symbol,
-                "latency_ms": round(dt_ms, 2),
-                "response": resp,
-            })
+            rows.append(
+                {
+                    "type": opt_type,
+                    "strike": k,
+                    "moneyness": cls,
+                    "symbol": symbol,
+                    "latency_ms": round(dt_ms, 2),
+                    "response": resp,
+                }
+            )
             print(f"{opt_type} {k:>5} {cls:<9}  {dt_ms:6.1f} ms  status={resp.get('status')}")
     with open("docs/benchmarks/greeks_baseline_pyvollib.json", "w") as f:
-        json.dump({
-            "engine": "py_vollib==1.0.1 (Black-76)",
-            "spot": SPOT,
-            "expiry": EXPIRY,
-            "samples": rows,
-        }, f, indent=2)
+        json.dump(
+            {
+                "engine": "py_vollib==1.0.1 (Black-76)",
+                "spot": SPOT,
+                "expiry": EXPIRY,
+                "samples": rows,
+            },
+            f,
+            indent=2,
+        )
     print(f"\nSaved {len(rows)} samples → docs/benchmarks/greeks_baseline_pyvollib.json")
 
 

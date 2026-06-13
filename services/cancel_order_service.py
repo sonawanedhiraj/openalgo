@@ -33,11 +33,15 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = API_TYPE
 
-    bus.publish(AnalyzerErrorEvent(
-        mode="analyze", api_type=API_TYPE,
-        request_data=analyzer_request, response_data=error_response,
-        error_message=error_message,
-    ))
+    bus.publish(
+        AnalyzerErrorEvent(
+            mode="analyze",
+            api_type=API_TYPE,
+            request_data=analyzer_request,
+            response_data=error_response,
+            error_message=error_message,
+        )
+    )
 
     return error_response
 
@@ -128,19 +132,29 @@ def cancel_order_with_auth(
 
         order_request_data["api_type"] = API_TYPE
         if success:
-            bus.publish(OrderCancelledEvent(
-                mode="analyze", api_type=API_TYPE,
-                orderid=orderid, status=response.get("status", "success"),
-                request_data=order_request_data, response_data=response,
-                api_key=api_key,
-            ))
+            bus.publish(
+                OrderCancelledEvent(
+                    mode="analyze",
+                    api_type=API_TYPE,
+                    orderid=orderid,
+                    status=response.get("status", "success"),
+                    request_data=order_request_data,
+                    response_data=response,
+                    api_key=api_key,
+                )
+            )
         else:
-            bus.publish(OrderCancelFailedEvent(
-                mode="analyze", api_type=API_TYPE,
-                orderid=orderid, error_message=response.get("message", ""),
-                request_data=order_request_data, response_data=response,
-                api_key=api_key,
-            ))
+            bus.publish(
+                OrderCancelFailedEvent(
+                    mode="analyze",
+                    api_type=API_TYPE,
+                    orderid=orderid,
+                    error_message=response.get("message", ""),
+                    request_data=order_request_data,
+                    response_data=response,
+                    api_key=api_key,
+                )
+            )
 
         return success, response, status_code
 
@@ -148,12 +162,17 @@ def cancel_order_with_auth(
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        bus.publish(OrderCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            orderid=orderid, error_message="Broker-specific module not found",
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                orderid=orderid,
+                error_message="Broker-specific module not found",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, 404
 
     try:
@@ -165,22 +184,32 @@ def cancel_order_with_auth(
             "status": "error",
             "message": "Failed to cancel order due to internal error",
         }
-        bus.publish(OrderCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            orderid=orderid, error_message="Failed to cancel order due to internal error",
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                orderid=orderid,
+                error_message="Failed to cancel order due to internal error",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, 500
 
     if status_code == 200:
         order_response_data = {"status": "success", "orderid": orderid}
-        bus.publish(OrderCancelledEvent(
-            mode="live", api_type=API_TYPE,
-            orderid=orderid, status=response_message.get("status", "success"),
-            request_data=order_request_data, response_data=order_response_data,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderCancelledEvent(
+                mode="live",
+                api_type=API_TYPE,
+                orderid=orderid,
+                status=response_message.get("status", "success"),
+                request_data=order_request_data,
+                response_data=order_response_data,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return True, order_response_data, 200
     else:
         message = (
@@ -189,12 +218,17 @@ def cancel_order_with_auth(
             else "Failed to cancel order"
         )
         error_response = {"status": "error", "message": message}
-        bus.publish(OrderCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            orderid=orderid, error_message=message,
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                orderid=orderid,
+                error_message=message,
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, status_code
 
 
@@ -228,12 +262,17 @@ def cancel_order(
     if not orderid:
         error_message = "Order ID is missing"
         error_response = {"status": "error", "message": error_message}
-        bus.publish(OrderCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            orderid="", error_message=error_message,
-            request_data={"orderid": orderid}, response_data=error_response,
-            api_key=api_key or "",
-        ))
+        bus.publish(
+            OrderCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                orderid="",
+                error_message=error_message,
+                request_data={"orderid": orderid},
+                response_data=error_response,
+                api_key=api_key or "",
+            )
+        )
         return False, error_response, 400
 
     # Case 1: API-based authentication
@@ -253,12 +292,17 @@ def cancel_order(
                         "message": "Cancel order operation is not allowed in Semi-Auto mode. Please switch to Auto mode to cancel orders.",
                     }
                     logger.warning(f"Cancel order blocked for user {user_id} (semi-auto mode)")
-                    bus.publish(OrderCancelFailedEvent(
-                        mode="live", api_type=API_TYPE,
-                        orderid=orderid, error_message=error_response["message"],
-                        request_data={"orderid": orderid}, response_data=error_response,
-                        api_key=api_key,
-                    ))
+                    bus.publish(
+                        OrderCancelFailedEvent(
+                            mode="live",
+                            api_type=API_TYPE,
+                            orderid=orderid,
+                            error_message=error_response["message"],
+                            request_data={"orderid": orderid},
+                            response_data=error_response,
+                            api_key=api_key,
+                        )
+                    )
                     return False, error_response, 403
 
         AUTH_TOKEN, broker_name = get_auth_token_broker(api_key)

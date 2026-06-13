@@ -260,12 +260,18 @@ def get_option_chain(
             # CRYPTO: look up the canonical perpetual symbol from cache (e.g. BTC -> BTCUSDFUT)
             quote_exchange = exchange.upper()
             _perp = fno_search_symbols(
-                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{base_symbol}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
                 return (
                     False,
-                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    {
+                        "status": "error",
+                        "message": f"No perpetual futures found for {base_symbol} on {exchange}",
+                    },
                     404,
                 )
             quote_symbol = _perp[0]["symbol"]
@@ -394,7 +400,11 @@ def get_option_chain(
                     except Exception as _qe:
                         logger.warning(f"[CRYPTO] Quote error for {_item['symbol']}: {_qe}")
                         _results.append(
-                            {"symbol": _item["symbol"], "exchange": _item["exchange"], "error": str(_qe)}
+                            {
+                                "symbol": _item["symbol"],
+                                "exchange": _item["exchange"],
+                                "error": str(_qe),
+                            }
                         )
                 quotes_response = {"status": "success", "results": _results}
                 success = True

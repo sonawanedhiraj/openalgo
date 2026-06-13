@@ -511,7 +511,7 @@ class IiflMqttClient:
             self.logger.debug("PUBLISH truncated topic")
             return
 
-        topic = body[2:2 + topic_len].decode("utf-8", errors="replace")
+        topic = body[2 : 2 + topic_len].decode("utf-8", errors="replace")
         qos = (flags & 0x06) >> 1
 
         # We negotiated QoS 0 on subscribe, so the broker should never send

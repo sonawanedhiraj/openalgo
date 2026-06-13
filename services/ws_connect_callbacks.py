@@ -75,12 +75,16 @@ def _fire_connect_callbacks(user_id: str, broker: str) -> None:
         return
     logger.info(
         "Broker WS connected+authenticated (user=%s, broker=%s) — firing %d connect callback(s)",
-        user_id, broker, len(callbacks),
+        user_id,
+        broker,
+        len(callbacks),
     )
     for name, cb in callbacks:
+
         def _run(n=name, c=cb):
             try:
                 c(user_id, broker)
             except Exception:
                 logger.exception("Connect callback %r raised", n)
+
         threading.Thread(target=_run, name=f"connect-cb-{name}", daemon=True).start()

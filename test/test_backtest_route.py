@@ -18,12 +18,8 @@ def app_with_backtest(monkeypatch):
     from blueprints.backtest import backtest_bp
     from database import backtest_db as bdb
 
-    test_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
     monkeypatch.setattr(bdb, "engine", test_engine)
     monkeypatch.setattr(bdb, "db_session", test_session)
     bdb.Base.metadata.create_all(test_engine)

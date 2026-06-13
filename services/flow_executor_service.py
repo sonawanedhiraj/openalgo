@@ -158,9 +158,7 @@ class NodeExecutor:
 
     def log(self, message: str, level: str = "info"):
         """Add log entry"""
-        self.logs.append(
-            {"time": datetime.now().isoformat(), "message": message, "level": level}
-        )
+        self.logs.append({"time": datetime.now().isoformat(), "message": message, "level": level})
         if level == "error":
             logger.error(message)
         else:
@@ -1319,9 +1317,7 @@ class NodeExecutor:
         data = result.get("data", {}) or {}
         available = float(data.get("availablecash", 0) or 0)
         condition_met = available >= min_available
-        self.log(
-            f"Fund check: available={available} >= {min_available} = {condition_met}"
-        )
+        self.log(f"Fund check: available={available} >= {min_available} = {condition_met}")
         return {"status": "success", "condition": condition_met, "available": available}
 
     def execute_price_condition(self, node_data: dict) -> dict:
@@ -1357,9 +1353,7 @@ class NodeExecutor:
             field_value = float(data.get(field, 0) or 0)
 
         condition_met = self._compare(field_value, operator, threshold)
-        self.log(
-            f"Price check: {field}={field_value} {operator} {threshold} = {condition_met}"
-        )
+        self.log(f"Price check: {field}={field_value} {operator} {threshold} = {condition_met}")
         return {
             "status": "success",
             "condition": condition_met,
@@ -1374,12 +1368,18 @@ class NodeExecutor:
         >=, <=) used by the UI or word operators (gt, lt, eq, neq, gte, lte)
         used by some legacy node configs. Unknown operator → False."""
         ops = {
-            ">": left > right, "gt": left > right,
-            "<": left < right, "lt": left < right,
-            "==": left == right, "eq": left == right,
-            "!=": left != right, "neq": left != right,
-            ">=": left >= right, "gte": left >= right,
-            "<=": left <= right, "lte": left <= right,
+            ">": left > right,
+            "gt": left > right,
+            "<": left < right,
+            "lt": left < right,
+            "==": left == right,
+            "eq": left == right,
+            "!=": left != right,
+            "neq": left != right,
+            ">=": left >= right,
+            "gte": left >= right,
+            "<=": left <= right,
+            "lte": left <= right,
         }
         return ops.get(operator, False)
 

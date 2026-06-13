@@ -51,7 +51,9 @@ def journal_recent():
     """Recent journal rows. ``?hours=N`` controls the window (default 24)."""
     hours = _int_arg("hours", default=24)
     try:
-        return jsonify({"hours": hours, "trades": trade_journal_service.get_recent_trades(hours=hours)})
+        return jsonify(
+            {"hours": hours, "trades": trade_journal_service.get_recent_trades(hours=hours)}
+        )
     except Exception as e:
         logger.exception("journal_recent failed: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500

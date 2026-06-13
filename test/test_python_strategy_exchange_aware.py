@@ -49,9 +49,7 @@ def calendar_db():
         poolclass=StaticPool,
     )
     mc.engine = engine
-    mc.db_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    )
+    mc.db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
     mc.Base.query = mc.db_session.query_property()
     mc.Base.metadata.create_all(engine)
     mc.clear_market_calendar_cache()

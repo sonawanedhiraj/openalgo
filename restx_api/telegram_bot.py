@@ -164,12 +164,24 @@ class TelegramBotConfig(Resource):
                     rate_limit = int(data["rate_limit_per_minute"])
                     if not 1 <= rate_limit <= 120:
                         return make_response(
-                            jsonify({"status": "error", "message": "rate_limit_per_minute must be between 1 and 120"}), 400
+                            jsonify(
+                                {
+                                    "status": "error",
+                                    "message": "rate_limit_per_minute must be between 1 and 120",
+                                }
+                            ),
+                            400,
                         )
                     config_update["rate_limit_per_minute"] = rate_limit
                 except (TypeError, ValueError):
                     return make_response(
-                        jsonify({"status": "error", "message": "rate_limit_per_minute must be an integer"}), 400
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": "rate_limit_per_minute must be an integer",
+                            }
+                        ),
+                        400,
                     )
 
             success = update_bot_config(config_update)
@@ -408,7 +420,10 @@ class BroadcastMessage(Resource):
 
             if len(message) > 4096:
                 return make_response(
-                    jsonify({"status": "error", "message": "Message must not exceed 4096 characters"}), 400
+                    jsonify(
+                        {"status": "error", "message": "Message must not exceed 4096 characters"}
+                    ),
+                    400,
                 )
 
             # Check if broadcast is enabled
@@ -517,9 +532,7 @@ class SendNotification(Resource):
             else:
                 # Async: fire-and-forget (default, fast path)
                 alert_executor.submit(telegram_alert.send_alert_sync, telegram_id, message)
-                logger.info(
-                    f"Telegram notification queued for user {username} (ID: {telegram_id})"
-                )
+                logger.info(f"Telegram notification queued for user {username} (ID: {telegram_id})")
                 return make_response(
                     jsonify({"status": "success", "message": "Notification queued for delivery"}),
                     200,

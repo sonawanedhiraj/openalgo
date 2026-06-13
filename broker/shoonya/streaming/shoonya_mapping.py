@@ -2,6 +2,7 @@
 Shoonya-specific mapping utilities for the WebSocket adapter
 """
 
+
 class ShoonyaExchangeMapper:
     """Maps between OpenAlgo exchange names and Shoonya exchange codes"""
 

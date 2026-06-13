@@ -23,7 +23,7 @@ def test_nbcc_brokerage_per_leg_matches_kite():
     is within Rs0.5 of Kite -- the small residual is the exchange/SEBI/GST rate
     approximations baked into the model, which are out of scope for this fix.
     """
-    buy_value = 500 * 107.65   # 53825.0
+    buy_value = 500 * 107.65  # 53825.0
     sell_value = 500 * 106.65  # 53325.0
 
     charges = compute_zerodha_intraday_charges(buy_value, sell_value)

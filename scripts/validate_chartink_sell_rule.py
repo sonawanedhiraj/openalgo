@@ -144,7 +144,9 @@ def eval_daily_gates(symbol: str) -> tuple[bool | None, str]:
     # End-of-day validation on settled bars: today = -1, yesterday = -2.
     today = daily.iloc[-1]
     yest = daily.iloc[-2]
-    if _any_nan(today.close, today.open, today.volume, yest.close, yest.high, yest.low, yest.volume):
+    if _any_nan(
+        today.close, today.open, today.volume, yest.close, yest.high, yest.low, yest.volume
+    ):
         return None, "NaN in required daily fields"
 
     # Gate 6: close > 100
@@ -259,8 +261,12 @@ def main() -> None:
 
     lines.append("\n## Intersections\n")
     lines.append(f"- **A ∩ C** = {len(a_and_c)} → {fmt_list(a_and_c)}")
-    lines.append(f"- **A − C** (Chartink fired, daily gates miss) = {len(a_not_c)} → {fmt_list(a_not_c)}")
-    lines.append(f"- **C − A** (rule fires, no Chartink SELL) = {len(c_not_a)} → {fmt_list(c_not_a)}")
+    lines.append(
+        f"- **A − C** (Chartink fired, daily gates miss) = {len(a_not_c)} → {fmt_list(a_not_c)}"
+    )
+    lines.append(
+        f"- **C − A** (rule fires, no Chartink SELL) = {len(c_not_a)} → {fmt_list(c_not_a)}"
+    )
 
     lines.append("\n## Per-set symbol lists (first 20)\n")
     lines.append(f"- **Set A_sell**: {fmt_list(set_a)}")

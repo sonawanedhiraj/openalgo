@@ -1,4 +1,5 @@
 """Retry only the PE samples that hit rate limit, then merge into baseline JSON."""
+
 import json
 import os
 import sys
@@ -29,7 +30,9 @@ for r in failed:
     dt_ms = (time.perf_counter() - t0) * 1000.0
     r["response"] = payload
     r["latency_ms"] = round(dt_ms, 2)
-    print(f"{r['type']} {r['strike']:>5} {r['moneyness']:<9} {dt_ms:6.1f} ms  status={payload.get('status')}")
+    print(
+        f"{r['type']} {r['strike']:>5} {r['moneyness']:<9} {dt_ms:6.1f} ms  status={payload.get('status')}"
+    )
     time.sleep(1.1)
 
 with open(PATH, "w") as f:

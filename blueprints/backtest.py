@@ -64,16 +64,20 @@ def trigger_run():
         if not value
     ]
     if missing:
-        return jsonify({
-            "status": "error",
-            "message": f"missing required field(s): {', '.join(missing)}",
-        }), 400
+        return jsonify(
+            {
+                "status": "error",
+                "message": f"missing required field(s): {', '.join(missing)}",
+            }
+        ), 400
 
     if not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols):
-        return jsonify({
-            "status": "error",
-            "message": "symbols must be a list of strings",
-        }), 400
+        return jsonify(
+            {
+                "status": "error",
+                "message": "symbols must be a list of strings",
+            }
+        ), 400
 
     kwargs = {
         "symbols": symbols,

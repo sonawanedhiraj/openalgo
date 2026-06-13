@@ -23,22 +23,14 @@ def app_with_preflight(monkeypatch, tmp_path):
     from database import daily_intent_db as dim
     from database import scan_cycle_db as scdb
 
-    di_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    di_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=di_engine)
-    )
+    di_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    di_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=di_engine))
     monkeypatch.setattr(dim, "engine", di_engine)
     monkeypatch.setattr(dim, "db_session", di_session)
     dim.Base.metadata.create_all(di_engine)
 
-    sc_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    sc_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=sc_engine)
-    )
+    sc_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sc_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=sc_engine))
     monkeypatch.setattr(scdb, "engine", sc_engine)
     monkeypatch.setattr(scdb, "db_session", sc_session)
     scdb.Base.metadata.create_all(sc_engine)
@@ -66,9 +58,7 @@ def app_with_preflight(monkeypatch, tmp_path):
         finally:
             sess.remove()
 
-    monkeypatch.setattr(
-        "services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles
-    )
+    monkeypatch.setattr("services.scan_cycle_service.get_recent_cycles", _fake_get_recent_cycles)
     monkeypatch.setattr(
         "services.preflight_service._check_broker_session",
         lambda: {
@@ -92,9 +82,7 @@ def app_with_preflight(monkeypatch, tmp_path):
 
 
 def _insert_cycle(scdb, started_at_iso: str) -> None:
-    row = scdb.ScanCycle(
-        started_at=started_at_iso, cycle_kind="chartink", post_status="ok"
-    )
+    row = scdb.ScanCycle(started_at=started_at_iso, cycle_kind="chartink", post_status="ok")
     scdb.db_session.add(row)
     scdb.db_session.commit()
     scdb.db_session.remove()

@@ -398,8 +398,14 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.depth_20_data_received[correlation_id] = time.time()
 
             # Lazy-connect the 20-depth WebSocket on first demand
-            if self.ws_client_20depth and not self.ws_client_20depth.connected and not self.ws_client_20depth.running:
-                self.logger.info("Lazy-connecting Dhan 20-depth WebSocket (first 20-depth subscription)")
+            if (
+                self.ws_client_20depth
+                and not self.ws_client_20depth.connected
+                and not self.ws_client_20depth.running
+            ):
+                self.logger.info(
+                    "Lazy-connecting Dhan 20-depth WebSocket (first 20-depth subscription)"
+                )
                 self.ws_client_20depth.connect()
 
             # Queue for batch flush only when connection is up.
@@ -517,7 +523,8 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # does not leave a ghost upstream subscription on Dhan
             # (Dhan has no real unsubscribe — once SUBSCRIBE is sent, it sticks).
             self.subscription_queue = [
-                item for item in self.subscription_queue
+                item
+                for item in self.subscription_queue
                 if not (
                     item["instrument"]["ExchangeSegment"] == dhan_exchange
                     and item["instrument"]["SecurityId"] == token
@@ -1055,18 +1062,18 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """Destructor to ensure resources are cleaned up"""
         try:
             # During garbage collection, logger may not be available
-            if hasattr(self, 'running') and self.running:
+            if hasattr(self, "running") and self.running:
                 self.running = False
 
             # Try to clean up WebSocket clients
-            if hasattr(self, 'ws_client_5depth') and self.ws_client_5depth:
+            if hasattr(self, "ws_client_5depth") and self.ws_client_5depth:
                 try:
                     self.ws_client_5depth.disconnect()
                 except Exception:
                     pass
                 self.ws_client_5depth = None
 
-            if hasattr(self, 'ws_client_20depth') and self.ws_client_20depth:
+            if hasattr(self, "ws_client_20depth") and self.ws_client_20depth:
                 try:
                     self.ws_client_20depth.disconnect()
                 except Exception:

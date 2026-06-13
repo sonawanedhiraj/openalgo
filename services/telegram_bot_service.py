@@ -144,9 +144,7 @@ class TelegramBotService:
             except BaseException as exc:  # noqa: BLE001 - propagate across thread
                 result_q.put(("err", exc))
 
-        t = original_threading.Thread(
-            target=_worker, daemon=True, name="openalgo-kaleido-render"
-        )
+        t = original_threading.Thread(target=_worker, daemon=True, name="openalgo-kaleido-render")
         t.start()
         t.join()
 
@@ -547,7 +545,9 @@ class TelegramBotService:
             from utils.httpx_client import get_httpx_client
 
             try:
-                response = get_httpx_client().get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+                response = get_httpx_client().get(
+                    f"https://api.telegram.org/bot{token}/getMe", timeout=10
+                )
 
                 if response.status_code == 200:
                     data = response.json()
@@ -1166,7 +1166,9 @@ class TelegramBotService:
             try:
                 price = float(order.get("price", 0))
                 price_str = (
-                    "Market" if price == 0 and order.get("pricetype") == "MARKET" else f"{cs}{price}"
+                    "Market"
+                    if price == 0 and order.get("pricetype") == "MARKET"
+                    else f"{cs}{price}"
                 )
             except (ValueError, TypeError):
                 price_str = f"{cs}{order.get('price', 0)}"
@@ -1881,7 +1883,7 @@ class TelegramBotService:
 
         log_command(user.id, "menu", update.effective_chat.id)
 
-    def _format_orderbook(self, response: dict, cs: str = '₹') -> str:
+    def _format_orderbook(self, response: dict, cs: str = "₹") -> str:
         """Format orderbook response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch orderbook"
@@ -1921,7 +1923,7 @@ class TelegramBotService:
             message += f"_... and {len(orders) - 10} more orders_"
         return message
 
-    def _format_tradebook(self, response: dict, cs: str = '₹') -> str:
+    def _format_tradebook(self, response: dict, cs: str = "₹") -> str:
         """Format tradebook response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch tradebook"
@@ -1951,7 +1953,7 @@ class TelegramBotService:
             message += f"_... and {len(trades) - 10} more trades_"
         return message
 
-    def _format_positions(self, response: dict, cs: str = '₹') -> str:
+    def _format_positions(self, response: dict, cs: str = "₹") -> str:
         """Format positions response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch positions"
@@ -1978,7 +1980,7 @@ class TelegramBotService:
             message += f"_... and {len(active_positions) - 10} more positions_"
         return message
 
-    def _format_holdings(self, response: dict, cs: str = '₹') -> str:
+    def _format_holdings(self, response: dict, cs: str = "₹") -> str:
         """Format holdings response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch holdings"
@@ -2001,7 +2003,7 @@ class TelegramBotService:
             message += f"_... and {len(holdings) - 10} more holdings_"
         return message
 
-    def _format_funds(self, response: dict, cs: str = '₹') -> str:
+    def _format_funds(self, response: dict, cs: str = "₹") -> str:
         """Format funds response into message"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch funds"
@@ -2022,7 +2024,7 @@ class TelegramBotService:
             f"💼 Total: {cs}{(available + collateral):,.2f}"
         )
 
-    def _format_pnl(self, response: dict, cs: str = '₹') -> str:
+    def _format_pnl(self, response: dict, cs: str = "₹") -> str:
         """Format P&L response into message (uses positionbook data)"""
         if not response or response.get("status") != "success":
             return "❌ Failed to fetch P&L"
@@ -2037,7 +2039,9 @@ class TelegramBotService:
                 pass
 
         pnl_emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
-        return f"💹 *PROFIT & LOSS*\n━━━━━━━━━━━━━━━\n\n{pnl_emoji} *Day P&L*\n└ {cs}{total_pnl:,.2f}"
+        return (
+            f"💹 *PROFIT & LOSS*\n━━━━━━━━━━━━━━━\n\n{pnl_emoji} *Day P&L*\n└ {cs}{total_pnl:,.2f}"
+        )
 
     async def cmd_closeall(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /closeall command — close all open positions with confirmation"""
@@ -2114,12 +2118,8 @@ class TelegramBotService:
             [InlineKeyboardButton(f"🐍 {name}", callback_data=f"spy_{idx}")]
             for idx, (_, name) in enumerate(running)
         ]
-        keyboard.append(
-            [InlineKeyboardButton("🛑 Stop All", callback_data="spy_all")]
-        )
-        keyboard.append(
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")]
-        )
+        keyboard.append([InlineKeyboardButton("🛑 Stop All", callback_data="spy_all")])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await update.message.reply_text(
@@ -2299,9 +2299,7 @@ class TelegramBotService:
 
             stoppy_list = context.user_data.get("stoppy_list", [])
             if idx < 0 or idx >= len(stoppy_list):
-                await query.edit_message_text(
-                    "❌ Selection expired. Please run /stoppython again."
-                )
+                await query.edit_message_text("❌ Selection expired. Please run /stoppython again.")
                 return
 
             sid, name = stoppy_list[idx]
@@ -2323,9 +2321,7 @@ class TelegramBotService:
             stoppy_list = context.user_data.get("stoppy_list", [])
             count = len(stoppy_list)
             if count == 0:
-                await query.edit_message_text(
-                    "❌ Selection expired. Please run /stoppython again."
-                )
+                await query.edit_message_text("❌ Selection expired. Please run /stoppython again.")
                 return
 
             keyboard = [
@@ -2353,9 +2349,7 @@ class TelegramBotService:
 
             stoppy_list = context.user_data.get("stoppy_list", [])
             if idx < 0 or idx >= len(stoppy_list):
-                await query.edit_message_text(
-                    "❌ Selection expired. Please run /stoppython again."
-                )
+                await query.edit_message_text("❌ Selection expired. Please run /stoppython again.")
                 return
 
             sid, name = stoppy_list[idx]
@@ -2434,6 +2428,7 @@ class TelegramBotService:
                 # Sync mode to frontend via SocketIO
                 try:
                     from extensions import socketio
+
                     socketio.emit("app_mode_changed", {"analyze_mode": new_mode})
                 except Exception:
                     pass
@@ -2656,7 +2651,9 @@ class TelegramBotService:
                         # Add small delay to avoid rate limits
                         await asyncio.sleep(0.1)
                 except Exception as e:
-                    logger.exception(f"Failed to send broadcast to {user.get('telegram_id')}: {str(e)}")
+                    logger.exception(
+                        f"Failed to send broadcast to {user.get('telegram_id')}: {str(e)}"
+                    )
                     fail_count += 1
 
             logger.debug(f"Broadcast complete: {success_count} success, {fail_count} failed")

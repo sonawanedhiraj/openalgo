@@ -168,9 +168,7 @@ def modify_gtt_order(data, auth):
         existing = _lookup_existing_legs(trigger_id, auth)
         if existing:
             single_leg = existing[0][0] or "ENTRY_LEG"
-            logger.info(
-                f"Dhan modify_gtt: resolved SINGLE legName={single_leg} from forever book"
-            )
+            logger.info(f"Dhan modify_gtt: resolved SINGLE legName={single_leg} from forever book")
             leg_names = [single_leg]
         else:
             logger.warning(
@@ -271,9 +269,7 @@ def cancel_gtt_order(trigger_id, auth):
         return {"status": "success", "trigger_id": str(response_data["orderId"])}, 200
 
     msg = (
-        response_data.get("errorMessage")
-        or response_data.get("message")
-        or "Failed to cancel GTT"
+        response_data.get("errorMessage") or response_data.get("message") or "Failed to cancel GTT"
     )
     return {"status": "error", "message": msg}, response.status_code
 

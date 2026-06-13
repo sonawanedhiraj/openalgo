@@ -804,7 +804,8 @@ class FlattradeWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return
 
             delay = min(
-                Config.BASE_RECONNECT_DELAY * (2**self.reconnect_attempts), Config.MAX_RECONNECT_DELAY
+                Config.BASE_RECONNECT_DELAY * (2**self.reconnect_attempts),
+                Config.MAX_RECONNECT_DELAY,
             )
 
             self.logger.info(f"Reconnecting in {delay}s (attempt {self.reconnect_attempts + 1})")

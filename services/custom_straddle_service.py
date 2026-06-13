@@ -74,10 +74,17 @@ def get_custom_straddle_simulation(
         # Handle crypto perpetual symbol lookup (e.g. BTC → BTCUSDFUT)
         if exchange.upper() in CRYPTO_EXCHANGES:
             _perp = fno_search_symbols(
-                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{base_symbol}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
-                return False, {"status": "error", "message": f"No perpetual futures found for {base_symbol}"}, 404
+                return (
+                    False,
+                    {"status": "error", "message": f"No perpetual futures found for {base_symbol}"},
+                    404,
+                )
             underlying_quote_symbol = _perp[0]["symbol"]
         else:
             underlying_quote_symbol = base_symbol
@@ -87,22 +94,33 @@ def get_custom_straddle_simulation(
             base_symbol, expiry_date.upper(), "CE", options_exchange
         )
         if not available_strikes:
-            return False, {
-                "status": "error",
-                "message": f"No strikes found for {base_symbol} {expiry_date} on {options_exchange}",
-            }, 404
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": f"No strikes found for {base_symbol} {expiry_date} on {options_exchange}",
+                },
+                404,
+            )
 
         # Fetch underlying history
         success_u, resp_u, _ = get_history(
-            symbol=underlying_quote_symbol, exchange=quote_exchange,
-            interval=interval, start_date=start_date_str,
-            end_date=end_date_str, api_key=api_key,
+            symbol=underlying_quote_symbol,
+            exchange=quote_exchange,
+            interval=interval,
+            start_date=start_date_str,
+            end_date=end_date_str,
+            api_key=api_key,
         )
         if not success_u:
-            return False, {
-                "status": "error",
-                "message": f"Failed to fetch underlying history: {resp_u.get('message', 'Unknown')}",
-            }, 400
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": f"Failed to fetch underlying history: {resp_u.get('message', 'Unknown')}",
+                },
+                400,
+            )
 
         df_underlying = pd.DataFrame(resp_u.get("data", []))
         if df_underlying.empty:
@@ -137,9 +155,12 @@ def get_custom_straddle_simulation(
             ce_lookup, pe_lookup = {}, {}
 
             success_ce, resp_ce, _ = get_history(
-                symbol=ce_symbol, exchange=options_exchange,
-                interval=interval, start_date=start_date_str,
-                end_date=end_date_str, api_key=api_key,
+                symbol=ce_symbol,
+                exchange=options_exchange,
+                interval=interval,
+                start_date=start_date_str,
+                end_date=end_date_str,
+                api_key=api_key,
             )
             if success_ce:
                 df_ce = pd.DataFrame(resp_ce.get("data", []))
@@ -150,9 +171,12 @@ def get_custom_straddle_simulation(
                             ce_lookup[ts] = float(row["close"])
 
             success_pe, resp_pe, _ = get_history(
-                symbol=pe_symbol, exchange=options_exchange,
-                interval=interval, start_date=start_date_str,
-                end_date=end_date_str, api_key=api_key,
+                symbol=pe_symbol,
+                exchange=options_exchange,
+                interval=interval,
+                start_date=start_date_str,
+                end_date=end_date_str,
+                api_key=api_key,
             )
             if success_pe:
                 df_pe = pd.DataFrame(resp_pe.get("data", []))
@@ -181,7 +205,7 @@ def get_custom_straddle_simulation(
         # today. Keeps cumulative P&L, trade log, and summary consistent
         # with the chart range.
         all_trading_days = sorted(daily_candles.keys())
-        trading_days = all_trading_days[-max(1, days):]
+        trading_days = all_trading_days[-max(1, days) :]
         for day in trading_days:
             candles = daily_candles[day]
 
@@ -212,17 +236,19 @@ def get_custom_straddle_simulation(
                     entry_ce = ce_at_atm
                     entry_pe = pe_at_atm
 
-                    trades.append({
-                        "time": int(ts.timestamp()),
-                        "type": "ENTRY",
-                        "strike": atm,
-                        "ce_price": round(ce_at_atm, 2),
-                        "pe_price": round(pe_at_atm, 2),
-                        "straddle": round(ce_at_atm + pe_at_atm, 2),
-                        "spot": round(spot, 2),
-                        "leg_pnl": 0.0,
-                        "cumulative_pnl": round(cumulative_realized, 2),
-                    })
+                    trades.append(
+                        {
+                            "time": int(ts.timestamp()),
+                            "type": "ENTRY",
+                            "strike": atm,
+                            "ce_price": round(ce_at_atm, 2),
+                            "pe_price": round(pe_at_atm, 2),
+                            "straddle": round(ce_at_atm + pe_at_atm, 2),
+                            "spot": round(spot, 2),
+                            "leg_pnl": 0.0,
+                            "cumulative_pnl": round(cumulative_realized, 2),
+                        }
+                    )
                 else:
                     # ── ADJUSTMENT check ──
                     if abs(atm - entry_strike) >= adjustment_points:
@@ -237,29 +263,27 @@ def get_custom_straddle_simulation(
                             and new_ce is not None
                             and new_pe is not None
                         ):
-                            leg_pnl = (
-                                (entry_ce - old_ce) + (entry_pe - old_pe)
-                            ) * quantity
+                            leg_pnl = ((entry_ce - old_ce) + (entry_pe - old_pe)) * quantity
                             day_realized += leg_pnl
                             day_adjustments += 1
 
-                            trades.append({
-                                "time": int(ts.timestamp()),
-                                "type": "ADJUSTMENT",
-                                "old_strike": entry_strike,
-                                "strike": atm,
-                                "exit_ce": round(old_ce, 2),
-                                "exit_pe": round(old_pe, 2),
-                                "exit_straddle": round(old_ce + old_pe, 2),
-                                "ce_price": round(new_ce, 2),
-                                "pe_price": round(new_pe, 2),
-                                "straddle": round(new_ce + new_pe, 2),
-                                "spot": round(spot, 2),
-                                "leg_pnl": round(leg_pnl, 2),
-                                "cumulative_pnl": round(
-                                    cumulative_realized + day_realized, 2
-                                ),
-                            })
+                            trades.append(
+                                {
+                                    "time": int(ts.timestamp()),
+                                    "type": "ADJUSTMENT",
+                                    "old_strike": entry_strike,
+                                    "strike": atm,
+                                    "exit_ce": round(old_ce, 2),
+                                    "exit_pe": round(old_pe, 2),
+                                    "exit_straddle": round(old_ce + old_pe, 2),
+                                    "ce_price": round(new_ce, 2),
+                                    "pe_price": round(new_pe, 2),
+                                    "straddle": round(new_ce + new_pe, 2),
+                                    "spot": round(spot, 2),
+                                    "leg_pnl": round(leg_pnl, 2),
+                                    "cumulative_pnl": round(cumulative_realized + day_realized, 2),
+                                }
+                            )
 
                             entry_strike = atm
                             entry_ce = new_ce
@@ -270,9 +294,7 @@ def get_custom_straddle_simulation(
                 cur_pe = strike_data.get(entry_strike, {}).get("pe", {}).get(ts)
 
                 if cur_ce is not None and cur_pe is not None:
-                    unrealized = (
-                        (entry_ce - cur_ce) + (entry_pe - cur_pe)
-                    ) * quantity
+                    unrealized = ((entry_ce - cur_ce) + (entry_pe - cur_pe)) * quantity
                     last_unrealized = unrealized
                 else:
                     unrealized = last_unrealized
@@ -283,20 +305,24 @@ def get_custom_straddle_simulation(
                 atm_ce = strike_data[atm]["ce"].get(ts, 0) or 0
                 atm_pe = strike_data[atm]["pe"].get(ts, 0) or 0
 
-                synthetic_future = round(atm + atm_ce - atm_pe, 2) if atm_ce and atm_pe else round(spot, 2)
+                synthetic_future = (
+                    round(atm + atm_ce - atm_pe, 2) if atm_ce and atm_pe else round(spot, 2)
+                )
 
-                pnl_series.append({
-                    "time": int(ts.timestamp()),
-                    "pnl": round(total_pnl, 2),
-                    "spot": round(spot, 2),
-                    "atm_strike": atm,
-                    "entry_strike": entry_strike,
-                    "ce_price": round(atm_ce, 2),
-                    "pe_price": round(atm_pe, 2),
-                    "straddle": round(atm_ce + atm_pe, 2),
-                    "synthetic_future": synthetic_future,
-                    "adjustments": total_adjustments + day_adjustments,
-                })
+                pnl_series.append(
+                    {
+                        "time": int(ts.timestamp()),
+                        "pnl": round(total_pnl, 2),
+                        "spot": round(spot, 2),
+                        "atm_strike": atm,
+                        "entry_strike": entry_strike,
+                        "ce_price": round(atm_ce, 2),
+                        "pe_price": round(atm_pe, 2),
+                        "straddle": round(atm_ce + atm_pe, 2),
+                        "synthetic_future": synthetic_future,
+                        "adjustments": total_adjustments + day_adjustments,
+                    }
+                )
 
                 # ── EXIT at last candle ──
                 if is_last and entry_strike is not None:
@@ -304,25 +330,25 @@ def get_custom_straddle_simulation(
                     exit_pe = strike_data.get(entry_strike, {}).get("pe", {}).get(ts)
 
                     if exit_ce is not None and exit_pe is not None:
-                        leg_pnl = (
-                            (entry_ce - exit_ce) + (entry_pe - exit_pe)
-                        ) * quantity
+                        leg_pnl = ((entry_ce - exit_ce) + (entry_pe - exit_pe)) * quantity
                     else:
                         leg_pnl = last_unrealized
 
-                    trades.append({
-                        "time": int(ts.timestamp()),
-                        "type": "EXIT",
-                        "strike": entry_strike,
-                        "ce_price": round(exit_ce or 0, 2),
-                        "pe_price": round(exit_pe or 0, 2),
-                        "straddle": round((exit_ce or 0) + (exit_pe or 0), 2),
-                        "spot": round(spot, 2),
-                        "leg_pnl": round(leg_pnl, 2),
-                        "cumulative_pnl": round(
-                            cumulative_realized + day_realized + leg_pnl, 2
-                        ),
-                    })
+                    trades.append(
+                        {
+                            "time": int(ts.timestamp()),
+                            "type": "EXIT",
+                            "strike": entry_strike,
+                            "ce_price": round(exit_ce or 0, 2),
+                            "pe_price": round(exit_pe or 0, 2),
+                            "straddle": round((exit_ce or 0) + (exit_pe or 0), 2),
+                            "spot": round(spot, 2),
+                            "leg_pnl": round(leg_pnl, 2),
+                            "cumulative_pnl": round(
+                                cumulative_realized + day_realized + leg_pnl, 2
+                            ),
+                        }
+                    )
 
             # End of day — settle
             if entry_strike is not None:
@@ -331,9 +357,7 @@ def get_custom_straddle_simulation(
                 final_pe = strike_data.get(entry_strike, {}).get("pe", {}).get(last_ts)
 
                 if final_ce is not None and final_pe is not None:
-                    final_leg = (
-                        (entry_ce - final_ce) + (entry_pe - final_pe)
-                    ) * quantity
+                    final_leg = ((entry_ce - final_ce) + (entry_pe - final_pe)) * quantity
                 else:
                     final_leg = last_unrealized
 
@@ -342,43 +366,51 @@ def get_custom_straddle_simulation(
             total_adjustments += day_adjustments
 
         if not pnl_series:
-            return False, {
-                "status": "error",
-                "message": "No simulation data (option history may be missing)",
-            }, 404
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": "No simulation data (option history may be missing)",
+                },
+                404,
+            )
 
         # Current LTP
         success_q, quote_resp, _ = get_quotes(
-            symbol=underlying_quote_symbol, exchange=quote_exchange, api_key=api_key,
+            symbol=underlying_quote_symbol,
+            exchange=quote_exchange,
+            api_key=api_key,
         )
-        underlying_ltp = (
-            quote_resp.get("data", {}).get("ltp", 0) if success_q else 0
-        )
+        underlying_ltp = quote_resp.get("data", {}).get("ltp", 0) if success_q else 0
 
         pnl_values = [p["pnl"] for p in pnl_series]
 
-        return True, {
-            "status": "success",
-            "data": {
-                "underlying": base_symbol,
-                "underlying_ltp": underlying_ltp,
-                "expiry_date": expiry_date.upper(),
-                "interval": interval,
-                "days_to_expiry": _calculate_days_to_expiry(expiry_date),
-                "adjustment_points": adjustment_points,
-                "lot_size": lot_size,
-                "lots": lots,
-                "quantity": quantity,
-                "pnl_series": pnl_series,
-                "trades": trades,
-                "summary": {
-                    "total_pnl": round(cumulative_realized, 2),
-                    "total_adjustments": total_adjustments,
-                    "max_pnl": round(max(pnl_values), 2),
-                    "min_pnl": round(min(pnl_values), 2),
+        return (
+            True,
+            {
+                "status": "success",
+                "data": {
+                    "underlying": base_symbol,
+                    "underlying_ltp": underlying_ltp,
+                    "expiry_date": expiry_date.upper(),
+                    "interval": interval,
+                    "days_to_expiry": _calculate_days_to_expiry(expiry_date),
+                    "adjustment_points": adjustment_points,
+                    "lot_size": lot_size,
+                    "lots": lots,
+                    "quantity": quantity,
+                    "pnl_series": pnl_series,
+                    "trades": trades,
+                    "summary": {
+                        "total_pnl": round(cumulative_realized, 2),
+                        "total_adjustments": total_adjustments,
+                        "max_pnl": round(max(pnl_values), 2),
+                        "min_pnl": round(min(pnl_values), 2),
+                    },
                 },
             },
-        }, 200
+            200,
+        )
 
     except Exception as e:
         logger.exception(f"Error in custom straddle simulation: {e}")

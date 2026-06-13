@@ -1,4 +1,4 @@
-﻿# Mapping OpenAlgo API Request to Delta Exchange API Parameters
+# Mapping OpenAlgo API Request to Delta Exchange API Parameters
 # Delta Exchange API docs: https://docs.delta.exchange
 
 from database.token_db import get_br_symbol, get_symbol_info, get_token
@@ -80,9 +80,7 @@ def transform_data(data, token):
         trigger = data.get("trigger_price", "0")
         transformed["stop_price"] = str(trigger) if trigger else "0"
         # Default trigger method; caller can override via data["stop_trigger_method"]
-        transformed["stop_trigger_method"] = data.get(
-            "stop_trigger_method", "last_traded_price"
-        )
+        transformed["stop_trigger_method"] = data.get("stop_trigger_method", "last_traded_price")
         # Trailing stop: forward trail_amount if provided
         if data.get("trail_amount"):
             transformed["trail_amount"] = str(data["trail_amount"])

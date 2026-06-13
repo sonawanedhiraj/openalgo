@@ -190,7 +190,10 @@ def transform_positions_data(positions_data):
             if api_key_obj:
                 api_key = decrypt_token(api_key_obj.api_key_encrypted)
                 symbols_payload = [
-                    {"symbol": pos.get("tradingSymbol", ""), "exchange": pos.get("exchangeSegment", "")}
+                    {
+                        "symbol": pos.get("tradingSymbol", ""),
+                        "exchange": pos.get("exchangeSegment", ""),
+                    }
                     for pos in positions_data
                     if pos.get("tradingSymbol") and pos.get("exchangeSegment")
                 ]
@@ -292,9 +295,7 @@ def map_portfolio_data(portfolio_data):
                 if h.get("_oa_symbol") and h.get("_exchange")
             ]
             if symbols_payload:
-                success, response, _ = get_multiquotes(
-                    symbols=symbols_payload, api_key=api_key
-                )
+                success, response, _ = get_multiquotes(symbols=symbols_payload, api_key=api_key)
                 if success and isinstance(response, dict) and "results" in response:
                     ltp_map = {}
                     for result in response["results"]:
@@ -355,14 +356,16 @@ def transform_holdings_data(holdings_data):
         else:
             pnl = 0.0
             pnlpercent = 0.0
-        transformed_data.append({
-            "symbol": h.get("_oa_symbol") or h.get("tradingSymbol", ""),
-            "exchange": h.get("_exchange") or "NSE",
-            "quantity": qty,
-            "product": "CNC",
-            "average_price": round(avg, 2),
-            "ltp": round(ltp, 2),
-            "pnl": pnl,
-            "pnlpercent": pnlpercent,
-        })
+        transformed_data.append(
+            {
+                "symbol": h.get("_oa_symbol") or h.get("tradingSymbol", ""),
+                "exchange": h.get("_exchange") or "NSE",
+                "quantity": qty,
+                "product": "CNC",
+                "average_price": round(avg, 2),
+                "ltp": round(ltp, 2),
+                "pnl": pnl,
+                "pnlpercent": pnlpercent,
+            }
+        )
     return transformed_data

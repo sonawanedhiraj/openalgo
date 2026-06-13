@@ -825,9 +825,13 @@ class FyersHSMWebSocket:
         self.authenticated = False
 
         if self.running:
-            self.logger.warning(f"HSM WebSocket closed unexpectedly: {close_msg} ({close_status_code})")
+            self.logger.warning(
+                f"HSM WebSocket closed unexpectedly: {close_msg} ({close_status_code})"
+            )
         else:
-            self.logger.debug(f"HSM WebSocket closed during shutdown: {close_msg} ({close_status_code})")
+            self.logger.debug(
+                f"HSM WebSocket closed during shutdown: {close_msg} ({close_status_code})"
+            )
 
         if self.on_close_callback:
             self.on_close_callback()
@@ -908,7 +912,7 @@ class FyersHSMWebSocket:
         self.reconnect_attempts += 1
         delay = min(
             self.BASE_RECONNECT_DELAY * (2 ** (self.reconnect_attempts - 1)),
-            self.MAX_RECONNECT_DELAY
+            self.MAX_RECONNECT_DELAY,
         )
 
         self.logger.info(

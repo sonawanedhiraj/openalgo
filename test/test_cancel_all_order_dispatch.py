@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -48,16 +46,18 @@ def test_cancel_all_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
 
     broker_api = MagicMock(return_value=(["OID1"], []))
     monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
     sandbox_mock = MagicMock()
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
 
     success, _, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is True
@@ -74,17 +74,19 @@ def test_cancel_all_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monke
     _patch_modes(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     broker_api = MagicMock()
     monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
 
     cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     sandbox_mock.assert_called_once()
@@ -99,17 +101,19 @@ def test_cancel_all_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, 
     _patch_modes(monkeypatch, analyze=True)
 
     sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     broker_api = MagicMock()
     monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
 
     cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     sandbox_mock.assert_called_once()
@@ -125,16 +129,18 @@ def test_cancel_all_rejects_when_skip(fresh_intent_db, monkeypatch):
 
     sandbox_mock = MagicMock()
     broker_api = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock
-    )
-    monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
 
     success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -153,16 +159,18 @@ def test_cancel_all_rejects_when_disabled(fresh_intent_db, monkeypatch):
 
     sandbox_mock = MagicMock()
     broker_api = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock
-    )
-    monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
 
     success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -181,22 +189,30 @@ def test_cancel_all_reject_response_shape_matches_existing_convention(fresh_inte
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", MagicMock())
     monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=MagicMock()),
     )
 
     reject_result = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     broker_api = MagicMock(return_value=(["OID"], []))
     monkeypatch.setattr(
-        cancel_all_order_service, "import_broker_module",
+        cancel_all_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
     success_result = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"}, auth_token="dummy", broker="zerodha", original_data=_payload(),
+        {"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     for r in (reject_result, success_result):

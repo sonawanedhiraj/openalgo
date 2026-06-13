@@ -90,14 +90,11 @@ def _ensure_columns():
     try:
         with engine.connect() as conn:
             existing = {
-                row[1]
-                for row in conn.execute(text("PRAGMA table_info(sector_follow_trades)"))
+                row[1] for row in conn.execute(text("PRAGMA table_info(sector_follow_trades)"))
             }
             for col, ddl in wanted.items():
                 if col not in existing:
-                    conn.execute(
-                        text(f"ALTER TABLE sector_follow_trades ADD COLUMN {col} {ddl}")
-                    )
+                    conn.execute(text(f"ALTER TABLE sector_follow_trades ADD COLUMN {col} {ddl}"))
                     logger.info("sector_follow_trades: added column %s", col)
             conn.commit()
     except Exception as e:
@@ -167,11 +164,9 @@ def record_trade(
 def get_open_entries(strategy_id, entry_date):
     """Return BUY rows recorded on ``entry_date`` for the strategy (for T+1 exit)."""
     try:
-        return (
-            SectorFollowTrade.query.filter_by(
-                strategy_id=strategy_id, side="BUY", entry_date=entry_date
-            ).all()
-        )
+        return SectorFollowTrade.query.filter_by(
+            strategy_id=strategy_id, side="BUY", entry_date=entry_date
+        ).all()
     except Exception as e:
         logger.exception(f"Failed to query open sector_follow entries: {e}")
         return []

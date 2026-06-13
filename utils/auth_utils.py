@@ -318,7 +318,9 @@ def async_master_contract_download(broker):
 
         # Update download statistics for smart download tracking
         update_download_stats(broker, duration_seconds, exchange_stats)
-        logger.info(f"Download stats recorded: {duration_seconds}s, exchanges: {list(exchange_stats.keys())}")
+        logger.info(
+            f"Download stats recorded: {duration_seconds}s, exchanges: {list(exchange_stats.keys())}"
+        )
 
         # Load symbols into memory cache after successful download
         try:
@@ -377,10 +379,12 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
 
     # Register active session for multi-device tracking
     import secrets
+
     session_id = secrets.token_hex(32)
     session["session_id"] = session_id  # Store in cookie for logout cleanup
 
     from database.auth_db import get_active_sessions, register_session
+
     register_session(
         username=user_session_key,
         session_id=session_id,
@@ -391,17 +395,22 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
 
     # Emit session count update via SocketIO (event-driven, no polling)
     from extensions import socketio
+
     active = get_active_sessions(user_session_key)
-    socketio.emit("active_sessions_update", {
-        "count": len(active),
-        "sessions": active,
-    })
+    socketio.emit(
+        "active_sessions_update",
+        {
+            "count": len(active),
+            "sessions": active,
+        },
+    )
 
     logger.info(f"User {user_session_key} logged in successfully with broker {broker}")
 
     # Log OAuth login attempt (resume logins are logged separately in auth.py)
     try:
         from database.auth_db import log_login_attempt
+
         log_login_attempt(
             username=user_session_key,
             ip_address=get_real_ip(),
@@ -424,7 +433,9 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
 
         # Smart download: Check if we need to download or can use cached data
         should_download, reason = should_download_master_contract(broker)
-        logger.info(f"Smart download check for {broker}: should_download={should_download}, reason={reason}")
+        logger.info(
+            f"Smart download check for {broker}: should_download={should_download}, reason={reason}"
+        )
 
         if should_download:
             # Start async download in background thread

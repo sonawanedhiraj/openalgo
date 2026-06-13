@@ -65,7 +65,7 @@ def get_api_response(endpoint, auth, method="GET", payload="", params=None):
     # The Retry-After header is honoured when present.  On each retry the HMAC
     # signature is rebuilt with a fresh timestamp.
     _MAX_RETRIES = 3
-    _RETRY_BASE  = 1.0  # seconds; doubles each attempt
+    _RETRY_BASE = 1.0  # seconds; doubles each attempt
     response = None
 
     for _attempt in range(_MAX_RETRIES + 1):
@@ -88,8 +88,9 @@ def get_api_response(endpoint, auth, method="GET", payload="", params=None):
         if response.status_code == 429 and _attempt < _MAX_RETRIES:
             retry_after = response.headers.get("Retry-After")
             wait = (
-                float(retry_after) if retry_after
-                else (_RETRY_BASE * (2 ** _attempt)) + random.uniform(0.0, 0.5)
+                float(retry_after)
+                if retry_after
+                else (_RETRY_BASE * (2**_attempt)) + random.uniform(0.0, 0.5)
             )
             logger.warning(
                 f"[DeltaExchange] HTTP 429 rate-limit on {endpoint} "
@@ -124,9 +125,7 @@ def get_api_response(endpoint, auth, method="GET", payload="", params=None):
         return {"success": False, "error": {"code": "json_parse_error", "message": str(e)}}
 
     if response.status_code not in (200, 201):
-        logger.error(
-            f"[DeltaExchange] HTTP {response.status_code}: {response.text[:300]}"
-        )
+        logger.error(f"[DeltaExchange] HTTP {response.status_code}: {response.text[:300]}")
 
     return data
 
@@ -134,6 +133,7 @@ def get_api_response(endpoint, auth, method="GET", payload="", params=None):
 # ---------------------------------------------------------------------------
 # Order book / trade book
 # ---------------------------------------------------------------------------
+
 
 def _get_all_open_orders(auth):
     """Internal: Fetch all open orders regardless of creation date (for cancel all operations)."""
@@ -163,13 +163,17 @@ def get_order_book(auth):
 
         # 1. Fetch open orders
         open_result = get_api_response("/v2/orders", auth, method="GET", params={"state": "open"})
-        logger.debug(f"[DeltaExchange] /v2/orders (open) count={len(open_result.get('result', []))}")
+        logger.debug(
+            f"[DeltaExchange] /v2/orders (open) count={len(open_result.get('result', []))}"
+        )
         if open_result.get("success"):
             all_orders.extend(open_result.get("result", []))
 
         # 2. Fetch historical orders
         hist_result = get_api_response("/v2/orders/history", auth, method="GET")
-        logger.debug(f"[DeltaExchange] /v2/orders/history count={len(hist_result.get('result', []))}")
+        logger.debug(
+            f"[DeltaExchange] /v2/orders/history count={len(hist_result.get('result', []))}"
+        )
         if hist_result.get("success"):
             all_orders.extend(hist_result.get("result", []))
 
@@ -180,7 +184,9 @@ def get_order_book(auth):
             if created_at:
                 try:
                     # Parse UTC timestamp and convert to IST
-                    dt_utc = datetime.strptime(created_at[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=pytz.UTC)
+                    dt_utc = datetime.strptime(created_at[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                        tzinfo=pytz.UTC
+                    )
                     dt_ist = dt_utc.astimezone(ist)
                     if dt_ist.date() == today_date:
                         today_orders.append(order)
@@ -214,7 +220,9 @@ def get_trade_book(auth):
                 if created_at:
                     try:
                         # Parse UTC timestamp and convert to IST
-                        dt_utc = datetime.strptime(created_at[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=pytz.UTC)
+                        dt_utc = datetime.strptime(created_at[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                            tzinfo=pytz.UTC
+                        )
                         dt_ist = dt_utc.astimezone(ist)
                         if dt_ist.date() == today_date:
                             today_trades.append(trade)
@@ -233,6 +241,7 @@ def get_trade_book(auth):
 # Positions / holdings
 # ---------------------------------------------------------------------------
 
+
 def get_positions(auth):
     """
     Fetch all open positions — both derivatives (margined) and spot (wallet).
@@ -247,7 +256,9 @@ def get_positions(auth):
     # 1. Derivative positions (perpetual futures, options)
     try:
         result = get_api_response("/v2/positions/margined", auth, method="GET")
-        logger.debug(f"[DeltaExchange] /v2/positions/margined count={len(result.get('result', []))}")
+        logger.debug(
+            f"[DeltaExchange] /v2/positions/margined count={len(result.get('result', []))}"
+        )
         if result.get("success"):
             positions.extend(result.get("result", []))
         else:
@@ -258,7 +269,9 @@ def get_positions(auth):
     # 2. Spot holdings from wallet balances
     try:
         wallet_result = get_api_response("/v2/wallet/balances", auth, method="GET")
-        logger.debug(f"[DeltaExchange] /v2/wallet/balances count={len(wallet_result.get('result', []))}")
+        logger.debug(
+            f"[DeltaExchange] /v2/wallet/balances count={len(wallet_result.get('result', []))}"
+        )
         if wallet_result.get("success"):
             for asset in wallet_result.get("result", []):
                 if not isinstance(asset, dict):
@@ -274,15 +287,17 @@ def get_positions(auth):
                     continue
                 # Synthesise a position-like dict matching /v2/positions/margined structure
                 spot_symbol = f"{symbol}_INR"
-                positions.append({
-                    "product_id": asset.get("asset_id", ""),
-                    "product_symbol": spot_symbol,
-                    "size": size,
-                    "entry_price": "0",  # Wallet doesn't track entry price
-                    "realized_pnl": "0",
-                    "unrealized_pnl": "0",
-                    "_is_spot": True,  # Internal flag for downstream mapping
-                })
+                positions.append(
+                    {
+                        "product_id": asset.get("asset_id", ""),
+                        "product_symbol": spot_symbol,
+                        "size": size,
+                        "entry_price": "0",  # Wallet doesn't track entry price
+                        "realized_pnl": "0",
+                        "unrealized_pnl": "0",
+                        "_is_spot": True,  # Internal flag for downstream mapping
+                    }
+                )
     except Exception as e:
         logger.error(f"[DeltaExchange] Exception fetching spot wallet positions: {e}")
 
@@ -297,14 +312,14 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks = {}  # {symbol_key: threading.Lock}
 _symbol_locks_lock = threading.Lock()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache = {}  # {auth_token: {"data": ..., "timestamp": ...}}
 _position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+_POSITION_CACHE_TTL = 1.0  # seconds
 
 
 def _get_symbol_lock(symbol, exchange, product):
@@ -339,7 +354,6 @@ def _invalidate_position_cache(auth):
         _position_cache.pop(auth, None)
 
 
-
 def get_open_position(tradingsymbol, exchange, product, auth):
     """
     Return the net position size (as string) for a given symbol.
@@ -363,6 +377,7 @@ def get_open_position(tradingsymbol, exchange, product, auth):
 # Order placement
 # ---------------------------------------------------------------------------
 
+
 def _set_leverage(product_id: int, leverage: str, auth: str) -> None:
     """
     Set leverage for a product before placing an order.
@@ -384,9 +399,7 @@ def _set_leverage(product_id: int, leverage: str, auth: str) -> None:
     payload = json.dumps({"leverage": leverage})
     result = get_api_response(endpoint, auth, method="POST", payload=payload)
     if result.get("success"):
-        logger.info(
-            f"[DeltaExchange] Leverage set to {leverage}x for product_id={product_id}"
-        )
+        logger.info(f"[DeltaExchange] Leverage set to {leverage}x for product_id={product_id}")
     else:
         msg = (
             f"[DeltaExchange] Failed to set leverage for product_id={product_id}: "
@@ -415,9 +428,11 @@ def place_order_api(data, auth):
     if not token:
         msg = f"[DeltaExchange] Symbol '{data['symbol']}' not found in master contract DB for exchange '{data['exchange']}'. Run master contract sync first."
         logger.error(msg)
+
         class _ErrResp:
             status_code = 400
             status = 400
+
         return _ErrResp(), {"status": "error", "message": msg}, None
 
     # Set leverage if requested (Delta Exchange requires a separate pre-order call)
@@ -426,6 +441,7 @@ def place_order_api(data, auth):
     if not leverage:
         try:
             from database.leverage_db import get_leverage
+
             db_leverage = get_leverage()
             if db_leverage and int(db_leverage) > 0:
                 leverage = str(int(db_leverage))
@@ -569,6 +585,7 @@ def place_smartorder_api(data, auth):
 # Order cancellation
 # ---------------------------------------------------------------------------
 
+
 def cancel_order(orderid, auth):
     """
     Cancel an open order via DELETE /v2/orders.
@@ -582,9 +599,7 @@ def cancel_order(orderid, auth):
         product_id_str, order_id_str = orderid_str.split(":", 1)
         body = {"id": int(order_id_str), "product_id": int(product_id_str)}
     else:
-        logger.warning(
-            f"[DeltaExchange] cancel_order called with non-composite id: {orderid_str}"
-        )
+        logger.warning(f"[DeltaExchange] cancel_order called with non-composite id: {orderid_str}")
         body = {"id": int(orderid_str)}
 
     result = get_api_response("/v2/orders", auth, method="DELETE", payload=json.dumps(body))
@@ -624,8 +639,7 @@ def cancel_all_orders_api(data, auth):
         return [], []
 
     orders_to_cancel = [
-        o for o in order_book
-        if isinstance(o, dict) and o.get("state") in ("open", "pending")
+        o for o in order_book if isinstance(o, dict) and o.get("state") in ("open", "pending")
     ]
 
     cancelled, failed = [], []
@@ -642,6 +656,7 @@ def cancel_all_orders_api(data, auth):
 # ---------------------------------------------------------------------------
 # Order modification
 # ---------------------------------------------------------------------------
+
 
 def modify_order(data, auth):
     """Modify an existing open order via PUT /v2/orders."""
@@ -663,6 +678,7 @@ def modify_order(data, auth):
 # ---------------------------------------------------------------------------
 # Close all positions
 # ---------------------------------------------------------------------------
+
 
 def close_all_positions(current_api_key, auth):
     """Square off all open positions (derivatives + spot) using market orders."""

@@ -131,9 +131,7 @@ def test_single_stale_symbol_flags_not_ok(tmp_duckdb, patch_symbols):
 def test_missing_symbol_is_not_ok(tmp_duckdb, patch_symbols):
     patch_symbols(["AAA"], ["NIFTY"])
     path = tmp_duckdb({"AAA": (2026, 6, 10), "NIFTY": None})
-    ok, details = dfs.check_strategy_data_ready(
-        "x", date="2026-06-11", duckdb_path=path
-    )
+    ok, details = dfs.check_strategy_data_ready("x", date="2026-06-11", duckdb_path=path)
     assert ok is False
     assert details["NIFTY"]["ok"] is False
     assert details["NIFTY"]["staleness_days"] is None
@@ -190,7 +188,9 @@ def test_index_only_skips_stocks(tmp_duckdb, patch_symbols):
 # format_freshness_report
 # --------------------------------------------------------------------------- #
 def test_format_report_ok_and_stale():
-    ok_details = {"AAA": {"ok": True, "last_date": "2026-06-10", "staleness_days": 1, "kind": "stock"}}
+    ok_details = {
+        "AAA": {"ok": True, "last_date": "2026-06-10", "staleness_days": 1, "kind": "stock"}
+    }
     assert "✅ OK" in dfs.format_freshness_report("s", ok_details)
 
     stale_details = {

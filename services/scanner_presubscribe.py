@@ -163,7 +163,8 @@ class PreSubscriber:
         if not pending:
             logger.debug(
                 "%s pre-subscribe: nothing pending (%d already subscribed)",
-                self.name, len(symbols),
+                self.name,
+                len(symbols),
             )
             return 0
 
@@ -173,14 +174,10 @@ class PreSubscriber:
         # proxy's "Subscription processing complete" ack as a failure).
         ok_conn, client, err = self._get_connection(user_id)
         if not ok_conn or client is None:
-            logger.warning(
-                "%s pre-subscribe: broker WS not available (%s)", self.name, err
-            )
+            logger.warning("%s pre-subscribe: broker WS not available (%s)", self.name, err)
             return 0
 
-        batch = [
-            {"exchange": self._exchange_resolver(s), "symbol": s} for s in pending
-        ]
+        batch = [{"exchange": self._exchange_resolver(s), "symbol": s} for s in pending]
         try:
             result = client.subscribe(batch, mode=self._mode)
         except Exception:
@@ -205,13 +202,19 @@ class PreSubscriber:
 
         logger.info(
             "%s pre-subscribed %d/%d symbols (status=%s, msg=%s, total tracked=%d)",
-            self.name, len(newly), len(pending),
-            result.get("status"), result.get("message"), total,
+            self.name,
+            len(newly),
+            len(pending),
+            result.get("status"),
+            result.get("message"),
+            total,
         )
         for entry in failed:
             logger.warning(
                 "%s pre-subscribe failed for %s: %s",
-                self.name, entry.get("symbol"), entry.get("message", "unknown"),
+                self.name,
+                entry.get("symbol"),
+                entry.get("message", "unknown"),
             )
         return len(newly)
 

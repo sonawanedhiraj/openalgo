@@ -148,9 +148,7 @@ def run_ingest_cycle() -> dict:
                 new_count += 1
                 total_new += 1
             except Exception as e:
-                logger.warning(
-                    f"insert_intel failed for {item['title'][:60]}: {e}"
-                )
+                logger.warning(f"insert_intel failed for {item['title'][:60]}: {e}")
         per_feed[label] = {"fetched": len(items), "new": new_count}
     summary = {
         "duration_s": round(time.time() - started, 2),
@@ -183,9 +181,7 @@ def start_news_ingest_scheduler() -> dict:
     # Every 5 min from 08:00–15:30 IST mon-fri. Cron: minute=*/5, hour=8-15.
     _scheduler.add_job(
         run_ingest_cycle,
-        CronTrigger(
-            minute="*/5", hour="8-15", day_of_week="mon-fri", timezone=IST
-        ),
+        CronTrigger(minute="*/5", hour="8-15", day_of_week="mon-fri", timezone=IST),
         id="news_ingest_cycle",
         replace_existing=True,
         misfire_grace_time=120,

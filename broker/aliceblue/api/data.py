@@ -46,12 +46,12 @@ class BrokerData:
         # Other intraday timeframes are resampled from 1-minute data.
         self.timeframe_map = {
             "1m": "1",
-            "3m": "1",   # resampled from 1m
-            "5m": "1",   # resampled from 1m
+            "3m": "1",  # resampled from 1m
+            "5m": "1",  # resampled from 1m
             "10m": "1",  # resampled from 1m
             "15m": "1",  # resampled from 1m
             "30m": "1",  # resampled from 1m
-            "1h": "1",   # resampled from 1m
+            "1h": "1",  # resampled from 1m
             "D": "D",  # V3 API uses 'D' for daily (docs text says '1D' but API rejects it)
         }
 
@@ -67,7 +67,10 @@ class BrokerData:
         """
         # Return existing connection if it's valid and not forced to create a new one
         if not force_new and hasattr(self, "_websocket") and self._websocket:
-            if hasattr(self._websocket, "is_websocket_connected") and self._websocket.is_websocket_connected():
+            if (
+                hasattr(self._websocket, "is_websocket_connected")
+                and self._websocket.is_websocket_connected()
+            ):
                 return self._websocket
 
         try:
@@ -83,7 +86,7 @@ class BrokerData:
                     logger.warning(f"Error closing existing WebSocket: {str(e)}")
 
             # Get user ID (clientId/UCC) for WebSocket authentication
-            auth_obj = Auth.query.filter_by(broker='aliceblue', is_revoked=False).first()
+            auth_obj = Auth.query.filter_by(broker="aliceblue", is_revoked=False).first()
             user_id = auth_obj.user_id if auth_obj else None
 
             # Fallback: extract UCC from JWT token
@@ -142,7 +145,9 @@ class BrokerData:
         }
         return exchange_map.get(exchange, exchange)
 
-    def _try_fetch_quote_via_ws(self, api_exchange: str, token: str, br_symbol: str, symbol: str, exchange: str) -> dict | None:
+    def _try_fetch_quote_via_ws(
+        self, api_exchange: str, token: str, br_symbol: str, symbol: str, exchange: str
+    ) -> dict | None:
         """Attempt a single WebSocket quote fetch. Returns quote dict or None."""
         websocket = None
         instruments = None
@@ -217,11 +222,15 @@ class BrokerData:
             # Attempt quote fetch with retry
             quote = None
             for attempt in range(1, MAX_RETRIES + 1):
-                quote = self._try_fetch_quote_via_ws(api_exchange, token, br_symbol, symbol, exchange)
+                quote = self._try_fetch_quote_via_ws(
+                    api_exchange, token, br_symbol, symbol, exchange
+                )
                 if quote:
                     break
                 if attempt < MAX_RETRIES:
-                    logger.info(f"Retrying quote fetch for {symbol} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    logger.info(
+                        f"Retrying quote fetch for {symbol} (attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
                     # Force a fresh WebSocket connection on retry.
                     # get_websocket(force_new=True) cleanly disconnects the old
                     # instance before creating a new one.
@@ -229,7 +238,9 @@ class BrokerData:
                     time.sleep(1.0)
 
             if not quote:
-                raise Exception(f"No quote data received for {symbol} on {exchange} after {MAX_RETRIES} attempts")
+                raise Exception(
+                    f"No quote data received for {symbol} on {exchange} after {MAX_RETRIES} attempts"
+                )
 
             return {
                 "bid": float(quote.get("bid", 0)),
@@ -350,7 +361,9 @@ class BrokerData:
 
             if not success:
                 # Retry once with a fresh connection — update ws reference
-                logger.warning("First subscription attempt failed, retrying with fresh connection...")
+                logger.warning(
+                    "First subscription attempt failed, retrying with fresh connection..."
+                )
                 ws = self.get_websocket(force_new=True)
                 if ws and ws.is_connected:
                     success = ws.subscribe(instruments, is_depth=False)
@@ -359,7 +372,11 @@ class BrokerData:
                 logger.error("Failed to send subscription request after retry")
                 for key, info in symbol_map.items():
                     results.append(
-                        {"symbol": info["symbol"], "exchange": info["exchange"], "error": "Subscription failed"}
+                        {
+                            "symbol": info["symbol"],
+                            "exchange": info["exchange"],
+                            "error": "Subscription failed",
+                        }
                     )
                 return skipped_symbols + results
 
@@ -368,7 +385,9 @@ class BrokerData:
             # Wait for data to arrive — use higher cap for large batches
             # (Vol Surface / OI Profile can request 60+ symbols at once)
             wait_time = min(max(len(instruments) * 0.08, 2), 20)
-            logger.debug(f"Waiting {wait_time:.1f}s for quote data ({len(instruments)} instruments)...")
+            logger.debug(
+                f"Waiting {wait_time:.1f}s for quote data ({len(instruments)} instruments)..."
+            )
             time.sleep(wait_time)
 
             # Helper to format a quote dict
@@ -393,14 +412,20 @@ class BrokerData:
 
                 if quote:
                     results.append(
-                        {"symbol": info["symbol"], "exchange": info["exchange"], "data": _format_quote(quote)}
+                        {
+                            "symbol": info["symbol"],
+                            "exchange": info["exchange"],
+                            "data": _format_quote(quote),
+                        }
                     )
                 else:
                     missing_keys.append(key)
 
             # Retry pass for symbols that didn't return data on first attempt
             if missing_keys:
-                logger.info(f"{len(missing_keys)}/{len(symbol_map)} symbols missing after first pass, retrying...")
+                logger.info(
+                    f"{len(missing_keys)}/{len(symbol_map)} symbols missing after first pass, retrying..."
+                )
                 time.sleep(3.0)  # Extra wait for stragglers
 
                 for key in missing_keys:
@@ -410,17 +435,23 @@ class BrokerData:
 
                     if quote:
                         results.append(
-                            {"symbol": info["symbol"], "exchange": info["exchange"], "data": _format_quote(quote)}
+                            {
+                                "symbol": info["symbol"],
+                                "exchange": info["exchange"],
+                                "data": _format_quote(quote),
+                            }
                         )
                     else:
                         results.append(
-                            {"symbol": info["symbol"], "exchange": info["exchange"], "error": "No data received"}
+                            {
+                                "symbol": info["symbol"],
+                                "exchange": info["exchange"],
+                                "error": "No data received",
+                            }
                         )
 
-            received_count = len([r for r in results if 'data' in r])
-            logger.info(
-                f"Retrieved quotes for {received_count}/{len(symbol_map)} symbols"
-            )
+            received_count = len([r for r in results if "data" in r])
+            logger.info(f"Retrieved quotes for {received_count}/{len(symbol_map)} symbols")
             return skipped_symbols + results
 
         finally:
@@ -498,20 +529,24 @@ class BrokerData:
             raw_bids = depth.get("bids", [])
             for i in range(5):
                 if i < len(raw_bids):
-                    bids.append({
-                        "price": raw_bids[i].get("price", 0),
-                        "quantity": raw_bids[i].get("quantity", 0),
-                    })
+                    bids.append(
+                        {
+                            "price": raw_bids[i].get("price", 0),
+                            "quantity": raw_bids[i].get("quantity", 0),
+                        }
+                    )
                 else:
                     bids.append({"price": 0, "quantity": 0})
 
             raw_asks = depth.get("asks", [])
             for i in range(5):
                 if i < len(raw_asks):
-                    asks.append({
-                        "price": raw_asks[i].get("price", 0),
-                        "quantity": raw_asks[i].get("quantity", 0),
-                    })
+                    asks.append(
+                        {
+                            "price": raw_asks[i].get("price", 0),
+                            "quantity": raw_asks[i].get("quantity", 0),
+                        }
+                    )
                 else:
                     asks.append({"price": 0, "quantity": 0})
 
@@ -565,6 +600,7 @@ class BrokerData:
 
             # Pick the nearest expiry futures contract
             from datetime import datetime as _dt
+
             nearest = None
             nearest_expiry = None
             today = _dt.now().date()
@@ -696,7 +732,6 @@ class BrokerData:
             # Alternative: Try adding session token to payload as some historical APIs expect it
             # payload['sessionId'] = session_id
 
-
             # Convert timestamps to milliseconds as required by AliceBlue V3 API
             # V3 docs example: "from": "1660128489000" (13-digit milliseconds)
             import time
@@ -820,12 +855,16 @@ class BrokerData:
                 "resolution": aliceblue_timeframe,
             }
 
-            logger.debug(f"Historical API request: {symbol}:{exchange} res={aliceblue_timeframe} token={token} payload={payload}")
+            logger.debug(
+                f"Historical API request: {symbol}:{exchange} res={aliceblue_timeframe} token={token} payload={payload}"
+            )
 
             # Make request to historical API
             client = get_httpx_client()
             try:
-                response = client.post(HISTORICAL_API_URL, headers=headers, json=payload, timeout=15)
+                response = client.post(
+                    HISTORICAL_API_URL, headers=headers, json=payload, timeout=15
+                )
                 response.raise_for_status()
                 data = response.json()
             except httpx.HTTPStatusError as http_err:
@@ -851,7 +890,11 @@ class BrokerData:
                         return fut_df
 
                 # Provide more helpful error messages based on the error
-                if "No data available" in error_msg or "market time" in error_msg.lower() or "Session" in error_msg:
+                if (
+                    "No data available" in error_msg
+                    or "market time" in error_msg.lower()
+                    or "Session" in error_msg
+                ):
                     if exchange in ["MCX", "NFO", "CDS"]:
                         logger.error(
                             f"No data available. For {exchange}, AliceBlue only provides data for current expiry contracts."
@@ -913,6 +956,7 @@ class BrokerData:
 
                 # AliceBlue timestamps are in IST - localize them for correct epoch conversion
                 import pytz
+
                 ist = pytz.timezone("Asia/Kolkata")
                 df["timestamp"] = df["timestamp"].dt.tz_localize(ist)
 
@@ -945,20 +989,27 @@ class BrokerData:
                 try:
                     # Convert timestamp back to datetime for resampling
                     import pytz as _pytz2
+
                     _ist2 = _pytz2.timezone("Asia/Kolkata")
-                    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(_ist2)
+                    df["dt"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(
+                        _ist2
+                    )
                     df = df.set_index("dt")
 
-                    resampled = df.resample(f"{resample_minutes}min", label="left", closed="left").agg(
-                        {
-                            "open": "first",
-                            "high": "max",
-                            "low": "min",
-                            "close": "last",
-                            "volume": "sum",
-                            "oi": "last",
-                        }
-                    ).dropna(subset=["open"])
+                    resampled = (
+                        df.resample(f"{resample_minutes}min", label="left", closed="left")
+                        .agg(
+                            {
+                                "open": "first",
+                                "high": "max",
+                                "low": "min",
+                                "close": "last",
+                                "volume": "sum",
+                                "oi": "last",
+                            }
+                        )
+                        .dropna(subset=["open"])
+                    )
 
                     # Convert back to unix timestamps
                     resampled["timestamp"] = resampled.index.astype("int64") // 10**9
@@ -966,7 +1017,9 @@ class BrokerData:
                     df = resampled[["close", "high", "low", "open", "timestamp", "volume", "oi"]]
                     logger.info(f"Resampled to {len(df)} candles at {timeframe}")
                 except Exception as resample_err:
-                    logger.error(f"Resampling to {timeframe} failed: {resample_err}. Returning 1m data.")
+                    logger.error(
+                        f"Resampling to {timeframe} failed: {resample_err}. Returning 1m data."
+                    )
 
             return df
 

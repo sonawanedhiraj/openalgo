@@ -14,6 +14,7 @@ Threading model: a single daemon thread drains the queue. Under eventlet
 (gunicorn -w 1 production), `queue.Queue.get(timeout=...)` cooperatively
 yields, so the writer interleaves with the rest of the app.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -234,8 +235,7 @@ class TickLogWriter:
 
             batch.append(item)
             should_flush = (
-                len(batch) >= self.batch_size
-                or (time.time() - last_flush) >= self.flush_seconds
+                len(batch) >= self.batch_size or (time.time() - last_flush) >= self.flush_seconds
             )
             if should_flush:
                 try:
@@ -330,7 +330,11 @@ class TickLogWriter:
                     full_path = os.path.join(self.directory, name)
                     try:
                         os.remove(full_path)
-                        logger.info("[TICKLOG] Pruned %s (older than %d days)", full_path, self.retention_days)
+                        logger.info(
+                            "[TICKLOG] Pruned %s (older than %d days)",
+                            full_path,
+                            self.retention_days,
+                        )
                     except OSError:
                         logger.warning("[TICKLOG] Could not prune %s", full_path)
         except OSError:

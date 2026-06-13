@@ -52,9 +52,7 @@ def _env_float(name: str, default: float) -> float:
     try:
         return float(raw)
     except (TypeError, ValueError):
-        logger.warning(
-            "ScanHitPoster: %s=%r not a number, using default %s", name, raw, default
-        )
+        logger.warning("ScanHitPoster: %s=%r not a number, using default %s", name, raw, default)
         return default
 
 
@@ -66,9 +64,7 @@ def _resolve_default_webhook_url() -> str | None:
     refuses to POST. We deliberately do NOT hardcode the webhook UUID; it
     lives in the ``strategies`` table and varies per install.
     """
-    strategy_name = _env_str(
-        "SCAN_HIT_POSTER_STRATEGY_NAME", "chartink_FnO_intraday_buy"
-    )
+    strategy_name = _env_str("SCAN_HIT_POSTER_STRATEGY_NAME", "chartink_FnO_intraday_buy")
     host_server = _env_str("HOST_SERVER", "http://127.0.0.1:5000").rstrip("/")
     try:
         from database.strategy_db import Strategy
@@ -112,9 +108,7 @@ class ScanHitPoster:
         http_client: Any = None,
     ) -> None:
         if mode not in _VALID_MODES:
-            logger.warning(
-                "ScanHitPoster: unknown mode %r, falling back to shadow", mode
-            )
+            logger.warning("ScanHitPoster: unknown mode %r, falling back to shadow", mode)
             mode = MODE_SHADOW
         self.mode = mode
         self.webhook_url = webhook_url or None
@@ -182,7 +176,8 @@ class ScanHitPoster:
         if self.mode == MODE_SHADOW:
             logger.info(
                 "ScanHitPoster[shadow]: would post symbols=%s scan_name=%r (no POST)",
-                symbols, scan_name,
+                symbols,
+                scan_name,
             )
             # Audit row was written by the scanner with posted_to_engine=0.
             # Shadow mode leaves it untouched.
@@ -219,13 +214,15 @@ class ScanHitPoster:
         except httpx.TimeoutException as e:
             logger.warning(
                 "ScanHitPoster[active]: POST to %s timed out (%s) — audit row stays unposted",
-                self.webhook_url, e,
+                self.webhook_url,
+                e,
             )
             return
         except httpx.HTTPError as e:
             logger.warning(
                 "ScanHitPoster[active]: POST to %s failed (%s) — audit row stays unposted",
-                self.webhook_url, e,
+                self.webhook_url,
+                e,
             )
             return
         except Exception:
@@ -238,7 +235,8 @@ class ScanHitPoster:
         if not (200 <= int(status_code or 0) < 300):
             logger.warning(
                 "ScanHitPoster[active]: engine returned HTTP %s for symbols=%s",
-                status_code, symbols,
+                status_code,
+                symbols,
             )
             return
 
@@ -246,7 +244,9 @@ class ScanHitPoster:
             self._mark_posted(scan_result_id)
         logger.info(
             "ScanHitPoster[active]: posted symbols=%s scan_name=%r HTTP %s",
-            symbols, payload.get("scan_name"), status_code,
+            symbols,
+            payload.get("scan_name"),
+            status_code,
         )
 
     def _build_payload(

@@ -71,6 +71,7 @@ def track_latency(api_type):
         Returns:
             callable: The wrapped function.
         """
+
         @wraps(f)
         def wrapped(*args, **kwargs):
             """

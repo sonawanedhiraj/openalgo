@@ -15,6 +15,7 @@ def _escape_like(term: str) -> str:
     """Escape LIKE wildcard characters to prevent unintended broad matching."""
     return term.replace("%", r"\%").replace("_", r"\_")
 
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 # Conditionally create engine based on DB type
 if DATABASE_URL and "sqlite" in DATABASE_URL:

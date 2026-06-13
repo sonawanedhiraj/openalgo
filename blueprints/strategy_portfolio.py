@@ -115,9 +115,7 @@ def update_strategy(entry_id: int):
     return jsonify({"status": "success", "item": row})
 
 
-@strategy_portfolio_bp.route(
-    "/api/strategy-portfolio/<int:entry_id>", methods=["DELETE"]
-)
+@strategy_portfolio_bp.route("/api/strategy-portfolio/<int:entry_id>", methods=["DELETE"])
 @check_session_validity
 @limiter.limit(PORTFOLIO_WRITE_LIMIT)
 def delete_strategy(entry_id: int):

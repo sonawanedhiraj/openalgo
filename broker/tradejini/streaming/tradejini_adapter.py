@@ -340,7 +340,9 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             # Attempt to reconnect if we're still running
             if self.running:
-                self._connect_thread = threading.Thread(target=self._connect_with_retry, daemon=True)
+                self._connect_thread = threading.Thread(
+                    target=self._connect_with_retry, daemon=True
+                )
                 self._connect_thread.start()
 
     def _on_data(self, ws, message) -> None:

@@ -650,14 +650,14 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks = {}  # {symbol_key: threading.Lock}
 _symbol_locks_lock = threading.Lock()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache = {}  # {auth_token: {"data": ..., "timestamp": ...}}
 _position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+_POSITION_CACHE_TTL = 1.0  # seconds
 
 
 def _get_symbol_lock(symbol, exchange, product):
@@ -1089,7 +1089,9 @@ def place_smartorder_api(data, auth):
                     original_qty = int(float(data.get("quantity", "0")))
                     if original_qty != 0:
                         original_action = data.get("action", "").upper()
-                        logger.info(f"place_smartorder_api - No position, pos_size=0: {original_action} {original_qty}")
+                        logger.info(
+                            f"place_smartorder_api - No position, pos_size=0: {original_action} {original_qty}"
+                        )
                         final_action = original_action
                         final_quantity = original_qty
                     else:
@@ -1172,7 +1174,9 @@ def place_smartorder_api(data, auth):
                     and orderid
                 ):
                     wrapped_response = {"status": "success", "orderid": str(orderid)}
-                    logger.info(f"place_smartorder_api - Order placed successfully: {wrapped_response}")
+                    logger.info(
+                        f"place_smartorder_api - Order placed successfully: {wrapped_response}"
+                    )
                     return res, wrapped_response, orderid
                 else:
                     error_msg = "Unknown error in order placement"

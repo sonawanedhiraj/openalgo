@@ -514,9 +514,11 @@ def _aggregate_to_interval(
     from services.bar_aggregator import BarBuilder  # noqa: PLC0415
 
     closed: list[dict[str, Any]] = []
-    builder = BarBuilder(symbol, interval, on_bar=lambda bar: (
-        closed.append(bar) if bar.get("elapsed_pct", 0.0) >= 1.0 else None
-    ))
+    builder = BarBuilder(
+        symbol,
+        interval,
+        on_bar=lambda bar: (closed.append(bar) if bar.get("elapsed_pct", 0.0) >= 1.0 else None),
+    )
 
     cum_vol = 0
     for raw in bars_1m:
@@ -524,11 +526,13 @@ def _aggregate_to_interval(
         if ts is None:
             continue
         cum_vol += int(raw.get("volume") or 0)
-        builder.on_tick({
-            "ts": ts,
-            "price": float(raw.get("close") or 0.0),
-            "cumulative_volume": cum_vol,
-        })
+        builder.on_tick(
+            {
+                "ts": ts,
+                "price": float(raw.get("close") or 0.0),
+                "cumulative_volume": cum_vol,
+            }
+        )
 
     final_bar = builder.close_current_bar(forced=True)
     if final_bar is not None and final_bar.get("elapsed_pct", 0.0) >= 1.0:
@@ -689,8 +693,7 @@ def _enabled_rules(rule_names: list[str] | None) -> list[tuple[str, Any, str]]:
     all_rules = scanner_service.all_rules()
     if not rule_names:
         return [
-            (name, meta["fn"], meta.get("screener_type", "buy"))
-            for name, meta in all_rules.items()
+            (name, meta["fn"], meta.get("screener_type", "buy")) for name, meta in all_rules.items()
         ]
 
     out: list[tuple[str, Any, str]] = []
@@ -762,9 +765,7 @@ def _replay_symbol(
 
     from services import indicators as _ind  # noqa: PLC0415
 
-    bars_1m = _fetch_bars(
-        symbol, exchange, from_date, to_date, source=data_source, cache=bar_cache
-    )
+    bars_1m = _fetch_bars(symbol, exchange, from_date, to_date, source=data_source, cache=bar_cache)
     if not bars_1m:
         logger.info("backtest: no 1m history for %s/%s, skipping", symbol, exchange)
         return 0
@@ -840,14 +841,16 @@ def _replay_symbol(
             pending_entry = None
 
         # ----- 2. Append this bar to the rolling history window.
-        history_rows.append({
-            "ts": bar_ts,
-            "open": bar_open,
-            "high": bar_high,
-            "low": bar_low,
-            "close": bar_close,
-            "volume": float(bar.get("volume", 0) or 0),
-        })
+        history_rows.append(
+            {
+                "ts": bar_ts,
+                "open": bar_open,
+                "high": bar_high,
+                "low": bar_low,
+                "close": bar_close,
+                "volume": float(bar.get("volume", 0) or 0),
+            }
+        )
         if len(history_rows) > _HISTORY_WINDOW:
             history_rows = history_rows[-_HISTORY_WINDOW:]
 
@@ -864,25 +867,17 @@ def _replay_symbol(
                 # the strategy). Matches how a real broker prices an
                 # ambiguous intrabar fill.
                 if bar_low <= open_trade["sl_price"]:
-                    exit_price = slippage_model.exit_fill(
-                        open_trade["sl_price"], direction
-                    )
+                    exit_price = slippage_model.exit_fill(open_trade["sl_price"], direction)
                     exit_reason = "stop_loss"
                 elif bar_high >= open_trade["target_price"]:
-                    exit_price = slippage_model.exit_fill(
-                        open_trade["target_price"], direction
-                    )
+                    exit_price = slippage_model.exit_fill(open_trade["target_price"], direction)
                     exit_reason = "target"
             else:  # SHORT
                 if bar_high >= open_trade["sl_price"]:
-                    exit_price = slippage_model.exit_fill(
-                        open_trade["sl_price"], direction
-                    )
+                    exit_price = slippage_model.exit_fill(open_trade["sl_price"], direction)
                     exit_reason = "stop_loss"
                 elif bar_low <= open_trade["target_price"]:
-                    exit_price = slippage_model.exit_fill(
-                        open_trade["target_price"], direction
-                    )
+                    exit_price = slippage_model.exit_fill(open_trade["target_price"], direction)
                     exit_reason = "target"
 
             # EOD squareoff: force-close at bar close (we are by definition
@@ -964,7 +959,9 @@ def _replay_symbol(
                 except Exception:
                     logger.exception(
                         "backtest: rule %r raised on %s @ %s",
-                        rule_name, symbol, bar_ts.isoformat(),
+                        rule_name,
+                        symbol,
+                        bar_ts.isoformat(),
                     )
                     continue
                 if not matched:
@@ -1049,9 +1046,7 @@ def run_backtest(
     itself crashes.
     """
     if data_source not in _VALID_DATA_SOURCES:
-        raise ValueError(
-            f"data_source must be one of {_VALID_DATA_SOURCES}, got {data_source!r}"
-        )
+        raise ValueError(f"data_source must be one of {_VALID_DATA_SOURCES}, got {data_source!r}")
     rules = _enabled_rules(rule_names)
     effective_rule_names = [name for name, _, _ in rules]
     eod_time = _parse_eod_time(eod_time_ist)

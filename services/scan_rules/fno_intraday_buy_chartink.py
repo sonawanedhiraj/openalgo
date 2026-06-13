@@ -97,8 +97,12 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
 
     # Reject if any required daily field is NaN.
     if _any_nan(
-        today_d.close, today_d.open, today_d.volume,
-        yest_d.close, yest_d.high, yest_d.low,
+        today_d.close,
+        today_d.open,
+        today_d.volume,
+        yest_d.close,
+        yest_d.high,
+        yest_d.low,
     ):
         return False
 

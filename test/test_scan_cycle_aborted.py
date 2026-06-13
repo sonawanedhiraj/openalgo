@@ -28,9 +28,7 @@ def fresh_cycle_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(scdb, "engine", test_engine)
     monkeypatch.setattr(scdb, "db_session", test_session)
@@ -74,9 +72,7 @@ def test_record_aborted_cycle_writes_row(fresh_cycle_db):
     assert result["started_at"] is not None
 
     row = (
-        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
-        .filter_by(id=result["id"])
-        .first()
+        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle).filter_by(id=result["id"]).first()
     )
     assert row is not None
     assert row.post_status == "aborted_preflight"
@@ -104,9 +100,7 @@ def test_record_aborted_cycle_stores_operator_intent_and_metadata(fresh_cycle_db
     )
 
     row = (
-        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
-        .filter_by(id=result["id"])
-        .first()
+        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle).filter_by(id=result["id"]).first()
     )
     assert row.cycle_kind == "manual"
     assert row.operator_intent == "live"
@@ -134,9 +128,7 @@ def test_record_aborted_cycle_post_status_for_each_stage(fresh_cycle_db, stage, 
     assert result["post_status"] == expected
 
     row = (
-        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
-        .filter_by(id=result["id"])
-        .first()
+        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle).filter_by(id=result["id"]).first()
     )
     assert row.post_status == expected
 
@@ -160,9 +152,7 @@ def test_record_aborted_cycle_failsafe_on_db_outage(monkeypatch):
             return None
 
     monkeypatch.setattr(scdb, "db_session", _BrokenSession())
-    result = scan_cycle_service.record_aborted_cycle(
-        abort_reason="x", abort_stage="preflight"
-    )
+    result = scan_cycle_service.record_aborted_cycle(abort_reason="x", abort_stage="preflight")
     assert result["id"] == -1
     assert result["post_status"] == "aborted_preflight"
 
@@ -191,11 +181,7 @@ def test_endpoint_valid_payload_returns_200_and_row_lands(app_with_chartink, fre
     assert body["post_status"] == "aborted_preflight"
     assert body["id"] > 0
 
-    row = (
-        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
-        .filter_by(id=body["id"])
-        .first()
-    )
+    row = fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle).filter_by(id=body["id"]).first()
     assert row is not None
     assert row.post_status == "aborted_preflight"
     payload = json.loads(row.error_payload)

@@ -21,9 +21,7 @@ def fresh_cycle_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(scdb, "engine", test_engine)
     monkeypatch.setattr(scdb, "db_session", test_session)
@@ -61,9 +59,7 @@ def test_heartbeat_creates_row(fresh_cycle_db):
     scan_cycle_service.heartbeat(cid, "scan_buy", "ok", "5 syms")
 
     rows = (
-        fresh_cycle_db.db_session.query(fresh_cycle_db.CycleHeartbeat)
-        .filter_by(cycle_id=cid)
-        .all()
+        fresh_cycle_db.db_session.query(fresh_cycle_db.CycleHeartbeat).filter_by(cycle_id=cid).all()
     )
     assert len(rows) == 1
     assert rows[0].stage == "scan_buy"
@@ -213,9 +209,7 @@ def test_cycles_since_counts_correctly(fresh_cycle_db):
     assert scan_cycle_service.cycles_since(before) == 2
 
     # A future timestamp returns 0.
-    future = (
-        dt.datetime.now(pytz.timezone("Asia/Kolkata")) + dt.timedelta(hours=1)
-    ).isoformat()
+    future = (dt.datetime.now(pytz.timezone("Asia/Kolkata")) + dt.timedelta(hours=1)).isoformat()
     assert scan_cycle_service.cycles_since(future) == 0
 
 

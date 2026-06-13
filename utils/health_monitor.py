@@ -44,12 +44,12 @@ HEALTH_RETENTION_DAYS = int(os.getenv("HEALTH_RETENTION_DAYS", "7"))
 import platform as _platform
 
 _IS_WINDOWS = _platform.system() == "Windows"
-FD_WARNING_THRESHOLD = int(os.getenv(
-    "HEALTH_FD_WARNING_THRESHOLD", "5000" if _IS_WINDOWS else "700"
-))
-FD_CRITICAL_THRESHOLD = int(os.getenv(
-    "HEALTH_FD_CRITICAL_THRESHOLD", "10000" if _IS_WINDOWS else "900"
-))
+FD_WARNING_THRESHOLD = int(
+    os.getenv("HEALTH_FD_WARNING_THRESHOLD", "5000" if _IS_WINDOWS else "700")
+)
+FD_CRITICAL_THRESHOLD = int(
+    os.getenv("HEALTH_FD_CRITICAL_THRESHOLD", "10000" if _IS_WINDOWS else "900")
+)
 
 # Memory Thresholds (MB)
 MEMORY_WARNING_THRESHOLD = int(os.getenv("HEALTH_MEMORY_WARNING_THRESHOLD", "500"))
@@ -219,7 +219,13 @@ def get_fd_metrics():
         }
     except Exception as e:
         logger.error(f"Error getting FD metrics: {e}")
-        return {"count": 0, "limit": None, "usage_percent": 0.0, "available": None, "status": "unknown"}
+        return {
+            "count": 0,
+            "limit": None,
+            "usage_percent": 0.0,
+            "available": None,
+            "status": "unknown",
+        }
 
 
 def get_memory_metrics():
@@ -629,7 +635,9 @@ def start_health_collector(interval=None):
 
         _collector_running = True
         _collector_thread = threading.Thread(
-            target=_collector_loop, name="HealthCollector", daemon=True  # Daemon = zero impact
+            target=_collector_loop,
+            name="HealthCollector",
+            daemon=True,  # Daemon = zero impact
         )
         _collector_thread.start()
         logger.debug("Started health monitoring collector (background daemon thread)")

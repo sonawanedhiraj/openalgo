@@ -261,18 +261,14 @@ class FyersAdapter:
                         continue
                     pair = brsymbol_to_openalgo.get(brsym)
                     if not pair:
-                        self.logger.warning(
-                            f"brsymbol {brsym} did not match any input symbol"
-                        )
+                        self.logger.warning(f"brsymbol {brsym} did not match any input symbol")
                         continue
                     exch, sym = pair
                     full_symbol = f"{exch}:{sym}"
                     self.symbol_to_hsm[full_symbol] = hsm_token
                     self.hsm_to_symbol[hsm_token] = full_symbol
                     mapped_count += 1
-                    self.logger.debug(
-                        f"Mapped {full_symbol} <-> {hsm_token} (brsymbol: {brsym})"
-                    )
+                    self.logger.debug(f"Mapped {full_symbol} <-> {hsm_token} (brsymbol: {brsym})")
 
                 # Sanity check: every input symbol should have ended up mapped.
                 unmapped_subs = [

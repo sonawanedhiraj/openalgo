@@ -42,8 +42,12 @@ def map_order_data(order_data):
     - The modified order_data with updated 'tradingsymbol' and 'product' fields.
     """
     # Handle error responses from the API (e.g., after-hours errors, auth errors)
-    if isinstance(order_data, dict) and (order_data.get("errorType") or order_data.get("status") in ("error", "failed")):
-        logger.info(f"API returned error, no order data to map: {order_data.get('errorType', order_data.get('status', 'unknown'))}")
+    if isinstance(order_data, dict) and (
+        order_data.get("errorType") or order_data.get("status") in ("error", "failed")
+    ):
+        logger.info(
+            f"API returned error, no order data to map: {order_data.get('errorType', order_data.get('status', 'unknown'))}"
+        )
         return []
 
     # Check if 'data' is None

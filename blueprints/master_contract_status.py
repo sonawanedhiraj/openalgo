@@ -177,29 +177,22 @@ def force_master_contract_download():
             # Check if download is needed using smart logic
             should_download, reason = should_download_master_contract(broker)
             if not should_download:
-                return jsonify({
-                    "status": "skipped",
-                    "message": reason,
-                    "should_download": False
-                }), 200
+                return jsonify(
+                    {"status": "skipped", "message": reason, "should_download": False}
+                ), 200
 
         # Initialize status and start download
         init_broker_status(broker)
         thread = Thread(target=async_master_contract_download, args=(broker,), daemon=True)
         thread.start()
 
-        return jsonify({
-            "status": "success",
-            "message": "Master contract download started",
-            "started": True
-        }), 200
+        return jsonify(
+            {"status": "success", "message": "Master contract download started", "started": True}
+        ), 200
 
     except Exception as e:
         logger.exception(f"Error starting master contract download: {str(e)}")
-        return jsonify({
-            "status": "error",
-            "message": f"Failed to start download: {str(e)}"
-        }), 500
+        return jsonify({"status": "error", "message": f"Failed to start download: {str(e)}"}), 500
 
 
 @master_contract_status_bp.route("/master-contract/smart-status", methods=["GET"])
@@ -218,12 +211,13 @@ def get_smart_download_status():
         should_download, reason = should_download_master_contract(broker)
         cutoff_hour, cutoff_minute, tz = get_master_contract_cutoff(broker)
         import pytz
+
         tz_label = "UTC" if tz is pytz.utc else "IST"
         status_data["smart_download"] = {
             "should_download": should_download,
             "reason": reason,
             "cutoff_time": f"{cutoff_hour:02d}:{cutoff_minute:02d}",
-            "cutoff_timezone": tz_label
+            "cutoff_timezone": tz_label,
         }
 
         return jsonify(status_data), 200

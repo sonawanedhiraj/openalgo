@@ -30,7 +30,6 @@ def _get_dhan_client_id() -> str | None:
     return broker_api_key.strip() or None
 
 
-
 def get_api_response(endpoint, auth, method="POST", payload=""):
     AUTH_TOKEN = auth
     client_id = _get_dhan_client_id()
@@ -79,8 +78,10 @@ def get_api_response(endpoint, auth, method="POST", payload=""):
         # Handle 429 rate limiting with retry
         if res.status_code == 429:
             if attempt < max_retries:
-                wait_time = 0.5 * (2 ** attempt)  # 0.5s, 1s, 2s
-                logger.warning(f"Rate limited (429), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
+                wait_time = 0.5 * (2**attempt)  # 0.5s, 1s, 2s
+                logger.warning(
+                    f"Rate limited (429), retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})"
+                )
                 time.sleep(wait_time)
                 continue
             else:
@@ -589,7 +590,11 @@ class BrokerData:
                                 raw_high = float(highs[i]) if highs[i] else 0
                                 raw_low = float(lows[i]) if lows[i] else 0
                                 raw_vol = int(float(volumes[i])) if volumes[i] else 0
-                                raw_oi = int(float(openinterest[i])) if (i < len(openinterest) and openinterest[i]) else 0
+                                raw_oi = (
+                                    int(float(openinterest[i]))
+                                    if (i < len(openinterest) and openinterest[i])
+                                    else 0
+                                )
 
                                 quote = {
                                     "ltp": raw_ltp,
@@ -659,7 +664,9 @@ class BrokerData:
             # Create DataFrame from all candles
             df = pd.DataFrame(all_candles)
             if df.empty:
-                logger.info(f"Sandbox returned empty history for {symbol}, generating fake candles.")
+                logger.info(
+                    f"Sandbox returned empty history for {symbol}, generating fake candles."
+                )
 
                 # Calculate interval in seconds based on requested timeframe
                 interval_seconds = self.timeframe_map.get(interval, 300)
@@ -691,15 +698,17 @@ class BrokerData:
                         quote_tmpl.copy(),
                         seed=candle_ts,
                     )
-                    fake_candles.append({
-                        "timestamp": candle_ts,
-                        "open": realistic["open"],
-                        "high": realistic["high"],
-                        "low": realistic["low"],
-                        "close": realistic["ltp"],
-                        "volume": realistic["volume"],
-                        "oi": realistic["oi"],
-                    })
+                    fake_candles.append(
+                        {
+                            "timestamp": candle_ts,
+                            "open": realistic["open"],
+                            "high": realistic["high"],
+                            "low": realistic["low"],
+                            "close": realistic["ltp"],
+                            "volume": realistic["volume"],
+                            "oi": realistic["oi"],
+                        }
+                    )
                 df = pd.DataFrame(fake_candles)
             else:
                 # Sort by timestamp and remove duplicates
@@ -715,7 +724,9 @@ class BrokerData:
             logger.error(f"Error fetching historical data: {str(e)}")
             raise Exception(f"Error fetching historical data: {str(e)}")
 
-    def _get_quotes_via_chart(self, security_id: str, exchange_segment: str, instrument_type: str) -> dict:
+    def _get_quotes_via_chart(
+        self, security_id: str, exchange_segment: str, instrument_type: str
+    ) -> dict:
         """
         Fetch latest quote data using the intraday chart API.
         The sandbox does not have a /marketfeed/quote endpoint, so we use
@@ -778,7 +789,9 @@ class BrokerData:
             "volume": total_volume,
             "oi": dummy_oi,
         }
-        logger.info(f"Chart data for securityId={security_id}: LTP={ltp}, O={day_open}, H={day_high}, L={day_low}, V={total_volume}, OI={dummy_oi}, candles={len(closes)}")
+        logger.info(
+            f"Chart data for securityId={security_id}: LTP={ltp}, O={day_open}, H={day_high}, L={day_low}, V={total_volume}, OI={dummy_oi}, candles={len(closes)}"
+        )
         return result
 
     def _stable_noise(self, seed_key: str, low: float, high: float) -> float:
@@ -946,7 +959,11 @@ class BrokerData:
             quote_ltp=incoming_ltp,
         )
 
-        if incoming_ltp <= 0 or incoming_ltp < (inferred_spot * 0.2) or incoming_ltp > (inferred_spot * 5):
+        if (
+            incoming_ltp <= 0
+            or incoming_ltp < (inferred_spot * 0.2)
+            or incoming_ltp > (inferred_spot * 5)
+        ):
             ltp_center = inferred_spot
         else:
             ltp_center = incoming_ltp
@@ -955,9 +972,22 @@ class BrokerData:
         ltp = ltp_center + self._stable_noise(seed_key + "|ltp", -span, span)
 
         quote["ltp"] = round(max(0.05, ltp), 2)
-        quote["open"] = round(max(0.05, ltp_center + self._stable_noise(seed_key + "|open", -span, span)), 2)
-        quote["high"] = round(max(quote["ltp"], ltp_center + self._stable_noise(seed_key + "|high", 0, span * 1.8)), 2)
-        quote["low"] = round(max(0.05, min(quote["ltp"], ltp_center - abs(self._stable_noise(seed_key + "|low", 0, span * 1.8)))), 2)
+        quote["open"] = round(
+            max(0.05, ltp_center + self._stable_noise(seed_key + "|open", -span, span)), 2
+        )
+        quote["high"] = round(
+            max(quote["ltp"], ltp_center + self._stable_noise(seed_key + "|high", 0, span * 1.8)), 2
+        )
+        quote["low"] = round(
+            max(
+                0.05,
+                min(
+                    quote["ltp"],
+                    ltp_center - abs(self._stable_noise(seed_key + "|low", 0, span * 1.8)),
+                ),
+            ),
+            2,
+        )
 
         if not quote.get("oi"):
             quote["oi"] = max(1000, int(abs(self._stable_noise(seed_key + "|oi", 1000, 100000))))
@@ -977,8 +1007,15 @@ class BrokerData:
             dict: Quote data with ltp, open, high, low, volume, bid, ask, prev_close, oi
         """
         empty_quote = {
-            "ltp": 0, "open": 0, "high": 0, "low": 0,
-            "volume": 0, "bid": 0, "ask": 0, "prev_close": 0, "oi": 0,
+            "ltp": 0,
+            "open": 0,
+            "high": 0,
+            "low": 0,
+            "volume": 0,
+            "bid": 0,
+            "ask": 0,
+            "prev_close": 0,
+            "oi": 0,
         }
         try:
             security_id = get_token(symbol, exchange)
@@ -989,8 +1026,10 @@ class BrokerData:
                 logger.warning(f"Could not resolve {symbol}/{exchange} to security ID")
                 return empty_quote
 
-            logger.info(f"Getting chart-based quotes for {symbol} ({exchange}), "
-                        f"security_id={security_id}, segment={exchange_segment}")
+            logger.info(
+                f"Getting chart-based quotes for {symbol} ({exchange}), "
+                f"security_id={security_id}, segment={exchange_segment}"
+            )
 
             chart_data = self._get_quotes_via_chart(security_id, exchange_segment, instrument_type)
 
@@ -1027,7 +1066,9 @@ class BrokerData:
             dict: Market depth data with bids, asks and other details
         """
         try:
-            logger.info(f"Getting depth for {symbol}/{exchange} (sandbox: depth not available, using chart data for OHLC)")
+            logger.info(
+                f"Getting depth for {symbol}/{exchange} (sandbox: depth not available, using chart data for OHLC)"
+            )
 
             # Get OHLC from chart-based quotes
             quotes = self.get_quotes(symbol, exchange)
@@ -1081,21 +1122,23 @@ class BrokerData:
                 if i > 0:
                     time.sleep(0.15)
                 quote = self.get_quotes(symbol, exchange)
-                results.append({
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "data": {
-                        "bid": quote.get("bid", 0),
-                        "ask": quote.get("ask", 0),
-                        "open": quote.get("open", 0),
-                        "high": quote.get("high", 0),
-                        "low": quote.get("low", 0),
-                        "ltp": quote.get("ltp", 0),
-                        "prev_close": quote.get("prev_close", 0),
-                        "volume": quote.get("volume", 0),
-                        "oi": quote.get("oi", 0),
-                    },
-                })
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "data": {
+                            "bid": quote.get("bid", 0),
+                            "ask": quote.get("ask", 0),
+                            "open": quote.get("open", 0),
+                            "high": quote.get("high", 0),
+                            "low": quote.get("low", 0),
+                            "ltp": quote.get("ltp", 0),
+                            "prev_close": quote.get("prev_close", 0),
+                            "volume": quote.get("volume", 0),
+                            "oi": quote.get("oi", 0),
+                        },
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Skipping symbol {symbol} on {exchange}: {str(e)}")
                 skipped_symbols.append({"symbol": symbol, "exchange": exchange, "error": str(e)})

@@ -79,9 +79,7 @@ class AliceBlueWebSocket:
             payload = {"source": "API", "userId": self.user_id}
 
             client = get_httpx_client()
-            response = client.post(
-                url, json=payload, headers=self._get_auth_header(), timeout=10
-            )
+            response = client.post(url, json=payload, headers=self._get_auth_header(), timeout=10)
 
             if response.status_code == 200:
                 data = response.json()
@@ -109,9 +107,7 @@ class AliceBlueWebSocket:
             payload = {"source": "API", "userId": self.user_id}
 
             client = get_httpx_client()
-            response = client.post(
-                url, json=payload, headers=self._get_auth_header(), timeout=10
-            )
+            response = client.post(url, json=payload, headers=self._get_auth_header(), timeout=10)
 
             if response.status_code == 200:
                 data = response.json()

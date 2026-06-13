@@ -88,7 +88,11 @@ def get_margin_data(auth_token):
         total_unrealised = 0.0
         try:
             position_book = get_positions(auth_token)
-            if position_book and position_book.get("status") == "success" and "data" in position_book:
+            if (
+                position_book
+                and position_book.get("status") == "success"
+                and "data" in position_book
+            ):
                 position_book = map_order_data(position_book)
                 total_realised = sum(position.get("realised", 0) for position in position_book)
                 total_unrealised = sum(position.get("unrealised", 0) for position in position_book)

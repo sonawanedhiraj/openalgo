@@ -214,9 +214,7 @@ def api_search():
                             "lotsize": result.lotsize,
                             "contract_value": result.contract_value,
                             "instrumenttype": result.instrumenttype,
-                            "freeze_qty": get_freeze_qty_for_option(
-                                result.symbol, result.exchange
-                            ),
+                            "freeze_qty": get_freeze_qty_for_option(result.symbol, result.exchange),
                         }
                     )
 
@@ -254,9 +252,7 @@ def api_underlyings():
         "yes",
     )
 
-    logger.debug(
-        f"Fetching underlyings: exchange={exchange}, include_futures={include_futures}"
-    )
+    logger.debug(f"Fetching underlyings: exchange={exchange}, include_futures={include_futures}")
     underlyings = get_distinct_underlyings(exchange=exchange, include_futures=include_futures)
 
     # Filter out exchange test symbols (e.g. 011NSETEST, 021BSETEST)

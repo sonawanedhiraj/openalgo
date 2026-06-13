@@ -954,9 +954,7 @@ class BrokerData:
 
         except Exception as e:
             error_msg = str(e)
-            logger.exception(
-                f"Error in get_history: {error_msg}"
-            )  # Debug log
+            logger.exception(f"Error in get_history: {error_msg}")  # Debug log
 
             # Check if this is the timestamp conversion error with raw_data available
             if (

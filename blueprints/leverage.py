@@ -17,10 +17,12 @@ leverage_bp = Blueprint("leverage_bp", __name__, url_prefix="/leverage")
 @check_session_validity
 def get_current():
     """Get the current common leverage setting."""
-    return jsonify({
-        "status": "success",
-        "leverage": get_leverage(),
-    })
+    return jsonify(
+        {
+            "status": "success",
+            "leverage": get_leverage(),
+        }
+    )
 
 
 @leverage_bp.route("/api/update", methods=["POST"])
@@ -37,6 +39,7 @@ def update_leverage():
     try:
         leverage = float(data["leverage"])
         import math
+
         if math.isnan(leverage) or math.isinf(leverage):
             return jsonify({"status": "error", "message": "Invalid leverage value"}), 400
         if leverage < 0:
@@ -50,7 +53,9 @@ def update_leverage():
     set_leverage(leverage)
 
     label = f"{int(leverage)}x" if leverage > 0 else "Default"
-    return jsonify({
-        "status": "success",
-        "message": f"Leverage set to {label}",
-    })
+    return jsonify(
+        {
+            "status": "success",
+            "message": f"Leverage set to {label}",
+        }
+    )

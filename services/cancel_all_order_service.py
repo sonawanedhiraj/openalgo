@@ -33,11 +33,15 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = API_TYPE
 
-    bus.publish(AnalyzerErrorEvent(
-        mode="analyze", api_type=API_TYPE,
-        request_data=analyzer_request, response_data=error_response,
-        error_message=error_message,
-    ))
+    bus.publish(
+        AnalyzerErrorEvent(
+            mode="analyze",
+            api_type=API_TYPE,
+            request_data=analyzer_request,
+            response_data=error_response,
+            error_message=error_message,
+        )
+    )
 
     return error_response
 
@@ -129,27 +133,43 @@ def cancel_all_orders_with_auth(
         analyzer_request = order_request_data.copy()
         analyzer_request["api_type"] = API_TYPE
 
-        bus.publish(AllOrdersCancelledEvent(
-            mode="analyze", api_type=API_TYPE,
-            canceled_count=response_data.get("canceled_count", 0) if isinstance(response_data, dict) else 0,
-            failed_count=response_data.get("failed_count", 0) if isinstance(response_data, dict) else 0,
-            canceled_orders=response_data.get("canceled_orders", []) if isinstance(response_data, dict) else [],
-            failed_cancellations=response_data.get("failed_cancellations", []) if isinstance(response_data, dict) else [],
-            request_data=analyzer_request, response_data=response_data,
-            api_key=order_data.get("apikey", ""),
-        ))
+        bus.publish(
+            AllOrdersCancelledEvent(
+                mode="analyze",
+                api_type=API_TYPE,
+                canceled_count=response_data.get("canceled_count", 0)
+                if isinstance(response_data, dict)
+                else 0,
+                failed_count=response_data.get("failed_count", 0)
+                if isinstance(response_data, dict)
+                else 0,
+                canceled_orders=response_data.get("canceled_orders", [])
+                if isinstance(response_data, dict)
+                else [],
+                failed_cancellations=response_data.get("failed_cancellations", [])
+                if isinstance(response_data, dict)
+                else [],
+                request_data=analyzer_request,
+                response_data=response_data,
+                api_key=order_data.get("apikey", ""),
+            )
+        )
         return success, response_data, status_code
 
     # mode is EffectiveMode.LIVE — proceed with actual broker cancel-all.
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        bus.publish(OrderFailedEvent(
-            mode="live", api_type=API_TYPE,
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-            error_message="Broker-specific module not found",
-        ))
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+                error_message="Broker-specific module not found",
+            )
+        )
         return False, error_response, 404
 
     try:
@@ -163,12 +183,16 @@ def cancel_all_orders_with_auth(
             "status": "error",
             "message": "Failed to cancel all orders due to internal error",
         }
-        bus.publish(OrderFailedEvent(
-            mode="live", api_type=API_TYPE,
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-            error_message=str(e),
-        ))
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+                error_message=str(e),
+            )
+        )
         return False, error_response, 500
 
     # Prepare response data
@@ -179,13 +203,19 @@ def cancel_all_orders_with_auth(
         "message": f"Canceled {len(canceled_orders)} orders. Failed to cancel {len(failed_cancellations)} orders.",
     }
 
-    bus.publish(AllOrdersCancelledEvent(
-        mode="live", api_type=API_TYPE,
-        canceled_count=len(canceled_orders), failed_count=len(failed_cancellations),
-        canceled_orders=canceled_orders, failed_cancellations=failed_cancellations,
-        request_data=order_request_data, response_data=response_data,
-        api_key=original_data.get("apikey", ""),
-    ))
+    bus.publish(
+        AllOrdersCancelledEvent(
+            mode="live",
+            api_type=API_TYPE,
+            canceled_count=len(canceled_orders),
+            failed_count=len(failed_cancellations),
+            canceled_orders=canceled_orders,
+            failed_cancellations=failed_cancellations,
+            request_data=order_request_data,
+            response_data=response_data,
+            api_key=original_data.get("apikey", ""),
+        )
+    )
 
     return True, response_data, 200
 
@@ -239,13 +269,19 @@ def cancel_all_orders(
                     order_request_data = copy.deepcopy(original_data)
                     if "apikey" in order_request_data:
                         order_request_data.pop("apikey", None)
-                    bus.publish(AllOrdersCancelledEvent(
-                        mode="live", api_type=API_TYPE,
-                        canceled_count=0, failed_count=0,
-                        canceled_orders=[], failed_cancellations=[],
-                        request_data=order_request_data, response_data=error_response,
-                        api_key=api_key,
-                    ))
+                    bus.publish(
+                        AllOrdersCancelledEvent(
+                            mode="live",
+                            api_type=API_TYPE,
+                            canceled_count=0,
+                            failed_count=0,
+                            canceled_orders=[],
+                            failed_cancellations=[],
+                            request_data=order_request_data,
+                            response_data=error_response,
+                            api_key=api_key,
+                        )
+                    )
                     return False, error_response, 403
 
         # Add API key to order data

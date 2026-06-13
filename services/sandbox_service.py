@@ -38,7 +38,9 @@ def get_user_id_from_apikey(api_key: str) -> str | None:
 
 
 def sandbox_place_order(
-    order_data: dict[str, Any], api_key: str, original_data: dict[str, Any],
+    order_data: dict[str, Any],
+    api_key: str,
+    original_data: dict[str, Any],
     prefetched_quote: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """

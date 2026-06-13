@@ -71,12 +71,16 @@ def copy_from_dataframe(df):
     try:
         if filtered_data_dict:
             total = len(filtered_data_dict)
-            logger.info(f"Inserting {total} new records into the database in batches of {BATCH_SIZE}")
+            logger.info(
+                f"Inserting {total} new records into the database in batches of {BATCH_SIZE}"
+            )
             for i in range(0, total, BATCH_SIZE):
                 batch = filtered_data_dict[i : i + BATCH_SIZE]
                 db_session.bulk_insert_mappings(SymToken, batch)
                 db_session.flush()
-                logger.info(f"Inserted batch {i // BATCH_SIZE + 1} ({min(i + BATCH_SIZE, total)}/{total} records)")
+                logger.info(
+                    f"Inserted batch {i // BATCH_SIZE + 1} ({min(i + BATCH_SIZE, total)}/{total} records)"
+                )
             db_session.commit()
             logger.info(f"Bulk insert completed successfully with {total} new records.")
         else:
@@ -614,7 +618,9 @@ def process_groww_data(path):
         expiry_parsed = pd.to_datetime(df_mapped["expiry"], errors="coerce")
         valid_expiry = expiry_parsed.notna()
         if valid_expiry.any():
-            df_mapped.loc[valid_expiry, "expiry"] = expiry_parsed[valid_expiry].dt.strftime("%d-%b-%y").str.upper()
+            df_mapped.loc[valid_expiry, "expiry"] = (
+                expiry_parsed[valid_expiry].dt.strftime("%d-%b-%y").str.upper()
+            )
         df_mapped["expiry"] = df_mapped["expiry"].fillna("")
 
         # Map instrument types directly from Groww's data
@@ -697,12 +703,16 @@ def process_groww_data(path):
 
         if fno_data_mask.any():
             # Parse expiry dates for FNO rows and format as DDMMMYY
-            fno_expiry = pd.to_datetime(df_mapped.loc[fno_data_mask, "expiry"], format="%d-%b-%y", errors="coerce")
+            fno_expiry = pd.to_datetime(
+                df_mapped.loc[fno_data_mask, "expiry"], format="%d-%b-%y", errors="coerce"
+            )
             expiry_str = fno_expiry.dt.strftime("%d%b%y").str.upper()
 
             # Use underlying symbol where available, else trading_symbol
             underlying = df_mapped.loc[fno_data_mask, "underlying"]
-            base_symbol = underlying.where(underlying.notna() & (underlying != ""), df_mapped.loc[fno_data_mask, "symbol"])
+            base_symbol = underlying.where(
+                underlying.notna() & (underlying != ""), df_mapped.loc[fno_data_mask, "symbol"]
+            )
 
             # Strike as string: preserve decimals (e.g. 287.5 for 2.5-rupee
             # interval stocks like BANKBARODA, ADANIPOWER); collapse only
@@ -710,6 +720,7 @@ def process_groww_data(path):
             def _format_strike(v):
                 f = float(v)
                 return str(int(f)) if f == int(f) else str(f)
+
             strike_str = df_mapped.loc[fno_data_mask, "strike"].fillna(0).apply(_format_strike)
 
             # Get instrument type from original df
@@ -723,14 +734,18 @@ def process_groww_data(path):
                 )
 
             # Build symbols for CE options
-            ce_mask = fno_data_mask & (orig_inst_type.reindex(df_mapped.index, fill_value="") == "CE")
+            ce_mask = fno_data_mask & (
+                orig_inst_type.reindex(df_mapped.index, fill_value="") == "CE"
+            )
             if ce_mask.any():
                 df_mapped.loc[ce_mask, "symbol"] = (
                     base_symbol[ce_mask] + expiry_str[ce_mask] + strike_str[ce_mask] + "CE"
                 )
 
             # Build symbols for PE options
-            pe_mask = fno_data_mask & (orig_inst_type.reindex(df_mapped.index, fill_value="") == "PE")
+            pe_mask = fno_data_mask & (
+                orig_inst_type.reindex(df_mapped.index, fill_value="") == "PE"
+            )
             if pe_mask.any():
                 df_mapped.loc[pe_mask, "symbol"] = (
                     base_symbol[pe_mask] + expiry_str[pe_mask] + strike_str[pe_mask] + "PE"
@@ -822,7 +837,9 @@ def master_contract_download():
             & (token_df["brsymbol"].str.contains(" ", na=False))
         )
         if nfo_space_mask.any():
-            token_df.loc[nfo_space_mask, "symbol"] = token_df.loc[nfo_space_mask, "brsymbol"].str.replace(" ", "", regex=False)
+            token_df.loc[nfo_space_mask, "symbol"] = token_df.loc[
+                nfo_space_mask, "brsymbol"
+            ].str.replace(" ", "", regex=False)
 
         # Step 6: Insert into database
         logger.info(f"Inserting {len(token_df)} records into database")

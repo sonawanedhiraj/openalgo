@@ -54,7 +54,9 @@ def _entry_candle(ts: dt.datetime, elapsed: float = 0.8) -> Candle:
     )
 
 
-def _seed_open_position(engine: SimplifiedStockEngine, symbol: str, entry_time: dt.datetime) -> None:
+def _seed_open_position(
+    engine: SimplifiedStockEngine, symbol: str, entry_time: dt.datetime
+) -> None:
     """Plant an open Position so confirm_exit has something to close."""
     engine.positions[symbol] = Position(
         symbol=symbol,

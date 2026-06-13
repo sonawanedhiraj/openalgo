@@ -613,18 +613,20 @@ def close_position():
                 log_request = order_data.copy()
                 log_request["api_type"] = "closeposition"
 
-                bus.publish(PositionClosedEvent(
-                    mode="live",
-                    api_type="closeposition",
-                    symbol=symbol,
-                    exchange=exchange,
-                    product=product,
-                    orderid=str(orderid),
-                    message="Position close order placed successfully.",
-                    request_data=log_request,
-                    response_data=response_data,
-                    api_key=api_key,
-                ))
+                bus.publish(
+                    PositionClosedEvent(
+                        mode="live",
+                        api_type="closeposition",
+                        symbol=symbol,
+                        exchange=exchange,
+                        product=product,
+                        orderid=str(orderid),
+                        message="Position close order placed successfully.",
+                        request_data=log_request,
+                        response_data=response_data,
+                        api_key=api_key,
+                    )
+                )
         else:
             # No orderid, definite error
             response_data = {

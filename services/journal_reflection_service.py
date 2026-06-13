@@ -53,8 +53,8 @@ BACKTEST_CAVEAT = (
     "every day for 6 months. The live strategy only takes positions on stocks "
     "that appeared on the screener that day. Backtest hit-rate and P&L numbers "
     "are therefore over-broad and not directly comparable to live outcomes. "
-    "Use backtest patterns directionally only (e.g. \"SHORTs perform worse on "
-    "high-VIX days\" is OK; \"we'd have made X% returns\" is NOT). A screener-"
+    'Use backtest patterns directionally only (e.g. "SHORTs perform worse on '
+    'high-VIX days" is OK; "we\'d have made X% returns" is NOT). A screener-'
     "filtered re-run is on the roadmap."
 )
 
@@ -222,9 +222,9 @@ def render_reflection_prompt(inputs: dict[str, Any]) -> str:
         "1. A 3-5 sentence top-level summary of the day.\n"
         "2. A JSON array of structured patterns/observations under a heading "
         "`PATTERNS_JSON`. Each entry: "
-        "`{\"observation\": str, \"evidence\": str, \"confidence\": \"low|med|high\"}`.\n"
+        '`{"observation": str, "evidence": str, "confidence": "low|med|high"}`.\n'
         "3. A JSON array of open questions worth investigating under a heading "
-        "`QUESTIONS_JSON`. Each entry: `{\"question\": str, \"why\": str}`.\n"
+        '`QUESTIONS_JSON`. Each entry: `{"question": str, "why": str}`.\n'
         "Both JSON arrays MUST be valid JSON in fenced code blocks tagged "
         "```json so the post-processor can extract them."
     )
@@ -234,8 +234,7 @@ def render_reflection_prompt(inputs: dict[str, Any]) -> str:
         inputs.get("journal_trades") or [],
     )
     screener_block = _format_block(
-        "SCAN_RESULTS (screener candidates — what the screeners surfaced as "
-        "possible trades)",
+        "SCAN_RESULTS (screener candidates — what the screeners surfaced as possible trades)",
         inputs.get("screener_hits") or [],
     )
     backtest_block = _format_block(
@@ -266,13 +265,15 @@ def render_reflection_prompt(inputs: dict[str, Any]) -> str:
     for block in caveat_blocks:
         sections.append(block)
         sections.append("")
-    sections.extend([
-        journal_block,
-        "",
-        screener_block,
-        "",
-        backtest_block,
-    ])
+    sections.extend(
+        [
+            journal_block,
+            "",
+            screener_block,
+            "",
+            backtest_block,
+        ]
+    )
     return "\n".join(sections)
 
 
@@ -362,9 +363,7 @@ def _call_bridge(prompt: str) -> dict[str, Any]:
     except httpx.HTTPError as exc:
         raise RuntimeError(f"bridge unreachable at {url}: {exc}") from exc
     if response.status_code >= 300:
-        raise RuntimeError(
-            f"bridge returned HTTP {response.status_code}: {response.text[:300]}"
-        )
+        raise RuntimeError(f"bridge returned HTTP {response.status_code}: {response.text[:300]}")
     try:
         payload = response.json()
     except ValueError as exc:

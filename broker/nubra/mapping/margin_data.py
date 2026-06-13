@@ -10,7 +10,7 @@ logger = get_logger(__name__)
 def transform_margin_positions(positions):
     """
     Transform OpenAlgo margin position format to Nubra margin format.
-    
+
     Nubra Margin API Payload Structure:
     {
         "with_portfolio": true,
@@ -85,7 +85,7 @@ def transform_margin_positions(positions):
                 "order_delivery_type": delivery_type,
                 "price_type": price_type,
                 "order_price": price_in_paise,
-                "order_type": order_type
+                "order_type": order_type,
             }
 
             transformed_orders.append(nubra_order)
@@ -114,18 +114,20 @@ def transform_margin_positions(positions):
     payload_data = {
         "with_portfolio": True,  # Critical for accurate calculation
         "with_legs": False,
-        "is_basket": True,       # Always treat as basket for margin batch calculation
+        "is_basket": True,  # Always treat as basket for margin batch calculation
         "order_req": {
             "exchange": primary_exchange if primary_exchange else "NSE",
             "orders": transformed_orders,
             # basket_params is REQUIRED when is_basket is true
             "basket_params": {
                 "order_side": first_order.get("order_side", "ORDER_SIDE_BUY"),
-                "order_delivery_type": first_order.get("order_delivery_type", "ORDER_DELIVERY_TYPE_CNC"),
+                "order_delivery_type": first_order.get(
+                    "order_delivery_type", "ORDER_DELIVERY_TYPE_CNC"
+                ),
                 "price_type": first_order.get("price_type", "MARKET"),
-                "multiplier": 1  # Default multiplier
-            }
-        }
+                "multiplier": 1,  # Default multiplier
+            },
+        },
     }
 
     return payload_data
@@ -137,7 +139,7 @@ def map_product_type(product):
     """
     mapping = {
         "CNC": "ORDER_DELIVERY_TYPE_CNC",
-        "NRML": "ORDER_DELIVERY_TYPE_CNC", # NRML maps to CNC/Margin
+        "NRML": "ORDER_DELIVERY_TYPE_CNC",  # NRML maps to CNC/Margin
         "MIS": "ORDER_DELIVERY_TYPE_IDAY",
     }
     return mapping.get(product.upper(), "ORDER_DELIVERY_TYPE_IDAY")
@@ -200,7 +202,7 @@ def parse_margin_response(response_data):
 
         # Nubra sometimes returns error code in response
         if response_data.get("code"):
-             return {
+            return {
                 "status": "error",
                 "message": response_data.get("message", "Unknown error from Nubra"),
             }
@@ -225,4 +227,3 @@ def parse_margin_response(response_data):
     except Exception as e:
         logger.error(f"Error parsing margin response: {e}")
         return {"status": "error", "message": f"Failed to parse margin response: {str(e)}"}
-

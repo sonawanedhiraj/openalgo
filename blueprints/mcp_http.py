@@ -156,9 +156,7 @@ def _apply_cors(response: Response, origin: str | None) -> Response:
         # Browser-side OAuth clients need to read the discovery hint
         # from the 401 response. Without this header the WWW-Authenticate
         # value is hidden by CORS and the client reports "no OAuth".
-        response.headers["Access-Control-Expose-Headers"] = (
-            "WWW-Authenticate, Link, Content-Type"
-        )
+        response.headers["Access-Control-Expose-Headers"] = "WWW-Authenticate, Link, Content-Type"
         response.headers["Access-Control-Max-Age"] = "600"
         response.headers["Vary"] = "Origin"
     return response
@@ -577,9 +575,7 @@ def _dispatch_tool_call(
         # Don't leak the required scope value back to the client beyond
         # the WWW-Authenticate challenge — fold it into the JSON-RPC
         # error data block for clients that look there.
-        return _jsonrpc_error(
-            rpc_id, -32000, "insufficient_scope", data={"required_scope": needed}
-        )
+        return _jsonrpc_error(rpc_id, -32000, "insufficient_scope", data={"required_scope": needed})
 
     fn = get_tool_callable(tool_name)
     if fn is None:

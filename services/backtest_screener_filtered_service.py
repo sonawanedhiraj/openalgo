@@ -96,7 +96,9 @@ def _load_default_universe() -> list[str]:
     """
     candidates = [
         _FNO_UNIVERSE_FILE,
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), _FNO_UNIVERSE_FILE),
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), _FNO_UNIVERSE_FILE
+        ),
     ]
     for path in candidates:
         if not os.path.exists(path):
@@ -339,9 +341,7 @@ def _replay_symbol_screener(
             by_date[key] = cell
         return cell
 
-    bars_1m = _fetch_bars(
-        symbol, exchange, from_date, to_date, source="db", cache=bar_cache
-    )
+    bars_1m = _fetch_bars(symbol, exchange, from_date, to_date, source="db", cache=bar_cache)
     if not bars_1m:
         return {"by_date": by_date, "trades": trades_summary}
 
@@ -410,14 +410,16 @@ def _replay_symbol_screener(
             pending_entry = None
 
         # 2) Append this bar to the rolling history.
-        history_rows.append({
-            "ts": bar_ts,
-            "open": bar_open,
-            "high": bar_high,
-            "low": bar_low,
-            "close": bar_close,
-            "volume": float(bar.get("volume", 0) or 0),
-        })
+        history_rows.append(
+            {
+                "ts": bar_ts,
+                "open": bar_open,
+                "high": bar_high,
+                "low": bar_low,
+                "close": bar_close,
+                "volume": float(bar.get("volume", 0) or 0),
+            }
+        )
         if len(history_rows) > _HISTORY_WINDOW:
             history_rows = history_rows[-_HISTORY_WINDOW:]
 
@@ -471,18 +473,20 @@ def _replay_symbol_screener(
                     cell["wins"] += 1
                 elif pnl < 0:
                     cell["losses"] += 1
-                trades_summary.append({
-                    "symbol": symbol,
-                    "direction": direction,
-                    "entry_at": open_trade["entry_at"].isoformat(),
-                    "entry_price": entry_p,
-                    "exit_at": bar_ts.isoformat(),
-                    "exit_price": float(exit_price),
-                    "pnl": float(pnl),
-                    "exit_reason": exit_reason,
-                    "rule_name": open_trade["rule_name"],
-                    "hit_ts": open_trade["hit_ts"],
-                })
+                trades_summary.append(
+                    {
+                        "symbol": symbol,
+                        "direction": direction,
+                        "entry_at": open_trade["entry_at"].isoformat(),
+                        "entry_price": entry_p,
+                        "exit_at": bar_ts.isoformat(),
+                        "exit_price": float(exit_price),
+                        "pnl": float(pnl),
+                        "exit_reason": exit_reason,
+                        "rule_name": open_trade["rule_name"],
+                        "hit_ts": open_trade["hit_ts"],
+                    }
+                )
                 if exit_reason == "stop_loss":
                     sl_block_date = bar_date
                 open_trade = None
@@ -503,9 +507,7 @@ def _replay_symbol_screener(
         if open_trade is None and pending_entry is None and len(history_rows) >= 21:
             bars_df = pd.DataFrame(history_rows)
             indicators_dict = (
-                _build_indicators_dict(bars_df)
-                if indicator_fn is None
-                else indicator_fn(bars_df)
+                _build_indicators_dict(bars_df) if indicator_fn is None else indicator_fn(bars_df)
             )
             for rule_name, rule_fn, screener_type in rules:
                 try:
@@ -513,7 +515,9 @@ def _replay_symbol_screener(
                 except Exception:
                     logger.exception(
                         "screener_bt: rule %r raised on %s @ %s",
-                        rule_name, symbol, bar_ts.isoformat(),
+                        rule_name,
+                        symbol,
+                        bar_ts.isoformat(),
                     )
                     continue
                 if not matched:
@@ -633,8 +637,12 @@ def run_screener_filtered_backtest(
     expected_days = len(trading_dates)
     logger.info(
         "screener_bt: run_id=%s start=%s end=%s universe=%d weekdays=%d rules=%s",
-        run_id, start_date, end_date, len(universe),
-        expected_days, [r[0] for r in rules],
+        run_id,
+        start_date,
+        end_date,
+        len(universe),
+        expected_days,
+        [r[0] for r in rules],
     )
 
     by_date_total: dict[str, dict[str, Any]] = {}
@@ -672,15 +680,18 @@ def run_screener_filtered_backtest(
 
         completed_symbols += 1
         for date_key, cell in sym_result.get("by_date", {}).items():
-            agg = by_date_total.setdefault(date_key, {
-                "date": date_key,
-                "buy_count": 0,
-                "sell_count": 0,
-                "entries": 0,
-                "wins": 0,
-                "losses": 0,
-                "pnl": 0.0,
-            })
+            agg = by_date_total.setdefault(
+                date_key,
+                {
+                    "date": date_key,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "entries": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "pnl": 0.0,
+                },
+            )
             agg["buy_count"] += cell["buy_hits"]
             agg["sell_count"] += cell["sell_hits"]
             agg["entries"] += cell["entries"]
@@ -694,7 +705,8 @@ def run_screener_filtered_backtest(
             logger.info(
                 "screener_bt: progress %d/%d symbols done; running totals "
                 "buy=%d sell=%d entries=%d",
-                sym_idx + 1, len(universe),
+                sym_idx + 1,
+                len(universe),
                 sum(d["buy_count"] for d in by_date_total.values()),
                 sum(d["sell_count"] for d in by_date_total.values()),
                 sum(d["entries"] for d in by_date_total.values()),
@@ -705,7 +717,8 @@ def run_screener_filtered_backtest(
     # ahead of time, but we can flag a day's emptiness in the summary.
     expected_dates = {d.isoformat() for d in trading_dates}
     days_with_any_data = {
-        date_key for date_key, cell in by_date_total.items()
+        date_key
+        for date_key, cell in by_date_total.items()
         if cell["buy_count"] + cell["sell_count"] + cell["entries"] > 0
     }
     silent_days = sorted(expected_dates - days_with_any_data)
@@ -758,7 +771,12 @@ def run_screener_filtered_backtest(
 
     logger.info(
         "screener_bt: run_id=%s done — hits=%d entries=%d wins=%d losses=%d pnl=%.2f",
-        run_id, scanner_hits_total, entries_taken, wins, losses, net_pnl,
+        run_id,
+        scanner_hits_total,
+        entries_taken,
+        wins,
+        losses,
+        net_pnl,
     )
     return summary
 

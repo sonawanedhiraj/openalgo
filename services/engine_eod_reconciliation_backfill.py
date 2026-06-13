@@ -77,9 +77,11 @@ def main(argv: list[str] | None = None) -> int:
             f"skipped={len(result.skipped)}"
         )
         for d in result.exit_details:
-            print(f"    + {d['symbol']:<12} {d['direction']:<5} qty={d['quantity']:<4} "
-                  f"exit={d['exit_price']} pnl={d['pnl']} fills={d['fills']} "
-                  f"order={d['exit_order_id']}")
+            print(
+                f"    + {d['symbol']:<12} {d['direction']:<5} qty={d['quantity']:<4} "
+                f"exit={d['exit_price']} pnl={d['pnl']} fills={d['fills']} "
+                f"order={d['exit_order_id']}"
+            )
         for s in result.skipped:
             print(f"    - {s.get('symbol')}: {s.get('reason')}")
         print(f"    detail_json={json.dumps(result.exit_details)}")

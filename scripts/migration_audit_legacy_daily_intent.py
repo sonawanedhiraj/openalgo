@@ -148,8 +148,7 @@ def _verdict_for(path: str, texts: list[str]) -> tuple[str, str]:
     if is_direct:
         return (
             "REVIEW",
-            "Direct daily_intent-table reader not in the known "
-            "classification — inspect manually.",
+            "Direct daily_intent-table reader not in the known classification — inspect manually.",
         )
     return (
         "BY-DESIGN-INDIRECT",
@@ -175,8 +174,7 @@ def _phantom_check() -> dict:
             ).fetchall()
         ]
         reliance_phantom_total = conn.execute(
-            "SELECT COUNT(*) FROM trade_journal WHERE symbol='RELIANCE' "
-            "AND entry_price IN (?, ?)",
+            "SELECT COUNT(*) FROM trade_journal WHERE symbol='RELIANCE' AND entry_price IN (?, ?)",
             _PHANTOM_RELIANCE_PRICES,
         ).fetchone()[0]
         reliance_phantom_open = conn.execute(
@@ -283,10 +281,7 @@ def main() -> int:
             f"    RELIANCE 101.7/97.4 synthetic rows: {phantom['reliance_phantom_total']} "
             f"total, {phantom['reliance_phantom_open']} still open"
         )
-        print(
-            f"    open trending_equity_intraday rows: "
-            f"{phantom['trending_equity_intraday_open']}"
-        )
+        print(f"    open trending_equity_intraday rows: {phantom['trending_equity_intraday_open']}")
         print(f"    total open (exited_at IS NULL) rows: {phantom['open_count']}")
         for r in phantom["open_rows"]:
             kind = "REAL position" if r["looks_real_order_id"] else "SYNTHETIC/test"

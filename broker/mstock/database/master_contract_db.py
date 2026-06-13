@@ -422,8 +422,8 @@ def process_mstock_json(json_data):
                 "TELCOM": "BSETELECOM",
             }
             mask_bse_idx = df["exchange"] == "BSE_INDEX"
-            df.loc[mask_bse_idx, "symbol"] = (
-                df.loc[mask_bse_idx, "name"].replace(bse_index_symbol_map)
+            df.loc[mask_bse_idx, "symbol"] = df.loc[mask_bse_idx, "name"].replace(
+                bse_index_symbol_map
             )
     except Exception as e:
         logger.warning(f"Could not fetch BSE index tokens for mapping: {e}")

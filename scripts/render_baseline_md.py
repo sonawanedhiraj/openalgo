@@ -1,4 +1,5 @@
 """Render docs/benchmarks/greeks_baseline_pyvollib.json → human-readable markdown."""
+
 import json
 from collections import defaultdict
 
@@ -80,10 +81,15 @@ def latency_summary() -> str:
 
 
 def coverage_summary() -> str:
-    rows = ["| Type | DEEP ITM | ITM | ATM | OTM | DEEP OTM | Total |", "|:---|---:|---:|---:|---:|---:|---:|"]
+    rows = [
+        "| Type | DEEP ITM | ITM | ATM | OTM | DEEP OTM | Total |",
+        "|:---|---:|---:|---:|---:|---:|---:|",
+    ]
     for t in ("CE", "PE"):
         counts = [len(by_class[(t, c)]) for c in ORDER]
-        rows.append(f"| {t} | {counts[0]} | {counts[1]} | {counts[2]} | {counts[3]} | {counts[4]} | {sum(counts)} |")
+        rows.append(
+            f"| {t} | {counts[0]} | {counts[1]} | {counts[2]} | {counts[3]} | {counts[4]} | {sum(counts)} |"
+        )
     return "### Moneyness coverage\n\n" + "\n".join(rows) + "\n"
 
 
@@ -96,7 +102,7 @@ Captured before migrating from `py_vollib==1.0.1` to `opengreeks`. This snapshot
 - **Underlying**: NIFTY @ ₹{SPOT:.2f} (NSE_INDEX LTP)
 - **Expiry**: 26-MAY-2026 (`NIFTY26MAY26<strike><CE/PE>`)
 - **Risk-free rate**: 0 (default for NFO in `DEFAULT_INTEREST_RATES`)
-- **Samples**: {len(samples)} ({sum(1 for r in samples if r['type'] == 'CE')} CE + {sum(1 for r in samples if r['type'] == 'PE')} PE)
+- **Samples**: {len(samples)} ({sum(1 for r in samples if r["type"] == "CE")} CE + {sum(1 for r in samples if r["type"] == "PE")} PE)
 - **Raw JSON**: [`greeks_baseline_pyvollib.json`](./greeks_baseline_pyvollib.json)
 
 ## Moneyness classification
@@ -113,9 +119,9 @@ Computed from strike vs spot ({SPOT:.0f}):
 
 {coverage_summary()}
 {latency_summary()}
-{section('CE')}
+{section("CE")}
 
-{section('PE')}
+{section("PE")}
 
 ## Notes
 

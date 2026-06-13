@@ -674,9 +674,7 @@ class OrderManager:
                         else:
                             # MARKET order: process normally (fills at bid/ask or LTP)
                             exec_engine._process_order(order, cached_quote)
-                            logger.info(
-                                f"Market order {orderid} executed immediately"
-                            )
+                            logger.info(f"Market order {orderid} executed immediately")
                     else:
                         logger.warning(
                             f"Could not fetch quote for {symbol} on {exchange}, order remains open"
@@ -751,7 +749,15 @@ class OrderManager:
                 new_quantity = int(new_data["quantity"])
                 # Validate lot size (from cache)
                 symbol_obj = get_symbol_info(order.symbol, order.exchange)
-                if symbol_obj and order.exchange in ["NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX", "CRYPTO"]:
+                if symbol_obj and order.exchange in [
+                    "NFO",
+                    "BFO",
+                    "CDS",
+                    "BCD",
+                    "MCX",
+                    "NCDEX",
+                    "CRYPTO",
+                ]:
                     lot_size = symbol_obj.lotsize or 1
                     if new_quantity % lot_size != 0:
                         return (

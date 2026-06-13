@@ -25,9 +25,7 @@ from __future__ import annotations
 
 # OpenAlgo exchanges that are routed to the index MQTT topic prefix
 # (prod/marketfeed/index/v1/...) rather than the market feed prefix.
-INDEX_EXCHANGES: frozenset[str] = frozenset(
-    {"NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX"}
-)
+INDEX_EXCHANGES: frozenset[str] = frozenset({"NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX"})
 
 # OpenAlgo exchanges that support open-interest data. Anything outside this
 # set has no OI stream — saves a wasted SUBSCRIBE frame.

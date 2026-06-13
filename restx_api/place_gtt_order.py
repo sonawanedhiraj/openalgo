@@ -35,16 +35,18 @@ class PlaceGTTOrder(Resource):
                     return make_response(jsonify(emit_analyzer_error(data, error_message)), 400)
                 error_response = {"status": "error", "message": error_message}
                 safe_request = {k: v for k, v in data.items() if k != "apikey"}
-                bus.publish(GTTFailedEvent(
-                    mode="live",
-                    api_type="placegttorder",
-                    symbol=data.get("symbol", ""),
-                    exchange=data.get("exchange", ""),
-                    trigger_type=data.get("trigger_type", ""),
-                    request_data=safe_request,
-                    response_data=error_response,
-                    error_message=error_message,
-                ))
+                bus.publish(
+                    GTTFailedEvent(
+                        mode="live",
+                        api_type="placegttorder",
+                        symbol=data.get("symbol", ""),
+                        exchange=data.get("exchange", ""),
+                        trigger_type=data.get("trigger_type", ""),
+                        request_data=safe_request,
+                        response_data=error_response,
+                        error_message=error_message,
+                    )
+                )
                 return make_response(jsonify(error_response), 400)
 
             api_key = order_data.pop("apikey", None)

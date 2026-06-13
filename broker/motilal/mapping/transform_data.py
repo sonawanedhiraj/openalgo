@@ -103,13 +103,9 @@ def transform_data(data, token, auth_token=None):
                         f"MPP: LTP unavailable for {data['symbol']}, sending MARKET as-is"
                     )
             else:
-                logger.warning(
-                    f"MPP: No auth_token for {data['symbol']}, cannot fetch LTP"
-                )
+                logger.warning(f"MPP: No auth_token for {data['symbol']}, cannot fetch LTP")
         except Exception as e:
-            logger.error(
-                f"MPP Error for MARKET {data['symbol']}: {e}. Sending MARKET as-is"
-            )
+            logger.error(f"MPP Error for MARKET {data['symbol']}: {e}. Sending MARKET as-is")
 
     # MPP for SL-M orders: convert to STOPLOSS with protected limit price
     elif pricetype == "SL-M":
@@ -139,13 +135,9 @@ def transform_data(data, token, auth_token=None):
                     f"OrderType=SL-M->STOPLOSS, Trigger={tp}, LimitPrice={protected_price}"
                 )
             except Exception as e:
-                logger.error(
-                    f"MPP Error for SL-M {data['symbol']}: {e}. Sending SL-M as-is"
-                )
+                logger.error(f"MPP Error for SL-M {data['symbol']}: {e}. Sending SL-M as-is")
         else:
-            logger.warning(
-                f"MPP: trigger_price=0 for SL-M {data['symbol']}, sending as-is"
-            )
+            logger.warning(f"MPP: trigger_price=0 for SL-M {data['symbol']}, sending as-is")
 
     # Basic mapping for Motilal Oswal
     transformed = {

@@ -40,22 +40,22 @@ def configure_llvmlite_paths() -> None:
         None
     """
     # Only configure on Linux (Windows/macOS don't have this issue)
-    if sys.platform != 'linux':
+    if sys.platform != "linux":
         return
 
     # Get the base directory (project root)
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     # Create cache directories in project folder
-    numba_cache = os.path.join(base_dir, '.numba_cache')
-    llvm_tmp = os.path.join(base_dir, '.llvm_tmp')
+    numba_cache = os.path.join(base_dir, ".numba_cache")
+    llvm_tmp = os.path.join(base_dir, ".llvm_tmp")
 
     # Set environment variables if not already set
-    if 'NUMBA_CACHE_DIR' not in os.environ:
-        os.environ['NUMBA_CACHE_DIR'] = numba_cache
+    if "NUMBA_CACHE_DIR" not in os.environ:
+        os.environ["NUMBA_CACHE_DIR"] = numba_cache
 
-    if 'LLVMLITE_TMPDIR' not in os.environ:
-        os.environ['LLVMLITE_TMPDIR'] = llvm_tmp
+    if "LLVMLITE_TMPDIR" not in os.environ:
+        os.environ["LLVMLITE_TMPDIR"] = llvm_tmp
 
     # Create directories if they don't exist
     for dir_path in [numba_cache, llvm_tmp]:
@@ -75,23 +75,27 @@ def check_tmp_noexec() -> None:
 
     This helps users understand why llvmlite might fail to load.
     """
-    if sys.platform != 'linux':
+    if sys.platform != "linux":
         return
 
     try:
-        with open('/proc/mounts') as f:
+        with open("/proc/mounts") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 4 and parts[1] == '/tmp':
-                    mount_options = parts[3].split(',')
-                    if 'noexec' in mount_options:
+                if len(parts) >= 4 and parts[1] == "/tmp":
+                    mount_options = parts[3].split(",")
+                    if "noexec" in mount_options:
                         print("\n" + "=" * 70)
                         print("⚠️  WARNING: /tmp is mounted with 'noexec' flag")
                         print("   This can cause issues with Python libraries like numba/llvmlite.")
                         print("")
                         print("   OpenAlgo has auto-configured alternative paths:")
-                        print(f"   - NUMBA_CACHE_DIR={os.environ.get('NUMBA_CACHE_DIR', 'not set')}")
-                        print(f"   - LLVMLITE_TMPDIR={os.environ.get('LLVMLITE_TMPDIR', 'not set')}")
+                        print(
+                            f"   - NUMBA_CACHE_DIR={os.environ.get('NUMBA_CACHE_DIR', 'not set')}"
+                        )
+                        print(
+                            f"   - LLVMLITE_TMPDIR={os.environ.get('LLVMLITE_TMPDIR', 'not set')}"
+                        )
                         print("")
                         print("   If you still see 'failed to map segment' errors, either:")
                         print("   1. Remount /tmp: sudo mount -o remount,exec /tmp")
@@ -167,14 +171,14 @@ def check_env_version_compatibility() -> bool:
         def version_tuple(v: str) -> tuple:
             """
             Convert version string to tuple of integers for comparison.
-            
+
             Args:
                 v (str): Version string (e.g. '1.5.0').
-            
+
             Returns:
                 tuple: Tuple of integers (e.g. (1, 5, 0)).
             """
-            return tuple(int(x) for x in v.split('.'))
+            return tuple(int(x) for x in v.split("."))
 
         env_ver = version_tuple(env_version)
         sample_ver = version_tuple(sample_version)
@@ -262,9 +266,7 @@ def _db_has_user_data(env_dir: str) -> bool:
 
     try:
         with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
-            )
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
             if cur.fetchone() is None:
                 return False
             cur = conn.execute("SELECT 1 FROM users LIMIT 1")
@@ -531,9 +533,7 @@ def _ensure_fernet_salt(env_path: str) -> None:
         return
 
     # Locate the API_KEY_PEPPER line — it's the placement anchor for FERNET_SALT.
-    pepper_pat = re.compile(
-        r"^[ \t]*API_KEY_PEPPER[ \t]*=.*?(?=\r?\n|\Z)", re.MULTILINE
-    )
+    pepper_pat = re.compile(r"^[ \t]*API_KEY_PEPPER[ \t]*=.*?(?=\r?\n|\Z)", re.MULTILINE)
     pepper_m = pepper_pat.search(content)
     if pepper_m is None:
         # PEPPER line missing — required-vars check will surface this.
@@ -630,9 +630,7 @@ def _ensure_fernet_salt(env_path: str) -> None:
     if db_path and os.path.exists(db_path):
         sample_cts = _sample_ciphertexts(db_path, limit=20)
         if sample_cts:
-            decryptable = any(
-                _try_decrypt(old_fernet, ct, InvalidToken) for ct in sample_cts
-            )
+            decryptable = any(_try_decrypt(old_fernet, ct, InvalidToken) for ct in sample_cts)
             if not decryptable:
                 sys.stderr.write(
                     "\n\033[91m\033[1m[OpenAlgo Fernet salt]\033[0m\n"
@@ -742,8 +740,7 @@ def _sample_ciphertexts(db_path: str, limit: int = 20) -> list:
                 if cur.fetchone() is None:
                     continue
                 cur = conn.execute(
-                    f"SELECT {col} FROM {table} "
-                    f"WHERE {col} IS NOT NULL AND {col} != '' LIMIT ?",
+                    f"SELECT {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != '' LIMIT ?",
                     (limit - len(samples),),
                 )
                 samples.extend(r[0] for r in cur.fetchall())
@@ -1249,9 +1246,7 @@ def load_and_check_env_variables() -> None:
     # Single: "10 per second"
     # Compound (Flask-Limiter syntax): "10 per second;40 per minute"
     single_limit = r"\d+\s+per\s+(second|minute|hour|day)"
-    rate_limit_pattern = re.compile(
-        rf"^{single_limit}(;{single_limit})*$"
-    )
+    rate_limit_pattern = re.compile(rf"^{single_limit}(;{single_limit})*$")
 
     for var in rate_limit_vars:
         value = os.getenv(var, "")

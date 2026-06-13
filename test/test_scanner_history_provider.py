@@ -39,9 +39,7 @@ def _fake_get_ohlcv(*, symbol, exchange, interval, start_timestamp, end_timestam
 
 
 def test_get_daily_returns_lookback_tail(monkeypatch):
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv)
     p = ScannerHistoryProvider(["SBIN"], daily_lookback_bars=205)
     p.refresh()
     df = p.get_daily("SBIN")
@@ -51,9 +49,7 @@ def test_get_daily_returns_lookback_tail(monkeypatch):
 
 
 def test_get_weekly_returns_lookback_tail(monkeypatch):
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv)
     p = ScannerHistoryProvider(["SBIN"], weekly_lookback_bars=22)
     p.refresh()
     df = p.get_weekly("SBIN")
@@ -68,9 +64,7 @@ def test_lazy_load_for_uncached_symbol(monkeypatch):
         calls.append((symbol, interval))
         return _make_frame(300 if interval == "D" else 40)
 
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", tracking
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", tracking)
     # INFY not in the configured symbol list and refresh() not called.
     p = ScannerHistoryProvider(["SBIN"])
     df = p.get_daily("INFY")
@@ -83,9 +77,7 @@ def test_lazy_load_for_uncached_symbol(monkeypatch):
 
 
 def test_refresh_updates_last_refresh_at(monkeypatch):
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv)
     p = ScannerHistoryProvider(["SBIN", "INFY"])
     assert p.get_cache_status()["last_refresh_at"] is None
     result = p.refresh()
@@ -98,9 +90,7 @@ def test_refresh_updates_last_refresh_at(monkeypatch):
 
 
 def test_missing_data_returns_none(monkeypatch):
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv)
     p = ScannerHistoryProvider(["UNKNOWN"])
     p.refresh()
     assert p.get_daily("UNKNOWN") is None
@@ -113,9 +103,7 @@ def test_error_on_one_symbol_captured_others_load(monkeypatch):
             raise RuntimeError("duckdb boom")
         return _make_frame(300 if interval == "D" else 40)
 
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", flaky
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", flaky)
     p = ScannerHistoryProvider(["SBIN", "BAD", "INFY"])
     result = p.refresh()
     assert result["symbols_loaded"] == 2
@@ -128,9 +116,7 @@ def test_error_on_one_symbol_captured_others_load(monkeypatch):
 
 
 def test_concurrent_reads_during_refresh(monkeypatch):
-    monkeypatch.setattr(
-        "services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv
-    )
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv)
     p = ScannerHistoryProvider(["SBIN", "INFY", "TCS", "WIPRO"])
     p.refresh()
 

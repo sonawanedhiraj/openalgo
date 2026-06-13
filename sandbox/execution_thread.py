@@ -275,9 +275,7 @@ def _start_websocket_upgrade_watcher():
                         _execution_thread = None
                         break
                     else:
-                        logger.warning(
-                            f"Auto-upgrade failed to start WebSocket engine: {message}"
-                        )
+                        logger.warning(f"Auto-upgrade failed to start WebSocket engine: {message}")
                 except Exception as e:
                     logger.exception(f"Error during auto-upgrade to WebSocket engine: {e}")
 

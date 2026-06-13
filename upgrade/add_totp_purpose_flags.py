@@ -65,11 +65,7 @@ def run() -> bool:
     logger.info(f"Adding {len(pending)} column(s) to users: {', '.join(pending)}")
     with engine.begin() as conn:
         for column in pending:
-            conn.execute(
-                text(
-                    f"ALTER TABLE users ADD COLUMN {column} BOOLEAN NOT NULL DEFAULT 0"
-                )
-            )
+            conn.execute(text(f"ALTER TABLE users ADD COLUMN {column} BOOLEAN NOT NULL DEFAULT 0"))
             logger.info(f"  + {column}")
 
     logger.info("Migration complete.")

@@ -533,9 +533,7 @@ class FyersTbtWebSocket:
         """Start data-stall watchdog thread"""
         if self.health_check_thread and self.health_check_thread.is_alive():
             return
-        self.health_check_thread = threading.Thread(
-            target=self._health_check_loop, daemon=True
-        )
+        self.health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         self.health_check_thread.start()
 
     def _health_check_loop(self):
@@ -633,9 +631,7 @@ class FyersTbtWebSocket:
                     if channel not in self.active_channels:
                         self.switch_channel(resume_channels=[channel], pause_channels=[])
                 except Exception as e:
-                    self.logger.error(
-                        f"Error flushing subscribe batch for channel {channel}: {e}"
-                    )
+                    self.logger.error(f"Error flushing subscribe batch for channel {channel}: {e}")
         except Exception as e:
             self.logger.error(f"Subscribe batch flush error: {e}")
 

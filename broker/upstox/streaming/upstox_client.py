@@ -5,6 +5,7 @@ Synchronous Upstox V3 WebSocket client using websocket-client library.
 Uses the same sync pattern as Angel/Dhan adapters to avoid asyncio event loop
 conflicts with eventlet in gunicorn deployments.
 """
+
 import json
 import logging
 import ssl
@@ -244,7 +245,9 @@ class UpstoxWebSocketClient:
     def _on_ws_message(self, ws, message):
         """Called for both binary (protobuf) and text (JSON) messages"""
         self._last_message_time = time.time()
-        self.logger.debug(f"Received message: type={type(message).__name__}, size={len(message) if message else 0}")
+        self.logger.debug(
+            f"Received message: type={type(message).__name__}, size={len(message) if message else 0}"
+        )
         if isinstance(message, bytes):
             self._process_binary_message(message)
         else:
@@ -269,9 +272,7 @@ class UpstoxWebSocketClient:
         if self._health_check_thread and self._health_check_thread.is_alive():
             return
 
-        self._health_check_thread = threading.Thread(
-            target=self._health_check_loop, daemon=True
-        )
+        self._health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         self._health_check_thread.start()
 
     def _health_check_loop(self):
@@ -353,9 +354,7 @@ class UpstoxWebSocketClient:
         """Get WebSocket URL from Upstox authorization endpoint"""
         try:
             headers = {"Accept": "application/json", "Authorization": f"Bearer {self.auth_token}"}
-            response = requests.get(
-                self.AUTH_ENDPOINT, headers=headers, timeout=self.HTTP_TIMEOUT
-            )
+            response = requests.get(self.AUTH_ENDPOINT, headers=headers, timeout=self.HTTP_TIMEOUT)
             response.raise_for_status()
             auth_data = response.json()
             ws_url = auth_data.get("data", {}).get("authorized_redirect_uri")

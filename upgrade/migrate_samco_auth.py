@@ -78,9 +78,7 @@ def upgrade():
             added = 0
             for col_name, col_type in AUX_COLUMNS:
                 if col_name not in existing_columns:
-                    conn.execute(
-                        text(f"ALTER TABLE auth ADD COLUMN {col_name} {col_type}")
-                    )
+                    conn.execute(text(f"ALTER TABLE auth ADD COLUMN {col_name} {col_type}"))
                     logger.info(f"Added column: {col_name}")
                     added += 1
                 else:

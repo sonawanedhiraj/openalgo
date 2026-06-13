@@ -160,7 +160,7 @@ def compute_realized_vol(
                 lookback_days + 1,
             )
             continue
-        prices = np.array([c for _, c in series[-(lookback_days + 1):]], dtype=float)
+        prices = np.array([c for _, c in series[-(lookback_days + 1) :]], dtype=float)
         if np.any(prices <= 0):
             continue
         log_returns = np.diff(np.log(prices))
@@ -188,9 +188,7 @@ def select_lowvol_basket(volatilities: dict[str, float], bottom_n: int) -> list[
     return [sym for sym, _ in ranked[:bottom_n]]
 
 
-def compute_risk_parity_weights(
-    mom_basket_vol: float, lv_basket_vol: float
-) -> tuple[float, float]:
+def compute_risk_parity_weights(mom_basket_vol: float, lv_basket_vol: float) -> tuple[float, float]:
     """Inverse-vol weights for (momentum, low-vol) legs, summing to 1.0.
 
     Each leg's weight is proportional to the inverse of its realized vol — the
@@ -334,9 +332,7 @@ def compute_rebalance(
     lv_vol = _basket_vol(lowvol_basket, volatilities)
     momentum_weight, lowvol_weight = compute_risk_parity_weights(mom_vol, lv_vol)
 
-    last_prices = {
-        sym: series[-1][1] for sym, series in closes.items() if series
-    }
+    last_prices = {sym: series[-1][1] for sym, series in closes.items() if series}
 
     target_positions = compute_target_positions(
         momentum_basket,

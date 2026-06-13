@@ -356,7 +356,6 @@ class NxtradStream:
         except Exception:
             pass
 
-
     def isConnected(self):
         return self.isConnected
 

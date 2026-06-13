@@ -167,11 +167,7 @@ def check_strategy_data_ready(
     if max_staleness_business_days is None:
         max_staleness_business_days = default_max_staleness_business_days()
 
-    ref_date = (
-        datetime.strptime(date, "%Y-%m-%d").date()
-        if date
-        else datetime.now(_IST).date()
-    )
+    ref_date = datetime.strptime(date, "%Y-%m-%d").date() if date else datetime.now(_IST).date()
     ref_business_day = _prev_or_same_business_day(ref_date)
 
     groups = _resolve_strategy_symbols(strategy_name)

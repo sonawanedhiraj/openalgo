@@ -173,9 +173,7 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         ):
             self._connect_thread.join(timeout=5)
             if self._connect_thread.is_alive():
-                self.logger.warning(
-                    "Motilal adapter connect thread did not exit within 5s"
-                )
+                self.logger.warning("Motilal adapter connect thread did not exit within 5s")
         self._connect_thread = None
 
         if hasattr(self, "ws_client") and self.ws_client:

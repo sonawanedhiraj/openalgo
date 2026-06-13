@@ -99,7 +99,9 @@ def heartbeat(
     except Exception as e:
         logger.exception(
             "scan_cycle.heartbeat audit write failed (cycle=%s stage=%s): %s",
-            cycle_id, stage, e,
+            cycle_id,
+            stage,
+            e,
         )
         try:
             sess.rollback()
@@ -137,9 +139,7 @@ def complete_cycle(
     try:
         row = sess.query(ScanCycle).filter_by(id=cycle_id).first()
         if row is None:
-            logger.warning(
-                "scan_cycle.complete_cycle: cycle_id=%s not found", cycle_id
-            )
+            logger.warning("scan_cycle.complete_cycle: cycle_id=%s not found", cycle_id)
             return
 
         row.completed_at = _now_iso()
@@ -163,7 +163,8 @@ def complete_cycle(
     except Exception as e:
         logger.warning(
             "scan_cycle.complete_cycle audit write failed (cycle=%s): %s",
-            cycle_id, e,
+            cycle_id,
+            e,
         )
         try:
             sess.rollback()
@@ -286,8 +287,7 @@ def get_recent_cycles(hours: int = 24) -> list[dict]:
     import pytz
 
     cutoff = (
-        dt.datetime.now(pytz.timezone("Asia/Kolkata"))
-        - dt.timedelta(hours=hours)
+        dt.datetime.now(pytz.timezone("Asia/Kolkata")) - dt.timedelta(hours=hours)
     ).isoformat()
 
     sess = _session()
@@ -322,11 +322,7 @@ def cycles_since(iso_ts: str) -> int:
     """Count cycles started at or after ``iso_ts`` — for preflight staleness."""
     sess = _session()
     try:
-        return (
-            sess.query(ScanCycle)
-            .filter(ScanCycle.started_at >= iso_ts)
-            .count()
-        )
+        return sess.query(ScanCycle).filter(ScanCycle.started_at >= iso_ts).count()
     finally:
         sess.remove()
 

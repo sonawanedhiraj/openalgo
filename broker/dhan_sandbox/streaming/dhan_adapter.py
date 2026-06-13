@@ -204,9 +204,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """
         if self.batch_timer:
             self.batch_timer.cancel()
-        self.batch_timer = threading.Timer(
-            self.batch_delay, self._process_batch_subscriptions
-        )
+        self.batch_timer = threading.Timer(self.batch_delay, self._process_batch_subscriptions)
         self.batch_timer.daemon = True
         self.batch_timer.start()
 
@@ -225,9 +223,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
             ws_client = self.ws_client
 
         if not ws_client:
-            self.logger.warning(
-                f"Dropping batch of {len(pending)} subscriptions — ws_client gone"
-            )
+            self.logger.warning(f"Dropping batch of {len(pending)} subscriptions — ws_client gone")
             return
 
         # Group by (mode, exchange_code) — Dhan's subscribe_tokens accepts
@@ -249,9 +245,7 @@ class DhanWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     f"(exchange_code={exch_code})"
                 )
             except Exception as e:
-                self.logger.error(
-                    f"Batch subscribe failed for mode {mode}: {e}"
-                )
+                self.logger.error(f"Batch subscribe failed for mode {mode}: {e}")
 
     def disconnect(self):
         """

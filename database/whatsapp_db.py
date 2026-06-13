@@ -209,9 +209,7 @@ class WhatsAppNotificationQueue(Base):
 class WhatsAppUserPreference(Base):
     __tablename__ = "whatsapp_user_preferences"
 
-    whatsapp_jid = Column(
-        String(120), ForeignKey("whatsapp_users.whatsapp_jid"), primary_key=True
-    )
+    whatsapp_jid = Column(String(120), ForeignKey("whatsapp_users.whatsapp_jid"), primary_key=True)
     order_notifications = Column(Boolean, default=True)
     trade_notifications = Column(Boolean, default=True)
     pnl_notifications = Column(Boolean, default=True)
@@ -238,9 +236,7 @@ def _ensure_columns(table: str, columns: dict[str, str]) -> None:
     from sqlalchemy import text
 
     with engine.connect() as conn:
-        existing = {
-            row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))
-        }
+        existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
         for col_name, col_type in columns.items():
             if col_name not in existing:
                 logger.info("WhatsApp DB: adding missing column %s.%s", table, col_name)
@@ -683,9 +679,7 @@ def get_user_preferences(whatsapp_jid: str) -> dict[str, Any]:
         return _wa_preferences_cache[cache_key]
     try:
         prefs = (
-            db_session.query(WhatsAppUserPreference)
-            .filter_by(whatsapp_jid=whatsapp_jid)
-            .first()
+            db_session.query(WhatsAppUserPreference).filter_by(whatsapp_jid=whatsapp_jid).first()
         )
         if not prefs:
             result = {
@@ -728,9 +722,7 @@ def update_user_preferences(whatsapp_jid: str, updates: dict[str, Any]) -> bool:
     }
     try:
         prefs = (
-            db_session.query(WhatsAppUserPreference)
-            .filter_by(whatsapp_jid=whatsapp_jid)
-            .first()
+            db_session.query(WhatsAppUserPreference).filter_by(whatsapp_jid=whatsapp_jid).first()
         )
         if not prefs:
             prefs = WhatsAppUserPreference(whatsapp_jid=whatsapp_jid)
@@ -758,9 +750,7 @@ def log_command(whatsapp_jid: str, command: str, parameters: dict | None = None)
     try:
         params_json = json.dumps(parameters) if parameters else None
         db_session.add(
-            WhatsAppCommandLog(
-                whatsapp_jid=whatsapp_jid, command=command, parameters=params_json
-            )
+            WhatsAppCommandLog(whatsapp_jid=whatsapp_jid, command=command, parameters=params_json)
         )
         user = db_session.query(WhatsAppUser).filter_by(whatsapp_jid=whatsapp_jid).first()
         if user:

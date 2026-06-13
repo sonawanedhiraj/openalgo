@@ -357,7 +357,9 @@ class ZebuWebSocketAdapter(BaseBrokerWebSocketAdapter):
         elif full_api_key:
             # Legacy format without ::: separator
             self.actid = full_api_key
-            self.logger.warning(f"BROKER_API_KEY missing ':::' separator, using as-is: {self.actid}")
+            self.logger.warning(
+                f"BROKER_API_KEY missing ':::' separator, using as-is: {self.actid}"
+            )
         else:
             # Fallback to user_id if no API key is set
             self.actid = user_id
@@ -766,9 +768,7 @@ class ZebuWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 Config.MAX_RECONNECT_DELAY,
             )
 
-            self.logger.info(
-                f"Reconnecting in {delay}s (attempt {self.reconnect_attempts + 1})"
-            )
+            self.logger.info(f"Reconnecting in {delay}s (attempt {self.reconnect_attempts + 1})")
 
             # Cancel existing timer if present
             if self._reconnect_timer:

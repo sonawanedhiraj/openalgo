@@ -518,12 +518,10 @@ def process_fyers_cds_json(path):
         lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x
     )
     df.loc[df["optType"] == "CE", "symbol"] = (
-        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x)
-        + "CE"
+        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x) + "CE"
     )
     df.loc[df["optType"] == "PE", "symbol"] = (
-        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x)
-        + "PE"
+        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x) + "PE"
     )
 
     # Keep only the columns needed for the database schema
@@ -652,12 +650,10 @@ def process_fyers_mcx_json(path):
         lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x
     )
     df.loc[df["optType"] == "CE", "symbol"] = (
-        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x)
-        + "CE"
+        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x) + "CE"
     )
     df.loc[df["optType"] == "PE", "symbol"] = (
-        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x)
-        + "PE"
+        df["symDetails"].apply(lambda x: reformat_symbol_detail(x) if pd.notnull(x) else x) + "PE"
     )
 
     # Keep only the columns needed for the database schema

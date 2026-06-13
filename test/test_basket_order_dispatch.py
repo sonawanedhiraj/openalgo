@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -59,18 +57,20 @@ def test_basket_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    broker_place = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1")
-    )
+    broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     sandbox_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
 
     success, _, status = basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     assert success is True
@@ -90,18 +90,24 @@ def test_basket_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypat
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     broker_place = MagicMock()
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     # Avoid touching quotes_service in the analyze branch
     from services import quotes_service as qs
+
     monkeypatch.setattr(
-        qs, "get_multiquotes",
+        qs,
+        "get_multiquotes",
         lambda **kw: (False, {"message": "skipped"}, 500),
     )
 
     success, _, status = basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     assert success is True
@@ -121,17 +127,23 @@ def test_basket_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     broker_place = MagicMock()
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     from services import quotes_service as qs
+
     monkeypatch.setattr(
-        qs, "get_multiquotes",
+        qs,
+        "get_multiquotes",
         lambda **kw: (False, {"message": "skipped"}, 500),
     )
 
     basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     sandbox_mock.assert_called()
@@ -149,12 +161,16 @@ def test_basket_rejects_when_skip(fresh_intent_db, monkeypatch):
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
 
     success, response, status = basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     assert success is False
@@ -174,12 +190,16 @@ def test_basket_rejects_when_disabled(fresh_intent_db, monkeypatch):
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
 
     success, response, status = basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     assert success is False
@@ -221,13 +241,17 @@ def test_basket_all_orders_failed_reports_error(fresh_intent_db, monkeypatch):
         return SimpleNamespace(status=400), {"message": "rejected"}, None
 
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=_reject),
     )
 
     basket = _multi_basket(["INFY", "SBIN"])
     success, response, status = basket_order_service.process_basket_order_with_auth(
-        basket, auth_token="dummy", broker="zerodha", original_data=basket,
+        basket,
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=basket,
     )
 
     assert response["status"] == "error"
@@ -251,13 +275,17 @@ def test_basket_partial_fill_reports_partial(fresh_intent_db, monkeypatch):
         return SimpleNamespace(status=400), {"message": "rejected"}, None
 
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=_mixed),
     )
 
     basket = _multi_basket(["INFY", "SBIN", "TCS"])
     success, response, status = basket_order_service.process_basket_order_with_auth(
-        basket, auth_token="dummy", broker="zerodha", original_data=basket,
+        basket,
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=basket,
     )
 
     assert response["status"] == "partial"
@@ -273,23 +301,29 @@ def test_basket_reject_response_shape_matches_existing_convention(fresh_intent_d
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", MagicMock())
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
     reject_result = basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    broker_place = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1")
-    )
+    broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
-        basket_order_service, "import_broker_module",
+        basket_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     success_result = basket_order_service.process_basket_order_with_auth(
-        _basket(), auth_token="dummy", broker="zerodha", original_data=_basket(),
+        _basket(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_basket(),
     )
 
     for r in (reject_result, success_result):

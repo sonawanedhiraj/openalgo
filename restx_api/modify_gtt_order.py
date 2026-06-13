@@ -35,15 +35,17 @@ class ModifyGTTOrder(Resource):
                     return make_response(jsonify(emit_analyzer_error(data, error_message)), 400)
                 error_response = {"status": "error", "message": error_message}
                 safe_request = {k: v for k, v in data.items() if k != "apikey"}
-                bus.publish(GTTModifyFailedEvent(
-                    mode="live",
-                    api_type="modifygttorder",
-                    symbol=data.get("symbol", ""),
-                    trigger_id=data.get("trigger_id", ""),
-                    request_data=safe_request,
-                    response_data=error_response,
-                    error_message=error_message,
-                ))
+                bus.publish(
+                    GTTModifyFailedEvent(
+                        mode="live",
+                        api_type="modifygttorder",
+                        symbol=data.get("symbol", ""),
+                        trigger_id=data.get("trigger_id", ""),
+                        request_data=safe_request,
+                        response_data=error_response,
+                        error_message=error_message,
+                    )
+                )
                 return make_response(jsonify(error_response), 400)
 
             api_key = order_data.pop("apikey", None)

@@ -497,9 +497,15 @@ class PositionManager:
                 pos_cv = _cv_map.get(position.symbol, 1.0)
                 pos_cv_dec = Decimal(str(pos_cv))
                 if position.quantity != 0:
-                    investment = abs(Decimal(str(position.average_price)) * Decimal(str(position.quantity)) * pos_cv_dec)
+                    investment = abs(
+                        Decimal(str(position.average_price))
+                        * Decimal(str(position.quantity))
+                        * pos_cv_dec
+                    )
                     if investment > 0:
-                        calculated_pnl_percent = (position_total_pnl_today / investment) * Decimal("100")
+                        calculated_pnl_percent = (position_total_pnl_today / investment) * Decimal(
+                            "100"
+                        )
                     else:
                         calculated_pnl_percent = Decimal("0.00")
                     display_avg_price = float(position.average_price)
@@ -519,7 +525,9 @@ class PositionManager:
                         "pnl": float(
                             position_total_pnl_today
                         ),  # Today's total P&L (realized + unrealized)
-                        "pnlpercent": float(calculated_pnl_percent),  # Fixed: use pnlpercent (no underscore) to match frontend
+                        "pnlpercent": float(
+                            calculated_pnl_percent
+                        ),  # Fixed: use pnlpercent (no underscore) to match frontend
                         "unrealized_pnl": float(unrealized_pnl),  # Unrealized only (for reference)
                         "today_realized_pnl": float(today_realized),
                         "total_pnl_today": float(position_total_pnl_today),
@@ -630,7 +638,9 @@ class PositionManager:
                     s for s in missing_symbols if s not in quote_cache or quote_cache[s] is None
                 ]
                 if still_missing:
-                    logger.debug(f"{len(still_missing)} symbols not available via multiquotes, waiting for WebSocket data")
+                    logger.debug(
+                        f"{len(still_missing)} symbols not available via multiquotes, waiting for WebSocket data"
+                    )
             else:
                 logger.debug(f"Positions MTM: All {ws_count} symbols from WebSocket (no API calls)")
 
@@ -1339,7 +1349,9 @@ def cleanup_expired_contracts():
 
                     except Exception as e:
                         db_session.rollback()
-                        logger.exception(f"Error cleaning up expired position {position.symbol}: {e}")
+                        logger.exception(
+                            f"Error cleaning up expired position {position.symbol}: {e}"
+                        )
                         continue
 
             except Exception as e:

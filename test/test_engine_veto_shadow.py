@@ -90,9 +90,7 @@ def test_shadow_mode_records_decision_but_does_not_block(monkeypatch):
             "services.signal_review_service.review_signal",
             return_value=_stub_review("skip"),
         ) as mock_review,
-        patch(
-            "services.signal_review_service.mark_actually_taken"
-        ) as mock_mark,
+        patch("services.signal_review_service.mark_actually_taken") as mock_mark,
         patch(
             "services.sandbox_service.sandbox_place_order",
             return_value=_sandbox_success_response(),
@@ -154,15 +152,9 @@ def test_active_mode_blocks_on_skip(monkeypatch):
             "services.signal_review_service.review_signal",
             return_value=_stub_review("skip", reasoning="negative breadth"),
         ),
-        patch(
-            "services.signal_review_service.mark_actually_taken"
-        ) as mock_mark,
-        patch(
-            "services.sandbox_service.sandbox_place_order"
-        ) as mock_sandbox,
-        patch(
-            "services.place_order_service.place_order"
-        ) as mock_live,
+        patch("services.signal_review_service.mark_actually_taken") as mock_mark,
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+        patch("services.place_order_service.place_order") as mock_live,
     ):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 
@@ -213,12 +205,8 @@ def test_off_mode_does_not_call_reviewer(monkeypatch):
     service.engine.pending_entries[signal.symbol] = signal
 
     with (
-        patch(
-            "services.signal_review_service.review_signal"
-        ) as mock_review,
-        patch(
-            "services.signal_review_service.mark_actually_taken"
-        ) as mock_mark,
+        patch("services.signal_review_service.review_signal") as mock_review,
+        patch("services.signal_review_service.mark_actually_taken") as mock_mark,
         patch(
             "services.sandbox_service.sandbox_place_order",
             return_value=_sandbox_success_response(),
@@ -333,9 +321,7 @@ def test_order_failure_marks_actually_taken_false(monkeypatch):
             return_value=_stub_review("take"),
         ),
         patch("services.signal_review_service.mark_actually_taken") as mock_mark,
-        patch(
-            "services.sandbox_service.sandbox_place_order", return_value=sandbox_failure
-        ),
+        patch("services.sandbox_service.sandbox_place_order", return_value=sandbox_failure),
     ):
         service._place_entry_order(signal, api_key="test-key", strategy_name="trend-up")
 

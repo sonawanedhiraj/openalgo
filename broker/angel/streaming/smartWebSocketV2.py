@@ -427,7 +427,9 @@ class SmartWebSocketV2:
                 )
             else:
                 logger.error(f"Invalid retry strategy {self.retry_strategy}")
-                self._safe_call_on_error("Invalid Retry Strategy", f"Strategy {self.retry_strategy} not supported")
+                self._safe_call_on_error(
+                    "Invalid Retry Strategy", f"Strategy {self.retry_strategy} not supported"
+                )
                 return
 
             time.sleep(delay)

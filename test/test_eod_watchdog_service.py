@@ -53,12 +53,8 @@ def fresh_journal_db(monkeypatch):
     test_trade_journal_service.py."""
     from database import trade_journal_db as tjdb
 
-    test_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
     monkeypatch.setattr(tjdb, "engine", test_engine)
     monkeypatch.setattr(tjdb, "db_session", test_session)
     tjdb.Base.metadata.create_all(test_engine)
@@ -138,10 +134,18 @@ def test_list_intraday_strategies_excludes_positional_strategy():
 
         def on_scan_hit(self, symbol, direction): ...
         def seed_history(self, symbol, candles): ...
-        def on_bar(self, symbol, candle): return None
-        def on_tick(self, symbol, price): return []
-        def confirm_entry(self, symbol, executed_price=None): return None
-        def confirm_exit(self, symbol, exit_price=None, reason=None): return None
+        def on_bar(self, symbol, candle):
+            return None
+
+        def on_tick(self, symbol, price):
+            return []
+
+        def confirm_entry(self, symbol, executed_price=None):
+            return None
+
+        def confirm_exit(self, symbol, exit_price=None, reason=None):
+            return None
+
         def clear_pending_entry(self, symbol): ...
         def clear_pending_exit(self, symbol): ...
 
@@ -162,12 +166,15 @@ def test_list_intraday_strategies_excludes_positional_strategy():
 def test_start_eod_watchdog_schedules_one_job_per_intraday_strategy(stopped_watchdog):
     from services import eod_watchdog_service
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_a", "15:20"), ("strat_b", "15:25")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_a": object(), "strat_b": object(), "positional_x": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_a", "15:20"), ("strat_b", "15:25")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_a": object(), "strat_b": object(), "positional_x": object()},
+        ),
     ):
         result = eod_watchdog_service.start_eod_watchdog()
 
@@ -197,12 +204,15 @@ def test_watchdog_caps_fire_time_before_venue_square_off(stopped_watchdog, monke
     monkeypatch.delenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", raising=False)
     monkeypatch.delenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED", raising=False)
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_a", "15:20")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_a": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_a", "15:20")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_a": object()},
+        ),
     ):
         result = eod_watchdog_service.start_eod_watchdog()
 
@@ -221,12 +231,15 @@ def test_watchdog_honors_earlier_strategy_time(stopped_watchdog, monkeypatch):
 
     monkeypatch.delenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", raising=False)
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_early", "14:00")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_early": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_early", "14:00")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_early": object()},
+        ),
     ):
         result = eod_watchdog_service.start_eod_watchdog()
 
@@ -239,12 +252,15 @@ def test_watchdog_cap_time_is_env_configurable(stopped_watchdog, monkeypatch):
 
     monkeypatch.setenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", "15:10")
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_a", "15:20")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_a": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_a", "15:20")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_a": object()},
+        ),
     ):
         result = eod_watchdog_service.start_eod_watchdog()
 
@@ -258,12 +274,15 @@ def test_watchdog_disabled_by_feature_flag(stopped_watchdog, monkeypatch):
 
     monkeypatch.setenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED", "false")
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_a", "15:20")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_a": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_a", "15:20")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_a": object()},
+        ),
     ):
         result = eod_watchdog_service.start_eod_watchdog()
 
@@ -275,12 +294,15 @@ def test_start_eod_watchdog_is_idempotent(stopped_watchdog):
     """Calling start twice must not stack jobs or raise."""
     from services import eod_watchdog_service
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_a", "15:20")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_a": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_a", "15:20")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_a": object()},
+        ),
     ):
         eod_watchdog_service.start_eod_watchdog()
         second = eod_watchdog_service.start_eod_watchdog()
@@ -296,12 +318,15 @@ def test_start_eod_watchdog_is_idempotent(stopped_watchdog):
 def test_start_eod_watchdog_skips_bad_time_format(stopped_watchdog):
     from services import eod_watchdog_service
 
-    with patch(
-        "services.eod_watchdog_service.list_intraday_strategies",
-        return_value=[("strat_good", "15:20"), ("strat_bad", "not-a-time")],
-    ), patch(
-        "services.eod_watchdog_service.registered_strategies",
-        return_value={"strat_good": object(), "strat_bad": object()},
+    with (
+        patch(
+            "services.eod_watchdog_service.list_intraday_strategies",
+            return_value=[("strat_good", "15:20"), ("strat_bad", "not-a-time")],
+        ),
+        patch(
+            "services.eod_watchdog_service.registered_strategies",
+            return_value={"strat_good": object(), "strat_bad": object()},
+        ),
     ):
         result = eod_watchdog_service.start_eod_watchdog()
 
@@ -322,17 +347,16 @@ def test_run_strategy_eod_flatten_dispatches_to_flatten():
         "failed": [],
         "skipped": [],
     }
-    with patch(
-        "services.simplified_stock_engine_service.flatten_strategy_positions",
-        return_value=flatten_result,
-    ) as mock_flatten, patch(
-        "services.notification_service.get_notification_service"
-    ) as mock_ns:
+    with (
+        patch(
+            "services.simplified_stock_engine_service.flatten_strategy_positions",
+            return_value=flatten_result,
+        ) as mock_flatten,
+        patch("services.notification_service.get_notification_service") as mock_ns,
+    ):
         eod_watchdog_service._run_strategy_eod_flatten("trending_equity_intraday")
 
-    mock_flatten.assert_called_once_with(
-        "trending_equity_intraday", reason="eod_watchdog"
-    )
+    mock_flatten.assert_called_once_with("trending_equity_intraday", reason="eod_watchdog")
     mock_ns.return_value.publish_eod_watchdog_summary.assert_called_once_with(
         strategy_name="trending_equity_intraday", result=flatten_result
     )
@@ -343,12 +367,13 @@ def test_run_strategy_eod_flatten_crash_escalates_failure_alert():
     NOT propagate the exception (which would crash the APScheduler thread)."""
     from services import eod_watchdog_service
 
-    with patch(
-        "services.simplified_stock_engine_service.flatten_strategy_positions",
-        side_effect=RuntimeError("kaboom"),
-    ), patch(
-        "services.notification_service.get_notification_service"
-    ) as mock_ns:
+    with (
+        patch(
+            "services.simplified_stock_engine_service.flatten_strategy_positions",
+            side_effect=RuntimeError("kaboom"),
+        ),
+        patch("services.notification_service.get_notification_service") as mock_ns,
+    ):
         # Must not raise.
         eod_watchdog_service._run_strategy_eod_flatten("strat_x")
 
@@ -390,9 +415,7 @@ def test_flatten_strategy_positions_no_open_rows_is_noop(fresh_journal_db):
     from services import simplified_stock_engine_service as ses
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order"
-    ) as mock_po:
+    with _patched_engine_service(svc), patch("services.place_order_service.place_order") as mock_po:
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     mock_po.assert_not_called()
@@ -415,13 +438,14 @@ def test_flatten_strategy_positions_flattens_todays_open_long(fresh_journal_db):
     )
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order",
-        return_value=(True, {"orderid": "WD-1", "status": "success"}, 200),
-    ) as mock_po:
-        result = ses.flatten_strategy_positions(
-            "trending_equity_intraday", reason="eod_watchdog"
-        )
+    with (
+        _patched_engine_service(svc),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-1", "status": "success"}, 200),
+        ) as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday", reason="eod_watchdog")
 
     assert mock_po.called
     sent_payload = mock_po.call_args.args[0]
@@ -438,11 +462,7 @@ def test_flatten_strategy_positions_flattens_todays_open_long(fresh_journal_db):
     assert result["failed"] == []
 
     # Row is now closed.
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     assert row.exited_at is not None
     assert row.exit_reason == "eod_watchdog"
     assert row.exit_order_id == "WD-1"
@@ -462,10 +482,13 @@ def test_flatten_strategy_positions_flattens_short_with_buy(fresh_journal_db):
     )
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order",
-        return_value=(True, {"orderid": "WD-2"}, 200),
-    ) as mock_po:
+    with (
+        _patched_engine_service(svc),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-2"}, 200),
+        ) as mock_po,
+    ):
         ses.flatten_strategy_positions("trending_equity_intraday")
 
     sent_payload = mock_po.call_args.args[0]
@@ -488,10 +511,13 @@ def test_flatten_strategy_positions_ignores_other_strategies(fresh_journal_db):
     )
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order",
-        return_value=(True, {"orderid": "X"}, 200),
-    ) as mock_po:
+    with (
+        _patched_engine_service(svc),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "X"}, 200),
+        ) as mock_po,
+    ):
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     assert mock_po.call_count == 1
@@ -519,9 +545,7 @@ def test_flatten_strategy_positions_ignores_already_exited_rows(fresh_journal_db
     )
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order"
-    ) as mock_po:
+    with _patched_engine_service(svc), patch("services.place_order_service.place_order") as mock_po:
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     mock_po.assert_not_called()
@@ -540,9 +564,7 @@ def test_flatten_strategy_positions_ignores_yesterdays_rows(fresh_journal_db):
     )
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order"
-    ) as mock_po:
+    with _patched_engine_service(svc), patch("services.place_order_service.place_order") as mock_po:
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     mock_po.assert_not_called()
@@ -560,12 +582,14 @@ def test_flatten_strategy_positions_handles_place_order_failure(fresh_journal_db
     )
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order",
-        return_value=(False, {"message": "insufficient_margin"}, 400),
-    ), patch(
-        "services.notification_service.get_notification_service"
-    ) as mock_ns:
+    with (
+        _patched_engine_service(svc),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(False, {"message": "insufficient_margin"}, 400),
+        ),
+        patch("services.notification_service.get_notification_service") as mock_ns,
+    ):
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     assert result["attempted"] == 1
@@ -574,11 +598,7 @@ def test_flatten_strategy_positions_handles_place_order_failure(fresh_journal_db
     assert result["failed"][0]["symbol"] == "REJECTED"
 
     # Row must remain open so the next watchdog pass (or operator) can retry.
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     assert row.exited_at is None
 
     mock_ns.return_value.publish_eod_watchdog_failure.assert_called_once()
@@ -589,12 +609,8 @@ def test_flatten_strategy_positions_isolates_per_symbol_failure(fresh_journal_db
     rejection cannot strand the rest of the book."""
     from services import simplified_stock_engine_service as ses
 
-    _seed_open_row(
-        fresh_journal_db, symbol="FAILS", strategy="trending_equity_intraday"
-    )
-    _seed_open_row(
-        fresh_journal_db, symbol="SUCCEEDS", strategy="trending_equity_intraday"
-    )
+    _seed_open_row(fresh_journal_db, symbol="FAILS", strategy="trending_equity_intraday")
+    _seed_open_row(fresh_journal_db, symbol="SUCCEEDS", strategy="trending_equity_intraday")
 
     # Reject the FAILS symbol regardless of processing order; fill the rest.
     def _po(payload, *args, **kwargs):
@@ -603,9 +619,11 @@ def test_flatten_strategy_positions_isolates_per_symbol_failure(fresh_journal_db
         return (True, {"orderid": "OK"}, 200)
 
     svc = _make_svc_mock()
-    with _patched_engine_service(svc), patch(
-        "services.place_order_service.place_order", side_effect=_po
-    ), patch("services.notification_service.get_notification_service"):
+    with (
+        _patched_engine_service(svc),
+        patch("services.place_order_service.place_order", side_effect=_po),
+        patch("services.notification_service.get_notification_service"),
+    ):
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     assert result["attempted"] == 2
@@ -614,8 +632,7 @@ def test_flatten_strategy_positions_isolates_per_symbol_failure(fresh_journal_db
     assert result["failed"][0]["symbol"] == "FAILS"
 
     rows = {
-        r.symbol: r
-        for r in fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).all()
+        r.symbol: r for r in fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).all()
     }
     assert rows["SUCCEEDS"].exited_at is not None  # B flattened
     assert rows["FAILS"].exited_at is None  # A left open for retry/operator
@@ -633,11 +650,12 @@ def test_flatten_strategy_positions_handles_no_api_key(fresh_journal_db):
 
     # Empty per-symbol map AND empty user_api_keys, AND auth_db helper returns None.
     svc = _make_svc_mock(api_key=None)
-    with _patched_engine_service(svc), patch(
-        "database.auth_db.get_first_available_api_key", return_value=None
-    ), patch("services.place_order_service.place_order") as mock_po, patch(
-        "services.notification_service.get_notification_service"
-    ) as mock_ns:
+    with (
+        _patched_engine_service(svc),
+        patch("database.auth_db.get_first_available_api_key", return_value=None),
+        patch("services.place_order_service.place_order") as mock_po,
+        patch("services.notification_service.get_notification_service") as mock_ns,
+    ):
         result = ses.flatten_strategy_positions("trending_equity_intraday")
 
     mock_po.assert_not_called()

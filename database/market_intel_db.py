@@ -119,9 +119,7 @@ def latest_intel_by_kind(
 
     cutoff = None
     if since_minutes is not None:
-        cutoff = datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(
-            minutes=since_minutes
-        )
+        cutoff = datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(minutes=since_minutes)
 
     out: list[dict] = []
     for row in rows:

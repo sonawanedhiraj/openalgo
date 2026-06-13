@@ -262,9 +262,9 @@ def test_supertrend_uptrend_direction_and_line():
     out = indicators.supertrend(bars, period=7, multiplier=3.0)
     # Inspect the settled region (after warmup).
     settled = out.iloc[20:]
-    assert (
-        settled["direction"] == 1
-    ).all(), f"expected +1 throughout uptrend, got {settled['direction'].unique()}"
+    assert (settled["direction"] == 1).all(), (
+        f"expected +1 throughout uptrend, got {settled['direction'].unique()}"
+    )
     # The Supertrend line tracks below close in an uptrend.
     close = bars["close"].iloc[20:]
     assert (settled["line"] < close).all()
@@ -365,6 +365,6 @@ def test_supertrend_parity_with_hand_formula():
     hand = _hand_supertrend(highs, lows, prices, period=7, multiplier=3.0)
     # Compare directions where the wrapper's ATR has warmed up (period onward).
     for i in range(7, len(prices)):
-        assert (
-            int(out["direction"].iloc[i]) == hand[i]
-        ), f"direction mismatch at bar {i}: wrapper={out['direction'].iloc[i]} hand={hand[i]}"
+        assert int(out["direction"].iloc[i]) == hand[i], (
+            f"direction mismatch at bar {i}: wrapper={out['direction'].iloc[i]} hand={hand[i]}"
+        )

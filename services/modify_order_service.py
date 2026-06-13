@@ -33,11 +33,15 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = API_TYPE
 
-    bus.publish(AnalyzerErrorEvent(
-        mode="analyze", api_type=API_TYPE,
-        request_data=analyzer_request, response_data=error_response,
-        error_message=error_message,
-    ))
+    bus.publish(
+        AnalyzerErrorEvent(
+            mode="analyze",
+            api_type=API_TYPE,
+            request_data=analyzer_request,
+            response_data=error_response,
+            error_message=error_message,
+        )
+    )
 
     return error_response
 
@@ -127,23 +131,31 @@ def modify_order_with_auth(
 
         order_request_data["api_type"] = API_TYPE
         if success:
-            bus.publish(OrderModifiedEvent(
-                mode="analyze", api_type=API_TYPE,
-                symbol=order_data.get("symbol", ""),
-                exchange=order_data.get("exchange", ""),
-                orderid=order_data.get("orderid", ""),
-                request_data=order_request_data, response_data=response,
-                api_key=api_key,
-            ))
+            bus.publish(
+                OrderModifiedEvent(
+                    mode="analyze",
+                    api_type=API_TYPE,
+                    symbol=order_data.get("symbol", ""),
+                    exchange=order_data.get("exchange", ""),
+                    orderid=order_data.get("orderid", ""),
+                    request_data=order_request_data,
+                    response_data=response,
+                    api_key=api_key,
+                )
+            )
         else:
-            bus.publish(OrderModifyFailedEvent(
-                mode="analyze", api_type=API_TYPE,
-                symbol=order_data.get("symbol", ""),
-                orderid=order_data.get("orderid", ""),
-                error_message=response.get("message", ""),
-                request_data=order_request_data, response_data=response,
-                api_key=api_key,
-            ))
+            bus.publish(
+                OrderModifyFailedEvent(
+                    mode="analyze",
+                    api_type=API_TYPE,
+                    symbol=order_data.get("symbol", ""),
+                    orderid=order_data.get("orderid", ""),
+                    error_message=response.get("message", ""),
+                    request_data=order_request_data,
+                    response_data=response,
+                    api_key=api_key,
+                )
+            )
 
         return success, response, status_code
 
@@ -151,13 +163,18 @@ def modify_order_with_auth(
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        bus.publish(OrderModifyFailedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=order_data.get("symbol", ""), orderid=order_data.get("orderid", ""),
-            error_message="Broker-specific module not found",
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderModifyFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=order_data.get("symbol", ""),
+                orderid=order_data.get("orderid", ""),
+                error_message="Broker-specific module not found",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, 404
 
     try:
@@ -169,24 +186,34 @@ def modify_order_with_auth(
             "status": "error",
             "message": "Failed to modify order due to internal error",
         }
-        bus.publish(OrderModifyFailedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=order_data.get("symbol", ""), orderid=order_data.get("orderid", ""),
-            error_message="Failed to modify order due to internal error",
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderModifyFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=order_data.get("symbol", ""),
+                orderid=order_data.get("orderid", ""),
+                error_message="Failed to modify order due to internal error",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, 500
 
     if status_code == 200:
         response_data = {"status": "success", "orderid": order_data["orderid"]}
-        bus.publish(OrderModifiedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=order_data.get("symbol", ""), exchange=order_data.get("exchange", ""),
-            orderid=order_data["orderid"],
-            request_data=order_request_data, response_data=response_data,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderModifiedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                orderid=order_data["orderid"],
+                request_data=order_request_data,
+                response_data=response_data,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return True, response_data, 200
     else:
         message = (
@@ -195,13 +222,18 @@ def modify_order_with_auth(
             else "Failed to modify order"
         )
         error_response = {"status": "error", "message": message}
-        bus.publish(OrderModifyFailedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=order_data.get("symbol", ""), orderid=order_data.get("orderid", ""),
-            error_message=message,
-            request_data=order_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            OrderModifyFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=order_data.get("symbol", ""),
+                orderid=order_data.get("orderid", ""),
+                error_message=message,
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, status_code
 
 
@@ -251,13 +283,18 @@ def modify_order(
                     order_request_data = copy.deepcopy(original_data)
                     if "apikey" in order_request_data:
                         order_request_data.pop("apikey", None)
-                    bus.publish(OrderModifyFailedEvent(
-                        mode="live", api_type=API_TYPE,
-                        symbol=order_data.get("symbol", ""), orderid=order_data.get("orderid", ""),
-                        error_message=error_response["message"],
-                        request_data=order_request_data, response_data=error_response,
-                        api_key=api_key,
-                    ))
+                    bus.publish(
+                        OrderModifyFailedEvent(
+                            mode="live",
+                            api_type=API_TYPE,
+                            symbol=order_data.get("symbol", ""),
+                            orderid=order_data.get("orderid", ""),
+                            error_message=error_response["message"],
+                            request_data=order_request_data,
+                            response_data=error_response,
+                            api_key=api_key,
+                        )
+                    )
                     return False, error_response, 403
 
         # Add API key to order data

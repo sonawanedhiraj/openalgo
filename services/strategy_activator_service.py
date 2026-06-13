@@ -127,11 +127,6 @@ def _explain_mismatch(profile, regime) -> str:
         return f"volatility {regime.volatility!r} not in {sorted(profile.volatility)!r}"
     if profile.breadth is not None and regime.breadth not in profile.breadth:
         return f"breadth {regime.breadth!r} not in {sorted(profile.breadth)!r}"
-    if (
-        profile.time_of_day is not None
-        and regime.time_of_day not in profile.time_of_day
-    ):
-        return (
-            f"time_of_day {regime.time_of_day!r} not in {sorted(profile.time_of_day)!r}"
-        )
+    if profile.time_of_day is not None and regime.time_of_day not in profile.time_of_day:
+        return f"time_of_day {regime.time_of_day!r} not in {sorted(profile.time_of_day)!r}"
     return "profile mismatch"

@@ -27,9 +27,7 @@ IST = pytz.timezone("Asia/Kolkata")
 def _isolated_engine(monkeypatch):
     """Swap the module-level engine + session to a fresh in-memory DB per test."""
     engine = create_engine("sqlite:///:memory:")
-    session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    )
+    session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
     monkeypatch.setattr(mi_mod, "engine", engine)
     monkeypatch.setattr(mi_mod, "db_session", session)
     mi_mod.Base.query = session.query_property()

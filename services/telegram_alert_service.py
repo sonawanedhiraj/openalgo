@@ -320,9 +320,7 @@ class TelegramAlertService:
                     logger.info(f"Telegram notification sent (plain text) to {telegram_id}")
                     return True
 
-            logger.error(
-                f"Telegram API error {resp.status_code}: {resp.text}"
-            )
+            logger.error(f"Telegram API error {resp.status_code}: {resp.text}")
             add_notification(telegram_id, message, priority=8)
             return False
 

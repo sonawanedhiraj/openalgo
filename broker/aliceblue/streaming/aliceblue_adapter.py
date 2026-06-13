@@ -302,9 +302,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # fixed sleep — returns immediately on success and gives a clean
             # timeout signal on failure.
             if not self._auth_event.wait(timeout=10):
-                self.logger.warning(
-                    "Timed out waiting for AliceBlue auth confirmation"
-                )
+                self.logger.warning("Timed out waiting for AliceBlue auth confirmation")
                 return False
 
             return bool(self.ws_client.sock and self.ws_client.sock.connected)
@@ -533,9 +531,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 # returned via a different path (e.g. running flag) make sure
                 # auth has actually settled.
                 if not self._auth_event.wait(timeout=5):
-                    self.logger.warning(
-                        "Auth handshake did not complete in time after reconnect"
-                    )
+                    self.logger.warning("Auth handshake did not complete in time after reconnect")
                     return self._create_error_response(
                         "RECONNECT_TIMEOUT", "Auth handshake timeout after reconnect"
                     )
@@ -1036,9 +1032,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     f"Resubscribed {len(unique_keys)} tokens with feed type '{feed_type}'"
                 )
             except Exception as e:
-                self.logger.error(
-                    f"Error resubscribing batch for feed type '{feed_type}': {e}"
-                )
+                self.logger.error(f"Error resubscribing batch for feed type '{feed_type}': {e}")
 
     def is_connected(self) -> bool:
         """Check if WebSocket is connected"""

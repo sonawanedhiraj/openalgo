@@ -47,9 +47,7 @@ def main():
             raise RuntimeError(f"HTTP {r.status_code}")
         body = r.json()
         if not body.get("ok"):
-            failed = [
-                k for k, v in (body.get("checks") or {}).items() if not (v or {}).get("ok")
-            ]
+            failed = [k for k, v in (body.get("checks") or {}).items() if not (v or {}).get("ok")]
             raise RuntimeError(
                 f"preflight not ok: failed={failed}, decision={body.get('go_decision')}"
             )

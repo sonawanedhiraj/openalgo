@@ -75,8 +75,14 @@ from services.simplified_stock_engine_core import (
 
 # ── Default stocks: FnO Top Gainers from May 20, 2026 ──────────────────────
 DEFAULT_STOCKS = [
-    "POWERINDIA", "ABB", "CGPOWER", "SIEMENS",
-    "MANKIND", "HINDALCO", "HINDPETRO", "SAMMAANCAP",
+    "POWERINDIA",
+    "ABB",
+    "CGPOWER",
+    "SIEMENS",
+    "MANKIND",
+    "HINDALCO",
+    "HINDPETRO",
+    "SAMMAANCAP",
 ]
 
 # ── Market timing ───────────────────────────────────────────────────────────
@@ -85,6 +91,7 @@ MARKET_CLOSE = dt.time(15, 30)
 
 
 # ── Config sourcing ─────────────────────────────────────────────────────────
+
 
 def config_from_engine_api(
     base_url: str = "http://127.0.0.1:5000",
@@ -129,11 +136,13 @@ def config_from_engine_api(
     # Always override mode to disabled for backtesting safety
     cfg = _replace(cfg, mode="disabled")
 
-    print(f"  Config loaded: atr_sl_mult={cfg.atr_sl_mult}, "
-          f"max_trades={cfg.max_trades_per_day}, "
-          f"cooldown={cfg.cooldown_candles}, "
-          f"capital={cfg.account_capital}, "
-          f"leverage={cfg.account_leverage}x")
+    print(
+        f"  Config loaded: atr_sl_mult={cfg.atr_sl_mult}, "
+        f"max_trades={cfg.max_trades_per_day}, "
+        f"cooldown={cfg.cooldown_candles}, "
+        f"capital={cfg.account_capital}, "
+        f"leverage={cfg.account_leverage}x"
+    )
     return cfg
 
 
@@ -145,14 +154,17 @@ def config_from_env_safe() -> SimplifiedEngineConfig:
     """
     try:
         from services.simplified_stock_engine_service import config_from_env
+
         cfg = config_from_env()
         # Force disabled mode — backtests must never touch sandbox.db or broker
         cfg = _replace(cfg, mode="disabled")
-        print(f"  Config from env: atr_sl_mult={cfg.atr_sl_mult}, "
-              f"max_trades={cfg.max_trades_per_day}, "
-              f"cooldown={cfg.cooldown_candles}, "
-              f"capital={cfg.account_capital}, "
-              f"leverage={cfg.account_leverage}x")
+        print(
+            f"  Config from env: atr_sl_mult={cfg.atr_sl_mult}, "
+            f"max_trades={cfg.max_trades_per_day}, "
+            f"cooldown={cfg.cooldown_candles}, "
+            f"capital={cfg.account_capital}, "
+            f"leverage={cfg.account_leverage}x"
+        )
         return cfg
     except Exception as e:
         print(f"  [WARN] Could not load config_from_env: {e}")
@@ -166,10 +178,12 @@ def _replace(cfg: SimplifiedEngineConfig, **overrides) -> SimplifiedEngineConfig
     dataclasses.replace() would work but we support manual overrides too.
     """
     import dataclasses
+
     return dataclasses.replace(cfg, **overrides)
 
 
 # ── Tick data loading ───────────────────────────────────────────────────────
+
 
 def load_tick_data(
     tick_dir: str,
@@ -216,7 +230,9 @@ def load_tick_data(
     if not tick_files:
         return result
 
-    print(f"  Loading tick data from {len(tick_files)} file(s): {', '.join(os.path.basename(f) for f in tick_files)}")
+    print(
+        f"  Loading tick data from {len(tick_files)} file(s): {', '.join(os.path.basename(f) for f in tick_files)}"
+    )
     line_count = 0
 
     for tick_file in tick_files:
@@ -247,11 +263,13 @@ def load_tick_data(
                         result[sym] = []
                     # TickLogWriter uses "ltp", legacy format uses "price"
                     price = row.get("ltp") or row.get("price") or 0
-                    result[sym].append({
-                        "price": float(price),
-                        "volume": int(row.get("volume", 0) or 0),
-                        "ts": ts,
-                    })
+                    result[sym].append(
+                        {
+                            "price": float(price),
+                            "volume": int(row.get("volume", 0) or 0),
+                            "ts": ts,
+                        }
+                    )
                     line_count += 1
                 except (json.JSONDecodeError, ValueError, KeyError):
                     continue
@@ -398,11 +416,10 @@ def _row_to_candle(row: dict) -> Candle | None:
             or row.get("t")
         )
         if isinstance(raw_ts, (int, float)):
-            ts = dt.datetime.fromtimestamp(
-                raw_ts / 1000 if raw_ts > 10_000_000_000 else raw_ts
-            )
+            ts = dt.datetime.fromtimestamp(raw_ts / 1000 if raw_ts > 10_000_000_000 else raw_ts)
         elif isinstance(raw_ts, str):
             from dateutil import parser as date_parser
+
             ts = date_parser.parse(raw_ts)
         elif isinstance(raw_ts, dt.datetime):
             ts = raw_ts
@@ -522,12 +539,17 @@ class BacktestRunner:
                 # Auto-confirm entry at the signal's reference price
                 position = self.engine.confirm_entry(symbol, entry_signal.reference_price)
                 if position:
-                    self._log_event("ENTRY", symbol, candle, {
-                        "price": position.entry_price,
-                        "qty": position.qty,
-                        "stop_loss": position.stop_loss,
-                        "risk_per_share": position.risk_per_share,
-                    })
+                    self._log_event(
+                        "ENTRY",
+                        symbol,
+                        candle,
+                        {
+                            "price": position.entry_price,
+                            "qty": position.qty,
+                            "stop_loss": position.stop_loss,
+                            "risk_per_share": position.risk_per_share,
+                        },
+                    )
 
             # Check for exits (stop-loss, trailing, EOD). on_price_update may
             # return exits for OTHER symbols too (global profit-lock, EOD
@@ -535,15 +557,22 @@ class BacktestRunner:
             exit_signals = self.engine.on_price_update(symbol, candle.close)
             for exit_sig in exit_signals:
                 exits_triggered += 1
-                trade = self.engine.confirm_exit(exit_sig.symbol, exit_sig.reference_price, exit_sig.reason)
+                trade = self.engine.confirm_exit(
+                    exit_sig.symbol, exit_sig.reference_price, exit_sig.reason
+                )
                 if trade:
-                    self._log_event("EXIT", exit_sig.symbol, candle, {
-                        "entry_price": trade.entry_price,
-                        "exit_price": trade.exit_price,
-                        "qty": trade.qty,
-                        "gross_pnl": trade.gross_pnl,
-                        "reason": trade.exit_reason,
-                    })
+                    self._log_event(
+                        "EXIT",
+                        exit_sig.symbol,
+                        candle,
+                        {
+                            "entry_price": trade.entry_price,
+                            "exit_price": trade.exit_price,
+                            "qty": trade.qty,
+                            "gross_pnl": trade.gross_pnl,
+                            "reason": trade.exit_reason,
+                        },
+                    )
 
             # Also check with high/low to see if SL was hit intra-candle
             if symbol in self.engine.positions:
@@ -553,28 +582,42 @@ class BacktestRunner:
                     exit_sigs = self.engine.on_price_update(symbol, pos.stop_loss)
                     for exit_sig in exit_sigs:
                         exits_triggered += 1
-                        trade = self.engine.confirm_exit(symbol, pos.stop_loss, "stop_loss_intracandle")
+                        trade = self.engine.confirm_exit(
+                            symbol, pos.stop_loss, "stop_loss_intracandle"
+                        )
                         if trade:
-                            self._log_event("EXIT", symbol, candle, {
-                                "entry_price": trade.entry_price,
-                                "exit_price": trade.exit_price,
-                                "qty": trade.qty,
-                                "gross_pnl": trade.gross_pnl,
-                                "reason": trade.exit_reason,
-                            })
+                            self._log_event(
+                                "EXIT",
+                                symbol,
+                                candle,
+                                {
+                                    "entry_price": trade.entry_price,
+                                    "exit_price": trade.exit_price,
+                                    "qty": trade.qty,
+                                    "gross_pnl": trade.gross_pnl,
+                                    "reason": trade.exit_reason,
+                                },
+                            )
                 elif pos.qty < 0 and candle.high >= pos.stop_loss:
                     exit_sigs = self.engine.on_price_update(symbol, pos.stop_loss)
                     for exit_sig in exit_sigs:
                         exits_triggered += 1
-                        trade = self.engine.confirm_exit(symbol, pos.stop_loss, "stop_loss_intracandle")
+                        trade = self.engine.confirm_exit(
+                            symbol, pos.stop_loss, "stop_loss_intracandle"
+                        )
                         if trade:
-                            self._log_event("EXIT", symbol, candle, {
-                                "entry_price": trade.entry_price,
-                                "exit_price": trade.exit_price,
-                                "qty": trade.qty,
-                                "gross_pnl": trade.gross_pnl,
-                                "reason": trade.exit_reason,
-                            })
+                            self._log_event(
+                                "EXIT",
+                                symbol,
+                                candle,
+                                {
+                                    "entry_price": trade.entry_price,
+                                    "exit_price": trade.exit_price,
+                                    "qty": trade.qty,
+                                    "gross_pnl": trade.gross_pnl,
+                                    "reason": trade.exit_reason,
+                                },
+                            )
 
         # ── 3. Force EOD exit for any remaining positions ───────────────
         self._force_eod_exits(target_date)
@@ -608,6 +651,7 @@ class BacktestRunner:
         def make_handler(sym: str):
             def handler(symbol: str, candle: Candle):
                 completed_candles[symbol].append(candle)
+
             return handler
 
         builders: dict[str, FiveMinuteCandleBuilder] = {}
@@ -646,12 +690,17 @@ class BacktestRunner:
                     entries_triggered += 1
                     position = self.engine.confirm_entry(sym, entry_signal.reference_price)
                     if position:
-                        self._log_event("ENTRY", sym, candle, {
-                            "price": position.entry_price,
-                            "qty": position.qty,
-                            "stop_loss": position.stop_loss,
-                            "risk_per_share": position.risk_per_share,
-                        })
+                        self._log_event(
+                            "ENTRY",
+                            sym,
+                            candle,
+                            {
+                                "price": position.entry_price,
+                                "qty": position.qty,
+                                "stop_loss": position.stop_loss,
+                                "risk_per_share": position.risk_per_share,
+                            },
+                        )
 
             # Feed every tick to on_price_update for SL/trailing checks.
             # on_price_update may return exits for OTHER symbols too (global
@@ -664,15 +713,20 @@ class BacktestRunner:
                     exit_sig.symbol, exit_sig.reference_price, exit_sig.reason
                 )
                 if trade:
-                    self._log_event("EXIT_TICK", exit_sig.symbol, None, {
-                        "entry_price": trade.entry_price,
-                        "exit_price": trade.exit_price,
-                        "qty": trade.qty,
-                        "gross_pnl": trade.gross_pnl,
-                        "reason": trade.exit_reason,
-                        "tick_price": price,
-                        "tick_time": ts.strftime("%H:%M:%S.%f")[:12],
-                    })
+                    self._log_event(
+                        "EXIT_TICK",
+                        exit_sig.symbol,
+                        None,
+                        {
+                            "entry_price": trade.entry_price,
+                            "exit_price": trade.exit_price,
+                            "qty": trade.qty,
+                            "gross_pnl": trade.gross_pnl,
+                            "reason": trade.exit_reason,
+                            "tick_price": price,
+                            "tick_time": ts.strftime("%H:%M:%S.%f")[:12],
+                        },
+                    )
 
         # Force EOD exit
         self._force_eod_exits(target_date)
@@ -690,17 +744,20 @@ class BacktestRunner:
         """
         self._sim_time = dt.datetime.combine(target_date, self.config.eod_exit_time)
         for exit_sig in self.engine.check_eod_exits():
-            trade = self.engine.confirm_exit(
-                exit_sig.symbol, exit_sig.reference_price, "eod"
-            )
+            trade = self.engine.confirm_exit(exit_sig.symbol, exit_sig.reference_price, "eod")
             if trade:
-                self._log_event("EXIT_EOD", exit_sig.symbol, None, {
-                    "entry_price": trade.entry_price,
-                    "exit_price": trade.exit_price,
-                    "qty": trade.qty,
-                    "gross_pnl": trade.gross_pnl,
-                    "reason": trade.exit_reason,
-                })
+                self._log_event(
+                    "EXIT_EOD",
+                    exit_sig.symbol,
+                    None,
+                    {
+                        "entry_price": trade.entry_price,
+                        "exit_price": trade.exit_price,
+                        "qty": trade.qty,
+                        "gross_pnl": trade.gross_pnl,
+                        "reason": trade.exit_reason,
+                    },
+                )
 
     def _log_event(self, event_type: str, symbol: str, candle: Candle | None, details: dict):
         entry = {
@@ -735,8 +792,10 @@ def print_results(
         return
 
     # ── Per-trade breakdown ─────────────────────────────────────────────
-    print(f"\n  {'#':>2}  {'Symbol':<14} {'Dir':>4} {'Qty':>5} {'Entry':>9} {'Exit':>9} "
-          f"{'Gross P&L':>10} {'Charges':>8} {'Net P&L':>10} {'Reason':<12}")
+    print(
+        f"\n  {'#':>2}  {'Symbol':<14} {'Dir':>4} {'Qty':>5} {'Entry':>9} {'Exit':>9} "
+        f"{'Gross P&L':>10} {'Charges':>8} {'Net P&L':>10} {'Reason':<12}"
+    )
     print("  " + "-" * 95)
 
     total_gross = 0.0
@@ -761,19 +820,25 @@ def print_results(
         reason = (t.exit_reason or "unknown")[:12]
         pnl_sign = "+" if t.gross_pnl >= 0 else ""
 
-        print(f"  {i:>2}  {t.symbol:<14} {direction:>4} {t.abs_qty:>5} "
-              f"₹{t.entry_price:>8,.2f} ₹{t.exit_price:>8,.2f} "
-              f"{pnl_sign}₹{t.gross_pnl:>8,.2f} ₹{charges.total:>7,.2f} "
-              f"{'+' if net_pnl >= 0 else ''}₹{net_pnl:>8,.2f} {reason}")
+        print(
+            f"  {i:>2}  {t.symbol:<14} {direction:>4} {t.abs_qty:>5} "
+            f"₹{t.entry_price:>8,.2f} ₹{t.exit_price:>8,.2f} "
+            f"{pnl_sign}₹{t.gross_pnl:>8,.2f} ₹{charges.total:>7,.2f} "
+            f"{'+' if net_pnl >= 0 else ''}₹{net_pnl:>8,.2f} {reason}"
+        )
 
     # ── Summary ─────────────────────────────────────────────────────────
     print("  " + "-" * 95)
     win_rate = (winners / len(trades) * 100) if trades else 0
-    print(f"\n  Total Trades: {len(trades)}  |  Winners: {winners}  |  Losers: {losers}  |  Win Rate: {win_rate:.0f}%")
-    print(f"  Gross P&L:  {'+'if total_gross>=0 else ''}₹{total_gross:,.2f}")
+    print(
+        f"\n  Total Trades: {len(trades)}  |  Winners: {winners}  |  Losers: {losers}  |  Win Rate: {win_rate:.0f}%"
+    )
+    print(f"  Gross P&L:  {'+' if total_gross >= 0 else ''}₹{total_gross:,.2f}")
     print(f"  Charges:    ₹{total_charges:,.2f}")
-    print(f"  Net P&L:    {'+'if total_net>=0 else ''}₹{total_net:,.2f}")
-    print(f"  ROI:        {'+' if total_net>=0 else ''}{(total_net/config.account_capital*100):.2f}%")
+    print(f"  Net P&L:    {'+' if total_net >= 0 else ''}₹{total_net:,.2f}")
+    print(
+        f"  ROI:        {'+' if total_net >= 0 else ''}{(total_net / config.account_capital * 100):.2f}%"
+    )
     print("=" * 70)
 
     # ── Detailed Trade Log ──────────────────────────────────────────────
@@ -807,20 +872,22 @@ def generate_json_report(
         total_gross += t.gross_pnl
         total_charges_val += charges.total
 
-        trade_data.append({
-            "symbol": t.symbol,
-            "direction": "LONG" if t.is_long else "SHORT",
-            "qty": t.abs_qty,
-            "entry_price": t.entry_price,
-            "exit_price": t.exit_price,
-            "entry_time": t.entry_time.strftime("%H:%M:%S"),
-            "exit_time": t.exit_time.strftime("%H:%M:%S"),
-            "exit_reason": t.exit_reason,
-            "gross_pnl": round(t.gross_pnl, 2),
-            "charges": round(charges.total, 2),
-            "net_pnl": round(net_pnl, 2),
-            "turnover": round(t.turnover, 2),
-        })
+        trade_data.append(
+            {
+                "symbol": t.symbol,
+                "direction": "LONG" if t.is_long else "SHORT",
+                "qty": t.abs_qty,
+                "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
+                "entry_time": t.entry_time.strftime("%H:%M:%S"),
+                "exit_time": t.exit_time.strftime("%H:%M:%S"),
+                "exit_reason": t.exit_reason,
+                "gross_pnl": round(t.gross_pnl, 2),
+                "charges": round(charges.total, 2),
+                "net_pnl": round(net_pnl, 2),
+                "turnover": round(t.turnover, 2),
+            }
+        )
 
     total_net = total_gross - total_charges_val
     winners = sum(1 for t in trade_data if t["net_pnl"] >= 0)
@@ -889,13 +956,15 @@ Tick data replay:
 """,
     )
     parser.add_argument(
-        "--date", "-d",
+        "--date",
+        "-d",
         action="append",
         default=None,
         help="Date(s) to backtest (YYYY-MM-DD). Can specify multiple. Default: yesterday.",
     )
     parser.add_argument(
-        "--symbols", "-s",
+        "--symbols",
+        "-s",
         default=None,
         help=f"Comma-separated symbols. Default: {','.join(DEFAULT_STOCKS)}",
     )
@@ -961,10 +1030,14 @@ Tick data replay:
     parser.add_argument("--capital", type=float, default=None, help="Override account capital.")
     parser.add_argument("--leverage", type=float, default=None, help="Override leverage.")
     parser.add_argument("--max-risk", type=float, default=None, help="Override max risk per trade.")
-    parser.add_argument("--atr-sl-mult", type=float, default=None, help="Override ATR stop-loss multiplier.")
+    parser.add_argument(
+        "--atr-sl-mult", type=float, default=None, help="Override ATR stop-loss multiplier."
+    )
     parser.add_argument("--max-trades", type=int, default=None, help="Override max trades per day.")
     parser.add_argument("--cooldown", type=int, default=None, help="Override cooldown candles.")
-    parser.add_argument("--volume-mult", type=float, default=None, help="Override volume multiplier.")
+    parser.add_argument(
+        "--volume-mult", type=float, default=None, help="Override volume multiplier."
+    )
 
     args = parser.parse_args()
 
@@ -974,8 +1047,10 @@ Tick data replay:
     if args.replay_symbols:
         symbols = symbols_from_engine(args.engine_url)
         if not symbols:
-            print("  [ERROR] --replay-symbols: no active symbols in engine. "
-                  "Use --symbols or --from-results instead.")
+            print(
+                "  [ERROR] --replay-symbols: no active symbols in engine. "
+                "Use --symbols or --from-results instead."
+            )
             sys.exit(1)
         print(f"  Symbols from engine: {', '.join(symbols)}")
     elif args.from_results:
@@ -1006,6 +1081,7 @@ Tick data replay:
 
     # ── Apply CLI overrides on top of base config ────────────────────────
     import dataclasses
+
     overrides = {}
     if args.capital is not None:
         overrides["account_capital"] = args.capital
@@ -1059,8 +1135,13 @@ Tick data replay:
         all_candles: dict[str, list[Candle]] = {}
         for symbol in symbols:
             candles = fetch_history_candles(
-                symbol, "NSE", date_str, args.history_days,
-                auth_token=auth_token, feed_token=feed_token, broker=broker,
+                symbol,
+                "NSE",
+                date_str,
+                args.history_days,
+                auth_token=auth_token,
+                feed_token=feed_token,
+                broker=broker,
             )
             if candles:
                 all_candles[symbol] = candles

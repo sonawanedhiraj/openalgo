@@ -104,7 +104,9 @@ def normalize_position(position):
         "Sqty": str(position.get("sellQuantity", position.get("daySellQuantity", 0))),
         "LTP": str(position.get("ltp", position.get("previousDayClose", 0))),
         "MtoM": str(position.get("mtm", position.get("markToMarket", 0))),
-        "unrealisedprofitloss": str(position.get("unrealisedPnl", position.get("unrealisedProfitLoss", 0))),
+        "unrealisedprofitloss": str(
+            position.get("unrealisedPnl", position.get("unrealisedProfitLoss", 0))
+        ),
         "realisedprofitloss": str(position.get("realizedPnl", position.get("realisedPnl", 0))),
         "instrumentId": position.get("instrumentId", ""),
     }
@@ -364,6 +366,7 @@ def transform_tradebook_data(tradebook_data):
         if filltime_raw:
             try:
                 from datetime import datetime as _dt
+
                 # Try full datetime format: DD-MM-YYYY HH:MM:SS
                 parsed = _dt.strptime(filltime_raw, "%d-%m-%Y %H:%M:%S")
                 timestamp = parsed.strftime("%Y-%m-%d %H:%M:%S")

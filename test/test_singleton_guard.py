@@ -43,9 +43,7 @@ def test_passes_when_port_free_and_no_other_writer(monkeypatch):
     monkeypatch.setattr(socket, "socket", _FakeSock)
     # Force the psutil branch to be skipped so the test is hermetic and never
     # scans the real process table.
-    monkeypatch.setitem(
-        __import__("sys").modules, "psutil", None
-    )
+    monkeypatch.setitem(__import__("sys").modules, "psutil", None)
 
     # Should not raise SystemExit.
     singleton_guard.check_singleton_or_abort()

@@ -90,9 +90,7 @@ def _now_iso() -> str:
 def _row_to_dict(row: JournalReflection) -> dict[str, Any]:
     return {
         "id": row.id,
-        "reflection_date": row.reflection_date.isoformat()
-        if row.reflection_date
-        else None,
+        "reflection_date": row.reflection_date.isoformat() if row.reflection_date else None,
         "created_at": row.created_at,
         "data_window_days": row.data_window_days,
         "n_journal_trades": row.n_journal_trades,

@@ -224,18 +224,20 @@ def process_shoonya_nse_data(output_path):
     )
 
     # Explicit overrides for NSE_INDEX symbols that don't follow simple concatenation
-    df_filtered.loc[nse_idx_mask, "symbol"] = df_filtered.loc[nse_idx_mask, "symbol"].replace({
-        # Major Indices
-        "NIFTY50": "NIFTY",
-        "NIFTYINDEX": "NIFTY",
-        "NIFTYBANK": "BANKNIFTY",
-        "NIFTYFIN": "FINNIFTY",
-        "NIFTYFINSERVICE": "FINNIFTY",
-        "NIFTYFINANCIALSERVICES": "FINNIFTY",
-        "NIFTYNEXT50": "NIFTYNXT50",
-        "NIFTYMIDSELECT": "MIDCPNIFTY",
-        "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
-    })
+    df_filtered.loc[nse_idx_mask, "symbol"] = df_filtered.loc[nse_idx_mask, "symbol"].replace(
+        {
+            # Major Indices
+            "NIFTY50": "NIFTY",
+            "NIFTYINDEX": "NIFTY",
+            "NIFTYBANK": "BANKNIFTY",
+            "NIFTYFIN": "FINNIFTY",
+            "NIFTYFINSERVICE": "FINNIFTY",
+            "NIFTYFINANCIALSERVICES": "FINNIFTY",
+            "NIFTYNEXT50": "NIFTYNXT50",
+            "NIFTYMIDSELECT": "MIDCPNIFTY",
+            "NIFTYMIDCAPSELECT": "MIDCPNIFTY",
+        }
+    )
 
     # Return the processed DataFrame
     return df_filtered

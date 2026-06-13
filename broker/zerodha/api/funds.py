@@ -65,9 +65,7 @@ def get_margin_data(auth_token):
         total_realised = 0
         total_unrealised = 0
         try:
-            pos_response = client.get(
-                "https://api.kite.trade/portfolio/positions", headers=headers
-            )
+            pos_response = client.get("https://api.kite.trade/portfolio/positions", headers=headers)
             pos_response.raise_for_status()
             position_book = pos_response.json()
 
@@ -86,9 +84,7 @@ def get_margin_data(auth_token):
 
                 # Fetch live LTP for open positions via quotes API
                 if open_positions:
-                    instruments = [
-                        f"{p['exchange']}:{p['tradingsymbol']}" for p in open_positions
-                    ]
+                    instruments = [f"{p['exchange']}:{p['tradingsymbol']}" for p in open_positions]
                     query = "&".join(f"i={inst}" for inst in instruments)
                     quote_response = client.get(
                         f"https://api.kite.trade/quote/ltp?{query}", headers=headers

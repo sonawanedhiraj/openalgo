@@ -97,18 +97,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--current-positions",
         default="{}",
-        help='JSON dict of current holdings, e.g. \'{"BANKBEES":100}\'',
+        help="JSON dict of current holdings, e.g. '{\"BANKBEES\":100}'",
     )
     parser.add_argument("--config", default=CONFIG_PATH, help="Path to config snapshot")
-    parser.add_argument(
-        "--db-path", default="db/historify.duckdb", help="historify DuckDB path"
-    )
+    parser.add_argument("--db-path", default="db/historify.duckdb", help="historify DuckDB path")
     args = parser.parse_args(argv)
 
     asof = _parse_asof(args.asof)
-    current_positions = {
-        k: int(v) for k, v in json.loads(args.current_positions).items()
-    }
+    current_positions = {k: int(v) for k, v in json.loads(args.current_positions).items()}
     config = load_config(args.config)
 
     logger.info("Computing sector_rotation_etf rebalance as of %s", asof)

@@ -140,9 +140,7 @@ def service(monkeypatch):
     is anchored to a fixed in-market time.
     """
     # Daily circuit breaker — fail open with "not tripped".
-    monkeypatch.setattr(
-        "services.risk_service.daily_circuit_breaker_tripped", lambda: (False, "")
-    )
+    monkeypatch.setattr("services.risk_service.daily_circuit_breaker_tripped", lambda: (False, ""))
 
     cfg = SimplifiedEngineConfig(mode=MODE_SANDBOX)
     fake_now = dt.datetime(2026, 5, 29, 11, 30)
@@ -152,9 +150,7 @@ def service(monkeypatch):
     svc._api_key_by_symbol["RELIANCE"] = "test-api-key"
 
     # Bypass the LLM veto layer (mode='off' returns (True, None)).
-    monkeypatch.setattr(
-        svc, "_run_pre_order_review", lambda signal, strategy_name: (True, None)
-    )
+    monkeypatch.setattr(svc, "_run_pre_order_review", lambda signal, strategy_name: (True, None))
     # Sandbox doesn't hit live funds gate, but stub anyway for safety.
     monkeypatch.setattr(svc, "_check_live_funds", lambda api_key: (True, 1_000_000.0, None))
 
@@ -164,9 +160,7 @@ def service(monkeypatch):
         "_dispatch_order",
         lambda payload, api_key, is_entry: (True, {"orderid": "ORD-42"}),
     )
-    monkeypatch.setattr(
-        svc, "_wait_for_fill", lambda api_key, strategy_name, order_id: 101.5
-    )
+    monkeypatch.setattr(svc, "_wait_for_fill", lambda api_key, strategy_name, order_id: 101.5)
 
     return svc, engine
 
@@ -211,7 +205,9 @@ def test_entry_writes_record_entry_and_update_fill(monkeypatch, service):
     signal = _make_entry_signal()
     engine.pending_entries[signal.symbol] = signal
 
-    svc._place_entry_order(signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_entry_order(
+        signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     # One entry record, with LONG / qty=10 / strategy=trending_equity_intraday.
     assert len(journal.entries) == 1
@@ -244,14 +240,14 @@ def test_entry_with_fill_unconfirmed_still_writes_record(monkeypatch, service):
     _install_journal_stub(monkeypatch, journal)
 
     # Override the fill stub to return None (unconfirmed).
-    monkeypatch.setattr(
-        svc, "_wait_for_fill", lambda api_key, strategy_name, order_id: None
-    )
+    monkeypatch.setattr(svc, "_wait_for_fill", lambda api_key, strategy_name, order_id: None)
 
     signal = _make_entry_signal()
     engine.pending_entries[signal.symbol] = signal
 
-    svc._place_entry_order(signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_entry_order(
+        signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     assert len(journal.entries) == 1
     assert journal.entries[0]["entry_order_id"] == "ORD-42"
@@ -274,7 +270,9 @@ def test_entry_does_not_journal_when_broker_rejects(monkeypatch, service):
     signal = _make_entry_signal()
     engine.pending_entries[signal.symbol] = signal
 
-    svc._place_entry_order(signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_entry_order(
+        signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     assert journal.entries == []
     assert journal.fills == []
@@ -307,7 +305,9 @@ def test_exit_stop_loss_writes_record_exit(monkeypatch, service):
     exit_signal = _build_exit_signal("stop_loss")
     engine.pending_exits[exit_signal.symbol] = exit_signal
 
-    svc._place_exit_order(exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_exit_order(
+        exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     # Looked up the open row, then wrote the exit.
     assert journal.lookups == ["RELIANCE"]
@@ -329,7 +329,9 @@ def test_exit_eod_writes_normalized_reason(monkeypatch, service):
     exit_signal = _build_exit_signal("eod")
     engine.pending_exits[exit_signal.symbol] = exit_signal
 
-    svc._place_exit_order(exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_exit_order(
+        exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     assert len(journal.exits) == 1
     assert journal.exits[0]["exit_reason"] == "eod_squareoff"
@@ -344,7 +346,9 @@ def test_exit_global_profit_lock_writes_reason(monkeypatch, service):
     exit_signal = _build_exit_signal("global_profit_lock_loser")
     engine.pending_exits[exit_signal.symbol] = exit_signal
 
-    svc._place_exit_order(exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_exit_order(
+        exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     assert len(journal.exits) == 1
     assert journal.exits[0]["exit_reason"] == "global_profit_lock_loser"
@@ -361,7 +365,9 @@ def test_exit_with_no_open_row_does_not_raise(monkeypatch, service):
     exit_signal = _build_exit_signal("stop_loss")
     engine.pending_exits[exit_signal.symbol] = exit_signal
 
-    svc._place_exit_order(exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_exit_order(
+        exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     # Lookup happened but no exit was recorded.
     assert journal.lookups == ["RELIANCE"]
@@ -383,7 +389,9 @@ def test_broken_journal_does_not_break_entry(monkeypatch, service):
     engine.pending_entries[signal.symbol] = signal
 
     # Must complete normally even when every journal call raises.
-    svc._place_entry_order(signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_entry_order(
+        signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     # Engine still confirmed the position despite journal exceptions.
     assert "RELIANCE" in engine.positions
@@ -397,7 +405,9 @@ def test_broken_journal_does_not_break_exit(monkeypatch, service):
     exit_signal = _build_exit_signal("stop_loss")
     engine.pending_exits[exit_signal.symbol] = exit_signal
 
-    svc._place_exit_order(exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy")
+    svc._place_exit_order(
+        exit_signal, api_key="test-api-key", strategy_name="chartink_FnO_intraday_buy"
+    )
 
     # Engine still closed the position.
     assert "RELIANCE" not in engine.positions

@@ -21,9 +21,7 @@ def fresh_backtest_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(bdb, "engine", test_engine)
     monkeypatch.setattr(bdb, "db_session", test_session)
@@ -95,9 +93,9 @@ def test_record_and_close_trade_then_finalize(fresh_backtest_db):
 
     # Three trades: +100, -50, +75 → gross 125, 2 winners, 1 loser.
     trade_specs = [
-        ("LONG", 600.0, 602.0, 50, "target"),     # +100
+        ("LONG", 600.0, 602.0, 50, "target"),  # +100
         ("LONG", 605.0, 604.0, 50, "stop_loss"),  # -50
-        ("LONG", 610.0, 611.5, 50, "target"),     # +75
+        ("LONG", 610.0, 611.5, 50, "target"),  # +75
     ]
     for direction, entry, exit_p, qty, reason in trade_specs:
         tid = backtest_service.record_trade(

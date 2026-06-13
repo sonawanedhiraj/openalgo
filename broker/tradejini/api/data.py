@@ -562,7 +562,12 @@ class BrokerData:
             symbol_keys.append(symbol_key)
 
             # Store mapping for response processing
-            symbol_map[symbol_key] = {"symbol": symbol, "exchange": exchange, "ws_exchange": ws_exchange, "token": token}
+            symbol_map[symbol_key] = {
+                "symbol": symbol,
+                "exchange": exchange,
+                "ws_exchange": ws_exchange,
+                "token": token,
+            }
 
         if not symbol_keys:
             logger.warning("No valid symbols to fetch quotes for")

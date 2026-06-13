@@ -38,7 +38,9 @@ class PlaceOrder(Resource):
             api_key = order_data.get("apikey", None)
 
             # Call the service function to place the order
-            success, response_data, status_code = place_order(order_data=order_data, api_key=api_key)
+            success, response_data, status_code = place_order(
+                order_data=order_data, api_key=api_key
+            )
 
             return make_response(jsonify(response_data), status_code)
 

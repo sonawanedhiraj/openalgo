@@ -84,8 +84,7 @@ class ScannerHistoryProvider:
 
         # Lazy-load a symbol that was not pre-configured / not yet cached.
         logger.info(
-            f"ScannerHistoryProvider lazy-loading {interval} bars for {sym} "
-            f"({self.exchange})"
+            f"ScannerHistoryProvider lazy-loading {interval} bars for {sym} ({self.exchange})"
         )
         frame = self._fetch(sym, interval, lookback_bars)
         with self._lock:
@@ -143,9 +142,7 @@ class ScannerHistoryProvider:
 
     # ----------------------------------------------------------------- private
 
-    def _fetch(
-        self, symbol: str, interval: str, lookback_bars: int
-    ) -> pd.DataFrame | None:
+    def _fetch(self, symbol: str, interval: str, lookback_bars: int) -> pd.DataFrame | None:
         """Fetch the last ``lookback_bars`` rows for one symbol/interval.
 
         Returns the tail frame, or ``None`` when DuckDB has no data. Errors
@@ -205,9 +202,7 @@ def run_boot_warmup() -> dict | None:
     disabled or on failure.
     """
     if os.getenv("SCANNER_HISTORY_WARMUP_ENABLED", "true").lower() != "true":
-        logger.info(
-            "Scanner history warm-up disabled (SCANNER_HISTORY_WARMUP_ENABLED!=true)"
-        )
+        logger.info("Scanner history warm-up disabled (SCANNER_HISTORY_WARMUP_ENABLED!=true)")
         return None
     try:
         provider = get_provider()

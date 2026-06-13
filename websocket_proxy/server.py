@@ -89,7 +89,7 @@ class WebSocketProxy:
         self.MODE_MAP = dict(_MODE_BY_UPPER_LABEL)
 
         # RESOURCE MONITORING: Track metrics for health checks
-        self._stats_lock = aio.Lock() if hasattr(aio, 'Lock') else None
+        self._stats_lock = aio.Lock() if hasattr(aio, "Lock") else None
         self._messages_processed = 0
         self._last_cleanup_time = time.time()
         self._cleanup_interval = 300  # Clean stale entries every 5 minutes
@@ -331,13 +331,16 @@ class WebSocketProxy:
         try:
             # Get base adapter stats if available
             from .base_adapter import BaseBrokerWebSocketAdapter
+
             adapter_stats = BaseBrokerWebSocketAdapter.get_resource_stats()
         except Exception:
             adapter_stats = {}
 
         # Calculate subscription index stats
         total_subscriptions = len(self.subscription_index)
-        total_client_subscriptions = sum(len(clients) for clients in self.subscription_index.values())
+        total_client_subscriptions = sum(
+            len(clients) for clients in self.subscription_index.values()
+        )
         throttle_entries = len(self.last_message_time)
 
         return {
@@ -354,8 +357,7 @@ class WebSocketProxy:
                 "unique_symbols": total_subscriptions,
                 "total_client_subscriptions": total_client_subscriptions,
                 "per_client_counts": {
-                    str(client_id): len(subs)
-                    for client_id, subs in self.subscriptions.items()
+                    str(client_id): len(subs) for client_id, subs in self.subscriptions.items()
                 },
             },
             "broker_adapters": {
@@ -388,7 +390,8 @@ class WebSocketProxy:
 
         # Find and remove stale entries
         stale_keys = [
-            key for key, timestamp in self.last_message_time.items()
+            key
+            for key, timestamp in self.last_message_time.items()
             if current_time - timestamp > self._throttle_entry_max_age
         ]
 
@@ -729,19 +732,24 @@ class WebSocketProxy:
                 initialization_result = adapter.initialize(broker_name, user_id)
                 if initialization_result and initialization_result.get("status") == "error":
                     error_msg = initialization_result.get(
-                        "message", initialization_result.get("error", "Failed to initialize broker adapter")
+                        "message",
+                        initialization_result.get("error", "Failed to initialize broker adapter"),
                     )
 
                     # Check if this is an auth error (403/401) - retry with fresh token
                     # This handles the stale cache issue described in GitHub issue #765
                     if adapter.is_auth_error(error_msg):
-                        logger.warning(f"Auth error during initialization for user {user_id}, retrying with fresh token")
+                        logger.warning(
+                            f"Auth error during initialization for user {user_id}, retrying with fresh token"
+                        )
                         adapter.clear_auth_cache_for_user(user_id)
 
                         # Retry initialization with fresh credentials
                         initialization_result = adapter.initialize(broker_name, user_id)
                         if initialization_result and initialization_result.get("status") == "error":
-                            error_msg = initialization_result.get("message", "Failed to initialize after retry")
+                            error_msg = initialization_result.get(
+                                "message", "Failed to initialize after retry"
+                            )
                             await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
                             return
                     else:
@@ -753,25 +761,28 @@ class WebSocketProxy:
                 # Handle both response formats:
                 # - Adapter format: {"status": "error", "code": "...", "message": "..."}
                 # - ConnectionPool format: {"success": False, "error": "..."}
-                is_error = (
-                    (connect_result and connect_result.get("status") == "error") or
-                    (connect_result and connect_result.get("success") == False)
+                is_error = (connect_result and connect_result.get("status") == "error") or (
+                    connect_result and connect_result.get("success") == False
                 )
                 if is_error:
-                    error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect to broker"))
+                    error_msg = connect_result.get(
+                        "message", connect_result.get("error", "Failed to connect to broker")
+                    )
                     error_code = connect_result.get("code", "")
 
                     # Always retry connection failures with fresh token (issue #765)
                     # Connection failures after re-login are almost always due to stale cached tokens
                     # The upstox_client logs "401 Unauthorized" but returns generic "CONNECTION_FAILED"
                     should_retry = (
-                        adapter.is_auth_error(error_msg) or
-                        error_code in ("CONNECTION_FAILED", "CONNECTION_ERROR") or
-                        "failed to connect" in error_msg.lower()
+                        adapter.is_auth_error(error_msg)
+                        or error_code in ("CONNECTION_FAILED", "CONNECTION_ERROR")
+                        or "failed to connect" in error_msg.lower()
                     )
 
                     if should_retry:
-                        logger.warning(f"Connection failed for user {user_id}, retrying with fresh token (error: {error_msg}, code: {error_code})")
+                        logger.warning(
+                            f"Connection failed for user {user_id}, retrying with fresh token (error: {error_msg}, code: {error_code})"
+                        )
 
                         # Clear stale cache in WebSocket process (issue #765)
                         self._clear_auth_cache_for_user(user_id)
@@ -788,12 +799,15 @@ class WebSocketProxy:
                             init_retry_result = adapter.initialize(broker_name, user_id)
                         # Handle both response formats
                         init_is_error = (
-                            (init_retry_result and init_retry_result.get("status") == "error") or
-                            (init_retry_result and init_retry_result.get("success") == False)
-                        )
+                            init_retry_result and init_retry_result.get("status") == "error"
+                        ) or (init_retry_result and init_retry_result.get("success") == False)
                         if init_is_error:
-                            error_msg = init_retry_result.get("message", init_retry_result.get("error", "Failed to re-initialize"))
-                            logger.error(f"Re-initialization failed for user {user_id}: {error_msg}")
+                            error_msg = init_retry_result.get(
+                                "message", init_retry_result.get("error", "Failed to re-initialize")
+                            )
+                            logger.error(
+                                f"Re-initialization failed for user {user_id}: {error_msg}"
+                            )
                             await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
                             return
 
@@ -802,12 +816,16 @@ class WebSocketProxy:
                         connect_result = adapter.connect()
                         # Handle both response formats
                         connect_is_error = (
-                            (connect_result and connect_result.get("status") == "error") or
-                            (connect_result and connect_result.get("success") == False)
-                        )
+                            connect_result and connect_result.get("status") == "error"
+                        ) or (connect_result and connect_result.get("success") == False)
                         if connect_is_error:
-                            error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
-                            logger.error(f"Retry connection also failed for user {user_id}: {error_msg}")
+                            error_msg = connect_result.get(
+                                "message",
+                                connect_result.get("error", "Failed to connect after retry"),
+                            )
+                            logger.error(
+                                f"Retry connection also failed for user {user_id}: {error_msg}"
+                            )
                             await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
                             return
 
@@ -838,36 +856,56 @@ class WebSocketProxy:
                         adapter = create_broker_adapter(broker_name)
                         if adapter:
                             # Clear cache on the new adapter as well
-                            if hasattr(adapter, 'clear_auth_cache_for_user'):
+                            if hasattr(adapter, "clear_auth_cache_for_user"):
                                 adapter.clear_auth_cache_for_user(user_id)
 
                             initialization_result = adapter.initialize(broker_name, user_id)
                             # Handle both response formats
                             init_is_error = (
-                                (initialization_result and initialization_result.get("status") == "error") or
-                                (initialization_result and initialization_result.get("success") == False)
+                                initialization_result
+                                and initialization_result.get("status") == "error"
+                            ) or (
+                                initialization_result
+                                and initialization_result.get("success") == False
                             )
                             if not init_is_error:
                                 connect_result = adapter.connect()
                                 # Handle both response formats
                                 connect_is_error = (
-                                    (connect_result and connect_result.get("status") == "error") or
-                                    (connect_result and connect_result.get("success") == False)
-                                )
+                                    connect_result and connect_result.get("status") == "error"
+                                ) or (connect_result and connect_result.get("success") == False)
                                 if not connect_is_error:
                                     self.broker_adapters[user_id] = adapter
-                                    logger.info(f"Successfully connected {broker_name} adapter for user {user_id} after retry")
+                                    logger.info(
+                                        f"Successfully connected {broker_name} adapter for user {user_id} after retry"
+                                    )
                                     # Fall through to success response
                                 else:
-                                    error_msg = connect_result.get("message", connect_result.get("error", "Failed to connect after retry"))
-                                    await self.send_error(client_id, "BROKER_CONNECTION_ERROR", error_msg)
+                                    error_msg = connect_result.get(
+                                        "message",
+                                        connect_result.get(
+                                            "error", "Failed to connect after retry"
+                                        ),
+                                    )
+                                    await self.send_error(
+                                        client_id, "BROKER_CONNECTION_ERROR", error_msg
+                                    )
                                     return
                             else:
-                                error_msg = initialization_result.get("message", initialization_result.get("error", "Failed to initialize after retry"))
+                                error_msg = initialization_result.get(
+                                    "message",
+                                    initialization_result.get(
+                                        "error", "Failed to initialize after retry"
+                                    ),
+                                )
                                 await self.send_error(client_id, "BROKER_INIT_ERROR", error_msg)
                                 return
                         else:
-                            await self.send_error(client_id, "BROKER_ERROR", f"Failed to create adapter for {broker_name}")
+                            await self.send_error(
+                                client_id,
+                                "BROKER_ERROR",
+                                f"Failed to create adapter for {broker_name}",
+                            )
                             return
                     except Exception as retry_error:
                         logger.exception(f"Retry also failed for {broker_name}: {retry_error}")
@@ -1419,7 +1457,9 @@ class WebSocketProxy:
                     del self.broker_adapters[user_id]
                     logger.info(f"Disconnected stale broker adapter for user {user_id}")
                 except Exception as adapter_error:
-                    logger.warning(f"Error disconnecting adapter for user {user_id}: {adapter_error}")
+                    logger.warning(
+                        f"Error disconnecting adapter for user {user_id}: {adapter_error}"
+                    )
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse cache invalidation message: {e}")
@@ -1508,7 +1548,9 @@ class WebSocketProxy:
         Also handles cache invalidation messages from Flask process for cross-process
         cache synchronization (see GitHub issue #765).
         """
-        logger.debug("Starting OPTIMIZED ZeroMQ listener with subscription indexing and cache invalidation support")
+        logger.debug(
+            "Starting OPTIMIZED ZeroMQ listener with subscription indexing and cache invalidation support"
+        )
 
         while self.running:
             try:
@@ -1580,7 +1622,10 @@ class WebSocketProxy:
                     ("MCX", "INDEX"),
                     ("GLOBAL", "INDEX"),
                 )
-                if len(remaining) >= 2 and (remaining[0], remaining[1]) in _MULTI_SEGMENT_EXCHANGE_PREFIXES:
+                if (
+                    len(remaining) >= 2
+                    and (remaining[0], remaining[1]) in _MULTI_SEGMENT_EXCHANGE_PREFIXES
+                ):
                     exchange = f"{remaining[0]}_{remaining[1]}"
                     symbol = "_".join(remaining[2:])
                 else:

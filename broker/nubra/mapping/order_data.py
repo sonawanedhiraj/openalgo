@@ -9,11 +9,11 @@ logger = get_logger(__name__)
 def map_order_data(order_data):
     """
     Processes and modifies a list of order dictionaries from Nubra API.
-    
+
     Nubra API returns orders as a direct list with fields like:
     - order_id, order_side, order_status, order_type, order_price, order_qty
     - ref_data containing: token, stock_name, exchange, etc.
-    
+
     Parameters:
     - order_data: Response from Nubra API (list of orders or dict with status).
 
@@ -66,7 +66,9 @@ def map_order_data(order_data):
             "ORDER_STATUS_CANCELLED": "cancelled",
             "ORDER_STATUS_PARTIALLY_FILLED": "open",
         }
-        status = status_map.get(order_status, order_status.replace("ORDER_STATUS_", "").lower() if order_status else "")
+        status = status_map.get(
+            order_status, order_status.replace("ORDER_STATUS_", "").lower() if order_status else ""
+        )
 
         # Nubra uses both order_type and price_type:
         # - order_type: ORDER_TYPE_REGULAR, ORDER_TYPE_STOPLOSS, ORDER_TYPE_ICEBERG
@@ -110,7 +112,10 @@ def map_order_data(order_data):
             "ORDER_DELIVERY_TYPE_MARGIN": "NRML",
             "ORDER_DELIVERY_TYPE_NRML": "NRML",
         }
-        producttype = product_map.get(delivery_type, delivery_type.replace("ORDER_DELIVERY_TYPE_", "") if delivery_type else "")
+        producttype = product_map.get(
+            delivery_type,
+            delivery_type.replace("ORDER_DELIVERY_TYPE_", "") if delivery_type else "",
+        )
 
         # Exchange from ref_data
         exchange = ref_data.get("exchange", "")
@@ -120,7 +125,11 @@ def map_order_data(order_data):
 
         # Get symbol from database using token
         symbol_from_db = get_symbol(symboltoken, exchange)
-        tradingsymbol = symbol_from_db if symbol_from_db else order.get("display_name", ref_data.get("stock_name", ""))
+        tradingsymbol = (
+            symbol_from_db
+            if symbol_from_db
+            else order.get("display_name", ref_data.get("stock_name", ""))
+        )
 
         # Build normalized order object
         # Note: Nubra prices are in paise, convert to rupees (divide by 100)
@@ -157,6 +166,7 @@ def map_order_data(order_data):
             try:
                 # Nubra timestamp is in nanoseconds, convert to readable format
                 from datetime import datetime
+
                 ts_seconds = order_time / 1_000_000_000
                 dt = datetime.fromtimestamp(ts_seconds)
                 normalized_order["updatetime"] = dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -253,11 +263,11 @@ def transform_order_data(orders):
 def map_trade_data(trade_data):
     """
     Map Nubra's orders response to tradebook format.
-    
+
     Nubra doesn't have a separate tradebook API. This function takes the
     orders response (from /orders/v2) and filters for filled orders,
     mapping them to the normalized tradebook format.
-    
+
     Nubra returns orders as a direct list (not wrapped in {"data": [...]}).
     Prices are in paise (÷100 for rupees).
     """
@@ -282,7 +292,8 @@ def map_trade_data(trade_data):
 
     # Filter for filled/completed orders only (these are the "trades")
     filled_orders = [
-        order for order in orders
+        order
+        for order in orders
         if order.get("order_status") in ["ORDER_STATUS_FILLED", "ORDER_STATUS_PARTIALLY_FILLED"]
     ]
 
@@ -294,7 +305,11 @@ def map_trade_data(trade_data):
 
         # Get OpenAlgo symbol
         symbol_from_db = get_symbol(symboltoken, exchange)
-        tradingsymbol = symbol_from_db if symbol_from_db else order.get("display_name", ref_data.get("stock_name", ""))
+        tradingsymbol = (
+            symbol_from_db
+            if symbol_from_db
+            else order.get("display_name", ref_data.get("stock_name", ""))
+        )
 
         # Map transaction type
         order_side = order.get("order_side", "")
@@ -314,7 +329,10 @@ def map_trade_data(trade_data):
             "ORDER_DELIVERY_TYPE_MARGIN": "NRML",
             "ORDER_DELIVERY_TYPE_NRML": "NRML",
         }
-        producttype = product_map.get(delivery_type, delivery_type.replace("ORDER_DELIVERY_TYPE_", "") if delivery_type else "")
+        producttype = product_map.get(
+            delivery_type,
+            delivery_type.replace("ORDER_DELIVERY_TYPE_", "") if delivery_type else "",
+        )
 
         # Convert prices from paise to rupees
         avg_filled_price = (order.get("avg_filled_price", 0) or 0) / 100
@@ -327,6 +345,7 @@ def map_trade_data(trade_data):
         if order_time:
             try:
                 from datetime import datetime
+
                 ts_seconds = order_time / 1_000_000_000
                 dt = datetime.fromtimestamp(ts_seconds)
                 filltime = dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -373,13 +392,13 @@ def transform_tradebook_data(tradebook_data):
 def map_position_data(position_data):
     """
     Map Nubra's positions response to OpenAlgo normalized format.
-    
-    Nubra returns positions in portfolio.stock_positions, portfolio.fut_positions, 
+
+    Nubra returns positions in portfolio.stock_positions, portfolio.fut_positions,
     portfolio.opt_positions arrays. Prices are in paise (divide by 100).
-    
+
     Args:
         position_data: Raw response from Nubra's /portfolio/positions API
-        
+
     Returns:
         List of normalized position dictionaries
     """
@@ -523,10 +542,10 @@ def map_position_data(position_data):
 def transform_positions_data(positions_data):
     """
     Transform normalized position data to final UI format.
-    
+
     Args:
         positions_data: List of normalized position dictionaries from map_position_data
-        
+
     Returns:
         List of transformed position dictionaries for UI display
     """
@@ -633,23 +652,27 @@ def map_portfolio_data(portfolio_data):
         net_pnl = (h.get("net_pnl", 0) or 0) / 100
         day_pnl = (h.get("day_pnl", 0) or 0) / 100
 
-        mapped_holdings.append({
-            "tradingsymbol": tradingsymbol,
-            "exchange": exchange,
-            "quantity": h.get("qty", 0),
-            "product": "CNC",  # Holdings are always delivery
-            "average_price": round(avg_price, 2),
-            "ltp": round(ltp, 2),
-            "prev_close": round(prev_close, 2),
-            "invested_value": round(invested_value, 2),
-            "current_value": round(current_value, 2),
-            "pnl": round(net_pnl, 2),
-            "pnlpercent": round(h.get("net_pnl_chg", 0) or 0, 2),
-            "day_pnl": round(day_pnl, 2),
-            "day_pnl_chg": round(h.get("day_pnl", 0) or 0, 2),  # percentage from API? No, use ltp_chg
-            "ltp_chg": round(h.get("ltp_chg", 0) or 0, 2),
-            "ref_id": ref_id,
-        })
+        mapped_holdings.append(
+            {
+                "tradingsymbol": tradingsymbol,
+                "exchange": exchange,
+                "quantity": h.get("qty", 0),
+                "product": "CNC",  # Holdings are always delivery
+                "average_price": round(avg_price, 2),
+                "ltp": round(ltp, 2),
+                "prev_close": round(prev_close, 2),
+                "invested_value": round(invested_value, 2),
+                "current_value": round(current_value, 2),
+                "pnl": round(net_pnl, 2),
+                "pnlpercent": round(h.get("net_pnl_chg", 0) or 0, 2),
+                "day_pnl": round(day_pnl, 2),
+                "day_pnl_chg": round(
+                    h.get("day_pnl", 0) or 0, 2
+                ),  # percentage from API? No, use ltp_chg
+                "ltp_chg": round(h.get("ltp_chg", 0) or 0, 2),
+                "ref_id": ref_id,
+            }
+        )
 
     # Convert holding_stats paise → rupees
     mapped_stats = {

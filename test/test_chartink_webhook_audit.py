@@ -35,9 +35,7 @@ def fresh_cycle_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(scdb, "engine", test_engine)
     monkeypatch.setattr(scdb, "db_session", test_session)

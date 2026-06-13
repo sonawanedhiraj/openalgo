@@ -30,9 +30,7 @@ def fresh_reflection_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
     monkeypatch.setattr(jrdb, "engine", test_engine)
     monkeypatch.setattr(jrdb, "db_session", test_session)
     jrdb.Base.metadata.create_all(test_engine)

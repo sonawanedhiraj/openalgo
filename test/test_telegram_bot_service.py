@@ -35,9 +35,7 @@ def test_send_notification_chat_not_found_soft_deletes():
 
 
 def test_send_notification_forbidden_soft_deletes():
-    svc = _make_running_service(
-        telegram.error.Forbidden("Bot was blocked by the user")
-    )
+    svc = _make_running_service(telegram.error.Forbidden("Bot was blocked by the user"))
     with patch("services.telegram_bot_service.delete_telegram_user") as del_user:
         result = asyncio.run(svc.send_notification(555, "hi"))
     assert result is False
@@ -46,9 +44,7 @@ def test_send_notification_forbidden_soft_deletes():
 
 def test_send_notification_parse_entities_still_retries_plain():
     """Regression guard: markdown-parse fallback must NOT soft-delete."""
-    svc = _make_running_service(
-        [telegram.error.BadRequest("Can't parse entities"), None]
-    )
+    svc = _make_running_service([telegram.error.BadRequest("Can't parse entities"), None])
     with patch("services.telegram_bot_service.delete_telegram_user") as del_user:
         result = asyncio.run(svc.send_notification(999, "*bad"))
     assert result is True
@@ -76,9 +72,10 @@ def test_broadcast_continues_past_forbidden_user():
     app.bot.send_message = send
     svc.application = app
 
-    with patch(
-        "services.telegram_bot_service.get_all_telegram_users", return_value=users
-    ), patch("services.telegram_bot_service.delete_telegram_user") as del_user:
+    with (
+        patch("services.telegram_bot_service.get_all_telegram_users", return_value=users),
+        patch("services.telegram_bot_service.delete_telegram_user") as del_user,
+    ):
         success, fail = asyncio.run(svc.broadcast_message("hello"))
 
     assert success == 2
@@ -105,9 +102,10 @@ def test_broadcast_continues_past_chat_not_found_user():
     app.bot.send_message = send
     svc.application = app
 
-    with patch(
-        "services.telegram_bot_service.get_all_telegram_users", return_value=users
-    ), patch("services.telegram_bot_service.delete_telegram_user") as del_user:
+    with (
+        patch("services.telegram_bot_service.get_all_telegram_users", return_value=users),
+        patch("services.telegram_bot_service.delete_telegram_user") as del_user,
+    ):
         success, fail = asyncio.run(svc.broadcast_message("hello"))
 
     assert success == 2

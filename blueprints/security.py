@@ -25,9 +25,13 @@ def _validate_ip(ip_string):
 def _sanitize_host(host):
     """Validate and sanitize a hostname for safe use in queries."""
     # Only allow valid hostname characters (letters, digits, hyphens, dots)
-    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$', host):
+    if not re.match(
+        r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$",
+        host,
+    ):
         return None
     return host
+
 
 security_bp = Blueprint("security_bp", __name__, url_prefix="/security")
 
@@ -427,11 +431,15 @@ def update_security_settings():
             return jsonify({"error": "404 threshold must be between 1 and 1000"}), 400
         # 0 = permanent ban, 1-8760 = hours
         if ban_duration_404 != 0 and (ban_duration_404 < 1 or ban_duration_404 > 8760):
-            return jsonify({"error": "Ban duration must be Permanent (0) or between 1 hour and 1 year"}), 400
+            return jsonify(
+                {"error": "Ban duration must be Permanent (0) or between 1 hour and 1 year"}
+            ), 400
         if threshold_api < 1 or threshold_api > 100:
             return jsonify({"error": "API threshold must be between 1 and 100"}), 400
         if ban_duration_api != 0 and (ban_duration_api < 1 or ban_duration_api > 8760):
-            return jsonify({"error": "Ban duration must be Permanent (0) or between 1 hour and 1 year"}), 400
+            return jsonify(
+                {"error": "Ban duration must be Permanent (0) or between 1 hour and 1 year"}
+            ), 400
         if repeat_offender_limit < 1 or repeat_offender_limit > 10:
             return jsonify({"error": "Repeat offender limit must be between 1 and 10"}), 400
 
@@ -520,11 +528,13 @@ def active_sessions_list():
 
         sessions = get_active_sessions(username)
         current_session_id = session.get("session_id")
-        return jsonify({
-            "status": "success",
-            "current_session_id": current_session_id,
-            "sessions": sessions,
-        })
+        return jsonify(
+            {
+                "status": "success",
+                "current_session_id": current_session_id,
+                "sessions": sessions,
+            }
+        )
     except Exception as e:
         logger.exception(f"Error fetching active sessions: {e}")
         return jsonify({"status": "error", "sessions": []}), 500

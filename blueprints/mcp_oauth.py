@@ -73,9 +73,7 @@ def _apply_cors_to_response(response):
     response.headers["Access-Control-Allow-Headers"] = (
         "Authorization, Content-Type, X-Requested-With"
     )
-    response.headers["Access-Control-Expose-Headers"] = (
-        "WWW-Authenticate, Link, Content-Type"
-    )
+    response.headers["Access-Control-Expose-Headers"] = "WWW-Authenticate, Link, Content-Type"
     response.headers["Access-Control-Max-Age"] = "600"
     response.headers["Vary"] = "Origin"
     return response
@@ -308,9 +306,7 @@ def register_client():
 
     redirect_uris = data.get("redirect_uris")
     if not isinstance(redirect_uris, list) or not redirect_uris:
-        return _oauth_error(
-            "invalid_redirect_uri", "redirect_uris must be a non-empty list.", 400
-        )
+        return _oauth_error("invalid_redirect_uri", "redirect_uris must be a non-empty list.", 400)
     if len(redirect_uris) > MAX_REDIRECT_URIS:
         return _oauth_error(
             "invalid_redirect_uri",
@@ -452,15 +448,11 @@ def _oauth_redirect(redirect_uri: str, query_params: dict[str, str]):
         # also work, but add the specific origin we're about to send
         # the user to. This is per-response only; the rest of the app
         # still gets the strict policy.
-        response.headers["Content-Security-Policy"] = (
-            f"form-action 'self' {origin}"
-        )
+        response.headers["Content-Security-Policy"] = f"form-action 'self' {origin}"
     return response
 
 
-def _redirect_with_error(
-    redirect_uri: str, error: str, description: str, state: str | None
-) -> Any:
+def _redirect_with_error(redirect_uri: str, error: str, description: str, state: str | None) -> Any:
     """Send the user-agent back to the client with a standard OAuth error.
 
     Used for errors that occur *after* we've validated the redirect_uri —
@@ -688,9 +680,7 @@ def authorize_endpoint():
     # huge consent page or build a 10MB redirect URL (security review
     # finding L-1).
     if state is not None and len(state) > 512:
-        return _oauth_error(
-            "invalid_request", "state parameter too long (max 512 chars).", 400
-        )
+        return _oauth_error("invalid_request", "state parameter too long (max 512 chars).", 400)
     code_challenge = src.get("code_challenge", "").strip()
     code_challenge_method = src.get("code_challenge_method", "").strip()
 
@@ -732,9 +722,7 @@ def authorize_endpoint():
             redirect_uri, "invalid_scope", f"Unsupported scope: {bad_scope}", state
         )
     if not requested_scopes:
-        return _redirect_with_error(
-            redirect_uri, "invalid_scope", "scope is required.", state
-        )
+        return _redirect_with_error(redirect_uri, "invalid_scope", "scope is required.", state)
 
     # ---- Per-purpose 2FA gate (when admin has enabled it) ----
     user = find_user_by_exact_username(session["user"])
@@ -742,9 +730,7 @@ def authorize_endpoint():
         return _oauth_error("server_error", "Authenticated user not found.", 500)
 
     write_requested = SCOPE_WRITE_ORDERS in requested_scopes
-    requires_fresh_totp = (
-        write_requested and user.is_totp_required_for("mcp")
-    )
+    requires_fresh_totp = write_requested and user.is_totp_required_for("mcp")
 
     # ---- GET = render consent screen ----
     if request.method == "GET":
@@ -773,9 +759,7 @@ def authorize_endpoint():
             redirect_uri, "access_denied", "User denied the request.", state
         )
     if decision != "approve":
-        return _redirect_with_error(
-            redirect_uri, "invalid_request", "Invalid decision.", state
-        )
+        return _redirect_with_error(redirect_uri, "invalid_request", "Invalid decision.", state)
 
     # Approve path: enforce fresh TOTP if required for this scope set.
     if requires_fresh_totp:
@@ -870,9 +854,7 @@ def _authenticate_client_at_token() -> tuple[OAuthClient | None, str]:
 
     if client.client_secret_hash:
         # Confidential client — secret required.
-        if not client_secret or not verify_secret(
-            client_secret, client.client_secret_hash
-        ):
+        if not client_secret or not verify_secret(client_secret, client.client_secret_hash):
             return None, "invalid client credentials"
     else:
         # Public client — no secret accepted.
@@ -949,8 +931,7 @@ def _grant_authorization_code(client: OAuthClient):
     db_session.commit()
 
     logger.info(
-        f"[OAuth /token] code-grant ok client_id={client.client_id} "
-        f"jti={jti} scope='{entry.scope}'"
+        f"[OAuth /token] code-grant ok client_id={client.client_id} jti={jti} scope='{entry.scope}'"
     )
 
     return jsonify(
@@ -972,9 +953,7 @@ def _grant_refresh(client: OAuthClient):
     if not presented:
         return _oauth_error("invalid_request", "refresh_token is required.", 400)
 
-    new_refresh = rotate_refresh_token(
-        presented_plaintext=presented, client_id=client.client_id
-    )
+    new_refresh = rotate_refresh_token(presented_plaintext=presented, client_id=client.client_id)
     if new_refresh is None:
         # Either bad/expired/unknown OR reuse-detected (in which case
         # rotate_refresh_token has already revoked the family).
@@ -1049,8 +1028,6 @@ def revoke_endpoint():
 
     # We only act on refresh tokens. Access tokens are stateless JWTs.
     if token_type_hint in ("refresh_token", ""):
-        revoke_presented_refresh(
-            presented_plaintext=token_value, client_id=client.client_id
-        )
+        revoke_presented_refresh(presented_plaintext=token_value, client_id=client.client_id)
 
     return ("", 200)

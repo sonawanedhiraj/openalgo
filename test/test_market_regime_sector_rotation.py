@@ -120,6 +120,7 @@ def test_sector_rotation_empty_universe_degrades_gracefully():
 
 def test_sector_rotation_concentration_dominant_leader():
     """A clear top-of-the-pack leader produces concentration > 0.5."""
+
     # IT +5%, others clustered near 0
     def live(sym):
         return 5.0 if sym == "NIFTYIT" else 0.1
@@ -149,9 +150,7 @@ def test_sector_rotation_concentration_broad_rotation():
 
 
 def test_default_sector_symbols_reads_env(monkeypatch):
-    monkeypatch.setenv(
-        "REGIME_SECTOR_SYMBOLS", " niftyit , niftyauto ,banknifty "
-    )
+    monkeypatch.setenv("REGIME_SECTOR_SYMBOLS", " niftyit , niftyauto ,banknifty ")
     assert mrs._default_sector_symbols() == ["NIFTYIT", "NIFTYAUTO", "BANKNIFTY"]
 
     monkeypatch.delenv("REGIME_SECTOR_SYMBOLS", raising=False)
@@ -209,16 +208,12 @@ def test_compute_current_regime_populates_sector_fields(monkeypatch):
 
 
 def test_live_sector_quote_returns_none_when_no_api_key(monkeypatch):
-    monkeypatch.setattr(
-        "database.auth_db.get_first_available_api_key", lambda: None
-    )
+    monkeypatch.setattr("database.auth_db.get_first_available_api_key", lambda: None)
     assert mrs._live_sector_quote_pct("NIFTYIT") is None
 
 
 def test_live_sector_quote_returns_none_when_prev_close_zero(monkeypatch):
-    monkeypatch.setattr(
-        "database.auth_db.get_first_available_api_key", lambda: "key"
-    )
+    monkeypatch.setattr("database.auth_db.get_first_available_api_key", lambda: "key")
     monkeypatch.setattr(
         "services.quotes_service.get_quotes",
         lambda **kwargs: (True, {"data": {"ltp": 100.0, "prev_close": 0.0}}, 200),
@@ -227,9 +222,7 @@ def test_live_sector_quote_returns_none_when_prev_close_zero(monkeypatch):
 
 
 def test_live_sector_quote_returns_pct_on_success(monkeypatch):
-    monkeypatch.setattr(
-        "database.auth_db.get_first_available_api_key", lambda: "key"
-    )
+    monkeypatch.setattr("database.auth_db.get_first_available_api_key", lambda: "key")
     monkeypatch.setattr(
         "services.quotes_service.get_quotes",
         lambda **kwargs: (

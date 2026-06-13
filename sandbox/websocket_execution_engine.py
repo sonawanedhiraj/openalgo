@@ -403,16 +403,12 @@ class WebSocketExecutionEngine:
 
             api_key = get_api_key_for_tradingview(user_id)
             if not api_key:
-                logger.warning(
-                    f"WebSocket subscribe skipped: no API key for user {user_id}"
-                )
+                logger.warning(f"WebSocket subscribe skipped: no API key for user {user_id}")
                 return
             broker = get_broker_name(api_key) if api_key else None
             broker_name = broker or "unknown"
             if broker_name == "unknown":
-                logger.warning(
-                    f"WebSocket subscribe may fail: unknown broker for user {user_id}"
-                )
+                logger.warning(f"WebSocket subscribe may fail: unknown broker for user {user_id}")
 
             symbol_payload = [{"symbol": s, "exchange": e} for s, e in symbols]
             success, response, status_code = subscribe_to_symbols(
@@ -435,16 +431,12 @@ class WebSocketExecutionEngine:
 
             api_key = get_api_key_for_tradingview(user_id)
             if not api_key:
-                logger.warning(
-                    f"WebSocket unsubscribe skipped: no API key for user {user_id}"
-                )
+                logger.warning(f"WebSocket unsubscribe skipped: no API key for user {user_id}")
                 return
             broker = get_broker_name(api_key) if api_key else None
             broker_name = broker or "unknown"
             if broker_name == "unknown":
-                logger.warning(
-                    f"WebSocket unsubscribe may fail: unknown broker for user {user_id}"
-                )
+                logger.warning(f"WebSocket unsubscribe may fail: unknown broker for user {user_id}")
 
             symbol_payload = [{"symbol": s, "exchange": e} for s, e in symbols]
             success, response, status_code = unsubscribe_from_symbols(

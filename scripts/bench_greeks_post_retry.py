@@ -1,4 +1,5 @@
 """Retry the PE samples that hit rate limit in the post-migration bench."""
+
 import json
 import os
 import sys
@@ -15,7 +16,9 @@ with open(PATH) as f:
     data = json.load(f)
 
 failed = [r for r in data["samples"] if r["response"].get("status") != "success"]
-print(f"Waiting 65s for rate-limit window to clear, then retrying {len(failed)} samples at 2.1s pacing...")
+print(
+    f"Waiting 65s for rate-limit window to clear, then retrying {len(failed)} samples at 2.1s pacing..."
+)
 time.sleep(65)
 
 for r in failed:
@@ -30,7 +33,9 @@ for r in failed:
     dt_ms = (time.perf_counter() - t0) * 1000.0
     r["response"] = payload
     r["latency_ms"] = round(dt_ms, 2)
-    print(f"{r['type']} {r['strike']:>5} {r['moneyness']:<9} {dt_ms:6.1f} ms  status={payload.get('status')}")
+    print(
+        f"{r['type']} {r['strike']:>5} {r['moneyness']:<9} {dt_ms:6.1f} ms  status={payload.get('status')}"
+    )
     time.sleep(2.1)
 
 with open(PATH, "w") as f:

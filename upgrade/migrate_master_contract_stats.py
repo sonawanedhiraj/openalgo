@@ -52,7 +52,9 @@ def migrate_master_contract_status_table():
 
         # Check if table exists
         if "master_contract_status" not in inspector.get_table_names():
-            logger.info("master_contract_status table doesn't exist. It will be created on first run.")
+            logger.info(
+                "master_contract_status table doesn't exist. It will be created on first run."
+            )
             return True
 
         # Get existing columns

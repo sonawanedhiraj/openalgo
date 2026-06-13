@@ -384,7 +384,10 @@ def api_holiday_add():
         # Validate special session has open exchanges with timings
         if holiday_type == "SPECIAL_SESSION" and not open_exchanges:
             return jsonify(
-                {"status": "error", "message": "Special session requires at least one exchange with timings"}
+                {
+                    "status": "error",
+                    "message": "Special session requires at least one exchange with timings",
+                }
             ), 400
 
         holiday_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -1652,7 +1655,11 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     lines = []
     lines.append(f"{h1}OpenAlgo System Report")
     lines.append("")
-    lines.append(_md_kv("Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) if is_md else f"Generated: {datetime.now()}")
+    lines.append(
+        _md_kv("Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if is_md
+        else f"Generated: {datetime.now()}"
+    )
     lines.append("")
 
     mode = payload.get("mode") or {}
@@ -1696,11 +1703,16 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     lines.append(_md_kv("Memory used (%)", hw.get("memory_percent")))
     if hw.get("disk_log"):
         lines.append(
-            _md_kv("Disk log", f"{hw['disk_log']['free_gb']} GB free of {hw['disk_log']['total_gb']} GB")
+            _md_kv(
+                "Disk log",
+                f"{hw['disk_log']['free_gb']} GB free of {hw['disk_log']['total_gb']} GB",
+            )
         )
     if hw.get("disk_db"):
         lines.append(
-            _md_kv("Disk db", f"{hw['disk_db']['free_gb']} GB free of {hw['disk_db']['total_gb']} GB")
+            _md_kv(
+                "Disk db", f"{hw['disk_db']['free_gb']} GB free of {hw['disk_db']['total_gb']} GB"
+            )
         )
     lines.append("")
 
@@ -1739,7 +1751,9 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     lines.append(f"{h2}Brokers")
     lines.append(_md_kv("Active broker", brokers.get("active_broker")))
     lines.append(_md_kv("User logged in", brokers.get("user_logged_in")))
-    lines.append(_md_kv("Configured", ", ".join(brokers.get("configured_brokers") or []) or "_none_"))
+    lines.append(
+        _md_kv("Configured", ", ".join(brokers.get("configured_brokers") or []) or "_none_")
+    )
     lines.append("")
 
     dbs = payload.get("databases") or []
@@ -1776,7 +1790,11 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
             lvl = entry.get("level", "?")
             mod = entry.get("module", "?")
             msg = _strip_ansi(entry.get("message", ""))[:500]
-            lines.append(f"{bullet}`{ts}` **{lvl}** in `{mod}`: {msg}" if is_md else f"  - [{ts}] {lvl} in {mod}: {msg}")
+            lines.append(
+                f"{bullet}`{ts}` **{lvl}** in `{mod}`: {msg}"
+                if is_md
+                else f"  - [{ts}] {lvl} in {mod}: {msg}"
+            )
         lines.append("")
 
     body = "\n".join(lines)
@@ -1979,9 +1997,7 @@ def api_oauth_client_approve(client_id):
             f"[OAuth admin] approved client_id={client_id} "
             f"by user={request.headers.get('X-Forwarded-User') or 'session'}"
         )
-        return jsonify(
-            {"status": "success", "client": _serialize_oauth_client(client)}
-        )
+        return jsonify({"status": "success", "client": _serialize_oauth_client(client)})
     except Exception as e:
         logger.exception(f"Error approving OAuth client: {e}")
         return jsonify({"status": "error", "message": "Failed to approve."}), 500
@@ -2019,8 +2035,7 @@ def api_oauth_client_revoke(client_id):
 
         revoked_count = revoke_client(client_id, "admin_revoke")
         logger.warning(
-            f"[OAuth admin] REVOKE client_id={client_id} "
-            f"({revoked_count} tokens) by session"
+            f"[OAuth admin] REVOKE client_id={client_id} ({revoked_count} tokens) by session"
         )
         return jsonify(
             {
@@ -2096,8 +2111,17 @@ def api_mcp_audit():
         # whitelist stops it from leaking through this endpoint
         # (security review finding M-3).
         _AUDIT_KEYS = frozenset(
-            {"ts", "jti", "client_id", "tool", "scope", "params_hash",
-             "duration_ms", "outcome", "request_ip"}
+            {
+                "ts",
+                "jti",
+                "client_id",
+                "tool",
+                "scope",
+                "params_hash",
+                "duration_ms",
+                "outcome",
+                "request_ip",
+            }
         )
 
         def _sanitize_audit(entry: dict) -> dict:
@@ -2161,7 +2185,7 @@ def api_mcp_kill_switch():
         return jsonify(
             {
                 "status": "error",
-                "message": "Kill switch requires confirm=\"REVOKE_ALL_MCP_TOKENS\".",
+                "message": 'Kill switch requires confirm="REVOKE_ALL_MCP_TOKENS".',
             }
         ), 400
 
@@ -2310,7 +2334,10 @@ def api_mcp_settings_put():
         public_url = public_url.strip().rstrip("/")
         if public_url and not re.match(r"^https://[A-Za-z0-9.\-]+(:\d+)?(/.*)?$", public_url):
             return jsonify(
-                {"status": "error", "message": "public_url must be HTTPS (e.g. https://yourdomain.com)."}
+                {
+                    "status": "error",
+                    "message": "public_url must be HTTPS (e.g. https://yourdomain.com).",
+                }
             ), 400
 
     # Pre-flight: enabling MCP must not produce a config that refuses to boot.
@@ -2326,7 +2353,9 @@ def api_mcp_settings_put():
                     ),
                 }
             ), 400
-        effective_url = public_url if public_url is not None else (os.getenv("MCP_PUBLIC_URL") or "").strip()
+        effective_url = (
+            public_url if public_url is not None else (os.getenv("MCP_PUBLIC_URL") or "").strip()
+        )
         if not effective_url:
             return jsonify(
                 {
@@ -2341,18 +2370,20 @@ def api_mcp_settings_put():
     env_path = _resolve_env_path()
     if not env_path.exists():
         logger.error(f"[MCP admin] .env not found at {env_path}")
-        return jsonify(
-            {"status": "error", "message": f".env not found at {env_path}"}
-        ), 500
+        return jsonify({"status": "error", "message": f".env not found at {env_path}"}), 500
 
     try:
         if "http_enabled" in data:
-            _set_env_value(env_path, "MCP_HTTP_ENABLED", "True" if data["http_enabled"] else "False")
+            _set_env_value(
+                env_path, "MCP_HTTP_ENABLED", "True" if data["http_enabled"] else "False"
+            )
         if public_url is not None:
             _set_env_value(env_path, "MCP_PUBLIC_URL", public_url)
         if "require_approval" in data:
             _set_env_value(
-                env_path, "MCP_OAUTH_REQUIRE_APPROVAL", "True" if data["require_approval"] else "False"
+                env_path,
+                "MCP_OAUTH_REQUIRE_APPROVAL",
+                "True" if data["require_approval"] else "False",
             )
         if "write_scope_enabled" in data:
             _set_env_value(

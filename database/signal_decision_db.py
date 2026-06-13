@@ -158,9 +158,7 @@ def _row_to_dict(row: SignalDecision) -> dict[str, Any]:
         "reasoning": row.reasoning,
         "confidence": row.confidence,
         "enforcement_mode": row.enforcement_mode,
-        "actually_taken": (
-            None if row.actually_taken is None else bool(row.actually_taken)
-        ),
+        "actually_taken": (None if row.actually_taken is None else bool(row.actually_taken)),
         "context_snapshot": row.context_snapshot,
         "bridge_latency_ms": row.bridge_latency_ms,
         "bridge_session_id": row.bridge_session_id,
@@ -237,8 +235,6 @@ def mark_actually_taken(decision_id: int, taken: bool) -> None:
         db_session.commit()
     except Exception:
         db_session.rollback()
-        logger.exception(
-            "signal_decision: mark_actually_taken failed for id=%s", decision_id
-        )
+        logger.exception("signal_decision: mark_actually_taken failed for id=%s", decision_id)
     finally:
         db_session.remove()

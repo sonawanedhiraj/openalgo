@@ -319,7 +319,12 @@ def test_backfill_past_date(journal_db, sandbox_db):
 
     # Closing fill dated on the same past day.
     _add_sandbox_fill(
-        sandbox_db, "OIL", "BUY", 217, 427.95, "X-OIL",
+        sandbox_db,
+        "OIL",
+        "BUY",
+        217,
+        427.95,
+        "X-OIL",
         when=dt.datetime(2026, 6, 10, 15, 16, 0),
     )
     _set_sandbox_position(sandbox_db, "OIL", 0, 460.30)

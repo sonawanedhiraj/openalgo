@@ -206,7 +206,9 @@ class ZerodhaWebSocket:
                 self.logger.error("Max reconnect attempts reached")
                 break
 
-            delay = min(self.reconnect_delay * (1.5 ** self.reconnect_attempts), self.max_reconnect_delay)
+            delay = min(
+                self.reconnect_delay * (1.5**self.reconnect_attempts), self.max_reconnect_delay
+            )
             self.logger.info(f"Reconnecting in {delay:.0f}s (attempt {self.reconnect_attempts})...")
             # Interruptible sleep: stop() sets _stop_event so graceful
             # shutdown does not have to wait out the full backoff.
@@ -281,7 +283,9 @@ class ZerodhaWebSocket:
             if not self.connected:
                 consecutive_failures += 1
                 if consecutive_failures > 3:
-                    self.logger.error("Multiple connection failures, clearing pending subscriptions")
+                    self.logger.error(
+                        "Multiple connection failures, clearing pending subscriptions"
+                    )
                     with self.lock:
                         self.pending_subscriptions.clear()
                     break
@@ -297,7 +301,9 @@ class ZerodhaWebSocket:
             batch_mode = None
 
             with self.lock:
-                while self.pending_subscriptions and len(batch_tokens) < self.MAX_TOKENS_PER_SUBSCRIBE:
+                while (
+                    self.pending_subscriptions and len(batch_tokens) < self.MAX_TOKENS_PER_SUBSCRIBE
+                ):
                     token, mode = self.pending_subscriptions[0]
                     if batch_mode is None:
                         batch_mode = mode
@@ -517,9 +523,7 @@ class ZerodhaWebSocket:
     def _start_health_check(self):
         if self._health_check_thread and self._health_check_thread.is_alive():
             return
-        self._health_check_thread = threading.Thread(
-            target=self._health_check_loop, daemon=True
-        )
+        self._health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         self._health_check_thread.start()
 
     def _health_check_loop(self):
@@ -556,7 +560,7 @@ class ZerodhaWebSocket:
 
         for mode, tokens in tokens_by_mode.items():
             for i in range(0, len(tokens), self.MAX_TOKENS_PER_SUBSCRIBE):
-                batch = tokens[i:i + self.MAX_TOKENS_PER_SUBSCRIBE]
+                batch = tokens[i : i + self.MAX_TOKENS_PER_SUBSCRIBE]
                 try:
                     sub_msg = json.dumps({"a": "subscribe", "v": batch})
                     self.ws.send(sub_msg)
@@ -582,11 +586,11 @@ class ZerodhaWebSocket:
             for _ in range(num_packets):
                 if offset + 2 > len(data):
                     break
-                packet_length = struct.unpack(">H", data[offset:offset + 2])[0]
+                packet_length = struct.unpack(">H", data[offset : offset + 2])[0]
                 offset += 2
                 if offset + packet_length > len(data):
                     break
-                packet_data = data[offset:offset + packet_length]
+                packet_data = data[offset : offset + packet_length]
                 tick = self._parse_packet(packet_data)
                 if tick:
                     packets.append(tick)
@@ -635,22 +639,24 @@ class ZerodhaWebSocket:
             if len(packet) >= 44:
                 try:
                     fields = struct.unpack(">11i", packet[0:44])
-                    tick.update({
-                        "instrument_token": fields[0],
-                        "last_traded_price": fields[1] / 100.0,
-                        "last_price": fields[1] / 100.0,
-                        "last_traded_quantity": fields[2],
-                        "average_traded_price": fields[3] / 100.0,
-                        "average_price": fields[3] / 100.0,
-                        "volume_traded": fields[4],
-                        "volume": fields[4],
-                        "total_buy_quantity": fields[5],
-                        "total_sell_quantity": fields[6],
-                        "open_price": fields[7] / 100.0,
-                        "high_price": fields[8] / 100.0,
-                        "low_price": fields[9] / 100.0,
-                        "close_price": fields[10] / 100.0,
-                    })
+                    tick.update(
+                        {
+                            "instrument_token": fields[0],
+                            "last_traded_price": fields[1] / 100.0,
+                            "last_price": fields[1] / 100.0,
+                            "last_traded_quantity": fields[2],
+                            "average_traded_price": fields[3] / 100.0,
+                            "average_price": fields[3] / 100.0,
+                            "volume_traded": fields[4],
+                            "volume": fields[4],
+                            "total_buy_quantity": fields[5],
+                            "total_sell_quantity": fields[6],
+                            "open_price": fields[7] / 100.0,
+                            "high_price": fields[8] / 100.0,
+                            "low_price": fields[9] / 100.0,
+                            "close_price": fields[10] / 100.0,
+                        }
+                    )
 
                     tick["ohlc"] = {
                         "open": fields[7] / 100.0,
@@ -672,17 +678,17 @@ class ZerodhaWebSocket:
                     for i in range(5):
                         base = depth_offset + (i * 12)
                         if base + 12 <= len(packet):
-                            qty = struct.unpack(">I", packet[base:base + 4])[0]
-                            price = struct.unpack(">I", packet[base + 4:base + 8])[0] / 100.0
-                            orders = struct.unpack(">H", packet[base + 8:base + 10])[0]
+                            qty = struct.unpack(">I", packet[base : base + 4])[0]
+                            price = struct.unpack(">I", packet[base + 4 : base + 8])[0] / 100.0
+                            orders = struct.unpack(">H", packet[base + 8 : base + 10])[0]
                             buy_depth.append({"quantity": qty, "price": price, "orders": orders})
 
                     for i in range(5):
                         base = depth_offset + 60 + (i * 12)
                         if base + 12 <= len(packet):
-                            qty = struct.unpack(">I", packet[base:base + 4])[0]
-                            price = struct.unpack(">I", packet[base + 4:base + 8])[0] / 100.0
-                            orders = struct.unpack(">H", packet[base + 8:base + 10])[0]
+                            qty = struct.unpack(">I", packet[base : base + 4])[0]
+                            price = struct.unpack(">I", packet[base + 4 : base + 8])[0] / 100.0
+                            orders = struct.unpack(">H", packet[base + 8 : base + 10])[0]
                             sell_depth.append({"quantity": qty, "price": price, "orders": orders})
 
                     tick["depth"] = {"buy": buy_depth, "sell": sell_depth}
@@ -692,7 +698,9 @@ class ZerodhaWebSocket:
                             tick["exchange_timestamp"] = struct.unpack(">I", packet[60:64])[0]
                             oi_offset = 184 - 4
                             if oi_offset + 4 <= len(packet):
-                                tick["open_interest"] = struct.unpack(">I", packet[oi_offset:oi_offset + 4])[0]
+                                tick["open_interest"] = struct.unpack(
+                                    ">I", packet[oi_offset : oi_offset + 4]
+                                )[0]
                         except struct.error:
                             pass
 

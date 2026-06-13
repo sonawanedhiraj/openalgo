@@ -45,9 +45,7 @@ def fresh_scanner_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(sdb, "engine", test_engine)
     monkeypatch.setattr(sdb, "db_session", test_session)
@@ -405,9 +403,7 @@ def test_from_env_defaults_to_shadow(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
     # Block the DB fallback so the test doesn't depend on a Strategy row.
-    monkeypatch.setattr(
-        scan_hit_poster, "_resolve_default_webhook_url", lambda: None
-    )
+    monkeypatch.setattr(scan_hit_poster, "_resolve_default_webhook_url", lambda: None)
 
     poster = ScanHitPoster.from_env()
     assert poster.mode == MODE_SHADOW
@@ -416,8 +412,6 @@ def test_from_env_defaults_to_shadow(monkeypatch):
 
 def test_from_env_unknown_mode_falls_back_to_shadow(monkeypatch):
     monkeypatch.setenv("SCAN_HIT_POSTER_MODE", "rampage")
-    monkeypatch.setattr(
-        scan_hit_poster, "_resolve_default_webhook_url", lambda: None
-    )
+    monkeypatch.setattr(scan_hit_poster, "_resolve_default_webhook_url", lambda: None)
     poster = ScanHitPoster.from_env()
     assert poster.mode == MODE_SHADOW

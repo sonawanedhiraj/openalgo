@@ -45,9 +45,7 @@ def test_get_first_available_api_key_skips_revoked():
     auth_mod = setup_test_db()
 
     # Setup: admin with revoked session (no broker)
-    admin_auth = auth_mod.Auth(
-        name="admin", auth="", feed_token=None, broker="", is_revoked=1
-    )
+    admin_auth = auth_mod.Auth(name="admin", auth="", feed_token=None, broker="", is_revoked=1)
     auth_mod.db_session.add(admin_auth)
     auth_mod.db_session.commit()
 
@@ -56,8 +54,11 @@ def test_get_first_available_api_key_skips_revoked():
 
     # Setup: jagat with active session (broker=shoonya)
     jagat_auth = auth_mod.Auth(
-        name="jagat_user", auth="encrypted_token", feed_token=None,
-        broker="shoonya", is_revoked=0,
+        name="jagat_user",
+        auth="encrypted_token",
+        feed_token=None,
+        broker="shoonya",
+        is_revoked=0,
     )
     auth_mod.db_session.add(jagat_auth)
     auth_mod.db_session.commit()
@@ -81,9 +82,7 @@ def test_get_first_available_api_key_skips_revoked():
     auth_mod.db_session.commit()
 
     result2 = auth_mod.get_first_available_api_key()
-    assert result2 is None, (
-        f"Expected None when all sessions are revoked, got '{result2}'"
-    )
+    assert result2 is None, f"Expected None when all sessions are revoked, got '{result2}'"
 
     print("PASS: get_first_available_api_key() returns None when all sessions revoked")
 
@@ -94,8 +93,11 @@ def test_get_first_available_api_key_skips_no_broker():
 
     # User with active session but no broker configured
     no_broker_auth = auth_mod.Auth(
-        name="no_broker_user", auth="", feed_token=None,
-        broker="", is_revoked=0,
+        name="no_broker_user",
+        auth="",
+        feed_token=None,
+        broker="",
+        is_revoked=0,
     )
     auth_mod.db_session.add(no_broker_auth)
     auth_mod.db_session.commit()
@@ -103,8 +105,11 @@ def test_get_first_available_api_key_skips_no_broker():
 
     # User with active session and broker
     active_auth = auth_mod.Auth(
-        name="active_user", auth="token", feed_token=None,
-        broker="shoonya", is_revoked=0,
+        name="active_user",
+        auth="token",
+        feed_token=None,
+        broker="shoonya",
+        is_revoked=0,
     )
     auth_mod.db_session.add(active_auth)
     auth_mod.db_session.commit()
@@ -130,8 +135,11 @@ def test_auth_token_broker_caches_negative_result():
 
     # User with revoked session
     revoked_auth = auth_mod.Auth(
-        name="revoked_user", auth="old_token", feed_token=None,
-        broker="shoonya", is_revoked=1,
+        name="revoked_user",
+        auth="old_token",
+        feed_token=None,
+        broker="shoonya",
+        is_revoked=1,
     )
     auth_mod.db_session.add(revoked_auth)
     auth_mod.db_session.commit()
@@ -174,12 +182,13 @@ def test_only_admin_revoked_reproduces_original_bug():
     auth_mod = setup_test_db()
 
     # Exact production state
-    admin_auth = auth_mod.Auth(
-        name="admin", auth="", feed_token=None, broker="", is_revoked=1
-    )
+    admin_auth = auth_mod.Auth(name="admin", auth="", feed_token=None, broker="", is_revoked=1)
     jagat_auth = auth_mod.Auth(
-        name="jagat_4579e4", auth="encrypted_shoonya_token", feed_token=None,
-        broker="shoonya", is_revoked=0,
+        name="jagat_4579e4",
+        auth="encrypted_shoonya_token",
+        feed_token=None,
+        broker="shoonya",
+        is_revoked=0,
     )
     auth_mod.db_session.add(admin_auth)
     auth_mod.db_session.add(jagat_auth)

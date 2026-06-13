@@ -85,14 +85,13 @@ def scan_rule(
     collisions are visible.
     """
     if screener_type not in {"buy", "sell"}:
-        raise ValueError(
-            f"screener_type must be 'buy' or 'sell', got {screener_type!r}"
-        )
+        raise ValueError(f"screener_type must be 'buy' or 'sell', got {screener_type!r}")
 
     def decorator(fn: Callable[..., bool]) -> Callable[..., bool]:
         if name in _rule_registry:
-            logger.warning("scan_rule %r being re-registered (was %s, now %s)",
-                           name, _rule_registry[name], fn)
+            logger.warning(
+                "scan_rule %r being re-registered (was %s, now %s)", name, _rule_registry[name], fn
+            )
         _rule_registry[name] = fn
         _rule_metadata[name] = {
             "screener_type": screener_type,
@@ -110,10 +109,7 @@ def get_rule(name: str) -> Callable[..., bool] | None:
 
 def all_rules() -> dict[str, dict[str, Any]]:
     """Snapshot of the registry: ``{name: {"fn": callable, **metadata}}``."""
-    return {
-        name: {"fn": fn, **_rule_metadata.get(name, {})}
-        for name, fn in _rule_registry.items()
-    }
+    return {name: {"fn": fn, **_rule_metadata.get(name, {})} for name, fn in _rule_registry.items()}
 
 
 def _clear_rule_registry_for_tests() -> None:
@@ -223,9 +219,7 @@ def record_scan_result(
 ) -> int:
     """Append a scan result row and return its id."""
     if source not in {"chartink", "inhouse", "shadow", "manual"}:
-        raise ValueError(
-            f"source must be one of chartink|inhouse|shadow|manual, got {source!r}"
-        )
+        raise ValueError(f"source must be one of chartink|inhouse|shadow|manual, got {source!r}")
     sess = _session()
     try:
         row = ScanResult(
@@ -255,9 +249,7 @@ def get_scan_results(hours: int = 24, source: str | None = None) -> list[dict[st
 
     import pytz
 
-    cutoff = (
-        datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(hours=hours)
-    ).isoformat()
+    cutoff = (datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(hours=hours)).isoformat()
 
     sess = _session()
     try:
@@ -373,11 +365,7 @@ def get_scan_comparison(
 
         csess = scdb.db_session
         try:
-            rows = (
-                csess.query(scdb.ScanCycle)
-                .filter(scdb.ScanCycle.cycle_kind == "chartink")
-                .all()
-            )
+            rows = csess.query(scdb.ScanCycle).filter(scdb.ScanCycle.cycle_kind == "chartink").all()
             for row in rows:
                 if (row.started_at or "")[:10] != date:
                     continue
@@ -438,6 +426,7 @@ def get_scan_comparison(
 # subscribe the webhook poster to ``topic="scan_hit"``. Until then the
 # events fire but go to no subscriber, which is the intended idle state.
 
+
 @dataclass
 class ScanHitEvent(Event):
     """Emitted on the event bus when a rule fires at bar close.
@@ -471,12 +460,14 @@ _DEFAULT_ZMQ_ENDPOINT = "tcp://127.0.0.1:5555"
 # Two-segment exchange prefixes — keep in sync with the proxy's table.
 # If a new index/multi-segment exchange ships, add it both here and in
 # ``websocket_proxy/server.py:zmq_listener``.
-_MULTI_SEGMENT_EXCHANGE_PREFIXES: frozenset[tuple[str, str]] = frozenset({
-    ("NSE", "INDEX"),
-    ("BSE", "INDEX"),
-    ("MCX", "INDEX"),
-    ("GLOBAL", "INDEX"),
-})
+_MULTI_SEGMENT_EXCHANGE_PREFIXES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("NSE", "INDEX"),
+        ("BSE", "INDEX"),
+        ("MCX", "INDEX"),
+        ("GLOBAL", "INDEX"),
+    }
+)
 
 
 def _parse_topic(topic: str) -> tuple[str, str, str] | None:
@@ -551,9 +542,7 @@ def _normalize_tick(market_data: dict[str, Any]) -> dict[str, Any] | None:
                 break
             if isinstance(value, (int, float)):
                 # Treat values > 10^10 as milliseconds (epoch_s ceiling).
-                ts = _dt.datetime.fromtimestamp(
-                    value / 1000 if value > 10_000_000_000 else value
-                )
+                ts = _dt.datetime.fromtimestamp(value / 1000 if value > 10_000_000_000 else value)
                 break
         except Exception:
             continue
@@ -579,14 +568,16 @@ class _Rolling15mBars:
 
     def _on_bar(self, bar: dict[str, Any]) -> None:
         if bar.get("elapsed_pct", 0.0) >= 1.0:
-            self._closed.append({
-                "ts": bar.get("ts"),
-                "open": bar.get("open"),
-                "high": bar.get("high"),
-                "low": bar.get("low"),
-                "close": bar.get("close"),
-                "volume": bar.get("volume"),
-            })
+            self._closed.append(
+                {
+                    "ts": bar.get("ts"),
+                    "open": bar.get("open"),
+                    "high": bar.get("high"),
+                    "low": bar.get("low"),
+                    "close": bar.get("close"),
+                    "volume": bar.get("volume"),
+                }
+            )
 
     def on_tick(self, tick: dict[str, Any]) -> None:
         self._builder.on_tick(tick)
@@ -691,7 +682,9 @@ class ScannerService:
         self._running = True
         logger.info(
             "ScannerService started: %d symbols on intervals=%s, zmq=%s",
-            len(self.symbols), self.intervals, self.zmq_endpoint,
+            len(self.symbols),
+            self.intervals,
+            self.zmq_endpoint,
         )
 
     def stop(self) -> None:
@@ -725,9 +718,7 @@ class ScannerService:
             self._zmq_socket.setsockopt(zmq.SUBSCRIBE, b"")
             self._zmq_socket.connect(self.zmq_endpoint)
         except Exception:
-            logger.exception(
-                "ScannerService: failed to open ZMQ SUB at %s", self.zmq_endpoint
-            )
+            logger.exception("ScannerService: failed to open ZMQ SUB at %s", self.zmq_endpoint)
             return
 
         poller = zmq.Poller()
@@ -795,13 +786,9 @@ class ScannerService:
             indicators_dict = self._build_indicators(symbol, bars)
             self._evaluate_definitions(symbol, interval, bars, indicators_dict, bar)
         except Exception:
-            logger.exception(
-                "ScannerService: _on_bar_close failed for %s/%s", symbol, interval
-            )
+            logger.exception("ScannerService: _on_bar_close failed for %s/%s", symbol, interval)
 
-    def _append_bar(
-        self, symbol: str, interval: str, bar: dict[str, Any]
-    ) -> pd.DataFrame:
+    def _append_bar(self, symbol: str, interval: str, bar: dict[str, Any]) -> pd.DataFrame:
         """Push the closed bar onto the rolling window and return the frame."""
         import pandas as pd  # noqa: PLC0415
 
@@ -868,9 +855,7 @@ class ScannerService:
                 bars_daily = self._history_provider.get_daily(symbol)
                 bars_weekly = self._history_provider.get_weekly(symbol)
             except Exception:
-                logger.exception(
-                    "ScannerService: history provider lookup failed for %s", symbol
-                )
+                logger.exception("ScannerService: history provider lookup failed for %s", symbol)
 
         return {
             "ema_20": ema_20,
@@ -906,7 +891,8 @@ class ScannerService:
             if rule_fn is None:
                 logger.debug(
                     "ScannerService: no registered rule named %r (definition id=%s)",
-                    rule_name, definition.get("id"),
+                    rule_name,
+                    definition.get("id"),
                 )
                 continue
             try:
@@ -914,7 +900,9 @@ class ScannerService:
             except Exception:
                 logger.exception(
                     "ScannerService: rule %r raised for %s/%s",
-                    rule_name, symbol, interval,
+                    rule_name,
+                    symbol,
+                    interval,
                 )
                 continue
             if not matched:
@@ -932,7 +920,8 @@ class ScannerService:
             except Exception:
                 logger.exception(
                     "ScannerService: record_scan_result failed for %s/%s",
-                    symbol, interval,
+                    symbol,
+                    interval,
                 )
 
             try:
@@ -950,5 +939,6 @@ class ScannerService:
             except Exception:
                 logger.exception(
                     "ScannerService: failed to publish scan_hit for %s/%s",
-                    symbol, interval,
+                    symbol,
+                    interval,
                 )

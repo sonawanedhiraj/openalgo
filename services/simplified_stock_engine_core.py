@@ -83,7 +83,9 @@ class SimplifiedEngineConfig:
     @property
     def effective_funds_floor(self) -> float:
         """The funds_floor to enforce in live mode. Defaults to account_capital."""
-        return float(self.funds_floor) if self.funds_floor is not None else float(self.account_capital)
+        return (
+            float(self.funds_floor) if self.funds_floor is not None else float(self.account_capital)
+        )
 
 
 @dataclass
@@ -152,6 +154,7 @@ class CompletedTrade:
     the executed price reported by the broker / sandbox fill (falls back to
     the signal's reference price when neither is available, e.g. disabled mode).
     """
+
     symbol: str
     qty: int
     entry_price: float
@@ -190,6 +193,7 @@ class CompletedTrade:
 @dataclass(frozen=True)
 class TradeCharges:
     """Per-trade breakdown of regulatory and broker charges."""
+
     brokerage: float
     stt: float
     exchange: float
@@ -519,7 +523,11 @@ class SimplifiedStockEngine:
         if total_profit < (self.config.rr_trail_start_r * self.config.max_risk_per_trade):
             return
 
-        ratio = total_profit / self.config.max_risk_per_trade if self.config.max_risk_per_trade > 0 else 0.0
+        ratio = (
+            total_profit / self.config.max_risk_per_trade
+            if self.config.max_risk_per_trade > 0
+            else 0.0
+        )
         lock_pct = 0.10 + (0.95 - 0.10) * min(max(ratio / 3.0, 0.0), 1.0)
         locked_profit = total_profit * lock_pct
         money_locked_per_share = locked_profit / max(abs_qty, 1)
@@ -599,7 +607,9 @@ class SimplifiedStockEngine:
 
         passed, reason = self._passes_atr_entry_filter(symbol, candle, record)
         if not passed:
-            logger.info("[SIMPLIFIED-NO-TRADE-SELL] %s rejected by entry filter: %s", symbol, reason)
+            logger.info(
+                "[SIMPLIFIED-NO-TRADE-SELL] %s rejected by entry filter: %s", symbol, reason
+            )
             return None
 
         atr = float(self._atr_map.get(symbol) or 0.0)
@@ -670,8 +680,7 @@ class SimplifiedStockEngine:
             if blocked_until is not None:
                 if now < blocked_until:
                     logger.info(
-                        "[SIMPLIFIED-SAME-DAY-BLOCK] %s blocked until %s "
-                        "(stop-out earlier today)",
+                        "[SIMPLIFIED-SAME-DAY-BLOCK] %s blocked until %s (stop-out earlier today)",
                         symbol,
                         blocked_until.isoformat(),
                     )
@@ -753,15 +762,11 @@ class SimplifiedStockEngine:
             elif per_share_profit > 0:
                 lock_amount = per_share_profit * self.config.lock_profit_pct
                 if is_long:
-                    candidate_sl = round(
-                        min(pos.entry_price + lock_amount, price - 0.01), 2
-                    )
+                    candidate_sl = round(min(pos.entry_price + lock_amount, price - 0.01), 2)
                     if candidate_sl > pos.stop_loss:
                         pos.stop_loss = candidate_sl
                 else:
-                    candidate_sl = round(
-                        max(pos.entry_price - lock_amount, price + 0.01), 2
-                    )
+                    candidate_sl = round(max(pos.entry_price - lock_amount, price + 0.01), 2)
                     if candidate_sl < pos.stop_loss:
                         pos.stop_loss = candidate_sl
         return exits
@@ -796,7 +801,9 @@ class SimplifiedStockEngine:
 
     def _update_recent(self, symbol: str, candle: Candle) -> None:
         recent = list(self.recent_candles.get(symbol, []))
-        recent = [c for c in recent if self._normalize_bucket(c.ts) != self._normalize_bucket(candle.ts)]
+        recent = [
+            c for c in recent if self._normalize_bucket(c.ts) != self._normalize_bucket(candle.ts)
+        ]
         recent.append(candle)
         recent.sort(key=lambda c: c.ts)
         self.recent_candles[symbol] = recent[-self.config.history_candidate_count :]
@@ -806,7 +813,11 @@ class SimplifiedStockEngine:
         low = float(candle.low)
         close = float(candle.close)
         prev_close = self._prev_close.get(symbol)
-        tr = max(high - low, abs(high - (prev_close if prev_close is not None else close)), abs(low - (prev_close if prev_close is not None else close)))
+        tr = max(
+            high - low,
+            abs(high - (prev_close if prev_close is not None else close)),
+            abs(low - (prev_close if prev_close is not None else close)),
+        )
 
         dq = self._tr_deques.setdefault(symbol, deque(maxlen=self.config.atr_period))
         dq.append(float(tr))
@@ -829,7 +840,9 @@ class SimplifiedStockEngine:
 
     def _is_reference_expired(self, record: ReferenceCandleRecord) -> bool:
         red_ts = record.candle.ts.replace(tzinfo=None)
-        return (self.now_provider().replace(tzinfo=None) - red_ts).total_seconds() > self.config.reference_candle_expiry_seconds
+        return (
+            self.now_provider().replace(tzinfo=None) - red_ts
+        ).total_seconds() > self.config.reference_candle_expiry_seconds
 
     def _is_eod_done(self) -> bool:
         return self.eod_done_date == self.now_provider().date()

@@ -25,25 +25,26 @@ import pytest
 # (action, qty, position_size, current_position) -> expected (action, quantity) or "no_action"
 SPEC_TABLE = [
     # action  qty  pos_size  current_pos  -> expected_action  expected_qty  description
-    ("BUY",   100,  0,        0,           "BUY",             100,          "No position, pos_size=0 -> use action+qty from request"),
-    ("BUY",   100,  100,     -100,         "BUY",             200,          "Short -100, target +100 -> BUY 200"),
-    ("BUY",   100,  100,      100,         None,              0,            "Already at target -> no action"),
-    ("BUY",   100,  200,      100,         "BUY",             100,          "Long 100, target 200 -> BUY 100"),
-    ("SELL",  100,  0,        0,           "SELL",            100,          "No position, pos_size=0 -> use action+qty from request"),
-    ("SELL",  100, -100,      100,         "SELL",            200,          "Long +100, target -100 -> SELL 200"),
-    ("SELL",  100, -100,     -100,         None,              0,            "Already at target -> no action"),
-    ("SELL",  100, -200,     -100,         "SELL",            100,          "Short -100, target -200 -> SELL 100"),
+    ("BUY", 100, 0, 0, "BUY", 100, "No position, pos_size=0 -> use action+qty from request"),
+    ("BUY", 100, 100, -100, "BUY", 200, "Short -100, target +100 -> BUY 200"),
+    ("BUY", 100, 100, 100, None, 0, "Already at target -> no action"),
+    ("BUY", 100, 200, 100, "BUY", 100, "Long 100, target 200 -> BUY 100"),
+    ("SELL", 100, 0, 0, "SELL", 100, "No position, pos_size=0 -> use action+qty from request"),
+    ("SELL", 100, -100, 100, "SELL", 200, "Long +100, target -100 -> SELL 200"),
+    ("SELL", 100, -100, -100, None, 0, "Already at target -> no action"),
+    ("SELL", 100, -200, -100, "SELL", 100, "Short -100, target -200 -> SELL 100"),
     # Edge cases
-    ("BUY",   5,   0,        5,           "SELL",            5,            "Long 5, pos_size=0 -> close position SELL 5"),
-    ("SELL",  5,   0,       -5,           "BUY",             5,            "Short -5, pos_size=0 -> close position BUY 5"),
-    ("BUY",   0,   0,        0,           None,              0,            "qty=0, pos_size=0, no position -> no action"),
-    ("BUY",   0,   100,      100,         None,              0,            "qty=0, already matched -> no action"),
+    ("BUY", 5, 0, 5, "SELL", 5, "Long 5, pos_size=0 -> close position SELL 5"),
+    ("SELL", 5, 0, -5, "BUY", 5, "Short -5, pos_size=0 -> close position BUY 5"),
+    ("BUY", 0, 0, 0, None, 0, "qty=0, pos_size=0, no position -> no action"),
+    ("BUY", 0, 100, 100, None, 0, "qty=0, already matched -> no action"),
 ]
 
 
 # ---------------------------------------------------------------------------
 # Helpers to extract and test position logic
 # ---------------------------------------------------------------------------
+
 
 def compute_smart_order_action(action, quantity, position_size, current_position):
     """
@@ -80,15 +81,24 @@ class TestSmartOrderPositionLogic:
         SPEC_TABLE,
         ids=[row[-1] for row in SPEC_TABLE],
     )
-    def test_spec_table(self, action, qty, pos_size, current_pos, expected_action, expected_qty, desc):
-        computed_action, computed_qty = compute_smart_order_action(action, qty, pos_size, current_pos)
-        assert computed_action == expected_action, f"{desc}: expected action={expected_action}, got {computed_action}"
-        assert computed_qty == expected_qty, f"{desc}: expected qty={expected_qty}, got {computed_qty}"
+    def test_spec_table(
+        self, action, qty, pos_size, current_pos, expected_action, expected_qty, desc
+    ):
+        computed_action, computed_qty = compute_smart_order_action(
+            action, qty, pos_size, current_pos
+        )
+        assert computed_action == expected_action, (
+            f"{desc}: expected action={expected_action}, got {computed_action}"
+        )
+        assert computed_qty == expected_qty, (
+            f"{desc}: expected qty={expected_qty}, got {computed_qty}"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Test per-symbol lock serialization
 # ---------------------------------------------------------------------------
+
 
 class TestPerSymbolLock:
     """Test that per-symbol locks serialize smart orders correctly."""
@@ -123,8 +133,9 @@ class TestPerSymbolLock:
         t2.join()
 
         # Order 1 should complete before Order 2 starts
-        assert execution_order.index("end_1") < execution_order.index("start_2"), \
+        assert execution_order.index("end_1") < execution_order.index("start_2"), (
             f"Expected serialized execution, got: {execution_order}"
+        )
 
     def test_different_symbols_parallel(self):
         """Two smart orders for different symbols should execute in parallel."""
@@ -157,12 +168,15 @@ class TestPerSymbolLock:
 
         # Both should have started within 50ms of each other (parallel)
         diff = abs(start_times[1] - start_times[2])
-        assert diff < 0.05, f"Different symbols should run in parallel, but start diff was {diff:.3f}s"
+        assert diff < 0.05, (
+            f"Different symbols should run in parallel, but start diff was {diff:.3f}s"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Test position cache behavior
 # ---------------------------------------------------------------------------
+
 
 class TestPositionCache:
     """Test cache TTL, invalidation, and thread safety."""
@@ -269,12 +283,37 @@ class TestPositionCache:
 
 # List of all brokers to test
 ALL_BROKERS = [
-    "aliceblue", "angel", "compositedge", "definedge", "deltaexchange",
-    "dhan", "dhan_sandbox", "firstock", "fivepaisa", "fivepaisaxts",
-    "flattrade", "fyers", "groww", "ibulls", "iifl", "indmoney",
-    "jainamxts", "kotak", "motilal", "mstock", "nubra", "paytm",
-    "pocketful", "rmoney", "samco", "shoonya", "tradejini", "upstox",
-    "wisdom", "zebu", "zerodha",
+    "aliceblue",
+    "angel",
+    "compositedge",
+    "definedge",
+    "deltaexchange",
+    "dhan",
+    "dhan_sandbox",
+    "firstock",
+    "fivepaisa",
+    "fivepaisaxts",
+    "flattrade",
+    "fyers",
+    "groww",
+    "ibulls",
+    "iifl",
+    "indmoney",
+    "jainamxts",
+    "kotak",
+    "motilal",
+    "mstock",
+    "nubra",
+    "paytm",
+    "pocketful",
+    "rmoney",
+    "samco",
+    "shoonya",
+    "tradejini",
+    "upstox",
+    "wisdom",
+    "zebu",
+    "zerodha",
 ]
 
 
@@ -288,12 +327,13 @@ class TestBrokerModuleStructure:
         with open(filepath) as f:
             content = f.read()
 
-        assert "_get_cached_positions" in content, \
+        assert "_get_cached_positions" in content, (
             f"{broker}: missing _get_cached_positions function"
-        assert "_invalidate_position_cache" in content, \
+        )
+        assert "_invalidate_position_cache" in content, (
             f"{broker}: missing _invalidate_position_cache function"
-        assert "_get_symbol_lock" in content, \
-            f"{broker}: missing _get_symbol_lock function"
+        )
+        assert "_get_symbol_lock" in content, f"{broker}: missing _get_symbol_lock function"
 
     @pytest.mark.parametrize("broker", ALL_BROKERS)
     def test_has_lock_usage(self, broker):
@@ -302,8 +342,7 @@ class TestBrokerModuleStructure:
         with open(filepath) as f:
             content = f.read()
 
-        assert "symbol_lock" in content, \
-            f"{broker}: place_smartorder_api not using per-symbol lock"
+        assert "symbol_lock" in content, f"{broker}: place_smartorder_api not using per-symbol lock"
 
     @pytest.mark.parametrize("broker", ALL_BROKERS)
     def test_get_open_position_uses_cache(self, broker):
@@ -314,17 +353,18 @@ class TestBrokerModuleStructure:
 
         # Find get_open_position function and check it uses cached version
         import re
+
         func_match = re.search(
-            r'def get_open_position\(.*?\):(.*?)(?=\ndef |\Z)',
-            content, re.DOTALL
+            r"def get_open_position\(.*?\):(.*?)(?=\ndef |\Z)", content, re.DOTALL
         )
         if func_match:
             func_body = func_match.group(1)
             # Should use _get_cached_positions, not raw get_positions
             uses_cache = "_get_cached_positions" in func_body
             uses_raw = "= get_positions(" in func_body
-            assert uses_cache or not uses_raw, \
+            assert uses_cache or not uses_raw, (
                 f"{broker}: get_open_position calls get_positions() directly instead of _get_cached_positions()"
+            )
 
     @pytest.mark.parametrize("broker", ALL_BROKERS)
     def test_has_cache_invalidation_after_order(self, broker):
@@ -333,8 +373,9 @@ class TestBrokerModuleStructure:
         with open(filepath) as f:
             content = f.read()
 
-        assert "_invalidate_position_cache" in content, \
+        assert "_invalidate_position_cache" in content, (
             f"{broker}: missing cache invalidation after order placement"
+        )
 
     @pytest.mark.parametrize("broker", ALL_BROKERS)
     def test_imports_threading_and_time(self, broker):
@@ -350,6 +391,7 @@ class TestBrokerModuleStructure:
     def test_compiles_without_error(self, broker):
         """Each broker file should compile without syntax errors."""
         import py_compile
+
         filepath = f"broker/{broker}/api/order_api.py"
         try:
             py_compile.compile(filepath, doraise=True)
@@ -360,6 +402,7 @@ class TestBrokerModuleStructure:
 # ---------------------------------------------------------------------------
 # Integration test: simulate 4 concurrent smart orders
 # ---------------------------------------------------------------------------
+
 
 class TestConcurrentSmartOrders:
     """Simulate concurrent smart orders to verify lock + cache behavior."""
@@ -379,10 +422,19 @@ class TestConcurrentSmartOrders:
 
         def mock_get_positions(auth):
             call_count["get_positions"] += 1
-            return {"status": True, "data": {"net": [
-                {"tradingsymbol": "YESBANK", "exchange": "NSE", "product": "MIS",
-                 "quantity": str(current_broker_position[0])}
-            ]}}
+            return {
+                "status": True,
+                "data": {
+                    "net": [
+                        {
+                            "tradingsymbol": "YESBANK",
+                            "exchange": "NSE",
+                            "product": "MIS",
+                            "quantity": str(current_broker_position[0]),
+                        }
+                    ]
+                },
+            }
 
         def get_cached(auth):
             with cache_lock:
@@ -433,7 +485,9 @@ class TestConcurrentSmartOrders:
 
         assert placed == 1, f"Expected 1 order placed, got {placed}. Results: {results}"
         assert matched == 3, f"Expected 3 matched, got {matched}. Results: {results}"
-        assert call_count["place_order"] == 1, f"Expected 1 place_order call, got {call_count['place_order']}"
+        assert call_count["place_order"] == 1, (
+            f"Expected 1 place_order call, got {call_count['place_order']}"
+        )
 
 
 if __name__ == "__main__":

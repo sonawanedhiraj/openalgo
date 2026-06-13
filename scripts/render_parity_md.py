@@ -5,6 +5,7 @@ Pulls from three JSON inputs:
   - docs/benchmarks/greeks_post_opengreeks.json     (post-migration E2E)
   - docs/benchmarks/greeks_parity_opengreeks.json   (pure-math parity + speedup)
 """
+
 import json
 from statistics import median
 
@@ -24,8 +25,11 @@ def latency_stats(lat):
     s = sorted(lat)
     n = len(s)
     return {
-        "min": s[0], "p50": s[n // 2], "mean": sum(s) / n,
-        "p95": s[int(n * 0.95)], "max": s[-1],
+        "min": s[0],
+        "p50": s[n // 2],
+        "mean": sum(s) / n,
+        "p95": s[int(n * 0.95)],
+        "max": s[-1],
     }
 
 
@@ -64,7 +68,9 @@ def math_speedup_section():
         "|:---|---:|---:|---:|",
     ]
     for r in rows:
-        md.append(f"| `{r['function']}` | {r['pyvollib_us']:.3f} | {r['opengreeks_us']:.3f} | **{r['speedup']:.1f}×** |")
+        md.append(
+            f"| `{r['function']}` | {r['pyvollib_us']:.3f} | {r['opengreeks_us']:.3f} | **{r['speedup']:.1f}×** |"
+        )
     md.append("")
     md.append(
         f"### Full chain refresh — IV + 5 Greeks across {chain['n_options']} options "
@@ -92,9 +98,13 @@ def parity_summary_section():
         if name == "iv":
             errs = [r["iv_abs_err"] for r in parity_rows if r["iv_abs_err"] is not None]
         else:
-            errs = [r["greeks"][name]["abs_err"] for r in parity_rows
-                    if r.get("greeks") and r["greeks"].get(name)
-                    and r["greeks"][name]["abs_err"] is not None]
+            errs = [
+                r["greeks"][name]["abs_err"]
+                for r in parity_rows
+                if r.get("greeks")
+                and r["greeks"].get(name)
+                and r["greeks"][name]["abs_err"] is not None
+            ]
         return max(errs) if errs else 0.0
 
     rows = [
@@ -119,12 +129,15 @@ def parity_summary_section():
 
 def coverage_table(samples):
     from collections import defaultdict
+
     by_class = defaultdict(int)
     for r in samples:
         by_class[(r["type"], r["moneyness"])] += 1
     ORDER = ["DEEP ITM", "ITM", "ATM", "OTM", "DEEP OTM"]
-    rows = ["| Type | DEEP ITM | ITM | ATM | OTM | DEEP OTM | Total |",
-            "|:---|---:|---:|---:|---:|---:|---:|"]
+    rows = [
+        "| Type | DEEP ITM | ITM | ATM | OTM | DEEP OTM | Total |",
+        "|:---|---:|---:|---:|---:|---:|---:|",
+    ]
     for t in ("CE", "PE"):
         c = [by_class[(t, m)] for m in ORDER]
         rows.append(f"| {t} | {c[0]} | {c[1]} | {c[2]} | {c[3]} | {c[4]} | {sum(c)} |")
@@ -136,8 +149,10 @@ def side_by_side_table(opt_type):
     lines = [
         f"### {opt_type} — strike-by-strike values (py_vollib → opengreeks)",
         "",
-        ("| Strike | Moneyness | IV % (py / og) | Δ (py / og) | "
-         "Γ ×1e-4 (py / og) | Θ (py / og) | Vega (py / og) |"),
+        (
+            "| Strike | Moneyness | IV % (py / og) | Δ (py / og) | "
+            "Γ ×1e-4 (py / og) | Θ (py / og) | Vega (py / og) |"
+        ),
         "|---:|:---|:---|:---|:---|:---|:---|",
     ]
     for r in baseline["samples"]:
@@ -160,7 +175,10 @@ def side_by_side_table(opt_type):
 
 def field_diffs():
     """Compute API-response field-level diffs that real users would see."""
-    diffs = {k: [] for k in ("delta", "gamma", "theta", "vega", "rho", "implied_volatility", "option_price")}
+    diffs = {
+        k: []
+        for k in ("delta", "gamma", "theta", "vega", "rho", "implied_volatility", "option_price")
+    }
     for r in baseline["samples"]:
         sym = r["symbol"]
         b = r["response"]
@@ -177,10 +195,12 @@ def field_diffs():
     lines = [
         "## End-to-end API response diffs (live market data, ~18 min apart)",
         "",
-        ("Same 40 strikes hit twice: first against py_vollib, then against opengreeks. "
-         "Spot/option LTPs naturally drift in the gap, so this section is *not* the "
-         "parity check — for that, see the pure-math parity table above. The values "
-         "here just confirm the API output stays clean and structurally identical."),
+        (
+            "Same 40 strikes hit twice: first against py_vollib, then against opengreeks. "
+            "Spot/option LTPs naturally drift in the gap, so this section is *not* the "
+            "parity check — for that, see the pure-math parity table above. The values "
+            "here just confirm the API output stays clean and structurally identical."
+        ),
         "",
         "| Field | n | median |Δ| | max |Δ| |",
         "|:---|---:|---:|---:|",
@@ -200,10 +220,18 @@ def find_steady_diff():
     drift = []
     for r in baseline["samples"]:
         sym = r["symbol"]
-        b = r["response"]; p = post_by_sym[sym]["response"]
+        b = r["response"]
+        p = post_by_sym[sym]["response"]
         if b.get("status") == "success" and p.get("status") == "success":
             if "option_price" in b and "option_price" in p:
-                drift.append((abs(b["option_price"] - p["option_price"]), sym, b["option_price"], p["option_price"]))
+                drift.append(
+                    (
+                        abs(b["option_price"] - p["option_price"]),
+                        sym,
+                        b["option_price"],
+                        p["option_price"],
+                    )
+                )
     drift.sort(reverse=True)
     return drift[:3]
 
@@ -219,14 +247,14 @@ This document captures the parity validation and performance gain after replacin
 - **Underlying**: NIFTY @ ₹{SPOT:.2f}
 - **Expiry**: 26-MAY-2026 (`NIFTY26MAY26<strike><CE/PE>`)
 - **Risk-free rate**: 0 (NFO default)
-- **Samples**: {len(baseline['samples'])} ({sum(1 for s in baseline['samples'] if s['type'] == 'CE')} CE + {sum(1 for s in baseline['samples'] if s['type'] == 'PE')} PE)
+- **Samples**: {len(baseline["samples"])} ({sum(1 for s in baseline["samples"] if s["type"] == "CE")} CE + {sum(1 for s in baseline["samples"] if s["type"] == "PE")} PE)
 - **Raw data**: [`greeks_baseline_pyvollib.json`](./greeks_baseline_pyvollib.json),
   [`greeks_post_opengreeks.json`](./greeks_post_opengreeks.json),
   [`greeks_parity_opengreeks.json`](./greeks_parity_opengreeks.json)
 
 ## Moneyness coverage
 
-{coverage_table(baseline['samples'])}
+{coverage_table(baseline["samples"])}
 
 {parity_summary_section()}
 
@@ -240,9 +268,9 @@ The headline-looking diffs in the table above (e.g., IV moves of a few basis poi
 are **market drift between the two runs**, not engine diffs. The pure-math parity
 section above proves both libraries return identical values on identical inputs.
 
-{side_by_side_table('CE')}
+{side_by_side_table("CE")}
 
-{side_by_side_table('PE')}
+{side_by_side_table("PE")}
 
 ## Migration changes
 

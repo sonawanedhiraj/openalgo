@@ -187,9 +187,7 @@ def process_firstock_nse_data(output_path):
     index_mask = df["is_index"]
     if index_mask.any():
         df.loc[index_mask, "symbol"] = df.loc[index_mask].apply(
-            lambda r: map_to_openalgo_index_symbol(
-                r["brsymbol"], r.get("name", ""), "NSE"
-            ),
+            lambda r: map_to_openalgo_index_symbol(r["brsymbol"], r.get("name", ""), "NSE"),
             axis=1,
         )
 
@@ -381,9 +379,7 @@ def process_firstock_bse_data(output_path):
     index_mask = df["is_index"]
     if index_mask.any():
         df.loc[index_mask, "symbol"] = df.loc[index_mask].apply(
-            lambda r: map_to_openalgo_index_symbol(
-                r["brsymbol"], r.get("name", ""), "BSE"
-            ),
+            lambda r: map_to_openalgo_index_symbol(r["brsymbol"], r.get("name", ""), "BSE"),
             axis=1,
         )
 
@@ -525,36 +521,106 @@ def process_firstock_bfo_data(output_path):
 # whitespace-insensitive) normalizes to the OpenAlgo format; unmatched
 # indices pass through unchanged so new/custom indices still get stored.
 OPENALGO_NSE_INDICES = {
-    "NIFTY", "NIFTYNXT50", "FINNIFTY", "BANKNIFTY", "MIDCPNIFTY", "INDIAVIX",
+    "NIFTY",
+    "NIFTYNXT50",
+    "FINNIFTY",
+    "BANKNIFTY",
+    "MIDCPNIFTY",
+    "INDIAVIX",
     "HANGSENGBEESNAV",
-    "NIFTY100", "NIFTY200", "NIFTY500",
-    "NIFTYALPHA50", "NIFTYAUTO", "NIFTYCOMMODITIES", "NIFTYCONSUMPTION",
-    "NIFTYCPSE", "NIFTYDIVOPPS50", "NIFTYENERGY", "NIFTYFMCG",
-    "NIFTYGROWSECT15", "NIFTYGS10YR", "NIFTYGS10YRCLN", "NIFTYGS1115YR",
-    "NIFTYGS15YRPLUS", "NIFTYGS48YR", "NIFTYGS813YR", "NIFTYGSCOMPSITE",
-    "NIFTYINFRA", "NIFTYIT", "NIFTYMEDIA", "NIFTYMETAL",
-    "NIFTYMIDLIQ15", "NIFTYMIDCAP100", "NIFTYMIDCAP150", "NIFTYMIDCAP50",
-    "NIFTYMIDSML400", "NIFTYMNC", "NIFTYPHARMA", "NIFTYPSE",
-    "NIFTYPSUBANK", "NIFTYPVTBANK", "NIFTYREALTY", "NIFTYSERVSECTOR",
-    "NIFTYSMLCAP100", "NIFTYSMLCAP250", "NIFTYSMLCAP50",
-    "NIFTY100EQLWGT", "NIFTY100LIQ15", "NIFTY100LOWVOL30", "NIFTY100QUALTY30",
-    "NIFTY200QUALTY30", "NIFTY50DIVPOINT", "NIFTY50EQLWGT",
-    "NIFTY50PR1XINV", "NIFTY50PR2XLEV", "NIFTY50TR1XINV", "NIFTY50TR2XLEV",
+    "NIFTY100",
+    "NIFTY200",
+    "NIFTY500",
+    "NIFTYALPHA50",
+    "NIFTYAUTO",
+    "NIFTYCOMMODITIES",
+    "NIFTYCONSUMPTION",
+    "NIFTYCPSE",
+    "NIFTYDIVOPPS50",
+    "NIFTYENERGY",
+    "NIFTYFMCG",
+    "NIFTYGROWSECT15",
+    "NIFTYGS10YR",
+    "NIFTYGS10YRCLN",
+    "NIFTYGS1115YR",
+    "NIFTYGS15YRPLUS",
+    "NIFTYGS48YR",
+    "NIFTYGS813YR",
+    "NIFTYGSCOMPSITE",
+    "NIFTYINFRA",
+    "NIFTYIT",
+    "NIFTYMEDIA",
+    "NIFTYMETAL",
+    "NIFTYMIDLIQ15",
+    "NIFTYMIDCAP100",
+    "NIFTYMIDCAP150",
+    "NIFTYMIDCAP50",
+    "NIFTYMIDSML400",
+    "NIFTYMNC",
+    "NIFTYPHARMA",
+    "NIFTYPSE",
+    "NIFTYPSUBANK",
+    "NIFTYPVTBANK",
+    "NIFTYREALTY",
+    "NIFTYSERVSECTOR",
+    "NIFTYSMLCAP100",
+    "NIFTYSMLCAP250",
+    "NIFTYSMLCAP50",
+    "NIFTY100EQLWGT",
+    "NIFTY100LIQ15",
+    "NIFTY100LOWVOL30",
+    "NIFTY100QUALTY30",
+    "NIFTY200QUALTY30",
+    "NIFTY50DIVPOINT",
+    "NIFTY50EQLWGT",
+    "NIFTY50PR1XINV",
+    "NIFTY50PR2XLEV",
+    "NIFTY50TR1XINV",
+    "NIFTY50TR2XLEV",
     "NIFTY50VALUE20",
 }
 
 OPENALGO_BSE_INDICES = {
-    "SENSEX", "BANKEX", "SENSEX50",
-    "BSE100", "BSE150MIDCAPINDEX", "BSE200", "BSE250LARGEMIDCAPINDEX",
-    "BSE400MIDSMALLCAPINDEX", "BSE500",
-    "BSEAUTO", "BSECAPITALGOODS", "BSECARBONEX", "BSECONSUMERDURABLES",
-    "BSECPSE", "BSEDOLLEX100", "BSEDOLLEX200", "BSEDOLLEX30", "BSEENERGY",
-    "BSEFASTMOVINGCONSUMERGOODS", "BSEFINANCIALSERVICES", "BSEGREENEX",
-    "BSEHEALTHCARE", "BSEINDIAINFRASTRUCTUREINDEX", "BSEINDUSTRIALS",
-    "BSEINFORMATIONTECHNOLOGY", "BSEIPO", "BSELARGECAP", "BSEMETAL",
-    "BSEMIDCAP", "BSEMIDCAPSELECTINDEX", "BSEOIL&GAS", "BSEPOWER",
-    "BSEPSU", "BSEREALTY", "BSESENSEXNEXT50", "BSESMALLCAP",
-    "BSESMALLCAPSELECTINDEX", "BSESMEIPO", "BSETECK", "BSETELECOM",
+    "SENSEX",
+    "BANKEX",
+    "SENSEX50",
+    "BSE100",
+    "BSE150MIDCAPINDEX",
+    "BSE200",
+    "BSE250LARGEMIDCAPINDEX",
+    "BSE400MIDSMALLCAPINDEX",
+    "BSE500",
+    "BSEAUTO",
+    "BSECAPITALGOODS",
+    "BSECARBONEX",
+    "BSECONSUMERDURABLES",
+    "BSECPSE",
+    "BSEDOLLEX100",
+    "BSEDOLLEX200",
+    "BSEDOLLEX30",
+    "BSEENERGY",
+    "BSEFASTMOVINGCONSUMERGOODS",
+    "BSEFINANCIALSERVICES",
+    "BSEGREENEX",
+    "BSEHEALTHCARE",
+    "BSEINDIAINFRASTRUCTUREINDEX",
+    "BSEINDUSTRIALS",
+    "BSEINFORMATIONTECHNOLOGY",
+    "BSEIPO",
+    "BSELARGECAP",
+    "BSEMETAL",
+    "BSEMIDCAP",
+    "BSEMIDCAPSELECTINDEX",
+    "BSEOIL&GAS",
+    "BSEPOWER",
+    "BSEPSU",
+    "BSEREALTY",
+    "BSESENSEXNEXT50",
+    "BSESMALLCAP",
+    "BSESMALLCAPSELECTINDEX",
+    "BSESMEIPO",
+    "BSETECK",
+    "BSETELECOM",
 }
 
 # Explicit aliases for broker/exchange names that diverge from the OpenAlgo
@@ -608,12 +674,8 @@ def _normalize_index_key(value):
 
 # Pre-computed normalized lookup dicts: normalized_key -> canonical OpenAlgo symbol.
 # Built once at module load so tolerant matching is a single dict lookup.
-_NSE_INDEX_NORMALIZED_LOOKUP = {
-    _normalize_index_key(s): s for s in OPENALGO_NSE_INDICES
-}
-_BSE_INDEX_NORMALIZED_LOOKUP = {
-    _normalize_index_key(s): s for s in OPENALGO_BSE_INDICES
-}
+_NSE_INDEX_NORMALIZED_LOOKUP = {_normalize_index_key(s): s for s in OPENALGO_NSE_INDICES}
+_BSE_INDEX_NORMALIZED_LOOKUP = {_normalize_index_key(s): s for s in OPENALGO_BSE_INDICES}
 
 
 def _basic_index_cleanup(value):
@@ -706,9 +768,7 @@ def fetch_firstock_indices():
         response.status = response.status_code
 
         if response.status_code != 200:
-            logger.error(
-                f"Failed to fetch Firstock indices. Status code: {response.status_code}"
-            )
+            logger.error(f"Failed to fetch Firstock indices. Status code: {response.status_code}")
             return pd.DataFrame()
 
         data = response.json()
@@ -731,12 +791,8 @@ def fetch_firstock_indices():
             if not token or not trading_symbol:
                 continue
 
-            openalgo_symbol = map_to_openalgo_index_symbol(
-                trading_symbol, idxname, br_exchange
-            )
-            oa_exchange = (
-                f"{br_exchange}_INDEX" if br_exchange in ("NSE", "BSE") else br_exchange
-            )
+            openalgo_symbol = map_to_openalgo_index_symbol(trading_symbol, idxname, br_exchange)
+            oa_exchange = f"{br_exchange}_INDEX" if br_exchange in ("NSE", "BSE") else br_exchange
 
             rows.append(
                 {

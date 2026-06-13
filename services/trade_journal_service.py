@@ -163,9 +163,7 @@ def update_entry_fill(
     try:
         row = sess.query(TradeJournal).filter_by(id=journal_id).first()
         if row is None:
-            logger.error(
-                "trade_journal.update_entry_fill: journal_id=%s not found", journal_id
-            )
+            logger.error("trade_journal.update_entry_fill: journal_id=%s not found", journal_id)
             return
         if entry_price is not None:
             row.entry_price = float(entry_price)
@@ -173,9 +171,7 @@ def update_entry_fill(
         row.updated_at = _now_iso()
         sess.commit()
     except Exception as e:
-        logger.exception(
-            "trade_journal.update_entry_fill failed (id=%s): %s", journal_id, e
-        )
+        logger.exception("trade_journal.update_entry_fill failed (id=%s): %s", journal_id, e)
         _alert_operator(
             f"Journal update_entry_fill failed (id={journal_id}) — reconcile fill price."
         )
@@ -214,9 +210,7 @@ def record_exit(
     try:
         row = sess.query(TradeJournal).filter_by(id=journal_id).first()
         if row is None:
-            logger.error(
-                "trade_journal.record_exit: journal_id=%s not found", journal_id
-            )
+            logger.error("trade_journal.record_exit: journal_id=%s not found", journal_id)
             return
 
         now_iso = _now_iso()
@@ -242,12 +236,7 @@ def record_exit(
         if pnl is not None:
             row.pnl = float(pnl)
 
-        if (
-            pnl_pct is None
-            and pnl is not None
-            and row.entry_price
-            and row.quantity
-        ):
+        if pnl_pct is None and pnl is not None and row.entry_price and row.quantity:
             denom = float(row.entry_price) * abs(int(row.quantity))
             if denom > 0:
                 pnl_pct = float(pnl) / denom
@@ -427,9 +416,7 @@ def get_open_journal_id_for_symbol(symbol: str) -> int | None:
         )
         return int(row.id) if row else None
     except Exception as e:
-        logger.exception(
-            "trade_journal.get_open_journal_id_for_symbol failed: %s", e
-        )
+        logger.exception("trade_journal.get_open_journal_id_for_symbol failed: %s", e)
         return None
     finally:
         try:

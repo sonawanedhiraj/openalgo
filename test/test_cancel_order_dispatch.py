@@ -21,9 +21,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -55,7 +53,10 @@ def test_cancel_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", sandbox_called)
 
     success, response, status = cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     assert success is True
@@ -77,12 +78,16 @@ def test_cancel_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypat
 
     broker_called = MagicMock()
     monkeypatch.setattr(
-        cancel_order_service, "import_broker_module",
+        cancel_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=broker_called),
     )
 
     success, response, status = cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     assert success is True
@@ -105,12 +110,16 @@ def test_cancel_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
 
     broker_called = MagicMock()
     monkeypatch.setattr(
-        cancel_order_service, "import_broker_module",
+        cancel_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=broker_called),
     )
 
     cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     sandbox_mock.assert_called_once()
@@ -129,12 +138,16 @@ def test_cancel_rejects_when_skip(fresh_intent_db, monkeypatch):
     broker_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", sandbox_mock)
     monkeypatch.setattr(
-        cancel_order_service, "import_broker_module",
+        cancel_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=broker_mock),
     )
 
     success, response, status = cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     assert success is False
@@ -156,12 +169,16 @@ def test_cancel_rejects_when_disabled(fresh_intent_db, monkeypatch):
     broker_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", sandbox_mock)
     monkeypatch.setattr(
-        cancel_order_service, "import_broker_module",
+        cancel_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=broker_mock),
     )
 
     success, response, status = cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     assert success is False
@@ -183,22 +200,30 @@ def test_cancel_reject_response_shape_matches_existing_convention(fresh_intent_d
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_order", MagicMock())
     monkeypatch.setattr(
-        cancel_order_service, "import_broker_module",
+        cancel_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=MagicMock()),
     )
 
     reject_result = cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     broker_cancel = MagicMock(return_value=({"status": "success"}, 200))
     monkeypatch.setattr(
-        cancel_order_service, "import_broker_module",
+        cancel_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(cancel_order=broker_cancel),
     )
     success_result = cancel_order_service.cancel_order_with_auth(
-        "TEST-OID-1", auth_token="dummy", broker="zerodha", original_data=_original_data(),
+        "TEST-OID-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original_data(),
     )
 
     assert isinstance(reject_result, tuple) and len(reject_result) == 3

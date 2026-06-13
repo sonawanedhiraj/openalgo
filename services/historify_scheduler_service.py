@@ -527,8 +527,7 @@ class HistorifyScheduler:
         """
         if os.getenv("SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED", "true").lower() != "true":
             logger.debug(
-                "sector_follow index backfill disabled "
-                "(SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED!=true)"
+                "sector_follow index backfill disabled (SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED!=true)"
             )
             return
         try:

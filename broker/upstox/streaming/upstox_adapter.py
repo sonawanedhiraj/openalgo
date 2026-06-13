@@ -5,6 +5,7 @@ Upstox V3 WebSocket adapter implementation (synchronous).
 Uses sync websocket-client (same as Angel/Dhan) to avoid asyncio event loop
 conflicts with eventlet in gunicorn+eventlet deployments.
 """
+
 import json
 import logging
 import threading
@@ -180,9 +181,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
         with self.lock:
             if self.batch_timer is not None:
                 self.batch_timer.cancel()
-            self.batch_timer = threading.Timer(
-                self.batch_delay, self._process_batch_subscriptions
-            )
+            self.batch_timer = threading.Timer(self.batch_delay, self._process_batch_subscriptions)
             self.batch_timer.daemon = True
             self.batch_timer.start()
 
@@ -469,7 +468,9 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 market_data = self._extract_market_data(feed_data, sub_info, current_ts)
 
                 if market_data:
-                    self.logger.debug(f"Publishing {symbol}.{exchange} mode={mode} topic={topic} ltp={market_data.get('ltp', 'N/A')}")
+                    self.logger.debug(
+                        f"Publishing {symbol}.{exchange} mode={mode} topic={topic} ltp={market_data.get('ltp', 'N/A')}"
+                    )
                     if mode == 3:  # Depth mode
                         depth_data = market_data.copy()
                         depth_levels = {

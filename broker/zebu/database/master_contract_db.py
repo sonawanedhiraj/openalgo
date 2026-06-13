@@ -293,9 +293,9 @@ def process_zebu_nfo_data(output_path):
     #  df["expiry"] = df["expiry"].apply(format_expiry_date)
 
     # First convert string to datetime object using the original format '15-APR-2026'
-    df['expiry'] = pd.to_datetime(df['expiry'], format='%d-%b-%Y', errors='coerce')
+    df["expiry"] = pd.to_datetime(df["expiry"], format="%d-%b-%Y", errors="coerce")
     # Format the datetime object to the desired format '15-APR-26'
-    df['expiry'] = df['expiry'].dt.strftime('%d-%b-%y').str.upper().fillna("")
+    df["expiry"] = df["expiry"].dt.strftime("%d-%b-%y").str.upper().fillna("")
 
     # Replace the 'XX' option type with 'FUT' for futures
     df["instrumenttype"] = df.apply(
@@ -304,7 +304,9 @@ def process_zebu_nfo_data(output_path):
 
     # Format the symbol column based on the instrument type
     def format_symbol(row):
-        formated_expiry = row['expiry'].replace('-', '')  # Remove hyphens from expiry for symbol formatting
+        formated_expiry = row["expiry"].replace(
+            "-", ""
+        )  # Remove hyphens from expiry for symbol formatting
         if row["instrumenttype"] == "FUT":
             return f"{row['name']}{formated_expiry}FUT"
         else:
@@ -415,9 +417,9 @@ def process_zebu_cds_data(output_path):
     #  df["expiry"] = df["expiry"].apply(format_expiry_date)
 
     # First convert string to datetime object using the original format '15-APR-2026'
-    df['expiry'] = pd.to_datetime(df['expiry'], format='%d-%b-%Y', errors='coerce')
+    df["expiry"] = pd.to_datetime(df["expiry"], format="%d-%b-%Y", errors="coerce")
     # Format the datetime object to the desired format '15-APR-26'
-    df['expiry'] = df['expiry'].dt.strftime('%d-%b-%y').str.upper().fillna("")
+    df["expiry"] = df["expiry"].dt.strftime("%d-%b-%y").str.upper().fillna("")
 
     # Replace the 'XX' option type with 'FUT' for futures
     df["instrumenttype"] = df.apply(
@@ -434,7 +436,9 @@ def process_zebu_cds_data(output_path):
 
     # Format the symbol column based on the instrument type
     def format_symbol(row):
-        formated_expiry = row['expiry'].replace('-', '')  # Remove hyphens from expiry for symbol formatting
+        formated_expiry = row["expiry"].replace(
+            "-", ""
+        )  # Remove hyphens from expiry for symbol formatting
         if row["instrumenttype"] == "FUT":
             return f"{row['name']}{formated_expiry}FUT"
         else:
@@ -539,9 +543,9 @@ def process_zebu_mcx_data(output_path):
     #  df["expiry"] = df["expiry"].apply(format_expiry_date)
 
     # First convert string to datetime object using the original format '15-APR-2026'
-    df['expiry'] = pd.to_datetime(df['expiry'], format='%d-%b-%Y', errors='coerce')
+    df["expiry"] = pd.to_datetime(df["expiry"], format="%d-%b-%Y", errors="coerce")
     # Format the datetime object to the desired format '15-APR-26'
-    df['expiry'] = df['expiry'].dt.strftime('%d-%b-%y').str.upper().fillna("")
+    df["expiry"] = df["expiry"].dt.strftime("%d-%b-%y").str.upper().fillna("")
 
     # Replace the 'XX' option type with 'FUT' for futures
     df["instrumenttype"] = df.apply(
@@ -558,7 +562,9 @@ def process_zebu_mcx_data(output_path):
 
     # Format the symbol column based on the instrument type
     def format_symbol(row):
-        formated_expiry = row['expiry'].replace('-', '')  # Remove hyphens from expiry for symbol formatting
+        formated_expiry = row["expiry"].replace(
+            "-", ""
+        )  # Remove hyphens from expiry for symbol formatting
         if row["instrumenttype"] == "FUT":
             return f"{row['name']}{formated_expiry}FUT"
         else:

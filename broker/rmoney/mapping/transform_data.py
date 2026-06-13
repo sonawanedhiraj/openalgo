@@ -83,12 +83,12 @@ def map_exchange_numeric(exchange):
     - NCDEX = 21 (NCDEX Commodity)
     """
     exchange_numeric_mapping = {
-        "NSE": 1,      # NSECM
-        "NFO": 2,      # NSEFO
-        "CDS": 3,      # NSECD
-        "BSE": 11,     # BSECM
-        "BFO": 12,     # BSEFO
-        "MCX": 51,     # MCXFO
+        "NSE": 1,  # NSECM
+        "NFO": 2,  # NSEFO
+        "CDS": 3,  # NSECD
+        "BSE": 11,  # BSECM
+        "BFO": 12,  # BSEFO
+        "MCX": 51,  # MCXFO
     }
     if exchange not in exchange_numeric_mapping:
         raise ValueError(f"Unsupported exchange: {exchange}")

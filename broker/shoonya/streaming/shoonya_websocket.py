@@ -626,10 +626,7 @@ class ShoonyaWebSocket:
                     self._subscription_thread = None
                     return
 
-                while (
-                    self._pending_subscriptions
-                    and len(batch_scrips) < self.MAX_SCRIPS_PER_BATCH
-                ):
+                while self._pending_subscriptions and len(batch_scrips) < self.MAX_SCRIPS_PER_BATCH:
                     msg_type, scrip = self._pending_subscriptions[0]
                     if batch_msg_type is None:
                         batch_msg_type = msg_type
@@ -643,14 +640,10 @@ class ShoonyaWebSocket:
 
             scrip_list = "#".join(batch_scrips)
             operation_name = self._operation_name_for_msg_type(batch_msg_type)
-            success = self._send_subscription_message(
-                batch_msg_type, scrip_list, operation_name
-            )
+            success = self._send_subscription_message(batch_msg_type, scrip_list, operation_name)
 
             if success:
-                self.logger.info(
-                    f"Sent batch {operation_name} for {len(batch_scrips)} scrips"
-                )
+                self.logger.info(f"Sent batch {operation_name} for {len(batch_scrips)} scrips")
                 # Pace consecutive batches so we don't flood the server
                 with self._subscription_lock:
                     has_more = bool(self._pending_subscriptions)
@@ -667,9 +660,7 @@ class ShoonyaWebSocket:
                     if self.running and not self._shutdown_event.is_set():
                         for scrip in reversed(batch_scrips):
                             self._pending_subscriptions.appendleft((batch_msg_type, scrip))
-                self.logger.warning(
-                    f"{operation_name} batch failed; retrying after backoff"
-                )
+                self.logger.warning(f"{operation_name} batch failed; retrying after backoff")
                 if self._shutdown_event.wait(self.SUBSCRIPTION_RETRY_DELAY):
                     return
 
@@ -779,8 +770,6 @@ class ShoonyaWebSocket:
             "actid": self.actid,
             "ws_url": self.WS_URL,
             "last_message_time": self._get_last_message_time(),
-            "heartbeat_thread_alive": heartbeat_thread.is_alive()
-            if heartbeat_thread
-            else False,
+            "heartbeat_thread_alive": heartbeat_thread.is_alive() if heartbeat_thread else False,
             "ws_thread_alive": ws_thread.is_alive() if ws_thread else False,
         }

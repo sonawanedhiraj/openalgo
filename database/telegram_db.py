@@ -211,7 +211,9 @@ def init_db():
             cols = {c["name"] for c in insp.get_columns("bot_config")}
             if "telegram_chat_ids" not in cols:
                 with engine.begin() as conn:
-                    conn.execute(_sa_text("ALTER TABLE bot_config ADD COLUMN telegram_chat_ids TEXT"))
+                    conn.execute(
+                        _sa_text("ALTER TABLE bot_config ADD COLUMN telegram_chat_ids TEXT")
+                    )
                 logger.info("Telegram DB: added bot_config.telegram_chat_ids column")
         except Exception as e:
             logger.debug(f"Telegram DB: telegram_chat_ids migration skipped: {e}")

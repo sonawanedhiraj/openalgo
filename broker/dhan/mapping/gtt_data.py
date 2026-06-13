@@ -153,14 +153,10 @@ def map_gtt_book(gtt_list):
         first = legs[0]
         ex = map_exchange(first.get("exchangeSegment", "")) or ""
         br_sym = first.get("tradingSymbol", "")
-        oa_sym = (
-            get_oa_symbol(brsymbol=br_sym, exchange=ex) if br_sym and ex else br_sym
-        )
+        oa_sym = get_oa_symbol(brsymbol=br_sym, exchange=ex) if br_sym and ex else br_sym
 
         # Sort legs so STOP_LOSS_LEG (lower trigger) comes first for OCO.
-        sorted_legs = sorted(
-            legs, key=lambda l: float(l.get("triggerPrice", 0) or 0)
-        )
+        sorted_legs = sorted(legs, key=lambda l: float(l.get("triggerPrice", 0) or 0))
         trigger_prices = [float(l.get("triggerPrice", 0) or 0) for l in sorted_legs]
 
         out_legs = []
@@ -169,34 +165,38 @@ def map_gtt_book(gtt_list):
             # Dhan's GET response doesn't expose LIMIT/MARKET — infer from price.
             # MARKET GTTs are stored with price=0; LIMIT GTTs carry the limit.
             inferred_pricetype = "MARKET" if leg_price == 0 else "LIMIT"
-            out_legs.append({
-                "action": (leg.get("transactionType", "") or "").upper(),
-                "quantity": leg.get("quantity", 0),
-                "price": leg.get("price", 0),
-                "pricetype": inferred_pricetype,
-                "product": reverse_map_product_type(leg.get("productType", "")) or "CNC",
-                # Dhan-internal legName needed by modify (STOP_LOSS_LEG / TARGET_LEG / ENTRY_LEG).
-                "leg_name": leg.get("legName", "") or "",
-            })
+            out_legs.append(
+                {
+                    "action": (leg.get("transactionType", "") or "").upper(),
+                    "quantity": leg.get("quantity", 0),
+                    "price": leg.get("price", 0),
+                    "pricetype": inferred_pricetype,
+                    "product": reverse_map_product_type(leg.get("productType", "")) or "CNC",
+                    # Dhan-internal legName needed by modify (STOP_LOSS_LEG / TARGET_LEG / ENTRY_LEG).
+                    "leg_name": leg.get("legName", "") or "",
+                }
+            )
 
         # Dhan reuses the ``orderType`` field in the GET response for the SINGLE/OCO flag.
         flag = (first.get("orderType") or "").upper()
         trigger_type_oa = "two-leg" if flag == "OCO" else "single"
         status_raw = (first.get("orderStatus") or "").upper()
 
-        result.append({
-            "trigger_id": oid,
-            "trigger_type": trigger_type_oa,
-            "status": _STATUS_MAP.get(status_raw, status_raw.lower()),
-            "symbol": oa_sym or br_sym,
-            "exchange": ex,
-            "trigger_prices": trigger_prices,
-            "last_price": 0,  # Dhan does not return LTP in this response
-            "legs": out_legs,
-            "created_at": first.get("createTime", "") or "",
-            "updated_at": first.get("updateTime", "") or "",
-            # Dhan Forever Orders have no explicit expiry — leave blank.
-            "expires_at": "",
-        })
+        result.append(
+            {
+                "trigger_id": oid,
+                "trigger_type": trigger_type_oa,
+                "status": _STATUS_MAP.get(status_raw, status_raw.lower()),
+                "symbol": oa_sym or br_sym,
+                "exchange": ex,
+                "trigger_prices": trigger_prices,
+                "last_price": 0,  # Dhan does not return LTP in this response
+                "legs": out_legs,
+                "created_at": first.get("createTime", "") or "",
+                "updated_at": first.get("updateTime", "") or "",
+                # Dhan Forever Orders have no explicit expiry — leave blank.
+                "expires_at": "",
+            }
+        )
 
     return result

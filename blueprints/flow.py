@@ -566,6 +566,7 @@ def _execute_webhook(token, webhook_data=None, url_secret=None):
     # The column is encrypted at rest; use the helper that decrypts it
     # (and falls back to plaintext for pre-migration rows).
     from database.flow_db import get_workflow_api_key
+
     api_key = get_workflow_api_key(workflow)  # Use API key stored when workflow was activated
     if not api_key:
         api_key = get_current_api_key()  # Fallback to session (if called from UI)

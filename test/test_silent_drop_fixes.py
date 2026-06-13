@@ -71,8 +71,13 @@ def test_options_leg_split_partial_fill_reports_partial(monkeypatch):
     }
 
     result = oms.resolve_and_place_leg(
-        leg, common, api_key="k", leg_index=0, total_legs=1,
-        auth_token="t", broker="zerodha",
+        leg,
+        common,
+        api_key="k",
+        leg_index=0,
+        total_legs=1,
+        auth_token="t",
+        broker="zerodha",
     )
 
     assert result["status"] == "partial"
@@ -90,8 +95,17 @@ def test_options_spread_partial_legs_reports_partial(monkeypatch):
 
     leg_calls = {"n": 0}
 
-    def _fake_leg(leg, common_data, api_key, orig_idx, total_legs,
-                  auth_token, broker, underlying_ltp, leg_quote_cache=None):
+    def _fake_leg(
+        leg,
+        common_data,
+        api_key,
+        orig_idx,
+        total_legs,
+        auth_token,
+        broker,
+        underlying_ltp,
+        leg_quote_cache=None,
+    ):
         leg_calls["n"] += 1
         status = "success" if leg_calls["n"] == 1 else "error"
         return {"leg": orig_idx + 1, "symbol": f"SYM{orig_idx}", "status": status}
@@ -111,7 +125,11 @@ def test_options_spread_partial_legs_reports_partial(monkeypatch):
     }
 
     success, response, status = oms.process_multiorder_with_auth(
-        data, auth_token="t", broker="zerodha", api_key="k", original_data=data,
+        data,
+        auth_token="t",
+        broker="zerodha",
+        api_key="k",
+        original_data=data,
     )
 
     assert response["status"] == "partial"
@@ -129,13 +147,18 @@ def test_options_spread_all_legs_rejected_reports_error(monkeypatch):
         oms,
         "resolve_and_place_leg",
         lambda leg, common_data, api_key, orig_idx, *a, **k: {
-            "leg": orig_idx + 1, "status": "error", "message": "rejected"
+            "leg": orig_idx + 1,
+            "status": "error",
+            "message": "rejected",
         },
     )
 
     data = {
-        "underlying": "NIFTY", "exchange": "NFO", "expiry_date": "2026-03-28",
-        "strike_int": 50, "strategy": "ut",
+        "underlying": "NIFTY",
+        "exchange": "NFO",
+        "expiry_date": "2026-03-28",
+        "strike_int": 50,
+        "strategy": "ut",
         "legs": [
             {"action": "BUY", "option_type": "CE", "offset": 0, "quantity": 50},
             {"action": "SELL", "option_type": "PE", "offset": 0, "quantity": 50},
@@ -143,7 +166,11 @@ def test_options_spread_all_legs_rejected_reports_error(monkeypatch):
     }
 
     success, response, status = oms.process_multiorder_with_auth(
-        data, auth_token="t", broker="zerodha", api_key="k", original_data=data,
+        data,
+        auth_token="t",
+        broker="zerodha",
+        api_key="k",
+        original_data=data,
     )
 
     assert response["status"] == "error"
@@ -164,10 +191,20 @@ def test_sandbox_fill_not_banked_complete_when_position_update_raises(monkeypatc
     committed_states = []
 
     order = SimpleNamespace(
-        orderid="O1", user_id="u", symbol="INFY", exchange="NSE",
-        action="BUY", quantity=1, product="MIS", strategy="ut",
-        order_status="open", average_price=None, filled_quantity=0,
-        pending_quantity=1, update_timestamp=None, rejection_reason=None,
+        orderid="O1",
+        user_id="u",
+        symbol="INFY",
+        exchange="NSE",
+        action="BUY",
+        quantity=1,
+        product="MIS",
+        strategy="ut",
+        order_status="open",
+        average_price=None,
+        filled_quantity=0,
+        pending_quantity=1,
+        update_timestamp=None,
+        rejection_reason=None,
         margin_blocked=0,
     )
 

@@ -17,9 +17,11 @@ from utils.logging import get_logger
 def _is_eventlet_patched():
     try:
         import eventlet.patcher
+
         return eventlet.patcher.is_monkey_patched("socket")
     except (ImportError, AttributeError):
         return False
+
 
 USE_ASYNC = not _is_eventlet_patched()
 
@@ -732,9 +734,7 @@ class BrokerData:
 
                     # Check if we have valid data
                     if chunk_df.empty:
-                        logger.debug(
-                            f"No valid data after parsing CSV for {timeframe} timeframe"
-                        )
+                        logger.debug(f"No valid data after parsing CSV for {timeframe} timeframe")
                         logger.debug("This might be due to incorrect date parsing")
                         current_start = current_end + timedelta(days=1)
                         continue

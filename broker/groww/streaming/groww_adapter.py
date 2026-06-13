@@ -403,7 +403,9 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
         groww_exchange, segment = GrowwExchangeMapper.get_exchange_segment(exchange)
 
         if exchange in ["NFO", "BFO"]:
-            self.logger.debug(f"F&O Subscription: {symbol}, exchange={exchange}->{groww_exchange}, segment={segment}, token={token}")
+            self.logger.debug(
+                f"F&O Subscription: {symbol}, exchange={exchange}->{groww_exchange}, segment={segment}, token={token}"
+            )
 
         # Generate unique correlation ID
         correlation_id = f"{symbol}_{exchange}_{mode}"
@@ -514,9 +516,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self._process_batch_subscriptions()
 
             mode_name = {1: "LTP", 2: "Quote", 3: "Depth"}.get(mode, str(mode))
-            self.logger.info(
-                f"Queued subscription for {symbol}.{exchange} in {mode_name} mode"
-            )
+            self.logger.info(f"Queued subscription for {symbol}.{exchange} in {mode_name} mode")
 
         mode_name = {1: "LTP", 2: "Quote", 3: "Depth"}.get(mode, str(mode))
         return self._create_success_response(
@@ -589,13 +589,9 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
         if shadow_sub_key is not None and self.connected and self.ws_client:
             try:
                 self.ws_client.unsubscribe(shadow_sub_key)
-                self.logger.debug(
-                    f"Unsubscribed shadow LTP for {symbol}.{exchange}"
-                )
+                self.logger.debug(f"Unsubscribed shadow LTP for {symbol}.{exchange}")
             except Exception as e:
-                self.logger.error(
-                    f"Error unsubscribing shadow LTP for {symbol}.{exchange}: {e}"
-                )
+                self.logger.error(f"Error unsubscribing shadow LTP for {symbol}.{exchange}: {e}")
 
         # Clear the cache entry — only if no other sub still uses this token.
         if sub_info_for_cache:
@@ -706,9 +702,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.subscription_keys[item["correlation_id"]] = sub_key
 
                     if item["exchange"] in ["NFO", "BFO"]:
-                        self.logger.debug(
-                            f"F&O subscription key created: {sub_key}"
-                        )
+                        self.logger.debug(f"F&O subscription key created: {sub_key}")
             except Exception as e:
                 self.logger.error(f"Batch subscription failed: {e}", exc_info=True)
 
@@ -748,9 +742,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
             return
 
         try:
-            self.logger.info(
-                f"📦 Reconnect: batch resubscribing {len(batch_specs)} symbols"
-            )
+            self.logger.info(f"📦 Reconnect: batch resubscribing {len(batch_specs)} symbols")
             with self.batch_lock:
                 sub_keys = self.ws_client.subscribe_batch(batch_specs)
                 for cid, sub_key in zip(correlation_ids, sub_keys):

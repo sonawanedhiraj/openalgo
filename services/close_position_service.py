@@ -33,11 +33,15 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = API_TYPE
 
-    bus.publish(AnalyzerErrorEvent(
-        mode="analyze", api_type=API_TYPE,
-        request_data=analyzer_request, response_data=error_response,
-        error_message=error_message,
-    ))
+    bus.publish(
+        AnalyzerErrorEvent(
+            mode="analyze",
+            api_type=API_TYPE,
+            request_data=analyzer_request,
+            response_data=error_response,
+            error_message=error_message,
+        )
+    )
 
     return error_response
 
@@ -134,16 +138,19 @@ def close_position_with_auth(
         success, response, status_code = sandbox_close_position(close_data, api_key, original_data)
 
         position_request_data["api_type"] = API_TYPE
-        bus.publish(PositionClosedEvent(
-            mode="analyze", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""),
-            exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            message=response.get("message", ""),
-            request_data=position_request_data,
-            response_data=response,
-            api_key=api_key,
-        ))
+        bus.publish(
+            PositionClosedEvent(
+                mode="analyze",
+                api_type=API_TYPE,
+                symbol=position_data.get("symbol", ""),
+                exchange=position_data.get("exchange", ""),
+                product=position_data.get("product_type", "") or position_data.get("product", ""),
+                message=response.get("message", ""),
+                request_data=position_request_data,
+                response_data=response,
+                api_key=api_key,
+            )
+        )
 
         return success, response, status_code
 
@@ -151,14 +158,20 @@ def close_position_with_auth(
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
-        bus.publish(PositionClosedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            orderid="", message="Broker-specific module not found",
-            request_data=position_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            PositionClosedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=position_data.get("symbol", ""),
+                exchange=position_data.get("exchange", ""),
+                product=position_data.get("product_type", "") or position_data.get("product", ""),
+                orderid="",
+                message="Broker-specific module not found",
+                request_data=position_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, 404
 
     try:
@@ -171,26 +184,38 @@ def close_position_with_auth(
             "status": "error",
             "message": "Failed to close positions due to internal error",
         }
-        bus.publish(PositionClosedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            orderid="", message="Failed to close positions due to internal error",
-            request_data=position_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            PositionClosedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=position_data.get("symbol", ""),
+                exchange=position_data.get("exchange", ""),
+                product=position_data.get("product_type", "") or position_data.get("product", ""),
+                orderid="",
+                message="Failed to close positions due to internal error",
+                request_data=position_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, 500
 
     if status_code == 200:
         response_data = {"status": "success", "message": "All Open Positions Squared Off"}
-        bus.publish(PositionClosedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            orderid="", message="All Open Positions Squared Off",
-            request_data=position_request_data, response_data=response_data,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            PositionClosedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=position_data.get("symbol", ""),
+                exchange=position_data.get("exchange", ""),
+                product=position_data.get("product_type", "") or position_data.get("product", ""),
+                orderid="",
+                message="All Open Positions Squared Off",
+                request_data=position_request_data,
+                response_data=response_data,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return True, response_data, 200
     else:
         message = (
@@ -199,14 +224,20 @@ def close_position_with_auth(
             else "Failed to close positions"
         )
         error_response = {"status": "error", "message": message}
-        bus.publish(PositionClosedEvent(
-            mode="live", api_type=API_TYPE,
-            symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-            product=position_data.get("product_type", "") or position_data.get("product", ""),
-            orderid="", message=message,
-            request_data=position_request_data, response_data=error_response,
-            api_key=original_data.get("apikey", ""),
-        ))
+        bus.publish(
+            PositionClosedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                symbol=position_data.get("symbol", ""),
+                exchange=position_data.get("exchange", ""),
+                product=position_data.get("product_type", "") or position_data.get("product", ""),
+                orderid="",
+                message=message,
+                request_data=position_request_data,
+                response_data=error_response,
+                api_key=original_data.get("apikey", ""),
+            )
+        )
         return False, error_response, status_code
 
 
@@ -259,14 +290,21 @@ def close_position(
                     position_request_data = copy.deepcopy(original_data)
                     if "apikey" in position_request_data:
                         position_request_data.pop("apikey", None)
-                    bus.publish(PositionClosedEvent(
-                        mode="live", api_type=API_TYPE,
-                        symbol=position_data.get("symbol", ""), exchange=position_data.get("exchange", ""),
-                        product=position_data.get("product_type", "") or position_data.get("product", ""),
-                        orderid="", message=error_response["message"],
-                        request_data=position_request_data, response_data=error_response,
-                        api_key=api_key,
-                    ))
+                    bus.publish(
+                        PositionClosedEvent(
+                            mode="live",
+                            api_type=API_TYPE,
+                            symbol=position_data.get("symbol", ""),
+                            exchange=position_data.get("exchange", ""),
+                            product=position_data.get("product_type", "")
+                            or position_data.get("product", ""),
+                            orderid="",
+                            message=error_response["message"],
+                            request_data=position_request_data,
+                            response_data=error_response,
+                            api_key=api_key,
+                        )
+                    )
                     return False, error_response, 403
 
         # Add API key to position data

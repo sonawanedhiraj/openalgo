@@ -718,9 +718,7 @@ def get_pnl_data():
                             )
 
                     except Exception as e:
-                        logger.exception(
-                            f"Error processing carry-forward position {symbol}: {e}"
-                        )
+                        logger.exception(f"Error processing carry-forward position {symbol}: {e}")
                         continue
 
                 # Case 2: Closed carry-forward position (exit-only trades today, no entry trade)
@@ -741,9 +739,7 @@ def get_pnl_data():
                     else:
                         continue
 
-                    total_exit_qty = sum(
-                        float(t.get("quantity", 0)) for t in trades_for_symbol
-                    )
+                    total_exit_qty = sum(float(t.get("quantity", 0)) for t in trades_for_symbol)
                     if total_exit_qty == 0:
                         continue
 
@@ -798,41 +794,29 @@ def get_pnl_data():
                                         before_close = df_hist.index <= close_time
                                         after_close = df_hist.index > close_time
                                     else:
-                                        before_close = pd.Series(
-                                            True, index=df_hist.index
-                                        )
-                                        after_close = pd.Series(
-                                            False, index=df_hist.index
-                                        )
+                                        before_close = pd.Series(True, index=df_hist.index)
+                                        after_close = pd.Series(False, index=df_hist.index)
 
                                     if was_long:
                                         df_hist.loc[before_close, pnl_col] = (
-                                            df_hist.loc[
-                                                before_close, f"{symbol}_price"
-                                            ]
+                                            df_hist.loc[before_close, f"{symbol}_price"]
                                             - entry_price
                                         ) * total_exit_qty
                                     else:
                                         df_hist.loc[before_close, pnl_col] = (
                                             entry_price
-                                            - df_hist.loc[
-                                                before_close, f"{symbol}_price"
-                                            ]
+                                            - df_hist.loc[before_close, f"{symbol}_price"]
                                         ) * total_exit_qty
 
                                     if after_close.any():
-                                        df_hist.loc[after_close, pnl_col] = (
-                                            position_pnl_value
-                                        )
+                                        df_hist.loc[after_close, pnl_col] = position_pnl_value
 
                                     # Remove incorrect trade-based column if present
                                     if (
                                         portfolio_pnl is not None
                                         and pnl_col in portfolio_pnl.columns
                                     ):
-                                        portfolio_pnl.drop(
-                                            columns=[pnl_col], inplace=True
-                                        )
+                                        portfolio_pnl.drop(columns=[pnl_col], inplace=True)
                                         if len(portfolio_pnl.columns) == 0:
                                             portfolio_pnl = None
 

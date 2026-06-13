@@ -1023,9 +1023,7 @@ def setup_environment(app):
                         len(_wd_result.get("skipped") or []),
                     )
                 elif _wd_result.get("disabled"):
-                    logger.info(
-                        "EOD watchdog disabled via " "SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED"
-                    )
+                    logger.info("EOD watchdog disabled via SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED")
                 else:
                     logger.warning("EOD watchdog did not start (already running or empty)")
             except Exception:
@@ -1452,7 +1450,7 @@ if __name__ == "__main__":
 
         def _ml(t=""):
             p = max(_W - 4 - _vl(t), 0)
-            return f"{C}{V}{R} {t}{' '*p} {C}{V}{R}"
+            return f"{C}{V}{R} {t}{' ' * p} {C}{V}{R}"
 
         _slp = max((_W - 4 - _vl(_sl)) // 2, 0)
         _srp = max(_W - 4 - _vl(_sl) - _slp, 0)
@@ -1461,9 +1459,9 @@ if __name__ == "__main__":
             "\n".join(
                 [
                     "",
-                    f"{C}{TL}{H*3}{G}{BD}{_t}{R}{C}{H*_td}{TR}{R}",
+                    f"{C}{TL}{H * 3}{G}{BD}{_t}{R}{C}{H * _td}{TR}{R}",
                     _ml(),
-                    f"{C}{V}{R} {' '*_slp}{DM}{_sl}{R}{' '*_srp} {C}{V}{R}",
+                    f"{C}{V}{R} {' ' * _slp}{DM}{_sl}{R}{' ' * _srp} {C}{V}{R}",
                     _ml(),
                     _ml(f"{W}{BD}Endpoints{R}"),
                     _ml(f"{W}Web App{R}    {C}{_wu}{R}"),
@@ -1472,7 +1470,7 @@ if __name__ == "__main__":
                     _ml(),
                     _ml(f"{W}Status{R}     {G}{BD}Ready{R}"),
                     _ml(),
-                    f"{C}{BL}{H*(_W-2)}{BR}{R}",
+                    f"{C}{BL}{H * (_W - 2)}{BR}{R}",
                     "",
                 ]
             ),

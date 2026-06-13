@@ -173,9 +173,7 @@ class SensitiveDataFilter(logging.Filter):
                     str_arg = str(arg)
                     filtered = str_arg
                     for pattern, replacement in SENSITIVE_PATTERNS:
-                        filtered = re.sub(
-                            pattern, replacement, filtered, flags=re.IGNORECASE
-                        )
+                        filtered = re.sub(pattern, replacement, filtered, flags=re.IGNORECASE)
                     # Only replace with the string version if redaction changed it
                     filtered_args.append(filtered if filtered != str_arg else arg)
                 record.args = tuple(filtered_args)
@@ -318,6 +316,7 @@ class JSONErrorFormatter(logging.Formatter):
         # Capture Flask request context if available
         try:
             from flask import has_request_context, request
+
             if has_request_context():
                 entry["request"] = {
                     "method": request.method,
@@ -410,9 +409,7 @@ def setup_logging():
         if errors_file.exists() and errors_file.stat().st_size > 0:
             lines = errors_file.read_text(encoding="utf-8").splitlines()
             if len(lines) > 1000:
-                errors_file.write_text(
-                    "\n".join(lines[-1000:]) + "\n", encoding="utf-8"
-                )
+                errors_file.write_text("\n".join(lines[-1000:]) + "\n", encoding="utf-8")
     except Exception:
         pass
     json_handler = logging.FileHandler(

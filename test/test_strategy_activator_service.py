@@ -183,9 +183,7 @@ def test_past_eod_does_not_block_overnight_strategy(overnight_strategy):
     assert reason == "no profile"
 
 
-def test_missing_regime_when_profile_present_fails_closed(
-    bullish_only_strategy, monkeypatch
-):
+def test_missing_regime_when_profile_present_fails_closed(bullish_only_strategy, monkeypatch):
     """If the classifier returns ``None`` (compute failed) we fail
     closed — a profiled strategy must not be entered against an
     unknown regime."""

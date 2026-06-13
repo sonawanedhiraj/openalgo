@@ -76,6 +76,7 @@ def test_fire_invokes_all_callbacks_each_in_its_own_thread():
         def _cb(user_id, broker):
             seen.append((name, threading.current_thread().name, f"{user_id}/{broker}"))
             done.wait(timeout=5)
+
         return _cb
 
     cbreg.register_connect_callback("scanner", make_cb("scanner"))
@@ -165,13 +166,16 @@ class _FakeClient:
             sym = s["symbol"]
             if sym in self.fail_symbols:
                 per_symbol.append(
-                    {"symbol": sym, "exchange": s["exchange"], "status": "error",
-                     "message": "Token not found"}
+                    {
+                        "symbol": sym,
+                        "exchange": s["exchange"],
+                        "status": "error",
+                        "message": "Token not found",
+                    }
                 )
             else:
                 per_symbol.append(
-                    {"symbol": sym, "exchange": s["exchange"], "status": "success",
-                     "mode": mode}
+                    {"symbol": sym, "exchange": s["exchange"], "status": "success", "mode": mode}
                 )
         return {
             "status": self.overall_status,

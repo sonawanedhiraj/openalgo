@@ -983,9 +983,7 @@ def simplified_stock_engine_webhook(webhook_id):
             return jsonify({"status": "error", "error": "Invalid webhook ID"}), 404
 
         if not strategy.is_active:
-            logger.info(
-                "Strategy %s is inactive, ignoring simplified engine webhook", strategy.id
-            )
+            logger.info("Strategy %s is inactive, ignoring simplified engine webhook", strategy.id)
             scan_cycle_service.heartbeat(
                 cycle_id, "preflight", "skipped", f"strategy {strategy.id} inactive"
             )
@@ -994,10 +992,10 @@ def simplified_stock_engine_webhook(webhook_id):
 
         data = request.get_json()
         if not data:
-            logger.error("No data received in simplified engine webhook for strategy %s", strategy.id)
-            scan_cycle_service.heartbeat(
-                cycle_id, "preflight", "error", "empty payload"
+            logger.error(
+                "No data received in simplified engine webhook for strategy %s", strategy.id
             )
+            scan_cycle_service.heartbeat(cycle_id, "preflight", "error", "empty payload")
             scan_cycle_service.complete_cycle(
                 cycle_id,
                 post_status="error",
@@ -1012,9 +1010,7 @@ def simplified_stock_engine_webhook(webhook_id):
             squareoff_time = datetime.strptime(strategy.squareoff_time, "%H:%M").time()
 
             if current_time < start_time:
-                scan_cycle_service.heartbeat(
-                    cycle_id, "preflight", "skipped", "before start_time"
-                )
+                scan_cycle_service.heartbeat(cycle_id, "preflight", "skipped", "before start_time")
                 scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
                 return jsonify(
                     {"status": "error", "error": "Cannot arm engine before start time"}
@@ -1028,9 +1024,7 @@ def simplified_stock_engine_webhook(webhook_id):
                     {"status": "error", "error": "Cannot arm engine after square off time"}
                 ), 400
             if current_time >= end_time:
-                scan_cycle_service.heartbeat(
-                    cycle_id, "preflight", "skipped", "after end_time"
-                )
+                scan_cycle_service.heartbeat(cycle_id, "preflight", "skipped", "after end_time")
                 scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
                 return jsonify(
                     {"status": "error", "error": "Cannot arm new entries after end time"}
@@ -1060,9 +1054,7 @@ def simplified_stock_engine_webhook(webhook_id):
         except Exception as e:
             logger.warning("%s parse failed (non-fatal): %s", scan_stage, e)
             syms = []
-        scan_cycle_service.heartbeat(
-            cycle_id, scan_stage, "ok", f"{len(syms)} syms"
-        )
+        scan_cycle_service.heartbeat(cycle_id, scan_stage, "ok", f"{len(syms)} syms")
 
         # Capture today's effective mode for the audit. Best-effort — if the
         # resolver throws (e.g. DailyIntent table missing on an old install),

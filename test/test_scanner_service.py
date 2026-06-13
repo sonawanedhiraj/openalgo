@@ -94,9 +94,7 @@ def fresh_scanner_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(sdb, "engine", test_engine)
     monkeypatch.setattr(sdb, "db_session", test_session)
@@ -147,8 +145,11 @@ def _seed_history(
     close has enough history for the 21-bar minimum the example rules need.
     """
     bars = _make_bars(closes, volumes)
-    bars.insert(0, "ts", [dt.datetime(2026, 5, 30, 9, 15) + dt.timedelta(minutes=5 * i)
-                          for i in range(len(bars))])
+    bars.insert(
+        0,
+        "ts",
+        [dt.datetime(2026, 5, 30, 9, 15) + dt.timedelta(minutes=5 * i) for i in range(len(bars))],
+    )
     svc._bar_history[(symbol, interval)] = bars
 
 
@@ -160,14 +161,18 @@ def _seed_history(
 def test_parse_topic_extracts_exchange_symbol_mode():
     assert scanner_service._parse_topic("NSE_RELIANCE_QUOTE") == ("NSE", "RELIANCE", "QUOTE")
     assert scanner_service._parse_topic("NFO_BANKNIFTY24APR24FUT_LTP") == (
-        "NFO", "BANKNIFTY24APR24FUT", "LTP",
+        "NFO",
+        "BANKNIFTY24APR24FUT",
+        "LTP",
     )
 
 
 def test_parse_topic_handles_multi_segment_index_exchange():
     assert scanner_service._parse_topic("NSE_INDEX_NIFTY_LTP") == ("NSE_INDEX", "NIFTY", "LTP")
     assert scanner_service._parse_topic("BSE_INDEX_SENSEX_QUOTE") == (
-        "BSE_INDEX", "SENSEX", "QUOTE",
+        "BSE_INDEX",
+        "SENSEX",
+        "QUOTE",
     )
 
 
@@ -181,11 +186,13 @@ def test_parse_topic_skips_cache_and_account_events():
 
 
 def test_normalize_tick_extracts_price_volume_and_ms_timestamp():
-    out = scanner_service._normalize_tick({
-        "ltp": "2451.25",
-        "volume": "1500000",
-        "timestamp": 1748580900000,  # epoch ms — well above 10^10
-    })
+    out = scanner_service._normalize_tick(
+        {
+            "ltp": "2451.25",
+            "volume": "1500000",
+            "timestamp": 1748580900000,  # epoch ms — well above 10^10
+        }
+    )
     assert out is not None
     assert out["price"] == 2451.25
     assert out["cumulative_volume"] == 1500000
@@ -277,7 +284,9 @@ def test_on_bar_close_skips_when_rule_does_not_fire(fresh_scanner_db):
     # Same volume as the trailing baseline ⇒ no surge ⇒ no fire.
     non_matching_bar = {
         "ts": dt.datetime(2026, 5, 30, 11, 0),
-        "open": 110.0, "high": 111.5, "low": 109.5,
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
         "close": 150.0,
         "volume": 1000,
         "elapsed_pct": 1.0,
@@ -316,8 +325,11 @@ def test_on_bar_close_evaluates_all_enabled_definitions(fresh_scanner_db):
 
     surge_above_ema = {
         "ts": dt.datetime(2026, 5, 30, 11, 0),
-        "open": 110.0, "high": 111.5, "low": 109.5,
-        "close": 150.0, "volume": 5000,
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 5000,
         "elapsed_pct": 1.0,
     }
     svc._on_bar_close("RELIANCE", "5m", surge_above_ema)
@@ -352,8 +364,12 @@ def test_on_bar_close_skips_disabled_definitions(fresh_scanner_db):
     _seed_history(svc, "RELIANCE", "5m", closes, volumes)
     surge = {
         "ts": dt.datetime(2026, 5, 30, 11, 0),
-        "open": 110.0, "high": 111.5, "low": 109.5,
-        "close": 150.0, "volume": 5000, "elapsed_pct": 1.0,
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 5000,
+        "elapsed_pct": 1.0,
     }
     svc._on_bar_close("RELIANCE", "5m", surge)
 
@@ -377,10 +393,19 @@ def test_on_bar_close_skips_definition_with_unregistered_rule(fresh_scanner_db):
     closes = [100.0 + i * 0.5 for i in range(20)]
     volumes = [1000.0] * 20
     _seed_history(svc, "RELIANCE", "5m", closes, volumes)
-    svc._on_bar_close("RELIANCE", "5m", {
-        "ts": dt.datetime.now(), "open": 1, "high": 1, "low": 1,
-        "close": 1, "volume": 1, "elapsed_pct": 1.0,
-    })
+    svc._on_bar_close(
+        "RELIANCE",
+        "5m",
+        {
+            "ts": dt.datetime.now(),
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "volume": 1,
+            "elapsed_pct": 1.0,
+        },
+    )
 
     # No crash, no row, no event.
     assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
@@ -416,8 +441,14 @@ def test_indicators_dict_populated_with_expected_keys():
     result = svc._build_indicators("RELIANCE", bars)
     # Backward-compat indicator keys plus the four Task-4 multi-timeframe keys.
     assert set(result.keys()) == {
-        "ema_20", "atr_14", "rsi_14", "volume_avg_20",
-        "bars_5m", "bars_15m", "bars_daily", "bars_weekly",
+        "ema_20",
+        "atr_14",
+        "rsi_14",
+        "volume_avg_20",
+        "bars_5m",
+        "bars_15m",
+        "bars_daily",
+        "bars_weekly",
     }
     # The four legacy series remain Series of the same length as bars.
     for name in ("ema_20", "atr_14", "rsi_14", "volume_avg_20"):
@@ -472,11 +503,13 @@ def test_15m_bars_built_from_tick_stream():
     for i in range(7):  # 09:15 .. 09:45 in 5-min steps
         ts = base + dt.timedelta(minutes=5 * i)
         cum_vol += 100
-        payload = json.dumps({
-            "ltp": 100.0 + i,
-            "volume": cum_vol,
-            "timestamp": int(ts.timestamp()),
-        })
+        payload = json.dumps(
+            {
+                "ltp": 100.0 + i,
+                "volume": cum_vol,
+                "timestamp": int(ts.timestamp()),
+            }
+        )
         svc._ingest_message("NSE_RELIANCE_QUOTE", payload)
 
     bars = _make_bars(closes=[100.0] * 5, volumes=[1000.0] * 5)
@@ -523,15 +556,21 @@ def test_existing_rule_still_evaluates_against_new_indicators_dict():
 
 def test_history_rolls_off_old_bars():
     """Bar history must cap at ``history_size`` to keep the window small."""
-    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus(),
-                                          history_size=5)
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus(), history_size=5)
     base_ts = dt.datetime(2026, 5, 30, 9, 15)
     for i in range(10):
-        svc._append_bar("RELIANCE", "5m", {
-            "ts": base_ts + dt.timedelta(minutes=5 * i),
-            "open": float(i), "high": float(i + 1), "low": float(i - 1),
-            "close": float(i), "volume": 100 + i,
-        })
+        svc._append_bar(
+            "RELIANCE",
+            "5m",
+            {
+                "ts": base_ts + dt.timedelta(minutes=5 * i),
+                "open": float(i),
+                "high": float(i + 1),
+                "low": float(i - 1),
+                "close": float(i),
+                "volume": 100 + i,
+            },
+        )
     frame = svc._bar_history[("RELIANCE", "5m")]
     assert len(frame) == 5
     assert list(frame["close"]) == [5.0, 6.0, 7.0, 8.0, 9.0]

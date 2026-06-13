@@ -38,9 +38,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -78,26 +76,23 @@ def test_place_order_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr(
-        "services.mode_service._today_ist_str", lambda: "2026-05-28"
-    )
+    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
     broker_place_order = MagicMock(
         return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-LIVE-1")
     )
     fake_broker_module = SimpleNamespace(place_order_api=broker_place_order)
-    monkeypatch.setattr(
-        place_order_service, "import_broker_module", lambda _b: fake_broker_module
-    )
+    monkeypatch.setattr(place_order_service, "import_broker_module", lambda _b: fake_broker_module)
 
     sandbox_called = MagicMock()
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_order", sandbox_called
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_called)
 
     payload = _order_payload()
     success, response, status = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 
@@ -120,26 +115,26 @@ def test_place_order_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monk
 
     set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr(
-        "services.mode_service._today_ist_str", lambda: "2026-05-28"
-    )
+    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
     sandbox_mock = MagicMock(
         return_value=(True, {"status": "success", "orderid": "SBX-1", "mode": "analyze"}, 200)
     )
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_order", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
 
     broker_called = MagicMock()
     monkeypatch.setattr(
-        place_order_service, "import_broker_module",
+        place_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_called),
     )
 
     payload = _order_payload()
     success, response, status = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 
@@ -156,9 +151,7 @@ def test_place_order_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monk
 # ---------------------------------------------------------------------------
 
 
-def test_place_order_routes_to_sandbox_when_live_but_analyze_on(
-    fresh_intent_db, monkeypatch
-):
+def test_place_order_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
     """THE BUG: daily_intent='live' + analyze_mode=True must conservative-down
     to sandbox, not silently fire on the live broker.
     """
@@ -167,26 +160,26 @@ def test_place_order_routes_to_sandbox_when_live_but_analyze_on(
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: True)
-    monkeypatch.setattr(
-        "services.mode_service._today_ist_str", lambda: "2026-05-28"
-    )
+    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
     sandbox_mock = MagicMock(
         return_value=(True, {"status": "success", "orderid": "SBX-BUG", "mode": "analyze"}, 200)
     )
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_order", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
 
     broker_called = MagicMock()
     monkeypatch.setattr(
-        place_order_service, "import_broker_module",
+        place_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_called),
     )
 
     payload = _order_payload()
     success, response, status = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 
@@ -207,23 +200,23 @@ def test_place_order_rejects_when_skip(fresh_intent_db, monkeypatch):
 
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr(
-        "services.mode_service._today_ist_str", lambda: "2026-05-28"
-    )
+    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
     sandbox_mock = MagicMock()
     broker_mock = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_order", sandbox_mock
-    )
-    monkeypatch.setattr(
-        place_order_service, "import_broker_module",
+        place_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_mock),
     )
 
     payload = _order_payload()
     success, response, status = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 
@@ -247,23 +240,23 @@ def test_place_order_rejects_when_disabled(fresh_intent_db, monkeypatch):
 
     # NO set_daily_intent call — table is empty.
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr(
-        "services.mode_service._today_ist_str", lambda: "2026-05-28"
-    )
+    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
     sandbox_mock = MagicMock()
     broker_mock = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_order", sandbox_mock
-    )
-    monkeypatch.setattr(
-        place_order_service, "import_broker_module",
+        place_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_mock),
     )
 
     payload = _order_payload()
     success, response, status = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 
@@ -289,25 +282,25 @@ def test_place_order_reject_response_shape_matches_existing_convention(
     from services import place_order_service
     from services.mode_service import set_daily_intent
 
-    monkeypatch.setattr(
-        "services.mode_service._today_ist_str", lambda: "2026-05-28"
-    )
+    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
 
     # ---- shape for SKIP rejection ----
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     sandbox_mock = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_order", sandbox_mock
-    )
-    monkeypatch.setattr(
-        place_order_service, "import_broker_module",
+        place_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
 
     payload = _order_payload()
     reject_result = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 
@@ -318,11 +311,15 @@ def test_place_order_reject_response_shape_matches_existing_convention(
         return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-OK")
     )
     monkeypatch.setattr(
-        place_order_service, "import_broker_module",
+        place_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place_order),
     )
     success_result = place_order_service.place_order_with_auth(
-        payload, auth_token="dummy-token", broker="zerodha", original_data=payload,
+        payload,
+        auth_token="dummy-token",
+        broker="zerodha",
+        original_data=payload,
         emit_event=False,
     )
 

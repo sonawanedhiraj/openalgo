@@ -923,7 +923,10 @@ class HSWrapper:
                         d = self.getNewTopicData(topic_name)
                         if d:
                             # Evict oldest entries if topic_list exceeds cap
-                            if len(self.topic_list) >= self._max_topics and f not in self.topic_list:
+                            if (
+                                len(self.topic_list) >= self._max_topics
+                                and f not in self.topic_list
+                            ):
                                 oldest_key = next(iter(self.topic_list))
                                 del self.topic_list[oldest_key]
                             self.topic_list[f] = d
@@ -1101,7 +1104,9 @@ class HSWrapper:
 
 
 class StartServer:
-    def __init__(self, a, token, sid, onopen, onmessage, onerror, onclose, owner=None, send_lock=None):
+    def __init__(
+        self, a, token, sid, onopen, onmessage, onerror, onclose, owner=None, send_lock=None
+    ):
         self.userSocket = self
         self.a = a
         self.onopen = onopen
@@ -1219,7 +1224,17 @@ class HSWebSocket:
         self.onmessage = on_message
         self.on_error = on_error
         self.onclose = on_close
-        StartServer(self.url, token, sid, self.onopen, self.onmessage, self.on_error, self.onclose, owner=self, send_lock=self._send_lock)
+        StartServer(
+            self.url,
+            token,
+            sid,
+            self.onopen,
+            self.onmessage,
+            self.on_error,
+            self.onclose,
+            owner=self,
+            send_lock=self._send_lock,
+        )
 
     def hs_send(self, d):
         req_json = json.loads(d)
@@ -1492,7 +1507,9 @@ class HSIWebSocket:
         self.onmessage = onmessage
         self.onclose = onclose
         self.onerror = onerror
-        StartHSIServer(self.url, self.onopen, self.onmessage, self.onerror, self.onclose, owner=self)
+        StartHSIServer(
+            self.url, self.onopen, self.onmessage, self.onerror, self.onclose, owner=self
+        )
 
     def send(self, d):
         reqJson = json.loads(d)

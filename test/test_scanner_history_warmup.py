@@ -20,6 +20,7 @@ from services.historify_scheduler_service import (
 
 # --------------------------------------------------------------- boot warm-up
 
+
 def test_run_boot_warmup_calls_refresh_once(monkeypatch):
     monkeypatch.setenv("SCANNER_HISTORY_WARMUP_ENABLED", "true")
     fake_provider = MagicMock()
@@ -73,6 +74,7 @@ def test_refresh_scanner_history_job_calls_provider():
 
 
 # ----------------------------------------------------------- scheduler wiring
+
 
 def _fresh_scheduler_with_mock():
     """Return the HistorifyScheduler singleton with a mocked APScheduler."""

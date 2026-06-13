@@ -35,7 +35,10 @@ def straddle_data():
         api_key = get_api_key_for_tradingview(login_username)
         if not api_key:
             return jsonify(
-                {"status": "error", "message": "API key not configured. Please generate an API key in /apikey"}
+                {
+                    "status": "error",
+                    "message": "API key not configured. Please generate an API key in /apikey",
+                }
             ), 401
 
         data = request.get_json(silent=True) or {}
@@ -78,9 +81,7 @@ def straddle_intervals():
 
         api_key = get_api_key_for_tradingview(login_username)
         if not api_key:
-            return jsonify(
-                {"status": "error", "message": "API key not configured"}
-            ), 401
+            return jsonify({"status": "error", "message": "API key not configured"}), 401
 
         success, response, status_code = get_intervals(api_key=api_key)
         return jsonify(response), status_code

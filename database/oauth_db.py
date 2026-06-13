@@ -208,9 +208,8 @@ def init_db() -> None:
 def revoke_family(family_id: str, reason: str) -> int:
     """Revoke every refresh token in the given family. Returns count revoked."""
     now = datetime.utcnow()
-    rows = (
-        OAuthRefreshToken.query.filter_by(family_id=family_id, revoked_at=None)
-        .update({"revoked_at": now, "revoke_reason": reason})
+    rows = OAuthRefreshToken.query.filter_by(family_id=family_id, revoked_at=None).update(
+        {"revoked_at": now, "revoke_reason": reason}
     )
     db_session.commit()
     if rows:
@@ -221,9 +220,8 @@ def revoke_family(family_id: str, reason: str) -> int:
 def revoke_client(client_id: str, reason: str) -> int:
     """Revoke every refresh token for a client AND mark the client revoked."""
     now = datetime.utcnow()
-    rows = (
-        OAuthRefreshToken.query.filter_by(client_id=client_id, revoked_at=None)
-        .update({"revoked_at": now, "revoke_reason": reason})
+    rows = OAuthRefreshToken.query.filter_by(client_id=client_id, revoked_at=None).update(
+        {"revoked_at": now, "revoke_reason": reason}
     )
     OAuthClient.query.filter_by(client_id=client_id).update({"revoked_at": now})
     db_session.commit()

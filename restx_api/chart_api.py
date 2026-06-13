@@ -77,12 +77,19 @@ class ChartPreferencesResource(Resource):
             # Limit payload: max 50 keys, each key max 50 chars, each value max 1MB
             if len(preferences) > 50:
                 return make_response(
-                    jsonify({"status": "error", "message": "Too many preference keys (max 50)"}), 400
+                    jsonify({"status": "error", "message": "Too many preference keys (max 50)"}),
+                    400,
                 )
             for k, v in preferences.items():
                 if len(k) > 50:
                     return make_response(
-                        jsonify({"status": "error", "message": f"Preference key too long: {k[:20]}... (max 50 chars)"}), 400
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": f"Preference key too long: {k[:20]}... (max 50 chars)",
+                            }
+                        ),
+                        400,
                     )
                 # Check serialized size for all value types (not just strings)
                 try:
@@ -91,7 +98,13 @@ class ChartPreferencesResource(Resource):
                     serialized = str(v)
                 if len(serialized) > 1_048_576:
                     return make_response(
-                        jsonify({"status": "error", "message": f"Preference value too large for key: {k} (max 1MB)"}), 400
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": f"Preference value too large for key: {k} (max 1MB)",
+                            }
+                        ),
+                        400,
                     )
 
             if not preferences:

@@ -599,12 +599,18 @@ def get_option_symbol(
             from utils.constants import INSTRUMENT_PERPFUT
 
             _perp = fno_search_symbols(
-                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{base_symbol}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
                 return (
                     False,
-                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    {
+                        "status": "error",
+                        "message": f"No perpetual futures found for {base_symbol} on {exchange}",
+                    },
                     404,
                 )
             quote_symbol = _perp[0]["symbol"]

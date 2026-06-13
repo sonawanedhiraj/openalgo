@@ -92,7 +92,7 @@ def _request_body():
 
 async def _take_subprocess(prompt):  # noqa: ARG001 — signature matches real helper
     return (
-        'I see no major regime conflict. Final decision:\n'
+        "I see no major regime conflict. Final decision:\n"
         '{"decision": "take", "reasoning": "regime aligned", "confidence": 0.82}',
         "sess-take-001",
     )
@@ -140,9 +140,7 @@ def test_review_signal_skip_decision(client):
 
 
 def test_review_signal_parse_failure_returns_take(client):
-    with patch(
-        "bridge.server._invoke_claude_for_review", side_effect=_no_json_subprocess
-    ):
+    with patch("bridge.server._invoke_claude_for_review", side_effect=_no_json_subprocess):
         resp = client.post("/review-signal", json=_request_body())
 
     assert resp.status_code == 200
@@ -205,9 +203,7 @@ def test_review_signal_invalid_request_returns_422(client):
 
 
 def test_review_signal_missing_candidate_returns_422(client):
-    resp = client.post(
-        "/review-signal", json={"context": {"positions_count": 0}}
-    )
+    resp = client.post("/review-signal", json={"context": {"positions_count": 0}})
     assert resp.status_code == 422
 
 

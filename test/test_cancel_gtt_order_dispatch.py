@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -48,12 +46,16 @@ def test_cancel_gtt_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
 
     broker_cancel = MagicMock(return_value=({"status": "ok"}, 200))
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=broker_cancel),
     )
 
     success, _, status = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     assert success is True
@@ -70,12 +72,16 @@ def test_cancel_gtt_returns_501_when_sandbox_intent(fresh_intent_db, monkeypatch
 
     broker_cancel = MagicMock()
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=broker_cancel),
     )
 
     success, _, status = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     assert success is False
@@ -92,12 +98,16 @@ def test_cancel_gtt_returns_501_when_live_but_analyze_on(fresh_intent_db, monkey
 
     broker_cancel = MagicMock()
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=broker_cancel),
     )
 
     success, _, status = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     assert status == 501
@@ -113,12 +123,16 @@ def test_cancel_gtt_rejects_when_skip(fresh_intent_db, monkeypatch):
 
     broker_cancel = MagicMock()
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=broker_cancel),
     )
 
     success, response, status = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     assert success is False
@@ -135,12 +149,16 @@ def test_cancel_gtt_rejects_when_disabled(fresh_intent_db, monkeypatch):
 
     broker_cancel = MagicMock()
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=broker_cancel),
     )
 
     success, response, status = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     assert success is False
@@ -157,21 +175,29 @@ def test_cancel_gtt_reject_response_shape_matches_existing_convention(fresh_inte
     _patch_modes(monkeypatch)
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=MagicMock()),
     )
     reject_result = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     broker_cancel = MagicMock(return_value=({"status": "ok"}, 200))
     monkeypatch.setattr(
-        cancel_gtt_order_service, "import_broker_gtt_module",
+        cancel_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(cancel_gtt_order=broker_cancel),
     )
     success_result = cancel_gtt_order_service.cancel_gtt_order_with_auth(
-        "TRG-1", auth_token="dummy", broker="zerodha", original_data=_original(),
+        "TRG-1",
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_original(),
     )
 
     for r in (reject_result, success_result):

@@ -150,7 +150,8 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 except Exception as e:
                     self.reconnect_attempts += 1
                     delay = min(
-                        self.reconnect_delay * (2**self.reconnect_attempts), self.max_reconnect_delay
+                        self.reconnect_delay * (2**self.reconnect_attempts),
+                        self.max_reconnect_delay,
                     )
                     self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
                     time.sleep(delay)
@@ -246,7 +247,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return
 
             # Get API key (should be stored from initialization)
-            api_key = getattr(self, '_api_key', 'api_key')
+            api_key = getattr(self, "_api_key", "api_key")
 
             # Create new SmartWebSocketV2 instance
             self.ws_client = SmartWebSocketV2(
@@ -513,9 +514,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.batch_timer = None
 
         if not self.connected or not self.ws_client:
-            self.logger.warning(
-                f"Dropping batch of {len(pending)} subscriptions — not connected"
-            )
+            self.logger.warning(f"Dropping batch of {len(pending)} subscriptions — not connected")
             return
 
         # Group by mode (broker requires separate subscribe per mode), then by

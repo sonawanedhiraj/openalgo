@@ -38,13 +38,15 @@ class ClosePosition(Resource):
                 if get_analyze_mode():
                     return make_response(jsonify(emit_analyzer_error(data, error_message)), 400)
                 error_response = {"status": "error", "message": error_message}
-                bus.publish(OrderFailedEvent(
-                    mode="live",
-                    api_type="closeposition",
-                    request_data=data,
-                    response_data=error_response,
-                    error_message=error_message,
-                ))
+                bus.publish(
+                    OrderFailedEvent(
+                        mode="live",
+                        api_type="closeposition",
+                        request_data=data,
+                        response_data=error_response,
+                        error_message=error_message,
+                    )
+                )
                 return make_response(jsonify(error_response), 400)
 
             # Extract API key
@@ -64,13 +66,15 @@ class ClosePosition(Resource):
             if get_analyze_mode():
                 return make_response(jsonify(emit_analyzer_error(data, error_message)), 400)
             error_response = {"status": "error", "message": error_message}
-            bus.publish(OrderFailedEvent(
-                mode="live",
-                api_type="closeposition",
-                request_data=data,
-                response_data=error_response,
-                error_message=error_message,
-            ))
+            bus.publish(
+                OrderFailedEvent(
+                    mode="live",
+                    api_type="closeposition",
+                    request_data=data,
+                    response_data=error_response,
+                    error_message=error_message,
+                )
+            )
             return make_response(jsonify(error_response), 400)
 
         except Exception:
@@ -79,11 +83,13 @@ class ClosePosition(Resource):
             if get_analyze_mode():
                 return make_response(jsonify(emit_analyzer_error(data, error_message)), 500)
             error_response = {"status": "error", "message": error_message}
-            bus.publish(OrderFailedEvent(
-                mode="live",
-                api_type="closeposition",
-                request_data=data,
-                response_data=error_response,
-                error_message=error_message,
-            ))
+            bus.publish(
+                OrderFailedEvent(
+                    mode="live",
+                    api_type="closeposition",
+                    request_data=data,
+                    response_data=error_response,
+                    error_message=error_message,
+                )
+            )
             return make_response(jsonify(error_response), 500)

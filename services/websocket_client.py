@@ -142,9 +142,7 @@ class WebSocketClient:
         self.authenticated = False
         logger.info("Disconnected from WebSocket server")
 
-    async def _send_and_await_ack(
-        self, message: dict, request_id: str, timeout: float
-    ) -> dict:
+    async def _send_and_await_ack(self, message: dict, request_id: str, timeout: float) -> dict:
         """Send a message and await the proxy's matching response.
 
         Runs inside the asyncio loop thread (called via run_coroutine_threadsafe).
@@ -201,8 +199,7 @@ class WebSocketClient:
             ack = future.result(timeout=12)
         except TimeoutError:
             logger.warning(
-                f"Subscribe timed out waiting for proxy ack (mode={mode}, "
-                f"symbols={len(symbols)})"
+                f"Subscribe timed out waiting for proxy ack (mode={mode}, symbols={len(symbols)})"
             )
             return {
                 "status": "error",
@@ -269,8 +266,7 @@ class WebSocketClient:
             ack = future.result(timeout=12)
         except TimeoutError:
             logger.warning(
-                f"Unsubscribe timed out waiting for proxy ack (mode={mode}, "
-                f"symbols={len(symbols)})"
+                f"Unsubscribe timed out waiting for proxy ack (mode={mode}, symbols={len(symbols)})"
             )
             return {
                 "status": "error",
@@ -480,13 +476,9 @@ class WebSocketClient:
                     try:
                         from services.ws_connect_callbacks import _fire_connect_callbacks
 
-                        _fire_connect_callbacks(
-                            data.get("user_id"), data.get("broker")
-                        )
+                        _fire_connect_callbacks(data.get("user_id"), data.get("broker"))
                     except Exception as cb_err:
-                        logger.exception(
-                            f"Error firing WS connect callbacks: {cb_err}"
-                        )
+                        logger.exception(f"Error firing WS connect callbacks: {cb_err}")
                 else:
                     logger.error(f"Authentication failed: {data.get('message')}")
 

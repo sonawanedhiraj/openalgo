@@ -53,6 +53,7 @@ def _make(clock, last_holder, *, market_open=True, **kw):
 
 # --- market-hours predicate (real default) ----------------------------------
 
+
 def _ist_epoch(h, m):
     # 2026-06-04 is a Thursday (weekday) — a normal trading day.
     return datetime(2026, 6, 4, h, m, tzinfo=_IST).timestamp()
@@ -97,6 +98,7 @@ def test_market_open_predicate_boundaries():
 
 # --- staleness escalation -----------------------------------------------------
 
+
 def test_fresh_ticks_no_action():
     clock = Clock(1000.0)
     holder = [clock() - 10]  # 10s old — well within 90s
@@ -125,10 +127,10 @@ def test_cooldown_blocks_double_trigger():
     holder = [clock() - 120]
     wd, soft, hard = _make(clock, holder)
     assert wd.check() == "soft"  # first stall -> soft
-    clock.tick(30)               # 30s later, still inside 60s cooldown
-    holder[0] = clock() - 150    # still stale
+    clock.tick(30)  # 30s later, still inside 60s cooldown
+    holder[0] = clock() - 150  # still stale
     assert wd.check() == "cooldown"
-    assert soft.calls == 1       # NOT retriggered
+    assert soft.calls == 1  # NOT retriggered
     assert hard.calls == 0
 
 
@@ -137,8 +139,8 @@ def test_still_stale_after_cooldown_triggers_hard_recovery():
     holder = [clock() - 120]
     wd, soft, hard = _make(clock, holder)
     assert wd.check() == "soft"
-    clock.tick(70)               # past the 60s cooldown
-    holder[0] = clock() - 200    # 200s old > 180s hard threshold
+    clock.tick(70)  # past the 60s cooldown
+    holder[0] = clock() - 200  # 200s old > 180s hard threshold
     assert wd.check() == "hard"
     assert soft.calls == 1 and hard.calls == 1
 

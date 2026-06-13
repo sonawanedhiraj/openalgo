@@ -81,6 +81,7 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
+
 # Module-level singleton — there's only ever one watchdog per process. We use
 # a lock around start/stop so a (theoretical) concurrent restart can't race
 # and leave two schedulers running.
@@ -114,9 +115,7 @@ def start_eod_watchdog() -> dict[str, Any]:
 
     with _lock:
         if _scheduler is not None and _scheduler.running:
-            logger.warning(
-                "[EOD-WATCHDOG] start_eod_watchdog called but scheduler already running"
-            )
+            logger.warning("[EOD-WATCHDOG] start_eod_watchdog called but scheduler already running")
             return {"started": False, "jobs": [], "skipped": []}
 
         _scheduler = BackgroundScheduler(
@@ -151,8 +150,7 @@ def start_eod_watchdog() -> dict[str, Any]:
     cap = _parse_hhmm(os.getenv("SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME", _WATCHDOG_CAP_TIME))
     if cap is None:
         logger.error(
-            "[EOD-WATCHDOG] invalid SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME — "
-            "falling back to %s",
+            "[EOD-WATCHDOG] invalid SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME — falling back to %s",
             _WATCHDOG_CAP_TIME,
         )
         cap = _parse_hhmm(_WATCHDOG_CAP_TIME)
@@ -162,7 +160,8 @@ def start_eod_watchdog() -> dict[str, Any]:
         if parsed is None:
             logger.error(
                 "[EOD-WATCHDOG] %s has invalid eod_exit_time=%r — skipping",
-                strategy_name, eod_time,
+                strategy_name,
+                eod_time,
             )
             skipped.append({"strategy": strategy_name, "reason": "bad_time"})
             continue
@@ -194,16 +193,16 @@ def start_eod_watchdog() -> dict[str, Any]:
         )
         logger.info(
             "[EOD-WATCHDOG] Scheduled %s daily at %s IST (mon-fri; declared=%s)",
-            strategy_name, fire_time, eod_time,
+            strategy_name,
+            fire_time,
+            eod_time,
         )
 
     if not jobs:
         logger.warning("[EOD-WATCHDOG] No intraday strategies registered — watchdog idle")
 
     _scheduler.start()
-    logger.info(
-        "[EOD-WATCHDOG] Started (jobs=%d, skipped=%d)", len(jobs), len(skipped)
-    )
+    logger.info("[EOD-WATCHDOG] Started (jobs=%d, skipped=%d)", len(jobs), len(skipped))
     return {"started": True, "jobs": jobs, "skipped": skipped}
 
 
@@ -297,5 +296,6 @@ def _publish_summary(strategy_name: str, result: dict[str, Any]) -> None:
     except Exception as e:  # noqa: BLE001 — fail-safe
         logger.warning(
             "[EOD-WATCHDOG] summary notification failed for %s: %s",
-            strategy_name, e,
+            strategy_name,
+            e,
         )

@@ -87,9 +87,7 @@ class BacktestRun(Base):
     # pre-migration rows.
     methodology = Column(String(32), nullable=True)
 
-    __table_args__ = (
-        Index("idx_backtest_runs_started", "started_at"),
-    )
+    __table_args__ = (Index("idx_backtest_runs_started", "started_at"),)
 
 
 class BacktestTrade(Base):
@@ -182,7 +180,9 @@ def _migrate_add_methodology_columns() -> None:
                 except Exception as e:
                     logger.warning(
                         "backtest_db: migration ALTER %s.%s failed: %s",
-                        table, column, e,
+                        table,
+                        column,
+                        e,
                     )
     except Exception as e:
         logger.warning("backtest_db: migration introspection failed: %s", e)

@@ -248,9 +248,7 @@ class BrokerData:
             self._last_depth_call_at = time.monotonic()
 
         if response.get("s") != "ok":
-            logger.debug(
-                f"Depth fetch for OI failed for {br_symbol}: {response.get('message')}"
-            )
+            logger.debug(f"Depth fetch for OI failed for {br_symbol}: {response.get('message')}")
             return 0
 
         depth_data = response.get("d", {}).get(br_symbol, {})

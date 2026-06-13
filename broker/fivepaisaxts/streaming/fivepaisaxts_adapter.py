@@ -236,9 +236,7 @@ class FivepaisaXTSWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     with self.lock:
                         self.reconnect_attempts += 1
                         attempts = self.reconnect_attempts
-                    delay = min(
-                        self.reconnect_delay * (2**attempts), self.max_reconnect_delay
-                    )
+                    delay = min(self.reconnect_delay * (2**attempts), self.max_reconnect_delay)
                     self.logger.error(f"Connection failed: {e}. Retrying in {delay} seconds...")
                     time.sleep(delay)
 

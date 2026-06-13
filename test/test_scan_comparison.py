@@ -30,12 +30,8 @@ def dbs(monkeypatch):
     from database import scanner_db as sdb
 
     for mod in (sdb, scdb):
-        eng = create_engine(
-            "sqlite:///:memory:", connect_args={"check_same_thread": False}
-        )
-        sess = scoped_session(
-            sessionmaker(autocommit=False, autoflush=False, bind=eng)
-        )
+        eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+        sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
         mod.Base.metadata.create_all(eng)
         monkeypatch.setattr(mod, "engine", eng)
         monkeypatch.setattr(mod, "db_session", sess)

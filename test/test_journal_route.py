@@ -20,12 +20,8 @@ def app_with_journal(monkeypatch):
     from blueprints.journal import journal_bp
     from database import trade_journal_db as tjdb
 
-    test_engine = create_engine(
-        "sqlite:///:memory:", connect_args={"check_same_thread": False}
-    )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
     monkeypatch.setattr(tjdb, "engine", test_engine)
     monkeypatch.setattr(tjdb, "db_session", test_session)
     tjdb.Base.metadata.create_all(test_engine)

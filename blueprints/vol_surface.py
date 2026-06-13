@@ -34,7 +34,10 @@ def surface_data():
         api_key = get_api_key_for_tradingview(login_username)
         if not api_key:
             return jsonify(
-                {"status": "error", "message": "API key not configured. Please generate an API key in /apikey"}
+                {
+                    "status": "error",
+                    "message": "API key not configured. Please generate an API key in /apikey",
+                }
             ), 401
 
         data = request.get_json(silent=True) or {}

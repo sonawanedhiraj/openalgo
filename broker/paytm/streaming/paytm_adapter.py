@@ -165,9 +165,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 return
             self._reconnecting = True
             self._shutdown_event.clear()
-            self._reconnect_thread = threading.Thread(
-                target=self._connect_with_retry, daemon=True
-            )
+            self._reconnect_thread = threading.Thread(target=self._connect_with_retry, daemon=True)
         self._reconnect_thread.start()
 
     def _connect_with_retry(self) -> None:
@@ -211,9 +209,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.reconnect_delay * (2 ** max(0, self.reconnect_attempts - 1)),
                     self.max_reconnect_delay,
                 )
-                self.logger.info(
-                    f"Paytm WS closed after {duration:.1f}s; reconnecting in {delay}s"
-                )
+                self.logger.info(f"Paytm WS closed after {duration:.1f}s; reconnecting in {delay}s")
                 # Interruptible sleep: disconnect() sets the event so we
                 # don't keep retrying after shutdown.
                 if self._shutdown_event.wait(delay):
@@ -239,9 +235,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
         """
         if self.batch_timer:
             self.batch_timer.cancel()
-        self.batch_timer = threading.Timer(
-            self.batch_delay, self._process_batch_subscriptions
-        )
+        self.batch_timer = threading.Timer(self.batch_delay, self._process_batch_subscriptions)
         self.batch_timer.daemon = True
         self.batch_timer.start()
 
@@ -486,9 +480,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # If the ADD was cancelled in-place, nothing was ever on the wire.
         if had_pending_add:
-            self.logger.info(
-                f"Cancelled pending subscribe for {symbol}.{exchange} before flush"
-            )
+            self.logger.info(f"Cancelled pending subscribe for {symbol}.{exchange} before flush")
             return self._create_success_response(
                 f"Unsubscribed from {symbol}.{exchange}",
                 symbol=symbol,

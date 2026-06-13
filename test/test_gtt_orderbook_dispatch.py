@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -44,12 +42,15 @@ def test_gtt_orderbook_reads_from_broker_when_live(fresh_intent_db, monkeypatch)
 
     broker_get = MagicMock(return_value=({"triggers": []}, 200))
     monkeypatch.setattr(
-        gtt_orderbook_service, "import_broker_gtt_module",
+        gtt_orderbook_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(get_gtt_book=broker_get),
     )
 
     success, _, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
 
     assert success is True
@@ -67,12 +68,15 @@ def test_gtt_orderbook_returns_501_when_sandbox_intent(fresh_intent_db, monkeypa
 
     broker_get = MagicMock()
     monkeypatch.setattr(
-        gtt_orderbook_service, "import_broker_gtt_module",
+        gtt_orderbook_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(get_gtt_book=broker_get),
     )
 
     success, response, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
 
     assert success is False
@@ -90,13 +94,16 @@ def test_gtt_orderbook_reads_from_broker_when_skip_or_disabled(fresh_intent_db, 
 
     broker_get = MagicMock(return_value=({"triggers": []}, 200))
     monkeypatch.setattr(
-        gtt_orderbook_service, "import_broker_gtt_module",
+        gtt_orderbook_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(get_gtt_book=broker_get),
     )
 
     # DISABLED (no intent row)
     success, _, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     assert success is True
     assert status == 200
@@ -105,7 +112,9 @@ def test_gtt_orderbook_reads_from_broker_when_skip_or_disabled(fresh_intent_db, 
     # SKIP
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     success, _, status = gtt_orderbook_service.get_gtt_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     assert success is True
     assert status == 200

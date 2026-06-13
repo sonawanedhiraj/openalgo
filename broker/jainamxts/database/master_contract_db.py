@@ -522,9 +522,7 @@ def process_index_data(index_data):
 
     # BSE short-code mapping (applied only to BSE_INDEX symbols)
     bse_idx_mask = df["exchange"] == "BSE_INDEX"
-    df.loc[bse_idx_mask, "symbol"] = normalize_bse_index_symbols(
-        df.loc[bse_idx_mask, "symbol"]
-    )
+    df.loc[bse_idx_mask, "symbol"] = normalize_bse_index_symbols(df.loc[bse_idx_mask, "symbol"])
 
     # Final cleanup: enforce no spaces/hyphens in symbols
     df["symbol"] = df["symbol"].str.replace(r"[\s\-]+", "", regex=True)

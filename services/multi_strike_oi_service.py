@@ -133,9 +133,7 @@ def get_multi_strike_oi_data(
                                 oi_val = float(row.get("oi", 0) or 0)
                             except (TypeError, ValueError):
                                 oi_val = 0.0
-                            series.append(
-                                {"time": int(ts.timestamp()), "value": round(oi_val, 2)}
-                            )
+                            series.append({"time": int(ts.timestamp()), "value": round(oi_val, 2)})
             oi_lookup[(symbol, leg_exchange)] = series
 
         # ── Assemble per-leg response ─────────────────────────────────
@@ -146,7 +144,7 @@ def get_multi_strike_oi_data(
         # Keep the original leg order from the Strategy Builder so the UI's
         # colour assignment stays stable across add/remove.
         leg_series = []
-        for raw in (legs or []):
+        for raw in legs or []:
             norm = _normalize_leg(raw)
             if not norm:
                 continue
@@ -171,9 +169,7 @@ def get_multi_strike_oi_data(
         # dates rather than hardcoding session close times.
         underlying_series = _cap_last_n_trading_dates(underlying_series, days, ist)
         for leg_entry in leg_series:
-            leg_entry["series"] = _cap_last_n_trading_dates(
-                leg_entry["series"], days, ist
-            )
+            leg_entry["series"] = _cap_last_n_trading_dates(leg_entry["series"], days, ist)
 
         # ── Latest underlying LTP ─────────────────────────────────────
         success_q, quote_resp, _ = get_quotes(

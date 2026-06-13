@@ -71,9 +71,7 @@ def migrate_leverage():
                     """
                 )
             )
-            conn.execute(
-                text("INSERT INTO leverage_config (id, leverage) VALUES (1, 0.0)")
-            )
+            conn.execute(text("INSERT INTO leverage_config (id, leverage) VALUES (1, 0.0)"))
             conn.commit()
             logger.info("Created table: leverage_config (single-row config)")
 

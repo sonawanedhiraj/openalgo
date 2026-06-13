@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -53,12 +51,16 @@ def test_modify_gtt_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
 
     broker_mod = MagicMock(return_value=({"status": "ok", "trigger_id": "TRG-1"}, 200))
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=broker_mod),
     )
 
     success, _, status = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is True
@@ -75,12 +77,16 @@ def test_modify_gtt_returns_501_when_sandbox_intent(fresh_intent_db, monkeypatch
 
     broker_mod = MagicMock()
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=broker_mod),
     )
 
     success, response, status = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -97,12 +103,16 @@ def test_modify_gtt_returns_501_when_live_but_analyze_on(fresh_intent_db, monkey
 
     broker_mod = MagicMock()
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=broker_mod),
     )
 
     success, response, status = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert status == 501
@@ -118,12 +128,16 @@ def test_modify_gtt_rejects_when_skip(fresh_intent_db, monkeypatch):
 
     broker_mod = MagicMock()
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=broker_mod),
     )
 
     success, response, status = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -140,12 +154,16 @@ def test_modify_gtt_rejects_when_disabled(fresh_intent_db, monkeypatch):
 
     broker_mod = MagicMock()
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=broker_mod),
     )
 
     success, response, status = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -162,21 +180,29 @@ def test_modify_gtt_reject_response_shape_matches_existing_convention(fresh_inte
     _patch_modes(monkeypatch)
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=MagicMock()),
     )
     reject_result = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     broker_mod = MagicMock(return_value=({"status": "ok", "trigger_id": "TRG"}, 200))
     monkeypatch.setattr(
-        modify_gtt_order_service, "import_broker_gtt_module",
+        modify_gtt_order_service,
+        "import_broker_gtt_module",
         lambda _b: SimpleNamespace(modify_gtt_order=broker_mod),
     )
     success_result = modify_gtt_order_service.modify_gtt_order_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     for r in (reject_result, success_result):

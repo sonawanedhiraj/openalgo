@@ -26,6 +26,7 @@ def _eventlet_active() -> bool:
     """True when eventlet has monkey-patched the stdlib (gunicorn worker)."""
     try:
         from eventlet.patcher import is_monkey_patched
+
         return bool(is_monkey_patched("socket"))
     except Exception:
         return False
@@ -133,6 +134,7 @@ def cleanup_websocket_server():
         # Clean up shared ZMQ context (handles app restart without process exit)
         try:
             from .base_adapter import BaseBrokerWebSocketAdapter
+
             BaseBrokerWebSocketAdapter.cleanup_shared_context()
             logger.info("Shared ZMQ context cleaned up")
         except Exception as e:

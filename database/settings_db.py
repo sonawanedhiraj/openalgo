@@ -221,11 +221,17 @@ def get_security_settings():
         db_session.commit()
 
     result = {
-        "auto_ban_enabled": bool(settings.security_auto_ban_enabled) if settings.security_auto_ban_enabled is not None else False,
+        "auto_ban_enabled": bool(settings.security_auto_ban_enabled)
+        if settings.security_auto_ban_enabled is not None
+        else False,
         "404_threshold": settings.security_404_threshold or 100,
-        "404_ban_duration": settings.security_404_ban_duration if settings.security_404_ban_duration is not None else 0,
+        "404_ban_duration": settings.security_404_ban_duration
+        if settings.security_404_ban_duration is not None
+        else 0,
         "api_threshold": settings.security_api_threshold or 100,
-        "api_ban_duration": settings.security_api_ban_duration if settings.security_api_ban_duration is not None else 0,
+        "api_ban_duration": settings.security_api_ban_duration
+        if settings.security_api_ban_duration is not None
+        else 0,
         "repeat_offender_limit": settings.security_repeat_offender_limit or 2,
     }
 

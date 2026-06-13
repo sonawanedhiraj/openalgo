@@ -82,29 +82,43 @@ def get_vol_surface_data(
         # CRYPTO: look up the canonical perpetual symbol from cache (e.g. BTC → BTCUSDFUT)
         if exchange.upper() in CRYPTO_EXCHANGES:
             _perp = fno_search_symbols(
-                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{base_symbol}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
                 return (
                     False,
-                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    {
+                        "status": "error",
+                        "message": f"No perpetual futures found for {base_symbol} on {exchange}",
+                    },
                     404,
                 )
             underlying_quote_symbol = _perp[0]["symbol"]
         else:
             underlying_quote_symbol = base_symbol
         # Symbol builder: CRYPTO canonical format vs Indian FNO suffix format
-        _build_sym = construct_crypto_option_symbol if exchange.upper() in CRYPTO_EXCHANGES else construct_option_symbol
+        _build_sym = (
+            construct_crypto_option_symbol
+            if exchange.upper() in CRYPTO_EXCHANGES
+            else construct_option_symbol
+        )
 
         # Step 1: Fetch underlying LTP once
         success, quote_response, status_code = get_quotes(
             symbol=underlying_quote_symbol, exchange=quote_exchange, api_key=api_key
         )
         if not success:
-            return False, {
-                "status": "error",
-                "message": f"Failed to fetch LTP for {base_symbol}: {quote_response.get('message', '')}",
-            }, status_code
+            return (
+                False,
+                {
+                    "status": "error",
+                    "message": f"Failed to fetch LTP for {base_symbol}: {quote_response.get('message', '')}",
+                },
+                status_code,
+            )
 
         underlying_ltp = quote_response.get("data", {}).get("ltp")
         if not underlying_ltp:
@@ -127,11 +141,13 @@ def get_vol_surface_data(
             end = min(len(strikes), atm_idx + strike_count + 1)
             selected = strikes[start:end]
 
-            expiry_strike_data.append({
-                "expiry": expiry,
-                "strikes": selected,
-                "atm": atm,
-            })
+            expiry_strike_data.append(
+                {
+                    "expiry": expiry,
+                    "strikes": selected,
+                    "atm": atm,
+                }
+            )
 
         if not expiry_strike_data:
             return False, {"status": "error", "message": "No valid expiry data found"}, 404
@@ -171,9 +187,7 @@ def get_vol_surface_data(
                 symbol_map[sym] = (strike, opt_type)
 
             # Batch fetch all LTPs
-            success_q, quotes_resp, _ = get_multiquotes(
-                symbols=symbols_to_fetch, api_key=api_key
-            )
+            success_q, quotes_resp, _ = get_multiquotes(symbols=symbols_to_fetch, api_key=api_key)
 
             quotes_map = {}
             if success_q and "results" in quotes_resp:
@@ -219,22 +233,27 @@ def get_vol_surface_data(
                 test_sym = _build_sym(base_symbol, expiry, common_strikes[0], "CE")
                 _, expiry_dt, _, _ = parse_option_symbol(test_sym, options_exchange)
                 from datetime import datetime
+
                 dte = max(0, (expiry_dt - datetime.now()).total_seconds() / 86400)
                 expiry_info.append({"date": expiry, "dte": round(dte, 1)})
             except Exception:
                 expiry_info.append({"date": expiry, "dte": 0})
 
-        return True, {
-            "status": "success",
-            "data": {
-                "underlying": base_symbol,
-                "underlying_ltp": underlying_ltp,
-                "atm_strike": atm_strike,
-                "strikes": common_strikes,
-                "expiries": expiry_info,
-                "surface": surface,
+        return (
+            True,
+            {
+                "status": "success",
+                "data": {
+                    "underlying": base_symbol,
+                    "underlying_ltp": underlying_ltp,
+                    "atm_strike": atm_strike,
+                    "strikes": common_strikes,
+                    "expiries": expiry_info,
+                    "surface": surface,
+                },
             },
-        }, 200
+            200,
+        )
 
     except Exception as e:
         logger.exception(f"Error computing vol surface: {e}")

@@ -73,40 +73,95 @@ class FixedClock:
 def _buy_history():
     start = dt.datetime(2026, 4, 29, 9, 30)
     candles = [
-        Candle(ts=start + dt.timedelta(minutes=5 * i), open=100 + (i % 2),
-               high=102 + (i % 2), low=99 + (i % 2), close=101 + (i % 2),
-               volume=600, elapsed_pct=1.0)
+        Candle(
+            ts=start + dt.timedelta(minutes=5 * i),
+            open=100 + (i % 2),
+            high=102 + (i % 2),
+            low=99 + (i % 2),
+            close=101 + (i % 2),
+            volume=600,
+            elapsed_pct=1.0,
+        )
         for i in range(11)
     ]
-    candles[-3] = Candle(ts=dt.datetime(2026, 4, 29, 10, 10), open=100, high=101,
-                         low=98, close=99, volume=100, elapsed_pct=1.0)
-    candles[-2] = Candle(ts=dt.datetime(2026, 4, 29, 10, 15), open=101, high=102,
-                         low=100, close=102, volume=800, elapsed_pct=1.0)
-    candles[-1] = Candle(ts=dt.datetime(2026, 4, 29, 10, 20), open=102, high=103,
-                         low=100, close=101, volume=200, elapsed_pct=1.0)
+    candles[-3] = Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 10),
+        open=100,
+        high=101,
+        low=98,
+        close=99,
+        volume=100,
+        elapsed_pct=1.0,
+    )
+    candles[-2] = Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 15),
+        open=101,
+        high=102,
+        low=100,
+        close=102,
+        volume=800,
+        elapsed_pct=1.0,
+    )
+    candles[-1] = Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 20),
+        open=102,
+        high=103,
+        low=100,
+        close=101,
+        volume=200,
+        elapsed_pct=1.0,
+    )
     return candles
 
 
 def _sell_history():
     start = dt.datetime(2026, 4, 29, 9, 30)
     candles = [
-        Candle(ts=start + dt.timedelta(minutes=5 * i), open=100 + (i % 2),
-               high=102 + (i % 2), low=99 + (i % 2), close=101 + (i % 2),
-               volume=600, elapsed_pct=1.0)
+        Candle(
+            ts=start + dt.timedelta(minutes=5 * i),
+            open=100 + (i % 2),
+            high=102 + (i % 2),
+            low=99 + (i % 2),
+            close=101 + (i % 2),
+            volume=600,
+            elapsed_pct=1.0,
+        )
         for i in range(11)
     ]
-    candles[-3] = Candle(ts=dt.datetime(2026, 4, 29, 10, 10), open=100, high=103,
-                         low=99, close=102, volume=900, elapsed_pct=1.0)
-    candles[-2] = Candle(ts=dt.datetime(2026, 4, 29, 10, 15), open=101, high=102,
-                         low=98, close=99, volume=800, elapsed_pct=1.0)
-    candles[-1] = Candle(ts=dt.datetime(2026, 4, 29, 10, 20), open=99, high=101,
-                         low=98, close=100, volume=200, elapsed_pct=1.0)
+    candles[-3] = Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 10),
+        open=100,
+        high=103,
+        low=99,
+        close=102,
+        volume=900,
+        elapsed_pct=1.0,
+    )
+    candles[-2] = Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 15),
+        open=101,
+        high=102,
+        low=98,
+        close=99,
+        volume=800,
+        elapsed_pct=1.0,
+    )
+    candles[-1] = Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 20),
+        open=99,
+        high=101,
+        low=98,
+        close=100,
+        volume=200,
+        elapsed_pct=1.0,
+    )
     return candles
 
 
 def _buy_engine(now=dt.datetime(2026, 4, 29, 10, 24)):
-    cfg = SimplifiedEngineConfig(no_new_openings_time=dt.time(15, 10),
-                                 reference_candle_expiry_seconds=20 * 60)
+    cfg = SimplifiedEngineConfig(
+        no_new_openings_time=dt.time(15, 10), reference_candle_expiry_seconds=20 * 60
+    )
     eng = SimplifiedStockEngine(config=cfg, now_provider=FixedClock(now))
     eng.activate_buy_symbol("RELIANCE")
     eng.load_historical_candles("RELIANCE", _buy_history())
@@ -114,8 +169,9 @@ def _buy_engine(now=dt.datetime(2026, 4, 29, 10, 24)):
 
 
 def _sell_engine(now=dt.datetime(2026, 4, 29, 10, 24)):
-    cfg = SimplifiedEngineConfig(no_new_openings_time=dt.time(15, 10),
-                                 reference_candle_expiry_seconds=20 * 60)
+    cfg = SimplifiedEngineConfig(
+        no_new_openings_time=dt.time(15, 10), reference_candle_expiry_seconds=20 * 60
+    )
     eng = SimplifiedStockEngine(config=cfg, now_provider=FixedClock(now))
     eng.activate_sell_symbol("RELIANCE")
     eng.load_historical_candles("RELIANCE", _sell_history())
@@ -123,13 +179,27 @@ def _sell_engine(now=dt.datetime(2026, 4, 29, 10, 24)):
 
 
 def _buy_breakout_candle():
-    return Candle(ts=dt.datetime(2026, 4, 29, 10, 20), open=100, high=102, low=99,
-                  close=101.5, volume=300, elapsed_pct=0.75)
+    return Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 20),
+        open=100,
+        high=102,
+        low=99,
+        close=101.5,
+        volume=300,
+        elapsed_pct=0.75,
+    )
 
 
 def _sell_breakdown_candle():
-    return Candle(ts=dt.datetime(2026, 4, 29, 10, 20), open=99, high=99.5, low=96,
-                  close=97.5, volume=600, elapsed_pct=0.75)
+    return Candle(
+        ts=dt.datetime(2026, 4, 29, 10, 20),
+        open=99,
+        high=99.5,
+        low=96,
+        close=97.5,
+        volume=600,
+        elapsed_pct=0.75,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -142,9 +212,7 @@ def _service(engine, monkeypatch, *, veto_off=True):
     svc._strategy_by_symbol["RELIANCE"] = "chartink_FnO_intraday_buy"
     svc._api_key_by_symbol["RELIANCE"] = "test-api-key"
     # Circuit breaker fail-open (not tripped) unless a test overrides it.
-    monkeypatch.setattr(
-        "services.risk_service.daily_circuit_breaker_tripped", lambda: (False, "")
-    )
+    monkeypatch.setattr("services.risk_service.daily_circuit_breaker_tripped", lambda: (False, ""))
     if veto_off:
         monkeypatch.setattr(
             svc, "_run_pre_order_review", lambda signal, strategy_name: (True, None)
@@ -157,10 +225,18 @@ def _sandbox_ok():
 
 
 def _sell_entry_signal():
-    return EntrySignal(symbol="RELIANCE", action=DIRECTION_SELL, quantity=10,
-                       reference_price=97.5, stop_loss=99.0, risk_per_share=1.5,
-                       candle_ts=dt.datetime(2026, 4, 29, 10, 20), exchange="NSE",
-                       product="MIS", pricetype="MARKET")
+    return EntrySignal(
+        symbol="RELIANCE",
+        action=DIRECTION_SELL,
+        quantity=10,
+        reference_price=97.5,
+        stop_loss=99.0,
+        risk_per_share=1.5,
+        candle_ts=dt.datetime(2026, 4, 29, 10, 20),
+        exchange="NSE",
+        product="MIS",
+        pricetype="MARKET",
+    )
 
 
 # =========================================================================== #
@@ -183,10 +259,10 @@ class TestBuySellBreakoutToOrder:
         from unittest.mock import patch
 
         with (
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()) as m_sbx,
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=101.7),
+            patch(
+                "services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()
+            ) as m_sbx,
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=101.7),
         ):
             svc._place_entry_order(sig, api_key="k", strategy_name="chartink_FnO_intraday_buy")
         m_sbx.assert_called_once()
@@ -203,10 +279,10 @@ class TestBuySellBreakoutToOrder:
         from unittest.mock import patch
 
         with (
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()) as m_sbx,
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=97.4),
+            patch(
+                "services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()
+            ) as m_sbx,
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=97.4),
         ):
             svc._place_entry_order(sig, api_key="k", strategy_name="chartink_FnO_intraday_buy")
         m_sbx.assert_called_once()
@@ -251,10 +327,8 @@ class TestJournalPairing:
 
         sig = eng.on_new_candle("RELIANCE", _buy_breakout_candle())
         with (
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()),
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=101.7),
+            patch("services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()),
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=101.7),
         ):
             svc._place_entry_order(sig, api_key="k", strategy_name="s")
             # Adverse tick → stop fires → exit order.
@@ -277,8 +351,10 @@ class TestJournalPairing:
         from unittest.mock import patch
 
         sig = eng.on_new_candle("RELIANCE", _buy_breakout_candle())
-        with patch("services.sandbox_service.sandbox_place_order",
-                   return_value=(False, {"status": "error", "message": "rejected"}, 400)):
+        with patch(
+            "services.sandbox_service.sandbox_place_order",
+            return_value=(False, {"status": "error", "message": "rejected"}, 400),
+        ):
             svc._place_entry_order(sig, api_key="k", strategy_name="s")
         # Rejected order → no position, no orphan journal entry.
         assert "RELIANCE" not in eng.positions
@@ -289,9 +365,17 @@ class TestJournalPairing:
 # Flows 3 & 4 — veto SHADOW (never blocks) / ACTIVE (blocks on skip)
 # =========================================================================== #
 def _stub_review(decision, decision_id=42, mode="shadow"):
-    return {"id": decision_id, "decision": decision, "reasoning": "stub",
-            "confidence": 0.7, "latency_ms": 10, "claude_session_id": "sid",
-            "raw_output": "", "enforcement_mode": mode, "cache_hit": False}
+    return {
+        "id": decision_id,
+        "decision": decision,
+        "reasoning": "stub",
+        "confidence": 0.7,
+        "latency_ms": 10,
+        "claude_session_id": "sid",
+        "raw_output": "",
+        "enforcement_mode": mode,
+        "cache_hit": False,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -312,13 +396,14 @@ class TestVetoShadowActive:
         from unittest.mock import patch
 
         with (
-            patch("services.signal_review_service.review_signal",
-                  return_value=_stub_review("skip")),
+            patch(
+                "services.signal_review_service.review_signal", return_value=_stub_review("skip")
+            ),
             patch("services.signal_review_service.mark_actually_taken"),
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()) as m_sbx,
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=101.7),
+            patch(
+                "services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()
+            ) as m_sbx,
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=101.7),
         ):
             svc._place_entry_order(sig, api_key="k", strategy_name="s")
         m_sbx.assert_called_once()  # shadow: skip recorded but order placed
@@ -331,8 +416,10 @@ class TestVetoShadowActive:
         from unittest.mock import patch
 
         with (
-            patch("services.signal_review_service.review_signal",
-                  return_value=_stub_review("skip", mode="active")),
+            patch(
+                "services.signal_review_service.review_signal",
+                return_value=_stub_review("skip", mode="active"),
+            ),
             patch("services.signal_review_service.mark_actually_taken") as m_mark,
             patch("services.sandbox_service.sandbox_place_order") as m_sbx,
         ):
@@ -349,13 +436,15 @@ class TestVetoShadowActive:
         from unittest.mock import patch
 
         with (
-            patch("services.signal_review_service.review_signal",
-                  return_value=_stub_review("take", mode="active")),
+            patch(
+                "services.signal_review_service.review_signal",
+                return_value=_stub_review("take", mode="active"),
+            ),
             patch("services.signal_review_service.mark_actually_taken"),
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()) as m_sbx,
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=101.7),
+            patch(
+                "services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()
+            ) as m_sbx,
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=101.7),
         ):
             svc._place_entry_order(sig, api_key="k", strategy_name="s")
         m_sbx.assert_called_once()
@@ -373,13 +462,12 @@ class TestVetoDirectionConsistency:
         from unittest.mock import patch
 
         with (
-            patch("services.signal_review_service.review_signal",
-                  return_value=_stub_review("take")) as m_rev,
+            patch(
+                "services.signal_review_service.review_signal", return_value=_stub_review("take")
+            ) as m_rev,
             patch("services.signal_review_service.mark_actually_taken"),
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()),
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=101.7),
+            patch("services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()),
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=101.7),
         ):
             svc._place_entry_order(sig, api_key="k", strategy_name="chartink_FnO_intraday_buy")
         m_rev.assert_called_once()
@@ -398,16 +486,14 @@ class TestVetoDirectionConsistency:
         from unittest.mock import patch
 
         with (
-            patch("services.signal_review_service.review_signal",
-                  return_value=_stub_review("take")) as m_rev,
+            patch(
+                "services.signal_review_service.review_signal", return_value=_stub_review("take")
+            ) as m_rev,
             patch("services.signal_review_service.mark_actually_taken"),
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()),
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=97.4),
+            patch("services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()),
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=97.4),
         ):
-            svc._place_entry_order(sig, api_key="k",
-                                   strategy_name="chartink_FnO_intraday_buy")
+            svc._place_entry_order(sig, api_key="k", strategy_name="chartink_FnO_intraday_buy")
         kw = m_rev.call_args.kwargs
         assert kw["source"] == "chartink_FnO_intraday_buy"  # still carries "buy"
         assert kw["direction"] == "SELL"  # but the true side is now explicit
@@ -421,16 +507,14 @@ class TestVetoDirectionConsistency:
         from unittest.mock import patch
 
         with (
-            patch("services.signal_review_service.review_signal",
-                  return_value=_stub_review("take")) as m_rev,
+            patch(
+                "services.signal_review_service.review_signal", return_value=_stub_review("take")
+            ) as m_rev,
             patch("services.signal_review_service.mark_actually_taken"),
-            patch("services.sandbox_service.sandbox_place_order",
-                  return_value=_sandbox_ok()),
-            patch.object(SimplifiedStockEngineService, "_wait_for_fill",
-                         return_value=97.4),
+            patch("services.sandbox_service.sandbox_place_order", return_value=_sandbox_ok()),
+            patch.object(SimplifiedStockEngineService, "_wait_for_fill", return_value=97.4),
         ):
-            svc._place_entry_order(sig, api_key="k",
-                                   strategy_name="chartink_FnO_intraday_buy")
+            svc._place_entry_order(sig, api_key="k", strategy_name="chartink_FnO_intraday_buy")
         kw = m_rev.call_args.kwargs
         # The reviewer MUST be able to tell this is a SELL/short, either via an
         # explicit direction kwarg or a sell-tagged source. Today neither holds.
@@ -508,8 +592,15 @@ class TestRiskGates:
         eng.activate_buy_symbol("RELIANCE")
         eng.load_historical_candles("RELIANCE", _buy_history())
         nxt = _buy_breakout_candle()
-        nxt = Candle(ts=nxt.ts + dt.timedelta(minutes=5), open=nxt.open, high=nxt.high,
-                     low=nxt.low, close=nxt.close, volume=nxt.volume, elapsed_pct=0.75)
+        nxt = Candle(
+            ts=nxt.ts + dt.timedelta(minutes=5),
+            open=nxt.open,
+            high=nxt.high,
+            low=nxt.low,
+            close=nxt.close,
+            volume=nxt.volume,
+            elapsed_pct=0.75,
+        )
         assert eng.on_new_candle("RELIANCE", nxt) is None
 
 
@@ -524,9 +615,12 @@ class TestEodSquareoff:
         # Advance the clock past the EOD exit time.
         eod_now = dt.datetime.combine(
             dt.date(2026, 4, 29),
-            (dt.datetime.min + dt.timedelta(
-                hours=eng.config.eod_exit_time.hour,
-                minutes=eng.config.eod_exit_time.minute + 1)).time(),
+            (
+                dt.datetime.min
+                + dt.timedelta(
+                    hours=eng.config.eod_exit_time.hour, minutes=eng.config.eod_exit_time.minute + 1
+                )
+            ).time(),
         )
         eng.now_provider = FixedClock(eod_now)
         exits = eng.check_eod_exits()
@@ -545,9 +639,11 @@ def journal_db(monkeypatch):
     import database.trade_journal_db as tjdb
 
     with tempfile.TemporaryDirectory() as d:
-        eng = create_engine(f"sqlite:///{os.path.join(d, 'tj.db')}",
-                            poolclass=NullPool,
-                            connect_args={"check_same_thread": False})
+        eng = create_engine(
+            f"sqlite:///{os.path.join(d, 'tj.db')}",
+            poolclass=NullPool,
+            connect_args={"check_same_thread": False},
+        )
         sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
         monkeypatch.setattr(tjdb, "engine", eng)
         monkeypatch.setattr(tjdb, "db_session", sess)
@@ -560,9 +656,14 @@ class TestEodSummarySemantics:
     def test_eod_summary_is_gross_realized_closed_only(self, journal_db):
         import services.trade_journal_service as tj
 
-        jid = tj.record_entry(symbol="JINDALSTEL", direction="SHORT", quantity=88,
-                              strategy_name="trending_equity_intraday",
-                              signal_source="chartink", entry_price=1129.0)
+        jid = tj.record_entry(
+            symbol="JINDALSTEL",
+            direction="SHORT",
+            quantity=88,
+            strategy_name="trending_equity_intraday",
+            signal_source="chartink",
+            entry_price=1129.0,
+        )
         tj.update_entry_fill(jid, entry_price=1129.0)
         # Gross +₹352 = (1129 - 1125) × 88. No charges deducted.
         tj.record_exit(jid, exit_price=1125.0, exit_reason="stop_loss", pnl=352.0)
@@ -577,14 +678,24 @@ class TestEodSummarySemantics:
         import services.trade_journal_service as tj
 
         # One closed + one still-open (no record_exit) → only the closed counts.
-        jid = tj.record_entry(symbol="SBIN", direction="LONG", quantity=10,
-                              strategy_name="trending_equity_intraday",
-                              signal_source="chartink", entry_price=800.0)
+        jid = tj.record_entry(
+            symbol="SBIN",
+            direction="LONG",
+            quantity=10,
+            strategy_name="trending_equity_intraday",
+            signal_source="chartink",
+            entry_price=800.0,
+        )
         tj.update_entry_fill(jid, entry_price=800.0)
         tj.record_exit(jid, exit_price=810.0, exit_reason="target", pnl=100.0)
-        open_jid = tj.record_entry(symbol="INFY", direction="LONG", quantity=5,
-                                   strategy_name="trending_equity_intraday",
-                                   signal_source="chartink", entry_price=1500.0)
+        open_jid = tj.record_entry(
+            symbol="INFY",
+            direction="LONG",
+            quantity=5,
+            strategy_name="trending_equity_intraday",
+            signal_source="chartink",
+            entry_price=1500.0,
+        )
         tj.update_entry_fill(open_jid, entry_price=1500.0)  # never exited
 
         summ = tj.get_today_summary()
@@ -594,12 +705,19 @@ class TestEodSummarySemantics:
     def test_eod_summary_groups_by_exit_reason(self, journal_db):
         import services.trade_journal_service as tj
 
-        for sym, reason, pnl in [("AAA", "stop_loss", -50.0),
-                                 ("BBB", "stop_loss", -30.0),
-                                 ("CCC", "eod_squareoff", 200.0)]:
-            jid = tj.record_entry(symbol=sym, direction="LONG", quantity=1,
-                                  strategy_name="trending_equity_intraday",
-                                  signal_source="chartink", entry_price=100.0)
+        for sym, reason, pnl in [
+            ("AAA", "stop_loss", -50.0),
+            ("BBB", "stop_loss", -30.0),
+            ("CCC", "eod_squareoff", 200.0),
+        ]:
+            jid = tj.record_entry(
+                symbol=sym,
+                direction="LONG",
+                quantity=1,
+                strategy_name="trending_equity_intraday",
+                signal_source="chartink",
+                entry_price=100.0,
+            )
             tj.update_entry_fill(jid, entry_price=100.0)
             tj.record_exit(jid, exit_price=100.0, exit_reason=reason, pnl=pnl)
 

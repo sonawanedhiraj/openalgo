@@ -162,9 +162,7 @@ class DhanWebSocket:
             # Use _original_threading.Thread so the asyncio event loop runs
             # on a real OS thread under gunicorn+eventlet — see issue #1344
             # and the import-time setup at the top of this file.
-            self.thread = _original_threading.Thread(
-                target=self._run_event_loop, daemon=True
-            )
+            self.thread = _original_threading.Thread(target=self._run_event_loop, daemon=True)
             self.thread.start()
             self.running = True
             logger.info("WebSocket client thread started")

@@ -65,10 +65,18 @@ def test_register_decorator_rejects_duplicates():
 
         def on_scan_hit(self, symbol, direction): ...
         def seed_history(self, symbol, candles): ...
-        def on_bar(self, symbol, candle): return None
-        def on_tick(self, symbol, price): return []
-        def confirm_entry(self, symbol, executed_price=None): return None
-        def confirm_exit(self, symbol, exit_price=None, reason=None): return None
+        def on_bar(self, symbol, candle):
+            return None
+
+        def on_tick(self, symbol, price):
+            return []
+
+        def confirm_entry(self, symbol, executed_price=None):
+            return None
+
+        def confirm_exit(self, symbol, exit_price=None, reason=None):
+            return None
+
         def clear_pending_entry(self, symbol): ...
         def clear_pending_exit(self, symbol): ...
 
@@ -80,10 +88,18 @@ def test_register_decorator_rejects_duplicates():
 
             def on_scan_hit(self, symbol, direction): ...
             def seed_history(self, symbol, candles): ...
-            def on_bar(self, symbol, candle): return None
-            def on_tick(self, symbol, price): return []
-            def confirm_entry(self, symbol, executed_price=None): return None
-            def confirm_exit(self, symbol, exit_price=None, reason=None): return None
+            def on_bar(self, symbol, candle):
+                return None
+
+            def on_tick(self, symbol, price):
+                return []
+
+            def confirm_entry(self, symbol, executed_price=None):
+                return None
+
+            def confirm_exit(self, symbol, exit_price=None, reason=None):
+                return None
+
             def clear_pending_entry(self, symbol): ...
             def clear_pending_exit(self, symbol): ...
 
@@ -108,9 +124,7 @@ def test_trending_equity_strategy_implements_all_hooks():
     abstract_methods = BaseStrategy.__abstractmethods__
     assert abstract_methods  # sanity: there are some abstract hooks
     overridden = TrendingEquityIntradayStrategy.__abstractmethods__
-    assert overridden == frozenset(), (
-        f"Subclass still has abstract methods: {overridden}"
-    )
+    assert overridden == frozenset(), f"Subclass still has abstract methods: {overridden}"
 
     # Every abstract method name must appear on the subclass with its own
     # implementation (not inherited as still-abstract).
@@ -201,9 +215,7 @@ def test_trending_equity_strategy_forwards_confirm_entry_and_exit():
     engine.confirm_entry.assert_called_once_with("RELIANCE", 2501.0)
 
     strategy.confirm_exit("RELIANCE", exit_price=2495.5, reason="stop_loss")
-    engine.confirm_exit.assert_called_once_with(
-        "RELIANCE", exit_price=2495.5, reason="stop_loss"
-    )
+    engine.confirm_exit.assert_called_once_with("RELIANCE", exit_price=2495.5, reason="stop_loss")
 
 
 def test_trending_equity_strategy_forwards_seed_history_and_clear_pending():

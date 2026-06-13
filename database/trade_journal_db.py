@@ -138,9 +138,7 @@ def _ensure_columns():
             continue
         try:
             with engine.begin() as conn:
-                conn.execute(
-                    text(f"ALTER TABLE trade_journal ADD COLUMN {name} {sql_type}")
-                )
+                conn.execute(text(f"ALTER TABLE trade_journal ADD COLUMN {name} {sql_type}"))
             logger.info("trade_journal: added column %s %s", name, sql_type)
         except Exception as e:
             logger.warning("trade_journal: failed adding column %s: %s", name, e)

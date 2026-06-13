@@ -27,9 +27,7 @@ def fresh_cycle_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(scdb, "engine", test_engine)
     monkeypatch.setattr(scdb, "db_session", test_session)
@@ -77,9 +75,7 @@ def _wire(monkeypatch, syms):
     """Stub strategy lookup, symbol parser, and engine service."""
     from blueprints import chartink as chartink_module
 
-    monkeypatch.setattr(
-        chartink_module, "get_strategy_by_webhook_id", lambda _id: _fake_strategy()
-    )
+    monkeypatch.setattr(chartink_module, "get_strategy_by_webhook_id", lambda _id: _fake_strategy())
     monkeypatch.setattr(
         "services.simplified_stock_engine_service.parse_chartink_symbols",
         lambda payload: list(syms),

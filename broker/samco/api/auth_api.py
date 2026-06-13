@@ -22,7 +22,10 @@ def _parse_response(step, response):
     try:
         return response.json()
     except Exception:
-        return {"status": "Failure", "statusMessage": f"HTTP {response.status_code}: {step} failed - {response.text[:200]}"}
+        return {
+            "status": "Failure",
+            "statusMessage": f"HTTP {response.status_code}: {step} failed - {response.text[:200]}",
+        }
 
 
 def get_client_id():
@@ -85,9 +88,7 @@ def generate_secret_key(uid, otp):
         payload = {"uid": uid, "otp": otp}
 
         logger.info(f"Generating secret API key for user: {uid}")
-        response = client.post(
-            f"{BASE_URL}/otp/secretKeyGenerator", headers=headers, json=payload
-        )
+        response = client.post(f"{BASE_URL}/otp/secretKeyGenerator", headers=headers, json=payload)
         data = _parse_response("secretKeyGenerator", response)
 
         if data.get("status") == "Success":

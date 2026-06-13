@@ -22,9 +22,7 @@ def fresh_scanner_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(sdb, "engine", test_engine)
     monkeypatch.setattr(sdb, "db_session", test_session)
@@ -71,9 +69,7 @@ def test_create_scan_definition_and_retrieve(fresh_scanner_db):
     assert row["screener_type"] == "buy"
     assert row["enabled"] is True
     # expression_json round-trips as a JSON string.
-    assert json.loads(row["expression_json"]) == {
-        "rule": "close > vwap and rsi(14) > 60"
-    }
+    assert json.loads(row["expression_json"]) == {"rule": "close > vwap and rsi(14) > 60"}
 
 
 def test_create_duplicate_name_raises(fresh_scanner_db):
@@ -130,9 +126,7 @@ def test_get_scan_results_filters_by_source(fresh_scanner_db):
     scanner_service.record_scan_result(
         scan_definition_id=def_id, symbols=["A", "B"], source="chartink"
     )
-    scanner_service.record_scan_result(
-        scan_definition_id=def_id, symbols=["C"], source="inhouse"
-    )
+    scanner_service.record_scan_result(scan_definition_id=def_id, symbols=["C"], source="inhouse")
     scanner_service.record_scan_result(
         scan_definition_id=def_id, symbols=["D", "E"], source="shadow"
     )
@@ -197,9 +191,7 @@ def test_create_scan_definition_rejects_bad_screener_type(fresh_scanner_db):
     scanner_service.init_scanner_db()
 
     with pytest.raises(ValueError):
-        scanner_service.create_scan_definition(
-            name="bad", screener_type="hold", expression_json={}
-        )
+        scanner_service.create_scan_definition(name="bad", screener_type="hold", expression_json={})
 
 
 def test_record_scan_result_rejects_bad_source(fresh_scanner_db):

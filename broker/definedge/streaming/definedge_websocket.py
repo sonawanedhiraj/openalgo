@@ -296,7 +296,9 @@ class DefinedGeWebSocket:
         exchange = data.get("e")
 
         # Log tick data at debug level to avoid flooding logs
-        logger.debug(f"Tick data for {exchange}|{token}: lp={data.get('lp')}, fields={list(data.keys())}")
+        logger.debug(
+            f"Tick data for {exchange}|{token}: lp={data.get('lp')}, fields={list(data.keys())}"
+        )
 
         if self.on_tick:
             try:

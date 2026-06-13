@@ -191,9 +191,7 @@ class MotilalWebSocket:
         ):
             self._heartbeat_thread.join(timeout=2)
             if self._heartbeat_thread.is_alive():
-                logger.warning(
-                    "Motilal heartbeat thread did not exit within 2s of disconnect"
-                )
+                logger.warning("Motilal heartbeat thread did not exit within 2s of disconnect")
         self._heartbeat_thread = None
 
         if self.ws:
@@ -231,9 +229,7 @@ class MotilalWebSocket:
         ):
             self._connect_thread.join(timeout=5)
             if self._connect_thread.is_alive():
-                logger.warning(
-                    "Motilal connect thread did not exit within 5s of disconnect"
-                )
+                logger.warning("Motilal connect thread did not exit within 5s of disconnect")
         self._connect_thread = None
 
         logger.info("Motilal WebSocket disconnected")
@@ -860,9 +856,7 @@ class MotilalWebSocket:
             t = threading.Thread(target=delayed_reconnect, daemon=True)
             with self._reconnect_threads_lock:
                 # prune dead refs to keep the list bounded
-                self._reconnect_threads = [
-                    th for th in self._reconnect_threads if th.is_alive()
-                ]
+                self._reconnect_threads = [th for th in self._reconnect_threads if th.is_alive()]
                 self._reconnect_threads.append(t)
             t.start()
 

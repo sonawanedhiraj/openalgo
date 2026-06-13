@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -48,14 +46,18 @@ def test_close_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
 
     broker_close = MagicMock(return_value=({"status": "ok"}, 200))
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=broker_close),
     )
     sandbox_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
 
     success, _, status = close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is True
@@ -75,12 +77,16 @@ def test_close_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatc
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
     broker_close = MagicMock()
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=broker_close),
     )
 
     close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     sandbox_mock.assert_called_once()
@@ -98,12 +104,16 @@ def test_close_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
     broker_close = MagicMock()
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=broker_close),
     )
 
     close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     sandbox_mock.assert_called_once()
@@ -121,12 +131,16 @@ def test_close_rejects_when_skip(fresh_intent_db, monkeypatch):
     broker_close = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=broker_close),
     )
 
     success, response, status = close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -146,12 +160,16 @@ def test_close_rejects_when_disabled(fresh_intent_db, monkeypatch):
     broker_close = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", sandbox_mock)
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=broker_close),
     )
 
     success, response, status = close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     assert success is False
@@ -170,21 +188,29 @@ def test_close_reject_response_shape_matches_existing_convention(fresh_intent_db
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.sandbox_service.sandbox_close_position", MagicMock())
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=MagicMock()),
     )
     reject_result = close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     broker_close = MagicMock(return_value=({"status": "ok"}, 200))
     monkeypatch.setattr(
-        close_position_service, "import_broker_module",
+        close_position_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(close_all_positions=broker_close),
     )
     success_result = close_position_service.close_position_with_auth(
-        _payload(), auth_token="dummy", broker="zerodha", original_data=_payload(),
+        _payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
     )
 
     for r in (reject_result, success_result):

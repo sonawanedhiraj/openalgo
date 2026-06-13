@@ -20,9 +20,7 @@ import database.telegram_db as _tdb
 # Rebind to a private default-pool in-memory engine whose connection persists,
 # mirroring test/test_market_intel_db.py and test/test_orphaned_apikey.py.
 _engine = create_engine("sqlite:///:memory:")
-_tdb.db_session = scoped_session(
-    sessionmaker(autocommit=False, autoflush=False, bind=_engine)
-)
+_tdb.db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=_engine))
 _tdb.Base.query = _tdb.db_session.query_property()
 _tdb.Base.metadata.create_all(_engine)
 

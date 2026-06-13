@@ -25,9 +25,7 @@ def fresh_backtest_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(bdb, "engine", test_engine)
     monkeypatch.setattr(bdb, "db_session", test_session)
@@ -108,14 +106,16 @@ def _build_day_bars(
                 low_px = close_px - 0.1
             vol = surge_volume
 
-        bars.append({
-            "timestamp": _ist_epoch(date, h, mm),
-            "open": open_px,
-            "high": high_px,
-            "low": low_px,
-            "close": close_px,
-            "volume": vol,
-        })
+        bars.append(
+            {
+                "timestamp": _ist_epoch(date, h, mm),
+                "open": open_px,
+                "high": high_px,
+                "low": low_px,
+                "close": close_px,
+                "volume": vol,
+            }
+        )
 
     return bars
 
@@ -192,9 +192,7 @@ def test_pick_detected_and_trade_written(fresh_backtest_db, monkeypatch):
         direction="up",
     )
 
-    monkeypatch.setattr(
-        bsfs, "_fetch_bars", _stub_fetch_bars({"INFY": bars})
-    )
+    monkeypatch.setattr(bsfs, "_fetch_bars", _stub_fetch_bars({"INFY": bars}))
     # Skip exchange lookup overhead.
     monkeypatch.setattr(bsfs, "_exchange_for_symbol", lambda s, default="NSE": "NSE")
 
@@ -227,17 +225,17 @@ def test_multi_day_window_sorted_by_date(fresh_backtest_db, monkeypatch):
     day2 = _dt.date(2026, 5, 26)  # Tue
 
     # Symbol A: surge on day1 only. Symbol B: surge on day2 only.
-    bars_a = (
-        _build_day_bars(date=day1, surge_minute=105, surge_volume=200_000, n_minutes=180)
-        + _build_day_bars(date=day2, surge_minute=None, n_minutes=180)
-    )
-    bars_b = (
-        _build_day_bars(date=day1, surge_minute=None, n_minutes=180)
-        + _build_day_bars(date=day2, surge_minute=110, surge_volume=200_000, n_minutes=180)
+    bars_a = _build_day_bars(
+        date=day1, surge_minute=105, surge_volume=200_000, n_minutes=180
+    ) + _build_day_bars(date=day2, surge_minute=None, n_minutes=180)
+    bars_b = _build_day_bars(date=day1, surge_minute=None, n_minutes=180) + _build_day_bars(
+        date=day2, surge_minute=110, surge_volume=200_000, n_minutes=180
     )
 
     monkeypatch.setattr(
-        bsfs, "_fetch_bars", _stub_fetch_bars({"AAA": bars_a, "BBB": bars_b}),
+        bsfs,
+        "_fetch_bars",
+        _stub_fetch_bars({"AAA": bars_a, "BBB": bars_b}),
     )
     monkeypatch.setattr(bsfs, "_exchange_for_symbol", lambda s, default="NSE": "NSE")
 
@@ -294,7 +292,8 @@ def test_single_day_window_runs_quickly(fresh_backtest_db, monkeypatch):
     bars = _build_day_bars(date=date, surge_minute=None, n_minutes=180)
 
     monkeypatch.setattr(
-        bsfs, "_fetch_bars",
+        bsfs,
+        "_fetch_bars",
         _stub_fetch_bars({"A": bars, "B": bars, "C": bars}),
     )
     monkeypatch.setattr(bsfs, "_exchange_for_symbol", lambda s, default="NSE": "NSE")

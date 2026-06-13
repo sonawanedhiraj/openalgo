@@ -57,7 +57,10 @@ def _find_futures_symbol(
         # For crypto exchanges, perpetuals (PERPFUT) serve as the underlying
         if exchange.upper() in CRYPTO_EXCHANGES:
             _perp = fno_search_symbols(
-                query=f"{underlying}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{underlying}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
                 return None
@@ -156,7 +159,9 @@ def _fetch_daily_oi_changes(
                 # Rate limited - retry with backoff
                 if status_code == 429 and attempt < MAX_RETRIES:
                     delay = RETRY_BASE_DELAY * (2**attempt)
-                    logger.warning(f"Rate limited fetching {symbol}, retry {attempt + 1} after {delay}s")
+                    logger.warning(
+                        f"Rate limited fetching {symbol}, retry {attempt + 1} after {delay}s"
+                    )
                     time.sleep(delay)
                     continue
 
@@ -164,7 +169,9 @@ def _fetch_daily_oi_changes(
             except Exception as e:
                 if attempt < MAX_RETRIES and "429" in str(e):
                     delay = RETRY_BASE_DELAY * (2**attempt)
-                    logger.warning(f"Rate limited fetching {symbol}, retry {attempt + 1} after {delay}s")
+                    logger.warning(
+                        f"Rate limited fetching {symbol}, retry {attempt + 1} after {delay}s"
+                    )
                     time.sleep(delay)
                     continue
                 return symbol, 0.0
@@ -318,9 +325,7 @@ def get_oi_profile_data(
                 candles = _cap_last_n_trading_dates(candles, days, ist)
 
         # Step 3: Fetch daily OI changes (parallel)
-        prev_oi_map = _fetch_daily_oi_changes(
-            option_symbols_for_history, options_exchange, api_key
-        )
+        prev_oi_map = _fetch_daily_oi_changes(option_symbols_for_history, options_exchange, api_key)
 
         # Step 4: Compute OI changes
         for item in oi_chain:

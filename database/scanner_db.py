@@ -80,9 +80,7 @@ class ScanResult(Base):
     __tablename__ = "scan_results"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    scan_definition_id = Column(
-        Integer, ForeignKey("scan_definitions.id"), nullable=False
-    )
+    scan_definition_id = Column(Integer, ForeignKey("scan_definitions.id"), nullable=False)
     run_at = Column(String(40), nullable=False)
     symbols = Column(Text, nullable=False)  # JSON array
     source = Column(String(16), nullable=False)  # 'chartink' | 'inhouse' | 'shadow' | 'manual'

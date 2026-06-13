@@ -13,7 +13,11 @@ def _coerce_quantity_to_int(data):
         qty = data["quantity"]
         if qty != int(qty):
             raise ValidationError(
-                {"quantity": [f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."]}
+                {
+                    "quantity": [
+                        f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."
+                    ]
+                }
             )
         data["quantity"] = int(qty)
     return data
@@ -26,7 +30,10 @@ class OrderSchema(Schema):
     symbol = fields.Str(required=True)
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
     quantity = fields.Float(
-        required=True, validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number.")
+        required=True,
+        validate=validate.Range(
+            min=0, min_inclusive=False, error="Quantity must be a positive number."
+        ),
     )
     pricetype = fields.Str(
         missing="MARKET", validate=validate.OneOf(["MARKET", "LIMIT", "SL", "SL-M"])
@@ -99,7 +106,10 @@ class ModifyOrderSchema(Schema):
         required=True, validate=validate.Range(min=0, error="Price must be a non-negative number.")
     )
     quantity = fields.Float(
-        required=True, validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number.")
+        required=True,
+        validate=validate.Range(
+            min=0, min_inclusive=False, error="Quantity must be a positive number."
+        ),
     )
     disclosed_quantity = fields.Int(
         required=True,
@@ -136,7 +146,10 @@ class BasketOrderItemSchema(Schema):
     symbol = fields.Str(required=True)
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
     quantity = fields.Float(
-        required=True, validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number.")
+        required=True,
+        validate=validate.Range(
+            min=0, min_inclusive=False, error="Quantity must be a positive number."
+        ),
     )
     pricetype = fields.Str(
         missing="MARKET", validate=validate.OneOf(["MARKET", "LIMIT", "SL", "SL-M"])
@@ -175,7 +188,9 @@ class SplitOrderSchema(Schema):
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
     quantity = fields.Float(
         required=True,
-        validate=validate.Range(min=0, min_inclusive=False, error="Total quantity must be a positive number."),
+        validate=validate.Range(
+            min=0, min_inclusive=False, error="Total quantity must be a positive number."
+        ),
     )  # Total quantity to split
     splitsize = fields.Int(
         required=True,
@@ -208,7 +223,9 @@ class OptionsOrderSchema(Schema):
     underlying = fields.Str(
         required=True
     )  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE, or NIFTY28NOV24FUT)
-    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE, NFO, BFO)
+    exchange = fields.Str(
+        required=True, validate=validate.OneOf(VALID_EXCHANGES)
+    )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE, NFO, BFO)
     expiry_date = fields.Str(
         required=False
     )  # Optional if underlying includes expiry (DDMMMYY format)
@@ -291,7 +308,9 @@ class OptionsMultiOrderSchema(Schema):
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     strategy = fields.Str(required=True)
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE)
-    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
+    exchange = fields.Str(
+        required=True, validate=validate.OneOf(VALID_EXCHANGES)
+    )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
     expiry_date = fields.Str(
         required=False
     )  # Optional if underlying includes expiry (DDMMMYY format)
@@ -310,7 +329,9 @@ class SyntheticFutureSchema(Schema):
 
     apikey = fields.Str(required=True, validate=validate.Length(min=1, max=256))
     underlying = fields.Str(required=True)  # Underlying symbol (NIFTY, BANKNIFTY, RELIANCE)
-    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
+    exchange = fields.Str(
+        required=True, validate=validate.OneOf(VALID_EXCHANGES)
+    )  # Exchange (NSE_INDEX, NSE, BSE_INDEX, BSE)
     expiry_date = fields.Str(required=True)  # Expiry date in DDMMMYY format (e.g., 28OCT25)
 
 
@@ -323,9 +344,7 @@ class MarginPositionSchema(Schema):
             min=1, max=50, error="Symbol must be between 1 and 50 characters."
         ),
     )
-    exchange = fields.Str(
-        required=True, validate=validate.OneOf(VALID_EXCHANGES)
-    )
+    exchange = fields.Str(required=True, validate=validate.OneOf(VALID_EXCHANGES))
     action = fields.Str(required=True, validate=validate.OneOf(["BUY", "SELL", "buy", "sell"]))
     quantity = fields.Str(required=True)  # String to match API contract, validated in service layer
     product = fields.Str(required=True, validate=validate.OneOf(["MIS", "NRML", "CNC"]))
@@ -340,7 +359,10 @@ class MarginCalculatorSchema(Schema):
     """Schema for margin calculator request"""
 
     apikey = fields.Str(
-        required=True, validate=validate.Length(min=1, max=256, error="API key must be between 1 and 256 characters.")
+        required=True,
+        validate=validate.Length(
+            min=1, max=256, error="API key must be between 1 and 256 characters."
+        ),
     )
     positions = fields.List(
         fields.Nested(MarginPositionSchema),
@@ -352,6 +374,7 @@ class MarginCalculatorSchema(Schema):
 # -----------------------------------------------------------------------------
 # GTT (Good Till Triggered) Schemas
 # -----------------------------------------------------------------------------
+
 
 def _validate_gtt_place_request(data):
     """Validate flat GTT-place fields and normalise.
@@ -389,22 +412,26 @@ def _validate_gtt_place_request(data):
         if target in (None, 0, 0.0):
             raise ValidationError({"target": ["Required for OCO (target leg limit)."]})
         if float(sl_trigger) >= float(tg_trigger):
-            raise ValidationError({
-                "triggerprice_sl": [
-                    "Stoploss trigger must be less than target trigger (triggerprice_tg)."
-                ]
-            })
+            raise ValidationError(
+                {
+                    "triggerprice_sl": [
+                        "Stoploss trigger must be less than target trigger (triggerprice_tg)."
+                    ]
+                }
+            )
         # Legacy alias used by broker mappers / event payloads.
         data["trigger_price"] = float(tg_trigger)
     else:  # SINGLE — exactly one of triggerprice_sl / triggerprice_tg is the trigger.
         sl_v = float(sl_trigger) if sl_trigger not in (None, "", 0, 0.0) else 0.0
         tg_v = float(tg_trigger) if tg_trigger not in (None, "", 0, 0.0) else 0.0
         if sl_v <= 0 and tg_v <= 0:
-            raise ValidationError({
-                "triggerprice_sl": [
-                    "SINGLE GTT requires a positive triggerprice_sl or triggerprice_tg."
-                ]
-            })
+            raise ValidationError(
+                {
+                    "triggerprice_sl": [
+                        "SINGLE GTT requires a positive triggerprice_sl or triggerprice_tg."
+                    ]
+                }
+            )
         resolved = sl_v if sl_v > 0 else tg_v
         data["triggerprice_sl"] = sl_v if sl_v > 0 else None
         data["triggerprice_tg"] = tg_v if sl_v <= 0 else None
@@ -416,9 +443,13 @@ def _validate_gtt_place_request(data):
     qty = data.get("quantity")
     if qty is not None and exchange and exchange not in CRYPTO_EXCHANGES:
         if qty != int(qty):
-            raise ValidationError({
-                "quantity": [f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."]
-            })
+            raise ValidationError(
+                {
+                    "quantity": [
+                        f"Fractional quantity ({qty}) is not allowed for non-crypto exchanges."
+                    ]
+                }
+            )
         data["quantity"] = int(qty)
 
     data["action"] = data["action"].upper()
@@ -462,7 +493,9 @@ class PlaceGTTOrderSchema(Schema):
     )
     quantity = fields.Float(
         required=True,
-        validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
+        validate=validate.Range(
+            min=0, min_inclusive=False, error="Quantity must be a positive number."
+        ),
     )
     pricetype = fields.Str(missing="LIMIT", validate=validate.OneOf(["LIMIT", "MARKET"]))
     price = fields.Float(
@@ -521,7 +554,9 @@ class ModifyGTTOrderSchema(Schema):
     )
     quantity = fields.Float(
         required=True,
-        validate=validate.Range(min=0, min_inclusive=False, error="Quantity must be a positive number."),
+        validate=validate.Range(
+            min=0, min_inclusive=False, error="Quantity must be a positive number."
+        ),
     )
     pricetype = fields.Str(missing="LIMIT", validate=validate.OneOf(["LIMIT", "MARKET"]))
     price = fields.Float(

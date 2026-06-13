@@ -31,6 +31,7 @@ def _safe_order_id(orderid: Any) -> str:
         raise ValueError(f"Invalid orderid: {candidate!r}")
     return candidate
 
+
 _OPEN_STATUSES = {
     "OPEN",
     "PENDING",
@@ -146,7 +147,9 @@ def _first_result(payload: Any) -> dict:
 
 def _is_direct_order_payload(data: Any) -> bool:
     if isinstance(data, list):
-        return bool(data) and all(isinstance(item, dict) and _DIRECT_ORDER_KEYS.issubset(item) for item in data)
+        return bool(data) and all(
+            isinstance(item, dict) and _DIRECT_ORDER_KEYS.issubset(item) for item in data
+        )
     return isinstance(data, dict) and _DIRECT_ORDER_KEYS.issubset(data)
 
 
@@ -319,7 +322,11 @@ def place_smartorder_api(data, auth):
         quantity = current_position - position_size
 
     if not action or quantity <= 0:
-        return None, {"status": "success", "message": "No action needed. Position already aligned"}, None
+        return (
+            None,
+            {"status": "success", "message": "No action needed. Position already aligned"},
+            None,
+        )
 
     order_data = data.copy()
     order_data["action"] = action

@@ -345,7 +345,7 @@ class NotificationService:
             self._pf_last_signature = None
             self._pf_last_alert_at = None
 
-            text = "✅ *Preflight cleared*\n" f"Recovered after ~{elapsed_min} min of aborts."
+            text = f"✅ *Preflight cleared*\nRecovered after ~{elapsed_min} min of aborts."
             self.notify("preflight_abort", text, recovered=True)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_preflight_clear failed: %s", e)
@@ -519,7 +519,7 @@ class NotificationService:
         try:
             sev_key = (severity or "warning").lower()
             prefix = _SEVERITY_PREFIX.get(sev_key, "⚠️")
-            text = f"{prefix} *Anomaly [{sev_key}]*\n" f"├ Source: `{source}`\n" f"└ {message}"
+            text = f"{prefix} *Anomaly [{sev_key}]*\n├ Source: `{source}`\n└ {message}"
             self.notify("anomaly_alert", text, source=source, severity=sev_key)
         except Exception as e:  # noqa: BLE001
             logger.warning("publish_anomaly failed: %s", e)

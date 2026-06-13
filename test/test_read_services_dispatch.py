@@ -30,9 +30,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -56,6 +54,7 @@ def _patch_modes(monkeypatch, analyze=False):
 
 def _patch_orderbook(monkeypatch, broker_funcs):
     from services import orderbook_service
+
     monkeypatch.setattr(orderbook_service, "import_broker_module", lambda _b: broker_funcs)
 
 
@@ -80,7 +79,9 @@ def test_orderbook_reads_from_broker_when_live(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_orderbook", sandbox_mock)
 
     success, _, status = orderbook_service.get_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
 
     assert success is True
@@ -102,7 +103,9 @@ def test_orderbook_reads_from_sandbox_when_sandbox_intent(fresh_intent_db, monke
     _patch_orderbook(monkeypatch, {"get_order_book": broker_get})
 
     success, _, status = orderbook_service.get_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
 
     assert success is True
@@ -133,7 +136,9 @@ def test_orderbook_reads_from_broker_when_skip(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_orderbook", sandbox_mock)
 
     success, _, status = orderbook_service.get_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
 
     assert success is True
@@ -162,7 +167,9 @@ def test_orderbook_reads_from_broker_when_disabled(fresh_intent_db, monkeypatch)
     monkeypatch.setattr("services.sandbox_service.sandbox_get_orderbook", sandbox_mock)
 
     success, _, status = orderbook_service.get_orderbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
 
     assert success is True
@@ -187,12 +194,15 @@ def test_positionbook_routes_by_resolver(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_positions", sandbox_mock)
     broker_get = MagicMock()
     monkeypatch.setattr(
-        positionbook_service, "import_broker_module",
+        positionbook_service,
+        "import_broker_module",
         lambda _b: {"get_positions": broker_get},
     )
 
     success, _, _ = positionbook_service.get_positionbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     assert success is True
     sandbox_mock.assert_called_once()
@@ -208,7 +218,8 @@ def test_positionbook_skip_falls_through_to_broker(fresh_intent_db, monkeypatch)
 
     broker_get = MagicMock(return_value=[])
     monkeypatch.setattr(
-        positionbook_service, "import_broker_module",
+        positionbook_service,
+        "import_broker_module",
         lambda _b: {
             "get_positions": broker_get,
             "map_position_data": lambda x: [],
@@ -219,7 +230,9 @@ def test_positionbook_skip_falls_through_to_broker(fresh_intent_db, monkeypatch)
     monkeypatch.setattr("services.sandbox_service.sandbox_get_positions", sandbox_mock)
 
     positionbook_service.get_positionbook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     broker_get.assert_called_once()
     sandbox_mock.assert_not_called()
@@ -241,12 +254,15 @@ def test_tradebook_routes_by_resolver(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_tradebook", sandbox_mock)
     broker_get = MagicMock()
     monkeypatch.setattr(
-        tradebook_service, "import_broker_module",
+        tradebook_service,
+        "import_broker_module",
         lambda _b: {"get_trade_book": broker_get},
     )
 
     tradebook_service.get_tradebook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     sandbox_mock.assert_called_once()
     broker_get.assert_not_called()
@@ -259,7 +275,8 @@ def test_tradebook_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch
 
     broker_get = MagicMock(return_value=[])
     monkeypatch.setattr(
-        tradebook_service, "import_broker_module",
+        tradebook_service,
+        "import_broker_module",
         lambda _b: {
             "get_trade_book": broker_get,
             "map_trade_data": lambda x: [],
@@ -270,7 +287,9 @@ def test_tradebook_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch
     monkeypatch.setattr("services.sandbox_service.sandbox_get_tradebook", sandbox_mock)
 
     tradebook_service.get_tradebook_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     broker_get.assert_called_once()
     sandbox_mock.assert_not_called()
@@ -292,12 +311,15 @@ def test_holdings_routes_by_resolver(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_holdings", sandbox_mock)
     broker_get = MagicMock()
     monkeypatch.setattr(
-        holdings_service, "import_broker_module",
+        holdings_service,
+        "import_broker_module",
         lambda _b: {"get_holdings": broker_get},
     )
 
     holdings_service.get_holdings_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     sandbox_mock.assert_called_once()
     broker_get.assert_not_called()
@@ -312,7 +334,8 @@ def test_holdings_skip_falls_through_to_broker(fresh_intent_db, monkeypatch):
 
     broker_get = MagicMock(return_value=[])
     monkeypatch.setattr(
-        holdings_service, "import_broker_module",
+        holdings_service,
+        "import_broker_module",
         lambda _b: {
             "get_holdings": broker_get,
             "map_portfolio_data": lambda x: [],
@@ -324,7 +347,9 @@ def test_holdings_skip_falls_through_to_broker(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_holdings", sandbox_mock)
 
     holdings_service.get_holdings_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     broker_get.assert_called_once()
     sandbox_mock.assert_not_called()
@@ -346,12 +371,15 @@ def test_funds_routes_by_resolver(fresh_intent_db, monkeypatch):
     monkeypatch.setattr("services.sandbox_service.sandbox_get_funds", sandbox_mock)
     broker_get = MagicMock()
     monkeypatch.setattr(
-        funds_service, "import_broker_module",
+        funds_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(get_margin_data=broker_get),
     )
 
     funds_service.get_funds_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     sandbox_mock.assert_called_once()
     broker_get.assert_not_called()
@@ -364,14 +392,17 @@ def test_funds_disabled_falls_through_to_broker(fresh_intent_db, monkeypatch):
 
     broker_get = MagicMock(return_value={"cash": 10000.0})
     monkeypatch.setattr(
-        funds_service, "import_broker_module",
+        funds_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(get_margin_data=broker_get),
     )
     sandbox_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_get_funds", sandbox_mock)
 
     success, _, status = funds_service.get_funds_with_auth(
-        auth_token="dummy", broker="zerodha", original_data={"apikey": "test"},
+        auth_token="dummy",
+        broker="zerodha",
+        original_data={"apikey": "test"},
     )
     assert success is True
     assert status == 200
@@ -401,7 +432,8 @@ def test_openposition_routes_to_sandbox_when_sandbox(fresh_intent_db, monkeypatc
 
     success, _, status = openposition_service.get_open_position_with_auth(
         {"apikey": "test", "symbol": "INFY", "exchange": "NSE", "product": "MIS"},
-        auth_token="dummy", broker="zerodha",
+        auth_token="dummy",
+        broker="zerodha",
         original_data={"apikey": "test", "symbol": "INFY", "exchange": "NSE", "product": "MIS"},
     )
 
@@ -425,7 +457,8 @@ def test_openposition_skip_falls_through_to_positionbook(fresh_intent_db, monkey
 
     success, _, status = openposition_service.get_open_position_with_auth(
         {"apikey": "test", "symbol": "INFY", "exchange": "NSE", "product": "MIS"},
-        auth_token="dummy", broker="zerodha",
+        auth_token="dummy",
+        broker="zerodha",
         original_data={"apikey": "test", "symbol": "INFY", "exchange": "NSE", "product": "MIS"},
     )
 
@@ -450,7 +483,9 @@ def test_orderstatus_routes_to_sandbox_when_sandbox(fresh_intent_db, monkeypatch
     monkeypatch.setattr("services.sandbox_service.sandbox_get_order_status", sandbox_mock)
 
     success, _, _ = orderstatus_service.get_order_status_with_auth(
-        {"orderid": "OID-1"}, auth_token="dummy", broker="zerodha",
+        {"orderid": "OID-1"},
+        auth_token="dummy",
+        broker="zerodha",
         original_data={"apikey": "test", "orderid": "OID-1"},
     )
 
@@ -473,7 +508,9 @@ def test_orderstatus_skip_falls_through_to_orderbook(fresh_intent_db, monkeypatc
     monkeypatch.setattr("services.orderbook_service.get_orderbook", fake_ob)
 
     orderstatus_service.get_order_status_with_auth(
-        {"orderid": "OID-1"}, auth_token="dummy", broker="zerodha",
+        {"orderid": "OID-1"},
+        auth_token="dummy",
+        broker="zerodha",
         original_data={"apikey": "test", "orderid": "OID-1"},
     )
 

@@ -231,15 +231,12 @@ def rotate_refresh_token(
     # un-revoked and issue duplicate successors (security review
     # finding H-2). The WHERE clause means only one of the racing
     # requests will affect 1 row; the other affects 0 and bails.
-    rows_updated = (
-        OAuthRefreshToken.query.filter_by(id=matched.id, revoked_at=None)
-        .update(
-            {
-                "revoked_at": now,
-                "last_used_at": now,
-                "revoke_reason": "rotated",
-            }
-        )
+    rows_updated = OAuthRefreshToken.query.filter_by(id=matched.id, revoked_at=None).update(
+        {
+            "revoked_at": now,
+            "last_used_at": now,
+            "revoke_reason": "rotated",
+        }
     )
     if rows_updated == 0:
         # Lost the race — another request already consumed this token.
@@ -268,9 +265,7 @@ def rotate_refresh_token(
     return IssuedRefreshToken(plaintext=plaintext, row=successor, expires_in=ttl)
 
 
-def revoke_presented_refresh(
-    *, presented_plaintext: str, client_id: str
-) -> bool:
+def revoke_presented_refresh(*, presented_plaintext: str, client_id: str) -> bool:
     """Mark a refresh token revoked. Returns True on success or no-op."""
     if not presented_plaintext or not client_id:
         return False

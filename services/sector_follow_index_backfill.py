@@ -89,7 +89,10 @@ def backfill_sector_indices(
     symbols = [{"symbol": s, "exchange": exchange} for s in syms]
     logger.info(
         "sector_follow index 1m backfill: %d indices %s..%s (%s)",
-        len(symbols), start_date, end_date, exchange,
+        len(symbols),
+        start_date,
+        end_date,
+        exchange,
     )
     try:
         success, response, status_code = create_and_start_job(

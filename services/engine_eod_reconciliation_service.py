@@ -299,7 +299,13 @@ def reconcile_engine_journal(
             logger.info(
                 "[EOD-RECONCILE] Journaled sandbox square-off %s %s qty=%d exit=%.2f pnl=%s "
                 "(jid=%d, %d fill(s))",
-                direction, symbol, entry_qty, exit_price, pnl, journal_id, len(fills),
+                direction,
+                symbol,
+                entry_qty,
+                exit_price,
+                pnl,
+                journal_id,
+                len(fills),
             )
     finally:
         try:
@@ -309,7 +315,11 @@ def reconcile_engine_journal(
 
     logger.info(
         "[EOD-RECONCILE] date=%s strategy=%s checked=%d added=%d skipped=%d dry_run=%s",
-        result.date, strategy_name, result.entries_checked, result.exits_added,
-        len(result.skipped), dry_run,
+        result.date,
+        strategy_name,
+        result.entries_checked,
+        result.exits_added,
+        len(result.skipped),
+        dry_run,
     )
     return result

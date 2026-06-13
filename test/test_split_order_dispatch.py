@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -56,18 +54,20 @@ def test_split_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    broker_place = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1")
-    )
+    broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     sandbox_mock = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
 
     success, _, status = split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     assert success is True
@@ -87,15 +87,20 @@ def test_split_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatc
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     broker_place = MagicMock()
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     # Stub quotes_service to avoid REST call
     from services import quotes_service as qs
+
     monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
 
     success, _, status = split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     assert success is True
@@ -115,14 +120,19 @@ def test_split_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     broker_place = MagicMock()
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     from services import quotes_service as qs
+
     monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
 
     split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     sandbox_mock.assert_called()
@@ -140,12 +150,16 @@ def test_split_rejects_when_skip(fresh_intent_db, monkeypatch):
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
 
     success, response, status = split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     assert success is False
@@ -165,12 +179,16 @@ def test_split_rejects_when_disabled(fresh_intent_db, monkeypatch):
     broker_place = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
 
     success, response, status = split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     assert success is False
@@ -189,23 +207,29 @@ def test_split_reject_response_shape_matches_existing_convention(fresh_intent_db
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", MagicMock())
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
     reject_result = split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    broker_place = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID")
-    )
+    broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID"))
     monkeypatch.setattr(
-        split_order_service, "import_broker_module",
+        split_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
     success_result = split_order_service.split_order_with_auth(
-        _split_payload(), auth_token="dummy", broker="zerodha", original_data=_split_payload(),
+        _split_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_split_payload(),
     )
 
     for r in (reject_result, success_result):

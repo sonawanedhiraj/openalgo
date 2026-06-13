@@ -59,17 +59,17 @@ class DeltaWebSocket:
     """
 
     # ── constants ─────────────────────────────────────────────────────────────
-    WS_URL            = "wss://socket.india.delta.exchange"
-    HEARTBEAT_INTERVAL = 30      # seconds between pings
-    MSG_TYPE_AUTH      = "key-auth"
-    MSG_TYPE_SUB       = "subscribe"
-    MSG_TYPE_UNSUB     = "unsubscribe"
-    CHANNEL_TICKER     = "v2/ticker"
-    CHANNEL_L2_BOOK    = "l2_orderbook"
+    WS_URL = "wss://socket.india.delta.exchange"
+    HEARTBEAT_INTERVAL = 30  # seconds between pings
+    MSG_TYPE_AUTH = "key-auth"
+    MSG_TYPE_SUB = "subscribe"
+    MSG_TYPE_UNSUB = "unsubscribe"
+    CHANNEL_TICKER = "v2/ticker"
+    CHANNEL_L2_BOOK = "l2_orderbook"
     # Private authenticated channels (require auth message to be sent first)
-    CHANNEL_ORDERS    = "orders"      # real-time order fill / cancel / modify events
-    CHANNEL_POSITIONS = "positions"   # real-time position updates
-    CHANNEL_MARGINS   = "margins"     # real-time margin / wallet changes
+    CHANNEL_ORDERS = "orders"  # real-time order fill / cancel / modify events
+    CHANNEL_POSITIONS = "positions"  # real-time position updates
+    CHANNEL_MARGINS = "margins"  # real-time margin / wallet changes
 
     def __init__(
         self,
@@ -83,21 +83,21 @@ class DeltaWebSocket:
         retry_delay: int = 5,
         retry_multiplier: int = 2,
     ):
-        self.api_key    = api_key
+        self.api_key = api_key
         self.api_secret = api_secret
 
         # User-supplied callbacks
-        self.on_message = on_message  or (lambda ws, msg: None)
-        self.on_error   = on_error    or (lambda ws, err: None)
-        self.on_open    = on_open     or (lambda ws: None)
-        self.on_close   = on_close    or (lambda ws: None)
+        self.on_message = on_message or (lambda ws, msg: None)
+        self.on_error = on_error or (lambda ws, err: None)
+        self.on_open = on_open or (lambda ws: None)
+        self.on_close = on_close or (lambda ws: None)
 
         self.max_retry_attempt = max_retry_attempt
-        self.retry_delay       = retry_delay
-        self.retry_multiplier  = retry_multiplier
+        self.retry_delay = retry_delay
+        self.retry_multiplier = retry_multiplier
 
-        self.wsapp:  websocket.WebSocketApp | None = None
-        self._lock   = threading.Lock()
+        self.wsapp: websocket.WebSocketApp | None = None
+        self._lock = threading.Lock()
         self._connected = False
         self._stop_flag = False
         # Persistent subscription registry: deterministic_key → raw JSON message.
@@ -115,7 +115,7 @@ class DeltaWebSocket:
     def _build_auth_msg(self) -> str:
         """Build HMAC-SHA256 authenticated auth message."""
         timestamp = str(int(time.time()))
-        message   = f"GET{timestamp}/live"
+        message = f"GET{timestamp}/live"
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
             message.encode("utf-8"),
@@ -124,7 +124,7 @@ class DeltaWebSocket:
         payload = {
             "type": self.MSG_TYPE_AUTH,
             "payload": {
-                "api-key":   self.api_key,
+                "api-key": self.api_key,
                 "signature": signature,
                 "timestamp": timestamp,
             },
@@ -136,9 +136,7 @@ class DeltaWebSocket:
     def _build_sub_msg(self, channel: str, symbols: list[str], unsub=False) -> str:
         msg = {
             "type": self.MSG_TYPE_UNSUB if unsub else self.MSG_TYPE_SUB,
-            "payload": {
-                "channels": [{"name": channel, "symbols": symbols}]
-            },
+            "payload": {"channels": [{"name": channel, "symbols": symbols}]},
         }
         return json.dumps(msg)
 
@@ -166,7 +164,7 @@ class DeltaWebSocket:
         so no explicit re-subscribe call from the caller is ever needed.
         """
         with self._lock:
-            self._active_sub_msgs[key] = msg   # persist for reconnect replay
+            self._active_sub_msgs[key] = msg  # persist for reconnect replay
             if self._connected:
                 try:
                     if self.wsapp:
@@ -222,10 +220,12 @@ class DeltaWebSocket:
         channel_entry: dict = {"name": channel}
         if channel in (self.CHANNEL_ORDERS, self.CHANNEL_POSITIONS):
             channel_entry["symbols"] = ["all"]
-        return json.dumps({
-            "type": self.MSG_TYPE_UNSUB if unsub else self.MSG_TYPE_SUB,
-            "payload": {"channels": [channel_entry]},
-        })
+        return json.dumps(
+            {
+                "type": self.MSG_TYPE_UNSUB if unsub else self.MSG_TYPE_SUB,
+                "payload": {"channels": [channel_entry]},
+            }
+        )
 
     def subscribe_orders_channel(self) -> None:
         """Subscribe to the authenticated 'orders' channel.
@@ -242,7 +242,9 @@ class DeltaWebSocket:
         Delivers real-time position updates (size, entry price, PnL) whenever
         a position changes for the authenticated user.
         """
-        self._queue_or_send(self.CHANNEL_POSITIONS, self._build_private_sub_msg(self.CHANNEL_POSITIONS))
+        self._queue_or_send(
+            self.CHANNEL_POSITIONS, self._build_private_sub_msg(self.CHANNEL_POSITIONS)
+        )
 
     def subscribe_margins_channel(self) -> None:
         """Subscribe to the authenticated 'margins' channel.
@@ -260,13 +262,15 @@ class DeltaWebSocket:
 
         while not self._stop_flag and retry_attempts <= self.max_retry_attempt:
             try:
-                logger.info("DeltaWS connecting to %s (attempt %s)", self.WS_URL, retry_attempts + 1)
+                logger.info(
+                    "DeltaWS connecting to %s (attempt %s)", self.WS_URL, retry_attempts + 1
+                )
                 self.wsapp = websocket.WebSocketApp(
                     self.WS_URL,
-                    on_open    = self._ws_on_open,
-                    on_message = self._ws_on_message,
-                    on_error   = self._ws_on_error,
-                    on_close   = self._ws_on_close,
+                    on_open=self._ws_on_open,
+                    on_message=self._ws_on_message,
+                    on_error=self._ws_on_error,
+                    on_close=self._ws_on_close,
                 )
                 self.wsapp.run_forever(
                     sslopt={"cert_reqs": ssl.CERT_REQUIRED},

@@ -350,9 +350,7 @@ def _live_sector_quote_pct(symbol: str) -> float | None:
         api_key = get_first_available_api_key()
         if not api_key:
             return None
-        success, response, _ = get_quotes(
-            symbol=symbol, exchange=_SECTOR_EXCHANGE, api_key=api_key
-        )
+        success, response, _ = get_quotes(symbol=symbol, exchange=_SECTOR_EXCHANGE, api_key=api_key)
         if not success:
             return None
         data = response.get("data") or {}

@@ -24,9 +24,7 @@ def fresh_backtest_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
     monkeypatch.setattr(bdb, "engine", test_engine)
     monkeypatch.setattr(bdb, "db_session", test_session)
     bdb.Base.metadata.create_all(bind=test_engine)
@@ -61,7 +59,9 @@ def _warmup_bars(start: dt.datetime, n: int = 22, price: float = 100.0) -> list[
     """N flat-volume bars walking forward in 5-minute steps."""
     out = []
     for i in range(n):
-        out.append(_bar(start + dt.timedelta(minutes=5 * i), price, price + 0.1, price - 0.1, price))
+        out.append(
+            _bar(start + dt.timedelta(minutes=5 * i), price, price + 0.1, price - 0.1, price)
+        )
     return out
 
 
@@ -107,7 +107,8 @@ def _patch_replay(monkeypatch, bars_by_symbol: dict[str, list[dict]]):
         # Patch aggregate to return our bars regardless of input, just for
         # this call. Use a nested monkeypatch so other tests aren't affected.
         monkeypatch.setattr(
-            backtest_service, "_aggregate_to_interval_ohlc",
+            backtest_service,
+            "_aggregate_to_interval_ohlc",
             lambda bars_1m, interval: injected,
         )
         return original(**kwargs)
@@ -186,9 +187,7 @@ def test_run_backtest_records_entry_when_rule_matches(
 # ---------------------------------------------------------------------------
 
 
-def test_run_backtest_exits_on_stop_loss(
-    fresh_backtest_db, monkeypatch, isolated_rule_registry
-):
+def test_run_backtest_exits_on_stop_loss(fresh_backtest_db, monkeypatch, isolated_rule_registry):
     from services import backtest_service, scanner_service
 
     @scanner_service.scan_rule("test_buy_once", "buy", "fires on the 21st bar only")
@@ -230,9 +229,7 @@ def test_run_backtest_exits_on_stop_loss(
 # ---------------------------------------------------------------------------
 
 
-def test_run_backtest_exits_on_target(
-    fresh_backtest_db, monkeypatch, isolated_rule_registry
-):
+def test_run_backtest_exits_on_target(fresh_backtest_db, monkeypatch, isolated_rule_registry):
     from services import backtest_service, scanner_service
 
     @scanner_service.scan_rule("test_buy_once_t", "buy", "fires on the 21st bar")
@@ -273,9 +270,7 @@ def test_run_backtest_exits_on_target(
 # ---------------------------------------------------------------------------
 
 
-def test_run_backtest_eod_squareoff(
-    fresh_backtest_db, monkeypatch, isolated_rule_registry
-):
+def test_run_backtest_eod_squareoff(fresh_backtest_db, monkeypatch, isolated_rule_registry):
     from services import backtest_service, scanner_service
 
     @scanner_service.scan_rule("test_buy_eod", "buy", "fires on bar 21")
@@ -299,9 +294,7 @@ def test_run_backtest_eod_squareoff(
     # Bar 22 stays within target/SL range so it doesn't exit on its own.
     bars.append(_bar(entry_bar_ts, 100.0, 100.2, 99.9, 100.05))
     # Bar 23 lands past the 11:00 EOD cutoff we'll set.
-    bars.append(
-        _bar(dt.datetime(2026, 5, 25, 11, 5), 100.0, 100.2, 99.9, 100.1)
-    )
+    bars.append(_bar(dt.datetime(2026, 5, 25, 11, 5), 100.0, 100.2, 99.9, 100.1))
     _patch_replay(monkeypatch, {"X": bars})
 
     # Use 11:05 cutoff so bar 22 (at 11:00) enters and bar 23 (at 11:05)
@@ -349,9 +342,7 @@ def test_run_backtest_same_day_cooldown_blocks_reentry(
     bars.append(_bar(entry_bar_ts, 100.0, 100.2, 90.0, 95.0))
     # Bars 23+ keep firing the rule with healthy room above SL/target.
     for i in range(23, 50):
-        bars.append(
-            _bar(start + dt.timedelta(minutes=5 * i), 100.0, 100.5, 99.5, 100.0)
-        )
+        bars.append(_bar(start + dt.timedelta(minutes=5 * i), 100.0, 100.5, 99.5, 100.0))
     _patch_replay(monkeypatch, {"X": bars})
 
     run_id = backtest_service.run_backtest(
@@ -479,7 +470,7 @@ def test_replay_with_default_slippage_produces_realistic_fills(
     # of 100.10) to 100.10 - 0.035 → 100.05 nearest tick. Asserting both show
     # the slippage drag.
     assert t["entry_price"] > 100.0  # filled above bar 22's open of 100.0
-    assert t["exit_price"] < 100.1   # filled below bar 23's close of 100.1
+    assert t["exit_price"] < 100.1  # filled below bar 23's close of 100.1
 
 
 def test_replay_zero_slippage_matches_mvp_behavior(
@@ -621,9 +612,7 @@ def test_armed_symbol_disarms_at_next_scan_if_rule_no_longer_matches(
 
     # Match only at bar 22 (the first scan boundary); after that the
     # screener is silent on this symbol.
-    @scanner_service.scan_rule(
-        "test_buy_once_then_silent", "buy", "matches exactly at bar 22"
-    )
+    @scanner_service.scan_rule("test_buy_once_then_silent", "buy", "matches exactly at bar 22")
     def _at_22(bars, indicators):  # noqa: ARG001
         return len(bars) == 22
 
@@ -766,9 +755,7 @@ def test_data_source_db_passes_through(fresh_backtest_db, monkeypatch):
     assert calls[0]["source"] == "db"
 
 
-def test_data_source_auto_falls_back_to_api_when_db_empty(
-    fresh_backtest_db, monkeypatch
-):
+def test_data_source_auto_falls_back_to_api_when_db_empty(fresh_backtest_db, monkeypatch):
     from services import backtest_service
 
     sources_seen: list[str] = []
@@ -793,9 +780,7 @@ def test_data_source_auto_falls_back_to_api_when_db_empty(
     assert sources_seen == ["db", "api"]
 
 
-def test_in_process_cache_avoids_duplicate_history_calls(
-    fresh_backtest_db, monkeypatch
-):
+def test_in_process_cache_avoids_duplicate_history_calls(fresh_backtest_db, monkeypatch):
     """Symbols can repeat within one run (e.g. duplicates in the input list).
 
     Without the cache the broker history API would be hit once per

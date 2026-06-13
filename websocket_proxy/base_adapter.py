@@ -122,7 +122,9 @@ class BaseBrokerWebSocketAdapter(ABC):
         # Track instance count for shared context cleanup decisions
         with self._context_lock:
             BaseBrokerWebSocketAdapter._instance_count += 1
-            self.logger.debug(f"Adapter instance count: {BaseBrokerWebSocketAdapter._instance_count}")
+            self.logger.debug(
+                f"Adapter instance count: {BaseBrokerWebSocketAdapter._instance_count}"
+            )
 
         # Check if being created within a ConnectionPool context
         # This handles the case where broker adapters don't forward kwargs to super().__init__()
@@ -313,7 +315,9 @@ class BaseBrokerWebSocketAdapter(ABC):
             self.logger.debug("Skipping ZMQ cleanup - using shared publisher")
             # Still decrement instance count (only once due to _zmq_cleaned_up flag)
             with self._context_lock:
-                BaseBrokerWebSocketAdapter._instance_count = max(0, BaseBrokerWebSocketAdapter._instance_count - 1)
+                BaseBrokerWebSocketAdapter._instance_count = max(
+                    0, BaseBrokerWebSocketAdapter._instance_count - 1
+                )
             return
 
         try:
@@ -331,11 +335,18 @@ class BaseBrokerWebSocketAdapter(ABC):
 
             # Decrement instance count and cleanup shared context if last instance
             with self._context_lock:
-                BaseBrokerWebSocketAdapter._instance_count = max(0, BaseBrokerWebSocketAdapter._instance_count - 1)
-                self.logger.debug(f"Adapter instance count after cleanup: {BaseBrokerWebSocketAdapter._instance_count}")
+                BaseBrokerWebSocketAdapter._instance_count = max(
+                    0, BaseBrokerWebSocketAdapter._instance_count - 1
+                )
+                self.logger.debug(
+                    f"Adapter instance count after cleanup: {BaseBrokerWebSocketAdapter._instance_count}"
+                )
 
                 # If this was the last instance, clean up shared context
-                if BaseBrokerWebSocketAdapter._instance_count == 0 and BaseBrokerWebSocketAdapter._shared_context:
+                if (
+                    BaseBrokerWebSocketAdapter._instance_count == 0
+                    and BaseBrokerWebSocketAdapter._shared_context
+                ):
                     self.logger.info("Last adapter instance - cleaning up shared ZMQ context")
                     try:
                         BaseBrokerWebSocketAdapter._shared_context.term()
@@ -460,6 +471,7 @@ class BaseBrokerWebSocketAdapter(ABC):
         """
         try:
             from database.auth_db import get_auth_token
+
             return get_auth_token(user_id, bypass_cache=bypass_cache)
         except Exception as e:
             self.logger.exception(f"Error getting auth token for user {user_id}: {e}")
@@ -513,7 +525,9 @@ class BaseBrokerWebSocketAdapter(ABC):
             # It only caches broker names which don't affect auth token validation
 
             if caches_cleared:
-                self.logger.info(f"Cleared auth caches for user {user_id}: {', '.join(caches_cleared)}")
+                self.logger.info(
+                    f"Cleared auth caches for user {user_id}: {', '.join(caches_cleared)}"
+                )
             else:
                 self.logger.debug(f"No cached auth data found for user {user_id}")
 

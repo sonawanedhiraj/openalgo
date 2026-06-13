@@ -34,9 +34,7 @@ def fresh_journal_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(tjdb, "engine", test_engine)
     monkeypatch.setattr(tjdb, "db_session", test_session)
@@ -67,11 +65,7 @@ def test_record_entry_returns_positive_id(fresh_journal_db):
     )
     assert jid > 0
 
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     assert row is not None
     assert row.symbol == "RELIANCE"
     assert row.direction == "LONG"
@@ -104,11 +98,7 @@ def test_record_entry_persists_ltp_at_signal(fresh_journal_db):
     # Fill comes in at a worse price; ltp_at_signal must stay pinned.
     tjs.update_entry_fill(jid, entry_price=951.10)
 
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     assert row.ltp_at_signal == 950.0
     assert row.entry_price == 951.10
 
@@ -121,9 +111,7 @@ def test_record_entry_persists_ltp_at_signal(fresh_journal_db):
         signal_source="manual",
     )
     row2 = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid2)
-        .first()
+        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid2).first()
     )
     assert row2.ltp_at_signal is None
 
@@ -141,11 +129,7 @@ def test_update_entry_fill_patches_row(fresh_journal_db):
 
     tjs.update_entry_fill(jid, entry_price=1450.25, entry_fill_at="2026-05-30T11:30:00+05:30")
 
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     assert row.entry_price == 1450.25
     assert row.entry_fill_at == "2026-05-30T11:30:00+05:30"
 
@@ -183,11 +167,7 @@ def test_record_exit_derives_pnl_long(fresh_journal_db):
     )
     tjs.record_exit(jid, exit_price=1620.0, exit_reason="target", exit_order_id="EX-1")
 
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     # LONG: (exit - entry) * qty = (1620 - 1600) * 10 = 200
     assert row.pnl == pytest.approx(200.0)
     # pnl_pct = pnl / (entry * qty) = 200 / 16000 = 0.0125
@@ -213,11 +193,7 @@ def test_record_exit_derives_pnl_short(fresh_journal_db):
     )
     tjs.record_exit(jid, exit_price=840.0, exit_reason="stop_loss")
 
-    row = (
-        fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal)
-        .filter_by(id=jid)
-        .first()
-    )
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
     # SHORT: (entry - exit) * qty = (850 - 840) * 20 = 200
     assert row.pnl == pytest.approx(200.0)
 

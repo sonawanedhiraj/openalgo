@@ -126,7 +126,10 @@ class ScannerWsWatchdog:
         self._thread.start()
         logger.info(
             "Scanner WS watchdog started (soft=%.0fs hard=%.0fs cooldown=%.0fs interval=%.0fs)",
-            self.soft_threshold, self.hard_threshold, self.cooldown, self.interval,
+            self.soft_threshold,
+            self.hard_threshold,
+            self.cooldown,
+            self.interval,
         )
 
     def stop(self) -> None:
@@ -146,7 +149,9 @@ def start_scanner_ws_watchdog(username: str, *, app=None) -> ScannerWsWatchdog:
             return None
         if state["client_id"] != id(client):
             # Fresh client instance — register a once-per-tick stamp recorder.
-            client.register_callback("market_data", lambda _d: last_tick.__setitem__(0, time.time()))
+            client.register_callback(
+                "market_data", lambda _d: last_tick.__setitem__(0, time.time())
+            )
             state["client_id"] = id(client)
         return client
 

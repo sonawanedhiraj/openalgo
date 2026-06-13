@@ -59,17 +59,11 @@ def _get_positions_pnl(api_key, api_secret):
             return 0.0, 0.0
         data = response.json()
         if not data.get("success"):
-            logger.warning(
-                f"[DeltaExchange] positions/margined API error: {data.get('error', {})}"
-            )
+            logger.warning(f"[DeltaExchange] positions/margined API error: {data.get('error', {})}")
             return 0.0, 0.0
         positions = data.get("result", [])
-        realized = sum(
-            _f(p.get("realized_pnl")) for p in positions if isinstance(p, dict)
-        )
-        unrealized = sum(
-            _f(p.get("unrealized_pnl")) for p in positions if isinstance(p, dict)
-        )
+        realized = sum(_f(p.get("realized_pnl")) for p in positions if isinstance(p, dict))
+        unrealized = sum(_f(p.get("unrealized_pnl")) for p in positions if isinstance(p, dict))
         return realized, unrealized
     except Exception as e:
         logger.warning(f"[DeltaExchange] Could not fetch positions P&L: {e}")

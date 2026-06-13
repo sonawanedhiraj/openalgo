@@ -21,9 +21,7 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-sector_follow_bp = Blueprint(
-    "sector_follow_bp", __name__, url_prefix="/sector_follow_cap5_vol"
-)
+sector_follow_bp = Blueprint("sector_follow_bp", __name__, url_prefix="/sector_follow_cap5_vol")
 
 
 def _extract_api_key() -> str | None:

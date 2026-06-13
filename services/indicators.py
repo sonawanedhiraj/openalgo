@@ -60,9 +60,7 @@ def sma(series: pd.Series, period: int) -> pd.Series:
     return series.rolling(period).mean()
 
 
-def supertrend(
-    bars: pd.DataFrame, period: int = 7, multiplier: float = 3.0
-) -> pd.DataFrame:
+def supertrend(bars: pd.DataFrame, period: int = 7, multiplier: float = 3.0) -> pd.DataFrame:
     """Supertrend indicator (default 7, 3) backed by ``pandas-ta-classic``.
 
     The Supertrend bands are built from the basic upper/lower bands

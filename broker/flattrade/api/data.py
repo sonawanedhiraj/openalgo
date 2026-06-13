@@ -20,9 +20,11 @@ from utils.logging import get_logger
 def _is_eventlet_patched():
     try:
         import eventlet.patcher
+
         return eventlet.patcher.is_monkey_patched("socket")
     except (ImportError, AttributeError):
         return False
+
 
 USE_ASYNC = not _is_eventlet_patched()
 

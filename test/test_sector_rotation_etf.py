@@ -101,7 +101,11 @@ def test_compute_target_positions_equal_weight_within_leg():
 def test_compute_target_positions_overlap_summed():
     # A is in both legs -> notionals summed, reason "both".
     targets = compute_target_positions(
-        ["A", "B", "C"], ["A", "D", "E"], 0.5, 0.5, 300000.0,
+        ["A", "B", "C"],
+        ["A", "D", "E"],
+        0.5,
+        0.5,
+        300000.0,
         dict.fromkeys("ABCDE", 100.0),
     )
     assert targets["A"]["target_notional"] == pytest.approx(100000.0)
@@ -160,9 +164,7 @@ def test_compute_rebalance_end_to_end_smoke(tmp_path):
             ts = int(datetime(d.year, d.month, d.day, tzinfo=UTC).timestamp())
             price *= math.exp(drift + rng.normal(0, 0.01))
             rows.append((sym, "NSE", "D", ts, price, price, price, price, 1000))
-    con.executemany(
-        "INSERT INTO market_data VALUES (?,?,?,?,?,?,?,?,?)", rows
-    )
+    con.executemany("INSERT INTO market_data VALUES (?,?,?,?,?,?,?,?,?)", rows)
     con.close()
 
     config = SectorRotationConfig(

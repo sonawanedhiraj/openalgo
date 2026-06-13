@@ -98,9 +98,7 @@ def test_fetch_feed_items_normalizes_entries():
     assert items[0]["link"] == "https://x.example/news/1"
     assert items[0]["published_raw"].startswith("Mon, 01 Jun")
     assert "Central bank" in items[0]["summary"]
-    assert items[0]["dedup_hash"] == nis._dedup_hash(
-        "stub_source", "RBI holds repo rate steady"
-    )
+    assert items[0]["dedup_hash"] == nis._dedup_hash("stub_source", "RBI holds repo rate steady")
     # Second entry falls back to `updated`.
     assert items[1]["published_raw"].startswith("Mon, 01 Jun")
 
@@ -145,9 +143,7 @@ def test_get_existing_hashes_extracts_set_from_payloads():
         {"payload_json": {"title": "no hash"}},  # ignored
         {"payload_json": "raw string"},  # ignored
     ]
-    with patch(
-        "database.market_intel_db.latest_intel_by_kind", return_value=fake_rows
-    ):
+    with patch("database.market_intel_db.latest_intel_by_kind", return_value=fake_rows):
         out = nis.get_existing_hashes(since_minutes=60)
     assert out == {"h1", "h2"}
 
@@ -187,9 +183,11 @@ def test_run_ingest_cycle_writes_new_skips_dupes(monkeypatch):
         inserted.append(json.loads(payload_json))
         return len(inserted)
 
-    with patch.object(nis, "fetch_feed_items", side_effect=fake_fetch), patch(
-        "database.market_intel_db.insert_intel", side_effect=fake_insert
-    ), patch.object(nis, "get_existing_hashes", return_value={h_dupe}):
+    with (
+        patch.object(nis, "fetch_feed_items", side_effect=fake_fetch),
+        patch("database.market_intel_db.insert_intel", side_effect=fake_insert),
+        patch.object(nis, "get_existing_hashes", return_value={h_dupe}),
+    ):
         summary = nis.run_ingest_cycle()
 
     assert summary["feeds"] == 2
@@ -215,9 +213,11 @@ def test_run_ingest_cycle_handles_insert_failure(monkeypatch):
             }
         ]
 
-    with patch.object(nis, "fetch_feed_items", side_effect=fake_fetch), patch(
-        "database.market_intel_db.insert_intel", side_effect=RuntimeError("db down")
-    ), patch.object(nis, "get_existing_hashes", return_value=set()):
+    with (
+        patch.object(nis, "fetch_feed_items", side_effect=fake_fetch),
+        patch("database.market_intel_db.insert_intel", side_effect=RuntimeError("db down")),
+        patch.object(nis, "get_existing_hashes", return_value=set()),
+    ):
         summary = nis.run_ingest_cycle()
 
     # Both feeds tried, no rows committed, no crash.

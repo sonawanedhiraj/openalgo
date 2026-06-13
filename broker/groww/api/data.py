@@ -1663,9 +1663,7 @@ class BrokerData:
                 if isinstance(sym, dict) and "symbol" in sym and "exchange" in sym:
                     symbols_to_process.append(sym)
                 elif isinstance(sym, str):
-                    symbols_to_process.append(
-                        {"symbol": sym, "exchange": _infer_exchange(sym)}
-                    )
+                    symbols_to_process.append({"symbol": sym, "exchange": _infer_exchange(sym)})
 
         # No valid symbols to process
         if not symbols_to_process:
@@ -2236,9 +2234,7 @@ class BrokerData:
         # us in cooldown and continuing only delays the user.
         MAX_CONSECUTIVE_429 = 4
         # Index existing results so we can merge by (symbol, exchange).
-        result_index = {
-            (r.get("symbol"), r.get("exchange")): r for r in existing_results
-        }
+        result_index = {(r.get("symbol"), r.get("exchange")): r for r in existing_results}
 
         def _fetch_one(exchange_symbol: str) -> dict:
             original = symbol_map.get(exchange_symbol, {})
@@ -2265,9 +2261,7 @@ class BrokerData:
                     debug=False,
                 )
             except Exception as fetch_err:
-                logger.warning(
-                    f"Quote fetch failed for {exchange_symbol}: {fetch_err}"
-                )
+                logger.warning(f"Quote fetch failed for {exchange_symbol}: {fetch_err}")
                 return {
                     "symbol": original.get("symbol", exchange_symbol),
                     "exchange": original.get("exchange", "UNKNOWN"),
@@ -2443,4 +2437,3 @@ class BrokerData:
             f"Full-quote overlay: {overlaid}/{len(exchange_symbols)} strikes enriched "
             f"with bid/ask/qty/volume/OI."
         )
-

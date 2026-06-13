@@ -71,11 +71,16 @@ def get_api_response(endpoint, auth, method="GET", payload="", max_retries=2):
         except json.JSONDecodeError:
             # Rate limit returns plain text like "Access denied because of exceeding access rate"
             if "exceeding access rate" in response.text.lower() and attempt < max_retries:
-                logger.warning(f"Rate limited on {endpoint}, retrying in 1s (attempt {attempt + 1}/{max_retries})")
+                logger.warning(
+                    f"Rate limited on {endpoint}, retrying in 1s (attempt {attempt + 1}/{max_retries})"
+                )
                 time.sleep(1)
                 continue
             logger.error(f"Failed to parse JSON response from {endpoint}: {response.text}")
-            return {"status": "error", "message": f"Invalid JSON response (HTTP {response.status_code})"}
+            return {
+                "status": "error",
+                "message": f"Invalid JSON response (HTTP {response.status_code})",
+            }
 
     return {"status": "error", "message": "Max retries exceeded"}
 
@@ -99,14 +104,14 @@ def get_holdings(auth):
 # --- Per-Symbol Smart Order Lock ---
 # Ensures only one smart order per symbol executes at a time.
 # Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}          # {symbol_key: threading.Lock}
+_symbol_locks = {}  # {symbol_key: threading.Lock}
 _symbol_locks_lock = threading.Lock()
 
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
-_position_cache = {}        # {auth_token: {"data": ..., "timestamp": ...}}
+_position_cache = {}  # {auth_token: {"data": ..., "timestamp": ...}}
 _position_cache_lock = threading.Lock()
-_POSITION_CACHE_TTL = 1.0   # seconds
+_POSITION_CACHE_TTL = 1.0  # seconds
 
 
 def _get_symbol_lock(symbol, exchange, product):
@@ -139,7 +144,6 @@ def _invalidate_position_cache(auth):
     """Invalidate the position cache so the next queued order fetches fresh data."""
     with _position_cache_lock:
         _position_cache.pop(auth, None)
-
 
 
 def get_open_position(tradingsymbol, exchange, producttype, auth):

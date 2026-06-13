@@ -456,11 +456,13 @@ def bulk_remove_from_watchlist(
                 exchange = item.get("exchange", "").upper()
 
                 if not symbol or not exchange:
-                    failed.append({
-                        "symbol": symbol or "MISSING",
-                        "exchange": exchange or "MISSING",
-                        "error": "Missing symbol or exchange",
-                    })
+                    failed.append(
+                        {
+                            "symbol": symbol or "MISSING",
+                            "exchange": exchange or "MISSING",
+                            "error": "Missing symbol or exchange",
+                        }
+                    )
                     continue
 
                 # Check if exists
@@ -479,13 +481,17 @@ def bulk_remove_from_watchlist(
                     removed += 1
                     existing_set.discard((symbol, exchange))
                 except Exception as e:
-                    failed.append({
-                        "symbol": symbol,
-                        "exchange": exchange,
-                        "error": str(e),
-                    })
+                    failed.append(
+                        {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "error": str(e),
+                        }
+                    )
 
-        logger.info(f"Bulk watchlist remove: {removed} removed, {skipped} skipped, {len(failed)} failed")
+        logger.info(
+            f"Bulk watchlist remove: {removed} removed, {skipped} skipped, {len(failed)} failed"
+        )
         return removed, skipped, failed
 
     except Exception as e:
@@ -1303,11 +1309,13 @@ def bulk_delete_market_data(
                 exchange = item.get("exchange", "").upper()
 
                 if not symbol or not exchange:
-                    failed.append({
-                        "symbol": symbol or "MISSING",
-                        "exchange": exchange or "MISSING",
-                        "error": "Missing symbol or exchange",
-                    })
+                    failed.append(
+                        {
+                            "symbol": symbol or "MISSING",
+                            "exchange": exchange or "MISSING",
+                            "error": "Missing symbol or exchange",
+                        }
+                    )
                     continue
 
                 try:
@@ -1319,7 +1327,7 @@ def bulk_delete_market_data(
                         """,
                         [symbol, exchange],
                     )
-                    rows_deleted = result.rowcount if hasattr(result, 'rowcount') else 0
+                    rows_deleted = result.rowcount if hasattr(result, "rowcount") else 0
 
                     # Delete from data_catalog
                     conn.execute(
@@ -1338,14 +1346,18 @@ def bulk_delete_market_data(
                         logger.debug(f"Bulk delete: No data found for {symbol}:{exchange}")
 
                 except Exception as e:
-                    failed.append({
-                        "symbol": symbol,
-                        "exchange": exchange,
-                        "error": str(e),
-                    })
+                    failed.append(
+                        {
+                            "symbol": symbol,
+                            "exchange": exchange,
+                            "error": str(e),
+                        }
+                    )
                     logger.error(f"Bulk delete: Failed to delete {symbol}:{exchange}: {e}")
 
-        logger.info(f"Bulk delete completed: {deleted} deleted, {skipped} skipped, {len(failed)} failed")
+        logger.info(
+            f"Bulk delete completed: {deleted} deleted, {skipped} skipped, {len(failed)} failed"
+        )
         return deleted, skipped, failed
 
     except Exception as e:
@@ -1520,8 +1532,18 @@ def vacuum_database():
 # exchange the platform validates as legal, otherwise /history download/upload
 # rejects symbols that the live /quote and /history-API paths happily serve.
 SUPPORTED_EXCHANGES = [
-    "NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD", "NCO",
-    "NSE_INDEX", "BSE_INDEX", "MCX_INDEX", "GLOBAL_INDEX",
+    "NSE",
+    "BSE",
+    "NFO",
+    "BFO",
+    "MCX",
+    "CDS",
+    "BCD",
+    "NCO",
+    "NSE_INDEX",
+    "BSE_INDEX",
+    "MCX_INDEX",
+    "GLOBAL_INDEX",
     "CRYPTO",
 ]
 
@@ -2353,7 +2375,9 @@ def export_to_parquet(
                     SELECT DISTINCT symbol, exchange FROM data_catalog
                     ORDER BY symbol, exchange
                 """).fetchdf()
-                symbols_list = [(row["symbol"], row["exchange"]) for _, row in symbols_df.iterrows()]
+                symbols_list = [
+                    (row["symbol"], row["exchange"]) for _, row in symbols_df.iterrows()
+                ]
 
             if not symbols_list:
                 return False, "No symbols found to export", 0
@@ -2362,8 +2386,8 @@ def export_to_parquet(
             target_interval = interval if interval else "D"
 
             is_daily_agg = is_daily_aggregated_interval(target_interval)
-            is_intraday_computed = (
-                target_interval in COMPUTED_INTERVALS or is_custom_interval(target_interval)
+            is_intraday_computed = target_interval in COMPUTED_INTERVALS or is_custom_interval(
+                target_interval
             )
 
             for sym, exch in symbols_list:
@@ -2423,9 +2447,7 @@ def export_to_parquet(
                         if parsed and parsed["type"] == "intraday":
                             minutes = parsed["minutes"]
                         else:
-                            logger.warning(
-                                f"Cannot parse interval {target_interval}, skipping"
-                            )
+                            logger.warning(f"Cannot parse interval {target_interval}, skipping")
                             skipped_intervals.append(f"{sym}:{exch}:{target_interval}")
                             continue
                     interval_seconds = minutes * 60
@@ -2492,8 +2514,16 @@ def export_to_parquet(
                 df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
                 df = df[
                     [
-                        "symbol", "exchange", "interval", "timestamp",
-                        "open", "high", "low", "close", "volume", "oi",
+                        "symbol",
+                        "exchange",
+                        "interval",
+                        "timestamp",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume",
+                        "oi",
                         "datetime",
                     ]
                 ]
@@ -2519,7 +2549,9 @@ def export_to_parquet(
         file_size = os.path.getsize(abs_output) / (1024 * 1024)  # MB
         message = f"Exported {record_count} records ({file_size:.2f} MB)"
         if skipped_intervals:
-            message += f". Note: {len(skipped_intervals)} symbol(s) skipped due to missing source data."
+            message += (
+                f". Note: {len(skipped_intervals)} symbol(s) skipped due to missing source data."
+            )
         logger.info(message)
         return True, message, record_count
 

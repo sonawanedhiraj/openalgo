@@ -351,11 +351,11 @@ def process_paytm_csv(path):
 
     nse_idx_mask = token_df["exchange"] == "NSE_INDEX"
     bse_idx_mask = token_df["exchange"] == "BSE_INDEX"
-    token_df.loc[nse_idx_mask, "symbol"] = (
-        token_df.loc[nse_idx_mask, "symbol"].replace(nse_index_map)
+    token_df.loc[nse_idx_mask, "symbol"] = token_df.loc[nse_idx_mask, "symbol"].replace(
+        nse_index_map
     )
-    token_df.loc[bse_idx_mask, "symbol"] = (
-        token_df.loc[bse_idx_mask, "symbol"].replace(bse_index_map)
+    token_df.loc[bse_idx_mask, "symbol"] = token_df.loc[bse_idx_mask, "symbol"].replace(
+        bse_index_map
     )
 
     return token_df

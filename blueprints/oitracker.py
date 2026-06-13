@@ -58,7 +58,9 @@ def oi_data():
             return jsonify({"status": "error", "message": "Invalid input format"}), 400
 
         if not re.match(r"^\d{2}[A-Z]{3}\d{2}$", expiry_date):
-            return jsonify({"status": "error", "message": "Invalid expiry_date format. Expected DDMMMYY"}), 400
+            return jsonify(
+                {"status": "error", "message": "Invalid expiry_date format. Expected DDMMMYY"}
+            ), 400
 
         success, response, status_code = get_oi_data(
             underlying=underlying,
@@ -71,7 +73,9 @@ def oi_data():
 
     except Exception as e:
         logger.exception(f"Error in OI data API: {e}")
-        return jsonify({"status": "error", "message": "An error occurred processing your request"}), 500
+        return jsonify(
+            {"status": "error", "message": "An error occurred processing your request"}
+        ), 500
 
 
 @oitracker_bp.route("/oitracker/api/maxpain", methods=["POST"])
@@ -110,7 +114,9 @@ def maxpain():
             return jsonify({"status": "error", "message": "Invalid input format"}), 400
 
         if not re.match(r"^\d{2}[A-Z]{3}\d{2}$", expiry_date):
-            return jsonify({"status": "error", "message": "Invalid expiry_date format. Expected DDMMMYY"}), 400
+            return jsonify(
+                {"status": "error", "message": "Invalid expiry_date format. Expected DDMMMYY"}
+            ), 400
 
         success, response, status_code = calculate_max_pain(
             underlying=underlying,
@@ -123,4 +129,6 @@ def maxpain():
 
     except Exception as e:
         logger.exception(f"Error in Max Pain API: {e}")
-        return jsonify({"status": "error", "message": "An error occurred processing your request"}), 500
+        return jsonify(
+            {"status": "error", "message": "An error occurred processing your request"}
+        ), 500

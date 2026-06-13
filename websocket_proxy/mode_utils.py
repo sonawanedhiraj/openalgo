@@ -39,9 +39,7 @@ def normalize_mode(value) -> tuple[int, str]:
         raise TypeError(f"Mode must be int or str, got bool ({value!r})")
     if isinstance(value, int):
         if value not in _MODE_CANONICAL:
-            raise ValueError(
-                f"Invalid mode {value}; expected 1 (LTP), 2 (Quote), or 3 (Depth)"
-            )
+            raise ValueError(f"Invalid mode {value}; expected 1 (LTP), 2 (Quote), or 3 (Depth)")
         return value, _MODE_CANONICAL[value]
     if isinstance(value, str):
         upper = value.strip().upper()
@@ -69,4 +67,4 @@ def normalize_mode_or_none(value) -> tuple[int, str] | None:
 # Kept private-by-convention (single underscore) so new code is steered to
 # the functions above instead.
 MODE_BY_UPPER_LABEL = dict(_MODE_BY_UPPER_LABEL)  # {"LTP": 1, "QUOTE": 2, "DEPTH": 3}
-MODE_CANONICAL = dict(_MODE_CANONICAL)            # {1: "LTP", 2: "Quote", 3: "Depth"}
+MODE_CANONICAL = dict(_MODE_CANONICAL)  # {1: "LTP", 2: "Quote", 3: "Depth"}

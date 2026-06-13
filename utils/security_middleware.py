@@ -36,9 +36,7 @@ class SecurityMiddleware:
         """
         self.app = app
 
-    def __call__(
-        self, environ: WSGIEnviron, start_response: StartResponse
-    ) -> Iterable[bytes]:
+    def __call__(self, environ: WSGIEnviron, start_response: StartResponse) -> Iterable[bytes]:
         """Process an incoming WSGI request.
 
         Checks the client IP against the ban list. Banned IPs receive a

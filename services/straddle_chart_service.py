@@ -139,12 +139,18 @@ def get_straddle_chart_data(
         # CRYPTO: look up the canonical perpetual symbol from cache (e.g. BTC → BTCUSDFUT)
         if exchange.upper() in CRYPTO_EXCHANGES:
             _perp = fno_search_symbols(
-                query=f"{base_symbol}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{base_symbol}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
                 return (
                     False,
-                    {"status": "error", "message": f"No perpetual futures found for {base_symbol} on {exchange}"},
+                    {
+                        "status": "error",
+                        "message": f"No perpetual futures found for {base_symbol} on {exchange}",
+                    },
                     404,
                 )
             underlying_quote_symbol = _perp[0]["symbol"]
@@ -186,11 +192,19 @@ def get_straddle_chart_data(
 
         df_underlying = pd.DataFrame(resp_u.get("data", []))
         if df_underlying.empty:
-            return False, {"status": "error", "message": "No underlying history data available"}, 404
+            return (
+                False,
+                {"status": "error", "message": "No underlying history data available"},
+                404,
+            )
 
         df_underlying = _convert_timestamp_to_ist(df_underlying)
         if df_underlying is None:
-            return False, {"status": "error", "message": "Failed to parse underlying timestamps"}, 500
+            return (
+                False,
+                {"status": "error", "message": "Failed to parse underlying timestamps"},
+                500,
+            )
 
         # Step 4: For each candle, compute ATM strike
         atm_per_row = []
@@ -206,13 +220,19 @@ def get_straddle_chart_data(
         if not unique_strikes:
             return False, {"status": "error", "message": "Could not determine any ATM strikes"}, 400
 
-        logger.debug(f"Straddle chart: {len(unique_strikes)} unique ATM strikes for {base_symbol}: {sorted(unique_strikes)}")
+        logger.debug(
+            f"Straddle chart: {len(unique_strikes)} unique ATM strikes for {base_symbol}: {sorted(unique_strikes)}"
+        )
 
         # Step 6: For each unique strike, fetch CE and PE history
         # Build lookup: {strike: {timestamp: {ce_close, pe_close}}}
         strike_data = {}
 
-        _build_sym = construct_crypto_option_symbol if exchange.upper() in CRYPTO_EXCHANGES else construct_option_symbol
+        _build_sym = (
+            construct_crypto_option_symbol
+            if exchange.upper() in CRYPTO_EXCHANGES
+            else construct_option_symbol
+        )
         for strike in sorted(unique_strikes):
             ce_symbol = _build_sym(base_symbol, expiry_date.upper(), strike, "CE")
             pe_symbol = _build_sym(base_symbol, expiry_date.upper(), strike, "PE")
@@ -295,7 +315,10 @@ def get_straddle_chart_data(
         if not series:
             return (
                 False,
-                {"status": "error", "message": "No straddle data available (option history may be missing)"},
+                {
+                    "status": "error",
+                    "message": "No straddle data available (option history may be missing)",
+                },
                 404,
             )
 

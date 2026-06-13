@@ -39,12 +39,12 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def __init__(self):
         super().__init__()
-        self.logger       = logging.getLogger("delta_websocket_adapter")
-        self.ws_client    = None
-        self.user_id      = None
-        self.broker_name  = "deltaexchange"
-        self.running      = False
-        self._lock        = threading.Lock()
+        self.logger = logging.getLogger("delta_websocket_adapter")
+        self.ws_client = None
+        self.user_id = None
+        self.broker_name = "deltaexchange"
+        self.running = False
+        self._lock = threading.Lock()
         self.last_values: dict[str, dict] = {}
 
     # ── BaseBrokerWebSocketAdapter interface ──────────────────────────────────
@@ -62,30 +62,30 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             api_key    / access_token — the Delta Exchange API key
             api_secret               — the Delta Exchange API secret
         """
-        self.user_id     = user_id
+        self.user_id = user_id
         self.broker_name = broker_name
 
         if auth_data:
-            api_key    = auth_data.get("api_key") or auth_data.get("access_token", "")
+            api_key = auth_data.get("api_key") or auth_data.get("access_token", "")
             api_secret = auth_data.get("api_secret", "")
         else:
             # OpenAlgo stores the api_key as the auth token
-            api_key    = get_auth_token(user_id) or ""
+            api_key = get_auth_token(user_id) or ""
             api_secret = os.getenv("BROKER_API_SECRET", "")
 
         if not api_key:
             raise ValueError(f"No API key found for user {user_id}")
 
         self.ws_client = DeltaWebSocket(
-            api_key    = api_key,
-            api_secret = api_secret,
-            on_open    = self._on_open,
-            on_message = self._on_data,
-            on_error   = self._on_error,
-            on_close   = self._on_close,
-            max_retry_attempt = 5,
-            retry_delay       = 5,
-            retry_multiplier  = 2,
+            api_key=api_key,
+            api_secret=api_secret,
+            on_open=self._on_open,
+            on_message=self._on_data,
+            on_error=self._on_error,
+            on_close=self._on_close,
+            max_retry_attempt=5,
+            retry_delay=5,
+            retry_multiplier=2,
         )
 
         self.running = True
@@ -133,16 +133,16 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             )
 
         br_symbol = get_br_symbol(symbol, exchange) or symbol
-        channel   = DeltaModeMapper.get_channel(mode)
-        corr_id   = f"{symbol}_{exchange}_{mode}"
+        channel = DeltaModeMapper.get_channel(mode)
+        corr_id = f"{symbol}_{exchange}_{mode}"
 
         with self._lock:
             self.subscriptions[corr_id] = {
-                "symbol":    symbol,
-                "exchange":  exchange,
+                "symbol": symbol,
+                "exchange": exchange,
                 "br_symbol": br_symbol,
-                "mode":      mode,
-                "channel":   channel,
+                "mode": mode,
+                "channel": channel,
                 "depth_level": depth_level,
             }
 
@@ -155,14 +155,19 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.ws_client.subscribe_ticker([br_symbol])
                 else:
                     self.ws_client.subscribe_l2_orderbook([br_symbol])
-                self.logger.info("Subscribed: %s.%s mode=%s channel=%s", symbol, exchange, mode, channel)
+                self.logger.info(
+                    "Subscribed: %s.%s mode=%s channel=%s", symbol, exchange, mode, channel
+                )
             except Exception as exc:
                 self.logger.error("subscribe error %s.%s: %s", symbol, exchange, exc)
                 return self._create_error_response("SUBSCRIPTION_ERROR", str(exc))
 
         return self._create_success_response(
             f"Subscription requested for {symbol}.{exchange}",
-            symbol=symbol, exchange=exchange, mode=mode, channel=channel,
+            symbol=symbol,
+            exchange=exchange,
+            mode=mode,
+            channel=channel,
         )
 
     def unsubscribe(self, symbol: str, exchange: str, mode: int = 2) -> dict[str, Any]:
@@ -170,8 +175,8 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         channel = DeltaModeMapper.get_channel(mode)
         corr_id = f"{symbol}_{exchange}_{mode}"
 
-        should_disconnect      = False
-        should_upstream_unsub  = False
+        should_disconnect = False
+        should_upstream_unsub = False
         with self._lock:
             # Read the stored br_symbol that was resolved at subscribe() time
             # before removing the entry.  This guarantees the upstream unsubscribe
@@ -188,16 +193,14 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # still needs this br_symbol + channel (e.g. mode 1 and mode 2 both
             # map to v2/ticker — removing one must not kill the shared stream).
             should_upstream_unsub = not any(
-                s.get("br_symbol") == br_symbol and s.get("channel") == channel
-                for s in remaining
+                s.get("br_symbol") == br_symbol and s.get("channel") == channel for s in remaining
             )
 
             # Only drop the LTP cache when no other mode for this symbol/exchange
             # remains (the cache is keyed on symbol_exchange, shared across modes).
             cache_key = f"{symbol}_{exchange}"
             if not any(
-                s.get("symbol") == symbol and s.get("exchange") == exchange
-                for s in remaining
+                s.get("symbol") == symbol and s.get("exchange") == exchange for s in remaining
             ):
                 self.last_values.pop(cache_key, None)
 
@@ -282,7 +285,7 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             "unrealized_pnl": "400" }
         """
         try:
-            msg_type  = msg.get("type", "")
+            msg_type = msg.get("type", "")
             br_symbol = msg.get("symbol", "") or msg.get("product_symbol", "")
 
             # ── Private / account-level events (no symbol-level subscription needed) ─────
@@ -313,19 +316,21 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             ts = int(time.time() * 1000)
             for subscription in subscriptions:
-                oa_symbol   = subscription["symbol"]
+                oa_symbol = subscription["symbol"]
                 oa_exchange = subscription["exchange"]
-                oa_mode     = subscription["mode"]
-                mode_str    = DeltaModeMapper.get_mode_str(oa_mode)
-                topic       = f"{oa_exchange}_{oa_symbol}_{mode_str}"
+                oa_mode = subscription["mode"]
+                mode_str = DeltaModeMapper.get_mode_str(oa_mode)
+                topic = f"{oa_exchange}_{oa_symbol}_{mode_str}"
 
                 market_data = dict(base_data)  # shallow copy per subscriber
-                market_data.update({
-                    "symbol":    oa_symbol,
-                    "exchange":  oa_exchange,
-                    "mode":      oa_mode,
-                    "timestamp": ts,
-                })
+                market_data.update(
+                    {
+                        "symbol": oa_symbol,
+                        "exchange": oa_exchange,
+                        "mode": oa_mode,
+                        "timestamp": ts,
+                    }
+                )
 
                 self.publish_market_data(topic, market_data)
 
@@ -389,13 +394,18 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
             bid_price  ← quotes.best_bid
             ask_price  ← quotes.best_ask
         """
+
         def _f(v, d=0.0):
-            try: return float(v) if v is not None else d
-            except: return d
+            try:
+                return float(v) if v is not None else d
+            except:
+                return d
 
         def _i(v, d=0):
-            try: return int(float(v)) if v is not None else d
-            except: return d
+            try:
+                return int(float(v)) if v is not None else d
+            except:
+                return d
 
         quotes = msg.get("quotes") or {}
 
@@ -413,19 +423,19 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         raw_ltp = msg.get("mark_price") or msg.get("spot_price")
 
         result = {
-            "ltp":           _cv("ltp",        raw_ltp,                _f),
-            "open":          _cv("open",        msg.get("open"),        _f),
-            "high":          _cv("high",        msg.get("high"),        _f),
-            "low":           _cv("low",         msg.get("low"),         _f),
-            "close":         _cv("close",       msg.get("close"),       _f),
-            "volume":        _cv("volume",      msg.get("volume"),      _i),
-            "oi":            _cv("oi",          msg.get("oi"),          _f),
-            "bid_price":     _cv("bid_price",   quotes.get("best_bid"), _f),
-            "ask_price":     _cv("ask_price",   quotes.get("best_ask"), _f),
-            "bid_qty":       0,
-            "ask_qty":       0,
+            "ltp": _cv("ltp", raw_ltp, _f),
+            "open": _cv("open", msg.get("open"), _f),
+            "high": _cv("high", msg.get("high"), _f),
+            "low": _cv("low", msg.get("low"), _f),
+            "close": _cv("close", msg.get("close"), _f),
+            "volume": _cv("volume", msg.get("volume"), _i),
+            "oi": _cv("oi", msg.get("oi"), _f),
+            "bid_price": _cv("bid_price", quotes.get("best_bid"), _f),
+            "ask_price": _cv("ask_price", quotes.get("best_ask"), _f),
+            "bid_qty": 0,
+            "ask_qty": 0,
             "average_price": 0,
-            "oi_change":     0,
+            "oi_change": 0,
         }
 
         with self._lock:
@@ -444,27 +454,32 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         Delta l2_orderbook levels:
           buy/sell: [{"limit_price": str, "size": int, "depth": str}, ...]
         """
+
         def _f(v, d=0.0):
-            try: return float(v) if v is not None else d
-            except: return d
+            try:
+                return float(v) if v is not None else d
+            except:
+                return d
 
         def _parse_levels(side_list, n=5):
             levels = []
             for lvl in (side_list or [])[:n]:
-                levels.append({"price": _f(lvl.get("limit_price")), "quantity": int(lvl.get("size", 0))})
+                levels.append(
+                    {"price": _f(lvl.get("limit_price")), "quantity": int(lvl.get("size", 0))}
+                )
             while len(levels) < n:
                 levels.append({"price": 0.0, "quantity": 0})
             return levels
 
-        bids = _parse_levels(msg.get("buy",  []))
+        bids = _parse_levels(msg.get("buy", []))
         asks = _parse_levels(msg.get("sell", []))
 
         result = {
             "depth": {
-                "buy":  bids,
+                "buy": bids,
                 "sell": asks,
             },
-            "totalbuyqty":  sum(lvl["quantity"] for lvl in bids),
+            "totalbuyqty": sum(lvl["quantity"] for lvl in bids),
             "totalsellqty": sum(lvl["quantity"] for lvl in asks),
             "ltp": 0,
         }
@@ -486,18 +501,19 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         match ensures each subscriber receives its own publish call.
         """
         expected_channel = (
-            DeltaWebSocket.CHANNEL_TICKER if msg_type == "v2/ticker"
+            DeltaWebSocket.CHANNEL_TICKER
+            if msg_type == "v2/ticker"
             else DeltaWebSocket.CHANNEL_L2_BOOK
         )
         with self._lock:
             matched = [
-                sub for sub in self.subscriptions.values()
+                sub
+                for sub in self.subscriptions.values()
                 if sub.get("br_symbol") == br_symbol and sub.get("channel") == expected_channel
             ]
             if not matched:
                 # Fallback: any sub with matching br_symbol regardless of channel
                 matched = [
-                    sub for sub in self.subscriptions.values()
-                    if sub.get("br_symbol") == br_symbol
+                    sub for sub in self.subscriptions.values() if sub.get("br_symbol") == br_symbol
                 ]
         return matched

@@ -66,9 +66,7 @@ def _make_service(symbols, provider=None):
         provider = MagicMock()
         provider.get_daily.return_value = make_daily_bars()
         provider.get_weekly.return_value = make_weekly_bars()
-    with patch(
-        "services.scanner_history_provider.get_provider", return_value=provider
-    ):
+    with patch("services.scanner_history_provider.get_provider", return_value=provider):
         svc = ScannerService(symbols=symbols)
     svc._history_provider = provider
     return svc
@@ -77,9 +75,7 @@ def _make_service(symbols, provider=None):
 def _stub_15m(svc, symbol, frame=None):
     """Replace the per-symbol 15m builder with a stub returning ``frame``."""
     builder = MagicMock()
-    builder.get_recent_bars.return_value = (
-        frame if frame is not None else make_15m_bars()
-    )
+    builder.get_recent_bars.return_value = frame if frame is not None else make_15m_bars()
     svc._bar_15m_history[symbol] = builder
 
 

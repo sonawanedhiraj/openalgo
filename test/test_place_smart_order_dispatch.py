@@ -16,9 +16,7 @@ def fresh_intent_db(monkeypatch):
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
     )
-    test_session = scoped_session(
-        sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
 
     monkeypatch.setattr(dim, "engine", test_engine)
     monkeypatch.setattr(dim, "db_session", test_session)
@@ -56,20 +54,20 @@ def test_smart_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     _patch_modes(monkeypatch)
 
-    broker_smart = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1")
-    )
+    broker_smart = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=broker_smart),
     )
     sandbox_mock = MagicMock()
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_smart_order", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_smart_order", sandbox_mock)
 
     success, _, status = place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     assert success is True
@@ -86,17 +84,19 @@ def test_smart_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatc
     _patch_modes(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_smart_order", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_smart_order", sandbox_mock)
     broker_smart = MagicMock()
     monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=broker_smart),
     )
 
     place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     sandbox_mock.assert_called_once()
@@ -111,17 +111,19 @@ def test_smart_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
     _patch_modes(monkeypatch, analyze=True)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
-    monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_smart_order", sandbox_mock
-    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_smart_order", sandbox_mock)
     broker_smart = MagicMock()
     monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=broker_smart),
     )
 
     place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     sandbox_mock.assert_called_once()
@@ -137,16 +139,18 @@ def test_smart_rejects_when_skip(fresh_intent_db, monkeypatch):
 
     sandbox_mock = MagicMock()
     broker_smart = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_smart_order", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_smart_order", sandbox_mock
-    )
-    monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=broker_smart),
     )
 
     success, response, status = place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     assert success is False
@@ -164,16 +168,18 @@ def test_smart_rejects_when_disabled(fresh_intent_db, monkeypatch):
 
     sandbox_mock = MagicMock()
     broker_smart = MagicMock()
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_smart_order", sandbox_mock)
     monkeypatch.setattr(
-        "services.sandbox_service.sandbox_place_smart_order", sandbox_mock
-    )
-    monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=broker_smart),
     )
 
     success, response, status = place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     assert success is False
@@ -192,23 +198,29 @@ def test_smart_reject_response_shape_matches_existing_convention(fresh_intent_db
     set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr("services.sandbox_service.sandbox_place_smart_order", MagicMock())
     monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=MagicMock()),
     )
     reject_result = place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    broker_smart = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID")
-    )
+    broker_smart = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID"))
     monkeypatch.setattr(
-        place_smart_order_service, "import_broker_module",
+        place_smart_order_service,
+        "import_broker_module",
         lambda _b: SimpleNamespace(place_smartorder_api=broker_smart),
     )
     success_result = place_smart_order_service.place_smart_order_with_auth(
-        _smart_payload(), auth_token="dummy", broker="zerodha", original_data=_smart_payload(),
+        _smart_payload(),
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_smart_payload(),
     )
 
     for r in (reject_result, success_result):

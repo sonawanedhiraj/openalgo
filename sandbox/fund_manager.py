@@ -325,7 +325,9 @@ class FundManager:
 
             except Exception as e:
                 db_session.rollback()
-                logger.exception(f"Error transferring margin to holdings for user {self.user_id}: {e}")
+                logger.exception(
+                    f"Error transferring margin to holdings for user {self.user_id}: {e}"
+                )
                 return False, f"Error transferring margin to holdings: {str(e)}"
 
     def credit_sale_proceeds(self, amount, description=""):

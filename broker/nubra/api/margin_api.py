@@ -9,6 +9,7 @@ logger = get_logger(__name__)
 
 NUBRA_BASE_URL = "https://api.nubra.io"
 
+
 def calculate_margin_api(positions, auth):
     """
     Calculate margin requirement for a basket of positions using Nubra API.

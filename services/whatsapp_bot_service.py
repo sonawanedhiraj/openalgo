@@ -196,9 +196,7 @@ def validate_attachment_path(path: str | None) -> str | None:
             or resolved.lower() == os.path.abspath(r).lower()
             for r in roots
         ):
-            logger.warning(
-                "Attachment path rejected: outside WHATSAPP_ATTACHMENT_ROOTS allowlist"
-            )
+            logger.warning("Attachment path rejected: outside WHATSAPP_ATTACHMENT_ROOTS allowlist")
             return None
         if not os.path.isfile(resolved):
             logger.warning("Attachment path rejected: not a regular file")
@@ -234,6 +232,7 @@ class WarsNotInstalled(RuntimeError):
 def _import_wars():
     try:
         import wars  # type: ignore
+
         return wars
     except Exception as e:  # ImportError or compile errors on first install
         raise WarsNotInstalled() from e
@@ -519,7 +518,10 @@ class WhatsAppBotService:
             # Emit BOTH events. whatsapp_paired carries the identity; the
             # status event re-broadcasts the full pair_state for any client
             # that missed the first one.
-            self._emit("whatsapp_paired", {"own_phone": own_phone, "own_jid": str(own_jid) if own_jid else None})
+            self._emit(
+                "whatsapp_paired",
+                {"own_phone": own_phone, "own_jid": str(own_jid) if own_jid else None},
+            )
             self._emit("whatsapp_pair_status", self.get_pair_state())
             logger.info("WhatsApp pair: emitted whatsapp_paired + whatsapp_pair_status")
 
@@ -719,8 +721,10 @@ class WhatsAppBotService:
             "9198..."      -> single recipient (digits, +91..., JID, or group JID)
             ["a", "b", ...] -> list (capped at MAX_RECIPIENTS)
         """
-        if to is None or (isinstance(to, str) and not to.strip()) or (
-            isinstance(to, list) and not to
+        if (
+            to is None
+            or (isinstance(to, str) and not to.strip())
+            or (isinstance(to, list) and not to)
         ):
             return [self._SELF_MARKER]
         if isinstance(to, str):
@@ -759,7 +763,11 @@ class WhatsAppBotService:
         """
         if not self._is_running or self._wa is None:
             logger.warning("WhatsApp send: bot not running, dropping message")
-            return {"sent": [], "failed": [{"to": "<bot>", "error": "Bot not connected"}], "skipped": 0}
+            return {
+                "sent": [],
+                "failed": [{"to": "<bot>", "error": "Bot not connected"}],
+                "skipped": 0,
+            }
 
         # Re-entrancy: a slash-command handler (running on the bot thread
         # itself via wars's on_message dispatch) can call send_sync without
@@ -790,9 +798,7 @@ class WhatsAppBotService:
                 "failed": [{"to": "<bot>", "error": result_holder["error"]}],
                 "skipped": 0,
             }
-        return result_holder.get(
-            "result", {"sent": [], "failed": [], "skipped": 0}
-        )
+        return result_holder.get("result", {"sent": [], "failed": [], "skipped": 0})
 
     def _send_on_bot_thread(
         self,
@@ -929,9 +935,7 @@ class WhatsAppBotService:
             logger.warning("WhatsApp wars on_disconnect fired")
             with self._lock:
                 self._is_running = False
-            self._emit(
-                "whatsapp_status", {"is_running": False, "is_paired": self.is_paired}
-            )
+            self._emit("whatsapp_status", {"is_running": False, "is_paired": self.is_paired})
 
     def _dispatch_command(self, wa, msg, text: str) -> None:
         """Parse `/cmd arg1 arg2 ...` and route to the matching handler.
@@ -1019,6 +1023,7 @@ class WhatsAppBotService:
             )
         try:
             from database.auth_db import get_api_key_for_tradingview
+
             api_key = get_api_key_for_tradingview(owner_username)
         except Exception:
             logger.exception("Failed to load owner api_key from auth_db")

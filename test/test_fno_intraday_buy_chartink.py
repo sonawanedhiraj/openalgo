@@ -136,9 +136,7 @@ def make_indicators(daily, weekly, b5m, b15m):
 
 def happy():
     """All-12-gates-pass indicators bundle."""
-    return make_indicators(
-        make_daily_bars(), make_weekly_bars(), make_5m_bars(), make_15m_bars()
-    )
+    return make_indicators(make_daily_bars(), make_weekly_bars(), make_5m_bars(), make_15m_bars())
 
 
 # --------------------------------------------------------------------------- #
@@ -209,21 +207,27 @@ def _fail_g9():  # open <= yest close
 def _fail_g10():  # open below pivot but above yest close
     return make_indicators(
         make_daily_bars(today_open=2050.0, yest_high=2300.0, yest_low=2000.0),
-        make_weekly_bars(), make_5m_bars(), make_15m_bars(),
+        make_weekly_bars(),
+        make_5m_bars(),
+        make_15m_bars(),
     )
 
 
 def _fail_g2():  # vol below SMA(50) but above SMA(200) (old_vol low)
     return make_indicators(
         make_daily_bars(today_vol=900.0, old_vol=500.0, recent_vol=1000.0),
-        make_weekly_bars(), make_5m_bars(), make_15m_bars(),
+        make_weekly_bars(),
+        make_5m_bars(),
+        make_15m_bars(),
     )
 
 
 def _fail_g8():  # vol above SMA(50) but below SMA(200) (old_vol high)
     return make_indicators(
         make_daily_bars(today_vol=1500.0, old_vol=10000.0, recent_vol=1000.0),
-        make_weekly_bars(), make_5m_bars(), make_15m_bars(),
+        make_weekly_bars(),
+        make_5m_bars(),
+        make_15m_bars(),
     )
 
 
@@ -260,8 +264,18 @@ def _fail_g4():  # 5m prior Supertrend line < yest close (prices shifted down)
 @pytest.mark.parametrize(
     "builder",
     [
-        _fail_g6, _fail_g12, _fail_g1, _fail_g9, _fail_g10, _fail_g2,
-        _fail_g8, _fail_g7, _fail_g13, _fail_g5, _fail_g3, _fail_g4,
+        _fail_g6,
+        _fail_g12,
+        _fail_g1,
+        _fail_g9,
+        _fail_g10,
+        _fail_g2,
+        _fail_g8,
+        _fail_g7,
+        _fail_g13,
+        _fail_g5,
+        _fail_g3,
+        _fail_g4,
     ],
 )
 def test_gate_fails(builder):
@@ -281,13 +295,19 @@ def test_golden_full_pass():
 def test_nan_daily_sma_rejects():
     daily = make_daily_bars()
     daily.iloc[-5, daily.columns.get_loc("volume")] = np.nan  # taints SMA(50)/(200)
-    assert rule(None, make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())) is False
+    assert (
+        rule(None, make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars()))
+        is False
+    )
 
 
 def test_nan_15m_rsi_rejects():
     # Flat closes → zero gains / zero losses → RSI = 0/0 = NaN (not a silent pass).
     b15 = make_15m_bars(step=0.0)
-    assert rule(None, make_indicators(make_daily_bars(), make_weekly_bars(), make_5m_bars(), b15)) is False
+    assert (
+        rule(None, make_indicators(make_daily_bars(), make_weekly_bars(), make_5m_bars(), b15))
+        is False
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -297,7 +317,13 @@ def _add_forming_bar(daily):
     """Append a non-conforming 'still forming' daily bar (no gap vs prev close)."""
     idx = daily.index[-1] + pd.Timedelta(days=1)
     row = pd.DataFrame(
-        {"open": [2100.0], "high": [2110.0], "low": [2090.0], "close": [2100.0], "volume": [5000.0]},
+        {
+            "open": [2100.0],
+            "high": [2110.0],
+            "low": [2090.0],
+            "close": [2100.0],
+            "volume": [5000.0],
+        },
         index=[idx],
     )
     return pd.concat([daily, row])

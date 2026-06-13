@@ -121,35 +121,21 @@ def create_gtt_indexes(conn):
     logger.info("Creating GTT indexes...")
 
     # sandbox_gtt
-    conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_gtt_gtt_id ON sandbox_gtt(gtt_id)")
-    )
-    conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_gtt_user_id ON sandbox_gtt(user_id)")
-    )
-    conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_gtt_symbol ON sandbox_gtt(symbol)")
-    )
-    conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_gtt_exchange ON sandbox_gtt(exchange)")
-    )
-    conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_gtt_status ON sandbox_gtt(gtt_status)")
-    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gtt_gtt_id ON sandbox_gtt(gtt_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gtt_user_id ON sandbox_gtt(user_id)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gtt_symbol ON sandbox_gtt(symbol)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gtt_exchange ON sandbox_gtt(exchange)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gtt_status ON sandbox_gtt(gtt_status)"))
     conn.execute(
         text("CREATE INDEX IF NOT EXISTS idx_gtt_user_status ON sandbox_gtt(user_id, gtt_status)")
     )
     conn.execute(
-        text(
-            "CREATE INDEX IF NOT EXISTS idx_gtt_symbol_exchange ON sandbox_gtt(symbol, exchange)"
-        )
+        text("CREATE INDEX IF NOT EXISTS idx_gtt_symbol_exchange ON sandbox_gtt(symbol, exchange)")
     )
 
     # sandbox_gtt_legs — covers both the active scan (leg_status='pending')
     # and the reaper (leg_status='triggering' AND claimed_at < cutoff).
-    conn.execute(
-        text("CREATE INDEX IF NOT EXISTS idx_gtt_leg_gtt_id ON sandbox_gtt_legs(gtt_id)")
-    )
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gtt_leg_gtt_id ON sandbox_gtt_legs(gtt_id)"))
     conn.execute(
         text(
             "CREATE INDEX IF NOT EXISTS idx_gtt_leg_status_claimed "
@@ -258,10 +244,7 @@ def status():
             missing_tables = []
             for t in required_tables:
                 row = conn.execute(
-                    text(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type='table' AND name=:name"
-                    ),
+                    text("SELECT name FROM sqlite_master WHERE type='table' AND name=:name"),
                     {"name": t},
                 ).fetchone()
                 if not row:
@@ -272,9 +255,7 @@ def status():
 
             # Config present? (sandbox_config may be absent on a truly fresh DB.)
             if not _sandbox_config_exists(conn):
-                logger.info(
-                    "⚠️  sandbox_config table is missing — run migrate_sandbox.py first."
-                )
+                logger.info("⚠️  sandbox_config table is missing — run migrate_sandbox.py first.")
                 return False
 
             missing_configs = []

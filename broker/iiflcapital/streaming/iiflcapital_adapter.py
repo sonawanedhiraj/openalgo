@@ -142,7 +142,10 @@ class IiflcapitalWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def connect(self) -> dict[str, Any]:
         if not self.ws_client:
-            return {"status": "error", "message": "Adapter not initialized — call initialize() first"}
+            return {
+                "status": "error",
+                "message": "Adapter not initialized — call initialize() first",
+            }
 
         with self.lock:
             if self.running and self.connected:
@@ -270,7 +273,9 @@ class IiflcapitalWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.exception(f"IIFL subscribe failed for {exchange}:{symbol}: {e}")
             return {"status": "error", "message": str(e)}
 
-        self.logger.info(f"Subscribed to IIFL {exchange}:{symbol} (segment={segment} token=[REDACTED] mode={mode})")
+        self.logger.info(
+            f"Subscribed to IIFL {exchange}:{symbol} (segment={segment} token=[REDACTED] mode={mode})"
+        )
         return {
             "status": "success",
             "symbol": symbol,

@@ -532,7 +532,9 @@ def transform_positions_data(positions_data):
                 ),  # Float as per OpenAlgo standard
                 "ltp": float(position.get("lastTradedPrice", 0.0)),  # Last traded price
                 "pnl": float(position.get("pnlAbsolute", 0.0)),  # Profit and loss
-                "lot_size": float(position.get("lot_size", 1.0)),  # Contract size (e.g. 0.01 ETH for ETHUSD.P)
+                "lot_size": float(
+                    position.get("lot_size", 1.0)
+                ),  # Contract size (e.g. 0.01 ETH for ETHUSD.P)
             }
             transformed_data.append(transformed_position)
         return transformed_data

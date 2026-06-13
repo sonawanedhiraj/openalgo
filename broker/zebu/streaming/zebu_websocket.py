@@ -221,9 +221,7 @@ class ZebuWebSocket:
         debug_msg = auth_msg.copy()
         token_val = debug_msg.get("accesstoken", "")
         if token_val:
-            debug_msg["accesstoken"] = (
-                token_val[:10] + "..." if len(token_val) > 10 else "***"
-            )
+            debug_msg["accesstoken"] = token_val[:10] + "..." if len(token_val) > 10 else "***"
         self.logger.info(f"Sending auth message: {debug_msg}")
 
         try:

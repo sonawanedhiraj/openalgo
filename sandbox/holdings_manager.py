@@ -284,7 +284,9 @@ class HoldingsManager:
                 key = (holding.symbol, holding.exchange)
                 if key not in seen:
                     seen.add(key)
-                    symbols_to_fetch.append({"symbol": holding.symbol, "exchange": holding.exchange})
+                    symbols_to_fetch.append(
+                        {"symbol": holding.symbol, "exchange": holding.exchange}
+                    )
 
             if not symbols_to_fetch:
                 return
@@ -310,7 +312,9 @@ class HoldingsManager:
                             if symbol and exchange and data:
                                 quote_cache[(symbol, exchange)] = data
                     else:
-                        logger.debug(f"Multiquotes returned no results: {response.get('message', 'Unknown error')}")
+                        logger.debug(
+                            f"Multiquotes returned no results: {response.get('message', 'Unknown error')}"
+                        )
                 else:
                     logger.warning("No API keys found for fetching multiquotes")
             except Exception as e:

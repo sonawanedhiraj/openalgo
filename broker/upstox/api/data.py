@@ -419,18 +419,22 @@ class BrokerData:
         for ind_key in indicator_keys:
             original = key_map.pop(ind_key)
             try:
-                indicator_results.append({
-                    "symbol": original["symbol"],
-                    "exchange": original["exchange"],
-                    "data": self._get_indicator_ltp(ind_key),
-                })
+                indicator_results.append(
+                    {
+                        "symbol": original["symbol"],
+                        "exchange": original["exchange"],
+                        "data": self._get_indicator_ltp(ind_key),
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Failed to fetch LTP for indicator {ind_key}: {e}")
-                indicator_results.append({
-                    "symbol": original["symbol"],
-                    "exchange": original["exchange"],
-                    "error": str(e),
-                })
+                indicator_results.append(
+                    {
+                        "symbol": original["symbol"],
+                        "exchange": original["exchange"],
+                        "error": str(e),
+                    }
+                )
 
         # Return early if only indicators were requested
         if not instrument_keys:

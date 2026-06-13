@@ -4,6 +4,7 @@ Pure-math parity + speedup benchmark: py_vollib vs opengreeks.
 Replays the exact inputs recorded in the baseline JSON (no broker fetch, no HTTP)
 so we get apples-to-apples library timing and bit-level error metrics.
 """
+
 import json
 import time
 from collections.abc import Callable
@@ -77,10 +78,15 @@ def run_parity():
         sigma = iv_pyv if iv_pyv is not None else (iv_og if iv_og is not None else 0.0)
 
         row = {
-            **{k: inp[k] for k in ("symbol", "type", "moneyness", "F", "K", "t", "r", "price", "flag")},
+            **{
+                k: inp[k]
+                for k in ("symbol", "type", "moneyness", "F", "K", "t", "r", "price", "flag")
+            },
             "iv_pyvollib": iv_pyv,
             "iv_opengreeks": iv_og,
-            "iv_abs_err": abs((iv_pyv or 0) - (iv_og or 0)) if (iv_pyv is not None and iv_og is not None) else None,
+            "iv_abs_err": abs((iv_pyv or 0) - (iv_og or 0))
+            if (iv_pyv is not None and iv_og is not None)
+            else None,
             "greeks": {},
         }
 
@@ -89,8 +95,8 @@ def run_parity():
                 ("delta", pyvg.delta, ogb.delta),
                 ("gamma", pyvg.gamma, ogb.gamma),
                 ("theta", pyvg.theta, ogb.theta),
-                ("vega",  pyvg.vega,  ogb.vega),
-                ("rho",   pyvg.rho,   ogb.rho),
+                ("vega", pyvg.vega, ogb.vega),
+                ("rho", pyvg.rho, ogb.rho),
             ]:
                 try:
                     g_pyv = py_fn(flag, F, K, t, r, sigma)
@@ -103,8 +109,14 @@ def run_parity():
                 row["greeks"][name] = {
                     "pyvollib": g_pyv,
                     "opengreeks": g_og,
-                    "abs_err": (abs(g_pyv - g_og) if (g_pyv is not None and g_og is not None) else None),
-                    "rel_err": (abs(g_pyv - g_og) / abs(g_pyv) if (g_pyv not in (None, 0) and g_og is not None) else None),
+                    "abs_err": (
+                        abs(g_pyv - g_og) if (g_pyv is not None and g_og is not None) else None
+                    ),
+                    "rel_err": (
+                        abs(g_pyv - g_og) / abs(g_pyv)
+                        if (g_pyv not in (None, 0) and g_og is not None)
+                        else None
+                    ),
                 }
         rows.append(row)
 
@@ -114,7 +126,11 @@ def run_parity():
 def run_speedup():
     """Median single-call latency per function on a representative ATM input."""
     # ATM sample as canonical
-    atm = next(s for s in baseline["samples"] if s["type"] == "CE" and s["moneyness"] == "ATM" and s["strike"] == 23650)
+    atm = next(
+        s
+        for s in baseline["samples"]
+        if s["type"] == "CE" and s["moneyness"] == "ATM" and s["strike"] == 23650
+    )
     inp = to_inputs(atm)
     F, K, t, r, price, flag = inp["F"], inp["K"], inp["t"], inp["r"], inp["price"], inp["flag"]
     sigma = inp["baseline_iv"]
@@ -124,20 +140,22 @@ def run_speedup():
         ("delta", (pyvg.delta, ogb.delta), (flag, F, K, t, r, sigma)),
         ("gamma", (pyvg.gamma, ogb.gamma), (flag, F, K, t, r, sigma)),
         ("theta", (pyvg.theta, ogb.theta), (flag, F, K, t, r, sigma)),
-        ("vega",  (pyvg.vega,  ogb.vega),  (flag, F, K, t, r, sigma)),
-        ("rho",   (pyvg.rho,   ogb.rho),   (flag, F, K, t, r, sigma)),
+        ("vega", (pyvg.vega, ogb.vega), (flag, F, K, t, r, sigma)),
+        ("rho", (pyvg.rho, ogb.rho), (flag, F, K, t, r, sigma)),
     ]
 
     results = []
     for name, (py_fn, og_fn), args in funcs:
         us_pyv, _ = bench_one(py_fn, args)
         us_og, _ = bench_one(og_fn, args)
-        results.append({
-            "function": name,
-            "pyvollib_us": round(us_pyv, 3),
-            "opengreeks_us": round(us_og, 3),
-            "speedup": round(us_pyv / us_og, 1) if us_og > 0 else None,
-        })
+        results.append(
+            {
+                "function": name,
+                "pyvollib_us": round(us_pyv, 3),
+                "opengreeks_us": round(us_og, 3),
+                "speedup": round(us_pyv / us_og, 1) if us_og > 0 else None,
+            }
+        )
     return results
 
 
@@ -158,40 +176,50 @@ def run_chain_speedup():
         out = []
         for i in inputs:
             iv = pyv_iv(i["price"], i["F"], i["K"], i["r"], i["t"], i["flag"])
-            out.append((
-                iv,
-                pyvg.delta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                pyvg.gamma(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                pyvg.theta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                pyvg.vega(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                pyvg.rho(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-            ))
+            out.append(
+                (
+                    iv,
+                    pyvg.delta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    pyvg.gamma(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    pyvg.theta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    pyvg.vega(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    pyvg.rho(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                )
+            )
         return out
 
     def chain_og():
         out = []
         for i in inputs:
             iv = ogb.implied_volatility(i["price"], i["F"], i["K"], i["r"], i["t"], i["flag"])
-            out.append((
-                iv,
-                ogb.delta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                ogb.gamma(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                ogb.theta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                ogb.vega(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-                ogb.rho(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
-            ))
+            out.append(
+                (
+                    iv,
+                    ogb.delta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    ogb.gamma(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    ogb.theta(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    ogb.vega(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                    ogb.rho(i["flag"], i["F"], i["K"], i["t"], i["r"], iv),
+                )
+            )
         return out
 
     # warmup
-    chain_pyv(); chain_og()
+    chain_pyv()
+    chain_og()
 
     runs = 200
     samples_pyv = []
     samples_og = []
     for _ in range(runs):
-        t0 = time.perf_counter_ns(); chain_pyv(); samples_pyv.append(time.perf_counter_ns() - t0)
-        t0 = time.perf_counter_ns(); chain_og(); samples_og.append(time.perf_counter_ns() - t0)
-    samples_pyv.sort(); samples_og.sort()
+        t0 = time.perf_counter_ns()
+        chain_pyv()
+        samples_pyv.append(time.perf_counter_ns() - t0)
+        t0 = time.perf_counter_ns()
+        chain_og()
+        samples_og.append(time.perf_counter_ns() - t0)
+    samples_pyv.sort()
+    samples_og.sort()
     return {
         "n_options": len(inputs),
         "iterations": runs,
@@ -224,7 +252,9 @@ def main():
     print("\n=== per-function speedup (ATM call, microseconds) ===")
     print(f"{'function':<22}{'py_vollib (µs)':>16}{'opengreeks (µs)':>18}{'speedup':>12}")
     for r in speedup:
-        print(f"{r['function']:<22}{r['pyvollib_us']:>16.3f}{r['opengreeks_us']:>18.3f}{r['speedup']:>11.1f}x")
+        print(
+            f"{r['function']:<22}{r['pyvollib_us']:>16.3f}{r['opengreeks_us']:>18.3f}{r['speedup']:>11.1f}x"
+        )
 
     print("\n=== chain refresh (40 options, IV+5 Greeks) ===")
     print(f"py_vollib  : {chain['pyvollib_median_ms']:.3f} ms")
@@ -237,7 +267,13 @@ def main():
         if name == "iv":
             errs = [r["iv_abs_err"] for r in parity if r["iv_abs_err"] is not None]
         else:
-            errs = [r["greeks"][name]["abs_err"] for r in parity if r.get("greeks") and r["greeks"].get(name) and r["greeks"][name]["abs_err"] is not None]
+            errs = [
+                r["greeks"][name]["abs_err"]
+                for r in parity
+                if r.get("greeks")
+                and r["greeks"].get(name)
+                and r["greeks"][name]["abs_err"] is not None
+            ]
         if errs:
             print(f"  {name:<6}: max {max(errs):.3e}")
 

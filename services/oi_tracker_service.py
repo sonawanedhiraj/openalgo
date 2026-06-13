@@ -43,10 +43,15 @@ def _get_nearest_futures_price(
         if exchange.upper() in CRYPTO_EXCHANGES:
             # CRYPTO perpetuals are stored as PERPFUT — no expiry filter
             _perp = fno_search_symbols(
-                query=f"{underlying}USDFUT", exchange=exchange, instrumenttype=INSTRUMENT_PERPFUT, limit=1
+                query=f"{underlying}USDFUT",
+                exchange=exchange,
+                instrumenttype=INSTRUMENT_PERPFUT,
+                limit=1,
             )
             if not _perp:
-                logger.warning(f"No perpetual futures contracts found for {underlying} on {exchange}")
+                logger.warning(
+                    f"No perpetual futures contracts found for {underlying} on {exchange}"
+                )
                 return None
 
             fut_symbol = _perp[0]["symbol"]
@@ -57,7 +62,9 @@ def _get_nearest_futures_price(
             if auth_token is None:
                 logger.warning("Could not retrieve auth token for CRYPTO futures quote")
                 return None
-            logger.info(f"Fetching perpetual futures price for {fut_symbol} on {fut_exchange} via broker={broker}")
+            logger.info(
+                f"Fetching perpetual futures price for {fut_symbol} on {fut_exchange} via broker={broker}"
+            )
             broker_module = import_broker_module(broker)
             BrokerData = broker_module.BrokerData
             quote_response = BrokerData(auth_token).get_quotes(fut_symbol, fut_exchange)
@@ -272,7 +279,11 @@ def calculate_max_pain(
             return False, {"status": "error", "message": "No OI data available"}, 404
 
         # Filter out invalid entries
-        chain = [item for item in chain if isinstance(item.get("strike"), (int, float)) and item["strike"] > 0]
+        chain = [
+            item
+            for item in chain
+            if isinstance(item.get("strike"), (int, float)) and item["strike"] > 0
+        ]
         if not chain:
             return False, {"status": "error", "message": "No valid strike data available"}, 404
 

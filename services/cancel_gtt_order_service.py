@@ -21,11 +21,15 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
         del analyzer_request["apikey"]
     analyzer_request["api_type"] = API_TYPE
 
-    bus.publish(AnalyzerErrorEvent(
-        mode="analyze", api_type=API_TYPE,
-        request_data=analyzer_request, response_data=error_response,
-        error_message=error_message,
-    ))
+    bus.publish(
+        AnalyzerErrorEvent(
+            mode="analyze",
+            api_type=API_TYPE,
+            request_data=analyzer_request,
+            response_data=error_response,
+            error_message=error_message,
+        )
+    )
     return error_response
 
 
@@ -87,23 +91,38 @@ def cancel_gtt_order_with_auth(
     if broker_module is None:
         message = f"GTT orders are not supported for broker '{broker}' yet"
         error_response = {"status": "error", "message": message}
-        bus.publish(GTTCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            trigger_id=trigger_id, error_message=message,
-            request_data=order_request_data, response_data=error_response, api_key=api_key,
-        ))
+        bus.publish(
+            GTTCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                trigger_id=trigger_id,
+                error_message=message,
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+            )
+        )
         return False, error_response, 501
 
     try:
         response_message, status_code = broker_module.cancel_gtt_order(trigger_id, auth_token)
     except Exception as e:
         logger.exception(f"Error in broker_module.cancel_gtt_order: {e}")
-        error_response = {"status": "error", "message": "Failed to cancel GTT due to internal error"}
-        bus.publish(GTTCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            trigger_id=trigger_id, error_message=str(e),
-            request_data=order_request_data, response_data=error_response, api_key=api_key,
-        ))
+        error_response = {
+            "status": "error",
+            "message": "Failed to cancel GTT due to internal error",
+        }
+        bus.publish(
+            GTTCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                trigger_id=trigger_id,
+                error_message=str(e),
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+            )
+        )
         return False, error_response, 500
 
     if status_code == 200:
@@ -113,12 +132,19 @@ def cancel_gtt_order_with_auth(
             if isinstance(response_message, dict)
             else trigger_id,
         }
-        bus.publish(GTTCancelledEvent(
-            mode="live", api_type=API_TYPE,
-            trigger_id=str(success_response["trigger_id"]),
-            status=response_message.get("status", "success") if isinstance(response_message, dict) else "success",
-            request_data=order_request_data, response_data=success_response, api_key=api_key,
-        ))
+        bus.publish(
+            GTTCancelledEvent(
+                mode="live",
+                api_type=API_TYPE,
+                trigger_id=str(success_response["trigger_id"]),
+                status=response_message.get("status", "success")
+                if isinstance(response_message, dict)
+                else "success",
+                request_data=order_request_data,
+                response_data=success_response,
+                api_key=api_key,
+            )
+        )
         return True, success_response, 200
 
     message = (
@@ -127,11 +153,17 @@ def cancel_gtt_order_with_auth(
         else "Failed to cancel GTT"
     )
     error_response = {"status": "error", "message": message}
-    bus.publish(GTTCancelFailedEvent(
-        mode="live", api_type=API_TYPE,
-        trigger_id=trigger_id, error_message=message,
-        request_data=order_request_data, response_data=error_response, api_key=api_key,
-    ))
+    bus.publish(
+        GTTCancelFailedEvent(
+            mode="live",
+            api_type=API_TYPE,
+            trigger_id=trigger_id,
+            error_message=message,
+            request_data=order_request_data,
+            response_data=error_response,
+            api_key=api_key,
+        )
+    )
     return False, error_response, status_code
 
 
@@ -150,11 +182,17 @@ def cancel_gtt_order(
 
     if not trigger_id:
         error_response = {"status": "error", "message": "trigger_id is missing"}
-        bus.publish(GTTCancelFailedEvent(
-            mode="live", api_type=API_TYPE,
-            trigger_id="", error_message=error_response["message"],
-            request_data=original_data, response_data=error_response, api_key=api_key or "",
-        ))
+        bus.publish(
+            GTTCancelFailedEvent(
+                mode="live",
+                api_type=API_TYPE,
+                trigger_id="",
+                error_message=error_response["message"],
+                request_data=original_data,
+                response_data=error_response,
+                api_key=api_key or "",
+            )
+        )
         return False, error_response, 400
 
     # API-based auth
@@ -173,12 +211,17 @@ def cancel_gtt_order(
                         "message": "Cancel GTT order is not allowed in Semi-Auto mode. Switch to Auto mode.",
                     }
                     logger.warning(f"Cancel GTT blocked for user {user_id} (semi-auto mode)")
-                    bus.publish(GTTCancelFailedEvent(
-                        mode="live", api_type=API_TYPE,
-                        trigger_id=trigger_id, error_message=error_response["message"],
-                        request_data=original_data, response_data=error_response,
-                        api_key=api_key,
-                    ))
+                    bus.publish(
+                        GTTCancelFailedEvent(
+                            mode="live",
+                            api_type=API_TYPE,
+                            trigger_id=trigger_id,
+                            error_message=error_response["message"],
+                            request_data=original_data,
+                            response_data=error_response,
+                            api_key=api_key,
+                        )
+                    )
                     return False, error_response, 403
 
         AUTH_TOKEN, broker_name = get_auth_token_broker(api_key)

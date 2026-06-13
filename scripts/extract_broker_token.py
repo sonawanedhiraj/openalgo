@@ -85,13 +85,15 @@ def main(as_json: bool = False) -> int:
 
     extracted = []
     for row in rows:
-        extracted.append({
-            "broker": row.broker,
-            "name": row.name,
-            "user_id": row.user_id,
-            "auth_token": decrypt_token(row.auth),
-            "feed_token": decrypt_token(row.feed_token) if row.feed_token else None,
-        })
+        extracted.append(
+            {
+                "broker": row.broker,
+                "name": row.name,
+                "user_id": row.user_id,
+                "auth_token": decrypt_token(row.auth),
+                "feed_token": decrypt_token(row.feed_token) if row.feed_token else None,
+            }
+        )
 
     if as_json:
         json.dump(extracted, sys.stdout, indent=2)
