@@ -13,7 +13,7 @@ or DuckDB write happens.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from services import sector_follow_stock_backfill as sfsb
 from services.sector_follow_service import load_config
@@ -91,24 +91,13 @@ def test_refresh_uses_lookback_window():
     assert start < end
 
 
-def test_scheduled_job_registered_on_16_10_mon_fri_cron():
-    """_register_sector_follow_stock_job adds a 16:10 IST mon-fri CronTrigger."""
+def test_stock_cron_registration_removed_from_scheduler():
+    """The 16:10 cron registration method is gone (replaced by boot+periodic).
+
+    Guards the refactor: the scheduler no longer carries a sector_follow stock
+    backfill cron job (see services/sector_follow_backfill_scheduler.py).
+    """
     from services.historify_scheduler_service import HistorifyScheduler
 
-    sched = HistorifyScheduler()
-    mock_scheduler = MagicMock()
-    with patch.object(type(sched), "scheduler", new=mock_scheduler):
-        sched._register_sector_follow_stock_job()
-
-    assert mock_scheduler.add_job.call_count == 1
-    _, kwargs = mock_scheduler.add_job.call_args
-    assert kwargs["id"] == "sector_follow_stock_backfill"
-    assert kwargs["replace_existing"] is True
-
-    trigger = kwargs["trigger"]
-    fields = {f.name: str(f) for f in trigger.fields}
-    assert fields["hour"] == "16"
-    assert fields["minute"] == "10"
-    # day_of_week mon-fri == 0-4 in APScheduler's field repr
-    assert fields["day_of_week"] in ("mon-fri", "0-4")
-    assert str(trigger.timezone) == "Asia/Kolkata"
+    assert not hasattr(HistorifyScheduler, "_register_sector_follow_stock_job")
+    assert not hasattr(HistorifyScheduler, "_register_sector_follow_index_job")

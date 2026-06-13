@@ -254,38 +254,78 @@ the latest decisions automatically.
 - Env var (default `true`) gating the daily 16:05 IST sector-index 1m refresh job. Introduced on the Phase 3 branch — full entry lands with that merge.
 ### sector_follow_cap5_vol — sector-index 1m refresh
 
-#### SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED
-- **Current value:** unset → code default `true`
-- **Set in:** env (not in `.sample.env`; read in `services/historify_scheduler_service.py._register_sector_follow_index_job`)
-- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables)
-- **Effect:** gates registration of the daily 16:05 IST `sector_follow_index_backfill` APScheduler job, which keeps the strategy's mapped sector-index 1m feed fresh in `db/historify.duckdb`. Disabling it leaves the index feed to go stale → the 15:20 signal fails-closed at the sector gate (no entries).
-- **Who flips:** operator only.
+#### SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED — RETIRED
+- **Current value:** **no longer read** (the 16:05 cron job it gated was removed).
+- **Effect:** previously gated registration of the daily 16:05 IST
+  `sector_follow_index_backfill` APScheduler job. That cron is gone — the index 1m
+  feed is now kept fresh by the boot+periodic state-convergence check (see
+  `SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED` below), which is unconditional (no
+  per-feed enable flag).
 - **History:**
   - **2026-06-09 (Phase 3):** Introduced with the sector-index feed wiring (`feat/sector_follow_cap5_vol_phase3`, commit `3bfa4a08`). Default `true` so a fresh deploy keeps the feed current without extra config.
+  - **2026-06-13:** RETIRED. The 16:05/16:10 cron jobs were replaced by a
+    boot-time + periodic stale-check (state-convergence pattern); this env var is
+    no longer referenced anywhere. Setting it has no effect.
 
-#### sector_follow_stock_backfill (daily 16:10 IST job — NO env flag)
-- **Current value:** always on — **no feature flag** (deliberate; the job is
-  additive and harmless when the feed is already fresh, so there is no
-  `*_ENABLED` gate, unlike the index job).
-- **Set in:** registered unconditionally in
-  `services/historify_scheduler_service.py._register_sector_follow_stock_job`.
-  Cron `10 16 * * mon-fri` (16:10 IST), `replace_existing=True`,
-  `coalesce=True`, `misfire_grace_time=300` (from scheduler `job_defaults`).
-- **Effect:** keeps the 30 `LOCK_STATIC_30` universe stocks' 1m feed fresh in
-  `db/historify.duckdb`, the stock-side companion to the 16:05 index job. Without
-  it the stock feed goes stale → the 15:20 signal and the data-freshness gate
-  fail-closed (no entries). Body
-  `services/sector_follow_stock_backfill.refresh_sector_follow_stocks`
-  (4-day incremental lookback). One-shot CLI:
-  `uv run python -m services.sector_follow_stock_backfill --from … --to …`.
-- **Who flips:** N/A (no flag). To disable, an operator would remove the
-  registration call — but doing so reopens the manual-backfill gap.
+#### sector_follow_stock_backfill (was: daily 16:10 IST cron — RETIRED)
+- **Current value:** the 16:10 cron is **removed**; the stock 1m feed is now kept
+  fresh by the boot+periodic convergence check (see
+  `SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED` below). No env flag (the convergence
+  check is unconditional per universe).
+- **Effect (historical):** kept the 30 `LOCK_STATIC_30` universe stocks' 1m feed
+  fresh in `db/historify.duckdb`. CLI still available for manual multi-day
+  catch-up: `uv run python -m services.sector_follow_stock_backfill --from … --to …`.
 - **History:**
-  - **2026-06-13:** Introduced to close the manual-backfill gap (directly to
-    `dev`). Before this, only the sector **indices** had a daily refresh; the 30
-    universe **stocks** relied on a manual `create_and_start_job` catch-up, and a
-    missed catch-up held all entries on 2026-06-12 (every stock 2 business days
-    stale). No flag, per the additive-and-harmless rationale.
+  - **2026-06-13:** Introduced to close the manual-backfill gap (daily 16:10 IST
+    cron). Before this, only the sector **indices** had a daily refresh; a missed
+    catch-up held all entries on 2026-06-12 (every stock 2 business days stale).
+  - **2026-06-13 (same day):** RETIRED the cron in favor of the state-convergence
+    pattern — see below. The directive: *"start once OpenAlgo starts every time
+    and start the task based on the last backfill timestamp only if required, for
+    index and stocks both, instead of dependency on a scheduler."*
+
+### sector_follow_cap5_vol — boot+periodic 1m feed convergence
+
+Replaces the retired 16:05/16:10 IST backfill crons. On boot (after a broker
+session appears) and periodically in the post-close window, the system reads
+`MAX(timestamp)` per index + stock from `db/historify.duckdb` and incrementally
+fetches only the symbols behind today's expected 15:30 IST close. See
+`services/sector_follow_backfill_scheduler.py` (wired in `app.py` via
+`init_sector_follow_backfill`).
+
+#### SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED
+- **Current value:** unset → code default `true`
+- **Set in:** env (not in `.sample.env`); read in
+  `services/sector_follow_backfill_scheduler._periodic_enabled`.
+- **Values:** `true` / `false` (any value other than `true`, case-insensitive, disables).
+- **Effect:** master gate for the **periodic** re-check daemon thread. When
+  `false`, only the **boot-time** convergence check runs (the boot check is never
+  gated — it is the self-healing replacement for the missed cron catch-up). The
+  boot check alone covers the common restart-after-relogin case; the periodic loop
+  adds the after-close catch-up on a day OpenAlgo stayed up.
+- **Who flips:** operator only.
+- **History:**
+  - **2026-06-13:** Introduced with the state-convergence refactor (direct to `dev`).
+
+#### SECTOR_FOLLOW_PERIODIC_INTERVAL_MIN
+- **Current value:** unset → code default `30` (minutes)
+- **Set in:** env; read in `services/sector_follow_backfill_scheduler._interval_seconds`
+  (clamped to a 60s floor).
+- **Effect:** how often the periodic loop re-checks staleness inside the post-close
+  window. 30 min comfortably covers Zerodha's ~5–15 min current-day historical lag
+  without hammering the broker's 3 req/sec limit.
+- **History:**
+  - **2026-06-13:** Introduced with the state-convergence refactor.
+
+#### SECTOR_FOLLOW_PERIODIC_END_TIME
+- **Current value:** unset → code default `17:00` (IST, `HH:MM`)
+- **Set in:** env; read in `services/sector_follow_backfill_scheduler._end_time`.
+- **Effect:** the close of the periodic re-check window (the window opens at the
+  fixed `15:30` IST market close). After this time the loop stops checking for the
+  day and backs off until tomorrow's window. 17:00 gives ~90 min past close for
+  Zerodha to finish publishing the day's post-close 1m bars.
+- **History:**
+  - **2026-06-13:** Introduced with the state-convergence refactor.
 
 ### Simplified engine — EOD watchdog timing
 

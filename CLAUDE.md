@@ -81,6 +81,11 @@ When any architectural change ships, the matching documentation update ships in 
 - `COWORK_OBJECTIVE.md` — strategic objective
 - `audit/README.md` — audit policy
 
+**What changed today (2026-06-13):** Research persistence moved from gitignored
+`outputs/` to tracked `docs/research/` as of 2026-06-13. See
+[`docs/research/README.md`](docs/research/README.md) for the index, naming
+conventions, and how to add new docs.
+
 ## Parameter changes ALWAYS go to dev directly
 
 Any change to a tunable parameter (env var, DB config row, threshold default in
@@ -814,8 +819,9 @@ signals, logs, and writes the `sector_follow_trades` journal only. Flip to
 `blueprints/sector_follow.py` (control API at `/sector_follow_cap5_vol/api/*` —
 status/positions/pause/resume/close_all),
 `database/sector_follow_db.py` (`sector_follow_trades` journal),
-`services/sector_follow_index_backfill.py` (daily 16:05 IST sector-index 1m
-refresh, gated by `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`). Plan + locked operator
+`services/sector_follow_index_backfill.py` + `services/sector_follow_stock_backfill.py`
+(sector-index + universe-stock 1m feed; refreshed by the boot+periodic
+state-convergence check below, not a cron). Plan + locked operator
 decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follow_cap5_vol/PLAN.md).
 Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
 at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
@@ -836,8 +842,8 @@ fail loud and fail safe.
 - **Table** `data_health_check` in `db/openalgo.db`
   (`database/data_health_db.py`) — one row per check: `check_at`, `overall_ok`,
   `stale_symbols` (JSON), `details_json`, `alert_sent`.
-- **Daily 16:30 IST job** `sector_follow_data_health` (runs after the 16:05
-  backfill). On stale data: Telegram-alerts the operator AND auto-pauses
+- **Daily 16:30 IST job** `sector_follow_data_health` (runs inside the post-close
+  backfill-convergence window). On stale data: Telegram-alerts the operator AND auto-pauses
   *tomorrow's* entries by writing a **`strategy_runtime_override`** row
   (mode-only, B6: `override_type='pause'`, `expires_at=` tomorrow 15:30 IST,
   `reason='stale_feed: …'`, `set_by='sector_follow'`). The engine's job-entry
@@ -855,21 +861,42 @@ fail loud and fail safe.
   `docs/PARAMETER_LOG.md`. The gate/job are no-ops when the flag is off; the
   HTTP endpoint always works.
 
-Both the index AND the 30 universe stock feeds are now refreshed by **daily
-APScheduler jobs**: `sector_follow_index_backfill` at 16:05 IST and
-`sector_follow_stock_backfill` at 16:10 IST mon-fri (5 min later). The stock
-backfill closing the long-standing manual gap is the 2026-06-13 fix — before it,
-the stock 1m refresh was operator-manual and a missed catch-up held all entries
-on 2026-06-12 (every universe stock 2 business days stale).
+Both the index AND the 30 universe stock feeds are refreshed by a **boot-time +
+periodic state-convergence check** (`services/sector_follow_backfill_scheduler.py`,
+wired in `app.py` via `init_sector_follow_backfill`). This **supersedes the
+16:05/16:10 IST cron jobs** from commit `5c2a06eff` and earlier — those were
+removed from `historify_scheduler_service.py`. Per the directive: *"start once
+OpenAlgo starts every time and start the task based on the last backfill timestamp
+only if required, for index and stocks both, instead of dependency on a scheduler."*
 
-**Manual catch-up** for a stale feed (both feeds route through the same historify
-pipeline, and both need an active broker session — historical fetch fails on an
-expired daily Zerodha token): index 1m via `uv run python -m
-services.sector_follow_index_backfill --from YYYY-MM-DD --to YYYY-MM-DD`; stock 1m
-via `uv run python -m services.sector_follow_stock_backfill --from YYYY-MM-DD --to
-YYYY-MM-DD` (NSE 1m incremental over the locked-static-30 universe). The daily
-16:10 job means a manual stock catch-up is now only needed to backfill a
-historical gap (e.g. after a multi-day outage), not as routine maintenance.
+How it works:
+- Each backfill service exposes **`check_and_refresh_if_stale(today)`** — reads
+  `MAX(timestamp)` per symbol from `historify.duckdb` (via
+  `data_freshness_service.compute_stale_symbols`), and fetches **only the symbols
+  behind today's expected 15:30 IST close** through the same incremental historify
+  pipeline. Idempotent (fresh → no-op) and fail-graceful (a dead-token fetch is
+  `logger.exception`-logged into `errors`, never raised; an anomaly alert fires on
+  any error).
+- **Boot hook**: on every OpenAlgo start, a daemon thread waits for a broker
+  session to appear, then runs the index + stock convergence check once (never
+  blocks boot). So a restart after the daily ~3 AM Zerodha re-login auto-catches
+  up whatever went stale overnight — the self-healing replacement for the missed
+  16:10 catch-up that held all entries on 2026-06-12.
+- **Periodic loop**: a daemon thread re-checks every
+  `SECTOR_FOLLOW_PERIODIC_INTERVAL_MIN` minutes (default 30) inside the
+  `15:30`..`SECTOR_FOLLOW_PERIODIC_END_TIME` (default `17:00`) IST window on
+  trading days, backing off until the next day once both universes report fresh.
+  Gated by `SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED` (default `true`). This closes
+  the after-close gap on a day OpenAlgo was already running.
+
+**Manual catch-up** for a deep historical gap (both feeds route through the same
+historify pipeline, and both need an active broker session — historical fetch
+fails on an expired daily Zerodha token) is still available via the CLIs: index
+1m `uv run python -m services.sector_follow_index_backfill --from YYYY-MM-DD --to
+YYYY-MM-DD`; stock 1m `uv run python -m services.sector_follow_stock_backfill
+--from YYYY-MM-DD --to YYYY-MM-DD`. With the convergence check, the CLI is now
+only needed to backfill a multi-day outage beyond the small lookback window — the
+boot+periodic path handles routine staleness automatically.
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.

@@ -106,8 +106,10 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   dedicated log file).
 - **Control API:** see "Strategy control endpoints" below.
 - **Status:** scaffold-only, `deployable: false` — see
-  `strategies/sector_follow_cap5_vol/PLAN.md`. A companion 16:05 index-refresh job
-  (added on the Phase 3 branch) keeps its sector-index 1m feed fresh.
+  `strategies/sector_follow_cap5_vol/PLAN.md`. Its sector-index + universe-stock
+  1m feeds are kept fresh by a boot-time + periodic state-convergence check
+  (`services/sector_follow_backfill_scheduler.py`), not a cron — see the note
+  under the APScheduler jobs table below.
 ## In-process APScheduler jobs (OpenAlgo worker)
 
 These cron jobs run **inside** the single eventlet worker on the shared
@@ -117,14 +119,32 @@ need no external scheduler.
 
 | Job id | Cron (IST) | What it does | Gating / writes |
 |---|---|---|---|
-| `sector_follow_index_backfill` | `5 16 * * 1-5` (16:05, after close) | 1m backfill of the sector indices mapped in `strategies/sector_follow_cap5_vol/sector_map.json` (+ 2 defensive 1m-missing indices), so the strategy's 15:20 signal reads a fresh index feed rather than a stale one. Incremental, 4-day lookback; self-heals a missed run/weekend. Additive — routes through the same `historify_service.create_and_start_job` pipeline as the stock backfill, never touching watchlist schedules. | Gated by env `SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED` (default `true`); writes 1m bars to `db/historify.duckdb` `market_data`. Body: `services/sector_follow_index_backfill.refresh_sector_follow_indices` (registered by `_register_sector_follow_index_job`). One-shot CLI: `uv run python -m services.sector_follow_index_backfill --from YYYY-MM-DD --to YYYY-MM-DD`. |
-| `sector_follow_stock_backfill` | `10 16 * * 1-5` (16:10, after close) | 1m backfill of the **30 universe stocks** in `strategies/sector_follow_cap5_vol/config_snapshot.json` (`LOCK_STATIC_30`), the stock-side companion to the 16:05 index job, so the strategy's 15:20 signal and its data-freshness gate read a fresh stock feed. Closes the 2026-06-13 manual-backfill gap (a missed catch-up held all entries on 2026-06-12, every stock 2 business days stale). Incremental, 4-day lookback; self-heals a missed run/weekend. Additive — routes through the same `historify_service.create_and_start_job` pipeline, never touching watchlist schedules. Runs 5 min after the index job. | **No feature flag** (additive, harmless when fresh); writes 1m bars to `db/historify.duckdb` `market_data`. Body: `services/sector_follow_stock_backfill.refresh_sector_follow_stocks` (registered by `_register_sector_follow_stock_job`). One-shot CLI: `uv run python -m services.sector_follow_stock_backfill --from YYYY-MM-DD --to YYYY-MM-DD`. Needs an active broker session (historical fetch fails on an expired Zerodha token). |
 | `scanner_comparison_eod` | `45 15 * * 1-5` (15:45 IST) | **In-house-scanner-vs-Chartink EOD comparison** — the in-process replacement for the retired Cowork `scanner-vs-chartink-daily-comparison` task (§3). For today: unions the Chartink BUY/SELL webhook lists (`scan_cycle`, `cycle_kind='chartink'`) and the in-house scanner hits (`scan_results`, `source='inhouse'`, grouped by `scan_definition.screener_type`), computes per-side counts/intersection/Jaccard/recall + a tuning verdict, writes one `scanner_comparison` row per side (idempotent delete-then-insert per `(date, side)`), and Telegrams the summary via `notify()`. Read-only on every DB except its own table. | Per-fire gate env `SCANNER_COMPARISON_EOD_ENABLED` (default `true`); fire time env `SCANNER_COMPARISON_EOD_TIME` (default `15:45`); Telegram toggle `NOTIFY_SCANNER_COMPARISON` (default `true`). Body: `services/scanner_comparison_eod_service._eod_comparison_job` (registered by `init_scanner_comparison_eod_service`). |
 | `telegram_inbound_morning_prompt` | ~~`45 8 * * 1-5`~~ | **RETIRED (mode-only, 2026-06-12, B5).** The morning intent prompt is gone — there is no per-day run/pause/halt to set (strategies run continuously in their persistent `strategy_mode`). `register_jobs` no longer schedules this job and removes any stale instance. The Telegram bot now only serves `/status` (reports modes); all intent commands return a deprecation notice pointing at `/api/pause`. | No longer registered. Was gated on `TELEGRAM_INBOUND_ENABLED=true`. |
 | `eod_watchdog_<strategy>` | `mon-fri` at `min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)` — default **15:14** for `trending_equity_intraday` | Safety-net EOD flatten for the simplified engine. One cron job per registered intraday strategy; calls `flatten_strategy_positions` (open `trade_journal` rows → opposite-side MARKET via `place_order`, mode-aware sandbox/live). Backstop for the tick-driven `_maybe_flatten_eod`, which can't fire when the broker tick stream dies before close. **Fires at 15:14, one minute before the 15:15 sandbox/broker MIS auto-square-off** — the cap is the 2026-06-10 fix: the watchdog used to fire at the declared 15:20, *after* sandbox had force-closed and started rejecting flatten orders, stranding OIL/HINDZINC/TATAELXSI. Belt to the 15:30 EOD reconciliation suspenders. | Runs on a **dedicated `BackgroundScheduler`** (not the shared instance), `services/eod_watchdog_service.py`. Gated by env `SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED` (default `true`); cap via `SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME` (default `15:14`). `misfire_grace_time=300`. Started from `app.py` boot after journal rehydrate. |
 
 > The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
 > EOD jobs on this same scheduler — see the SectorFollowService process entry.
+
+**sector_follow 1m feed: boot-time + periodic state-convergence (not a cron).**
+The `sector_follow_index_backfill` (`5 16 * * 1-5`) and `sector_follow_stock_backfill`
+(`10 16 * * 1-5`) cron jobs were **removed** (commit `5c2a06eff` registered them;
+they are gone from `historify_scheduler_service.py`). They are replaced by a
+state-convergence check in `services/sector_follow_backfill_scheduler.py`
+(`init_sector_follow_backfill`, wired in `app.py`): each backfill service now
+exposes `check_and_refresh_if_stale(today)` which reads `MAX(timestamp)` per
+symbol from `db/historify.duckdb` and incrementally fetches **only** the indices /
+stocks behind today's expected 15:30 IST close (idempotent when fresh;
+fail-graceful — a dead-token fetch is logged and alerted, never raised). It runs
+**once at boot** (a daemon thread that waits for a broker session, so a restart
+after the daily ~3 AM Zerodha re-login auto-catches up overnight staleness) and
+then **periodically** every `SECTOR_FOLLOW_PERIODIC_INTERVAL_MIN` minutes
+(default 30) inside the `15:30`..`SECTOR_FOLLOW_PERIODIC_END_TIME` (default
+`17:00`) IST window on trading days, backing off until the next day once both
+universes are fresh. Gated by `SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED` (default
+`true`). The per-window CLIs (`python -m services.sector_follow_index_backfill` /
+`…stock_backfill --from --to`) remain for manual multi-day historical catch-up;
+both still need an active broker session. Writes 1m bars to `market_data`.
 
 ### Telegram inbound intent bot (Phase 6)
 
@@ -389,7 +409,8 @@ in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.p
   SectorFollowService (`services/sector_follow_service.py`) registers 5 APScheduler
   jobs (entry/exit/reset/EOD/data-health); control API at `/sector_follow_cap5_vol/api/*`;
   trade journal in `db/openalgo.db` `sector_follow_trades`. Sector-index 1m feed
-  kept fresh by the `sector_follow_index_backfill` job. Plan/decisions: `PLAN.md`.
+  kept fresh by the boot+periodic convergence check
+  (`services/sector_follow_backfill_scheduler.py`), not a cron. Plan/decisions: `PLAN.md`.
 - `docs/SIMPLIFIED_ENGINE_HANDOFF.md` — engine integration context
 - `docs/COWORK_SESSION_LEARNINGS.md` — Cowork-specific learnings, webhook IDs
 - `audit/README.md` — read-only scheduled-task policy + `proposed_fixes.jsonl` schema

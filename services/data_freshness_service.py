@@ -123,6 +123,58 @@ def get_data_freshness(
     return out
 
 
+def compute_stale_symbols(
+    duckdb_path: str,
+    symbols: list[str],
+    today: date | None = None,
+    max_staleness_business_days: int = 0,
+    interval: str = "1m",
+) -> tuple[list[str], list[str], dict[str, dict]]:
+    """Split ``symbols`` into stale vs fresh against the latest trading day.
+
+    Pure / read-only. Reads MAX(timestamp) per symbol from ``historify.duckdb``
+    and compares each symbol's most-recent 1m bar IST date to the most recent
+    business day on/before ``today`` (today's expected 15:30 IST close). A symbol
+    is **stale** when it is more than ``max_staleness_business_days`` business days
+    behind that reference (default 0 — the boot/periodic convergence target wants
+    *today's* close present) or has no bars at all.
+
+    Returns ``(stale, fresh, details)`` where ``details`` maps each symbol to
+    ``{last_ts, last_date, staleness_days, stale}``. ``stale``/``fresh`` are sorted.
+    """
+    ref_date = today or datetime.now(_IST).date()
+    ref_business_day = _prev_or_same_business_day(ref_date)
+
+    freshness = get_data_freshness(duckdb_path, symbols, interval=interval)
+
+    stale: list[str] = []
+    fresh: list[str] = []
+    details: dict[str, dict] = {}
+    for sym in symbols:
+        last_ts = freshness.get(sym)
+        if last_ts is None:
+            details[sym] = {
+                "last_ts": None,
+                "last_date": None,
+                "staleness_days": None,
+                "stale": True,
+            }
+            stale.append(sym)
+            continue
+        last_date = _ist_date_of_epoch(last_ts)
+        staleness = business_days_between(last_date, ref_business_day)
+        is_stale = staleness > max_staleness_business_days
+        details[sym] = {
+            "last_ts": last_ts,
+            "last_date": last_date.isoformat(),
+            "staleness_days": staleness,
+            "stale": is_stale,
+        }
+        (stale if is_stale else fresh).append(sym)
+
+    return sorted(stale), sorted(fresh), details
+
+
 def _resolve_strategy_symbols(strategy_name: str) -> dict[str, list[str]]:
     """Map a strategy to the ``{'stock': [...], 'index': [...]}`` it depends on.
 

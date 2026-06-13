@@ -724,6 +724,23 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
 
+            # sector_follow_cap5_vol 1m feed convergence (replaces the 16:05/16:10
+            # IST cron backfill jobs). On boot — after a broker session appears —
+            # it reads MAX(timestamp) per index + stock from historify.duckdb and
+            # catches up only the stale tail, then a periodic loop re-checks during
+            # the post-close publish window (15:30..17:00 IST). Non-blocking: the
+            # boot check runs on a daemon thread. See
+            # services/sector_follow_backfill_scheduler.py.
+            try:
+                from services.sector_follow_backfill_scheduler import (
+                    init_sector_follow_backfill,
+                )
+
+                init_sector_follow_backfill(app=app)
+                logger.debug("Sector Follow backfill convergence initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Sector Follow backfill convergence: {e}")
+
             # Sector Follow CAP5_VOL strategy (R40 deployable variant). Default
             # mode=scaffold means loading this changes ZERO live trading behavior
             # — it only registers 15:20/15:25/09:00 IST jobs that compute + log.

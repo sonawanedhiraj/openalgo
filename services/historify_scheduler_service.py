@@ -75,11 +75,11 @@ class HistorifyScheduler:
                 # Register the daily scanner-history cache refresh (Task 3)
                 self._register_scanner_history_job()
 
-                # Register the daily sector_follow_cap5_vol index 1m refresh
-                self._register_sector_follow_index_job()
-
-                # Register the daily sector_follow_cap5_vol universe-stock 1m refresh
-                self._register_sector_follow_stock_job()
+                # NOTE: the sector_follow_cap5_vol index (16:05 IST) and stock
+                # (16:10 IST) 1m backfill cron jobs were removed in favor of a
+                # boot-time + periodic state-convergence check that fetches only
+                # the stale tail (see services/sector_follow_backfill_scheduler.py,
+                # wired in app.py via init_sector_follow_backfill).
 
             except Exception as e:
                 logger.exception(f"Failed to initialize Historify Scheduler: {e}")
@@ -516,66 +516,13 @@ class HistorifyScheduler:
         except Exception as e:
             logger.exception(f"Failed to register scanner_history_refresh job: {e}")
 
-    def _register_sector_follow_index_job(self):
-        """Register the 16:05 IST sector_follow_cap5_vol index 1m refresh job.
-
-        Keeps the mapped sector indices' 1m bars current so the strategy's 15:20
-        signal isn't reading a stale index feed (see
-        ``strategies/sector_follow_cap5_vol/index_data_coverage.md``). Additive —
-        downloads index 1m through the same job pipeline as the stock backfill,
-        never touching the watchlist schedules. Runs at 16:05 IST (after the
-        16:00 scanner refresh and after market close). Gated by
-        ``SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED`` (default true); idempotent via
-        ``replace_existing=True``.
-        """
-        if os.getenv("SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED", "true").lower() != "true":
-            logger.debug(
-                "sector_follow index backfill disabled (SECTOR_FOLLOW_INDEX_BACKFILL_ENABLED!=true)"
-            )
-            return
-        try:
-            from services.sector_follow_index_backfill import refresh_sector_follow_indices
-
-            self.scheduler.add_job(
-                refresh_sector_follow_indices,
-                trigger=CronTrigger(hour=16, minute=5, timezone="Asia/Kolkata"),
-                id="sector_follow_index_backfill",
-                replace_existing=True,
-                name="Sector Follow CAP5_VOL index 1m refresh (16:05 IST)",
-            )
-            logger.info("Registered sector_follow_index_backfill job (16:05 IST daily)")
-        except Exception as e:
-            logger.exception(f"Failed to register sector_follow_index_backfill job: {e}")
-
-    def _register_sector_follow_stock_job(self):
-        """Register the 16:10 IST sector_follow_cap5_vol universe-stock 1m refresh.
-
-        Mirrors ``_register_sector_follow_index_job`` for the 30 universe **stocks**
-        (the index job covers only the mapped sector indices). Keeps each stock's
-        1m bars current so the strategy's 15:20 signal — and its data-freshness
-        gate — isn't reading a stale stock feed. Before this job the stock backfill
-        was manual, and the gap held all entries on 2026-06-12 (every stock 2
-        business days stale). Additive — downloads stock 1m through the same job
-        pipeline as the index backfill, never touching the watchlist schedules.
-        Runs at 16:10 IST mon-fri (5 min after the 16:05 index refresh). Idempotent
-        via ``replace_existing=True``. No feature flag — additive and harmless when
-        the feed is already fresh.
-        """
-        try:
-            from services.sector_follow_stock_backfill import refresh_sector_follow_stocks
-
-            self.scheduler.add_job(
-                refresh_sector_follow_stocks,
-                trigger=CronTrigger(
-                    hour=16, minute=10, day_of_week="mon-fri", timezone="Asia/Kolkata"
-                ),
-                id="sector_follow_stock_backfill",
-                replace_existing=True,
-                name="Sector Follow CAP5_VOL stock 1m refresh (16:10 IST mon-fri)",
-            )
-            logger.info("Registered sector_follow_stock_backfill job (16:10 IST mon-fri)")
-        except Exception as e:
-            logger.exception(f"Failed to register sector_follow_stock_backfill job: {e}")
+    # The sector_follow_cap5_vol index (16:05 IST) and stock (16:10 IST) 1m
+    # backfill cron jobs were removed. They are replaced by a boot-time +
+    # periodic state-convergence check that reads MAX(timestamp) per symbol and
+    # fetches only the stale tail — see
+    # ``services/sector_follow_backfill_scheduler.py`` (wired in app.py via
+    # ``init_sector_follow_backfill``). The per-window CLI backfills remain for
+    # manual historical catch-up.
 
     def shutdown(self):
         """Shutdown the scheduler"""
