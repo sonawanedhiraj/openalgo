@@ -585,3 +585,15 @@ echo 'OK: local gate passed - safe to push'
    accept that upstream lands on `dev` and adjust the two-tier model
    accordingly? The procedure doc assumes (a). **Needs a decision before the
    next sync.**
+
+## Self-hosted runner smoke verification log
+
+End-to-end proof that the `openalgo-laptop` self-hosted runner picks up and
+passes the `CI (self-hosted)` workflow. Each entry follows a real PR run.
+
+- **2026-06-13** — Re-verified after fixing the CI env-var gates (dev
+  `2707d824e`): `gate` was aborting on the default `REDIRECT_URL` placeholder
+  copied from `.sample.env`, and `backend-test` was erroring at pytest
+  collection on an unset `API_KEY_PEPPER`. With both fixed, runner pickup and
+  the full self-hosted pipeline were validated via PR
+  [#5](https://github.com/sonawanedhiraj/openalgo/pull/5) (`chore/runner-smoke-2`).
