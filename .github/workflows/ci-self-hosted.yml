@@ -33,7 +33,13 @@ jobs:
       # one from the committed sample; placeholder secrets auto-rotate on load
       # and nothing here touches a real broker session.
       - name: Provision .env for import-only smoke
-        run: cp .sample.env .env
+        run: |
+          cp .sample.env .env
+          # utils/env_check.py rejects the default REDIRECT_URL placeholder
+          # ('.../<broker>/callback') and aborts boot. Point it at a valid
+          # broker callback — zerodha is in VALID_BROKERS. CI smoke is
+          # import-only and never touches a real broker session.
+          sed -i "s#http://127.0.0.1:5000/<broker>/callback#http://127.0.0.1:5000/zerodha/callback#" .env
       - name: Run pre-merge gate
         run: make gate
 
@@ -44,6 +50,14 @@ jobs:
   # branch protection until the markers land. Candidate required check after.
   backend-test:
     runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    # database/auth_db.py + user_db.py raise at import if API_KEY_PEPPER is
+    # unset (Argon2 hashing / Fernet KDF), which aborts pytest collection
+    # before `-m unit` can select anything. These are CI-only non-secret
+    # placeholders — no .env is provisioned, so conftest's temp-DB redirect
+    # stays intact and no real broker/DB is ever touched.
+    env:
+      API_KEY_PEPPER: ci-self-hosted-placeholder-pepper-not-a-real-secret  # pragma: allowlist secret
+      APP_KEY: ci-self-hosted-placeholder-appkey-not-a-real-secret  # pragma: allowlist secret
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
