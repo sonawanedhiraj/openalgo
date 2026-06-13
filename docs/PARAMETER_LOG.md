@@ -384,35 +384,34 @@ the latest decisions automatically.
 > paths now match the `test/` marker) is **not** a tunable — it is an always-on
 > correctness fix in `_is_test_source_entry`, so it has no PARAMETER_LOG knob.
 
-### Broker WebSocket — event-driven session reconnect
+### Broker WebSocket — event-driven session reconnect (no tunable)
 
-#### BROKER_SESSION_AUTO_RECONNECT_ENABLED
-- **Current value:** `false` (default; ships cold — pure no-op until the operator opts in)
-- **Set in:** env var. Read in `websocket_proxy/server.py:WebSocketProxy._broker_auto_reconnect_enabled`
-  (accepts `true`/`1`/`yes`/`on`, case-insensitive; anything else is off).
-- **Code default:** `false`
-- **What it gates:** the WebSocket proxy's reaction to the ZMQ `CACHE_INVALIDATE`
-  event that `database.auth_db.upsert_auth()` already publishes after every broker
-  re-login. **When `false` (default):** the pre-existing behavior is preserved —
-  the proxy disconnects + drops the stale broker adapter, and the next client auth
-  lazily rebuilds it with the fresh token (the feed only resumes once a client
-  reconnects). **When `true`:** `_reconnect_broker_adapter(user_id)` runs instead —
-  it snapshots the adapter's current symbol subscriptions, disconnects, re-reads the
-  new token via `adapter.initialize()`, reconnects, and re-subscribes the held symbol
-  set, so the market-data feed resumes **without an OpenAlgo restart**. On reconnect
-  failure the adapter is removed (falls back to the lazy-rebuild path). Indian broker
-  tokens expire daily ~3 AM IST; this is what lets a morning Zerodha re-login restore
-  the WS feed without bouncing the process.
-- **Why flag-gated off:** ships behavior-neutral. The reconnect runs synchronously
-  on the ZMQ listener loop (mirrors the existing synchronous disconnect), so the
-  operator enables it deliberately after a live test. No restart-path change until
-  `=true`.
+#### ~~BROKER_SESSION_AUTO_RECONNECT_ENABLED~~ (removed — now unconditional default)
+- **Status:** **Removed 2026-06-13.** There is no env var. Event-driven WS reinit
+  on a broker re-login is the **default, unconditional behavior** — the safety
+  guarantee is carried by the hermetic E2E suite
+  (`test/test_broker_session_auto_reconnect.py`), not by a flag.
+- **What happens (no knob):** the WebSocket proxy reacts to the ZMQ
+  `CACHE_INVALIDATE` event that `database.auth_db.upsert_auth()` publishes after
+  every broker re-login. `WebSocketProxy._reconnect_broker_adapter(user_id)`
+  snapshots the adapter's current symbol subscriptions, disconnects, re-reads the
+  new token via `adapter.initialize()`, reconnects, and re-subscribes the held set,
+  so the market-data feed resumes **without an OpenAlgo restart**. On reconnect
+  failure the snapshot is retained (`_last_known_subscriptions`) and the dead
+  adapter is dropped for the next client auth to rebuild. Indian broker tokens
+  expire daily ~3 AM IST; this is what lets a morning Zerodha re-login restore the
+  WS feed without bouncing the process. The login path also emits a
+  `broker_session_refreshed` SocketIO event for UI/observability (not the trigger —
+  the proxy is a separate subprocess that can only be reached over ZMQ).
 - **History:**
-  - **2026-06-13:** Introduced with event-driven WS reinit
-    (`feat(broker): event-driven WS reinit on Zerodha session refresh`). Default
-    `false` — the cache-invalidation handler keeps its disconnect+drop behavior
-    until the operator sets `BROKER_SESSION_AUTO_RECONNECT_ENABLED=true` and
-    restarts once to load the new code.
+  - **2026-06-13 (AM):** Introduced as `BROKER_SESSION_AUTO_RECONNECT_ENABLED`
+    (default `false`) in `feat(broker): event-driven WS reinit on Zerodha session
+    refresh` (dev `60ac04546`).
+  - **2026-06-13 (PM):** Flag **removed** per operator direction — once the E2E
+    tests proved it works, the behavior became the unconditional default
+    (`feat(broker): event-driven WS reinit on Zerodha session refresh (no restart
+    required, no flag)`). No migration needed; nothing read the env var in
+    production yet.
 
 ## Other tunables (placeholder — populate as discovered)
 

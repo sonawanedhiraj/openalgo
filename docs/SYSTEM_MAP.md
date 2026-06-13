@@ -290,6 +290,40 @@ dispatch bypasses `place_order_service` entirely). Full design:
 (reference price at decision time), `entry_date`, `vol_ratio`, `stock_ret`,
 `sector_ret`, `order_id`, `note`, `created_at`. Append-only; no retention/pruning job.
 
+## Broker session lifecycle (login → token persist → WS reinit)
+
+Indian broker tokens expire daily ~3 AM IST, so the operator re-logs in each
+trading morning. The WS market-data feed must pick up the new token **without an
+OpenAlgo restart** (a restart wipes in-memory state and is risky mid-market).
+
+Flow on every broker login:
+
+1. **Login completion** — `blueprints/brlogin.py` `broker_callback` →
+   `utils/auth_utils.handle_auth_success(...)`.
+2. **Token persist** — `handle_auth_success` calls
+   `database/auth_db.upsert_auth(...)`, which encrypts + stores the token in the
+   `auth` table (`db/openalgo.db`), clears local auth caches, and **publishes a ZMQ
+   `CACHE_INVALIDATE_ALL_{user}` event** (`database/cache_invalidation.py` →
+   `SharedZmqPublisher`). This is the single cross-process signal.
+3. **UI notification** — `handle_auth_success` → `notify_broker_session_refreshed`
+   emits a `broker_session_refreshed` **SocketIO** event (browser dashboard only;
+   not the reconnect trigger).
+4. **WS proxy reinit** — the **separate WS-proxy subprocess** (`websocket_proxy/
+   server.py`, port 8765) receives the ZMQ event in `zmq_listener` →
+   `_handle_cache_invalidation` → `_reconnect_broker_adapter(user_id)`: snapshots
+   the adapter's held subscriptions, disconnects, `initialize()` (re-reads the new
+   token from `auth_db`), `connect()`, and re-subscribes the symbol set. **No
+   feature flag** — it is the unconditional default. Failure-graceful (logs
+   `logger.exception`, retains the snapshot in `_last_known_subscriptions`, drops
+   the dead adapter for lazy rebuild) and idempotent (one adapter reused; disconnect
+   precedes every reconnect).
+
+**Why ZMQ, not SocketIO, for the reinit:** the WS proxy runs as its own subprocess
+(spawned in `websocket_proxy/app_integration.py` under eventlet), so Flask
+SocketIO — in-process to Flask + browser clients — cannot reach it. ZMQ is the only
+in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.py`
+(hermetic; builds the proxy via `WebSocketProxy.__new__`).
+
 ## Known recurring patterns
 
 - **Morning Zerodha token rollover** ~02:00–03:00 IST → WS reconnect burst

@@ -351,6 +351,33 @@ def async_master_contract_download(broker):
     return master_contract_status
 
 
+def notify_broker_session_refreshed(username, broker):
+    """Emit a SocketIO ``broker_session_refreshed`` event after a broker re-login.
+
+    This is a **UI/observability notification only**. The WebSocket proxy runs in
+    a separate subprocess and cannot receive Flask SocketIO events — it reconnects
+    its broker adapter off the ZMQ ``CACHE_INVALIDATE`` event published by
+    ``upsert_auth()`` (see ``WebSocketProxy._reconnect_broker_adapter``). This
+    event lets the browser dashboard show that the market-data feed is
+    reconnecting with the new daily token. Emit failure must never block login.
+
+    Args:
+        username: The user/session key whose broker session was refreshed.
+        broker: The broker name (e.g. ``zerodha``).
+    """
+    try:
+        from extensions import socketio
+
+        socketio.emit(
+            "broker_session_refreshed",
+            {"username": username, "broker": broker},
+        )
+        logger.info(f"Emitted broker_session_refreshed for {username} ({broker})")
+    except Exception:
+        # Never block or fail a login because a UI notification could not be sent.
+        logger.exception("Failed to emit broker_session_refreshed event")
+
+
 def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, user_id=None):
     """
     Handles common tasks after successful authentication.
@@ -430,6 +457,11 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
         logger.info(f"Database record upserted with ID: {inserted_id}")
         # Initialize master contract status for this broker
         init_broker_status(broker)
+
+        # Notify the UI that a fresh broker session landed (event-driven; the WS
+        # proxy reconnects off the ZMQ cache-invalidation event upsert_auth()
+        # publishes — see notify_broker_session_refreshed for the layer split).
+        notify_broker_session_refreshed(user_session_key, broker)
 
         # Smart download: Check if we need to download or can use cached data
         should_download, reason = should_download_master_contract(broker)
