@@ -16,7 +16,6 @@ Thumbs.db
 .idea/
 .claude/settings.json
 .claude/settings.local.json
-.python-version
 config.ini
 .venvv
 .cloudflared/*.json
@@ -72,14 +71,14 @@ db/backups/
 !all_symbols.csv
 !data/qtyfreeze.csv
 
-# Environments 
-.env 
-.venv 
-env/ 
-venv/ 
-ENV/ 
-env.bak/ 
-venv.bak/ 
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
 # Node modules (all directories)
 node_modules/

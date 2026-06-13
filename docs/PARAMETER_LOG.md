@@ -18,6 +18,27 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Build/runtime environment
+
+#### `.python-version` = `3.12` (new file, 2026-06-13)
+- **Current value:** `3.12` (single-line file at repo root)
+- **Set in:** `.python-version` (new tracked file)
+- **What it gates:** the Python interpreter `uv run` selects for every command.
+  `uv` honors `.python-version` and pins the project to 3.12 even when a newer
+  interpreter (3.14) is installed system-wide.
+- **Why:** eventlet has no wheels for Python 3.14, so OpenAlgo cannot boot under
+  3.14 (Flask-SocketIO falls back to the threading async-mode and the Werkzeug
+  guard kills the server — port 5000 never binds). On 2026-06-13 `uv run`
+  defaulted to system-newest 3.14 and the parallel app+bridge launches deadlocked
+  uv's lock while building a fresh 3.12 env on demand → a 41-min restart outage
+  (21:11→21:53 IST) instead of the usual ~2 min.
+- **Effect:** `uv run` now auto-selects 3.12; the explicit `--python 3.12` flag is
+  no longer needed, and a cold restart no longer races to build the wrong env.
+- **Related:** boot-fail learning (memory `py314-eventlet-werkzeug-boot-fail`) —
+  no eventlet on 3.14 → threading async-mode → Werkzeug guard kills boot; needs
+  `allow_unsafe_werkzeug` or Py3.12. `pyproject.toml` already requires
+  `>=3.12`; this file makes uv's default match that floor.
+
 ### Strategy control — unified daily intent
 
 #### STRATEGY_DAILY_INTENT_ENABLED
