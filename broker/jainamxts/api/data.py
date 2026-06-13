@@ -906,11 +906,16 @@ class BrokerData:
                 logger.error(f"Unknown exchange segment: {exchange}")
                 raise Exception(f"Unknown exchange segment: {exchange}")
 
-            # Get exchange_token from database
+            # Get exchange_token from database. NOTE: bind the DB session to a
+            # distinct name (db_sess) — naming it `session` here would shadow the
+            # module-level `from flask import session` import for the whole
+            # function, turning the earlier flask-session reads (marketdata_userid
+            # / marketdata_token) into references to an unbound local
+            # (UnboundLocalError at runtime; F823 statically).
             logger.debug("Querying database for symbol token...")
-            with db_session() as session:
+            with db_session() as db_sess:
                 symbol_info = (
-                    session.query(SymToken)
+                    db_sess.query(SymToken)
                     .filter(SymToken.exchange == exchange, SymToken.brsymbol == br_symbol)
                     .first()
                 )
