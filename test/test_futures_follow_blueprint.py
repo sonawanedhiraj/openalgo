@@ -36,7 +36,7 @@ class _FakeService:
         self.closed = False
 
     def get_status(self):
-        return {"mode": "scaffold", "lots_held": 0, "margin_used_inr": 0.0}
+        return {"mode": "sandbox", "lots_held": 0, "margin_used_inr": 0.0}
 
     def open_positions_view(self):
         return []
@@ -104,7 +104,7 @@ def test_status_ok(client, monkeypatch):
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["status"] == "success"
-    assert body["data"]["mode"] == "scaffold"
+    assert body["data"]["mode"] == "sandbox"
 
 
 def test_positions_ok(client, monkeypatch):

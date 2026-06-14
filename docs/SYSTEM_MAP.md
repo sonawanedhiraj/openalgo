@@ -116,10 +116,12 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   `init_futures_follow_service(app, scheduler)` (called from `app.py`). Lives inside
   the single OpenAlgo worker; **not** a separate process or a Cowork host task. A
   **leveraged broad-market-beta** sleeve built on the sector_follow signal set.
-- **Mode flag:** env `FUTURES_FOLLOW_MODE` = `scaffold` (default) | `sandbox` |
-  `live`. **`scaffold` places NO orders** — it computes signals, logs, and writes
-  the trade journal only. `sandbox` routes to `db/sandbox.db`; `live` places real
-  broker orders. An unknown value force-falls-back to `scaffold`.
+- **Mode flag:** env `FUTURES_FOLLOW_MODE` = `sandbox` (default) | `live` — **no
+  scaffold / observe-only state.** **`sandbox` ACTIVELY trades** — it places real
+  orders into `db/sandbox.db` (virtual ₹1Cr) from boot; `live` places real broker
+  orders. An unknown value force-falls-back to `sandbox`. Operator can pause active
+  trading via `/api/pause` (durable `strategy_runtime_override`) without changing
+  mode; only a `strategy_mode` row can escalate sandbox→live.
 - **Signal reuse:** does NOT reimplement gates — `production_signal_evaluator`
   calls the live `services/sector_follow_service` evaluator (config, sector map,
   DuckDB metrics, `passes_gates`, `select_entries`) so it fires on exactly the
@@ -137,7 +139,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   |---|---|---|
   | `futures_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
   | `futures_follow_eod_watchdog` | 15:14 | Tick-independent backstop: flatten any still-open T+1 position before the auto-square-off window. Exits are never gated |
-  | `futures_follow_entry` | 15:20 | Reuse the sector_follow evaluator, resolve the NIFTY near-month future, buy 1 lot/signal up to the 50% margin cap (mode-aware; honors override gate + kill switch + freshness) |
+  | `futures_follow_entry` | 15:20 | Reuse the sector_follow evaluator, resolve the NIFTY near-month future, **place** 1 lot/signal BUY up to the 50% margin cap (sandbox/live; honors override gate + kill switch + freshness). First sandbox cycle 2026-06-15 |
   | `futures_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1). Never blocked by the kill switch / override |
   | `futures_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary **+** writes a Day-N markdown report to `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md` (independent sinks) |
 
@@ -146,18 +148,20 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   `run_exit` only *warns*. Gated by `DATA_FRESHNESS_VALIDATION_ENABLED`.
 - **Kill switch:** trips when day P&L < −`daily_loss_kill_pct`% of capital (default
   3%); blocks new entries, open positions still run to T+1 exit.
-- **DBs written:** `db/openalgo.db` → `futures_follow_trades` (trade journal, all
-  modes), `strategies` (one seeded row, natural key `name='futures_follow_cap50'`),
-  `strategy_runtime_override` (pause/kill_switch holds).
+- **DBs written:** `db/openalgo.db` → `futures_follow_trades` (trade journal,
+  sandbox/live), `strategies` (one seeded row, natural key
+  `name='futures_follow_cap50'`), `strategy_runtime_override` (pause/kill_switch
+  holds); plus order rows in `db/sandbox.db` via the sandbox order path.
 - **File output:** `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md`
   (git-ignored, observational; path hardcoded).
 - **Control API:** see "Strategy control endpoints" below
   (`/futures_follow_cap50/api/*`).
-- **Status:** scaffold-only, `deployable: false`. **Caveat:** leveraged beta, NOT
-  alpha — the signal does not predict NIFTY (hit-rate 53.4%, corr 0.295); it will
-  struggle in a sustained flat/bear NIFTY regime. Backtest (NIFTY-only CAP50): CAGR
-  14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L. See
-  `strategies/futures_follow_cap50/PLAN.md`.
+- **Status:** **ACTIVE in sandbox**, `deployable: true` (default
+  `FUTURES_FOLLOW_MODE=sandbox`; first sandbox cycle 2026-06-15 15:20 IST).
+  **Caveat:** leveraged beta, NOT alpha — the signal does not predict NIFTY
+  (hit-rate 53.4%, corr 0.295); it will struggle in a sustained flat/bear NIFTY
+  regime. Backtest (NIFTY-only CAP50): CAGR 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L.
+  See `strategies/futures_follow_cap50/PLAN.md`.
 
 ## In-process APScheduler jobs (OpenAlgo worker)
 
@@ -301,7 +305,7 @@ periodic-in-the-post-close-window shape as sector_follow, gated by
 
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **futures_follow_trades** (futures_follow_cap50 journal — one row per NIFTY-futures order leg in all modes; futures-specific columns `nifty_symbol`/`lots`/`entry_price`/`exit_price`/`gross_pnl`/`charges_inr`/`net_pnl`/`margin_inr`/`signal_id`; created idempotently by `database/futures_follow_db.init_db`, also in the boot `db_init_functions` list), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **strategy_mode** (mode-only architecture: the single *persistent* per-strategy operator control — `{strategy_name PK, mode ∈ {live, sandbox} default sandbox, updated_at, updated_by, notes}`; created by `database/strategy_mode_db.init_db`; backfilled from the latest `strategy_daily_intent` row per strategy by `scripts/migrate_strategy_daily_intent_to_strategy_mode.py` (drops the intent/cap axes; legacy `mode='skip'` → `sandbox`); read via `services/mode_service.resolve_mode`; supersedes the `strategy_daily_intent` `mode` column — the intent/pause/halt axis is being moved to a separate self-expiring `strategy_runtime_override` table for automated safety guards), **strategy_runtime_override** (mode-only architecture: the ephemeral, self-expiring safety-guard table — `{id PK, strategy_name, override_type ∈ {pause, kill_switch}, expires_at (UTC), reason, set_by, created_at}`; created by `database/strategy_runtime_override_db.init_db`; written ONLY by automated guards (data-health auto-pause, daily kill-switch) and the sector_follow `/api/pause` emergency override — never an operator daily prompt or Telegram; **lazy expiry** — reads ignore rows past `expires_at`; blocks new ENTRIES only, never exits/EOD; read at engine job-entry via `is_entry_blocked`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job AND by the scanner backfill convergence — one row per interval, `strategy_name='scanner_universe_1m'`/`'scanner_universe_D'`, via `services/scanner_backfill_scheduler`), **signal_decision** (Stage-1 LLM veto-layer audit — one row per candidate review; `direction` TEXT column (`BUY`/`SELL`, nullable) records the side the engine armed, added 2026-06-11 via idempotent boot-time `ALTER TABLE` in `signal_decision_db._migrate_add_direction_column`; previously the side was unrecoverable because the chartink `source` string carries "buy" for both legs), **scanner_comparison** (daily in-house-scanner-vs-Chartink parity verdict — one row per `(date, screener_side)`: `inhouse_count`, `chartink_count`, `intersection_count`, `jaccard`, `ratio`, `false_positives_json`, `false_negatives_json`, `tuning_suggestion`, `telegram_sent`; created by `database/scanner_comparison_db.init_db`; written by the 15:45 IST `scanner_comparison_eod` job; idempotent delete-then-insert per date+side) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **futures_follow_trades** (futures_follow_cap50 journal — one row per NIFTY-futures order leg in sandbox/live; futures-specific columns `nifty_symbol`/`lots`/`entry_price`/`exit_price`/`gross_pnl`/`charges_inr`/`net_pnl`/`margin_inr`/`signal_id`; created idempotently by `database/futures_follow_db.init_db`, also in the boot `db_init_functions` list), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **strategy_mode** (mode-only architecture: the single *persistent* per-strategy operator control — `{strategy_name PK, mode ∈ {live, sandbox} default sandbox, updated_at, updated_by, notes}`; created by `database/strategy_mode_db.init_db`; backfilled from the latest `strategy_daily_intent` row per strategy by `scripts/migrate_strategy_daily_intent_to_strategy_mode.py` (drops the intent/cap axes; legacy `mode='skip'` → `sandbox`); read via `services/mode_service.resolve_mode`; supersedes the `strategy_daily_intent` `mode` column — the intent/pause/halt axis is being moved to a separate self-expiring `strategy_runtime_override` table for automated safety guards), **strategy_runtime_override** (mode-only architecture: the ephemeral, self-expiring safety-guard table — `{id PK, strategy_name, override_type ∈ {pause, kill_switch}, expires_at (UTC), reason, set_by, created_at}`; created by `database/strategy_runtime_override_db.init_db`; written ONLY by automated guards (data-health auto-pause, daily kill-switch) and the sector_follow `/api/pause` emergency override — never an operator daily prompt or Telegram; **lazy expiry** — reads ignore rows past `expires_at`; blocks new ENTRIES only, never exits/EOD; read at engine job-entry via `is_entry_blocked`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job AND by the scanner backfill convergence — one row per interval, `strategy_name='scanner_universe_1m'`/`'scanner_universe_D'`, via `services/scanner_backfill_scheduler`), **signal_decision** (Stage-1 LLM veto-layer audit — one row per candidate review; `direction` TEXT column (`BUY`/`SELL`, nullable) records the side the engine armed, added 2026-06-11 via idempotent boot-time `ALTER TABLE` in `signal_decision_db._migrate_add_direction_column`; previously the side was unrecoverable because the chartink `source` string carries "buy" for both legs), **scanner_comparison** (daily in-house-scanner-vs-Chartink parity verdict — one row per `(date, screener_side)`: `inhouse_count`, `chartink_count`, `intersection_count`, `jaccard`, `ratio`, `false_positives_json`, `false_negatives_json`, `tuning_suggestion`, `telegram_sent`; created by `database/scanner_comparison_db.init_db`; written by the 15:45 IST `scanner_comparison_eod` job; idempotent delete-then-insert per date+side) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
@@ -514,8 +518,9 @@ in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.p
   kept fresh by the boot+periodic convergence check
   (`services/sector_follow_backfill_scheduler.py`), not a cron. Plan/decisions: `PLAN.md`.
 - `strategies/futures_follow_cap50/` — leveraged-beta NIFTY-futures sleeve on the
-  sector_follow signal set (**scaffold-only, `deployable: false`**).
-  FuturesFollowService (`services/futures_follow_service.py`) reuses the
+  sector_follow signal set (**ACTIVE in sandbox, `deployable: true`**; first sandbox
+  cycle 2026-06-15). FuturesFollowService (`services/futures_follow_service.py`)
+  reuses the
   sector_follow evaluator and registers 5 APScheduler jobs
   (reset/watchdog/entry/exit/EOD, 09:00/15:14/15:20/15:25/15:30 IST); control API at
   `/futures_follow_cap50/api/*`; trade journal in `db/openalgo.db`

@@ -1,14 +1,17 @@
 # Futures Follow CAP50
 
-`futures_follow_cap50` · v0.1.0 · **scaffold-only · deployable: false**
+`futures_follow_cap50` · v0.2.0 · **ACTIVE in sandbox · deployable: true**
 
 A **leveraged broad-market-beta** sleeve built on the `sector_follow_cap5_vol`
-signal set. At **15:20 IST** it reuses the sector_follow C1×W2+E4 evaluator to find
-today's ≤5 gate-passing stock signals, and for each — greedily in vol-ratio order —
-buys **one NIFTY near-month index future lot**, HARD-CAPPED at **50% of capital as
-overnight SPAN margin**. Positions are held to the **next trading day 15:25 IST**
-(T+1) and sold MARKET. **No stop loss** (Phase-1 proved hard stops are net-negative
-on this signal class); the **15:14 IST EOD watchdog** is the only safety backstop.
+signal set. **It trades the virtual ₹1Cr sandbox book by default — from boot, with
+no scaffold/observe-only state.** At **15:20 IST** it reuses the sector_follow
+C1×W2+E4 evaluator to find today's ≤5 gate-passing stock signals, and for each —
+greedily in vol-ratio order — buys **one NIFTY near-month index future lot**,
+HARD-CAPPED at **50% of capital as overnight SPAN margin**. Positions are held to
+the **next trading day 15:25 IST** (T+1) and sold MARKET. **No stop loss** (Phase-1
+proved hard stops are net-negative on this signal class); the **15:14 IST EOD
+watchdog** is the only safety backstop. **First sandbox cycle: Monday 2026-06-15
+15:20 IST.**
 
 ## ⚠️ Honest classification — leveraged beta, NOT alpha
 
@@ -26,11 +29,16 @@ vehicle.
 
 ## Mode
 
-`FUTURES_FOLLOW_MODE` (env) = `scaffold` (default) | `sandbox` | `live`
+`FUTURES_FOLLOW_MODE` (env) = `sandbox` (default) | `live` — there is no
+scaffold/observe-only state.
 
-- **scaffold:** compute signals, log, write the trade journal — **NO orders placed.**
-- **sandbox:** orders route to `db/sandbox.db` (virtual ₹1Cr).
-- **live:** real broker orders. **Operator-only flip** — never automated.
+- **sandbox (default):** orders route to `db/sandbox.db` (virtual ₹1Cr) — **active
+  trading from boot.**
+- **live:** real broker orders. **Operator-only flip** (env or a `strategy_mode`
+  row) — never automated.
+
+The operator can still pause active trading via `POST /futures_follow_cap50/api/pause`
+(writes a durable `strategy_runtime_override`) and resume via `/api/resume`.
 
 ## Key files
 

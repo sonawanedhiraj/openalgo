@@ -97,7 +97,7 @@ def _make_service(signals=None, **overrides):
     def fake_contract_resolver(underlying="NIFTY", exchange="NFO", as_of=None):
         return dict(_CONTRACT)
 
-    mode = overrides.pop("mode", "scaffold")
+    mode = overrides.pop("mode", "sandbox")
     price_fetcher = overrides.pop("price_fetcher", lambda symbol, exchange: 24000.0)
     notifier = overrides.pop("notifier", lambda msg: None)
     data_health_checker = overrides.pop("data_health_checker", None)
@@ -232,20 +232,30 @@ def test_cap_50_enforcement_third_signal_skipped_when_two_already_held():
 
 
 # --------------------------------------------------------------------------- #
-# Mode-aware order placement
+# Mode-aware order placement (sandbox is the structural default — no scaffold)
 # --------------------------------------------------------------------------- #
-def test_scaffold_mode_does_not_place_orders():
-    svc = _make_service(signals=[_sig("AAA")], mode="scaffold")
+def test_default_mode_is_sandbox_and_places_orders(monkeypatch):
+    # With mode=None (constructor reads the env) and no env override, the service
+    # defaults to ACTIVE sandbox trading — it routes a real order, not a logged-only
+    # signal.
+    monkeypatch.delenv("FUTURES_FOLLOW_MODE", raising=False)
+    svc = _make_service(signals=[_sig("AAA")], mode=None)  # mode=None → env default
+    assert svc.mode == "sandbox"
     placed = svc.run_entry()
-    assert len(placed) == 1  # paper-recorded
-    assert svc._test_placed == []  # but NO order routed
-    assert svc.lots_held() == 1
-    # journal row still written (status scaffold)
-    assert len(svc._test_journal) == 1
-    assert svc._test_journal[0]["status"] == "scaffold"
+    assert len(placed) == 1
+    assert len(svc._test_placed) == 1  # an order WAS routed
+    assert svc._test_placed[0][0] == "sandbox"
+    assert svc._test_journal[0]["status"] == "placed"
+
+
+def test_unknown_mode_falls_back_to_sandbox():
+    svc = _make_service(signals=[_sig("AAA")], mode="bogus")
+    assert svc.mode == "sandbox"
 
 
 def test_sandbox_mode_routes_to_sandbox_book():
+    # Verify the order actually flows to the (mocked) sandbox placer — not just
+    # signal logging.
     svc = _make_service(signals=[_sig("AAA")], mode="sandbox")
     svc.run_entry()
     assert len(svc._test_placed) == 1
@@ -253,7 +263,10 @@ def test_sandbox_mode_routes_to_sandbox_book():
     assert mode == "sandbox"
     assert order["action"] == "BUY"
     assert order["symbol"] == "NIFTY26JUN24FUT"
+    assert order["product"] == "NRML"
+    assert order["quantity"] == 75
     assert svc._test_journal[0]["status"] == "placed"
+    assert svc.lots_held() == 1
 
 
 def test_entry_rejection_journaled_no_phantom_position():
@@ -482,26 +495,31 @@ def _decision(mode="sandbox", cap=None, source="strategy_mode"):
     return EffectiveDecision(mode=mode, intent="run", daily_capital_cap=cap, source=source)
 
 
-def test_strategy_mode_override_changes_routing():
+def test_strategy_mode_row_escalates_sandbox_to_live():
+    # A persistent strategy_mode row with mode='live' escalates the default
+    # sandbox routing to live.
     svc = _make_service(
         signals=[_sig("AAA")],
-        mode="scaffold",
-        intent_resolver=lambda: _decision(mode="sandbox", source="strategy_mode"),
+        mode="sandbox",
+        intent_resolver=lambda: _decision(mode="live", source="strategy_mode"),
     )
     svc.run_entry()
-    assert svc.mode == "sandbox"
+    assert svc.mode == "live"
     assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][0] == "live"
 
 
-def test_env_source_does_not_override_mode():
+def test_env_source_cannot_escalate_to_live():
+    # Safety: a non-strategy_mode decision (env/default) must NOT escalate the
+    # active sandbox book to live — only a strategy_mode row can flip live.
     svc = _make_service(
         signals=[_sig("AAA")],
-        mode="scaffold",
-        intent_resolver=lambda: _decision(mode="sandbox", source="env"),
+        mode="sandbox",
+        intent_resolver=lambda: _decision(mode="live", source="env"),
     )
     svc.run_entry()
-    assert svc.mode == "scaffold"  # unchanged
-    assert svc._test_placed == []  # scaffold places no orders
+    assert svc.mode == "sandbox"  # unchanged — stays sandbox
+    assert svc._test_placed[0][0] == "sandbox"  # still routes to sandbox
 
 
 def test_daily_capital_cap_tightens_margin_cap():

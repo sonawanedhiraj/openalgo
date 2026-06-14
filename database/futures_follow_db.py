@@ -3,14 +3,13 @@
 A self-contained, additive table in the main database (``openalgo.db``). It does
 NOT modify any existing model or table — it adds ``futures_follow_trades`` so every
 NIFTY-futures entry/exit the strategy makes is attributable to its ``strategy_id``.
-Used in all three modes (scaffold/sandbox/live) so the schema is exercised
-end-to-end before any real order flows.
+Used in both modes (sandbox/live) so the schema is exercised end-to-end.
 
 Mirrors ``database/sector_follow_db.py`` exactly, with futures-specific columns
 (``nifty_symbol``, ``lots``, ``entry_price``, ``exit_price``, ``gross_pnl``,
 ``charges_inr``, ``net_pnl``). One row per order leg (entry or exit) — an entry
-row is written at 15:20 (status ``placed``/``rejected``/``exception``/``scaffold``),
-its matching exit row at the T+1 15:25 square-off with realized P&L stamped.
+row is written at 15:20 (status ``placed``/``rejected``/``exception``), its
+matching exit row at the T+1 15:25 square-off with realized P&L stamped.
 
 Read-only on every other module — this file only owns its own table.
 """
@@ -49,13 +48,13 @@ Base.query = db_session.query_property()
 
 
 class FuturesFollowTrade(Base):
-    """One row per strategy order leg (entry or exit) across all modes."""
+    """One row per strategy order leg (entry or exit) in sandbox or live mode."""
 
     __tablename__ = "futures_follow_trades"
 
     id = Column(Integer, primary_key=True)
     strategy_id = Column(Integer, nullable=True)  # FK -> strategies.id (nullable until seeded)
-    mode = Column(String(10), nullable=False)  # scaffold | sandbox | live
+    mode = Column(String(10), nullable=False)  # sandbox | live
     side = Column(String(4), nullable=False)  # BUY | SELL
     nifty_symbol = Column(String(50), nullable=False)  # resolved NIFTY future contract symbol
     exchange = Column(String(10), nullable=False, default="NFO")
@@ -78,7 +77,6 @@ class FuturesFollowTrade(Base):
     #   placed   — order accepted (orderid present or broker status=success)
     #   rejected — broker/sandbox returned an error response
     #   exception — order placement raised
-    #   scaffold — scaffold mode, no order routed
     status = Column(String(12), nullable=False, default="placed")
     error_message = Column(String(255), nullable=True)  # broker/exception message on failure
     note = Column(String(255), nullable=True)

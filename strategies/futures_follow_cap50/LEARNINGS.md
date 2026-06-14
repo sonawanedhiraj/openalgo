@@ -68,9 +68,21 @@ the leverage CNC stock structurally cannot access. No stop loss — Phase-1 prov
 hard stops on this signal class are net-negative. No Jan-2026 air-pocket (the
 inherited E4 sector-5d-vol p80 catastrophe filter zeroes January entries).
 
-## Implementation notes (scaffold)
+## Implementation notes
 
-### 2026-06-15 — Phase 1: core scaffold shipped (scaffold-only, deployable:false)
+### 2026-06-15 — v0.2.0: sandbox is the structural default (deployable: true)
+
+Per the operator redirect (must trade in sandbox from Monday's open), the scaffold
+mode was **dropped entirely** — there is no observe-only / "log without placing"
+state. `VALID_MODES = ("sandbox", "live")`, default `sandbox`; an unknown
+`FUTURES_FOLLOW_MODE` force-falls-back to `sandbox`. `place_entry`/`place_exit`
+always route via the order placer (sandbox → `sandbox.db`, live → broker); journal
+statuses are `placed`/`rejected`/`exception` only. `config_snapshot.json`:
+`mode: "sandbox"`, `deployable: true`. The mode-override + runtime-override +
+data-freshness + kill-switch rails are unchanged and remain the operational safeties
+(they are not "shadow" flags). First sandbox cycle: Monday 2026-06-15 15:20 IST.
+
+### 2026-06-15 — Phase 1: core service shipped
 
 - `services/futures_follow_service.py` — `FuturesFollowService` mirroring
   `sector_follow_service.py`. **Reuses** the sector_follow evaluator
@@ -90,7 +102,7 @@ inherited E4 sector-5d-vol p80 catastrophe filter zeroes January entries).
 - `blueprints/futures_follow.py` — control API at `/futures_follow_cap50/api/*`
   (status / positions / pause / resume / close_all / data_health).
 - `app.py` — `init_futures_follow_service(app=app)` + DB init + blueprint register.
-  Default mode=scaffold → zero live behavior change.
+  Default mode=sandbox → actively trades the virtual ₹1Cr book from boot.
 - **Decision point flagged:** the spec said "NIFTY weekly future" but NIFTY index
   futures are MONTHLY (only options are weekly). The resolver picks the **near-month
   (front) monthly FUT**. Documented in PLAN.md and the resolver docstring.

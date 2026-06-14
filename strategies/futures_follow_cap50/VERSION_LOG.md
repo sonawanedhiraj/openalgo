@@ -1,5 +1,23 @@
 # Futures Follow CAP50 — Version Log
 
+## v0.2.0 — 2026-06-15
+Sandbox is the structural default — scaffold mode dropped entirely (operator
+redirect: must trade in sandbox from Monday 2026-06-15 open).
+Mode: **sandbox (default)** · Deployable: **true**
+
+- `VALID_MODES = ("sandbox", "live")`; default `FUTURES_FOLLOW_MODE=sandbox`;
+  unknown value force-falls-back to `sandbox` (was `scaffold`).
+- `place_entry`/`place_exit` no longer have a scaffold "no-order" branch — they
+  always route via the order placer (sandbox → `sandbox.db`, live → broker). Journal
+  statuses are `placed`/`rejected`/`exception` only (the `scaffold` status is gone).
+- `config_snapshot.json`: `mode: "sandbox"`, `deployable: true`.
+- All safety rails unchanged: cap-50%-margin/day HARD enforcement, 15:14 EOD
+  watchdog, 3% daily kill switch, data-freshness gate, runtime-override pause.
+- Tests reworked: sandbox-mode tests assert actual order placement; the scaffold
+  no-order tests are removed; a default-mode test confirms boot defaults to active
+  sandbox trading.
+- First sandbox cycle: Monday 2026-06-15 15:20 IST.
+
 ## v0.1.0 — 2026-06-15
 Initial scaffold from the 2026-06-14 NIFTY-only CAP50 leverage research.
 Mode: scaffold-only · Deployable: false

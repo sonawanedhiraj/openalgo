@@ -778,9 +778,10 @@ def setup_environment(app):
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
 
             # Futures Follow CAP50 strategy (leveraged-beta NIFTY-futures sleeve on
-            # the sector_follow signal set). Default mode=scaffold means loading
-            # this changes ZERO live trading behavior — it only registers
-            # 09:00/15:14/15:20/15:25/15:30 IST jobs that compute + log. See
+            # the sector_follow signal set). Default mode=sandbox means it ACTIVELY
+            # trades the virtual ₹1Cr sandbox book from boot — the
+            # 09:00/15:14/15:20/15:25/15:30 IST jobs place real sandbox orders (no
+            # live broker orders until the operator sets mode=live). See
             # strategies/futures_follow_cap50/ and FUTURES_FOLLOW_MODE.
             try:
                 from services.futures_follow_service import init_futures_follow_service

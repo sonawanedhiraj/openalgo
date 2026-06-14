@@ -850,7 +850,7 @@ decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follo
 Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
 at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
 
-**Scaffold strategy**: [`strategies/futures_follow_cap50/`](strategies/futures_follow_cap50/)
+**Active sandbox strategy**: [`strategies/futures_follow_cap50/`](strategies/futures_follow_cap50/)
 — a **leveraged broad-market-beta** sleeve built on the sector_follow signal set
 (spawned from the 2026-06-14 NIFTY-only CAP50 leverage research). At 15:20 IST it
 **reuses** the `sector_follow_cap5_vol` C1×W2+E4 evaluator (does NOT reimplement the
@@ -863,13 +863,17 @@ MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. **No stop loss** (Phase-
 proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**
 is the only backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
 (0.03% notional) round-trip charges.
-**SCAFFOLD ONLY — not live** (`mode: scaffold-only`, `deployable: false`). Like
-sector_follow it IS wired into the runtime: `FuturesFollowService`
-(`services/futures_follow_service.py`) is built at boot and registers 5 APScheduler
-jobs (reset 09:00 / watchdog 15:14 / entry 15:20 / exit 15:25 / EOD-summary 15:30
-IST), but the default `FUTURES_FOLLOW_MODE=scaffold` places **no orders** — it
-computes signals, logs, and writes the `futures_follow_trades` journal only. Flip to
-`sandbox` / `live` is operator-only.
+**ACTIVELY TRADING IN SANDBOX** (`mode: sandbox`, `deployable: true`) — there is **no
+scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
+`FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
+registers 5 APScheduler jobs (reset 09:00 / watchdog 15:14 / entry 15:20 / exit 15:25
+/ EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
+real orders into `sandbox.db` (the virtual ₹1Cr book) from boot** — the first sandbox
+cycle is **Monday 2026-06-15 15:20 IST** (the session's first sector_follow signal →
+a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a
+`strategy_mode` row); operator can pause active trading via
+`POST /futures_follow_cap50/api/pause` (durable `strategy_runtime_override`) without
+changing mode.
 **Honest caveat (load-bearing — do not lose):** the backtest clears 12% (CAGR
 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L, 2024-01..2026-06) but the signal does
 **NOT** predict NIFTY direction (hit-rate 53.4% < 55%, corr 0.295). The return is

@@ -1,19 +1,25 @@
-# Futures Follow CAP50 — Delivery Plan
+# Futures Follow CAP50 — Deployment Plan
 
-`futures_follow_cap50` · v0.1.0 · **scaffold-only · deployable: false**
+`futures_follow_cap50` · v0.2.0 · **ACTIVE in sandbox · deployable: true**
 
 ## Overview
 
 This strategy is the deployable extract of the **NIFTY-only CAP50** futures wrapper
 that emerged from the 2026-06-14 leverage research on the `sector_follow_cap5_vol`
-signal set. It is a daily, long-only, **overnight-hold leveraged-beta** sleeve: at
-**15:20 IST** it reuses the sector_follow C1×W2+E4 evaluator to find today's ≤5
-gate-passing stock signals, and for each signal — greedily in vol-ratio order —
-buys **one NIFTY near-month index future lot**, HARD-CAPPED at **50% of capital as
-overnight SPAN margin**. Signals beyond the cap are skipped. Each position is exited
-at the **next trading day's 15:25 IST close (T+1)** MARKET sell. **No stop loss**
-(Phase-1 proved hard stops are net-negative on this signal class). Charges are
-modeled at ~**0.030% of notional** (~₹530/lot round-trip).
+signal set. **It trades the virtual ₹1Cr sandbox book by default — from the moment
+the service loads — with no scaffold/observe-only state.** It is a daily, long-only,
+**overnight-hold leveraged-beta** sleeve: at **15:20 IST** it reuses the
+sector_follow C1×W2+E4 evaluator to find today's ≤5 gate-passing stock signals, and
+for each signal — greedily in vol-ratio order — buys **one NIFTY near-month index
+future lot**, HARD-CAPPED at **50% of capital as overnight SPAN margin**. Signals
+beyond the cap are skipped. Each position is exited at the **next trading day's 15:25
+IST close (T+1)** MARKET sell. **No stop loss** (Phase-1 proved hard stops are
+net-negative on this signal class). Charges are modeled at ~**0.030% of notional**
+(~₹530/lot round-trip).
+
+**First sandbox cycle: Monday 2026-06-15 15:20 IST** — the first sector_follow signal
+of the session fires → futures_follow places a NIFTY-futures BUY order in
+`sandbox.db`. EOD reconciliation/summary: same day 15:30 IST and daily thereafter.
 
 **Verbatim verdict carried from the backtest (NIFTY-only CAP50):** CAGR **14.44%**,
 Sharpe **1.27**, MaxDD **−8.0%**, peak overnight margin ~50%, worst overnight day
@@ -32,7 +38,7 @@ real alpha. Size it as a *separate, leverage-bounded beta bet*, never as
 "sector_follow with futures." Sector-matched routing (banking→BANKNIFTY) was tested
 and **REJECTED** (costs 0.74pp CAGR, no correlation gain). NIFTY-only is the vehicle.
 
-## Operator decisions (defaults locked in scaffold; confirm before sandbox)
+## Operator decisions (locked, sandbox-active)
 
 1. **Capital:** ₹10,00,000 (the backtest book size).
 2. **Cap:** HARD 50% of capital as overnight SPAN margin (~2 NIFTY lots on ₹10L at
@@ -45,44 +51,50 @@ and **REJECTED** (costs 0.74pp CAGR, no correlation gain). NIFTY-only is the veh
 6. **Daily loss kill switch:** 3.0% of capital (halt new entries, hold to T+1 exit).
 7. **Signal source:** REUSE the live `sector_follow_cap5_vol` evaluator — do not
    reimplement gates.
+8. **Default mode:** **`sandbox`** — active virtual trading from boot. `live` is an
+   explicit operator flip only.
 
 ## Mode lifecycle
 
-`FUTURES_FOLLOW_MODE` in `.env` controls execution. Transitions happen **only on
-explicit operator approval** — the module never self-promotes.
+`FUTURES_FOLLOW_MODE` in `.env` (or a persistent `strategy_mode` row) controls
+execution. There are only two modes — **no scaffold/observe-only state.**
 
-- **`scaffold`** (default): compute signals + log the recommended lots + write the
-  trade journal. **No orders placed.** Safe to run continuously for observation.
-- **`sandbox`**: orders flow into `sandbox.db` (virtual ₹1 Cr), isolated from live.
-- **`live`**: real broker orders via Zerodha. Entered only after a sandbox pilot and
-  explicit operator approval.
+- **`sandbox`** (default): orders flow into `sandbox.db` (virtual ₹1 Cr), isolated
+  from live trading. **Active from boot.**
+- **`live`**: real broker orders via Zerodha. Entered only on explicit operator
+  approval after the sandbox cycle is validated.
 
-## Delivery plan (phases)
+Active trading can be paused without changing mode via
+`POST /futures_follow_cap50/api/pause` (durable `strategy_runtime_override`); resume
+via `/api/resume`. The data-freshness gate and 3% kill switch also gate entries
+automatically.
 
-### Phase 1 — Core scaffold (THIS COMMIT)
-- `services/futures_follow_service.py` — signal reuse, near-month contract
-  resolution, cap-50 sizing, charge model, mode-aware order placement, kill switch,
-  pause/resume/close_all, runtime-override + data-freshness gates, 5 APScheduler
-  jobs, EOD summary + markdown report + watchdog.
-- `database/futures_follow_db.py` — `futures_follow_trades` journal.
-- `blueprints/futures_follow.py` — control API.
-- `strategies/futures_follow_cap50/` — config + docs.
-- `test/test_futures_follow_*.py` — hermetic tests (cap-50, scaffold no-order,
-  sandbox routing, freshness gate, override gate, charges, DB, blueprint).
-- `app.py` wiring (default mode=scaffold → zero live behavior change).
-- **Exit criteria:** all tests green; service computes + logs in scaffold mode.
+## Deployment timeline
 
-### Phase 2 — Sandbox pilot
-- Operator flips `FUTURES_FOLLOW_MODE=sandbox` (or sets a `strategy_mode` row).
-- Run for N trading days; daily EOD logging vs backtest expectation. Validate the
-  contract resolver picks the right front-month, the 50% cap holds on heavy signal
+### Day 0 — Monday 2026-06-15 (first sandbox cycle)
+- Service loads on the next OpenAlgo restart in `sandbox` mode (default).
+- **15:20 IST:** first sector_follow signal of the session → futures_follow resolves
+  the NIFTY near-month future, sizes 1 lot/signal under the 50% cap, places BUY
+  order(s) in `sandbox.db`.
+- **15:30 IST:** EOD summary (Telegram + `eod_reports/2026-06-15.md`).
+- Operator verifies: the BUY landed in sandbox.db, lots ≤ 50%-margin cap, the
+  journal row is `status='placed'`.
+
+### Day 1+ — daily cycle
+- **09:00 IST:** daily reset (kill switch + journals).
+- **15:14 IST:** EOD watchdog (flatten any stranded T+1 position).
+- **15:20 IST:** entry (new signals).
+- **15:25 IST:** T+1 exit (square off prior-day positions) with realized P&L.
+- **15:30 IST:** EOD summary + reconciliation report.
+
+### Sandbox validation window → live decision gate
+- Run the sandbox cycle for N trading days; compare realized vs backtest
+  (CAGR/Sharpe/MaxDD/margin/charges). Validate the contract resolver picks the right
+  front-month (especially around monthly expiry), the 50% cap holds on heavy signal
   days, and the charge model matches sandbox fills.
-- **Exit criteria:** N days with EOD records and a realized-vs-backtest comparison.
-
-### Phase 3 — Live decision gate
-- Sandbox-vs-backtest report (CAGR, Sharpe, MaxDD, margin). **Operator decision
-  gate** — propose `live` only if within tolerance, and only with the beta caveat
-  understood (size small, never let peak overnight margin exceed ~50%).
+- **Operator decision gate:** propose `live` only if within tolerance, and only with
+  the beta caveat understood (size small, never let peak overnight margin exceed
+  ~50%).
 
 ## Risk register
 

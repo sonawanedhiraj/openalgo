@@ -121,7 +121,7 @@ Conditional-edge per-asset framing died on n+Bonferroni (R39): the per-stock con
 - **Latest LEARNINGS:** `strategies/sector_follow_cap5_vol/LEARNINGS.md`
 
 ### Futures Follow CAP50 (NIFTY-futures leveraged-beta sleeve)
-- **Status:** Phase 1 scaffold COMPLETE — 2026-06-15 (scaffold-only, `deployable: false`, `FUTURES_FOLLOW_MODE=scaffold`). Service/DB/blueprint/tests/docs all shipped and wired into boot; places no orders by default. Sandbox pilot is the operator's next step.
+- **Status:** **ACTIVE in sandbox** — 2026-06-15 (`deployable: true`, `FUTURES_FOLLOW_MODE=sandbox` default; no scaffold/observe-only state). Service/DB/blueprint/tests/docs all shipped and wired into boot; **places real orders into `sandbox.db` from boot.** First sandbox cycle Monday 2026-06-15 15:20 IST. Live flip is operator-only (env or `strategy_mode` row).
 - **Last validated:** 2026-06-14 (NIFTY-only CAP50 leverage study on the sector_follow signal set).
 - **Spec:** A **leveraged broad-market-beta** sleeve, NOT stock-selection alpha. At 15:20 IST it **reuses** the sector_follow_cap5_vol C1×W2+E4 evaluator to find ≤5 daily stock signals, and for each — greedily in vol-ratio order — buys **1 NIFTY near-month index future lot** (NIFTY futures are monthly; front-month resolved from the master contract), HARD-CAPPED at **50% of capital as overnight SPAN margin** (late signals skipped). Product NRML, exchange NFO, MARKET. Held to T+1 15:25 MARKET sell. **No stop loss** (Phase-1 proved hard stops net-negative); 15:14 EOD watchdog backstop; 3% daily-loss kill switch. Charges ~₹530/lot (0.03% notional).
 - **Universe / capital:** signals from sector_follow's LOCK_STATIC_30; ₹10L book, ~2 lots fit the 50% cap.

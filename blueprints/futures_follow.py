@@ -6,8 +6,8 @@ route. URL prefix: /futures_follow_cap50.
 
 All endpoints are API-key authenticated (X-API-KEY header or ``apikey`` in the JSON
 body / query string), matching blueprints/sector_follow.py. The strategy ships
-``scaffold`` by default, so in that mode these endpoints report state and toggle
-in-memory flags without ever touching a broker.
+``sandbox`` by default (actively trading the virtual ₹1Cr book); these endpoints
+report state and provide the operator pause / resume / emergency close-all controls.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 {
-  "version": "0.1.0",
-  "mode": "scaffold-only",
-  "deployable": false,
+  "version": "0.2.0",
+  "mode": "sandbox",
+  "deployable": true,
   "strategy_name": "futures_follow_cap50",
   "strategy_id": null,
   "classification": "leveraged broad-market beta sleeve (NOT stock-selection alpha)",

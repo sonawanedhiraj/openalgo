@@ -8,6 +8,10 @@ overnight SPAN margin. Positions are held to the **next trading day 15:25 IST**
 (T+1) MARKET sell. NO stop loss (Phase-1 proved hard stops are net-negative on this
 signal class); the EOD watchdog at 15:14 IST is the only safety backstop.
 
+**It is ACTIVELY trading in sandbox by default** — from boot it places real orders
+into ``sandbox.db`` (the virtual ₹1Cr book). There is no observe-only / scaffold
+state; the mode flag is only ``sandbox`` or ``live``.
+
 Honest caveat (carried from the backtest, do not lose it): the signal does NOT
 predict NIFTY direction (hit-rate 53.4% < 55%, corr 0.295). The 14.44% CAGR comes
 from leveraging the small positive broad-market drift on bullish signal-days — it
@@ -15,9 +19,8 @@ is **leveraged beta, not the sector_follow stock-selection alpha.** A flat/bear
 NIFTY year has no stock-selection edge to fall back on. Keep the CNC T+1 equity
 book (sector_follow_cap5_vol) as the alpha primary.
 
-Mode flag (env): FUTURES_FOLLOW_MODE = scaffold | sandbox | live
-  scaffold: compute signals, log, write trade journal, NO orders (default)
-  sandbox: orders to sandbox.db only
+Mode flag (env): FUTURES_FOLLOW_MODE = sandbox | live
+  sandbox (default): orders to sandbox.db (virtual ₹1Cr) — active trading
   live: real broker orders
 
 Backtest reference (NIFTY-only CAP50): CAGR 14.44%, Sharpe 1.27, MaxDD −8.0% on
@@ -58,7 +61,7 @@ _DEFAULT_CONFIG_PATH = _STRATEGY_DIR / "config_snapshot.json"
 _EOD_REPORTS_DIR = _STRATEGY_DIR / "eod_reports"
 
 STRATEGY_NAME = "futures_follow_cap50"
-VALID_MODES = ("scaffold", "sandbox", "live")
+VALID_MODES = ("sandbox", "live")
 
 
 # --------------------------------------------------------------------------- #
@@ -66,7 +69,7 @@ VALID_MODES = ("scaffold", "sandbox", "live")
 # --------------------------------------------------------------------------- #
 @dataclass
 class FuturesFollowConfig:
-    """Strategy configuration. Mirrors config_snapshot.json (scaffold defaults)."""
+    """Strategy configuration. Mirrors config_snapshot.json (sandbox defaults)."""
 
     capital_inr: float = 1_000_000.0  # ₹10L (the backtest book size)
     cap_margin_pct: float = 0.50  # HARD cap: max 50% of capital as overnight margin
@@ -299,11 +302,10 @@ def production_contract_resolver(
 def production_order_placer(mode: str, order: dict) -> dict:
     """Route an order according to mode. Returns {status, orderid, ...}.
 
-    scaffold: never reaches here (place_entry/exit short-circuit). sandbox/live
-    both go through services.place_order_service.place_order — sandbox relies on
-    the platform's analyze/daily-intent dispatch to land in sandbox.db, live places
-    a real broker order. Kept thin and lazily-imported so importing this module
-    never pulls the order stack.
+    Both modes go through services.place_order_service.place_order — sandbox relies
+    on the platform's analyze/daily-intent dispatch to land in sandbox.db, live
+    places a real broker order. Kept thin and lazily-imported so importing this
+    module never pulls the order stack.
     """
     from database.auth_db import get_first_available_api_key
     from services.place_order_service import place_order
@@ -449,10 +451,10 @@ class FuturesFollowService:
         self.app = app
         self.scheduler = scheduler
         self.config = config if config is not None else load_config()
-        self.mode = (mode or os.getenv("FUTURES_FOLLOW_MODE", "scaffold")).lower()
+        self.mode = (mode or os.getenv("FUTURES_FOLLOW_MODE", "sandbox")).lower()
         if self.mode not in VALID_MODES:
-            logger.warning("Unknown FUTURES_FOLLOW_MODE=%s — forcing scaffold", self.mode)
-            self.mode = "scaffold"
+            logger.warning("Unknown FUTURES_FOLLOW_MODE=%s — forcing sandbox", self.mode)
+            self.mode = "sandbox"
 
         self._signal_evaluator = signal_evaluator or production_signal_evaluator
         self._contract_resolver = contract_resolver or production_contract_resolver
@@ -649,12 +651,12 @@ class FuturesFollowService:
         entry_price: float,
         entry_date: str | None = None,
     ) -> dict | None:
-        """Buy ``lots`` NIFTY future lot(s) for one signal (mode-aware).
+        """Buy ``lots`` NIFTY future lot(s) for one signal in the active mode.
 
-        Honors the kill switch + manual pause. scaffold: paper-record only, no
-        order. sandbox/live: route via the injected order placer. All modes write a
-        trade-journal row. A rejected/exception order journals the attempt but
-        creates NO phantom position."""
+        Honors the kill switch + manual pause. Always routes via the injected order
+        placer (sandbox → sandbox.db, live → broker) and writes a trade-journal row.
+        A rejected/exception order journals the attempt but creates NO phantom
+        position."""
         if self.kill_switch_active:
             logger.info("futures_follow entry skipped (kill switch active)")
             return None
@@ -674,82 +676,67 @@ class FuturesFollowService:
         entry_date = entry_date or self._now().date().isoformat()
 
         order_id = None
-        status = "scaffold"
+        status = "placed"
         error_message = None
-        if self.mode == "scaffold":
+        try:
+            resp = self._order_placer(
+                self.mode,
+                {
+                    "symbol": symbol,
+                    "exchange": self.config.exchange,
+                    "action": "BUY",
+                    "product": self.config.product,
+                    "quantity": qty,
+                },
+            )
+        except Exception as e:
+            logger.exception("futures_follow ENTRY placement raised: %s", symbol)
+            resp = {"status": "error", "message": str(e)}
+            status = "exception"
+        resp = resp or {}
+        order_id = resp.get("orderid")
+        if status != "exception":
+            status = "placed" if str(resp.get("status", "")).lower() == "success" else "rejected"
+        if status == "placed":
             logger.info(
-                "[scaffold] futures_follow ENTRY %s %dlot(s)=%dqty @ %.2f "
-                "(signal=%s vol_ratio=%.2f margin≈₹%.0f) — NO ORDER",
+                "[%s] futures_follow ENTRY %s %dlot(s) qty=%d @ %.2f order_id=%s",
+                self.mode,
                 symbol,
                 lots,
                 qty,
                 entry_price,
-                signal_symbol,
-                vol_ratio,
-                margin,
+                order_id,
             )
         else:
-            try:
-                resp = self._order_placer(
-                    self.mode,
-                    {
-                        "symbol": symbol,
-                        "exchange": self.config.exchange,
-                        "action": "BUY",
-                        "product": self.config.product,
-                        "quantity": qty,
-                    },
-                )
-            except Exception as e:
-                logger.exception("futures_follow ENTRY placement raised: %s", symbol)
-                resp = {"status": "error", "message": str(e)}
-                status = "exception"
-            resp = resp or {}
-            order_id = resp.get("orderid")
-            if status != "exception":
-                status = (
-                    "placed" if str(resp.get("status", "")).lower() == "success" else "rejected"
-                )
-            if status == "placed":
-                logger.info(
-                    "[%s] futures_follow ENTRY %s %dlot(s) qty=%d @ %.2f order_id=%s",
-                    self.mode,
-                    symbol,
-                    lots,
-                    qty,
-                    entry_price,
-                    order_id,
-                )
-            else:
-                error_message = str(
-                    resp.get("message") or resp.get("status") or "order placement failed"
-                )[:255]
-                logger.error(
-                    "[%s] futures_follow ENTRY %s %s %dlot(s) @ %.2f — %s",
-                    self.mode,
-                    status.upper(),
-                    symbol,
-                    lots,
-                    entry_price,
-                    error_message,
-                )
-                self._record_trade(
-                    side="BUY",
-                    nifty_symbol=symbol,
-                    lots=lots,
-                    quantity=qty,
-                    entry_price=entry_price,
-                    entry_date=entry_date,
-                    exchange=self.config.exchange,
-                    product=self.config.product,
-                    signal_id=signal_id,
-                    vol_ratio=vol_ratio,
-                    margin_inr=margin,
-                    order_id=None,
-                    status=status,
-                    error_message=error_message,
-                )
-                return None
+            error_message = str(
+                resp.get("message") or resp.get("status") or "order placement failed"
+            )[:255]
+            logger.error(
+                "[%s] futures_follow ENTRY %s %s %dlot(s) @ %.2f — %s",
+                self.mode,
+                status.upper(),
+                symbol,
+                lots,
+                entry_price,
+                error_message,
+            )
+            self._record_trade(
+                side="BUY",
+                nifty_symbol=symbol,
+                lots=lots,
+                quantity=qty,
+                entry_price=entry_price,
+                entry_date=entry_date,
+                exchange=self.config.exchange,
+                product=self.config.product,
+                signal_id=signal_id,
+                vol_ratio=vol_ratio,
+                margin_inr=margin,
+                order_id=None,
+                status=status,
+                error_message=error_message,
+            )
+            return None
 
         pos_id = order_id or f"{symbol}:{signal_symbol}:{uuid.uuid4().hex[:8]}"
         self.paper_book[pos_id] = FuturesPosition(
@@ -810,61 +797,50 @@ class FuturesFollowService:
         symbol = position.nifty_symbol
         exit_price = price if price is not None else position.entry_price
         order_id = None
-        status = "scaffold"
+        status = "placed"
         error_message = None
-        if self.mode == "scaffold":
+        try:
+            resp = self._order_placer(
+                self.mode,
+                {
+                    "symbol": symbol,
+                    "exchange": self.config.exchange,
+                    "action": "SELL",
+                    "product": self.config.product,
+                    "quantity": position.quantity,
+                },
+            )
+        except Exception as e:
+            logger.exception("futures_follow EXIT placement raised: %s", symbol)
+            resp = {"status": "error", "message": str(e)}
+            status = "exception"
+        resp = resp or {}
+        order_id = resp.get("orderid")
+        if status != "exception":
+            status = "placed" if str(resp.get("status", "")).lower() == "success" else "rejected"
+        if status == "placed":
             logger.info(
-                "[scaffold] futures_follow EXIT %s %dlot(s) qty=%d @ %.2f — NO ORDER",
+                "[%s] futures_follow EXIT %s %dlot(s) qty=%d @ %.2f order_id=%s",
+                self.mode,
                 symbol,
                 position.lots,
                 position.quantity,
                 exit_price,
+                order_id,
             )
         else:
-            try:
-                resp = self._order_placer(
-                    self.mode,
-                    {
-                        "symbol": symbol,
-                        "exchange": self.config.exchange,
-                        "action": "SELL",
-                        "product": self.config.product,
-                        "quantity": position.quantity,
-                    },
-                )
-            except Exception as e:
-                logger.exception("futures_follow EXIT placement raised: %s", symbol)
-                resp = {"status": "error", "message": str(e)}
-                status = "exception"
-            resp = resp or {}
-            order_id = resp.get("orderid")
-            if status != "exception":
-                status = (
-                    "placed" if str(resp.get("status", "")).lower() == "success" else "rejected"
-                )
-            if status == "placed":
-                logger.info(
-                    "[%s] futures_follow EXIT %s %dlot(s) qty=%d @ %.2f order_id=%s",
-                    self.mode,
-                    symbol,
-                    position.lots,
-                    position.quantity,
-                    exit_price,
-                    order_id,
-                )
-            else:
-                error_message = str(
-                    resp.get("message") or resp.get("status") or "order placement failed"
-                )[:255]
-                logger.error(
-                    "[%s] futures_follow EXIT %s %s %dlot(s) @ %.2f — %s",
-                    self.mode,
-                    status.upper(),
-                    symbol,
-                    position.lots,
-                    exit_price,
-                    error_message,
-                )
+            error_message = str(
+                resp.get("message") or resp.get("status") or "order placement failed"
+            )[:255]
+            logger.error(
+                "[%s] futures_follow EXIT %s %s %dlot(s) @ %.2f — %s",
+                self.mode,
+                status.upper(),
+                symbol,
+                position.lots,
+                exit_price,
+                error_message,
+            )
 
         buy_notional = position.entry_price * position.quantity
         sell_notional = exit_price * position.quantity
@@ -951,8 +927,8 @@ class FuturesFollowService:
 
     def _apply_mode_override(self, decision) -> None:
         """Mode-only: honor a persistent ``strategy_mode`` row by mapping its mode
-        onto the service's native routing mode. Env/default sources leave the
-        scaffold/no-orders default untouched (deploy is a no-op until a row exists)."""
+        onto the service's native routing mode. Env/default sources leave the active
+        sandbox default untouched (only a ``strategy_mode`` row can escalate to live)."""
         if getattr(decision, "source", None) != "strategy_mode":
             return
         mapped = {"sandbox": "sandbox", "live": "live"}.get(decision.mode)
@@ -1516,8 +1492,9 @@ def _watchdog_job() -> None:
 
 
 def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowService:
-    """Build the singleton and register its scheduler jobs. Default mode=scaffold so
-    loading this module changes no live trading behavior."""
+    """Build the singleton and register its scheduler jobs. Default mode=sandbox so
+    the strategy actively trades the virtual ₹1Cr sandbox book from boot (no live
+    broker orders until the operator flips mode=live)."""
     svc = FuturesFollowService(
         app=app, scheduler=scheduler, data_health_checker=production_data_health_checker
     )

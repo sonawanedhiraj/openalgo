@@ -21,25 +21,32 @@ the latest decisions automatically.
 ### futures_follow_cap50 — strategy (added 2026-06-15)
 
 #### FUTURES_FOLLOW_MODE
-- **Current value:** unset → defaults `scaffold` (`.sample.env` not modified — add
-  `FUTURES_FOLLOW_MODE=scaffold` there at the next convenient operator edit).
+- **Current value:** unset → defaults **`sandbox`** (`.sample.env` not modified — add
+  `FUTURES_FOLLOW_MODE=sandbox` there at the next convenient operator edit).
 - **Set in:** env; read in `services/futures_follow_service.py`
   (`FuturesFollowService.__init__`).
-- **Values:** `scaffold` | `sandbox` | `live`
-  - `scaffold` (default): compute signals, log, write the trade journal — **NO
-    orders placed.**
-  - `sandbox`: orders routed to `db/sandbox.db` (virtual ₹1Cr).
+- **Values:** `sandbox` | `live` — **there is NO scaffold / observe-only state.**
+  - `sandbox` (default): orders routed to `db/sandbox.db` (virtual ₹1Cr) — **the
+    strategy actively trades from boot.**
   - `live`: real broker orders.
-  - Any unknown value force-falls-back to `scaffold` (logged WARNING).
-- **Who flips:** **operator only** — the strategy ships scaffold; `sandbox`/`live`
-  is a deliberate operator decision, never automated. A persistent `strategy_mode`
-  row (`strategy_name='futures_follow_cap50'`) overrides the env value at runtime.
+  - Any unknown value force-falls-back to `sandbox` (logged WARNING).
+- **Who flips to live:** **operator only** — `sandbox`→`live` is a deliberate
+  operator decision (env or a persistent `strategy_mode` row,
+  `strategy_name='futures_follow_cap50'`), never automated. The env/default source
+  can NOT escalate to live; only a `strategy_mode` row can. Active sandbox trading
+  can be paused without changing mode via `POST /futures_follow_cap50/api/pause`.
 - **History:**
-  - **2026-06-15 (Phase 1 scaffold):** Introduced with the FuturesFollowService
-    core + observability endpoints. Default `scaffold` so wiring the service into
-    boot changes no live trading behavior. Backtest reference (NIFTY-only CAP50):
-    CAGR 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L. **Caveat:** leveraged beta, not
-    alpha (signal does not predict NIFTY — hit-rate 53.4%, corr 0.295).
+  - **2026-06-15 (v0.1.0, scaffold):** Introduced with default `scaffold` (compute +
+    log only). **Superseded same day — see below.**
+  - **2026-06-15 (v0.2.0, sandbox-default — operator redirect):** Default flipped to
+    **`sandbox`** and the scaffold mode dropped entirely (`VALID_MODES =
+    ("sandbox","live")`). The strategy now places real orders into `sandbox.db` from
+    boot; first sandbox cycle Monday 2026-06-15 15:20 IST. `config_snapshot.json`:
+    `mode: "sandbox"`, `deployable: true`. Rationale: get the strategy actively
+    paper-trading the virtual book before the operator evaluates a live flip.
+    Backtest reference (NIFTY-only CAP50): CAGR 14.44%, Sharpe 1.27, MaxDD −8.0% on
+    ₹10L. **Caveat:** leveraged beta, not alpha (signal does not predict NIFTY —
+    hit-rate 53.4%, corr 0.295).
 
 #### config_snapshot.json (non-env tunables — NOT environment variables)
 - **File:** `strategies/futures_follow_cap50/config_snapshot.json` — canonical
