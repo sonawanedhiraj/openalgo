@@ -850,6 +850,46 @@ decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follo
 Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
 at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
 
+**Scaffold strategy**: [`strategies/futures_follow_cap50/`](strategies/futures_follow_cap50/)
+— a **leveraged broad-market-beta** sleeve built on the sector_follow signal set
+(spawned from the 2026-06-14 NIFTY-only CAP50 leverage research). At 15:20 IST it
+**reuses** the `sector_follow_cap5_vol` C1×W2+E4 evaluator (does NOT reimplement the
+gates) to find today's ≤5 stock signals, and for each — greedily in vol-ratio order
+— buys **one NIFTY near-month index future lot** (NIFTY futures are MONTHLY; the
+resolver picks the front-month from the master contract — there is no weekly NIFTY
+future), HARD-CAPPED at **50% of capital as overnight SPAN margin** (₹10L book ⇒ ~2
+lots; late signals beyond the cap are skipped). Product **NRML**, exchange **NFO**,
+MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. **No stop loss** (Phase-1
+proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**
+is the only backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
+(0.03% notional) round-trip charges.
+**SCAFFOLD ONLY — not live** (`mode: scaffold-only`, `deployable: false`). Like
+sector_follow it IS wired into the runtime: `FuturesFollowService`
+(`services/futures_follow_service.py`) is built at boot and registers 5 APScheduler
+jobs (reset 09:00 / watchdog 15:14 / entry 15:20 / exit 15:25 / EOD-summary 15:30
+IST), but the default `FUTURES_FOLLOW_MODE=scaffold` places **no orders** — it
+computes signals, logs, and writes the `futures_follow_trades` journal only. Flip to
+`sandbox` / `live` is operator-only.
+**Honest caveat (load-bearing — do not lose):** the backtest clears 12% (CAGR
+14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L, 2024-01..2026-06) but the signal does
+**NOT** predict NIFTY direction (hit-rate 53.4% < 55%, corr 0.295). The return is
+leveraged broad-market drift on bullish signal-days — **leveraged beta, not the
+sector_follow stock-selection alpha** — so it will struggle in a sustained flat/bear
+NIFTY regime, where it has no edge to fall back on. Sector-matched routing
+(banking→BANKNIFTY) was tested and **rejected** (costs 0.74pp CAGR, no correlation
+gain — NIFTY-only is the vehicle). Keep `sector_follow_cap5_vol` (CNC T+1 equity) as
+the alpha primary; run this as a separate, leverage-bounded beta sleeve. Key files:
+`services/futures_follow_service.py` (evaluator reuse + sizing + scheduler glue),
+`blueprints/futures_follow.py` (control API at `/futures_follow_cap50/api/*` —
+status/positions/pause/resume/close_all/data_health),
+`database/futures_follow_db.py` (`futures_follow_trades` journal). Plan + locked
+decisions: [`strategies/futures_follow_cap50/PLAN.md`](strategies/futures_follow_cap50/PLAN.md).
+Backtest reports:
+[`docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md`](docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md)
+(NIFTY-only CAP50 control) and `2026-06-14_futures_10L.md`. Daily EOD report mirror
+written to `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md` at 15:30 IST
+(git-ignored, observational).
+
 ## Data freshness validation (sector_follow_cap5_vol)
 
 A durable guard against the class of failure that produced the 2026-05-29→06-10

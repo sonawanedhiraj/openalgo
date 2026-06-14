@@ -110,6 +110,8 @@ ci/runner/.env.runner
 
 # sector_follow_cap5_vol Day-N EOD reports — observational, not source
 strategies/sector_follow_cap5_vol/eod_reports/
+# futures_follow_cap50 Day-N EOD reports — observational, not source
+strategies/futures_follow_cap50/eod_reports/
 # Agent/boot diagnostic logs (transient; real logs are openalgo_*.log / errors.jsonl)
 log/_*
 log/boot_*

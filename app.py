@@ -49,6 +49,7 @@ from blueprints.core import core_bp
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
 from blueprints.dashboard import dashboard_bp
 from blueprints.flow import flow_bp  # Import the flow blueprint
+from blueprints.futures_follow import futures_follow_bp  # futures_follow_cap50 observability
 from blueprints.gc_json import gc_json_bp
 from blueprints.gex import gex_bp  # Import the GEX blueprint
 from blueprints.health import health_bp  # Import the health monitoring blueprint
@@ -107,6 +108,7 @@ from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
 from database.data_health_db import init_db as ensure_data_health_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
+from database.futures_follow_db import init_db as ensure_futures_follow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -277,6 +279,7 @@ def create_app():
     app.register_blueprint(settings_bp)
     app.register_blueprint(chartink_bp)
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
+    app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
@@ -655,6 +658,7 @@ def setup_environment(app):
                 ("Qty Freeze DB", ensure_qty_freeze_tables_exists),
                 ("Historify DB", ensure_historify_tables_exists),
                 ("Flow DB", ensure_flow_tables_exists),
+                ("Futures Follow DB", ensure_futures_follow_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
             ]
@@ -772,6 +776,19 @@ def setup_environment(app):
                 logger.debug("Sector Follow CAP5_VOL service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
+
+            # Futures Follow CAP50 strategy (leveraged-beta NIFTY-futures sleeve on
+            # the sector_follow signal set). Default mode=scaffold means loading
+            # this changes ZERO live trading behavior — it only registers
+            # 09:00/15:14/15:20/15:25/15:30 IST jobs that compute + log. See
+            # strategies/futures_follow_cap50/ and FUTURES_FOLLOW_MODE.
+            try:
+                from services.futures_follow_service import init_futures_follow_service
+
+                init_futures_follow_service(app=app)
+                logger.debug("Futures Follow CAP50 service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Futures Follow service: {e}")
 
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a

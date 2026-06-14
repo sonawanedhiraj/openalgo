@@ -18,6 +18,57 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### futures_follow_cap50 — strategy (added 2026-06-15)
+
+#### FUTURES_FOLLOW_MODE
+- **Current value:** unset → defaults `scaffold` (`.sample.env` not modified — add
+  `FUTURES_FOLLOW_MODE=scaffold` there at the next convenient operator edit).
+- **Set in:** env; read in `services/futures_follow_service.py`
+  (`FuturesFollowService.__init__`).
+- **Values:** `scaffold` | `sandbox` | `live`
+  - `scaffold` (default): compute signals, log, write the trade journal — **NO
+    orders placed.**
+  - `sandbox`: orders routed to `db/sandbox.db` (virtual ₹1Cr).
+  - `live`: real broker orders.
+  - Any unknown value force-falls-back to `scaffold` (logged WARNING).
+- **Who flips:** **operator only** — the strategy ships scaffold; `sandbox`/`live`
+  is a deliberate operator decision, never automated. A persistent `strategy_mode`
+  row (`strategy_name='futures_follow_cap50'`) overrides the env value at runtime.
+- **History:**
+  - **2026-06-15 (Phase 1 scaffold):** Introduced with the FuturesFollowService
+    core + observability endpoints. Default `scaffold` so wiring the service into
+    boot changes no live trading behavior. Backtest reference (NIFTY-only CAP50):
+    CAGR 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L. **Caveat:** leveraged beta, not
+    alpha (signal does not predict NIFTY — hit-rate 53.4%, corr 0.295).
+
+#### config_snapshot.json (non-env tunables — NOT environment variables)
+- **File:** `strategies/futures_follow_cap50/config_snapshot.json` — canonical
+  source for the strategy's non-env tunables. Loaded by `load_config()`; the
+  `FuturesFollowConfig` dataclass mirrors it. **The task brief named these as
+  `FUTURES_FOLLOW_*` env vars; in the shipped code they live in config (or are
+  scheduler-fixed cron times), NOT env — documented here accurately so the
+  intent/reality match holds.**
+- **Cap (was: `FUTURES_FOLLOW_CAP_MARGIN_PCT`):** `cap_margin_pct` = **0.50** —
+  HARD cap, max 50% of capital as overnight SPAN margin (the other 50% is the
+  gap-crash buffer — do NOT raise without a fresh tail-risk study). `capital_inr`
+  ₹10,00,000, `nifty_lot_margin_inr` ₹2,50,000 (per-lot SPAN estimate used for the
+  cap decision; operator refreshes from the broker), `nifty_lot_size` 75,
+  `lots_per_signal` 1, `max_signals_per_day` 5.
+- **Daily loss kill (was: `FUTURES_FOLLOW_DAILY_LOSS_KILL_PCT`):**
+  `daily_loss_kill_pct` = **3.0** (halt new entries, hold open positions to T+1).
+- **Times (was: `FUTURES_FOLLOW_ENTRY_TIME_IST` / `..._EXIT_TIME_IST` /
+  `..._EOD_WATCHDOG_TIME_IST`):** scheduler-fixed cron times in
+  `FuturesFollowService.register_jobs` — entry **15:20**, exit **15:25**, EOD
+  watchdog **15:14**, daily reset 09:00, EOD summary 15:30 IST (all `mon-fri`,
+  `Asia/Kolkata`). The watchdog at 15:14 fires before any auto-square-off window.
+- **Product/exchange:** `product` NRML (futures carry — not MIS/CNC), `exchange`
+  NFO, MARKET orders. `cost_pct_round_trip` 0.030 (~₹530/lot).
+- **Who changes:** operator, recorded in
+  `strategies/futures_follow_cap50/VERSION_LOG.md`.
+- **Shared flag:** the data-freshness gate reuses `DATA_FRESHNESS_VALIDATION_ENABLED`
+  + `MAX_STALENESS_BUSINESS_DAYS` (documented under sector_follow) since the futures
+  sleeve fires on the sector_follow signal feed.
+
 ### Build/runtime environment
 
 #### `.python-version` = `3.12` (new file, 2026-06-13)
