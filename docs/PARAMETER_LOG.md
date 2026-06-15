@@ -18,6 +18,73 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### In-house screener — Tier-1 observability hardening (added 2026-06-15)
+
+All default-on and additive — they change what is observed/skipped, never which
+signals fire. Source: `services/scanner_service.py` + the two
+`services/scan_rules/fno_intraday_*_chartink.py` rule modules. Plan:
+`docs/research/strategy/screener/2026-06-15_inhouse_deep_analysis.md` (Tier 1).
+
+#### SCANNER_POSTCLOSE_GATE_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in `services/scanner_service.py`
+  (`_postclose_gate_enabled()`), gating the market-hours guard in
+  `_evaluate_definitions`.
+- **What it does:** when `true`, the scanner skips rule evaluation (INFO log)
+  outside `[09:15, 15:30]` IST. `false` → evaluation runs at any wall-clock time
+  (the pre-Tier-1 behavior).
+- **Why added:** the 2026-06-15 post-close spurious-SELL incident (17 AUROPHARMA
+  SELL fires at 16:10–17:30 IST on a stale daily bar, FM-6).
+
+#### SCANNER_DBAR_DATE_VERIFY_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in both `fno_intraday_buy_chartink.py` /
+  `fno_intraday_sell_chartink.py` (`_dbar_date_verify_enabled()`).
+- **What it does:** post-settle (`today_idx == -1`), the rule aborts with a
+  WARNING when its latest daily-D bar is dated before today (stale-D guard). Only
+  fires when the daily frame carries a `timestamp` column (production reads);
+  `false` → legacy behavior (no date check).
+- **Why added:** defense-in-depth for FM-6 — a future change to the market-hours
+  gate must not be able to re-open the stale-bar post-close path on its own.
+
+#### SCANNER_COMPLETENESS_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in `services/scanner_service.py`
+  (`_completeness_enabled()`), gating `_record_completeness`.
+- **What it does:** when `true`, the scanner accumulates which symbols produced a
+  live bar per rolling window and emits a decision-input completeness metric.
+  `false` → no window accumulation, no metric.
+- **Why added:** ends the "0 hits == no data == failure" ambiguity (DP-4) by
+  reporting `n_live/total` and alerting on partial feed degradation.
+
+#### SCANNER_COMPLETENESS_WINDOW_MIN
+- **Current value:** unset → defaults **`5`** (minutes, ~one 5m bar cycle).
+- **Set in:** env; read in `services/scanner_service.py`
+  (`_completeness_window_min()`).
+- **What it does:** the rolling window over which symbol liveness is accumulated
+  before the completeness metric is emitted + reset.
+
+#### SCANNER_COMPLETENESS_WARN_PCT
+- **Current value:** unset → defaults **`50`** (percent).
+- **Set in:** env; read in `services/scanner_service.py`
+  (`_completeness_warn_pct()`).
+- **What it does:** a live fraction below this threshold sends a 🟠 WARNING
+  Telegram alert (`scanner_completeness` event).
+
+#### SCANNER_COMPLETENESS_CRIT_PCT
+- **Current value:** unset → defaults **`20`** (percent).
+- **Set in:** env; read in `services/scanner_service.py`
+  (`_completeness_crit_pct()`).
+- **What it does:** a live fraction below this threshold sends a 🔴 CRITICAL
+  Telegram alert. Per-severity once-a-day dedup prevents spam.
+
+#### NOTIFY_SCANNER_COMPLETENESS
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in `services/notification_service.py` (`per_event`).
+- **What it does:** per-event toggle for the `scanner_completeness` Telegram
+  alert. `false` → the metric still logs but no Telegram is sent. (Master switch
+  `NOTIFY_TELEGRAM_ENABLED` still applies.)
+
 ### sector_follow_cap5_vol — Fix 1b smoke check (added 2026-06-15)
 
 #### SECTOR_FOLLOW_SMOKE_CHECK_ENABLED

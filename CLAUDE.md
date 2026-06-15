@@ -1086,6 +1086,51 @@ intervals** (`1m` AND `D`):
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
 
+### In-house screener observability — Tier-1 hardening (2026-06-15)
+
+The in-house scanner (`services/scanner_service.py`) is purely event-driven and
+historically **failed closed, silently** — every missing input became a bare
+`return False`/`(None, None)` with no log, so "tick-starved feed" and "genuinely
+quiet market" produced byte-identical zero-hit logs. Tier-1 of the Phase-B plan
+(`docs/research/strategy/screener/2026-06-15_inhouse_deep_analysis.md`) applies
+sector_follow's Fix 1b disciplines (loud failure + completeness metric +
+market-hours gate) to the scanner. **All three are additive — they change *what
+is observed/skipped*, never *which signals fire***:
+
+- **Market-hours gate** (`_evaluate_definitions`): skips evaluation with an INFO
+  log outside `[09:15, 15:30]` IST, so a straggler/backfill tick that closes a
+  bar after the session cannot fire a stale-bar signal (the 2026-06-15 17×
+  post-close AUROPHARMA SELL class, FM-6). Flag `SCANNER_POSTCLOSE_GATE_ENABLED`
+  (default `true`). `_now_ist()` is indirected for testability.
+- **D-bar-date verify** (both `services/scan_rules/fno_intraday_*_chartink.py`):
+  post-settle (`today_idx == -1`), the rule aborts with a WARNING when its latest
+  daily-D bar is dated *before* today — the stale-D condition that let a prior-day
+  bar masquerade as "today's settled bar." Flag `SCANNER_DBAR_DATE_VERIFY_ENABLED`
+  (default `true`); gated on the production `timestamp` column so synthetic test
+  frames are exempt. Paired with the market-hours gate so a future change to
+  either one cannot silently re-open the post-close path.
+- **Loud per-symbol PASS/FAIL + missing-input logging**: `_evaluate_definitions`
+  logs `scanner PASS <sym>` at INFO (rare) / `scanner FAIL <sym>` at DEBUG (per-bar
+  firehose); `get_today_ohlcv` logs a reason instead of a silent `(None, None)`;
+  the rules log a WARNING naming the symbol + which input is `None` (data missing)
+  vs DEBUG for a short-but-present warm-up frame; `scanner_universe_backfill`'s
+  `check_and_refresh_if_stale` WARNs with the affected symbols + reason on a failed
+  catch-up (FM-11: an expired token could fail every symbol with only a quiet error
+  key as the trace).
+- **Per-cycle decision-input completeness metric** (`_record_completeness` /
+  `_emit_completeness`): the scanner accumulates the set of symbols that produced a
+  live bar within a rolling `SCANNER_COMPLETENESS_WINDOW_MIN` (default 5) minute
+  window and, when the window rolls, emits `n_live / total_subscribed` — **<50%
+  WARNING, <20% CRITICAL** via Telegram (`notification_service.notify`,
+  `scanner_completeness` event, per-severity once-a-day dedup). This is the single
+  change that makes "0 hits because no data" visually distinct from "0 hits because
+  quiet market." Flags `SCANNER_COMPLETENESS_ENABLED` (default `true`),
+  `SCANNER_COMPLETENESS_WARN_PCT` (50), `SCANNER_COMPLETENESS_CRIT_PCT` (20),
+  `SCANNER_COMPLETENESS_WINDOW_MIN` (5). **Limitation:** a *total* feed outage
+  produces no bar closes at all, so this path never fires — that case is the 15:18
+  smoke check's job (Tier 2, not yet shipped). The metric catches *partial*
+  degradation and reports coverage. See `docs/PARAMETER_LOG.md` for all flags.
+
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
 A daily in-process APScheduler job (**15:45 IST mon-fri**) that scores how the

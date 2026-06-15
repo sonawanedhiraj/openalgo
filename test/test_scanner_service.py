@@ -852,3 +852,93 @@ def test_get_today_ohlcv_logs_reason_when_no_bars(caplog):
 
     assert (close, vol) == (None, None)
     assert any("no live bars for RELIANCE" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 Fix #3 — decision-input completeness metric
+# ---------------------------------------------------------------------------
+
+
+def _ist(hour, minute=0):
+    return scanner_service._IST.localize(dt.datetime(2026, 5, 30, hour, minute))
+
+
+def test_completeness_metric_emitted_per_cycle(caplog):
+    """When the rolling window elapses, n_live/total is logged for the PRIOR
+    window (the triggering bar belongs to the next window)."""
+    import logging
+
+    svc = scanner_service.ScannerService(symbols=["A", "B", "C", "D"], bus=_CapturingBus())
+    t0 = _ist(11, 0)
+    svc._record_completeness("A", t0)
+    svc._record_completeness("B", t0)  # 2 of 4 live this window
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._record_completeness("C", t0 + dt.timedelta(minutes=6))  # rolls the window
+    assert any("decision-input completeness: 2/4 (50%)" in r.message for r in caplog.records)
+
+
+def test_completeness_below_50pct_triggers_warning_telegram():
+    """A live fraction under the WARN threshold (default 50%) sends a WARNING."""
+    sent = []
+    svc = scanner_service.ScannerService(
+        symbols=list("ABCDEFGHIJ"), bus=_CapturingBus(), notifier=sent.append
+    )
+    # 4 of 10 (40%) live → below 50% WARN, above 20% CRIT.
+    for s in "ABCD":
+        svc._completeness_window_syms.add(s)
+    svc._emit_completeness(_ist(11, 0))
+    assert len(sent) == 1
+    assert "WARNING" in sent[0] and "4/10" in sent[0]
+
+
+def test_completeness_below_20pct_triggers_critical_telegram():
+    """A live fraction under the CRIT threshold (default 20%) sends a CRITICAL."""
+    sent = []
+    svc = scanner_service.ScannerService(
+        symbols=list("ABCDEFGHIJ"), bus=_CapturingBus(), notifier=sent.append
+    )
+    svc._completeness_window_syms.add("A")  # 1 of 10 (10%) → CRITICAL
+    svc._emit_completeness(_ist(11, 0))
+    assert len(sent) == 1
+    assert "CRITICAL" in sent[0] and "1/10" in sent[0]
+
+
+def test_completeness_full_coverage_is_quiet():
+    """Full coverage (no degradation) logs the metric but sends no alert —
+    distinguishes a genuinely quiet market from a starved feed."""
+    sent = []
+    svc = scanner_service.ScannerService(
+        symbols=list("ABCD"), bus=_CapturingBus(), notifier=sent.append
+    )
+    for s in "ABCD":
+        svc._completeness_window_syms.add(s)  # 100% live
+    svc._emit_completeness(_ist(11, 0))
+    assert sent == []
+
+
+def test_completeness_dedup_one_alert_per_day():
+    """The same severity alerts at most once per day; a new day re-arms it."""
+    sent = []
+    svc = scanner_service.ScannerService(
+        symbols=list("ABCDEFGHIJ"), bus=_CapturingBus(), notifier=sent.append
+    )
+
+    def _degraded_emit(at):
+        svc._completeness_window_syms = {"A", "B", "C", "D"}  # 40% → WARNING
+        svc._emit_completeness(at)
+
+    _degraded_emit(_ist(11, 0))
+    _degraded_emit(_ist(11, 30))  # same day, same severity → deduped
+    assert len(sent) == 1
+    _degraded_emit(_ist(11, 0) + dt.timedelta(days=1))  # next day → re-armed
+    assert len(sent) == 2
+
+
+def test_completeness_disabled_does_not_record(monkeypatch, fresh_scanner_db):
+    """SCANNER_COMPLETENESS_ENABLED=false → no window accumulation."""
+    monkeypatch.setenv("SCANNER_COMPLETENESS_ENABLED", "false")
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    _enable_buy_definition()
+    bar = _seed_matching_buy(svc)
+    svc._on_bar_close("RELIANCE", "5m", bar)
+    assert svc._completeness_window_syms == set()

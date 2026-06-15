@@ -153,6 +153,12 @@ class NotificationService:
             # ON — the operator wants the parity verdict each trading day. See
             # services/scanner_comparison_eod_service.py.
             "scanner_comparison": _env_bool("NOTIFY_SCANNER_COMPARISON", default=True),
+            # In-house scanner per-cycle decision-input completeness alert
+            # (Tier-1 Fix #3). Fires WARNING (<50% of the universe produced live
+            # bars this window) / CRITICAL (<20%) so a silently-degraded feed is
+            # distinguishable from a genuinely quiet market. See
+            # services/scanner_service.py (_emit_completeness).
+            "scanner_completeness": _env_bool("NOTIFY_SCANNER_COMPLETENESS", default=True),
             # Generic "background code task finished" push. Default ON — used by
             # spawned code tasks to confirm completion to the operator. Routes
             # through the same Telegram path (no batching); the caller supplies
