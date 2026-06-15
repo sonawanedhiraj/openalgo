@@ -129,7 +129,13 @@ def run_backfill_checks(today=None) -> dict:
     index_res = _index_check(today)
     stock_res = _stock_check(today)
     errors = list(index_res.get("errors", [])) + list(stock_res.get("errors", []))
-    all_fresh = not index_res.get("stale_symbols") and not stock_res.get("stale_symbols")
+
+    # A "skipped_locked" arm read nothing (historify was briefly locked) — it is
+    # NOT proof the feed is fresh, so it must not let the periodic loop back off.
+    def _arm_fresh(r: dict) -> bool:
+        return not r.get("stale_symbols") and r.get("status") != "skipped_locked"
+
+    all_fresh = _arm_fresh(index_res) and _arm_fresh(stock_res)
     return {
         "index": index_res,
         "stock": stock_res,

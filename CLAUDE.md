@@ -906,7 +906,15 @@ fail loud and fail safe.
   `historify.duckdb`. `check_strategy_data_ready(strategy, date,
   max_staleness_business_days=1)` returns `(ok, per-symbol details)`;
   business-day aware (weekend gap ≠ stale; holidays NOT modelled). For
-  sector_follow it checks the 8 mapped indices + 30 universe stocks.
+  sector_follow it checks the 8 mapped indices + 30 universe stocks. All
+  read-only DuckDB reads go through **`connect_historify_readonly()`**, which
+  tries `read_only=True` first but falls back to a config-matching connect when
+  the live app already holds `historify.duckdb` open read-write **in the same
+  process** — DuckDB's instance cache otherwise rejects the mismatched config
+  ("Can't open a connection … with a different configuration"). This was the
+  recurring post-close (15:30+) lock-warning spam; the fallback reuses the shared
+  in-process connection so the read just succeeds. The same helper backs the
+  live 15:20 sector_follow evaluator read (`sector_follow_service`).
 - **Table** `data_health_check` in `db/openalgo.db`
   (`database/data_health_db.py`) — one row per check: `check_at`, `overall_ok`,
   `stale_symbols` (JSON), `details_json`, `alert_sent`.
@@ -949,7 +957,11 @@ How it works:
   behind today's expected 15:30 IST close** through the same incremental historify
   pipeline. Idempotent (fresh → no-op) and fail-graceful (a dead-token fetch is
   `logger.exception`-logged into `errors`, never raised; an anomaly alert fires on
-  any error).
+  any error). A **transient DuckDB lock** on the freshness read
+  (`is_transient_lock_error` — e.g. a separate CLI backfill holds the file) is
+  downgraded to a quiet `logger.info` skip (`status='skipped_locked'`, no Telegram
+  anomaly); the arm is treated as *not fresh* so the periodic loop retries rather
+  than backing off, and the boot/next-tick convergence catches up.
 - **Boot hook**: on every OpenAlgo start, a daemon thread waits for a broker
   session to appear, then runs the index + stock convergence check once (never
   blocks boot). So a restart after the daily ~3 AM Zerodha re-login auto-catches

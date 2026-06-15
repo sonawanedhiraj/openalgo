@@ -210,7 +210,7 @@ def duckdb_metrics_provider(
     stock fails the gate (fail-closed). Returns
     {symbol: {sector_ret, stock_ret, vol_ratio, current_price}}.
     """
-    import duckdb
+    from services.data_freshness_service import connect_historify_readonly
 
     as_of_epoch = as_of.timestamp()
     as_of_date = as_of.astimezone(_IST).date()
@@ -220,7 +220,7 @@ def duckdb_metrics_provider(
     all_syms = sorted(set(universe) | set(index_syms))
 
     raw: dict[str, list[tuple]] = {s: [] for s in all_syms}
-    con = duckdb.connect(db_path, read_only=True)
+    con = connect_historify_readonly(db_path)
     try:
         placeholders = ", ".join(["?"] * len(all_syms))
         rows = con.execute(

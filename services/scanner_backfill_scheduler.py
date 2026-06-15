@@ -154,7 +154,9 @@ def run_backfill_checks(today=None) -> dict:
         res = check_and_refresh_if_stale(today, interval=interval)
         per_interval[interval] = res
         errors.extend(res.get("errors", []))
-        if res.get("stale_symbols"):
+        # A "skipped_locked" arm read nothing (historify briefly locked) — not
+        # proof of freshness, so don't let the periodic loop back off on it.
+        if res.get("stale_symbols") or res.get("status") == "skipped_locked":
             all_fresh = False
     return {"intervals": per_interval, "all_fresh": all_fresh, "errors": errors}
 
@@ -170,8 +172,10 @@ def _persist_health(res: dict) -> None:
     for interval, ires in res.get("intervals", {}).items():
         stale = ires.get("stale_symbols", [])
         had_error = bool(ires.get("errors"))
-        # overall_ok: the feed is healthy iff nothing was stale AND no fetch error.
-        overall_ok = not stale and not had_error
+        # overall_ok: the feed is healthy iff the check actually ran (status "ok"),
+        # nothing was stale, AND no fetch error. A "skipped_locked" read is not a
+        # health signal, so it must not record a falsely-healthy row.
+        overall_ok = ires.get("status") == "ok" and not stale and not had_error
         try:
             insert_check(
                 strategy_name=_health_strategy_name(interval),

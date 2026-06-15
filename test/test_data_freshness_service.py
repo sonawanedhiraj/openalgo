@@ -201,3 +201,58 @@ def test_format_report_ok_and_stale():
     assert "STALE" in report
     assert "NIFTY" in report
     assert "2026-05-29" in report
+
+
+# --------------------------------------------------------------------------- #
+# DuckDB lock-tolerant connection helpers
+# --------------------------------------------------------------------------- #
+def test_is_transient_lock_error_classifies_known_messages():
+    cfg = duckdb.ConnectionException(
+        "Can't open a connection to same database file with a different "
+        "configuration than existing connections"
+    )
+    assert dfs.is_transient_lock_error(cfg) is True
+    assert dfs.is_transient_lock_error(RuntimeError("Could not set lock on file")) is True
+    assert dfs.is_transient_lock_error(RuntimeError("Conflicting lock is held")) is True
+    # Genuine faults must NOT be swallowed as transient.
+    assert dfs.is_transient_lock_error(RuntimeError("token expired")) is False
+    assert dfs.is_transient_lock_error(ValueError("no api key available")) is False
+
+
+def test_connect_historify_readonly_falls_back_on_config_mismatch(tmp_duckdb, monkeypatch):
+    """When read_only is refused by an in-process read-write holder, fall back to a
+    config-matching connect so the read still succeeds (the lock-contention fix)."""
+    path = tmp_duckdb({"AAA": (2026, 6, 11)})
+    calls = []
+    real_connect = duckdb.connect
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        calls.append(read_only)
+        if read_only:
+            raise duckdb.ConnectionException(
+                "Can't open a connection to same database file with a different "
+                "configuration than existing connections"
+            )
+        return real_connect(p, *args, read_only=read_only, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+
+    con = dfs.connect_historify_readonly(path)
+    try:
+        rows = con.execute("SELECT symbol FROM market_data").fetchall()
+    finally:
+        con.close()
+    assert rows == [("AAA",)]
+    # Tried read_only first (refused), then fell back to the shared config.
+    assert calls == [True, False]
+
+
+def test_connect_historify_readonly_reraises_unrelated_connection_error(monkeypatch):
+    """A non-config-mismatch ConnectionException must propagate (no silent fallback)."""
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        raise duckdb.ConnectionException("database does not exist")
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+    with pytest.raises(duckdb.ConnectionException, match="does not exist"):
+        dfs.connect_historify_readonly("nope.duckdb")

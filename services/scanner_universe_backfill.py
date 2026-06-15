@@ -248,6 +248,19 @@ def check_and_refresh_if_stale(
             interval=interval,
         )
     except Exception as e:  # never let a freshness read crash the caller
+        from services.data_freshness_service import is_transient_lock_error
+
+        if is_transient_lock_error(e):
+            # historify briefly held read-write elsewhere (e.g. a separate CLI
+            # backfill process). Skip this cycle quietly — no Telegram anomaly —
+            # the boot/next-tick convergence catches up.
+            logger.info(
+                "scanner universe %s stale-check skipped — historify briefly locked: %s",
+                interval,
+                e,
+            )
+            result["status"] = "skipped_locked"
+            return result
         logger.exception(
             "scanner universe %s stale-check failed to read freshness: %s", interval, e
         )

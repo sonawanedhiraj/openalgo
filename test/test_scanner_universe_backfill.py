@@ -155,6 +155,33 @@ def test_broker_failure_is_caught_logged_and_reported():
     m_logger.exception.assert_called()
 
 
+def test_transient_lock_skips_quietly_without_alerting():
+    """A DuckDB lock-contention read error is downgraded to a quiet skip — status
+    'skipped_locked', no errors (so no Telegram), and NOT logged at exception."""
+    universe = ["RELIANCE", "SBIN"]
+
+    def locked(*args, **kwargs):
+        raise RuntimeError(
+            "Connection Error: Can't open a connection to same database file with "
+            "a different configuration than existing connections"
+        )
+
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch("services.data_freshness_service.get_data_freshness", side_effect=locked),
+        patch.object(sub, "backfill_scanner_universe") as m_bf,
+        patch.object(sub, "logger") as m_logger,
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")  # must NOT raise
+
+    assert res["status"] == "skipped_locked"
+    assert res["errors"] == []
+    assert res["stale_symbols"] == []
+    m_bf.assert_not_called()  # no refresh attempted on a skip
+    m_logger.exception.assert_not_called()  # quiet — INFO only
+    m_logger.info.assert_called()
+
+
 def test_backfill_error_status_surfaces_as_error():
     """A non-exception backfill rejection also populates errors (no raise)."""
     universe = ["RELIANCE"]

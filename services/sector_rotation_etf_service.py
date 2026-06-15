@@ -12,7 +12,6 @@ All database access is strictly read-only.
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timezone
 
-import duckdb
 import numpy as np
 
 from utils.logging import get_logger
@@ -86,7 +85,9 @@ def load_daily_closes(
         return {}
 
     result: dict[str, list[tuple[date, float]]] = {}
-    con = duckdb.connect(db_path, read_only=True)
+    from services.data_freshness_service import connect_historify_readonly
+
+    con = connect_historify_readonly(db_path)
     try:
         placeholders = ", ".join(["?"] * len(symbols))
         rows = con.execute(
