@@ -18,6 +18,22 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Logging / observability (added 2026-06-15)
+
+#### LOG_TO_FILE
+- **Current value:** `True` (was `False`).
+- **Set in:** `.env`; read in `utils/logging.py` `setup_logging()`. Writes
+  daily-rotated `log/openalgo_YYYY-MM-DD.log` (dir `LOG_DIR='log'`, retained
+  `LOG_RETENTION=14` days).
+- **Why changed:** the live Windows instance captures runtime INFO logs *only*
+  via the operator's `Start-Process` stdout/stderr redirect, which is fragile —
+  on 2026-06-15 the current instance (started 08:25) wrote to no captured file at
+  all (`openalgo_stderr.log` froze at 08:20 = the prior instance), leaving the
+  15:20 futures_follow cycle un-observable in any log. Enabling `LOG_TO_FILE`
+  gives a durable, rotation-managed file log independent of the launch redirect.
+  `errors.jsonl` (ERROR-only) is unchanged. Pairs with the restart now using a
+  timestamped `log/openalgo_<ts>.out/.err.log` redirect.
+
 ### futures_follow_cap50 — strategy (added 2026-06-15)
 
 #### FUTURES_FOLLOW_MODE
