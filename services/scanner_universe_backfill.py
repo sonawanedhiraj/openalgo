@@ -301,8 +301,20 @@ def check_and_refresh_if_stale(
         # Empty-universe / no-op success variant — nothing to refresh, not an error.
         pass
     else:
+        # Tier-1 Fix #2: name the affected symbols + reason at WARNING instead of
+        # only recording it in the returned dict. An expired broker session can
+        # fail every stale symbol; without this the only trace was a quiet error
+        # key the periodic loop swallowed (FM-11 in the in-house deep analysis).
+        msg = bf.get("message", "unknown backfill error")
+        logger.warning(
+            "scanner universe %s catch-up FAILED for %d symbol(s) — %s — symbols=%s",
+            interval,
+            len(stale),
+            msg,
+            stale,
+        )
         result["status"] = "error"
-        result["errors"].append(bf.get("message", "unknown backfill error"))
+        result["errors"].append(msg)
     return result
 
 

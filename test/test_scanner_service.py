@@ -790,3 +790,65 @@ def test_within_market_hours_boundaries():
     assert scanner_service._within_market_hours(mk(9, 14)) is False
     assert scanner_service._within_market_hours(mk(15, 31)) is False
     assert scanner_service._within_market_hours(mk(11, 0)) is True
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 Fix #2 — loud per-symbol PASS/FAIL + missing-input logging
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_logs_pass_for_qualifying_symbol(fresh_scanner_db, caplog):
+    """A matching symbol emits an INFO 'scanner PASS <sym>' line."""
+    import logging
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    bar = _seed_matching_buy(svc)  # default pinned clock is 11:00 (in-hours)
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert any(
+        "scanner PASS RELIANCE" in r.message and r.levelno == logging.INFO for r in caplog.records
+    )
+
+
+def test_scanner_logs_fail_with_reason_for_disqualifying_symbol(fresh_scanner_db, caplog):
+    """A non-matching symbol emits a DEBUG 'scanner FAIL <sym>' line (kept at DEBUG
+    so the per-bar no-match firehose does not flood the log)."""
+    import logging
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,  # no surge → no match
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
+
+
+def test_get_today_ohlcv_logs_reason_when_no_bars(caplog):
+    """A symbol with no bars today logs a reason instead of a silent (None, None)."""
+    import logging
+
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        close, vol = svc.get_today_ohlcv("RELIANCE", dt.date(2026, 5, 30))
+
+    assert (close, vol) == (None, None)
+    assert any("no live bars for RELIANCE" in r.message for r in caplog.records)

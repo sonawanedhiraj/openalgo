@@ -800,6 +800,17 @@ class ScannerService:
                     total_vol += float(cur.get("volume") or 0)
                     last_close = float(cur.get("close"))
             if not seen or last_close is None:
+                # Tier-1 Fix #2: name the reason instead of a silent (None, None).
+                # DEBUG (not WARNING) because this is the EXPECTED return for an
+                # untracked symbol (e.g. an index the scanner doesn't stream); the
+                # caller (sector_follow) escalates loudly when it actually matters.
+                logger.debug(
+                    "ScannerService.get_today_ohlcv: no live bars for %s on %s "
+                    "(seen=%s) — caller should fall back to historify",
+                    symbol,
+                    as_of_date,
+                    seen,
+                )
                 return None, None
             return last_close, total_vol
         except Exception:
@@ -1025,7 +1036,21 @@ class ScannerService:
                     interval,
                 )
                 continue
-            if not matched:
+            # Tier-1 Fix #2: loud per-symbol PASS / quiet FAIL. PASS is rare (only
+            # on a match) so it is INFO; FAIL fires for ~every symbol on ~every bar
+            # so it stays DEBUG to avoid flooding the log. The specific missing-input
+            # reason (None daily-D etc.) is logged at WARNING inside the rule itself,
+            # and the per-cycle completeness metric (Fix #3) surfaces aggregate gaps.
+            if matched:
+                logger.info(
+                    "scanner PASS %s rule=%s interval=%s close=%s",
+                    symbol,
+                    rule_name,
+                    interval,
+                    bar.get("close"),
+                )
+            else:
+                logger.debug("scanner FAIL %s rule=%s interval=%s", symbol, rule_name, interval)
                 continue
 
             scan_result_id = 0

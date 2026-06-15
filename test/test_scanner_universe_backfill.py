@@ -204,6 +204,31 @@ def test_backfill_error_status_surfaces_as_error():
     assert res["refreshed"] == []
 
 
+def test_backfill_logs_warning_when_symbol_errors(caplog):
+    """Tier-1 Fix #2: a failed catch-up logs a WARNING naming the affected
+    symbols + reason, not only a quiet error key in the returned dict (FM-11)."""
+    import logging
+
+    universe = ["RELIANCE", "SBIN"]
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            return_value={s: _epoch(WED) for s in universe},
+        ),
+        patch.object(
+            sub,
+            "backfill_scanner_universe",
+            return_value={"status": "error", "message": "no api key available"},
+        ),
+        caplog.at_level(logging.WARNING, logger="services.scanner_universe_backfill"),
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    assert res["status"] == "error"
+    assert any("catch-up FAILED" in r.message and "no api key" in r.message for r in caplog.records)
+
+
 # --------------------------------------------------------------------------- #
 # 5. Empty universe (SCANNER_SYMBOLS unset) → no-op, no fetch
 # --------------------------------------------------------------------------- #

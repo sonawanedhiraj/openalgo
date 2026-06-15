@@ -411,3 +411,34 @@ def test_rule_dbar_verify_skipped_without_timestamp_column(monkeypatch):
     existing tests are unaffected."""
     monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
     assert rule(None, happy()) is True
+
+
+# --------------------------------------------------------------------------- #
+# Tier-1 Fix #2 — loud missing-input logging
+# --------------------------------------------------------------------------- #
+def test_rule_logs_warning_when_input_is_none(caplog):
+    """A ``None`` daily frame is rejected with a WARNING naming the symbol +
+    reason, not the old silent ``return False``."""
+    import logging
+
+    ind = happy()
+    ind["bars_daily"] = None
+    ind["symbol"] = "RELIANCE"
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
+        assert rule(None, ind) is False
+    assert any(
+        "bars_daily is None" in r.message and "RELIANCE" in r.message for r in caplog.records
+    )
+
+
+def test_rule_short_history_is_debug_not_warning(caplog):
+    """A short-but-present (warm-up) frame rejects without a WARNING — only the
+    'no data' condition is loud."""
+    import logging
+
+    ind = happy()
+    ind["bars_15m"] = make_15m_bars(n=10)  # present but < 15 rows
+    ind["symbol"] = "RELIANCE"
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
+        assert rule(None, ind) is False
+    assert not any("rejecting" in r.message for r in caplog.records)

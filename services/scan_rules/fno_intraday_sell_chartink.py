@@ -56,6 +56,17 @@ _IST = pytz.timezone("Asia/Kolkata")
 _SETTLE_CUTOFF = dtime(15, 31)  # after this IST time, today's daily bar has settled
 
 
+def _reject_missing(symbol: str, reason: str) -> bool:
+    """Loudly log a missing-input rejection (Tier-1 Fix #2), then return False.
+
+    A ``None`` daily/weekly/intraday frame means the data pipeline did not supply
+    an input — a supply problem worth a WARNING, not the silent ``return False``
+    that made the 2026-06-15 failures look like ordinary quiet days. (Short-but-
+    present frames are normal warm-up and stay at DEBUG below.)"""
+    logger.warning("fno_intraday_sell_chartink %s: rejecting — %s", symbol, reason)
+    return False
+
+
 def _dbar_date_verify_enabled() -> bool:
     """``SCANNER_DBAR_DATE_VERIFY_ENABLED`` env flag (default true). Gates the
     post-settle daily-bar-date staleness guard below."""
@@ -120,13 +131,30 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     # --- Warm-up guards: insufficient history rejects (does NOT skip gates) ---
     # Unlike BUY, SELL has no SMA(volume, 200) gate, so daily needs only enough
     # rows for [-1]/[-2] (post-settle) or [-2]/[-3] (pre-settle) indexing.
-    if bars_daily is None or len(bars_daily) < 3:
+    # Tier-1 Fix #2: a None frame (data missing) is WARNING; a short-but-present
+    # frame (warm-up) is DEBUG, so the loud signal is specifically "no data".
+    sym = indicators.get("symbol", "?")
+    if bars_daily is None:
+        return _reject_missing(sym, "bars_daily is None (no daily-D data)")
+    if len(bars_daily) < 3:
+        logger.debug(
+            "fno_intraday_sell_chartink %s: daily warm-up (%d<3 rows)", sym, len(bars_daily)
+        )
         return False
-    if bars_weekly is None or len(bars_weekly) < 22:
+    if bars_weekly is None:
+        return _reject_missing(sym, "bars_weekly is None")
+    if len(bars_weekly) < 22:
+        logger.debug("fno_intraday_sell_chartink %s: weekly warm-up (%d<22)", sym, len(bars_weekly))
         return False
-    if bars_5m is None or len(bars_5m) < 8:  # Supertrend(7) warm-up (period + ATR seed)
+    if bars_5m is None:
+        return _reject_missing(sym, "bars_5m is None")
+    if len(bars_5m) < 8:  # Supertrend(7) warm-up (period + ATR seed)
+        logger.debug("fno_intraday_sell_chartink %s: 5m warm-up (%d<8)", sym, len(bars_5m))
         return False
-    if bars_15m is None or len(bars_15m) < 15:  # RSI(14) warm-up
+    if bars_15m is None:
+        return _reject_missing(sym, "bars_15m is None")
+    if len(bars_15m) < 15:  # RSI(14) warm-up
+        logger.debug("fno_intraday_sell_chartink %s: 15m warm-up (%d<15)", sym, len(bars_15m))
         return False
 
     # --- Live-bar alignment ---
