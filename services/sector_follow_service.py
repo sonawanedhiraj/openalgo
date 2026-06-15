@@ -535,6 +535,21 @@ def data_freshness_enabled() -> bool:
     return os.getenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true").lower() == "true"
 
 
+def smoke_check_enabled() -> bool:
+    """``SECTOR_FOLLOW_SMOKE_CHECK_ENABLED`` env flag (default true). Gates the
+    15:18 IST pre-entry pipeline smoke check."""
+    return os.getenv("SECTOR_FOLLOW_SMOKE_CHECK_ENABLED", "true").lower() == "true"
+
+
+def smoke_min_coverage() -> float:
+    """``SECTOR_FOLLOW_SMOKE_MIN_COVERAGE`` (default 0.5): the minimum fraction of
+    the universe that must have live aggregator data for the smoke check to pass."""
+    try:
+        return float(os.getenv("SECTOR_FOLLOW_SMOKE_MIN_COVERAGE", "0.5"))
+    except ValueError:
+        return 0.5
+
+
 def production_data_health_checker(
     strategy_name: str, date: str | None = None, index_only: bool = False
 ):
@@ -1357,6 +1372,103 @@ class SectorFollowService:
         """09:00 IST: reset kill switch + daily P&L."""
         self.reset_daily_state()
 
+    # ----- pre-entry pipeline smoke check (15:18 IST) -------------------- #
+    def _historify_probe_ok(self) -> bool:
+        """True iff the 20-day historify lookback returns prior-day data for a
+        sample universe symbol. Uses the same history reader as the live evaluator
+        so it exercises the real lock-safe read path."""
+        universe = self.config.universe
+        if not universe:
+            return True
+        sample = universe[0]
+        as_of = self._now()
+        as_of_date = as_of.astimezone(_IST).date()
+        window_start = as_of.timestamp() - (self.config.vol_avg_lookback_days + 15) * 86400
+        reader = self._history_reader or (lambda syms, ws: production_history_reader(syms, ws))
+        try:
+            raw = reader([sample], window_start)
+            prior_close, _avg = _historical_metrics(
+                raw.get(sample, []), as_of_date, self.config.vol_avg_lookback_days
+            )
+            return prior_close is not None
+        except Exception:
+            logger.exception("sector_follow historify probe failed")
+            return False
+
+    def assert_data_pipeline_healthy(self) -> tuple[bool, dict]:
+        """15:18 IST pre-entry smoke check (Part C). Three checks:
+
+        1. The in-process aggregator has today's data for >= ``smoke_min_coverage``
+           of the universe (default 50%).
+        2. The 20-day historify lookback returns prior-day data for a sample symbol.
+        3. A broker session is live.
+
+        On failure it writes a same-day ``pause`` runtime override (which the
+        engine's job-entry gate honors, holding the 15:20 entries) and Telegrams
+        the operator. The override expires at 15:30 IST, so it never disables the
+        strategy beyond today. Returns ``(ok, details)``. Fail-open on the gate
+        flag being off (returns ok=True without writing an override)."""
+        as_of = self._now()
+        as_of_date = as_of.astimezone(_IST).date()
+        if not smoke_check_enabled():
+            logger.debug("sector_follow 15:18 smoke check skipped (flag off)")
+            return True, {"skipped": True}
+
+        universe = self.config.universe
+        total = len(universe)
+        n_have = 0
+        for sym in universe:
+            try:
+                close, _vol = self._intraday_provider(sym, as_of)
+            except Exception:
+                close = None
+            if close is not None:
+                n_have += 1
+        min_cov = smoke_min_coverage()
+        agg_frac = (n_have / total) if total else 0.0
+        agg_ok = agg_frac >= min_cov
+
+        hist_ok = self._historify_probe_ok()
+        try:
+            session_ok = bool(self._broker_session_checker())
+        except Exception:
+            session_ok = False
+
+        ok = agg_ok and hist_ok and session_ok
+        details = {
+            "aggregator_coverage": f"{n_have}/{total}",
+            "aggregator_frac": round(agg_frac, 3),
+            "aggregator_ok": agg_ok,
+            "historify_ok": hist_ok,
+            "broker_session_ok": session_ok,
+            "min_coverage": min_cov,
+        }
+        if ok:
+            logger.info("sector_follow 15:18 smoke check PASSED: %s", str(details))
+            return True, details
+
+        reasons = []
+        if not agg_ok:
+            reasons.append(f"aggregator coverage {n_have}/{total} (<{min_cov:.0%})")
+        if not hist_ok:
+            reasons.append("historify lookback unavailable")
+        if not session_ok:
+            reasons.append("broker session not live")
+        reason = "; ".join(reasons)
+        logger.error("sector_follow 15:18 SMOKE CHECK FAILED: %s", reason)
+        # Hold today's 15:20 entries via a self-expiring pause override.
+        expires_ist = as_of.replace(hour=15, minute=30, second=0, microsecond=0)
+        self._set_runtime_override("pause", expires_ist, f"smoke_check_failed: {reason}")
+        try:
+            self._notify(
+                f"🚨 sector_follow_cap5_vol 15:18 SMOKE CHECK FAILED "
+                f"({as_of_date.isoformat()}): {reason}. Holding today's 15:20 entries "
+                "(self-clears at 15:30)."
+            )
+        except Exception:
+            logger.exception("sector_follow smoke-check alert failed")
+        return False, details
+
     # ----- observability + EOD summary ----------------------------------- #
     def _config_view(self) -> dict:
         """A small, JSON-safe subset of config for the status endpoint."""
@@ -1733,6 +1845,13 @@ class SectorFollowService:
             replace_existing=True,
             name="Sector Follow CAP5_VOL data freshness check (16:30 IST)",
         )
+        sched.add_job(
+            _smoke_check_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=18, timezone="Asia/Kolkata"),
+            id="sector_follow_smoke_check",
+            replace_existing=True,
+            name="Sector Follow CAP5_VOL pre-entry smoke check (15:18 IST)",
+        )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
             self.mode,
@@ -1773,6 +1892,11 @@ def _eod_summary_job() -> None:
 def _data_health_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.run_data_health_check()
+
+
+def _smoke_check_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.assert_data_pipeline_healthy()
 
 
 def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:

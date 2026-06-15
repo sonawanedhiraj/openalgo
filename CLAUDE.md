@@ -902,6 +902,41 @@ backfill job did not exist yet, and the hermetic (mocked-data) E2E suite never
 noticed an *environmental* regression. The validation layer makes feed staleness
 fail loud and fail safe.
 
+**Fix 1b — aggregator-source for today's data + loud failure (2026-06-15).** A
+*different* silent-failure class surfaced on the first sandbox cycle: at 15:20 IST
+historify had **no stock 1m bars for today** (the backfill convergence only runs
+15:30+), so `_series_metrics` returned `stock_ret=None`, every gate failed closed,
+and the strategy emitted **0 signals with no alert** — while the WS feed was
+ticking the whole `LOCK_STATIC_30` universe into the in-process scanner aggregator
+the entire time. The fix splits market data by its natural source:
+
+- **TODAY's intraday close+volume** now come from the **in-process scanner
+  aggregator** (`services/sector_follow_service.py` `production_intraday_provider`
+  → `ScannerService.get_today_ohlcv(symbol, date)`). All 30 universe stocks are
+  already in `SCANNER_SYMBOLS`, so their live bars are in memory. The **20-day
+  lookback** (prior close, avg daily volume) stays on historify (the correct
+  source for *historical* days). 6 of 8 sector indices are **not** in the scanner
+  universe, so their `sector_ret` still comes from historify via the per-symbol
+  fallback below.
+- **Per-symbol historify fallback** for today's data is kept but logs a **WARNING**
+  ("aggregator had no today bars — falling back to historify"). Every metric
+  carries `intraday_source ∈ {aggregator, historify, none}`.
+- **Loud failure:** `evaluate_candidates` logs per-symbol **PASS/FAIL** with the
+  exact gate/None reason, then emits a **decision-input completeness** metric
+  (`n_symbols_on_live_intraday / total`): **<50% → Telegram WARNING, <20% →
+  CRITICAL**. A silently-degraded pipeline can no longer look like a genuine
+  zero-signal day.
+- **15:18 IST pre-entry smoke check** (`assert_data_pipeline_healthy`, APScheduler
+  job `sector_follow_smoke_check`): (1) aggregator has today's data for
+  ≥`SECTOR_FOLLOW_SMOKE_MIN_COVERAGE` (default 0.5) of the universe, (2) the
+  historify lookback returns prior-day data for a sample symbol, (3) a broker
+  session is live. On failure it writes a same-day `pause` `strategy_runtime_override`
+  (holds the 15:20 entries via the engine's `_entry_held_by_override` gate;
+  expires 15:30 IST so it self-clears) and Telegram-alerts. Gated by
+  `SECTOR_FOLLOW_SMOKE_CHECK_ENABLED` (default `true`). Tests:
+  `test/test_sector_follow_service.py` (aggregator read, historify fallback,
+  all-empty loud logging, smoke-check abort/alert).
+
 - **Pure service** `services/data_freshness_service.py` — read-only on
   `historify.duckdb`. `check_strategy_data_ready(strategy, date,
   max_staleness_business_days=1)` returns `(ok, per-symbol details)`;

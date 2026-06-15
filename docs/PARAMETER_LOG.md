@@ -18,6 +18,32 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### sector_follow_cap5_vol — Fix 1b smoke check (added 2026-06-15)
+
+#### SECTOR_FOLLOW_SMOKE_CHECK_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in `services/sector_follow_service.py`
+  (`smoke_check_enabled()`), gating the 15:18 IST `sector_follow_smoke_check`
+  APScheduler job (`assert_data_pipeline_healthy`).
+- **What it does:** when `true`, a 15:18 IST pre-entry smoke check verifies the
+  data pipeline (aggregator coverage ≥ `SECTOR_FOLLOW_SMOKE_MIN_COVERAGE`,
+  historify lookback works, broker session live) and — on failure — writes a
+  self-expiring `pause` `strategy_runtime_override` that holds the 15:20 entries +
+  Telegram-alerts. `false` → the job is a no-op (`ok=True`, no override written).
+- **Why added:** the 2026-06-15 silent zero-signal incident — historify had no
+  today stock 1m at 15:20 and the strategy failed closed with no alert. The smoke
+  check catches a degraded pipeline 2 minutes before the entry window.
+
+#### SECTOR_FOLLOW_SMOKE_MIN_COVERAGE
+- **Current value:** unset → defaults **`0.5`**.
+- **Set in:** env; read in `services/sector_follow_service.py`
+  (`smoke_min_coverage()`).
+- **What it does:** the minimum fraction of the `LOCK_STATIC_30` universe that
+  must have **live aggregator** data for smoke-check Check 1 to pass. Below this,
+  the 15:18 check fails and holds the 15:20 entries. Same threshold the
+  `evaluate_candidates` completeness metric warns at (a separate hard-coded
+  CRITICAL floor at 20% lives in `_emit_completeness_metric`).
+
 ### Logging / observability (added 2026-06-15)
 
 #### LOG_TO_FILE

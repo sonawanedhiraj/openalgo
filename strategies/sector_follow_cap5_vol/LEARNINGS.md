@@ -13,6 +13,56 @@ _(populate as the service module is built)_
 
 ## Live Learnings
 
+### 2026-06-15 — Silent zero-signal incident + Fix 1b (aggregator-source + loud failure)
+
+**Incident.** The first sandbox cycle (Mon 2026-06-15, 15:20 IST) produced **0
+signals**. Root cause was a **data-supply gap, not gate logic**: at 15:20
+`historify.duckdb` had **no stock 1m bars for today** — the backfill convergence
+loop only runs 15:30–17:00 IST, so nothing had landed today's intraday yet. The
+live evaluator read *today's* stock return from historify, got `None`,
+`passes_gates()` failed closed for every name, and the strategy emitted nothing
+**with no alert**. Forensics: `docs/research/strategy/sector_follow_cap5_vol/2026-06-15_gate_forensics.md`.
+
+The cruel part: the WS feed was ticking the **entire `LOCK_STATIC_30` universe**
+the whole session — those 1m/5m bars lived in the in-process scanner aggregator
+(`ScannerService`, which subscribes all of `SCANNER_SYMBOLS`, and all 30 sector
+stocks are in it). sector_follow just never consulted it.
+
+**Fix 1b (this branch).** Split market data by its natural source:
+
+1. **TODAY's intraday close+volume → the in-process scanner aggregator.**
+   `production_intraday_provider` → `ScannerService.get_today_ohlcv(symbol, date)`
+   aggregates today's closed history + the in-progress bar. The **20-day lookback**
+   (prior close, avg daily volume) stays on historify — the correct source for
+   *historical* days, which never has today's intraday mid-session anyway.
+2. **Loud failure** is the systemic fix (the bug was *silent*, not just wrong):
+   - per-symbol historify fallback for today's data logs a **WARNING**;
+   - `evaluate_candidates` logs **PASS/FAIL per symbol** with the exact gate or
+     `None`-input reason;
+   - a **decision-input completeness** metric (`n_on_live_intraday / total`)
+     Telegrams **WARNING <50% / CRITICAL <20%** — a degraded pipeline can no
+     longer masquerade as a real zero-signal day.
+3. **15:18 IST pre-entry smoke check** (`assert_data_pipeline_healthy`): aggregator
+   coverage ≥ 50%, historify lookback works, broker session live. On failure it
+   writes a self-expiring `pause` runtime override (holds the 15:20 entries) +
+   alerts. Flags: `SECTOR_FOLLOW_SMOKE_CHECK_ENABLED` / `SECTOR_FOLLOW_SMOKE_MIN_COVERAGE`.
+
+**Known limitation (load-bearing — do not lose):** 6 of the 8 mapped sector
+indices (NIFTYAUTO/FMCG/IT/METAL/PSUBANK/PVTBANK) are **not** in `SCANNER_SYMBOLS`,
+so their `sector_ret` still comes from **historify** via the fallback (logged as
+`intraday_source='historify'`), not the aggregator. Only NIFTY + FINNIFTY are in
+the scanner universe. The stock side — the part that actually broke on 06-15 — is
+now fully live-sourced; the index side depends on the index 1m feed being fresh at
+15:20 (it was on 06-15: NIFTY +0.991% was computed). If a future incident is an
+*index* staleness, the fix is to add the sector indices to the scanner universe
+(or give sector_follow its own index aggregator), not to touch the stock path.
+
+**Also note:** the scanner tracks `SCANNER_INTERVALS` (default **5m**, not 1m).
+`get_today_ohlcv` reads the primary interval — 5m bars give the same daily
+aggregates (today close = last bar close; today volume = sum of today's bar
+deltas), so the "1m" in the original plan is satisfied by the 5m series without
+forcing a scanner-interval change.
+
 ### 2026-06-10 — Strategy spawned from R40 winner V_SF_CAP5_VOL
 
 Strategy spawned from R40 winner `V_SF_CAP5_VOL`. Carrying the R40 backtest as

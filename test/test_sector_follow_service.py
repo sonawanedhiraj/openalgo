@@ -893,11 +893,14 @@ def _prior_days_history(close_fri=100.0, vol_thu=800.0, vol_fri=1200.0, today_ba
     return rows
 
 
-def _make_real_service(intraday, history, notifier=None, **cfg_overrides):
+def _make_real_service(
+    intraday, history, notifier=None, broker_session_checker=None, **cfg_overrides
+):
     """Build a service driving the REAL metrics pipeline (no metrics_provider
     override) with injected intraday + history sources. ``intraday`` is a
     {symbol: (close, vol)} map; ``history`` is a {symbol: [(ts, close, vol)]} map."""
     notifier = notifier or (lambda msg: None)
+    broker_session_checker = broker_session_checker or (lambda: True)
 
     def intraday_provider(sym, as_of):
         return intraday.get(sym, (None, None))
@@ -916,6 +919,7 @@ def _make_real_service(intraday, history, notifier=None, **cfg_overrides):
         mode="scaffold",
         intraday_provider=intraday_provider,
         history_reader=history_reader,
+        broker_session_checker=broker_session_checker,
         order_placer=lambda mode, order: {"status": "success", "orderid": "X"},
         price_fetcher=lambda s, e: None,
         notifier=notifier,
@@ -1010,3 +1014,77 @@ def test_make_duckdb_metrics_provider_assembles_two_sources():
     out = provider(datetime(2026, 6, 15, 15, 20, tzinfo=_IST), ["AAA"], {"AAA": "NIFTY"}, cfg)
     assert out["AAA"]["intraday_source"] == "aggregator"
     assert out["AAA"]["stock_ret"] == pytest.approx(0.02)
+
+
+# --------------------------------------------------------------------------- #
+# Fix 1b Part C — 15:18 pre-entry pipeline smoke check
+# --------------------------------------------------------------------------- #
+def test_smoke_check_passes_when_pipeline_healthy():
+    """All three checks green -> ok, no override written."""
+    intraday = {"AAA": (102.0, 2000.0)}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history)
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is True
+    assert details["aggregator_ok"] is True
+    assert details["historify_ok"] is True
+    assert details["broker_session_ok"] is True
+
+
+def test_smoke_check_aborts_entry_if_aggregator_empty_at_1518():
+    """Aggregator empty -> smoke check fails AND writes a pause runtime override
+    that holds the 15:20 entries."""
+    from database import strategy_runtime_override_db as sro
+
+    intraday = {}  # aggregator has no today data for any symbol
+    history = {"AAA": _prior_days_history(close_fri=100.0)}  # lookback fine
+    svc = _make_real_service(intraday, history)
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert details["aggregator_ok"] is False
+    # A pause override was written (entry hold), reason names the smoke failure.
+    rows = sro.list_overrides(include_expired=True)
+    pauses = [
+        r for r in rows if r["override_type"] == "pause" and "smoke_check_failed" in r["reason"]
+    ]
+    assert pauses, f"expected a smoke-check pause override, got {rows}"
+    # And the engine's entry gate honors it at the smoke-check instant.
+    blocked, _ov = sro.is_entry_blocked("sector_follow_cap5_vol", now=datetime(2026, 6, 15, 9, 50))
+    assert blocked is True
+
+
+def test_smoke_check_telegrams_on_failure():
+    """A failing smoke check alerts the operator over Telegram."""
+    alerts = []
+    intraday = {}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history, notifier=lambda m: alerts.append(m))
+    ok, _details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert any("SMOKE CHECK FAILED" in a for a in alerts)
+
+
+def test_smoke_check_fails_when_broker_session_down():
+    """Live aggregator + historify but no broker session -> fail + alert."""
+    alerts = []
+    intraday = {"AAA": (102.0, 2000.0)}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(
+        intraday, history, notifier=lambda m: alerts.append(m), broker_session_checker=lambda: False
+    )
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert details["broker_session_ok"] is False
+    assert any("broker session not live" in a for a in alerts)
+
+
+def test_smoke_check_skipped_when_flag_off(monkeypatch):
+    """With the flag off the check is a no-op (ok=True, no override)."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("SECTOR_FOLLOW_SMOKE_CHECK_ENABLED", "false")
+    svc = _make_real_service({}, {"AAA": _prior_days_history()})
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is True
+    assert details.get("skipped") is True
+    assert sro.list_overrides(include_expired=True) == []
