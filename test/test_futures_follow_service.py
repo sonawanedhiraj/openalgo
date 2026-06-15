@@ -675,5 +675,106 @@ def test_contract_resolver_picks_nearest_non_expired(monkeypatch):
     assert c["symbol"] == "NIFTY26JUN24FUT"
 
 
+# --------------------------------------------------------------------------- #
+# Expiry-day safety: the strategy holds T+1 overnight, so a contract that won't
+# survive until tomorrow's 15:25 exit must be skipped (skip expiries <= today+1).
+#
+# Dates below are the REAL NIFTY monthly FUT expiries verified against the live
+# master contract (db/openalgo.db symtoken) on 2026-06-15:
+#   30-JUN-26 (Tue), 28-JUL-26 (Tue), 25-AUG-26 (Tue)  — pattern: LAST TUESDAY of
+# the month (NSE moved NIFTY expiry off Thursday). The resolver gate is pure
+# calendar arithmetic on the `expiry` field, so the weekday is incidental — but
+# the test data mirrors reality so it documents the true expiry cadence.
+# --------------------------------------------------------------------------- #
+def _two_month_rows():
+    """Current-month (30-JUN-26 Tue) and next-month (28-JUL-26 Tue) NIFTY FUT rows."""
+    return [
+        {
+            "symbol": "NIFTY30JUN26FUT",
+            "name": "NIFTY",
+            "expiry": "30-JUN-26",
+            "lotsize": 75,
+            "brsymbol": "cur",
+            "token": "10",
+        },
+        {
+            "symbol": "NIFTY28JUL26FUT",
+            "name": "NIFTY",
+            "expiry": "28-JUL-26",
+            "lotsize": 75,
+            "brsymbol": "next",
+            "token": "11",
+        },
+    ]
+
+
+def test_resolver_picks_current_month_on_normal_day(monkeypatch):
+    """Normal day (Mon 2026-06-15, today): current-month 30-JUN-26 is far enough out."""
+    from services import futures_follow_service as ffs
+
+    monkeypatch.setattr("database.symbol.fno_search_symbols_db", lambda **kw: _two_month_rows())
+    as_of = datetime(2026, 6, 15, 15, 20, tzinfo=_IST)  # Monday (verified today)
+    c = ffs.production_contract_resolver("NIFTY", "NFO", as_of)
+    assert c["symbol"] == "NIFTY30JUN26FUT"
+
+
+def test_resolver_picks_next_month_on_expiry_day(monkeypatch):
+    """Expiry Tuesday (2026-06-30): current contract expires today → next month."""
+    from services import futures_follow_service as ffs
+
+    monkeypatch.setattr("database.symbol.fno_search_symbols_db", lambda **kw: _two_month_rows())
+    as_of = datetime(2026, 6, 30, 15, 20, tzinfo=_IST)  # real NIFTY expiry Tuesday
+    c = ffs.production_contract_resolver("NIFTY", "NFO", as_of)
+    assert c["symbol"] == "NIFTY28JUL26FUT"
+
+
+def test_resolver_picks_next_month_one_day_before_expiry(monkeypatch):
+    """Mon 2026-06-29: current contract expires tomorrow (Tue 06-30), cannot survive T+1."""
+    from services import futures_follow_service as ffs
+
+    monkeypatch.setattr("database.symbol.fno_search_symbols_db", lambda **kw: _two_month_rows())
+    as_of = datetime(2026, 6, 29, 15, 20, tzinfo=_IST)  # Monday, day before expiry
+    c = ffs.production_contract_resolver("NIFTY", "NFO", as_of)
+    assert c["symbol"] == "NIFTY28JUL26FUT"
+
+
+def test_resolver_picks_current_month_two_days_before_expiry(monkeypatch):
+    """2026-06-28: current contract survives T+1 (as_of+1=06-29 < 06-30 expiry)."""
+    from services import futures_follow_service as ffs
+
+    monkeypatch.setattr("database.symbol.fno_search_symbols_db", lambda **kw: _two_month_rows())
+    as_of = datetime(2026, 6, 28, 15, 20, tzinfo=_IST)  # two days before Tue 06-30 expiry
+    c = ffs.production_contract_resolver("NIFTY", "NFO", as_of)
+    assert c["symbol"] == "NIFTY30JUN26FUT"
+
+
+def test_resolver_returns_none_when_all_expire_within_one_day(monkeypatch):
+    """Only contracts expiring today and tomorrow available → fail closed (None)."""
+    from services import futures_follow_service as ffs
+
+    rows = [
+        {
+            "symbol": "NIFTY30JUN26FUT",
+            "name": "NIFTY",
+            "expiry": "30-JUN-26",  # today
+            "lotsize": 75,
+            "brsymbol": "cur",
+            "token": "10",
+        },
+        {
+            "symbol": "NIFTY01JUL26FUT",
+            "name": "NIFTY",
+            "expiry": "01-JUL-26",  # tomorrow
+            "lotsize": 75,
+            "brsymbol": "tom",
+            "token": "11",
+        },
+    ]
+    monkeypatch.setattr("database.symbol.fno_search_symbols_db", lambda **kw: rows)
+    as_of = datetime(2026, 6, 30, 15, 20, tzinfo=_IST)  # today == 30-JUN expiry
+    c = ffs.production_contract_resolver("NIFTY", "NFO", as_of)
+    assert c is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

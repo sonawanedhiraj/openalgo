@@ -857,7 +857,14 @@ at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
 gates) to find today's ≤5 stock signals, and for each — greedily in vol-ratio order
 — buys **one NIFTY near-month index future lot** (NIFTY futures are MONTHLY; the
 resolver picks the front-month from the master contract — there is no weekly NIFTY
-future), HARD-CAPPED at **50% of capital as overnight SPAN margin** (₹10L book ⇒ ~2
+future; the resolver **skips any contract expiring within 1 day** (today or
+tomorrow) so the T+1 overnight hold is always viable — on a monthly-expiry day
+the current-month contract is skipped and the next-month future is picked
+automatically, never buying a contract that expires before the T+1 exit. NIFTY
+monthly expiry is the **last Tuesday** of the month (verified 2026-06-15 against
+the master contract: 30-JUN-26 / 28-JUL-26 / 25-AUG-26, all Tuesdays — NSE moved
+NIFTY expiry off Thursday)),
+HARD-CAPPED at **50% of capital as overnight SPAN margin** (₹10L book ⇒ ~2
 lots; late signals beyond the cap are skipped). Product **NRML**, exchange **NFO**,
 MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. **No stop loss** (Phase-1
 proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**

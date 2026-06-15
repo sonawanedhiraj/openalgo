@@ -46,6 +46,21 @@ and **REJECTED** (costs 0.74pp CAGR, no correlation gain). NIFTY-only is the veh
    tail is understated (close-to-close P&L ignores intraday SPAN calls on a gap).
 3. **Instrument:** NIFTY **near-month** (front) monthly future — there are no weekly
    NIFTY futures. Resolved dynamically from the master contract.
+   - **T+1 expiry safety:** the resolver **skips any contract expiring within 1
+     day** (today or tomorrow). Because the strategy holds the position T+1
+     overnight (buy 15:20, sell next day 15:25), a contract that won't survive
+     until tomorrow's 15:25 exit cannot be used. On a monthly-expiry day the
+     current-month contract is skipped and the next-month future is picked
+     automatically — this prevents buying a contract minutes from expiry.
+     (`production_contract_resolver`: `exp <= as_of + 1 day → skip`; covered by
+     `test_resolver_*` in `test/test_futures_follow_service.py`.)
+   - **Verified expiry cadence (2026-06-15, master contract):** NIFTY monthly FUT
+     expiry is the **LAST TUESDAY** of the month — `30-JUN-26` / `28-JUL-26` /
+     `25-AUG-26` are all Tuesdays. NSE moved NIFTY expiry off Thursday; do not
+     assume "last Thursday". The **next** NIFTY monthly expiry is **2026-06-30
+     (Tuesday)**. The resolver gate is pure date arithmetic on the broker
+     `expiry` field, so it is correct regardless of the weekday — but plan
+     around 30-JUN, not 25-JUN.
 4. **Product:** NRML (futures carry). **Not MIS, not CNC.**
 5. **Stop loss:** NONE (per backtest). EOD watchdog at 15:14 IST is the backstop.
 6. **Daily loss kill switch:** 3.0% of capital (halt new entries, hold to T+1 exit).
@@ -107,7 +122,9 @@ automatically.
    *Mitigation:* the 50% cap keeps a buffer; never raise it.
 3. **Contract resolution** — picking the wrong expiry (rolling near the monthly
    expiry) or a stale master contract. *Mitigation:* resolver picks the nearest
-   non-expired monthly FUT each run; validate in sandbox around expiry week.
+   monthly FUT **expiring more than 1 day out** each run (skips today/tomorrow so
+   the T+1 hold is viable — see operator decision 3); validate in sandbox around
+   expiry week.
 4. **Per-lot margin drift** — the cap uses a fixed `nifty_lot_margin_inr` estimate;
    real SPAN varies intraday. *Mitigation:* operator refreshes the config estimate
    from the broker margin API; the 50% cap is conservative.

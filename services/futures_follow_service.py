@@ -275,7 +275,12 @@ def production_contract_resolver(
         if (r.get("name") or "").strip().upper() != underlying.upper():
             continue
         exp = _parse_expiry(r.get("expiry"))
-        if exp is None or exp < as_of_date:
+        # Skip contracts expiring today OR tomorrow — the strategy holds the
+        # position T+1 overnight (buy 15:20, sell next day 15:25), so a contract
+        # that won't survive until tomorrow's 15:25 exit cannot be used. On a
+        # monthly-expiry Thursday this skips the current-month contract and the
+        # next-month future is picked automatically.
+        if exp is None or exp <= as_of_date + timedelta(days=1):
             continue
         dated.append((exp, r))
     if not dated:
