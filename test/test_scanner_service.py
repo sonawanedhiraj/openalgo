@@ -106,6 +106,23 @@ def fresh_scanner_db(monkeypatch):
     test_engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _pin_market_hours(monkeypatch):
+    """Pin the scanner's IST clock to 11:00 (mid-session) for every test.
+
+    Tier-1 Fix #1 added a market-hours gate to ``_evaluate_definitions`` that
+    skips evaluation outside [09:15, 15:30] IST. Without this pin, the
+    long-standing ``_on_bar_close`` fire/no-fire tests would pass or fail
+    depending on the wall-clock time the suite happens to run. The gate-specific
+    tests below override ``_now_ist`` to drive the post-close / pre-open paths.
+    """
+    monkeypatch.setattr(
+        scanner_service,
+        "_now_ist",
+        lambda: scanner_service._IST.localize(dt.datetime(2026, 5, 30, 11, 0)),
+    )
+
+
 class _CapturingBus:
     """Synchronous stand-in for ``EventBus`` so tests can assert on emitted events.
 
@@ -439,8 +456,10 @@ def test_indicators_dict_populated_with_expected_keys():
         volumes=[1000.0] * 30,
     )
     result = svc._build_indicators("RELIANCE", bars)
-    # Backward-compat indicator keys plus the four Task-4 multi-timeframe keys.
+    # Backward-compat indicator keys, the four Task-4 multi-timeframe keys, plus
+    # the ``symbol`` key (Tier-1 Fix #1/#2 — rules name the symbol in their logs).
     assert set(result.keys()) == {
+        "symbol",
         "ema_20",
         "atr_14",
         "rsi_14",
@@ -450,6 +469,7 @@ def test_indicators_dict_populated_with_expected_keys():
         "bars_daily",
         "bars_weekly",
     }
+    assert result["symbol"] == "RELIANCE"
     # The four legacy series remain Series of the same length as bars.
     for name in ("ema_20", "atr_14", "rsi_14", "volume_avg_20"):
         series = result[name]
@@ -518,7 +538,7 @@ def test_15m_bars_built_from_tick_stream():
     assert isinstance(bars_15m, pd.DataFrame)
     # 09:15 and 09:30 buckets have closed; 09:45 is still in progress.
     assert len(bars_15m) == 2
-    assert set(["ts", "open", "high", "low", "close", "volume"]).issubset(bars_15m.columns)
+    assert {"ts", "open", "high", "low", "close", "volume"}.issubset(bars_15m.columns)
 
 
 def test_15m_bars_capped_at_50():
@@ -659,3 +679,114 @@ def test_scanner_start_idempotent_until_stopped():
         svc.start()
         assert svc._subscriber_thread is first_thread
         svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Tier-1 Fix #1 — market-hours gate on evaluation
+# ---------------------------------------------------------------------------
+
+
+def _seed_matching_buy(svc):
+    """Seed RELIANCE history + return a surge bar that fires ``_test_buy_surge_ema``."""
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    return {
+        "ts": dt.datetime(2026, 5, 30, 16, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 5000,
+        "elapsed_pct": 1.0,
+    }
+
+
+def _pin_now(monkeypatch, hour, minute=0):
+    monkeypatch.setattr(
+        scanner_service,
+        "_now_ist",
+        lambda: scanner_service._IST.localize(dt.datetime(2026, 5, 30, hour, minute)),
+    )
+
+
+def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypatch, caplog):
+    """A bar that closes at 16:00 IST must be skipped (post-close) with an INFO log."""
+    import logging
+
+    _pin_now(monkeypatch, 16, 0)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    bar = _seed_matching_buy(svc)
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", bar)
+
+    # No evaluation happened → no row, no event.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    assert any(
+        "scanner evaluation skipped" in r.message and "post-close" in r.message
+        for r in caplog.records
+    )
+
+
+def test_scanner_skips_evaluation_before_market_open(fresh_scanner_db, monkeypatch, caplog):
+    """A bar that closes at 08:00 IST must be skipped (pre-open)."""
+    import logging
+
+    _pin_now(monkeypatch, 8, 0)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    bar = _seed_matching_buy(svc)
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    assert any(
+        "scanner evaluation skipped" in r.message and "pre-open" in r.message
+        for r in caplog.records
+    )
+
+
+def test_scanner_evaluates_during_market_hours(fresh_scanner_db, monkeypatch):
+    """Inside [09:15, 15:30] IST the same surge bar fires normally."""
+    _pin_now(monkeypatch, 11, 0)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    bar = _seed_matching_buy(svc)
+
+    svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert len(scanner_service.get_scan_results(hours=24, source="inhouse")) == 1
+    assert len(capturing_bus.events) == 1
+
+
+def test_postclose_gate_disabled_allows_post_close_evaluation(fresh_scanner_db, monkeypatch):
+    """With SCANNER_POSTCLOSE_GATE_ENABLED=false the gate is a no-op (legacy path)."""
+    _pin_now(monkeypatch, 16, 0)
+    monkeypatch.setenv("SCANNER_POSTCLOSE_GATE_ENABLED", "false")
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    bar = _seed_matching_buy(svc)
+
+    svc._on_bar_close("RELIANCE", "5m", bar)
+
+    # Gate disabled → evaluation proceeds even post-close.
+    assert len(scanner_service.get_scan_results(hours=24, source="inhouse")) == 1
+
+
+def test_within_market_hours_boundaries():
+    """The window is inclusive of 09:15 and 15:30, exclusive outside."""
+    mk = lambda h, m: scanner_service._IST.localize(dt.datetime(2026, 5, 30, h, m))  # noqa: E731
+    assert scanner_service._within_market_hours(mk(9, 15)) is True
+    assert scanner_service._within_market_hours(mk(15, 30)) is True
+    assert scanner_service._within_market_hours(mk(9, 14)) is False
+    assert scanner_service._within_market_hours(mk(15, 31)) is False
+    assert scanner_service._within_market_hours(mk(11, 0)) is True

@@ -56,6 +56,43 @@ _IST = pytz.timezone("Asia/Kolkata")
 _SETTLE_CUTOFF = dtime(15, 31)  # after this IST time, today's daily bar has settled
 
 
+def _dbar_date_verify_enabled() -> bool:
+    """``SCANNER_DBAR_DATE_VERIFY_ENABLED`` env flag (default true). Gates the
+    post-settle daily-bar-date staleness guard below."""
+    return os.environ.get("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _daily_bar_date(bars_daily: pd.DataFrame, idx: int):
+    """IST calendar date of the daily bar at ``idx``, or ``None`` when it cannot
+    be derived.
+
+    Reads the ``timestamp`` column that historify-sourced frames always carry
+    (epoch seconds, or a datetime). Synthetic test frames that lack the column
+    return ``None`` so the date guard skips them — it only fires where there is
+    a real timestamp to check against (production reads).
+    """
+    cols = getattr(bars_daily, "columns", [])
+    if "timestamp" not in cols:
+        return None
+    try:
+        ts = bars_daily.iloc[idx].get("timestamp")
+        if ts is None or pd.isna(ts):
+            return None
+        # Convert via pandas (not ``datetime.fromtimestamp``) so the conversion
+        # is independent of the module-level ``datetime`` symbol — tests
+        # monkeypatch that to freeze ``now`` and it has no ``fromtimestamp``.
+        if isinstance(ts, (int, float)):
+            return pd.Timestamp(float(ts), unit="s", tz="UTC").tz_convert(_IST).date()
+        return pd.Timestamp(ts).date()
+    except Exception:
+        return None
+
+
 @scan_rule(
     "fno_intraday_sell_chartink",
     "sell",
@@ -106,6 +143,26 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
 
     today_d = bars_daily.iloc[today_idx]
     yest_d = bars_daily.iloc[yest_idx]
+
+    # --- D-bar-date verify (Tier-1 Fix #1) ---
+    # Post-settle the rule treats iloc[-1] as TODAY's settled daily bar. If the
+    # stored daily-D feed is stale (no row for today — the 2026-06-15 FM-4/FM-6
+    # condition that produced 17 post-close AUROPHARMA SELLs), that bar is a
+    # PRIOR day and the rule would fire on stale data. Verify the bar's own date
+    # equals today before trusting it; abort loudly otherwise. Skipped pre-settle
+    # (iloc[-2] is the previous session by design) and when the frame carries no
+    # timestamp to check (synthetic test frames).
+    if today_idx == -1 and _dbar_date_verify_enabled():
+        bar_date = _daily_bar_date(bars_daily, today_idx)
+        if bar_date is not None and bar_date < now_ist.date():
+            logger.warning(
+                "fno_intraday_sell_chartink %s: latest daily bar is STALE "
+                "(bar_date=%s < today=%s) — aborting (post-close/stale-D guard)",
+                indicators.get("symbol", "?"),
+                bar_date,
+                now_ist.date(),
+            )
+            return False
 
     # Reject if any required daily field is NaN.
     if _any_nan(

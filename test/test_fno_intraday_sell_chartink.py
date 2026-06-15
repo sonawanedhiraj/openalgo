@@ -347,3 +347,67 @@ def test_env_override_lowers_sell_gap(monkeypatch):
     assert rule(None, ind) is False
     monkeypatch.setenv("CHARTINK_RULE_SELL_GAP_PCT", "1.5")
     assert rule(None, ind) is True
+
+
+# --------------------------------------------------------------------------- #
+# Tier-1 Fix #1 — D-bar-date verify (post-settle stale-daily guard)
+#
+# This is the rule-side defense for the 2026-06-15 FM-6 incident: 17 spurious
+# post-close AUROPHARMA SELL fires on a stale daily-D bar.
+# --------------------------------------------------------------------------- #
+from datetime import date as _date  # noqa: E402
+from datetime import timedelta as _timedelta  # noqa: E402
+
+import pytz as _pytz  # noqa: E402
+
+_IST_TZ = _pytz.timezone("Asia/Kolkata")
+
+
+def _with_timestamps(daily, last_date):
+    """Attach a ``timestamp`` column (epoch seconds, IST 09:15) so the last row
+    is dated ``last_date`` and prior rows walk back one calendar day each."""
+    daily = daily.reset_index(drop=True).copy()
+    n = len(daily)
+    ts = []
+    for i in range(n):
+        d = last_date - _timedelta(days=(n - 1 - i))
+        ts.append(int(_IST_TZ.localize(_RealDateTime(d.year, d.month, d.day, 9, 15)).timestamp()))
+    daily["timestamp"] = ts
+    return daily
+
+
+def test_rule_aborts_when_daily_bar_is_stale(monkeypatch, caplog):
+    """Post-settle, a latest daily bar dated *yesterday* (stale-D) aborts loudly —
+    the exact AUROPHARMA post-close condition."""
+    import logging
+
+    monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
+    daily = _with_timestamps(make_daily_bars(), last_date=_date(2026, 6, 3))  # frozen today=06-04
+    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
+    ind["symbol"] = "AUROPHARMA"
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
+        assert rule(None, ind) is False
+    assert any("STALE" in r.message and "AUROPHARMA" in r.message for r in caplog.records)
+
+
+def test_rule_proceeds_when_daily_bar_is_today(monkeypatch):
+    """Post-settle, a latest daily bar dated *today* passes the guard and fires."""
+    monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
+    daily = _with_timestamps(make_daily_bars(), last_date=_date(2026, 6, 4))  # frozen today
+    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
+    assert rule(None, ind) is True
+
+
+def test_rule_dbar_verify_disabled_allows_stale(monkeypatch):
+    """With the flag off, a stale daily bar is NOT aborted (legacy behavior)."""
+    monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "false")
+    daily = _with_timestamps(make_daily_bars(), last_date=_date(2026, 6, 3))
+    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
+    assert rule(None, ind) is True
+
+
+def test_rule_dbar_verify_skipped_without_timestamp_column(monkeypatch):
+    """Frames lacking a ``timestamp`` column (synthetic) are exempt — proves the
+    existing tests are unaffected."""
+    monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
+    assert rule(None, happy()) is True

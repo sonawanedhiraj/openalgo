@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import time as _dtime
 from typing import Any
 
 import pandas as pd
+import pytz
 from sqlalchemy.exc import IntegrityError
 
 from database.scanner_db import (
@@ -47,6 +50,48 @@ from utils.event_bus import bus as _default_bus
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Market-hours gate (Tier-1 Fix #1 — kills the post-close AUROPHARMA-SELL class).
+#
+# The scanner is purely tick-driven: a straggler/backfill tick that closes a bar
+# after the session ends still drives ``_evaluate_definitions``. Combined with
+# the rule's wall-clock ``_SETTLE_CUTOFF`` flip and a stale daily-D bar, that
+# produced 17 spurious post-close AUROPHARMA SELL fires on 2026-06-15 (see
+# docs/research/strategy/screener/2026-06-15_inhouse_deep_analysis.md, FM-6/DP-5).
+# This gate skips evaluation entirely outside [09:15, 15:30] IST. It is paired
+# with a rule-side D-bar-date verify (in the scan_rules modules) so a future
+# change to either one cannot silently re-open the post-close path on its own.
+# ---------------------------------------------------------------------------
+_IST = pytz.timezone("Asia/Kolkata")
+_MARKET_OPEN_IST = _dtime(9, 15)
+_MARKET_CLOSE_IST = _dtime(15, 30)
+
+
+def _postclose_gate_enabled() -> bool:
+    """``SCANNER_POSTCLOSE_GATE_ENABLED`` env flag (default true). When false the
+    market-hours gate is a no-op — evaluation runs at any wall-clock time (the
+    pre-Tier-1 behavior)."""
+    return os.environ.get("SCANNER_POSTCLOSE_GATE_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _now_ist() -> _dt.datetime:
+    """Current IST time. Indirected through a module function so tests can pin it."""
+    return _dt.datetime.now(_IST)
+
+
+def _within_market_hours(now_ist: _dt.datetime) -> bool:
+    """True iff ``now_ist`` falls inside the [09:15, 15:30] IST trading window.
+
+    ``datetime.time()`` returns the naive wall-clock component for both naive and
+    tz-aware datetimes, so the comparison is against IST clock time directly."""
+    t = now_ist.time()
+    return _MARKET_OPEN_IST <= t <= _MARKET_CLOSE_IST
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +589,7 @@ def _normalize_tick(market_data: dict[str, Any]) -> dict[str, Any] | None:
                 # Treat values > 10^10 as milliseconds (epoch_s ceiling).
                 ts = _dt.datetime.fromtimestamp(value / 1000 if value > 10_000_000_000 else value)
                 break
-        except Exception:
+        except Exception:  # nosec B112 — intentional: try the next timestamp key on parse failure
             continue
 
     return {"price": price, "cumulative_volume": cum_volume, "ts": ts}
@@ -913,6 +958,9 @@ class ScannerService:
                 logger.exception("ScannerService: history provider lookup failed for %s", symbol)
 
         return {
+            # The symbol is threaded into the bundle so rules can name it in
+            # their loud-failure / D-bar-date-verify logs (Tier-1 Fix #1/#2).
+            "symbol": symbol,
             "ema_20": ema_20,
             "atr_14": atr_14,
             "rsi_14": rsi_14,
@@ -937,7 +985,24 @@ class ScannerService:
         symbol per row) and publish a ``ScanHitEvent``. We intentionally
         write one row per (definition, symbol, bar) hit — the consumer in
         item 6 will dedupe / debounce if needed.
+
+        Tier-1 Fix #1: a market-hours gate skips evaluation entirely outside
+        [09:15, 15:30] IST so a straggler/backfill tick that closes a bar
+        post-close cannot fire a (stale-bar) signal.
         """
+        if _postclose_gate_enabled():
+            now_ist = _now_ist()
+            if not _within_market_hours(now_ist):
+                phase = "post-close" if now_ist.time() > _MARKET_CLOSE_IST else "pre-open"
+                logger.info(
+                    "scanner evaluation skipped: %s (now=%s IST) for %s/%s",
+                    phase,
+                    now_ist.strftime("%H:%M"),
+                    symbol,
+                    interval,
+                )
+                return
+
         for definition in get_scan_definitions(enabled_only=True):
             rule_name = definition.get("rule_module") or definition.get("name")
             if not rule_name:
