@@ -706,6 +706,61 @@ class ScannerService:
     def running(self) -> bool:
         return self._running
 
+    # -- intraday read-out (consumed by sector_follow Fix 1b) ---------------
+
+    def get_today_ohlcv(
+        self, symbol: str, as_of_date: _dt.date
+    ) -> tuple[float | None, float | None]:
+        """Aggregate TODAY's ``(close, volume)`` for ``symbol`` from the live feed.
+
+        Reads the rolling closed-bar history for ``symbol`` at the primary
+        interval plus the in-progress bar, filtered to ``as_of_date`` (IST). The
+        close is the latest bar's close; the volume is the sum of today's bar
+        volumes (each bar's volume is the delta-from-cumulative the BarBuilder
+        already computed, so the sum is today's cumulative traded volume).
+
+        Returns ``(None, None)`` when the scanner has no bars for ``symbol`` today
+        (e.g. an index the scanner doesn't track, or a feed that never started) so
+        the caller can fall back to historify. Thread-safe; never raises.
+
+        Bar timestamps are naive datetimes derived from the broker's
+        ``exchange_timestamp`` on an IST box, so ``ts.date()`` is the IST trade
+        date — the same assumption the aggregator's bucketing already relies on.
+        """
+        try:
+            interval = self.intervals[0] if self.intervals else "5m"
+            with self._history_lock:
+                frame = self._bar_history.get((symbol, interval))
+                rows = frame.to_dict("records") if frame is not None and not frame.empty else []
+            total_vol = 0.0
+            last_close: float | None = None
+            seen = False
+            for r in rows:
+                ts = r.get("ts")
+                if ts is None or getattr(ts, "date", lambda: None)() != as_of_date:
+                    continue
+                seen = True
+                total_vol += float(r.get("volume") or 0)
+                last_close = float(r.get("close"))
+            # Fold in the in-progress (not-yet-closed) bar — strictly after the
+            # last closed bar's bucket, so no double counting.
+            try:
+                cur = self.aggregator.current_bar(symbol, interval)
+            except Exception:
+                cur = None
+            if cur is not None:
+                ts = cur.get("ts")
+                if ts is not None and getattr(ts, "date", lambda: None)() == as_of_date:
+                    seen = True
+                    total_vol += float(cur.get("volume") or 0)
+                    last_close = float(cur.get("close"))
+            if not seen or last_close is None:
+                return None, None
+            return last_close, total_vol
+        except Exception:
+            logger.exception("ScannerService.get_today_ohlcv failed for %s", symbol)
+            return None, None
+
     # -- ZMQ subscriber -----------------------------------------------------
 
     def _run_subscriber(self) -> None:
@@ -942,3 +997,21 @@ class ScannerService:
                     symbol,
                     interval,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Live singleton accessor (set by app.py at boot; read by sector_follow Fix 1b).
+# ---------------------------------------------------------------------------
+_SCANNER_SINGLETON: ScannerService | None = None
+
+
+def set_scanner_service(svc: ScannerService | None) -> None:
+    """Record the live ScannerService so other in-process services (sector_follow)
+    can read today's aggregated bars without an import cycle. Called by app.py."""
+    global _SCANNER_SINGLETON
+    _SCANNER_SINGLETON = svc
+
+
+def get_scanner_service() -> ScannerService | None:
+    """Return the live ScannerService, or None when the scanner is disabled."""
+    return _SCANNER_SINGLETON

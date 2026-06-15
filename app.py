@@ -907,6 +907,12 @@ def setup_environment(app):
                     app.scanner_service = ScannerService(
                         symbols=symbols, intervals=scanner_intervals
                     )
+                    # Publish the live singleton so in-process consumers
+                    # (sector_follow Fix 1b reads today's aggregated bars) can
+                    # reach it without an import cycle.
+                    from services.scanner_service import set_scanner_service
+
+                    set_scanner_service(app.scanner_service)
                     app.scanner_service.start()
                     logger.info(
                         "Scanner service started (symbols=%d, intervals=%s)",
