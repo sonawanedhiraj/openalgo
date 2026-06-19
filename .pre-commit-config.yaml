@@ -12,7 +12,12 @@ repos:
     hooks:
       - id: biome-check
         name: Biome lint and format
-        entry: npx --prefix frontend biome check --write src/
+        # `cd frontend &&` ensures biome's relative `src/` path resolves no
+        # matter how the wrapping shell handles `npx --prefix`. Without the cd,
+        # pre-commit (running from repo root) hands biome a `src/` it can't find
+        # at root, and the hook fails with an internal os-error-2 — even though
+        # the same `npx --prefix` call succeeds when run directly from a shell.
+        entry: bash -c "cd frontend && npx biome check --write src/"
         language: system
         files: ^frontend/src/.*\.(ts|tsx|js|jsx)$
         pass_filenames: false

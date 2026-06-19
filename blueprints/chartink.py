@@ -5,7 +5,7 @@ import threading
 import time as time_module
 import uuid
 from collections import deque
-from datetime import datetime, time
+from datetime import datetime
 from time import time
 
 import pytz
@@ -89,7 +89,10 @@ def process_orders():
                     break
 
                 try:
-                    response = requests.post(
+                    # Local loopback call to self (BASE_URL is always
+                    # 127.0.0.1:5000 in this process); the queue handles
+                    # slow paths via its retry/backoff loop.
+                    response = requests.post(  # nosec B113
                         f"{BASE_URL}/api/v1/placesmartorder", json=smart_order["payload"]
                     )
                     if response.ok:
@@ -125,7 +128,10 @@ def process_orders():
                         break
 
                     try:
-                        response = requests.post(
+                        # Local loopback call to self (BASE_URL is always
+                        # 127.0.0.1:5000 in this process); the queue's rate
+                        # limiter caps throughput regardless.
+                        response = requests.post(  # nosec B113
                             f"{BASE_URL}/api/v1/placeorder", json=regular_order["payload"]
                         )
                         if response.ok:
@@ -506,7 +512,7 @@ def configure_symbols(strategy_id):
                 try:
                     quantity = int(quantity)
                 except ValueError:
-                    raise ValueError("Quantity must be a valid number")
+                    raise ValueError("Quantity must be a valid number") from None
 
                 if quantity <= 0:
                     raise ValueError("Quantity must be greater than 0")
@@ -862,7 +868,6 @@ def webhook(webhook_id):
 
         # Get symbols and trigger prices
         symbols = data.get("stocks", "").split(",")
-        trigger_prices = data.get("trigger_prices", "").split(",")
 
         if not symbols:
             logger.error("No symbols received in webhook")
@@ -1188,6 +1193,47 @@ def simplified_engine_status():
         return jsonify({"status": "success", "data": service.status()})
     except Exception as e:
         logger.exception("simplified-engine status failed: %s", str(e))
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@chartink_bp.route("/api/scanner-comparison/today", methods=["GET"])
+@check_session_validity
+def scanner_comparison_today():
+    """Live in-house-vs-Chartink screener comparison for today (or ``?date=``).
+
+    Read-only overlay on ``scan_cycle`` (Chartink webhook audit) and
+    ``scan_results`` (in-house scanner output). Reuses
+    ``scanner_comparison_eod_service`` so the metric definitions (Jaccard,
+    recall, top-diff names, tuning verdict) stay aligned with the 15:45 IST EOD
+    job. Returns the BUY+SELL summary plus the per-event timeline that backs
+    the side-by-side panels.
+    """
+    user_id = session.get("user")
+    if not user_id:
+        return jsonify({"status": "error", "message": "Session expired"}), 401
+
+    raw_date = (request.args.get("date") or "").strip() or None
+
+    try:
+        from services.scanner_comparison_eod_service import (
+            compute_comparison,
+            get_timeline_for_date,
+        )
+
+        summary = compute_comparison(date=raw_date)
+        timeline = get_timeline_for_date(date=summary["date"])
+        return jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "date": summary["date"],
+                    "summary": {"BUY": summary["BUY"], "SELL": summary["SELL"]},
+                    "timeline": timeline,
+                },
+            }
+        )
+    except Exception as e:
+        logger.exception("scanner-comparison today failed: %s", str(e))
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

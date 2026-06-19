@@ -279,6 +279,12 @@ def react_analyzer():
     return serve_react_app()
 
 
+# Screener Comparison (in-house scanner vs Chartink, side-by-side timeline)
+@react_bp.route("/screener-comparison")
+def react_screener_comparison():
+    return serve_react_app()
+
+
 # ============================================================
 # Phase 6 Routes - Strategy & Automation
 # ============================================================

@@ -2607,7 +2607,9 @@ export default function Historify() {
                                     className="h-8 w-8"
                                     onClick={() => handlePauseResumeSchedule(schedule)}
                                     title={schedule.is_paused ? 'Resume' : 'Pause'}
-                                    aria-label={schedule.is_paused ? 'Resume schedule' : 'Pause schedule'}
+                                    aria-label={
+                                      schedule.is_paused ? 'Resume schedule' : 'Pause schedule'
+                                    }
                                   >
                                     {schedule.is_paused ? (
                                       <Play className="h-4 w-4" />
@@ -2653,7 +2655,11 @@ export default function Historify() {
                                     }
                                   }}
                                   title="View history"
-                                  aria-label={expandedSchedule === schedule.id ? 'Collapse schedule details' : 'Expand schedule details'}
+                                  aria-label={
+                                    expandedSchedule === schedule.id
+                                      ? 'Collapse schedule details'
+                                      : 'Expand schedule details'
+                                  }
                                 >
                                   {expandedSchedule === schedule.id ? (
                                     <X className="h-4 w-4" />

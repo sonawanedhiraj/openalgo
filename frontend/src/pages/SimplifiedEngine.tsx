@@ -16,13 +16,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { showToast } from '@/utils/toast'
@@ -35,13 +29,7 @@ interface DirectionCardProps {
   toggling: boolean
 }
 
-function DirectionCard({
-  direction,
-  enabled,
-  symbols,
-  onToggle,
-  toggling,
-}: DirectionCardProps) {
+function DirectionCard({ direction, enabled, symbols, onToggle, toggling }: DirectionCardProps) {
   const isBuy = direction === 'BUY'
   const Icon = isBuy ? ArrowUpCircle : ArrowDownCircle
   const accentClass = isBuy
@@ -82,8 +70,7 @@ function DirectionCard({
           <div>
             <div className="text-sm font-medium">Enable {direction} entries</div>
             <div className="text-xs text-muted-foreground">
-              When off, webhooks for this direction are rejected. Existing positions
-              are not closed.
+              When off, webhooks for this direction are rejected. Existing positions are not closed.
             </div>
           </div>
           <Switch
@@ -101,7 +88,8 @@ function DirectionCard({
           </div>
           {symbols.length === 0 ? (
             <div className="text-xs text-muted-foreground">
-              No symbols armed yet. Send a Chartink webhook with a {isBuy ? 'BUY' : 'SELL'}-flavoured scan name.
+              No symbols armed yet. Send a Chartink webhook with a {isBuy ? 'BUY' : 'SELL'}
+              -flavoured scan name.
             </div>
           ) : (
             <div className="flex flex-wrap gap-1.5">
@@ -138,9 +126,8 @@ function ModeBanner({ status }: { status: SimplifiedEngineStatus }) {
       <Activity className="h-4 w-4" />
       <AlertTitle>{label}</AlertTitle>
       <AlertDescription>
-        Trades today: <strong>{status.trades_today}</strong> /{' '}
-        {status.max_trades_per_day}. Round trips closed:{' '}
-        <strong>{status.completed_trades_today}</strong>. Quote subscriptions:{' '}
+        Trades today: <strong>{status.trades_today}</strong> / {status.max_trades_per_day}. Round
+        trips closed: <strong>{status.completed_trades_today}</strong>. Quote subscriptions:{' '}
         <strong>{status.subscribed_symbols.length}</strong>.
       </AlertDescription>
     </Alert>
@@ -173,9 +160,7 @@ function EngineStateCard({ status }: { status: SimplifiedEngineStatus }) {
               <div className="font-mono">
                 Available: <strong>{funds.available_cash.toFixed(2)}</strong>
               </div>
-              <div className="font-mono text-muted-foreground">
-                Floor: {funds.floor.toFixed(2)}
-              </div>
+              <div className="font-mono text-muted-foreground">Floor: {funds.floor.toFixed(2)}</div>
               <div className="text-xs text-muted-foreground">
                 Checked: {fundsAge ? fundsAge.toLocaleTimeString() : '-'}
               </div>
@@ -212,9 +197,7 @@ function EngineStateCard({ status }: { status: SimplifiedEngineStatus }) {
 
         <div className="rounded-md border p-3 sm:col-span-2">
           <div className="flex items-center justify-between mb-1">
-            <div className="text-xs font-medium uppercase text-muted-foreground">
-              Tick log
-            </div>
+            <div className="text-xs font-medium uppercase text-muted-foreground">Tick log</div>
             <Badge variant={tick.enabled ? 'default' : 'secondary'}>
               {tick.enabled ? 'enabled' : 'disabled'}
             </Badge>
@@ -247,8 +230,8 @@ function EngineStateCard({ status }: { status: SimplifiedEngineStatus }) {
             </div>
           ) : (
             <div className="text-xs text-muted-foreground">
-              Set <code className="bg-muted px-1 rounded">SIMPLIFIED_ENGINE_TICK_LOG=true</code>{' '}
-              to enable.
+              Set <code className="bg-muted px-1 rounded">SIMPLIFIED_ENGINE_TICK_LOG=true</code> to
+              enable.
             </div>
           )}
         </div>
@@ -260,11 +243,7 @@ function EngineStateCard({ status }: { status: SimplifiedEngineStatus }) {
 function PositionsTable({ status }: { status: SimplifiedEngineStatus }) {
   const symbols = Object.keys(status.positions)
   if (symbols.length === 0) {
-    return (
-      <div className="text-sm text-muted-foreground py-6 text-center">
-        No open positions.
-      </div>
-    )
+    return <div className="text-sm text-muted-foreground py-6 text-center">No open positions.</div>
   }
   return (
     <div className="overflow-x-auto">
@@ -310,9 +289,7 @@ export default function SimplifiedEngine() {
   const [status, setStatus] = useState<SimplifiedEngineStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [togglingDirection, setTogglingDirection] = useState<EngineDirection | null>(
-    null
-  )
+  const [togglingDirection, setTogglingDirection] = useState<EngineDirection | null>(null)
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -320,8 +297,7 @@ export default function SimplifiedEngine() {
       const data = await simplifiedEngineApi.getStatus()
       setStatus(data)
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to load engine status'
+      const message = err instanceof Error ? err.message : 'Failed to load engine status'
       setError(message)
       showToast.error(message, 'chartink')
     } finally {
@@ -335,28 +311,21 @@ export default function SimplifiedEngine() {
     return () => window.clearInterval(interval)
   }, [fetchStatus])
 
-  const handleToggle = useCallback(
-    async (direction: EngineDirection, next: boolean) => {
-      try {
-        setTogglingDirection(direction)
-        const flags = await simplifiedEngineApi.toggleDirection(direction, next)
-        setStatus((prev) =>
-          prev ? { ...prev, direction_enabled: { ...prev.direction_enabled, ...flags } } : prev
-        )
-        showToast.success(
-          `${direction} strategy ${next ? 'enabled' : 'paused'}`,
-          'chartink'
-        )
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'Failed to toggle strategy'
-        showToast.error(message, 'chartink')
-      } finally {
-        setTogglingDirection(null)
-      }
-    },
-    []
-  )
+  const handleToggle = useCallback(async (direction: EngineDirection, next: boolean) => {
+    try {
+      setTogglingDirection(direction)
+      const flags = await simplifiedEngineApi.toggleDirection(direction, next)
+      setStatus((prev) =>
+        prev ? { ...prev, direction_enabled: { ...prev.direction_enabled, ...flags } } : prev
+      )
+      showToast.success(`${direction} strategy ${next ? 'enabled' : 'paused'}`, 'chartink')
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to toggle strategy'
+      showToast.error(message, 'chartink')
+    } finally {
+      setTogglingDirection(null)
+    }
+  }, [])
 
   const buyEnabled = status?.direction_enabled?.BUY ?? false
   const sellEnabled = status?.direction_enabled?.SELL ?? false
@@ -420,8 +389,8 @@ export default function SimplifiedEngine() {
           <code className="bg-muted px-1 mx-1 rounded">
             /chartink/simplified-stock-engine/&lt;webhook_id&gt;
           </code>
-          . The engine reads <strong>scan_name</strong>: contains "BUY" → arms a long
-          watch; contains "SELL" / "SHORT" / "COVER" → arms a short watch.
+          . The engine reads <strong>scan_name</strong>: contains "BUY" → arms a long watch;
+          contains "SELL" / "SHORT" / "COVER" → arms a short watch.
         </AlertDescription>
       </Alert>
 
@@ -446,8 +415,8 @@ export default function SimplifiedEngine() {
         <CardHeader>
           <CardTitle className="text-lg">Open positions</CardTitle>
           <CardDescription>
-            Live positions tracked by the engine. Pending entries:{' '}
-            {status.pending_entries.length}; pending exits: {status.pending_exits.length}.
+            Live positions tracked by the engine. Pending entries: {status.pending_entries.length};
+            pending exits: {status.pending_exits.length}.
           </CardDescription>
         </CardHeader>
         <CardContent>

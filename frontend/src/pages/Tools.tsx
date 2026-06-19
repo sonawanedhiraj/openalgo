@@ -79,6 +79,13 @@ const tools = [
     href: '/oiprofile',
     color: 'bg-orange-500',
   },
+  {
+    title: 'Screener Comparison',
+    description:
+      'Live in-house scanner vs Chartink screener side-by-side — counts, intersection, Jaccard, and a per-event timeline',
+    href: '/screener-comparison',
+    color: 'bg-sky-500',
+  },
 ]
 
 export default function Tools() {

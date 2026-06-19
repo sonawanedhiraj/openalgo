@@ -67,6 +67,7 @@ const IVSmile = lazy(() => import('@/pages/IVSmile'))
 const OIProfile = lazy(() => import('@/pages/OIProfile'))
 const StrategyBuilder = lazy(() => import('@/pages/StrategyBuilder'))
 const StrategyPortfolio = lazy(() => import('@/pages/StrategyPortfolio'))
+const ScreenerComparison = lazy(() => import('@/pages/ScreenerComparison'))
 
 // Strategy pages
 const StrategyIndex = lazy(() => import('@/pages/strategy/StrategyIndex'))
@@ -206,6 +207,7 @@ function App() {
                 <Route path="/oiprofile" element={<OIProfile />} />
                 <Route path="/strategybuilder" element={<StrategyBuilder />} />
                 <Route path="/strategybuilder/portfolio" element={<StrategyPortfolio />} />
+                <Route path="/screener-comparison" element={<ScreenerComparison />} />
                 {/* Legacy /tools/strategy paths — redirect to the new route. */}
                 <Route
                   path="/tools/strategy"
