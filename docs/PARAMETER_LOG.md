@@ -18,6 +18,30 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Preflight error gate — per-signature cap (added 2026-06-19)
+
+#### PREFLIGHT_ERROR_PER_SIGNATURE_CAP
+- **Current value:** unset → defaults **`5`**.
+- **Set in:** env; read in `services/preflight_service.py._check_recent_errors`
+  (constant `PREFLIGHT_ERROR_PER_SIGNATURE_CAP_DEFAULT`), applied in
+  `_count_recent_errors` via `_error_signature`.
+- **What it does:** caps how much any single error *signature* — `(logger,
+  source file:line)` — contributes to the gate's **effective** count. The gate
+  compares `effective_count` (each signature capped at this value) to
+  `PREFLIGHT_MAX_ERRORS_LAST_HOUR` (default 10). `count_last_hour` still reports
+  the raw total; the response also carries `effective_count` and
+  `distinct_signatures`. Entries with no logger can't be attributed to one fault
+  and are counted individually (not capped). `0`/negative disables capping
+  (effective == raw, the legacy behavior).
+- **Why added:** the 2026-06-19 TCS incident — a single per-tick exit storm
+  (~1600 identical `services.simplified_stock_engine_service:453` lines in 30
+  min) single-handedly tripped the error gate and **aborted every scan cycle**.
+  Capping each signature means one runaway code path can't DOS the whole scan
+  pipeline; a genuinely broad problem (many distinct signatures) still aggregates
+  over the threshold and aborts. Default `5` (≤ the abort threshold) so one
+  signature alone can never abort. Pairs with the P0 engine fix that stops the
+  storm at its source (`fix(simplified-engine): stop orphan-position exit storm`).
+
 ### In-house screener — Tier-1 observability hardening (added 2026-06-15)
 
 All default-on and additive — they change what is observed/skipped, never which

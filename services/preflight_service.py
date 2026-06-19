@@ -55,6 +55,18 @@ PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT = 10
 # stale errors hanging around. Configurable via PREFLIGHT_ERROR_WINDOW_MIN.
 PREFLIGHT_ERROR_WINDOW_MIN_DEFAULT = 30
 
+# Per-signature cap on how much a single repeating error contributes to the
+# gate's effective count. A "signature" is (logger, source file:line). Without
+# this, one runaway code path — e.g. the 2026-06-19 TCS per-tick exit storm,
+# ~1600 identical services.simplified_stock_engine_service:453 lines in 30 min —
+# single-handedly blows past the abort threshold and blocks EVERY scan cycle,
+# even though it's one known fault. Capping each signature's contribution means a
+# lone repeating error can't trip the gate by itself; a genuinely broad problem
+# (many distinct signatures) still aggregates over the threshold. Set ≤ the abort
+# threshold so one signature alone can never abort. 0/negative disables capping
+# (pure raw count). Configurable via PREFLIGHT_ERROR_PER_SIGNATURE_CAP.
+PREFLIGHT_ERROR_PER_SIGNATURE_CAP_DEFAULT = 5
+
 # Pre-market errors (before today's 09:15 IST open) are structurally different
 # from intraday issues — e.g. the morning broker-token-rollover WS reconnect
 # storm. They shouldn't block an intraday liveness gate. Toggle via
@@ -515,18 +527,51 @@ def _has_production_logger(entry: dict) -> bool:
     return head in _PRODUCTION_LOGGER_PREFIXES
 
 
+def _error_signature(obj: dict) -> tuple[str, str] | None:
+    """Concrete signature for the per-signature error cap: ``(logger, file)``.
+
+    Returns ``None`` when the entry carries no logger — such an entry can't be
+    confidently attributed to a single recurring fault, so the caller counts it
+    individually rather than collapsing it (this preserves the plain
+    "N errors → abort" semantics for unattributed bursts and for the bare
+    ``{ts, level}`` entries the older preflight tests seed). Production errors
+    always carry a logger (``get_logger(__name__)``); the ``file`` field
+    (``path:line``) discriminates distinct faults under the same logger and
+    collapses a per-tick storm at one site to a single signature.
+    """
+    logger_name = obj.get("logger")
+    if not isinstance(logger_name, str) or not logger_name.strip():
+        return None
+    file_loc = obj.get("file")
+    file_str = file_loc.strip() if isinstance(file_loc, str) else ""
+    return (logger_name.strip(), file_str)
+
+
 def _count_recent_errors(
     errors_path: Path,
     now: datetime,
     window_minutes: int,
     premarket_cutoff: datetime | None = None,
-) -> int:
+    per_signature_cap: int | None = None,
+) -> tuple[int, int, int]:
     """Count entries in errors.jsonl whose ts is within the trailing window.
 
-    Skips entries flagged by :func:`_is_test_source_entry` so the count
-    reflects production-relevant errors only. When ``premarket_cutoff`` is
-    given and later than the rolling-window cutoff, it tightens the floor so
-    pre-market errors (before today's 09:15 IST open) are excluded.
+    Returns ``(raw_count, effective_count, distinct_signatures)``:
+
+    * ``raw_count`` — every production-relevant entry in the window (the value
+      surfaced as ``count_last_hour`` for observability).
+    * ``effective_count`` — the value the gate compares to the threshold. Each
+      concrete signature (see :func:`_error_signature`) contributes at most
+      ``per_signature_cap`` so one runaway code path can't single-handedly trip
+      the gate (the 2026-06-19 TCS storm). Entries with no concrete signature
+      are counted individually, so for unattributed bursts ``effective == raw``.
+      ``per_signature_cap`` of ``None``/≤0 disables capping (``effective == raw``).
+    * ``distinct_signatures`` — number of distinct concrete signatures seen.
+
+    Skips entries flagged by :func:`_is_test_source_entry` so the count reflects
+    production-relevant errors only. When ``premarket_cutoff`` is given and later
+    than the rolling-window cutoff, it tightens the floor so pre-market errors
+    (before today's 09:15 IST open) are excluded.
 
     When ``PREFLIGHT_REQUIRE_PRODUCTION_LOGGER`` is enabled (default off), an
     entry that carries a logger field which is NOT a production namespace is
@@ -538,7 +583,9 @@ def _count_recent_errors(
     cutoff = now.replace(tzinfo=None) - timedelta(minutes=window_minutes)
     if premarket_cutoff is not None and premarket_cutoff > cutoff:
         cutoff = premarket_cutoff
-    count = 0
+    raw = 0
+    unsigned = 0
+    sig_counts: dict[tuple[str, str], int] = {}
     try:
         with errors_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -565,17 +612,38 @@ def _count_recent_errors(
                 # treated as noise. A missing logger is left to count.
                 if require_prod_logger and obj.get("logger") and not _has_production_logger(obj):
                     continue
-                count += 1
+                raw += 1
+                sig = _error_signature(obj)
+                if sig is None:
+                    unsigned += 1
+                else:
+                    sig_counts[sig] = sig_counts.get(sig, 0) + 1
     except OSError as e:
         logger.warning("preflight: errors.jsonl read failed (%s): %s", errors_path, e)
-        return 0
-    return count
+        return (0, 0, 0)
+
+    if per_signature_cap is None or per_signature_cap <= 0:
+        effective = raw
+    else:
+        effective = unsigned + sum(min(c, per_signature_cap) for c in sig_counts.values())
+    return (raw, effective, len(sig_counts))
 
 
 def _check_recent_errors(now: datetime) -> dict:
-    """Is the ERROR rate in the recent rolling window below threshold?"""
+    """Is the ERROR rate in the recent rolling window below threshold?
+
+    The gate compares the *effective* count — each repeating error signature
+    capped at ``PREFLIGHT_ERROR_PER_SIGNATURE_CAP`` — against the threshold, so a
+    single runaway code path can't abort every scan cycle on its own (the
+    2026-06-19 TCS storm). ``count_last_hour`` stays the raw total for
+    observability; ``effective_count`` and ``distinct_signatures`` expose how the
+    capping landed.
+    """
     threshold = _env_int("PREFLIGHT_MAX_ERRORS_LAST_HOUR", PREFLIGHT_MAX_ERRORS_LAST_HOUR_DEFAULT)
     window_minutes = _env_int("PREFLIGHT_ERROR_WINDOW_MIN", PREFLIGHT_ERROR_WINDOW_MIN_DEFAULT)
+    per_signature_cap = _env_int(
+        "PREFLIGHT_ERROR_PER_SIGNATURE_CAP", PREFLIGHT_ERROR_PER_SIGNATURE_CAP_DEFAULT
+    )
     log_dir = os.getenv("LOG_DIR", "log")
     errors_path = Path(log_dir) / "errors.jsonl"
 
@@ -583,6 +651,9 @@ def _check_recent_errors(now: datetime) -> dict:
         return {
             "ok": True,
             "count_last_hour": 0,
+            "effective_count": 0,
+            "distinct_signatures": 0,
+            "per_signature_cap": per_signature_cap,
             "window_minutes": window_minutes,
             "threshold": threshold,
             "reason": "no errors.jsonl found",
@@ -596,23 +667,33 @@ def _check_recent_errors(now: datetime) -> dict:
         if candidate <= now.replace(tzinfo=None):
             premarket_cutoff = candidate
 
-    count = _count_recent_errors(
+    raw, effective, distinct = _count_recent_errors(
         errors_path,
         now,
         window_minutes=window_minutes,
         premarket_cutoff=premarket_cutoff,
+        per_signature_cap=per_signature_cap,
     )
-    if count > threshold:
+    if effective > threshold:
+        reason = f"{effective} errors in last {window_minutes} min"
+        if effective != raw:
+            reason += f" (raw {raw} across {distinct} signature(s), capped {per_signature_cap}/sig)"
         return {
             "ok": False,
-            "count_last_hour": count,
+            "count_last_hour": raw,
+            "effective_count": effective,
+            "distinct_signatures": distinct,
+            "per_signature_cap": per_signature_cap,
             "window_minutes": window_minutes,
             "threshold": threshold,
-            "reason": f"{count} errors in last {window_minutes} min",
+            "reason": reason,
         }
     return {
         "ok": True,
-        "count_last_hour": count,
+        "count_last_hour": raw,
+        "effective_count": effective,
+        "distinct_signatures": distinct,
+        "per_signature_cap": per_signature_cap,
         "window_minutes": window_minutes,
         "threshold": threshold,
         "reason": None,
