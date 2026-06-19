@@ -1,0 +1,39 @@
+name: "Strategy backtest round"
+description: "Track a backtest round / strategy experiment and its registry outcome."
+title: "strategy(R<NN>): <strategy name / hypothesis>"
+labels: ["type:strategy"]
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis / change
+      description: What is being tested and why (vs the current active strategy).
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Test setup
+      description: Universe, date range, capital, parameters, protocol (per STRATEGY_REGISTRY).
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Sharpe / CAGR / MaxDD / win-rate / alpha, and the verdict (deploy / reject / iterate).
+    validations:
+      required: true
+  - type: input
+    id: artifacts
+    attributes:
+      label: Report / registry / commit
+      description: Research doc path, STRATEGY_REGISTRY entry, and commit SHA.
+      placeholder: "docs/research/... ; STRATEGY_REGISTRY R<NN> ; <sha>"
+  - type: checkboxes
+    id: dod
+    attributes:
+      label: Definition of Done
+      options:
+        - label: STRATEGY_REGISTRY.md entry added (direct to dev)
+        - label: Research/report doc committed under docs/research/
+        - label: Commit SHA recorded here
+        - label: "If deployed to sandbox/live: Docker deploy-test passed"
