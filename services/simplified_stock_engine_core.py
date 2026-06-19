@@ -399,7 +399,18 @@ class SimplifiedStockEngine:
         self.apply_simple_rr_trailing(symbol, price)
 
         pos = self.positions.get(symbol)
-        if pos and symbol not in self.pending_exits:
+        # A position with risk_per_share == 0 has no established stop yet — this
+        # is the marker the journal-rehydrate path leaves (it sets
+        # stop_loss = entry_price as a placeholder; see
+        # SimplifiedStockEngineService.rehydrate_positions_from_journal). Firing
+        # the tick-driven SL against that placeholder would exit on essentially
+        # every tick: a SHORT's stop_loss == entry means `price >= stop` is true
+        # the moment price is at or above entry. Skip the tick SL until a real
+        # stop is known; check_eod_exits and the EOD watchdog (which ignore
+        # stop_loss) still flatten the position at the close. Real positions
+        # always have risk_per_share >= min_risk_per_share (> 0) from
+        # confirm_entry, so this gate never suppresses a genuine stop.
+        if pos and symbol not in self.pending_exits and pos.risk_per_share > 0:
             if pos.qty > 0 and price <= pos.stop_loss:
                 exits.append(self._build_exit_signal(symbol, price, "stop_loss"))
             elif pos.qty < 0 and price >= pos.stop_loss:

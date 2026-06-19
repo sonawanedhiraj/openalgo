@@ -796,3 +796,67 @@ def test_rehydrate_ignores_yesterdays_rows(fresh_journal_db):
     added = svc.rehydrate_positions_from_journal()
     assert added == 0
     assert "YESTERDAY" not in svc.engine.positions
+
+
+def test_rehydrate_populates_api_key_and_strategy_maps(fresh_journal_db):
+    """P0 (2026-06-19 TCS storm): a rehydrated position must also get an
+    api_key/strategy mapping so its exit path can place an order. Without this
+    the position is live but unmapped, and every exit tick errored
+    'No API key mapped' until the preflight gate aborted scan cycles."""
+    svc = _make_real_service()
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="TCS",
+        strategy="trending_equity_intraday",
+        qty=48,
+        entry_price=2070.5,
+        direction="SHORT",
+    )
+
+    with patch("database.auth_db.get_first_available_api_key", return_value="resolved-key"):
+        added = svc.rehydrate_positions_from_journal()
+
+    assert added == 1
+    assert svc._api_key_by_symbol["TCS"] == "resolved-key"
+    assert svc._strategy_by_symbol["TCS"] == "simplified_stock_engine"
+
+
+def test_rehydrate_does_not_clobber_existing_mapping(fresh_journal_db):
+    """A mapping a live scan already set wins over the rehydrate fallback."""
+    svc = _make_real_service()
+    svc._api_key_by_symbol["TCS"] = "scan-key"
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="TCS",
+        strategy="trending_equity_intraday",
+        qty=48,
+        entry_price=2070.5,
+        direction="SHORT",
+    )
+
+    with patch("database.auth_db.get_first_available_api_key", return_value="resolved-key"):
+        svc.rehydrate_positions_from_journal()
+
+    assert svc._api_key_by_symbol["TCS"] == "scan-key"
+
+
+def test_rehydrate_without_resolvable_key_still_restores_position(fresh_journal_db):
+    """If no key resolves at boot, the position is still restored (the runtime
+    _resolve_order_api_key fallback covers the exit later) — rehydrate is
+    best-effort on the mapping and never blocks on a missing key."""
+    svc = _make_real_service()
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="TCS",
+        strategy="trending_equity_intraday",
+        qty=48,
+        entry_price=2070.5,
+        direction="SHORT",
+    )
+
+    with patch("database.auth_db.get_first_available_api_key", return_value=None):
+        added = svc.rehydrate_positions_from_journal()
+
+    assert added == 1
+    assert "TCS" in svc.engine.positions
+    assert "TCS" not in svc._api_key_by_symbol
