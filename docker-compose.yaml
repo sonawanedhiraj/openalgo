@@ -10,14 +10,17 @@ services:
       - "${FLASK_PORT:-5000}:5000"
       - "${WEBSOCKET_PORT:-8765}:8765"
 
-    # persistent DB, strategies, logs + mount the host .env read-only so dotenv can read it
+    # Load environment from .env file if it exists
+    env_file:
+      - .env
+
+    # persistent DB, strategies, logs
     volumes:
       - openalgo_db:/app/db
       - openalgo_log:/app/log            # Application logs (named volume)
       - openalgo_strategies:/app/strategies  # Python strategies (named volume)
       - openalgo_keys:/app/keys          # API keys/certificates (named volume)
       - openalgo_tmp:/app/tmp            # Temporary directory for numba/scipy (named volume)
-      - ./.env:/app/.env
 
     # (optional) extra env-vars that are NOT in .env
     environment:

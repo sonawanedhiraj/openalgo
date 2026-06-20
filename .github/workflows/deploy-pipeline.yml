@@ -1,0 +1,95 @@
+name: Deploy pipeline (Docker + tests + E2E)
+
+on:
+  pull_request:
+    branches: [dev]
+    paths-ignore:
+      - 'docs/**'
+      - 'strategies/STRATEGY_REGISTRY.md'
+      - '*.md'    # root-level .md only — src code still triggers
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate throwaway .env from .sample.env
+        run: |
+          cp .sample.env .env
+          # Patch secrets (random, throwaway for testing only)
+          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+          # Ensure sandbox mode
+          sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
+          if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
+            echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
+          fi
+          if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
+            echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
+          fi
+
+      - name: Build the production image
+        run: docker compose build
+
+      - name: Run unit + integration tests INSIDE the container (parallelized)
+        run: |
+          docker compose run --rm --no-deps -e DATABASE_URL="" openalgo \
+            /app/.venv/bin/python -m pytest /app/test/ -n auto --ignore=/app/test/e2e --ignore=/app/test/test_bridge_server.py --ignore=/app/test/test_email_functionality.py
+
+      - name: Run E2E tests INSIDE the container
+        run: |
+          docker compose run --rm --no-deps -e DATABASE_URL="" openalgo \
+            /app/.venv/bin/python -m pytest /app/test/e2e -v
+
+      - name: Boot container as a service (with project isolation)
+        run: |
+          docker compose -p deploy_test up -d
+
+      - name: Wait for container to be healthy
+        run: |
+          echo "Waiting for container health..."
+          for i in {1..90}; do
+            # For docker compose with -p prefix, the fixed container_name is still used
+            health=$(docker inspect --format='{{.State.Health.Status}}' openalgo-web 2>/dev/null || echo "none")
+            if [ "$health" = "healthy" ]; then
+              echo "Container is healthy"
+              exit 0
+            fi
+            echo "Attempt $i/90: health=$health, waiting..."
+            sleep 1
+          done
+          echo "Container failed to become healthy within 90s"
+          docker compose -p deploy_test logs --tail=100
+          exit 1
+
+      - name: External smoke checks
+        run: |
+          echo "Checking /auth/check-setup..."
+          curl -f http://127.0.0.1:5000/auth/check-setup
+          echo "✓ /auth/check-setup OK"
+
+          echo "Checking GET /..."
+          status=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/)
+          echo "GET / returned $status"
+          if [[ "$status" == "200" || "$status" == "302" || "$status" == "301" ]]; then
+            echo "✓ GET / OK ($status)"
+          else
+            echo "✗ GET / returned $status (expected 200/301/302)"
+            exit 1
+          fi
+
+      - name: Teardown (always run)
+        if: always()
+        run: |
+          echo "Tearing down test containers..."
+          docker compose -p deploy_test down -v --remove-orphans || true
+          docker compose down -v --remove-orphans || true
+          # Clean up generated .env
+          rm -f .env
