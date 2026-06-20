@@ -157,6 +157,45 @@ an immediate follow-up direct commit.
 strategy, evaluating a rule): read PARAMETER_LOG AND verify against `.env`. The
 doc captures intent; the env captures reality. Mismatches are real bugs.
 
+### NEVER rotate `API_KEY_PEPPER` or `FERNET_SALT` on a running install
+
+These two values are a categorical exception to the "edit `.env`, log it,
+restart" pattern above. They are not tunables — they are **load-bearing
+crypto material** that everything authenticated and encrypted on this install
+is sealed against. Rotating either is a destructive reset.
+
+What breaks the moment a running install starts up against a rotated value:
+
+- **Login.** The user password is hashed as `Argon2(password + API_KEY_PEPPER)`
+  (`database/user_db.py:120-136`). With a new pepper the existing
+  `password_hash` row never verifies; `/login` returns a generic 401 "Invalid
+  credentials" with no extra error log — the operator looks locked out for
+  no apparent reason.
+- **Every encrypted secret in `db/openalgo.db`.** Broker tokens, stored API
+  keys, TOTP secrets, SMTP password are all Fernet-encrypted with a key
+  derived from `API_KEY_PEPPER` + `FERNET_SALT`. A rotation makes every
+  ciphertext unreadable. Re-login to Zerodha won't help once the row is
+  written under the new pepper — the *next* restart can't decrypt it either.
+
+There is **no in-tree migration** that re-hashes the password and
+re-encrypts every secret on the way through a rotation. So a rotation is in
+practice a destructive reset.
+
+**Rules:**
+
+1. Do not touch `API_KEY_PEPPER` or `FERNET_SALT` in `.env` after the
+   first-run rotation has happened (i.e. once the placeholders have been
+   replaced and a user has been created). Not as part of a fix, not as part
+   of a "let me try a fresh value", not "just in case".
+2. Before editing `.env` for anything, make a backup: `cp .env
+   .env.bak.<timestamp>`. `.env.bak*` is gitignored.
+3. If you think you must rotate them (compromise, install transfer), plan
+   the full re-setup first: user-password reset, every broker re-link, every
+   stored API key re-issued, every TOTP secret re-enrolled, SMTP password
+   re-entered. There is no halfway.
+4. If a rotation has already happened and the install is locked out, follow
+   [`docs/runbooks/api_key_pepper_rotation_recovery.md`](docs/runbooks/api_key_pepper_rotation_recovery.md).
+
 ## Strategy registry updates ALWAYS go to dev directly
 
 Same pattern as the parameter log: `strategies/STRATEGY_REGISTRY.md` is reference
