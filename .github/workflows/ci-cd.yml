@@ -63,13 +63,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install uv
+        run: |
+          pip install uv --quiet
+
       - name: Generate throwaway .env for testing
         run: |
           cp .sample.env .env
           # Generate random secrets (throwaway for testing only)
-          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
-          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
-          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
           sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
           sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
           sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
@@ -113,6 +117,7 @@ jobs:
       - name: Run E2E tests against running application
         run: |
           echo "Running E2E tests..."
+          pip install uv --quiet
           uv run python -m pytest test/e2e -v --tb=short
           echo "✅ E2E tests passed"
 
