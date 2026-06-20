@@ -86,6 +86,9 @@ jobs:
           if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
             echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
           fi
+          # Verify .env file was created and is readable
+          test -f .env && echo "✅ .env file created successfully" || echo "❌ .env file creation failed"
+          ls -lh .env
 
       - name: Build Docker image
         run: |
