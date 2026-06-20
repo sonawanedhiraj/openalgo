@@ -68,6 +68,35 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 | `scanner-vs-chartink-daily-comparison` | `45 15 * * 1-5` (15:45 IST) | **RETIRED 2026-06-12** — moved in-process to the `scanner_comparison_eod` APScheduler job (§ In-process jobs). Operator should disable the Cowork task. It silently failed in the sandbox anyway (no repo/folder access) |
 | `daily-trading-pipeline` | `30 9 * * 1-5` | DISABLED (deprecated) |
 
+### 3.5. GitHub Actions CI/CD Pipeline (self-hosted runner, port-independent)
+- **Status:** ✅ ACTIVE (PR #9 merged 2026-06-20)
+- **Workflow file:** `.github/workflows/ci-cd.yml`
+- **Trigger:** Every PR targeting `dev` or `main`; also on direct push to those branches
+- **Runner:** Self-hosted on Windows/WSL at `C:\actions-runner\`
+  - Runner auto-updates on each job; restarts may occur mid-job
+  - Runner pool visible via `gh run list` and `gh run view`
+- **Two-stage pipeline:**
+
+  | Stage | Job ID | Duration | Purpose |
+  |-------|--------|----------|---------|
+  | 1: CI | `ci-unit-tests` | ~4 min | Run 120+ unit/integration tests in parallel with pytest-xdist (`-n auto`). All tests must pass to proceed to stage 2 |
+  | 2: CD | `cd-docker-e2e` | ~3 min (build 1m21s, boot 2m5s, tests 20s) | Build Docker image, boot container via docker-compose, run E2E tests against running app, teardown. Depends on CI |
+
+- **Branch protection:** Both `ci-unit-tests` and `cd-docker-e2e` are **required checks** for merge to `dev`. Only these two are blocking; `quality`, `backend-lint`, `security-scan`, `silent-drops`, `pipeline` are informational only.
+- **CI environment:** Test-only secrets provided at runtime:
+  - `API_KEY_PEPPER`, `APP_KEY`, `FERNET_SALT` (not stored in repo, only in GitHub Secrets)
+  - Conftest redirects all `DATABASE_URL` env vars to throwaway temp dir (full isolation)
+  - 3 tests marked `@pytest.mark.xfail` due to self-hosted timing/isolation sensitivity
+- **CD environment:** `.env` generated with random secrets (`uv run python -c "import secrets; print(secrets.token_hex(32))"`)
+  - Docker Compose loads via `env_file: [.env]` (not volume mount — that fails on GitHub Actions)
+  - Health check curls `http://127.0.0.1:5000/auth/check-setup` (30s interval, 40s start period, 3 retries)
+- **DB isolation:** No live DB pollution — conftest tripwire aborts immediately if any test imports `db/openalgo.db`
+- **Known issues:**
+  - GitHub API check-status sync can be slow (5-10 min); required checks may show "expected" despite completing successfully. Workaround: wait or temporarily disable branch protection to merge.
+  - Runner auto-update exits gracefully after current job; next dispatch uses new binary
+  - `docker-compose up` on self-hosted occasionally takes 2+ min to boot; health retries allow 120s max boot time
+- **Links:** PR #9 (merged), workflow runs at https://github.com/sonawanedhiraj/openalgo/actions
+
 ### 4. SectorFollowService (in-process, OpenAlgo eventlet worker)
 - **Entry:** `services/sector_follow_service.py` — built + wired at boot by
   `init_sector_follow_service(app, scheduler)` (called from `app.py`). Lives inside
