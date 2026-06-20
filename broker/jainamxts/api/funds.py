@@ -13,8 +13,8 @@ logger = get_logger(__name__)
 
 def get_margin_data(auth_token):
     """Fetch margin data from JainamXTS's API using the provided auth token."""
-    api_key = os.getenv("BROKER_API_KEY")
-    api_secret = os.getenv("BROKER_API_SECRET")
+    os.getenv("BROKER_API_KEY")
+    os.getenv("BROKER_API_SECRET")
 
     client = get_httpx_client()
 

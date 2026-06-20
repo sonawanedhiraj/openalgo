@@ -508,13 +508,12 @@ def transform_holdings_data(holdings_data):
         exchange = holding.get("exchange", "")
 
         # Calculate investment value
-        investment_value = total_qty * avg_buy_price
+        total_qty * avg_buy_price
 
         # For current value, we need LTP - since Definedge doesn't provide it in holdings,
         # we'll need to get it from market data or use a placeholder
         # For now, calculate P&L as 0 since we don't have real-time price
         # This should be updated with actual market prices in production
-        current_value = investment_value  # Placeholder - should be total_qty * ltp
         pnl = 0.0  # Placeholder - should be current_value - investment_value
         pnl_percent = 0.0  # Placeholder
 

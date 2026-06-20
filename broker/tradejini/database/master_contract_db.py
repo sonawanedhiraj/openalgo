@@ -142,7 +142,7 @@ def get_scrip_data(scrip_group):
         for line in lines[1:]:
             values = line.strip().split(",")
             if len(values) == len(headers):
-                data.append(dict(zip(headers, values)))
+                data.append(dict(zip(headers, values, strict=False)))
 
         logger.info(f"Processed {len(data)} records for {scrip_group}")
         return data
@@ -208,7 +208,7 @@ def process_scrip_data(scrip_data, group_info):
         for line in lines[1:]:
             values = line.strip().split(",")
             if len(values) == len(headers):
-                scrip_data.append(dict(zip(headers, values)))
+                scrip_data.append(dict(zip(headers, values, strict=False)))
 
     # Get group name and format
     group_name = group_info.get("name", "")

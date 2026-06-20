@@ -253,7 +253,7 @@ class BrokerData:
         if interval in ["D", "1D", "1d", "W", "w", "1W", "1w"]:
             logger.info(f"Setting all {interval} candles to 09:15:00 IST market open time")
             new_index = []
-            for i, idx in enumerate(df.index):
+            for _i, idx in enumerate(df.index):
                 # Convert the date part to a Python date object
                 if isinstance(idx, pd.Timestamp):
                     date_part = idx.date()
@@ -1587,7 +1587,7 @@ class BrokerData:
 
         # Debug output
         logger.info("FINAL SIMPLE FORMAT:")
-        for key, value in simple_data.items():
+        for _key, value in simple_data.items():
             logger.info(f"{{key}}: {value}")
 
         # Return exact structure expected by OpenAlgo
@@ -1617,7 +1617,6 @@ class BrokerData:
         # Back-compat: legacy callers passed timeout in the second positional
         # slot. If we got an int there, treat it as the timeout and ignore.
         if isinstance(exchange, int) and not isinstance(exchange, bool):
-            timeout = exchange
             exchange = None
 
         # If a bare-string symbol came in along with an explicit exchange,
@@ -1676,7 +1675,7 @@ class BrokerData:
         exchange = sym_data["exchange"]
 
         # Get token for this symbol
-        token = get_token(symbol, exchange)
+        get_token(symbol, exchange)
 
         # Map OpenAlgo exchange to Groww exchange format
         if exchange == "NSE":
@@ -1909,7 +1908,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_quotes_batch(self, symbols: list) -> list:
         """

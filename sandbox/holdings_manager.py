@@ -165,7 +165,6 @@ class HoldingsManager:
 
                 if holding:
                     # Update existing holding
-                    old_holding_qty = holding.quantity
 
                     if position.quantity > 0:
                         # Adding to holding (BUY)
@@ -421,7 +420,7 @@ def process_all_t1_settlements():
             logger.info("No CNC positions to settle")
             return
 
-        users = set(p.user_id for p in positions)
+        users = {p.user_id for p in positions}
         logger.info(f"Processing T+1 settlement for {len(users)} users")
 
         settled_users = 0

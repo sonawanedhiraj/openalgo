@@ -481,8 +481,6 @@ def highlight_url(url: str, text: str = None) -> str:
     bright_white = Fore.WHITE + Style.BRIGHT
     reset = Style.RESET_ALL
 
-    display_text = text or url
-
     # Format: [bright_white]text[reset] -> [bright_cyan]url[reset]
     if text and text != url:
         return f"{bright_white}{text}{reset} -> {bright_cyan}{url}{reset}"

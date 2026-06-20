@@ -367,7 +367,7 @@ def map_portfolio_data(portfolio_data):
 
     Parameters:
     - portfolio_data: A dictionary containing the portfolio/holdings information from RMoney XTS API.
-    
+
     Returns:
     - A dictionary with 'holdings' and 'totalholding' keys structured for the OpenAlgoXTS system.
     """

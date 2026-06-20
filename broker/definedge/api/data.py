@@ -224,7 +224,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_quotes: {str(e)}")
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -269,7 +269,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _fetch_single_quote_sync(
         self, symbol: str, exchange: str, api_exchange: str, token: str, api_session_key: str
@@ -965,4 +965,4 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_depth: {str(e)}")
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e

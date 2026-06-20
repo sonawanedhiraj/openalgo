@@ -871,7 +871,7 @@ class AngelWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.debug(
                 f"No {side_label} depth data in message (expected for indices). Keys: {message.keys()}"
             )
-            for i in range(5):  # Default to 5 empty levels
+            for _i in range(5):  # Default to 5 empty levels
                 depth.append({"price": 0.0, "quantity": 0, "orders": 0})
         else:
             # Log the depth data being returned for debugging

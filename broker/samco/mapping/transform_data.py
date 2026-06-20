@@ -88,7 +88,7 @@ def transform_data(data, token, auth_token=None):
                 )
         except Exception as e:
             logger.error(f"MPP Error: {str(e)}")
-            raise ValueError(f"MARKET order failed: {str(e)}")
+            raise ValueError(f"MARKET order failed: {str(e)}") from None
 
     # Apply Market Price Protection for SL-M orders (convert to SL with protected price)
     elif data["pricetype"] == "SL-M":

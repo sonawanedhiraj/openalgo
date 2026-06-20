@@ -135,7 +135,7 @@ class FlowScheduler:
                 logger.info(f"Creating one-time trigger: {execute_datetime}")
             except ValueError as e:
                 logger.error(f"Invalid execute_at datetime: {execute_at} - {e}")
-                raise ValueError(f"Invalid datetime format: {execute_at}")
+                raise ValueError(f"Invalid datetime format: {execute_at}") from None
 
         elif schedule_type == "daily":
             try:
@@ -144,7 +144,7 @@ class FlowScheduler:
                 logger.info(f"Creating daily trigger: {time_str}")
             except ValueError as e:
                 logger.error(f"Invalid time format: {time_str} - {e}")
-                raise ValueError(f"Invalid time format: {time_str}")
+                raise ValueError(f"Invalid time format: {time_str}") from None
 
         elif schedule_type == "weekly" and days:
             try:
@@ -155,10 +155,10 @@ class FlowScheduler:
                 logger.info(f"Creating weekly trigger: {day_of_week} at {time_str}")
             except (ValueError, KeyError) as e:
                 logger.error(f"Invalid weekly schedule config: {e}")
-                raise ValueError("Invalid weekly schedule configuration")
+                raise ValueError("Invalid weekly schedule configuration") from None
 
         else:
-            raise ValueError(f"Invalid schedule configuration: type={schedule_type}")
+            raise ValueError(f"Invalid schedule configuration: type={schedule_type}") from None
 
         self.scheduler.add_job(
             func,

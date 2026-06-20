@@ -1649,8 +1649,6 @@ def _render_report(payload, errors_summary, errors_recent, fmt):
     bullet = "- " if is_md else "  - "
     h1 = "# " if is_md else ""
     h2 = "## " if is_md else ""
-    code_open = "```\n" if is_md else ""
-    code_close = "```\n" if is_md else ""
 
     lines = []
     lines.append(f"{h1}OpenAlgo System Report")

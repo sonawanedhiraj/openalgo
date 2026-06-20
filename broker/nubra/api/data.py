@@ -78,7 +78,9 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
         except json.JSONDecodeError:
             logger.error(f"Debug - Failed to parse response. Status code: {response.status_code}")
             logger.debug(f"Debug - Response text: {response.text}")
-            raise Exception(f"Failed to parse API response (status {response.status_code})")
+            raise Exception(
+                f"Failed to parse API response (status {response.status_code})"
+            ) from None
 
 
 class BrokerData:
@@ -219,7 +221,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching quotes for {symbol} on {exchange}: {str(e)}")
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def _get_quotes_via_websocket(self, symbol: str, exchange: str) -> dict:
         """
@@ -596,7 +598,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes (batch)")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
         finally:
             # Guarantee batch unsubscribe even on exceptions
@@ -928,7 +930,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Debug - Error: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def get_oi_history(
         self, symbol: str, exchange: str, interval: str, start_date: str, end_date: str
@@ -997,7 +999,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def _get_depth_via_websocket(self, symbol: str, exchange: str) -> dict:
         """

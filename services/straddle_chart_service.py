@@ -216,7 +216,7 @@ def get_straddle_chart_data(
         df_underlying["atm_strike"] = atm_per_row
 
         # Step 5: Collect unique ATM strikes
-        unique_strikes = set(s for s in atm_per_row if s is not None)
+        unique_strikes = {s for s in atm_per_row if s is not None}
         if not unique_strikes:
             return False, {"status": "error", "message": "Could not determine any ATM strikes"}, 400
 

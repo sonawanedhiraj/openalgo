@@ -435,7 +435,7 @@ class PaytmWebSocketAdapter(BaseBrokerWebSocketAdapter):
             )
 
         token = token_info["token"]
-        brexchange = token_info["brexchange"]
+        token_info["brexchange"]
 
         # Generate correlation ID
         correlation_id = f"{symbol}_{exchange}_{mode}"

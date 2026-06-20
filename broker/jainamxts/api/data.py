@@ -50,7 +50,7 @@ def get_api_response(endpoint, auth, method="GET", payload="", feed_token=None, 
                     payload = json.loads(payload)
                 except json.JSONDecodeError:
                     logger.error("Failed to parse payload as JSON")
-                    raise Exception("Invalid payload format")
+                    raise Exception("Invalid payload format") from None
             logger.debug(f"Payload: {json.dumps(payload, indent=2)}")
 
         # Perform the request
@@ -277,7 +277,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching quotes: {str(e)}")
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -325,7 +325,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """
@@ -685,7 +685,7 @@ class BrokerData:
                     segment_id = exchange_segment_map.get(exchange)
                     logger.debug(f"Exchange: {{exchange}}, Segment ID: {segment_id}")
                     if segment_id is None:
-                        raise ValueError(f"Unknown exchange: {exchange}")
+                        raise ValueError(f"Unknown exchange: {exchange}") from None
                     payload = {
                         "instruments": [
                             {"exchangeSegment": segment_id, "exchangeInstrumentID": token}
@@ -807,7 +807,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching historical data: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def get_intervals(self) -> list:
         """Get available intervals/timeframes for historical data

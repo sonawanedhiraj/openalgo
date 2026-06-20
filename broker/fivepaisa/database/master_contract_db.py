@@ -143,7 +143,7 @@ def download_csv_5paisa_data(url, output_path):
                 logger.info("Maximum retries reached for master contract download.")
                 raise Exception(
                     f"Failed to download master contract after {max_retries} attempts: {str(e)}"
-                )
+                ) from e
         except Exception as e:
             logger.error(f"Failed to download data: {e}")
             if "time" in str(e).lower() and current_retry < max_retries:

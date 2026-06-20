@@ -337,7 +337,6 @@ def place_smartorder_api(data: dict[str, Any], auth: str) -> dict[str, Any]:
     AUTH_TOKEN = auth
 
     # If no API call is made in this function then res will return None
-    res = None
 
     # Extract necessary info from data
     symbol = data.get("symbol")
@@ -423,7 +422,7 @@ def _place_smartorder_locked(data, AUTH_TOKEN, symbol, exchange, product):
 
         # logger.info(f"{order_data}")
         # Place the order
-        res, response, orderid = place_order_api(order_data, auth)
+        res, response, orderid = place_order_api(order_data, AUTH_TOKEN)
         _invalidate_position_cache(AUTH_TOKEN)
         logger.info(f"{response}")
         logger.info(f"{orderid}")

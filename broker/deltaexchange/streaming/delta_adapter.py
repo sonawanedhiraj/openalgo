@@ -398,13 +398,13 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         def _f(v, d=0.0):
             try:
                 return float(v) if v is not None else d
-            except:
+            except (ValueError, TypeError):
                 return d
 
         def _i(v, d=0):
             try:
                 return int(float(v)) if v is not None else d
-            except:
+            except (ValueError, TypeError):
                 return d
 
         quotes = msg.get("quotes") or {}
@@ -458,7 +458,7 @@ class DeltaWebSocketAdapter(BaseBrokerWebSocketAdapter):
         def _f(v, d=0.0):
             try:
                 return float(v) if v is not None else d
-            except:
+            except (ValueError, TypeError):
                 return d
 
         def _parse_levels(side_list, n=5):

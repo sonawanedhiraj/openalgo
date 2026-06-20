@@ -255,7 +255,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -290,7 +290,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """
@@ -370,7 +370,7 @@ class BrokerData:
 
             if not success:
                 logger.error("Failed to send subscription request after retry")
-                for key, info in symbol_map.items():
+                for _key, info in symbol_map.items():
                     results.append(
                         {
                             "symbol": info["symbol"],
@@ -567,7 +567,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def _get_index_history_via_futures(
         self, symbol: str, original_exchange: str, timeframe: str, start_date: str, end_date: str

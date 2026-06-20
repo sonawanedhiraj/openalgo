@@ -95,7 +95,7 @@ class BrokerData:
         """
         try:
             # Convert symbol to broker format and get token
-            br_symbol = get_br_symbol(symbol, exchange)
+            get_br_symbol(symbol, exchange)
             token = get_token(symbol, exchange)
 
             # Convert OpenAlgo exchange to broker exchange for API calls
@@ -129,7 +129,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -174,7 +174,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _fetch_single_quote_sync(
         self, symbol: str, exchange: str, api_exchange: str, token: str, api_key: str
@@ -415,7 +415,7 @@ class BrokerData:
         """
         try:
             # Convert symbol to broker format and get token
-            br_symbol = get_br_symbol(symbol, exchange)
+            get_br_symbol(symbol, exchange)
             token = get_token(symbol, exchange)
 
             # Convert OpenAlgo exchange to broker exchange for API calls
@@ -470,7 +470,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def get_history(
         self, symbol: str, exchange: str, interval: str, start_date: str, end_date: str
@@ -664,4 +664,4 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_history: {e}")  # Add debug logging
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e

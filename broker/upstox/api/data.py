@@ -96,7 +96,7 @@ class BrokerData:
                     logger.info(f"Found token using base exchange: {base_exchange}")
 
             if not token:
-                raise ValueError(f"No token found for {symbol} on {exchange}")
+                raise ValueError(f"No token found for {symbol} on {exchange}") from None
 
             logger.debug(f"Using instrument key: {token}")
             return token
@@ -365,7 +365,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_quotes_batch(self, symbols: list) -> list:
         """
@@ -473,7 +473,7 @@ class BrokerData:
             v2_data = v2_response.json()
 
             if v2_data.get("status") == "success":
-                for key, value in v2_data.get("data", {}).items():
+                for _key, value in v2_data.get("data", {}).items():
                     inst_key = value.get("instrument_token")
                     if inst_key:
                         v2_quotes[inst_key] = value
@@ -486,7 +486,7 @@ class BrokerData:
 
         # Build lookup by instrument_token
         quotes_by_key = {}
-        for key, value in quote_data.items():
+        for _key, value in quote_data.items():
             inst_key = value.get("instrument_token")
             if inst_key:
                 quotes_by_key[inst_key] = value
@@ -1069,7 +1069,7 @@ class BrokerData:
 
             # Find the quote data - Upstox uses exchange:symbol format for the key
             quote = None
-            for key, value in quote_data.items():
+            for _key, value in quote_data.items():
                 if value.get("instrument_token") == instrument_key:
                     quote = value
                     break
@@ -1089,7 +1089,7 @@ class BrokerData:
 
                 if v3_response.get("status") == "success":
                     v3_quote_data = v3_response.get("data", {})
-                    for key, value in v3_quote_data.items():
+                    for _key, value in v3_quote_data.items():
                         if value.get("instrument_token") == instrument_key:
                             live_ohlc = value.get("live_ohlc", {})
                             prev_ohlc = value.get("prev_ohlc", {})

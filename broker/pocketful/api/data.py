@@ -92,7 +92,7 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
         raise
     except Exception as e:
         logger.error(f"API request failed: {str(e)}")
-        raise PocketfulAPIError(f"API request failed: {str(e)}")
+        raise PocketfulAPIError(f"API request failed: {str(e)}") from e
 
 
 class BrokerData:
@@ -145,7 +145,7 @@ class BrokerData:
             raise
         except (PocketfulAPIError, Exception) as e:
             logger.error(f"Error fetching quotes: {str(e)}")
-            raise PocketfulAPIError(f"Error fetching quotes: {str(e)}")
+            raise PocketfulAPIError(f"Error fetching quotes: {str(e)}") from e
 
     def _get_quotes_from_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -347,10 +347,10 @@ class BrokerData:
                     )
             except httpx.HTTPError as e:
                 logger.error(f"Error fetching client_id: {str(e)}")
-                raise PocketfulAPIError(f"Error fetching client_id: {str(e)}")
+                raise PocketfulAPIError(f"Error fetching client_id: {str(e)}") from e
             except Exception as e:
                 logger.error(f"Error fetching client_id: {str(e)}")
-                raise PocketfulAPIError(f"Error fetching client_id: {str(e)}")
+                raise PocketfulAPIError(f"Error fetching client_id: {str(e)}") from e
 
         return self.client_id
 
@@ -380,7 +380,7 @@ class BrokerData:
                 return True
             except Exception as e:
                 logger.error(f"Error establishing WebSocket connection: {str(e)}")
-                raise PocketfulAPIError(f"Error establishing WebSocket connection: {str(e)}")
+                raise PocketfulAPIError(f"Error establishing WebSocket connection: {str(e)}") from e
         return self.ws_connected
 
     def get_market_depth(self, symbol: str, exchange: str) -> dict:
@@ -400,7 +400,7 @@ class BrokerData:
             raise
         except (PocketfulAPIError, Exception) as e:
             logger.error(f"Error fetching market depth: {str(e)}")
-            raise PocketfulAPIError(f"Error fetching market depth: {str(e)}")
+            raise PocketfulAPIError(f"Error fetching market depth: {str(e)}") from e
 
     def _get_mock_market_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -638,7 +638,7 @@ class BrokerData:
             raise
         except (PocketfulAPIError, Exception) as e:
             logger.error(f"Error fetching market depth: {str(e)}")
-            raise PocketfulAPIError(f"Error fetching market depth: {str(e)}")
+            raise PocketfulAPIError(f"Error fetching market depth: {str(e)}") from e
 
     def _get_quotes_compact_noexcept(self, symbol: str, exchange: str) -> dict:
         """

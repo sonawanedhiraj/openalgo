@@ -116,8 +116,8 @@ class MstockWebSocket:
             elif len(data) == 379:
                 packet = data
             elif len(data) >= 383:
-                num_packets = struct.unpack("<H", data[0:2])[0]
-                packet_size = struct.unpack("<H", data[2:4])[0]
+                struct.unpack("<H", data[0:2])[0]
+                struct.unpack("<H", data[2:4])[0]
                 packet = data[4 : 4 + 379]
             else:
                 logger.error(f"Invalid packet size: {len(data)} bytes")

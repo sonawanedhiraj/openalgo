@@ -64,7 +64,6 @@ def _get_ticker(symbol: str) -> dict:
     (e.g. WinError 10035 / WSAEWOULDBLOCK under concurrent load).
     """
     url = f"{BASE_URL}/v2/tickers/{symbol}"
-    last_err: Exception | None = None
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -72,7 +71,6 @@ def _get_ticker(symbol: str) -> dict:
             resp = client.get(url, headers={"Accept": "application/json"}, timeout=15.0)
             break  # success
         except _TRANSIENT_ERRORS as exc:
-            last_err = exc
             if attempt < _MAX_RETRIES:
                 logger.warning(
                     "Transient error fetching ticker %s (attempt %d/%d): %s – retrying",
@@ -123,7 +121,6 @@ def _get_l2orderbook(product_id: int) -> dict:
     Retries up to _MAX_RETRIES times on transient HTTP/2 socket errors.
     """
     url = f"{BASE_URL}/v2/l2orderbook/{product_id}"
-    last_err: Exception | None = None
 
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -131,7 +128,6 @@ def _get_l2orderbook(product_id: int) -> dict:
             resp = client.get(url, headers={"Accept": "application/json"}, timeout=15.0)
             break  # success
         except _TRANSIENT_ERRORS as exc:
-            last_err = exc
             if attempt < _MAX_RETRIES:
                 logger.warning(
                     "Transient error fetching l2orderbook %s (attempt %d/%d): %s – retrying",
@@ -245,7 +241,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"[DeltaExchange] get_quotes error for {symbol}: {e}")
-            raise Exception(f"Error fetching quotes for {symbol}: {e}")
+            raise Exception(f"Error fetching quotes for {symbol}: {e}") from e
 
     # ──────────────────────────────────────────────────────────────────────────
     # get_depth
@@ -371,7 +367,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"[DeltaExchange] get_depth error for {symbol}: {e}")
-            raise Exception(f"Error fetching market depth for {symbol}: {e}")
+            raise Exception(f"Error fetching market depth for {symbol}: {e}") from e
 
     # ──────────────────────────────────────────────────────────────────────────
     # get_history
@@ -586,7 +582,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"[DeltaExchange] get_history error for {symbol}: {e}")
-            raise Exception(f"Error fetching historical data for {symbol}: {e}")
+            raise Exception(f"Error fetching historical data for {symbol}: {e}") from e
 
     # ──────────────────────────────────────────────────────────────────────────    # get_option_chain
     # ─────────────────────────────────────────────────────────────────────────────

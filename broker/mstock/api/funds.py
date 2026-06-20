@@ -44,7 +44,7 @@ def get_margin_data(auth_token):
             f"Fund summary response: status={margin_data.get('status')}, has_data={bool(margin_data.get('data'))}"
         )
         logger.debug(f"Full margin data response: {margin_data}")
-        if margin_data.get("status") == True and margin_data.get("data"):
+        if margin_data.get("status") and margin_data.get("data"):
             data = margin_data["data"][0]
             key_mapping = {
                 "AVAILABLE_BALANCE": "availablecash",

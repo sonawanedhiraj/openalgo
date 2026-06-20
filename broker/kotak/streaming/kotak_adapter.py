@@ -82,7 +82,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
             raise ValueError("Invalid authentication token format")
 
         self._auth_config = dict(
-            zip(["auth_token", "sid", "hs_server_id", "access_token"], auth_parts)
+            zip(["auth_token", "sid", "hs_server_id", "access_token"], auth_parts, strict=False)
         )
 
         # Create websocket client
@@ -314,7 +314,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                             merged_data[key] = value
                     parsed_data = merged_data
                     logger.debug(
-                        f"Merged data: {dict((k, v) for k, v in parsed_data.items() if k not in ['tk'])}"
+                        f"Merged data: { {k: v for k, v in parsed_data.items() if k not in ['tk']} }"
                     )
                     ltp = parsed_data.get("ltp")
                     has_depth_data = "bids" in parsed_data and "asks" in parsed_data
@@ -687,7 +687,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                 # Re-subscribe saved symbols
                 failed_resubs = []
-                for sub_key, sub_info in saved_subs.items():
+                for _sub_key, sub_info in saved_subs.items():
                     try:
                         self.subscribe(
                             sub_info["symbol"],
@@ -736,6 +736,7 @@ class KotakWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 zip(
                     ["auth_token", "sid", "hs_server_id", "access_token"],
                     auth_parts,
+                    strict=False,
                 )
             )
 

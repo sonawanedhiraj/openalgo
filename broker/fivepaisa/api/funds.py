@@ -39,7 +39,7 @@ def get_margin_data(auth_token: str) -> dict[str, Any]:
     except ValueError:
         raise ValueError(
             "BROKER_API_KEY format is incorrect. Expected format: 'api_key:::client_id'"
-        )
+        ) from None
 
     # Get the shared httpx client
     client = get_httpx_client()

@@ -349,7 +349,7 @@ class Aliceblue:
         session_response = self._request("ws/createWsSession", "A", session_data)
 
         if session_response.get("stat") == "Ok":
-            ws_session = session_response["result"]["wsSess"]
+            session_response["result"]["wsSess"]
 
             # Connect to WebSocket
             websocket.enableTrace(True)

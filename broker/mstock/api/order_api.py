@@ -285,7 +285,7 @@ def place_smartorder_api(data, auth):
             action = data["action"]
             quantity = data["quantity"]
             res, response, orderid = place_order_api(data, auth_token)
-            _invalidate_position_cache(AUTH_TOKEN)
+            _invalidate_position_cache(auth_token)
             return res, response, orderid
 
         elif position_size == current_position:
@@ -327,7 +327,7 @@ def place_smartorder_api(data, auth):
 
             # Place the order
             res, response, orderid = place_order_api(order_data, auth)
-            _invalidate_position_cache(AUTH_TOKEN)
+            _invalidate_position_cache(auth_token)
             logger.debug(f"Smart order response: {response}")
             logger.debug(f"Smart order ID: {orderid}")
 

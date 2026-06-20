@@ -369,7 +369,7 @@ class MotilalWebSocket:
                 # Parse header (10 bytes)
                 exchange_byte = packet[0:1].decode("utf-8", errors="ignore")
                 scrip = int.from_bytes(packet[1:5], byteorder="little", signed=True)
-                timestamp = int.from_bytes(packet[5:9], byteorder="little", signed=True)
+                int.from_bytes(packet[5:9], byteorder="little", signed=True)
                 msgtype = packet[9:10].decode("utf-8", errors="ignore")
 
                 # Parse body (20 bytes) based on message type
@@ -586,7 +586,7 @@ class MotilalWebSocket:
             # Determine message type based on fields present
             exchange = data.get("Exchange", "")
             scrip_code = data.get("Scrip Code", "")
-            timestamp = data.get("Time", "")
+            data.get("Time", "")
 
             if not exchange or not scrip_code:
                 logger.debug("Message does not contain Exchange or Scrip Code, skipping")
@@ -1084,7 +1084,7 @@ class MotilalWebSocket:
         )
 
         # Resubscribe to scrips
-        for full_key, scrip_info in self.subscribed_scrips.items():
+        for _full_key, scrip_info in self.subscribed_scrips.items():
             self.register_scrip(
                 scrip_info["exchange"],
                 scrip_info["exchange_type"],

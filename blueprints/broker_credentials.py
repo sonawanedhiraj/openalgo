@@ -220,9 +220,7 @@ def update_credentials():
             # Validate broker name
             broker_name = get_broker_from_redirect_url(redirect_url)
             valid_brokers_str = get_env_value("VALID_BROKERS")
-            valid_brokers = set(
-                b.strip().lower() for b in valid_brokers_str.split(",") if b.strip()
-            )
+            valid_brokers = {b.strip().lower() for b in valid_brokers_str.split(",") if b.strip()}
 
             if broker_name and broker_name not in valid_brokers:
                 return jsonify(

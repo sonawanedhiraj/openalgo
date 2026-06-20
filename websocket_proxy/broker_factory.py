@@ -73,7 +73,7 @@ def _get_adapter_class(broker_name: str) -> type[BaseBrokerWebSocketAdapter]:
 
     except (ImportError, AttributeError) as e:
         logger.exception(f"Failed to load adapter for broker {broker_name}: {e}")
-        raise ValueError(f"Unsupported broker: {broker_name}. No adapter available.")
+        raise ValueError(f"Unsupported broker: {broker_name}. No adapter available.") from None
 
 
 def create_broker_adapter(
