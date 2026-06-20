@@ -1,0 +1,166 @@
+{
+  "full_window": {
+    "from": "2024-01-01",
+    "to": "2026-06-19",
+    "n_days": 900,
+    "years": 2.464,
+    "total_return_pct": -54.601,
+    "cagr_pct": -27.42,
+    "sharpe_annual": -1.876,
+    "sortino_annual": -3.368,
+    "max_dd_pct": -55.295,
+    "n_trades": 978,
+    "win_rate_pct": 45.5,
+    "avg_R": -0.087,
+    "profit_factor": 0.795,
+    "trades_per_month": 33.08,
+    "monthly_green_pct": 23.33,
+    "avg_win_inr": 4772.28,
+    "avg_loss_inr": -5008.78,
+    "final_equity_inr": 453985.95,
+    "by_exit_reason": {
+      "eod_flat": {
+        "n": 26,
+        "sum": 4976.25,
+        "mean": 191.39,
+        "win_rate": 61.54
+      },
+      "stop": {
+        "n": 434,
+        "sum": -2503758.75,
+        "mean": -5769.03,
+        "win_rate": 0.0
+      },
+      "target": {
+        "n": 508,
+        "sum": 1940464.7,
+        "mean": 3819.81,
+        "win_rate": 83.66
+      },
+      "time_stop": {
+        "n": 10,
+        "sum": 12303.75,
+        "mean": 1230.37,
+        "win_rate": 40.0
+      }
+    },
+    "by_side": {
+      "LONG": {
+        "n": 530,
+        "sum": -297489.06,
+        "win_rate": 45.09
+      },
+      "SHORT": {
+        "n": 448,
+        "sum": -248524.99,
+        "win_rate": 45.98
+      }
+    },
+    "buy_and_hold": {
+      "from": "2024-01-01",
+      "to": "2026-06-19",
+      "n_days": 900,
+      "years": 2.464,
+      "total_return_pct": 17.617,
+      "cagr_pct": 6.807,
+      "sharpe_annual": 0.303,
+      "sortino_annual": 0.418,
+      "max_dd_pct": -23.027,
+      "n_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_R": 0.0,
+      "profit_factor": 0.0,
+      "trades_per_month": 0.0,
+      "monthly_green_pct": 0.0,
+      "avg_win_inr": 0.0,
+      "avg_loss_inr": 0.0,
+      "final_equity_inr": 1176171.25
+    }
+  },
+  "ytd_2026": {
+    "from": "2026-01-01",
+    "to": "2026-06-19",
+    "n_days": 169,
+    "years": 0.463,
+    "total_return_pct": -22.897,
+    "cagr_pct": -42.992,
+    "sharpe_annual": -4.367,
+    "sortino_annual": -7.084,
+    "max_dd_pct": -22.544,
+    "n_trades": 182,
+    "win_rate_pct": 40.66,
+    "avg_R": -0.17,
+    "profit_factor": 0.624,
+    "trades_per_month": 32.78,
+    "monthly_green_pct": 0.0,
+    "avg_win_inr": 5127.83,
+    "avg_loss_inr": -5633.57,
+    "final_equity_inr": 771034.26,
+    "by_exit_reason": {
+      "eod_flat": {
+        "n": 9,
+        "sum": -7192.5,
+        "mean": -799.17,
+        "win_rate": 44.44
+      },
+      "stop": {
+        "n": 82,
+        "sum": -551058.75,
+        "mean": -6720.23,
+        "win_rate": 0.0
+      },
+      "target": {
+        "n": 89,
+        "sum": 340985.51,
+        "mean": 3831.3,
+        "win_rate": 78.65
+      },
+      "time_stop": {
+        "n": 2,
+        "sum": -11700.0,
+        "mean": -5850.0,
+        "win_rate": 0.0
+      }
+    },
+    "buy_and_hold": {
+      "from": "2026-01-01",
+      "to": "2026-06-19",
+      "n_days": 169,
+      "years": 0.463,
+      "total_return_pct": -15.938,
+      "cagr_pct": -31.287,
+      "sharpe_annual": -1.143,
+      "sortino_annual": -1.742,
+      "max_dd_pct": -29.305,
+      "n_trades": 0,
+      "win_rate_pct": 0.0,
+      "avg_R": 0.0,
+      "profit_factor": 0.0,
+      "trades_per_month": 0.0,
+      "monthly_green_pct": 0.0,
+      "avg_win_inr": 0.0,
+      "avg_loss_inr": 0.0,
+      "final_equity_inr": 840617.5
+    }
+  },
+  "full_window_with_charges": {
+    "from": "2024-01-01",
+    "to": "2026-06-19",
+    "n_days": 900,
+    "years": 2.464,
+    "total_return_pct": -309.862,
+    "cagr_pct": null,
+    "sharpe_annual": -10.099,
+    "sortino_annual": -14.64,
+    "max_dd_pct": -310.299,
+    "n_trades": 978,
+    "win_rate_pct": 29.04,
+    "avg_R": -0.575,
+    "profit_factor": 0.277,
+    "trades_per_month": 33.08,
+    "monthly_green_pct": 0.0,
+    "avg_win_inr": 4189.9,
+    "avg_loss_inr": -6179.47,
+    "final_equity_inr": -2098621.35
+  }
+}
