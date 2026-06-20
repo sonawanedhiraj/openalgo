@@ -237,12 +237,7 @@ class StartBot(Resource):
                 return make_response(jsonify({"status": "error", "message": message}), 500)
 
             # Start bot
-            if config.get("polling_mode", True):
-                success, message = run_async(bot.start_polling())
-            else:
-                # Webhook mode would be configured separately
-                success = True
-                message = "Bot initialized for webhook mode"
+            success, message = telegram_bot_service.start_bot()
 
             if success:
                 return make_response(jsonify({"status": "success", "message": message}), 200)
@@ -411,7 +406,7 @@ class BroadcastMessage(Resource):
                 )
 
             message = data.get("message")
-            filters = data.get("filters", {})
+            data.get("filters", {})
 
             if not message or not isinstance(message, str):
                 return make_response(

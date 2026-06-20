@@ -120,7 +120,7 @@ def get_margin_data(auth_token: str) -> dict[str, str]:
             pnl = processed_funds.get("realized_profit_and_loss", {})
             real_pnl_equity = float(pnl.get("equity_amount", 0))
             real_pnl_commodity = float(pnl.get("commodity_amount", 0))
-            total_real_pnl = real_pnl_equity + real_pnl_commodity
+            real_pnl_equity + real_pnl_commodity
 
             # Get utilized amount
             utilized = processed_funds.get("utilized_amount", {})

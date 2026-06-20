@@ -405,15 +405,13 @@ def calculate_portfolio_statistics(holdings_data):
             float(holding.get("npoadqty", 0)), float(holding.get("dpqty", 0))
         )
         upload_price = float(holding.get("upldprc", 0))
-        market_price = float(
-            nse_entry.get("upldprc", 0)
-        )  # Assuming 'pp' is the market price for NSE
+        float(nse_entry.get("upldprc", 0))  # Assuming 'pp' is the market price for NSE
 
         # Calculate investment value and holding value for NSE
         inv_value = quantity * upload_price
         holding_value = quantity * upload_price
         profit_and_loss = holding_value - inv_value
-        pnl_percentage = (profit_and_loss / inv_value) * 100 if inv_value != 0 else 0
+        (profit_and_loss / inv_value) * 100 if inv_value != 0 else 0
 
         # Accumulate the totals
         # totalholdingvalue += holding_value

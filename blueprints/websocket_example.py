@@ -448,13 +448,13 @@ def example_usage():
 
     # Example 2: Get LTP directly from cache
     market_service = get_market_data_service()
-    ltp = market_service.get_ltp("RELIANCE", "NSE")
+    market_service.get_ltp("RELIANCE", "NSE")
 
     # Example 3: Subscribe to updates
     def my_callback(data):
         print(f"Received update: {data}")
 
-    subscriber_id = subscribe_to_market_updates("ltp", my_callback, {"NSE:RELIANCE", "NSE:TCS"})
+    subscribe_to_market_updates("ltp", my_callback, {"NSE:RELIANCE", "NSE:TCS"})
 
     # Example 4: Get market data for a user
     success, data, status = get_market_data(user_id, "RELIANCE", "NSE")

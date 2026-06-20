@@ -426,7 +426,7 @@ class ZerodhaWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                     # Get subscription info to determine exchange and subscribed modes
                     with self.lock:
-                        for key, sub_info in self.subscribed_symbols.items():
+                        for _key, sub_info in self.subscribed_symbols.items():
                             if sub_info["token"] == token:
                                 # Found a subscription for this token
                                 subscription_exchange = sub_info["exchange"]

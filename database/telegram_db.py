@@ -665,7 +665,7 @@ def get_command_stats(days: int = 7) -> dict:
             .all()
         )
 
-        commands_by_type = {cmd: count for cmd, count in command_counts}
+        commands_by_type = dict(command_counts)
 
         # Active users
         active_users = (

@@ -25,7 +25,7 @@ def map_order_data(order_data):
     if isinstance(order_data, dict):
         if "data" in order_data and order_data.get("data") is not None:
             orders = order_data["data"]
-        elif order_data.get("status") == False or order_data.get("error"):
+        elif not order_data.get("status") or order_data.get("error"):
             logger.info(f"No data available or error in response: {order_data}")
             return []
         else:
@@ -275,7 +275,7 @@ def map_trade_data(trade_data):
     if isinstance(trade_data, dict):
         if "data" in trade_data and trade_data.get("data") is not None:
             orders = trade_data["data"]
-        elif trade_data.get("status") == False or trade_data.get("error"):
+        elif not trade_data.get("status") or trade_data.get("error"):
             logger.info(f"No trade data available or error: {trade_data}")
             return []
         else:

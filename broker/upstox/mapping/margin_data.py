@@ -119,7 +119,7 @@ def parse_margin_response(response_data):
         final_margin = data.get("final_margin", 0)
 
         # Calculate margin benefit (difference between required and final margin)
-        margin_benefit = required_margin - final_margin
+        required_margin - final_margin
 
         # Extract margin breakdown (array of margins per instrument)
         margins = data.get("margins", [])

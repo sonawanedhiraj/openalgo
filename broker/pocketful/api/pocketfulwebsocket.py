@@ -545,14 +545,14 @@ class PocketfulSocket:
     def subscribe_order_update(self, orderupdate_payload):
         subscription_pkt = [orderupdate_payload["client_id"], "web"]
         th_order_update = threading.Thread(
-            target=send_message, args=("OrderUpdateMessage", subscription_pkt)
+            target=self.send_message, args=("OrderUpdateMessage", subscription_pkt)
         )
         th_order_update.start()
 
     def unsubscribe_order_update(self, orderupdate_payload):
         unsubscription_pkt = [orderupdate_payload["client_id"], "web"]
         th_order_update = threading.Thread(
-            target=unsubscribe_update, args=("OrderUpdateMessage", unsubscription_pkt)
+            target=self.unsubscribe_update, args=("OrderUpdateMessage", unsubscription_pkt)
         )
         th_order_update.start()
 
@@ -563,14 +563,14 @@ class PocketfulSocket:
     def subscribe_trade_update(self, tradeupdate_payload):
         subscription_pkt = [tradeupdate_payload["client_id"], "web"]
         th_trade_update = threading.Thread(
-            target=send_message, args=("TradeUpdateMessage", subscription_pkt)
+            target=self.send_message, args=("TradeUpdateMessage", subscription_pkt)
         )
         th_trade_update.start()
 
     def unsubscribe_trade_update(self, tradeupdate_payload):
         unsubscription_pkt = [tradeupdate_payload["client_id"], "web"]
         th_trade_update = threading.Thread(
-            target=unsubscribe_update, args=("OrderUpdateMessage", unsubscription_pkt)
+            target=self.unsubscribe_update, args=("OrderUpdateMessage", unsubscription_pkt)
         )
         th_trade_update.start()
 

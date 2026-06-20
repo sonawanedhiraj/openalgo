@@ -350,7 +350,7 @@ class SamcoWebSocketAdapter(BaseBrokerWebSocketAdapter):
         # Group subscriptions by mode and batch them into single requests
         with self.lock:
             subscriptions_by_mode = {}
-            for correlation_id, sub in self.subscriptions.items():
+            for _correlation_id, sub in self.subscriptions.items():
                 mode = sub["mode"]
                 if mode not in subscriptions_by_mode:
                     subscriptions_by_mode[mode] = []

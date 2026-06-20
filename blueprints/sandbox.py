@@ -641,7 +641,7 @@ def my_pnl():
         import pytz
 
         user_id = session.get("user")
-        ist = pytz.timezone("Asia/Kolkata")
+        pytz.timezone("Asia/Kolkata")
 
         # Get all positions (both open and closed) for P&L history
         positions = (

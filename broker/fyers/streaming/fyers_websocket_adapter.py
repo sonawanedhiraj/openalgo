@@ -283,7 +283,6 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             with self.lock:
                 # Convert to OpenAlgo format
-                symbol_info = [{"exchange": exchange, "symbol": symbol}]
 
                 # Create a unique callback for this specific subscription
                 # Capture the original subscription details
@@ -345,7 +344,6 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
                         actual_symbol = symbol[:-3]
                         use_tbt = True
                         # Update symbol_info with actual symbol for broker API
-                        symbol_info = [{"exchange": exchange, "symbol": actual_symbol}]
                         # Keep original_symbol as "TCS:50" for ZeroMQ topic matching
                         # The client subscribed with "TCS:50", so we must publish with that
 
@@ -425,7 +423,7 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
                 if key in self.subscriptions:
                     # Remove from our subscription tracking
-                    subscription_info = self.subscriptions.pop(key)
+                    self.subscriptions.pop(key)
 
                     self.logger.info(f"Unsubscribe for {exchange}:{symbol} (mode: {mode})")
                     # self.logger.warning("Note: Fyers HSM doesn't support selective unsubscription - data will stop publishing but HSM will continue receiving in background")
@@ -944,12 +942,12 @@ class FyersWebSocketAdapter(BaseBrokerWebSocketAdapter):
             elif mode == 2:  # Quote
                 # Convert all price fields from paise to rupees using correct field names
                 raw_ltp = fyers_data.get("ltp", 0)
-                raw_open = fyers_data.get("open_price", 0)
-                raw_high = fyers_data.get("high_price", 0)
-                raw_low = fyers_data.get("low_price", 0)
-                raw_close = fyers_data.get("prev_close_price", 0)
-                raw_bid = fyers_data.get("bid_price", 0)
-                raw_ask = fyers_data.get("ask_price", 0)
+                fyers_data.get("open_price", 0)
+                fyers_data.get("high_price", 0)
+                fyers_data.get("low_price", 0)
+                fyers_data.get("prev_close_price", 0)
+                fyers_data.get("bid_price", 0)
+                fyers_data.get("ask_price", 0)
 
                 # Data is already properly mapped by FyersDataMapper with OHLC fields
                 # Debug log to see if we have the proper data now

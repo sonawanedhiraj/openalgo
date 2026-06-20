@@ -1089,7 +1089,7 @@ def load_and_check_env_variables() -> None:
 
     # Special validation for broker-specific API key formats
     broker_api_key = os.getenv("BROKER_API_KEY", "")
-    broker_api_secret = os.getenv("BROKER_API_SECRET", "")
+    os.getenv("BROKER_API_SECRET", "")
     redirect_url = os.getenv("REDIRECT_URL", "")
 
     # Extract broker name from redirect URL for validation
@@ -1206,7 +1206,7 @@ def load_and_check_env_variables() -> None:
         print("The application cannot start without valid broker configuration.")
         sys.exit(1)
 
-    valid_brokers = set(broker.strip().lower() for broker in valid_brokers_str.split(","))
+    valid_brokers = {broker.strip().lower() for broker in valid_brokers_str.split(",")}
 
     try:
         import re

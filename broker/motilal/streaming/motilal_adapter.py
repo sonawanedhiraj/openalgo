@@ -364,7 +364,7 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
         with self.lock:
             subscriptions_copy = dict(self.subscriptions)
 
-        for correlation_id, sub in subscriptions_copy.items():
+        for _correlation_id, sub in subscriptions_copy.items():
             try:
                 success = self.ws_client.register_scrip(
                     exchange=sub["motilal_exchange"],

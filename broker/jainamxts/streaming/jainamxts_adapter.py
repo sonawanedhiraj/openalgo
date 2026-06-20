@@ -681,7 +681,7 @@ class JainamXTSWebSocketAdapter(BaseBrokerWebSocketAdapter):
             active_modes = []
             mode_to_str = {1: "LTP", 2: "QUOTE", 3: "DEPTH"}
 
-            for correlation_id, sub in self.subscriptions.items():
+            for _correlation_id, sub in self.subscriptions.items():
                 if sub.get("symbol") == symbol and sub.get("exchange") == exchange:
                     active_modes.append(sub.get("mode"))
 

@@ -104,10 +104,10 @@ def get_api_response(endpoint, auth, method="POST", payload=None, custom_timeout
     except Exception as e:
         if "timeout" in str(e).lower():
             logger.error("Request timeout while calling Firstock API")
-            raise Exception("Request timeout - please try again with smaller date range")
+            raise Exception("Request timeout - please try again with smaller date range") from None
         elif "connection" in str(e).lower():
             logger.error("Connection error while calling Firstock API")
-            raise Exception("Connection error - please check your internet connection")
+            raise Exception("Connection error - please check your internet connection") from None
         else:
             logger.exception(f"API Error: {e}")
             raise
@@ -243,7 +243,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_quotes_batch(self, symbols: list) -> list:
         """
@@ -577,7 +577,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception(f"Error in get_history_chunked: {e}")
-            raise Exception(f"Error fetching chunked historical data: {str(e)}")
+            raise Exception(f"Error fetching chunked historical data: {str(e)}") from e
 
     def get_history_intraday_chunks(
         self, symbol: str, exchange: str, start_date, end_date
@@ -724,7 +724,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_history_intraday_chunks: {e}")
-            raise Exception(f"Error fetching 1m historical data: {str(e)}")
+            raise Exception(f"Error fetching 1m historical data: {str(e)}") from e
 
     def get_history(
         self, symbol: str, exchange: str, interval: str, start_date, end_date
@@ -1078,4 +1078,4 @@ class BrokerData:
 
         except Exception as e:
             logger.exception(f"Error in get_history: {e}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e

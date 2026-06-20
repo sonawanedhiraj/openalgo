@@ -9,9 +9,9 @@ from utils.httpx_client import get_httpx_client
 
 def authenticate_broker(code):
     try:
-        BROKER_API_KEY = os.getenv("BROKER_API_KEY")
+        os.getenv("BROKER_API_KEY")
         BROKER_API_SECRET = os.getenv("BROKER_API_SECRET")
-        REDIRECT_URL = os.getenv("REDIRECT_URL")
+        os.getenv("REDIRECT_URL")
 
         # For IndMoney, the access token is directly provided in BROKER_API_SECRET
         # No OAuth flow needed - just return the access token

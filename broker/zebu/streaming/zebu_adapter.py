@@ -110,10 +110,6 @@ class MarketDataCache:
         merged = cached.copy()
 
         # Define field categories
-        basic_fields = ["lp", "o", "h", "l", "c", "v", "ap", "pc", "ltq", "ltt", "tbq", "tsq"]
-        depth_prices = ["bp1", "bp2", "bp3", "bp4", "bp5", "sp1", "sp2", "sp3", "sp4", "sp5"]
-        depth_quantities = ["bq1", "bq2", "bq3", "bq4", "bq5", "sq1", "sq2", "sq3", "sq4", "sq5"]
-        depth_orders = ["bo1", "bo2", "bo3", "bo4", "bo5", "so1", "so2", "so3", "so4", "so5"]
 
         for key, value in new.items():
             if self._should_preserve_cached_value(key, value, cached):

@@ -74,7 +74,7 @@ def get_timings(date_str: str) -> tuple[bool, dict[str, Any], int]:
             return False, {"status": "error", "message": "Invalid date format. Use YYYY-MM-DD"}, 400
 
         # Validate date range (not too far in past or future)
-        today = date.today()
+        date.today()
         min_date = date(2020, 1, 1)
         max_date = date(2050, 12, 31)
 

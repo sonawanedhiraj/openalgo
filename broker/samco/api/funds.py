@@ -31,7 +31,7 @@ def get_margin_data(auth_token):
 
     if margin_data.get("status") == "Success":
         equity_limit = margin_data.get("equityLimit", {})
-        commodity_limit = margin_data.get("commodityLimit", {})
+        margin_data.get("commodityLimit", {})
 
         # Use equity segment as the primary margin source
         # Samco reports the same fund pool under both equity and commodity segments

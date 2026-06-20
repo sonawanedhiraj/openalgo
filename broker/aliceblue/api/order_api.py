@@ -161,7 +161,7 @@ def get_positions(auth):
 def get_holdings(auth):
     """Fetch holdings from V2 API and normalize to old field names."""
     response = get_api_response("/open-api/od/v1/holdings/CNC", auth)
-    result = _extract_result(response)
+    _extract_result(response)
 
 
 # --- Per-Symbol Smart Order Lock ---
@@ -207,19 +207,6 @@ def _invalidate_position_cache(auth):
     """Invalidate the position cache so the next queued order fetches fresh data."""
     with _position_cache_lock:
         _position_cache.pop(auth, None)
-
-    if result is None:
-        # V2 API returns error message when there are no holdings
-        msg = response.get("message", "")
-        if "No holding" in msg or "not found" in msg.lower() or "Failed to retrieve" in msg:
-            logger.info(f"No holdings found: {msg}")
-            return []
-        return {"stat": "Not_Ok", "emsg": msg or "Failed to fetch holdings"}
-
-    if not result:
-        return []
-
-    return [normalize_holding(h) for h in result]
 
 
 # ─── Open position lookup ────────────────────────────────────────────────────

@@ -1046,37 +1046,37 @@ class NodeExecutor:
             if isinstance(node, ast.Constant):
                 if isinstance(node.value, (int, float)):
                     return node.value
-                raise ValueError(f"Unsupported constant: {node.value}")
+                raise ValueError(f"Unsupported constant: {node.value}") from None
             elif isinstance(node, ast.BinOp):
                 left = _eval(node.left)
                 right = _eval(node.right)
                 op_type = type(node.op)
                 if op_type not in operators:
-                    raise ValueError(f"Unsupported operator: {op_type.__name__}")
+                    raise ValueError(f"Unsupported operator: {op_type.__name__}") from None
                 if op_type is ast.Pow:
                     if abs(right) > 100:
-                        raise ValueError(f"Exponent too large: {right} (max 100)")
+                        raise ValueError(f"Exponent too large: {right} (max 100)") from None
                 return operators[op_type](left, right)
             elif isinstance(node, ast.UnaryOp):
                 operand = _eval(node.operand)
                 op_type = type(node.op)
                 if op_type not in operators:
-                    raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
+                    raise ValueError(f"Unsupported unary operator: {op_type.__name__}") from None
                 return operators[op_type](operand)
             elif isinstance(node, ast.Expression):
                 return _eval(node.body)
             else:
-                raise ValueError(f"Unsupported expression type: {type(node).__name__}")
+                raise ValueError(f"Unsupported expression type: {type(node).__name__}") from None
 
         cleaned = expression.strip()
         if not cleaned:
-            raise ValueError("Empty expression")
+            raise ValueError("Empty expression") from None
 
         try:
             tree = ast.parse(cleaned, mode="eval")
             return float(_eval(tree))
         except SyntaxError as e:
-            raise ValueError(f"Invalid expression syntax: {e}")
+            raise ValueError(f"Invalid expression syntax: {e}") from None
 
     # === Utility Nodes ===
 

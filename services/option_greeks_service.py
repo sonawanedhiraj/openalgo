@@ -115,7 +115,7 @@ def parse_option_symbol(
         match = re.match(r"([A-Z]+)(\d{2})([A-Z]{3})(\d{2})([\d.]+)(CE|PE)", symbol.upper())
 
         if not match:
-            raise ValueError(f"Invalid option symbol format: {symbol}")
+            raise ValueError(f"Invalid option symbol format: {symbol}") from None
 
         base_symbol, day, month_str, year, strike_str, opt_type = match.groups()
 
@@ -152,7 +152,9 @@ def parse_option_symbol(
                     )
                 logger.info(f"Using custom expiry time: {custom_expiry_time}")
             except Exception as e:
-                raise ValueError(f"Failed to parse expiry_time '{custom_expiry_time}': {str(e)}")
+                raise ValueError(
+                    f"Failed to parse expiry_time '{custom_expiry_time}': {str(e)}"
+                ) from None
         else:
             # Use default expiry time based on exchange:
             # NFO/BFO: 15:30 (3:30 PM)
@@ -184,7 +186,7 @@ def parse_option_symbol(
 
     except Exception as e:
         logger.exception(f"Error parsing option symbol {symbol}: {e}")
-        raise ValueError(f"Failed to parse option symbol {symbol}: {str(e)}")
+        raise ValueError(f"Failed to parse option symbol {symbol}: {str(e)}") from None
 
 
 def get_underlying_exchange(base_symbol: str, options_exchange: str) -> str:

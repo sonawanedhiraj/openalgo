@@ -88,10 +88,6 @@ def get_margin_data(auth_token):
         collateral = 0.0
         net_margin = 0.0
         utilized_margin = 0.0
-        span_margin = 0.0
-        var_margin = 0.0
-        ext_loss_margin = 0.0
-        option_premium = 0.0
 
         # Extract values from Pocketful's response format
         # The values are in a list of [description, value] pairs

@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import struct
 import sys
 import threading
@@ -976,7 +977,7 @@ class DhanWebSocket:
 
             # Parse buy depth (5 levels)
             offset = 7  # Starting after token and exchange
-            for i in range(5):
+            for _i in range(5):
                 price = struct.unpack("<f", data[offset : offset + 4])[0]
                 offset += 4
                 quantity = struct.unpack("<I", data[offset : offset + 4])[0]
@@ -986,7 +987,7 @@ class DhanWebSocket:
                 buy_depth.append({"price": price, "quantity": quantity, "orders": orders})
 
             # Parse sell depth (5 levels)
-            for i in range(5):
+            for _i in range(5):
                 price = struct.unpack("<f", data[offset : offset + 4])[0]
                 offset += 4
                 quantity = struct.unpack("<I", data[offset : offset + 4])[0]
@@ -1606,7 +1607,7 @@ class DhanWebSocket:
                 feed_code = header[2]  # Single byte
                 exchange_segment = header[3]  # Single byte
                 security_id = struct.unpack("<i", header[4:8])[0]  # Little-endian
-                msg_sequence = struct.unpack("<I", header[8:12])[0]  # Little-endian (ignored)
+                struct.unpack("<I", header[8:12])[0]  # Little-endian (ignored)
                 logger.debug(
                     f"20-level depth header: length={msg_length}, feed_code={feed_code}, exchange={exchange_segment}, token={security_id}"
                 )
@@ -2088,7 +2089,7 @@ class DhanWebSocket:
                 logger.error(f"Error processing 20-level depth message (struct error): {e}")
                 logger.error(f"Exception type: {type(e).__name__}")
                 if "header" in locals():
-                    logger.error(f"Header hex: {header.hex()}")
+                    logger.error(f"Header hex: {header.hex()}")  # noqa: F821
                 logger.error(f"Full message length: {len(message)}")
                 # Log which parsing step failed
                 logger.error(f"msg_length parsed: {'msg_length' in locals()}")

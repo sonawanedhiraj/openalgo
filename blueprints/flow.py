@@ -450,7 +450,7 @@ def regenerate_webhook(workflow_id):
     from database.flow_db import get_workflow, regenerate_webhook_secret, regenerate_webhook_token
 
     new_token = regenerate_webhook_token(workflow_id)
-    new_secret = regenerate_webhook_secret(workflow_id)
+    regenerate_webhook_secret(workflow_id)
 
     if not new_token:
         return jsonify({"error": "Failed to regenerate token"}), 500

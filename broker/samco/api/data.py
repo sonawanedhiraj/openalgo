@@ -97,7 +97,9 @@ def get_api_response(endpoint, auth, method="GET", payload=None, max_retries=3):
         except json.JSONDecodeError:
             logger.error(f"Debug - Failed to parse response. Status code: {response.status_code}")
             logger.debug(f"Debug - Response text: {response.text}")
-            raise Exception(f"Failed to parse API response (status {response.status_code})")
+            raise Exception(
+                f"Failed to parse API response (status {response.status_code})"
+            ) from None
 
     # Should not reach here, but just in case
     raise Exception("Max retries exceeded")
@@ -226,7 +228,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def _get_index_quotes(self, symbol: str, exchange: str) -> dict:
         """
@@ -272,7 +274,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching index quotes: {str(e)}")
+            raise Exception(f"Error fetching index quotes: {str(e)}") from e
 
     def get_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -388,7 +390,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -452,7 +454,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """
@@ -670,7 +672,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Debug - Error: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def _get_historical_data(
         self,
@@ -920,4 +922,4 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Debug - Error fetching intraday data: {str(e)}")
-            raise Exception(f"Error fetching intraday data: {str(e)}")
+            raise Exception(f"Error fetching intraday data: {str(e)}") from e

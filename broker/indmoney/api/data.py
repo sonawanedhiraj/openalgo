@@ -61,7 +61,7 @@ def get_api_response(endpoint, auth, method="GET", params=None):
 
     except Exception as req_error:
         logger.error(f"Request failed: {str(req_error)}")
-        raise Exception(f"Failed to make request to Indmoney API: {str(req_error)}")
+        raise Exception(f"Failed to make request to Indmoney API: {str(req_error)}") from req_error
 
     # Add status attribute for compatibility with existing codebase
     res.status = res.status_code
@@ -116,7 +116,7 @@ def get_api_response(endpoint, auth, method="GET", params=None):
     except json.JSONDecodeError as e:
         logger.error(f"JSON decode error: {str(e)}")
         logger.error(f"Response text that failed to parse: {res.text}")
-        raise Exception(f"Indmoney API returned invalid JSON: {str(e)}")
+        raise Exception(f"Indmoney API returned invalid JSON: {str(e)}") from None
 
     # Handle Indmoney API error responses
     response_status = response.get("status")
@@ -451,7 +451,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """
@@ -554,7 +554,7 @@ class BrokerData:
         except Exception as e:
             logger.error(f"Error calling quotes API: {str(e)}")
             # Return error for all symbols in the batch
-            for scrip_code, original in symbol_map.items():
+            for _scrip_code, original in symbol_map.items():
                 results.append(
                     {
                         "symbol": original["symbol"],
@@ -783,7 +783,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_depth: {str(e)}", exc_info=True)
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def get_history(
         self, symbol: str, exchange: str, interval: str, start_date: str, end_date: str
@@ -984,7 +984,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching historical data: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def _date_to_timestamp_ms(self, date_str: str, end_of_day: bool = False) -> int:
         """Convert date string to Unix timestamp in milliseconds (IST)"""

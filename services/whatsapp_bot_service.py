@@ -930,13 +930,6 @@ class WhatsAppBotService:
         except Exception:
             logger.exception("Failed to persist own_jid")
 
-        @wa.on_disconnect
-        def _on_disconnect() -> None:
-            logger.warning("WhatsApp wars on_disconnect fired")
-            with self._lock:
-                self._is_running = False
-            self._emit("whatsapp_status", {"is_running": False, "is_paired": self.is_paired})
-
     def _dispatch_command(self, wa, msg, text: str) -> None:
         """Parse `/cmd arg1 arg2 ...` and route to the matching handler.
         Caller has already authenticated this as a message from the

@@ -739,7 +739,7 @@ if __name__ == "__main__":
     logger.info("Starting Sandbox Execution Engine")
 
     # Get check interval from config
-    from database.sandbox_db import init_db
+    from database.sandbox_db import get_config, init_db
 
     init_db()
 

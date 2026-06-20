@@ -184,7 +184,6 @@ def place_order_api(data, auth_token):
 
 def place_smartorder_api(data, auth_token):
     # If no API call is made in this function then res will return None
-    res = None
 
     # Extract necessary info from data
     symbol = data.get("symbol")

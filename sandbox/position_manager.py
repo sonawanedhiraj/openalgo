@@ -1069,11 +1069,10 @@ class PositionManager:
                 if position.product == "MIS":
                     # Auto square-off MIS positions at market close
                     # Create a reverse order to square off
-                    action = "SELL" if position.quantity > 0 else "BUY"
                     quantity = abs(position.quantity)
 
                     # Use last traded price or average price for square-off
-                    price = float(position.average_price) if position.average_price else 0
+                    float(position.average_price) if position.average_price else 0
 
                     # Update position to closed
                     position.quantity = 0
@@ -1158,7 +1157,7 @@ def update_all_positions_mtm():
             logger.debug("No positions to update")
             return
 
-        users = set(p.user_id for p in positions)
+        users = {p.user_id for p in positions}
         logger.info(f"Updating MTM for {len(positions)} positions across {len(users)} users")
 
         for user_id in users:
@@ -1186,7 +1185,7 @@ def process_all_users_settlement():
             logger.info("No positions to settle")
             return
 
-        users = set(p.user_id for p in positions)
+        users = {p.user_id for p in positions}
         logger.debug(f"Processing T+1 settlement for {len(users)} users at midnight")
 
         for user_id in users:
@@ -1398,7 +1397,7 @@ def catchup_missed_settlements():
 
         logger.info(f"Found {len(cnc_positions)} CNC positions that need catch-up settlement")
 
-        users = set(p.user_id for p in cnc_positions)
+        users = {p.user_id for p in cnc_positions}
 
         for user_id in users:
             try:

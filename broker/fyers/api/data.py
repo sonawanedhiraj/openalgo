@@ -163,7 +163,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception(f"Error fetching quotes for {exchange}:{symbol}")
-            raise Exception(f"Error fetching quotes: {e}")
+            raise Exception(f"Error fetching quotes: {e}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -223,7 +223,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _fetch_oi_for_symbol(self, br_symbol: str) -> int:
         """
@@ -581,7 +581,7 @@ class BrokerData:
         except Exception as e:
             error_msg = f"Error fetching historical data for {exchange}:{symbol}"
             logger.exception(error_msg)
-            raise Exception(f"{error_msg}: {e}")
+            raise Exception(f"{error_msg}: {e}") from e
 
     def get_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -649,4 +649,4 @@ class BrokerData:
 
         except Exception as e:
             logger.exception(f"Error fetching market depth for {exchange}:{symbol}")
-            raise Exception(f"Error fetching market depth: {e}")
+            raise Exception(f"Error fetching market depth: {e}") from e

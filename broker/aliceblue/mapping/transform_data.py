@@ -59,7 +59,7 @@ def transform_data(data):
     """
     Transform an OpenAlgo place-order request into an AliceBlue V2 API payload item.
     """
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
     token = get_token(data["symbol"], data["exchange"])
 
     return {

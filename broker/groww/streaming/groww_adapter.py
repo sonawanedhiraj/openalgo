@@ -138,14 +138,14 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             if not auth_token:
                 self.logger.error(f"No authentication token found for user {user_id}")
-                raise ValueError(f"No authentication token found for user {user_id}")
+                raise ValueError(f"No authentication token found for user {user_id}") from None
         else:
             # Use provided token
             auth_token = auth_data.get("auth_token")
 
             if not auth_token:
                 self.logger.error("Missing required authentication data")
-                raise ValueError("Missing required authentication data")
+                raise ValueError("Missing required authentication data") from None
 
         # Create WebSocket client with callbacks
         self.ws_client = GrowwNATSWebSocket(
@@ -698,7 +698,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.info(f"📦 Batch subscribing {len(batch_specs)} symbols")
                 sub_keys = self.ws_client.subscribe_batch(batch_specs)
 
-                for item, sub_key in zip(queue, sub_keys):
+                for item, sub_key in zip(queue, sub_keys, strict=False):
                     self.subscription_keys[item["correlation_id"]] = sub_key
 
                     if item["exchange"] in ["NFO", "BFO"]:
@@ -745,7 +745,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.info(f"📦 Reconnect: batch resubscribing {len(batch_specs)} symbols")
             with self.batch_lock:
                 sub_keys = self.ws_client.subscribe_batch(batch_specs)
-                for cid, sub_key in zip(correlation_ids, sub_keys):
+                for cid, sub_key in zip(correlation_ids, sub_keys, strict=False):
                     self.subscription_keys[cid] = sub_key
                 self._last_batch_flush_at = time.time()
         except Exception as e:
@@ -916,7 +916,7 @@ class GrowwWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # and an appropriately shaped payload. Depth-mode users always
             # see the merged snapshot (LTP+OHLC+volume+depth); LTP/Quote-mode
             # users see the raw normalized LTP fields.
-            for cid, subscription in matches:
+            for _, subscription in matches:
                 sub_symbol = subscription["symbol"]
                 sub_exchange = subscription["exchange"]
                 sub_mode = subscription["mode"]

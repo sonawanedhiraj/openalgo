@@ -8,7 +8,7 @@ import time as time_module
 import uuid
 from collections import deque
 from datetime import datetime, time
-from time import time
+from time import time as time_func
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -134,7 +134,7 @@ def process_orders():
                 pass  # No smart orders, continue to regular orders
 
             # Process regular orders (up to 10 per second)
-            now = time()
+            now = time_func()
 
             # Clean up old timestamps
             while last_regular_orders and now - last_regular_orders[0] > 1:
@@ -613,7 +613,7 @@ def configure_symbols(strategy_id):
                 try:
                     quantity = int(quantity)
                 except ValueError:
-                    raise ValueError("Quantity must be a valid number")
+                    raise ValueError("Quantity must be a valid number") from None
 
                 if quantity <= 0:
                     raise ValueError("Quantity must be greater than 0")

@@ -521,7 +521,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
             if not self.ws_client or not self.ws_client.sock or not self.ws_client.sock.connected:
                 self.logger.info("AliceBlue WebSocket not connected - attempting to reconnect...")
                 reconnect_result = self.connect()
-                if reconnect_result and reconnect_result.get("success") == False:
+                if reconnect_result and not reconnect_result.get("success"):
                     self.logger.error("Failed to reconnect to AliceBlue WebSocket")
                     return self._create_error_response(
                         "RECONNECT_FAILED", "Failed to reconnect to WebSocket"
@@ -896,9 +896,8 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     # Add message type
                     parsed_data["message_type"] = "dk"
                     # Store symbol info from dk message
-                    token = data.get("tk", "")
-                    exchange = data.get("e", "")
-                    symbol_key = f"{exchange}|{token}"
+                    data.get("tk", "")
+                    data.get("e", "")
                     if "ts" in data:
                         # Extract and clean symbol name
                         raw_symbol = data["ts"]

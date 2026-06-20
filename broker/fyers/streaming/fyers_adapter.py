@@ -363,7 +363,6 @@ class FyersAdapter:
                 return
 
             # Find matching subscription using HSM token or original symbol
-            callback = None
             openalgo_data_type = "Quote"  # Default
             matched_subscription = None
 

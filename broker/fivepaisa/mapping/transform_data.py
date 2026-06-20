@@ -8,7 +8,7 @@ def transform_data(data, token):
     """
     Transforms the new API request structure to the current expected structure.
     """
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
     # Basic mapping
     transformed = {
         "OrderType": map_action(data["action"].upper()),

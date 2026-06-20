@@ -1838,7 +1838,7 @@ def create_download_job(
                 # Prepare symbols DataFrame for batch insert
                 # Use atomic ID generation within the same transaction
                 if symbols:
-                    symbols_df = pd.DataFrame(
+                    pd.DataFrame(
                         [
                             {
                                 "job_id": job_id,
