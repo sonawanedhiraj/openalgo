@@ -97,6 +97,24 @@ jobs:
           test -f .env && echo "✅ .env file created successfully" || echo "❌ .env file creation failed"
           ls -lh .env
 
+      - name: Preflight — runner can reach Docker daemon
+        run: |
+          if ! docker version --format '{{.Server.Version}}' 2>/dev/null; then
+            echo "::error::Runner cannot reach the Docker daemon."
+            echo "::error::Likely cause: /var/run/docker.sock not mounted in the runner container."
+            echo "::error::Fix: add docker-compose.override.yml in C:\\actions-runner\\ with:"
+            echo "::error::  services: {gh-runner: {volumes: [/var/run/docker.sock:/var/run/docker.sock]}}"
+            echo "::error::Then: docker rm -f openalgo-gh-runner && cd C:\\actions-runner && docker compose up -d"
+            exit 1
+          fi
+          AVAIL=$(df / --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G ' || echo 999)
+          if [ "${AVAIL:-999}" -lt 5 ]; then
+            echo "::error::Runner disk has only ${AVAIL}GB free (need ≥5 GB for Docker build)."
+            echo "::error::Run: docker system prune -f"
+            exit 1
+          fi
+          echo "✅ Preflight: Docker $(docker version --format '{{.Server.Version}}'), ${AVAIL}GB disk free"
+
       - name: Build Docker image
         run: |
           echo "Building Docker image..."
