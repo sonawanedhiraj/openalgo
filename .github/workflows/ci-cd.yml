@@ -39,6 +39,10 @@ jobs:
             --ignore=test/test_bridge_server.py \
             --ignore=test/test_email_functionality.py \
             -v --tb=short
+        env:
+          API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
 
       - name: Report CI status
         if: always()
