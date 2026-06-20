@@ -1,0 +1,107 @@
+name: Issue lifecycle (auto-close + link-guard)
+
+# Two responsibilities, both grounded in the task-tracking workflow
+# (see docs/TASK_CAPABILITIES.md and CLAUDE.md → "Task Tracking"):
+#
+#   1. autoclose  — when a PR merges into dev/main, close the issues it
+#                   references via `Closes #N`. GitHub's native keyword
+#                   auto-close only fires on merges to the DEFAULT branch, and
+#                   our PRs target `dev`, so we close them ourselves.
+#
+#   2. link-guard — a code-changing PR into dev/main MUST reference an issue
+#                   (`Closes #N`). Intended to be a REQUIRED status check.
+#                   Runs on EVERY PR (no path filter) so it always reports a
+#                   conclusion and can never get stuck in "expected".
+#                   Docs-only PRs pass with a reminder instead of failing.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, closed]
+    branches: [dev, main]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  autoclose:
+    name: autoclose
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close referenced issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Extract issue numbers after close keywords (closes/fixes/resolves).
+          nums=$(printf '%s' "$PR_BODY" \
+            | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) +#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -u || true)
+          if [ -z "${nums:-}" ]; then
+            echo "No close keywords in PR #$PR_NUM body — nothing to close."
+            exit 0
+          fi
+          for n in $nums; do
+            echo "Closing issue #$n (referenced by merged PR #$PR_NUM)"
+            gh issue close "$n" --repo "$REPO" \
+              --comment "Auto-closed by merged PR #$PR_NUM." || \
+              echo "  (could not close #$n — may already be closed)"
+          done
+
+  link-guard:
+    name: link-guard
+    # Run on all non-close events so the required check always reports.
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an issue link on code changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          has_link=$(printf '%s' "$PR_BODY" \
+            | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) +#[0-9]+' || true)
+
+          # Determine whether the PR changes any non-docs (code) file.
+          files=$(gh pr diff "$PR_NUM" --repo "$REPO" --name-only 2>/dev/null || true)
+          if [ -z "${files:-}" ]; then
+            echo "Could not list changed files; treating as code change to be safe."
+            code_changed=1
+          else
+            # Docs-only = every changed path is *.md or under docs/.
+            code_changed=0
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                *.md|docs/*) : ;;            # docs — ignore
+                *) code_changed=1 ;;          # anything else counts as code
+              esac
+            done <<< "$files"
+          fi
+
+          if [ -n "$has_link" ]; then
+            echo "✅ PR #$PR_NUM links an issue: $has_link"
+            exit 0
+          fi
+
+          if [ "$code_changed" -eq 0 ]; then
+            echo "ℹ️ Docs-only PR with no issue link — allowed, but please open a"
+            echo "   type:docs issue and add 'Closes #N' so the work is tracked."
+            exit 0
+          fi
+
+          echo "::error::This PR changes code but does not reference an issue."
+          echo "Add 'Closes #<issue>' to the PR description (open one with the"
+          echo "type:* / area:* / session:* labels first). See docs/TASK_CAPABILITIES.md."
+          exit 1
