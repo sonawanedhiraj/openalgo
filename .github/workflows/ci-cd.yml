@@ -14,6 +14,13 @@ on:
       - 'strategies/STRATEGY_REGISTRY.md'
       - '*.md'
 
+# Supersede in-progress runs for the same ref so a new push to a PR cancels the
+# previous CI/CD instead of piling a second run onto the single self-hosted
+# runner (see issue #17 — runner starvation).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ============================================================================
   # STAGE 1: CI - Unit and Integration Tests (Native Python, Parallelized)
