@@ -43,6 +43,55 @@ Quick checks:
 2. `mcp__session_info__list_sessions` + `read_transcript` on today's "Fno scan cycle" sessions
 3. Then errors.jsonl (filter pytest noise per memory)
 
+## Task Tracking — Every Task Is a GitHub Issue
+
+Every unit of work — feature, bug fix, documentation, **or backtest round** —
+is tracked as a labelled GitHub issue and closed when its work merges. This
+applies to **all** sessions: interactive Claude Code, bridge-spawned `claude -p`
+(it inherits this file via `cwd=PROJECT_ROOT`), and Cowork dispatch (read-only —
+see the carve-out below). Capability reference:
+[`docs/TASK_CAPABILITIES.md`](docs/TASK_CAPABILITIES.md).
+
+**The lifecycle (do this for every task):**
+
+1. **Open or attach.** Before starting, `gh issue list --search "<keywords>"`.
+   Reuse an existing issue or create one:
+   `gh issue create --title "..." --label "type:<bug|enhancement|docs|infra|incident|strategy>" --label "area:<…>" --label "session:claude-code"`.
+   Capture the issue number `N`.
+2. **Branch by number.** `git checkout -b <type>/<N>-<slug>` (e.g.
+   `feat/42-add-foo`). For parallel work, use a **git worktree** (below).
+3. **Link the PR.** The PR description **MUST** contain `Closes #N`. This is a
+   **required check** (`link-guard`): a code-changing PR with no issue link
+   cannot merge. Docs-only PRs are exempt from the block but should still link a
+   `type:docs` issue.
+4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
+   (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
+   keyword close only fires on the default branch, so we do it ourselves).
+   No-PR/manual work (a doc edit, a closed-as-wontfix) → close it yourself with
+   a result comment.
+
+**Labels** (filterable; bootstrap via `bash scripts/gh/bootstrap_labels.sh`):
+`type:*` (kind), `status:*` (lifecycle), `session:*` (which session opened it),
+`area:*` (subsystem), `P0/P1/P2` (priority), `strategy:backtest-round` (each
+backtest round gets its own issue linked to the registry entry).
+
+**Parallel tasks — use git worktrees (load-bearing).** Concurrent code-editing
+tasks must run in their own `git worktree` (`Agent(isolation: "worktree")` or
+`git worktree add ../wt-<N> <branch>`). Two agents committing in the *same*
+checkout deadlock `pre-commit` (git-stash collision) and the killed stash
+**silently reverts working-tree edits**. A worktree gives each task its own
+index. Recovery if edits vanish: `.cache/pre-commit/patch*` → `git apply
+--cached` → `uv run ruff` → `git commit --no-verify` → push. Fresh worktrees
+lack the gitignored `.env` — `cp` it in before importing anything that reads
+`API_KEY_PEPPER`.
+
+**Cowork read-only carve-out.** Cowork dispatch tasks are read-only on code
+(see "Scheduled Tasks Audit-Trail Policy") — they **open** a `session:cowork`
+issue (or append to `audit/proposed_fixes.jsonl`) describing the problem, then
+exit. A Claude Code/bridge session does the code change, links `Closes #N`, and
+closes it. The create→work→close lifecycle is **asymmetric**: Cowork opens, an
+editing session closes.
+
 ## Documentation discipline — change docs WITH code, not after
 
 When any architectural change ships, the matching documentation update ships in the SAME commit. Not in a follow-up. Doc drift starts the moment code lands.
