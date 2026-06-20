@@ -11,7 +11,7 @@ on:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -38,10 +38,10 @@ jobs:
       - name: Build the production image
         run: docker compose build
 
-      - name: Run unit + integration tests INSIDE the container
+      - name: Run unit + integration tests INSIDE the container (parallelized)
         run: |
           docker compose run --rm --no-deps -e DATABASE_URL="" openalgo \
-            /app/.venv/bin/python -m pytest /app/test/ -x -q --ignore=/app/test/e2e --ignore=/app/test/test_bridge_server.py --ignore=/app/test/test_email_functionality.py
+            /app/.venv/bin/python -m pytest /app/test/ -n auto --ignore=/app/test/e2e --ignore=/app/test/test_bridge_server.py --ignore=/app/test/test_email_functionality.py
 
       - name: Run E2E tests INSIDE the container
         run: |
