@@ -99,3 +99,4 @@ docker compose -p openalgo-smoke down -v
 > `./.env`; the `-p` project prefix does **not** override a fixed container name,
 > so stop the live `openalgo-web` first if it is containerised, or prefer the
 > `scripts/docker_smoke.sh` `docker run` path which has no such clash.
+# CD Pipeline Status Check Activation
