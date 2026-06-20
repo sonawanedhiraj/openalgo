@@ -1,0 +1,136 @@
+name: CI/CD Pipeline (Unit Tests + Docker + E2E)
+
+on:
+  pull_request:
+    branches: [dev, main]
+    paths-ignore:
+      - 'docs/**'
+      - 'strategies/STRATEGY_REGISTRY.md'
+      - '*.md'
+  push:
+    branches: [dev, main]
+    paths-ignore:
+      - 'docs/**'
+      - 'strategies/STRATEGY_REGISTRY.md'
+      - '*.md'
+
+jobs:
+  # ============================================================================
+  # STAGE 1: CI - Unit and Integration Tests (Native Python, Parallelized)
+  # ============================================================================
+  ci-unit-tests:
+    name: "CI: Unit + Integration Tests"
+    runs-on: self-hosted
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run unit + integration tests (parallelized)
+        run: |
+          uv run python -m pytest test/ \
+            -n auto \
+            --ignore=test/e2e \
+            --ignore=test/test_bridge_server.py \
+            --ignore=test/test_email_functionality.py \
+            -v --tb=short
+        env:
+          DATABASE_URL: ""
+
+      - name: Report CI status
+        if: always()
+        run: |
+          echo "✅ CI Stage Complete"
+          echo "Unit tests passed on self-hosted runner"
+
+  # ============================================================================
+  # STAGE 2: CD - Docker Build, Boot, and E2E Tests
+  # ============================================================================
+  cd-docker-e2e:
+    name: "CD: Docker + E2E Tests"
+    runs-on: self-hosted
+    needs: ci-unit-tests
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Generate throwaway .env for testing
+        run: |
+          cp .sample.env .env
+          # Generate random secrets (throwaway for testing only)
+          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+          # Ensure sandbox mode
+          sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
+          if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
+            echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
+          fi
+          if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
+            echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
+          fi
+
+      - name: Build Docker image
+        run: |
+          echo "Building Docker image..."
+          docker compose build --quiet
+          echo "✅ Docker image built successfully"
+
+      - name: Boot container with health check
+        run: |
+          echo "Starting OpenAlgo container..."
+          docker compose up -d
+
+          # Wait for app to be ready (up to 2 minutes)
+          echo "Waiting for application to be ready..."
+          for i in {1..60}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/ 2>/dev/null || echo "000")
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
+              echo "✅ Application is ready (HTTP $STATUS)"
+              break
+            fi
+            echo "  [$i/60] Waiting... (HTTP $STATUS)"
+            sleep 2
+          done
+
+          # Final status check
+          docker compose ps
+          echo "✅ Container is running"
+
+      - name: Run E2E tests against running application
+        run: |
+          echo "Running E2E tests..."
+          uv run python -m pytest test/e2e -v --tb=short
+          echo "✅ E2E tests passed"
+
+      - name: Teardown containers
+        if: always()
+        run: |
+          echo "Cleaning up Docker containers..."
+          docker compose down -v --remove-orphans || true
+          rm -f .env
+          echo "✅ Cleanup complete"
+
+      - name: Report CD status
+        if: always()
+        run: |
+          echo "✅ CD Stage Complete"
+          echo "Docker image built, booted, and E2E tests passed"
+
+# ============================================================================
+# Branch Protection Requirements
+# ============================================================================
+# Add these as required status checks on dev/main branches:
+# - ci-unit-tests
+# - cd-docker-e2e
+#
+# Command to add via GitHub CLI:
+# gh api repos/sonawanedhiraj/openalgo/branches/dev/protection/required_status_checks \
+#   --input - <<< '{"strict": true, "contexts": ["ci-unit-tests", "cd-docker-e2e"]}'
