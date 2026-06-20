@@ -32,20 +32,16 @@ repos:
     rev: 1.8.6
     hooks:
       - id: bandit
-        # Skipped IDs are all pre-existing patterns in app.py / historify_db.py /
-        # other long-running modules. CLAUDE.md's stated bandit policy is
-        # "non-blocking initially" — these checks fire on existing code that
-        # otherwise blocks every commit that touches the file even when the diff
-        # introduces nothing new. Higher-signal checks (B102 exec, B301 pickle,
-        # B501 weak TLS, etc.) keep enforcing.
-        #
-        # B104 hardcoded_bind_all_interfaces  — 0.0.0.0 listen in app.py
-        # B110 try_except_pass                — best-effort cleanup paths
-        # B404 import_subprocess               — subprocess module use in app.py
-        # B603 subprocess_without_shell_equals_true
-        # B607 start_process_with_partial_path
-        # B608 hardcoded_sql_expressions       — parameterised SQL with column-only f-string interpolation
-        args: ["-x", ".venv,frontend,test", "-s", "B104,B110,B404,B603,B607,B608"]
+        # -s B608,B110: B608 (hardcoded-SQL f-string) and B110 (try/except/pass)
+        # both have many pre-existing instances in database/historify_db.py —
+        # parameterised UPDATE/SELECT queries that interpolate only validated
+        # column names (values stay bound to ? placeholders) and best-effort
+        # cleanup paths. CLAUDE.md's stated bandit policy is "non-blocking
+        # initially" — these two checks fire pre-existing noise that
+        # otherwise blocks every commit that touches the file, even when the
+        # diff itself introduces no SQL or new except-pass. Keep the rest
+        # (B102 exec, B301 pickle, B501 weak TLS, etc.) enforcing.
+        args: ["-x", ".venv,frontend,test", "-s", "B608,B110"]
         files: \.py$
 
   # Custom silent-drop rules — see .semgrep/silent-drops.yml +

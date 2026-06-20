@@ -179,6 +179,21 @@ def init_database():
             )
         """)
 
+        # job_items.id sequence — replaces the hand-rolled MAX(id)+ROW_NUMBER()
+        # pattern that raced on 2026-06-19 (Duplicate key "id: 4074") when the
+        # scanner-universe boot convergence + periodic loop computed the same
+        # MAX. Seeded past the current max so existing rows are honoured even
+        # after a restart on a non-empty job_items.
+        #
+        # DuckDB exposes neither setval() nor ALTER SEQUENCE RESTART; the only
+        # documented way to anchor a sequence past existing data is DROP +
+        # CREATE with START. Doing this in init_database is safe because init
+        # is idempotent and serial (called once at boot before any other
+        # caller touches the sequence).
+        current_max = conn.execute("SELECT COALESCE(MAX(id), 0) FROM job_items").fetchone()[0]
+        conn.execute("DROP SEQUENCE IF EXISTS seq_job_items")
+        conn.execute(f"CREATE SEQUENCE seq_job_items START WITH {int(current_max) + 1}")
+
         # Symbol Metadata Table - enriched symbol info for display
         conn.execute("""
             CREATE TABLE IF NOT EXISTS symbol_metadata (
@@ -1835,10 +1850,14 @@ def create_download_job(
                     ],
                 )
 
-                # Prepare symbols DataFrame for batch insert
-                # Use atomic ID generation within the same transaction
+                # Prepare symbols DataFrame for batch insert. NOTE the binding
+                # is load-bearing: the SQL below resolves ``symbols_df`` via
+                # DuckDB's Python-frame scan. Prior to the 2026-06-19 fix this
+                # DataFrame was created unbound (no ``=``) and DuckDB picked
+                # it up by accident — fragile and not how DuckDB's contract
+                # is documented.
                 if symbols:
-                    pd.DataFrame(
+                    symbols_df = pd.DataFrame(  # noqa: F841 — resolved by DuckDB from frame locals
                         [
                             {
                                 "job_id": job_id,
@@ -1850,12 +1869,15 @@ def create_download_job(
                         ]
                     )
 
-                    # Atomic batch insert with computed IDs using ROW_NUMBER
-                    # This generates IDs atomically without race conditions
+                    # Race-safe ID generation via a DB-level sequence. The
+                    # prior MAX(id)+ROW_NUMBER() pattern raced when two
+                    # callers computed MAX simultaneously (the 2026-06-19
+                    # scanner-universe boot+periodic overlap → "Duplicate
+                    # key id: 4074"). nextval is atomic per row.
                     conn.execute("""
                         INSERT INTO job_items (id, job_id, symbol, exchange, status)
                         SELECT
-                            (SELECT COALESCE(MAX(id), 0) FROM job_items) + ROW_NUMBER() OVER () as id,
+                            nextval('seq_job_items') AS id,
                             job_id, symbol, exchange, status
                         FROM symbols_df
                     """)
@@ -1863,7 +1885,18 @@ def create_download_job(
                 conn.execute("COMMIT")
 
             except Exception as inner_e:
-                conn.execute("ROLLBACK")
+                # Idempotent rollback — if the failing statement already
+                # auto-aborted the transaction (DuckDB does this on
+                # constraint violations), a manual ROLLBACK raises "cannot
+                # rollback - no transaction is active" and the *real*
+                # error is masked. The 2026-06-19 15:31 catch-up surfaced
+                # this exact mask. Swallow the secondary error only.
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception as rb_err:
+                    logger.debug(
+                        "create_download_job rollback no-op (txn already ended): %s", rb_err
+                    )
                 raise inner_e
 
         logger.info(f"Created download job {job_id} with {len(symbols)} symbols")
