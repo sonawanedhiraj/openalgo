@@ -39,8 +39,6 @@ jobs:
             --ignore=test/test_bridge_server.py \
             --ignore=test/test_email_functionality.py \
             -v --tb=short
-        env:
-          DATABASE_URL: ""
 
       - name: Report CI status
         if: always()
