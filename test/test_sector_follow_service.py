@@ -48,22 +48,22 @@ def _isolate_runtime_override(monkeypatch):
 
 
 def _config(**overrides) -> SectorFollowConfig:
-    base = dict(
-        capital_inr=250000.0,
-        max_position_inr=50000.0,
-        max_concurrent_positions=5,
-        gate_sector_pct=1.0,
-        gate_stock_pct=0.5,
-        gate_vol_mult=1.0,
-        daily_loss_kill_pct=3.0,
-        cost_pct_round_trip=0.0857,
-        vol_avg_lookback_days=20,
-        broker="zerodha",
-        exchange="NSE",
-        product="CNC",
-        universe=["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"],
-        strategy_id=99,
-    )
+    base = {
+        "capital_inr": 250000.0,
+        "max_position_inr": 50000.0,
+        "max_concurrent_positions": 5,
+        "gate_sector_pct": 1.0,
+        "gate_stock_pct": 0.5,
+        "gate_vol_mult": 1.0,
+        "daily_loss_kill_pct": 3.0,
+        "cost_pct_round_trip": 0.0857,
+        "vol_avg_lookback_days": 20,
+        "broker": "zerodha",
+        "exchange": "NSE",
+        "product": "CNC",
+        "universe": ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"],
+        "strategy_id": 99,
+    }
     base.update(overrides)
     return SectorFollowConfig(**base)
 

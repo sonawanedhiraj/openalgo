@@ -269,7 +269,7 @@ def main():
         print("✅ Connected successfully!")
 
         # Inform about all exchanges subscribed
-        exchanges = sorted(set(s["exchange"] for s in test_symbols))
+        exchanges = sorted({s["exchange"] for s in test_symbols})
         print(
             f"📊 Subscribing to {len(test_symbols):,} symbols across exchanges: {', '.join(exchanges)}"
         )

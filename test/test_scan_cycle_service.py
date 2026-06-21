@@ -183,7 +183,7 @@ def test_get_recent_cycles_returns_ordered(fresh_cycle_db):
     from services import scan_cycle_service
 
     c1 = scan_cycle_service.start_cycle("chartink")
-    c2 = scan_cycle_service.start_cycle("inhouse")
+    scan_cycle_service.start_cycle("inhouse")
     c3 = scan_cycle_service.start_cycle("manual")
 
     cycles = scan_cycle_service.get_recent_cycles(hours=24)

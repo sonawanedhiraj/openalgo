@@ -620,7 +620,6 @@ def test_session_boundary_inclusive(calendar_db):
     assert win is not None
 
     # Construct an "is_market_open" check at the exact start_ms boundary
-    midnight_ist = IST.localize(datetime(2026, 4, 14, 0, 0, 0))
     start_dt = datetime.fromtimestamp(win["start_ms"] / 1000, tz=IST)
     end_dt = datetime.fromtimestamp(win["end_ms"] / 1000, tz=IST)
     assert start_dt.hour == 17 and start_dt.minute == 0

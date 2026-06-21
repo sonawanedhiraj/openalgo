@@ -56,9 +56,6 @@ def bench_one(fn: Callable, args: tuple, n: int = 5000) -> tuple[float, float]:
 
 def run_parity():
     rows = []
-    pyv_total_ns = 0
-    og_total_ns = 0
-
     for s in baseline["samples"]:
         inp = to_inputs(s)
         flag, F, K, t, r, price = inp["flag"], inp["F"], inp["K"], inp["t"], inp["r"], inp["price"]
