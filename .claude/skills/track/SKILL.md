@@ -17,9 +17,12 @@ how to call it.
 
 ## When to use
 
-- **At the start of a task** → `new` (open-or-attach an issue, get a branch).
+- **At the start of a task** → `new` (open issue + branch + **draft PR** in one
+  step). The draft PR is opened automatically when `--branch` or `--worktree`
+  is set, so `PR# = issue# + 1` always.
 - **After opening the PR** → `link` (guarantee `Closes #N` is in the body — it
-  is a required check).
+  is a required check). The draft PR opened by `new` already has it; `link` is
+  only needed when the PR was hand-rolled outside `new`.
 - **When the work is merged or otherwise complete** → `done` (close the issue).
   Note: a PR merged to `dev`/`main` with `Closes #N` auto-closes via the
   `issue-autoclose.yml` Action, so `done` is mainly for no-PR/manual work.
@@ -31,14 +34,17 @@ Always check for an existing issue first, then create if none fits:
 ```bash
 gh issue list --search "<keywords>" --state open      # reuse if a match exists
 
-# Create issue + branch in one step:
+# Create issue + branch + DRAFT PR in one step:
 bash scripts/gh/track.sh new "<title>" --type <bug|enhancement|docs|infra|incident|strategy> \
     [--area <engine|scanner|preflight|…>] [--session <claude-code|bridge|cowork>] --branch
 
 # For PARALLEL work (multiple concurrent tasks), use a worktree instead of --branch:
 bash scripts/gh/track.sh new "<title>" --type <t> --worktree   # creates ../wt-<N>, copies .env
 
-# Link the PR (run after `gh pr create`):
+# Skip the draft-PR step (rare — operator wants commits before exposing on GitHub):
+bash scripts/gh/track.sh new "<title>" --type <t> --branch --no-draft-pr
+
+# Link the PR (only needed when the PR was hand-rolled outside `new`):
 bash scripts/gh/track.sh link <N>
 
 # Close when done (no-PR work, or to add a result comment):
@@ -57,6 +63,9 @@ bash scripts/gh/track.sh list
   enhancement→`feat`, docs→`docs`, infra→`infra`, strategy→`strategy`).
 - **`Closes #N` is mandatory** in the PR body for code changes — the
   `link-guard` check blocks otherwise.
+- **PR# = issue# + 1** — `new` opens the draft PR in the same gh session as
+  the issue (immediately after), so no other tracked item can land in between.
+  Pass `--no-draft-pr` only when there's a specific reason to defer.
 - **Worktree isolation for parallel tasks** — never run two concurrent
   code-editing tasks in the same checkout (pre-commit stash-collision silently
   reverts edits). `--worktree` creates `../wt-<N>` with `.env` copied in.

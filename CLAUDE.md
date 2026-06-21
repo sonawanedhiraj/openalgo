@@ -54,16 +54,18 @@ see the carve-out below). Capability reference:
 
 **The lifecycle (do this for every task):**
 
-1. **Open or attach.** Before starting, `gh issue list --search "<keywords>"`.
-   Reuse an existing issue or create one:
-   `gh issue create --title "..." --label "type:<bug|enhancement|docs|infra|incident|strategy>" --label "area:<…>" --label "session:claude-code"`.
-   Capture the issue number `N`.
-2. **Branch by number.** `git checkout -b <type>/<N>-<slug>` (e.g.
-   `feat/42-add-foo`). For parallel work, use a **git worktree** (below).
-3. **Link the PR.** The PR description **MUST** contain `Closes #N`. This is a
-   **required check** (`link-guard`): a code-changing PR with no issue link
-   cannot merge. Docs-only PRs are exempt from the block but should still link a
-   `type:docs` issue.
+1. **Open or attach + draft PR.** Before starting, `gh issue list --search "<keywords>"`.
+   Reuse an existing issue or create one + branch + draft PR in one step:
+   `bash scripts/gh/track.sh new "<title>" --type <…> --branch` (or `--worktree`
+   for parallel work). The helper opens the issue → creates the branch →
+   pushes an empty placeholder commit → opens a **draft PR with `Closes #N`
+   in the body**. This guarantees `PR# = issue# + 1` because no other tracked
+   item can land between the two `gh` calls.
+2. **Push commits to the branch.** The draft PR auto-updates as commits land.
+   `gh pr ready <PR#>` when the work is review-ready.
+3. **`Closes #N` is mandatory** in the PR body for code changes — the
+   `link-guard` check blocks otherwise. `track.sh new` writes this for you;
+   only `link <N>` matters for PRs that were hand-rolled outside `new`.
 4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
    (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
    keyword close only fires on the default branch, so we do it ourselves).
