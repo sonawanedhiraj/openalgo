@@ -80,10 +80,16 @@ err()   { log "ERROR: $*"; }
 notify_op() {
     local subject="$1" body="$2"
     if [ "$DRY_RUN" = "1" ]; then return 0; fi
+    # The notification_service module exports a SINGLETON via
+    # get_notification_service() — NOT a top-level `notify` function. The
+    # earlier draft of this script used `from services.notification_service
+    # import notify` which raised ImportError silently in the catch. Use the
+    # singleton accessor instead. (Same bug was shipped in the smoke_check
+    # and dry_tripwire services and should be patched separately.)
     uv run python -c "
 try:
-    from services.notification_service import notify
-    notify('task_complete', f'⚙️ wait_and_merge: $subject\n\n$body')
+    from services.notification_service import get_notification_service
+    get_notification_service().notify('task_complete', f'⚙️ wait_and_merge: $subject\n\n$body')
 except Exception as e:
     import sys; print(f'(notify failed: {e})', file=sys.stderr)
 " 2>>"$LOG" || true
