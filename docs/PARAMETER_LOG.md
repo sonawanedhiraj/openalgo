@@ -801,6 +801,39 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     (the 2026-06-11/12 "1944→7 hits/day" collapse) by replaying the bars missed
     while the socket was down. Test: `test/test_ws_recovery_service.py`.
 
+## `SCANNER_SMOKE_CHECK_*` — scanner pre-entry smoke check (Tier 2, issue #32)
+
+- **Files:** `services/scanner_smoke_check_service.py`, `app.py` (wire-in),
+  `test/test_scanner_smoke_check.py`.
+- **What it controls:** the 09:18 IST pre-entry smoke check for the in-house
+  scanner. Closes the gap CLAUDE.md acknowledges in the Tier-1 hardening
+  section — a total feed outage produces no bar closes, so the per-cycle
+  completeness metric never fires.
+- **Knobs:**
+  - `SCANNER_SMOKE_CHECK_ENABLED` (default `true`) — master gate. When false
+    the job still registers (so toggling at runtime takes effect without
+    re-init) but the check returns `(True, {"skipped": True})` immediately.
+  - `SCANNER_SMOKE_CHECK_TIME` (default `09:18`) — cron fire time, `HH:MM` IST.
+  - `SCANNER_SMOKE_MIN_COVERAGE` (default `0.5`) — minimum fraction of
+    `SCANNER_SYMBOLS` that must have produced at least one live bar today
+    via the in-process aggregator.
+- **Gates checked:** (1) aggregator coverage ≥ min, (2)
+  `data_health_check.latest('scanner_universe_1m').overall_ok`, (3)
+  `data_health_check.latest('scanner_universe_D').overall_ok`, (4) broker
+  session live.
+- **Failure path:** writes a `data_health_check` row with
+  `strategy_name='scanner_smoke_check'`, CRIT Telegram via
+  `notify('scanner_smoke_check_fail', …)`. **No runtime override is written
+  for the scanner** (unlike sector_follow which holds a single entry-job, the
+  scanner is a passive consumer with no entry-job to gate).
+- **Dedup:** at most one CRIT per `(date, instance)` — second fire on the
+  same day is silent. Process restart resets dedup intentionally.
+- **History:**
+  - **2026-06-21:** Introduced as the upstream gate for the Friday
+    2026-06-19 silent-pipeline failure mode (issue #32). Mirrors
+    `sector_follow_service.assert_data_pipeline_healthy` (15:18 IST). 12
+    hermetic E2E tests in `test/test_scanner_smoke_check.py`.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

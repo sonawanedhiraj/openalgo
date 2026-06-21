@@ -777,6 +777,25 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
 
+            # In-house scanner pre-entry smoke check (Tier 2, 09:18 IST). Closes
+            # the gap CLAUDE.md flags in the Tier-1 hardening section: a total
+            # feed outage produces no bar closes, so the per-cycle completeness
+            # metric never fires. The smoke check is the upstream gate.
+            # Read-only on DBs + scanner state; failure path is Telegram CRIT
+            # + data_health_check row. No runtime override is written (the
+            # scanner is a passive 5m-bar consumer with no entry-job to gate;
+            # visibility IS the fix). See
+            # services/scanner_smoke_check_service.py and issue #32.
+            try:
+                from services.scanner_smoke_check_service import (
+                    init_scanner_smoke_check,
+                )
+
+                init_scanner_smoke_check(app=app)
+                logger.debug("Scanner smoke check initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize scanner smoke check: {e}")
+
             # Futures Follow CAP50 strategy (leveraged-beta NIFTY-futures sleeve on
             # the sector_follow signal set). Default mode=sandbox means it ACTIVELY
             # trades the virtual ₹1Cr sandbox book from boot — the
