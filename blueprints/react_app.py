@@ -296,6 +296,17 @@ def react_scanner_detail(scan_id):
     return serve_react_app()
 
 
+# Strategies Dashboard (Tier 2 read-only: strategy list + detail)
+@react_bp.route("/strategies", strict_slashes=False)
+def react_strategies_index():
+    return serve_react_app()
+
+
+@react_bp.route("/strategies/<name>", strict_slashes=False)
+def react_strategy_dashboard_detail(name):
+    return serve_react_app()
+
+
 # ============================================================
 # Phase 6 Routes - Strategy & Automation
 # ============================================================

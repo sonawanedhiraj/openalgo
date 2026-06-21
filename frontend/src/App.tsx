@@ -87,6 +87,12 @@ const PythonStrategyGuide = lazy(() => import('@/pages/python-strategy/PythonStr
 const ScannerIndex = lazy(() => import('@/pages/scanner/ScannerIndex'))
 const ScannerDetail = lazy(() => import('@/pages/scanner/ScannerDetail'))
 
+// Strategies Dashboard (Tier 2 — read-only strategy browser)
+const StrategiesDashboardIndex = lazy(
+  () => import('@/pages/strategies-dashboard/StrategiesDashboardIndex')
+)
+const StrategyDetailPage = lazy(() => import('@/pages/strategies-dashboard/StrategyDetail'))
+
 // Chartink pages
 const ChartinkIndex = lazy(() => import('@/pages/chartink/ChartinkIndex'))
 const NewChartinkStrategy = lazy(() => import('@/pages/chartink/NewChartinkStrategy'))
@@ -215,6 +221,9 @@ function App() {
                 {/* In-house Scanner Browser (Tier 1 read-only) */}
                 <Route path="/scanner" element={<ScannerIndex />} />
                 <Route path="/scanner/:id" element={<ScannerDetail />} />
+                {/* Strategies Dashboard (Tier 2 read-only) */}
+                <Route path="/strategies" element={<StrategiesDashboardIndex />} />
+                <Route path="/strategies/:name" element={<StrategyDetailPage />} />
                 {/* Legacy /tools/strategy paths — redirect to the new route. */}
                 <Route
                   path="/tools/strategy"

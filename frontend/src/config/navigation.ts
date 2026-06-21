@@ -1,4 +1,5 @@
 import {
+  Activity,
   BarChart3,
   Bell,
   BookOpen,
@@ -44,6 +45,7 @@ export const navItems: NavItem[] = [
   { href: '/logs', label: 'Logs', icon: FileBarChart },
   { href: '/tools', label: 'Tools', icon: Wrench },
   { href: '/scanner', label: 'Scanner', icon: ScanLine },
+  { href: '/strategies', label: 'Strategies', icon: Activity },
 ]
 
 // Items shown in mobile bottom navigation
@@ -88,7 +90,7 @@ export const externalLinks = {
 // Shared utility to check if a route is active
 // Uses startsWith for routes with nested pages (like /strategy/*)
 export function isActiveRoute(pathname: string, href: string): boolean {
-  if (href === '/strategy' || href === '/scanner') {
+  if (href === '/strategy' || href === '/scanner' || href === '/strategies') {
     return pathname.startsWith(href)
   }
   return pathname === href
