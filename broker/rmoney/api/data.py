@@ -145,9 +145,9 @@ class BrokerData:
             raise Exception(f"Unknown exchange segment: {exchange}")
 
         # Get exchange_token from database
-        with db_session() as session:
+        with db_session() as db:
             symbol_info = (
-                session.query(SymToken)
+                db.query(SymToken)
                 .filter(SymToken.exchange == exchange, SymToken.brsymbol == br_symbol)
                 .first()
             )
@@ -551,7 +551,7 @@ class BrokerData:
                             oi_key = f"{oi_data.get('ExchangeSegment')}_{oi_data.get('ExchangeInstrumentID')}"
                             oi_value = oi_data.get("OpenInterest", 0)
                             oi_map[oi_key] = oi_value
-                        except Exception:
+                        except Exception:  # nosec B112 — gracefully skip malformed OI entries
                             continue
 
                     # Merge OI into results
@@ -897,10 +897,11 @@ class BrokerData:
             # Try to get from session if not found in instance
             if (
                 not user_id
-                and hasattr(session, "marketdata_userid")
-                and session.get("marketdata_userid")
+                and hasattr(self, "session")
+                and hasattr(self.session, "marketdata_userid")
+                and self.session.get("marketdata_userid")
             ):
-                user_id = session.get("marketdata_userid")
+                user_id = self.session.get("marketdata_userid")
                 logger.debug(f"Using session user_id: {user_id}")
 
             # If no user ID is available, use the one from feed token authentication
@@ -920,10 +921,11 @@ class BrokerData:
             # Try to get from session if not found in instance
             if (
                 not feed_token
-                and hasattr(session, "marketdata_token")
-                and session.get("marketdata_token")
+                and hasattr(self, "session")
+                and hasattr(self.session, "marketdata_token")
+                and self.session.get("marketdata_token")
             ):
-                feed_token = session.get("marketdata_token")
+                feed_token = self.session.get("marketdata_token")
                 logger.debug("Using session feed_token")
 
             # If still no feed token, try to get a new one
@@ -1044,26 +1046,6 @@ class BrokerData:
                 "oi": 0,
             }
             logger.info("Returning empty market depth structure")
-            return empty_depth
-
-        except Exception as e:
-            logger.error(f"Error in get_market_depth: {str(e)}", exc_info=True)
-            # Return empty structure on error
-            empty_depth = {
-                "bids": [{"price": 0, "quantity": 0} for _ in range(5)],
-                "asks": [{"price": 0, "quantity": 0} for _ in range(5)],
-                "totalbuyqty": 0,
-                "totalsellqty": 0,
-                "ltp": 0,
-                "ltq": 0,
-                "volume": 0,
-                "open": 0,
-                "high": 0,
-                "low": 0,
-                "prev_close": 0,
-                "oi": 0,
-            }
-            logger.info("Returning empty market depth structure due to error")
             return empty_depth
 
     def get_depth(self, symbol: str, exchange: str) -> dict:

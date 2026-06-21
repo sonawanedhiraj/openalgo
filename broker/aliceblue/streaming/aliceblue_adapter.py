@@ -1193,7 +1193,7 @@ class AliceblueWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 topics_to_publish.append((mode_map[max_mode], max_mode))
 
             # Publish to all applicable topics
-            for mode_name, mode_num in topics_to_publish:
+            for mode_name, _mode_num in topics_to_publish:
                 topic = f"{exchange}_{symbol}_{mode_name}"
                 self.logger.debug(f"Publishing {msg_type} to {topic}")
 

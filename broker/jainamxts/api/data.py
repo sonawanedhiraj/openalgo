@@ -996,26 +996,6 @@ class BrokerData:
             logger.info("Returning empty market depth structure")
             return empty_depth
 
-        except Exception as e:
-            logger.error(f"Error in get_market_depth: {str(e)}", exc_info=True)
-            # Return empty structure on error
-            empty_depth = {
-                "bids": [{"price": 0, "quantity": 0} for _ in range(5)],
-                "asks": [{"price": 0, "quantity": 0} for _ in range(5)],
-                "totalbuyqty": 0,
-                "totalsellqty": 0,
-                "ltp": 0,
-                "ltq": 0,
-                "volume": 0,
-                "open": 0,
-                "high": 0,
-                "low": 0,
-                "prev_close": 0,
-                "oi": 0,
-            }
-            logger.info("Returning empty market depth structure due to error")
-            return empty_depth
-
     def get_depth(self, symbol: str, exchange: str) -> dict:
         """Alias for get_market_depth to maintain compatibility with common API"""
         return self.get_market_depth(symbol, exchange)

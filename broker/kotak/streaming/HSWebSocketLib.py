@@ -943,7 +943,7 @@ class HSWrapper:
                             fcount = buf2long(e[pos : pos + 1])
                             pos += 1
                             # logger.info(f"fcount2: {fcount}")
-                            for index in range(fcount):
+                            for _index in range(fcount):
                                 fid = buf2long(e[pos : pos + 1])
                                 pos += 1
                                 data_len = buf2long(e[pos : pos + 1])

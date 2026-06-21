@@ -817,7 +817,7 @@ def map_portfolio_data(portfolio_data):
                 break
         # If still no data found but there are dict values, check if any value is a list
         if not processed_data:
-            for key, value in portfolio_data.items():
+            for _key, value in portfolio_data.items():
                 if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
                     processed_data = value
                     break

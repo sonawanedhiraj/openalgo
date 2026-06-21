@@ -208,7 +208,7 @@ def get_straddle_chart_data(
 
         # Step 4: For each candle, compute ATM strike
         atm_per_row = []
-        for ts, row in df_underlying.iterrows():
+        for _ts, row in df_underlying.iterrows():
             close_price = float(row["close"])
             atm = find_atm_strike_from_actual(close_price, available_strikes)
             atm_per_row.append(atm)

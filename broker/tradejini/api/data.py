@@ -579,7 +579,7 @@ class BrokerData:
         if not subscription_success:
             logger.error("Failed to send subscription request")
             # Return errors for all symbols
-            for symbol_key, info in symbol_map.items():
+            for _symbol_key, info in symbol_map.items():
                 results.append(
                     {
                         "symbol": info["symbol"],
