@@ -419,7 +419,7 @@ class BrokerData:
                     del symbol_map[token_str]
 
             # Add unfetched symbols as errors
-            for token_str, info in symbol_map.items():
+            for _token_str, info in symbol_map.items():
                 results.append(
                     {
                         "symbol": info["symbol"],
@@ -464,7 +464,7 @@ class BrokerData:
             )
 
             # Validate token
-            if not token or token == "None" or str(token).strip() == "":
+            if not token or token == "None" or str(token).strip() == "":  # nosec B105 — checking if token is the string 'None', not a password
                 raise Exception(
                     f"Invalid or missing token for symbol '{symbol}' on exchange '{exchange}'. Token: {token}"
                 )
@@ -733,7 +733,7 @@ class BrokerData:
             )
 
             # Validate token
-            if not token or token == "None" or str(token).strip() == "":
+            if not token or token == "None" or str(token).strip() == "":  # nosec B105 — checking if token is the string 'None', not a password
                 raise Exception(
                     f"Invalid or missing token for symbol '{symbol}' on exchange '{exchange}'. Token: {token}"
                 )

@@ -145,9 +145,9 @@ class BrokerData:
             raise Exception(f"Unknown exchange segment: {exchange}")
 
         # Get exchange_token from database
-        with db_session() as session:
+        with db_session() as db:
             symbol_info = (
-                session.query(SymToken)
+                db.query(SymToken)
                 .filter(SymToken.exchange == exchange, SymToken.brsymbol == br_symbol)
                 .first()
             )
@@ -789,10 +789,11 @@ class BrokerData:
             # Try to get from session if not found in instance
             if (
                 not user_id
-                and hasattr(session, "marketdata_userid")
-                and session.get("marketdata_userid")
+                and hasattr(self, "session")
+                and hasattr(self.session, "marketdata_userid")
+                and self.session.get("marketdata_userid")
             ):
-                user_id = session.get("marketdata_userid")
+                user_id = self.session.get("marketdata_userid")
                 logger.debug(f"Using session user_id: {user_id}")
 
             # If no user ID is available, use the one from feed token authentication
@@ -812,10 +813,11 @@ class BrokerData:
             # Try to get from session if not found in instance
             if (
                 not feed_token
-                and hasattr(session, "marketdata_token")
-                and session.get("marketdata_token")
+                and hasattr(self, "session")
+                and hasattr(self.session, "marketdata_token")
+                and self.session.get("marketdata_token")
             ):
-                feed_token = session.get("marketdata_token")
+                feed_token = self.session.get("marketdata_token")
                 logger.debug("Using session feed_token")
 
             # If still no feed token, try to get a new one

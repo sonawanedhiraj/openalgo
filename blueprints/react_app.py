@@ -285,6 +285,28 @@ def react_screener_comparison():
     return serve_react_app()
 
 
+# In-house Scanner Browser (Tier 1 read-only: definition list + signal history)
+@react_bp.route("/scanner", strict_slashes=False)
+def react_scanner_index():
+    return serve_react_app()
+
+
+@react_bp.route("/scanner/<int:scan_id>", strict_slashes=False)
+def react_scanner_detail(scan_id):
+    return serve_react_app()
+
+
+# Strategies Dashboard (Tier 2 read-only: strategy list + detail)
+@react_bp.route("/strategies", strict_slashes=False)
+def react_strategies_index():
+    return serve_react_app()
+
+
+@react_bp.route("/strategies/<name>", strict_slashes=False)
+def react_strategy_dashboard_detail(name):
+    return serve_react_app()
+
+
 # ============================================================
 # Phase 6 Routes - Strategy & Automation
 # ============================================================

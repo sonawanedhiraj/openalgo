@@ -236,7 +236,7 @@ class BrokerData:
 
                 if v2_data.get("status") == "success":
                     v2_quote_data = v2_data.get("data", {})
-                    for key, value in v2_quote_data.items():
+                    for _key, value in v2_quote_data.items():
                         if value.get("instrument_token") == instrument_key:
                             depth = value.get("depth", {})
                             if depth:

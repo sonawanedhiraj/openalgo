@@ -80,11 +80,15 @@ from blueprints.react_app import (  # Import React frontend blueprint
     serve_react_app,
 )
 from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
+from blueprints.scanner_api import scanner_api_bp  # In-house scanner browser API (Tier 1)
 from blueprints.search import search_bp
 from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
 from blueprints.security import security_bp  # Import the security blueprint
 from blueprints.settings import settings_bp  # Import the settings blueprint
 from blueprints.straddle_chart import straddle_bp  # Import the straddle chart blueprint
+from blueprints.strategies_dashboard_api import (
+    strategies_dashboard_bp,  # Strategies Dashboard API (Tier 2)
+)
 from blueprints.strategy import strategy_bp  # Import the strategy blueprint
 from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
@@ -297,6 +301,8 @@ def create_app():
     app.register_blueprint(whatsapp_bp)  # Register WhatsApp blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint
     app.register_blueprint(sandbox_bp)  # Register Sandbox blueprint
+    app.register_blueprint(scanner_api_bp)  # Register in-house scanner browser API
+    app.register_blueprint(strategies_dashboard_bp)  # Register Strategies Dashboard API (Tier 2)
     app.register_blueprint(playground_bp)  # Register API playground blueprint
     app.register_blueprint(logging_bp)  # Register Logging blueprint
     app.register_blueprint(admin_bp)  # Register Admin blueprint

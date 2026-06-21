@@ -575,7 +575,7 @@ class MotilalWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     sell_depth.append({"price": 0, "quantity": 0, "orders": 0})
         else:
             # No depth data available - return 5 levels of zeros
-            for i in range(5):
+            for _i in range(5):
                 buy_depth.append({"price": 0, "quantity": 0, "orders": 0})
                 sell_depth.append({"price": 0, "quantity": 0, "orders": 0})
 
