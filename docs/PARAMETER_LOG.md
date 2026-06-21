@@ -801,6 +801,44 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     (the 2026-06-11/12 "1944→7 hits/day" collapse) by replaying the bars missed
     while the socket was down. Test: `test/test_ws_recovery_service.py`.
 
+## `SCANNER_DRY_*` — scanner zero-results tripwire (issue #33)
+
+- **Files:** `services/scanner_dry_tripwire_service.py`, `app.py` (wire-in),
+  `test/test_scanner_dry_tripwire.py`.
+- **What it controls:** the downstream silent-failure detector for the
+  in-house scanner. Catches the Friday 2026-06-19 gap that the Tier-1
+  completeness metric missed — completeness was 56% (above the 50% WARN
+  floor) while the scanner produced 0 BUY hits all day because the stored
+  daily gates ran against ~6-day-old bars.
+- **Knobs:**
+  - `SCANNER_DRY_TRIPWIRE_ENABLED` (default `true`) — master gate. When
+    false the job still registers but `check_dry_scanner` returns
+    `{"status": "flag_off"}` immediately without provider calls.
+  - `SCANNER_DRY_THRESHOLD_MIN` (default `30`) — gap in minutes from the
+    latest `scan_results` row with `source='inhouse'` before the tripwire
+    fires. Friday's gap was 6h+; 30 min catches a real silent-failure
+    within one full bar window after the 09:30 warm-up.
+  - `SCANNER_DRY_CHECK_INTERVAL_MIN` (default `5`) — APScheduler firing
+    cadence during market hours (09:30-15:30 IST).
+- **Severity logic:** at fire time the tripwire probes `scan_cycle` for
+  any `cycle_kind='chartink'` rows within the threshold window. If
+  Chartink is producing rows but in-house is silent → **CRIT** (pipeline
+  degraded). If Chartink is also dry → **WARN** (market is genuinely
+  quiet — visibility only, not a page). A failing Chartink probe defaults
+  to **WARN** (don't escalate on telemetry hiccups).
+- **Skips that never fire:** outside 09:15-15:30 IST market hours,
+  weekends, the 09:15-09:30 IST warm-up window (the scanner can't have
+  produced anything yet), or when no broker session is live (operator off
+  — silence is expected).
+- **Dedup:** per-day-per-severity. CRIT and WARN have independent dedup
+  keys so a mid-day regime change (Chartink goes dry) still surfaces
+  once. Process restart resets dedup intentionally.
+- **History:**
+  - **2026-06-21:** Introduced as the downstream silent-failure detector
+    paired with the smoke check (`SCANNER_SMOKE_CHECK_*` above) for the
+    Friday 2026-06-19 outage. 13 hermetic E2E tests in
+    `test/test_scanner_dry_tripwire.py`.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

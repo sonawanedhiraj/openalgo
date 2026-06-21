@@ -159,6 +159,14 @@ class NotificationService:
             # distinguishable from a genuinely quiet market. See
             # services/scanner_service.py (_emit_completeness).
             "scanner_completeness": _env_bool("NOTIFY_SCANNER_COMPLETENESS", default=True),
+            # In-house scanner zero-results tripwire (issue #33). Fires when no
+            # scan_results row with source='inhouse' has been written for
+            # SCANNER_DRY_THRESHOLD_MIN minutes during market hours.
+            # Severity is encoded in the message body: CRIT when Chartink is
+            # producing rows but in-house is silent (pipeline degraded), WARN
+            # when Chartink is also dry (market is genuinely quiet — visibility
+            # only). See services/scanner_dry_tripwire_service.py.
+            "scanner_dry": _env_bool("NOTIFY_SCANNER_DRY", default=True),
             # Generic "background code task finished" push. Default ON — used by
             # spawned code tasks to confirm completion to the operator. Routes
             # through the same Telegram path (no batching); the caller supplies
