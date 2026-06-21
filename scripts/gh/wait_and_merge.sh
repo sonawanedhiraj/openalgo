@@ -80,16 +80,20 @@ err()   { log "ERROR: $*"; }
 notify_op() {
     local subject="$1" body="$2"
     if [ "$DRY_RUN" = "1" ]; then return 0; fi
-    # The notification_service module exports a SINGLETON via
-    # get_notification_service() — NOT a top-level `notify` function. The
-    # earlier draft of this script used `from services.notification_service
-    # import notify` which raised ImportError silently in the catch. Use the
-    # singleton accessor instead. (Same bug was shipped in the smoke_check
-    # and dry_tripwire services and should be patched separately.)
-    uv run python -c "
+    # Pass subject and body via env vars rather than interpolating them
+    # into the Python source. If body contains an apostrophe (e.g. the
+    # word 'pending' surrounded by quotes from the caller — a real case
+    # in the stuck-state message), interpolating into an f-string
+    # delimited by single quotes terminates the literal early and the
+    # whole Python script raises SyntaxError — so the alert that warns
+    # of trouble is itself the bug that swallows the alert. The
+    # 2026-06-21 false-stuck escalation on PR #46 hit this exact path.
+    SUBJECT="$subject" BODY="$body" uv run python -c "
+import os
 try:
     from services.notification_service import get_notification_service
-    get_notification_service().notify('task_complete', f'⚙️ wait_and_merge: $subject\n\n$body')
+    msg = f'⚙️ wait_and_merge: {os.environ[\"SUBJECT\"]}\n\n{os.environ[\"BODY\"]}'
+    get_notification_service().notify('task_complete', msg)
 except Exception as e:
     import sys; print(f'(notify failed: {e})', file=sys.stderr)
 " 2>>"$LOG" || true
