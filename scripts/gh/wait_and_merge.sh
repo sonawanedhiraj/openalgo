@@ -37,7 +37,10 @@ cd "$(git rev-parse --show-toplevel)"
 LOG=".cache/wait-and-merge.log"
 POLL_INTERVAL_S=30
 BUDGET_MIN=40
-STUCK_THRESHOLD=5
+# 30 polls × 30s = 15 min of TRULY FROZEN per-check rollup. Anything shorter
+# false-positives on a single self-hosted runner that takes ≈10-15 min to clear
+# its queue between PRs. 15 min of zero per-check movement is real stuck.
+STUCK_THRESHOLD=30
 DRY_RUN=0
 REQUIRED_CHECKS=(
     "silent-drops"
@@ -87,26 +90,33 @@ except Exception as e:
 }
 
 # ----------------- per-PR state probe ----------------------------------------
-# Echoes one of: green / pending / red / conflict / merged
+# Echoes two lines: state-name, then a signature of the required-check rollup.
+# state is one of: green / pending / red / conflict / merged.
+# signature is a deterministic hash of the per-required-check (status,conclusion)
+# tuples. Different signature across polls = checks moved = NOT stuck, even if
+# the overall state stayed "pending". This is the fix to the false-positive
+# stuck-escalation we saw on the 2026-06-21 retry.
 pr_state() {
     local pr=$1
     local out
     out=$(gh pr view "$pr" --json state,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null) \
-        || { echo "pending"; return; }
+        || { printf 'pending\n-\n'; return; }
 
-    local pr_state
-    pr_state=$(printf '%s' "$out" | python -c "
+    printf '%s' "$out" | python -c "
 import sys, json
 d = json.load(sys.stdin)
 if d.get('state') == 'MERGED':
-    print('merged'); sys.exit(0)
+    print('merged'); print('-'); sys.exit(0)
 ms = (d.get('mergeStateStatus') or '').upper()
 mg = (d.get('mergeable') or '').upper()
 if mg == 'CONFLICTING' or ms == 'DIRTY':
-    print('conflict'); sys.exit(0)
+    print('conflict'); print('-'); sys.exit(0)
 needed = set([$(printf '%s,' "${REQUIRED_CHECKS[@]}" | sed "s/,$//" | sed 's/[^,]*/\"\0\"/g')])
 checks = d.get('statusCheckRollup') or []
 seen, red, pending = set(), False, False
+# Signature: sorted (name, status, conclusion) joined — distinguishes
+# QUEUED → IN_PROGRESS → COMPLETED transitions on each individual check.
+sig_parts = []
 for c in checks:
     name = c.get('name')
     if name not in needed:
@@ -114,19 +124,21 @@ for c in checks:
     seen.add(name)
     status = c.get('status') or ''
     concl  = c.get('conclusion') or ''
+    sig_parts.append(f'{name}|{status}|{concl}')
     if status != 'COMPLETED':
         pending = True
     elif concl != 'SUCCESS':
         red = True
 missing = needed - seen
 if red:
-    print('red')
+    state = 'red'
 elif missing or pending:
-    print('pending')
+    state = 'pending'
 else:
-    print('green')
-")
-    echo "$pr_state"
+    state = 'green'
+print(state)
+print('|'.join(sorted(sig_parts)) or '-')
+"
 }
 
 # ----------------- merge ----------------------------------------------------
@@ -203,7 +215,7 @@ log "Budget: ${BUDGET_MIN} min  |  interval: ${POLL_INTERVAL_S}s  |  stuck thres
 log "Dry run: $DRY_RUN"
 log ""
 
-declare -A done_prs prev_state stuck_count
+declare -A done_prs prev_sig stuck_count
 budget_end=$(( $(date +%s) + BUDGET_MIN * 60 ))
 attempt=0
 final_status="ok"
@@ -221,17 +233,24 @@ while true; do
     all_done=1
     for pr in "${PRS[@]}"; do
         if [ "${done_prs[$pr]:-0}" = "1" ]; then continue; fi
-        state=$(pr_state "$pr")
+        # pr_state returns two lines: state, signature
+        state_and_sig=$(pr_state "$pr")
+        state=$(printf '%s\n' "$state_and_sig" | sed -n '1p')
+        sig=$(printf '%s\n' "$state_and_sig" | sed -n '2p')
 
-        # Stuck-state detection: same non-success state N times in a row.
-        prev=${prev_state[$pr]:-}
-        if [ "$state" = "$prev" ]; then
+        # Stuck-state detection: same SIGNATURE (not just state) N times in a
+        # row. A check transitioning QUEUED → IN_PROGRESS → COMPLETED is
+        # progress — the overall state stays 'pending' across those polls but
+        # the signature changes, resetting stuck_count. Only a TRULY frozen
+        # rollup (no check moved at all) counts toward stuck.
+        prev=${prev_sig[$pr]:-}
+        if [ "$sig" = "$prev" ]; then
             stuck_count[$pr]=$(( ${stuck_count[$pr]:-0} + 1 ))
         else
             stuck_count[$pr]=1
         fi
-        prev_state[$pr]=$state
-        log "PR #$pr: $state (consecutive: ${stuck_count[$pr]})"
+        prev_sig[$pr]=$sig
+        log "PR #$pr: $state (sig-stable for ${stuck_count[$pr]} polls)"
 
         case "$state" in
             merged)
