@@ -18,8 +18,9 @@ how to call it.
 ## When to use
 
 - **At the start of a task** → `new` (open-or-attach an issue, get a branch).
-- **After opening the PR** → `link` (guarantee `Closes #N` is in the body — it
-  is a required check).
+- **After opening the PR** → `link <N>` — writes `Closes #N` to the body AND
+  prepends `[#N]` to the title so PR-list scans reveal the linked issue at
+  a glance.
 - **When the work is merged or otherwise complete** → `done` (close the issue).
   Note: a PR merged to `dev`/`main` with `Closes #N` auto-closes via the
   `issue-autoclose.yml` Action, so `done` is mainly for no-PR/manual work.
@@ -57,6 +58,9 @@ bash scripts/gh/track.sh list
   enhancement→`feat`, docs→`docs`, infra→`infra`, strategy→`strategy`).
 - **`Closes #N` is mandatory** in the PR body for code changes — the
   `link-guard` check blocks otherwise.
+- **PR title prefixed `[#N]`** so any PR-list scan reveals the linked issue
+  at a glance. `track.sh link <N>` writes this for you. GitHub auto-links
+  the `#N` in the title, so it's a one-click jump to the issue.
 - **Worktree isolation for parallel tasks** — never run two concurrent
   code-editing tasks in the same checkout (pre-commit stash-collision silently
   reverts edits). `--worktree` creates `../wt-<N>` with `.env` copied in.
