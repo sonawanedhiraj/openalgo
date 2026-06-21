@@ -322,7 +322,9 @@ def check_dry_scanner(
         return {"status": "dedup_silent", "severity": severity, "gap_min": gap_min}
 
     message = _format_alert(severity, gap_min, last, chartink_alive)
-    logger.error("scanner_dry tripwire %s: %s", severity, details)
+    # f-string (not %s + args) — see scanner_smoke_check_service for the
+    # SensitiveDataFilter + record.args desync rationale.
+    logger.error(f"scanner_dry tripwire {severity}: {details}")
     try:
         notifier(message, severity)
         if severity == "CRIT":
