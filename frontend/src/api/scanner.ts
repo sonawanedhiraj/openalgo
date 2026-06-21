@@ -37,12 +37,24 @@ export interface SignalsResponse {
   definition: ScanDefinitionDetail
   signals: ScanSignal[]
   since: string
+  until: string | null
   limit: number
   count: number
 }
 
+export interface SymbolHit {
+  symbol: string
+  hit_count: number
+  definitions: string[]
+  latest_hit: string
+}
+
+export interface HitsBySymbolResponse {
+  date: string
+  symbols: SymbolHit[]
+}
+
 export const scannerApi = {
-  /** List all enabled scan definitions with latest signals and today's hit count. */
   getDefinitions: async (): Promise<ScanDefinitionSummary[]> => {
     const res = await webClient.get<{ status: string; data: ScanDefinitionSummary[] }>(
       '/scanner/api/definitions'
@@ -50,17 +62,36 @@ export const scannerApi = {
     return res.data.data
   },
 
-  /** Signal history for a single definition.
-   *  @param id  scan_definition id
-   *  @param since  ISO-8601 lower bound (default: server applies now-24h)
-   *  @param limit  max rows (default 200, max 500)
-   */
-  getSignals: async (id: number, since?: string, limit?: number): Promise<SignalsResponse> => {
+  getSignals: async (
+    id: number,
+    since?: string,
+    until?: string,
+    limit?: number
+  ): Promise<SignalsResponse> => {
     const params: Record<string, string | number> = {}
     if (since) params.since = since
+    if (until) params.until = until
     if (limit !== undefined) params.limit = limit
     const res = await webClient.get<{ status: string; data: SignalsResponse }>(
       `/scanner/api/definitions/${id}/signals`,
+      { params }
+    )
+    return res.data.data
+  },
+
+  toggleDefinition: async (id: number): Promise<{ id: number; enabled: boolean }> => {
+    const res = await webClient.post<{
+      status: string
+      data: { id: number; enabled: boolean }
+    }>(`/scanner/api/definitions/${id}/toggle`)
+    return res.data.data
+  },
+
+  getHitsBySymbol: async (date?: string): Promise<HitsBySymbolResponse> => {
+    const params: Record<string, string> = {}
+    if (date) params.date = date
+    const res = await webClient.get<{ status: string; data: HitsBySymbolResponse }>(
+      '/scanner/api/hits-by-symbol',
       { params }
     )
     return res.data.data

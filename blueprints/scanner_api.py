@@ -1,21 +1,27 @@
-"""Read-only API endpoints for the in-house scanner browser (Tier 1).
+"""API endpoints for the in-house scanner browser (Tier 1 + Tier 2).
 
-Two endpoints consumed by the React /scanner page:
+Endpoints consumed by the React /scanner page:
 
-  GET /scanner/api/definitions
-      All enabled scan_definitions with their latest 5 signals and today's
-      hit count.  Returns the full definition list so the index page can
-      render without extra round-trips.
+  GET  /scanner/api/definitions
+      All scan_definitions (enabled and disabled), enabled-first.  Each entry
+      carries its latest 5 signals and today's hit count.
 
-  GET /scanner/api/definitions/<id>/signals
+  GET  /scanner/api/definitions/<id>/signals
       Signal history for a single definition.  Accepts ``?since=<iso>``
-      (default: now-24h) and ``?limit=<int>`` (default: 200, max: 500).
+      (default: now-24h), ``?until=<iso>`` (optional ceiling), and
+      ``?limit=<int>`` (default: 200, max: 500).
+
+  POST /scanner/api/definitions/<id>/toggle
+      Flip a definition's enabled state (1→0 or 0→1).  Returns the new state.
+
+  GET  /scanner/api/hits-by-symbol
+      Aggregate hits by symbol for a given date (default: today IST).
+      Returns [{symbol, hit_count, definitions, latest_hit}] sorted by
+      hit_count descending.
 
 Authentication: Flask session (same as /chartink/api/scanner-comparison).
 This is a React-facing endpoint served inside the authenticated app, so
 session auth is the natural fit — no API key header required.
-
-READ-ONLY.  These endpoints never write to any database.
 """
 
 from __future__ import annotations
@@ -64,20 +70,26 @@ def _parse_symbols(raw: str | None) -> list[str]:
         return []
 
 
+def _unauthorized():
+    return jsonify({"status": "error", "message": "Session expired"}), 401
+
+
 @scanner_api_bp.route("/api/definitions", methods=["GET"])
 @check_session_validity
 def list_definitions():
-    """List all enabled scan_definitions with latest signals and today hit count."""
-    user_id = session.get("user")
-    if not user_id:
-        return jsonify({"status": "error", "message": "Session expired"}), 401
+    """List all scan_definitions (enabled and disabled) with latest signals and today hit count.
+
+    Enabled definitions sort before disabled ones; within each group, alphabetical by name.
+    """
+    if not session.get("user"):
+        return _unauthorized()
 
     try:
         sess = db_session()
+        # Return ALL definitions — enabled-first, then alphabetical
         defs = (
             sess.query(ScanDefinition)
-            .filter(ScanDefinition.enabled == 1)
-            .order_by(ScanDefinition.name)
+            .order_by(ScanDefinition.enabled.desc(), ScanDefinition.name)
             .all()
         )
 
@@ -142,15 +154,18 @@ def get_signals(definition_id: int):
 
     Query params:
         since   ISO-8601 string (default: now - 24h)
+        until   ISO-8601 string (optional ceiling; not applied when absent)
         limit   int (default 200, max 500)
     """
-    user_id = session.get("user")
-    if not user_id:
-        return jsonify({"status": "error", "message": "Session expired"}), 401
+    if not session.get("user"):
+        return _unauthorized()
 
     try:
         since_raw = (request.args.get("since") or "").strip()
         since = since_raw if since_raw else _iso_minus_hours(24)
+
+        until_raw = (request.args.get("until") or "").strip()
+        until: str | None = until_raw if until_raw else None
 
         try:
             limit = int(request.args.get("limit", _SIGNAL_LIMIT_DEFAULT))
@@ -165,16 +180,14 @@ def get_signals(definition_id: int):
         if defn is None:
             return jsonify({"status": "error", "message": "Definition not found"}), 404
 
-        rows = (
-            sess.query(ScanResult)
-            .filter(
-                ScanResult.scan_definition_id == definition_id,
-                ScanResult.run_at >= since,
-            )
-            .order_by(ScanResult.run_at.desc())
-            .limit(limit)
-            .all()
+        q = sess.query(ScanResult).filter(
+            ScanResult.scan_definition_id == definition_id,
+            ScanResult.run_at >= since,
         )
+        if until:
+            q = q.filter(ScanResult.run_at <= until)
+
+        rows = q.order_by(ScanResult.run_at.desc()).limit(limit).all()
 
         signals = [
             {
@@ -203,6 +216,7 @@ def get_signals(definition_id: int):
                     },
                     "signals": signals,
                     "since": since,
+                    "until": until,
                     "limit": limit,
                     "count": len(signals),
                 },
@@ -211,4 +225,97 @@ def get_signals(definition_id: int):
 
     except Exception as e:
         logger.exception("scanner get_signals %s failed: %s", definition_id, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/definitions/<int:definition_id>/toggle", methods=["POST"])
+@check_session_validity
+def toggle_definition(definition_id: int):
+    """Flip a definition's enabled state (1→0 or 0→1).
+
+    Returns {"status": "success", "data": {"id": ..., "enabled": bool}}.
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        sess = db_session()
+        defn = sess.query(ScanDefinition).filter(ScanDefinition.id == definition_id).first()
+        if defn is None:
+            return jsonify({"status": "error", "message": "Definition not found"}), 404
+
+        new_state = 0 if defn.enabled else 1
+        defn.enabled = new_state
+        defn.updated_at = _now_ist_iso()
+        sess.commit()
+
+        logger.info("scanner definition %s toggled → enabled=%s", definition_id, bool(new_state))
+        return jsonify(
+            {"status": "success", "data": {"id": definition_id, "enabled": bool(new_state)}}
+        )
+
+    except Exception as e:
+        logger.exception("scanner toggle_definition %s failed: %s", definition_id, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/hits-by-symbol", methods=["GET"])
+@check_session_validity
+def hits_by_symbol():
+    """Aggregate signal hits by symbol for a given date.
+
+    Query params:
+        date    YYYY-MM-DD (default: today IST)
+
+    Returns:
+        {date, symbols: [{symbol, hit_count, definitions, latest_hit}]}
+        sorted by hit_count descending.
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        date_str = (request.args.get("date") or "").strip() or _today_ist()
+
+        sess = db_session()
+        rows = (
+            sess.query(ScanResult, ScanDefinition)
+            .join(ScanDefinition, ScanResult.scan_definition_id == ScanDefinition.id)
+            .filter(ScanResult.run_at.like(f"{date_str}%"))
+            .order_by(ScanResult.run_at.desc())
+            .all()
+        )
+
+        # Aggregate per symbol across all definitions
+        symbol_map: dict[str, dict] = {}
+        for result, defn in rows:
+            symbols = _parse_symbols(result.symbols)
+            for sym in symbols:
+                if sym not in symbol_map:
+                    symbol_map[sym] = {
+                        "symbol": sym,
+                        "hit_count": 0,
+                        "definitions": set(),
+                        "latest_hit": result.run_at,
+                    }
+                symbol_map[sym]["hit_count"] += 1
+                symbol_map[sym]["definitions"].add(defn.name)
+                if result.run_at > symbol_map[sym]["latest_hit"]:
+                    symbol_map[sym]["latest_hit"] = result.run_at
+
+        symbols_list = [
+            {
+                "symbol": v["symbol"],
+                "hit_count": v["hit_count"],
+                "definitions": sorted(v["definitions"]),
+                "latest_hit": v["latest_hit"],
+            }
+            for v in symbol_map.values()
+        ]
+        symbols_list.sort(key=lambda x: x["hit_count"], reverse=True)
+
+        return jsonify({"status": "success", "data": {"date": date_str, "symbols": symbols_list}})
+
+    except Exception as e:
+        logger.exception("scanner hits_by_symbol failed: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
