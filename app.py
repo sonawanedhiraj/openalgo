@@ -796,6 +796,24 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize scanner smoke check: {e}")
 
+            # In-house scanner zero-results tripwire (issue #33). Downstream
+            # silent-failure detector that catches the Friday 2026-06-19 gap
+            # the per-cycle completeness metric missed (56% coverage but 0 BUY
+            # hits all day because daily gates ran against stale stored bars).
+            # Fires every SCANNER_DRY_CHECK_INTERVAL_MIN minutes during market
+            # hours; CRIT when Chartink is producing rows but in-house is
+            # silent (pipeline degraded), WARN when both are dry (quiet
+            # market). See services/scanner_dry_tripwire_service.py.
+            try:
+                from services.scanner_dry_tripwire_service import (
+                    init_scanner_dry_tripwire,
+                )
+
+                init_scanner_dry_tripwire(app=app)
+                logger.debug("Scanner dry tripwire initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize scanner dry tripwire: {e}")
+
             # Futures Follow CAP50 strategy (leveraged-beta NIFTY-futures sleeve on
             # the sector_follow signal set). Default mode=sandbox means it ACTIVELY
             # trades the virtual ₹1Cr sandbox book from boot — the
