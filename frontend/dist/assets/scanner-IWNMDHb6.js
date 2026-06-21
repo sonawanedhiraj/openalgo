@@ -1,1 +1,0 @@
-import{y as i}from"./index-D4aGgyeM.js";const o={getDefinitions:async()=>(await i.get("/scanner/api/definitions")).data.data,getSignals:async(n,s,t)=>{const a={};return s&&(a.since=s),t!==void 0&&(a.limit=t),(await i.get(`/scanner/api/definitions/${n}/signals`,{params:a})).data.data}};export{o as s};

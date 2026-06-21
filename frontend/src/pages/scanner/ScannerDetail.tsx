@@ -1,12 +1,14 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, ArrowUpDown, RefreshCw, ScanLine, TrendingDown, TrendingUp } from 'lucide-react'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { type ScanSignal, scannerApi } from '@/api/scanner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -26,6 +28,120 @@ function fmtDateTime(ts: string): string {
   if (!m) return ts
   return `${m[1]} ${m[2]}`
 }
+
+function todayStr(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function daysAgo(n: number): string {
+  const d = new Date()
+  d.setDate(d.getDate() - n)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function toISTIso(dateStr: string, endOfDay = false): string {
+  const time = endOfDay ? 'T23:59:59' : 'T00:00:00'
+  return `${dateStr}${time}+05:30`
+}
+
+// ---------------------------------------------------------------------------
+// Hit-density bar chart
+// ---------------------------------------------------------------------------
+
+interface HourBucket {
+  hour: number
+  label: string
+  count: number
+}
+
+function HitDensityChart({
+  signals,
+  activeHour,
+  onHourClick,
+}: {
+  signals: ScanSignal[]
+  activeHour: number | null
+  onHourClick: (h: number | null) => void
+}) {
+  const buckets = useMemo<HourBucket[]>(() => {
+    const counts = new Array(24).fill(0)
+    for (const sig of signals) {
+      const m = sig.run_at.match(/T(\d{2}):/)
+      if (m) counts[parseInt(m[1], 10)] += 1
+    }
+    return counts
+      .map((count, hour) => ({
+        hour,
+        label: `${String(hour).padStart(2, '0')}:00`,
+        count,
+      }))
+      .filter((b) => b.count > 0)
+  }, [signals])
+
+  if (buckets.length === 0) return null
+
+  return (
+    <Card>
+      <CardHeader className="pb-2">
+        <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wide">
+          Hits per hour
+          {activeHour !== null && (
+            <span className="ml-2 normal-case text-primary">
+              · filtered to {String(activeHour).padStart(2, '0')}:xx
+              <button
+                type="button"
+                className="ml-2 underline text-xs"
+                onClick={() => onHourClick(null)}
+              >
+                clear
+              </button>
+            </span>
+          )}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="h-36 pt-0">
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={buckets} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+            <XAxis dataKey="label" tick={{ fontSize: 10 }} />
+            <YAxis allowDecimals={false} tick={{ fontSize: 10 }} />
+            <Tooltip
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              formatter={(value: any) => [value, 'signals']}
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              labelFormatter={(label: any) => `Hour ${label}`}
+            />
+            <Bar
+              dataKey="count"
+              radius={[3, 3, 0, 0]}
+              cursor="pointer"
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              onClick={(entry: any) => {
+                const h = typeof entry?.hour === 'number' ? entry.hour : null
+                if (h !== null) onHourClick(activeHour === h ? null : h)
+              }}
+            >
+              {buckets.map((b) => (
+                <Cell
+                  key={b.hour}
+                  fill={
+                    activeHour === null || activeHour === b.hour
+                      ? 'hsl(var(--primary))'
+                      : 'hsl(var(--muted))'
+                  }
+                />
+              ))}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </CardContent>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Signal row
+// ---------------------------------------------------------------------------
 
 function SignalRow({ sig, isNew }: { sig: ScanSignal; isNew: boolean }) {
   return (
@@ -65,19 +181,56 @@ function SignalRow({ sig, isNew }: { sig: ScanSignal; isNew: boolean }) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
 export default function ScannerDetail() {
   const { id } = useParams<{ id: string }>()
   const definitionId = id ? parseInt(id, 10) : NaN
+  const queryClient = useQueryClient()
 
   const [sortField, setSortField] = useState<SortField>('run_at')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
   const [seenIds] = useState(() => new Set<number>())
+  const [activeHour, setActiveHour] = useState<number | null>(null)
+
+  // Date range — default last 7 days
+  const [sinceDate, setSinceDate] = useState(daysAgo(7))
+  const [untilDate, setUntilDate] = useState(todayStr())
+
+  const sinceISO = toISTIso(sinceDate, false)
+  const untilISO = toISTIso(untilDate, true)
+
+  const [optimisticEnabled, setOptimisticEnabled] = useState<boolean | null>(null)
 
   const { data, isLoading, isError, error, refetch, isFetching, dataUpdatedAt } = useQuery({
-    queryKey: ['scanner-signals', definitionId],
-    queryFn: () => scannerApi.getSignals(definitionId),
+    queryKey: ['scanner-signals', definitionId, sinceDate, untilDate],
+    queryFn: () => scannerApi.getSignals(definitionId, sinceISO, untilISO),
     refetchInterval: REFRESH_MS,
     enabled: !Number.isNaN(definitionId),
+  })
+
+  // Sync toggle state with server data
+  useEffect(() => {
+    if (data?.definition?.enabled !== undefined) {
+      setOptimisticEnabled(data.definition.enabled)
+    }
+  }, [data?.definition?.enabled])
+
+  const toggleMutation = useMutation({
+    mutationFn: () => scannerApi.toggleDefinition(definitionId),
+    onMutate: () => {
+      setOptimisticEnabled((prev) => (prev === null ? null : !prev))
+    },
+    onSuccess: (result) => {
+      setOptimisticEnabled(result.enabled)
+      queryClient.invalidateQueries({ queryKey: ['scanner-definitions'] })
+      queryClient.invalidateQueries({ queryKey: ['scanner-signals', definitionId] })
+    },
+    onError: () => {
+      setOptimisticEnabled(data?.definition?.enabled ?? null)
+    },
   })
 
   const handleSort = useCallback(
@@ -105,6 +258,14 @@ export default function ScannerDetail() {
     })
   }, [data, sortField, sortDir])
 
+  const displayed = useMemo(() => {
+    if (activeHour === null) return sorted
+    return sorted.filter((sig) => {
+      const m = sig.run_at.match(/T(\d{2}):/)
+      return m ? parseInt(m[1], 10) === activeHour : false
+    })
+  }, [sorted, activeHour])
+
   const newIds = useMemo(() => {
     if (!data) return new Set<number>()
     const fresh = new Set<number>()
@@ -127,6 +288,7 @@ export default function ScannerDetail() {
     : null
 
   const defn = data?.definition
+  const enabledState = optimisticEnabled ?? defn?.enabled ?? true
   const isBuy = defn?.screener_type === 'buy'
   const Icon = isBuy ? TrendingUp : TrendingDown
 
@@ -158,11 +320,24 @@ export default function ScannerDetail() {
               </h1>
             )}
             <p className="text-sm text-muted-foreground">
-              Signal history (last 24h) · auto-refreshes every 30s
+              Signal history · auto-refreshes every 30s
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-3 shrink-0">
+          {defn && (
+            <div className="flex items-center gap-2">
+              <span className="text-sm text-muted-foreground">
+                {enabledState ? 'Enabled' : 'Disabled'}
+              </span>
+              <Switch
+                checked={enabledState}
+                onCheckedChange={() => toggleMutation.mutate()}
+                disabled={toggleMutation.isPending || isLoading}
+                aria-label="Toggle definition"
+              />
+            </div>
+          )}
           {lastUpdated && (
             <span className="text-xs text-muted-foreground">Updated {lastUpdated}</span>
           )}
@@ -200,8 +375,8 @@ export default function ScannerDetail() {
               <div>
                 <dt className="text-xs text-muted-foreground">Status</dt>
                 <dd>
-                  <Badge variant={defn.enabled ? 'default' : 'secondary'}>
-                    {defn.enabled ? 'Enabled' : 'Disabled'}
+                  <Badge variant={enabledState ? 'default' : 'secondary'}>
+                    {enabledState ? 'Enabled' : 'Disabled'}
                   </Badge>
                 </dd>
               </div>
@@ -218,6 +393,67 @@ export default function ScannerDetail() {
             </dl>
           </CardContent>
         </Card>
+      )}
+
+      {/* Date range picker */}
+      <Card>
+        <CardContent className="pt-4">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <label className="text-sm font-medium" htmlFor="since-date">
+                From
+              </label>
+              <input
+                id="since-date"
+                type="date"
+                value={sinceDate}
+                max={untilDate}
+                onChange={(e) => {
+                  setSinceDate(e.target.value)
+                  setActiveHour(null)
+                }}
+                className="h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <label className="text-sm font-medium" htmlFor="until-date">
+                To
+              </label>
+              <input
+                id="until-date"
+                type="date"
+                value={untilDate}
+                min={sinceDate}
+                max={todayStr()}
+                onChange={(e) => {
+                  setUntilDate(e.target.value)
+                  setActiveHour(null)
+                }}
+                className="h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              />
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setSinceDate(daysAgo(7))
+                setUntilDate(todayStr())
+                setActiveHour(null)
+              }}
+            >
+              Reset to last 7 days
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Hit density chart */}
+      {!isLoading && (data?.signals.length ?? 0) > 0 && (
+        <HitDensityChart
+          signals={data?.signals ?? []}
+          activeHour={activeHour}
+          onHourClick={setActiveHour}
+        />
       )}
 
       {/* Error */}
@@ -280,22 +516,27 @@ export default function ScannerDetail() {
                   </TableCell>
                 </TableRow>
               ))}
-            {!isLoading && sorted.length === 0 && (
+            {!isLoading && displayed.length === 0 && (
               <TableRow>
                 <TableCell colSpan={5} className="text-center py-12 text-muted-foreground">
-                  No signals in the last 24 hours.
+                  {activeHour !== null
+                    ? `No signals in hour ${String(activeHour).padStart(2, '0')}:xx for this range.`
+                    : `No signals from ${sinceDate} to ${untilDate}.`}
                 </TableCell>
               </TableRow>
             )}
             {!isLoading &&
-              sorted.map((sig) => <SignalRow key={sig.id} sig={sig} isNew={newIds.has(sig.id)} />)}
+              displayed.map((sig) => (
+                <SignalRow key={sig.id} sig={sig} isNew={newIds.has(sig.id)} />
+              ))}
           </TableBody>
         </Table>
       </div>
 
       {data && (
         <p className="text-xs text-muted-foreground text-right">
-          Showing {data.count} signal{data.count !== 1 ? 's' : ''} since {fmtDateTime(data.since)}
+          Showing {displayed.length} of {data.count} signal{data.count !== 1 ? 's' : ''} ·{' '}
+          {sinceDate} to {untilDate}
         </p>
       )}
     </div>

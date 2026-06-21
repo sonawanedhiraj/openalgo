@@ -1,11 +1,22 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, RefreshCw, ScanLine, TrendingDown, TrendingUp } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { type ScanDefinitionSummary, scannerApi } from '@/api/scanner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 const REFRESH_MS = 30_000
 
@@ -14,10 +25,44 @@ function fmtTime(ts: string): string {
   return m ? m[1] : ts
 }
 
+function todayStr(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// ---------------------------------------------------------------------------
+// Definition card with toggle
+// ---------------------------------------------------------------------------
+
 function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
+  const queryClient = useQueryClient()
+  const [optimisticEnabled, setOptimisticEnabled] = useState(def.enabled)
+
+  useEffect(() => {
+    setOptimisticEnabled(def.enabled)
+  }, [def.enabled])
+
+  const toggleMutation = useMutation({
+    mutationFn: () => scannerApi.toggleDefinition(def.id),
+    onMutate: () => {
+      setOptimisticEnabled((prev) => !prev)
+    },
+    onSuccess: (result) => {
+      setOptimisticEnabled(result.enabled)
+      queryClient.invalidateQueries({ queryKey: ['scanner-definitions'] })
+    },
+    onError: () => {
+      setOptimisticEnabled(def.enabled)
+    },
+  })
+
   const isBuy = def.screener_type === 'buy'
   const Icon = isBuy ? TrendingUp : TrendingDown
-  const accent = isBuy ? 'border-green-500/30 bg-green-500/5' : 'border-red-500/30 bg-red-500/5'
+  const accent = optimisticEnabled
+    ? isBuy
+      ? 'border-green-500/30 bg-green-500/5'
+      : 'border-red-500/30 bg-red-500/5'
+    : 'border-muted bg-muted/20 opacity-60'
   const badgeVariant = isBuy ? 'default' : 'destructive'
 
   return (
@@ -25,10 +70,18 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
       <CardHeader className="pb-3">
         <div className="flex items-start justify-between gap-2">
           <div className="flex items-center gap-2 min-w-0">
-            <Icon className={`h-5 w-5 shrink-0 ${isBuy ? 'text-green-500' : 'text-red-500'}`} />
+            <Icon
+              className={`h-5 w-5 shrink-0 ${isBuy ? 'text-green-500' : 'text-red-500'} ${!optimisticEnabled ? 'opacity-50' : ''}`}
+            />
             <CardTitle className="text-base truncate">{def.name}</CardTitle>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            <Switch
+              checked={optimisticEnabled}
+              onCheckedChange={() => toggleMutation.mutate()}
+              disabled={toggleMutation.isPending}
+              aria-label={`Toggle ${def.name}`}
+            />
             <Badge variant={badgeVariant} className="uppercase text-xs">
               {def.screener_type}
             </Badge>
@@ -37,7 +90,10 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
             </Badge>
           </div>
         </div>
-        {def.rule_module && (
+        {!optimisticEnabled && (
+          <p className="text-xs text-muted-foreground mt-1 italic">Disabled — not scanning</p>
+        )}
+        {def.rule_module && optimisticEnabled && (
           <p className="text-xs text-muted-foreground mt-1 truncate">
             Rule: {def.rule_module.replace('services.scan_rules.', '')}
           </p>
@@ -104,6 +160,101 @@ function DefinitionCardSkeleton() {
   )
 }
 
+// ---------------------------------------------------------------------------
+// "Today's hits by symbol" tab
+// ---------------------------------------------------------------------------
+
+function HitsBySymbolTable() {
+  const [date, setDate] = useState(todayStr())
+
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['scanner-hits-by-symbol', date],
+    queryFn: () => scannerApi.getHitsBySymbol(date),
+    refetchInterval: REFRESH_MS,
+  })
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3 flex-wrap">
+        <label className="text-sm font-medium" htmlFor="hbs-date">
+          Date
+        </label>
+        <input
+          id="hbs-date"
+          type="date"
+          value={date}
+          max={todayStr()}
+          onChange={(e) => setDate(e.target.value)}
+          className="h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+        />
+        <Button variant="ghost" size="sm" onClick={() => setDate(todayStr())}>
+          Today
+        </Button>
+      </div>
+
+      {isError && <p className="text-sm text-destructive">Failed to load hits. Try again.</p>}
+
+      <div className="rounded-lg border overflow-hidden">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Symbol</TableHead>
+              <TableHead className="text-center">Hits</TableHead>
+              <TableHead>Definitions</TableHead>
+              <TableHead className="text-right">Latest hit</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {isLoading &&
+              [1, 2, 3].map((i) => (
+                <TableRow key={i}>
+                  <TableCell>
+                    <Skeleton className="h-4 w-24" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-4 w-8 mx-auto" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-4 w-32" />
+                  </TableCell>
+                  <TableCell>
+                    <Skeleton className="h-4 w-24 ml-auto" />
+                  </TableCell>
+                </TableRow>
+              ))}
+            {!isLoading && (data?.symbols.length ?? 0) === 0 && (
+              <TableRow>
+                <TableCell colSpan={4} className="text-center py-10 text-muted-foreground">
+                  No hits found for {date}.
+                </TableCell>
+              </TableRow>
+            )}
+            {!isLoading &&
+              data?.symbols.map((row) => (
+                <TableRow key={row.symbol}>
+                  <TableCell className="font-mono font-medium">{row.symbol}</TableCell>
+                  <TableCell className="text-center tabular-nums">
+                    <Badge variant="secondary">{row.hit_count}</Badge>
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {row.definitions.join(', ')}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums text-xs text-muted-foreground">
+                    {fmtTime(row.latest_hit)}
+                  </TableCell>
+                </TableRow>
+              ))}
+          </TableBody>
+        </Table>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
 export default function ScannerIndex() {
   const { data, isLoading, isError, error, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['scanner-definitions'],
@@ -120,6 +271,9 @@ export default function ScannerIndex() {
       })
     : null
 
+  const enabledCount = data ? data.filter((d) => d.enabled).length : 0
+  const totalCount = data ? data.length : 0
+
   return (
     <div className="p-4 md:p-6 space-y-6">
       {/* Header */}
@@ -129,7 +283,7 @@ export default function ScannerIndex() {
           <div>
             <h1 className="text-2xl font-semibold">In-House Scanner</h1>
             <p className="text-sm text-muted-foreground">
-              Live signals from enabled scan definitions · auto-refreshes every 30s
+              Scan definitions · auto-refreshes every 30s
             </p>
           </div>
         </div>
@@ -157,36 +311,48 @@ export default function ScannerIndex() {
         </div>
       )}
 
-      {/* Loading skeleton */}
-      {isLoading && (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-          {[1, 2, 3].map((i) => (
-            <DefinitionCardSkeleton key={i} />
-          ))}
-        </div>
-      )}
+      <Tabs defaultValue="definitions">
+        <TabsList>
+          <TabsTrigger value="definitions">By Definition</TabsTrigger>
+          <TabsTrigger value="by-symbol">By Symbol</TabsTrigger>
+        </TabsList>
 
-      {/* Empty state */}
-      {!isLoading && !isError && data?.length === 0 && (
-        <div className="flex flex-col items-center justify-center py-16 gap-3 text-muted-foreground">
-          <ScanLine className="h-12 w-12 opacity-30" />
-          <p className="text-sm">No enabled scan definitions found.</p>
-        </div>
-      )}
+        {/* By Definition tab */}
+        <TabsContent value="definitions" className="mt-4 space-y-4">
+          {isLoading && (
+            <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+              {[1, 2, 3].map((i) => (
+                <DefinitionCardSkeleton key={i} />
+              ))}
+            </div>
+          )}
 
-      {/* Definition cards */}
-      {!isLoading && data && data.length > 0 && (
-        <>
-          <p className="text-sm text-muted-foreground">
-            {data.length} definition{data.length !== 1 ? 's' : ''} enabled
-          </p>
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {data.map((def) => (
-              <DefinitionCard key={def.id} def={def} />
-            ))}
-          </div>
-        </>
-      )}
+          {!isLoading && !isError && totalCount === 0 && (
+            <div className="flex flex-col items-center justify-center py-16 gap-3 text-muted-foreground">
+              <ScanLine className="h-12 w-12 opacity-30" />
+              <p className="text-sm">No scan definitions found.</p>
+            </div>
+          )}
+
+          {!isLoading && data && totalCount > 0 && (
+            <>
+              <p className="text-sm text-muted-foreground">
+                {enabledCount} of {totalCount} definition{totalCount !== 1 ? 's' : ''} enabled
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                {data.map((def) => (
+                  <DefinitionCard key={def.id} def={def} />
+                ))}
+              </div>
+            </>
+          )}
+        </TabsContent>
+
+        {/* By Symbol tab */}
+        <TabsContent value="by-symbol" className="mt-4">
+          <HitsBySymbolTable />
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }
