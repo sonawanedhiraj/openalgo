@@ -1,0 +1,8 @@
+{
+  "merged_at_sha": "422583bda",
+  "merged_at_iso": "2026-06-21T06:01:49Z",
+  "merged_pr": 35,
+  "unit_count": 1523,
+  "integration_count": 61,
+  "seeded_by": "PR #45 — initial seed from dev HEAD after #35 merged"
+}

@@ -1,0 +1,94 @@
+name: Update test-count baseline
+
+# Runs on every push to dev (after a PR merges). Counts current tests and
+# overwrites `.github/test-baselines.json` so subsequent PRs are gated against
+# the new floor. The commit it makes carries the magic skip-token in the
+# message so the standard CI workflows don't re-trigger on it, and this
+# workflow itself is path-filtered to ignore its own writes.
+
+on:
+  push:
+    branches: [dev]
+    # Avoid the self-loop: this workflow's commits only touch the baseline
+    # file, so excluding that path makes the workflow not re-trigger on its
+    # own writes.
+    paths-ignore:
+      - '.github/test-baselines.json'
+
+permissions:
+  contents: write   # to commit the baseline back to dev
+
+jobs:
+  update-baseline:
+    name: "Update .github/test-baselines.json"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip if the head commit is itself the baseline-bumping commit (defence
+    # in depth — paths-ignore should already block this).
+    if: ${{ !contains(github.event.head_commit.message, '[skip baseline]') }}
+
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Count tests on dev HEAD
+        id: count
+        env:
+          API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
+        run: |
+          json=$(bash scripts/ci/count_tests.sh)
+          unit=$(echo "$json" | python -c "import sys,json; print(json.load(sys.stdin)['unit_count'])")
+          integ=$(echo "$json" | python -c "import sys,json; print(json.load(sys.stdin)['integration_count'])")
+          echo "unit_count=$unit" >> "$GITHUB_OUTPUT"
+          echo "integration_count=$integ" >> "$GITHUB_OUTPUT"
+
+      - name: Find the merging PR for context
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          pr_num=$(gh pr list --search "$sha" --state merged --json number -q '.[0].number' || echo "")
+          [ -z "$pr_num" ] && pr_num=0
+          echo "merged_pr=$pr_num" >> "$GITHUB_OUTPUT"
+
+      - name: Write new baseline + commit
+        env:
+          UNIT:      ${{ steps.count.outputs.unit_count }}
+          INTEG:     ${{ steps.count.outputs.integration_count }}
+          MERGED_PR: ${{ steps.pr.outputs.merged_pr }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > .github/test-baselines.json <<JSON
+          {
+            "merged_at_sha": "$sha",
+            "merged_at_iso": "$iso",
+            "merged_pr": $MERGED_PR,
+            "unit_count": $UNIT,
+            "integration_count": $INTEG,
+            "seeded_by": "update-test-baseline.yml on push to dev"
+          }
+          JSON
+
+          # Only commit if the file actually changed (counts may be identical
+          # after a docs-only PR).
+          if git diff --quiet .github/test-baselines.json; then
+            echo "Baseline unchanged — no commit"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/test-baselines.json
+          git commit -m "chore(baseline): unit=$UNIT integration=$INTEG (PR #$MERGED_PR) [skip baseline] [skip ci]"
+          git push origin dev
