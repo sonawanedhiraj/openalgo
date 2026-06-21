@@ -1,0 +1,176 @@
+name: PR test-count check
+
+# Counts unit + integration tests on every PR and blocks merges that reduce
+# either count, unless the operator adds the `approve-test-decrease` label
+# (with a sticky comment loudly noting the approved decrease).
+#
+# Baseline = `.github/test-baselines.json` on the PR's BASE branch (i.e. the
+# state of dev at the most recent merge). The companion workflow
+# `update-test-baseline.yml` keeps this file in sync on every dev push.
+
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write   # for the sticky comment + label read
+
+jobs:
+  test-count:
+    name: "Test count check (no regression)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Count tests on PR head
+        id: pr_counts
+        env:
+          # The pytest collector needs the same secrets the CI stage uses.
+          API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
+        run: |
+          json=$(bash scripts/ci/count_tests.sh)
+          echo "$json"
+          unit=$(echo "$json" | python -c "import sys,json; print(json.load(sys.stdin)['unit_count'])")
+          integ=$(echo "$json" | python -c "import sys,json; print(json.load(sys.stdin)['integration_count'])")
+          echo "unit_count=$unit" >> "$GITHUB_OUTPUT"
+          echo "integration_count=$integ" >> "$GITHUB_OUTPUT"
+
+      - name: Read baseline from PR base
+        id: baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          base_branch="${{ github.base_ref }}"
+          # Fetch the baseline file from the BASE branch, not the PR head — the
+          # PR could mutate it and we don't want the gate to be self-referential.
+          baseline_json=$(gh api "repos/${{ github.repository }}/contents/.github/test-baselines.json?ref=$base_branch" \
+              --jq '.content' | base64 -d 2>/dev/null || echo '{}')
+          if [ -z "$baseline_json" ] || [ "$baseline_json" = "{}" ]; then
+            echo "no baseline yet on $base_branch — seeding from this PR (soft pass)"
+            echo "unit_baseline=0" >> "$GITHUB_OUTPUT"
+            echo "integration_baseline=0" >> "$GITHUB_OUTPUT"
+            echo "merged_pr=0" >> "$GITHUB_OUTPUT"
+            echo "first_baseline=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "baseline JSON: $baseline_json"
+          unit=$(echo "$baseline_json" | python -c "import sys,json; print(json.load(sys.stdin).get('unit_count', 0))")
+          integ=$(echo "$baseline_json" | python -c "import sys,json; print(json.load(sys.stdin).get('integration_count', 0))")
+          merged_pr=$(echo "$baseline_json" | python -c "import sys,json; print(json.load(sys.stdin).get('merged_pr', 0))")
+          echo "unit_baseline=$unit"             >> "$GITHUB_OUTPUT"
+          echo "integration_baseline=$integ"     >> "$GITHUB_OUTPUT"
+          echo "merged_pr=$merged_pr"            >> "$GITHUB_OUTPUT"
+          echo "first_baseline=0"                >> "$GITHUB_OUTPUT"
+
+      - name: Compute deltas + verdict
+        id: verdict
+        env:
+          PR_UNIT:       ${{ steps.pr_counts.outputs.unit_count }}
+          PR_INTEG:      ${{ steps.pr_counts.outputs.integration_count }}
+          BASE_UNIT:     ${{ steps.baseline.outputs.unit_baseline }}
+          BASE_INTEG:    ${{ steps.baseline.outputs.integration_baseline }}
+          FIRST_BASELINE: ${{ steps.baseline.outputs.first_baseline }}
+        run: |
+          unit_delta=$(( PR_UNIT - BASE_UNIT ))
+          integ_delta=$(( PR_INTEG - BASE_INTEG ))
+          # Has the operator approved the decrease via label?
+          has_label=$(printf '%s' '${{ toJSON(github.event.pull_request.labels.*.name) }}' \
+              | python -c "import sys,json; print('approve-test-decrease' in json.load(sys.stdin))")
+          regressed=0
+          [ $unit_delta  -lt 0 ] && regressed=1
+          [ $integ_delta -lt 0 ] && regressed=1
+          if [ "$FIRST_BASELINE" = "1" ]; then
+            verdict="seed"
+          elif [ $regressed -eq 0 ]; then
+            verdict="pass"
+          elif [ "$has_label" = "True" ]; then
+            verdict="overridden"
+          else
+            verdict="fail"
+          fi
+          echo "unit_delta=$unit_delta"           >> "$GITHUB_OUTPUT"
+          echo "integration_delta=$integ_delta"   >> "$GITHUB_OUTPUT"
+          echo "verdict=$verdict"                 >> "$GITHUB_OUTPUT"
+          echo "has_label=$has_label"             >> "$GITHUB_OUTPUT"
+
+      - name: Sticky comment on PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_UNIT:        ${{ steps.pr_counts.outputs.unit_count }}
+          PR_INTEG:       ${{ steps.pr_counts.outputs.integration_count }}
+          BASE_UNIT:      ${{ steps.baseline.outputs.unit_baseline }}
+          BASE_INTEG:     ${{ steps.baseline.outputs.integration_baseline }}
+          UNIT_DELTA:     ${{ steps.verdict.outputs.unit_delta }}
+          INTEG_DELTA:    ${{ steps.verdict.outputs.integration_delta }}
+          VERDICT:        ${{ steps.verdict.outputs.verdict }}
+          MERGED_PR:      ${{ steps.baseline.outputs.merged_pr }}
+          PR_NUMBER:      ${{ github.event.pull_request.number }}
+          BASE_BRANCH:    ${{ github.base_ref }}
+        run: |
+          # Body generation in Python — avoids YAML's block-scalar dedent
+          # gotcha that bites bash heredocs whose content lines hit column 0.
+          body=$(python <<'PY'
+          import os
+          icon, line = {
+              'pass':       ('✅', 'Counts not below baseline — gate passes.'),
+              'overridden': ('⚠️', '**Counts decreased**, but `approve-test-decrease` label is set — gate passes with approval. Reason for the decrease should be in the PR body.'),
+              'seed':       ('🌱', 'No baseline on the base branch yet — this run seeds it (soft pass).'),
+              'fail':       ('❌', '**Counts decreased** and no `approve-test-decrease` label is set — gate fails. Add the label if the decrease is intentional, or restore the missing tests.'),
+          }[os.environ['VERDICT']]
+          def delta(d):
+              d = int(d)
+              return f'+{d}' if d > 0 else (str(d) if d < 0 else '0')
+          merged_pr = int(os.environ['MERGED_PR'])
+          base_ref_str = f'PR #{merged_pr}' if merged_pr else 'initial baseline'
+          base_branch = os.environ['BASE_BRANCH']
+          print('<!-- test-count-bot:v1 -->')
+          print(f'## {icon} Test-count check')
+          print('')
+          print(f'|              | Baseline (`{base_ref_str}`) | This PR (`#{os.environ["PR_NUMBER"]}`) | Δ |')
+          print('| ---          | ---:               | ---:        | ---: |')
+          print(f'| Unit         | {os.environ["BASE_UNIT"]}         | {os.environ["PR_UNIT"]}    | {delta(os.environ["UNIT_DELTA"])} |')
+          print(f'| Integration  | {os.environ["BASE_INTEG"]}        | {os.environ["PR_INTEG"]}   | {delta(os.environ["INTEG_DELTA"])} |')
+          print('')
+          print(line)
+          print('')
+          print(f'<sub>Baseline = `.github/test-baselines.json` on `{base_branch}` (most recent merge to that branch). To override a legitimate decrease (e.g. deleting a deprecated feature\'s tests), add the `approve-test-decrease` label.</sub>')
+          PY
+          )
+
+          # Find existing sticky comment by the magic prefix; create or update.
+          MAGIC="<!-- test-count-bot:v1 -->"
+          existing=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+              --jq ".[] | select(.body | startswith(\"$MAGIC\")) | .id" | head -1)
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$existing" -f body="$body" >/dev/null
+            echo "Updated existing sticky comment $existing"
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" -f body="$body" >/dev/null
+            echo "Posted new sticky comment"
+          fi
+
+      - name: Enforce verdict
+        env:
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+        run: |
+          case "$VERDICT" in
+            pass|overridden|seed)
+              echo "✅ verdict=$VERDICT — gate passes"
+              ;;
+            fail)
+              echo "::error::Test count decreased without the approve-test-decrease label. See the sticky PR comment for the breakdown."
+              exit 1
+              ;;
+          esac
