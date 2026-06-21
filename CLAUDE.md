@@ -60,10 +60,14 @@ see the carve-out below). Capability reference:
    Capture the issue number `N`.
 2. **Branch by number.** `git checkout -b <type>/<N>-<slug>` (e.g.
    `feat/42-add-foo`). For parallel work, use a **git worktree** (below).
-3. **Link the PR.** The PR description **MUST** contain `Closes #N`. This is a
-   **required check** (`link-guard`): a code-changing PR with no issue link
-   cannot merge. Docs-only PRs are exempt from the block but should still link a
-   `type:docs` issue.
+3. **Link the PR.** The PR description **MUST** contain `Closes #N` AND the PR
+   title **MUST** be prefixed `[#N]`. Both are written for you by `bash
+   scripts/gh/track.sh link <N>`. The body's `Closes #N` is a **required check**
+   (`link-guard`): a code-changing PR with no issue link cannot merge. The title
+   prefix is a convention (no CI gate) that surfaces the linked issue in any
+   PR-list scan without having to click through. Docs-only PRs are exempt from
+   the link-guard block but should still link a `type:docs` issue and carry the
+   `[#N]` prefix.
 4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
    (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
    keyword close only fires on the default branch, so we do it ourselves).

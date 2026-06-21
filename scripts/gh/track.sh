@@ -84,20 +84,36 @@ cmd_new() {
 cmd_link() {
   local n="${1:-}"
   [ -n "$n" ] || die "link: missing issue number"
-  local pr body
+  local pr body title
   pr=$(gh pr view --json number -q .number 2>/dev/null || true)
   if [ -z "$pr" ]; then
     echo "No PR for the current branch yet. When you open it, include in the body:"
     echo "  Closes #$n"
+    echo "And prefix the title with [#$n] (so it's visible in the PR list)."
     return 0
   fi
   body=$(gh pr view "$pr" --json body -q .body 2>/dev/null || true)
+  title=$(gh pr view "$pr" --json title -q .title 2>/dev/null || true)
+
+  # Body — ensure Closes #N is present (existing link-guard contract).
   if printf '%s' "$body" | grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?) +#$n\b"; then
-    echo "PR #$pr already references issue #$n."
-    return 0
+    echo "PR #$pr body already references issue #$n."
+  else
+    gh pr edit "$pr" --body "$(printf '%s\n\nCloses #%s\n' "$body" "$n")" >/dev/null
+    echo "Added 'Closes #$n' to PR #$pr body."
   fi
-  gh pr edit "$pr" --body "$(printf '%s\n\nCloses #%s\n' "$body" "$n")"
-  echo "Added 'Closes #$n' to PR #$pr."
+
+  # Title — prepend [#N] if not already there. Match any of:
+  #   "[#42]"  "[#42] foo"  "[#42 #43] foo"  "[# 42] foo"
+  # Skip the rewrite when the issue number is already prefixed, regardless of
+  # surrounding decorations. Otherwise prepend "[#N] ".
+  if printf '%s' "$title" | grep -qE "^\[#[0-9 ,#]*\b$n\b[0-9 ,#]*\]"; then
+    echo "PR #$pr title already prefixed with #$n."
+  else
+    local new_title="[#$n] $title"
+    gh pr edit "$pr" --title "$new_title" >/dev/null
+    echo "Prefixed PR #$pr title with [#$n]: $new_title"
+  fi
 }
 
 cmd_done() {
