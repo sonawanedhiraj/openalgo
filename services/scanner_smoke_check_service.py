@@ -256,7 +256,12 @@ def assert_scanner_pipeline_healthy(
     }
 
     if ok:
-        logger.info("scanner smoke check 09:18 PASSED: %s", details)
+        # f-string (not %s + args) — the SensitiveDataFilter mutates
+        # record.args via re.sub on str(arg), which can desync %s
+        # placeholders from filtered args on some Python builds and
+        # raise "TypeError: not all arguments converted". This format
+        # path leaves args=() and is filter-safe by construction.
+        logger.info(f"scanner smoke check 09:18 PASSED: {details}")
         health_writer(True, [], details, False)
         return True, details
 
@@ -271,7 +276,7 @@ def assert_scanner_pipeline_healthy(
     if not session_ok:
         reasons.append("broker session not live")
     reason = "; ".join(reasons)
-    logger.error("scanner smoke check 09:18 FAILED: %s", reason)
+    logger.error(f"scanner smoke check 09:18 FAILED: {reason}")
 
     alert_already_sent_today = _last_alert_date == today
     if not alert_already_sent_today:
