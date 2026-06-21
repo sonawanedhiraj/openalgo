@@ -25,5 +25,6 @@ Closes #<!-- issue number; required so the issue links to this PR + the merge SH
 ```
 </details>
 
-> Note: default branch is `main`; PRs merged to `dev` will **not** auto-close the
-> linked issue — close it manually (or on the `main` release).
+> Note: `Closes #N` in the PR body auto-closes the linked issue on merge to `dev`
+> via the `issue-autoclose.yml` workflow (GitHub's native keyword close only fires
+> on the default branch; we close it ourselves).
