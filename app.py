@@ -80,6 +80,7 @@ from blueprints.react_app import (  # Import React frontend blueprint
     serve_react_app,
 )
 from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
+from blueprints.scanner_api import scanner_api_bp  # In-house scanner browser API (Tier 1)
 from blueprints.search import search_bp
 from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
 from blueprints.security import security_bp  # Import the security blueprint
@@ -297,6 +298,7 @@ def create_app():
     app.register_blueprint(whatsapp_bp)  # Register WhatsApp blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint
     app.register_blueprint(sandbox_bp)  # Register Sandbox blueprint
+    app.register_blueprint(scanner_api_bp)  # Register in-house scanner browser API
     app.register_blueprint(playground_bp)  # Register API playground blueprint
     app.register_blueprint(logging_bp)  # Register Logging blueprint
     app.register_blueprint(admin_bp)  # Register Admin blueprint
