@@ -7,6 +7,7 @@ Optimized for backtesting and analytical queries.
 """
 
 import os
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -25,6 +26,19 @@ load_dotenv()
 
 # Database path - in /db folder like other OpenAlgo databases
 HISTORIFY_DB_PATH = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
+
+# Windows uses mandatory exclusive write locks (LockFileEx) for the duration of a
+# DuckDB connection, unlike Linux where flock is advisory. Concurrent
+# duckdb.connect() calls from different threads in the same process race for the
+# OS lock and produce "could not set lock on file" bursts during the post-close
+# backfill window when sector_follow (38 symbols) + scanner (238+ symbols) both
+# feed the same ThreadPoolExecutor (max_workers=5). This lock ensures only one
+# duckdb.connect() call is in flight at any time from this process.
+#
+# Reads via data_freshness_service.connect_historify_readonly() bypass this lock
+# intentionally — they go through DuckDB's in-process instance reuse and never
+# hold the OS write lock.
+_db_write_lock = threading.Lock()
 
 
 def get_db_path() -> str:
@@ -46,16 +60,25 @@ def ensure_db_directory():
 
 
 @contextmanager
-def get_connection(max_retries: int = 3, retry_delay: float = 0.5):
+def get_connection(max_retries: int = 10, retry_delay: float = 1.0):
     """
     Get a DuckDB connection with proper resource management and retry logic.
 
-    DuckDB uses exclusive file locking on Windows. This function includes retry
-    logic to handle temporary file access conflicts in concurrent scenarios.
+    On Windows, DuckDB holds a mandatory exclusive write lock (LockFileEx) for
+    the lifetime of each connection. ``_db_write_lock`` serialises all
+    ``duckdb.connect()`` calls within this process so only one connection is
+    open at a time, preventing the "could not set lock" burst that occurs when
+    the sector_follow and scanner backfill jobs drive the shared
+    ThreadPoolExecutor with up to 5 concurrent workers.
+
+    The retry loop is retained as defence-in-depth for the cross-process case
+    (e.g. a manual CLI backfill running alongside the app). Default retries are
+    raised from 3 → 10 and base delay from 0.5 → 1.0 s so brief cross-process
+    contention is handled gracefully.
 
     Args:
-        max_retries: Maximum number of connection attempts (default: 3)
-        retry_delay: Delay in seconds between retries (default: 0.5)
+        max_retries: Maximum number of connection attempts (default: 10)
+        retry_delay: Base delay in seconds between retries (default: 1.0)
 
     Usage:
         with get_connection() as conn:
@@ -68,27 +91,30 @@ def get_connection(max_retries: int = 3, retry_delay: float = 0.5):
     conn = None
     last_error = None
 
-    for attempt in range(max_retries):
+    with _db_write_lock:
+        for attempt in range(max_retries):
+            try:
+                import duckdb
+
+                conn = duckdb.connect(db_path)
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.debug(f"DuckDB connection attempt {attempt + 1} failed, retrying: {e}")
+                    time.sleep(retry_delay * (attempt + 1))  # linear backoff
+                else:
+                    logger.exception(
+                        f"Failed to connect to DuckDB after {max_retries} attempts: {e}"
+                    )
+
+        if conn is None:
+            raise last_error or Exception("Failed to connect to DuckDB")
+
         try:
-            import duckdb
-
-            conn = duckdb.connect(db_path)
-            break
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                logger.debug(f"DuckDB connection attempt {attempt + 1} failed, retrying: {e}")
-                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-            else:
-                logger.exception(f"Failed to connect to DuckDB after {max_retries} attempts: {e}")
-
-    if conn is None:
-        raise last_error or Exception("Failed to connect to DuckDB")
-
-    try:
-        yield conn
-    finally:
-        conn.close()
+            yield conn
+        finally:
+            conn.close()
 
 
 def init_database():
