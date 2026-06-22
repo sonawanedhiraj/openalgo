@@ -3,7 +3,7 @@ import atexit
 import os
 import platform
 import signal
-import subprocess
+import subprocess  # nosec B404 — cmd is built from sys.executable + a whitelisted script path
 import sys
 import threading
 
@@ -32,9 +32,13 @@ def _eventlet_active() -> bool:
         return False
 
 
-# Set the correct event loop policy for Windows to avoid ZeroMQ warnings
+# Use ProactorEventLoop on Windows (I/O completion ports, no FD_SETSIZE limit).
+# SelectorEventLoop relies on select(), which is capped at ~512 handles on
+# Windows — a thread/FD leak (see incident #76) can crash the WS proxy at that
+# ceiling.  ProactorEventLoop has no such cap and is compatible with ZeroMQ
+# asyncio usage and websockets.  Linux/eventlet path is unaffected.
 if platform.system() == "Windows":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # Global flag to track if the WebSocket server has been started
 # Used to prevent multiple instances in Flask debug mode
@@ -189,7 +193,7 @@ def _spawn_websocket_subprocess():
         # Inherit stdout/stderr so the child's logging lands in the same
         # systemd journal as gunicorn. The WS server already uses Python
         # logging via utils.logging, so file/json log handlers fire too.
-        _websocket_subprocess = subprocess.Popen(
+        _websocket_subprocess = subprocess.Popen(  # nosec B603 — cmd list built from sys.executable
             cmd,
             cwd=project_root,
             stdout=None,
