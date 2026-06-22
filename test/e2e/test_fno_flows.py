@@ -267,7 +267,6 @@ class TestBuySellBreakoutToOrder:
             svc._place_entry_order(sig, api_key="k", strategy_name="chartink_FnO_intraday_buy")
         m_sbx.assert_called_once()
         # Order carried the BUY action + the breakout qty into the sandbox call.
-        payload = m_sbx.call_args.args[0] if m_sbx.call_args.args else m_sbx.call_args.kwargs
         assert eng.positions["RELIANCE"].qty == sig.quantity  # long
         assert eng.positions["RELIANCE"].entry_price == 101.7
 
@@ -532,7 +531,7 @@ class TestVetoDirectionConsistency:
 class TestStopAndTrailing:
     def test_atr_stop_loss_fires_exit(self):
         eng = _buy_engine()
-        sig = eng.on_new_candle("RELIANCE", _buy_breakout_candle())
+        eng.on_new_candle("RELIANCE", _buy_breakout_candle())
         pos = eng.confirm_entry("RELIANCE", executed_price=101.5)
         assert pos is not None
         exits = eng.on_price_update("RELIANCE", pos.stop_loss - 0.05)

@@ -1,0 +1,42 @@
+name: "Incident"
+description: "A production incident (trading disrupted, scan cycles blocked, data outage). Track triage → fix → retrospective."
+title: "incident(YYYY-MM-DD): <short summary>"
+labels: ["type:incident"]
+body:
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact & timeline
+      description: What broke, when (IST), and the blast radius (trading? scans? data?).
+    validations:
+      required: true
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: Root cause
+  - type: textarea
+    id: remediation
+    attributes:
+      label: Remediation
+      description: Immediate mitigation + the durable fix(es), with commit SHA(s)/PR(s).
+    validations:
+      required: true
+  - type: input
+    id: commits
+    attributes:
+      label: Fix commit(s) / PR(s)
+      placeholder: "e9e92624e (P0), fcc4aa8d4 (P1) ; PR #00"
+  - type: textarea
+    id: followups
+    attributes:
+      label: Follow-ups / prevention
+      description: Hardening, tests, monitoring to stop recurrence. Link any spawned issues.
+  - type: checkboxes
+    id: dod
+    attributes:
+      label: Definition of Done
+      options:
+        - label: Durable fix merged with regression test(s)
+        - label: "Docker deploy-test passed for the fix(es)"
+        - label: Retrospective / research doc linked
+        - label: Prevention follow-ups filed as issues

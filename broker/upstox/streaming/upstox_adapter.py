@@ -459,7 +459,7 @@ class UpstoxWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.logger.warning(f"No subscription found for feed key: {feed_key}")
                 return
 
-            for correlation_id, sub_info in matching_subscriptions:
+            for _, sub_info in matching_subscriptions:
                 symbol = sub_info["symbol"]
                 exchange = sub_info["exchange"]
                 mode = sub_info["mode"]

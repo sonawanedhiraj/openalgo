@@ -382,7 +382,7 @@ def test_poster_disabled_does_not_subscribe(monkeypatch):
     """
     monkeypatch.setenv("SCAN_HIT_POSTER_ENABLED", "false")
     bus = _FakeBus()
-    poster = ScanHitPoster(mode=MODE_SHADOW, bus=bus)
+    ScanHitPoster(mode=MODE_SHADOW, bus=bus)
     # If never started, no subscription should land.
     assert bus.subscribed == []
 

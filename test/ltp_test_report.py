@@ -285,7 +285,7 @@ def main():
         print(f"   {exchange}: {count} symbols")
 
     print("\n" + "=" * 50)
-    proceed = get_user_input("Press Enter to start the test (or Ctrl+C to cancel)...")
+    get_user_input("Press Enter to start the test (or Ctrl+C to cancel)...")
 
     # Statistics tracking
     update_count = 0
@@ -479,7 +479,7 @@ def main():
             if missing_symbols:
                 print(f"\n⚠️  Missing Symbols: {len(missing_symbols)}")
                 if len(missing_symbols) <= 10:
-                    print("Missing symbols:", ", ".join(sorted(list(missing_symbols))))
+                    print("Missing symbols:", ", ".join(sorted(missing_symbols)))
             else:
                 print("\n🎉 All symbols received data!")
 

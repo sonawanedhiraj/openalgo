@@ -1,0 +1,54 @@
+name: "Work item (feature / hardening / infra)"
+description: "A unit of engineering work to track end-to-end, with implementation details, commit/PR, and the Definition of Done."
+title: "<type>: <short summary>"
+labels: ["type:enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is this work and why does it matter?
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / root cause
+      description: For a fix, the root cause. For a feature, the problem it solves.
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Implementation details
+      description: What will change / changed, per file. Key design decisions and trade-offs.
+      placeholder: |
+        - services/foo.py — ...
+        - test/test_foo.py — ...
+    validations:
+      required: true
+  - type: input
+    id: commits
+    attributes:
+      label: Commit(s) / PR
+      description: "Commit SHA(s) and PR link once implemented. (Use `Closes #<n>` in the PR.)"
+      placeholder: "e9e92624e ; PR #00"
+  - type: textarea
+    id: tests
+    attributes:
+      label: Tests & verification
+      description: Which tests cover this, and how it was verified (results, counts).
+  - type: checkboxes
+    id: dod
+    attributes:
+      label: Definition of Done
+      description: "All boxes must be checked before closing. See docs/DEPLOYMENT_TESTING.md."
+      options:
+        - label: Unit/integration tests added or updated, and green
+        - label: "Docker deploy-test passed (scripts/docker_smoke.sh) — paste RESULT + image/commit"
+        - label: Docs updated if architectural (CLAUDE.md / docs/SYSTEM_MAP.md)
+        - label: PARAMETER_LOG / STRATEGY_REGISTRY updated if a tunable/strategy changed
+        - label: Commit SHA(s) recorded on this issue
+  - type: textarea
+    id: related
+    attributes:
+      label: Related docs / issues
+      description: Links to research docs, registry entries, related issues.

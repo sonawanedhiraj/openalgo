@@ -51,8 +51,8 @@ def isolated_rule_registry(monkeypatch):
     scanner_service._rule_metadata.update(saved_meta)
 
 
-def _bar(ts: dt.datetime, o: float, h: float, l: float, c: float, v: int = 1000) -> dict:
-    return {"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": v}
+def _bar(ts: dt.datetime, o: float, h: float, lo: float, c: float, v: int = 1000) -> dict:
+    return {"ts": ts, "open": o, "high": h, "low": lo, "close": c, "volume": v}
 
 
 def _warmup_bars(start: dt.datetime, n: int = 22, price: float = 100.0) -> list[dict]:

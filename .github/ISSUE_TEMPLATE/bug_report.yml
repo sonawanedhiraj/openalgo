@@ -1,0 +1,41 @@
+name: "Bug report"
+description: "A defect in the running system (error storm, wrong behaviour, crash, stuck state)."
+title: "fix: <short summary>"
+labels: ["type:bug"]
+body:
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: What was observed? Include log lines / counts / timestamps (IST).
+    validations:
+      required: true
+  - type: textarea
+    id: root_cause
+    attributes:
+      label: Root cause
+      description: The actual cause once diagnosed (file:line, mechanism).
+  - type: textarea
+    id: fix
+    attributes:
+      label: Fix / implementation details
+      description: What changed, per file, and why it resolves the root cause.
+  - type: input
+    id: commits
+    attributes:
+      label: Commit(s) / PR
+      placeholder: "<sha> ; PR #00"
+  - type: textarea
+    id: tests
+    attributes:
+      label: Tests & verification
+      description: Regression test(s) added, and how the fix was verified.
+  - type: checkboxes
+    id: dod
+    attributes:
+      label: Definition of Done
+      options:
+        - label: Regression test added, and green
+        - label: "Docker deploy-test passed (scripts/docker_smoke.sh) — paste RESULT + image/commit"
+        - label: Commit SHA(s) recorded on this issue
+        - label: Docs / audit trail updated if relevant

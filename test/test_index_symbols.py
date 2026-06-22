@@ -365,7 +365,7 @@ def run_tests(db_url, broker_name):
             print(
                 f"  [WARN] {len(nse_transformed)} unlisted symbols were TRANSFORMED beyond basic cleanup:"
             )
-            for sym, brsym, raw, cleaned in nse_transformed:
+            for sym, brsym, _, cleaned in nse_transformed:
                 print(f"    {brsym:40s} -> {sym:30s} (expected: {cleaned})")
             total_warn += len(nse_transformed)
         if nse_preserved:
@@ -466,7 +466,7 @@ def run_tests(db_url, broker_name):
             print(
                 f"  [WARN] {len(bse_transformed)} unlisted symbols were TRANSFORMED beyond basic cleanup:"
             )
-            for sym, brsym, raw, cleaned in bse_transformed:
+            for sym, brsym, _, cleaned in bse_transformed:
                 print(f"    {brsym:40s} -> {sym:30s} (expected: {cleaned})")
             total_warn += len(bse_transformed)
         if bse_preserved:

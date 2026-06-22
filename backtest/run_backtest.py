@@ -105,7 +105,7 @@ def config_from_engine_api(
     url = f"{base_url}/chartink/simplified-engine/api/status"
     print(f"  Fetching live engine config from {url} ...")
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with urllib.request.urlopen(url, timeout=5) as resp:  # nosec B310 — localhost only
             body = json.loads(resp.read().decode())
     except Exception as e:
         print(f"  [ERROR] Could not reach engine API: {e}")
@@ -292,7 +292,7 @@ def symbols_from_engine(base_url: str = "http://127.0.0.1:5000") -> list[str]:
     """
     url = f"{base_url}/chartink/simplified-engine/api/status"
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with urllib.request.urlopen(url, timeout=5) as resp:  # nosec B310 — localhost only
             body = json.loads(resp.read().decode())
     except Exception as e:
         print(f"  [WARN] Could not reach engine for symbol list: {e}")
@@ -580,7 +580,7 @@ class BacktestRunner:
                 # Check if SL was breached by candle low (for longs)
                 if pos.qty > 0 and candle.low <= pos.stop_loss:
                     exit_sigs = self.engine.on_price_update(symbol, pos.stop_loss)
-                    for exit_sig in exit_sigs:
+                    for _ in exit_sigs:
                         exits_triggered += 1
                         trade = self.engine.confirm_exit(
                             symbol, pos.stop_loss, "stop_loss_intracandle"
@@ -600,7 +600,7 @@ class BacktestRunner:
                             )
                 elif pos.qty < 0 and candle.high >= pos.stop_loss:
                     exit_sigs = self.engine.on_price_update(symbol, pos.stop_loss)
-                    for exit_sig in exit_sigs:
+                    for _ in exit_sigs:
                         exits_triggered += 1
                         trade = self.engine.confirm_exit(
                             symbol, pos.stop_loss, "stop_loss_intracandle"
@@ -850,7 +850,7 @@ def print_results(
             event = entry.pop("event")
             symbol = entry.pop("symbol")
             time = entry.pop("time")
-            candle_time = entry.pop("candle_time", "")
+            entry.pop("candle_time", "")
             details = ", ".join(f"{k}={v}" for k, v in entry.items())
             print(f"  {time:>8} {event:<6} {symbol:<14} {details}")
         print()

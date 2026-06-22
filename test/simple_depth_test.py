@@ -400,7 +400,7 @@ if __name__ == "__main__":
 
     # Live data can also be continuously polled using this method
     print("\nReceiving market data for 10 seconds...")
-    for i in range(10):
+    for _ in range(10):
         # Sleep to allow depth data to be received and printed by the callback
         time.sleep(1)
 

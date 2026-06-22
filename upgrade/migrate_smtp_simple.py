@@ -337,7 +337,7 @@ Examples:
     args = parser.parse_args()
 
     # Setup
-    logger = setup_logging(args.verbose)
+    setup_logging(args.verbose)
     use_emoji = not args.no_emoji
 
     safe_print("🚀 OpenAlgo SMTP Migration (Universal Path Version)", use_emoji)
