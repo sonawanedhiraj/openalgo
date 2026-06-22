@@ -2,6 +2,7 @@
 # Kite Connect GTT API reference: https://kite.trade/docs/connect/v3/gtt/
 
 import json
+import os
 import urllib.parse
 
 from broker.zerodha.mapping.gtt_data import (
@@ -16,7 +17,7 @@ from utils.mpp_slab import calculate_protected_price, get_instrument_type_from_s
 
 logger = get_logger(__name__)
 
-_BASE = "https://api.kite.trade"
+_BASE = os.getenv("BROKER_API_URL", "https://api.kite.trade")
 
 
 def _headers(auth, form=False):

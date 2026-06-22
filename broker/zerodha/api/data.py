@@ -51,6 +51,9 @@ class ZerodhaAPIError(Exception):
     pass
 
 
+BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
+
+
 def get_api_response(endpoint, auth, method="GET", payload=None):
     """
     Make an API request to Zerodha's API using shared httpx client with connection pooling.
@@ -69,7 +72,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         ZerodhaAPIError: For other API errors
     """
     AUTH_TOKEN = auth
-    base_url = "https://api.kite.trade"
+    base_url = BROKER_API_URL
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()

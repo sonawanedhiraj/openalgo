@@ -4,6 +4,8 @@ import os
 
 from utils.httpx_client import get_httpx_client
 
+BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
+
 
 def authenticate_broker(request_token):
     try:
@@ -12,7 +14,7 @@ def authenticate_broker(request_token):
         BROKER_API_SECRET = os.getenv("BROKER_API_SECRET")
 
         # Zerodha's endpoint for session token exchange
-        url = "https://api.kite.trade/session/token"
+        url = f"{BROKER_API_URL}/session/token"
 
         # Generating the checksum as a SHA-256 hash of concatenated api_key, request_token, and api_secret
         checksum_input = f"{BROKER_API_KEY}{request_token}{BROKER_API_SECRET}"
