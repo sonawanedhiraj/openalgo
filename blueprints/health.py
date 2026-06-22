@@ -14,6 +14,10 @@ ZERO LATENCY IMPACT - all metrics collected in background thread.
 
 import csv
 import io
+import os
+import socket
+import threading
+import time
 from datetime import datetime
 
 import pytz
@@ -97,6 +101,77 @@ def simple_health():
     except Exception as e:
         logger.error(f"Error in simple health check: {e}")
         return jsonify({"status": "fail", "description": str(e)}), 503
+
+
+@health_bp.route("/ws_proxy", methods=["GET"])
+@limiter.limit("120/minute")
+def ws_proxy_health():
+    """WS proxy liveness indicator for the /scanner header LED.
+
+    Unauthenticated. Polls every 15 s from the frontend.
+
+    Returns:
+        {status: healthy|degraded|down, last_tick_age_sec: N|null,
+         thread_count: N, subscribed_symbols: N|null}
+
+    Thresholds:
+        healthy  — TCP probe passes AND tick age < 60 s (or age unknown)
+        degraded — TCP probe passes AND tick age 60–179 s
+        down     — TCP probe fails OR tick age ≥ 180 s
+    """
+    ws_host = os.getenv("WEBSOCKET_HOST", "127.0.0.1")
+    ws_port = int(os.getenv("WEBSOCKET_PORT", "8765"))
+
+    port_open = False
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        port_open = sock.connect_ex((ws_host, ws_port)) == 0
+        sock.close()
+    except Exception:
+        port_open = False
+
+    thread_count = threading.active_count()
+
+    if not port_open:
+        return jsonify(
+            {
+                "status": "down",
+                "last_tick_age_sec": None,
+                "thread_count": thread_count,
+                "subscribed_symbols": None,
+            }
+        )
+
+    last_tick_age_sec = None
+    subscribed_symbols = None
+    try:
+        from websocket_proxy.app_integration import _websocket_proxy_instance  # noqa: PLC0415
+
+        if _websocket_proxy_instance is not None:
+            tick_times = _websocket_proxy_instance.last_message_time
+            subscribed_symbols = len(_websocket_proxy_instance.subscription_index)
+            if tick_times:
+                most_recent = max(tick_times.values())
+                last_tick_age_sec = round(time.time() - most_recent, 1)
+    except Exception:
+        pass
+
+    if last_tick_age_sec is None or last_tick_age_sec < 60:
+        status = "healthy"
+    elif last_tick_age_sec < 180:
+        status = "degraded"
+    else:
+        status = "down"
+
+    return jsonify(
+        {
+            "status": status,
+            "last_tick_age_sec": last_tick_age_sec,
+            "thread_count": thread_count,
+            "subscribed_symbols": subscribed_symbols,
+        }
+    )
 
 
 @health_bp.route("/check", methods=["GET"])

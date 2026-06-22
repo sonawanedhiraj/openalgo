@@ -17,8 +17,82 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
 const REFRESH_MS = 30_000
+const WS_HEALTH_POLL_MS = 15_000
+
+type WsStatus = 'healthy' | 'degraded' | 'down'
+
+interface WsProxyHealth {
+  status: WsStatus
+  last_tick_age_sec: number | null
+  thread_count: number
+  subscribed_symbols: number | null
+}
+
+async function fetchWsHealth(): Promise<WsProxyHealth> {
+  const res = await fetch('/health/ws_proxy')
+  if (!res.ok) throw new Error(`ws_proxy health ${res.status}`)
+  return res.json()
+}
+
+const LED_CLS: Record<WsStatus, string> = {
+  healthy: 'bg-green-500',
+  degraded: 'bg-amber-400',
+  down: 'bg-red-500',
+}
+
+const LED_LBL: Record<WsStatus, string> = {
+  healthy: 'WS healthy',
+  degraded: 'WS degraded',
+  down: 'WS down',
+}
+
+function WsHealthLed() {
+  const { data, isError } = useQuery<WsProxyHealth>({
+    queryKey: ['ws-proxy-health'],
+    queryFn: fetchWsHealth,
+    refetchInterval: WS_HEALTH_POLL_MS,
+    retry: 1,
+  })
+
+  const status: WsStatus = isError ? 'down' : (data?.status ?? 'down')
+  const dotCls = LED_CLS[status]
+
+  const tipLines: string[] = [`Status: ${status}`]
+  if (data) {
+    if (data.last_tick_age_sec !== null) tipLines.push(`Last tick: ${data.last_tick_age_sec}s ago`)
+    else tipLines.push('Last tick: unknown')
+    if (data.subscribed_symbols !== null)
+      tipLines.push(`Subscribed: ${data.subscribed_symbols} symbols`)
+    tipLines.push(`Threads: ${data.thread_count}`)
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={LED_LBL[status]}
+          className="flex items-center gap-1.5 cursor-default focus:outline-none"
+        >
+          <span
+            className={`inline-block h-2.5 w-2.5 rounded-full ${dotCls} ${status === 'healthy' ? 'animate-pulse' : ''}`}
+          />
+          <span className="text-xs text-muted-foreground">{LED_LBL[status]}</span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">
+        <div className="space-y-0.5">
+          {tipLines.map((l) => (
+            <p key={l}>{l}</p>
+          ))}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
 
 function fmtTime(ts: string, todayDate?: string): string {
   const date = new Date(ts)
@@ -306,6 +380,7 @@ export default function ScannerIndex() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <WsHealthLed />
           {lastUpdated && (
             <span className="text-xs text-muted-foreground">Updated {lastUpdated}</span>
           )}
