@@ -85,6 +85,27 @@ jobs:
             exit 1
           fi
 
+      - name: Install Playwright (Node + Chromium)
+        run: |
+          cd frontend
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run Playwright smoke tests
+        env:
+          OPENALGO_URL: http://127.0.0.1:5000
+        run: |
+          cd frontend
+          npx playwright test --config playwright.smoke.config.ts
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
       - name: Teardown (always run)
         if: always()
         run: |
