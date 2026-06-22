@@ -261,3 +261,86 @@ class TestConnectionPoolInitialize:
         assert after <= before + 1, (
             f"initialize() spawned unexpected threads: before={before} after={after}"
         )
+
+
+class TestConnectionPoolConnect:
+    """Response-shape tests for ConnectionPool.connect() (issue #84 sibling audit).
+
+    The connect() method has the same multi-format response predicate as
+    initialize(), and must use the same explicit `is False` check to distinguish
+    between {"status": "success"} (Zerodha format, no "success" key) and
+    {"success": False} (error format).
+
+    These tests mirror the initialize() tests to ensure connect() handles all
+    response shapes consistently.
+    """
+
+    def test_connect_success_bool_true(self):
+        """{"success": True} in connect response → success."""
+
+        # Fake adapter that returns success on both initialize and connect
+        class ConnectAdapter:
+            def initialize(self, broker_name, user_id, auth_data=None):
+                return {"success": True}
+
+            def connect(self):
+                return {"success": True}
+
+            def disconnect(self):
+                pass
+
+        pool = _make_pool(ConnectAdapter)
+        pool.initialize()
+        result = pool.connect()
+
+        assert result["success"] is True
+        assert pool.connected is True
+
+    def test_connect_zerodha_status_success_not_failure(self):
+        """{"status": "success"} (Zerodha shape) in connect → must succeed.
+
+        Regression test for issue #84 sibling predicate: if connect() uses
+        `not result.get("success")` instead of `is False`, then {"status":
+        "success"} (no "success" key) is treated as error because None is falsy.
+        """
+
+        class ZerodhaConnectAdapter:
+            def initialize(self, broker_name, user_id, auth_data=None):
+                return {"success": True}
+
+            def connect(self):
+                # Zerodha adapter returns status, not success
+                return {"status": "success"}
+
+            def disconnect(self):
+                pass
+
+        pool = _make_pool(ZerodhaConnectAdapter)
+        pool.initialize()
+        result = pool.connect()
+
+        assert result["success"] is True, (
+            '{"status": "success"} must NOT be treated as an error '
+            "— this indicates a regression of issue #84 in connect()"
+        )
+        assert pool.connected is True
+
+    def test_connect_failure_bool_false(self):
+        """{"success": False} in connect response → failure."""
+
+        class FailingConnectAdapter:
+            def initialize(self, broker_name, user_id, auth_data=None):
+                return {"success": True}
+
+            def connect(self):
+                return {"success": False, "error": "connection timeout"}
+
+            def disconnect(self):
+                pass
+
+        pool = _make_pool(FailingConnectAdapter)
+        pool.initialize()
+        result = pool.connect()
+
+        assert result["success"] is False
+        assert pool.connected is False
