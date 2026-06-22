@@ -437,6 +437,27 @@ class ConnectionPool:
                 adapter = self._create_adapter()
                 result = adapter.initialize(self.broker_name, self.user_id, auth_data)
 
+                # Defensive shape validation (belt-and-suspenders against unexpected responses)
+                if result is None:
+                    self.logger.warning(
+                        "Adapter initialization returned None — treating as success (defensive)"
+                    )
+                elif not isinstance(result, dict):
+                    self.logger.error(
+                        f"Adapter initialization returned unexpected type {type(result).__name__}: {repr(result)}"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"Unexpected response type: {type(result).__name__}",
+                    }
+                elif isinstance(result, dict) and not any(
+                    key in result for key in ("success", "status", "error")
+                ):
+                    self.logger.info(
+                        f"Adapter initialization response has no recognized keys (success/status/error) "
+                        f"— treating as success (defensive): {result}"
+                    )
+
                 # Handle both response formats from adapters:
                 # - {"success": False, "error": "..."} (ConnectionPool format)
                 # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
@@ -571,7 +592,7 @@ class ConnectionPool:
                     # Handle both response formats from adapters:
                     # - {"success": False, "error": "..."} (ConnectionPool format)
                     # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
-                    is_error = (result and not result.get("success")) or (
+                    is_error = (result and result.get("success") is False) or (
                         result and result.get("status") == "error"
                     )
                     if is_error:
