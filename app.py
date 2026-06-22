@@ -139,6 +139,7 @@ from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
 from services.telegram_bot_service import telegram_bot_service
+from services.thread_watchdog_service import init_thread_watchdog  # Thread-count watchdog
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.logging import (  # Import centralized logging
@@ -437,6 +438,9 @@ def create_app():
         # Initialize health monitoring (background daemon thread)
         init_health_monitoring(app)
 
+        # Initialize thread-count watchdog (WARN>100, CRIT>200, Telegram via anomaly_alert)
+        init_thread_watchdog(app)
+
         # NOTE: Python strategy scheduler is initialized in setup_environment()
         # AFTER database tables are created, to avoid "no such table" errors on fresh install
 
@@ -596,7 +600,8 @@ def create_app():
 
         # Determine if webhook URL is externally accessible
         is_localhost = any(
-            local in host_server.lower() for local in ["localhost", "127.0.0.1", "0.0.0.0"]
+            local in host_server.lower()
+            for local in ["localhost", "127.0.0.1", "0.0.0.0"]  # nosec B104
         )
 
         return jsonify({"host_server": host_server, "is_localhost": is_localhost})
@@ -1429,10 +1434,10 @@ def _warn_if_dirty_working_tree():
     if os.getenv("OPENALGO_BOOT_DIRTY_CHECK_ENABLED", "True").lower() not in ("true", "1", "t"):
         return
     try:
-        import subprocess
+        import subprocess  # nosec B404
 
         repo_root = os.path.dirname(os.path.abspath(__file__))
-        result = subprocess.run(
+        result = subprocess.run(  # nosec
             ["git", "status", "--porcelain"],
             cwd=repo_root,
             capture_output=True,
@@ -1519,7 +1524,7 @@ if __name__ == "__main__":
 
         _ver = _get_ver()
         _dip = host_ip
-        if host_ip == "0.0.0.0":
+        if host_ip == "0.0.0.0":  # nosec B104
             import socket as _sk
 
             try:
