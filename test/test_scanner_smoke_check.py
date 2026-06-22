@@ -321,3 +321,24 @@ def test_multiple_gate_failures_all_listed_in_alert():
     assert "scanner_universe_1m stale" in msg
     assert "scanner_universe_D stale" in msg
     assert "broker session not live" in msg
+
+
+# --------------------------------------------------------------------------- #
+# Job registration
+# --------------------------------------------------------------------------- #
+
+
+def test_scheduler_add_job_method_exists():
+    """Verify that HistorifyScheduler exposes an add_job passthrough method.
+
+    This is a regression test for B3 — the smoke check job had never
+    registered because the wrapper didn't expose add_job. The fix adds
+    the passthrough method to maintain consistency with other delegated
+    methods (remove_job, get_job, pause_job, resume_job).
+    """
+    from services.historify_scheduler_service import HistorifyScheduler
+
+    scheduler = HistorifyScheduler()
+    # Verify add_job method exists and is callable
+    assert hasattr(scheduler, "add_job"), "HistorifyScheduler missing add_job method"
+    assert callable(scheduler.add_job), "add_job must be callable"

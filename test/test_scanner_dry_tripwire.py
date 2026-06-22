@@ -295,3 +295,34 @@ def test_chartink_probe_failing_defaults_to_warn():
     res = svc.check_dry_scanner(as_of=now, **providers)
     assert res["status"] == "alerted_warn"
     assert res["severity"] == "WARN"
+
+
+# --------------------------------------------------------------------------- #
+# APScheduler job registration
+# --------------------------------------------------------------------------- #
+
+
+def test_tripwire_job_registers_with_scheduler():
+    """Verify that init_scanner_dry_tripwire registers the periodic job
+    with APScheduler. This is the regression test for the B4 fix —
+    the tripwire job has never actually registered since shipping."""
+    from unittest.mock import MagicMock
+
+    # Create a mock scheduler (a duck-typed mock of HistorifyScheduler)
+    mock_scheduler = MagicMock()
+    mock_scheduler.add_job = MagicMock(return_value=None)
+
+    # Call init with the mock scheduler
+    svc.init_scanner_dry_tripwire(app=None, scheduler=mock_scheduler)
+
+    # Verify add_job was called exactly once with correct args
+    assert mock_scheduler.add_job.call_count == 1
+    call_args = mock_scheduler.add_job.call_args
+
+    # Verify the job function is the tripwire job
+    assert call_args[0][0] == svc._tripwire_job
+
+    # Verify the job ID and other key params
+    assert call_args[1]["id"] == "scanner_dry_tripwire"
+    assert call_args[1]["replace_existing"] is True
+    assert "trigger" in call_args[1]

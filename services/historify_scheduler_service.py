@@ -448,6 +448,10 @@ class HistorifyScheduler:
             logger.exception(f"Failed to remove job {job_id}: {e}")
             return False
 
+    def add_job(self, func, *args, **kwargs):
+        """Add a job to the scheduler (passthrough to APScheduler)"""
+        return self.scheduler.add_job(func, *args, **kwargs)
+
     def get_job(self, job_id: str):
         """Get a job by ID"""
         return self.scheduler.get_job(job_id)
@@ -505,7 +509,7 @@ class HistorifyScheduler:
             )
             return
         try:
-            self.scheduler.add_job(
+            self.add_job(
                 refresh_scanner_history,
                 trigger=CronTrigger(hour=16, minute=0, timezone="Asia/Kolkata"),
                 id="scanner_history_refresh",
