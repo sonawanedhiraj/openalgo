@@ -165,6 +165,38 @@ class TestConnectionPoolInitialize:
         assert result["success"] is True
         assert pool.initialized is True
 
+    def test_list_response_is_failure(self, caplog):
+        """Result is [1,2,3] (list, wrong type) → returns failure, logs ERROR."""
+        pool = _make_pool(_make_adapter_class([1, 2, 3]))
+        result = pool.initialize()
+
+        assert result["success"] is False
+        assert "Unexpected response type: list" in result.get("error", "")
+        assert pool.initialized is False
+        assert len(pool.adapters) == 0
+        assert "Adapter initialization returned unexpected type list" in caplog.text
+
+    def test_string_response_is_failure(self, caplog):
+        """Result is "oops" (string) → returns failure, logs ERROR."""
+        pool = _make_pool(_make_adapter_class("oops"))
+        result = pool.initialize()
+
+        assert result["success"] is False
+        assert "Unexpected response type: str" in result.get("error", "")
+        assert pool.initialized is False
+        assert len(pool.adapters) == 0
+        assert "Adapter initialization returned unexpected type str" in caplog.text
+
+    def test_ambiguous_dict_response_is_success(self, caplog):
+        """Result is {"unknown_key": "value"} (dict, no recognized keys) → success, logs INFO."""
+        pool = _make_pool(_make_adapter_class({"unknown_key": "value"}))
+        result = pool.initialize()
+
+        assert result["success"] is True
+        assert pool.initialized is True
+        assert len(pool.adapters) == 1
+        assert "no recognized keys" in caplog.text
+
     # --- Exception safety ---
 
     def test_adapter_raises_exception_is_caught(self):
@@ -229,3 +261,86 @@ class TestConnectionPoolInitialize:
         assert after <= before + 1, (
             f"initialize() spawned unexpected threads: before={before} after={after}"
         )
+
+
+class TestConnectionPoolConnect:
+    """Response-shape tests for ConnectionPool.connect() (issue #84 sibling audit).
+
+    The connect() method has the same multi-format response predicate as
+    initialize(), and must use the same explicit `is False` check to distinguish
+    between {"status": "success"} (Zerodha format, no "success" key) and
+    {"success": False} (error format).
+
+    These tests mirror the initialize() tests to ensure connect() handles all
+    response shapes consistently.
+    """
+
+    def test_connect_success_bool_true(self):
+        """{"success": True} in connect response → success."""
+
+        # Fake adapter that returns success on both initialize and connect
+        class ConnectAdapter:
+            def initialize(self, broker_name, user_id, auth_data=None):
+                return {"success": True}
+
+            def connect(self):
+                return {"success": True}
+
+            def disconnect(self):
+                pass
+
+        pool = _make_pool(ConnectAdapter)
+        pool.initialize()
+        result = pool.connect()
+
+        assert result["success"] is True
+        assert pool.connected is True
+
+    def test_connect_zerodha_status_success_not_failure(self):
+        """{"status": "success"} (Zerodha shape) in connect → must succeed.
+
+        Regression test for issue #84 sibling predicate: if connect() uses
+        `not result.get("success")` instead of `is False`, then {"status":
+        "success"} (no "success" key) is treated as error because None is falsy.
+        """
+
+        class ZerodhaConnectAdapter:
+            def initialize(self, broker_name, user_id, auth_data=None):
+                return {"success": True}
+
+            def connect(self):
+                # Zerodha adapter returns status, not success
+                return {"status": "success"}
+
+            def disconnect(self):
+                pass
+
+        pool = _make_pool(ZerodhaConnectAdapter)
+        pool.initialize()
+        result = pool.connect()
+
+        assert result["success"] is True, (
+            '{"status": "success"} must NOT be treated as an error '
+            "— this indicates a regression of issue #84 in connect()"
+        )
+        assert pool.connected is True
+
+    def test_connect_failure_bool_false(self):
+        """{"success": False} in connect response → failure."""
+
+        class FailingConnectAdapter:
+            def initialize(self, broker_name, user_id, auth_data=None):
+                return {"success": True}
+
+            def connect(self):
+                return {"success": False, "error": "connection timeout"}
+
+            def disconnect(self):
+                pass
+
+        pool = _make_pool(FailingConnectAdapter)
+        pool.initialize()
+        result = pool.connect()
+
+        assert result["success"] is False
+        assert pool.connected is False
