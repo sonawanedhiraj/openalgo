@@ -20,9 +20,27 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
 const REFRESH_MS = 30_000
 
-function fmtTime(ts: string): string {
-  const m = ts.match(/T(\d{2}:\d{2}:\d{2})/)
-  return m ? m[1] : ts
+function fmtTime(ts: string, todayDate?: string): string {
+  const date = new Date(ts)
+
+  if (!todayDate) {
+    const m = ts.match(/T(\d{2}:\d{2}:\d{2})/)
+    return m ? m[1] : ts
+  }
+
+  const signalDate = ts.split('T')[0]
+  if (signalDate === todayDate) {
+    const m = ts.match(/T(\d{2}:\d{2}:\d{2})/)
+    return m ? m[1] : ts
+  }
+
+  return new Intl.DateTimeFormat('en-IN', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date)
 }
 
 function todayStr(): string {
@@ -114,7 +132,7 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
                 className="flex items-start gap-2 text-xs border rounded-md px-2 py-1.5 bg-muted/30"
               >
                 <span className="text-muted-foreground shrink-0 tabular-nums">
-                  {fmtTime(sig.run_at)}
+                  {fmtTime(sig.run_at, todayStr())}
                 </span>
                 <span className="truncate">
                   {sig.symbols.length > 0 ? sig.symbols.join(', ') : '—'}
@@ -240,7 +258,7 @@ function HitsBySymbolTable() {
                     {row.definitions.join(', ')}
                   </TableCell>
                   <TableCell className="text-right tabular-nums text-xs text-muted-foreground">
-                    {fmtTime(row.latest_hit)}
+                    {fmtTime(row.latest_hit, date)}
                   </TableCell>
                 </TableRow>
               ))}
