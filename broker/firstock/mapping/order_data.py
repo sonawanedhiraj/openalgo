@@ -371,7 +371,7 @@ def map_portfolio_data(portfolio_data):
                 mapped_holding["tsym"] = mapped_holding["trading_symbol"]
 
             # Map holding fields - set default values for now
-            lot_size = mapped_holding["lot_size"]
+            mapped_holding["lot_size"]
 
             # Firstock holdings API only provides symbol info, no quantity or price data
             # Setting minimal defaults to maintain API contract

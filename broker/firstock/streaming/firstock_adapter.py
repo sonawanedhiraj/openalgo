@@ -353,7 +353,7 @@ class FirstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
             # Group subscriptions by unique token and mode
             unique_subscriptions = {}
 
-            for correlation_id, sub in self.subscriptions.items():
+            for _correlation_id, sub in self.subscriptions.items():
                 subscription_key = f"{sub['subscription_token']}_{sub['mode']}"
 
                 if subscription_key not in unique_subscriptions:

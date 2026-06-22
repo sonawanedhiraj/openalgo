@@ -120,6 +120,16 @@ Conditional-edge per-asset framing died on n+Bonferroni (R39): the per-stock con
 - **Files:** `strategies/sector_follow_cap5_vol/`. Reports: `outputs/r40_sector_follow_capped_2026-06-10/REPORT.md`, `outputs/r41_5sleeve_blend_2026-06-10/REPORT.md`.
 - **Latest LEARNINGS:** `strategies/sector_follow_cap5_vol/LEARNINGS.md`
 
+### Futures Follow CAP50 (NIFTY-futures leveraged-beta sleeve)
+- **Status:** **ACTIVE in sandbox** — 2026-06-15 (`deployable: true`, `FUTURES_FOLLOW_MODE=sandbox` default; no scaffold/observe-only state). Service/DB/blueprint/tests/docs all shipped and wired into boot; **places real orders into `sandbox.db` from boot.** First sandbox cycle Monday 2026-06-15 15:20 IST. Live flip is operator-only (env or `strategy_mode` row).
+- **Last validated:** 2026-06-14 (NIFTY-only CAP50 leverage study on the sector_follow signal set).
+- **Spec:** A **leveraged broad-market-beta** sleeve, NOT stock-selection alpha. At 15:20 IST it **reuses** the sector_follow_cap5_vol C1×W2+E4 evaluator to find ≤5 daily stock signals, and for each — greedily in vol-ratio order — buys **1 NIFTY near-month index future lot** (NIFTY futures are monthly; front-month resolved from the master contract), HARD-CAPPED at **50% of capital as overnight SPAN margin** (late signals skipped). Product NRML, exchange NFO, MARKET. Held to T+1 15:25 MARKET sell. **No stop loss** (Phase-1 proved hard stops net-negative); 15:14 EOD watchdog backstop; 3% daily-loss kill switch. Charges ~₹530/lot (0.03% notional).
+- **Universe / capital:** signals from sector_follow's LOCK_STATIC_30; ₹10L book, ~2 lots fit the 50% cap.
+- **Backtest (NIFTY-only CAP50, ₹10L, 2024-01..2026-06, honest charges):** CAGR **14.44%**, Sharpe **1.27**, MaxDD **−8.0%**, peak overnight margin ~50%, worst overnight day −₹34,396, 149 trades, even year split (110k/133k/147k).
+- **Honest caveat (load-bearing):** the signal does **NOT** predict NIFTY direction (hit-rate **53.4%** < 55%, corr **0.295**). The 14.44% is leveraged broad-market drift on bullish signal-days, not the sector_follow alpha — it will struggle in a sustained flat/bear NIFTY regime. Sector-matched routing (banking→BANKNIFTY) tested and **rejected** (costs 0.74pp CAGR, no correlation gain). Keep the CNC T+1 equity book (sector_follow) as the alpha primary.
+- **Files:** `strategies/futures_follow_cap50/`, `services/futures_follow_service.py`, `blueprints/futures_follow.py`, `database/futures_follow_db.py`. Reports: `docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md` (NIFTY-only CAP50 control), `2026-06-14_futures_10L.md`.
+- **Latest LEARNINGS:** `strategies/futures_follow_cap50/LEARNINGS.md`
+
 ### Simplified Stock Engine (Chartink-driven Intraday)
 - **Status:** LIVE in sandbox mode (orders flow to `sandbox.db`, virtual INR 1 Cr). Operational since 2026-Q2.
 - **Spec:** Chartink screener-driven intraday breakout system — armed by webhook, fires market orders on 5-min candle breakouts, ATR-based stop loss, RR trailing. Independent mode flag `SIMPLIFIED_ENGINE_MODE`.

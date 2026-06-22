@@ -289,7 +289,7 @@ class FivepaisaWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Resubscribe to existing subscriptions if reconnecting
         with self.lock:
-            for correlation_id, sub in self.subscriptions.items():
+            for _correlation_id, sub in self.subscriptions.items():
                 try:
                     self.ws_client.subscribe(sub["method"], sub["scrip_data"])
                     self.logger.info(f"Resubscribed to {sub['symbol']}.{sub['exchange']}")

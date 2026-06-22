@@ -22,7 +22,7 @@ def transform_data(data, client_id=None, auth_token=None):
         auth_token: Authentication token for fetching quotes (passed from order_api)
     """
     # Get broker symbol for the order
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
 
     # Get the numeric token for the symbol
     token = get_token(data["symbol"], data["exchange"])
@@ -146,7 +146,7 @@ def transform_modify_order_data(data, client_id=None):
         client_id: Client ID to use for the order, if available
     """
     # Get broker symbol for the order
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
 
     # Get the numeric token for the symbol
     token = get_token(data["symbol"], data["exchange"])

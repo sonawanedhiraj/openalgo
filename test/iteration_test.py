@@ -141,7 +141,7 @@ async def listener(client):
     try:
         while client.connected:
             try:
-                message = await asyncio.wait_for(client.ws.recv(), timeout=0.1)
+                await asyncio.wait_for(client.ws.recv(), timeout=0.1)
                 # We're not interested in the content of the message, just receiving them
                 # logger.debug(f"[{client.id}] Received: {message[:50]}...")
             except TimeoutError:

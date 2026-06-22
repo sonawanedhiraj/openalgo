@@ -29,7 +29,7 @@ def tradingview_json():
 
             # Get actual API key for TradingView
             api_key = get_api_key_for_tradingview(session.get("user"))
-            broker = session.get("broker")
+            session.get("broker")
 
             if not api_key:
                 logger.error(f"API key not found for user: {session.get('user')}")

@@ -147,7 +147,7 @@ class BrokerData:
 
     def _convert_to_dhan_request(self, symbol, exchange):
         """Convert symbol and exchange to Dhan format"""
-        br_symbol = get_br_symbol(symbol, exchange)
+        get_br_symbol(symbol, exchange)
         # Extract security ID and determine exchange segment
         # This needs to be implemented based on your symbol mapping logic
         security_id = get_token(symbol, exchange)  # This should be mapped to Dhan's security ID
@@ -632,7 +632,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching historical data: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def get_quotes(self, symbol: str, exchange: str) -> dict:
         """
@@ -732,7 +732,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_quotes: {str(e)}", exc_info=True)
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -778,7 +778,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_quotes_batch(self, symbols: list) -> list:
         """
@@ -883,7 +883,7 @@ class BrokerData:
                     )
         except Exception as e:
             logger.error(f"API Error: {str(e)}")
-            raise Exception(f"API Error: {str(e)}")
+            raise Exception(f"API Error: {str(e)}") from e
 
         # Parse response and build results
         results = []
@@ -1071,4 +1071,4 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_depth: {str(e)}", exc_info=True)
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e

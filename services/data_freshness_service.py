@@ -85,6 +85,58 @@ def business_days_between(d_from: date, d_to: date) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# DuckDB connection helpers — tolerant of an in-process read-write holder
+# --------------------------------------------------------------------------- #
+def is_transient_lock_error(exc: BaseException) -> bool:
+    """True for DuckDB cross-/intra-process lock contention worth treating as
+    transient (retry/skip) rather than a hard fault.
+
+    Covers the in-process instance-cache config mismatch (the live app holds
+    ``historify.duckdb`` open read-write while a backfill thread opens it
+    read-only) and the classic file-lock messages a *separate* process hits.
+    """
+    msg = str(exc).lower()
+    return (
+        "different configuration" in msg
+        or "could not set lock" in msg
+        or "conflicting lock" in msg
+        or "being used by another process" in msg
+    )
+
+
+def connect_historify_readonly(duckdb_path: str):
+    """Open historify for a read-only query, tolerant of an existing read-write
+    connection held elsewhere in **this** process.
+
+    DuckDB keeps one database instance per file per process and refuses a second
+    connection that requests a *different* configuration ("Can't open a connection
+    to same database file with a different configuration than existing
+    connections"). The live OpenAlgo process holds ``historify.duckdb`` open
+    read-write (the historify writer), so a plain ``read_only=True`` open from a
+    backfill/evaluator thread collides — this was the recurring 15:30+ post-close
+    lock-warning spam.
+
+    Strategy: try ``read_only=True`` first (the cross-process-friendly path when no
+    writer is attached); on that specific config-mismatch error, fall back to a
+    default (config-matching) connect that reuses the already-open shared instance
+    — the read-only SELECT still succeeds. The caller still closes the returned
+    connection as usual.
+    """
+    import duckdb
+
+    try:
+        return duckdb.connect(duckdb_path, read_only=True)
+    except duckdb.ConnectionException as e:
+        if "different configuration" not in str(e):
+            raise
+        logger.info(
+            "historify already open read-write in this process; reusing the shared "
+            "connection for a read-only query (read_only mode unavailable)"
+        )
+        return duckdb.connect(duckdb_path)
+
+
+# --------------------------------------------------------------------------- #
 # Pure freshness queries
 # --------------------------------------------------------------------------- #
 def get_data_freshness(
@@ -99,10 +151,9 @@ def get_data_freshness(
     """
     if not symbols:
         return {}
-    import duckdb
 
     out: dict[str, int | None] = dict.fromkeys(symbols)
-    con = duckdb.connect(duckdb_path, read_only=True)
+    con = connect_historify_readonly(duckdb_path)
     try:
         placeholders = ", ".join(["?"] * len(symbols))
         rows = con.execute(

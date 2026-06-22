@@ -252,5 +252,6 @@ dev = [
     "pip>=26.1",
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.14.14",
 ]

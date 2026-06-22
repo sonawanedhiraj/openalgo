@@ -63,7 +63,7 @@ def get_api_response(endpoint, auth, method="GET", payload=""):
     except json.JSONDecodeError:
         logger.error(f"Failed to parse response. Status code: {response.status_code}")
         logger.debug(f"Response text: {response.text}")
-        raise Exception(f"Failed to parse API response (status {response.status_code})")
+        raise Exception(f"Failed to parse API response (status {response.status_code})") from None
 
 
 class BrokerData:
@@ -330,7 +330,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching quotes for {symbol} on {exchange}: {str(e)}")
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -373,7 +373,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """

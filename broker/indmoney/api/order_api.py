@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 
 def get_api_response(endpoint, auth, method="GET", payload="", params=None):
     AUTH_TOKEN = auth
-    api_key = os.getenv("BROKER_API_KEY")
+    os.getenv("BROKER_API_KEY")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -433,7 +433,7 @@ def place_order_api(data, auth):
 
 def place_smartorder_api(data, auth):
     AUTH_TOKEN = auth
-    BROKER_API_KEY = os.getenv("BROKER_API_KEY")
+    os.getenv("BROKER_API_KEY")
     # If no API call is made in this function then res will return None
     res = None
 

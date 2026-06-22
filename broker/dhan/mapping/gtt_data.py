@@ -156,8 +156,8 @@ def map_gtt_book(gtt_list):
         oa_sym = get_oa_symbol(brsymbol=br_sym, exchange=ex) if br_sym and ex else br_sym
 
         # Sort legs so STOP_LOSS_LEG (lower trigger) comes first for OCO.
-        sorted_legs = sorted(legs, key=lambda l: float(l.get("triggerPrice", 0) or 0))
-        trigger_prices = [float(l.get("triggerPrice", 0) or 0) for l in sorted_legs]
+        sorted_legs = sorted(legs, key=lambda leg_item: float(leg_item.get("triggerPrice", 0) or 0))
+        trigger_prices = [float(leg_item.get("triggerPrice", 0) or 0) for leg_item in sorted_legs]
 
         out_legs = []
         for leg in sorted_legs:

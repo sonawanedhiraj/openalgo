@@ -66,11 +66,12 @@ def authenticate_broker(password=None, twofa=None, twofa_type=None):
         else:
             error_msg = response_data.get("message", "Authentication failed")
             return None, error_msg
-    except requests.exceptions.RequestException as e:
-        return None, f"Request failed: {str(e)}"
     except json.JSONDecodeError:
         return None, "Invalid JSON response from server"
     except Exception as e:
+        # Catch any HTTP/request errors or other exceptions
+        if "request" in str(type(e).__name__).lower():
+            return None, f"Request failed: {str(e)}"
         return None, str(e)
 
 

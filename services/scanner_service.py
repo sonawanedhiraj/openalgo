@@ -24,13 +24,16 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import time as _dtime
 from typing import Any
 
 import pandas as pd
+import pytz
 from sqlalchemy.exc import IntegrityError
 
 from database.scanner_db import (
@@ -47,6 +50,109 @@ from utils.event_bus import bus as _default_bus
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Market-hours gate (Tier-1 Fix #1 — kills the post-close AUROPHARMA-SELL class).
+#
+# The scanner is purely tick-driven: a straggler/backfill tick that closes a bar
+# after the session ends still drives ``_evaluate_definitions``. Combined with
+# the rule's wall-clock ``_SETTLE_CUTOFF`` flip and a stale daily-D bar, that
+# produced 17 spurious post-close AUROPHARMA SELL fires on 2026-06-15 (see
+# docs/research/strategy/screener/2026-06-15_inhouse_deep_analysis.md, FM-6/DP-5).
+# This gate skips evaluation entirely outside [09:15, 15:30] IST. It is paired
+# with a rule-side D-bar-date verify (in the scan_rules modules) so a future
+# change to either one cannot silently re-open the post-close path on its own.
+# ---------------------------------------------------------------------------
+_IST = pytz.timezone("Asia/Kolkata")
+_MARKET_OPEN_IST = _dtime(9, 15)
+_MARKET_CLOSE_IST = _dtime(15, 30)
+
+
+def _postclose_gate_enabled() -> bool:
+    """``SCANNER_POSTCLOSE_GATE_ENABLED`` env flag (default true). When false the
+    market-hours gate is a no-op — evaluation runs at any wall-clock time (the
+    pre-Tier-1 behavior)."""
+    return os.environ.get("SCANNER_POSTCLOSE_GATE_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _now_ist() -> _dt.datetime:
+    """Current IST time. Indirected through a module function so tests can pin it."""
+    return _dt.datetime.now(_IST)
+
+
+def _within_market_hours(now_ist: _dt.datetime) -> bool:
+    """True iff ``now_ist`` falls inside the [09:15, 15:30] IST trading window.
+
+    ``datetime.time()`` returns the naive wall-clock component for both naive and
+    tz-aware datetimes, so the comparison is against IST clock time directly."""
+    t = now_ist.time()
+    return _MARKET_OPEN_IST <= t <= _MARKET_CLOSE_IST
+
+
+# ---------------------------------------------------------------------------
+# Decision-input completeness metric (Tier-1 Fix #3 — ends the "0 hits == no
+# data == failure" ambiguity, mirroring sector_follow Fix 1b).
+#
+# The scanner evaluates per-symbol-per-bar (tick-driven), so there is no natural
+# "cycle". We accumulate the set of symbols that produced a live bar within a
+# rolling wall-clock window and, when the window rolls, emit
+# ``n_live / total_subscribed`` — <50% WARNING, <20% CRITICAL via Telegram, with
+# a per-severity once-a-day dedup so a persistently-degraded feed does not spam.
+# Limitation: a TOTAL feed outage produces no bar closes at all, so this path
+# never fires — that case is the 15:18 smoke check's job (Tier 2). This metric
+# catches PARTIAL degradation (some symbols live, most not) and reports coverage.
+# ---------------------------------------------------------------------------
+
+
+def _completeness_enabled() -> bool:
+    """``SCANNER_COMPLETENESS_ENABLED`` env flag (default true)."""
+    return os.environ.get("SCANNER_COMPLETENESS_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _completeness_window_min() -> int:
+    """``SCANNER_COMPLETENESS_WINDOW_MIN`` (default 5) — the rolling accumulation
+    window in minutes, ~one 5m bar cycle."""
+    try:
+        return max(1, int(os.environ.get("SCANNER_COMPLETENESS_WINDOW_MIN", "5")))
+    except ValueError:
+        return 5
+
+
+def _completeness_warn_pct() -> float:
+    """``SCANNER_COMPLETENESS_WARN_PCT`` (default 50)."""
+    try:
+        return float(os.environ.get("SCANNER_COMPLETENESS_WARN_PCT", "50"))
+    except ValueError:
+        return 50.0
+
+
+def _completeness_crit_pct() -> float:
+    """``SCANNER_COMPLETENESS_CRIT_PCT`` (default 20)."""
+    try:
+        return float(os.environ.get("SCANNER_COMPLETENESS_CRIT_PCT", "20"))
+    except ValueError:
+        return 20.0
+
+
+def _default_completeness_notifier(message: str) -> None:
+    """Route a completeness alert to Telegram via the shared notification service.
+    Lazily imported so the scanner module stays cheap to import; never raises."""
+    try:
+        from services.notification_service import get_notification_service  # noqa: PLC0415
+
+        get_notification_service().notify("scanner_completeness", message)
+    except Exception:
+        logger.debug("scanner completeness notifier unavailable", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -544,7 +650,7 @@ def _normalize_tick(market_data: dict[str, Any]) -> dict[str, Any] | None:
                 # Treat values > 10^10 as milliseconds (epoch_s ceiling).
                 ts = _dt.datetime.fromtimestamp(value / 1000 if value > 10_000_000_000 else value)
                 break
-        except Exception:
+        except Exception:  # nosec B112 — intentional: try the next timestamp key on parse failure
             continue
 
     return {"price": price, "cumulative_volume": cum_volume, "ts": ts}
@@ -619,12 +725,21 @@ class ScannerService:
         bus: Any = None,
         zmq_endpoint: str = _DEFAULT_ZMQ_ENDPOINT,
         history_size: int = 100,
+        notifier: Callable[[str], None] | None = None,
     ) -> None:
         self.symbols: set[str] = {s.strip() for s in symbols if s and s.strip()}
         self.intervals: list[str] = list(intervals) if intervals else ["5m"]
         self.bus = bus if bus is not None else _default_bus
         self.zmq_endpoint = zmq_endpoint
         self.history_size = int(history_size)
+        # Tier-1 Fix #3: Telegram notifier for completeness alerts (injectable for
+        # tests; defaults to the shared notification service).
+        self._notifier = notifier or _default_completeness_notifier
+        # Rolling decision-input completeness window state.
+        self._completeness_window_syms: set[str] = set()
+        self._completeness_window_start: _dt.datetime | None = None
+        self._completeness_alert_day: _dt.date | None = None
+        self._completeness_alert_severities: set[str] = set()
 
         # Ensure the example rule modules are imported so they self-register
         # before any bar close lands. Import here (not at module top) to keep
@@ -705,6 +820,72 @@ class ScannerService:
 
     def running(self) -> bool:
         return self._running
+
+    # -- intraday read-out (consumed by sector_follow Fix 1b) ---------------
+
+    def get_today_ohlcv(
+        self, symbol: str, as_of_date: _dt.date
+    ) -> tuple[float | None, float | None]:
+        """Aggregate TODAY's ``(close, volume)`` for ``symbol`` from the live feed.
+
+        Reads the rolling closed-bar history for ``symbol`` at the primary
+        interval plus the in-progress bar, filtered to ``as_of_date`` (IST). The
+        close is the latest bar's close; the volume is the sum of today's bar
+        volumes (each bar's volume is the delta-from-cumulative the BarBuilder
+        already computed, so the sum is today's cumulative traded volume).
+
+        Returns ``(None, None)`` when the scanner has no bars for ``symbol`` today
+        (e.g. an index the scanner doesn't track, or a feed that never started) so
+        the caller can fall back to historify. Thread-safe; never raises.
+
+        Bar timestamps are naive datetimes derived from the broker's
+        ``exchange_timestamp`` on an IST box, so ``ts.date()`` is the IST trade
+        date — the same assumption the aggregator's bucketing already relies on.
+        """
+        try:
+            interval = self.intervals[0] if self.intervals else "5m"
+            with self._history_lock:
+                frame = self._bar_history.get((symbol, interval))
+                rows = frame.to_dict("records") if frame is not None and not frame.empty else []
+            total_vol = 0.0
+            last_close: float | None = None
+            seen = False
+            for r in rows:
+                ts = r.get("ts")
+                if ts is None or getattr(ts, "date", lambda: None)() != as_of_date:
+                    continue
+                seen = True
+                total_vol += float(r.get("volume") or 0)
+                last_close = float(r.get("close"))
+            # Fold in the in-progress (not-yet-closed) bar — strictly after the
+            # last closed bar's bucket, so no double counting.
+            try:
+                cur = self.aggregator.current_bar(symbol, interval)
+            except Exception:
+                cur = None
+            if cur is not None:
+                ts = cur.get("ts")
+                if ts is not None and getattr(ts, "date", lambda: None)() == as_of_date:
+                    seen = True
+                    total_vol += float(cur.get("volume") or 0)
+                    last_close = float(cur.get("close"))
+            if not seen or last_close is None:
+                # Tier-1 Fix #2: name the reason instead of a silent (None, None).
+                # DEBUG (not WARNING) because this is the EXPECTED return for an
+                # untracked symbol (e.g. an index the scanner doesn't stream); the
+                # caller (sector_follow) escalates loudly when it actually matters.
+                logger.debug(
+                    "ScannerService.get_today_ohlcv: no live bars for %s on %s "
+                    "(seen=%s) — caller should fall back to historify",
+                    symbol,
+                    as_of_date,
+                    seen,
+                )
+                return None, None
+            return last_close, total_vol
+        except Exception:
+            logger.exception("ScannerService.get_today_ohlcv failed for %s", symbol)
+            return None, None
 
     # -- ZMQ subscriber -----------------------------------------------------
 
@@ -858,6 +1039,9 @@ class ScannerService:
                 logger.exception("ScannerService: history provider lookup failed for %s", symbol)
 
         return {
+            # The symbol is threaded into the bundle so rules can name it in
+            # their loud-failure / D-bar-date-verify logs (Tier-1 Fix #1/#2).
+            "symbol": symbol,
             "ema_20": ema_20,
             "atr_14": atr_14,
             "rsi_14": rsi_14,
@@ -882,7 +1066,29 @@ class ScannerService:
         symbol per row) and publish a ``ScanHitEvent``. We intentionally
         write one row per (definition, symbol, bar) hit — the consumer in
         item 6 will dedupe / debounce if needed.
+
+        Tier-1 Fix #1: a market-hours gate skips evaluation entirely outside
+        [09:15, 15:30] IST so a straggler/backfill tick that closes a bar
+        post-close cannot fire a (stale-bar) signal.
+
+        Tier-1 Fix #3: each in-hours bar close records the symbol as "live this
+        window" for the decision-input completeness metric.
         """
+        now_ist = _now_ist()
+        if _postclose_gate_enabled() and not _within_market_hours(now_ist):
+            phase = "post-close" if now_ist.time() > _MARKET_CLOSE_IST else "pre-open"
+            logger.info(
+                "scanner evaluation skipped: %s (now=%s IST) for %s/%s",
+                phase,
+                now_ist.strftime("%H:%M"),
+                symbol,
+                interval,
+            )
+            return
+
+        if _completeness_enabled():
+            self._record_completeness(symbol, now_ist)
+
         for definition in get_scan_definitions(enabled_only=True):
             rule_name = definition.get("rule_module") or definition.get("name")
             if not rule_name:
@@ -905,7 +1111,21 @@ class ScannerService:
                     interval,
                 )
                 continue
-            if not matched:
+            # Tier-1 Fix #2: loud per-symbol PASS / quiet FAIL. PASS is rare (only
+            # on a match) so it is INFO; FAIL fires for ~every symbol on ~every bar
+            # so it stays DEBUG to avoid flooding the log. The specific missing-input
+            # reason (None daily-D etc.) is logged at WARNING inside the rule itself,
+            # and the per-cycle completeness metric (Fix #3) surfaces aggregate gaps.
+            if matched:
+                logger.info(
+                    "scanner PASS %s rule=%s interval=%s close=%s",
+                    symbol,
+                    rule_name,
+                    interval,
+                    bar.get("close"),
+                )
+            else:
+                logger.debug("scanner FAIL %s rule=%s interval=%s", symbol, rule_name, interval)
                 continue
 
             scan_result_id = 0
@@ -942,3 +1162,92 @@ class ScannerService:
                     symbol,
                     interval,
                 )
+
+    # -- decision-input completeness (Tier-1 Fix #3) ------------------------
+
+    def _record_completeness(self, symbol: str, now_ist: _dt.datetime) -> None:
+        """Note that ``symbol`` produced a live bar this window; emit + reset the
+        metric when the rolling window has elapsed."""
+        if self._completeness_window_start is None:
+            self._completeness_window_start = now_ist
+        elapsed = (now_ist - self._completeness_window_start).total_seconds()
+        if elapsed >= _completeness_window_min() * 60:
+            # The window elapsed — emit the PRIOR window's coverage, then start a
+            # fresh window that this triggering bar belongs to.
+            self._emit_completeness(now_ist)
+            self._completeness_window_syms = set()
+            self._completeness_window_start = now_ist
+        self._completeness_window_syms.add(symbol)
+
+    def _emit_completeness(self, now_ist: _dt.datetime) -> None:
+        """Log ``n_live/total`` for the window and Telegram-alert when the live
+        fraction falls below the WARNING / CRITICAL thresholds. Per-severity
+        once-a-day dedup so a persistently-degraded feed alerts at most once each
+        per day. Never raises."""
+        total = len(self.symbols)
+        if total <= 0:
+            return
+        n_live = len(self._completeness_window_syms)
+        frac = n_live / total
+        window_min = _completeness_window_min()
+        logger.info(
+            "scanner decision-input completeness: %d/%d (%.0f%%) symbols produced "
+            "live bars in the last %d min",
+            n_live,
+            total,
+            frac * 100,
+            window_min,
+        )
+        crit = _completeness_crit_pct() / 100.0
+        warn = _completeness_warn_pct() / 100.0
+        if frac < crit:
+            severity = "critical"
+        elif frac < warn:
+            severity = "warning"
+        else:
+            return
+
+        # Per-severity once-a-day dedup.
+        day = now_ist.date()
+        if self._completeness_alert_day != day:
+            self._completeness_alert_day = day
+            self._completeness_alert_severities = set()
+        if severity in self._completeness_alert_severities:
+            return
+        self._completeness_alert_severities.add(severity)
+
+        try:
+            if severity == "critical":
+                msg = (
+                    f"🔴 CRITICAL in-house scanner {day.isoformat()}: only "
+                    f"{n_live}/{total} ({frac * 100:.0f}%) symbols produced live bars in the "
+                    f"last {window_min} min — the feed is largely starved, signals are "
+                    "effectively fail-closed."
+                )
+            else:
+                msg = (
+                    f"🟠 WARNING in-house scanner {day.isoformat()}: only "
+                    f"{n_live}/{total} ({frac * 100:.0f}%) symbols produced live bars in the "
+                    f"last {window_min} min (partial feed degradation)."
+                )
+            self._notifier(msg)
+        except Exception:
+            logger.exception("scanner completeness alert failed")
+
+
+# ---------------------------------------------------------------------------
+# Live singleton accessor (set by app.py at boot; read by sector_follow Fix 1b).
+# ---------------------------------------------------------------------------
+_SCANNER_SINGLETON: ScannerService | None = None
+
+
+def set_scanner_service(svc: ScannerService | None) -> None:
+    """Record the live ScannerService so other in-process services (sector_follow)
+    can read today's aggregated bars without an import cycle. Called by app.py."""
+    global _SCANNER_SINGLETON
+    _SCANNER_SINGLETON = svc
+
+
+def get_scanner_service() -> ScannerService | None:
+    """Return the live ScannerService, or None when the scanner is disabled."""
+    return _SCANNER_SINGLETON

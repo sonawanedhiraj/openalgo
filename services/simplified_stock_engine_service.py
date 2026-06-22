@@ -233,6 +233,11 @@ class SimplifiedStockEngineService:
         self._user_callbacks_registered: set[str] = set()
         self._subscribed_symbols: set[tuple[str, str, str]] = set()
         self._sl_timers: dict[str, threading.Timer] = {}
+        # Throttle state for the "no api_key resolvable at all" log, keyed by
+        # symbol → last monotonic log time. Stops a keyless window (e.g. before
+        # the broker session exists) from flooding errors.jsonl the way the
+        # unmapped-symbol exit did on 2026-06-19.
+        self._keyless_logged_at: dict[str, float] = {}
         # Tracks the date on which the live-mode broker-position-aware EOD
         # flatten has already run. Reset implicitly when the date rolls.
         self._eod_flatten_done_date: dt.date | None = None
@@ -430,11 +435,62 @@ class SimplifiedStockEngineService:
         if signal:
             self._schedule_entry(signal)
 
+    # Throttle interval for the "no api_key resolvable at all" error log.
+    _KEYLESS_LOG_INTERVAL_SEC = 300.0
+
+    def _resolve_order_api_key(self, symbol: str) -> tuple[str | None, str]:
+        """Resolve ``(api_key, strategy_name)`` for an engine order on ``symbol``.
+
+        Prefers the per-symbol maps the scan webhook populates. When a symbol
+        has no mapping — which happens for a position rehydrated from the
+        journal after a restart that no later scan re-armed — fall back to a
+        default key so the order (an exit especially) is never blocked:
+        most-recently-mapped symbol key → any known user key →
+        ``database.auth_db.get_first_available_api_key()``. This deployment is
+        single-user (one broker session per instance), so the fallback key is
+        always the correct account.
+
+        Returns ``(None, strategy_name)`` only when no key exists anywhere
+        (e.g. no API key configured / broker session never established).
+        """
+        strategy_name = self._strategy_by_symbol.get(symbol, "simplified_stock_engine")
+        api_key = self._api_key_by_symbol.get(symbol)
+        if api_key:
+            return api_key, strategy_name
+        # Fallback — maps are read without the lock (RLock; callers run off the
+        # lock-held path and existing reads here are already lock-free) so an
+        # exit is never blocked by a missing per-symbol mapping.
+        if self._api_key_by_symbol:
+            return next(reversed(self._api_key_by_symbol.values())), strategy_name
+        if self._user_api_keys:
+            return next(reversed(self._user_api_keys.values())), strategy_name
+        try:
+            from database.auth_db import get_first_available_api_key
+
+            return get_first_available_api_key(), strategy_name
+        except Exception:
+            logger.exception(
+                "[SIMPLIFIED-ENGINE] get_first_available_api_key raised for %s", symbol
+            )
+            return None, strategy_name
+
+    def _log_keyless_throttled(self, symbol: str, kind: str) -> None:
+        """Log the unresolvable-key case at most once per symbol per
+        ``_KEYLESS_LOG_INTERVAL_SEC``, so it can never become a per-tick storm."""
+        now = time.monotonic()
+        if now - self._keyless_logged_at.get(symbol, 0.0) >= self._KEYLESS_LOG_INTERVAL_SEC:
+            self._keyless_logged_at[symbol] = now
+            logger.error(
+                "[SIMPLIFIED-ENGINE] No api_key resolvable for %s %s — order skipped "
+                "(throttled; check broker session / API key)",
+                symbol,
+                kind,
+            )
+
     def _schedule_entry(self, signal: EntrySignal) -> None:
-        api_key = self._api_key_by_symbol.get(signal.symbol)
-        strategy_name = self._strategy_by_symbol.get(signal.symbol, "simplified_stock_engine")
+        api_key, strategy_name = self._resolve_order_api_key(signal.symbol)
         if not api_key:
-            logger.error("[SIMPLIFIED-ENGINE] No API key mapped for %s", signal.symbol)
+            self._log_keyless_throttled(signal.symbol, "entry")
             self.engine.clear_pending_entry(signal.symbol)
             return
 
@@ -447,10 +503,9 @@ class SimplifiedStockEngineService:
         thread.start()
 
     def _schedule_exit(self, signal: ExitSignal) -> None:
-        api_key = self._api_key_by_symbol.get(signal.symbol)
-        strategy_name = self._strategy_by_symbol.get(signal.symbol, "simplified_stock_engine")
+        api_key, strategy_name = self._resolve_order_api_key(signal.symbol)
         if not api_key:
-            logger.error("[SIMPLIFIED-ENGINE] No API key mapped for %s exit", signal.symbol)
+            self._log_keyless_throttled(signal.symbol, "exit")
             self.engine.clear_pending_exit(signal.symbol)
             return
 
@@ -1636,6 +1691,21 @@ class SimplifiedStockEngineService:
             logger.exception("[SIMPLIFIED-REHYDRATE] get_open_trades_today raised")
             return 0
 
+        # Resolve a default api_key once (outside the lock — it may hit the DB)
+        # so each rehydrated symbol gets an order mapping. Without this a
+        # rehydrated position has a live position but no _api_key_by_symbol
+        # entry, so its exit path can't place an order — the 2026-06-19 TCS
+        # error storm. Single-user deployment, so the first available key is the
+        # correct account. Best-effort: a None key just leaves the runtime
+        # fallback in _resolve_order_api_key to cover it.
+        rehydrate_key: str | None = None
+        try:
+            from database.auth_db import get_first_available_api_key
+
+            rehydrate_key = get_first_available_api_key()
+        except Exception:
+            logger.exception("[SIMPLIFIED-REHYDRATE] get_first_available_api_key raised")
+
         added = 0
         with self._lock:
             for row in rows:
@@ -1687,6 +1757,11 @@ class SimplifiedStockEngineService:
                     max_rr=0.0,
                 )
                 self.engine.positions[symbol] = pos
+                # Map the symbol so its exit path can place an order. setdefault
+                # never clobbers a mapping a live scan already set.
+                self._strategy_by_symbol.setdefault(symbol, "simplified_stock_engine")
+                if rehydrate_key:
+                    self._api_key_by_symbol.setdefault(symbol, rehydrate_key)
                 added += 1
                 logger.info(
                     "[SIMPLIFIED-REHYDRATE] %s %s qty=%s entry=%.2f (journal_id=%s)",

@@ -48,22 +48,22 @@ def _isolate_runtime_override(monkeypatch):
 
 
 def _config(**overrides) -> SectorFollowConfig:
-    base = dict(
-        capital_inr=250000.0,
-        max_position_inr=50000.0,
-        max_concurrent_positions=5,
-        gate_sector_pct=1.0,
-        gate_stock_pct=0.5,
-        gate_vol_mult=1.0,
-        daily_loss_kill_pct=3.0,
-        cost_pct_round_trip=0.0857,
-        vol_avg_lookback_days=20,
-        broker="zerodha",
-        exchange="NSE",
-        product="CNC",
-        universe=["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"],
-        strategy_id=99,
-    )
+    base = {
+        "capital_inr": 250000.0,
+        "max_position_inr": 50000.0,
+        "max_concurrent_positions": 5,
+        "gate_sector_pct": 1.0,
+        "gate_stock_pct": 0.5,
+        "gate_vol_mult": 1.0,
+        "daily_loss_kill_pct": 3.0,
+        "cost_pct_round_trip": 0.0857,
+        "vol_avg_lookback_days": 20,
+        "broker": "zerodha",
+        "exchange": "NSE",
+        "product": "CNC",
+        "universe": ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"],
+        "strategy_id": 99,
+    }
     base.update(overrides)
     return SectorFollowConfig(**base)
 
@@ -862,3 +862,229 @@ def test_exit_rejection_is_journaled():
     assert row["side"] == "SELL"
     assert row["status"] == "rejected"
     assert "no holdings" in row["error_message"]
+
+
+# --------------------------------------------------------------------------- #
+# Fix 1b (2026-06-15) — aggregator-source for today's data + loud failure
+# --------------------------------------------------------------------------- #
+import logging  # noqa: E402
+
+from services.sector_follow_service import (  # noqa: E402
+    _compute_metrics,
+    make_duckdb_metrics_provider,
+)
+
+
+def _ist_epoch(y, mo, d, h, mi):
+    """Epoch seconds for an IST wall-clock time (matches _ist_date's reading)."""
+    return datetime(y, mo, d, h, mi, tzinfo=_IST).timestamp()
+
+
+def _prior_days_history(close_fri=100.0, vol_thu=800.0, vol_fri=1200.0, today_bars=None):
+    """Build a history_reader payload: two prior trading days (Thu 06-11, Fri
+    06-12), optionally plus today (Mon 06-15) bars. avg_vol over the two prior
+    days = (vol_thu + vol_fri)/2; prior_close = close_fri."""
+    rows = [
+        (_ist_epoch(2026, 6, 11, 15, 29), close_fri - 1.0, vol_thu),
+        (_ist_epoch(2026, 6, 12, 15, 29), close_fri, vol_fri),
+    ]
+    if today_bars:
+        rows = list(rows) + list(today_bars)
+    return rows
+
+
+def _make_real_service(
+    intraday, history, notifier=None, broker_session_checker=None, **cfg_overrides
+):
+    """Build a service driving the REAL metrics pipeline (no metrics_provider
+    override) with injected intraday + history sources. ``intraday`` is a
+    {symbol: (close, vol)} map; ``history`` is a {symbol: [(ts, close, vol)]} map."""
+    notifier = notifier or (lambda msg: None)
+    broker_session_checker = broker_session_checker or (lambda: True)
+
+    def intraday_provider(sym, as_of):
+        return intraday.get(sym, (None, None))
+
+    def history_reader(all_syms, window_start):
+        return {s: list(history.get(s, [])) for s in all_syms}
+
+    base = {"universe": ["AAA"], "strategy_id": 99}
+    base.update(cfg_overrides)
+    cfg = _config(**base)
+    from services.mode_service import EffectiveDecision
+
+    svc = SectorFollowService(
+        config=cfg,
+        sector_map=dict.fromkeys(cfg.universe, "NIFTY"),
+        mode="scaffold",
+        intraday_provider=intraday_provider,
+        history_reader=history_reader,
+        broker_session_checker=broker_session_checker,
+        order_placer=lambda mode, order: {"status": "success", "orderid": "X"},
+        price_fetcher=lambda s, e: None,
+        notifier=notifier,
+        trade_recorder=lambda **kw: 1,
+        now=lambda: datetime(2026, 6, 15, 15, 20, tzinfo=_IST),
+        intent_resolver=lambda: EffectiveDecision(
+            mode="sandbox", intent="run", daily_capital_cap=None, source="env"
+        ),
+    )
+    return svc
+
+
+def test_evaluator_reads_from_aggregator_when_today_bars_present():
+    """Today's close+volume come from the aggregator (not historify); the
+    candidate's current_price is the aggregator close and source='aggregator'."""
+    intraday = {"AAA": (102.0, 2000.0), "NIFTY": (101.5, 0.0)}
+    history = {
+        "AAA": _prior_days_history(close_fri=100.0),  # avg_vol=1000, prior_close=100
+        "NIFTY": _prior_days_history(close_fri=100.0),
+    }
+    svc = _make_real_service(intraday, history)
+    metrics = svc._metrics_provider(svc._now(), svc.config.universe, svc.sector_map, svc.config)
+    m = metrics["AAA"]
+    assert m["intraday_source"] == "aggregator"
+    assert m["current_price"] == 102.0
+    assert m["stock_ret"] == pytest.approx(0.02)  # 102/100 - 1
+    assert m["vol_ratio"] == pytest.approx(2.0)  # 2000/1000
+    assert m["sector_ret"] == pytest.approx(0.015)  # 101.5/100 - 1
+    # Full evaluator: AAA passes all three gates.
+    candidates = svc.evaluate_candidates()
+    assert [c["symbol"] for c in candidates] == ["AAA"]
+    assert candidates[0]["current_price"] == 102.0
+
+
+def test_evaluator_falls_back_to_historify_when_aggregator_empty(caplog):
+    """When the aggregator has no today bars, today's data falls back to
+    historify AND a WARNING is logged (the silent-bug class made loud)."""
+    intraday = {}  # aggregator empty for every symbol
+    history = {
+        "AAA": _prior_days_history(
+            close_fri=100.0, today_bars=[(_ist_epoch(2026, 6, 15, 15, 19), 102.0, 2000.0)]
+        ),
+        "NIFTY": _prior_days_history(
+            close_fri=100.0, today_bars=[(_ist_epoch(2026, 6, 15, 15, 19), 101.5, 0.0)]
+        ),
+    }
+    svc = _make_real_service(intraday, history)
+    with caplog.at_level(logging.WARNING, logger="services.sector_follow_service"):
+        metrics = svc._metrics_provider(svc._now(), svc.config.universe, svc.sector_map, svc.config)
+    m = metrics["AAA"]
+    assert m["intraday_source"] == "historify"
+    assert m["current_price"] == 102.0
+    assert m["stock_ret"] == pytest.approx(0.02)
+    assert any(
+        "falling back to historify" in r.message and "AAA" in r.message for r in caplog.records
+    )
+
+
+def test_evaluator_logs_loudly_when_all_symbols_have_no_data(caplog):
+    """No aggregator AND no today bars in historify: per-symbol incomplete-metrics
+    WARNINGs fire AND the completeness summary escalates to a CRITICAL alert."""
+    alerts = []
+    intraday = {}
+    history = {  # prior days only — no today data anywhere
+        "AAA": _prior_days_history(close_fri=100.0),
+        "BBB": _prior_days_history(close_fri=100.0),
+        "NIFTY": _prior_days_history(close_fri=100.0),
+    }
+    svc = _make_real_service(
+        intraday, history, notifier=lambda msg: alerts.append(msg), universe=["AAA", "BBB"]
+    )
+    with caplog.at_level(logging.WARNING, logger="services.sector_follow_service"):
+        candidates = svc.evaluate_candidates()
+    assert candidates == []  # everything fails closed
+    # Per-symbol loud diagnostics for the missing data.
+    assert any("AAA incomplete metrics" in r.message for r in caplog.records)
+    assert any("BBB incomplete metrics" in r.message for r in caplog.records)
+    # Completeness summary -> CRITICAL Telegram (0% live intraday).
+    assert any("CRITICAL" in a for a in alerts)
+
+
+def test_make_duckdb_metrics_provider_assembles_two_sources():
+    """The factory binds today (aggregator) + lookback (historify) and yields the
+    expected metric shape including the intraday_source tag."""
+    cfg = _config(universe=["AAA"])
+    provider = make_duckdb_metrics_provider(
+        intraday_provider=lambda s, a: {"AAA": (102.0, 2000.0), "NIFTY": (101.5, 0.0)}.get(
+            s, (None, None)
+        ),
+        history_reader=lambda syms, ws: {s: _prior_days_history(close_fri=100.0) for s in syms},
+    )
+    out = provider(datetime(2026, 6, 15, 15, 20, tzinfo=_IST), ["AAA"], {"AAA": "NIFTY"}, cfg)
+    assert out["AAA"]["intraday_source"] == "aggregator"
+    assert out["AAA"]["stock_ret"] == pytest.approx(0.02)
+
+
+# --------------------------------------------------------------------------- #
+# Fix 1b Part C — 15:18 pre-entry pipeline smoke check
+# --------------------------------------------------------------------------- #
+def test_smoke_check_passes_when_pipeline_healthy():
+    """All three checks green -> ok, no override written."""
+    intraday = {"AAA": (102.0, 2000.0)}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history)
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is True
+    assert details["aggregator_ok"] is True
+    assert details["historify_ok"] is True
+    assert details["broker_session_ok"] is True
+
+
+def test_smoke_check_aborts_entry_if_aggregator_empty_at_1518():
+    """Aggregator empty -> smoke check fails AND writes a pause runtime override
+    that holds the 15:20 entries."""
+    from database import strategy_runtime_override_db as sro
+
+    intraday = {}  # aggregator has no today data for any symbol
+    history = {"AAA": _prior_days_history(close_fri=100.0)}  # lookback fine
+    svc = _make_real_service(intraday, history)
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert details["aggregator_ok"] is False
+    # A pause override was written (entry hold), reason names the smoke failure.
+    rows = sro.list_overrides(include_expired=True)
+    pauses = [
+        r for r in rows if r["override_type"] == "pause" and "smoke_check_failed" in r["reason"]
+    ]
+    assert pauses, f"expected a smoke-check pause override, got {rows}"
+    # And the engine's entry gate honors it at the smoke-check instant.
+    blocked, _ov = sro.is_entry_blocked("sector_follow_cap5_vol", now=datetime(2026, 6, 15, 9, 50))
+    assert blocked is True
+
+
+def test_smoke_check_telegrams_on_failure():
+    """A failing smoke check alerts the operator over Telegram."""
+    alerts = []
+    intraday = {}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history, notifier=lambda m: alerts.append(m))
+    ok, _details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert any("SMOKE CHECK FAILED" in a for a in alerts)
+
+
+def test_smoke_check_fails_when_broker_session_down():
+    """Live aggregator + historify but no broker session -> fail + alert."""
+    alerts = []
+    intraday = {"AAA": (102.0, 2000.0)}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(
+        intraday, history, notifier=lambda m: alerts.append(m), broker_session_checker=lambda: False
+    )
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert details["broker_session_ok"] is False
+    assert any("broker session not live" in a for a in alerts)
+
+
+def test_smoke_check_skipped_when_flag_off(monkeypatch):
+    """With the flag off the check is a no-op (ok=True, no override)."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("SECTOR_FOLLOW_SMOKE_CHECK_ENABLED", "false")
+    svc = _make_real_service({}, {"AAA": _prior_days_history()})
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is True
+    assert details.get("skipped") is True
+    assert sro.list_overrides(include_expired=True) == []

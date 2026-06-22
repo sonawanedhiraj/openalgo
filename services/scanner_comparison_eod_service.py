@@ -210,6 +210,105 @@ def _metrics(inhouse: set[str], chartink: set[str], side: str) -> dict[str, Any]
     }
 
 
+def _parse_symbol_list(blob: Any) -> list[str]:
+    """Sorted unique-upper symbol list from a JSON-encoded blob, tolerant of junk.
+
+    Shares the same tolerance contract as ``_symbol_set_from_json`` but preserves
+    a deterministic order for the UI timeline (set iteration order is not stable
+    across processes).
+    """
+    return sorted(_symbol_set_from_json(blob))
+
+
+def get_timeline_for_date(date: str | None = None) -> dict[str, list[dict[str, Any]]]:
+    """Per-event timeline of every Chartink + in-house screener hit for ``date``.
+
+    Pure read; touches no writable table. Returns::
+
+        {
+            "chartink": [ {ts, side, symbols, posted, post_status, cycle_id}, ... ],
+            "inhouse":  [ {ts, side, symbols, posted, definition, result_id}, ... ],
+        }
+
+    Each event is a single audit-trail row (one ``scan_cycle`` for Chartink, one
+    ``scan_results`` for in-house). The UI renders them as side-by-side
+    chronologically-sorted tables. ``side`` is ``"BUY"``/``"SELL"``; for Chartink
+    a single cycle can carry both sides, so it appears once per side it had
+    symbols for.
+    """
+    if date is None:
+        date = _today_ist()
+
+    chartink: list[dict[str, Any]] = []
+    from database import scan_cycle_db as scdb
+
+    cyc_sess = scdb.db_session
+    try:
+        rows = (
+            cyc_sess.query(scdb.ScanCycle)
+            .filter(scdb.ScanCycle.cycle_kind == "chartink")
+            .order_by(scdb.ScanCycle.started_at.asc())
+            .all()
+        )
+        for row in rows:
+            ts = row.started_at or ""
+            if ts[:10] != date:
+                continue
+            post_status = (row.post_status or "").lower()
+            posted = post_status == "ok"
+            for side, blob in (("BUY", row.screener_buy), ("SELL", row.screener_sell)):
+                syms = _parse_symbol_list(blob)
+                if not syms:
+                    continue
+                chartink.append(
+                    {
+                        "ts": ts,
+                        "side": side,
+                        "symbols": syms,
+                        "count": len(syms),
+                        "posted": posted,
+                        "post_status": row.post_status,
+                        "cycle_id": row.id,
+                    }
+                )
+    finally:
+        cyc_sess.remove()
+
+    inhouse: list[dict[str, Any]] = []
+    from database import scanner_db as sdb
+
+    in_sess = sdb.db_session
+    try:
+        rows = (
+            in_sess.query(sdb.ScanResult, sdb.ScanDefinition.screener_type, sdb.ScanDefinition.name)
+            .join(sdb.ScanDefinition, sdb.ScanResult.scan_definition_id == sdb.ScanDefinition.id)
+            .filter(sdb.ScanResult.source == "inhouse")
+            .order_by(sdb.ScanResult.run_at.asc())
+            .all()
+        )
+        for row, screener_type, def_name in rows:
+            ts = row.run_at or ""
+            if ts[:10] != date:
+                continue
+            syms = _parse_symbol_list(row.symbols)
+            side = "BUY" if (screener_type or "").lower() == "buy" else "SELL"
+            inhouse.append(
+                {
+                    "ts": ts,
+                    "side": side,
+                    "symbols": syms,
+                    "count": len(syms),
+                    "posted": bool(row.posted_to_engine),
+                    "definition": def_name,
+                    "result_id": row.id,
+                }
+            )
+    finally:
+        in_sess.remove()
+
+    return {"chartink": chartink, "inhouse": inhouse}
+
+
 def compute_comparison(date: str | None = None) -> dict[str, Any]:
     """Compute the BUY + SELL comparison for ``date`` (default today IST).
 

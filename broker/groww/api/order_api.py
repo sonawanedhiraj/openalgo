@@ -5,7 +5,6 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
 
 from broker.groww.database.master_contract_db import (
     format_groww_to_openalgo_symbol,
@@ -44,6 +43,10 @@ from broker.groww.mapping.transform_data import (
     transform_data,
     transform_modify_order_data,
 )
+
+# Additional segment constants not in transform_data
+SEGMENT_CURRENCY = "CURRENCY"
+SEGMENT_COMMODITY = "COMMODITY"
 from database.auth_db import get_auth_token
 from database.token_db import get_br_symbol, get_oa_symbol, get_symbol, get_token
 from utils.httpx_client import get_httpx_client
@@ -898,7 +901,6 @@ def get_positions(auth):
                         # Get the trading symbol
                         groww_symbol = position.get("trading_symbol", "")
                         openalgo_symbol = groww_symbol
-                        symbol_converted = False
 
                         # Handle symbol conversion for consistency with orderbook
                         # This is primarily for FNO instruments, but we'll check all symbols
@@ -916,7 +918,6 @@ def get_positions(auth):
                                 logger.info(
                                     f"Database: Converted Groww symbol: {groww_symbol} -> {openalgo_symbol}"
                                 )
-                                symbol_converted = True
                             else:
                                 # Pattern matching fallbacks if database lookup fails
                                 # 1. Try option pattern
@@ -959,7 +960,6 @@ def get_positions(auth):
                                     logger.info(
                                         f"Pattern: Converted Groww option symbol: {groww_symbol} -> {openalgo_symbol}"
                                     )
-                                    symbol_converted = True
                                 else:
                                     # 2. Try futures pattern
                                     future_pattern = re.compile(
@@ -997,7 +997,6 @@ def get_positions(auth):
                                         logger.info(
                                             f"Pattern: Converted Groww futures symbol: {groww_symbol} -> {openalgo_symbol}"
                                         )
-                                        symbol_converted = True
 
                         except Exception as e:
                             logger.error(f"Error converting position symbol: {e}")
@@ -1094,7 +1093,6 @@ def get_positions(auth):
                             # Get the trading symbol
                             groww_symbol = position.get("trading_symbol", "")
                             openalgo_symbol = groww_symbol
-                            symbol_converted = False
 
                             # Handle FNO symbol conversion
                             if (
@@ -1115,7 +1113,6 @@ def get_positions(auth):
                                         logger.info(
                                             f"Database: Converted Groww FNO symbol: {groww_symbol} -> {openalgo_symbol}"
                                         )
-                                        symbol_converted = True
                                     else:
                                         # Fallback to pattern matching if database lookup fails
                                         # For Options: Convert from Groww format to OpenAlgo format
@@ -1158,7 +1155,6 @@ def get_positions(auth):
                                         logger.info(
                                             f"Pattern: Converted Groww option position symbol: {groww_symbol} -> {openalgo_symbol}"
                                         )
-                                        symbol_converted = True
 
                                     # For Futures: Convert from "NIFTY2551FUT" to "NIFTY29MAY25FUT"
                                     else:
@@ -1199,7 +1195,6 @@ def get_positions(auth):
                                             logger.info(
                                                 f"Pattern: Converted Groww futures position symbol: {groww_symbol} -> {openalgo_symbol}"
                                             )
-                                            symbol_converted = True
                                 except Exception as e:
                                     logger.error(f"Error converting position symbol: {e}")
                                     # Fall back to original symbol if conversion fails
@@ -1276,142 +1271,16 @@ def get_positions(auth):
         }, 500
 
 
-def get_holdings(auth):
-    """
-    Get holdings for the user using direct API calls
-
-    Args:
-        auth (str): Authentication token
-
-    Returns:
-        tuple: (holdings data, status code)
-    """
-    try:
-        logger.info("Using direct API implementation for get_holdings")
-
-        # Prepare the API client and headers
-        client = get_httpx_client()
-        headers = {
-            "Authorization": f"Bearer {auth}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
-
-        # Groww API endpoint for holdings
-        holdings_url = f"{GROWW_BASE_URL}/v1/portfolio/holdings"
-
-        # Log the request details
-        logger.info("-------- GET HOLDINGS REQUEST --------")
-        logger.info(f"API URL: {holdings_url}")
-
-        # Make the API call
-        response_obj = client.get(holdings_url, headers=headers, timeout=30)
-
-        # Log the response status
-        logger.info("-------- GET HOLDINGS RESPONSE --------")
-        logger.info(f"Response status code: {response_obj.status_code}")
-
-        # Parse the response
-        try:
-            response_data = response_obj.json()
-            logger.info(
-                f"Raw holdings response received with status code: {response_obj.status_code}"
-            )
-
-            # Process the response to extract holdings information
-            if response_obj.status_code == 200 and "payload" in response_data:
-                holdings = []
-
-                # Extract holdings from the payload
-                if "holdings" in response_data["payload"]:
-                    raw_holdings = response_data["payload"]["holdings"]
-                    logger.info(f"Found {len(raw_holdings)} holdings")
-
-                    # Transform holdings to a more consistent format
-                    for holding in raw_holdings:
-                        transformed_holding = {
-                            "symbol": holding.get("trading_symbol", ""),
-                            "exchange": holding.get("exchange", ""),
-                            "isin": holding.get("isin", ""),
-                            "quantity": holding.get("quantity", 0),
-                            "average_price": holding.get("average_price", 0),
-                            "last_price": holding.get("last_price", 0),
-                            "close_price": holding.get("close_price", 0),
-                            "pnl": holding.get("pnl", 0),
-                            "day_change": holding.get("day_change", 0),
-                            "day_change_percentage": holding.get("day_change_percentage", 0),
-                            "value": holding.get("value", 0),
-                            "company_name": holding.get("company_name", ""),
-                            # Using the key names OpenAlgo expects
-                            "tradingsymbol": holding.get("trading_symbol", ""),
-                            "instrument_token": holding.get("token", ""),
-                            "t1_quantity": holding.get("t1_quantity", 0),
-                            "realised": holding.get("realised_pnl", 0),
-                            "unrealised": holding.get("unrealised_pnl", 0),
-                        }
-                        holdings.append(transformed_holding)
-
-                # Create response object
-                formatted_response = {
-                    "status": "success",
-                    "message": f"Retrieved {len(holdings)} holdings",
-                    "data": holdings,
-                    "raw_response": response_data,
-                }
-
-                logger.info(f"Successfully processed {len(holdings)} holdings")
-                return formatted_response, 200
-            else:
-                # Handle error responses
-                error_message = response_data.get("message", "Error retrieving holdings")
-                error_details = response_data.get("error", {})
-
-                logger.warning(f"Error getting holdings: {error_message}")
-                if error_details:
-                    logger.warning(f"Error details: {json.dumps(error_details, indent=2)}")
-
-                return {
-                    "status": "error",
-                    "message": f"Failed to retrieve holdings: {error_message}",
-                    "data": [],
-                    "raw_response": response_data,
-                }, response_obj.status_code
-
-        except Exception as e:
-            logger.error(f"Error parsing holdings response: {e}")
-            return {
-                "status": "error",
-                "message": f"Error parsing holdings response: {str(e)}",
-                "data": [],
-                "tradebook": [],
-                "raw_data": response_obj.content.decode("utf-8", errors="replace"),
-            }, response_obj.status_code
-
-    except Exception as e:
-        logger.error(f"Error while fetching trades using direct API: {e}")
-        logger.exception("Full stack trace:")
-        # Even in error case, maintain consistent structure with empty data
-        # This ensures map_trade_data can still process it
-        return {
-            "status": "error",
-            "message": f"Error fetching trades: {str(e)}",
-            "data": [],  # Empty list but with the expected structure
-            "tradebook": [],
-            "raw_data": [],
-        }, 500
-
-
-# --- Per-Symbol Smart Order Lock ---
-# Ensures only one smart order per symbol executes at a time.
-# Others queue and execute sequentially, each getting a fresh position book.
-_symbol_locks = {}  # {symbol_key: threading.Lock}
-_symbol_locks_lock = threading.Lock()
-
 # --- Position Book Cache ---
 # Caches get_positions() for 1 second. Invalidated after each smart order placement.
 _position_cache = {}  # {auth_token: {"data": ..., "timestamp": ...}}
 _position_cache_lock = threading.Lock()
 _POSITION_CACHE_TTL = 1.0  # seconds
+
+# --- Symbol Locks ---
+# Serializes smart orders per symbol/exchange/product
+_symbol_locks = {}  # {symbol_key: threading.Lock}
+_symbol_locks_lock = threading.Lock()
 
 
 def _get_symbol_lock(symbol, exchange, product):
@@ -1627,7 +1496,9 @@ def direct_place_order_api(data, auth):
                 logger.info(f"Using price: {price_value} (original: {price}, type: {type(price)})")
             except (ValueError, TypeError) as e:
                 logger.error(f"Invalid price value ({price}, type: {type(price)}): {str(e)}")
-                raise ValueError(f"Invalid price format: {price}. Must be a valid number.")
+                raise ValueError(
+                    f"Invalid price format: {price}. Must be a valid number."
+                ) from None
 
         # Add trigger price for SL and SL-M orders with detailed logging
         if trigger_price is not None and order_type in [ORDER_TYPE_SL, ORDER_TYPE_SLM]:
@@ -1644,7 +1515,7 @@ def direct_place_order_api(data, auth):
                 )
                 raise ValueError(
                     f"Invalid trigger_price format: {trigger_price}. Must be a valid number."
-                )
+                ) from None
 
         # Validate quantity with detailed logging
         try:
@@ -1656,7 +1527,9 @@ def direct_place_order_api(data, auth):
             )
         except (ValueError, TypeError) as e:
             logger.error(f"Invalid quantity value ({quantity}, type: {type(quantity)}): {str(e)}")
-            raise ValueError(f"Invalid quantity format: {quantity}. Must be a positive integer.")
+            raise ValueError(
+                f"Invalid quantity format: {quantity}. Must be a positive integer."
+            ) from None
 
         logger.info(f"Placing {transaction_type} order for {quantity} of {trading_symbol}")
         logger.info(f"API Parameters: {payload}")
@@ -1840,53 +1713,9 @@ def direct_place_order(
     Returns:
         dict: Order response
     """
-    try:
-        # Initialize Groww API client
-        groww = init_groww_client(auth_token)
-
-        # Default exchange and segment
-        exchange = EXCHANGE_NSE
-        segment = SEGMENT_CASH
-        validity = VALIDITY_DAY
-
-        # Generate a valid Groww order reference ID if not provided
-        if not order_reference_id:
-            timestamp = datetime.now().strftime("%Y%m%d")
-            uuid_part = str(uuid.uuid4()).replace("-", "")[:8]
-            order_reference_id = f"{timestamp}-{uuid_part}"
-
-            # Ensure it meets Groww's requirements
-            order_reference_id = re.sub(r"[^a-zA-Z0-9-]", "", order_reference_id)[:20]
-            if len(order_reference_id) < 8:
-                order_reference_id = order_reference_id.ljust(8, "0")
-
-        logger.info(
-            f"Placing {transaction_type} order for {quantity} of {symbol} at {price if price else 'MARKET'}"
-        )
-        logger.info(
-            f"SDK Parameters: exchange={{exchange}}, segment={{segment}}, product={{product}}, order_type={order_type}"
-        )
-        logger.info(f"Using order reference ID: {order_reference_id}")
-
-        # Place order using SDK
-        response = groww.place_order(
-            trading_symbol=symbol,
-            quantity=quantity,
-            price=price,
-            validity=validity,
-            exchange=exchange,
-            segment=segment,
-            product=product,
-            order_type=order_type,
-            transaction_type=transaction_type,
-            order_reference_id=order_reference_id,
-        )
-        logger.info(f"Direct order response: {response}")
-        return response
-
-    except Exception as e:
-        logger.exception(f"Direct order error: {e}")
-        return {"status": "error", "message": str(e)}
+    # This function uses SDK which is not available - use direct_place_order_api instead
+    logger.warning("direct_place_order: SDK not available, use direct_place_order_api instead")
+    return {"status": "error", "message": "SDK method not implemented"}
 
 
 def place_smartorder_api(data, auth):
@@ -2703,7 +2532,7 @@ def direct_modify_order(data, auth):
                 )
                 raise ValueError(
                     f"Invalid quantity format: {data['quantity']}. Must be a positive integer."
-                )
+                ) from None
 
         # Process price with detailed logging
         if "price" in data and data["price"] and order_type == ORDER_TYPE_LIMIT:
@@ -2719,7 +2548,9 @@ def direct_modify_order(data, auth):
                 logger.error(
                     f"Invalid price value ({data['price']}, type: {type(data['price'])}): {str(e)}"
                 )
-                raise ValueError(f"Invalid price format: {data['price']}. Must be a valid number.")
+                raise ValueError(
+                    f"Invalid price format: {data['price']}. Must be a valid number."
+                ) from None
 
         # Process trigger_price with detailed logging
         if (
@@ -2741,7 +2572,7 @@ def direct_modify_order(data, auth):
                 )
                 raise ValueError(
                     f"Invalid trigger_price format: {data['trigger_price']}. Must be a valid number."
-                )
+                ) from None
 
         logger.info(f"Modifying order {groww_order_id} with parameters: {json.dumps(payload)}")
 
@@ -3133,7 +2964,7 @@ def cancel_all_orders_api(data, auth):
                     )
 
         # Prepare success response even if some orders failed
-        response = {
+        {
             "status": "success",
             "message": f"Successfully cancelled {len(cancelled_orders)} orders. {len(failed_to_cancel)} orders failed.",
             "cancelled_orders": cancelled_orders,

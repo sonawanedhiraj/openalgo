@@ -129,7 +129,13 @@ def run_backfill_checks(today=None) -> dict:
     index_res = _index_check(today)
     stock_res = _stock_check(today)
     errors = list(index_res.get("errors", [])) + list(stock_res.get("errors", []))
-    all_fresh = not index_res.get("stale_symbols") and not stock_res.get("stale_symbols")
+
+    # A "skipped_locked" arm read nothing (historify was briefly locked) — it is
+    # NOT proof the feed is fresh, so it must not let the periodic loop back off.
+    def _arm_fresh(r: dict) -> bool:
+        return not r.get("stale_symbols") and r.get("status") != "skipped_locked"
+
+    all_fresh = _arm_fresh(index_res) and _arm_fresh(stock_res)
     return {
         "index": index_res,
         "stock": stock_res,
@@ -241,21 +247,23 @@ def stop_periodic_backfill_check() -> None:
 # Boot entry
 # --------------------------------------------------------------------------- #
 def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
-    """Poll until a broker API key is configured (operator logged in).
+    """Poll until the broker session is live (operator logged in AND token valid).
 
-    Returns immediately when a key is already present (the common restart case).
-    A dead daily token is fine here — the catch-up fetch fails gracefully and the
-    next restart after re-login converges.
+    Returns immediately when a live session is already present (the common
+    restart case). A stored API key with a dead daily token (the typical
+    morning state after the ~3 AM Zerodha rotation) is treated as no session
+    — otherwise every backfill fetch 401s and floods errors.jsonl. See
+    ``services/broker_session_health.is_live_broker_session``.
     """
-    from database.auth_db import get_first_available_api_key
+    from services.broker_session_health import is_live_broker_session
 
     deadline = _time.time() + max_wait_sec
     while _time.time() < deadline and not _stop_event.is_set():
         try:
-            if get_first_available_api_key():
+            if is_live_broker_session():
                 return True
         except Exception:
-            logger.exception("sector_follow backfill: API-key probe failed")
+            logger.exception("sector_follow backfill: live-session probe raised")
         _stop_event.wait(_BOOT_WAIT_POLL_SEC)
     return False
 

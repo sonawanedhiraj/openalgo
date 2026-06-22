@@ -67,6 +67,7 @@ const IVSmile = lazy(() => import('@/pages/IVSmile'))
 const OIProfile = lazy(() => import('@/pages/OIProfile'))
 const StrategyBuilder = lazy(() => import('@/pages/StrategyBuilder'))
 const StrategyPortfolio = lazy(() => import('@/pages/StrategyPortfolio'))
+const ScreenerComparison = lazy(() => import('@/pages/ScreenerComparison'))
 
 // Strategy pages
 const StrategyIndex = lazy(() => import('@/pages/strategy/StrategyIndex'))
@@ -81,6 +82,16 @@ const EditPythonStrategy = lazy(() => import('@/pages/python-strategy/EditPython
 const PythonStrategyLogs = lazy(() => import('@/pages/python-strategy/PythonStrategyLogs'))
 const SchedulePythonStrategy = lazy(() => import('@/pages/python-strategy/SchedulePythonStrategy'))
 const PythonStrategyGuide = lazy(() => import('@/pages/python-strategy/PythonStrategyGuide'))
+
+// Scanner pages (Tier 1 — read-only browser)
+const ScannerIndex = lazy(() => import('@/pages/scanner/ScannerIndex'))
+const ScannerDetail = lazy(() => import('@/pages/scanner/ScannerDetail'))
+
+// Strategies Dashboard (Tier 2 — read-only strategy browser)
+const StrategiesDashboardIndex = lazy(
+  () => import('@/pages/strategies-dashboard/StrategiesDashboardIndex')
+)
+const StrategyDetailPage = lazy(() => import('@/pages/strategies-dashboard/StrategyDetail'))
 
 // Chartink pages
 const ChartinkIndex = lazy(() => import('@/pages/chartink/ChartinkIndex'))
@@ -206,6 +217,13 @@ function App() {
                 <Route path="/oiprofile" element={<OIProfile />} />
                 <Route path="/strategybuilder" element={<StrategyBuilder />} />
                 <Route path="/strategybuilder/portfolio" element={<StrategyPortfolio />} />
+                <Route path="/screener-comparison" element={<ScreenerComparison />} />
+                {/* In-house Scanner Browser (Tier 1 read-only) */}
+                <Route path="/scanner" element={<ScannerIndex />} />
+                <Route path="/scanner/:id" element={<ScannerDetail />} />
+                {/* Strategies Dashboard (Tier 2 read-only) */}
+                <Route path="/strategies" element={<StrategiesDashboardIndex />} />
+                <Route path="/strategies/:name" element={<StrategyDetailPage />} />
                 {/* Legacy /tools/strategy paths — redirect to the new route. */}
                 <Route
                   path="/tools/strategy"

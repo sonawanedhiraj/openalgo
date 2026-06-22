@@ -186,7 +186,7 @@ def check_permission(path: str, expected_mode: int, is_sensitive: bool) -> dict:
             result["writable"] = perms["writable"]
 
             # On Windows, check functional access instead of exact mode
-            is_dir = perms["is_directory"]
+            perms["is_directory"]
             needs_write = (expected_mode & 0o200) != 0
             needs_read = (expected_mode & 0o400) != 0
 
@@ -286,7 +286,7 @@ def fix_permissions():
         fixed = []
         failed = []
 
-        for path, expected_mode, description, is_sensitive in get_permission_checks():
+        for path, expected_mode, _description, _is_sensitive in get_permission_checks():
             full_path = os.path.join(base_path, path)
 
             # Skip if path doesn't exist - we'll create directories but not files

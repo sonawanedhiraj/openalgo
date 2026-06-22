@@ -139,7 +139,7 @@ class BrokerData:
 
     def _convert_to_dhan_request(self, symbol, exchange):
         """Convert symbol and exchange to Dhan format"""
-        br_symbol = get_br_symbol(symbol, exchange)
+        get_br_symbol(symbol, exchange)
         # Extract security ID and determine exchange segment
         # This needs to be implemented based on your symbol mapping logic
         security_id = get_token(symbol, exchange)  # This should be mapped to Dhan's security ID
@@ -689,6 +689,7 @@ class BrokerData:
 
                 base_ts = int(base_dt.timestamp())
                 quote_tmpl = {"ltp": 0, "open": 0, "high": 0, "low": 0, "volume": 0, "oi": 0}
+                fake_candles = []
 
                 # Generate candles respecting the requested interval
                 for i in range(num_candles):
@@ -722,7 +723,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error fetching historical data: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def _get_quotes_via_chart(
         self, security_id: str, exchange_segment: str, instrument_type: str
@@ -773,7 +774,7 @@ class BrokerData:
         # Day high = max of all highs
         day_high = max((float(h) for h in highs if h), default=0)
         # Day low = min of all lows (exclude zeros)
-        valid_lows = [float(l) for l in lows if l and float(l) > 0]
+        valid_lows = [float(low_val) for low_val in lows if low_val and float(low_val) > 0]
         day_low = min(valid_lows) if valid_lows else 0
         # Total volume = sum of all candle volumes
         total_volume = sum(int(float(v)) for v in volumes if v) if volumes else 0
@@ -1095,7 +1096,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Error in get_depth: {str(e)}", exc_info=True)
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """

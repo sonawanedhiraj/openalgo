@@ -485,7 +485,6 @@ class BrokerData:
             # Tradejini WebSocket can handle up to 3000 instruments
             # Using batch size of 100 for practical response times
             BATCH_SIZE = 100
-            WAIT_TIME_PER_SYMBOL = 0.1  # 100ms per symbol for data arrival
 
             if len(symbols) > BATCH_SIZE:
                 logger.debug(f"Processing {len(symbols)} symbols in batches of {BATCH_SIZE}")
@@ -507,7 +506,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
         finally:
             # Always close WebSocket after multiquotes request to prevent FD leaks
             try:
@@ -580,7 +579,7 @@ class BrokerData:
         if not subscription_success:
             logger.error("Failed to send subscription request")
             # Return errors for all symbols
-            for symbol_key, info in symbol_map.items():
+            for _symbol_key, info in symbol_map.items():
                 results.append(
                     {
                         "symbol": info["symbol"],
@@ -658,7 +657,7 @@ class BrokerData:
             # Get token for the symbol
             token = get_token(symbol, exchange)
             if not token:
-                raise ValueError(f"Token not found for {symbol} on {exchange}")
+                raise ValueError(f"Token not found for {symbol} on {exchange}") from None
 
             # Connect to WebSocket if not already connected
             if not self.ws.connected:

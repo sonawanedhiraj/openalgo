@@ -1190,7 +1190,7 @@ def get_distinct_underlyings_cached(
             for underlying_set in index.values():
                 underlyings.update(underlying_set)
 
-        return sorted(list(underlyings))
+        return sorted(underlyings)
 
     # Fallback to database. The DB query returns all distinct names for the
     # exchange — that already matches `include_futures=True` semantics. For

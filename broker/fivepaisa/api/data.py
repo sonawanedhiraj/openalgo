@@ -341,7 +341,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e
 
     def get_quotes(self, symbol: str, exchange: str) -> dict:
         """
@@ -489,7 +489,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_quotes_batch(self, symbols: list) -> list:
         """
@@ -594,7 +594,7 @@ class BrokerData:
 
                 if not original:
                     # Try to find by matching broker symbol in values
-                    for key, info in symbol_map.items():
+                    for _key, info in symbol_map.items():
                         if info.get("br_symbol") == scrip_data:
                             original = info
                             break
@@ -728,7 +728,6 @@ class BrokerData:
 
             # No special handling needed for 10m interval anymore
             # Just use the native 10m interval from the API
-            is_resampling_needed = False
 
             # For intraday, we need to specify both start and end date
             # Convert dates to datetime objects

@@ -1,0 +1,8 @@
+{
+  "merged_at_sha": "9b3772727191fd6d0cbe60b40fc6b355018244fb",
+  "merged_at_iso": "2026-06-21T07:10:08Z",
+  "merged_pr": 48,
+  "unit_count": 1523,
+  "integration_count": 61,
+  "seeded_by": "update-test-baseline.yml on push to dev"
+}

@@ -1,0 +1,75 @@
+# docker-compose.test.yml
+#
+# Broker integration test stack.  OpenAlgo is pointed at the FastAPI mock Zerodha
+# broker so that E2E tests can exercise the full auth → funds → orders flow
+# without a real broker connection.
+#
+# Usage (local):
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   OPENALGO_URL=http://127.0.0.1:5099 MOCK_BROKER_URL=http://127.0.0.1:8001 \
+#     cd frontend && npx playwright test e2e/broker_happy_path.spec.ts \
+#     --config playwright.broker.config.ts
+#   docker compose -f docker-compose.test.yml down -v
+
+services:
+
+  mock_broker:
+    build:
+      context: ./test/fixtures/mock_broker
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8001/_mock/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  openalgo:
+    image: openalgo:latest
+    ports:
+      - "5099:5000"
+      - "8766:8765"
+
+    # Inherit from the project .env (generated in CI before this file is used)
+    env_file:
+      - .env
+
+    environment:
+      # Point all Zerodha API calls at the mock broker
+      BROKER_API_URL: "http://mock_broker:8001"
+      # Enable the /_test/mock_auth shortcut route
+      MOCK_BROKER_ENABLED: "true"
+      # Fake Zerodha credentials — valid format required but values don't matter
+      BROKER_API_KEY: "mock_zerodha_key"  # pragma: allowlist secret
+      BROKER_API_SECRET: "mock_zerodha_secret"  # pragma: allowlist secret
+      # Must reference the port OpenAlgo is actually reachable on from outside
+      REDIRECT_URL: "http://127.0.0.1:5099/zerodha/callback"
+      # Test-friendly settings
+      FLASK_ENV: testing
+      FLASK_DEBUG: "0"
+      TZ: Asia/Kolkata
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      NUMBA_NUM_THREADS: "1"
+      # Disable strategies + heavy background workers in test mode
+      SECTOR_FOLLOW_CAP5_VOL_MODE: "disabled"
+      FUTURES_FOLLOW_MODE: "disabled"
+      SIMPLIFIED_ENGINE_MODE: "disabled"
+      DATA_FRESHNESS_VALIDATION_ENABLED: "false"
+      SCANNER_BACKFILL_ENABLED: "false"
+      SECTOR_FOLLOW_PERIODIC_CHECK_ENABLED: "false"
+
+    depends_on:
+      mock_broker:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5000/auth/check-setup"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s

@@ -799,7 +799,7 @@ class HSWrapper:
         field_count = buf2long(c[d : d + 1])
         d += 1
         if field_count > 0:
-            fld = buf2long(c[d : d + 1])
+            buf2long(c[d : d + 1])
             d = d + 1
             field_length = buf2long(c[d : d + 2])
             d += 2
@@ -811,7 +811,6 @@ class HSWrapper:
         if len(e) < 3:
             logger.warning(f"Truncated binary message: {len(e)} bytes, dropping")
             return None
-        pos = 0
         # logger.info(f"INTO Parse Data {e}")
         try:
             return self._parseDataInner(e)
@@ -821,7 +820,7 @@ class HSWrapper:
 
     def _parseDataInner(self, e):
         pos = 0
-        packetsCount = buf2long(e[pos:2])
+        buf2long(e[pos:2])
         pos += 2
         type = int.from_bytes(e[pos : pos + 1], "big")
         pos += 1
@@ -833,13 +832,13 @@ class HSWrapper:
             fCount = int.from_bytes(e[pos : pos + 1], "big")
             pos += 1
             if fCount >= 2:
-                fid1 = int.from_bytes(e[pos : pos + 1], "big")
+                int.from_bytes(e[pos : pos + 1], "big")
                 pos += 1
                 valLen = int.from_bytes(e[pos : pos + 2], "big")
                 pos += 2
                 status = e[pos : pos + valLen].decode("utf-8")
                 pos += valLen
-                fid1 = int.from_bytes(e[pos : pos + 1], "big")
+                int.from_bytes(e[pos : pos + 1], "big")
                 pos += 1
                 valLen = int.from_bytes(e[pos : pos + 2], "big")
                 pos += 2
@@ -857,7 +856,7 @@ class HSWrapper:
                     jsonRes["stCode"] = RespCodes.get("CONNECTION_FAILED")
                 self.ack_num = ackCount
             elif fCount == 1:
-                fid1 = int.from_bytes(e[pos : pos + 1], "big")
+                int.from_bytes(e[pos : pos + 1], "big")
                 pos += 1
                 valLen = int.from_bytes(e[pos : pos + 2], "big")
                 pos += 2
@@ -904,7 +903,7 @@ class HSWrapper:
                 g = buf2long(e[pos : pos + 2])
                 # logger.info(f"G in {g}")
                 pos += 2
-                for n in range(g):
+                for _n in range(g):
                     sub_msg_len = buf2long(e[pos : pos + 2])
                     pos += 2
                     sub_msg_start = pos
@@ -944,7 +943,7 @@ class HSWrapper:
                             fcount = buf2long(e[pos : pos + 1])
                             pos += 1
                             # logger.info(f"fcount2: {fcount}")
-                            for index in range(fcount):
+                            for _index in range(fcount):
                                 fid = buf2long(e[pos : pos + 1])
                                 pos += 1
                                 data_len = buf2long(e[pos : pos + 1])
@@ -1078,14 +1077,14 @@ class HSWrapper:
                             json_res["type"] = RespTypeValues.get("OPC")
                             json_res["msg"] = "successful"
                             json_res["stCode"] = RespCodes.get("SUCCESS")
-                            fld = buf2long(e[pos : pos + 1])
+                            buf2long(e[pos : pos + 1])
                             pos += 1
                             field_length = buf2long(e[pos : pos + 2])
                             pos += 2
                             opc_key = buf2string(e[pos : pos + field_length])
                             pos += field_length
                             json_res["key"] = opc_key
-                            fld = buf2long(e[pos : pos + 1])
+                            buf2long(e[pos : pos + 1])
                             pos += 1
                             field_length = buf2long(e[pos : pos + 2])
                             pos += 2

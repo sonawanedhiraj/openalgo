@@ -7,10 +7,12 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
+
 
 def get_margin_data(auth_token):
     """Fetch margin data from Zerodha's API using the provided auth token."""
-    api_key = os.getenv("BROKER_API_KEY")
+    os.getenv("BROKER_API_KEY")
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -19,7 +21,7 @@ def get_margin_data(auth_token):
 
     try:
         # Make the GET request using the shared client
-        response = client.get("https://api.kite.trade/user/margins", headers=headers)
+        response = client.get(f"{BROKER_API_URL}/user/margins", headers=headers)
         response.raise_for_status()  # Raises an exception for 4XX/5XX responses
 
         # Parse the response
@@ -65,7 +67,7 @@ def get_margin_data(auth_token):
         total_realised = 0
         total_unrealised = 0
         try:
-            pos_response = client.get("https://api.kite.trade/portfolio/positions", headers=headers)
+            pos_response = client.get(f"{BROKER_API_URL}/portfolio/positions", headers=headers)
             pos_response.raise_for_status()
             position_book = pos_response.json()
 
@@ -87,7 +89,7 @@ def get_margin_data(auth_token):
                     instruments = [f"{p['exchange']}:{p['tradingsymbol']}" for p in open_positions]
                     query = "&".join(f"i={inst}" for inst in instruments)
                     quote_response = client.get(
-                        f"https://api.kite.trade/quote/ltp?{query}", headers=headers
+                        f"{BROKER_API_URL}/quote/ltp?{query}", headers=headers
                     )
                     quote_response.raise_for_status()
                     quote_data = quote_response.json()

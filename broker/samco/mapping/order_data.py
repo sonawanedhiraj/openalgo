@@ -57,7 +57,7 @@ def map_order_data(order_data):
     if order_data:
         for order in order_data:
             # Extract the symbol and exchange for the current order
-            symbol = order.get("symbol", "")
+            order.get("symbol", "")
             trading_symbol = order.get("tradingSymbol", "")
             exchange = order.get("exchange", "")
 

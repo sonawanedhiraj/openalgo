@@ -241,7 +241,7 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching quotes: {str(e)}")
+            raise Exception(f"Error fetching quotes: {str(e)}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -284,7 +284,7 @@ class BrokerData:
 
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise Exception(f"Error fetching multiquotes: {e}")
+            raise Exception(f"Error fetching multiquotes: {e}") from e
 
     def _process_multiquotes_batch(self, symbols: list) -> list:
         """
@@ -419,7 +419,7 @@ class BrokerData:
                     del symbol_map[token_str]
 
             # Add unfetched symbols as errors
-            for token_str, info in symbol_map.items():
+            for _token_str, info in symbol_map.items():
                 results.append(
                     {
                         "symbol": info["symbol"],
@@ -464,7 +464,7 @@ class BrokerData:
             )
 
             # Validate token
-            if not token or token == "None" or str(token).strip() == "":
+            if not token or token == "None" or str(token).strip() == "":  # nosec B105 — checking if token is the string 'None', not a password
                 raise Exception(
                     f"Invalid or missing token for symbol '{symbol}' on exchange '{exchange}'. Token: {token}"
                 )
@@ -521,7 +521,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Debug - Error: {str(e)}")
-            raise Exception(f"Error fetching historical data: {str(e)}")
+            raise Exception(f"Error fetching historical data: {str(e)}") from e
 
     def _get_historical_data(
         self,
@@ -733,7 +733,7 @@ class BrokerData:
             )
 
             # Validate token
-            if not token or token == "None" or str(token).strip() == "":
+            if not token or token == "None" or str(token).strip() == "":  # nosec B105 — checking if token is the string 'None', not a password
                 raise Exception(
                     f"Invalid or missing token for symbol '{symbol}' on exchange '{exchange}'. Token: {token}"
                 )
@@ -836,7 +836,7 @@ class BrokerData:
 
         except Exception as e:
             logger.error(f"Debug - Error fetching intraday data: {str(e)}")
-            raise Exception(f"Error fetching intraday data: {str(e)}")
+            raise Exception(f"Error fetching intraday data: {str(e)}") from e
 
     def get_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -900,4 +900,4 @@ class BrokerData:
             }
 
         except Exception as e:
-            raise Exception(f"Error fetching market depth: {str(e)}")
+            raise Exception(f"Error fetching market depth: {str(e)}") from e

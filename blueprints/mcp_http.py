@@ -610,17 +610,16 @@ def _dispatch_tool_call(
 
     started = time.perf_counter()
     outcome = "success"
-    error_detail: str | None = None
     try:
         result_text = fn(**arguments)  # tools accept kwargs only
     except TypeError as e:
         outcome = "bad_arguments"
-        error_detail = str(e)[:300]
+        str(e)[:300]
         result_text = None
     except Exception as e:
         # Any tool-internal failure is logged but not leaked verbatim.
         outcome = "error"
-        error_detail = str(e)[:300]
+        str(e)[:300]
         logger.exception(f"[MCP tool] {tool_name} raised: {e}")
         result_text = None
     duration_ms = int((time.perf_counter() - started) * 1000)

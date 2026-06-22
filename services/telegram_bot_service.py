@@ -22,6 +22,8 @@ import json
 from datetime import datetime, timedelta
 
 import httpx
+from telegram import Update
+from telegram.ext import ContextTypes
 
 from database.auth_db import get_broker_name, get_username_by_apikey
 
@@ -57,7 +59,7 @@ class TelegramBotService:
         self.sdk_clients = {}  # Cache for OpenAlgo SDK clients per user
         self._stop_event = original_threading.Event()  # Thread-safe stop signal
 
-    def _get_sdk_client(self, telegram_id: int) -> openalgo_api | None:
+    def _get_sdk_client(self, telegram_id: int) -> Optional[Any]:
         """Get or create OpenAlgo SDK client for a user"""
         from openalgo import api as openalgo_api
 
@@ -259,7 +261,8 @@ class TelegramBotService:
 
             # Add volume bar chart
             colors = [
-                "red" if close < open else "green" for close, open in zip(df["close"], df["open"])
+                "red" if close < open else "green"
+                for close, open in zip(df["close"], df["open"], strict=False)
             ]
 
             fig.add_trace(
@@ -435,7 +438,8 @@ class TelegramBotService:
 
             # Add volume bar chart
             colors = [
-                "red" if close < open else "green" for close, open in zip(df["close"], df["open"])
+                "red" if close < open else "green"
+                for close, open in zip(df["close"], df["open"], strict=False)
             ]
 
             fig.add_trace(

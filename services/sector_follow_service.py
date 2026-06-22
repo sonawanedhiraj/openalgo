@@ -157,70 +157,84 @@ def compute_qty(max_position_inr: float, price: float) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Production market-data metrics provider (read-only on historify.duckdb)
+# Market-data metrics — TWO sources (Fix 1b, 2026-06-15)
+#
+# The 2026-06-15 silent failure: at 15:20 IST historify had NO stock 1m bars for
+# TODAY (the backfill convergence only runs 15:30+), so today's stock return came
+# back None, every gate failed closed, and the strategy produced 0 signals with no
+# alert. The WS feed WAS ticking the universe the whole time — those bars lived in
+# the in-process scanner aggregator, which sector_follow never consulted.
+#
+# The fix splits the two data needs by their natural source:
+#   * TODAY's intraday close + volume  -> the in-process scanner aggregator
+#     (live, gap-free during the session), via an injected ``intraday_provider``.
+#   * The 20-day lookback (prior close, avg daily volume) -> historify 1m, which
+#     is the correct source for *historical* days (it never has today's intraday
+#     mid-session anyway).
+# A per-symbol historify fallback for today's data is kept, but it logs LOUDLY so
+# the silent-failure class can never recur unseen.
 # --------------------------------------------------------------------------- #
 def _ist_date(epoch: float) -> date:
     return datetime.fromtimestamp(epoch, _IST).date()
 
 
-def _series_metrics(bars: list[tuple], as_of_epoch: float, as_of_date: date, lookback: int):
-    """Compute intraday return + volume ratio from 1m (timestamp, close, volume) bars.
+def _historical_metrics(bars: list[tuple], as_of_date: date, lookback: int):
+    """(prior_close, avg_daily_vol) from 1m (timestamp, close, volume) bars.
 
-    bars: ascending by timestamp. Returns (today_close, ret, vol_ratio) or
-    (None, None, None) when there is insufficient history.
+    Uses PRIOR trading days only (today and anything in the future are excluded),
+    so it is safe to feed historify even when historify also carries some of
+    today's bars. Returns ``(None, None)`` when no prior day exists; ``avg_vol``
+    is ``None`` when it works out to zero.
     """
     by_day: dict[date, list[tuple]] = {}
     for ts, close, vol in bars:
-        if ts > as_of_epoch:
-            continue
         d = _ist_date(ts)
-        by_day.setdefault(d, []).append((ts, float(close), float(vol or 0.0)))
+        if d >= as_of_date:
+            continue
+        by_day.setdefault(d, []).append((float(close), float(vol or 0.0)))
 
-    today = by_day.get(as_of_date)
-    prior_days = sorted(d for d in by_day if d < as_of_date)
-    if not today or not prior_days:
-        return None, None, None
-
-    today_close = today[-1][1]
-    prior_close = by_day[prior_days[-1]][-1][1]
-    if prior_close <= 0:
-        return None, None, None
-    ret = today_close / prior_close - 1.0
-
-    today_vol = sum(v for _, _, v in today)
+    prior_days = sorted(by_day)
+    if not prior_days:
+        return None, None
+    prior_close = by_day[prior_days[-1]][-1][0]
     recent = prior_days[-lookback:]
-    daily_vols = [sum(v for _, _, v in by_day[d]) for d in recent]
+    daily_vols = [sum(v for _, v in by_day[d]) for d in recent]
     avg_vol = sum(daily_vols) / len(daily_vols) if daily_vols else 0.0
-    vol_ratio = (today_vol / avg_vol) if avg_vol > 0 else None
-    return today_close, ret, vol_ratio
+    return prior_close, (avg_vol if avg_vol > 0 else None)
 
 
-def duckdb_metrics_provider(
-    as_of: datetime,
-    universe: list[str],
-    sector_map: dict[str, str],
-    config: SectorFollowConfig,
-    db_path: str = "db/historify.duckdb",
-) -> dict[str, dict]:
-    """Read-only intraday metrics for every universe stock from historify.duckdb.
-
-    Derives daily from 1m (stored daily for stocks is the sparse 63-bar set —
-    see strategies/sector_follow_cap5_vol/data_coverage.md). Sector return uses
-    the mapped index's 1m; if an index has no 1m bars, sector_ret is None and the
-    stock fails the gate (fail-closed). Returns
-    {symbol: {sector_ret, stock_ret, vol_ratio, current_price}}.
+def _today_metrics_from_bars(bars: list[tuple], as_of_epoch: float, as_of_date: date):
+    """(today_close, today_volume) from 1m bars for ``as_of_date`` up to
+    ``as_of_epoch``. ``(None, None)`` if there are no bars for today. This is the
+    historify *fallback* for today's data — the aggregator is the primary source.
     """
-    import duckdb
+    today = [
+        (float(c), float(v or 0.0))
+        for ts, c, v in bars
+        if ts <= as_of_epoch and _ist_date(ts) == as_of_date
+    ]
+    if not today:
+        return None, None
+    today_close = today[-1][0]
+    today_vol = sum(v for _, v in today)
+    return today_close, today_vol
 
-    as_of_epoch = as_of.timestamp()
-    as_of_date = as_of.astimezone(_IST).date()
-    window_start = as_of_epoch - (config.vol_avg_lookback_days + 15) * 86400
 
-    index_syms = sorted({sector_map.get(s, "NIFTY") for s in universe})
-    all_syms = sorted(set(universe) | set(index_syms))
-
+# ----- production data-source defaults (injected) ------------------------- #
+def production_history_reader(
+    all_syms: list[str], window_start: float, db_path: str = "db/historify.duckdb"
+) -> dict[str, list[tuple]]:
+    """Read 1m (timestamp, close, volume) bars for ``all_syms`` since
+    ``window_start`` from historify (read-only). Returns ``{symbol: [(ts, close,
+    volume), ...]}`` ascending by timestamp. Used for the 20-day lookback (and as
+    the today-data fallback). Goes through ``connect_historify_readonly`` so an
+    in-process read-write holder doesn't break the read (today's lock fix)."""
     raw: dict[str, list[tuple]] = {s: [] for s in all_syms}
-    con = duckdb.connect(db_path, read_only=True)
+    if not all_syms:
+        return raw
+    from services.data_freshness_service import connect_historify_readonly
+
+    con = connect_historify_readonly(db_path)
     try:
         placeholders = ", ".join(["?"] * len(all_syms))
         rows = con.execute(
@@ -236,30 +250,193 @@ def duckdb_metrics_provider(
         ).fetchall()
     finally:
         con.close()
-
     for symbol, ts, close, vol in rows:
         if symbol in raw:
             raw[symbol].append((ts, close, vol))
+    return raw
 
+
+def production_intraday_provider(symbol: str, as_of: datetime):
+    """TODAY's ``(close, volume)`` for ``symbol`` from the in-process scanner
+    aggregator; ``(None, None)`` when the scanner is absent or has no bars for
+    today. Never raises — any failure degrades to the historify fallback in
+    ``_compute_metrics``. Lazily imported so this module never pulls the scanner
+    stack at import time."""
+    try:
+        from services.scanner_service import get_scanner_service
+
+        svc = get_scanner_service()
+        if svc is None:
+            return None, None
+        as_of_date = as_of.astimezone(_IST).date()
+        return svc.get_today_ohlcv(symbol, as_of_date)
+    except Exception:
+        logger.debug("sector_follow intraday provider unavailable for %s", symbol, exc_info=True)
+        return None, None
+
+
+def production_broker_session_checker() -> bool:
+    """True iff a broker session (API key) is configured (operator logged in).
+    Best-effort; ``False`` on any error. Used by the 15:18 smoke check."""
+    try:
+        from database.auth_db import get_first_available_api_key
+
+        return bool(get_first_available_api_key())
+    except Exception:
+        logger.debug("sector_follow broker-session check failed", exc_info=True)
+        return False
+
+
+def _compute_metrics(
+    as_of: datetime,
+    universe: list[str],
+    sector_map: dict[str, str],
+    config: SectorFollowConfig,
+    *,
+    intraday_provider,
+    history_reader,
+) -> dict[str, dict]:
+    """Assemble per-symbol gate metrics from the two data sources.
+
+    ``intraday_provider(symbol, as_of) -> (close, volume)`` supplies today's data
+    (aggregator). ``history_reader(all_syms, window_start) -> {sym: [(ts, close,
+    volume)]}`` supplies the lookback (historify). Today's data falls back to
+    historify per-symbol with a LOUD warning when the aggregator is empty. Every
+    returned metric carries ``intraday_source`` ∈ {aggregator, historify, none}
+    so the caller can report decision-input completeness.
+    """
+    as_of_epoch = as_of.timestamp()
+    as_of_date = as_of.astimezone(_IST).date()
+    window_start = as_of_epoch - (config.vol_avg_lookback_days + 15) * 86400
     lookback = config.vol_avg_lookback_days
-    index_metrics: dict[str, float | None] = {}
+
+    index_syms = sorted({sector_map.get(s, "NIFTY") for s in universe})
+    all_syms = sorted(set(universe) | set(index_syms))
+    raw = history_reader(all_syms, window_start)
+
+    def _today(sym: str):
+        """(close, volume, source) for today — aggregator first, historify fallback."""
+        close = vol = None
+        try:
+            close, vol = intraday_provider(sym, as_of)
+        except Exception:
+            logger.exception("sector_follow intraday provider raised for %s", sym)
+            close = vol = None
+        if close is not None:
+            return close, vol, "aggregator"
+        h_close, h_vol = _today_metrics_from_bars(raw.get(sym, []), as_of_epoch, as_of_date)
+        if h_close is not None:
+            logger.warning(
+                "sector_follow %s: aggregator had no today bars — falling back to "
+                "historify (close=%.4f vol=%s). Live feed may be down or symbol "
+                "not tracked by the scanner.",
+                sym,
+                h_close,
+                h_vol,
+            )
+            return h_close, h_vol, "historify"
+        return None, None, "none"
+
+    # Sector index returns (close-only; volume is irrelevant for an index gate).
+    index_ret: dict[str, float | None] = {}
     for idx in index_syms:
-        _, idx_ret, _ = _series_metrics(raw.get(idx, []), as_of_epoch, as_of_date, lookback)
-        index_metrics[idx] = idx_ret
+        prior_close, _ = _historical_metrics(raw.get(idx, []), as_of_date, lookback)
+        t_close, _t_vol, _src = _today(idx)
+        if prior_close and prior_close > 0 and t_close is not None:
+            index_ret[idx] = t_close / prior_close - 1.0
+        else:
+            index_ret[idx] = None
+            logger.warning(
+                "sector_follow index %s: sector_ret is None (prior_close=%s today_close=%s)",
+                idx,
+                prior_close,
+                t_close,
+            )
 
     out: dict[str, dict] = {}
     for sym in universe:
-        price, stock_ret, vol_ratio = _series_metrics(
-            raw.get(sym, []), as_of_epoch, as_of_date, lookback
+        prior_close, avg_vol = _historical_metrics(raw.get(sym, []), as_of_date, lookback)
+        t_close, t_vol, src = _today(sym)
+        stock_ret = (
+            (t_close / prior_close - 1.0)
+            if (prior_close and prior_close > 0 and t_close is not None)
+            else None
         )
+        vol_ratio = (t_vol / avg_vol) if (avg_vol and avg_vol > 0 and t_vol is not None) else None
         idx = sector_map.get(sym, "NIFTY")
+        sector_ret = index_ret.get(idx)
+        # Loud per-symbol diagnostic (Part B.1): name exactly which input is missing
+        # instead of silently failing closed in passes_gates().
+        if stock_ret is None or sector_ret is None or vol_ratio is None:
+            missing = []
+            if stock_ret is None:
+                missing.append(f"stock_ret(prior={prior_close}, today={t_close}, src={src})")
+            if sector_ret is None:
+                missing.append(f"sector_ret[{idx}]")
+            if vol_ratio is None:
+                missing.append(f"vol_ratio(avg={avg_vol}, today_vol={t_vol})")
+            logger.warning("sector_follow %s incomplete metrics: %s", sym, ", ".join(missing))
         out[sym] = {
-            "sector_ret": index_metrics.get(idx),
+            "sector_ret": sector_ret,
             "stock_ret": stock_ret,
             "vol_ratio": vol_ratio,
-            "current_price": price,
+            "current_price": t_close,
+            "intraday_source": src,
         }
     return out
+
+
+def make_duckdb_metrics_provider(
+    intraday_provider=None,
+    history_reader=None,
+    db_path: str = "db/historify.duckdb",
+):
+    """Build a metrics provider closure bound to the given data sources.
+
+    With both args defaulted it reproduces the production behavior (scanner
+    aggregator for today + historify for the lookback). Tests inject fakes for
+    both to drive ``_compute_metrics`` hermetically (no DuckDB, no scanner).
+    """
+    ip = intraday_provider or production_intraday_provider
+    hr = history_reader or (lambda syms, ws: production_history_reader(syms, ws, db_path))
+
+    def _provider(as_of, universe, sector_map, config):
+        return _compute_metrics(
+            as_of, universe, sector_map, config, intraday_provider=ip, history_reader=hr
+        )
+
+    return _provider
+
+
+def duckdb_metrics_provider(
+    as_of: datetime,
+    universe: list[str],
+    sector_map: dict[str, str],
+    config: SectorFollowConfig,
+    db_path: str = "db/historify.duckdb",
+) -> dict[str, dict]:
+    """Back-compat production default: today's data from the scanner aggregator,
+    the 20-day lookback from historify. Returns ``{symbol: {sector_ret, stock_ret,
+    vol_ratio, current_price, intraday_source}}``."""
+    return make_duckdb_metrics_provider(db_path=db_path)(as_of, universe, sector_map, config)
+
+
+def _gate_fail_reason(m: dict, config: SectorFollowConfig) -> str:
+    """Human-readable reason a symbol failed the gates (for the PASS/FAIL log)."""
+    sr, st, vr = m.get("sector_ret"), m.get("stock_ret"), m.get("vol_ratio")
+    if sr is None or st is None or vr is None:
+        miss = [
+            n for n, v in (("sector_ret", sr), ("stock_ret", st), ("vol_ratio", vr)) if v is None
+        ]
+        return f"None data [{', '.join(miss)}] (src={m.get('intraday_source')})"
+    fails = []
+    if not sr > config.gate_sector_ret:
+        fails.append(f"sector {sr * 100:.2f}% <= {config.gate_sector_pct}%")
+    if not st > config.gate_stock_ret:
+        fails.append(f"stock {st * 100:.2f}% <= {config.gate_stock_pct}%")
+    if not vr > config.gate_vol_mult:
+        fails.append(f"vol {vr:.2f} <= {config.gate_vol_mult}")
+    return "; ".join(fails) or "unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +535,21 @@ def data_freshness_enabled() -> bool:
     return os.getenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true").lower() == "true"
 
 
+def smoke_check_enabled() -> bool:
+    """``SECTOR_FOLLOW_SMOKE_CHECK_ENABLED`` env flag (default true). Gates the
+    15:18 IST pre-entry pipeline smoke check."""
+    return os.getenv("SECTOR_FOLLOW_SMOKE_CHECK_ENABLED", "true").lower() == "true"
+
+
+def smoke_min_coverage() -> float:
+    """``SECTOR_FOLLOW_SMOKE_MIN_COVERAGE`` (default 0.5): the minimum fraction of
+    the universe that must have live aggregator data for the smoke check to pass."""
+    try:
+        return float(os.getenv("SECTOR_FOLLOW_SMOKE_MIN_COVERAGE", "0.5"))
+    except ValueError:
+        return 0.5
+
+
 def production_data_health_checker(
     strategy_name: str, date: str | None = None, index_only: bool = False
 ):
@@ -417,6 +609,9 @@ class SectorFollowService:
         now: Callable[[], datetime] | None = None,
         intent_resolver: Callable[[], object] | None = None,
         data_health_checker: Callable[..., tuple] | None = None,
+        intraday_provider: Callable[..., tuple] | None = None,
+        history_reader: Callable[..., dict] | None = None,
+        broker_session_checker: Callable[[], bool] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -427,7 +622,22 @@ class SectorFollowService:
             logger.warning("Unknown SECTOR_FOLLOW_CAP5_VOL_MODE=%s — forcing scaffold", self.mode)
             self.mode = "scaffold"
 
-        self._metrics_provider = metrics_provider or duckdb_metrics_provider
+        # Fix 1b data sources. ``intraday_provider`` supplies today's (close,
+        # volume) from the in-process scanner aggregator; ``history_reader``
+        # supplies the 20-day lookback from historify; ``broker_session_checker``
+        # backs the 15:18 smoke check. When ``metrics_provider`` is not explicitly
+        # injected, the default is built FROM these two sources so the smoke check
+        # and the live evaluator share the exact same providers.
+        self._intraday_provider = intraday_provider or production_intraday_provider
+        self._history_reader = history_reader
+        self._broker_session_checker = broker_session_checker or production_broker_session_checker
+        if metrics_provider is not None:
+            self._metrics_provider = metrics_provider
+        else:
+            self._metrics_provider = make_duckdb_metrics_provider(
+                intraday_provider=self._intraday_provider,
+                history_reader=self._history_reader,
+            )
         self._order_placer = order_placer or production_order_placer
         self._price_fetcher = price_fetcher or production_price_fetcher
         self._notify = notifier or telegram_notifier
@@ -504,12 +714,29 @@ class SectorFollowService:
 
     # ----- evaluation ---------------------------------------------------- #
     def evaluate_candidates(self, as_of: datetime | None = None) -> list[dict]:
-        """Return gate-passing candidates at as_of (default: now IST)."""
+        """Return gate-passing candidates at as_of (default: now IST).
+
+        Emits a loud per-symbol PASS/FAIL diagnostic (Part B.2) and a
+        decision-input completeness metric (Part B.3) so a silently-degraded data
+        pipeline — the 2026-06-15 class of bug — surfaces immediately instead of
+        looking like a genuine zero-signal day."""
         as_of = as_of or self._now()
         metrics = self._metrics_provider(as_of, self.config.universe, self.sector_map, self.config)
         candidates: list[dict] = []
+        n_intraday = 0
+        total = len(self.config.universe) or len(metrics)
         for symbol, m in metrics.items():
+            if m.get("intraday_source") == "aggregator":
+                n_intraday += 1
             if passes_gates(m, self.config):
+                logger.info(
+                    "sector_follow PASS %s: sector_ret=%.4f stock_ret=%.4f vol_ratio=%.2f src=%s",
+                    symbol,
+                    m.get("sector_ret"),
+                    m.get("stock_ret"),
+                    m.get("vol_ratio"),
+                    m.get("intraday_source"),
+                )
                 candidates.append(
                     {
                         "symbol": symbol,
@@ -519,13 +746,48 @@ class SectorFollowService:
                         "current_price": m["current_price"],
                     }
                 )
+            else:
+                logger.info(
+                    "sector_follow FAIL %s: reason=%s", symbol, _gate_fail_reason(m, self.config)
+                )
         logger.info(
             "sector_follow eval @ %s: %d/%d candidates passed gates",
             as_of.isoformat(),
             len(candidates),
             len(self.config.universe),
         )
+        self._emit_completeness_metric(n_intraday, total, as_of)
         return candidates
+
+    def _emit_completeness_metric(self, n_intraday: int, total: int, as_of: datetime) -> None:
+        """Log + Telegram the share of universe symbols served by the LIVE
+        aggregator (vs. historify fallback / no data). Below 50% warns; below 20%
+        is critical — the pipeline is effectively producing fail-closed signals."""
+        if total <= 0:
+            return
+        frac = n_intraday / total
+        logger.info(
+            "sector_follow decision-input completeness: %d/%d (%.0f%%) symbols on live "
+            "intraday data",
+            n_intraday,
+            total,
+            frac * 100,
+        )
+        try:
+            if frac < 0.20:
+                self._notify(
+                    f"🔴 CRITICAL sector_follow_cap5_vol {as_of.date().isoformat()}: only "
+                    f"{n_intraday}/{total} ({frac * 100:.0f}%) symbols have live intraday data — "
+                    "signals are largely fail-closed. The data pipeline is likely broken."
+                )
+            elif frac < 0.50:
+                self._notify(
+                    f"🟠 WARNING sector_follow_cap5_vol {as_of.date().isoformat()}: only "
+                    f"{n_intraday}/{total} ({frac * 100:.0f}%) symbols have live intraday data "
+                    "(rest fell back to historify or had none)."
+                )
+        except Exception:
+            logger.exception("sector_follow completeness alert failed")
 
     # ----- kill switch --------------------------------------------------- #
     def update_daily_pnl(self, realized_today: float, open_mtm: float) -> bool:
@@ -1110,6 +1372,103 @@ class SectorFollowService:
         """09:00 IST: reset kill switch + daily P&L."""
         self.reset_daily_state()
 
+    # ----- pre-entry pipeline smoke check (15:18 IST) -------------------- #
+    def _historify_probe_ok(self) -> bool:
+        """True iff the 20-day historify lookback returns prior-day data for a
+        sample universe symbol. Uses the same history reader as the live evaluator
+        so it exercises the real lock-safe read path."""
+        universe = self.config.universe
+        if not universe:
+            return True
+        sample = universe[0]
+        as_of = self._now()
+        as_of_date = as_of.astimezone(_IST).date()
+        window_start = as_of.timestamp() - (self.config.vol_avg_lookback_days + 15) * 86400
+        reader = self._history_reader or (lambda syms, ws: production_history_reader(syms, ws))
+        try:
+            raw = reader([sample], window_start)
+            prior_close, _avg = _historical_metrics(
+                raw.get(sample, []), as_of_date, self.config.vol_avg_lookback_days
+            )
+            return prior_close is not None
+        except Exception:
+            logger.exception("sector_follow historify probe failed")
+            return False
+
+    def assert_data_pipeline_healthy(self) -> tuple[bool, dict]:
+        """15:18 IST pre-entry smoke check (Part C). Three checks:
+
+        1. The in-process aggregator has today's data for >= ``smoke_min_coverage``
+           of the universe (default 50%).
+        2. The 20-day historify lookback returns prior-day data for a sample symbol.
+        3. A broker session is live.
+
+        On failure it writes a same-day ``pause`` runtime override (which the
+        engine's job-entry gate honors, holding the 15:20 entries) and Telegrams
+        the operator. The override expires at 15:30 IST, so it never disables the
+        strategy beyond today. Returns ``(ok, details)``. Fail-open on the gate
+        flag being off (returns ok=True without writing an override)."""
+        as_of = self._now()
+        as_of_date = as_of.astimezone(_IST).date()
+        if not smoke_check_enabled():
+            logger.debug("sector_follow 15:18 smoke check skipped (flag off)")
+            return True, {"skipped": True}
+
+        universe = self.config.universe
+        total = len(universe)
+        n_have = 0
+        for sym in universe:
+            try:
+                close, _vol = self._intraday_provider(sym, as_of)
+            except Exception:
+                close = None
+            if close is not None:
+                n_have += 1
+        min_cov = smoke_min_coverage()
+        agg_frac = (n_have / total) if total else 0.0
+        agg_ok = agg_frac >= min_cov
+
+        hist_ok = self._historify_probe_ok()
+        try:
+            session_ok = bool(self._broker_session_checker())
+        except Exception:
+            session_ok = False
+
+        ok = agg_ok and hist_ok and session_ok
+        details = {
+            "aggregator_coverage": f"{n_have}/{total}",
+            "aggregator_frac": round(agg_frac, 3),
+            "aggregator_ok": agg_ok,
+            "historify_ok": hist_ok,
+            "broker_session_ok": session_ok,
+            "min_coverage": min_cov,
+        }
+        if ok:
+            logger.info("sector_follow 15:18 smoke check PASSED: %s", str(details))
+            return True, details
+
+        reasons = []
+        if not agg_ok:
+            reasons.append(f"aggregator coverage {n_have}/{total} (<{min_cov:.0%})")
+        if not hist_ok:
+            reasons.append("historify lookback unavailable")
+        if not session_ok:
+            reasons.append("broker session not live")
+        reason = "; ".join(reasons)
+        logger.error("sector_follow 15:18 SMOKE CHECK FAILED: %s", reason)
+        # Hold today's 15:20 entries via a self-expiring pause override.
+        expires_ist = as_of.replace(hour=15, minute=30, second=0, microsecond=0)
+        self._set_runtime_override("pause", expires_ist, f"smoke_check_failed: {reason}")
+        try:
+            self._notify(
+                f"🚨 sector_follow_cap5_vol 15:18 SMOKE CHECK FAILED "
+                f"({as_of_date.isoformat()}): {reason}. Holding today's 15:20 entries "
+                "(self-clears at 15:30)."
+            )
+        except Exception:
+            logger.exception("sector_follow smoke-check alert failed")
+        return False, details
+
     # ----- observability + EOD summary ----------------------------------- #
     def _config_view(self) -> dict:
         """A small, JSON-safe subset of config for the status endpoint."""
@@ -1486,6 +1845,13 @@ class SectorFollowService:
             replace_existing=True,
             name="Sector Follow CAP5_VOL data freshness check (16:30 IST)",
         )
+        sched.add_job(
+            _smoke_check_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=18, timezone="Asia/Kolkata"),
+            id="sector_follow_smoke_check",
+            replace_existing=True,
+            name="Sector Follow CAP5_VOL pre-entry smoke check (15:18 IST)",
+        )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
             self.mode,
@@ -1526,6 +1892,11 @@ def _eod_summary_job() -> None:
 def _data_health_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.run_data_health_check()
+
+
+def _smoke_check_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.assert_data_pipeline_healthy()
 
 
 def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:

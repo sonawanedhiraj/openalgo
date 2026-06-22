@@ -175,7 +175,7 @@ def main() -> None:
     for sym in universe:
         try:
             res = eval_gates(sym)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001  # nosec B112 — intentional continue on bad symbol
             continue
         if res.get("status") == "ok" and res.get("all_pass"):
             set_c.add(sym.upper())
@@ -297,7 +297,7 @@ def main() -> None:
     L.append("## 5. Key takeaways\n")
     # Tally killers across all evaluated Set D symbols (excludes Set C all-pass).
     tally: dict[str, int] = {}
-    for sym, res in results.items():
+    for _, res in results.items():
         if res.get("status") != "ok":
             continue
         k = res.get("killer")

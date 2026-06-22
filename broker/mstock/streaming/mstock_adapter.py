@@ -90,7 +90,7 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             matching_subscriptions = []
             with self.lock:
-                for correlation_id, sub in self.subscriptions.items():
+                for _correlation_id, sub in self.subscriptions.items():
                     if sub["token"] == token:
                         matching_subscriptions.append(sub)
 

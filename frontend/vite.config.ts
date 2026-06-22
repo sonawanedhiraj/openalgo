@@ -63,10 +63,11 @@ export default defineConfig({
             if (id.includes('react-syntax-highlighter') || id.includes('prismjs') || id.includes('refractor')) {
               return 'vendor-syntax'
             }
-            // Charts - only needed on chart pages
-            if (id.includes('recharts') || id.includes('d3-')) {
-              return 'vendor-charts'
-            }
+            // recharts/d3-* intentionally NOT split into vendor-charts:
+            // manualChunks ID-based splitting doesn't preserve import-init order,
+            // so recharts (which calls React.forwardRef at module-eval time) was
+            // evaluating before vendor-react → TypeError on every page load (#57).
+            // Rollup's default chunking respects import edges; let it handle these.
           }
         },
       },

@@ -1,8 +1,14 @@
-name: CI (self-hosted)
+name: CI (backend checks)
 
-# Runs on the operator's Docker-isolated self-hosted runner (see ci/runner/).
-# Targets ONLY our hardened runner via its full label set, so no GitHub-hosted
-# job and no other runner can pick these up.
+# Advisory backend checks (gate, backend-test, backend-lint, security-scan).
+#
+# These run on GitHub-hosted `ubuntu-latest`, NOT the self-hosted runner. They
+# are pure ruff/bandit/pip-audit/`make gate`/pytest with no need for the laptop's
+# Docker, and none is a required status check. Keeping them OFF the single
+# one-job-at-a-time ephemeral self-hosted runner is deliberate: that runner is
+# reserved for ci-cd.yml (the required CI + CD jobs that genuinely need the
+# laptop's Docker). Putting these here previously starved the runner — the
+# required CI/CD jobs queued for 15+ min behind non-gating work (see issue #17).
 on:
   pull_request:
     branches: [main, dev]
@@ -21,7 +27,7 @@ jobs:
   # Mirrors the local `make gate` bundle. No running app / broker session
   # needed — smoke_boot is import-only. Candidate REQUIRED status check.
   gate:
-    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -49,7 +55,7 @@ jobs:
   # collects nothing and the job errors — keep it OUT of required checks in
   # branch protection until the markers land. Candidate required check after.
   backend-test:
-    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    runs-on: ubuntu-latest
     # database/auth_db.py + user_db.py raise at import if API_KEY_PEPPER is
     # unset (Argon2 hashing / Fernet KDF), which aborts pytest collection
     # before `-m unit` can select anything. These are CI-only non-secret
@@ -70,7 +76,7 @@ jobs:
 
   # Lint — advisory (pre-existing warnings in vendored broker modules).
   backend-lint:
-    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
@@ -87,7 +93,7 @@ jobs:
 
   # Security scan — advisory.
   security-scan:
-    runs-on: [self-hosted, linux, docker, openalgo-laptop]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7

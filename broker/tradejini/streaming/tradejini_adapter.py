@@ -76,9 +76,7 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
         else:
             # Use provided tokens
             auth_token = auth_data.get("auth_token")
-            feed_token = auth_data.get(
-                "feed_token", auth_token
-            )  # Use auth_token if feed_token not provided
+            auth_data.get("feed_token", auth_token)  # Use auth_token if feed_token not provided
             ws_url = auth_data.get("ws_url", "api.tradejini.com")
 
             if not auth_token:
@@ -561,7 +559,7 @@ class TradejiniWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # If no depth data found, return empty levels as fallback
         if not depth:
-            for i in range(5):  # Default to 5 empty levels
+            for _i in range(5):  # Default to 5 empty levels
                 depth.append({"price": 0.0, "quantity": 0, "orders": 0})
 
         return depth

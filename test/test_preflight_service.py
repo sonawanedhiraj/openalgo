@@ -1055,6 +1055,10 @@ def test_premarket_filter_disabled_via_env(preflight_env):
 
     preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_WINDOW_MIN", "600")
     preflight_env.monkeypatch.setenv("PREFLIGHT_IGNORE_PREMARKET_ERRORS", "0")
+    # This test isolates the pre-market filter; disable the per-signature cap so
+    # the raw 55-count drives the gate (the storm is only 2 signatures, which the
+    # default cap would collapse to 10 — that capping is covered by its own tests).
+    preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_PER_SIGNATURE_CAP", "0")
     _write_errors_jsonl(preflight_env.tmp_path, _premarket_storm() + _intraday_errors())
 
     result = preflight_service._check_recent_errors(preflight_env.fake_now)
@@ -1203,6 +1207,10 @@ def test_recent_errors_production_logger_filter_opt_in(preflight_env):
     ]
     _write_errors_jsonl(preflight_env.tmp_path, entries)
 
+    # These 15 entries share one signature; disable the per-signature cap so this
+    # test isolates the production-logger filter (capping has its own tests).
+    preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_PER_SIGNATURE_CAP", "0")
+
     # Default (flag off): these count toward the threshold and abort.
     preflight_env.monkeypatch.delenv("PREFLIGHT_REQUIRE_PRODUCTION_LOGGER", raising=False)
     off = preflight_service._check_recent_errors(preflight_env.fake_now)
@@ -1232,8 +1240,99 @@ def test_recent_errors_production_logger_filter_keeps_real_prod_entries(prefligh
     ]
     _write_errors_jsonl(preflight_env.tmp_path, entries)
 
+    # 15 entries, one signature; disable the per-signature cap so this isolates
+    # the production-logger filter (capping has its own tests).
+    preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_PER_SIGNATURE_CAP", "0")
     preflight_env.monkeypatch.setenv("PREFLIGHT_REQUIRE_PRODUCTION_LOGGER", "1")
     result = preflight_service._check_recent_errors(preflight_env.fake_now)
 
     assert result["count_last_hour"] == 15
+    assert result["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 12. Per-signature error cap (2026-06-19 TCS storm hardening)
+# ---------------------------------------------------------------------------
+
+
+def _sig_entries(n: int, *, logger: str, file: str, minute: int = 20) -> list[dict]:
+    """n ERROR entries sharing one (logger, file) signature, inside the window."""
+    return [
+        {"ts": _ts(minute), "level": "ERROR", "logger": logger, "file": file, "message": "boom"}
+        for _ in range(n)
+    ]
+
+
+def test_per_signature_cap_collapses_single_signature_storm(preflight_env):
+    """A single runaway code path (e.g. the 2026-06-19 TCS per-tick exit storm)
+    must NOT abort the gate on its own: 50 identical-signature errors cap to 5."""
+    from services import preflight_service
+
+    _write_errors_jsonl(
+        preflight_env.tmp_path,
+        _sig_entries(
+            50,
+            logger="services.simplified_stock_engine_service",
+            file="C:/x/services/simplified_stock_engine_service.py:453",
+        ),
+    )
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 50  # raw preserved for observability
+    assert result["effective_count"] == 5  # capped to the default PER_SIGNATURE_CAP
+    assert result["distinct_signatures"] == 1
+    assert result["ok"] is True  # 5 <= threshold 10 → no abort
+
+
+def test_per_signature_cap_still_aborts_on_broad_storm(preflight_env):
+    """Capping must not blind the gate to a genuinely broad problem: three
+    distinct signatures at 6 each → effective 15 > threshold 10 → abort."""
+    from services import preflight_service
+
+    entries = (
+        _sig_entries(6, logger="services.a", file="a.py:1")
+        + _sig_entries(6, logger="services.b", file="b.py:2")
+        + _sig_entries(6, logger="services.c", file="c.py:3")
+    )
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 18
+    assert result["effective_count"] == 15  # min(6, 5) * 3 distinct signatures
+    assert result["distinct_signatures"] == 3
+    assert result["ok"] is False
+
+
+def test_per_signature_cap_disabled_counts_raw(preflight_env):
+    """A cap of 0 disables capping — the raw count drives the gate (legacy)."""
+    from services import preflight_service
+
+    preflight_env.monkeypatch.setenv("PREFLIGHT_ERROR_PER_SIGNATURE_CAP", "0")
+    _write_errors_jsonl(
+        preflight_env.tmp_path,
+        _sig_entries(50, logger="services.simplified_stock_engine_service", file="x.py:453"),
+    )
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 50
+    assert result["effective_count"] == 50
+    assert result["ok"] is False
+
+
+def test_per_signature_cap_does_not_collapse_unsigned_entries(preflight_env):
+    """Bare entries with no logger can't be attributed to one fault, so they are
+    NOT capped — 12 of them still abort (preserves the unattributed-burst gate)."""
+    from services import preflight_service
+
+    entries = [{"ts": _ts(m % 30), "level": "ERROR"} for m in range(12)]
+    _write_errors_jsonl(preflight_env.tmp_path, entries)
+
+    result = preflight_service._check_recent_errors(preflight_env.fake_now)
+
+    assert result["count_last_hour"] == 12
+    assert result["effective_count"] == 12
+    assert result["distinct_signatures"] == 0
     assert result["ok"] is False

@@ -51,6 +51,9 @@ class ZerodhaAPIError(Exception):
     pass
 
 
+BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
+
+
 def get_api_response(endpoint, auth, method="GET", payload=None):
     """
     Make an API request to Zerodha's API using shared httpx client with connection pooling.
@@ -69,7 +72,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         ZerodhaAPIError: For other API errors
     """
     AUTH_TOKEN = auth
-    base_url = "https://api.kite.trade"
+    base_url = BROKER_API_URL
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -138,7 +141,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         except Exception:
             pass
 
-        raise ZerodhaAPIError(f"API request failed: {error_msg}")
+        raise ZerodhaAPIError(f"API request failed: {error_msg}") from None
 
 
 class BrokerData:
@@ -205,7 +208,7 @@ class BrokerData:
                     raise Exception(f"Could not find exchange token for {exchange}:{br_symbol}")
 
                 # Split token to get exchange_token for quotes
-                exchange_token = symbol_info.token.split("::::")[1]
+                symbol_info.token.split("::::")[1]
                 row_brexchange = symbol_info.brexchange
 
             exchange = _kite_quote_exchange(exchange, row_brexchange)
@@ -239,7 +242,7 @@ class BrokerData:
             raise
         except (ZerodhaAPIError, Exception) as e:
             logger.exception(f"Error fetching quotes: {e}")
-            raise ZerodhaAPIError(f"Error fetching quotes: {e}")
+            raise ZerodhaAPIError(f"Error fetching quotes: {e}") from e
 
     def get_multiquotes(self, symbols: list) -> list:
         """
@@ -288,7 +291,7 @@ class BrokerData:
             raise
         except Exception as e:
             logger.exception("Error fetching multiquotes")
-            raise ZerodhaAPIError(f"Error fetching multiquotes: {e}")
+            raise ZerodhaAPIError(f"Error fetching multiquotes: {e}") from e
 
     def _process_quotes_batch(self, symbols: list) -> list:
         """
@@ -544,7 +547,7 @@ class BrokerData:
             raise
         except (ZerodhaAPIError, Exception) as e:
             logger.exception(f"Error fetching historical data: {e}")
-            raise ZerodhaAPIError(f"Error fetching historical data: {e}")
+            raise ZerodhaAPIError(f"Error fetching historical data: {e}") from e
 
     def get_market_depth(self, symbol: str, exchange: str) -> dict:
         """
@@ -572,7 +575,7 @@ class BrokerData:
                     raise Exception(f"Could not find exchange token for {exchange}:{br_symbol}")
 
                 # Split token to get exchange_token for quotes
-                exchange_token = symbol_info.token.split("::::")[1]
+                symbol_info.token.split("::::")[1]
                 row_brexchange = symbol_info.brexchange
 
             exchange = _kite_quote_exchange(exchange, row_brexchange)
@@ -640,7 +643,7 @@ class BrokerData:
             raise
         except (ZerodhaAPIError, Exception) as e:
             logger.error(f"Error fetching market depth: {str(e)}")
-            raise ZerodhaAPIError(f"Error fetching market depth: {str(e)}")
+            raise ZerodhaAPIError(f"Error fetching market depth: {str(e)}") from e
 
     def get_depth(self, symbol: str, exchange: str) -> dict:
         """Alias for get_market_depth to maintain compatibility with common API"""

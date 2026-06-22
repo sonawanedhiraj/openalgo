@@ -49,6 +49,7 @@ from blueprints.core import core_bp
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
 from blueprints.dashboard import dashboard_bp
 from blueprints.flow import flow_bp  # Import the flow blueprint
+from blueprints.futures_follow import futures_follow_bp  # futures_follow_cap50 observability
 from blueprints.gc_json import gc_json_bp
 from blueprints.gex import gex_bp  # Import the GEX blueprint
 from blueprints.health import health_bp  # Import the health monitoring blueprint
@@ -79,11 +80,15 @@ from blueprints.react_app import (  # Import React frontend blueprint
     serve_react_app,
 )
 from blueprints.sandbox import sandbox_bp  # Import the sandbox blueprint
+from blueprints.scanner_api import scanner_api_bp  # In-house scanner browser API (Tier 1)
 from blueprints.search import search_bp
 from blueprints.sector_follow import sector_follow_bp  # sector_follow_cap5_vol observability
 from blueprints.security import security_bp  # Import the security blueprint
 from blueprints.settings import settings_bp  # Import the settings blueprint
 from blueprints.straddle_chart import straddle_bp  # Import the straddle chart blueprint
+from blueprints.strategies_dashboard_api import (
+    strategies_dashboard_bp,  # Strategies Dashboard API (Tier 2)
+)
 from blueprints.strategy import strategy_bp  # Import the strategy blueprint
 from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
@@ -107,6 +112,7 @@ from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
 from database.data_health_db import init_db as ensure_data_health_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
+from database.futures_follow_db import init_db as ensure_futures_follow_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -277,6 +283,7 @@ def create_app():
     app.register_blueprint(settings_bp)
     app.register_blueprint(chartink_bp)
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
+    app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
@@ -294,6 +301,8 @@ def create_app():
     app.register_blueprint(whatsapp_bp)  # Register WhatsApp blueprint
     app.register_blueprint(security_bp)  # Register Security blueprint
     app.register_blueprint(sandbox_bp)  # Register Sandbox blueprint
+    app.register_blueprint(scanner_api_bp)  # Register in-house scanner browser API
+    app.register_blueprint(strategies_dashboard_bp)  # Register Strategies Dashboard API (Tier 2)
     app.register_blueprint(playground_bp)  # Register API playground blueprint
     app.register_blueprint(logging_bp)  # Register Logging blueprint
     app.register_blueprint(admin_bp)  # Register Admin blueprint
@@ -655,6 +664,7 @@ def setup_environment(app):
                 ("Qty Freeze DB", ensure_qty_freeze_tables_exists),
                 ("Historify DB", ensure_historify_tables_exists),
                 ("Flow DB", ensure_flow_tables_exists),
+                ("Futures Follow DB", ensure_futures_follow_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
             ]
@@ -741,6 +751,26 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow backfill convergence: {e}")
 
+            # In-house scanner SCANNER_SYMBOLS universe feed convergence (both 1m
+            # AND daily). The scanner-side sibling of the sector_follow service
+            # above — it closes the two supply bugs the 2026-06-13 Friday replay
+            # surfaced (the scanner universe was never backfilled; the stored-D
+            # interval was universally stale). On boot — after a broker session
+            # appears — it reads MAX(timestamp) per symbol for each interval from
+            # historify.duckdb and catches up only the stale tail, then a periodic
+            # loop re-checks during the post-close publish window (15:30..17:00
+            # IST). Non-blocking daemon thread. See
+            # services/scanner_backfill_scheduler.py.
+            try:
+                from services.scanner_backfill_scheduler import (
+                    init_scanner_backfill_scheduler,
+                )
+
+                init_scanner_backfill_scheduler(app=app)
+                logger.debug("Scanner backfill convergence initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Scanner backfill convergence: {e}")
+
             # Sector Follow CAP5_VOL strategy (R40 deployable variant). Default
             # mode=scaffold means loading this changes ZERO live trading behavior
             # — it only registers 15:20/15:25/09:00 IST jobs that compute + log.
@@ -752,6 +782,57 @@ def setup_environment(app):
                 logger.debug("Sector Follow CAP5_VOL service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Sector Follow service: {e}")
+
+            # In-house scanner pre-entry smoke check (Tier 2, 09:18 IST). Closes
+            # the gap CLAUDE.md flags in the Tier-1 hardening section: a total
+            # feed outage produces no bar closes, so the per-cycle completeness
+            # metric never fires. The smoke check is the upstream gate.
+            # Read-only on DBs + scanner state; failure path is Telegram CRIT
+            # + data_health_check row. No runtime override is written (the
+            # scanner is a passive 5m-bar consumer with no entry-job to gate;
+            # visibility IS the fix). See
+            # services/scanner_smoke_check_service.py and issue #32.
+            try:
+                from services.scanner_smoke_check_service import (
+                    init_scanner_smoke_check,
+                )
+
+                init_scanner_smoke_check(app=app)
+                logger.debug("Scanner smoke check initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize scanner smoke check: {e}")
+
+            # In-house scanner zero-results tripwire (issue #33). Downstream
+            # silent-failure detector that catches the Friday 2026-06-19 gap
+            # the per-cycle completeness metric missed (56% coverage but 0 BUY
+            # hits all day because daily gates ran against stale stored bars).
+            # Fires every SCANNER_DRY_CHECK_INTERVAL_MIN minutes during market
+            # hours; CRIT when Chartink is producing rows but in-house is
+            # silent (pipeline degraded), WARN when both are dry (quiet
+            # market). See services/scanner_dry_tripwire_service.py.
+            try:
+                from services.scanner_dry_tripwire_service import (
+                    init_scanner_dry_tripwire,
+                )
+
+                init_scanner_dry_tripwire(app=app)
+                logger.debug("Scanner dry tripwire initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize scanner dry tripwire: {e}")
+
+            # Futures Follow CAP50 strategy (leveraged-beta NIFTY-futures sleeve on
+            # the sector_follow signal set). Default mode=sandbox means it ACTIVELY
+            # trades the virtual ₹1Cr sandbox book from boot — the
+            # 09:00/15:14/15:20/15:25/15:30 IST jobs place real sandbox orders (no
+            # live broker orders until the operator sets mode=live). See
+            # strategies/futures_follow_cap50/ and FUTURES_FOLLOW_MODE.
+            try:
+                from services.futures_follow_service import init_futures_follow_service
+
+                init_futures_follow_service(app=app)
+                logger.debug("Futures Follow CAP50 service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Futures Follow service: {e}")
 
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
@@ -869,6 +950,12 @@ def setup_environment(app):
                     app.scanner_service = ScannerService(
                         symbols=symbols, intervals=scanner_intervals
                     )
+                    # Publish the live singleton so in-process consumers
+                    # (sector_follow Fix 1b reads today's aggregated bars) can
+                    # reach it without an import cycle.
+                    from services.scanner_service import set_scanner_service
+
+                    set_scanner_service(app.scanner_service)
                     app.scanner_service.start()
                     logger.info(
                         "Scanner service started (symbols=%d, intervals=%s)",

@@ -170,6 +170,15 @@ def check_and_refresh_if_stale(
             path, universe, today=ref, max_staleness_business_days=max_staleness_business_days
         )
     except Exception as e:  # never let a freshness read crash the caller
+        from services.data_freshness_service import is_transient_lock_error
+
+        if is_transient_lock_error(e):
+            # historify briefly held read-write elsewhere (e.g. a separate CLI
+            # backfill process). Skip this cycle quietly — no Telegram anomaly —
+            # the boot/next-tick convergence catches up.
+            logger.info("sector_follow stock stale-check skipped — historify briefly locked: %s", e)
+            result["status"] = "skipped_locked"
+            return result
         logger.exception("sector_follow stock stale-check failed to read freshness: %s", e)
         result["status"] = "error"
         result["errors"].append(f"freshness_read: {e}")

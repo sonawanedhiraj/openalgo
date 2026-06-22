@@ -27,7 +27,7 @@ def get_margin_data(auth_token):
         trading_token = access_token_parts[0]
         trading_sid = access_token_parts[1]
         base_url = access_token_parts[2]
-        access_token = access_token_parts[3]
+        access_token_parts[3]
 
         if not base_url:
             logger.error("Base URL not found in auth token")

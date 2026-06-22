@@ -381,7 +381,9 @@ export default function ViewStrategy() {
                         variant="outline"
                         size="icon"
                         onClick={() => copyToClipboard(strategy.webhook_id, 'webhook_id')}
-                        aria-label={copiedField === 'webhook_id' ? 'Webhook ID copied' : 'Copy webhook ID'}
+                        aria-label={
+                          copiedField === 'webhook_id' ? 'Webhook ID copied' : 'Copy webhook ID'
+                        }
                       >
                         {copiedField === 'webhook_id' ? (
                           <Check className="h-4 w-4 text-green-500" />

@@ -264,7 +264,7 @@ def place_smartorder_api(data, auth):
             quantity = data["quantity"]
             logger.info(f"SmartOrder - No position, placing new order: {action} {quantity}")
             res, response, orderid = place_order_api(data, auth)
-            _invalidate_position_cache(AUTH_TOKEN)
+            _invalidate_position_cache(auth)
             return res, response, orderid
 
         elif position_size == current_position:
@@ -307,7 +307,7 @@ def place_smartorder_api(data, auth):
             order_data["quantity"] = str(quantity)
 
             res, response, orderid = place_order_api(order_data, auth)
-            _invalidate_position_cache(AUTH_TOKEN)
+            _invalidate_position_cache(auth)
             logger.info(f"SmartOrder response: {response}")
             logger.info(f"SmartOrder orderid: {orderid}")
 

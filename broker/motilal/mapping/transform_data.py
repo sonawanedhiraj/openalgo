@@ -54,7 +54,7 @@ def transform_data(data, token, auth_token=None):
         MARKET -> LIMIT  at LTP +/- slab%
         SL-M   -> STOPLOSS (SL) at trigger +/- slab%
     """
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
     openalgo_exchange = data["exchange"]
     motilal_exchange = map_exchange(openalgo_exchange)
     action = data["action"].upper()

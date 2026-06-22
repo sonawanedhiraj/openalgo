@@ -1,0 +1,10 @@
+# Issue template chooser. Blank issues are disabled so every tracked item uses
+# a structured form (implementation details + commit/PR + Definition of Done).
+blank_issues_enabled: false
+contact_links:
+  - name: Operational learnings / runbook
+    url: https://github.com/sonawanedhiraj/openalgo/blob/dev/docs/COWORK_SESSION_LEARNINGS.md
+    about: Day-to-day operating procedures and quick references (not a bug tracker).
+  - name: Deployment testing (Docker)
+    url: https://github.com/sonawanedhiraj/openalgo/blob/dev/docs/DEPLOYMENT_TESTING.md
+    about: How to run the Docker deploy-test that is part of the Definition of Done.

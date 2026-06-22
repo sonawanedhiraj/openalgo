@@ -30,7 +30,7 @@ def transform_data(data, token):
     - is_amo: boolean (for after market orders)
     - limit_price: float (required for LIMIT orders)
     """
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
 
     # Check if market order and convert to limit order with adjusted price
     order_type = map_order_type(data["pricetype"])

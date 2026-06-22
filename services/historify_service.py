@@ -2167,7 +2167,7 @@ def get_catalog_grouped_service(group_by: str = "underlying") -> tuple[bool, dic
         grouped = get_catalog_grouped(group_by)
 
         # Convert timestamps to dates in each group
-        for key, items in grouped.items():
+        for _key, items in grouped.items():
             for item in items:
                 if item.get("first_timestamp"):
                     item["first_date"] = datetime.fromtimestamp(item["first_timestamp"]).strftime(

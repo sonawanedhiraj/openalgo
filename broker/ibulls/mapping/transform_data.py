@@ -18,7 +18,7 @@ def transform_data(data, token):
     - BUY: Uses bid price + 0.1%
     - SELL: Uses ask price + 0.1%
     """
-    symbol = get_br_symbol(data["symbol"], data["exchange"])
+    get_br_symbol(data["symbol"], data["exchange"])
 
     # Check if market order and convert to limit order with adjusted price
     order_type = map_order_type(data["pricetype"])

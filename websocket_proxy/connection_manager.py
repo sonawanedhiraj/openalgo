@@ -440,7 +440,7 @@ class ConnectionPool:
                 # Handle both response formats from adapters:
                 # - {"success": False, "error": "..."} (ConnectionPool format)
                 # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
-                is_error = (result and result.get("success") == False) or (
+                is_error = (result and not result.get("success")) or (
                     result and result.get("status") == "error"
                 )
                 if is_error:
@@ -571,7 +571,7 @@ class ConnectionPool:
                     # Handle both response formats from adapters:
                     # - {"success": False, "error": "..."} (ConnectionPool format)
                     # - {"status": "error", "code": "...", "message": "..."} (Adapter format)
-                    is_error = (result and result.get("success") == False) or (
+                    is_error = (result and not result.get("success")) or (
                         result and result.get("status") == "error"
                     )
                     if is_error:

@@ -154,7 +154,7 @@ def test_rate_limit_reset(api, endpoint, limit):
     print("-" * 50)
 
     # Fill up the rate limit
-    for i in range(limit):
+    for _ in range(limit):
         api.make_request(endpoint)
 
     # This should be rate limited
@@ -185,7 +185,7 @@ def test_multiple_clients(api, endpoint, limit):
     print("-" * 50)
 
     # Client 1 uses up their limit
-    for i in range(limit):
+    for _ in range(limit):
         api.make_request(endpoint, client_ip="192.168.1.1")
 
     # Client 1 should be rate limited

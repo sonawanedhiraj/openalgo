@@ -567,7 +567,7 @@ def _aggregate_to_interval_ohlc(
         cell = buckets.get(bkey)
         o = float(raw.get("open") or 0.0)
         h = float(raw.get("high") or 0.0)
-        l = float(raw.get("low") or 0.0)
+        low_val = float(raw.get("low") or 0.0)
         c = float(raw.get("close") or 0.0)
         v = int(raw.get("volume") or 0)
         if cell is None:
@@ -575,14 +575,14 @@ def _aggregate_to_interval_ohlc(
                 "ts": bkey,
                 "open": o,
                 "high": h,
-                "low": l,
+                "low": low_val,
                 "close": c,
                 "volume": v,
             }
             order.append(bkey)
         else:
             cell["high"] = max(cell["high"], h)
-            cell["low"] = min(cell["low"], l)
+            cell["low"] = min(cell["low"], low_val)
             cell["close"] = c
             cell["volume"] += v
 

@@ -342,7 +342,7 @@ class PocketfulWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         # Resubscribe to existing subscriptions if reconnecting
         with self.lock:
-            for correlation_id, sub in self.subscriptions.items():
+            for _correlation_id, sub in self.subscriptions.items():
                 try:
                     self._send_subscription(
                         sub["exchange_code"], sub["token"], sub["pocketful_mode"]

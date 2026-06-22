@@ -185,7 +185,6 @@ class CSRFTester:
         if path_valid:
             with open(env_path, "rb") as f:
                 content = f.read()
-                has_crlf = b"\r\n" in content
                 has_lf = b"\n" in content
 
                 if current_platform == "Windows":

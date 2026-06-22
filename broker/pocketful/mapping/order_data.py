@@ -574,14 +574,12 @@ def transform_holdings_data(holdings_data):
 
     # Check if this data has already been transformed (called twice in the pipeline)
     # If the first item has 'symbol' and 'product' fields, it's likely already been transformed
-    is_already_transformed = False
     if holdings_data and isinstance(holdings_data, list) and len(holdings_data) > 0:
         first_item = holdings_data[0]
         if isinstance(first_item, dict) and "symbol" in first_item and "product" in first_item:
             logger.debug(
                 "DEBUG - Data appears to be already transformed, preserving existing transformation"
             )
-            is_already_transformed = True
             # Keep existing transformed data if it has valid symbols
             if first_item.get("symbol"):
                 return holdings_data
@@ -819,7 +817,7 @@ def map_portfolio_data(portfolio_data):
                 break
         # If still no data found but there are dict values, check if any value is a list
         if not processed_data:
-            for key, value in portfolio_data.items():
+            for _key, value in portfolio_data.items():
                 if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
                     processed_data = value
                     break

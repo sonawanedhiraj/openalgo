@@ -339,7 +339,7 @@ if __name__ == "__main__":
     # Live data can also be continuously polled using this method
     print("\nReceiving market data for 10 seconds...")
     poll_count = 1
-    for i in range(10):
+    for _ in range(10):
         # Get LTP data and print in formatted JSON
         ltp_data = feed.get_ltp()
         print(f"Poll {poll_count}:")

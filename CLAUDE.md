@@ -43,6 +43,59 @@ Quick checks:
 2. `mcp__session_info__list_sessions` + `read_transcript` on today's "Fno scan cycle" sessions
 3. Then errors.jsonl (filter pytest noise per memory)
 
+## Task Tracking — Every Task Is a GitHub Issue
+
+Every unit of work — feature, bug fix, documentation, **or backtest round** —
+is tracked as a labelled GitHub issue and closed when its work merges. This
+applies to **all** sessions: interactive Claude Code, bridge-spawned `claude -p`
+(it inherits this file via `cwd=PROJECT_ROOT`), and Cowork dispatch (read-only —
+see the carve-out below). Capability reference:
+[`docs/TASK_CAPABILITIES.md`](docs/TASK_CAPABILITIES.md).
+
+**The lifecycle (do this for every task):**
+
+1. **Open or attach.** Before starting, `gh issue list --search "<keywords>"`.
+   Reuse an existing issue or create one:
+   `gh issue create --title "..." --label "type:<bug|enhancement|docs|infra|incident|strategy>" --label "area:<…>" --label "session:claude-code"`.
+   Capture the issue number `N`.
+2. **Branch by number.** `git checkout -b <type>/<N>-<slug>` (e.g.
+   `feat/42-add-foo`). For parallel work, use a **git worktree** (below).
+3. **Link the PR.** The PR description **MUST** contain `Closes #N` AND the PR
+   title **MUST** be prefixed `[#N]`. Both are written for you by `bash
+   scripts/gh/track.sh link <N>`. The body's `Closes #N` is a **required check**
+   (`link-guard`): a code-changing PR with no issue link cannot merge. The title
+   prefix is a convention (no CI gate) that surfaces the linked issue in any
+   PR-list scan without having to click through. Docs-only PRs are exempt from
+   the link-guard block but should still link a `type:docs` issue and carry the
+   `[#N]` prefix.
+4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
+   (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
+   keyword close only fires on the default branch, so we do it ourselves).
+   No-PR/manual work (a doc edit, a closed-as-wontfix) → close it yourself with
+   a result comment.
+
+**Labels** (filterable; bootstrap via `bash scripts/gh/bootstrap_labels.sh`):
+`type:*` (kind), `status:*` (lifecycle), `session:*` (which session opened it),
+`area:*` (subsystem), `P0/P1/P2` (priority), `strategy:backtest-round` (each
+backtest round gets its own issue linked to the registry entry).
+
+**Parallel tasks — use git worktrees (load-bearing).** Concurrent code-editing
+tasks must run in their own `git worktree` (`Agent(isolation: "worktree")` or
+`git worktree add ../wt-<N> <branch>`). Two agents committing in the *same*
+checkout deadlock `pre-commit` (git-stash collision) and the killed stash
+**silently reverts working-tree edits**. A worktree gives each task its own
+index. Recovery if edits vanish: `.cache/pre-commit/patch*` → `git apply
+--cached` → `uv run ruff` → `git commit --no-verify` → push. Fresh worktrees
+lack the gitignored `.env` — `cp` it in before importing anything that reads
+`API_KEY_PEPPER`.
+
+**Cowork read-only carve-out.** Cowork dispatch tasks are read-only on code
+(see "Scheduled Tasks Audit-Trail Policy") — they **open** a `session:cowork`
+issue (or append to `audit/proposed_fixes.jsonl`) describing the problem, then
+exit. A Claude Code/bridge session does the code change, links `Closes #N`, and
+closes it. The create→work→close lifecycle is **asymmetric**: Cowork opens, an
+editing session closes.
+
 ## Documentation discipline — change docs WITH code, not after
 
 When any architectural change ships, the matching documentation update ships in the SAME commit. Not in a follow-up. Doc drift starts the moment code lands.
@@ -107,6 +160,45 @@ an immediate follow-up direct commit.
 **Before any parameter-dependent work** (spawning a backtest, deploying a
 strategy, evaluating a rule): read PARAMETER_LOG AND verify against `.env`. The
 doc captures intent; the env captures reality. Mismatches are real bugs.
+
+### NEVER rotate `API_KEY_PEPPER` or `FERNET_SALT` on a running install
+
+These two values are a categorical exception to the "edit `.env`, log it,
+restart" pattern above. They are not tunables — they are **load-bearing
+crypto material** that everything authenticated and encrypted on this install
+is sealed against. Rotating either is a destructive reset.
+
+What breaks the moment a running install starts up against a rotated value:
+
+- **Login.** The user password is hashed as `Argon2(password + API_KEY_PEPPER)`
+  (`database/user_db.py:120-136`). With a new pepper the existing
+  `password_hash` row never verifies; `/login` returns a generic 401 "Invalid
+  credentials" with no extra error log — the operator looks locked out for
+  no apparent reason.
+- **Every encrypted secret in `db/openalgo.db`.** Broker tokens, stored API
+  keys, TOTP secrets, SMTP password are all Fernet-encrypted with a key
+  derived from `API_KEY_PEPPER` + `FERNET_SALT`. A rotation makes every
+  ciphertext unreadable. Re-login to Zerodha won't help once the row is
+  written under the new pepper — the *next* restart can't decrypt it either.
+
+There is **no in-tree migration** that re-hashes the password and
+re-encrypts every secret on the way through a rotation. So a rotation is in
+practice a destructive reset.
+
+**Rules:**
+
+1. Do not touch `API_KEY_PEPPER` or `FERNET_SALT` in `.env` after the
+   first-run rotation has happened (i.e. once the placeholders have been
+   replaced and a user has been created). Not as part of a fix, not as part
+   of a "let me try a fresh value", not "just in case".
+2. Before editing `.env` for anything, make a backup: `cp .env
+   .env.bak.<timestamp>`. `.env.bak*` is gitignored.
+3. If you think you must rotate them (compromise, install transfer), plan
+   the full re-setup first: user-password reset, every broker re-link, every
+   stored API key re-issued, every TOTP secret re-enrolled, SMTP password
+   re-entered. There is no halfway.
+4. If a rotation has already happened and the install is locked out, follow
+   [`docs/runbooks/api_key_pepper_rotation_recovery.md`](docs/runbooks/api_key_pepper_rotation_recovery.md).
 
 ## Strategy registry updates ALWAYS go to dev directly
 
@@ -614,12 +706,33 @@ bandit + semgrep (ERROR-only) + detect-secrets + biome run on staged files.
 Enable locally: `uv pip install pre-commit && pre-commit install`.
 
 **CI** ([`.github/workflows/quality-gate.yml`](.github/workflows/quality-gate.yml)):
-runs on PRs to `dev`/`main` and pushes to `dev`. Ruff blocks; bandit and the
-public Semgrep rulesets (`--config=auto`) are best-effort (`|| true`); the custom
-ERROR rules block. **The custom-rule gate is RED until the 4 P0/P1 findings are
-fixed** (firing on them is the proof the rules work) — fix them, or run with
-`--baseline-commit <sha>` to defer to new violations only. Branch protection on
-`dev`/`main` is enabled via the GitHub UI (cannot be automated from the CLI).
+runs on PRs to `dev`/`main` and pushes to `dev`. As of 2026-06-14 the workflow
+is split into **two jobs** because GitHub gates required status checks at the
+*job* level, not the step level:
+
+- **`silent-drops`** — the lone job intended to be a **required check on `main`**
+  today. Minimal by design (checkout + uv + `uvx semgrep`) so it stays green and
+  fast: it runs *only* the custom ERROR rules (`uvx semgrep --config
+  .semgrep/silent-drops.yml --severity ERROR --error services/ blueprints/
+  sandbox/ restx_api/`) and blocks on any finding.
+- **`quality`** — everything else (ruff, bandit, the WARNING heuristics, the
+  public `--config=auto` rulesets), currently **informational**. Ruff still
+  carries pre-existing debt from the 1535-error backlog, so this job is red on
+  ruff; it will be **promoted to a required check on `main` once the ruff debt
+  clears** and the job is reliably green. Within it, bandit and the public
+  Semgrep rulesets remain best-effort (`|| true`).
+
+The split was needed precisely because the ruff debt kept the single combined
+job red, which would have made the otherwise-green silent-drops check
+un-requireable. **The custom-rule gate is GREEN as of 2026-06-11
+(commit `5d27bd5d6`)** — all 4 P0/P1 findings are fixed (the rules' firing on
+the pre-fix tree was the proof they work; see
+[`audit/silent_drop_audit_2026-06-11.md`](audit/silent_drop_audit_2026-06-11.md),
+each finding marked RESOLVED). `uvx semgrep --config .semgrep/silent-drops.yml
+services/ blueprints/ sandbox/ restx_api/ --severity ERROR` returns 0 findings,
+so the `silent-drops` required-status-check can be enabled on `main`'s branch
+protection. Branch protection on `dev`/`main` is configured via the GitHub UI
+(cannot be automated from the CLI).
 
 GitHub Actions guard `code-direct-push-guard.yml` alerts on direct-to-dev code
 pushes — alert-only, no block. See `.github/workflows/README.md`.
@@ -829,6 +942,57 @@ decisions: [`strategies/sector_follow_cap5_vol/PLAN.md`](strategies/sector_follo
 Daily EOD report mirror written to `strategies/sector_follow_cap5_vol/eod_reports/YYYY-MM-DD.md`
 at 15:30 IST (same content as the Telegram summary; git-ignored, observational).
 
+**Active sandbox strategy**: [`strategies/futures_follow_cap50/`](strategies/futures_follow_cap50/)
+— a **leveraged broad-market-beta** sleeve built on the sector_follow signal set
+(spawned from the 2026-06-14 NIFTY-only CAP50 leverage research). At 15:20 IST it
+**reuses** the `sector_follow_cap5_vol` C1×W2+E4 evaluator (does NOT reimplement the
+gates) to find today's ≤5 stock signals, and for each — greedily in vol-ratio order
+— buys **one NIFTY near-month index future lot** (NIFTY futures are MONTHLY; the
+resolver picks the front-month from the master contract — there is no weekly NIFTY
+future; the resolver **skips any contract expiring within 1 day** (today or
+tomorrow) so the T+1 overnight hold is always viable — on a monthly-expiry day
+the current-month contract is skipped and the next-month future is picked
+automatically, never buying a contract that expires before the T+1 exit. NIFTY
+monthly expiry is the **last Tuesday** of the month (verified 2026-06-15 against
+the master contract: 30-JUN-26 / 28-JUL-26 / 25-AUG-26, all Tuesdays — NSE moved
+NIFTY expiry off Thursday)),
+HARD-CAPPED at **50% of capital as overnight SPAN margin** (₹10L book ⇒ ~2
+lots; late signals beyond the cap are skipped). Product **NRML**, exchange **NFO**,
+MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. **No stop loss** (Phase-1
+proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**
+is the only backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
+(0.03% notional) round-trip charges.
+**ACTIVELY TRADING IN SANDBOX** (`mode: sandbox`, `deployable: true`) — there is **no
+scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
+`FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
+registers 5 APScheduler jobs (reset 09:00 / watchdog 15:14 / entry 15:20 / exit 15:25
+/ EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
+real orders into `sandbox.db` (the virtual ₹1Cr book) from boot** — the first sandbox
+cycle is **Monday 2026-06-15 15:20 IST** (the session's first sector_follow signal →
+a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a
+`strategy_mode` row); operator can pause active trading via
+`POST /futures_follow_cap50/api/pause` (durable `strategy_runtime_override`) without
+changing mode.
+**Honest caveat (load-bearing — do not lose):** the backtest clears 12% (CAGR
+14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L, 2024-01..2026-06) but the signal does
+**NOT** predict NIFTY direction (hit-rate 53.4% < 55%, corr 0.295). The return is
+leveraged broad-market drift on bullish signal-days — **leveraged beta, not the
+sector_follow stock-selection alpha** — so it will struggle in a sustained flat/bear
+NIFTY regime, where it has no edge to fall back on. Sector-matched routing
+(banking→BANKNIFTY) was tested and **rejected** (costs 0.74pp CAGR, no correlation
+gain — NIFTY-only is the vehicle). Keep `sector_follow_cap5_vol` (CNC T+1 equity) as
+the alpha primary; run this as a separate, leverage-bounded beta sleeve. Key files:
+`services/futures_follow_service.py` (evaluator reuse + sizing + scheduler glue),
+`blueprints/futures_follow.py` (control API at `/futures_follow_cap50/api/*` —
+status/positions/pause/resume/close_all/data_health),
+`database/futures_follow_db.py` (`futures_follow_trades` journal). Plan + locked
+decisions: [`strategies/futures_follow_cap50/PLAN.md`](strategies/futures_follow_cap50/PLAN.md).
+Backtest reports:
+[`docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md`](docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md)
+(NIFTY-only CAP50 control) and `2026-06-14_futures_10L.md`. Daily EOD report mirror
+written to `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md` at 15:30 IST
+(git-ignored, observational).
+
 ## Data freshness validation (sector_follow_cap5_vol)
 
 A durable guard against the class of failure that produced the 2026-05-29→06-10
@@ -837,11 +1001,54 @@ backfill job did not exist yet, and the hermetic (mocked-data) E2E suite never
 noticed an *environmental* regression. The validation layer makes feed staleness
 fail loud and fail safe.
 
+**Fix 1b — aggregator-source for today's data + loud failure (2026-06-15).** A
+*different* silent-failure class surfaced on the first sandbox cycle: at 15:20 IST
+historify had **no stock 1m bars for today** (the backfill convergence only runs
+15:30+), so `_series_metrics` returned `stock_ret=None`, every gate failed closed,
+and the strategy emitted **0 signals with no alert** — while the WS feed was
+ticking the whole `LOCK_STATIC_30` universe into the in-process scanner aggregator
+the entire time. The fix splits market data by its natural source:
+
+- **TODAY's intraday close+volume** now come from the **in-process scanner
+  aggregator** (`services/sector_follow_service.py` `production_intraday_provider`
+  → `ScannerService.get_today_ohlcv(symbol, date)`). All 30 universe stocks are
+  already in `SCANNER_SYMBOLS`, so their live bars are in memory. The **20-day
+  lookback** (prior close, avg daily volume) stays on historify (the correct
+  source for *historical* days). 6 of 8 sector indices are **not** in the scanner
+  universe, so their `sector_ret` still comes from historify via the per-symbol
+  fallback below.
+- **Per-symbol historify fallback** for today's data is kept but logs a **WARNING**
+  ("aggregator had no today bars — falling back to historify"). Every metric
+  carries `intraday_source ∈ {aggregator, historify, none}`.
+- **Loud failure:** `evaluate_candidates` logs per-symbol **PASS/FAIL** with the
+  exact gate/None reason, then emits a **decision-input completeness** metric
+  (`n_symbols_on_live_intraday / total`): **<50% → Telegram WARNING, <20% →
+  CRITICAL**. A silently-degraded pipeline can no longer look like a genuine
+  zero-signal day.
+- **15:18 IST pre-entry smoke check** (`assert_data_pipeline_healthy`, APScheduler
+  job `sector_follow_smoke_check`): (1) aggregator has today's data for
+  ≥`SECTOR_FOLLOW_SMOKE_MIN_COVERAGE` (default 0.5) of the universe, (2) the
+  historify lookback returns prior-day data for a sample symbol, (3) a broker
+  session is live. On failure it writes a same-day `pause` `strategy_runtime_override`
+  (holds the 15:20 entries via the engine's `_entry_held_by_override` gate;
+  expires 15:30 IST so it self-clears) and Telegram-alerts. Gated by
+  `SECTOR_FOLLOW_SMOKE_CHECK_ENABLED` (default `true`). Tests:
+  `test/test_sector_follow_service.py` (aggregator read, historify fallback,
+  all-empty loud logging, smoke-check abort/alert).
+
 - **Pure service** `services/data_freshness_service.py` — read-only on
   `historify.duckdb`. `check_strategy_data_ready(strategy, date,
   max_staleness_business_days=1)` returns `(ok, per-symbol details)`;
   business-day aware (weekend gap ≠ stale; holidays NOT modelled). For
-  sector_follow it checks the 8 mapped indices + 30 universe stocks.
+  sector_follow it checks the 8 mapped indices + 30 universe stocks. All
+  read-only DuckDB reads go through **`connect_historify_readonly()`**, which
+  tries `read_only=True` first but falls back to a config-matching connect when
+  the live app already holds `historify.duckdb` open read-write **in the same
+  process** — DuckDB's instance cache otherwise rejects the mismatched config
+  ("Can't open a connection … with a different configuration"). This was the
+  recurring post-close (15:30+) lock-warning spam; the fallback reuses the shared
+  in-process connection so the read just succeeds. The same helper backs the
+  live 15:20 sector_follow evaluator read (`sector_follow_service`).
 - **Table** `data_health_check` in `db/openalgo.db`
   (`database/data_health_db.py`) — one row per check: `check_at`, `overall_ok`,
   `stale_symbols` (JSON), `details_json`, `alert_sent`.
@@ -864,13 +1071,18 @@ fail loud and fail safe.
   `docs/PARAMETER_LOG.md`. The gate/job are no-ops when the flag is off; the
   HTTP endpoint always works.
 
-Both the index AND the 30 universe stock feeds are refreshed by a **boot-time +
-periodic state-convergence check** (`services/sector_follow_backfill_scheduler.py`,
-wired in `app.py` via `init_sector_follow_backfill`). This **supersedes the
-16:05/16:10 IST cron jobs** from commit `5c2a06eff` and earlier — those were
-removed from `historify_scheduler_service.py`. Per the directive: *"start once
-OpenAlgo starts every time and start the task based on the last backfill timestamp
-only if required, for index and stocks both, instead of dependency on a scheduler."*
+Two independent universes are kept fresh by **boot-time + periodic
+state-convergence checks**: (1) `sector_follow_cap5_vol`'s index + 30-stock 1m
+feeds (`services/sector_follow_backfill_scheduler.py`, wired via
+`init_sector_follow_backfill`), and (2) the **in-house scanner's
+`SCANNER_SYMBOLS` F&O universe in BOTH `1m` AND daily (`D`)**
+(`services/scanner_backfill_scheduler.py`, wired via
+`init_scanner_backfill_scheduler` — see the dedicated subsection below). The
+sector_follow check **supersedes the 16:05/16:10 IST cron jobs** from commit
+`5c2a06eff` and earlier — those were removed from `historify_scheduler_service.py`.
+Per the directive: *"start once OpenAlgo starts every time and start the task
+based on the last backfill timestamp only if required, for index and stocks both,
+instead of dependency on a scheduler."*
 
 How it works:
 - Each backfill service exposes **`check_and_refresh_if_stale(today)`** — reads
@@ -879,7 +1091,11 @@ How it works:
   behind today's expected 15:30 IST close** through the same incremental historify
   pipeline. Idempotent (fresh → no-op) and fail-graceful (a dead-token fetch is
   `logger.exception`-logged into `errors`, never raised; an anomaly alert fires on
-  any error).
+  any error). A **transient DuckDB lock** on the freshness read
+  (`is_transient_lock_error` — e.g. a separate CLI backfill holds the file) is
+  downgraded to a quiet `logger.info` skip (`status='skipped_locked'`, no Telegram
+  anomaly); the arm is treated as *not fresh* so the periodic loop retries rather
+  than backing off, and the boot/next-tick convergence catches up.
 - **Boot hook**: on every OpenAlgo start, a daemon thread waits for a broker
   session to appear, then runs the index + stock convergence check once (never
   blocks boot). So a restart after the daily ~3 AM Zerodha re-login auto-catches
@@ -901,8 +1117,118 @@ YYYY-MM-DD`; stock 1m `uv run python -m services.sector_follow_stock_backfill
 only needed to backfill a multi-day outage beyond the small lookback window — the
 boot+periodic path handles routine staleness automatically.
 
+### Scanner-universe feed convergence (`scanner_backfill_scheduler`)
+
+The scanner-side sibling of the sector_follow convergence above. It is the
+durable fix for the two **data-supply** bugs the 2026-06-13 Friday-screener
+replay surfaced (see
+`docs/research/strategy/screener/2026-06-13_friday_replay_with_backfilled_data.md`),
+which the sector_follow service does NOT cover because the two universes are
+disjoint:
+
+- **Bug A — the scanner universe was never backfilled.** The sector_follow
+  convergence refreshes only its locked-static-30 stocks + 8 indices; the
+  in-house screener mirrors Chartink across the full `SCANNER_SYMBOLS` F&O list
+  (~200 names). Friday 1m existed for only 38/238 historify symbols, so a replay
+  could reconstruct only 1 of Chartink's 8 Friday hits.
+- **Bug B — the stored daily (`D`) interval was universally stale** (ending
+  2026-06-04 for 229 symbols). `ScannerHistoryProvider` reads stored `D` via
+  `historify_db.get_ohlcv(interval='D')` for its daily gap/volume gates, so the
+  live scanner evaluated against ~6-trading-day-old daily bars on any day,
+  independent of tick health.
+
+`services/scanner_backfill_scheduler.py` (+ `services/scanner_universe_backfill.py`)
+closes both, mirroring the sector_follow pattern exactly but over **both storage
+intervals** (`1m` AND `D`):
+
+- **Symbol set** is derived live from the `SCANNER_SYMBOLS` env var (the same
+  source `ScannerHistoryProvider` / `scanner_presubscribe` read), so it tracks
+  the scanner config automatically. Each symbol routes to `NSE` or `NSE_INDEX`
+  via `scanner_presubscribe.resolve_exchange_for_symbol` (the universe interleaves
+  a few indices), and the download goes through the same incremental
+  `historify_service.create_and_start_job` pipeline.
+- **`check_and_refresh_if_stale(today, interval=...)`** reads `MAX(timestamp)` per
+  symbol for the interval from `historify.duckdb` (via
+  `data_freshness_service.compute_stale_symbols`, which already accepts an
+  `interval` argument) and fetches **only the symbols behind today's close**.
+  Idempotent (fresh → no-op), fail-graceful (a dead-token fetch is logged into
+  `errors`, never raised), empty-universe-safe (no-op when `SCANNER_SYMBOLS` is
+  unset).
+- **Boot hook + periodic loop** identical in shape to sector_follow: a daemon
+  thread waits for a broker session, runs the 1m then `D` convergence once
+  (never blocks boot), then a periodic daemon re-checks every
+  `SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN` minutes (default 30) inside
+  `15:30`..`SCANNER_BACKFILL_PERIODIC_END_TIME` (default `17:00`) IST on trading
+  days, backing off until tomorrow once both intervals report fresh.
+- **Health rows**: each interval check writes a `data_health_check` row
+  (`strategy_name='scanner_universe_1m'` / `'scanner_universe_D'`) via the
+  existing `database/data_health_db.insert_check` — no schema change, so
+  `get_latest_check` / the existing query + alerting paths keep working and
+  scanner coverage is directly queryable.
+- **Flags**: `SCANNER_BACKFILL_ENABLED` (master, default `true`),
+  `SCANNER_BACKFILL_PERIODIC_CHECK_ENABLED` (default `true`),
+  `SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN` (default `30`),
+  `SCANNER_BACKFILL_PERIODIC_END_TIME` (default `17:00`),
+  `SCANNER_BACKFILL_INTERVALS` (default `1m,D` — drop one arm to reduce broker
+  load). See `docs/PARAMETER_LOG.md`.
+- **Manual catch-up** for a deep historical gap — notably the one-time initial
+  deep 1m backfill for the ~200 never-fetched scanner symbols, which is beyond
+  the small lookback window — uses the CLI (needs an active broker session):
+  `uv run python -m services.scanner_universe_backfill --from YYYY-MM-DD --to
+  YYYY-MM-DD --interval 1m` (or `--interval D`).
+- **Daily-D approach (Approach 1):** the `D` arm fetches fresh daily bars
+  directly through the historify pipeline. A future task may migrate to deriving
+  daily by resampling the continuous stored 1m series (Approach 2, single source
+  of truth) — that only becomes viable once the full-universe 1m deep backfill
+  has landed.
+
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
+
+### In-house screener observability — Tier-1 hardening (2026-06-15)
+
+The in-house scanner (`services/scanner_service.py`) is purely event-driven and
+historically **failed closed, silently** — every missing input became a bare
+`return False`/`(None, None)` with no log, so "tick-starved feed" and "genuinely
+quiet market" produced byte-identical zero-hit logs. Tier-1 of the Phase-B plan
+(`docs/research/strategy/screener/2026-06-15_inhouse_deep_analysis.md`) applies
+sector_follow's Fix 1b disciplines (loud failure + completeness metric +
+market-hours gate) to the scanner. **All three are additive — they change *what
+is observed/skipped*, never *which signals fire***:
+
+- **Market-hours gate** (`_evaluate_definitions`): skips evaluation with an INFO
+  log outside `[09:15, 15:30]` IST, so a straggler/backfill tick that closes a
+  bar after the session cannot fire a stale-bar signal (the 2026-06-15 17×
+  post-close AUROPHARMA SELL class, FM-6). Flag `SCANNER_POSTCLOSE_GATE_ENABLED`
+  (default `true`). `_now_ist()` is indirected for testability.
+- **D-bar-date verify** (both `services/scan_rules/fno_intraday_*_chartink.py`):
+  post-settle (`today_idx == -1`), the rule aborts with a WARNING when its latest
+  daily-D bar is dated *before* today — the stale-D condition that let a prior-day
+  bar masquerade as "today's settled bar." Flag `SCANNER_DBAR_DATE_VERIFY_ENABLED`
+  (default `true`); gated on the production `timestamp` column so synthetic test
+  frames are exempt. Paired with the market-hours gate so a future change to
+  either one cannot silently re-open the post-close path.
+- **Loud per-symbol PASS/FAIL + missing-input logging**: `_evaluate_definitions`
+  logs `scanner PASS <sym>` at INFO (rare) / `scanner FAIL <sym>` at DEBUG (per-bar
+  firehose); `get_today_ohlcv` logs a reason instead of a silent `(None, None)`;
+  the rules log a WARNING naming the symbol + which input is `None` (data missing)
+  vs DEBUG for a short-but-present warm-up frame; `scanner_universe_backfill`'s
+  `check_and_refresh_if_stale` WARNs with the affected symbols + reason on a failed
+  catch-up (FM-11: an expired token could fail every symbol with only a quiet error
+  key as the trace).
+- **Per-cycle decision-input completeness metric** (`_record_completeness` /
+  `_emit_completeness`): the scanner accumulates the set of symbols that produced a
+  live bar within a rolling `SCANNER_COMPLETENESS_WINDOW_MIN` (default 5) minute
+  window and, when the window rolls, emits `n_live / total_subscribed` — **<50%
+  WARNING, <20% CRITICAL** via Telegram (`notification_service.notify`,
+  `scanner_completeness` event, per-severity once-a-day dedup). This is the single
+  change that makes "0 hits because no data" visually distinct from "0 hits because
+  quiet market." Flags `SCANNER_COMPLETENESS_ENABLED` (default `true`),
+  `SCANNER_COMPLETENESS_WARN_PCT` (50), `SCANNER_COMPLETENESS_CRIT_PCT` (20),
+  `SCANNER_COMPLETENESS_WINDOW_MIN` (5). **Limitation:** a *total* feed outage
+  produces no bar closes at all, so this path never fires — that case is the 15:18
+  smoke check's job (Tier 2, not yet shipped). The metric catches *partial*
+  degradation and reports coverage. See `docs/PARAMETER_LOG.md` for all flags.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 

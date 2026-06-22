@@ -55,7 +55,7 @@ def get_histogram_data(broker=None):
 
         # Create histogram bins
         bin_count = 30  # Number of bins
-        bin_width = (max_rtt - min_rtt) / bin_count if max_rtt > min_rtt else 1
+        (max_rtt - min_rtt) / bin_count if max_rtt > min_rtt else 1
 
         # Create histogram using numpy
         counts, bins = np.histogram(rtts, bins=bin_count, range=(min_rtt, max_rtt))

@@ -178,7 +178,7 @@ def format_openalgo_to_groww_symbol(symbol, exchange):
             for month in months:
                 if month in remaining:
                     # Find month position
-                    month_pos = remaining.find(month)
+                    remaining.find(month)
 
                     # Try to extract day (1-2 digits before month)
                     day_match = re.search(r"(\d{1,2})" + month, remaining)
@@ -444,7 +444,7 @@ def reformat_symbol(row):
     # Use trading symbol as base instead of name
     symbol = row["trading_symbol"]
     instrument_type = row["instrument_type"]
-    expiry = row["expiry_date"].replace("/", "").upper()
+    row["expiry_date"].replace("/", "").upper()
 
     # For equity and index instruments, use the symbol as is
     if instrument_type in ["EQ", "IDX"]:

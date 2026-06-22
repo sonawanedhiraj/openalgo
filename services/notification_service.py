@@ -153,6 +153,26 @@ class NotificationService:
             # ON — the operator wants the parity verdict each trading day. See
             # services/scanner_comparison_eod_service.py.
             "scanner_comparison": _env_bool("NOTIFY_SCANNER_COMPARISON", default=True),
+            # In-house scanner per-cycle decision-input completeness alert
+            # (Tier-1 Fix #3). Fires WARNING (<50% of the universe produced live
+            # bars this window) / CRITICAL (<20%) so a silently-degraded feed is
+            # distinguishable from a genuinely quiet market. See
+            # services/scanner_service.py (_emit_completeness).
+            "scanner_completeness": _env_bool("NOTIFY_SCANNER_COMPLETENESS", default=True),
+            # In-house scanner pre-entry smoke check (Tier-2, 09:18 IST). Fires
+            # CRIT when one of the four upstream gates fails (aggregator coverage,
+            # 1m freshness, D freshness, broker session) — defaults ON so a
+            # silent-pipeline morning is visible before the first evaluatable
+            # 5m bar closes. See services/scanner_smoke_check_service.py.
+            "scanner_smoke_check_fail": _env_bool("NOTIFY_SCANNER_SMOKE_CHECK", default=True),
+            # In-house scanner zero-results tripwire (issue #33). Fires when no
+            # scan_results row with source='inhouse' has been written for
+            # SCANNER_DRY_THRESHOLD_MIN minutes during market hours.
+            # Severity is encoded in the message body: CRIT when Chartink is
+            # producing rows but in-house is silent (pipeline degraded), WARN
+            # when Chartink is also dry (market is genuinely quiet — visibility
+            # only). See services/scanner_dry_tripwire_service.py.
+            "scanner_dry": _env_bool("NOTIFY_SCANNER_DRY", default=True),
             # Generic "background code task finished" push. Default ON — used by
             # spawned code tasks to confirm completion to the operator. Routes
             # through the same Telegram path (no batching); the caller supplies

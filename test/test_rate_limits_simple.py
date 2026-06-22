@@ -113,7 +113,7 @@ def test_rate_limiter_logic():
 
     # Should allow 10 requests
     success_count = 0
-    for i in range(12):
+    for _ in range(12):
         if limiter.is_allowed("/placeorder"):
             success_count += 1
 
@@ -126,7 +126,7 @@ def test_rate_limiter_logic():
     limiter.set_limit("/placesmartorder", "2 per second")
 
     success_count = 0
-    for i in range(5):
+    for _ in range(5):
         if limiter.is_allowed("/placesmartorder"):
             success_count += 1
 
@@ -152,7 +152,7 @@ def test_rate_limiter_logic():
 
     # Client 1 makes 5 requests
     client1_count = 0
-    for i in range(5):
+    for _ in range(5):
         if limiter.is_allowed("/api/endpoint", "client1"):
             client1_count += 1
 

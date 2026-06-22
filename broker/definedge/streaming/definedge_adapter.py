@@ -553,7 +553,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
             tick_scrips = set()
             depth_scrips = set()
 
-            for correlation_id, sub in self.subscriptions.items():
+            for _correlation_id, sub in self.subscriptions.items():
                 definedge_exchange = sub["definedge_exchange"]
                 token = sub["token"]
                 scrip = f"{definedge_exchange}|{token}"
@@ -702,7 +702,7 @@ class DefinedgeWebSocketAdapter(BaseBrokerWebSocketAdapter):
         try:
             # Check if there are Quote or LTP subscriptions for this token
             with self.lock:
-                for correlation_id, sub in self.subscriptions.items():
+                for _correlation_id, sub in self.subscriptions.items():
                     if sub["token"] == token and sub["mode"] in [1, 2]:  # LTP or Quote mode
                         mode = sub["mode"]
                         mode_str = {1: "LTP", 2: "QUOTE"}[mode]

@@ -156,7 +156,7 @@ def load_configs():
             with open(CONFIG_FILE, encoding="utf-8") as f:
                 STRATEGY_CONFIGS = json.load(f)
             mutated = False
-            for sid, cfg in STRATEGY_CONFIGS.items():
+            for _sid, cfg in STRATEGY_CONFIGS.items():
                 if "exchange" not in cfg or not cfg.get("exchange"):
                     cfg["exchange"] = "NSE"
                     mutated = True
@@ -1750,7 +1750,7 @@ def start_strategy(strategy_id):
         elif not is_scheduled_day:
             reason = f"Today ({today_day.capitalize()}) is not in schedule"
             # Find next scheduled day
-            next_days = [d for d in schedule_days]
+            next_days = list(schedule_days)
             next_start = f"next scheduled day ({', '.join(next_days)}) at {schedule_start} IST"
         else:
             reason = f"Outside schedule hours ({schedule_start} - {schedule_stop} IST)"
@@ -2663,7 +2663,7 @@ def restore_strategy_states():
             f"Master contracts not ready - strategies will remain in error state until contracts are downloaded: {contract_message}"
         )
         # Mark all running strategies as error state due to master contract dependency
-        for strategy_id, config in STRATEGY_CONFIGS.items():
+        for _strategy_id, config in STRATEGY_CONFIGS.items():
             if config.get("is_running"):
                 config["is_running"] = False
                 config["is_error"] = True
@@ -2675,7 +2675,6 @@ def restore_strategy_states():
 
     restored_count = 0
     error_count = 0
-    cleaned_count = 0
 
     for strategy_id, config in STRATEGY_CONFIGS.items():
         if config.get("is_running") and config.get("pid"):
