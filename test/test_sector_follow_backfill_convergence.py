@@ -219,7 +219,9 @@ def test_boot_runs_both_index_and_stock_checks_in_order():
 
 
 def test_boot_waits_for_broker_session_then_returns_true():
-    with patch("database.auth_db.get_first_available_api_key", return_value="api-key"):
+    # PR #56 replaced the old get_first_available_api_key gate with is_live_broker_session.
+    # Patch the new seam so the test doesn't touch the DB or a real broker.
+    with patch("services.broker_session_health.is_live_broker_session", return_value=True):
         assert sched._wait_for_broker_session(max_wait_sec=5) is True
 
 
