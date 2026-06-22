@@ -1117,3 +1117,43 @@ def samco_update_ip():
             "message": data.get("statusMessage", "IP updated successfully"),
         }
     )
+
+
+# ============================================================
+# Test-mode mock broker auth (MOCK_BROKER_ENABLED=true only)
+# ============================================================
+
+
+@brlogin_bp.route("/_test/mock_auth", methods=["GET"])
+def test_mock_auth():
+    """Complete Zerodha broker auth without Kite OAuth — test-mode only.
+
+    Only active when MOCK_BROKER_ENABLED=true (never in production). Exchanges a
+    fixed mock request_token via the configured BROKER_API_URL (which in tests
+    points at the FastAPI mock broker). Requires the caller to already be
+    OpenAlgo-logged-in (session["user"] set via POST /auth/login).
+    """
+    if os.getenv("MOCK_BROKER_ENABLED", "false").lower() != "true":
+        from flask import abort
+
+        abort(404)
+
+    if "user" not in session:
+        return redirect(url_for("auth.login"))
+
+    broker = "zerodha"
+    broker_auth_functions = app.broker_auth_functions
+    auth_function = broker_auth_functions.get(f"{broker}_auth")
+
+    if not auth_function:
+        return jsonify({"error": "Broker auth function not found"}), 500
+
+    auth_token, error_message = auth_function("mock_request_token")
+    if not auth_token:
+        logger.error(f"Mock broker auth failed: {error_message}")
+        return jsonify({"error": error_message}), 400
+
+    api_key = os.getenv("BROKER_API_KEY", "mock_zerodha_key")
+    auth_token = f"{api_key}:{auth_token}"
+    session["broker"] = broker
+    return handle_auth_success(auth_token, session["user"], broker)

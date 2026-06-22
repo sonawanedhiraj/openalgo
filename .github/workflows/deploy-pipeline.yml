@@ -106,6 +106,50 @@ jobs:
           path: frontend/playwright-report/
           retention-days: 7
 
+      # ── Tier 3: Mock broker integration test ──────────────────────────────
+      - name: Build mock broker image
+        run: docker compose -f docker-compose.test.yml -p mock_test build
+
+      - name: Boot OpenAlgo + mock broker (port 5099 + 8001)
+        run: |
+          docker compose -f docker-compose.test.yml -p mock_test up -d
+          echo "Waiting for both services to be healthy..."
+          for i in $(seq 1 60); do
+            mock_health=$(curl -sf http://127.0.0.1:8001/_mock/healthz 2>/dev/null && echo "ok" || echo "no")
+            oa_health=$(curl -sf http://127.0.0.1:5099/auth/check-setup 2>/dev/null && echo "ok" || echo "no")
+            if [ "$mock_health" = "ok" ] && [ "$oa_health" = "ok" ]; then
+              echo "Both services healthy"
+              exit 0
+            fi
+            echo "Attempt $i/60: mock=$mock_health, openalgo=$oa_health"
+            sleep 3
+          done
+          echo "Services failed to become healthy"
+          docker compose -f docker-compose.test.yml -p mock_test logs --tail=80
+          exit 1
+
+      - name: Run broker happy-path E2E test
+        env:
+          OPENALGO_URL: http://127.0.0.1:5099
+          MOCK_BROKER_URL: http://127.0.0.1:8001
+        run: |
+          cd frontend
+          npx playwright test e2e/broker_happy_path.spec.ts \
+            --config playwright.broker.config.ts
+
+      - name: Upload broker E2E report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-broker-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Teardown mock broker
+        if: always()
+        run: docker compose -f docker-compose.test.yml -p mock_test down -v --remove-orphans || true
+      # ── End Tier 3 ──────────────────────────────────────────────────────────
+
       - name: Teardown (always run)
         if: always()
         run: |

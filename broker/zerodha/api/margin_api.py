@@ -1,10 +1,13 @@
 import json
+import os
 
 from broker.zerodha.mapping.margin_data import parse_margin_response, transform_margin_positions
 from utils.httpx_client import get_httpx_client
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
 
 
 def calculate_margin_api(positions, auth):
@@ -58,12 +61,12 @@ def calculate_margin_api(positions, auth):
     # Both endpoints expect array of orders directly in the body
     if len(transformed_positions) > 1:
         # Basket endpoint with consider_positions=true to factor in existing positions
-        endpoint = "https://api.kite.trade/margins/basket?consider_positions=true"
+        endpoint = f"{BROKER_API_URL}/margins/basket?consider_positions=true"
         payload = transformed_positions
         logger.info(f"Using basket margin endpoint for {len(transformed_positions)} positions")
     else:
         # Orders endpoint for single position
-        endpoint = "https://api.kite.trade/margins/orders"
+        endpoint = f"{BROKER_API_URL}/margins/orders"
         payload = transformed_positions
         logger.info("Using orders margin endpoint for single position")
 

@@ -19,6 +19,9 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 
+BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
+
+
 def get_api_response(endpoint, auth, method="GET", payload=None):
     """
     Make an API request to Zerodha's API using shared httpx client with connection pooling.
@@ -33,7 +36,7 @@ def get_api_response(endpoint, auth, method="GET", payload=None):
         dict: API response data
     """
     AUTH_TOKEN = auth
-    base_url = "https://api.kite.trade"
+    base_url = BROKER_API_URL
 
     # Get the shared httpx client with connection pooling
     client = get_httpx_client()
@@ -200,7 +203,7 @@ def place_order_api(data, auth):
 
     # Make the request using the shared client
     response = client.post(
-        "https://api.kite.trade/orders/regular", headers=headers, content=payload_encoded
+        f"{BROKER_API_URL}/orders/regular", headers=headers, content=payload_encoded
     )
 
     # Log raw response
@@ -379,9 +382,7 @@ def cancel_order(orderid, auth):
         headers = {"X-Kite-Version": "3", "Authorization": f"token {AUTH_TOKEN}"}
 
         # Make the DELETE request using the shared client
-        response = client.delete(
-            f"https://api.kite.trade/orders/regular/{orderid}", headers=headers
-        )
+        response = client.delete(f"{BROKER_API_URL}/orders/regular/{orderid}", headers=headers)
 
         response.raise_for_status()
         data = response.json()
@@ -438,7 +439,7 @@ def modify_order(data, auth):
 
     # Make the request using the shared client
     response = client.put(
-        f"https://api.kite.trade/orders/regular/{data['orderid']}",
+        f"{BROKER_API_URL}/orders/regular/{data['orderid']}",
         headers=headers,
         content=payload_encoded,
     )
