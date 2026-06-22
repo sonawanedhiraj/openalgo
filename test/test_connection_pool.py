@@ -165,6 +165,38 @@ class TestConnectionPoolInitialize:
         assert result["success"] is True
         assert pool.initialized is True
 
+    def test_list_response_is_failure(self, caplog):
+        """Result is [1,2,3] (list, wrong type) → returns failure, logs ERROR."""
+        pool = _make_pool(_make_adapter_class([1, 2, 3]))
+        result = pool.initialize()
+
+        assert result["success"] is False
+        assert "Unexpected response type: list" in result.get("error", "")
+        assert pool.initialized is False
+        assert len(pool.adapters) == 0
+        assert "Adapter initialization returned unexpected type list" in caplog.text
+
+    def test_string_response_is_failure(self, caplog):
+        """Result is "oops" (string) → returns failure, logs ERROR."""
+        pool = _make_pool(_make_adapter_class("oops"))
+        result = pool.initialize()
+
+        assert result["success"] is False
+        assert "Unexpected response type: str" in result.get("error", "")
+        assert pool.initialized is False
+        assert len(pool.adapters) == 0
+        assert "Adapter initialization returned unexpected type str" in caplog.text
+
+    def test_ambiguous_dict_response_is_success(self, caplog):
+        """Result is {"unknown_key": "value"} (dict, no recognized keys) → success, logs INFO."""
+        pool = _make_pool(_make_adapter_class({"unknown_key": "value"}))
+        result = pool.initialize()
+
+        assert result["success"] is True
+        assert pool.initialized is True
+        assert len(pool.adapters) == 1
+        assert "no recognized keys" in caplog.text
+
     # --- Exception safety ---
 
     def test_adapter_raises_exception_is_caught(self):
