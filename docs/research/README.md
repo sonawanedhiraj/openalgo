@@ -15,6 +15,7 @@ Supersedes the gitignored `outputs/` for anything worth keeping.
 - `planning/` — roadmaps, capital planning, target-setting work
 - `engineering/` — tech debt audits, upstream syncs, CI/CD plumbing
 - `data/` — data-coverage notes, historify gaps, broker quirks
+- `scanner/` — in-house screener vs Chartink comparison reports, signal-divergence analysis
 
 ## Naming convention
 
