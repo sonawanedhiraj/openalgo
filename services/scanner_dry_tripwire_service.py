@@ -180,9 +180,9 @@ def production_notifier(message: str, severity: str) -> None:
     take a severity arg); the event_type stays the same so the operator's
     per-event toggle covers both CRIT and WARN."""
     try:
-        from services.notification_service import notify
+        from services.notification_service import get_notification_service
 
-        notify("scanner_dry", message)
+        get_notification_service().notify("scanner_dry", message)
     except Exception:
         logger.exception("scanner dry tripwire Telegram notify failed (severity=%s)", severity)
 
