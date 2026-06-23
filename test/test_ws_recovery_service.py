@@ -195,3 +195,137 @@ def test_idempotency_double_run_does_not_double_count():
     # No new closed bars and the in-progress bar is byte-identical.
     assert closes == closes_after_first
     assert agg.current_bar("AAA", "5m") == current_after_first
+
+
+# --------------------------------------------------------------------------- T7-a
+# Event bus: register() is idempotent — only one dispatch per event
+
+
+def test_register_idempotent_single_dispatch_per_event():
+    """Calling register() twice subscribes only once; event fires exactly one recovery."""
+    bus = EventBus()
+    notifier = MagicMock()
+
+    aggregator = MagicMock()
+    aggregator.replay_bars.return_value = 5
+
+    svc = WSRecoveryService(
+        aggregator_provider=lambda: aggregator,
+        universe_provider=lambda: [("AAA", "NSE")],
+        history_fetcher=lambda *a: _synthetic_bars(5),
+        api_key_provider=lambda: "key",
+        notifier=notifier,
+        bus=bus,
+    )
+    # Register twice — idempotent: should not double-subscribe.
+    svc.register()
+    svc.register()
+
+    bus.publish(BrokerSessionRefreshedEvent(username="alice", broker="zerodha"))
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and notifier.call_count == 0:
+        time.sleep(0.02)
+
+    # Exactly one notification sent (not two from a double-subscription)
+    assert notifier.call_count == 1, (
+        f"Expected exactly 1 notifier call (idempotent register); got {notifier.call_count}"
+    )
+
+
+# --------------------------------------------------------------------------- T7-b
+# Idempotency via mock aggregator — second run replays 0 bars
+
+
+def test_second_recover_call_with_same_bars_replays_zero():
+    """When replay_bars returns 0 on the second run, bars_replayed is 0."""
+    # First call: returns 10; second call: returns 0 (dedup already happened)
+    aggregator = MagicMock()
+    aggregator.replay_bars.side_effect = [10, 0]
+
+    svc = WSRecoveryService(
+        aggregator_provider=lambda: aggregator,
+        universe_provider=lambda: [("AAA", "NSE")],
+        history_fetcher=lambda *a: _synthetic_bars(10),
+        api_key_provider=lambda: "key",
+        notifier=MagicMock(),
+    )
+
+    first = svc.recover()
+    second = svc.recover()
+
+    assert first["bars_replayed"] == 10
+    assert second["bars_replayed"] == 0
+    # Second run: nothing was resynced (no new bars contributed)
+    assert second["resynced"] == 0
+
+
+# --------------------------------------------------------------------------- T7-c
+# Per-symbol isolation at the replay_bars layer (not the fetch layer)
+
+
+def test_replay_bars_exception_isolated_not_all_or_nothing(monkeypatch):
+    """replay_bars raising for one symbol does not abort the others."""
+    universe = [("AAA", "NSE"), ("BBB", "NSE"), ("CCC", "NSE")]
+
+    def replay(symbol, bars):
+        if symbol == "BBB":
+            raise RuntimeError("replay exploded for BBB")
+        return len(bars)
+
+    aggregator = MagicMock()
+    aggregator.replay_bars.side_effect = replay
+
+    fake_logger = MagicMock()
+    monkeypatch.setattr("services.ws_recovery_service.logger", fake_logger)
+
+    svc = WSRecoveryService(
+        aggregator_provider=lambda: aggregator,
+        universe_provider=lambda: universe,
+        history_fetcher=lambda *a: _synthetic_bars(5),
+        api_key_provider=lambda: "key",
+        notifier=MagicMock(),
+    )
+
+    summary = svc.on_broker_session_refreshed(
+        BrokerSessionRefreshedEvent(username="alice", broker="zerodha")
+    )
+
+    assert summary["status"] == "ok"
+    assert summary["failed"] == 1
+    assert summary["resynced"] == 2  # AAA + CCC
+    # logger.exception fired for the failing symbol
+    assert fake_logger.exception.called
+    assert any("BBB" in str(c.args) for c in fake_logger.exception.call_args_list)
+
+
+# --------------------------------------------------------------------------- T7-d
+# _format_alert: >20% failure prefixes warning; ≤20% does not
+
+
+def test_format_alert_warning_prefix_on_high_failure_rate():
+    """_format_alert prepends '⚠️' when failed/total > 20%, and omits it otherwise."""
+    base = {
+        "symbols": 10,
+        "resynced": 7,
+        "empty": 0,
+        "failed": 0,
+        "bars_replayed": 140,
+        "elapsed_sec": 1.2,
+        "gap_minutes": 3,
+    }
+
+    # No failures — no warning prefix
+    ok_msg = WSRecoveryService._format_alert({**base, "failed": 0})
+    assert not ok_msg.startswith("⚠️"), f"No-failure alert should not have warning: {ok_msg!r}"
+
+    # Exactly 20% fail (2/10) — boundary: NOT over 20%, so no warning
+    boundary_msg = WSRecoveryService._format_alert({**base, "failed": 2, "resynced": 8})
+    assert not boundary_msg.startswith("⚠️"), (
+        f"Exactly 20% should NOT trigger warning: {boundary_msg!r}"
+    )
+
+    # 21% fail (3/10 > 20%) — warning prefix required
+    warn_msg = WSRecoveryService._format_alert({**base, "failed": 3, "resynced": 7})
+    assert warn_msg.startswith("⚠️"), f"3/10 failed should trigger ⚠️ prefix: {warn_msg!r}"
+    assert ">20%" in warn_msg
