@@ -166,3 +166,114 @@ def _result_to_dict(row: ScanResult) -> dict[str, Any]:
         "posted_to_engine": bool(row.posted_to_engine),
         "notes": row.notes,
     }
+
+
+def _encode_parameters_json(parameters_json: "str | dict | None") -> "str | None":
+    """Encode parameters_json to a JSON string (or None)."""
+    if parameters_json is None:
+        return None
+    if isinstance(parameters_json, dict):
+        return json.dumps(parameters_json)
+    return parameters_json  # already a str
+
+
+def clone_definition(
+    source_id: int,
+    new_name: str,
+    parameters_json: "str | dict | None" = None,
+) -> int:
+    """Clone a scan_definition row, returning the new definition's id.
+
+    The clone inherits screener_type, rule_module, and expression_json from
+    source_id; enabled defaults to True; parent_definition_id is set to source_id.
+    Raises ValueError if source_id does not exist.
+    Raises IntegrityError on duplicate new_name.
+    """
+    sess = db_session()
+    try:
+        source = sess.query(ScanDefinition).filter(ScanDefinition.id == source_id).first()
+        if source is None:
+            raise ValueError(f"source_id {source_id} does not exist")
+        now = _now_iso()
+        clone = ScanDefinition(
+            name=new_name,
+            screener_type=source.screener_type,
+            expression_json=source.expression_json,
+            rule_module=source.rule_module,
+            enabled=1,
+            created_at=now,
+            updated_at=now,
+            parameters_json=_encode_parameters_json(parameters_json),
+            parent_definition_id=source_id,
+        )
+        sess.add(clone)
+        sess.commit()
+        return clone.id
+    except Exception:
+        sess.rollback()
+        raise
+    finally:
+        db_session.remove()
+
+
+def update_definition_params(
+    definition_id: int,
+    parameters_json: "str | dict | None",
+) -> None:
+    """Update parameters_json on a cloned (non-code-backed) definition.
+
+    Raises ValueError if definition_id does not exist OR if the row has
+    parent_definition_id IS NULL (code-backed rows are immutable by policy).
+    """
+    sess = db_session()
+    try:
+        row = sess.query(ScanDefinition).filter(ScanDefinition.id == definition_id).first()
+        if row is None:
+            raise ValueError(f"definition_id {definition_id} does not exist")
+        if row.parent_definition_id is None:
+            raise ValueError(
+                f"definition_id {definition_id} is code-backed (parent_definition_id is NULL)"
+                " and cannot be modified"
+            )
+        row.parameters_json = _encode_parameters_json(parameters_json)
+        row.updated_at = _now_iso()
+        sess.commit()
+    except Exception:
+        sess.rollback()
+        raise
+    finally:
+        db_session.remove()
+
+
+def delete_definition(definition_id: int) -> None:
+    """Hard-delete a cloned definition.
+
+    Raises ValueError if the row does not exist OR if parent_definition_id IS NULL
+    (code-backed rows cannot be deleted via the UI).
+    Raises ValueError with 'has children' message if other rows have
+    parent_definition_id = definition_id.
+    """
+    sess = db_session()
+    try:
+        row = sess.query(ScanDefinition).filter(ScanDefinition.id == definition_id).first()
+        if row is None:
+            raise ValueError(f"definition_id {definition_id} does not exist")
+        if row.parent_definition_id is None:
+            raise ValueError(
+                f"definition_id {definition_id} is code-backed (parent_definition_id is NULL)"
+                " and cannot be deleted"
+            )
+        children_count = (
+            sess.query(ScanDefinition)
+            .filter(ScanDefinition.parent_definition_id == definition_id)
+            .count()
+        )
+        if children_count > 0:
+            raise ValueError(f"definition_id {definition_id} has children and cannot be deleted")
+        sess.delete(row)
+        sess.commit()
+    except Exception:
+        sess.rollback()
+        raise
+    finally:
+        db_session.remove()
