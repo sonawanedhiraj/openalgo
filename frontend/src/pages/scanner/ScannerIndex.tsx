@@ -1,8 +1,26 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowRight, Copy, RefreshCw, ScanLine, TrendingDown, TrendingUp } from 'lucide-react'
+import {
+  ArrowRight,
+  Copy,
+  RefreshCw,
+  ScanLine,
+  Trash2,
+  TrendingDown,
+  TrendingUp,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { type ScanDefinitionSummary, scannerApi } from '@/api/scanner'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -142,7 +160,7 @@ interface CloneDialogProps {
   source: ScanDefinitionSummary
 }
 
-function CloneDialog({ open, onOpenChange, source }: CloneDialogProps) {
+export function CloneDialog({ open, onOpenChange, source }: CloneDialogProps) {
   const queryClient = useQueryClient()
   const [name, setName] = useState('')
   const [params, setParams] = useState<Record<string, number>>({})
@@ -226,6 +244,65 @@ function CloneDialog({ open, onOpenChange, source }: CloneDialogProps) {
 }
 
 // ---------------------------------------------------------------------------
+// Delete dialog
+// ---------------------------------------------------------------------------
+
+interface DeleteDialogProps {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  definition: ScanDefinitionSummary
+}
+
+export function DeleteDialog({ open, onOpenChange, definition }: DeleteDialogProps) {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+
+  const deleteMutation = useMutation({
+    mutationFn: () => scannerApi.deleteDefinition(definition.id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scanner-definitions'] })
+      onOpenChange(false)
+    },
+    onError: (err: unknown) => {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : ((err as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+            'Delete failed')
+      setError(msg)
+    },
+  })
+
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete &quot;{definition.name}&quot;?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This removes the custom definition and its parameter overrides. Built-in definitions
+            cannot be deleted.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {error && <p className="text-sm text-destructive px-1">{error}</p>}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleteMutation.isPending}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={(e) => {
+              e.preventDefault()
+              deleteMutation.mutate()
+            }}
+            disabled={deleteMutation.isPending}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+          >
+            {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Definition card with toggle
 // ---------------------------------------------------------------------------
 
@@ -233,6 +310,7 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
   const queryClient = useQueryClient()
   const [optimisticEnabled, setOptimisticEnabled] = useState(def.enabled)
   const [cloneOpen, setCloneOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
 
   useEffect(() => {
     setOptimisticEnabled(def.enabled)
@@ -260,6 +338,7 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
       : 'border-red-500/30 bg-red-500/5'
     : 'border-muted bg-muted/20 opacity-60'
   const badgeVariant = isBuy ? 'default' : 'destructive'
+  const isClone = def.parent_definition_id !== null
 
   return (
     <>
@@ -271,6 +350,11 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
                 className={`h-5 w-5 shrink-0 ${isBuy ? 'text-green-500' : 'text-red-500'} ${!optimisticEnabled ? 'opacity-50' : ''}`}
               />
               <CardTitle className="text-base truncate">{def.name}</CardTitle>
+              {isClone && (
+                <Badge variant="outline" className="text-xs text-muted-foreground shrink-0">
+                  custom
+                </Badge>
+              )}
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <Tooltip>
@@ -287,6 +371,22 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
                 </TooltipTrigger>
                 <TooltipContent side="top">Clone definition</TooltipContent>
               </Tooltip>
+              {isClone && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 text-destructive hover:text-destructive"
+                      onClick={() => setDeleteOpen(true)}
+                      aria-label={`Delete ${def.name}`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">Delete definition</TooltipContent>
+                </Tooltip>
+              )}
               <Switch
                 checked={optimisticEnabled}
                 onCheckedChange={() => toggleMutation.mutate()}
@@ -349,6 +449,7 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
         </CardContent>
       </Card>
       <CloneDialog open={cloneOpen} onOpenChange={setCloneOpen} source={def} />
+      <DeleteDialog open={deleteOpen} onOpenChange={setDeleteOpen} definition={def} />
     </>
   )
 }

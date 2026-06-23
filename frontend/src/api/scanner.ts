@@ -53,6 +53,7 @@ export interface ScanDefinitionSummary {
   updated_at: string
   latest_signals: Omit<ScanSignal, 'notes'>[]
   today_hit_count: number
+  parent_definition_id: number | null
 }
 
 export interface ScanDefinitionDetail {

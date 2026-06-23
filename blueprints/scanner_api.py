@@ -144,6 +144,7 @@ def list_definitions():
                     "updated_at": d.updated_at,
                     "latest_signals": latest_signals,
                     "today_hit_count": today_count,
+                    "parent_definition_id": d.parent_definition_id,
                 }
             )
 
