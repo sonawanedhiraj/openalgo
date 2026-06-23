@@ -1116,7 +1116,20 @@ class ScannerService:
                 )
                 continue
             try:
-                matched = bool(rule_fn(bars, indicators_dict))
+                raw_params = definition.get("parameters_json")
+                if raw_params:
+                    try:
+                        params = (
+                            json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                        )
+                    except (ValueError, TypeError):
+                        params = {}
+                else:
+                    params = {}
+                eff_indicators = (
+                    {**indicators_dict, "parameters": params} if params else indicators_dict
+                )
+                matched = bool(rule_fn(bars, eff_indicators))
             except Exception:
                 logger.exception(
                     "ScannerService: rule %r raised for %s/%s",

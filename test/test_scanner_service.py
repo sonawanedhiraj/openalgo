@@ -942,3 +942,86 @@ def test_completeness_disabled_does_not_record(monkeypatch, fresh_scanner_db):
     bar = _seed_matching_buy(svc)
     svc._on_bar_close("RELIANCE", "5m", bar)
     assert svc._completeness_window_syms == set()
+
+
+# ---------------------------------------------------------------------------
+# Chunk C — rule parameterisation via indicators["parameters"]
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_definitions_injects_params_into_indicators(fresh_scanner_db):
+    """A definition with parameters_json passes a 'parameters' key to the rule."""
+    captured = {}
+
+    @scanner_service.scan_rule(
+        "_test_capture_params", "buy", "test-only: captures the indicators dict"
+    )
+    def _capture_params(bars, indicators):
+        captured["parameters"] = indicators.get("parameters")
+        return False  # never fires a hit; we only care about what is passed in
+
+    scanner_service.create_scan_definition(
+        name="parameterised_def",
+        screener_type="buy",
+        expression_json=None,
+        rule_module="_test_capture_params",
+        enabled=True,
+        parameters_json='{"gap_pct": 1.5}',
+    )
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    bar = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 100.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+    svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert captured.get("parameters") == {"gap_pct": 1.5}
+
+
+def test_evaluate_definitions_no_params_key_when_parameters_json_empty(fresh_scanner_db):
+    """A definition without parameters_json reuses indicators_dict unchanged (no 'parameters' key)."""
+    captured = {}
+
+    @scanner_service.scan_rule(
+        "_test_capture_no_params", "buy", "test-only: captures indicators when no params"
+    )
+    def _capture_no_params(bars, indicators):
+        captured["has_parameters"] = "parameters" in indicators
+        return False
+
+    scanner_service.create_scan_definition(
+        name="unparameterised_def",
+        screener_type="buy",
+        expression_json=None,
+        rule_module="_test_capture_no_params",
+        enabled=True,
+        parameters_json=None,
+    )
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    bar = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 100.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+    svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert captured.get("has_parameters") is False
