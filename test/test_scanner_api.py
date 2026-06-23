@@ -437,3 +437,261 @@ def test_list_definitions_enabled_flag_correct_for_both_states(client):
     by_id = {d["id"]: d for d in data}
     assert by_id[did_on]["enabled"] is True
     assert by_id[did_off]["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: GET /scanner/api/definitions/<id>  (single definition)
+# ---------------------------------------------------------------------------
+
+
+def test_get_single_definition(client):
+    """GET /scanner/api/definitions/<id> returns 200 with correct shape including Tier-3 fields."""
+    tc, sdb = client
+    did = _add_definition(sdb, "single_def", "buy", rule_module="services.scan_rules.fno_buy")
+
+    res = tc.get(f"/scanner/api/definitions/{did}")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert data["id"] == did
+    assert data["name"] == "single_def"
+    assert data["screener_type"] == "buy"
+    assert data["rule_module"] == "services.scan_rules.fno_buy"
+    assert data["enabled"] is True
+    # Tier-3 fields must be present
+    assert "parameters_json" in data
+    assert "parent_definition_id" in data
+    assert data["parameters_json"] is None
+    assert data["parent_definition_id"] is None
+
+
+def test_get_single_definition_not_found(client):
+    """GET /scanner/api/definitions/999 returns 404."""
+    tc, _sdb = client
+    res = tc.get("/scanner/api/definitions/999")
+    assert res.status_code == 404
+    assert res.get_json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: POST /scanner/api/definitions/<id>/clone
+# ---------------------------------------------------------------------------
+
+
+def test_clone_definition(client):
+    """POST .../clone creates new row; response has id and name; new row has correct parent_definition_id."""
+    tc, sdb = client
+    did = _add_definition(sdb, "base_for_clone", "buy")
+
+    res = tc.post(
+        f"/scanner/api/definitions/{did}/clone",
+        data=json.dumps({"name": "my_clone"}),
+        content_type="application/json",
+    )
+    assert res.status_code == 201
+    body = res.get_json()
+    assert body["status"] == "success"
+    assert body["data"]["name"] == "my_clone"
+    new_id = body["data"]["id"]
+    assert new_id != did
+
+    # Verify the clone is retrievable and has the correct parent
+    res2 = tc.get(f"/scanner/api/definitions/{new_id}")
+    assert res2.status_code == 200
+    clone_data = res2.get_json()["data"]
+    assert clone_data["parent_definition_id"] == did
+    assert clone_data["screener_type"] == "buy"
+
+
+def test_clone_duplicate_name_returns_409(client):
+    """Cloning with an existing name returns 409."""
+    tc, sdb = client
+    did = _add_definition(sdb, "orig_for_dup", "buy")
+    _add_definition(sdb, "dup_name", "buy")
+
+    res = tc.post(
+        f"/scanner/api/definitions/{did}/clone",
+        data=json.dumps({"name": "dup_name"}),
+        content_type="application/json",
+    )
+    assert res.status_code == 409
+    assert res.get_json()["status"] == "error"
+
+
+def test_clone_missing_name_returns_400(client):
+    """Cloning without a name field returns 400."""
+    tc, sdb = client
+    did = _add_definition(sdb, "no_name_base", "buy")
+
+    res = tc.post(
+        f"/scanner/api/definitions/{did}/clone",
+        data=json.dumps({}),
+        content_type="application/json",
+    )
+    assert res.status_code == 400
+    assert res.get_json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: PUT /scanner/api/definitions/<id>/params
+# ---------------------------------------------------------------------------
+
+
+def test_update_params_on_clone(client):
+    """PUT .../params with a dict updates parameters_json on a cloned row."""
+    tc, sdb = client
+    base_id = _add_definition(sdb, "base_for_params", "buy")
+
+    # First clone it
+    clone_res = tc.post(
+        f"/scanner/api/definitions/{base_id}/clone",
+        data=json.dumps({"name": "params_clone"}),
+        content_type="application/json",
+    )
+    clone_id = clone_res.get_json()["data"]["id"]
+
+    # Now update params
+    params = {"threshold": 1.5, "volume_mult": 2.0}
+    res = tc.put(
+        f"/scanner/api/definitions/{clone_id}/params",
+        data=json.dumps({"parameters_json": params}),
+        content_type="application/json",
+    )
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["status"] == "success"
+    assert body["data"]["id"] == clone_id
+
+    # Verify via GET
+    get_res = tc.get(f"/scanner/api/definitions/{clone_id}")
+    clone_data = get_res.get_json()["data"]
+    assert clone_data["parameters_json"] == json.dumps(params)
+
+
+def test_update_params_on_code_backed_returns_403(client):
+    """PUT on a code-backed row (parent_definition_id IS NULL) returns 403."""
+    tc, sdb = client
+    did = _add_definition(sdb, "code_backed_put", "buy")  # parent_definition_id is NULL
+
+    res = tc.put(
+        f"/scanner/api/definitions/{did}/params",
+        data=json.dumps({"parameters_json": {"x": 1}}),
+        content_type="application/json",
+    )
+    assert res.status_code == 403
+    assert res.get_json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: DELETE /scanner/api/definitions/<id>
+# ---------------------------------------------------------------------------
+
+
+def test_delete_clone(client):
+    """DELETE on a cloned row returns 200 and the row is gone from the list."""
+    tc, sdb = client
+    base_id = _add_definition(sdb, "base_for_delete", "buy")
+
+    clone_res = tc.post(
+        f"/scanner/api/definitions/{base_id}/clone",
+        data=json.dumps({"name": "delete_me"}),
+        content_type="application/json",
+    )
+    clone_id = clone_res.get_json()["data"]["id"]
+
+    res = tc.delete(f"/scanner/api/definitions/{clone_id}")
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["status"] == "success"
+    assert body["data"]["id"] == clone_id
+
+    # Verify it's gone
+    get_res = tc.get(f"/scanner/api/definitions/{clone_id}")
+    assert get_res.status_code == 404
+
+
+def test_delete_code_backed_returns_403(client):
+    """DELETE on a code-backed row (parent_definition_id IS NULL) returns 403."""
+    tc, sdb = client
+    did = _add_definition(sdb, "code_backed_del", "buy")
+
+    res = tc.delete(f"/scanner/api/definitions/{did}")
+    assert res.status_code == 403
+    assert res.get_json()["status"] == "error"
+
+
+def test_delete_with_children_returns_409(client):
+    """DELETE on a row that has children returns 409."""
+    tc, sdb = client
+    base_id = _add_definition(sdb, "base_with_children", "buy")
+
+    # Create a clone (child of base)
+    clone_res = tc.post(
+        f"/scanner/api/definitions/{base_id}/clone",
+        data=json.dumps({"name": "child_clone"}),
+        content_type="application/json",
+    )
+    child_id = clone_res.get_json()["data"]["id"]
+
+    # Now create a grandchild (child of clone) so clone has children
+    tc.post(
+        f"/scanner/api/definitions/{child_id}/clone",
+        data=json.dumps({"name": "grandchild_clone"}),
+        content_type="application/json",
+    )
+
+    # Attempt to delete the child (which now has a grandchild)
+    res = tc.delete(f"/scanner/api/definitions/{child_id}")
+    assert res.status_code == 409
+    assert res.get_json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: auth check — all 4 new endpoints require a logged-in session
+# ---------------------------------------------------------------------------
+
+
+def test_all_new_endpoints_require_auth(monkeypatch, tmp_path):
+    """All 4 new Tier-3 endpoints return 401 when no user is in the session."""
+    sdb, sess = _rebind_scanner_db(monkeypatch, tmp_path)
+
+    monkeypatch.setattr("utils.session.is_session_valid", lambda: True)
+
+    from blueprints.scanner_api import scanner_api_bp
+
+    monkeypatch.setattr("blueprints.scanner_api.db_session", sess)
+
+    app = Flask(__name__)
+    app.config["TESTING"] = True
+    app.config["SECRET_KEY"] = "test-key-auth"  # pragma: allowlist secret
+    app.register_blueprint(scanner_api_bp)
+
+    # Seed a definition so the routes can be exercised (id=1 expected)
+    did = _add_definition(sdb, "auth_test_def", "buy")
+
+    with app.test_client() as tc:
+        # No session user injected — session is empty
+
+        endpoints = [
+            ("GET", f"/scanner/api/definitions/{did}"),
+            ("POST", f"/scanner/api/definitions/{did}/clone"),
+            ("PUT", f"/scanner/api/definitions/{did}/params"),
+            ("DELETE", f"/scanner/api/definitions/{did}"),
+        ]
+        for method, url in endpoints:
+            if method == "GET":
+                res = tc.get(url)
+            elif method == "POST":
+                res = tc.post(url, data=json.dumps({"name": "x"}), content_type="application/json")
+            elif method == "PUT":
+                res = tc.put(
+                    url,
+                    data=json.dumps({"parameters_json": None}),
+                    content_type="application/json",
+                )
+            else:
+                res = tc.delete(url)
+            assert res.status_code == 401, f"{method} {url} expected 401, got {res.status_code}"
+
+    sess.remove()
