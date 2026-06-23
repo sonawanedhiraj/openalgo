@@ -2,6 +2,7 @@
   "strategy": "simplified_engine",
   "snapshot_date": "2026-05-21",
   "version": "v1.1",
+  "deployable": true,
   "source": "SIMPLIFIED_ENGINE_* env vars",
   "config": {
     "mode": "sandbox",
