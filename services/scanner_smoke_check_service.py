@@ -148,9 +148,9 @@ def production_universe_provider() -> list[str]:
 def production_notifier(message: str) -> None:
     """Telegram CRIT via the existing notification_service. Fail-safe."""
     try:
-        from services.notification_service import notify
+        from services.notification_service import get_notification_service
 
-        notify("scanner_smoke_check_fail", message)
+        get_notification_service().notify("scanner_smoke_check_fail", message)
     except Exception:
         logger.exception("scanner smoke-check Telegram notify failed")
 
