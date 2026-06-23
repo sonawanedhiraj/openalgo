@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
 
-from services.data_freshness_service import connect_historify_readonly
 from utils.logging import get_logger
 
 # Initialize logger
@@ -879,7 +878,7 @@ def get_ohlcv(
 
         query += " ORDER BY timestamp ASC"
 
-        with connect_historify_readonly(get_db_path()) as conn:
+        with get_connection() as conn:
             result = conn.execute(query, params).fetchdf()
 
         return result
@@ -1027,7 +1026,7 @@ def _get_aggregated_ohlcv(
             ORDER BY timestamp ASC
         """
 
-        with connect_historify_readonly(get_db_path()) as conn:
+        with get_connection() as conn:
             result = conn.execute(query, params).fetchdf()
 
         return result
@@ -1152,7 +1151,7 @@ def _get_daily_aggregated_ohlcv(
             ORDER BY timestamp ASC
         """
 
-        with connect_historify_readonly(get_db_path()) as conn:
+        with get_connection() as conn:
             result = conn.execute(query, params).fetchdf()
 
         return result
