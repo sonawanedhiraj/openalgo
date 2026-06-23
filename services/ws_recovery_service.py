@@ -95,7 +95,7 @@ def _normalize_ts(value: Any) -> dt.datetime | None:
         ):
             try:
                 return parser(value)
-            except Exception:
+            except Exception:  # nosec B112 — intentional: try multiple parsers
                 continue
     return None
 
@@ -363,7 +363,7 @@ class WSRecoveryService:
             "gap_minutes": gap_min,
         }
         self._notifier(self._format_alert(summary))
-        logger.info("WS recovery complete: %s", summary)
+        logger.info("WS recovery complete: %r", summary)
         return summary
 
     @staticmethod
