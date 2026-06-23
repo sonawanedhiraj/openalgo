@@ -252,6 +252,8 @@ def create_scan_definition(
     expression_json: str | dict | list | None = None,
     rule_module: str | None = None,
     enabled: bool = True,
+    parameters_json: str | dict | None = None,
+    parent_definition_id: int | None = None,
 ) -> int:
     """Insert a scan definition and return its id.
 
@@ -260,6 +262,9 @@ def create_scan_definition(
     rules that live entirely in ``rule_module``; the column stores an
     empty JSON object in that case so the NOT NULL constraint is satisfied
     without callers needing to know.
+
+    ``parameters_json`` — optional Tier-3 override dict (or JSON string).
+    ``parent_definition_id`` — optional Tier-3 FK to the source definition.
 
     Raises ``IntegrityError`` on duplicate name.
     """
@@ -273,6 +278,13 @@ def create_scan_definition(
     else:
         encoded_expression = json.dumps(expression_json)
 
+    if parameters_json is None:
+        encoded_params = None
+    elif isinstance(parameters_json, str):
+        encoded_params = parameters_json
+    else:
+        encoded_params = json.dumps(parameters_json)
+
     now = _now_iso()
     sess = _session()
     try:
@@ -284,6 +296,8 @@ def create_scan_definition(
             enabled=1 if enabled else 0,
             created_at=now,
             updated_at=now,
+            parameters_json=encoded_params,
+            parent_definition_id=parent_definition_id,
         )
         sess.add(row)
         sess.commit()

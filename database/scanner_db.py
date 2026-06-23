@@ -34,8 +34,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    text,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import scoped_session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -69,6 +70,11 @@ class ScanDefinition(Base):
     enabled = Column(Integer, nullable=False, default=1)
     created_at = Column(String(40), nullable=False)
     updated_at = Column(String(40), nullable=False)
+    # Tier-3: parameter overrides (nullable — NULL means use rule defaults).
+    parameters_json = Column(Text, nullable=True)
+    # Tier-3: FK reference to the source row this was cloned from (unenforced at
+    # the SQLite layer); NULL = code-backed / built-in definition.
+    parent_definition_id = Column(Integer, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("name", name="uq_scan_definitions_name"),
@@ -94,11 +100,41 @@ class ScanResult(Base):
     )
 
 
+def _migrate_scan_definitions() -> None:
+    """Add Tier-3 columns to scan_definitions on existing databases (idempotent).
+
+    ``Base.metadata.create_all`` only creates tables that don't exist yet; it
+    never alters existing tables. This function runs ``ALTER TABLE … ADD COLUMN``
+    for each new column, catching the ``OperationalError`` that SQLite raises
+    when the column already exists so that the function is safe to call on both
+    fresh and pre-existing databases.
+    """
+    new_columns = [
+        ("parameters_json", "TEXT"),
+        ("parent_definition_id", "INTEGER"),
+    ]
+    try:
+        with engine.begin() as conn:
+            for col_name, col_type in new_columns:
+                try:
+                    conn.execute(
+                        text(f"ALTER TABLE scan_definitions ADD COLUMN {col_name} {col_type}")  # noqa: S608
+                    )
+                except OperationalError as exc:
+                    if "duplicate column name" in str(exc).lower():
+                        pass  # already present — idempotent
+                    else:
+                        raise
+    except Exception:
+        logger.debug("_migrate_scan_definitions: table may not exist yet (fresh DB)", exc_info=True)
+
+
 def init_db():
     """Create scan_definitions + scan_results tables if missing. Idempotent."""
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Scanner DB", logger)
+    _migrate_scan_definitions()
 
 
 def _now_iso() -> str:
@@ -115,6 +151,8 @@ def _definition_to_dict(row: ScanDefinition) -> dict[str, Any]:
         "enabled": bool(row.enabled),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
+        "parameters_json": row.parameters_json,
+        "parent_definition_id": row.parent_definition_id,
     }
 
 
