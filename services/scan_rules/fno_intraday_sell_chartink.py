@@ -128,6 +128,16 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     bars_daily = indicators.get("bars_daily")
     bars_weekly = indicators.get("bars_weekly")
 
+    # --- Three-tier parameter resolution: parameters dict → env var → default ---
+    p = indicators.get("parameters", {})
+    sell_pct = float(p.get("gap_pct", os.environ.get("CHARTINK_RULE_SELL_GAP_PCT", "3.0")))
+    atr_thresh = float(p.get("atr_pct", "5.0")) / 100.0
+    rsi_thresh = float(p.get("rsi_threshold", "50.0"))
+    st_period = int(p.get("supertrend_period", "7"))
+    st_mult = float(p.get("supertrend_mult", "3.0"))
+    price_min = float(p.get("price_min", "100.0"))
+    price_max = float(p.get("price_max", "5000.0"))
+
     # --- Warm-up guards: insufficient history rejects (does NOT skip gates) ---
     # Unlike BUY, SELL has no SMA(volume, 200) gate, so daily needs only enough
     # rows for [-1]/[-2] (post-settle) or [-2]/[-3] (pre-settle) indexing.
@@ -204,16 +214,14 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     ):
         return False
 
-    # Gate 6: daily close > 100
-    if today_d.close <= 100:
+    # Gate 6: daily close > price_min
+    if today_d.close <= price_min:
         return False
-    # Gate 12: daily close < 5000
-    if today_d.close >= 5000:
+    # Gate 12: daily close < price_max
+    if today_d.close >= price_max:
         return False
     # Gate 1: daily close < 1d-ago close * sell_mult (default 3% gap DOWN) — flipped
-    # from BUY. Threshold is read at call time from CHARTINK_RULE_SELL_GAP_PCT so
-    # changes take effect without a restart and stay aligned with the screener.
-    sell_pct = float(os.environ.get("CHARTINK_RULE_SELL_GAP_PCT", "3.0"))
+    # from BUY. Threshold is read via three-tier resolution: parameters dict → env var → default.
     sell_mult = 1.0 - sell_pct / 100.0
     if today_d.close >= yest_d.close * sell_mult:
         return False
@@ -229,24 +237,24 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if today_d.volume <= yest_d.volume:
         return False
 
-    # Gate 7: weekly ATR(21) > 5% * daily close (same as BUY).
+    # Gate 7: weekly ATR(21) > atr_thresh * daily close (same as BUY).
     # Exclude the current (potentially partial) week when we have a spare row.
     weekly_for_atr = bars_weekly.iloc[:-1] if len(bars_weekly) > 22 else bars_weekly
     weekly_atr = atr(weekly_for_atr, period=21).iloc[-1]
     if _any_nan(weekly_atr):
         return False
-    if weekly_atr <= today_d.close * 0.05:
+    if weekly_atr <= today_d.close * atr_thresh:
         return False
 
-    # Gate 5: 15m RSI(14) < 50 — flipped from BUY
+    # Gate 5: 15m RSI(14) < rsi_thresh — flipped from BUY
     rsi_15m = rsi(bars_15m["close"], period=14).iloc[-1]
     if _any_nan(rsi_15m):
         return False
-    if rsi_15m >= 50:
+    if rsi_15m >= rsi_thresh:
         return False
 
-    # Gates 3 + 4: 5m Supertrend(7, 3). [0] = iloc[-1] (current), [-1] = iloc[-2].
-    st = supertrend(bars_5m, period=7, multiplier=3.0)
+    # Gates 3 + 4: 5m Supertrend(st_period, st_mult). [0] = iloc[-1] (current), [-1] = iloc[-2].
+    st = supertrend(bars_5m, period=st_period, multiplier=st_mult)
     if len(st) < 2:
         return False
     st_now = st["line"].iloc[-1]

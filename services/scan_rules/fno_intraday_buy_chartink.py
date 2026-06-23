@@ -117,16 +117,32 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     bars_daily = indicators.get("bars_daily")
     bars_weekly = indicators.get("bars_weekly")
 
+    # --- Three-tier parameter resolution: parameters dict → env var → default ---
+    p = indicators.get("parameters", {})
+    buy_pct = float(p.get("gap_pct", os.environ.get("CHARTINK_RULE_BUY_GAP_PCT", "3.0")))
+    atr_thresh = float(p.get("atr_pct", "5.0")) / 100.0
+    vol_5m_mult = float(p.get("vol_5m_mult", "2.0"))
+    rsi_thresh = float(p.get("rsi_threshold", "50.0"))
+    st_period = int(p.get("supertrend_period", "7"))
+    st_mult = float(p.get("supertrend_mult", "3.0"))
+    price_min = float(p.get("price_min", "100.0"))
+    price_max = float(p.get("price_max", "5000.0"))
+    vol_sma_s = int(p.get("vol_sma_short", "50"))
+    vol_sma_l = int(p.get("vol_sma_long", "200"))
+
     # --- Warm-up guards: insufficient history rejects (does NOT skip gates) ---
-    # Daily needs 200 rows for SMA(volume, 200) and >=2 rows for [-1]/[-2] indexing.
+    # Daily needs vol_sma_l rows for SMA(volume, vol_sma_l) and >=2 rows for [-1]/[-2] indexing.
     # Tier-1 Fix #2: a None frame (data missing) is WARNING; a short-but-present
     # frame (warm-up) is DEBUG, so the loud signal is specifically "no data".
     sym = indicators.get("symbol", "?")
     if bars_daily is None:
         return _reject_missing(sym, "bars_daily is None (no daily-D data)")
-    if len(bars_daily) < 200:
+    if len(bars_daily) < vol_sma_l:
         logger.debug(
-            "fno_intraday_buy_chartink %s: daily warm-up (%d<200 rows)", sym, len(bars_daily)
+            "fno_intraday_buy_chartink %s: daily warm-up (%d<%d rows)",
+            sym,
+            len(bars_daily),
+            vol_sma_l,
         )
         return False
     if bars_weekly is None:
@@ -190,16 +206,14 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     ):
         return False
 
-    # Gate 6: daily close > 100
-    if today_d.close <= 100:
+    # Gate 6: daily close > price_min
+    if today_d.close <= price_min:
         return False
-    # Gate 12: daily close < 5000
-    if today_d.close >= 5000:
+    # Gate 12: daily close < price_max
+    if today_d.close >= price_max:
         return False
     # Gate 1: daily close > 1d-ago close * buy_mult (default 3% gap). Threshold is
-    # read at call time from CHARTINK_RULE_BUY_GAP_PCT so changes take effect
-    # without a restart and stay aligned with the Chartink screener formula.
-    buy_pct = float(os.environ.get("CHARTINK_RULE_BUY_GAP_PCT", "3.0"))
+    # read via three-tier resolution: parameters dict → env var → hardcoded default.
     buy_mult = 1.0 + buy_pct / 100.0
     if today_d.close <= yest_d.close * buy_mult:
         return False
@@ -211,9 +225,9 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if today_d.open <= pivot:
         return False
 
-    # Gates 2 + 8: daily volume vs SMA(50) and SMA(200)
-    sma_vol_50 = sma(bars_daily["volume"], 50).iloc[today_idx]
-    sma_vol_200 = sma(bars_daily["volume"], 200).iloc[today_idx]
+    # Gates 2 + 8: daily volume vs SMA(vol_sma_s) and SMA(vol_sma_l)
+    sma_vol_50 = sma(bars_daily["volume"], vol_sma_s).iloc[today_idx]
+    sma_vol_200 = sma(bars_daily["volume"], vol_sma_l).iloc[today_idx]
     if _any_nan(sma_vol_50, sma_vol_200):
         return False
     if today_d.volume <= sma_vol_50:
@@ -221,32 +235,32 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if today_d.volume <= sma_vol_200:
         return False
 
-    # Gate 7: weekly ATR(21) > 5% * daily close.
+    # Gate 7: weekly ATR(21) > atr_thresh * daily close.
     # Exclude the current (potentially partial) week when we have a spare row.
     weekly_for_atr = bars_weekly.iloc[:-1] if len(bars_weekly) > 22 else bars_weekly
     weekly_atr = atr(weekly_for_atr, period=21).iloc[-1]
     if _any_nan(weekly_atr):
         return False
-    if weekly_atr <= today_d.close * 0.05:
+    if weekly_atr <= today_d.close * atr_thresh:
         return False
 
-    # Gate 13: 5m volume > 2 * SMA(5m vol, 10)
+    # Gate 13: 5m volume > vol_5m_mult * SMA(5m vol, 10)
     sma_5m_vol_10 = sma(bars_5m["volume"], 10).iloc[-1]
     last_5m_vol = bars_5m["volume"].iloc[-1]
     if _any_nan(sma_5m_vol_10, last_5m_vol):
         return False
-    if last_5m_vol <= sma_5m_vol_10 * 2.0:
+    if last_5m_vol <= sma_5m_vol_10 * vol_5m_mult:
         return False
 
-    # Gate 5: 15m RSI(14) > 50
+    # Gate 5: 15m RSI(14) > rsi_thresh
     rsi_15m = rsi(bars_15m["close"], period=14).iloc[-1]
     if _any_nan(rsi_15m):
         return False
-    if rsi_15m <= 50:
+    if rsi_15m <= rsi_thresh:
         return False
 
-    # Gates 3 + 4: 5m Supertrend(7, 3). [0] = iloc[-1] (current), [-1] = iloc[-2].
-    st = supertrend(bars_5m, period=7, multiplier=3.0)
+    # Gates 3 + 4: 5m Supertrend(st_period, st_mult). [0] = iloc[-1] (current), [-1] = iloc[-2].
+    st = supertrend(bars_5m, period=st_period, multiplier=st_mult)
     if len(st) < 2:
         return False
     st_now = st["line"].iloc[-1]
