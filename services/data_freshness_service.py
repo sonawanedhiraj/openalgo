@@ -93,7 +93,8 @@ def is_transient_lock_error(exc: BaseException) -> bool:
 
     Covers the in-process instance-cache config mismatch (the live app holds
     ``historify.duckdb`` open read-write while a backfill thread opens it
-    read-only) and the classic file-lock messages a *separate* process hits.
+    read-only), the classic file-lock messages a *separate* process hits, and
+    the attach-conflict surfaced when a read query tries to re-attach the file.
     """
     msg = str(exc).lower()
     return (
@@ -101,10 +102,11 @@ def is_transient_lock_error(exc: BaseException) -> bool:
         or "could not set lock" in msg
         or "conflicting lock" in msg
         or "being used by another process" in msg
+        or "unique file handle conflict" in msg
     )
 
 
-def connect_historify_readonly(duckdb_path: str):
+def connect_historify_readonly(duckdb_path: str, max_retries: int = 3):
     """Open historify for a read-only query, tolerant of an existing read-write
     connection held elsewhere in **this** process.
 
@@ -117,23 +119,77 @@ def connect_historify_readonly(duckdb_path: str):
     lock-warning spam.
 
     Strategy: try ``read_only=True`` first (the cross-process-friendly path when no
-    writer is attached); on that specific config-mismatch error, fall back to a
-    default (config-matching) connect that reuses the already-open shared instance
-    — the read-only SELECT still succeeds. The caller still closes the returned
-    connection as usual.
+    writer is attached); on ANY transient lock error (config mismatch, OS file
+    lock, attach conflict — see ``is_transient_lock_error``), fall back to a
+    default (config-matching) connect that reuses the already-open shared instance.
+    If the fallback also hits transient contention, retry with brief backoff so
+    the in-flight write/read window has a chance to clear. The caller still closes
+    the returned connection as usual.
+
+    Args:
+        duckdb_path: Path to the DuckDB file.
+        max_retries: Total attempts for the fallback connect under contention
+            (default 3 → 100ms, 200ms, 300ms backoff).
+
+    Raises:
+        Whatever the final DuckDB exception is if all attempts fail.
+
+    History:
+        - PR #118 added the original fallback (only caught ``ConnectionException``
+          with text "different configuration").
+        - This PR (#126) broadens the catch to include ``IOException`` and
+          ``BinderException`` (gated by ``is_transient_lock_error``) and adds
+          retry+backoff for cases where the fallback ALSO transiently fails.
     """
+    import time
+
     import duckdb
 
+    # First attempt: cross-process-friendly read_only=True.
     try:
         return duckdb.connect(duckdb_path, read_only=True)
-    except duckdb.ConnectionException as e:
-        if "different configuration" not in str(e):
+    except (
+        duckdb.ConnectionException,
+        duckdb.IOException,
+        duckdb.BinderException,
+    ) as e:
+        if not is_transient_lock_error(e):
             raise
+        first_err = e
         logger.info(
-            "historify already open read-write in this process; reusing the shared "
-            "connection for a read-only query (read_only mode unavailable)"
+            "historify read_only open conflict (%s); falling back to shared "
+            "connection for read-only query",
+            type(e).__name__,
         )
-        return duckdb.connect(duckdb_path)
+
+    # Fallback path with retry: open with default config, reusing the
+    # already-open shared in-process instance. Retry briefly because under
+    # heavy contention the default-config open can ALSO surface a transient
+    # OS-level file lock before the in-process instance cache returns its
+    # handle.
+    last_err: BaseException = first_err
+    for attempt in range(max_retries):
+        try:
+            return duckdb.connect(duckdb_path)
+        except (
+            duckdb.ConnectionException,
+            duckdb.IOException,
+            duckdb.BinderException,
+        ) as e:
+            if not is_transient_lock_error(e):
+                raise
+            last_err = e
+            if attempt < max_retries - 1:
+                backoff_s = 0.1 * (attempt + 1)
+                logger.debug(
+                    "historify fallback connect attempt %d/%d failed (%s); retrying after %.1fs",
+                    attempt + 1,
+                    max_retries,
+                    type(e).__name__,
+                    backoff_s,
+                )
+                time.sleep(backoff_s)
+    raise last_err
 
 
 # --------------------------------------------------------------------------- #
