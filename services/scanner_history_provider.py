@@ -79,8 +79,11 @@ class ScannerHistoryProvider:
         sym = symbol.upper()
         with self._lock:
             frame = cache.get(sym)
-            if frame is not None:
-                return frame if not frame.empty else None
+            if frame is not None and not frame.empty:
+                return frame
+            # Empty sentinel (pd.DataFrame()) or absent — fall through to lazy-load.
+            # An empty sentinel means refresh() ran before backfill wrote DuckDB rows.
+            # Re-attempting the fetch lets the provider self-heal once data arrives.
 
         # Lazy-load a symbol that was not pre-configured / not yet cached.
         logger.info(

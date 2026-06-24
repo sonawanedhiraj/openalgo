@@ -10,6 +10,7 @@ Covers:
 
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 from apscheduler.triggers.cron import CronTrigger
 
 import services.scanner_history_provider as shp
@@ -17,6 +18,25 @@ from services.historify_scheduler_service import (
     HistorifyScheduler,
     refresh_scanner_history,
 )
+from services.scanner_history_provider import ScannerHistoryProvider
+
+_OHLCV_COLS = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
+
+
+def _make_frame(n: int, base: float = 100.0) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "timestamp": [1_700_000_000 + i * 86_400 for i in range(n)],
+            "open": [base + i for i in range(n)],
+            "high": [base + i + 1 for i in range(n)],
+            "low": [base + i - 1 for i in range(n)],
+            "close": [base + i + 0.5 for i in range(n)],
+            "volume": [1_000 + i for i in range(n)],
+            "oi": [0 for _ in range(n)],
+        },
+        columns=_OHLCV_COLS,
+    )
+
 
 # --------------------------------------------------------------- boot warm-up
 
@@ -110,3 +130,50 @@ def test_register_scanner_history_job_gate_off(monkeypatch):
     sched._register_scanner_history_job()
 
     sched._scheduler.add_job.assert_not_called()
+
+
+def test_boot_warmup_before_backfill_completes_leaves_provider_empty(monkeypatch):
+    """Documents boot-ordering: warmup refresh runs before backfill, leaving provider
+    in empty-sentinel state. Post-fix, lazy-load recovers when data arrives.
+
+    Full boot sequence:
+      1. app.py boots → scanner_backfill_scheduler submits D download (async, no rows yet)
+      2. app.py boots → run_boot_warmup() → refresh() → DuckDB empty → sentinels
+      3. [later] backfill download completes → DuckDB now has rows
+      4. scanner fires on bar-close → get_daily() → lazy-load → returns data  ← FIX
+
+    PRE-FIX: step 4 returns None — sentinel permanently blocks the lazy-load path.
+    POST-FIX: step 4 lazy-loads from DuckDB and returns real data.
+    """
+    backfill_done = [False]
+
+    def fetch(*, symbol, exchange, interval, start_timestamp, end_timestamp):
+        if backfill_done[0]:
+            return _make_frame(300 if interval == "D" else 40)
+        return pd.DataFrame()
+
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", fetch)
+
+    # Steps 1+2: provider created + warmup refresh before backfill completes
+    provider = ScannerHistoryProvider(["HDFCBANK", "ICICIBANK"], daily_lookback_bars=205)
+    provider.refresh()  # simulates run_boot_warmup() → refresh()
+
+    # Provider is in empty-sentinel state immediately after warmup
+    assert provider.get_cache_status()["daily_rows_total"] == 0
+    assert provider.get_daily("HDFCBANK") is None  # still no data in DuckDB
+
+    # Step 3: backfill download completes
+    backfill_done[0] = True
+
+    # Step 4: scanner calls get_daily() — must lazy-load successfully (post-fix)
+    result = provider.get_daily("HDFCBANK")
+    assert result is not None, (
+        "boot-ordering race: warmup refresh stores empty sentinels before backfill; "
+        "post-fix the next get_daily() call lazy-loads from the now-populated DuckDB"
+    )
+    assert len(result) == 205
+
+    # Second symbol in the list must also self-heal via lazy-load
+    result2 = provider.get_daily("ICICIBANK")
+    assert result2 is not None
+    assert len(result2) == 205
