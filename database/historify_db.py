@@ -25,7 +25,8 @@ logger = get_logger(__name__)
 
 # Write lock to serialize DuckDB writes and prevent Windows file locking conflicts
 # DuckDB doesn't handle concurrent writes well on Windows; this serializes write ops
-_write_lock = threading.Lock()
+# Use RLock (reentrant) to allow same thread to acquire multiple times (for nested calls)
+_write_lock = threading.RLock()
 
 
 def _synchronized_write(func):
