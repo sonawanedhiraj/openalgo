@@ -115,6 +115,73 @@ def test_error_on_one_symbol_captured_others_load(monkeypatch):
     assert p.get_daily("INFY") is not None
 
 
+def test_empty_sentinel_blocks_lazy_load_after_data_arrives(monkeypatch):
+    """Empty cache sentinel must NOT permanently block lazy-load once backfill arrives.
+
+    Race: refresh() runs while DuckDB has no rows → pd.DataFrame() sentinel stored.
+    Backfill completes → data lands in DuckDB. The next get_daily() call must
+    lazy-load that fresh data rather than returning None forever.
+
+    PRE-FIX: returns None (non-None empty DF short-circuits the lazy-load path).
+    POST-FIX: falls through to lazy-load and returns real data.
+    """
+    backfill_done = [False]
+
+    def fetch(*, symbol, exchange, interval, start_timestamp, end_timestamp):
+        if backfill_done[0]:
+            return _make_frame(300 if interval == "D" else 40)
+        return pd.DataFrame()
+
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", fetch)
+    p = ScannerHistoryProvider(["SBIN"], daily_lookback_bars=205)
+
+    # refresh() while DuckDB has no data → empty sentinel stored for SBIN
+    p.refresh()
+    assert p.get_cache_status()["daily_rows_total"] == 0
+
+    # Backfill completes — data is now in DuckDB
+    backfill_done[0] = True
+
+    # Must lazy-load without an explicit second refresh()
+    result = p.get_daily("SBIN")
+    assert result is not None, (
+        "empty sentinel must not permanently block lazy-load; "
+        "post-fix the cache falls through to _fetch when the stored frame is empty"
+    )
+    assert len(result) == 205
+
+
+def test_second_refresh_cures_empty_sentinel(monkeypatch):
+    """An explicit refresh() after backfill overwrites empty sentinels with real data.
+
+    Documents that refresh() is the pre-fix escape hatch. Post-fix, lazy-load makes
+    an explicit second refresh() unnecessary — but it must still work when called.
+    Both pre-fix and post-fix should PASS this test; the regression tests above
+    (test_empty_sentinel_blocks_lazy_load_after_data_arrives) catch the pre-fix gap.
+    """
+    data_ready = [False]
+
+    def fetch(*, symbol, exchange, interval, start_timestamp, end_timestamp):
+        if data_ready[0]:
+            return _make_frame(300 if interval == "D" else 40)
+        return pd.DataFrame()
+
+    monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", fetch)
+    p = ScannerHistoryProvider(["SBIN"], daily_lookback_bars=205)
+
+    # First refresh with empty DuckDB → sentinel
+    p.refresh()
+    assert p.get_daily("SBIN") is None
+
+    # Backfill arrives; second explicit refresh()
+    data_ready[0] = True
+    p.refresh()
+
+    result = p.get_daily("SBIN")
+    assert result is not None, "second refresh() after backfill must overwrite empty sentinel"
+    assert len(result) == 205
+
+
 def test_concurrent_reads_during_refresh(monkeypatch):
     monkeypatch.setattr("services.scanner_history_provider.historify_db.get_ohlcv", _fake_get_ohlcv)
     p = ScannerHistoryProvider(["SBIN", "INFY", "TCS", "WIPRO"])
