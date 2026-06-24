@@ -162,9 +162,10 @@ from websocket_proxy.app_integration import start_websocket_proxy
 logger = get_logger(__name__)
 
 
-def create_app():
+def create_app(testing: bool = False):
     # Initialize Flask application
     app = Flask(__name__)
+    app.config["TESTING"] = testing
 
     # Initialize SocketIO
     socketio.init_app(app)  # Link SocketIO to the Flask app
@@ -432,14 +433,15 @@ def create_app():
         csrf.exempt(app.view_functions["health_bp.simple_health"])
         csrf.exempt(app.view_functions["health_bp.detailed_health_check"])
 
-        # Initialize latency monitoring (after registering API blueprint)
-        init_latency_monitoring(app)
+        if not testing:
+            # Initialize latency monitoring (after registering API blueprint)
+            init_latency_monitoring(app)
 
-        # Initialize health monitoring (background daemon thread)
-        init_health_monitoring(app)
+            # Initialize health monitoring (background daemon thread)
+            init_health_monitoring(app)
 
-        # Initialize thread-count watchdog (WARN>100, CRIT>200, Telegram via anomaly_alert)
-        init_thread_watchdog(app)
+            # Initialize thread-count watchdog (WARN>100, CRIT>200, Telegram via anomaly_alert)
+            init_thread_watchdog(app)
 
         # NOTE: Python strategy scheduler is initialized in setup_environment()
         # AFTER database tables are created, to avoid "no such table" errors on fresh install
@@ -605,6 +607,42 @@ def create_app():
         )
 
         return jsonify({"host_server": host_server, "is_localhost": is_localhost})
+
+    @app.teardown_appcontext
+    def shutdown_database_sessions(exception=None):
+        """Remove all scoped sessions after each request to prevent FD leaks"""
+        _sessions = [
+            ("database.auth_db", "db_session"),
+            ("database.traffic_db", "logs_session"),
+            ("database.apilog_db", "db_session"),
+            ("database.latency_db", "latency_session"),
+            ("database.health_db", "health_session"),
+            ("database.settings_db", "db_session"),
+            ("database.strategy_db", "db_session"),
+            ("database.user_db", "db_session"),
+            ("database.action_center_db", "db_session"),
+            ("database.qty_freeze_db", "db_session"),
+            ("database.sandbox_db", "db_session"),
+            ("database.analyzer_db", "db_session"),
+            ("database.chart_prefs_db", "db_session"),
+            ("database.chartink_db", "db_session"),
+            ("database.flow_db", "db_session"),
+            ("database.leverage_db", "db_session"),
+            ("database.strategy_portfolio_db", "db_session"),
+            ("database.market_calendar_db", "db_session"),
+            ("database.telegram_db", "db_session"),
+            ("database.symbol", "db_session"),
+        ]
+        for module_name, session_attr in _sessions:
+            try:
+                import importlib
+
+                mod = importlib.import_module(module_name)
+                session = getattr(mod, session_attr, None)
+                if session is not None:
+                    session.remove()
+            except Exception:
+                pass
 
     return app
 
@@ -1319,108 +1357,65 @@ def setup_environment(app):
     threading.Thread(target=_init_databases_and_schedulers, daemon=True).start()
 
 
-# Refuse to boot a second concurrent instance before any Flask init — two
-# writers on the SQLite DBs corrupt them. See utils/singleton_guard.py.
-from utils.singleton_guard import check_singleton_or_abort as _check_singleton_or_abort
+# Module-level initialization — skipped when OPENALGO_TESTING=1 so that
+# ``from app import create_app`` in test/harness.py is safe (no singleton
+# check, no background daemons, no WS proxy).
+if os.environ.get("OPENALGO_TESTING") != "1":
+    # Refuse to boot a second concurrent instance before any Flask init — two
+    # writers on the SQLite DBs corrupt them. See utils/singleton_guard.py.
+    from utils.singleton_guard import check_singleton_or_abort as _check_singleton_or_abort
 
-_check_singleton_or_abort()
+    _check_singleton_or_abort()
 
-app = create_app()
+    app = create_app()
 
-# Explicitly call the setup environment function
-setup_environment(app)
+    # Explicitly call the setup environment function
+    setup_environment(app)
 
-# Restore caches from database in background (not needed until first trade/lookup)
-import threading
+    # Restore caches from database in background (not needed until first trade/lookup)
+    import threading
 
+    def _restore_caches_background():
+        # Wait for DB tables to be created before querying
+        app.db_ready.wait()
+        with app.app_context():
+            try:
+                from database.cache_restoration import restore_all_caches
 
-def _restore_caches_background():
-    # Wait for DB tables to be created before querying
-    app.db_ready.wait()
-    with app.app_context():
-        try:
-            from database.cache_restoration import restore_all_caches
+                cache_result = restore_all_caches()
 
-            cache_result = restore_all_caches()
+                if cache_result["success"]:
+                    symbol_count = cache_result["symbol_cache"].get("symbols_loaded", 0)
+                    auth_count = cache_result["auth_cache"].get("tokens_loaded", 0)
+                    if symbol_count > 0 or auth_count > 0:
+                        logger.debug(
+                            f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens"
+                        )
+            except Exception as e:
+                logger.debug(f"Cache restoration skipped: {e}")
 
-            if cache_result["success"]:
-                symbol_count = cache_result["symbol_cache"].get("symbols_loaded", 0)
-                auth_count = cache_result["auth_cache"].get("tokens_loaded", 0)
-                if symbol_count > 0 or auth_count > 0:
-                    logger.debug(
-                        f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens"
-                    )
-        except Exception as e:
-            logger.debug(f"Cache restoration skipped: {e}")
+    threading.Thread(target=_restore_caches_background, daemon=True).start()
 
-
-threading.Thread(target=_restore_caches_background, daemon=True).start()
-
-
-# Database session cleanup (teardown handler)
-@app.teardown_appcontext
-def shutdown_database_sessions(exception=None):
-    """Remove all scoped sessions after each request to prevent FD leaks"""
-    # All (module, session_variable_name) pairs that use scoped_session.
-    # Each must be removed per-request to release the underlying DB connection
-    # and prevent file descriptor accumulation.
-    _sessions = [
-        # --- Previously cleaned up ---
-        ("database.auth_db", "db_session"),
-        ("database.traffic_db", "logs_session"),
-        ("database.apilog_db", "db_session"),
-        ("database.latency_db", "latency_session"),
-        ("database.health_db", "health_session"),
-        # --- Previously missing (caused FD leak) ---
-        ("database.settings_db", "db_session"),
-        ("database.strategy_db", "db_session"),
-        ("database.user_db", "db_session"),
-        ("database.action_center_db", "db_session"),
-        ("database.qty_freeze_db", "db_session"),
-        ("database.sandbox_db", "db_session"),
-        ("database.analyzer_db", "db_session"),
-        ("database.chart_prefs_db", "db_session"),
-        ("database.chartink_db", "db_session"),
-        ("database.flow_db", "db_session"),
-        ("database.leverage_db", "db_session"),
-        ("database.strategy_portfolio_db", "db_session"),
-        ("database.market_calendar_db", "db_session"),
-        ("database.telegram_db", "db_session"),
-        ("database.symbol", "db_session"),
-    ]
-
-    for module_name, session_attr in _sessions:
-        try:
-            import importlib
-
-            mod = importlib.import_module(module_name)
-            session = getattr(mod, session_attr, None)
-            if session is not None:
-                session.remove()
-        except Exception:
-            pass
-
-
-# Integrate the WebSocket proxy server with the Flask app
-# Check if running in Docker (standalone mode) or local (integrated mode)
-# Docker is detected by checking for /.dockerenv file or APP_MODE override
-is_docker = (
-    os.path.exists("/.dockerenv")
-    or os.environ.get("APP_MODE", "").strip().strip("'\"") == "standalone"
-)
-
-if is_docker:
-    logger.debug(
-        "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
+    # Integrate the WebSocket proxy server with the Flask app
+    # Check if running in Docker (standalone mode) or local (integrated mode)
+    # Docker is detected by checking for /.dockerenv file or APP_MODE override
+    is_docker = (
+        os.path.exists("/.dockerenv")
+        or os.environ.get("APP_MODE", "").strip().strip("'\"") == "standalone"
     )
-else:
-    # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
-    # (not a thread) so the WS asyncio loop never shares an eventlet hub with
-    # gunicorn — closes the greenlet.error cross-thread crash class entirely
-    # (including GitHub issue #1421). Under the dev server (no eventlet) it
-    # still uses a real OS thread, as before.
-    logger.debug("Starting WebSocket proxy")
-    start_websocket_proxy(app)
+
+    if is_docker:
+        logger.debug(
+            "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
+        )
+    else:
+        # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
+        # (not a thread) so the WS asyncio loop never shares an eventlet hub with
+        # gunicorn — closes the greenlet.error cross-thread crash class entirely
+        # (including GitHub issue #1421). Under the dev server (no eventlet) it
+        # still uses a real OS thread, as before.
+        logger.debug("Starting WebSocket proxy")
+        start_websocket_proxy(app)
 
 
 def _warn_if_dirty_working_tree():
