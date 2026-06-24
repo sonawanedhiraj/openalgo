@@ -32,7 +32,14 @@ from datetime import datetime, timedelta, timezone
 import pytz
 from flask import Blueprint, jsonify, request, session
 
-from database.scanner_db import ScanDefinition, ScanResult, db_session
+from database.scanner_db import (
+    ScanDefinition,
+    ScanResult,
+    clone_definition,
+    db_session,
+    delete_definition,
+    update_definition_params,
+)
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -137,6 +144,7 @@ def list_definitions():
                     "updated_at": d.updated_at,
                     "latest_signals": latest_signals,
                     "today_hit_count": today_count,
+                    "parent_definition_id": d.parent_definition_id,
                 }
             )
 
@@ -256,6 +264,171 @@ def toggle_definition(definition_id: int):
 
     except Exception as e:
         logger.exception("scanner toggle_definition %s failed: %s", definition_id, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/definitions/<int:definition_id>", methods=["GET"])
+@check_session_validity
+def get_definition(definition_id: int):
+    """Return the full definition dict for a single scan_definition.
+
+    Returns 404 if the definition does not exist.
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        sess = db_session()
+        defn = sess.query(ScanDefinition).filter(ScanDefinition.id == definition_id).first()
+        if defn is None:
+            return jsonify({"status": "error", "message": "Definition not found"}), 404
+
+        return jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "id": defn.id,
+                    "name": defn.name,
+                    "screener_type": defn.screener_type,
+                    "expression_json": defn.expression_json,
+                    "rule_module": defn.rule_module,
+                    "enabled": bool(defn.enabled),
+                    "created_at": defn.created_at,
+                    "updated_at": defn.updated_at,
+                    "parameters_json": defn.parameters_json,
+                    "parent_definition_id": defn.parent_definition_id,
+                },
+            }
+        )
+
+    except Exception as e:
+        logger.exception("scanner get_definition %s failed: %s", definition_id, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/definitions/<int:definition_id>/clone", methods=["POST"])
+@check_session_validity
+def clone_definition_route(definition_id: int):
+    """Clone a scan_definition under a new name.
+
+    Body JSON: {name: str, parameters_json?: dict|str}
+    Returns 201 with {status, data: {id, name}}.
+    Returns 400 on missing name, 404 if source not found, 409 on duplicate name.
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        body = request.get_json(silent=True) or {}
+        new_name = (body.get("name") or "").strip()
+        if not new_name:
+            return jsonify({"status": "error", "message": "name is required"}), 400
+
+        parameters_json = body.get("parameters_json")
+
+        try:
+            new_id = clone_definition(
+                source_id=definition_id,
+                new_name=new_name,
+                parameters_json=parameters_json,
+            )
+        except ValueError as exc:
+            return jsonify({"status": "error", "message": str(exc)}), 404
+        except Exception as exc:
+            from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+            if isinstance(exc, _IntegrityError):
+                return jsonify({"status": "error", "message": "name already exists"}), 409
+            raise
+
+        logger.info(
+            "scanner clone_definition: source=%s → new_id=%s name=%r",
+            definition_id,
+            new_id,
+            new_name,
+        )
+        return jsonify({"status": "success", "data": {"id": new_id, "name": new_name}}), 201
+
+    except Exception as e:
+        logger.exception("scanner clone_definition %s failed: %s", definition_id, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/definitions/<int:definition_id>/params", methods=["PUT"])
+@check_session_validity
+def update_params_route(definition_id: int):
+    """Update parameters_json on a cloned (non-code-backed) definition.
+
+    Body JSON: {parameters_json: dict|str|null}
+    Returns {status, data: {id, parameters_json}}.
+    Returns 403 if the row is code-backed, 404 if not found.
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        body = request.get_json(silent=True) or {}
+        parameters_json = body.get("parameters_json")
+
+        try:
+            update_definition_params(
+                definition_id=definition_id,
+                parameters_json=parameters_json,
+            )
+        except ValueError as exc:
+            msg = str(exc)
+            if "does not exist" in msg:
+                return jsonify({"status": "error", "message": msg}), 404
+            # code-backed or parent_definition_id constraint
+            return jsonify({"status": "error", "message": msg}), 403
+
+        import json as _json
+
+        encoded = (
+            _json.dumps(parameters_json) if isinstance(parameters_json, dict) else parameters_json
+        )
+
+        logger.info("scanner update_params: definition_id=%s", definition_id)
+        return jsonify(
+            {
+                "status": "success",
+                "data": {"id": definition_id, "parameters_json": encoded},
+            }
+        )
+
+    except Exception as e:
+        logger.exception("scanner update_params %s failed: %s", definition_id, e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/definitions/<int:definition_id>", methods=["DELETE"])
+@check_session_validity
+def delete_definition_route(definition_id: int):
+    """Hard-delete a cloned scan_definition.
+
+    Returns {status, data: {id}}.
+    Returns 403 if code-backed, 404 if not found, 409 if has children.
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        try:
+            delete_definition(definition_id=definition_id)
+        except ValueError as exc:
+            msg = str(exc)
+            if "does not exist" in msg:
+                return jsonify({"status": "error", "message": msg}), 404
+            if "has children" in msg:
+                return jsonify({"status": "error", "message": msg}), 409
+            # code-backed
+            return jsonify({"status": "error", "message": msg}), 403
+
+        logger.info("scanner delete_definition: id=%s", definition_id)
+        return jsonify({"status": "success", "data": {"id": definition_id}})
+
+    except Exception as e:
+        logger.exception("scanner delete_definition %s failed: %s", definition_id, e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 

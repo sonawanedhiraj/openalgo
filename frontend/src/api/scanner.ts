@@ -2,6 +2,38 @@ import { webClient } from './client'
 
 export type ScreenerType = 'buy' | 'sell'
 
+// Tier-3 additions
+export interface ScanDefinitionFull extends ScanDefinitionDetail {
+  parameters_json: string | null
+  parent_definition_id: number | null
+}
+
+// Keys accepted by each rule
+export interface BuyRuleParams {
+  gap_pct?: number
+  atr_pct?: number
+  vol_5m_mult?: number
+  rsi_threshold?: number
+  supertrend_period?: number
+  supertrend_mult?: number
+  price_min?: number
+  price_max?: number
+  vol_sma_short?: number
+  vol_sma_long?: number
+}
+
+export interface SellRuleParams {
+  gap_pct?: number
+  atr_pct?: number
+  rsi_threshold?: number
+  supertrend_period?: number
+  supertrend_mult?: number
+  price_min?: number
+  price_max?: number
+}
+
+export type RuleParams = BuyRuleParams | SellRuleParams
+
 export interface ScanSignal {
   id: number
   run_at: string
@@ -21,6 +53,7 @@ export interface ScanDefinitionSummary {
   updated_at: string
   latest_signals: Omit<ScanSignal, 'notes'>[]
   today_hit_count: number
+  parent_definition_id: number | null
 }
 
 export interface ScanDefinitionDetail {
@@ -93,6 +126,42 @@ export const scannerApi = {
     const res = await webClient.get<{ status: string; data: HitsBySymbolResponse }>(
       '/scanner/api/hits-by-symbol',
       { params }
+    )
+    return res.data.data
+  },
+
+  getDefinition: async (id: number): Promise<ScanDefinitionFull> => {
+    const res = await webClient.get<{ status: string; data: ScanDefinitionFull }>(
+      `/scanner/api/definitions/${id}`
+    )
+    return res.data.data
+  },
+
+  cloneDefinition: async (
+    id: number,
+    body: { name: string; parameters_json?: RuleParams | null }
+  ): Promise<{ id: number; name: string }> => {
+    const res = await webClient.post<{ status: string; data: { id: number; name: string } }>(
+      `/scanner/api/definitions/${id}/clone`,
+      body
+    )
+    return res.data.data
+  },
+
+  updateParams: async (
+    id: number,
+    parameters_json: RuleParams | null
+  ): Promise<{ id: number; parameters_json: string | null }> => {
+    const res = await webClient.put<{
+      status: string
+      data: { id: number; parameters_json: string | null }
+    }>(`/scanner/api/definitions/${id}/params`, { parameters_json })
+    return res.data.data
+  },
+
+  deleteDefinition: async (id: number): Promise<{ id: number }> => {
+    const res = await webClient.delete<{ status: string; data: { id: number } }>(
+      `/scanner/api/definitions/${id}`
     )
     return res.data.data
   },
