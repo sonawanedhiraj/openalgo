@@ -6,7 +6,9 @@ High-performance columnar storage for historical market data.
 Optimized for backtesting and analytical queries.
 """
 
+import functools
 import os
+import threading
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -20,6 +22,31 @@ from utils.logging import get_logger
 
 # Initialize logger
 logger = get_logger(__name__)
+
+# Write lock to serialize DuckDB writes and prevent Windows file locking conflicts
+# DuckDB doesn't handle concurrent writes well on Windows; this serializes write ops
+_write_lock = threading.Lock()
+
+
+def _synchronized_write(func):
+    """Decorator to serialize DuckDB write operations.
+
+    Wraps all database write functions with a lock to prevent concurrent
+    access from multiple threads (ThreadPoolExecutor workers + Flask request
+    handlers) causing Windows file locking conflicts.
+
+    DuckDB doesn't handle concurrent writes well on Windows due to exclusive
+    file locking at the OS level. This decorator ensures only one write
+    operation executes at a time.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with _write_lock:
+            return func(*args, **kwargs)
+
+    return wrapper
+
 
 # Load environment variables
 load_dotenv()
@@ -309,6 +336,8 @@ def get_watchlist() -> list[dict[str, Any]]:
         return result.to_dict("records")
 
 
+@_synchronized_write
+@_synchronized_write
 def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tuple[bool, str]:
     """
     Add a symbol to the watchlist.
@@ -348,6 +377,8 @@ def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tu
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[int, int, list[dict[str, str]]]:
     """
     Add multiple symbols to the watchlist in a single transaction.
@@ -530,8 +561,8 @@ def clear_watchlist() -> tuple[bool, str]:
 # =============================================================================
 # Market Data Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: str) -> int:
     """
     Insert or update OHLCV data from a pandas DataFrame.
@@ -1247,6 +1278,8 @@ def get_data_range(symbol: str, exchange: str, interval: str) -> dict[str, Any] 
         return None
 
 
+@_synchronized_write
+@_synchronized_write
 def delete_market_data(symbol: str, exchange: str, interval: str | None = None) -> tuple[bool, str]:
     """
     Delete market data for a symbol.
@@ -1302,6 +1335,8 @@ def delete_market_data(symbol: str, exchange: str, interval: str | None = None) 
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def bulk_delete_market_data(
     symbols: list[dict[str, str]],
 ) -> tuple[int, int, list[dict[str, str]]]:
@@ -1799,8 +1834,8 @@ def import_from_parquet(
 # =============================================================================
 # Download Job Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def create_download_job(
     job_id: str,
     job_type: str,
@@ -2053,6 +2088,8 @@ def get_job_items(job_id: str, status: str = None) -> list[dict[str, Any]]:
         return []
 
 
+@_synchronized_write
+@_synchronized_write
 def update_job_status(job_id: str, status: str, error_message: str = None) -> bool:
     """Update the status of a download job."""
     try:
@@ -2093,6 +2130,8 @@ def update_job_status(job_id: str, status: str, error_message: str = None) -> bo
         return False
 
 
+@_synchronized_write
+@_synchronized_write
 def update_job_item_status(
     item_id: int, status: str, records_downloaded: int = 0, error_message: str = None
 ) -> bool:
@@ -2135,6 +2174,8 @@ def update_job_item_status(
         return False
 
 
+@_synchronized_write
+@_synchronized_write
 def update_job_progress(job_id: str, completed: int, failed: int) -> bool:
     """Update job progress counters."""
     try:
@@ -2154,6 +2195,8 @@ def update_job_progress(job_id: str, completed: int, failed: int) -> bool:
         return False
 
 
+@_synchronized_write
+@_synchronized_write
 def delete_download_job(job_id: str) -> tuple[bool, str]:
     """Delete a download job and its items."""
     try:
@@ -2172,8 +2215,8 @@ def delete_download_job(job_id: str) -> tuple[bool, str]:
 # =============================================================================
 # Symbol Metadata Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def upsert_symbol_metadata(symbols: list[dict[str, Any]]) -> int:
     """
     Insert or update symbol metadata.
@@ -3156,8 +3199,8 @@ def get_export_preview(
 # =============================================================================
 # Scheduler Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def create_schedule(
     schedule_id: str,
     name: str,
@@ -3301,6 +3344,8 @@ def get_all_schedules() -> list[dict[str, Any]]:
         return []
 
 
+@_synchronized_write
+@_synchronized_write
 def update_schedule(
     schedule_id: str,
     name: str | None = None,
@@ -3391,6 +3436,8 @@ def update_schedule(
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def delete_schedule(schedule_id: str) -> tuple[bool, str]:
     """Delete a schedule and its execution history."""
     try:
@@ -3444,6 +3491,8 @@ def increment_schedule_run_counts(schedule_id: str, is_success: bool) -> tuple[b
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def create_schedule_execution(schedule_id: str, download_job_id: str | None = None) -> int | None:
     """
     Create a new execution record for a schedule.
@@ -3485,6 +3534,8 @@ def create_schedule_execution(schedule_id: str, download_job_id: str | None = No
         return None
 
 
+@_synchronized_write
+@_synchronized_write
 def update_schedule_execution(
     execution_id: int,
     status: str | None = None,
