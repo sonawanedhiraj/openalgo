@@ -82,7 +82,7 @@ def check_tmp_noexec() -> None:
         with open("/proc/mounts") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 4 and parts[1] == "/tmp":
+                if len(parts) >= 4 and parts[1] == "/tmp":  # nosec B108 — reading /proc/mounts, not creating a temp file
                     mount_options = parts[3].split(",")
                     if "noexec" in mount_options:
                         print("\n" + "=" * 70)
@@ -1011,6 +1011,11 @@ def load_and_check_env_variables() -> None:
     Raises:
         SystemExit: If the .env file is missing or required variables are not set.
     """
+    # In test mode conftest.py redirects all DBs to a temp dir; skip broker/
+    # API-key validation so harness.py can import app without a .env present.
+    if os.environ.get("OPENALGO_TESTING"):
+        return
+
     # Configure LLVMLITE/NUMBA paths FIRST (before any imports can trigger loading)
     # This fixes "failed to map segment from shared object" on hardened Linux servers
     configure_llvmlite_paths()
