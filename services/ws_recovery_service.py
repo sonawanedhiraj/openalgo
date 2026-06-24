@@ -363,7 +363,7 @@ class WSRecoveryService:
             "gap_minutes": gap_min,
         }
         self._notifier(self._format_alert(summary))
-        logger.info("WS recovery complete: %r", summary)
+        logger.info(f"WS recovery complete: {summary!r}")
         return summary
 
     @staticmethod
