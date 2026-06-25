@@ -325,6 +325,7 @@ class TestEodReconciliationStampsExit:
         )
 
         today = _dt.date.today()
+        strategy_name = "b4_recon_close_t1"
 
         # 1. Seed an open journal row (no exit) for today.
         with harness.app.app_context():
@@ -332,7 +333,7 @@ class TestEodReconciliationStampsExit:
                 symbol="TESTSTOCK_RECON",
                 direction="LONG",
                 quantity=10,
-                strategy_name=DEFAULT_STRATEGY_NAME,
+                strategy_name=strategy_name,
                 signal_source="test_harness",
                 entry_price=1000.0,
                 entry_order_id="TEST_ENTRY_RECON_001",
@@ -342,7 +343,7 @@ class TestEodReconciliationStampsExit:
         # 2. Confirm the row is open (no exit yet).
         with harness.app.app_context():
             open_rows = trade_journal_service.get_open_trades_for_date(
-                today.isoformat(), strategy_name=DEFAULT_STRATEGY_NAME
+                today.isoformat(), strategy_name=strategy_name
             )
         assert any(r["id"] == journal_id for r in open_rows), (
             f"Journal row id={journal_id} should be open (no exit) before reconciliation"
@@ -371,7 +372,7 @@ class TestEodReconciliationStampsExit:
                 ),
                 patch("services.engine_eod_reconciliation_service._sandbox"),
             ):
-                result = reconcile_engine_journal(date=today, strategy_name=DEFAULT_STRATEGY_NAME)
+                result = reconcile_engine_journal(date=today, strategy_name=strategy_name)
 
         # 5. The result must show 1 exit added.
         assert result.exits_added == 1, (
@@ -385,7 +386,7 @@ class TestEodReconciliationStampsExit:
         # 6. Confirm the journal row is now closed.
         with harness.app.app_context():
             still_open = trade_journal_service.get_open_trades_for_date(
-                today.isoformat(), strategy_name=DEFAULT_STRATEGY_NAME
+                today.isoformat(), strategy_name=strategy_name
             )
         still_open_ids = [r["id"] for r in still_open]
         assert journal_id not in still_open_ids, (
@@ -403,13 +404,14 @@ class TestEodReconciliationStampsExit:
         )
 
         today = _dt.date.today()
+        strategy_name = "b4_recon_open_t2"
 
         with harness.app.app_context():
             journal_id = trade_journal_service.record_entry(
                 symbol="STILLOPEN_RECON",
                 direction="LONG",
                 quantity=5,
-                strategy_name=DEFAULT_STRATEGY_NAME,
+                strategy_name=strategy_name,
                 signal_source="test_harness",
                 entry_price=500.0,
                 entry_order_id="STILL_OPEN_RECON_ENTRY",
@@ -425,7 +427,7 @@ class TestEodReconciliationStampsExit:
                 ),
                 patch("services.engine_eod_reconciliation_service._sandbox"),
             ):
-                result = reconcile_engine_journal(date=today, strategy_name=DEFAULT_STRATEGY_NAME)
+                result = reconcile_engine_journal(date=today, strategy_name=strategy_name)
 
         assert result.exits_added == 0, (
             "reconcile_engine_journal must NOT stamp an exit when the position is still open. "
