@@ -35,8 +35,12 @@ class TestSandboxPlaceOrderCreatesSandboxOrderRow:
     """B1 (Flow 2, P0): calling sandbox_place_order with a mocked LTP writes a
     SandboxOrders row and returns status='success'."""
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     def harness(self):
+        # scope="class": BootHarness.create() (which calls create_app()) runs
+        # ONCE per class, not once per test.  Reduces parallel create_app() calls
+        # in resource-constrained CI (self-hosted Docker runner, ~300 MB free RAM)
+        # from N_tests to N_classes — the primary cause of the 10-minute timeout.
         with BootHarness.create() as h:
             yield h
 
@@ -139,8 +143,9 @@ class TestKillSwitchPersistsAcrossFreshServiceInstance:
     """B2 (Flow 15, P0): a kill_switch row written to the temp DB blocks entries
     when is_entry_blocked() is re-evaluated (simulates a service restart)."""
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     def harness(self):
+        # scope="class": one create_app() per class, not per test (CI timeout fix).
         with BootHarness.create() as h:
             yield h
 
@@ -220,8 +225,9 @@ class TestStrategyModeSetAndVisibleRoundTrip:
     """B3 (Flow A3 variant): set_strategy_mode() persists and get_strategy_mode()
     returns the same value — no REST call needed to prove the DB round-trip."""
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     def harness(self):
+        # scope="class": one create_app() per class, not per test (CI timeout fix).
         with BootHarness.create() as h:
             yield h
 
@@ -268,8 +274,9 @@ class TestChartinkWebhookArmsEngineAndRespondsOk:
     """B4 (Flow 4, P0): POST /chartink/simplified-stock-engine/<webhook_id> with
     a seeded strategy returns 200 + status='success' or a known expected response."""
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     def harness(self):
+        # scope="class": one create_app() per class, not per test (CI timeout fix).
         with BootHarness.create() as h:
             yield h
 
@@ -385,8 +392,9 @@ class TestChartinkWebhookArmsEngineAndRespondsOk:
 class TestPlaceOrderWithInvalidApiKeyReturns403:
     """B5 (Flow 1, P1): POST /api/v1/placeorder with an invalid apikey must return 403."""
 
-    @pytest.fixture(autouse=True)
+    @pytest.fixture(autouse=True, scope="class")
     def harness(self):
+        # scope="class": one create_app() per class, not per test (CI timeout fix).
         with BootHarness.create() as h:
             yield h
 
