@@ -150,6 +150,7 @@ _INIT_TARGETS = [
     ("database.sandbox_db", "init_db"),
     ("database.strategy_daily_intent_db", "init_db"),
     ("database.strategy_mode_db", "init_db"),
+    ("database.strategy_mode_audit_db", "init_db"),  # issue #162 — flip audit trail
     ("database.strategy_runtime_override_db", "init_db"),
     ("database.daily_intent_db", "init_db"),
     ("database.data_health_db", "init_db"),

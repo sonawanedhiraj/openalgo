@@ -10,24 +10,15 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import patch
 
-import pytest
-
 from database import strategy_mode_audit_db
 from database.strategy_mode_audit_db import (
     StrategyModeAudit,
-    init_db,
     list_attempts,
     record_attempt,
 )
 
-
-@pytest.fixture(autouse=True)
-def _ensure_table():
-    """The conftest test-DB redirect creates per-process tmpdir DBs but doesn't
-    auto-init this module's table. Call init_db() before every test so the
-    table exists in the redirected DB."""
-    init_db()
-    yield
+# The strategy_mode_audit table is created in the per-test redirected DB by
+# conftest._INIT_TARGETS — no per-file autouse fixture is needed.
 
 
 def test_record_attempt_accepted_writes_row():
