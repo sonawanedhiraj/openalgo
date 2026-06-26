@@ -766,8 +766,20 @@ class TestSmokeCheckAbortBlocksEntry:
         assert result == [], "Entry should be blocked by the smoke-check pause override"
         assert placed == []
 
-    def test_smoke_check_passes_when_aggregator_has_majority_coverage(self):
-        """Aggregator has data for all symbols → smoke check passes, no override."""
+    def test_smoke_check_passes_when_aggregator_has_majority_coverage(self, monkeypatch):
+        """Aggregator has data for all symbols → smoke check passes, no override.
+
+        Issue #161: smoke now also requires INDEX coverage. The fixture
+        ``_full_agg()`` already provides bars for indices (NIFTY etc.) used
+        by sector_map, so we just need to scope sector_index_symbols() to
+        the indices the aggregator covers.
+        """
+        # Restrict the index universe to NIFTY (which _full_agg() covers)
+        # so this test focuses on the original smoke-coverage assertion.
+        monkeypatch.setattr(
+            "services.sector_follow_index_backfill.sector_index_symbols",
+            lambda: ["NIFTY"],
+        )
         svc, _, _ = _make_service(
             aggregator_data=_full_agg(),
             history_data=self._hist(),
@@ -779,3 +791,4 @@ class TestSmokeCheckAbortBlocksEntry:
         assert ok is True
         assert details["aggregator_ok"] is True
         assert details["historify_ok"] is True
+        assert details["index_ok"] is True
