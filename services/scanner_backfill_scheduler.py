@@ -224,11 +224,31 @@ def _log_and_alert(res: dict, phase: str) -> None:
 
 
 def run_boot_backfill_checks(today=None) -> dict:
-    """One-shot boot convergence: catch up whatever is stale, persist + log + alert."""
+    """One-shot boot convergence: catch up whatever is stale, persist + log + alert.
+
+    Blocks until any submitted download jobs reach a terminal status so the
+    sibling scheduler's lock-protected boot worker doesn't start its writes
+    while this one's 5-worker pool is still mid-download (issue #151 —
+    in-process DuckDB write contention).
+    """
     logger.info("scanner backfill: boot convergence check starting")
     res = run_backfill_checks(today)
     _persist_health(res)
     _log_and_alert(res, phase="boot")
+
+    # Wait inside the boot_convergence_lock for both interval arms' jobs to
+    # finish. check_and_refresh_if_stale returns ``{"job_id": ...}`` per
+    # interval when work was submitted; a stale-free arm contributes nothing.
+    try:
+        from services.historify_service import wait_for_jobs
+
+        intervals = res.get("intervals") or {}
+        job_ids = [ires.get("job_id") for ires in intervals.values()]
+        finals = wait_for_jobs(job_ids)
+        if finals:
+            logger.info("scanner backfill: boot jobs final status: %s", finals)
+    except Exception:  # waiting must never break the boot path
+        logger.exception("scanner backfill: wait_for_jobs raised")
     return res
 
 

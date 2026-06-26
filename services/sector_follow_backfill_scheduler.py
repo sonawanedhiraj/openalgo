@@ -172,10 +172,32 @@ def _log_and_alert(res: dict, phase: str) -> None:
 
 
 def run_boot_backfill_checks(today=None) -> dict:
-    """One-shot boot convergence: catch up whatever is stale, log + alert."""
+    """One-shot boot convergence: catch up whatever is stale, log + alert.
+
+    Blocks until any submitted download jobs reach a terminal status so the
+    sibling scheduler's lock-protected boot worker doesn't start its writes
+    while this one's 5-worker pool is still mid-download (issue #151 —
+    in-process DuckDB write contention).
+    """
     logger.info("sector_follow backfill: boot convergence check starting")
     res = run_backfill_checks(today)
     _log_and_alert(res, phase="boot")
+
+    # Wait inside the boot_convergence_lock for the submitted jobs to finish.
+    # check_and_refresh_if_stale returns ``{"job_id": ...}`` when work was
+    # submitted; an empty/stale-free arm has no job_id and contributes nothing.
+    try:
+        from services.historify_service import wait_for_jobs
+
+        job_ids = [
+            (res.get("index") or {}).get("job_id"),
+            (res.get("stock") or {}).get("job_id"),
+        ]
+        finals = wait_for_jobs(job_ids)
+        if finals:
+            logger.info("sector_follow backfill: boot jobs final status: %s", finals)
+    except Exception:  # waiting must never break the boot path
+        logger.exception("sector_follow backfill: wait_for_jobs raised")
     return res
 
 

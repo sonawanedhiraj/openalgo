@@ -1671,8 +1671,9 @@ def _process_download_job(job_id: str, api_key: str):
             # Update progress counters in database
             update_job_progress(job_id, completed, failed)
 
-            # Random delay between 1-3 seconds (configurable)
-            delay = random.uniform(delay_min, delay_max)
+            # Random delay between 1-3 seconds (configurable). Not security-
+            # sensitive — just jitter for broker rate-limit avoidance.
+            delay = random.uniform(delay_min, delay_max)  # nosec B311 — rate-limit jitter, not crypto
             logger.debug(f"Waiting {delay:.1f}s before next download...")
             time.sleep(delay)
 
@@ -1680,7 +1681,7 @@ def _process_download_job(job_id: str, api_key: str):
             # 5-10s pause so broker long-window rate limiters (req/min) reset.
             items_done_this_run = processed_count - already_completed - already_failed
             if items_done_this_run > 0 and items_done_this_run % 10 == 0:
-                batch_delay = random.uniform(5, 10)
+                batch_delay = random.uniform(5, 10)  # nosec B311 — rate-limit jitter, not crypto
                 logger.info(
                     f"Job {job_id}: batch cooldown after {items_done_this_run} symbols, "
                     f"sleeping {batch_delay:.1f}s"
@@ -1797,6 +1798,95 @@ def get_job_status(job_id: str) -> tuple[bool, dict[str, Any], int]:
     except Exception as e:
         logger.exception(f"Error getting job status: {e}")
         return False, {"status": "error", "message": str(e)}, 500
+
+
+# Job lifecycle status values that mean "no longer running" — used by
+# ``wait_for_jobs`` below to decide when polling can stop.
+_TERMINAL_JOB_STATES = frozenset({"completed", "completed_with_errors", "failed", "cancelled"})
+
+
+def wait_for_jobs(
+    job_ids: list[str],
+    timeout_sec: int = 600,
+    poll_sec: float = 1.0,
+) -> dict[str, str]:
+    """Block until every job in ``job_ids`` reaches a terminal status, or timeout.
+
+    The boot-time backfill convergence (see ``services.boot_convergence`` and
+    the ``_boot_worker`` paths in the sector_follow + scanner schedulers)
+    relies on this to hold a serialisation lock for the **actual download
+    duration**, not just for the millisecond it takes
+    ``create_and_start_job`` to submit the job to the shared
+    ``ThreadPoolExecutor``. Without this wait, sibling schedulers' workers
+    overlap and the 5-worker pool produces in-process DuckDB lock errors
+    (see issue #151).
+
+    Args:
+        job_ids: Job identifiers to poll. ``None``/empty entries are skipped
+            (the convergence may legitimately have no work, in which case its
+            result dict has no ``job_id``).
+        timeout_sec: Bounded wait. After this many seconds the function returns
+            even if some jobs are still running — the operator gets the partial
+            state in the result and an INFO log. Default 600 s (10 min) is
+            comfortable headroom over the ~85 s a 250-symbol Zerodha download
+            takes at the 3 req/sec rate limit.
+        poll_sec: Status-poll interval. Default 1 s — cheap, since
+            ``get_job_status`` is a single SQLite SELECT.
+
+    Returns:
+        ``{job_id: final_status}`` for every job_id passed in. Status is the
+        live value at the moment polling stopped — ``"completed"`` /
+        ``"completed_with_errors"`` / ``"failed"`` / ``"cancelled"`` for terminal
+        states, ``"running"`` / ``"pending"`` if the timeout fired, or
+        ``"unknown"`` if the status query raised.
+
+    Never raises. A status-query failure logs and continues polling — the next
+    successful query will report the actual status.
+    """
+    pending = [jid for jid in job_ids if jid]
+    if not pending:
+        return {}
+
+    import time as _time
+
+    deadline = _time.monotonic() + max(0, timeout_sec)
+    final_status: dict[str, str] = dict.fromkeys(pending, "unknown")
+
+    while pending and _time.monotonic() < deadline:
+        still_pending: list[str] = []
+        for jid in pending:
+            try:
+                ok, payload, _code = get_job_status(jid)
+            except Exception:
+                logger.exception("wait_for_jobs: get_job_status raised for %s", jid)
+                still_pending.append(jid)
+                continue
+
+            if not ok:
+                # Job not found in DB — treat as terminal "unknown" so we
+                # don't poll forever on a job_id that was never persisted.
+                final_status[jid] = "unknown"
+                continue
+
+            job = (payload or {}).get("job") or {}
+            status = str(job.get("status") or "").strip().lower()
+            final_status[jid] = status or "unknown"
+            if status not in _TERMINAL_JOB_STATES:
+                still_pending.append(jid)
+
+        pending = still_pending
+        if pending:
+            _time.sleep(poll_sec)
+
+    if pending:
+        logger.info(
+            "wait_for_jobs: timeout after %ds with %d job(s) still pending: %s",
+            timeout_sec,
+            len(pending),
+            pending,
+        )
+
+    return final_status
 
 
 def get_all_jobs(status: str = None, limit: int = 50) -> tuple[bool, dict[str, Any], int]:
