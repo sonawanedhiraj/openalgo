@@ -992,14 +992,25 @@ def setup_environment(app):
             # webhook poster as a scan_hit consumer).
             try:
                 if os.environ.get("SCANNER_ENABLED", "false").lower() == "true":
+                    from services.scanner_aggregator_symbols import (
+                        compute_aggregator_symbols,
+                    )
                     from services.scanner_service import ScannerService
 
-                    raw_symbols = os.environ.get("SCANNER_SYMBOLS", "")
-                    symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+                    # Issue #161: the scanner aggregator must track every
+                    # symbol any downstream consumer queries. SCANNER_SYMBOLS
+                    # alone is NOT enough — sector_follow's mapped sector
+                    # indices (NIFTYAUTO/FMCG/IT/METAL/PSUBANK/PVTBANK +
+                    # NIFTY/BANKNIFTY) and REGIME_SECTOR_SYMBOLS are
+                    # WS-subscribed elsewhere but never seen by the
+                    # aggregator. compute_aggregator_symbols unions all
+                    # required sources and logs the per-source breakdown.
+                    symbols = compute_aggregator_symbols()
                     if not symbols:
                         logger.warning(
-                            "SCANNER_ENABLED=true but SCANNER_SYMBOLS is empty — "
-                            "scanner will idle (no symbols to watch)"
+                            "SCANNER_ENABLED=true but no symbols across "
+                            "SCANNER_SYMBOLS + REGIME_SECTOR_SYMBOLS + sector_follow — "
+                            "scanner will idle (nothing to watch)"
                         )
                     scanner_intervals = [
                         i.strip()

@@ -719,15 +719,25 @@ class SectorFollowService:
         Emits a loud per-symbol PASS/FAIL diagnostic (Part B.2) and a
         decision-input completeness metric (Part B.3) so a silently-degraded data
         pipeline — the 2026-06-15 class of bug — surfaces immediately instead of
-        looking like a genuine zero-signal day."""
+        looking like a genuine zero-signal day.
+
+        Issue #161 (today's 2026-06-26 15:20 IST failure): the LIVE flip
+        emitted 0 orders because every metric had ``sector_ret=None`` — the
+        scanner aggregator had no intraday bars for the mapped sector
+        indices. The boot-time fix in ``compute_aggregator_symbols`` prevents
+        this from recurring, but we also fail-loud here so the operator sees
+        a CRITICAL Telegram alert if it ever happens again."""
         as_of = as_of or self._now()
         metrics = self._metrics_provider(as_of, self.config.universe, self.sector_map, self.config)
         candidates: list[dict] = []
         n_intraday = 0
         total = len(self.config.universe) or len(metrics)
+        n_sector_ret_none = 0
         for symbol, m in metrics.items():
             if m.get("intraday_source") == "aggregator":
                 n_intraday += 1
+            if m.get("sector_ret") is None:
+                n_sector_ret_none += 1
             if passes_gates(m, self.config):
                 logger.info(
                     "sector_follow PASS %s: sector_ret=%.4f stock_ret=%.4f vol_ratio=%.2f src=%s",
@@ -757,7 +767,45 @@ class SectorFollowService:
             len(self.config.universe),
         )
         self._emit_completeness_metric(n_intraday, total, as_of)
+        # Issue #161 fail-loud: if EVERY metric had sector_ret=None the
+        # index aggregator is empty — exact today's-failure signature. Fire
+        # a CRITICAL Telegram so the operator sees it the same minute,
+        # not in next-day forensics. Skip when the universe is empty (no
+        # data at all is a different problem the completeness metric covers).
+        if total and n_sector_ret_none == total:
+            self._alert_all_indices_empty(as_of)
         return candidates
+
+    def _alert_all_indices_empty(self, as_of: datetime) -> None:
+        """Issue #161 CRITICAL: every metric had sector_ret=None — the
+        index aggregator is empty. This is today's exact failure mode.
+        Fail-loud so the operator can't miss it.
+
+        Once per day (dedup by date) so a multi-cycle outage doesn't spam.
+        """
+        ist_date = as_of.astimezone(_IST).date() if as_of.tzinfo else as_of.date()
+        if getattr(self, "_indices_empty_alert_date", None) == ist_date:
+            return
+        self._indices_empty_alert_date = ist_date
+        try:
+            from services.sector_follow_index_backfill import sector_index_symbols
+
+            indices = list(sector_index_symbols())
+        except Exception:
+            indices = []
+        msg = (
+            "🚨 CRITICAL sector_follow_cap5_vol: ALL mapped sector indices have "
+            f"sector_ret=None at {as_of.isoformat()}. The scanner aggregator is not "
+            f"producing intraday bars for the index universe ({indices}). "
+            "Strategy will emit 0 candidates — same root cause as 2026-06-26 15:20 "
+            "(issue #161). Check that compute_aggregator_symbols ran at boot AND "
+            "that the broker WS adapter is subscribing NSE_INDEX symbols."
+        )
+        logger.error(msg)
+        try:
+            self._notify(msg)
+        except Exception:
+            logger.exception("sector_follow all-indices-empty alert failed")
 
     def _emit_completeness_metric(self, n_intraday: int, total: int, as_of: datetime) -> None:
         """Log + Telegram the share of universe symbols served by the LIVE
@@ -1428,17 +1476,55 @@ class SectorFollowService:
         agg_frac = (n_have / total) if total else 0.0
         agg_ok = agg_frac >= min_cov
 
+        # Issue #161: this smoke check used to verify ONLY stock coverage and
+        # passed at 15:18 IST on 2026-06-26 with 30/30 stocks while ALL 8
+        # mapped sector indices had today_close=None. The strategy then
+        # emitted 0 orders at 15:20 in LIVE. Honest gate: also verify index
+        # coverage. Indices are looked up via the same intraday_provider
+        # so the gate measures exactly what run_entry will see.
+        try:
+            from services.sector_follow_index_backfill import sector_index_symbols
+
+            indices = list(sector_index_symbols())
+        except Exception:
+            logger.exception(
+                "sector_follow smoke check: sector_index_symbols import failed — "
+                "treating as no indices (smoke will report 'index_universe_empty')"
+            )
+            indices = []
+
+        idx_total = len(indices)
+        idx_have = 0
+        idx_missing: list[str] = []
+        for sym in indices:
+            try:
+                close, _vol = self._intraday_provider(sym, as_of)
+            except Exception:
+                close = None
+            if close is None:
+                idx_missing.append(sym)
+            else:
+                idx_have += 1
+        # Indices need 100% coverage — every mapped index contributes to a
+        # different stock subset's sector_ret. Even one missing index drops
+        # all stocks mapped to it from the candidate pool. Empty index
+        # universe (sector_map missing) is also a block.
+        idx_ok = bool(indices) and idx_have == idx_total
+
         hist_ok = self._historify_probe_ok()
         try:
             session_ok = bool(self._broker_session_checker())
         except Exception:
             session_ok = False
 
-        ok = agg_ok and hist_ok and session_ok
+        ok = agg_ok and idx_ok and hist_ok and session_ok
         details = {
             "aggregator_coverage": f"{n_have}/{total}",
             "aggregator_frac": round(agg_frac, 3),
             "aggregator_ok": agg_ok,
+            "index_coverage": f"{idx_have}/{idx_total}",
+            "index_ok": idx_ok,
+            "index_missing": idx_missing,
             "historify_ok": hist_ok,
             "broker_session_ok": session_ok,
             "min_coverage": min_cov,
@@ -1450,6 +1536,11 @@ class SectorFollowService:
         reasons = []
         if not agg_ok:
             reasons.append(f"aggregator coverage {n_have}/{total} (<{min_cov:.0%})")
+        if not idx_ok:
+            if not indices:
+                reasons.append("index universe empty (sector_map.json missing?)")
+            else:
+                reasons.append(f"index coverage {idx_have}/{idx_total} (missing {idx_missing})")
         if not hist_ok:
             reasons.append("historify lookback unavailable")
         if not session_ok:
