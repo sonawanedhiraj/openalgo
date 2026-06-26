@@ -23,47 +23,11 @@ concurrency:
 
 jobs:
   # ============================================================================
-  # STAGE 1: CI - Unit and Integration Tests (Native Python, Parallelized)
+  # STAGE 1: CI - Unit, Integration, Bridge, and Frontend Unit Tests
   # ============================================================================
   ci-unit-tests:
     name: "CI: Unit + Integration Tests"
     runs-on: self-hosted
-    timeout-minutes: 10
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        run: |
-          pip install uv --quiet
-
-      - name: Run unit + integration tests (parallelized)
-        run: |
-          uv run python -m pytest test/ \
-            -n auto \
-            --ignore=test/e2e \
-            --ignore=test/test_bridge_server.py \
-            --ignore=test/test_email_functionality.py \
-            -v --tb=short
-        env:
-          API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
-          APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
-          FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
-
-      - name: Report CI status
-        if: always()
-        run: |
-          echo "✅ CI Stage Complete"
-          echo "Unit tests passed on self-hosted runner"
-
-  # ============================================================================
-  # STAGE 2: CD - Docker Build, Boot, and E2E Tests
-  # ============================================================================
-  cd-docker-e2e:
-    name: "CD: Docker + E2E Tests"
-    runs-on: self-hosted
-    needs: ci-unit-tests
     timeout-minutes: 15
 
     steps:
@@ -73,6 +37,71 @@ jobs:
       - name: Install uv
         run: |
           pip install uv --quiet
+
+      # The full pytest suite. test_email_functionality.py is the ONLY ignore —
+      # it is an interactive operator script (uses input(), needs real SMTP
+      # creds) — not a test. Everything else, including test_bridge_server.py
+      # (FastAPI TestClient, no external deps) and test/e2e (which the CD
+      # stage re-runs against the booted container) runs here.
+      - name: Run unit + integration tests (parallelized)
+        run: |
+          uv run python -m pytest test/ \
+            -n auto \
+            --ignore=test/e2e \
+            --ignore=test/test_email_functionality.py \
+            -v --tb=short
+        env:
+          API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
+
+      # Frontend unit tests (vitest). Previously only fired via the manual
+      # workflow_dispatch in ci.yml; restored to every PR per issue #149 so
+      # frontend regressions are caught at PR time, not at "ship UI changes".
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend unit tests (vitest)
+        working-directory: frontend
+        run: npm run test:run
+
+      - name: Report CI status
+        if: always()
+        run: |
+          echo "✅ CI Stage Complete"
+          echo "Backend pytest + bridge tests + frontend vitest all run on self-hosted runner"
+
+  # ============================================================================
+  # STAGE 2: CD - Docker Build, Boot, E2E Tests, Playwright Smoke, Mock Broker
+  # ============================================================================
+  cd-docker-e2e:
+    name: "CD: Docker + E2E Tests"
+    runs-on: self-hosted
+    needs: ci-unit-tests
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          pip install uv --quiet
+
+      - name: Setup Node.js (for Playwright)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Generate throwaway .env for testing
         run: |
@@ -142,26 +171,101 @@ jobs:
           docker compose ps
           echo "✅ Container is running"
 
-      - name: Run E2E tests against running application
+      - name: Run pytest E2E tests against running application
         run: |
-          echo "Running E2E tests..."
-          pip install uv --quiet
+          echo "Running pytest E2E tests..."
           uv run python -m pytest test/e2e -v --tb=short
-          echo "✅ E2E tests passed"
+          echo "✅ pytest E2E tests passed"
 
-      - name: Teardown containers
+      # Playwright smoke test (chromium against the booted container at :5000).
+      # Restored from the deleted deploy-pipeline.yml per issue #149.
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install chromium --with-deps
+
+      - name: Run Playwright smoke tests
+        working-directory: frontend
+        env:
+          OPENALGO_URL: http://127.0.0.1:5000
+        run: |
+          echo "Running Playwright smoke against booted container..."
+          npx playwright test --config playwright.smoke.config.ts
+          echo "✅ Playwright smoke passed"
+
+      - name: Upload Playwright smoke report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Teardown main container
         if: always()
         run: |
-          echo "Cleaning up Docker containers..."
+          echo "Tearing down main OpenAlgo container..."
           docker compose down -v --remove-orphans || true
+          echo "✅ Main container torn down"
+
+      # Tier-3 mock-broker happy-path E2E. Restored from the deleted
+      # deploy-pipeline.yml per issue #149. Uses docker-compose.test.yml which
+      # boots OpenAlgo on :5099 + mock broker on :8001.
+      - name: Build mock broker stack
+        run: |
+          echo "Building mock broker stack..."
+          docker compose -f docker-compose.test.yml -p mock_test build --quiet
+          echo "✅ Mock broker stack built"
+
+      - name: Boot OpenAlgo + mock broker (ports 5099 + 8001)
+        run: |
+          docker compose -f docker-compose.test.yml -p mock_test up -d
+          echo "Waiting for both services to be healthy..."
+          for i in $(seq 1 60); do
+            mock_health=$(curl -sf http://127.0.0.1:8001/_mock/healthz 2>/dev/null && echo "ok" || echo "no")
+            oa_health=$(curl -sf http://127.0.0.1:5099/auth/check-setup 2>/dev/null && echo "ok" || echo "no")
+            if [ "$mock_health" = "ok" ] && [ "$oa_health" = "ok" ]; then
+              echo "✅ Both services healthy (mock=$mock_health, openalgo=$oa_health)"
+              break
+            fi
+            echo "  [$i/60] mock=$mock_health, openalgo=$oa_health"
+            sleep 3
+          done
+          docker compose -f docker-compose.test.yml -p mock_test ps
+
+      - name: Run Playwright broker happy-path test
+        working-directory: frontend
+        env:
+          OPENALGO_URL: http://127.0.0.1:5099
+          MOCK_BROKER_URL: http://127.0.0.1:8001
+        run: |
+          echo "Running broker happy-path E2E against mock broker..."
+          npx playwright test e2e/broker_happy_path.spec.ts \
+            --config playwright.broker.config.ts
+          echo "✅ Broker happy-path E2E passed"
+
+      - name: Upload broker E2E report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-broker-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Teardown mock broker stack
+        if: always()
+        run: |
+          echo "Tearing down mock broker stack..."
+          docker compose -f docker-compose.test.yml -p mock_test down -v --remove-orphans || true
           rm -f .env
-          echo "✅ Cleanup complete"
+          echo "✅ Mock broker stack torn down"
 
       - name: Report CD status
         if: always()
         run: |
           echo "✅ CD Stage Complete"
-          echo "Docker image built, booted, and E2E tests passed"
+          echo "Docker built, booted, pytest E2E + Playwright smoke + Tier-3 mock broker all run"
 
 # ============================================================================
 # Branch Protection Requirements
