@@ -10,6 +10,10 @@ from __future__ import annotations
 from datetime import datetime
 from unittest.mock import patch
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker
+
 from database import strategy_mode_audit_db
 from database.strategy_mode_audit_db import (
     StrategyModeAudit,
@@ -17,8 +21,28 @@ from database.strategy_mode_audit_db import (
     record_attempt,
 )
 
-# The strategy_mode_audit table is created in the per-test redirected DB by
-# conftest._INIT_TARGETS — no per-file autouse fixture is needed.
+
+@pytest.fixture(autouse=True)
+def _isolate_audit_db(monkeypatch):
+    """Rebind ``database.strategy_mode_audit_db`` to a fresh in-memory engine
+    per test.
+
+    The conftest's session-scope ``_INIT_TARGETS`` list creates the table
+    in the redirected temp DB at session start, but that engine is shared
+    across all tests in the worker and is vulnerable to pollution from any
+    test that swaps the global engine. Mirrors the per-test fixture pattern
+    in test_sector_follow_service.py / test_sector_follow_full_cycle.py to
+    keep this file hermetic regardless of xdist test ordering.
+    """
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(strategy_mode_audit_db, "engine", eng)
+    monkeypatch.setattr(strategy_mode_audit_db, "db_session", sess)
+    strategy_mode_audit_db.Base.query = sess.query_property()
+    strategy_mode_audit_db.Base.metadata.create_all(eng)
+    yield
+    sess.remove()
+    eng.dispose()
 
 
 def test_record_attempt_accepted_writes_row():
