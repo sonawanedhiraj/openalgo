@@ -208,6 +208,10 @@ def check_and_refresh_if_stale(
         result["errors"].append(str(e))
         return result
 
+    # Propagate the submitted job_id to the caller (issue #154). See sibling
+    # sector_follow_index_backfill for the rationale.
+    if bf.get("job_id"):
+        result["job_id"] = bf["job_id"]
     if bf.get("status") == "success":
         result["refreshed"] = stale
     else:

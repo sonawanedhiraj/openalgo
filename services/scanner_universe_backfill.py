@@ -295,6 +295,12 @@ def check_and_refresh_if_stale(
         result["errors"].append(str(e))
         return result
 
+    # Propagate the submitted job_id to the caller (issue #154). Without this,
+    # boot_convergence's wait_for_jobs (PR #152) sees job_id=None for each
+    # interval arm and exits immediately — the lock then releases while the
+    # 5-worker pool is still mid-download.
+    if bf.get("job_id"):
+        result["job_id"] = bf["job_id"]
     if bf.get("status") == "success":
         result["refreshed"] = stale
     elif bf.get("status") == "ok":
