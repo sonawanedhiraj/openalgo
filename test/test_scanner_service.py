@@ -458,8 +458,10 @@ def test_indicators_dict_populated_with_expected_keys():
     result = svc._build_indicators("RELIANCE", bars)
     # Backward-compat indicator keys, the four Task-4 multi-timeframe keys, plus
     # the ``symbol`` key (Tier-1 Fix #1/#2 — rules name the symbol in their logs).
+    # Issue #158 D2 added the ``exchange`` key so F&O rules can skip indices.
     assert set(result.keys()) == {
         "symbol",
+        "exchange",
         "ema_20",
         "atr_14",
         "rsi_14",

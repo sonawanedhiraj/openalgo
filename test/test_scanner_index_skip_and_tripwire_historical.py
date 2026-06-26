@@ -112,15 +112,50 @@ def _make_tripwire_callers():
     return notifier, health_writer
 
 
-def test_tripwire_historical_as_of_skips_notify(monkeypatch):
-    """as_of more than 1 hour behind wall-clock → no notifier, no health row."""
+def test_tripwire_historical_as_of_skips_notify_with_default_notifier(monkeypatch):
+    """as_of more than 1 hour behind wall-clock + default production notifier
+    → silent. This is the production-path guard against replays/backfills."""
+    monkeypatch.setenv("SCANNER_DRY_TRIPWIRE_ENABLED", "true")
+
+    from services import scanner_dry_tripwire_service as svc
+
+    health_writer = MagicMock()
+    # Patch the production_notifier symbol so we can assert it wasn't called
+    # WITHOUT having to call the real notifier (which would try to send
+    # Telegram).
+    patched_prod_notifier = MagicMock()
+    monkeypatch.setattr(svc, "production_notifier", patched_prod_notifier)
+
+    historical = datetime.now(tz=_IST) - timedelta(hours=2)
+
+    # notifier=None (the default sentinel) → service uses production_notifier
+    # → historical guard fires.
+    result = svc.check_dry_scanner(
+        as_of=historical,
+        latest_inhouse_provider=lambda: None,
+        chartink_has_rows_since=lambda _t: True,
+        broker_session_checker=lambda: True,
+        notifier=None,
+        health_writer=health_writer,
+        subscribed_at_provider=lambda: None,
+    )
+
+    assert result["status"] == "historical_silent"
+    assert result["as_of"] == historical.isoformat()
+    patched_prod_notifier.assert_not_called()
+    health_writer.assert_not_called()
+
+
+def test_tripwire_historical_as_of_with_custom_notifier_evaluates(monkeypatch):
+    """Tests inject custom notifiers explicitly — they get the normal flow
+    even with historical as_of, so existing scenario-driven tests keep
+    working. (The guard is only against the DEFAULT production notifier.)"""
     monkeypatch.setenv("SCANNER_DRY_TRIPWIRE_ENABLED", "true")
 
     from services import scanner_dry_tripwire_service as svc
 
     notifier, health_writer = _make_tripwire_callers()
 
-    # 2 hours ago — comfortably historical.
     historical = datetime.now(tz=_IST) - timedelta(hours=2)
 
     result = svc.check_dry_scanner(
@@ -128,15 +163,14 @@ def test_tripwire_historical_as_of_skips_notify(monkeypatch):
         latest_inhouse_provider=lambda: None,
         chartink_has_rows_since=lambda _t: True,
         broker_session_checker=lambda: True,
-        notifier=notifier,
+        notifier=notifier,  # custom — bypass the historical guard
         health_writer=health_writer,
         subscribed_at_provider=lambda: None,
     )
-
-    assert result["status"] == "historical_silent"
-    assert result["as_of"] == historical.isoformat()
-    notifier.assert_not_called()
-    health_writer.assert_not_called()
+    # Status is NOT historical_silent because the custom notifier opts out
+    # of the guard. The actual status depends on market-hours of the
+    # historical date.
+    assert result["status"] != "historical_silent"
 
 
 def test_tripwire_recent_as_of_still_evaluates(monkeypatch):

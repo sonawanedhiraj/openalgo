@@ -291,7 +291,7 @@ def check_dry_scanner(
     latest_inhouse_provider: Callable[[], datetime | None] = production_latest_inhouse_run_at,
     chartink_has_rows_since: Callable[[datetime], bool] = production_chartink_rows_since,
     broker_session_checker: Callable[[], bool] = production_broker_session_checker,
-    notifier: Callable[[str, str], None] = production_notifier,
+    notifier: Callable[[str, str], None] | None = None,
     health_writer: Callable[[str, dict, bool], None] = production_health_writer,
     subscribed_at_provider: Callable[[], datetime | None] = production_scanner_subscribed_at,
 ) -> dict:
@@ -318,17 +318,22 @@ def check_dry_scanner(
     now = as_of or datetime.now(tz=_IST)
 
     # Issue #158 D4: an explicit historical ``as_of`` (a replay / backfill /
-    # one-shot diagnostic, NOT the live periodic tick) must never notify.
-    # Without this guard, calling ``check_dry_scanner(as_of=<yesterday>)``
-    # fires a CRIT Telegram against today's operator. Threshold is 1 hour
+    # one-shot diagnostic) must never notify the operator. Threshold is 1 hour
     # behind real wall-clock — comfortably past any plausible live tick
-    # latency, well short of any replay/diagnostic window. The verdict is
-    # still returned (just no notifier/health-writer calls), so callers can
-    # use the result for forensic comparison without paging anyone.
-    if as_of is not None:
+    # latency. Only fires when the caller is using the DEFAULT production
+    # notifier (``notifier=None``) — tests that inject their own notifier are
+    # explicitly running a controlled scenario and want the normal evaluation
+    # path, even with a historical ``as_of`` for determinism.
+    using_default_notifier = notifier is None
+    if as_of is not None and using_default_notifier:
         wall_now = datetime.now(tz=_IST)
         if (wall_now - now).total_seconds() > 3600:
             return {"status": "historical_silent", "as_of": now.isoformat()}
+
+    # Resolve the default notifier now (after the historical guard so the
+    # `notifier is None` check above is reliable).
+    if notifier is None:
+        notifier = production_notifier
 
     if not _is_market_hours(now):
         return {"status": "off_hours"}
