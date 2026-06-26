@@ -323,7 +323,13 @@ def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
 
 def _boot_worker() -> None:
     if _wait_for_broker_session():
-        run_boot_backfill_checks()
+        # Serialise the convergence work against sibling schedulers so the four
+        # boot backfill jobs don't burst onto historify.duckdb simultaneously
+        # (see services/boot_convergence.py and issue #140).
+        from services.boot_convergence import boot_convergence_lock
+
+        with boot_convergence_lock(name="scanner"):
+            run_boot_backfill_checks()
     else:
         logger.warning(
             "scanner backfill: no broker session appeared at boot; "
