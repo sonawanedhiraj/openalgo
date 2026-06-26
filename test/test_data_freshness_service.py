@@ -256,3 +256,137 @@ def test_connect_historify_readonly_reraises_unrelated_connection_error(monkeypa
     monkeypatch.setattr(duckdb, "connect", fake_connect)
     with pytest.raises(duckdb.ConnectionException, match="does not exist"):
         dfs.connect_historify_readonly("nope.duckdb")
+
+
+# --------------------------------------------------------------------------- #
+# Issue #126 — broadened fallback for IOException + BinderException + retry
+# --------------------------------------------------------------------------- #
+def test_is_transient_lock_error_recognises_attach_conflict():
+    """BinderException attach-conflict is now classified as transient (issue #126)."""
+    err = duckdb.BinderException(
+        'Unique file handle conflict: Cannot attach "historify" - the database '
+        'file is already attached by database "historify"'
+    )
+    assert dfs.is_transient_lock_error(err) is True
+
+
+def test_connect_historify_readonly_falls_back_on_io_error(tmp_duckdb, monkeypatch):
+    """IOException 'being used by another process' must trigger the fallback (issue #126).
+
+    Before this fix, only ConnectionException was caught — IOException re-raised,
+    producing 40+ 'Cannot open file ... being used by another process' errors in
+    log/errors.jsonl despite PR #118's fallback existing.
+    """
+    path = tmp_duckdb({"AAA": (2026, 6, 11)})
+    calls = []
+    real_connect = duckdb.connect
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        calls.append(read_only)
+        if read_only:
+            raise duckdb.IOException(
+                f'IO Error: Cannot open file "{p}": The process cannot access '
+                "the file because it is being used by another process."
+            )
+        return real_connect(p, *args, read_only=read_only, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+
+    con = dfs.connect_historify_readonly(path)
+    try:
+        rows = con.execute("SELECT symbol FROM market_data").fetchall()
+    finally:
+        con.close()
+    assert rows == [("AAA",)]
+    # First read_only attempt refused with IOException, fallback succeeded.
+    assert calls == [True, False]
+
+
+def test_connect_historify_readonly_falls_back_on_binder_attach_conflict(tmp_duckdb, monkeypatch):
+    """BinderException attach-conflict must trigger the fallback (issue #126)."""
+    path = tmp_duckdb({"BBB": (2026, 6, 11)})
+    calls = []
+    real_connect = duckdb.connect
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        calls.append(read_only)
+        if read_only:
+            raise duckdb.BinderException(
+                'Unique file handle conflict: Cannot attach "historify" - '
+                "the database file is already attached"
+            )
+        return real_connect(p, *args, read_only=read_only, **kwargs)
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+
+    con = dfs.connect_historify_readonly(path)
+    try:
+        rows = con.execute("SELECT symbol FROM market_data").fetchall()
+    finally:
+        con.close()
+    assert rows == [("BBB",)]
+    assert calls == [True, False]
+
+
+def test_connect_historify_readonly_retries_fallback_under_contention(monkeypatch):
+    """When the fallback ALSO fails transiently, retry with backoff (issue #126).
+
+    Simulates: read_only refused → fallback default-config connect also racing
+    with a brief write → 2 fallback failures → 3rd succeeds.
+    """
+    sleeps = []
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+    attempts = {"read_only_attempts": 0, "default_attempts": 0}
+    sentinel_conn = object()
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        if read_only:
+            attempts["read_only_attempts"] += 1
+            raise duckdb.ConnectionException("different configuration than existing connections")
+        attempts["default_attempts"] += 1
+        if attempts["default_attempts"] < 3:
+            raise duckdb.IOException("Cannot open file: being used by another process")
+        return sentinel_conn
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+
+    result = dfs.connect_historify_readonly("any.duckdb", max_retries=3)
+    assert result is sentinel_conn
+    assert attempts["read_only_attempts"] == 1  # tried once
+    assert attempts["default_attempts"] == 3  # retried until success
+    # Backoff observed: 100ms, 200ms (the 3rd attempt succeeds so no sleep after)
+    assert sleeps == [0.1, 0.2]
+
+
+def test_connect_historify_readonly_raises_after_max_retries(monkeypatch):
+    """If contention persists past max_retries, raise the last DuckDB error (issue #126)."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        if read_only:
+            raise duckdb.ConnectionException("different configuration")
+        raise duckdb.IOException("being used by another process")
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+
+    with pytest.raises(duckdb.IOException, match="being used by another process"):
+        dfs.connect_historify_readonly("any.duckdb", max_retries=2)
+
+
+def test_connect_historify_readonly_does_not_retry_non_transient_fallback_error(monkeypatch):
+    """A non-transient error in the fallback path must propagate immediately (issue #126)."""
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    attempts = {"default": 0}
+
+    def fake_connect(p, *args, read_only=False, **kwargs):
+        if read_only:
+            raise duckdb.ConnectionException("different configuration")
+        attempts["default"] += 1
+        raise duckdb.ConnectionException("database does not exist")  # not transient
+
+    monkeypatch.setattr(duckdb, "connect", fake_connect)
+
+    with pytest.raises(duckdb.ConnectionException, match="does not exist"):
+        dfs.connect_historify_readonly("any.duckdb")
+    assert attempts["default"] == 1  # no retry on non-transient error
