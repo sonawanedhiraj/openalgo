@@ -1106,6 +1106,21 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize WS recovery service: {e}")
 
+            # Issue #157 (R4 of #156): boot-time orphan-exit reconciliation.
+            # Marks pre-existing trade_journal rows where exit_reason was set
+            # but exit_price never landed (broker rejection at 15:14 IST etc.)
+            # as 'abandoned_<original>' so the engine stops re-attempting them
+            # on every restart. Idempotent; non-blocking daemon; waits for the
+            # broker session before scanning.
+            try:
+                from services.orphan_exit_reconciliation_service import (
+                    init_orphan_exit_reconciliation,
+                )
+
+                init_orphan_exit_reconciliation()
+            except Exception as e:
+                logger.error(f"Failed to initialize orphan-exit reconciliation: {e}")
+
             # Scanner history cache warm-up (Task 3) — pre-load daily/weekly
             # bars so the first scan does not pay per-symbol lazy-load latency.
             # Gated by SCANNER_HISTORY_WARMUP_ENABLED (default true). Runs on a
