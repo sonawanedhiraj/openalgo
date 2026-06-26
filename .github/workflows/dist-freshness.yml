@@ -21,7 +21,12 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 24 matches the rest of CI (the runner's default) and the
+          # newer baseline in frontend/package.json engines (>=24.13.0).
+          # Vite produces different asset hashes per Node version, so this
+          # MUST stay aligned with whatever developers run locally — Node 20
+          # leaves PRs perpetually stale against any contributor on Node 22+.
+          node-version: 24
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
