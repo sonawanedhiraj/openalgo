@@ -54,7 +54,9 @@ def test_stale_triggers_refresh_of_stale_subset_1m():
     ):
         res = sub.check_and_refresh_if_stale(THURS, interval="1m")
 
-    assert set(res) == _RESULT_KEYS
+    # `job_id` (issue #154) may be added when a backfill job is submitted —
+    # subset check keeps the contract additive.
+    assert _RESULT_KEYS.issubset(set(res))
     assert res["status"] == "ok"
     assert res["interval"] == "1m"
     assert set(res["stale_symbols"]) == set(universe)
