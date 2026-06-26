@@ -777,6 +777,22 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
 
+            # Probe historify.duckdb for orphan-process contention BEFORE wiring
+            # any backfill scheduler. If a foreign python.exe is holding the
+            # file (a prior OpenAlgo that didn't fully die, a stuck backtester),
+            # the four boot backfill jobs would otherwise pile 200+ lock-error
+            # retries into errors.jsonl against a file they can never write to.
+            # Aborts boot loud with the holder PID. See services/boot_db_probe.py
+            # and issue #139.
+            try:
+                from services.boot_db_probe import assert_historify_unlocked
+
+                assert_historify_unlocked()
+            except SystemExit:
+                raise  # propagate the abort — the probe already logged + alerted
+            except Exception as e:
+                logger.error(f"boot_db_probe wiring failed (non-fatal): {e}")
+
             # sector_follow_cap5_vol 1m feed convergence (replaces the 16:05/16:10
             # IST cron backfill jobs). On boot — after a broker session appears —
             # it reads MAX(timestamp) per index + stock from historify.duckdb and
