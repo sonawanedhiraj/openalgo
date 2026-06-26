@@ -623,10 +623,17 @@ class WebSocketProxy:
             from database.auth_db import get_broker_name
 
             # Get user's connected broker from database
-            # This queries the auth_token table to find the user's active broker
+            # This queries the auth_token table to find the user's active broker.
+            # `is_revoked = 0` filter is the freshness gate (issue #141): once
+            # the login-resume probe finds the stored token stale it calls
+            # invalidate_auth() which sets is_revoked=True. Without this filter
+            # the proxy creates a Zerodha adapter against yesterday's token and
+            # 403s every 15s until the operator re-logs in. SQLAlchemy stores
+            # is_revoked as 0/1 (SQLite boolean).
             query = text("""
                 SELECT broker FROM auth_token
                 WHERE user_id = :user_id
+                  AND (is_revoked IS NULL OR is_revoked = 0)
                 ORDER BY id DESC
                 LIMIT 1
             """)
