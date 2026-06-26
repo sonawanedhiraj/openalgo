@@ -1022,6 +1022,25 @@ def setup_environment(app):
                         scanner_intervals,
                     )
 
+                    # Issue #156 Phase 2 (R3): seed the aggregator's rolling
+                    # bars from historify at boot so RSI(14)/SMA(20) windows
+                    # are full by the time the first live tick arrives —
+                    # eliminates the ~25k pandas_ta_classic verify_series
+                    # warnings per restart AND the 100-min silent warmup
+                    # period that looks identical to 'no setups today'.
+                    # Non-blocking daemon: waits for the broker session, then
+                    # folds last N min of 1m bars per symbol via
+                    # aggregator.replay_bars (idempotent, ws_recovery's later
+                    # replay never double-counts).
+                    try:
+                        from services.scanner_aggregator_seeder import (
+                            init_scanner_aggregator_seeder,
+                        )
+
+                        init_scanner_aggregator_seeder(app.scanner_service.aggregator, symbols)
+                    except Exception as e:
+                        logger.error(f"Failed to start aggregator seeder: {e}")
+
                     # Pre-subscribe scanner symbols to the broker WebSocket so
                     # ticks flow from market open without waiting for a Chartink
                     # hit. Event-driven (see services/scanner_presubscribe.py):
