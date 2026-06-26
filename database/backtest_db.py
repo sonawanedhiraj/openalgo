@@ -168,6 +168,17 @@ def _migrate_add_methodology_columns() -> None:
                 ("backtest_trades", "methodology", "VARCHAR(32)"),
                 ("backtest_trades", "scanner_hit_timestamp", "VARCHAR(40)"),
             ]:
+                # Guard against "no such table: backtest_trades" on a fresh
+                # DB or a partial init: PRAGMA table_info() returns an empty
+                # list both when a column is missing AND when the table
+                # itself is missing. Without this guard, _column_exists()
+                # returns False on a missing table, the ALTER fires, and
+                # SQLite raises "no such table" — the WARNING the operator
+                # sees on every restart of a fresh deploy. The table will be
+                # created by create_all() (already called above via
+                # init_db_with_logging) or on the very next init pass.
+                if not _table_exists(conn, table):
+                    continue
                 if _column_exists(conn, table, column):
                     continue
                 try:
@@ -186,6 +197,28 @@ def _migrate_add_methodology_columns() -> None:
                     )
     except Exception as e:
         logger.warning("backtest_db: migration introspection failed: %s", e)
+
+
+def _table_exists(conn, table: str) -> bool:
+    """Return True iff ``table`` exists in the SQLite schema.
+
+    Uses ``sqlite_master`` (the canonical SQLite schema catalog) rather than
+    PRAGMA so we can distinguish 'table missing' from 'column missing' — both
+    of which leave PRAGMA table_info() returning empty rows.
+    """
+    from sqlalchemy import text as _text
+
+    try:
+        row = conn.execute(
+            _text("SELECT name FROM sqlite_master WHERE type='table' AND name=:t"),
+            {"t": table},
+        ).fetchone()
+        return row is not None
+    except Exception:
+        # Non-SQLite backends (or a connection-level error) — assume the
+        # table exists so the ALTER attempt runs and any real failure is
+        # caught by the inner try/except with a logged warning.
+        return True
 
 
 def _column_exists(conn, table: str, column: str) -> bool:
