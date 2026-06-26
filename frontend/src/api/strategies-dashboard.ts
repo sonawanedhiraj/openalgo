@@ -169,4 +169,72 @@ export const strategiesDashboardApi = {
     )
     return res.data.data
   },
+
+  /**
+   * Flip a strategy's mode (sandbox <-> live) through the preflight gate.
+   *
+   * Returns the {@link FlipModeOutcome}. A 409 (preflight refused) is NOT
+   * thrown as an error here — the response body has `accepted=false` and a
+   * `blockers` list the UI surfaces to the operator. Other HTTP failures
+   * (400/404/5xx) throw normally.
+   *
+   * Resolves the today's-failure scenario from issue #162: the UI calls this
+   * and either gets `accepted=true` (mode mutated, event published) or
+   * `accepted=false` (mode unchanged, blockers explain why). Operator never
+   * silently ends up in a broken LIVE state.
+   */
+  flipMode: async (
+    name: string,
+    mode: 'live' | 'sandbox',
+    notes?: string
+  ): Promise<FlipModeOutcome> => {
+    const res = await webClient.post<FlipModeOutcome>(
+      `/strategies/api/${name}/mode`,
+      { mode, notes },
+      // Don't throw on 409 — that's the "blocked by preflight" response,
+      // not a transport-level failure. The UI inspects accepted/blockers.
+      { validateStatus: (s) => s === 202 || s === 409 }
+    )
+    return res.data
+  },
+
+  /** Recent mode flip attempts (accepted + blocked). */
+  getModeAudit: async (name: string, limit = 10): Promise<ModeAuditRow[]> => {
+    const res = await webClient.get<{
+      status: string
+      data: { name: string; rows: ModeAuditRow[]; limit: number }
+    }>(`/strategies/api/${name}/mode/audit`, { params: { limit } })
+    return res.data.data.rows
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Mode flip types (issue #162)
+// ---------------------------------------------------------------------------
+
+export interface FlipModeOutcome {
+  status: 'success' | 'blocked'
+  accepted: boolean
+  strategy_name: string
+  target_mode: 'live' | 'sandbox'
+  previous_mode: string | null
+  new_mode: string | null
+  blockers: string[]
+  warnings: string[]
+  audit_id: number | null
+  error_message: string | null
+}
+
+export interface ModeAuditRow {
+  id: number
+  strategy_name: string
+  target_mode: string
+  previous_mode: string | null
+  accepted: boolean
+  blockers: string[]
+  warnings: string[]
+  snapshot: Record<string, unknown>
+  flipped_at: string | null
+  flipped_by: string
+  error_message: string | null
 }

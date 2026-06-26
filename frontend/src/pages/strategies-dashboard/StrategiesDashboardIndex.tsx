@@ -1,17 +1,21 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
   Clock,
+  Loader2,
   PauseCircle,
+  Power,
   RefreshCw,
   TrendingDown,
   TrendingUp,
 } from 'lucide-react'
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
+  type FlipModeOutcome,
   type StrategyHealth,
   type StrategySummary,
   strategiesDashboardApi,
@@ -20,6 +24,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { showToast } from '@/utils/toast'
 
 const REFRESH_MS = 30_000
 
@@ -100,6 +105,112 @@ function PnlDisplay({ pnl }: { pnl: number | null | undefined }) {
 }
 
 // ---------------------------------------------------------------------------
+// Mode toggle button (issue #162)
+// ---------------------------------------------------------------------------
+//
+// One-click sandbox<->live flip routed through POST /strategies/api/<name>/mode.
+// The server runs the preflight; on a 409 ("blocked"), the response carries a
+// `blockers` list which we display to the operator so they know exactly what
+// to fix before retrying — not silent.
+
+function ModeToggleButton({ s }: { s: StrategySummary }) {
+  const queryClient = useQueryClient()
+  const [blockers, setBlockers] = useState<string[] | null>(null)
+
+  // Scaffold-only strategies have no LIVE path — disable the toggle entirely.
+  const isScaffold = !s.deployable || s.mode.includes('scaffold')
+  const targetMode: 'live' | 'sandbox' = s.mode === 'live' ? 'sandbox' : 'live'
+
+  const flip = useMutation({
+    mutationFn: () => strategiesDashboardApi.flipMode(s.name, targetMode),
+    onSuccess: (outcome: FlipModeOutcome) => {
+      if (outcome.accepted) {
+        setBlockers(null)
+        showToast.success(`${s.display_name} → ${outcome.new_mode?.toUpperCase()}`, 'strategy')
+        queryClient.invalidateQueries({ queryKey: ['strategies-list'] })
+      } else {
+        // Preflight refused — surface the blockers list to the operator.
+        setBlockers(outcome.blockers)
+        showToast.error(
+          `Cannot enable ${targetMode.toUpperCase()} (${outcome.blockers.length} blocker${outcome.blockers.length === 1 ? '' : 's'})`,
+          'strategy'
+        )
+      }
+    },
+    onError: () => {
+      showToast.error('Mode flip request failed — check server logs', 'strategy')
+    },
+  })
+
+  const handleClick = () => {
+    if (isScaffold) return
+    // Light confirm for the LIVE direction only; sandbox is always safe.
+    if (targetMode === 'live') {
+      const ok = window.confirm(
+        `Enable LIVE mode for ${s.display_name}?\n\n` +
+          'The server will run a preflight check first. If any condition is not met ' +
+          '(broker session, data freshness, orphan trades, etc.) the flip will be ' +
+          'refused with a clear blocker message.'
+      )
+      if (!ok) return
+    }
+    setBlockers(null)
+    flip.mutate()
+  }
+
+  if (isScaffold) {
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        className="w-full text-xs text-muted-foreground"
+        disabled
+        title="Scaffold strategy — no LIVE path"
+      >
+        <Power className="h-3 w-3 mr-1.5" />
+        Scaffold only
+      </Button>
+    )
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <Button
+        variant={targetMode === 'live' ? 'default' : 'outline'}
+        size="sm"
+        className="w-full text-xs"
+        onClick={handleClick}
+        disabled={flip.isPending}
+        title={
+          targetMode === 'live'
+            ? 'Enable LIVE mode (preflight will refuse if not ready)'
+            : 'Switch back to SANDBOX'
+        }
+      >
+        {flip.isPending ? (
+          <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+        ) : (
+          <Power className="h-3 w-3 mr-1.5" />
+        )}
+        {flip.isPending ? 'Flipping…' : `Switch to ${targetMode.toUpperCase()}`}
+      </Button>
+      {blockers && blockers.length > 0 && (
+        <div className="rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-2 space-y-1">
+          <p className="text-xs font-semibold text-red-700 dark:text-red-300 flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3" /> Cannot enable {targetMode.toUpperCase()}
+          </p>
+          <ul className="text-xs text-red-700 dark:text-red-300 space-y-0.5 ml-4 list-disc">
+            {blockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Strategy card
 // ---------------------------------------------------------------------------
 
@@ -165,6 +276,11 @@ function StrategyCard({ s }: { s: StrategySummary }) {
             })}
           </p>
         )}
+
+        {/* Mode flip toggle (issue #162) — gated by server-side preflight.
+            On block, the blockers list is rendered below the button so the
+            operator sees exactly why the flip was refused. */}
+        <ModeToggleButton s={s} />
 
         <Link to={`/strategies/${s.name}`}>
           <Button variant="outline" size="sm" className="w-full gap-1.5">
