@@ -351,3 +351,93 @@ def flip_mode(
         flipped_by,
     )
     return outcome
+
+
+# --------------------------------------------------------------------------- #
+# CLI fallback (issue #162 — S6)
+# --------------------------------------------------------------------------- #
+
+
+def _cli_main(argv: list[str] | None = None) -> int:
+    """``uv run python -m services.strategy_mode_service flip <name> <mode>``.
+
+    Operator-friendly entry point for flipping mode from the shell when the
+    UI is unavailable. Goes through the full preflight + audit + event path —
+    NOT a raw SQL update.
+
+    Examples:
+        # Block-or-flip (interactive): exits 0 on accept, 1 on block.
+        uv run python -m services.strategy_mode_service flip sector_follow_cap5_vol live
+
+        # Show recent audit for a strategy.
+        uv run python -m services.strategy_mode_service audit sector_follow_cap5_vol --limit 20
+
+        # List strategies + their current mode.
+        uv run python -m services.strategy_mode_service list
+    """
+    import argparse
+    import json as _json
+
+    parser = argparse.ArgumentParser(
+        prog="python -m services.strategy_mode_service",
+        description="Flip a strategy's persistent mode through the preflight gate.",
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    flip_p = sub.add_parser("flip", help="Flip a strategy's mode (sandbox↔live).")
+    flip_p.add_argument("strategy_name")
+    flip_p.add_argument("mode", choices=["live", "sandbox"])
+    flip_p.add_argument("--notes", default=None, help="Optional free-text note on the row.")
+    flip_p.add_argument(
+        "--by",
+        default=None,
+        help="Override the 'flipped_by' audit label (default: 'cli:<user>').",
+    )
+
+    audit_p = sub.add_parser("audit", help="Show recent flip attempts for a strategy.")
+    audit_p.add_argument("strategy_name")
+    audit_p.add_argument("--limit", type=int, default=10)
+
+    sub.add_parser("list", help="List current mode for every strategy with a row.")
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "flip":
+        import getpass
+        import os as _os
+
+        by = (
+            args.by
+            or f"cli:{_os.environ.get('USER') or _os.environ.get('USERNAME') or getpass.getuser() or 'unknown'}"
+        )
+        outcome = flip_mode(
+            strategy_name=args.strategy_name,
+            target_mode=args.mode,
+            flipped_by=by,
+            notes=args.notes,
+        )
+        print(_json.dumps(outcome.to_dict(), indent=2))
+        return 0 if outcome.accepted else 1
+
+    if args.cmd == "audit":
+        from database.strategy_mode_audit_db import list_attempts
+
+        rows = list_attempts(strategy_name=args.strategy_name, limit=args.limit)
+        print(_json.dumps(rows, indent=2, default=str))
+        return 0
+
+    if args.cmd == "list":
+        from database.strategy_mode_db import list_modes
+
+        rows = list_modes()
+        print(_json.dumps(rows, indent=2, default=str))
+        return 0
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    _sys.exit(_cli_main())

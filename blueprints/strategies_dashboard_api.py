@@ -1,6 +1,6 @@
-"""Read-only API endpoints for the Strategies Dashboard (Tier 2).
+"""API endpoints for the Strategies Dashboard (Tier 2).
 
-Four endpoints consumed by the React /strategies page:
+GET endpoints consumed by the React /strategies page:
 
   GET /strategies/api/list
       All known strategies with summary metrics (mode, deployable, today's P&L,
@@ -17,8 +17,22 @@ Four endpoints consumed by the React /strategies page:
   GET /strategies/api/<name>/parameters/diff?vs=<version>
       Parameter diff between the current config_snapshot and a named version.
 
+  GET /strategies/api/<name>/mode/audit?limit=N
+      Recent strategy_mode_audit rows for this strategy (accepted + blocked).
+      Used by the UI to surface what happened on past flip attempts.
+
+POST endpoint (issue #162):
+
+  POST /strategies/api/<name>/mode  {"mode": "live" | "sandbox", "notes": "..."}
+      Flip the strategy's mode through services.strategy_mode_service.flip_mode().
+      Runs the preflight; on block returns 409 with the blocker list; on accept
+      writes the strategy_mode row + audit row + publishes the in-process event.
+      This is the sanctioned path that replaces raw SQL UPDATE on strategy_mode
+      (which produced today's silent 0-orders-in-LIVE incident).
+
 Authentication: Flask session (same as /scanner/api/*, no API key required).
-READ-ONLY. These endpoints never write to any database.
+GETs are read-only. POST /mode mutates strategy_mode + strategy_mode_audit only
+via the audited service path.
 """
 
 from __future__ import annotations
@@ -518,3 +532,110 @@ def parameters_diff(name: str):
             },
         }
     )
+
+
+# --------------------------------------------------------------------------- #
+# Mode flip endpoint (issue #162) — the single sanctioned mutation path
+# --------------------------------------------------------------------------- #
+
+
+def _flipped_by_label() -> str:
+    """Identify the operator behind the flip for the audit row.
+
+    Falls back to ``"ui:unknown"`` when no Flask session user is set —
+    handles the dev-server "no auth required" case without crashing.
+    """
+    try:
+        from flask import session
+
+        user = session.get("user") or session.get("username") or "unknown"
+        return f"ui:{user}"
+    except Exception:
+        return "ui:unknown"
+
+
+@strategies_dashboard_bp.route("/api/<name>/mode", methods=["POST"])
+@check_session_validity
+def flip_strategy_mode(name: str):
+    """Flip a strategy's mode (sandbox↔live) through the preflight gate.
+
+    Body: ``{"mode": "live" | "sandbox", "notes": "optional"}``
+
+    Returns:
+        202 + accepted=True  → flip succeeded, mode mutated, event fired.
+        409 + accepted=False → preflight refused; blockers list explains why.
+                              mode is unchanged.
+        400                  → bad input (missing/invalid mode in body).
+    """
+    strategy_dir = _STRATEGIES_DIR / name
+    if not strategy_dir.exists():
+        return jsonify({"status": "error", "message": f"Strategy '{name}' not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    target_mode = (body.get("mode") or "").lower().strip()
+    notes = body.get("notes") or None
+
+    if target_mode not in ("live", "sandbox"):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Body must include {'mode': 'live' | 'sandbox'}",
+                }
+            ),
+            400,
+        )
+
+    try:
+        from services.strategy_mode_service import flip_mode
+    except Exception:
+        logger.exception("flip_strategy_mode: failed to import strategy_mode_service")
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Strategy mode service unavailable — see logs",
+                }
+            ),
+            500,
+        )
+
+    outcome = flip_mode(
+        strategy_name=name,
+        target_mode=target_mode,
+        flipped_by=_flipped_by_label(),
+        notes=notes,
+    )
+    payload = outcome.to_dict()
+    payload["status"] = "success" if outcome.accepted else "blocked"
+    status_code = 202 if outcome.accepted else 409
+    return jsonify(payload), status_code
+
+
+@strategies_dashboard_bp.route("/api/<name>/mode/audit", methods=["GET"])
+@check_session_validity
+def strategy_mode_audit(name: str):
+    """Return recent mode-flip attempts for this strategy.
+
+    Used by the UI to show the operator: "what happened on the last 10
+    flip attempts?" — accepted AND blocked attempts both surface.
+    """
+    strategy_dir = _STRATEGIES_DIR / name
+    if not strategy_dir.exists():
+        return jsonify({"status": "error", "message": f"Strategy '{name}' not found"}), 404
+
+    try:
+        limit = int(request.args.get("limit", "10"))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 100))
+
+    try:
+        from database.strategy_mode_audit_db import list_attempts
+
+        rows = list_attempts(strategy_name=name, limit=limit)
+    except Exception:
+        logger.exception("strategy_mode_audit: list_attempts failed for %s", name)
+        rows = []
+
+    return jsonify({"status": "success", "data": {"name": name, "rows": rows, "limit": limit}})
