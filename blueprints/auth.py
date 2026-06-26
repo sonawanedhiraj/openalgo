@@ -208,6 +208,22 @@ def _try_resume_broker_session(username):
         # Validate token with a lightweight broker API call (funds)
         import importlib
 
+        # On stale-token detection below, invalidate the stored row so background
+        # subsystems (WS proxy adapter pool, websocket_service, ws_recovery_service,
+        # scanner pre-subscribe) don't keep retrying Zerodha with yesterday's token
+        # while the operator stares at the broker-login button. See issue #141.
+        def _mark_stale_and_return_none() -> None:
+            try:
+                from database.auth_db import invalidate_auth
+
+                invalidate_auth(username)
+            except Exception:
+                logger.exception(
+                    "Resume probe: invalidate_auth failed for %s — background subsystems "
+                    "may continue to read the stale token until next upsert_auth",
+                    username,
+                )
+
         try:
             broker_module = importlib.import_module(f"broker.{broker}.api.funds")
             # Preferred path: brokers that expose a dedicated auth probe
@@ -216,6 +232,7 @@ def _try_resume_broker_session(username):
                 is_valid, error_message = broker_module.test_auth_token(auth_token)
                 if not is_valid:
                     logger.info(f"Broker token expired or invalid for {username}: {error_message}")
+                    _mark_stale_and_return_none()
                     return None
             funds_data = broker_module.get_margin_data(auth_token)
             # get_margin_data returns {} on failure for some brokers, but others
@@ -225,9 +242,11 @@ def _try_resume_broker_session(username):
             failure_reason = _broker_validation_failure_reason(funds_data)
             if failure_reason:
                 logger.info(f"Broker token expired or invalid for {username}: {failure_reason}")
+                _mark_stale_and_return_none()
                 return None
         except Exception as e:
             logger.info(f"Broker token validation failed for {username}: {e}")
+            _mark_stale_and_return_none()
             return None
 
         # Token is valid — resume the session via handle_auth_success

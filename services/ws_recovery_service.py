@@ -281,6 +281,66 @@ class WSRecoveryService:
 
     # -- core ---------------------------------------------------------------
 
+    @staticmethod
+    def _master_contract_wait_sec() -> int:
+        """Bounded wait (seconds) for master contracts to come ready after re-login."""
+        raw = os.environ.get("WS_RECOVERY_MASTER_CONTRACT_WAIT_SEC", "60")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 60
+
+    def _wait_for_master_contract_ready(self, broker: str) -> bool:
+        """Poll master_contract_status_db until ``is_ready`` or bounded timeout.
+
+        Returns True when:
+          * the broker's master contract reports ready, OR
+          * no status row exists at all (treat as "no info, proceed" — the
+            row is created lazily by handle_auth_success, and an existing test
+            harness or a never-touched broker has no row).
+
+        Returns False on bounded timeout while the row exists and is NOT ready.
+        A timeout is non-fatal — the caller skips replay and logs; the next
+        ``broker_session_refreshed`` event re-fires recovery once the download
+        eventually completes.
+        """
+        wait_sec = self._master_contract_wait_sec()
+        if wait_sec == 0:
+            # Gate explicitly disabled (test contexts, ops kill-switch).
+            return True
+        deadline = time.monotonic() + wait_sec
+        poll_sec = 1.0
+        try:
+            from database.master_contract_status_db import get_status
+        except Exception:
+            logger.exception(
+                "WS recovery: master_contract_status_db import failed — proceeding without gate"
+            )
+            return True
+
+        while time.monotonic() < deadline:
+            try:
+                status = get_status(broker)
+            except Exception:
+                logger.exception("WS recovery: master_contract get_status raised — retrying")
+                status = None
+            if status is None or status.get("status") == "unknown":
+                # No row, or get_status synthesised the "unknown" row for a
+                # broker that has never been touched (the path that hits
+                # background tests without a broker session). Proceed —
+                # blocking here would deadlock any caller that legitimately
+                # has no broker session yet.
+                logger.info(
+                    "WS recovery: no master_contract status row for %s — proceeding without wait",
+                    broker,
+                )
+                return True
+            if status.get("is_ready"):
+                logger.info("WS recovery: master contract ready for %s", broker)
+                return True
+            time.sleep(poll_sec)
+        return False
+
     def _resolve_aggregator(self) -> Any | None:
         if self._aggregator_provider is not None:
             return self._aggregator_provider()
@@ -313,6 +373,29 @@ class WSRecoveryService:
             logger.warning("WS recovery: no API key available — cannot fetch history")
             self._notifier("WS recovery: aborted — no broker API key available to fetch history")
             return {"status": "error", "reason": "no_api_key", "symbols": len(universe)}
+
+        # Master-contract readiness gate (issue #141). On a Zerodha re-login,
+        # ``handle_auth_success`` simultaneously emits ``broker_session_refreshed``
+        # (which fires us) AND kicks off the master-contract re-download. If we
+        # iterate immediately, the symbol→token map for the new session isn't
+        # populated yet and every ``get_history`` call 404s with "Could not find
+        # instrument token for NSE:XYZ" — the post-login cascade seen in
+        # log/openalgo_2026-06-26.log 08:54:51→08:56:07. Bounded wait keeps us
+        # from blocking forever if the download fails.
+        if broker and not self._wait_for_master_contract_ready(broker):
+            logger.warning(
+                "WS recovery: master contract not ready for %s within %ds — "
+                "skipping universe replay to avoid the instrument-token cascade",
+                broker,
+                self._master_contract_wait_sec(),
+            )
+            self._notifier(f"WS recovery: skipped — master contract for {broker} not ready in time")
+            return {
+                "status": "skipped",
+                "reason": "master_contract_not_ready",
+                "broker": broker,
+                "symbols": len(universe),
+            }
 
         total = len(universe)
         resynced = 0

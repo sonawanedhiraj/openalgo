@@ -581,6 +581,64 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
     return auth_obj.id
 
 
+def invalidate_auth(name: str) -> bool:
+    """Mark stored broker auth for ``name`` as revoked and clear every layer.
+
+    Used by the login-flow freshness probe (``_try_resume_broker_session``) and
+    any other caller that has just discovered the stored token is dead. Without
+    this, the row sits in the auth table and every background subsystem
+    (``websocket_proxy``, ``ws_recovery_service``, the scanner pre-subscribe
+    boot poll) reads it via ``get_auth_token`` and attempts Zerodha calls with
+    a token that will 401/403. See issue #141.
+
+    Symmetric with ``upsert_auth(..., revoke=True)`` for the cache + ZMQ +
+    in-process-pool cleanup, but does NOT require the caller to know the
+    current token (the resume probe doesn't keep it). Returns False when no
+    row exists (already-clean state) so the call is safe to repeat.
+
+    Idempotent. Never raises.
+    """
+    try:
+        auth_obj = Auth.query.filter_by(name=name).first()
+        if not auth_obj:
+            return False
+        if not auth_obj.is_revoked:
+            auth_obj.is_revoked = True
+            db_session.commit()
+            logger.info(f"Marked stored auth as revoked for user: {name}")
+        # Clear local caches even if already revoked — a previous call may have
+        # set the flag but failed before clearing the caches.
+        auth_cache.clear()
+        feed_token_cache.clear()
+        broker_cache.clear()
+    except Exception as e:
+        logger.exception(f"invalidate_auth: DB update failed for {name}: {e}")
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.exception("invalidate_auth: rollback also failed")
+        return False
+
+    # Cross-process cache invalidation (same as upsert_auth). Best-effort.
+    try:
+        from database.cache_invalidation import publish_all_cache_invalidation
+
+        publish_all_cache_invalidation(name)
+    except Exception as e:
+        logger.warning(f"invalidate_auth: ZMQ cache invalidation failed for {name}: {e}")
+
+    # In-process WS adapter pool cleanup (same rationale as upsert_auth — single
+    # gunicorn worker shares the pool with this process).
+    try:
+        from websocket_proxy.broker_factory import cleanup_pools_for_user
+
+        cleanup_pools_for_user(name, broker_name=auth_obj.broker if auth_obj else None)
+    except Exception as e:
+        logger.warning(f"invalidate_auth: WS pool cleanup failed for {name}: {e}")
+
+    return True
+
+
 def get_auth_token(name, bypass_cache: bool = False):
     """Get decrypted auth token.
 
