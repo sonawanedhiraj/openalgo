@@ -317,6 +317,19 @@ def check_dry_scanner(
 
     now = as_of or datetime.now(tz=_IST)
 
+    # Issue #158 D4: an explicit historical ``as_of`` (a replay / backfill /
+    # one-shot diagnostic, NOT the live periodic tick) must never notify.
+    # Without this guard, calling ``check_dry_scanner(as_of=<yesterday>)``
+    # fires a CRIT Telegram against today's operator. Threshold is 1 hour
+    # behind real wall-clock — comfortably past any plausible live tick
+    # latency, well short of any replay/diagnostic window. The verdict is
+    # still returned (just no notifier/health-writer calls), so callers can
+    # use the result for forensic comparison without paging anyone.
+    if as_of is not None:
+        wall_now = datetime.now(tz=_IST)
+        if (wall_now - now).total_seconds() > 3600:
+            return {"status": "historical_silent", "as_of": now.isoformat()}
+
     if not _is_market_hours(now):
         return {"status": "off_hours"}
     if _is_warmup(now):

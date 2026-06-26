@@ -1052,10 +1052,23 @@ class ScannerService:
             except Exception:
                 logger.exception("ScannerService: history provider lookup failed for %s", symbol)
 
+        # Resolve the symbol's exchange so rules can quickly skip non-stock
+        # universes (e.g. NSE_INDEX) without firing missing-input warnings
+        # against indices that were never meant to be evaluated. Issue #158 D2.
+        try:
+            from services.scanner_presubscribe import resolve_exchange_for_symbol
+
+            exchange = resolve_exchange_for_symbol(symbol)
+        except Exception:
+            # Resolver failure is non-fatal — rules that care will treat
+            # missing exchange as "unknown" and proceed as before.
+            exchange = None
+
         return {
             # The symbol is threaded into the bundle so rules can name it in
             # their loud-failure / D-bar-date-verify logs (Tier-1 Fix #1/#2).
             "symbol": symbol,
+            "exchange": exchange,
             "ema_20": ema_20,
             "atr_14": atr_14,
             "rsi_14": rsi_14,

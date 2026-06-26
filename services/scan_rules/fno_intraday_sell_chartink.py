@@ -121,6 +121,14 @@ def rule(bars: pd.DataFrame, indicators: dict) -> bool:
 
 
 def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
+    # Issue #158 D2: skip index symbols silently — this is an F&O-stock rule,
+    # and indices (NSE_INDEX) are subscribed for tick flow for the regime /
+    # sector_follow services, never for evaluation here. Without this check,
+    # every 5m bar close emits "bars_daily is None (no daily-D data)" for
+    # NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNXT50 → 470 daily WARNINGs.
+    if indicators.get("exchange") == "NSE_INDEX":
+        return False
+
     bars_5m = indicators.get("bars_5m")
     if bars_5m is None:
         bars_5m = bars  # rule_fn is called with the 5m frame as `bars`
