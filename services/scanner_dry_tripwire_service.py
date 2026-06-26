@@ -55,6 +55,18 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 _last_crit_date: date | None = None
 _last_warn_date: date | None = None
 
+# When the scanner most-recently (re-)subscribed to the WS proxy in THIS
+# process. Set by the connect-callback hook registered in
+# ``init_scanner_dry_tripwire``. ``check_dry_scanner`` uses this as a floor on
+# the effective baseline so a stale yesterday-row doesn't trigger a CRIT in the
+# minutes immediately after a restart or mid-day re-login — the scanner needs
+# at least one 5m bar close to produce a row. See issue #146 for the false
+# CRIT this fixes (2026-06-26 09:35:00 IST: app restarted 09:10, scanner
+# subscribed ~09:11, latest_inhouse_at was yesterday's 00:25; without this
+# baseline the gap reads 1990 min and CRITs at 09:35 — when in reality the
+# scanner has been subscribed for only 24 min).
+_scanner_subscribed_at: datetime | None = None
+
 
 # --------------------------------------------------------------------------- #
 # Flags
@@ -82,6 +94,53 @@ def check_interval_min() -> int:
         return int(os.getenv("SCANNER_DRY_CHECK_INTERVAL_MIN", "5"))
     except ValueError:
         return 5
+
+
+def subscribe_warmup_min() -> int:
+    """``SCANNER_DRY_SUBSCRIBE_WARMUP_MIN`` (default 5 — one 5m bar close).
+
+    Minimum time the scanner must be subscribed before the tripwire is allowed
+    to fire on a stale ``last_inhouse_at``. Without this, a fresh boot during
+    market hours alerts CRIT before the first bar of the day has closed.
+    """
+    try:
+        return int(os.getenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5"))
+    except ValueError:
+        return 5
+
+
+# --------------------------------------------------------------------------- #
+# Subscribe-hook state (used by the WS connect callback)
+# --------------------------------------------------------------------------- #
+
+
+def mark_scanner_subscribed(when: datetime | None = None) -> None:
+    """Record the moment the scanner (re-)subscribed in this process.
+
+    Called by the WS connect callback registered in ``init_scanner_dry_tripwire``.
+    Idempotent — repeated calls during a normal session overwrite with the
+    most-recent timestamp (a mid-day re-login resets the warmup window, which
+    is the right behaviour: the scanner just lost and regained its feed).
+
+    Args:
+        when: Timestamp to record (defaults to ``datetime.now(_IST)``).
+    """
+    global _scanner_subscribed_at  # noqa: PLW0603 — module-level by design
+    _scanner_subscribed_at = when or datetime.now(tz=_IST)
+    logger.info("scanner_dry tripwire: scanner subscribed at %s", _scanner_subscribed_at)
+
+
+def production_scanner_subscribed_at() -> datetime | None:
+    """Default provider — returns the module-level subscribe timestamp."""
+    return _scanner_subscribed_at
+
+
+def _reset_subscribe_state_for_tests() -> None:
+    """Reset module state — tests only."""
+    global _scanner_subscribed_at, _last_crit_date, _last_warn_date  # noqa: PLW0603
+    _scanner_subscribed_at = None
+    _last_crit_date = None
+    _last_warn_date = None
 
 
 # --------------------------------------------------------------------------- #
@@ -234,6 +293,7 @@ def check_dry_scanner(
     broker_session_checker: Callable[[], bool] = production_broker_session_checker,
     notifier: Callable[[str, str], None] = production_notifier,
     health_writer: Callable[[str, dict, bool], None] = production_health_writer,
+    subscribed_at_provider: Callable[[], datetime | None] = production_scanner_subscribed_at,
 ) -> dict:
     """Run the check and return ``{status, severity, gap_min, …}``.
 
@@ -269,23 +329,50 @@ def check_dry_scanner(
 
     threshold = dry_threshold_min()
     last = latest_inhouse_provider()
-    if last is None:
-        # No row at all today — the gap is "since the warmup ended", measured
-        # in minutes. This is the empty-DB / cold-start case.
+
+    # Subscribe-aware baseline (issue #146). Without this floor the tripwire
+    # CRITs at 09:35 IST on every fresh boot, because last_inhouse_at points
+    # at yesterday's session and the gap reads 33+ hours.
+    try:
+        subscribed_at = subscribed_at_provider()
+    except Exception:
+        logger.debug("scanner_dry tripwire: subscribed_at_provider raised", exc_info=True)
+        subscribed_at = None
+
+    subscribe_floor: datetime | None = None
+    if subscribed_at is not None:
+        # The scanner needs at least one 5m bar close after subscribing before
+        # we can fairly expect a row. SCANNER_DRY_SUBSCRIBE_WARMUP_MIN sets that
+        # grace; the floor below is the earliest moment a missing row is honest
+        # to alert on.
+        subscribe_floor = subscribed_at + timedelta(minutes=subscribe_warmup_min())
+
+    if last is None and subscribe_floor is None:
+        # Cold start with no subscribe signal — fall back to the 09:30 IST
+        # warmup-end cutoff (pre-#146 behaviour).
         warmup_end = now.astimezone(_IST).replace(
             hour=_SCANNER_WARMUP_END.hour,
             minute=_SCANNER_WARMUP_END.minute,
             second=0,
             microsecond=0,
         )
-        gap_min = (now - warmup_end).total_seconds() / 60.0
+        effective_baseline = warmup_end
+    elif last is None:
+        effective_baseline = subscribe_floor
+    elif subscribe_floor is None:
+        effective_baseline = last
     else:
-        gap_min = (now - last).total_seconds() / 60.0
-    gap_min = max(0.0, gap_min)
+        # Use the later of the two — the scanner's own row beats the floor
+        # once it has produced anything; the floor protects the warmup window.
+        effective_baseline = max(last, subscribe_floor)
+
+    gap_min = max(0.0, (now - effective_baseline).total_seconds() / 60.0)
 
     details = {
         "as_of": now.astimezone(_IST).isoformat(),
         "last_inhouse_at": last.isoformat() if last else None,
+        "scanner_subscribed_at": subscribed_at.isoformat() if subscribed_at else None,
+        "subscribe_warmup_min": subscribe_warmup_min(),
         "gap_min": round(gap_min, 1),
         "threshold_min": threshold,
     }
@@ -379,9 +466,34 @@ def _tripwire_job() -> None:
         logger.exception("scanner_dry tripwire job raised")
 
 
+def _on_broker_ws_connected(user_id: str, broker: str) -> None:
+    """WS connect-callback: stamp ``_scanner_subscribed_at`` so the tripwire
+    grants a warmup grace period before alerting on a stale last_inhouse_at.
+
+    The scanner pre-subscribe callback (``services.scanner_presubscribe``) is
+    fired by the same event under a different name. Both callbacks run in their
+    own daemon threads, so a slow scanner subscribe never delays this stamp.
+    See issue #146.
+    """
+    try:
+        mark_scanner_subscribed()
+    except Exception:
+        logger.exception("scanner_dry tripwire: mark_scanner_subscribed failed")
+
+
 def init_scanner_dry_tripwire(app=None, scheduler=None):
     """Register the periodic APScheduler job. Registered even when the flag is
     off so toggling at runtime takes effect without re-init."""
+    # Wire the subscribe-aware baseline hook (issue #146) regardless of the
+    # SCANNER_DRY_TRIPWIRE_ENABLED flag — if the operator flips the flag on at
+    # runtime we want the subscribe state already accumulating.
+    try:
+        from services.ws_connect_callbacks import register_connect_callback
+
+        register_connect_callback("scanner_dry_tripwire_subscribe_hook", _on_broker_ws_connected)
+    except Exception:
+        logger.exception("scanner_dry tripwire: failed to register WS connect callback")
+
     try:
         from apscheduler.triggers.cron import CronTrigger
 

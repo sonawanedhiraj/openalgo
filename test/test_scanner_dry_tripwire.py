@@ -25,12 +25,11 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 
 @pytest.fixture(autouse=True)
 def _reset_dedup_state():
-    """Clear per-process dedup so each test starts from a known baseline."""
-    svc._last_crit_date = None
-    svc._last_warn_date = None
+    """Clear per-process dedup AND the subscribe-baseline marker so each test
+    starts from a known baseline (issue #146)."""
+    svc._reset_subscribe_state_for_tests()
     yield
-    svc._last_crit_date = None
-    svc._last_warn_date = None
+    svc._reset_subscribe_state_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -326,3 +325,131 @@ def test_tripwire_job_registers_with_scheduler():
     assert call_args[1]["id"] == "scanner_dry_tripwire"
     assert call_args[1]["replace_existing"] is True
     assert "trigger" in call_args[1]
+
+
+# --------------------------------------------------------------------------- #
+# Subscribe-aware baseline (issue #146)
+# --------------------------------------------------------------------------- #
+
+
+def test_fresh_subscribe_with_stale_yesterday_row_does_not_fire(monkeypatch):
+    """The scenario the 2026-06-26 09:35 IST CRIT exposed: app restarted at
+    09:11, scanner subscribed at 09:12, last_inhouse_at points at yesterday
+    00:25. At 09:35 the tripwire must NOT fire — the scanner has only been
+    subscribed for ~23 min, less than the 5-min warmup + 30-min threshold."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    now = _ist(2026, 6, 26, 9, 35)
+    yesterday = _ist(2026, 6, 25, 0, 25)
+    svc.mark_scanner_subscribed(_ist(2026, 6, 26, 9, 12))
+
+    providers, notified, _h = _stub(latest_inhouse=yesterday, chartink_alive=True)
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    assert res["status"] == "ok"
+    assert notified == []
+
+
+def test_subscribed_long_enough_with_stale_row_does_fire(monkeypatch):
+    """The honest CRIT path: scanner subscribed an hour ago and still no row.
+    Stale yesterday row is overridden by the subscribe baseline (12:00 + 5min
+    warmup = 12:05). At 13:00 the gap is 55 min, exceeds the 30-min threshold,
+    Chartink has rows → CRIT fires."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    now = _ist(2026, 6, 26, 13, 0)
+    yesterday = _ist(2026, 6, 25, 0, 25)
+    svc.mark_scanner_subscribed(_ist(2026, 6, 26, 12, 0))
+
+    providers, notified, _h = _stub(latest_inhouse=yesterday, chartink_alive=True)
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    assert res["status"] == "alerted_crit"
+    assert res["severity"] == "CRIT"
+    assert len(notified) == 1
+
+
+def test_subscribe_floor_does_not_mask_a_recent_row(monkeypatch):
+    """If the scanner produced a row 2 min ago (more recent than the
+    subscribe baseline), the row wins. Healthy state — no alert."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    now = _ist(2026, 6, 26, 14, 0)
+    svc.mark_scanner_subscribed(_ist(2026, 6, 26, 9, 12))
+    recent = now - timedelta(minutes=2)
+
+    providers, notified, _h = _stub(latest_inhouse=recent, chartink_alive=True)
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    assert res["status"] == "ok"
+    assert notified == []
+
+
+def test_mid_day_resubscribe_resets_warmup(monkeypatch):
+    """A mid-day Zerodha re-login re-fires the connect callback. The tripwire
+    must grant a new warmup window (otherwise it fires CRIT right after a
+    routine token refresh). 12:00 re-login + 5-min warmup = 12:05 floor; at
+    12:30 the gap is 25 min, under threshold → OK."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    # Earlier subscribe — overwritten by the re-subscribe at 12:00.
+    svc.mark_scanner_subscribed(_ist(2026, 6, 26, 9, 12))
+    # Mid-day re-login at 12:00.
+    svc.mark_scanner_subscribed(_ist(2026, 6, 26, 12, 0))
+
+    now = _ist(2026, 6, 26, 12, 30)
+    yesterday = _ist(2026, 6, 25, 0, 25)
+
+    providers, notified, _h = _stub(latest_inhouse=yesterday, chartink_alive=True)
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    assert res["status"] == "ok"
+    assert notified == []
+
+
+def test_no_subscribe_signal_falls_back_to_warmup_end_cutoff(monkeypatch):
+    """When the scanner has never reported a subscribe (e.g. very early in
+    boot, or scanner disabled) AND there's no row yet, the tripwire falls
+    back to the legacy 09:30 IST cutoff so its alerting behaviour is
+    well-defined even without the subscribe hook firing."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    now = _ist(2026, 6, 26, 11, 0)  # 90 min after warmup cutoff
+    # No mark_scanner_subscribed call — _scanner_subscribed_at is None.
+
+    providers, notified, _h = _stub(latest_inhouse=None, chartink_alive=True)
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    # Gap = 90 min from 09:30 cutoff, exceeds 30-min threshold, Chartink alive → CRIT.
+    assert res["status"] == "alerted_crit"
+    assert res["severity"] == "CRIT"
+
+
+def test_details_include_subscribed_at_and_warmup(monkeypatch):
+    """The structured log payload exposes the subscribe context so an operator
+    can see why a particular check did or didn't fire."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    subscribe_at = _ist(2026, 6, 26, 9, 12)
+    svc.mark_scanner_subscribed(subscribe_at)
+    now = _ist(2026, 6, 26, 9, 35)
+
+    providers, _n, health = _stub(latest_inhouse=_ist(2026, 6, 25, 0, 25), chartink_alive=True)
+    svc.check_dry_scanner(as_of=now, **providers)
+
+    assert health, "health row should be written for a heartbeat OK"
+    details = health[-1]["details"]
+    assert details["scanner_subscribed_at"] == subscribe_at.isoformat()
+    assert details["subscribe_warmup_min"] == 5
+
+
+def test_subscribed_at_provider_exception_falls_back_safely(monkeypatch):
+    """If the subscribed_at_provider raises (shouldn't happen, but guard
+    against module-state corruption), the check still completes and treats
+    subscribe state as unknown — same as no-subscribe-signal."""
+    monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
+    now = _ist(2026, 6, 26, 11, 0)
+
+    providers, _n, _h = _stub(latest_inhouse=None, chartink_alive=False)
+
+    def explode():
+        raise RuntimeError("module state corrupted")
+
+    res = svc.check_dry_scanner(as_of=now, subscribed_at_provider=explode, **providers)
+    # Without subscribe info AND no row, falls back to 09:30 cutoff → 90 min
+    # gap → WARN (chartink dry).
+    assert res["status"] == "alerted_warn"
