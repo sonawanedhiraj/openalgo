@@ -11,6 +11,13 @@ misuse`` / DB-locked errors). Two independent checks:
 On a hit we print a clear message to stderr and ``sys.exit(1)``. This runs
 before any Flask init, so it deliberately uses ``print`` rather than the
 logging stack (which may not be configured yet).
+
+Bypass: set ``OPENALGO_SKIP_SINGLETON_GUARD=1`` to return early without any
+probing. This is load-bearing for the gunicorn boot path — see start.sh
+where the master process runs the check once before spawning workers, then
+exports the flag so each worker's ``app.py`` import doesn't re-trigger the
+bind probe (which would fail because the master has already bound :5000,
+causing every worker to exit 1 and the container to never serve traffic).
 """
 
 import os
@@ -24,7 +31,14 @@ _PORT = 5000
 
 
 def check_singleton_or_abort() -> None:
-    """Abort the process if another OpenAlgo instance is already running."""
+    """Abort the process if another OpenAlgo instance is already running.
+
+    Returns early if ``OPENALGO_SKIP_SINGLETON_GUARD=1`` is set in the
+    environment — see module docstring for why.
+    """
+    if os.environ.get("OPENALGO_SKIP_SINGLETON_GUARD") == "1":
+        return
+
     # 1. Port-bind probe. If the bind raises, something already owns :5000.
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
