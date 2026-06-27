@@ -155,20 +155,34 @@ jobs:
           echo "Starting OpenAlgo container..."
           docker compose up -d
 
-          # Wait for app to be ready (up to 2 minutes)
-          echo "Waiting for application to be ready..."
+          # The self-hosted runner is itself a container talking to the host's
+          # Docker daemon via socket-mount. ``docker compose up -d`` binds
+          # openalgo-web's port 5000 on the HOST's 0.0.0.0; the runner's
+          # 127.0.0.1 is its OWN loopback (a separate Docker bridge), not the
+          # host's, so a curl to 127.0.0.1:5000 from inside the runner gets
+          # ERR_CONNECTION_REFUSED. Use host.docker.internal:5000 — the
+          # host-gateway alias mapped in the runner's docker-compose.override.yml.
+          APP_URL="http://host.docker.internal:5000"
+
+          echo "Waiting for application to be ready at $APP_URL..."
+          READY=0
           for i in {1..60}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/ 2>/dev/null || echo "000")
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$APP_URL/" 2>/dev/null || echo "000")
             if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
               echo "✅ Application is ready (HTTP $STATUS)"
+              READY=1
               break
             fi
             echo "  [$i/60] Waiting... (HTTP $STATUS)"
             sleep 2
           done
 
-          # Final status check
           docker compose ps
+          if [ "$READY" != "1" ]; then
+            echo "::error::Application failed to become ready within 120s. Container logs:"
+            docker compose logs --tail=200 openalgo-web || true
+            exit 1
+          fi
           echo "✅ Container is running"
 
       - name: Run pytest E2E tests against running application
@@ -188,7 +202,9 @@ jobs:
       - name: Run Playwright smoke tests
         working-directory: frontend
         env:
-          OPENALGO_URL: http://127.0.0.1:5000
+          # Same socket-mount runner-network nuance as in the boot step above:
+          # the runner can't reach the host's 127.0.0.1:5000; use host.docker.internal.
+          OPENALGO_URL: http://host.docker.internal:5000
         run: |
           echo "Running Playwright smoke against booted container..."
           npx playwright test --config playwright.smoke.config.ts
