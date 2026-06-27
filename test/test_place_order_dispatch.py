@@ -385,16 +385,26 @@ def mock_broker_server():
     t.start()
 
     base_url = f"http://127.0.0.1:{port}"
-    deadline = time.monotonic() + 10
+    # 30s readiness budget — under heavy xdist contention on the self-hosted
+    # runner, uvicorn startup can race past the prior 10s deadline. Bumping
+    # to 30s eliminates the false 'Mock broker did not become ready' failures
+    # in CI while costing nothing on a healthy-startup happy path (loop
+    # exits the moment /healthz returns 200).
+    deadline = time.monotonic() + 30
+    last_exc: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            if httpx.get(f"{base_url}/_mock/healthz", timeout=0.3).status_code == 200:
+            if httpx.get(f"{base_url}/_mock/healthz", timeout=0.5).status_code == 200:
                 break
-        except Exception:
+        except Exception as e:
+            last_exc = e
             time.sleep(0.1)
     else:
         server.should_exit = True
-        pytest.fail(f"Mock broker did not become ready on {base_url}")
+        pytest.fail(
+            f"Mock broker did not become ready on {base_url} within 30s "
+            f"(last probe exception: {last_exc!r})"
+        )
 
     state.reset()
     yield base_url, state
