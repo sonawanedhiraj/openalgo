@@ -111,7 +111,7 @@ jobs:
     # blocks merge; the trade-off is that a broken PR may briefly hold the
     # self-hosted slot, which `concurrency: cancel-in-progress: true` (above)
     # already bounds by cancelling superseded runs.
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout code
@@ -144,7 +144,7 @@ jobs:
           test -f .env && echo "✅ .env file created successfully" || echo "❌ .env file creation failed"
           ls -lh .env
 
-      - name: Preflight — runner can reach Docker daemon
+      - name: Preflight — runner can reach Docker daemon + host gateway
         run: |
           if ! docker version --format '{{.Server.Version}}' 2>/dev/null; then
             echo "::error::Runner cannot reach the Docker daemon."
@@ -160,7 +160,18 @@ jobs:
             echo "::error::Run: docker system prune -f"
             exit 1
           fi
-          echo "✅ Preflight: Docker $(docker version --format '{{.Server.Version}}'), ${AVAIL}GB disk free"
+          # Both the pytest E2E step and the Playwright steps below talk to
+          # services bound on the HOST's loopback via the host-gateway alias.
+          # If host.docker.internal isn't resolvable the runner is missing
+          # `extra_hosts: ["host.docker.internal:host-gateway"]` in its override.
+          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
+            echo "::error::host.docker.internal does not resolve from inside the runner."
+            echo "::error::Fix: add to C:\\actions-runner\\docker-compose.override.yml:"
+            echo "::error::  services: {gh-runner: {extra_hosts: [\"host.docker.internal:host-gateway\"]}}"
+            echo "::error::Then: docker rm -f openalgo-gh-runner && cd C:\\actions-runner && docker compose up -d"
+            exit 1
+          fi
+          echo "✅ Preflight: Docker $(docker version --format '{{.Server.Version}}'), ${AVAIL}GB disk free, host.docker.internal OK"
 
       - name: Build Docker image
         run: |
@@ -203,17 +214,152 @@ jobs:
           docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
           echo "::endgroup::"
 
-      - name: Run E2E tests against running application
+      - name: Run pytest E2E tests against running application
+        # The runner is itself a container talking to the host's Docker via
+        # socket-mount. `compose up` binds the openalgo-web service on the HOST's
+        # 0.0.0.0:5000 — NOT the runner's loopback. Python tests that hit the
+        # network use OPENALGO_URL=http://host.docker.internal:5000 (the
+        # host-gateway alias must be present in the runner's
+        # docker-compose.override.yml as `extra_hosts: [host.docker.internal:host-gateway]`).
+        env:
+          OPENALGO_URL: http://host.docker.internal:5000
         run: |
-          echo "Running E2E tests..."
+          echo "Running pytest E2E tests..."
           pip install uv --quiet
           uv run python -m pytest test/e2e --tb=short
-          echo "✅ E2E tests passed"
+          echo "✅ pytest E2E tests passed"
 
-      - name: Teardown containers
+      # ====================================================================
+      # Playwright Phase A — smoke against the already-booted main container.
+      # Restored from the deleted deploy-pipeline.yml per issue #149.
+      # ====================================================================
+      - name: Setup Node.js (for Playwright)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      # Cache the Playwright browser binaries keyed on package-lock.json (which
+      # pins @playwright/test). Cold install of chromium+deps is ~45 s; warm
+      # cache restore is ~3 s.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install Playwright chromium (+ deps if cache miss)
+        working-directory: frontend
+        # `--with-deps` runs `apt-get install` for chromium's system libs.
+        # The self-hosted runner's dpkg state can be left half-configured by a
+        # prior interrupted apt operation in the runner container's base
+        # image, and `apt-get install` then surfaces unmet deps for half-
+        # installed packages. Three-step defensive recovery:
+        #   1. dpkg --configure -a → finishes any half-applied package.
+        #   2. apt-get update      → refreshes the package lists (the runner
+        #                            base image's lists can be days old).
+        #   3. apt-get -f install  → auto-resolves any unmet dependencies.
+        # All three are guarded with `|| true` so a healthy runner is a no-op.
+        run: |
+          sudo dpkg --configure -a 2>/dev/null || true
+          sudo apt-get update -qq 2>/dev/null || true
+          sudo apt-get install -y --fix-broken -qq 2>/dev/null || true
+          npx playwright install --with-deps chromium
+
+      - name: Run Playwright smoke against booted container
+        working-directory: frontend
+        # Same socket-mount runner-network nuance as the pytest E2E step above.
+        env:
+          OPENALGO_URL: http://host.docker.internal:5000
+        run: |
+          echo "Running Playwright smoke (chromium) against booted container..."
+          npx playwright test --config playwright.smoke.config.ts
+          echo "✅ Playwright smoke passed"
+
+      - name: Upload Playwright smoke report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      # ====================================================================
+      # Playwright Phase B — Tier-3 mock-broker happy-path.
+      # Requires the test compose stack (OpenAlgo on :5099 + mock broker on
+      # :8001) which conflicts with the main container's :5000 binding via
+      # docker-compose.test.yml's openalgo service mapping — so tear down the
+      # main stack first.
+      # ====================================================================
+      - name: Tear down main container (port swap for mock-broker stack)
+        run: |
+          echo "Tearing down main container before mock-broker stack boot..."
+          docker compose down -v --remove-orphans || true
+
+      - name: Build + boot mock-broker stack
+        run: |
+          echo "Building mock-broker stack (docker-compose.test.yml)..."
+          docker compose -f docker-compose.test.yml -p mock_test build --quiet
+          echo "Booting mock-broker stack (compose --wait)..."
+          docker compose -f docker-compose.test.yml -p mock_test up -d --wait
+          docker compose -f docker-compose.test.yml -p mock_test ps
+          echo "✅ Mock-broker stack healthy"
+
+      # Diagnostics dump on mock-broker boot failure. Mirrors the main-stack
+      # diagnostics earlier in the job, but targets the mock_test-* containers
+      # (the main `openalgo-web` is already torn down at this point so its
+      # dump is meaningless here).
+      - name: Dump mock-broker stack diagnostics on boot failure
+        if: failure()
+        run: |
+          echo "::group::compose ps -a (mock_test project)"
+          docker compose -f docker-compose.test.yml -p mock_test ps -a || true
+          echo "::endgroup::"
+          echo "::group::mock_test-openalgo-1 logs (last 300 lines)"
+          docker logs --tail=300 mock_test-openalgo-1 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::mock_test-openalgo-1 health inspect"
+          docker inspect --format '{{json .State.Health}}' mock_test-openalgo-1 2>/dev/null || true
+          echo "::endgroup::"
+          echo "::group::mock_test-mock_broker-1 logs (last 100 lines)"
+          docker logs --tail=100 mock_test-mock_broker-1 2>&1 || true
+          echo "::endgroup::"
+
+      - name: Run Playwright broker happy-path
+        working-directory: frontend
+        # Mock stack also runs on the host, addressable via host.docker.internal.
+        env:
+          OPENALGO_URL: http://host.docker.internal:5099
+          MOCK_BROKER_URL: http://host.docker.internal:8001
+        run: |
+          echo "Running Playwright broker happy-path against mock stack..."
+          npx playwright test --config playwright.broker.config.ts
+          echo "✅ Broker happy-path passed"
+
+      - name: Upload Playwright broker report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-broker-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Tear down mock-broker stack
         if: always()
         run: |
-          echo "Cleaning up Docker containers..."
+          echo "Cleaning up mock-broker stack..."
+          docker compose -f docker-compose.test.yml -p mock_test down -v --remove-orphans || true
+
+      - name: Final teardown (main + .env)
+        if: always()
+        run: |
+          echo "Cleaning up any remaining containers..."
           docker compose down -v --remove-orphans || true
           rm -f .env
           echo "✅ Cleanup complete"
@@ -222,7 +368,7 @@ jobs:
         if: always()
         run: |
           echo "✅ CD Stage Complete"
-          echo "Docker image built, booted, and E2E tests passed"
+          echo "Docker built, booted, pytest E2E + Playwright smoke + mock-broker happy-path all ran"
 
 # ============================================================================
 # Branch Protection Requirements
