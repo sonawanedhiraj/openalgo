@@ -45,7 +45,7 @@ jobs:
             --ignore=test/e2e \
             --ignore=test/test_bridge_server.py \
             --ignore=test/test_email_functionality.py \
-            -v --tb=short
+            --tb=short
         env:
           API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
           APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
@@ -122,31 +122,22 @@ jobs:
           echo "✅ Docker image built successfully"
 
       - name: Boot container with health check
+        # `--wait` blocks until every service reports healthy (or fails), using
+        # the compose healthcheck defined on the service. Replaces the previous
+        # bash poll that ran in parallel with — and competed against — the
+        # healthcheck. Compose exits non-zero on healthcheck failure, so no
+        # extra status check is needed.
         run: |
-          echo "Starting OpenAlgo container..."
-          docker compose up -d
-
-          # Wait for app to be ready (up to 2 minutes)
-          echo "Waiting for application to be ready..."
-          for i in {1..60}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/ 2>/dev/null || echo "000")
-            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
-              echo "✅ Application is ready (HTTP $STATUS)"
-              break
-            fi
-            echo "  [$i/60] Waiting... (HTTP $STATUS)"
-            sleep 2
-          done
-
-          # Final status check
+          echo "Starting OpenAlgo container (compose --wait)..."
+          docker compose up -d --wait
           docker compose ps
-          echo "✅ Container is running"
+          echo "✅ Container is running and healthy"
 
       - name: Run E2E tests against running application
         run: |
           echo "Running E2E tests..."
           pip install uv --quiet
-          uv run python -m pytest test/e2e -v --tb=short
+          uv run python -m pytest test/e2e --tb=short
           echo "✅ E2E tests passed"
 
       - name: Teardown containers
