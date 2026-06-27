@@ -311,6 +311,26 @@ jobs:
           docker compose -f docker-compose.test.yml -p mock_test ps
           echo "✅ Mock-broker stack healthy"
 
+      # Diagnostics dump on mock-broker boot failure. Mirrors the main-stack
+      # diagnostics earlier in the job, but targets the mock_test-* containers
+      # (the main `openalgo-web` is already torn down at this point so its
+      # dump is meaningless here).
+      - name: Dump mock-broker stack diagnostics on boot failure
+        if: failure()
+        run: |
+          echo "::group::compose ps -a (mock_test project)"
+          docker compose -f docker-compose.test.yml -p mock_test ps -a || true
+          echo "::endgroup::"
+          echo "::group::mock_test-openalgo-1 logs (last 300 lines)"
+          docker logs --tail=300 mock_test-openalgo-1 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::mock_test-openalgo-1 health inspect"
+          docker inspect --format '{{json .State.Health}}' mock_test-openalgo-1 2>/dev/null || true
+          echo "::endgroup::"
+          echo "::group::mock_test-mock_broker-1 logs (last 100 lines)"
+          docker logs --tail=100 mock_test-mock_broker-1 2>&1 || true
+          echo "::endgroup::"
+
       - name: Run Playwright broker happy-path
         working-directory: frontend
         # Mock stack also runs on the host, addressable via host.docker.internal.
