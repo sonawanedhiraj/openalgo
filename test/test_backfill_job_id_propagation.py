@@ -89,7 +89,13 @@ def test_sector_follow_stock_no_job_id_when_fresh():
 
 
 def test_scanner_universe_propagates_job_id_per_interval():
+    # Patch scanner_universe_symbols so the test doesn't depend on SCANNER_SYMBOLS
+    # env being set (CI does not load .env; locally it does). Without this the
+    # impl early-returns 'empty universe' before reaching the patched backfill.
     with (
+        patch.object(
+            scanner_universe_backfill, "scanner_universe_symbols", return_value=["RELIANCE"]
+        ),
         patch.object(
             scanner_universe_backfill,
             "compute_stale_symbols",
@@ -109,10 +115,15 @@ def test_scanner_universe_propagates_job_id_per_interval():
 
 
 def test_scanner_universe_no_job_id_when_fresh():
-    with patch.object(
-        scanner_universe_backfill,
-        "compute_stale_symbols",
-        return_value=([], ["RELIANCE"], {}),
+    with (
+        patch.object(
+            scanner_universe_backfill, "scanner_universe_symbols", return_value=["RELIANCE"]
+        ),
+        patch.object(
+            scanner_universe_backfill,
+            "compute_stale_symbols",
+            return_value=([], ["RELIANCE"], {}),
+        ),
     ):
         result = scanner_universe_backfill.check_and_refresh_if_stale(
             date(2026, 6, 26), interval="1m"
@@ -124,6 +135,7 @@ def test_scanner_universe_no_job_id_when_backfill_returns_ok_noop():
     """The empty-universe `status="ok"` path doesn't submit a job — no job_id
     in result."""
     with (
+        patch.object(scanner_universe_backfill, "scanner_universe_symbols", return_value=["X"]),
         patch.object(
             scanner_universe_backfill,
             "compute_stale_symbols",
@@ -145,6 +157,7 @@ def test_scanner_universe_no_job_id_on_backfill_error():
     """A failed backfill carries no job_id — wait_for_jobs would have nothing
     real to poll."""
     with (
+        patch.object(scanner_universe_backfill, "scanner_universe_symbols", return_value=["X"]),
         patch.object(
             scanner_universe_backfill,
             "compute_stale_symbols",
