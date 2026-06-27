@@ -1,6 +1,10 @@
 # Ignore stateful content (these will be generated again)
 db/
 log/
+tick_logs/
+outputs/
+audit/
+.cache/
 
 # Byte-compiled / cache files
 __pycache__/

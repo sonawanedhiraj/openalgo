@@ -1,17 +1,20 @@
+# syntax=docker/dockerfile:1.4
 # ------------------------------ Python Builder Stage ----------------------- #
 FROM python:3.12-bullseye AS python-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY pyproject.toml .
-# create isolated virtual-env with uv, then add gunicorn and eventlet with compatible versions
-RUN pip install --no-cache-dir uv && \
+COPY pyproject.toml uv.lock* ./
+# The cache mount on /root/.cache/uv lets uv reuse its downloaded wheel + http
+# cache across builds when pyproject.toml is unchanged — turning a minute-scale
+# reinstall into seconds. Requires BuildKit (default in Docker 23+).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    pip install --no-cache-dir uv && \
     uv venv .venv && \
     uv pip install --upgrade pip && \
     uv sync && \
-    uv pip install "gunicorn>=25.0,<26" eventlet && \
-    rm -rf /root/.cache
+    uv pip install "gunicorn>=25.0,<26" eventlet
 
 # ------------------------------ Frontend Builder Stage --------------------- #
 # Node 24 matches .nvmrc + the dist-freshness CI; Vite minification produces
@@ -24,7 +27,11 @@ WORKDIR /app
 # (npm run build exit 134 / SIGABRT) on a constrained Docker runner.
 ENV NODE_OPTIONS="--max-old-space-size=4096"
 COPY frontend/package*.json ./frontend/
-RUN cd frontend && npm install
+# npm ci (vs npm install) honours the committed package-lock.json for a
+# faster, deterministic install. The cache mount on /root/.npm reuses
+# downloaded tarballs across builds.
+RUN --mount=type=cache,target=/root/.npm \
+    cd frontend && npm ci
 COPY frontend/ ./frontend/
 RUN cd frontend && npm run build
 
