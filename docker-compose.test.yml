@@ -47,7 +47,12 @@ services:
       # Must reference the port OpenAlgo is actually reachable on from outside
       REDIRECT_URL: "http://127.0.0.1:5099/zerodha/callback"
       # Test-friendly settings
-      FLASK_ENV: testing
+      # OpenAlgo's env validator (utils/env_check.py) only accepts
+      # 'development' or 'production' for FLASK_ENV — anything else (including
+      # 'testing') aborts the gunicorn worker with code 1, which then
+      # restart-loops and leaves the container unhealthy. Use 'production'
+      # for the docker E2E stack; FLASK_DEBUG=0 keeps it non-interactive.
+      FLASK_ENV: production
       FLASK_DEBUG: "0"
       TZ: Asia/Kolkata
       OPENBLAS_NUM_THREADS: "1"
