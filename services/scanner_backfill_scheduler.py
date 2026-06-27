@@ -260,13 +260,44 @@ def _periodic_tick(now: datetime, end_t: time) -> tuple[bool, dict | None]:
 
     ``ran`` is False (and ``result`` None) when ``now`` is outside the trading-day
     post-close window — the loop just sleeps an interval and retries.
+
+    Issue #158 D3: also short-circuits when no broker session is live —
+    without this, the periodic tick fires every interval during the morning
+    re-login gap (3 AM rotation, operator not yet logged in), and the
+    backfill submits with no api_key, logging a noisy ``WARNING`` for every
+    stale symbol it found. With this gate, the loop quietly waits for the
+    broker session and runs the catch-up cleanly when ready.
     """
     if not (_is_trading_day(now.date()) and _within_window(now.time(), end_t)):
         return False, None
+    # Quiet-skip when no broker session — same fail-graceful pattern as the
+    # other backfill / convergence services. Logged at INFO (single line per
+    # tick) so it's diagnosable but doesn't flood. Honors a flag to disable.
+    if _gate_on_broker_session():
+        try:
+            from services.broker_session_health import is_live_broker_session
+
+            if not is_live_broker_session():
+                logger.info("scanner backfill periodic tick: no broker session yet — skipping")
+                return False, None
+        except Exception:
+            logger.exception("scanner backfill: live-session probe raised — proceeding anyway")
     res = run_backfill_checks(now.date())
     _persist_health(res)
     _log_and_alert(res, phase="periodic")
     return True, res
+
+
+def _gate_on_broker_session() -> bool:
+    """``SCANNER_BACKFILL_GATE_ON_BROKER_SESSION`` env flag (default true).
+    When True, the periodic tick skips when no broker session is live so
+    'no api key available' warnings stop flooding the morning logs."""
+    return os.environ.get("SCANNER_BACKFILL_GATE_ON_BROKER_SESSION", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
 
 
 def _periodic_loop() -> None:

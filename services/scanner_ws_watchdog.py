@@ -26,6 +26,7 @@ glue (reads the scanner client's market-data callback, drives ``ws.close()`` /
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -36,6 +37,19 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 _IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float-valued env var with a fallback default."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool_true(name: str) -> bool:
+    """True iff env var is set to a truthy value (default True)."""
+    return os.environ.get(name, "true").strip().lower() in ("true", "1", "yes", "on")
 
 
 def _default_market_open(epoch: float) -> bool:
@@ -58,11 +72,25 @@ class ScannerWsWatchdog:
         recover_hard: Callable[[], None],
         now: Callable[[], float] = time.time,
         market_open: Callable[[float], bool] = _default_market_open,
-        soft_threshold: float = 90.0,
-        hard_threshold: float = 180.0,
-        cooldown: float = 60.0,
-        interval: float = 30.0,
+        # Issue #158 D1: defaults bumped from 90/180/60/30s. The old 90s
+        # soft floor fired ~121× per trading day on the live feed — a
+        # normal mid-session pause between ticks (sparse symbol, end-of-bar
+        # quiet) crossed it. The new 180/360/120/60 defaults trigger only
+        # on genuinely stuck feeds while still recovering within a single
+        # 5m bar. All four are env-overridable for per-deploy tuning.
+        soft_threshold: float | None = None,
+        hard_threshold: float | None = None,
+        cooldown: float | None = None,
+        interval: float | None = None,
     ):
+        if soft_threshold is None:
+            soft_threshold = _env_float("SCANNER_WS_WATCHDOG_SOFT_THRESHOLD_SEC", 180.0)
+        if hard_threshold is None:
+            hard_threshold = _env_float("SCANNER_WS_WATCHDOG_HARD_THRESHOLD_SEC", 360.0)
+        if cooldown is None:
+            cooldown = _env_float("SCANNER_WS_WATCHDOG_COOLDOWN_SEC", 120.0)
+        if interval is None:
+            interval = _env_float("SCANNER_WS_WATCHDOG_INTERVAL_SEC", 60.0)
         self._tick_source = tick_source
         self._recover_soft = recover_soft
         self._recover_hard = recover_hard
