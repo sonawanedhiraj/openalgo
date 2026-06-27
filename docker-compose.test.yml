@@ -54,6 +54,13 @@ services:
       # for the docker E2E stack; FLASK_DEBUG=0 keeps it non-interactive.
       FLASK_ENV: production
       FLASK_DEBUG: "0"
+      # Disable CSRF for the broker happy-path Playwright test. The test
+      # POSTs form data to /setup + /auth/login without first fetching a
+      # CSRF token; with CSRF on, the server returns an HTML "Bad Request"
+      # error page, the test's `await loginResp.json()` then fails on
+      # "Unexpected token '<', '<!doctype'". This is a sandbox-only mock
+      # stack — never deployed.
+      CSRF_ENABLED: "FALSE"
       TZ: Asia/Kolkata
       OPENBLAS_NUM_THREADS: "1"
       OMP_NUM_THREADS: "1"
