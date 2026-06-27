@@ -477,8 +477,14 @@ class SimplifiedStockEngineService:
     def _log_keyless_throttled(self, symbol: str, kind: str) -> None:
         """Log the unresolvable-key case at most once per symbol per
         ``_KEYLESS_LOG_INTERVAL_SEC``, so it can never become a per-tick storm."""
+        # The first-sight case must log unconditionally — using a default of
+        # ``0.0`` in ``dict.get`` reduces the guard to ``now >= INTERVAL`` for
+        # an unseen symbol, which fails silently on freshly-booted hosts where
+        # ``time.monotonic()`` is small (CI VMs, containers). Distinguish
+        # "never logged" from "logged ≥ INTERVAL ago" explicitly.
         now = time.monotonic()
-        if now - self._keyless_logged_at.get(symbol, 0.0) >= self._KEYLESS_LOG_INTERVAL_SEC:
+        last = self._keyless_logged_at.get(symbol)
+        if last is None or now - last >= self._KEYLESS_LOG_INTERVAL_SEC:
             self._keyless_logged_at[symbol] = now
             logger.error(
                 "[SIMPLIFIED-ENGINE] No api_key resolvable for %s %s — order skipped "
@@ -1624,7 +1630,7 @@ class SimplifiedStockEngineService:
                     )
                 if isinstance(value, str):
                     return date_parser.parse(value).replace(tzinfo=None)
-            except Exception:
+            except Exception:  # nosec B112 — best-effort field-fallback; try the next key on any parse failure
                 continue
         return dt.datetime.now()
 
