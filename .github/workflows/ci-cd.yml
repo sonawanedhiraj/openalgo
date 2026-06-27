@@ -256,7 +256,15 @@ jobs:
 
       - name: Install Playwright chromium (+ deps if cache miss)
         working-directory: frontend
-        run: npx playwright install --with-deps chromium
+        # `--with-deps` runs `apt-get install` for chromium's system libs.
+        # The self-hosted runner's dpkg state can be left half-configured by a
+        # prior interrupted apt operation in the runner container's base
+        # image — apt then refuses every install with "dpkg was interrupted".
+        # Recover defensively before invoking playwright; the `|| true` keeps
+        # this a no-op on a healthy dpkg.
+        run: |
+          sudo dpkg --configure -a 2>/dev/null || true
+          npx playwright install --with-deps chromium
 
       - name: Run Playwright smoke against booted container
         working-directory: frontend
