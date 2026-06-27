@@ -353,7 +353,11 @@ def test_periodic_tick_skips_outside_window_runs_inside():
     assert ran is False and res is None
 
     # Weekday inside the window → runs.
+    # Issue #158 D3 added a broker-session gate; mock it to True so the
+    # within-window scenario this test verifies still runs (the gate's
+    # behaviour is exercised in test_scanner_watchdog_and_backfill_gate).
     with (
+        patch("services.broker_session_health.is_live_broker_session", return_value=True),
         patch.object(
             sched,
             "run_backfill_checks",
