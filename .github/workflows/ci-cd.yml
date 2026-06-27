@@ -259,11 +259,17 @@ jobs:
         # `--with-deps` runs `apt-get install` for chromium's system libs.
         # The self-hosted runner's dpkg state can be left half-configured by a
         # prior interrupted apt operation in the runner container's base
-        # image — apt then refuses every install with "dpkg was interrupted".
-        # Recover defensively before invoking playwright; the `|| true` keeps
-        # this a no-op on a healthy dpkg.
+        # image, and `apt-get install` then surfaces unmet deps for half-
+        # installed packages. Three-step defensive recovery:
+        #   1. dpkg --configure -a → finishes any half-applied package.
+        #   2. apt-get update      → refreshes the package lists (the runner
+        #                            base image's lists can be days old).
+        #   3. apt-get -f install  → auto-resolves any unmet dependencies.
+        # All three are guarded with `|| true` so a healthy runner is a no-op.
         run: |
           sudo dpkg --configure -a 2>/dev/null || true
+          sudo apt-get update -qq 2>/dev/null || true
+          sudo apt-get install -y --fix-broken -qq 2>/dev/null || true
           npx playwright install --with-deps chromium
 
       - name: Run Playwright smoke against booted container
