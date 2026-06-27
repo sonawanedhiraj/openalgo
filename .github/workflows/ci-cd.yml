@@ -27,16 +27,25 @@ jobs:
   # ============================================================================
   ci-unit-tests:
     name: "CI: Unit + Integration Tests"
-    runs-on: self-hosted
+    # Runs on GitHub-hosted ubuntu-latest — repo is public so minutes are free
+    # and unlimited. This frees the single-slot self-hosted runner for the one
+    # job that genuinely needs the laptop's Docker (cd-docker-e2e), and lets
+    # the two CI/CD stages run truly in parallel on independent infra pools.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install uv
-        run: |
-          pip install uv --quiet
+      # Matches ci-self-hosted.yml's setup so the uv wheel cache is reused.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies (incl. dev for pytest-xdist)
+        run: uv sync --dev
 
       - name: Run unit + integration tests (parallelized)
         run: |
@@ -55,7 +64,7 @@ jobs:
         if: always()
         run: |
           echo "✅ CI Stage Complete"
-          echo "Unit tests passed on self-hosted runner"
+          echo "Unit tests passed on ubuntu-latest"
 
   # ============================================================================
   # STAGE 2: CD - Docker Build, Boot, and E2E Tests
@@ -63,7 +72,12 @@ jobs:
   cd-docker-e2e:
     name: "CD: Docker + E2E Tests"
     runs-on: self-hosted
-    needs: ci-unit-tests
+    # `needs: ci-unit-tests` deliberately dropped — the two jobs now run on
+    # independent infra pools (ubuntu-latest + self-hosted), so they fire in
+    # parallel. Both remain required status checks, so a red unit-test still
+    # blocks merge; the trade-off is that a broken PR may briefly hold the
+    # self-hosted slot, which `concurrency: cancel-in-progress: true` (above)
+    # already bounds by cancelling superseded runs.
     timeout-minutes: 15
 
     steps:
