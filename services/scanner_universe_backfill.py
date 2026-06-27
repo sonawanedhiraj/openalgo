@@ -64,6 +64,11 @@ import json
 import os
 from datetime import date, datetime, timedelta
 
+from services.data_freshness_service import (
+    _DEFAULT_DUCKDB_PATH,
+    compute_stale_symbols,
+    is_transient_lock_error,
+)
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -221,8 +226,6 @@ def check_and_refresh_if_stale(
 
     Returns ``{status, interval, stale_symbols, refreshed, errors, skipped_fresh}``.
     """
-    from services.data_freshness_service import _DEFAULT_DUCKDB_PATH, compute_stale_symbols
-
     ref = today or date.today()
     path = duckdb_path or _DEFAULT_DUCKDB_PATH
     universe = scanner_universe_symbols()
@@ -248,8 +251,6 @@ def check_and_refresh_if_stale(
             interval=interval,
         )
     except Exception as e:  # never let a freshness read crash the caller
-        from services.data_freshness_service import is_transient_lock_error
-
         if is_transient_lock_error(e):
             # historify briefly held read-write elsewhere (e.g. a separate CLI
             # backfill process). Skip this cycle quietly — no Telegram anomaly —
