@@ -48,11 +48,14 @@ jobs:
         run: uv sync --dev
 
       - name: Run unit + integration tests (parallelized)
+        # `test_bridge_server.py` is in-process FastAPI TestClient — no broker /
+        # network deps — so it's safe to include here.
+        # `test_email_functionality.py` remains skipped: it uses `input()` and
+        # needs real SMTP creds — operator-only script, not a test.
         run: |
           uv run python -m pytest test/ \
             -n auto \
             --ignore=test/e2e \
-            --ignore=test/test_bridge_server.py \
             --ignore=test/test_email_functionality.py \
             --tb=short
         env:
@@ -65,6 +68,36 @@ jobs:
         run: |
           echo "✅ CI Stage Complete"
           echo "Unit tests passed on ubuntu-latest"
+
+  # ============================================================================
+  # STAGE 1b: CI - Frontend Unit Tests (vitest)
+  # ============================================================================
+  # Runs in parallel with ci-unit-tests and cd-docker-e2e on its own free
+  # ubuntu-latest slot. Previously only fired via the manual workflow_dispatch
+  # in ci.yml, so frontend regressions slipped to dev unnoticed.
+  ci-frontend-tests:
+    name: "CI: Frontend Tests (vitest)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run vitest
+        working-directory: frontend
+        run: npm run test:run
 
   # ============================================================================
   # STAGE 2: CD - Docker Build, Boot, and E2E Tests
@@ -196,8 +229,9 @@ jobs:
 # ============================================================================
 # Add these as required status checks on dev/main branches:
 # - ci-unit-tests
+# - ci-frontend-tests
 # - cd-docker-e2e
 #
 # Command to add via GitHub CLI:
 # gh api repos/sonawanedhiraj/openalgo/branches/dev/protection/required_status_checks \
-#   --input - <<< '{"strict": true, "contexts": ["ci-unit-tests", "cd-docker-e2e"]}'
+#   --input - <<< '{"strict": true, "contexts": ["ci-unit-tests", "ci-frontend-tests", "cd-docker-e2e"]}'
