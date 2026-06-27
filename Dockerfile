@@ -14,8 +14,15 @@ RUN pip install --no-cache-dir uv && \
     rm -rf /root/.cache
 
 # ------------------------------ Frontend Builder Stage --------------------- #
-FROM node:20-bullseye-slim AS frontend-builder
+# Node 24 matches .nvmrc + the dist-freshness CI; Vite minification produces
+# different asset hashes across Node majors so any divergence breaks
+# dist-freshness for contributors.
+FROM node:24-bookworm-slim AS frontend-builder
 WORKDIR /app
+# --max-old-space-size=4096 raises Node's V8 heap cap from the ~2GB default
+# to 4GB so the Vite/Rollup minify of the React bundle doesn't OOM
+# (npm run build exit 134 / SIGABRT) on a constrained Docker runner.
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 COPY frontend/package*.json ./frontend/
 RUN cd frontend && npm install
 COPY frontend/ ./frontend/
