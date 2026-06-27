@@ -147,6 +147,25 @@ jobs:
           docker compose ps
           echo "✅ Container is running and healthy"
 
+      # Diagnostics dump on boot failure (refs #183). When `compose --wait`
+      # exits non-zero with "container openalgo-web is unhealthy", the run
+      # currently contains zero application-side detail — leaving us blind to
+      # WHY the container is unhealthy. This step runs only on a prior-step
+      # failure and dumps the three things we'd run by hand: container state,
+      # the last 300 log lines, and the healthcheck history.
+      - name: Dump container diagnostics on boot failure
+        if: failure()
+        run: |
+          echo "::group::compose ps -a"
+          docker compose ps -a || true
+          echo "::endgroup::"
+          echo "::group::openalgo-web logs (last 300 lines)"
+          docker compose logs --tail=300 openalgo-web || true
+          echo "::endgroup::"
+          echo "::group::container health inspect"
+          docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
+          echo "::endgroup::"
+
       - name: Run E2E tests against running application
         run: |
           echo "Running E2E tests..."
