@@ -57,7 +57,9 @@ def test_index_stale_triggers_refresh_of_every_symbol():
     ):
         res = idx.check_and_refresh_if_stale(THURS)
 
-    assert set(res) == _RESULT_KEYS
+    # `job_id` (issue #154) may be added when a backfill job is submitted —
+    # subset check keeps the contract additive.
+    assert _RESULT_KEYS.issubset(set(res))
     assert res["status"] == "ok"
     assert set(res["stale_symbols"]) == set(universe)
     assert set(res["refreshed"]) == set(universe)

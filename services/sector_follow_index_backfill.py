@@ -33,6 +33,11 @@ import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from services.data_freshness_service import (
+    _DEFAULT_DUCKDB_PATH,
+    compute_stale_symbols,
+    is_transient_lock_error,
+)
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -161,8 +166,6 @@ def check_and_refresh_if_stale(
 
     Returns ``{status, stale_symbols, refreshed, errors, skipped_fresh}``.
     """
-    from services.data_freshness_service import _DEFAULT_DUCKDB_PATH, compute_stale_symbols
-
     ref = today or date.today()
     path = duckdb_path or _DEFAULT_DUCKDB_PATH
     universe = sector_index_symbols()
@@ -179,8 +182,6 @@ def check_and_refresh_if_stale(
             path, universe, today=ref, max_staleness_business_days=max_staleness_business_days
         )
     except Exception as e:  # never let a freshness read crash the caller
-        from services.data_freshness_service import is_transient_lock_error
-
         if is_transient_lock_error(e):
             # historify briefly held read-write elsewhere (e.g. a separate CLI
             # backfill process). Skip this cycle quietly — no Telegram anomaly —
@@ -217,6 +218,13 @@ def check_and_refresh_if_stale(
         result["errors"].append(str(e))
         return result
 
+    # Propagate the submitted job_id to the caller (issue #154). Without this,
+    # services/boot_convergence.py's wait_for_jobs (issue #151 / PR #152) sees
+    # job_id=None for every arm and exits immediately — the lock then releases
+    # while the 5-worker pool is still mid-download, exactly the contention
+    # PR #152 was meant to prevent.
+    if bf.get("job_id"):
+        result["job_id"] = bf["job_id"]
     if bf.get("status") == "success":
         result["refreshed"] = stale
     else:
