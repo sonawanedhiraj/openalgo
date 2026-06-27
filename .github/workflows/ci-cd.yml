@@ -160,7 +160,11 @@ jobs:
           docker compose ps -a || true
           echo "::endgroup::"
           echo "::group::openalgo-web logs (last 300 lines)"
-          docker compose logs --tail=300 openalgo-web || true
+          # Use raw `docker logs` against the container_name. `docker compose
+          # logs openalgo-web` fails — the compose service is named `openalgo`
+          # (see docker-compose.yaml), not `openalgo-web`; only the container
+          # is renamed via container_name.
+          docker logs --tail=300 openalgo-web 2>&1 || true
           echo "::endgroup::"
           echo "::group::container health inspect"
           docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
