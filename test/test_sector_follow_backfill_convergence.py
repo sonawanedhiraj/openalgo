@@ -68,7 +68,11 @@ def test_index_stale_triggers_refresh_of_every_symbol():
     # Only the stale symbols are handed to the fetch; window ends on the ref day.
     assert set(captured["symbols"]) == set(universe)
     assert captured["end"] == "2026-06-11"
-    assert captured["start"] < captured["end"]
+    # Issue #193 — incremental window collapses to today-only when the prior
+    # day's data is already on disk (WED stored, THURS being fetched).
+    # Pre-#193 asserted strict ``<``; the new behavior is byte-exact equality.
+    assert captured["start"] == "2026-06-11"
+    assert captured["start"] <= captured["end"]
 
 
 # --------------------------------------------------------------------------- #

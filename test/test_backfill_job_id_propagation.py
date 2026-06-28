@@ -174,3 +174,136 @@ def test_scanner_universe_no_job_id_on_backfill_error():
         )
     assert "job_id" not in result
     assert result["status"] == "error"
+
+
+# --------------------------------------------------------------------------- #
+# Issue #193 — convergence schedulers must pass the INCREMENTAL window to
+# the backfill helper, not a fixed [today - LOOKBACK, today]. These tests
+# would have failed on the pre-#193 ``start = ref - timedelta(days=LOOKBACK)``
+# line; they pass with the ``compute_incremental_start_date`` helper.
+# --------------------------------------------------------------------------- #
+
+
+def test_sector_follow_stock_passes_incremental_window_when_friday_data_present():
+    """Sunday boot, every stale stock holds Friday's bars → catch-up window is
+    Sat..Sun (start = Fri + 1 day), not the pre-fix Wed..Sun (today - 4 days)."""
+    captured: dict = {}
+
+    def fake_backfill(start, end, symbols=None):
+        captured["start"] = start
+        captured["end"] = end
+        return {"status": "success", "job_id": "test-job", "symbols": symbols}
+
+    details = {
+        "INFY": {"last_date": "2026-06-26"},  # Friday
+        "TCS": {"last_date": "2026-06-26"},  # Friday
+    }
+    with (
+        patch.object(
+            sector_follow_stock_backfill,
+            "compute_stale_symbols",
+            return_value=(["INFY", "TCS"], [], details),
+        ),
+        patch.object(
+            sector_follow_stock_backfill,
+            "backfill_sector_follow_stocks",
+            side_effect=fake_backfill,
+        ),
+    ):
+        sector_follow_stock_backfill.check_and_refresh_if_stale(date(2026, 6, 28))
+
+    assert captured["start"] == "2026-06-27", (
+        f"expected incremental start = Fri + 1day = 2026-06-27, got {captured['start']}"
+    )
+    assert captured["end"] == "2026-06-28"
+
+
+def test_sector_follow_stock_falls_back_to_full_lookback_when_no_stored_data():
+    """A symbol with no stored bars MUST trigger the LOOKBACK floor so the
+    first-time fetch is wide enough. (Helper docstring: per-symbol mixed
+    windows would need an API change to the backfill helpers.)"""
+    captured: dict = {}
+
+    def fake_backfill(start, end, symbols=None):
+        captured["start"] = start
+        captured["end"] = end
+        return {"status": "success", "job_id": "test-job", "symbols": symbols}
+
+    details = {"NEW_STOCK": {"last_date": None}}
+    with (
+        patch.object(
+            sector_follow_stock_backfill,
+            "compute_stale_symbols",
+            return_value=(["NEW_STOCK"], [], details),
+        ),
+        patch.object(
+            sector_follow_stock_backfill,
+            "backfill_sector_follow_stocks",
+            side_effect=fake_backfill,
+        ),
+    ):
+        sector_follow_stock_backfill.check_and_refresh_if_stale(date(2026, 6, 28))
+
+    # 2026-06-28 minus 4-day lookback = 2026-06-24
+    assert captured["start"] == "2026-06-24"
+
+
+def test_sector_follow_index_passes_incremental_window_when_friday_data_present():
+    captured: dict = {}
+
+    def fake_backfill(start, end, symbols=None):
+        captured["start"] = start
+        captured["end"] = end
+        return {"status": "success", "job_id": "test-job", "symbols": symbols}
+
+    details = {"NIFTY": {"last_date": "2026-06-26"}}
+    with (
+        patch.object(
+            sector_follow_index_backfill,
+            "compute_stale_symbols",
+            return_value=(["NIFTY"], [], details),
+        ),
+        patch.object(
+            sector_follow_index_backfill,
+            "backfill_sector_indices",
+            side_effect=fake_backfill,
+        ),
+    ):
+        sector_follow_index_backfill.check_and_refresh_if_stale(date(2026, 6, 28))
+
+    assert captured["start"] == "2026-06-27"
+    assert captured["end"] == "2026-06-28"
+
+
+def test_scanner_universe_passes_incremental_window_per_interval():
+    """The scanner helper's lookback varies by interval (``_LOOKBACK_DAYS``);
+    the incremental computation must still honor it as the cap."""
+    captured: dict = {}
+
+    def fake_backfill(start, end, interval=None, symbols=None):
+        captured["start"] = start
+        captured["end"] = end
+        captured["interval"] = interval
+        return {"status": "success", "job_id": "scanner-1m", "symbols": symbols}
+
+    details = {"RELIANCE": {"last_date": "2026-06-26"}}
+    with (
+        patch.object(
+            scanner_universe_backfill, "scanner_universe_symbols", return_value=["RELIANCE"]
+        ),
+        patch.object(
+            scanner_universe_backfill,
+            "compute_stale_symbols",
+            return_value=(["RELIANCE"], [], details),
+        ),
+        patch.object(
+            scanner_universe_backfill,
+            "backfill_scanner_universe",
+            side_effect=fake_backfill,
+        ),
+    ):
+        scanner_universe_backfill.check_and_refresh_if_stale(date(2026, 6, 28), interval="1m")
+
+    assert captured["start"] == "2026-06-27"
+    assert captured["end"] == "2026-06-28"
+    assert captured["interval"] == "1m"

@@ -74,6 +74,97 @@ def test_prev_or_same_business_day_rolls_back_weekend():
 
 
 # --------------------------------------------------------------------------- #
+# Issue #193 — compute_incremental_start_date: smallest necessary catch-up
+# window using per-symbol last_date from compute_stale_symbols' details dict.
+# Pre-#193 the convergence schedulers re-fetched a fixed [today - LOOKBACK,
+# today] window on every boot regardless of what was already on disk.
+# --------------------------------------------------------------------------- #
+from datetime import date as _D  # noqa: E402 — keep tests self-contained
+
+
+def test_incremental_start_all_symbols_at_friday_returns_saturday():
+    """Sunday boot with every stale symbol holding Friday's bars → start = Sat,
+    NOT Wed (pre-fix behavior). Smallest possible re-fetch window."""
+    sun = _D(2026, 6, 28)
+    fri = _D(2026, 6, 26)
+    details = {f"S{i}": {"last_date": fri.isoformat()} for i in range(5)}
+    got = dfs.compute_incremental_start_date(details, list(details), sun, lookback_days=4)
+    assert got == fri + timedelta(days=1) == _D(2026, 6, 27)
+
+
+def test_incremental_start_no_data_falls_back_to_full_lookback():
+    """At least one symbol has no stored bars → fall back to full LOOKBACK so the
+    initial fetch is wide enough. (Mixing per-symbol windows would require an
+    API change to the backfill helpers.)"""
+    sun = _D(2026, 6, 28)
+    details = {f"S{i}": {"last_date": None} for i in range(3)}
+    got = dfs.compute_incremental_start_date(details, list(details), sun, lookback_days=4)
+    assert got == sun - timedelta(days=4)
+
+
+def test_incremental_start_mixed_last_dates_driven_by_earliest():
+    """When stale symbols are at different staleness levels, the earliest one
+    drives the window. (Symbols already past that point just re-upsert overlap
+    — no extra broker cost beyond what the slowest stale symbol needs.)"""
+    sun = _D(2026, 6, 28)
+    details = {
+        "OLD": {"last_date": _D(2026, 6, 24).isoformat()},  # Wednesday
+        "MID": {"last_date": _D(2026, 6, 25).isoformat()},  # Thursday
+        "NEW": {"last_date": _D(2026, 6, 26).isoformat()},  # Friday
+    }
+    got = dfs.compute_incremental_start_date(details, list(details), sun, lookback_days=4)
+    # OLD's last bar is Wed → start = Thu (Wed + 1).
+    assert got == _D(2026, 6, 25)
+
+
+def test_incremental_start_deep_gap_is_capped_at_lookback_floor():
+    """If last_date is months old (a recovery situation), the helper still caps
+    the window at LOOKBACK_DAYS so we don't accidentally pull years of data
+    through the live convergence path. Deep gaps are CLI/manual territory."""
+    sun = _D(2026, 6, 28)
+    details = {"OLD": {"last_date": "2026-01-01"}}
+    got = dfs.compute_incremental_start_date(details, list(details), sun, lookback_days=4)
+    assert got == sun - timedelta(days=4)
+
+
+def test_incremental_start_clamps_at_ref_date_when_last_is_today():
+    """If last_date == today already, start should never exceed the reference
+    (impossible-but-defensive: a same-day re-run still wants today's bars)."""
+    sun = _D(2026, 6, 28)
+    details = {"X": {"last_date": sun.isoformat()}}
+    got = dfs.compute_incremental_start_date(details, list(details), sun, lookback_days=4)
+    assert got == sun
+
+
+def test_incremental_start_malformed_last_date_falls_back_safely():
+    """A junk ``last_date`` is treated as ``no-data`` (full LOOKBACK fallback)
+    so a single bad row can never crash the convergence."""
+    sun = _D(2026, 6, 28)
+    details = {"BAD": {"last_date": "not-a-date"}}
+    got = dfs.compute_incremental_start_date(details, list(details), sun, lookback_days=4)
+    assert got == sun - timedelta(days=4)
+
+
+def test_incremental_start_with_missing_symbol_in_details():
+    """A stale symbol with NO entry in ``details`` is treated as no-data and
+    triggers the LOOKBACK fallback (defensive — should never happen in
+    practice since ``compute_stale_symbols`` populates details for every input
+    symbol, but the helper must not KeyError)."""
+    sun = _D(2026, 6, 28)
+    details = {}  # entirely empty — caller bug, but helper must survive
+    got = dfs.compute_incremental_start_date(details, ["GHOST"], sun, lookback_days=4)
+    assert got == sun - timedelta(days=4)
+
+
+def test_incremental_start_empty_stale_returns_ref():
+    """Defensive — callers short-circuit on empty stale list before calling, but
+    the helper should not divide-by-zero or return something silly if invoked."""
+    sun = _D(2026, 6, 28)
+    got = dfs.compute_incremental_start_date({}, [], sun, lookback_days=4)
+    assert got == sun
+
+
+# --------------------------------------------------------------------------- #
 # get_data_freshness
 # --------------------------------------------------------------------------- #
 def test_get_data_freshness_returns_last_ts_and_none_for_missing(tmp_duckdb):

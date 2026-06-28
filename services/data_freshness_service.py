@@ -84,6 +84,64 @@ def business_days_between(d_from: date, d_to: date) -> int:
     return n
 
 
+def compute_incremental_start_date(
+    details: dict[str, dict],
+    stale_symbols: list[str],
+    ref: date,
+    lookback_days: int,
+) -> date:
+    """Earliest date the catch-up needs to fetch — issue #193.
+
+    The three convergence schedulers (``sector_follow_stock_backfill``,
+    ``sector_follow_index_backfill``, ``scanner_universe_backfill``) all used
+    to compute ``start = ref - lookback_days`` regardless of what data was
+    already on disk. On a Sunday boot with Friday's bars already stored, this
+    meant re-fetching 4 calendar days from the broker every restart even
+    though zero new data could exist. ``compute_stale_symbols`` already
+    returns each symbol's ``last_date`` in its ``details`` dict — this helper
+    folds those into the smallest necessary fetch window:
+
+    * If every stale symbol has at least one stored bar, return
+      ``max(min(last_dates) + 1 day, ref - lookback_days)``. The ``+1 day``
+      offset skips the day already covered (the broker's per-day fetch
+      includes the end date inclusively, and ``INSERT OR REPLACE`` would
+      dedupe a re-fetch anyway — but the broker call still costs quota).
+    * If ANY stale symbol has no data at all (``last_date`` is None — the
+      ``"never fetched"`` case), fall back to the full ``ref - lookback_days``
+      so the no-data symbol still gets a useful initial window. Mixing
+      windows per-symbol would require an API change to the backfill helpers;
+      this conservative fallback is the same behavior the bug originally
+      produced for that symbol class, just unavoidable.
+    * The ``lookback_days`` cap is a hard ceiling — even if the last_date is
+      months old (deep-gap recovery), we never reach further back than the
+      caller asked, preserving the existing manual-CLI-catch-up contract for
+      true historical gaps.
+
+    Returns the start ``date`` for the catch-up ``[start, ref]`` window.
+    """
+    if not stale_symbols:
+        return ref  # caller short-circuits before calling; defensive
+
+    lookback_floor = ref - timedelta(days=lookback_days)
+    last_dates: list[date] = []
+    for sym in stale_symbols:
+        info = details.get(sym) or {}
+        raw = info.get("last_date")
+        if not raw:
+            # At least one symbol has no data — fall back to full lookback.
+            return lookback_floor
+        try:
+            last_dates.append(date.fromisoformat(raw))
+        except (TypeError, ValueError):
+            # Malformed date string — treat the same as "no data" defensively.
+            return lookback_floor
+
+    incremental = min(last_dates) + timedelta(days=1)
+    # Never reach earlier than the lookback floor (deep-gap CLI territory) AND
+    # never start past the reference date (a same-day catch-up still wants today).
+    return min(max(incremental, lookback_floor), ref)
+
+
 # --------------------------------------------------------------------------- #
 # DuckDB connection helpers — tolerant of an in-process read-write holder
 # --------------------------------------------------------------------------- #

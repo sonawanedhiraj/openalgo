@@ -37,6 +37,7 @@ from datetime import date, datetime, timedelta
 
 from services.data_freshness_service import (
     _DEFAULT_DUCKDB_PATH,
+    compute_incremental_start_date,
     compute_stale_symbols,
     is_transient_lock_error,
 )
@@ -169,7 +170,7 @@ def check_and_refresh_if_stale(
         "skipped_fresh": [],
     }
     try:
-        stale, fresh, _details = compute_stale_symbols(
+        stale, fresh, details = compute_stale_symbols(
             path, universe, today=ref, max_staleness_business_days=max_staleness_business_days
         )
     except Exception as e:  # never let a freshness read crash the caller
@@ -191,8 +192,14 @@ def check_and_refresh_if_stale(
         logger.info("sector_follow stock feed fresh (%d stocks) — no refresh", len(fresh))
         return result
 
+    # Issue #193 — fetch only the incremental gap, not a fixed 4-day window.
+    # Pre-fix every Sunday boot pulled Wed-Fri data already on disk, costing
+    # ~10s of broker quota per boot. compute_incremental_start_date folds
+    # each stale symbol's stored ``last_date`` into the smallest necessary
+    # ``[start, ref]`` window, capped by the lookback floor.
     end = ref.strftime("%Y-%m-%d")
-    start = (ref - timedelta(days=_DAILY_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    start_date = compute_incremental_start_date(details, stale, ref, _DAILY_LOOKBACK_DAYS)
+    start = start_date.strftime("%Y-%m-%d")
     logger.info(
         "sector_follow stock feed stale: %d/%d behind — catching up %s..%s: %s",
         len(stale),
