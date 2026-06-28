@@ -909,6 +909,22 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
 
+            # Trading-day funnel (issue #159). Registers a single 15:35 IST
+            # mon-fri job that walks the signal → engine → order → journal
+            # pipeline, computes per-layer counts, and Telegrams the verdict
+            # so the next "zero trades" day produces an immediate alert
+            # naming the drop-off layer. Read-only on every DB; gated
+            # per-fire by TRADING_DAY_FUNNEL_ENABLED.
+            try:
+                from services.trading_day_funnel_service import (
+                    init_trading_day_funnel_service,
+                )
+
+                init_trading_day_funnel_service()
+                logger.debug("Trading day funnel job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Trading day funnel job: {e}")
+
             # Telegram INBOUND intent bot (Phase 6). Gated by
             # TELEGRAM_INBOUND_ENABLED (default false), so this is a no-op on
             # deploy until the operator flips the flag — it then polls Telegram

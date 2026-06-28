@@ -59,6 +59,7 @@ _EVENT_TYPES = (
     "eod_watchdog",
     "veto_decision",
     "task_complete",
+    "trading_day_funnel",
 )
 
 _SEVERITY_PREFIX = {
@@ -181,6 +182,12 @@ class NotificationService:
             # the unknown-event-type gate (the prior warn-and-drop behavior that
             # forced tasks to fall back to direct Bot API calls).
             "task_complete": _env_bool("NOTIFY_TASK_COMPLETE", default=True),
+            # Daily trading-day funnel diagnostic (issue #159). Default ON —
+            # the next "zero trades on a healthy-looking day" surfaces as a
+            # 15:35 IST Telegram message naming the drop-off layer instead of
+            # an empty journal the operator has to forensic-query the next
+            # morning. See services/trading_day_funnel_service.py.
+            "trading_day_funnel": _env_bool("NOTIFY_TRADING_DAY_FUNNEL", default=True),
         }
         # Preflight-abort alert de-duplication state (2026-06-03 incident: a
         # 14s DNS blip produced 14 identical "🛑 Preflight aborted" alerts as

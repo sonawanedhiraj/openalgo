@@ -18,6 +18,47 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Trading-day funnel diagnostic (issue #159, added 2026-06-28)
+
+#### TRADING_DAY_FUNNEL_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read each fire in
+  `services/trading_day_funnel_service._funnel_job`.
+- **What it does:** master gate for the daily 15:35 IST end-of-session funnel
+  summary that walks the signal → engine → order → journal pipeline and
+  Telegrams the per-layer counts (scanner hits, engine signals taken/vetoed,
+  per-strategy orders attempted/filled/open-EOD, sandbox cross-check) plus a
+  drop-off verdict naming the first layer where `K < M`. The next "zero
+  trades on a healthy-looking day" surfaces as a single Telegram message at
+  15:35 IST instead of empty-journal forensic-SQL the next morning.
+- **Why default true:** the failure class this catches is **silent**
+  (2026-06-26 produced 0 trades while every individual subsystem reported
+  healthy). The funnel itself is read-only and never raises into the
+  scheduler, so the operational cost of being on is zero and the diagnostic
+  payoff is large.
+- **Set false to:** suppress the daily Telegram (e.g. during a scheduler dev
+  window or to silence noisy notifications); the service still registers but
+  the per-fire body is a no-op.
+- **Related:** `NOTIFY_TRADING_DAY_FUNNEL` (per-event toggle inside
+  `services/notification_service.py`, default true) gates the Telegram
+  delivery layer; set it false to silence only the Telegram while still
+  letting the structured INFO log fire.
+
+#### TRADING_DAY_FUNNEL_TIME
+- **Current value:** unset → defaults **`15:35`** (IST).
+- **Set in:** env; read by
+  `services/trading_day_funnel_service.register_jobs` at boot.
+- **What it does:** the IST fire time `HH:MM` for the daily funnel job. Sits
+  between the 15:14 EOD watchdog / 15:25 sector_follow exit / 15:30 sandbox
+  MIS auto-square-off / 15:30 EOD reconciliation, and the 15:45 IST
+  `scanner_comparison_eod` job, so the funnel reads a fully-settled day.
+- **Why default 15:35:** late enough to capture every entry/exit/journal
+  write the EOD reconciliation made (15:30 trigger window), early enough
+  that the Telegram lands before the 15:45 comparison alert so the operator
+  reads them in causal order.
+- **Set to a different `HH:MM` to:** shift the slot. Junk values fall back
+  to the default rather than crashing boot.
+
 ### Preflight error gate — per-signature cap (added 2026-06-19)
 
 #### PREFLIGHT_ERROR_PER_SIGNATURE_CAP
