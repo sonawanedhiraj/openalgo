@@ -107,89 +107,74 @@ def is_transient_lock_error(exc: BaseException) -> bool:
 
 
 def connect_historify_readonly(duckdb_path: str, max_retries: int = 3):
-    """Open historify for a read-only query, tolerant of an existing read-write
-    connection held elsewhere in **this** process.
+    """Return a cursor on the historify per-process singleton (or a fresh
+    read-only connection for unit-test paths).
 
-    DuckDB keeps one database instance per file per process and refuses a second
-    connection that requests a *different* configuration ("Can't open a connection
-    to same database file with a different configuration than existing
-    connections"). The live OpenAlgo process holds ``historify.duckdb`` open
-    read-write (the historify writer), so a plain ``read_only=True`` open from a
-    backfill/evaluator thread collides — this was the recurring 15:30+ post-close
-    lock-warning spam.
+    Per issue #191 / #156 Phase 1: in production every caller passes the
+    same path (``HISTORIFY_DATABASE_PATH``), so they all share one
+    writeable connection — the only configuration that eliminates the
+    config-mismatch race the pre-#191 code suffered. The cursor returned
+    by :meth:`DuckDBPyConnection.cursor` is itself a DuckDB connection
+    that shares the underlying database; callers may use it as a context
+    manager (``with X as c:``) or as a direct assignment (``c = X(...)``);
+    closing the cursor releases only its own resources, never the shared
+    file handle.
 
-    Strategy: try ``read_only=True`` first (the cross-process-friendly path when no
-    writer is attached); on ANY transient lock error (config mismatch, OS file
-    lock, attach conflict — see ``is_transient_lock_error``), fall back to a
-    default (config-matching) connect that reuses the already-open shared instance.
-    If the fallback also hits transient contention, retry with brief backoff so
-    the in-flight write/read window has a chance to clear. The caller still closes
-    the returned connection as usual.
+    Path-mismatch fallthrough — unit-test ergonomics
+    -----------------------------------------------
+    Tests routinely pass a per-test tmpdir DB and need this function to
+    actually open *that* file (each test populates its own ``market_data``
+    rows there). When the resolved absolute path differs from the
+    singleton's path, fall through to a fresh read-only connect on the
+    requested path. This branch is exclusively a test ergonomic — in
+    production every caller's resolved path matches the singleton's, so
+    the fallthrough never fires. A WARNING is logged when it does so a
+    misrouted production caller surfaces immediately in ``errors.jsonl``
+    rather than silently re-introducing the #191 race.
 
-    Args:
-        duckdb_path: Path to the DuckDB file.
-        max_retries: Total attempts for the fallback connect under contention
-            (default 3 → 100ms, 200ms, 300ms backoff).
+    The ``max_retries`` argument is kept for API compatibility but is no
+    longer load-bearing — there is nothing transient to retry past once
+    everything in the process shares one connection. Will be removed in
+    a follow-up once every caller stops passing it.
 
-    Raises:
-        Whatever the final DuckDB exception is if all attempts fail.
+    Read-only enforcement is sacrificed for the singleton path (the
+    shared connection is writeable). None of the three current production
+    callers (``sector_follow_service``, ``sector_rotation_etf_service``,
+    this module's own freshness check) write through the cursor by
+    design; a future caller that does will hit the live DB rather than
+    failing closed. This trade-off was acknowledged in issue #156
+    ("read-only safety lost; all callers are read-only by convention").
 
-    History:
-        - PR #118 added the original fallback (only caught ``ConnectionException``
-          with text "different configuration").
-        - This PR (#126) broadens the catch to include ``IOException`` and
-          ``BinderException`` (gated by ``is_transient_lock_error``) and adds
-          retry+backoff for cases where the fallback ALSO transiently fails.
+    History
+    -------
+    * PR #118 introduced the first fallback (one exception class).
+    * PR #126 broadened to three exception classes + retry/backoff.
+    * Issue #191 fix (this commit): replaced both with the singleton; the
+      path-mismatch fallthrough preserves test ergonomics.
     """
-    import time
+    import os
 
+    from database.historify_db import _get_shared_conn, get_db_path
+
+    singleton_path = os.path.abspath(get_db_path())
+    requested = os.path.abspath(duckdb_path) if duckdb_path else singleton_path
+
+    if requested == singleton_path:
+        # Production happy-path — every live caller hits this branch.
+        return _get_shared_conn().cursor()
+
+    # Unit-test fallthrough. WARNING logs the mismatch so a misrouted
+    # production caller is immediately visible.
+    logger.warning(
+        "connect_historify_readonly: requested path %r != singleton path %r "
+        "— opening a separate read-only connection (test ergonomic; in "
+        "production this re-introduces the #191 config-mismatch risk)",
+        duckdb_path,
+        get_db_path(),
+    )
     import duckdb
 
-    # First attempt: cross-process-friendly read_only=True.
-    try:
-        return duckdb.connect(duckdb_path, read_only=True)
-    except (
-        duckdb.ConnectionException,
-        duckdb.IOException,
-        duckdb.BinderException,
-    ) as e:
-        if not is_transient_lock_error(e):
-            raise
-        first_err = e
-        logger.info(
-            "historify read_only open conflict (%s); falling back to shared "
-            "connection for read-only query",
-            type(e).__name__,
-        )
-
-    # Fallback path with retry: open with default config, reusing the
-    # already-open shared in-process instance. Retry briefly because under
-    # heavy contention the default-config open can ALSO surface a transient
-    # OS-level file lock before the in-process instance cache returns its
-    # handle.
-    last_err: BaseException = first_err
-    for attempt in range(max_retries):
-        try:
-            return duckdb.connect(duckdb_path)
-        except (
-            duckdb.ConnectionException,
-            duckdb.IOException,
-            duckdb.BinderException,
-        ) as e:
-            if not is_transient_lock_error(e):
-                raise
-            last_err = e
-            if attempt < max_retries - 1:
-                backoff_s = 0.1 * (attempt + 1)
-                logger.debug(
-                    "historify fallback connect attempt %d/%d failed (%s); retrying after %.1fs",
-                    attempt + 1,
-                    max_retries,
-                    type(e).__name__,
-                    backoff_s,
-                )
-                time.sleep(backoff_s)
-    raise last_err
+    return duckdb.connect(duckdb_path, read_only=True)
 
 
 # --------------------------------------------------------------------------- #

@@ -219,174 +219,127 @@ def test_is_transient_lock_error_classifies_known_messages():
     assert dfs.is_transient_lock_error(ValueError("no api key available")) is False
 
 
-def test_connect_historify_readonly_falls_back_on_config_mismatch(tmp_duckdb, monkeypatch):
-    """When read_only is refused by an in-process read-write holder, fall back to a
-    config-matching connect so the read still succeeds (the lock-contention fix)."""
-    path = tmp_duckdb({"AAA": (2026, 6, 11)})
+# --------------------------------------------------------------------------- #
+# Issue #191 / #156 Phase 1 — singleton + path-mismatch fallthrough
+#
+# The pre-#191 fallback-ladder tests (caught ConnectionException / IOException /
+# BinderException via monkeypatched duckdb.connect, asserted backoff intervals,
+# etc.) were deleted in the singleton commit because that whole code path no
+# longer exists. The singleton makes the config-mismatch errors mathematically
+# impossible in production, and the path-mismatch fallthrough is the only
+# remaining branch (test ergonomics).
+#
+# ``is_transient_lock_error`` is kept and tested in the section above — it is
+# still used by services/scanner_universe_backfill.py and
+# services/sector_follow_backfill_scheduler.py to classify transient errors
+# from the historify DOWNLOAD path (a different code path entirely).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_historify_singleton_each_test():
+    """Drop the singleton before and after every test in this module so
+    no cursor state leaks between tests through the shared connection."""
+    from database.historify_db import _reset_for_tests
+
+    _reset_for_tests()
+    yield
+    _reset_for_tests()
+
+
+def test_connect_historify_readonly_uses_singleton_when_path_matches(monkeypatch):
+    """Production happy path: caller passes the configured HISTORIFY_DATABASE_PATH
+    → cursor on the per-process shared connection, zero fresh ``duckdb.connect``."""
+    from database.historify_db import _get_shared_conn, get_db_path
+
+    # Track every duckdb.connect call — there should be exactly ONE (the
+    # singleton's lazy init), not one per ``connect_historify_readonly`` call.
     calls = []
     real_connect = duckdb.connect
 
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        calls.append(read_only)
-        if read_only:
-            raise duckdb.ConnectionException(
-                "Can't open a connection to same database file with a different "
-                "configuration than existing connections"
-            )
-        return real_connect(p, *args, read_only=read_only, **kwargs)
+    def counting_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_connect(*args, **kwargs)
 
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
+    monkeypatch.setattr(duckdb, "connect", counting_connect)
 
-    con = dfs.connect_historify_readonly(path)
+    shared = _get_shared_conn()
+    cur1 = dfs.connect_historify_readonly(get_db_path())
+    cur2 = dfs.connect_historify_readonly(get_db_path())
     try:
-        rows = con.execute("SELECT symbol FROM market_data").fetchall()
+        # Both cursors are distinct from each other AND from the singleton,
+        # but they share the underlying database (proved by a write through
+        # the singleton becoming visible on the cursors).
+        assert cur1 is not cur2
+        assert cur1 is not shared and cur2 is not shared
+        shared.execute("CREATE OR REPLACE TABLE _probe (k INT)")
+        n1 = cur1.execute("SELECT COUNT(*) FROM _probe").fetchone()[0]
+        n2 = cur2.execute("SELECT COUNT(*) FROM _probe").fetchone()[0]
+        assert n1 == 0 and n2 == 0
     finally:
-        con.close()
-    assert rows == [("AAA",)]
-    # Tried read_only first (refused), then fell back to the shared config.
-    assert calls == [True, False]
+        cur1.close()
+        cur2.close()
 
-
-def test_connect_historify_readonly_reraises_unrelated_connection_error(monkeypatch):
-    """A non-config-mismatch ConnectionException must propagate (no silent fallback)."""
-
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        raise duckdb.ConnectionException("database does not exist")
-
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
-    with pytest.raises(duckdb.ConnectionException, match="does not exist"):
-        dfs.connect_historify_readonly("nope.duckdb")
-
-
-# --------------------------------------------------------------------------- #
-# Issue #126 — broadened fallback for IOException + BinderException + retry
-# --------------------------------------------------------------------------- #
-def test_is_transient_lock_error_recognises_attach_conflict():
-    """BinderException attach-conflict is now classified as transient (issue #126)."""
-    err = duckdb.BinderException(
-        'Unique file handle conflict: Cannot attach "historify" - the database '
-        'file is already attached by database "historify"'
+    # Only the singleton's lazy init opened the file; the two readonly calls
+    # returned cursors and did NOT invoke duckdb.connect again.
+    assert len(calls) == 1, (
+        f"expected exactly 1 duckdb.connect (singleton lazy init), got {len(calls)}"
     )
-    assert dfs.is_transient_lock_error(err) is True
 
 
-def test_connect_historify_readonly_falls_back_on_io_error(tmp_duckdb, monkeypatch):
-    """IOException 'being used by another process' must trigger the fallback (issue #126).
-
-    Before this fix, only ConnectionException was caught — IOException re-raised,
-    producing 40+ 'Cannot open file ... being used by another process' errors in
-    log/errors.jsonl despite PR #118's fallback existing.
-    """
+def test_connect_historify_readonly_falls_through_for_mismatched_path(tmp_duckdb, caplog):
+    """Test ergonomic: a caller passing a per-test tmpdir DB gets a fresh
+    read-only connection on THAT path, with a WARNING surfacing the bypass."""
     path = tmp_duckdb({"AAA": (2026, 6, 11)})
-    calls = []
-    real_connect = duckdb.connect
 
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        calls.append(read_only)
-        if read_only:
-            raise duckdb.IOException(
-                f'IO Error: Cannot open file "{p}": The process cannot access '
-                "the file because it is being used by another process."
-            )
-        return real_connect(p, *args, read_only=read_only, **kwargs)
-
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
-
+    caplog.set_level("WARNING", logger="services.data_freshness_service")
     con = dfs.connect_historify_readonly(path)
     try:
         rows = con.execute("SELECT symbol FROM market_data").fetchall()
     finally:
         con.close()
     assert rows == [("AAA",)]
-    # First read_only attempt refused with IOException, fallback succeeded.
-    assert calls == [True, False]
+    # The WARNING is mandatory — it's the only signal in production that a
+    # caller is bypassing the singleton and re-introducing the #191 race.
+    assert any(
+        "singleton path" in r.message and "separate read-only connection" in r.message
+        for r in caplog.records
+    ), f"expected the path-mismatch WARNING; got: {[r.message for r in caplog.records]}"
 
 
-def test_connect_historify_readonly_falls_back_on_binder_attach_conflict(tmp_duckdb, monkeypatch):
-    """BinderException attach-conflict must trigger the fallback (issue #126)."""
-    path = tmp_duckdb({"BBB": (2026, 6, 11)})
-    calls = []
-    real_connect = duckdb.connect
+def test_connect_historify_readonly_path_mismatch_actually_uses_requested_path(tmp_path):
+    """Belt-and-braces: the fallthrough must read from the REQUESTED file, not
+    accidentally fall through to the singleton's path. A test that populated
+    its own tmpdir would otherwise silently see zero rows from a different DB.
 
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        calls.append(read_only)
-        if read_only:
-            raise duckdb.BinderException(
-                'Unique file handle conflict: Cannot attach "historify" - '
-                "the database file is already attached"
-            )
-        return real_connect(p, *args, read_only=read_only, **kwargs)
-
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
-
-    con = dfs.connect_historify_readonly(path)
-    try:
-        rows = con.execute("SELECT symbol FROM market_data").fetchall()
-    finally:
-        con.close()
-    assert rows == [("BBB",)]
-    assert calls == [True, False]
-
-
-def test_connect_historify_readonly_retries_fallback_under_contention(monkeypatch):
-    """When the fallback ALSO fails transiently, retry with backoff (issue #126).
-
-    Simulates: read_only refused → fallback default-config connect also racing
-    with a brief write → 2 fallback failures → 3rd succeeds.
+    Builds the two DBs inline (instead of using the ``tmp_duckdb`` factory,
+    which always writes to ``fresh.duckdb`` and would collide on a second
+    call) so we can prove the fallthrough honors the path on a per-call basis.
     """
-    sleeps = []
-    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+    path_a = str(tmp_path / "a.duckdb")
+    path_b = str(tmp_path / "b.duckdb")
+    for path, sym in ((path_a, "ONLY_IN_A"), (path_b, "ONLY_IN_B")):
+        seed = duckdb.connect(path)
+        seed.execute(
+            "CREATE TABLE market_data ("
+            "symbol VARCHAR, interval VARCHAR, timestamp BIGINT, close DOUBLE)"
+        )
+        seed.execute(
+            "INSERT INTO market_data VALUES (?, '1m', ?, 100.0)",
+            [sym, _epoch(2026, 6, 11)],
+        )
+        seed.close()
 
-    attempts = {"read_only_attempts": 0, "default_attempts": 0}
-    sentinel_conn = object()
+    con_a = dfs.connect_historify_readonly(path_a)
+    try:
+        rows_a = sorted(r[0] for r in con_a.execute("SELECT symbol FROM market_data").fetchall())
+    finally:
+        con_a.close()
+    con_b = dfs.connect_historify_readonly(path_b)
+    try:
+        rows_b = sorted(r[0] for r in con_b.execute("SELECT symbol FROM market_data").fetchall())
+    finally:
+        con_b.close()
 
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        if read_only:
-            attempts["read_only_attempts"] += 1
-            raise duckdb.ConnectionException("different configuration than existing connections")
-        attempts["default_attempts"] += 1
-        if attempts["default_attempts"] < 3:
-            raise duckdb.IOException("Cannot open file: being used by another process")
-        return sentinel_conn
-
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
-
-    result = dfs.connect_historify_readonly("any.duckdb", max_retries=3)
-    assert result is sentinel_conn
-    assert attempts["read_only_attempts"] == 1  # tried once
-    assert attempts["default_attempts"] == 3  # retried until success
-    # Backoff observed: 100ms, 200ms (the 3rd attempt succeeds so no sleep after)
-    assert sleeps == [0.1, 0.2]
-
-
-def test_connect_historify_readonly_raises_after_max_retries(monkeypatch):
-    """If contention persists past max_retries, raise the last DuckDB error (issue #126)."""
-    monkeypatch.setattr("time.sleep", lambda s: None)
-
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        if read_only:
-            raise duckdb.ConnectionException("different configuration")
-        raise duckdb.IOException("being used by another process")
-
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
-
-    with pytest.raises(duckdb.IOException, match="being used by another process"):
-        dfs.connect_historify_readonly("any.duckdb", max_retries=2)
-
-
-def test_connect_historify_readonly_does_not_retry_non_transient_fallback_error(monkeypatch):
-    """A non-transient error in the fallback path must propagate immediately (issue #126)."""
-    monkeypatch.setattr("time.sleep", lambda s: None)
-    attempts = {"default": 0}
-
-    def fake_connect(p, *args, read_only=False, **kwargs):
-        if read_only:
-            raise duckdb.ConnectionException("different configuration")
-        attempts["default"] += 1
-        raise duckdb.ConnectionException("database does not exist")  # not transient
-
-    monkeypatch.setattr(duckdb, "connect", fake_connect)
-
-    with pytest.raises(duckdb.ConnectionException, match="does not exist"):
-        dfs.connect_historify_readonly("any.duckdb")
-    assert attempts["default"] == 1  # no retry on non-transient error
+    assert rows_a == ["ONLY_IN_A"]
+    assert rows_b == ["ONLY_IN_B"]
