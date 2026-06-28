@@ -74,50 +74,112 @@ def ensure_db_directory():
         logger.info(f"Created database directory: {db_dir}")
 
 
+# --------------------------------------------------------------------------- #
+# Per-process shared connection — issue #191 / #156 Phase 1.
+#
+# Why this exists
+# ---------------
+# DuckDB keeps *one* database instance per file per process and refuses a
+# second connection that requests a different configuration ("Can't open a
+# connection to same database file with a different configuration than
+# existing connections"). The pre-#191 ``get_connection`` opened a brand-new
+# ``duckdb.connect(db_path)`` on every call, so any thread that opened with
+# ``read_only=True`` (the freshness service) plus any other thread opening
+# with the default writeable config (a backfill writer) would race on first
+# connect and the loser hit ``ConnectionException`` or ``IOException``.
+# Retry-with-the-same-config never resolved it, hence the recurring
+# ``Failed to connect to DuckDB after 3 attempts`` bursts at every boot.
+#
+# The structural fix: every reader and writer in this process shares ONE
+# long-lived, writeable ``DuckDBPyConnection``. Each call gets a cheap
+# cursor (``DuckDBPyConnection.cursor()``); cursors are themselves DuckDB
+# connections that share the underlying database — closing a cursor releases
+# only its own resources, never the shared file handle. With one process =
+# one config, the "different configuration" error becomes mathematically
+# impossible. See issue #191 for the full investigation; #156 prescribed this
+# fix as "Phase 1" and labelled the patches that landed without it as
+# symptom-on-the-edges.
+#
+# Per-pytest-process safety
+# -------------------------
+# ``test/conftest.py``'s ``_isolate_databases`` fixture redirects
+# ``HISTORIFY_DATABASE_PATH`` to a per-process ``tempfile.mkdtemp`` BEFORE any
+# ``database.*`` import binds. Since the singleton initialises lazily on the
+# first ``_get_shared_conn()`` call, it picks up the redirected path. Tests
+# that swap the path *mid-process* (subdir conftests rebinding to another
+# tmpdir) call :func:`_reset_for_tests` to drop the cached connection so the
+# next caller opens against the new path.
+# --------------------------------------------------------------------------- #
+_shared_conn: Any = None
+_shared_conn_lock = threading.Lock()
+
+
+def _get_shared_conn():
+    """Return the per-process shared writeable DuckDB connection.
+
+    Lazy + double-checked-locking init so the first caller from any thread
+    opens the file exactly once, and every subsequent caller (including
+    callers racing with the first) gets the same instance. The instance
+    survives until process exit (or :func:`_reset_for_tests` is called).
+    """
+    global _shared_conn
+    if _shared_conn is None:
+        with _shared_conn_lock:
+            if _shared_conn is None:
+                ensure_db_directory()
+                import duckdb
+
+                _shared_conn = duckdb.connect(get_db_path())
+                logger.info(
+                    "historify singleton initialised: path=%s (all cursors share this connection)",
+                    get_db_path(),
+                )
+    return _shared_conn
+
+
+def _reset_for_tests() -> None:
+    """Drop the cached connection so the next call re-opens against the
+    current ``HISTORIFY_DATABASE_PATH``.
+
+    The global ``test/conftest.py`` redirect lands the singleton on a
+    per-pytest-process tmpdir automatically — no test needs to call this for
+    that case. Use it only when a subdir conftest (e.g. ``test/e2e/conftest.py``)
+    rebinds the path to *another* tmpdir partway through a process.
+    """
+    global _shared_conn
+    with _shared_conn_lock:
+        if _shared_conn is not None:
+            try:
+                _shared_conn.close()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            _shared_conn = None
+
+
 @contextmanager
 def get_connection(max_retries: int = 3, retry_delay: float = 0.5):
+    """Yield a cursor on the per-process shared DuckDB connection.
+
+    API-compatible with the prior bare-``duckdb.connect()`` version: every
+    existing call site uses ``conn.execute(...)`` / ``conn.fetchdf(...)`` /
+    ``conn.executemany(...)``, which all work identically on a cursor (in the
+    DuckDB Python API a cursor is itself a connection sharing the underlying
+    database). When the ``with`` block exits the cursor is closed, releasing
+    only its own resources — the shared connection's file handle stays open.
+
+    ``max_retries`` / ``retry_delay`` are kept on the signature for backwards
+    compatibility but are no longer load-bearing: with a single config per
+    process there is nothing transient to retry past. They will be removed in
+    a follow-up once every caller stops passing them.
     """
-    Get a DuckDB connection with proper resource management and retry logic.
-
-    DuckDB uses exclusive file locking on Windows. This function includes retry
-    logic to handle temporary file access conflicts in concurrent scenarios.
-
-    Args:
-        max_retries: Maximum number of connection attempts (default: 3)
-        retry_delay: Delay in seconds between retries (default: 0.5)
-
-    Usage:
-        with get_connection() as conn:
-            result = conn.execute("SELECT * FROM market_data").fetchdf()
-    """
-    import time
-
-    ensure_db_directory()
-    db_path = get_db_path()
-    conn = None
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            import duckdb
-
-            conn = duckdb.connect(db_path)
-            break
-        except Exception as e:
-            last_error = e
-            if attempt < max_retries - 1:
-                logger.debug(f"DuckDB connection attempt {attempt + 1} failed, retrying: {e}")
-                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
-            else:
-                logger.exception(f"Failed to connect to DuckDB after {max_retries} attempts: {e}")
-
-    if conn is None:
-        raise last_error or Exception("Failed to connect to DuckDB")
-
+    cursor = _get_shared_conn().cursor()
     try:
-        yield conn
+        yield cursor
     finally:
-        conn.close()
+        try:
+            cursor.close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
 
 
 def init_database():
