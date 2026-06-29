@@ -90,14 +90,27 @@ class TestDataFreshnessStaleWritesHealthRow:
         from database.historify_db import init_database as _init_historify_db
 
         _init_historify_db()
+        # Sentinel symbol unlikely to be seeded by any other test in the
+        # shared temp DuckDB. The freshness gate doesn't care WHICH symbol
+        # is stale — only that the per-symbol details report it as stale.
+        # Using "RELIANCE" here collided with ``test_at_14_30_restart`` from
+        # PR #228, which seeds RELIANCE with today's bars via the new
+        # ``seed_historify_partial`` fixture. Whichever ran first won, and
+        # CI worker ordering is not stable.
+        test_symbol = "__PHASE3_STALE_SENTINEL__"
         con = duckdb.connect(db_path)
         try:
-            # Seed a single stale row for a test symbol
+            # Defensive: delete any prior rows for the sentinel from a previous
+            # test in the same xdist worker, then seed a single stale row.
+            con.execute(
+                "DELETE FROM market_data WHERE symbol = ?",
+                [test_symbol],
+            )
             con.execute(
                 "INSERT OR REPLACE INTO market_data "
                 "(symbol, exchange, interval, timestamp, open, high, low, close, volume, oi) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ["RELIANCE", "NSE", "1m", stale_ts, 100.0, 101.0, 99.0, 100.5, 10000, 0],
+                [test_symbol, "NSE", "1m", stale_ts, 100.0, 101.0, 99.0, 100.5, 10000, 0],
             )
         finally:
             con.close()
@@ -106,7 +119,7 @@ class TestDataFreshnessStaleWritesHealthRow:
         # so we don't need to seed the full 30-stock + 8-index universe.
         with patch(
             "services.data_freshness_service._resolve_strategy_symbols",
-            return_value={"stock": ["RELIANCE"], "index": []},
+            return_value={"stock": [test_symbol], "index": []},
         ):
             ok, details = check_strategy_data_ready(
                 "sector_follow_cap5_vol",
@@ -119,9 +132,9 @@ class TestDataFreshnessStaleWritesHealthRow:
             "Expected overall_ok=False for a symbol with 3-business-day-old data "
             f"(threshold=1). Got ok={ok!r}, details={details}"
         )
-        assert "RELIANCE" in details, "RELIANCE must appear in the per-symbol details"
-        assert details["RELIANCE"]["ok"] is False, (
-            "RELIANCE must be marked not-ok (stale) in the details dict"
+        assert test_symbol in details, f"{test_symbol} must appear in the per-symbol details"
+        assert details[test_symbol]["ok"] is False, (
+            f"{test_symbol} must be marked not-ok (stale) in the details dict"
         )
 
     def test_stale_check_can_write_data_health_row(self, harness):
