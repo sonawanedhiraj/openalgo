@@ -39,12 +39,20 @@ from utils.event_bus import Event
 # ``fno_intraday_*_chartink`` rules require multi-timeframe daily/weekly frames
 # and 200+ daily bars, so we register self-contained test rules here rather than
 # coupling these service tests to a production rule's predicate.
+#
+# These rules are registered fresh on every test via the ``_register_test_rules``
+# autouse fixture below — NOT at module import time. The rule registry is a
+# module-global dict shared across the whole pytest session, and another suite
+# (``test/integration/test_phase2_p0.py``) calls
+# ``scanner_service._clear_rule_registry_for_tests()`` in its teardown. Under
+# ``pytest -n auto`` (CI), if that suite happens to run earlier in the same
+# xdist worker our module-import-time registrations get wiped and the rules
+# vanish before our tests evaluate, producing the 7 failures originally seen on
+# PR #206 (no scan_results row, no PASS log, etc.). Re-registering per-test
+# closes that ordering hole — see issue #207.
 # ---------------------------------------------------------------------------
 
 
-@scanner_service.scan_rule(
-    "_test_buy_surge_ema", "buy", "test-only: vol surge >=2x AND close above EMA20"
-)
 def _test_buy_surge_ema(bars, indicators):
     if len(bars) < 21:
         return False
@@ -59,9 +67,6 @@ def _test_buy_surge_ema(bars, indicators):
     return bool(bars["close"].iloc[-1] > ema20.iloc[-1])
 
 
-@scanner_service.scan_rule(
-    "_test_sell_surge_ema", "sell", "test-only: vol surge >=2x AND close below EMA20"
-)
 def _test_sell_surge_ema(bars, indicators):
     if len(bars) < 21:
         return False
@@ -104,6 +109,32 @@ def fresh_scanner_db(monkeypatch):
 
     test_session.remove()
     test_engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _register_test_rules():
+    """Re-register the two test-only rules before every test.
+
+    The rule registry is a module-global dict (``scanner_service._rule_registry``)
+    shared across the whole pytest session. Another suite —
+    ``test/integration/test_phase2_p0.py`` — calls
+    ``scanner_service._clear_rule_registry_for_tests()`` in its teardown to
+    wipe its own ``_p0_always_true`` rule, which under ``pytest -n auto`` also
+    wipes the rules a previously-loaded ``test_scanner_service`` module
+    registered at import time. Registering per-test makes this file's contract
+    robust to that ordering hazard (issue #207).
+    """
+    scanner_service.scan_rule(
+        "_test_buy_surge_ema",
+        "buy",
+        "test-only: vol surge >=2x AND close above EMA20",
+    )(_test_buy_surge_ema)
+    scanner_service.scan_rule(
+        "_test_sell_surge_ema",
+        "sell",
+        "test-only: vol surge >=2x AND close below EMA20",
+    )(_test_sell_surge_ema)
+    yield
 
 
 @pytest.fixture(autouse=True)
