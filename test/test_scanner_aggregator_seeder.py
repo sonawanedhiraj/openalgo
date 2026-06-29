@@ -314,7 +314,7 @@ def test_boot_worker_runs_seed_when_session_up(monkeypatch):
     ):
         scanner_aggregator_seeder._boot_worker(mock_agg, ["RELIANCE", "SBIN"])
 
-    seed_fn.assert_called_once_with(mock_agg, ["RELIANCE", "SBIN"])
+    seed_fn.assert_called_once_with(mock_agg, ["RELIANCE", "SBIN"], bar_15m_history=None)
     notify_fn.assert_called_once()
     # Telegram message names the per-symbol counts.
     assert "2/2" in notify_fn.call_args.args[0]
@@ -494,3 +494,166 @@ def test_broker_fetcher_parses_epoch_timestamps():
     assert all(out[i]["ts"] <= out[i + 1]["ts"] for i in range(len(out) - 1))
     # ts is naive datetime.
     assert out[0]["ts"].tzinfo is None
+
+
+# --------------------------------------------------------------------------- #
+# 15m bar aggregation (issue #201)
+# --------------------------------------------------------------------------- #
+def _make_1m_bar(ts: datetime, base: float = 100.0, vol: int = 100) -> dict:
+    return {
+        "ts": ts,
+        "open": base,
+        "high": base + 0.5,
+        "low": base - 0.5,
+        "close": base + 0.1,
+        "volume": vol,
+    }
+
+
+def test_aggregate_1m_to_15m_buckets_by_quarter_hour():
+    """15 1m bars covering 09:15 → 09:29 should produce a single 15m bar at 09:15."""
+    bars_1m = [_make_1m_bar(datetime(2026, 6, 26, 9, 15) + timedelta(minutes=i)) for i in range(15)]
+    bars_15m = scanner_aggregator_seeder._aggregate_1m_to_15m(bars_1m)
+    assert len(bars_15m) == 1
+    b = bars_15m[0]
+    assert b["ts"] == datetime(2026, 6, 26, 9, 15)
+    # OHLCV semantics: volume aggregated, high/low extrema, open from first, close from last.
+    assert b["volume"] == 100 * 15
+    assert b["open"] == 100.0
+    assert b["close"] == 100.1
+
+
+def test_aggregate_1m_to_15m_trims_partial_closing_bucket():
+    """30 1m bars covering 09:15 → 09:44 (two full 15m buckets) followed by 5
+    partial 1m bars at 09:45 → produce 2 closed 15m bars, not 3."""
+    bars_1m = [
+        _make_1m_bar(datetime(2026, 6, 26, 9, 15) + timedelta(minutes=i)) for i in range(30 + 5)
+    ]
+    bars_15m = scanner_aggregator_seeder._aggregate_1m_to_15m(bars_1m)
+    # 09:15 and 09:30 buckets are full (15 each); 09:45 has only 5 — dropped.
+    assert len(bars_15m) == 2
+    assert bars_15m[0]["ts"] == datetime(2026, 6, 26, 9, 15)
+    assert bars_15m[1]["ts"] == datetime(2026, 6, 26, 9, 30)
+
+
+def test_aggregate_1m_to_15m_empty():
+    assert scanner_aggregator_seeder._aggregate_1m_to_15m([]) == []
+
+
+def test_seed_aggregator_also_seeds_15m_when_history_passed():
+    """When ``bar_15m_history`` is provided, every symbol with sufficient 1m
+    bars also seeds its 15m roller via ``seed_bars``."""
+    bars_1m = [_make_1m_bar(datetime(2026, 6, 26, 9, 15) + timedelta(minutes=i)) for i in range(30)]
+    mock_agg = MagicMock()
+    mock_agg.replay_bars = MagicMock(return_value=len(bars_1m))
+
+    roll15 = MagicMock()
+    roll15.seed_bars = MagicMock(return_value=2)
+    bar_15m_history = {"RELIANCE": roll15}
+
+    with patch.object(scanner_aggregator_seeder, "_read_1m_bars_for_symbol", return_value=bars_1m):
+        summary = scanner_aggregator_seeder.seed_aggregator(
+            mock_agg, ["RELIANCE"], bar_15m_history=bar_15m_history
+        )
+
+    roll15.seed_bars.assert_called_once()
+    seeded_15m = roll15.seed_bars.call_args.args[0]
+    assert len(seeded_15m) == 2  # two full buckets
+    assert summary["seeded_15m_bars"] == 2
+
+
+def test_seed_aggregator_does_not_seed_15m_when_no_history_passed():
+    """If ``bar_15m_history`` is not passed, only the 5m aggregator is seeded
+    (the legacy code path stays unchanged)."""
+    bars_1m = [_make_1m_bar(datetime(2026, 6, 26, 9, 15) + timedelta(minutes=i)) for i in range(30)]
+    mock_agg = MagicMock()
+    mock_agg.replay_bars = MagicMock(return_value=len(bars_1m))
+
+    with patch.object(scanner_aggregator_seeder, "_read_1m_bars_for_symbol", return_value=bars_1m):
+        summary = scanner_aggregator_seeder.seed_aggregator(mock_agg, ["RELIANCE"])
+
+    assert summary["seeded_15m_bars"] == 0
+
+
+def test_seed_aggregator_15m_seed_failure_does_not_block_5m():
+    """A raise in 15m seeding is caught and reported; the 5m seed still succeeds."""
+    bars_1m = [_make_1m_bar(datetime(2026, 6, 26, 9, 15) + timedelta(minutes=i)) for i in range(30)]
+    mock_agg = MagicMock()
+    mock_agg.replay_bars = MagicMock(return_value=30)
+
+    roll15 = MagicMock()
+    roll15.seed_bars = MagicMock(side_effect=RuntimeError("disk full"))
+    bar_15m_history = {"RELIANCE": roll15}
+
+    with patch.object(scanner_aggregator_seeder, "_read_1m_bars_for_symbol", return_value=bars_1m):
+        summary = scanner_aggregator_seeder.seed_aggregator(
+            mock_agg, ["RELIANCE"], bar_15m_history=bar_15m_history
+        )
+
+    # 5m seed succeeded; 15m seed crashed silently.
+    assert summary["seeded_symbols"] == 1
+    assert summary["total_bars"] == 30
+    assert summary["seeded_15m_bars"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# _Rolling15mBars.seed_bars (issue #201)
+# --------------------------------------------------------------------------- #
+def test_rolling_15m_seed_bars_appends_to_deque():
+    from services.scanner_service import _Rolling15mBars
+
+    roll = _Rolling15mBars("RELIANCE")
+    bars = [
+        {
+            "ts": datetime(2026, 6, 26, 9, 15) + timedelta(minutes=15 * i),
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1500,
+        }
+        for i in range(20)
+    ]
+    n = roll.seed_bars(bars)
+    assert n == 20
+    out = roll.get_recent_bars(50)
+    assert len(out) == 20
+
+
+def test_rolling_15m_seed_bars_dedups_by_timestamp():
+    """A repeated timestamp REPLACES the prior bar rather than double-counting."""
+    from services.scanner_service import _Rolling15mBars
+
+    roll = _Rolling15mBars("RELIANCE")
+    ts = datetime(2026, 6, 26, 9, 15)
+    roll.seed_bars(
+        [
+            {
+                "ts": ts,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 1500,
+            }
+        ]
+    )
+    # Re-seed same ts with different values.
+    added = roll.seed_bars(
+        [
+            {
+                "ts": ts,
+                "open": 100.0,
+                "high": 105.0,
+                "low": 99.0,
+                "close": 104.0,
+                "volume": 9999,
+            }
+        ]
+    )
+    # No NEW bar added — but the existing row's values are updated.
+    assert added == 0
+    out = roll.get_recent_bars(50)
+    assert len(out) == 1
+    assert out.iloc[0]["close"] == 104.0
+    assert out.iloc[0]["volume"] == 9999

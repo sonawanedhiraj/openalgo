@@ -1064,7 +1064,17 @@ def setup_environment(app):
                             init_scanner_aggregator_seeder,
                         )
 
-                        init_scanner_aggregator_seeder(app.scanner_service.aggregator, symbols)
+                        # Issue #201: also pass the per-symbol 15m bar
+                        # builders so the seeder pre-warms them from the
+                        # same 1m series; otherwise the rules' 15m RSI(14)
+                        # warm-up guard (needs 14 closed 15m bars =
+                        # ~3h30min of live ticks) blocks every signal
+                        # after a mid-session restart.
+                        init_scanner_aggregator_seeder(
+                            app.scanner_service.aggregator,
+                            symbols,
+                            bar_15m_history=getattr(app.scanner_service, "_bar_15m_history", None),
+                        )
                     except Exception as e:
                         logger.error(f"Failed to start aggregator seeder: {e}")
 
