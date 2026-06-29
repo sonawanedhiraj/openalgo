@@ -7,16 +7,20 @@ import { defineConfig } from '@playwright/test'
  *
  * Specs:
  *   - smoke.spec.ts          — route reachability + console-error allowlist
- *   - scanner_clone.spec.ts  — clone/delete scanner-definition flow (uses
- *                              Playwright route mocks; needs no broker)
  *
- * Both run against the same booted OpenAlgo container (no mock-broker
- * dependency), so they share a single CI job (cd-playwright-smoke). The
- * mock-broker happy-path lives in playwright.broker.config.ts.
+ * Note: scanner_clone.spec.ts is NOT in this config (issue #229). Although
+ * the spec uses page.route mocks for its API calls, the scanner page itself
+ * requires authenticated session state to render the definition cards the
+ * spec asserts on. The smoke stack boots OpenAlgo unauthenticated, so
+ * those specs fail with "element not found". Including scanner_clone in
+ * the smoke gate would require wiring an auth fixture into the spec —
+ * out of scope for #229, which is the gating-only change.
+ *
+ * The mock-broker happy-path lives in playwright.broker.config.ts.
  */
 export default defineConfig({
   testDir: './e2e',
-  testMatch: ['smoke.spec.ts', 'scanner_clone.spec.ts'],
+  testMatch: ['smoke.spec.ts'],
   timeout: 30000,
   expect: { timeout: 5000 },
   fullyParallel: false,
