@@ -66,7 +66,13 @@ def test_stale_triggers_refresh_of_stale_subset_1m():
     assert set(captured["symbols"]) == set(universe)
     assert captured["interval"] == "1m"
     assert captured["end"] == "2026-06-11"
-    assert captured["start"] < captured["end"]
+    # Issue #193 — with Wednesday's data on disk and ref=Thursday, the
+    # incremental window collapses to a single-day catch-up (start = WED + 1
+    # = THURS = end). Pre-#193 this asserted ``start < end`` which would have
+    # failed on the post-#193 behavior; the byte-exact equality is the
+    # regression: only today's bars are fetched, not a fixed 4-day window.
+    assert captured["start"] == "2026-06-11"
+    assert captured["start"] <= captured["end"]
 
 
 # --------------------------------------------------------------------------- #

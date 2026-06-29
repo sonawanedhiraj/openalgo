@@ -66,6 +66,7 @@ from datetime import date, datetime, timedelta
 
 from services.data_freshness_service import (
     _DEFAULT_DUCKDB_PATH,
+    compute_incremental_start_date,
     compute_stale_symbols,
     is_transient_lock_error,
 )
@@ -243,7 +244,7 @@ def check_and_refresh_if_stale(
         return result
 
     try:
-        stale, fresh, _details = compute_stale_symbols(
+        stale, fresh, details = compute_stale_symbols(
             path,
             universe,
             today=ref,
@@ -277,9 +278,12 @@ def check_and_refresh_if_stale(
         )
         return result
 
+    # Issue #193 — fetch only the incremental gap, not a fixed lookback window.
+    # See compute_incremental_start_date docstring for the contract.
     lookback = _LOOKBACK_DAYS.get(interval, 4)
     end = ref.strftime("%Y-%m-%d")
-    start = (ref - timedelta(days=lookback)).strftime("%Y-%m-%d")
+    start_date = compute_incremental_start_date(details, stale, ref, lookback)
+    start = start_date.strftime("%Y-%m-%d")
     logger.info(
         "scanner universe %s feed stale: %d/%d behind — catching up %s..%s",
         interval,
