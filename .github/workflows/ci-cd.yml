@@ -161,30 +161,27 @@ jobs:
           compression-level: 0  # already-compressed Docker layers; skip re-gzip
 
   # ============================================================================
-  # STAGE 2b: CD - Docker Boot + E2E Tests
+  # STAGE 2b: CD-PYTEST-E2E — pytest test/e2e against the booted main stack
   # ============================================================================
-  cd-docker-e2e:
-    name: "CD: Docker + E2E Tests"
-    # TRIAL (#211): moved from self-hosted to ubuntu-latest after the laptop
-    # runner went offline and blocked CD for hours. ubuntu-latest has Docker
-    # pre-installed and the repo is public so minutes are free. The runner
-    # IS the host, so `host.docker.internal` is replaced with `localhost`.
+  # PR B (#215): fanned out from the monolithic cd-docker-e2e job into 3
+  # parallel consumers of the cd-build artifact. Each runs on its own VM
+  # with its own compose, eliminating the prior port-swap teardown dance.
+  cd-pytest-e2e:
+    name: "CD: pytest E2E"
     needs: cd-build
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install uv
-        run: |
-          pip install uv --quiet
+        run: pip install uv --quiet
 
       - name: Generate throwaway .env for testing
         run: |
           cp .sample.env .env
-          # Generate random secrets (throwaway for testing only)
           uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
           uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
           uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
@@ -192,7 +189,6 @@ jobs:
           sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
           sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
           sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
-          # Ensure sandbox mode
           sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
           if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
             echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
@@ -200,53 +196,24 @@ jobs:
           if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
             echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
           fi
-          # Verify .env file was created and is readable
-          test -f .env && echo "✅ .env file created successfully" || echo "❌ .env file creation failed"
-          ls -lh .env
 
-      - name: Preflight — Docker daemon + disk space
-        # ubuntu-latest ships with Docker installed and the runner IS the host,
-        # so the previous host.docker.internal + socket-mount checks are dropped.
-        run: |
-          docker version --format 'Daemon: {{.Server.Version}}'
-          AVAIL=$(df / --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G ' || echo 999)
-          echo "Disk free: ${AVAIL}GB"
-          if [ "${AVAIL:-999}" -lt 5 ]; then
-            echo "::error::Disk has only ${AVAIL}GB free (need ≥5 GB for Docker build)."
-            exit 1
-          fi
-
-      - name: Download image artifact (from cd-build)
+      - name: Download + load image artifact
         uses: actions/download-artifact@v4
         with:
           name: openalgo-image
           path: /tmp
-
       - name: Load Docker image
         run: |
           docker load -i /tmp/openalgo-image.tar
-          docker image ls openalgo:latest
           rm /tmp/openalgo-image.tar
-          echo "✅ openalgo:latest loaded from artifact (no rebuild)"
+          echo "✅ openalgo:latest loaded from artifact"
 
-      - name: Boot container with health check
-        # `--wait` blocks until every service reports healthy (or fails), using
-        # the compose healthcheck defined on the service. Replaces the previous
-        # bash poll that ran in parallel with — and competed against — the
-        # healthcheck. Compose exits non-zero on healthcheck failure, so no
-        # extra status check is needed.
+      - name: Boot main container with health check
         run: |
-          echo "Starting OpenAlgo container (compose --wait)..."
           docker compose up -d --wait
           docker compose ps
           echo "✅ Container is running and healthy"
 
-      # Diagnostics dump on boot failure (refs #183). When `compose --wait`
-      # exits non-zero with "container openalgo-web is unhealthy", the run
-      # currently contains zero application-side detail — leaving us blind to
-      # WHY the container is unhealthy. This step runs only on a prior-step
-      # failure and dumps the three things we'd run by hand: container state,
-      # the last 300 log lines, and the healthcheck history.
       - name: Dump container diagnostics on boot failure
         if: failure()
         run: |
@@ -254,52 +221,94 @@ jobs:
           docker compose ps -a || true
           echo "::endgroup::"
           echo "::group::openalgo-web logs (last 300 lines)"
-          # Use raw `docker logs` against the container_name. `docker compose
-          # logs openalgo-web` fails — the compose service is named `openalgo`
-          # (see docker-compose.yaml), not `openalgo-web`; only the container
-          # is renamed via container_name.
           docker logs --tail=300 openalgo-web 2>&1 || true
           echo "::endgroup::"
           echo "::group::container health inspect"
           docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
           echo "::endgroup::"
 
-      - name: Run pytest E2E tests against running application
-        # On ubuntu-latest the runner IS the host, so the openalgo-web container
-        # is reachable at localhost:5000 directly — no host-gateway indirection.
+      - name: Run pytest E2E
         env:
           OPENALGO_URL: http://localhost:5000
         run: |
           echo "Running pytest E2E tests..."
-          pip install uv --quiet
           uv run python -m pytest test/e2e --tb=short
-          echo "✅ pytest E2E tests passed"
 
-      # ====================================================================
-      # Playwright Phase A — smoke against the already-booted main container.
-      # Restored from the deleted deploy-pipeline.yml per issue #149.
-      #
-      # Runs Playwright inside Microsoft's official image
-      # (mcr.microsoft.com/playwright:v1.58.0-jammy) — chromium + system deps
-      # are baked in, so the previous `npx playwright install --with-deps`
-      # step (which hung post-download for 22 min on ubuntu-latest, see #211)
-      # disappears entirely. Image tag matches @playwright/test pinned in
-      # frontend/package-lock.json (1.58.0); bump together when upgrading.
-      # `--network host` makes localhost:5000/:5099/:8001 reach the running
-      # compose containers on the runner.
-      # ====================================================================
-      - name: Run Playwright smoke against booted container
+      - name: Final teardown
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans || true
+
+  # ============================================================================
+  # STAGE 2c: CD-PLAYWRIGHT-SMOKE — Playwright smoke against the main stack
+  # ============================================================================
+  cd-playwright-smoke:
+    name: "CD: Playwright smoke"
+    needs: cd-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Generate throwaway .env for testing
+        run: |
+          cp .sample.env .env
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+          sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
+          if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
+            echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
+          fi
+          if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
+            echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
+          fi
+
+      - name: Download + load image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp
+      - name: Load Docker image
+        run: |
+          docker load -i /tmp/openalgo-image.tar
+          rm /tmp/openalgo-image.tar
+
+      - name: Boot main container with health check
+        run: |
+          docker compose up -d --wait
+          docker compose ps
+
+      - name: Dump container diagnostics on boot failure
+        if: failure()
+        run: |
+          docker compose ps -a || true
+          docker logs --tail=300 openalgo-web 2>&1 || true
+          docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
+
+      - name: Run Playwright smoke (MS image)
+        # Microsoft's official Playwright image — chromium + system deps baked
+        # in. Tag must match @playwright/test pinned in frontend/package-lock.json
+        # (1.58.0); bump together. `--network host` lets the container reach
+        # openalgo on localhost:5000.
         env:
           OPENALGO_URL: http://localhost:5000
         run: |
-          echo "Running Playwright smoke (chromium) against booted container..."
           docker run --rm --network host \
             -v "${{ github.workspace }}/frontend:/frontend" -w /frontend \
             -e OPENALGO_URL="$OPENALGO_URL" \
             -e CI=true \
             mcr.microsoft.com/playwright:v1.58.0-jammy \
             sh -c 'npm ci --no-audit --no-fund && npx playwright test --config playwright.smoke.config.ts'
-          echo "✅ Playwright smoke passed"
 
       - name: Upload Playwright smoke report on failure
         if: failure()
@@ -309,31 +318,67 @@ jobs:
           path: frontend/playwright-report/
           retention-days: 7
 
-      # ====================================================================
-      # Playwright Phase B — Tier-3 mock-broker happy-path.
-      # Requires the test compose stack (OpenAlgo on :5099 + mock broker on
-      # :8001) which conflicts with the main container's :5000 binding via
-      # docker-compose.test.yml's openalgo service mapping — so tear down the
-      # main stack first.
-      # ====================================================================
-      - name: Tear down main container (port swap for mock-broker stack)
+      - name: Final teardown
+        if: always()
         run: |
-          echo "Tearing down main container before mock-broker stack boot..."
           docker compose down -v --remove-orphans || true
+
+  # ============================================================================
+  # STAGE 2d: CD-PLAYWRIGHT-BROKER — Playwright happy-path against mock stack
+  # ============================================================================
+  # The mock-broker stack (docker-compose.test.yml) references
+  # `image: openalgo:latest` with no build directive, so it consumes the
+  # artifact-loaded image directly. Only the small mock_broker FastAPI
+  # fixture has its own build context.
+  cd-playwright-broker:
+    name: "CD: Playwright broker happy-path"
+    needs: cd-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Generate throwaway .env for testing
+        run: |
+          cp .sample.env .env
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+          sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
+          if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
+            echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
+          fi
+          if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
+            echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
+          fi
+
+      - name: Download + load image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp
+      - name: Load Docker image
+        run: |
+          docker load -i /tmp/openalgo-image.tar
+          rm /tmp/openalgo-image.tar
 
       - name: Build + boot mock-broker stack
         run: |
-          echo "Building mock-broker stack (docker-compose.test.yml)..."
-          docker compose -f docker-compose.test.yml -p mock_test build --quiet
-          echo "Booting mock-broker stack (compose --wait)..."
+          # Only the mock_broker fixture needs building; openalgo uses the
+          # artifact-loaded image.
+          docker compose -f docker-compose.test.yml -p mock_test build --quiet mock_broker
           docker compose -f docker-compose.test.yml -p mock_test up -d --wait
           docker compose -f docker-compose.test.yml -p mock_test ps
-          echo "✅ Mock-broker stack healthy"
 
-      # Diagnostics dump on mock-broker boot failure. Mirrors the main-stack
-      # diagnostics earlier in the job, but targets the mock_test-* containers
-      # (the main `openalgo-web` is already torn down at this point so its
-      # dump is meaningless here).
       - name: Dump mock-broker stack diagnostics on boot failure
         if: failure()
         run: |
@@ -350,12 +395,11 @@ jobs:
           docker logs --tail=100 mock_test-mock_broker-1 2>&1 || true
           echo "::endgroup::"
 
-      - name: Run Playwright broker happy-path
+      - name: Run Playwright broker happy-path (MS image)
         env:
           OPENALGO_URL: http://localhost:5099
           MOCK_BROKER_URL: http://localhost:8001
         run: |
-          echo "Running Playwright broker happy-path against mock stack..."
           docker run --rm --network host \
             -v "${{ github.workspace }}/frontend:/frontend" -w /frontend \
             -e OPENALGO_URL="$OPENALGO_URL" \
@@ -363,7 +407,6 @@ jobs:
             -e CI=true \
             mcr.microsoft.com/playwright:v1.58.0-jammy \
             sh -c 'npm ci --no-audit --no-fund && npx playwright test --config playwright.broker.config.ts'
-          echo "✅ Broker happy-path passed"
 
       - name: Upload Playwright broker report on failure
         if: failure()
@@ -373,34 +416,22 @@ jobs:
           path: frontend/playwright-report/
           retention-days: 7
 
-      - name: Tear down mock-broker stack
+      - name: Final teardown
         if: always()
         run: |
-          echo "Cleaning up mock-broker stack..."
           docker compose -f docker-compose.test.yml -p mock_test down -v --remove-orphans || true
-
-      - name: Final teardown (main + .env)
-        if: always()
-        run: |
-          echo "Cleaning up any remaining containers..."
-          docker compose down -v --remove-orphans || true
-          rm -f .env
-          echo "✅ Cleanup complete"
-
-      - name: Report CD status
-        if: always()
-        run: |
-          echo "✅ CD Stage Complete"
-          echo "Docker built, booted, pytest E2E + Playwright smoke + mock-broker happy-path all ran"
 
 # ============================================================================
 # Branch Protection Requirements
 # ============================================================================
-# Add these as required status checks on dev/main branches:
-# - ci-unit-tests
-# - ci-frontend-tests
-# - cd-docker-e2e
+# Add these as required status checks on dev/main branches (PR B post-#215):
+# - CI: Unit + Integration Tests
+# - CI: Frontend Tests (vitest)
+# - CD: Build Docker image
+# - CD: pytest E2E
+# - CD: Playwright smoke
+# - CD: Playwright broker happy-path
 #
-# Command to add via GitHub CLI:
-# gh api repos/sonawanedhiraj/openalgo/branches/dev/protection/required_status_checks \
-#   --input - <<< '{"strict": true, "contexts": ["ci-unit-tests", "ci-frontend-tests", "cd-docker-e2e"]}'
+# `cd-docker-e2e` was retired in #215 (PR B) — replaced by the three parallel
+# test jobs above. Operator must update branch protection accordingly (this
+# is a GitHub UI change, not code).
