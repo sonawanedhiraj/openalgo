@@ -104,13 +104,11 @@ jobs:
   # ============================================================================
   cd-docker-e2e:
     name: "CD: Docker + E2E Tests"
-    runs-on: self-hosted
-    # `needs: ci-unit-tests` deliberately dropped — the two jobs now run on
-    # independent infra pools (ubuntu-latest + self-hosted), so they fire in
-    # parallel. Both remain required status checks, so a red unit-test still
-    # blocks merge; the trade-off is that a broken PR may briefly hold the
-    # self-hosted slot, which `concurrency: cancel-in-progress: true` (above)
-    # already bounds by cancelling superseded runs.
+    # TRIAL (#211): moved from self-hosted to ubuntu-latest after the laptop
+    # runner went offline and blocked CD for hours. ubuntu-latest has Docker
+    # pre-installed and the repo is public so minutes are free. The runner
+    # IS the host, so `host.docker.internal` is replaced with `localhost`.
+    runs-on: ubuntu-latest
     timeout-minutes: 25
 
     steps:
@@ -144,34 +142,17 @@ jobs:
           test -f .env && echo "✅ .env file created successfully" || echo "❌ .env file creation failed"
           ls -lh .env
 
-      - name: Preflight — runner can reach Docker daemon + host gateway
+      - name: Preflight — Docker daemon + disk space
+        # ubuntu-latest ships with Docker installed and the runner IS the host,
+        # so the previous host.docker.internal + socket-mount checks are dropped.
         run: |
-          if ! docker version --format '{{.Server.Version}}' 2>/dev/null; then
-            echo "::error::Runner cannot reach the Docker daemon."
-            echo "::error::Likely cause: /var/run/docker.sock not mounted in the runner container."
-            echo "::error::Fix: add docker-compose.override.yml in C:\\actions-runner\\ with:"
-            echo "::error::  services: {gh-runner: {volumes: [/var/run/docker.sock:/var/run/docker.sock]}}"
-            echo "::error::Then: docker rm -f openalgo-gh-runner && cd C:\\actions-runner && docker compose up -d"
-            exit 1
-          fi
+          docker version --format 'Daemon: {{.Server.Version}}'
           AVAIL=$(df / --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G ' || echo 999)
+          echo "Disk free: ${AVAIL}GB"
           if [ "${AVAIL:-999}" -lt 5 ]; then
-            echo "::error::Runner disk has only ${AVAIL}GB free (need ≥5 GB for Docker build)."
-            echo "::error::Run: docker system prune -f"
+            echo "::error::Disk has only ${AVAIL}GB free (need ≥5 GB for Docker build)."
             exit 1
           fi
-          # Both the pytest E2E step and the Playwright steps below talk to
-          # services bound on the HOST's loopback via the host-gateway alias.
-          # If host.docker.internal isn't resolvable the runner is missing
-          # `extra_hosts: ["host.docker.internal:host-gateway"]` in its override.
-          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
-            echo "::error::host.docker.internal does not resolve from inside the runner."
-            echo "::error::Fix: add to C:\\actions-runner\\docker-compose.override.yml:"
-            echo "::error::  services: {gh-runner: {extra_hosts: [\"host.docker.internal:host-gateway\"]}}"
-            echo "::error::Then: docker rm -f openalgo-gh-runner && cd C:\\actions-runner && docker compose up -d"
-            exit 1
-          fi
-          echo "✅ Preflight: Docker $(docker version --format '{{.Server.Version}}'), ${AVAIL}GB disk free, host.docker.internal OK"
 
       - name: Build Docker image
         run: |
@@ -215,14 +196,10 @@ jobs:
           echo "::endgroup::"
 
       - name: Run pytest E2E tests against running application
-        # The runner is itself a container talking to the host's Docker via
-        # socket-mount. `compose up` binds the openalgo-web service on the HOST's
-        # 0.0.0.0:5000 — NOT the runner's loopback. Python tests that hit the
-        # network use OPENALGO_URL=http://host.docker.internal:5000 (the
-        # host-gateway alias must be present in the runner's
-        # docker-compose.override.yml as `extra_hosts: [host.docker.internal:host-gateway]`).
+        # On ubuntu-latest the runner IS the host, so the openalgo-web container
+        # is reachable at localhost:5000 directly — no host-gateway indirection.
         env:
-          OPENALGO_URL: http://host.docker.internal:5000
+          OPENALGO_URL: http://localhost:5000
         run: |
           echo "Running pytest E2E tests..."
           pip install uv --quiet
@@ -232,54 +209,27 @@ jobs:
       # ====================================================================
       # Playwright Phase A — smoke against the already-booted main container.
       # Restored from the deleted deploy-pipeline.yml per issue #149.
+      #
+      # Runs Playwright inside Microsoft's official image
+      # (mcr.microsoft.com/playwright:v1.58.0-jammy) — chromium + system deps
+      # are baked in, so the previous `npx playwright install --with-deps`
+      # step (which hung post-download for 22 min on ubuntu-latest, see #211)
+      # disappears entirely. Image tag matches @playwright/test pinned in
+      # frontend/package-lock.json (1.58.0); bump together when upgrading.
+      # `--network host` makes localhost:5000/:5099/:8001 reach the running
+      # compose containers on the runner.
       # ====================================================================
-      - name: Setup Node.js (for Playwright)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: 'npm'
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install frontend deps
-        working-directory: frontend
-        run: npm ci
-
-      # Cache the Playwright browser binaries keyed on package-lock.json (which
-      # pins @playwright/test). Cold install of chromium+deps is ~45 s; warm
-      # cache restore is ~3 s.
-      - name: Cache Playwright browsers
-        id: playwright-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('frontend/package-lock.json') }}
-
-      - name: Install Playwright chromium (+ deps if cache miss)
-        working-directory: frontend
-        # `--with-deps` runs `apt-get install` for chromium's system libs.
-        # The self-hosted runner's dpkg state can be left half-configured by a
-        # prior interrupted apt operation in the runner container's base
-        # image, and `apt-get install` then surfaces unmet deps for half-
-        # installed packages. Three-step defensive recovery:
-        #   1. dpkg --configure -a → finishes any half-applied package.
-        #   2. apt-get update      → refreshes the package lists (the runner
-        #                            base image's lists can be days old).
-        #   3. apt-get -f install  → auto-resolves any unmet dependencies.
-        # All three are guarded with `|| true` so a healthy runner is a no-op.
-        run: |
-          sudo dpkg --configure -a 2>/dev/null || true
-          sudo apt-get update -qq 2>/dev/null || true
-          sudo apt-get install -y --fix-broken -qq 2>/dev/null || true
-          npx playwright install --with-deps chromium
-
       - name: Run Playwright smoke against booted container
-        working-directory: frontend
-        # Same socket-mount runner-network nuance as the pytest E2E step above.
         env:
-          OPENALGO_URL: http://host.docker.internal:5000
+          OPENALGO_URL: http://localhost:5000
         run: |
           echo "Running Playwright smoke (chromium) against booted container..."
-          npx playwright test --config playwright.smoke.config.ts
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/frontend:/frontend" -w /frontend \
+            -e OPENALGO_URL="$OPENALGO_URL" \
+            -e CI=true \
+            mcr.microsoft.com/playwright:v1.58.0-jammy \
+            sh -c 'npm ci --no-audit --no-fund && npx playwright test --config playwright.smoke.config.ts'
           echo "✅ Playwright smoke passed"
 
       - name: Upload Playwright smoke report on failure
@@ -332,14 +282,18 @@ jobs:
           echo "::endgroup::"
 
       - name: Run Playwright broker happy-path
-        working-directory: frontend
-        # Mock stack also runs on the host, addressable via host.docker.internal.
         env:
-          OPENALGO_URL: http://host.docker.internal:5099
-          MOCK_BROKER_URL: http://host.docker.internal:8001
+          OPENALGO_URL: http://localhost:5099
+          MOCK_BROKER_URL: http://localhost:8001
         run: |
           echo "Running Playwright broker happy-path against mock stack..."
-          npx playwright test --config playwright.broker.config.ts
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/frontend:/frontend" -w /frontend \
+            -e OPENALGO_URL="$OPENALGO_URL" \
+            -e MOCK_BROKER_URL="$MOCK_BROKER_URL" \
+            -e CI=true \
+            mcr.microsoft.com/playwright:v1.58.0-jammy \
+            sh -c 'npm ci --no-audit --no-fund && npx playwright test --config playwright.broker.config.ts'
           echo "✅ Broker happy-path passed"
 
       - name: Upload Playwright broker report on failure
