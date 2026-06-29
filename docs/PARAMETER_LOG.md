@@ -105,12 +105,18 @@ signals fire. Source: `services/scanner_service.py` + the two
 - **Current value:** unset → defaults **`true`**.
 - **Set in:** env; read in both `fno_intraday_buy_chartink.py` /
   `fno_intraday_sell_chartink.py` (`_dbar_date_verify_enabled()`).
-- **What it does:** post-settle (`today_idx == -1`), the rule aborts with a
-  WARNING when its latest daily-D bar is dated before today (stale-D guard). Only
-  fires when the daily frame carries a `timestamp` column (production reads);
-  `false` → legacy behavior (no date check).
-- **Why added:** defense-in-depth for FM-6 — a future change to the market-hours
-  gate must not be able to re-open the stale-bar post-close path on its own.
+- **What it does:** **Reframed for Issue #197 (2026-06-29).** The rule now
+  derives today's running daily snapshot from today's 5m bars when
+  `bars_daily.iloc[-1]` is dated before today (the production state during
+  the trading session), so the original AUROPHARMA-style "fire on
+  stale-as-today" bug class is structurally impossible. The guard now
+  defends against the LATEST SETTLED bar being more than **5 calendar days**
+  behind today (backfill broken across multiple sessions), in which case
+  the rule aborts with a WARNING. Only fires when the daily frame carries
+  a `timestamp` column (production reads); `false` → no staleness check.
+- **Why added:** original Tier-1 defense for FM-6. Threshold widened to 5
+  days as part of Issue #197 because `iloc[-1]` is naturally 1-4 days
+  behind today during normal Mon-Fri operation (post-weekend / post-holiday).
 
 #### SCANNER_COMPLETENESS_ENABLED
 - **Current value:** unset → defaults **`true`**.

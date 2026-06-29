@@ -1,13 +1,13 @@
 """Chartink-equivalent SELL rule — mirror of ``fno_intraday_buy_chartink``.
 
 Mirrors the operator's live Chartink ``alert-for-intraday-sell-fno`` formula.
-It is the BUY rule with the directional inequalities flipped (Supertrend, RSI,
-open-vs-prev-close, open-vs-pivot, and the close-gap), plus a **simpler volume
+Inequalities are directionally flipped from BUY, with a **simpler volume
 gate**. As with BUY, evaluation short-circuits on the first miss.
 
 Key differences from the BUY rule (worth flagging):
-  * Gates 3, 4, 5, 9, 10 are inequality-flipped (the directional mirror).
-  * Gate 1 uses ``* 0.97`` (a 3% gap **DOWN**) instead of BUY's ``* 1.03``.
+  * Gates 3, 5, 9, 10 are inequality-flipped (the directional mirror).
+  * Gate 1 uses ``* (1 - sell_pct/100)`` (a gap **DOWN**) instead of BUY's
+    ``* (1 + buy_pct/100)``.
   * Volume is a single gate ``daily volume > 1 day ago volume`` — a deliberate
     Chartink design choice for the SELL leg. BUY's two daily-volume gates
     (SMA(50) + SMA(200)) AND its 5m-volume-surge gate (g13) are **all absent**
@@ -15,22 +15,28 @@ Key differences from the BUY rule (worth flagging):
     5-minute volume condition at all.
   * BUY's tautological gate 11 (``open > low``) mirrors to ``open < high`` for
     SELL — equally tautological, so it is likewise skipped.
+  * BUY's Gate 4 (``[-1] 5m Supertrend >= 1d-ago close``) is **absent** from
+    the Chartink SELL screener — the SELL screener has a SINGLE 5m-Supertrend
+    condition ("Crossed above Daily Close"), captured by Gate 3 alone.
+    Earlier revisions of this rule carried a phantom Gate 4 mirrored from
+    BUY; it has been removed (Issue #197).
 
-That leaves **10 active gates** (vs BUY's 12). The brief's "11" counted BUY's
-5m-volume gate as surviving; the source SELL formula has no 5m-volume condition,
-so it does not.
+That leaves **9 active gates** (vs BUY's 12).
 
 Gates (source frame / lookback):
-  6  daily close > 100                              daily[-1]      1
-  12 daily close < 5000                             daily[-1]      1
-  1  daily close < 1d-ago close * 0.97  (gap DOWN)  daily[-2:]     2
-  9  daily open  < 1d-ago close                     daily[-2:]     2
-  10 daily open  < pivot (H+L+C of [-2]) / 3        daily[-2:]     2
-  V  daily volume > 1d-ago volume                   daily[-2:]     2
-  7  weekly ATR(21) > 5% * daily close              weekly         22
-  5  15m RSI(14) < 50                               bars_15m       15
-  3  5m Supertrend(7,3)[0]  > daily close           bars_5m        >=8
-  4  5m Supertrend(7,3)[-1] <= 1d-ago daily close   bars_5m        >=8
+  6  daily close > 100                              today              1
+  12 daily close < 5000                             today              1
+  1  daily close < 1d-ago close * (1-sell_pct/100)  today + settled    2
+  9  daily open  < 1d-ago close                     today + settled    2
+  10 daily open  < pivot (H+L+C of yesterday) / 3   today + settled    2
+  V  daily volume > 1d-ago volume                   today + settled    2
+  7  weekly ATR(21) > 5% * daily close              weekly             22
+  5  15m RSI(14) < 50                               bars_15m           15
+  3  5m Supertrend(7,3)[0]  > today's running close bars_5m            >=8
+
+Today's running close/open/volume are derived from today's 5m bars when
+``bars_daily.iloc[-1]`` is yesterday-or-older (the production case during
+the trading session). See ``services.scan_rules._today_running``.
 
 Insufficient warm-up rejects the symbol (no gate skipping). Indicator NaN
 during warm-up is treated as a rejection, not a silent pass — every indicator
@@ -40,20 +46,19 @@ value is ``pd.isna``-checked before use.
 from __future__ import annotations
 
 import os
-from datetime import datetime
-from datetime import time as dtime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import pytz
 
 from services.indicators import atr, rsi, supertrend
+from services.scan_rules._today_running import derive_today_and_yest
 from services.scanner_service import scan_rule
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 _IST = pytz.timezone("Asia/Kolkata")
-_SETTLE_CUTOFF = dtime(15, 31)  # after this IST time, today's daily bar has settled
 
 
 def _reject_missing(symbol: str, reason: str) -> bool:
@@ -175,35 +180,34 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
         logger.debug("fno_intraday_sell_chartink %s: 15m warm-up (%d<15)", sym, len(bars_15m))
         return False
 
-    # --- Live-bar alignment ---
-    # Intraday, today's daily bar at iloc[-1] is still forming. Until 15:31 IST
-    # the most recent *settled* daily bar is iloc[-2]; "yesterday" is then
-    # iloc[-3]. After 15:31 IST today's bar has settled, so use -1 / -2.
+    # --- Today's running daily snapshot + yesterday's settled bar (Issue #197) ---
+    # Production ``bars_daily`` is the ScannerHistoryProvider cache backfilled
+    # from historify.duckdb at boot, and does NOT include today's bar until
+    # the post-close backfill runs at 15:30-17:00 IST. The shared helper
+    # ``derive_today_and_yest`` resolves the right pair regardless: it uses
+    # ``iloc[-1]`` as today when its date matches (broker refreshed or
+    # synthetic test frame) or aggregates today's 5m bars into a running
+    # daily snapshot otherwise.
     now_ist = datetime.now(_IST)
-    if now_ist.time() < _SETTLE_CUTOFF:
-        today_idx, yest_idx = -2, -3
-    else:
-        today_idx, yest_idx = -1, -2
-    if len(bars_daily) < abs(yest_idx):
-        return False
-
-    today_d = bars_daily.iloc[today_idx]
-    yest_d = bars_daily.iloc[yest_idx]
+    today_d, yest_d, yest_idx = derive_today_and_yest(bars_daily, bars_5m, now_ist)
+    if today_d is None or yest_d is None:
+        return _reject_missing(
+            sym,
+            "cannot derive today's running daily snapshot (no today 5m bars and "
+            "bars_daily has no today-dated bar)",
+        )
 
     # --- D-bar-date verify (Tier-1 Fix #1) ---
-    # Post-settle the rule treats iloc[-1] as TODAY's settled daily bar. If the
-    # stored daily-D feed is stale (no row for today — the 2026-06-15 FM-4/FM-6
-    # condition that produced 17 post-close AUROPHARMA SELLs), that bar is a
-    # PRIOR day and the rule would fire on stale data. Verify the bar's own date
-    # equals today before trusting it; abort loudly otherwise. Skipped pre-settle
-    # (iloc[-2] is the previous session by design) and when the frame carries no
+    # The stale-D defense fires when the LATEST SETTLED bar is itself older
+    # than yesterday — e.g. the 2026-06-15 FM-4/FM-6 condition where no
+    # backfill ran for several sessions. Skipped when the frame carries no
     # timestamp to check (synthetic test frames).
-    if today_idx == -1 and _dbar_date_verify_enabled():
-        bar_date = _daily_bar_date(bars_daily, today_idx)
-        if bar_date is not None and bar_date < now_ist.date():
+    if yest_idx == -1 and _dbar_date_verify_enabled():
+        bar_date = _daily_bar_date(bars_daily, yest_idx)
+        if bar_date is not None and bar_date < now_ist.date() - timedelta(days=5):
             logger.warning(
-                "fno_intraday_sell_chartink %s: latest daily bar is STALE "
-                "(bar_date=%s < today=%s) — aborting (post-close/stale-D guard)",
+                "fno_intraday_sell_chartink %s: latest settled daily bar is "
+                "STALE (bar_date=%s > 5 days behind today=%s) — aborting",
                 indicators.get("symbol", "?"),
                 bar_date,
                 now_ist.date(),
@@ -261,19 +265,21 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if rsi_15m >= rsi_thresh:
         return False
 
-    # Gates 3 + 4: 5m Supertrend(st_period, st_mult). [0] = iloc[-1] (current), [-1] = iloc[-2].
+    # Gate 3: 5m Supertrend(st_period, st_mult)[0] > today's running close
+    # (supertrend ABOVE price = downtrend confirmation). The Chartink SELL
+    # screener phrases this as "Crossed above Daily Close"; we encode it as
+    # the steady-state "currently above" check on every 5m bar close, since
+    # the in-house scanner re-evaluates on every bar (Chartink runs on a
+    # ~15-min cadence and naturally fires fewer times). Issue #197 dropped
+    # the phantom Gate 4 that mirrored BUY's [-1] supertrend condition —
+    # the Chartink SELL screener has only this single supertrend gate.
     st = supertrend(bars_5m, period=st_period, multiplier=st_mult)
-    if len(st) < 2:
+    if len(st) < 1:
         return False
     st_now = st["line"].iloc[-1]
-    st_prev = st["line"].iloc[-2]
-    if _any_nan(st_now, st_prev):
+    if _any_nan(st_now):
         return False
-    # Gate 3: current 5m Supertrend > daily close (price below the trend line) — flipped
     if st_now <= today_d.close:
-        return False
-    # Gate 4: prior 5m Supertrend <= 1d-ago daily close — flipped from BUY
-    if st_prev > yest_d.close:
         return False
 
     return True

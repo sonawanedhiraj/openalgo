@@ -311,37 +311,96 @@ def test_nan_15m_rsi_rejects():
 
 
 # --------------------------------------------------------------------------- #
-# Live-bar alignment (pre/post 15:31 IST switch)
+# Today-running-daily snapshot derivation (Issue #197)
+#
+# The rule no longer assumes ``bars_daily.iloc[-1]`` is today's forming bar;
+# it resolves today/yesterday via the shared ``derive_today_and_yest`` helper.
+# Synthetic test frames (no ``timestamp`` column) still get the legacy
+# behavior — iloc[-1] is treated as today, iloc[-2] as yesterday — so every
+# test above continues to pass.
 # --------------------------------------------------------------------------- #
-def _add_forming_bar(daily):
-    """Append a non-conforming 'still forming' daily bar (no gap vs prev close)."""
-    idx = daily.index[-1] + pd.Timedelta(days=1)
-    row = pd.DataFrame(
-        {
-            "open": [2100.0],
-            "high": [2110.0],
-            "low": [2090.0],
-            "close": [2100.0],
-            "volume": [5000.0],
-        },
-        index=[idx],
-    )
-    return pd.concat([daily, row])
+from datetime import date as _date  # noqa: E402
+from datetime import timedelta as _timedelta  # noqa: E402
 
 
-def test_alignment_preclose_uses_minus2(monkeypatch):
-    # Gap-up at [-2], junk forming bar at [-1]. Pre-15:31 → uses [-2]/[-3] → pass.
-    daily = _add_forming_bar(make_daily_bars())
-    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
+def _attach_timestamps(daily, last_date):
+    """Attach a ``timestamp`` column so the LAST bar is dated ``last_date``
+    IST (09:15) and earlier rows step back one calendar day each."""
+    import pytz as _pytz
+
+    ist = _pytz.timezone("Asia/Kolkata")
+    daily = daily.reset_index(drop=True).copy()
+    n = len(daily)
+    daily["timestamp"] = [
+        int(
+            ist.localize(
+                _RealDateTime(
+                    (last_date - _timedelta(days=(n - 1 - i))).year,
+                    (last_date - _timedelta(days=(n - 1 - i))).month,
+                    (last_date - _timedelta(days=(n - 1 - i))).day,
+                    9,
+                    15,
+                )
+            ).timestamp()
+        )
+        for i in range(n)
+    ]
+    return daily
+
+
+def _attach_5m_timestamps(bars_5m, today_date):
+    """Attach a ``timestamp`` column so every 5m bar is dated ``today_date``
+    (sequential 5-min increments from 09:15 IST)."""
+    import pytz as _pytz
+
+    ist = _pytz.timezone("Asia/Kolkata")
+    bars_5m = bars_5m.reset_index(drop=True).copy()
+    start = ist.localize(_RealDateTime(today_date.year, today_date.month, today_date.day, 9, 15))
+    bars_5m["timestamp"] = [
+        int((start + _timedelta(minutes=5 * i)).timestamp()) for i in range(len(bars_5m))
+    ]
+    return bars_5m
+
+
+def test_today_derived_from_5m_when_bars_daily_ends_yesterday(monkeypatch):
+    """Production path: ``bars_daily`` is stale (latest bar is yesterday).
+    The rule must derive today's running daily snapshot from today's 5m
+    bars and still fire on a genuine gap-up setup.
+
+    Setup: ``bars_daily`` ends with the flat history at 2000 dated yesterday.
+    Today's 5m frame is a steeper rising tape (start_close=2020, step=4:
+    closes 2020 → 2096) so the derived today_d has open=2020,
+    close=2096 (4.8% gap up vs yest=2000), volume=20000 (> prev_vol's SMA),
+    and the steeper rise keeps the 5m Supertrend below the running close so
+    gate 3 fires.
+    """
     _freeze(monkeypatch, 11, 0)
+    today_date = _date(2026, 6, 4)
+    yest_date = today_date - _timedelta(days=1)
+
+    # Drop the synthetic "today" gap-up row so iloc[-1] is the flat history.
+    # The BUY rule needs 200+ rows for the SMA(volume, 200) gate — use n=205.
+    daily = make_daily_bars(n=205, flat_close=2000.0)
+    daily = daily.iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, yest_date)
+
+    bars_5m = _attach_5m_timestamps(make_5m_bars(start_close=2020.0, step=4.0), today_date)
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
     assert rule(None, ind) is True
 
 
-def test_alignment_postclose_uses_minus1(monkeypatch):
-    # Same data; post-15:31 → uses [-1]/[-2] → junk forming bar fails gate-1.
-    daily = _add_forming_bar(make_daily_bars())
-    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
-    _freeze(monkeypatch, 16, 0)
+def test_rejects_when_no_today_5m_and_bars_daily_ends_yesterday(monkeypatch):
+    """If ``bars_daily`` ends yesterday AND 5m bars are all from prior days
+    (no today data), the rule cannot derive today_d — must reject loudly.
+    """
+    _freeze(monkeypatch, 11, 0)
+    today_date = _date(2026, 6, 4)
+    yest_date = today_date - _timedelta(days=1)
+
+    daily = make_daily_bars(n=205, flat_close=2000.0).iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, yest_date)
+    bars_5m = _attach_5m_timestamps(make_5m_bars(), yest_date)  # YESTERDAY
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
     assert rule(None, ind) is False
 
 
@@ -361,41 +420,32 @@ def test_env_override_lowers_buy_gap(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Tier-1 Fix #1 — D-bar-date verify (post-settle stale-daily guard)
+# D-bar-date verify — settled-bar staleness guard (Issue #197 reframing)
+#
+# The original AUROPHARMA bug class (firing on stale-as-today data) is
+# structurally impossible in the new design — the rule no longer trusts
+# ``iloc[-1]`` as today when its date doesn't match. The guard now defends
+# against the LATEST SETTLED bar being more than ~5 calendar days behind
+# today (backfill broken across multiple sessions).
 # --------------------------------------------------------------------------- #
-from datetime import date as _date  # noqa: E402
-from datetime import timedelta as _timedelta  # noqa: E402
-
 import pytz as _pytz  # noqa: E402
 
 _IST_TZ = _pytz.timezone("Asia/Kolkata")
 
 
-def _with_timestamps(daily, last_date):
-    """Attach a ``timestamp`` column (epoch seconds, IST 09:15) so the last row
-    is dated ``last_date`` and prior rows walk back one calendar day each.
-
-    Production daily frames from historify always carry this column; the
-    synthetic builders above intentionally omit it, which is why the date guard
-    skips them. These tests add it to drive the guard explicitly.
-    """
-    daily = daily.reset_index(drop=True).copy()
-    n = len(daily)
-    ts = []
-    for i in range(n):
-        d = last_date - _timedelta(days=(n - 1 - i))
-        ts.append(int(_IST_TZ.localize(_RealDateTime(d.year, d.month, d.day, 9, 15)).timestamp()))
-    daily["timestamp"] = ts
-    return daily
+# Legacy alias kept for tests that still use `_with_timestamps`.
+_with_timestamps = _attach_timestamps
 
 
-def test_rule_aborts_when_daily_bar_is_stale(monkeypatch, caplog):
-    """Post-settle, a latest daily bar dated *yesterday* (stale-D) aborts loudly."""
+def test_rule_aborts_when_settled_bar_is_very_stale(monkeypatch, caplog):
+    """When the latest settled D-bar is more than 5 calendar days behind today,
+    the guard aborts loudly."""
     import logging
 
     monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
-    daily = _with_timestamps(make_daily_bars(), last_date=_date(2026, 6, 3))  # frozen today=06-04
-    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
+    daily = _attach_timestamps(make_daily_bars(n=205), last_date=_date(2026, 5, 25))
+    bars_5m = _attach_5m_timestamps(make_5m_bars(), _date(2026, 6, 4))
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
     ind["symbol"] = "AUROPHARMA"
     with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
         assert rule(None, ind) is False
@@ -403,19 +453,29 @@ def test_rule_aborts_when_daily_bar_is_stale(monkeypatch, caplog):
 
 
 def test_rule_proceeds_when_daily_bar_is_today(monkeypatch):
-    """Post-settle, a latest daily bar dated *today* passes the guard and fires."""
+    """When ``iloc[-1]`` is dated TODAY, the helper takes Branch 1 — use
+    iloc[-1] as today's bar, iloc[-2] as yesterday's settled. The full-pass
+    setup fires."""
     monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
-    daily = _with_timestamps(make_daily_bars(), last_date=_date(2026, 6, 4))  # frozen today
+    daily = _attach_timestamps(make_daily_bars(), last_date=_date(2026, 6, 4))
     ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
     assert rule(None, ind) is True
 
 
-def test_rule_dbar_verify_disabled_allows_stale(monkeypatch):
-    """With the flag off, a stale daily bar is NOT aborted (legacy behavior)."""
+def test_rule_dbar_verify_disabled_allows_very_stale(monkeypatch, caplog):
+    """With the flag off, even a very-stale settled bar is NOT aborted (no
+    STALE warning). The rule may not fire on this scenario for other
+    reasons; this test only verifies the *abort path* is gated by the flag."""
+    import logging
+
     monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "false")
-    daily = _with_timestamps(make_daily_bars(), last_date=_date(2026, 6, 3))
-    ind = make_indicators(daily, make_weekly_bars(), make_5m_bars(), make_15m_bars())
-    assert rule(None, ind) is True
+    daily = _attach_timestamps(make_daily_bars(n=205), last_date=_date(2026, 5, 25))
+    bars_5m = _attach_5m_timestamps(make_5m_bars(), _date(2026, 6, 4))
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
+    ind["symbol"] = "AUROPHARMA"
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
+        rule(None, ind)
+    assert not any("STALE" in r.message for r in caplog.records)
 
 
 def test_rule_dbar_verify_skipped_without_timestamp_column(monkeypatch):
@@ -423,7 +483,7 @@ def test_rule_dbar_verify_skipped_without_timestamp_column(monkeypatch):
     only fires where there's a real timestamp to check (proves existing tests
     are unaffected)."""
     monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
-    assert rule(None, happy()) is True  # happy()'s daily has no timestamp column
+    assert rule(None, happy()) is True
 
 
 # --------------------------------------------------------------------------- #

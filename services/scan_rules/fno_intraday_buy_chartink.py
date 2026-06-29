@@ -29,20 +29,19 @@ every indicator value is ``pd.isna``-checked before use.
 from __future__ import annotations
 
 import os
-from datetime import datetime
-from datetime import time as dtime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import pytz
 
 from services.indicators import atr, rsi, sma, supertrend
+from services.scan_rules._today_running import derive_today_and_yest
 from services.scanner_service import scan_rule
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 _IST = pytz.timezone("Asia/Kolkata")
-_SETTLE_CUTOFF = dtime(15, 31)  # after this IST time, today's daily bar has settled
 
 
 def _reject_missing(symbol: str, reason: str) -> bool:
@@ -169,34 +168,32 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
         logger.debug("fno_intraday_buy_chartink %s: 15m warm-up (%d<15)", sym, len(bars_15m))
         return False
 
-    # --- Live-bar alignment ---
-    # Intraday, today's daily bar at iloc[-1] is still forming. Until 15:31 IST
-    # the most recent *settled* daily bar is iloc[-2]; "yesterday" is then
-    # iloc[-3]. After 15:31 IST today's bar has settled, so use -1 / -2.
+    # --- Today's running daily snapshot + yesterday's settled bar (Issue #197) ---
+    # Production ``bars_daily`` is the ScannerHistoryProvider cache backfilled
+    # from historify.duckdb at boot, and does NOT include today's bar until
+    # the post-close backfill runs at 15:30-17:00 IST. The shared helper
+    # ``derive_today_and_yest`` resolves the right pair regardless: it uses
+    # ``iloc[-1]`` as today when its date matches (broker refreshed or
+    # synthetic test frame) or aggregates today's 5m bars into a running
+    # daily snapshot otherwise.
     now_ist = datetime.now(_IST)
-    if now_ist.time() < _SETTLE_CUTOFF:
-        today_idx, yest_idx = -2, -3
-    else:
-        today_idx, yest_idx = -1, -2
-    if len(bars_daily) < abs(yest_idx):
-        return False
-
-    today_d = bars_daily.iloc[today_idx]
-    yest_d = bars_daily.iloc[yest_idx]
+    today_d, yest_d, yest_idx = derive_today_and_yest(bars_daily, bars_5m, now_ist)
+    if today_d is None or yest_d is None:
+        return _reject_missing(
+            sym,
+            "cannot derive today's running daily snapshot (no today 5m bars and "
+            "bars_daily has no today-dated bar)",
+        )
 
     # --- D-bar-date verify (Tier-1 Fix #1) ---
-    # Post-settle the rule treats iloc[-1] as TODAY's settled daily bar. If the
-    # stored daily-D feed is stale (no row for today — the 2026-06-15 FM-4/FM-6
-    # condition), that bar is a PRIOR day and the rule would fire on stale data.
-    # Verify the bar's own date equals today before trusting it; abort loudly
-    # otherwise. Skipped pre-settle (iloc[-2] is the previous session by design)
-    # and when the frame carries no timestamp to check (synthetic test frames).
-    if today_idx == -1 and _dbar_date_verify_enabled():
-        bar_date = _daily_bar_date(bars_daily, today_idx)
-        if bar_date is not None and bar_date < now_ist.date():
+    # The stale-D defense fires when the LATEST SETTLED bar is itself older
+    # than yesterday (Issue #197 reframing — see SELL rule for details).
+    if yest_idx == -1 and _dbar_date_verify_enabled():
+        bar_date = _daily_bar_date(bars_daily, yest_idx)
+        if bar_date is not None and bar_date < now_ist.date() - timedelta(days=5):
             logger.warning(
-                "fno_intraday_buy_chartink %s: latest daily bar is STALE "
-                "(bar_date=%s < today=%s) — aborting (post-close/stale-D guard)",
+                "fno_intraday_buy_chartink %s: latest settled daily bar is "
+                "STALE (bar_date=%s > 5 days behind today=%s) — aborting",
                 indicators.get("symbol", "?"),
                 bar_date,
                 now_ist.date(),
@@ -233,9 +230,12 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if today_d.open <= pivot:
         return False
 
-    # Gates 2 + 8: daily volume vs SMA(vol_sma_s) and SMA(vol_sma_l)
-    sma_vol_50 = sma(bars_daily["volume"], vol_sma_s).iloc[today_idx]
-    sma_vol_200 = sma(bars_daily["volume"], vol_sma_l).iloc[today_idx]
+    # Gates 2 + 8: daily volume vs SMA(vol_sma_s) and SMA(vol_sma_l). The SMA
+    # is computed at the LATEST SETTLED bar (yest_idx) so the reference is a
+    # function of prior settled history; today's running volume is the test
+    # value compared against it.
+    sma_vol_50 = sma(bars_daily["volume"], vol_sma_s).iloc[yest_idx]
+    sma_vol_200 = sma(bars_daily["volume"], vol_sma_l).iloc[yest_idx]
     if _any_nan(sma_vol_50, sma_vol_200):
         return False
     if today_d.volume <= sma_vol_50:
