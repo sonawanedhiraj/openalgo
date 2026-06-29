@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import sys
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -222,6 +223,35 @@ def _clear_rule_registry_for_tests() -> None:
     """Drop all registered rules. Tests use this to reset the registry."""
     _rule_registry.clear()
     _rule_metadata.clear()
+
+
+def _resolve_eval_snapshot(rule_fn: Callable[..., bool]) -> dict | None:
+    """Look up the rule module's ``get_last_eval_snapshot`` (Issue #205).
+
+    The rule modules optionally expose a thread-local ``get_last_eval_snapshot``
+    helper that returns the gate values that drove the last successful
+    evaluation. The scanner folds those values into the PASS log line so a
+    future ``derive_today_and_yest``-class regression can be reproduced from
+    logs alone, without a re-instrument-and-restart cycle.
+
+    Returns ``None`` for un-instrumented rules; the caller falls back to the
+    prior ``close=...`` log shape.
+    """
+    module_name = getattr(rule_fn, "__module__", None)
+    if not module_name:
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    helper = getattr(module, "get_last_eval_snapshot", None)
+    if helper is None or not callable(helper):
+        return None
+    try:
+        snapshot = helper()
+    except Exception:
+        # An un-trusted helper must not break the log site.
+        return None
+    return snapshot if isinstance(snapshot, dict) and snapshot else None
 
 
 def _session():
@@ -1202,13 +1232,33 @@ class ScannerService:
             # reason (None daily-D etc.) is logged at WARNING inside the rule itself,
             # and the per-cycle completeness metric (Fix #3) surfaces aggregate gaps.
             if matched:
-                logger.info(
-                    "scanner PASS %s rule=%s interval=%s close=%s",
-                    symbol,
-                    rule_name,
-                    interval,
-                    bar.get("close"),
-                )
+                # Issue #205: enrich the PASS line with the gate values that drove
+                # the match. We pull the snapshot from a thread-local exposed by
+                # the rule module (``get_last_eval_snapshot``). When a rule hasn't
+                # been instrumented yet, we fall back to the prior ``close=...``
+                # shape so the log site never crashes on an un-instrumented rule.
+                snapshot = _resolve_eval_snapshot(rule_fn)
+                if snapshot:
+                    kv = " ".join(
+                        f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                        for k, v in snapshot.items()
+                    )
+                    logger.info(
+                        "scanner PASS %s rule=%s interval=%s close=%s %s",
+                        symbol,
+                        rule_name,
+                        interval,
+                        bar.get("close"),
+                        kv,
+                    )
+                else:
+                    logger.info(
+                        "scanner PASS %s rule=%s interval=%s close=%s",
+                        symbol,
+                        rule_name,
+                        interval,
+                        bar.get("close"),
+                    )
             else:
                 logger.debug("scanner FAIL %s rule=%s interval=%s", symbol, rule_name, interval)
                 continue

@@ -179,6 +179,70 @@ signals fire. Source: `services/scanner_service.py` + the two
   enough to clear the 15m RSI(14) warm-up (needs 14×15m = 210 min) so the
   rules can evaluate from the first 5m bar close after a mid-session restart.
 
+### Scanner rule-vs-broker observability (issue #205, added 2026-06-29)
+
+Follow-up to the four scanner-rule fixes shipped 2026-06-29 (#198 / #200 /
+#202 / #204). 147+ unit tests verified gate logic on internally-consistent
+synthetic data; none caught the class of bug where two data sources for the
+same value DISAGREE (a frozen historify daily snapshot vs the live 5m
+aggregator). These knobs gate the three observability additions that surface
+the next regression of that class in minutes instead of hours.
+
+#### SCANNER_RULE_DIVERGENCE_WARN_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in both
+  `services/scan_rules/fno_intraday_buy_chartink.py` and
+  `services/scan_rules/fno_intraday_sell_chartink.py`
+  (`_divergence_warn_enabled`), gating the WARNING that fires when
+  `today_d.close` drifts from the latest 5m close by more than
+  `SCANNER_RULE_DIVERGENCE_WARN_PCT`.
+- **What it does:** the 2026-06-29 41-SELL false-positive storm was caused by
+  `today_d.close` being a frozen 14:28 snapshot while live 5m closes had
+  advanced ~3%. With this guard on, the same condition logs a WARNING into
+  `errors.jsonl` on every evaluation (per-symbol, per-bar-close) — a `grep
+  diverges log/errors.jsonl` becomes the first-look diagnostic.
+- **Set false to:** silence the WARNING during a known stale-data window
+  (post-close backfill catching up) without disabling the rule.
+
+#### SCANNER_RULE_DIVERGENCE_WARN_PCT
+- **Current value:** unset → defaults **`0.5`** (%).
+- **Set in:** env; read in both rule modules (`_divergence_warn_pct`).
+- **What it does:** the divergence threshold above which the WARNING fires.
+  0.5% is calibrated to TCS-class stocks where intraday drift between
+  back-to-back 5m bars rarely exceeds 0.3%; tune up on high-vol names if the
+  WARNING fires routinely.
+
+#### SCANNER_CONTRACT_TEST_ENABLED
+- **Current value:** unset → defaults **`false`**.
+- **Set in:** env; read by
+  `test/test_scanner_rule_vs_broker_contract.py` as a pytest module-level
+  `skipif` gate.
+- **What it does:** opt-in for the live-data contract test. When true, the
+  test reads recent in-house `scan_results` rows directly from
+  `db/openalgo.db` (read-only `file:` URI, bypassing the conftest temp-DB
+  redirect), re-fetches broker bars via `services.history_service.get_history`,
+  re-invokes the rule, and fails if divergence rate > `SCANNER_CONTRACT_TEST_MAX_DIVERGENCE_PCT`.
+- **Why default false:** the test depends on a live broker session and live
+  in-house fires. Default-off keeps unit CI hermetic and fast; the operator
+  runs it manually after a session or wires it into an hourly cron.
+
+#### SCANNER_CONTRACT_TEST_WINDOW_MIN
+- **Current value:** unset → defaults **`60`** (minutes).
+- **Set in:** env; read in
+  `test/test_scanner_rule_vs_broker_contract.py`.
+- **What it does:** look-back window for in-house fires the contract test
+  will verify. 60 min covers a normal manual run; a 5-min cron loop should
+  set it to `10` so signal-expiry false positives are minimized.
+
+#### SCANNER_CONTRACT_TEST_MAX_DIVERGENCE_PCT
+- **Current value:** unset → defaults **`5`** (%).
+- **Set in:** env; read in
+  `test/test_scanner_rule_vs_broker_contract.py`.
+- **What it does:** divergence-rate ceiling for a passing contract test.
+  Below ceiling → test passes (some signal expiry is normal); above → test
+  fails with a per-row breakdown naming the symbol, today_d.close, latest
+  5m close, and the offending `scan_results.id` for triage.
+
 ### sector_follow_cap5_vol — Fix 1b smoke check (added 2026-06-15)
 
 #### SECTOR_FOLLOW_SMOKE_CHECK_ENABLED
