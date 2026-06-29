@@ -22,13 +22,34 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 
 def setup_test_db():
-    """Create a fresh in-memory database with test data."""
+    """Create a fresh in-memory database with test data.
+
+    Defensive: closes any prior ``scoped_session`` before rebinding so a
+    previous test's per-thread session does not shadow the new engine.
+    Without this, on Linux CI under xdist parallelization, a sibling test
+    on the same worker can leave behind a thread-local session bound to a
+    different engine; the subsequent ``Auth.query`` / ``ApiKeys.query``
+    resolves through the stale session and yields ``no such table:
+    api_keys`` against a connection that was never ``create_all``-ed for
+    our new in-memory engine. PR #233 added 13 new tests to
+    ``test/contracts/`` which shifted xdist worker grouping enough to
+    surface this latent fragility.
+    """
     # Re-import to pick up the in-memory DATABASE_URL
     # We need to patch the module's engine before it's used
     from sqlalchemy import create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
 
     import database.auth_db as auth_mod
+
+    # Drop any prior thread-local session so the rebind below actually takes
+    # effect for queries issued in this test.
+    prior = getattr(auth_mod, "db_session", None)
+    if prior is not None:
+        try:
+            prior.remove()
+        except Exception:
+            pass
 
     engine = create_engine("sqlite:///:memory:")
     auth_mod.db_session = scoped_session(
