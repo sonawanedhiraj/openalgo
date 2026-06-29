@@ -100,7 +100,68 @@ jobs:
         run: npm run test:run
 
   # ============================================================================
-  # STAGE 2: CD - Docker Build, Boot, and E2E Tests
+  # STAGE 2a: CD-BUILD — build the Docker image once, share via artifact (#213)
+  # ============================================================================
+  # Split from the monolithic cd-docker-e2e job so subsequent test jobs can
+  # consume the same built image without rebuilding. PR A validates the
+  # mechanic with one consumer (cd-docker-e2e); PR B will fan out the test
+  # stage into parallel jobs (pytest / Playwright smoke / mock-broker
+  # Playwright) all needing this same artifact.
+  cd-build:
+    name: "CD: Build Docker image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Generate throwaway .env (compose build reads it)
+        run: |
+          cp .sample.env .env
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+
+      - name: Preflight — Docker daemon + disk space
+        run: |
+          docker version --format 'Daemon: {{.Server.Version}}'
+          AVAIL=$(df / --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G ' || echo 999)
+          echo "Disk free: ${AVAIL}GB"
+          if [ "${AVAIL:-999}" -lt 5 ]; then
+            echo "::error::Disk has only ${AVAIL}GB free."
+            exit 1
+          fi
+
+      - name: Build Docker image
+        run: |
+          echo "Building Docker image..."
+          docker compose build --quiet
+          docker image ls openalgo:latest
+          echo "✅ openalgo:latest built"
+
+      - name: Save image to tarball
+        run: |
+          docker save openalgo:latest -o /tmp/openalgo-image.tar
+          ls -lh /tmp/openalgo-image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp/openalgo-image.tar
+          retention-days: 1
+          compression-level: 0  # already-compressed Docker layers; skip re-gzip
+
+  # ============================================================================
+  # STAGE 2b: CD - Docker Boot + E2E Tests
   # ============================================================================
   cd-docker-e2e:
     name: "CD: Docker + E2E Tests"
@@ -108,6 +169,7 @@ jobs:
     # runner went offline and blocked CD for hours. ubuntu-latest has Docker
     # pre-installed and the repo is public so minutes are free. The runner
     # IS the host, so `host.docker.internal` is replaced with `localhost`.
+    needs: cd-build
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
@@ -154,11 +216,18 @@ jobs:
             exit 1
           fi
 
-      - name: Build Docker image
+      - name: Download image artifact (from cd-build)
+        uses: actions/download-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp
+
+      - name: Load Docker image
         run: |
-          echo "Building Docker image..."
-          docker compose build --quiet
-          echo "✅ Docker image built successfully"
+          docker load -i /tmp/openalgo-image.tar
+          docker image ls openalgo:latest
+          rm /tmp/openalgo-image.tar
+          echo "✅ openalgo:latest loaded from artifact (no rebuild)"
 
       - name: Boot container with health check
         # `--wait` blocks until every service reports healthy (or fails), using
