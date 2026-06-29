@@ -1,4 +1,4 @@
-"""Boot-time scanner aggregator seeding (issue #156 Phase 2 / R3).
+"""Boot-time scanner aggregator seeding (issue #156 Phase 2 / R3; #199).
 
 Why this file exists
 --------------------
@@ -9,36 +9,52 @@ indicator window:
 
 * RSI(14) needs 14 bars (~70 minutes of trading)
 * SMA(20) needs 20 bars (~100 minutes)
+* 15m RSI(14) needs 14 fifteen-minute bars (~3h 30min of trading)
 
-For the first ~100 minutes, every scan rule call hits
-``pandas_ta_classic.utils._core.verify_series`` which logs a WARNING per
-indicator per symbol per bar close and returns ``None``. The result on
-2026-06-26: **25,272 warnings in a single 10-minute window** plus a quiet
-100-minute period where the scanner produces no signals — looks identical
-to "no setups" but is actually "warming up empty".
+For the first ~100 minutes after a mid-session restart, every scan rule
+call rejects at the warm-up guard (`len(bars_5m) < 8` /
+`len(bars_15m) < 15`). For the first 3h 30min, the 15m RSI gate can't
+evaluate at all. The scanner produces no signals — looks identical to
+"no setups" but is actually "warming up empty".
 
-The fix is to **seed the aggregator's rolling state at boot** from the
-historical bars OpenAlgo already has in ``historify.duckdb``. The scanner
-runs against a pre-warmed window the moment the first live tick lands.
+The fix is to **seed the aggregator's rolling state at boot** from
+historical 1m bars. The scanner runs against a pre-warmed window the
+moment the first live tick lands.
+
+Data source (issue #199)
+------------------------
+**Two-tier read with broker fallback.** The seeder first reads from
+``historify.duckdb`` (fast, free, no rate limit). For symbols where
+historify has insufficient bars (the scanner universe is ~227 symbols
+but only the sector_follow subset's ~30 stocks + a few indices have
+recent 1m bars in historify during market hours — the scanner-side
+1m backfill only runs in the 15:30-17:00 IST window), it falls back to
+the broker's historical API via ``services.history_service.get_history``.
+The broker fetch is rate-limited (~3 req/sec) so 227 symbols take ~75s.
 
 Implementation outline
 ----------------------
 1. Wait for a broker session to come up (mirrors the sector_follow boot
    convergence pattern — no point seeding if we can't trade either).
-2. For each symbol in the aggregator's configured set, read the last N
-   minutes of 1m bars from ``historify.duckdb`` (default 500 min = ~100
-   5m bars, comfortable headroom over SMA(20)).
+2. For each symbol in the aggregator's configured set:
+   a. Read the last N minutes of 1m bars from ``historify.duckdb``.
+   b. If historify returned < N/3 bars, fall back to the broker API
+      (yesterday + today, trimmed to the requested lookback).
 3. Call ``aggregator.replay_bars(symbol, bars)`` to fold them in. The
    aggregator's ``replay_bars`` is idempotent (dedups by timestamp) so a
    subsequent ws_recovery replay never double-counts.
-4. Telegram a single completion summary — symbols seeded, total bars
-   folded, average bars per symbol, any symbols that came back empty.
+4. Telegram a single completion summary — symbols seeded (with the
+   per-source breakdown), total bars folded, average bars per symbol,
+   empty symbols, errors.
 
 Gating + safety
 ---------------
 * Master flag ``SCANNER_AGGREGATOR_SEED_ENABLED`` (default ``true``).
   Flip off if a future bug surfaces; the legacy warm-up-from-empty
   behaviour is preserved.
+* ``SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED`` (default ``true``,
+  issue #199) — independently gates only the broker-fetch arm so the
+  operator can disable broker calls without losing historify seeding.
 * Per-symbol fetch failures are logged via ``logger.exception`` and
   skipped — never all-or-nothing. The aggregator's slot for that symbol
   stays empty, which is exactly today's behaviour.
@@ -51,7 +67,7 @@ Gating + safety
 
 This is **additive** — the seeder doesn't change any existing aggregator
 or scanner code; it just calls ``replay_bars`` with bars from historify
-the same way ``ws_recovery_service`` does after a reconnect.
+or the broker the same way ``ws_recovery_service`` does after a reconnect.
 """
 
 from __future__ import annotations
@@ -99,16 +115,33 @@ def _timeout_sec() -> int:
         return _DEFAULT_TIMEOUT_SEC
 
 
-def _read_1m_bars_for_symbol(symbol: str, exchange: str, lookback_min: int) -> list[dict]:
+def _broker_fallback_enabled() -> bool:
+    """Issue #199 — independently gate the broker-fetch arm."""
+    return (
+        os.environ.get("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true").lower() == "true"
+    )
+
+
+def _get_api_key() -> str | None:
+    """Resolve an OpenAlgo API key for broker history calls. Never raises."""
+    try:
+        from database.auth_db import get_first_available_api_key
+
+        return get_first_available_api_key()
+    except Exception:
+        logger.exception("aggregator_seeder: failed to resolve API key")
+        return None
+
+
+def _read_1m_bars_from_historify(symbol: str, exchange: str, lookback_min: int) -> list[dict]:
     """Read the last ``lookback_min`` 1m bars for ``symbol`` from historify.
 
     Returns a list of ``{ts, open, high, low, close, volume}`` records in the
     shape ``MultiIntervalAggregator.replay_bars`` expects (ts is a naive
     datetime in IST — same convention as the live tick path).
 
-    Never raises — a failed read returns ``[]`` so the aggregator slot stays
-    empty (= today's pre-seeding behaviour for that symbol). Exceptions are
-    logged via ``logger.exception``.
+    Never raises — a failed read returns ``[]``. Exceptions are logged via
+    ``logger.exception``.
     """
     try:
         from database.historify_db import get_ohlcv
@@ -164,6 +197,135 @@ def _read_1m_bars_for_symbol(symbol: str, exchange: str, lookback_min: int) -> l
     return bars
 
 
+def _read_1m_bars_from_broker(
+    symbol: str, exchange: str, lookback_min: int, api_key: str
+) -> list[dict]:
+    """Fetch the last ``lookback_min`` 1m bars from the broker historical API.
+
+    Mirrors ``services.ws_recovery_service._default_history_fetcher`` but spans
+    yesterday + today so an early-session restart still has enough history to
+    clear the 15m RSI(14) warm-up (which needs ~3h30min = 210 1m bars). The
+    broker API enforces its own ~3 req/sec rate limit; the caller paces by
+    iterating symbols sequentially.
+
+    Never raises — failures are logged + return ``[]``.
+    """
+    try:
+        from services.history_service import get_history
+    except Exception:
+        logger.exception(
+            "aggregator_seeder: failed to import history_service — broker fallback disabled"
+        )
+        return []
+
+    now = datetime.now(_IST)
+    # 2-calendar-day window covers any restart time + the requested lookback.
+    # ``get_history`` returns the broker's intraday + prior-day 1m series; we
+    # trim to the last ``lookback_min`` bars below.
+    start_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
+
+    try:
+        success, payload, _code = get_history(
+            symbol=symbol,
+            exchange=exchange,
+            interval="1m",
+            start_date=start_date,
+            end_date=end_date,
+            api_key=api_key,
+        )
+    except Exception:
+        logger.exception(
+            "aggregator_seeder: broker get_history raised for %s/%s — skipping",
+            symbol,
+            exchange,
+        )
+        return []
+
+    if not success:
+        # Soft failure (e.g. token not found yet) — log at debug; the
+        # per-symbol slot stays empty just like the historify path.
+        logger.debug(
+            "aggregator_seeder: broker get_history failed for %s/%s: %s",
+            symbol,
+            exchange,
+            (payload or {}).get("message", "unknown"),
+        )
+        return []
+
+    rows = (payload or {}).get("data") or []
+    bars: list[dict] = []
+    for row in rows:
+        ts_value = row.get("timestamp")
+        if ts_value is None:
+            continue
+        try:
+            if isinstance(ts_value, datetime):
+                # Strip tz so it matches the historify/live-tick naive-IST convention.
+                ts_dt = ts_value.replace(tzinfo=None) if ts_value.tzinfo else ts_value
+            else:
+                ts_dt = datetime.fromtimestamp(int(ts_value), tz=_IST).replace(tzinfo=None)
+        except (TypeError, ValueError, OSError):
+            continue
+        try:
+            bars.append(
+                {
+                    "ts": ts_dt,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": int(row.get("volume") or 0),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    bars.sort(key=lambda b: b["ts"])
+    return bars[-lookback_min:] if lookback_min else bars
+
+
+def _read_1m_bars_for_symbol(
+    symbol: str, exchange: str, lookback_min: int, api_key: str | None = None
+) -> list[dict]:
+    """Read the last ``lookback_min`` 1m bars for ``symbol``.
+
+    Two-tier (issue #199):
+      1. Try historify.duckdb (fast, free, no rate limit).
+      2. If historify returned < ``lookback_min // 3`` bars AND the broker
+         fallback is enabled AND an API key is available, fetch from the
+         broker historical API and use that instead.
+
+    Returns a list of ``{ts, open, high, low, close, volume}`` records in the
+    shape ``MultiIntervalAggregator.replay_bars`` expects.
+
+    Never raises — per-source failures fall through to the next tier.
+    """
+    historify_bars = _read_1m_bars_from_historify(symbol, exchange, lookback_min)
+    min_required = max(60, lookback_min // 3)
+    if len(historify_bars) >= min_required:
+        return historify_bars
+
+    if not _broker_fallback_enabled():
+        return historify_bars
+
+    key = api_key if api_key is not None else _get_api_key()
+    if not key:
+        return historify_bars
+
+    broker_bars = _read_1m_bars_from_broker(symbol, exchange, lookback_min, key)
+    if len(broker_bars) > len(historify_bars):
+        logger.info(
+            "aggregator_seeder: %s — historify had %d bars (<%d), broker fallback returned %d",
+            symbol,
+            len(historify_bars),
+            min_required,
+            len(broker_bars),
+        )
+        return broker_bars
+    return historify_bars
+
+
 def _resolve_exchange_for_symbol(symbol: str) -> str:
     """Look up the exchange for ``symbol`` using the scanner's resolver.
 
@@ -186,8 +348,9 @@ def _resolve_exchange_for_symbol(symbol: str) -> str:
 def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
     """Seed ``aggregator`` with historical 1m bars for ``symbols``.
 
-    Pure function — no env reads beyond the lookback. Returns a summary dict
-    for the caller to log/Telegram:
+    Reads ``SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN`` and the broker-fallback flag
+    once at the top. Resolves the broker API key once (used by the fallback
+    arm). Returns a summary dict for the caller to log/Telegram:
     ``{"seeded_symbols": N, "empty_symbols": [...], "total_bars": M,
        "avg_bars_per_symbol": M/N, "errors": E}``.
 
@@ -212,6 +375,13 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
         }
 
     lookback = _lookback_min()
+    api_key = _get_api_key() if _broker_fallback_enabled() else None
+    if _broker_fallback_enabled() and not api_key:
+        logger.warning(
+            "aggregator_seeder: broker fallback enabled but no API key resolved — "
+            "broker arm will be skipped per symbol"
+        )
+
     seeded = 0
     empty: list[str] = []
     total_bars = 0
@@ -219,7 +389,7 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
 
     for sym in symbols:
         exch = _resolve_exchange_for_symbol(sym)
-        bars = _read_1m_bars_for_symbol(sym, exch, lookback)
+        bars = _read_1m_bars_for_symbol(sym, exch, lookback, api_key=api_key)
         if not bars:
             empty.append(sym)
             continue

@@ -156,6 +156,29 @@ signals fire. Source: `services/scanner_service.py` + the two
   alert. `false` → the metric still logs but no Telegram is sent. (Master switch
   `NOTIFY_TELEGRAM_ENABLED` still applies.)
 
+### scanner_aggregator_seeder — broker fallback (issue #199, added 2026-06-29)
+
+#### SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in `services/scanner_aggregator_seeder.py`
+  (`_broker_fallback_enabled()`), gating the broker-history fetch in
+  `_read_1m_bars_for_symbol`.
+- **What it does:** when historify returns < `lookback_min / 3` 1m bars for a
+  scanner symbol at boot, the seeder falls back to
+  `services.history_service.get_history` (broker API, `source='api'`) to fetch
+  the missing window. `false` → broker fallback disabled; the seeder uses only
+  historify (pre-#199 behaviour — leaves ~195/227 scanner symbols un-seeded
+  on a mid-session restart because the scanner-side 1m backfill only runs in
+  the 15:30-17:00 IST window).
+- **Why added:** Issue #199. On 2026-06-29 the seeder reported only `32/227
+  symbols seeded` at the 12:45 IST restart (boot log:
+  `aggregator_seeder: seeded 32/227 symbols, 6752 bars total (avg 211.0/symbol,
+  195 empty, 0 errors)`). The 195 empty symbols had no recent 1m bars in
+  historify because the scanner-universe 1m backfill is post-close only. With
+  the broker fallback, every scanner symbol gets ~500 min of 1m bars seeded —
+  enough to clear the 15m RSI(14) warm-up (needs 14×15m = 210 min) so the
+  rules can evaluate from the first 5m bar close after a mid-session restart.
+
 ### sector_follow_cap5_vol — Fix 1b smoke check (added 2026-06-15)
 
 #### SECTOR_FOLLOW_SMOKE_CHECK_ENABLED

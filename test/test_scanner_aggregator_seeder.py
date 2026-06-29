@@ -213,7 +213,7 @@ def test_seed_aggregator_mixed_results_summary_shape():
     """End-to-end shape: some seeded, some empty, some errored — summary is
     accurate."""
 
-    def read(sym, exch, lookback):
+    def read(sym, exch, lookback, api_key=None):
         if sym == "EMPTY":
             return []
         if sym == "BROKEN":
@@ -329,3 +329,168 @@ def test_boot_worker_empty_symbols_is_noop(monkeypatch):
         scanner_aggregator_seeder._boot_worker(MagicMock(), [])
     wait_fn.assert_not_called()
     seed_fn.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Broker fallback (issue #199)
+# --------------------------------------------------------------------------- #
+def _broker_bar(mi: int, ts_base: datetime | None = None) -> dict:
+    """Synth a single 1m broker bar dict — epoch-seconds timestamp."""
+    base = ts_base or datetime(2026, 6, 26, 9, 15)
+    ts = (base + timedelta(minutes=mi)).replace(tzinfo=_IST)
+    return {
+        "timestamp": int(ts.timestamp()),
+        "open": 100.0,
+        "high": 100.1,
+        "low": 99.9,
+        "close": 100.05,
+        "volume": 1000,
+    }
+
+
+def test_read_1m_bars_falls_back_to_broker_when_historify_short(monkeypatch):
+    """If historify returns <lookback/3 bars AND fallback enabled AND api key
+    available, the seeder uses broker history instead."""
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    # Empty historify
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=[],
+        ) as hist_fn,
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+            return_value=[
+                {
+                    "ts": datetime(2026, 6, 26, 9, 15) + timedelta(minutes=mi),
+                    "open": 100,
+                    "high": 100,
+                    "low": 100,
+                    "close": 100,
+                    "volume": 1000,
+                }
+                for mi in range(300)
+            ],
+        ) as broker_fn,
+    ):
+        out = scanner_aggregator_seeder._read_1m_bars_for_symbol(
+            "RELIANCE",
+            "NSE",
+            500,
+            api_key="test-key",  # pragma: allowlist secret
+        )
+    hist_fn.assert_called_once()
+    broker_fn.assert_called_once()
+    # Broker bars used (300) since historify returned 0.
+    assert len(out) == 300
+
+
+def test_read_1m_bars_skips_broker_when_historify_has_enough(monkeypatch):
+    """If historify has >=lookback/3 bars, no broker call is made."""
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    plenty = [
+        {
+            "ts": datetime(2026, 6, 26, 9, 15) + timedelta(minutes=mi),
+            "open": 100,
+            "high": 100,
+            "low": 100,
+            "close": 100,
+            "volume": 1,
+        }
+        for mi in range(300)  # >= 500/3 = 167
+    ]
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=plenty,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+        ) as broker_fn,
+    ):
+        out = scanner_aggregator_seeder._read_1m_bars_for_symbol(
+            "RELIANCE",
+            "NSE",
+            500,
+            api_key="test-key",  # pragma: allowlist secret
+        )
+    broker_fn.assert_not_called()
+    assert len(out) == 300
+
+
+def test_read_1m_bars_no_broker_fallback_when_flag_off(monkeypatch):
+    """SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED=false → broker never
+    called even when historify is empty (pre-#199 behaviour preserved)."""
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "false")
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=[],
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+        ) as broker_fn,
+    ):
+        out = scanner_aggregator_seeder._read_1m_bars_for_symbol(
+            "RELIANCE",
+            "NSE",
+            500,
+            api_key="test-key",  # pragma: allowlist secret
+        )
+    broker_fn.assert_not_called()
+    assert out == []
+
+
+def test_read_1m_bars_no_broker_when_no_api_key(monkeypatch):
+    """If we can't resolve an API key, broker arm is silently skipped."""
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=[],
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._get_api_key",
+            return_value=None,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+        ) as broker_fn,
+    ):
+        out = scanner_aggregator_seeder._read_1m_bars_for_symbol("RELIANCE", "NSE", 500)
+    broker_fn.assert_not_called()
+    assert out == []
+
+
+def test_broker_fetcher_returns_empty_on_failed_call(monkeypatch):
+    """A broker get_history that returns success=False yields []. No exception
+    propagates."""
+    fake_get_history = MagicMock(return_value=(False, {"message": "token miss"}, 502))
+    with patch("services.history_service.get_history", fake_get_history):
+        out = scanner_aggregator_seeder._read_1m_bars_from_broker(
+            "RELIANCE",
+            "NSE",
+            500,
+            "test-key",  # pragma: allowlist secret
+        )
+    assert out == []
+
+
+def test_broker_fetcher_parses_epoch_timestamps():
+    """Broker rows with epoch-seconds timestamps are converted to naive-IST
+    datetimes, sorted, and trimmed to lookback_min."""
+    rows = [_broker_bar(mi) for mi in range(0, 600, 1)]  # 600 bars
+    fake_payload = {"data": rows}
+    fake_get_history = MagicMock(return_value=(True, fake_payload, 200))
+    with patch("services.history_service.get_history", fake_get_history):
+        out = scanner_aggregator_seeder._read_1m_bars_from_broker(
+            "RELIANCE",
+            "NSE",
+            500,
+            "test-key",  # pragma: allowlist secret
+        )
+    assert len(out) == 500
+    # Sorted ascending.
+    assert all(out[i]["ts"] <= out[i + 1]["ts"] for i in range(len(out) - 1))
+    # ts is naive datetime.
+    assert out[0]["ts"].tzinfo is None
