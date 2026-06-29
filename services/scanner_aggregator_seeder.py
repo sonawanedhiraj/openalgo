@@ -345,14 +345,88 @@ def _resolve_exchange_for_symbol(symbol: str) -> str:
         return "NSE"
 
 
-def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
-    """Seed ``aggregator`` with historical 1m bars for ``symbols``.
+def _aggregate_1m_to_15m(bars_1m: list[dict]) -> list[dict]:
+    """Group 1m bars into 15m OHLCV bars (issue #201).
+
+    Each bucket = (ts.minute // 15). The bucket's ``ts`` is the bucket-start
+    minute (e.g. 09:15, 09:30, ...). Only buckets with at least one 1m bar
+    are emitted. Open = first 1m bar's open, close = last 1m bar's close,
+    high = max, low = min, volume = sum.
+
+    Returns bars sorted ascending by ``ts``. The closing bucket of the
+    series may be partial — the caller decides whether to drop it (the
+    scanner's live BarBuilder treats only ``elapsed_pct >= 1.0`` bars as
+    closed; we mirror that by trimming the last bucket if it contains
+    fewer than 15 1m rows).
+    """
+    if not bars_1m:
+        return []
+
+    buckets: dict = {}
+    for b in bars_1m:
+        ts = b.get("ts")
+        if ts is None:
+            continue
+        # Bucket start = floor to 15-min boundary.
+        try:
+            bucket_minute = (ts.minute // 15) * 15
+            bucket_ts = ts.replace(minute=bucket_minute, second=0, microsecond=0)
+        except AttributeError:
+            continue
+        slot = buckets.setdefault(
+            bucket_ts,
+            {
+                "ts": bucket_ts,
+                "open": b.get("open"),
+                "high": b.get("high"),
+                "low": b.get("low"),
+                "close": b.get("close"),
+                "volume": 0,
+                "_count": 0,
+            },
+        )
+        # Track open from first 1m bar in the bucket (already set on
+        # bucket creation), update close on every subsequent bar.
+        slot["close"] = b.get("close")
+        try:
+            if b.get("high") is not None and (slot["high"] is None or b["high"] > slot["high"]):
+                slot["high"] = b["high"]
+            if b.get("low") is not None and (slot["low"] is None or b["low"] < slot["low"]):
+                slot["low"] = b["low"]
+            slot["volume"] += int(b.get("volume") or 0)
+        except (TypeError, ValueError):
+            pass
+        slot["_count"] += 1
+
+    # Sort buckets ascending; drop the closing bucket if it's partial (<15
+    # 1m bars), mirroring the live BarBuilder's "only closed bars" guarantee.
+    bars_15m = sorted(buckets.values(), key=lambda b: b["ts"])
+    if bars_15m and bars_15m[-1]["_count"] < 15:
+        bars_15m = bars_15m[:-1]
+    for b in bars_15m:
+        b.pop("_count", None)
+    return bars_15m
+
+
+def seed_aggregator(
+    aggregator: Any,
+    symbols: list[str],
+    bar_15m_history: dict | None = None,
+) -> dict:
+    """Seed ``aggregator`` with historical 1m bars for ``symbols``, and
+    optionally pre-warm each symbol's 15m bar deque (issue #201).
 
     Reads ``SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN`` and the broker-fallback flag
     once at the top. Resolves the broker API key once (used by the fallback
-    arm). Returns a summary dict for the caller to log/Telegram:
+    arm). When ``bar_15m_history`` is provided (the scanner's
+    ``_bar_15m_history`` dict), this also aggregates the same 1m series into
+    15m bars and calls ``_Rolling15mBars.seed_bars(bars_15m)`` so the rule's
+    ``len(bars_15m) < 15`` warm-up guard clears on the first bar close after
+    a mid-session restart.
+
+    Returns a summary dict for the caller to log/Telegram:
     ``{"seeded_symbols": N, "empty_symbols": [...], "total_bars": M,
-       "avg_bars_per_symbol": M/N, "errors": E}``.
+       "avg_bars_per_symbol": M/N, "errors": E, "seeded_15m_bars": K}``.
 
     Never raises. Per-symbol failures are caught and reported.
     """
@@ -364,6 +438,7 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
             "total_bars": 0,
             "avg_bars_per_symbol": 0.0,
             "errors": 0,
+            "seeded_15m_bars": 0,
         }
     if not symbols:
         return {
@@ -372,6 +447,7 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
             "total_bars": 0,
             "avg_bars_per_symbol": 0.0,
             "errors": 0,
+            "seeded_15m_bars": 0,
         }
 
     lookback = _lookback_min()
@@ -385,6 +461,7 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
     seeded = 0
     empty: list[str] = []
     total_bars = 0
+    seeded_15m_bars = 0
     errors = 0
 
     for sym in symbols:
@@ -403,6 +480,20 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
             seeded += 1
             total_bars += n
 
+        # Issue #201: also seed the 15m bar deque from the same 1m series.
+        if bar_15m_history is not None:
+            roll15 = bar_15m_history.get(sym)
+            if roll15 is not None:
+                try:
+                    bars_15m = _aggregate_1m_to_15m(bars)
+                    if bars_15m:
+                        seeded_15m_bars += roll15.seed_bars(bars_15m)
+                except Exception:
+                    logger.exception(
+                        "aggregator_seeder: 15m seed raised for %s — skipping (5m seed still applied)",
+                        sym,
+                    )
+
     avg = (total_bars / seeded) if seeded else 0.0
     return {
         "seeded_symbols": seeded,
@@ -410,6 +501,7 @@ def seed_aggregator(aggregator: Any, symbols: list[str]) -> dict:
         "total_bars": total_bars,
         "avg_bars_per_symbol": round(avg, 1),
         "errors": errors,
+        "seeded_15m_bars": seeded_15m_bars,
     }
 
 
@@ -442,7 +534,11 @@ def _notify(message: str) -> None:
         logger.exception("aggregator_seeder: notify failed")
 
 
-def _boot_worker(aggregator: Any, symbols: list[str]) -> None:
+def _boot_worker(
+    aggregator: Any,
+    symbols: list[str],
+    bar_15m_history: dict | None = None,
+) -> None:
     """Boot daemon entry: wait for broker session, then seed."""
     if not _flag_enabled():
         logger.info("aggregator_seeder: disabled via SCANNER_AGGREGATOR_SEED_ENABLED=false")
@@ -470,18 +566,19 @@ def _boot_worker(aggregator: Any, symbols: list[str]) -> None:
         return
 
     start_ts = _time.monotonic()
-    summary = seed_aggregator(aggregator, symbols)
+    summary = seed_aggregator(aggregator, symbols, bar_15m_history=bar_15m_history)
     elapsed = _time.monotonic() - start_ts
     summary["elapsed_sec"] = round(elapsed, 1)
 
     logger.info(
-        "aggregator_seeder: seeded %d/%d symbols, %d bars total (avg %.1f/symbol, %d empty, %d errors) in %.1fs",
+        "aggregator_seeder: seeded %d/%d symbols, %d bars total (avg %.1f/symbol, %d empty, %d errors, %d 15m bars) in %.1fs",
         summary["seeded_symbols"],
         len(symbols),
         summary["total_bars"],
         summary["avg_bars_per_symbol"],
         len(summary["empty_symbols"]),
         summary["errors"],
+        summary.get("seeded_15m_bars", 0),
         elapsed,
     )
 
@@ -494,12 +591,17 @@ def _boot_worker(aggregator: Any, symbols: list[str]) -> None:
     _notify(
         f"{icon} scanner aggregator seeded: "
         f"{summary['seeded_symbols']}/{len(symbols)} symbols, "
-        f"{summary['total_bars']} bars ({summary['avg_bars_per_symbol']:.0f}/symbol avg) in "
+        f"{summary['total_bars']} bars ({summary['avg_bars_per_symbol']:.0f}/symbol avg, "
+        f"{summary.get('seeded_15m_bars', 0)} 15m bars) in "
         f"{elapsed:.1f}s. Empty: {len(summary['empty_symbols'])}. Errors: {summary['errors']}."
     )
 
 
-def init_scanner_aggregator_seeder(aggregator: Any, symbols: list[str]) -> None:
+def init_scanner_aggregator_seeder(
+    aggregator: Any,
+    symbols: list[str],
+    bar_15m_history: dict | None = None,
+) -> None:
     """Boot entry — fires the seed on a daemon thread. Non-blocking.
 
     Call this from ``app.py`` right after ScannerService is constructed and
@@ -512,7 +614,7 @@ def init_scanner_aggregator_seeder(aggregator: Any, symbols: list[str]) -> None:
     """
     threading.Thread(
         target=_boot_worker,
-        args=(aggregator, list(symbols)),
+        args=(aggregator, list(symbols), bar_15m_history),
         daemon=True,
         name="ScannerAggregatorSeed",
     ).start()

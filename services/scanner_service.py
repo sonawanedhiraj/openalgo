@@ -712,6 +712,51 @@ class _Rolling15mBars:
             rows = rows[-n:]
         return pd.DataFrame(rows)
 
+    def seed_bars(self, bars: list[dict[str, Any]]) -> int:
+        """Append pre-built 15m bars directly to the rolling deque (issue #201).
+
+        Bypasses the tick-simulation path so a boot-time seeder can pre-warm
+        the per-symbol 15m history from historical data without having to
+        replay every constituent 1m tick. ``bars`` are appended in order;
+        anything beyond ``maxlen`` is dropped by the deque.
+
+        Each bar dict must carry ``ts/open/high/low/close/volume``. The
+        ``elapsed_pct`` check from the live ``on_bar`` callback is skipped —
+        the caller is asserting these are already-closed bars.
+
+        Idempotent enough for retries: a duplicate ts replaces the prior
+        entry of the same timestamp before append, so a partial-then-full
+        seed converges without double-counting.
+
+        Returns the number of bars actually folded in (after de-dup).
+        """
+        if not bars:
+            return 0
+        seen_ts = {row.get("ts") for row in self._closed}
+        added = 0
+        for b in bars:
+            ts = b.get("ts")
+            row = {
+                "ts": ts,
+                "open": b.get("open"),
+                "high": b.get("high"),
+                "low": b.get("low"),
+                "close": b.get("close"),
+                "volume": b.get("volume"),
+            }
+            if ts is not None and ts in seen_ts:
+                # Replace the earlier bar with the new one (e.g. a
+                # partial-then-full re-seed). Maintain deque order.
+                self._closed = deque(
+                    (r if r.get("ts") != ts else row for r in self._closed),
+                    maxlen=self._closed.maxlen,
+                )
+            else:
+                self._closed.append(row)
+                seen_ts.add(ts)
+                added += 1
+        return added
+
 
 class ScannerService:
     """Subscribes to the ZMQ tick bus, builds bars per (symbol, interval),
