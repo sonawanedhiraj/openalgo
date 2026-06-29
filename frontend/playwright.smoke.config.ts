@@ -4,10 +4,19 @@ import { defineConfig } from '@playwright/test'
  * Smoke test config — runs against an already-booted Flask server.
  * Use: npx playwright test --config playwright.smoke.config.ts
  * Or in CI: OPENALGO_URL=http://127.0.0.1:5000 npx playwright test --config playwright.smoke.config.ts
+ *
+ * Specs:
+ *   - smoke.spec.ts          — route reachability + console-error allowlist
+ *   - scanner_clone.spec.ts  — clone/delete scanner-definition flow (uses
+ *                              Playwright route mocks; needs no broker)
+ *
+ * Both run against the same booted OpenAlgo container (no mock-broker
+ * dependency), so they share a single CI job (cd-playwright-smoke). The
+ * mock-broker happy-path lives in playwright.broker.config.ts.
  */
 export default defineConfig({
   testDir: './e2e',
-  testMatch: ['smoke.spec.ts'],
+  testMatch: ['smoke.spec.ts', 'scanner_clone.spec.ts'],
   timeout: 30000,
   expect: { timeout: 5000 },
   fullyParallel: false,

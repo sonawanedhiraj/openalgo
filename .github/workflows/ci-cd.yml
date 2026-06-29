@@ -434,13 +434,24 @@ jobs:
 # ============================================================================
 # Branch Protection Requirements
 # ============================================================================
-# Add these as required status checks on dev/main branches (PR B post-#215):
+# Add these as required status checks on dev/main branches (PR B post-#215;
+# smoke-stack scope tightened by #229):
 # - CI: Unit + Integration Tests
 # - CI: Frontend Tests (vitest)
 # - CD: Build Docker image
 # - CD: pytest E2E
-# - CD: Playwright smoke
-# - CD: Playwright broker happy-path
+# - CD: Playwright smoke              ← smoke.spec.ts + scanner_clone.spec.ts
+# - CD: Playwright broker happy-path  ← broker_happy_path.spec.ts on mock stack
+#
+# The last three jobs together form the "smoke-stack" gate from issue #229:
+# they bring the real Flask + WS-proxy subprocess + ZMQ + mock-broker stack
+# up via docker-compose (`docker-compose.yml` for the main stack,
+# `docker-compose.test.yml` for the mock-broker stack), wait on each
+# container's healthcheck, and exercise the cross-process boundaries that
+# the in-process BootHarness suite (Tier 1) cannot see. They are the durable
+# guard against the 2026-06-22 WS-proxy-down cascading 0-signal class of
+# failure (see memory: `ws-proxy-down-cascading-failure`,
+# `connection-pool-untested-integration-glue`).
 #
 # `cd-docker-e2e` was retired in #215 (PR B) — replaced by the three parallel
 # test jobs above. Operator must update branch protection accordingly (this
