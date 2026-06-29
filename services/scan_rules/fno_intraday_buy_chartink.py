@@ -38,6 +38,7 @@ every indicator value is ``pd.isna``-checked before use.
 from __future__ import annotations
 
 import os
+import threading
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -51,6 +52,43 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 _IST = pytz.timezone("Asia/Kolkata")
+
+# Per-thread snapshot of the last successful evaluation's gate values (#205).
+# The scanner reads this via ``get_last_eval_snapshot()`` after the rule
+# returns True and folds the values into the PASS log line so production
+# diagnosis becomes a ``grep "scanner PASS"`` instead of a re-instrument
+# + restart cycle. Set ONLY at the end of ``_evaluate`` (just before
+# ``return True``) so a partial / exception-aborted evaluation never
+# pollutes the next caller's snapshot.
+_last_eval = threading.local()
+
+
+def get_last_eval_snapshot() -> dict | None:
+    """Return the calling thread's last successful-evaluation gate snapshot, or
+    ``None`` if no successful evaluation has run on this thread yet.
+
+    Consumers (scanner PASS-log site) must tolerate ``None`` so a rule that
+    has not yet been instrumented falls back to the prior log shape.
+    """
+    return getattr(_last_eval, "snapshot", None)
+
+
+def _divergence_warn_enabled() -> bool:
+    """``SCANNER_RULE_DIVERGENCE_WARN_ENABLED`` env flag (default true)."""
+    return os.environ.get("SCANNER_RULE_DIVERGENCE_WARN_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _divergence_warn_pct() -> float:
+    """``SCANNER_RULE_DIVERGENCE_WARN_PCT`` env knob (default 0.5%)."""
+    try:
+        return float(os.environ.get("SCANNER_RULE_DIVERGENCE_WARN_PCT", "0.5"))
+    except (TypeError, ValueError):
+        return 0.5
 
 
 def _reject_missing(symbol: str, reason: str) -> bool:
@@ -193,6 +231,34 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
             "bars_daily has no today-dated bar)",
         )
 
+    # --- Divergence WARNING (Issue #205) ---
+    # If today_d.close drifts more than SCANNER_RULE_DIVERGENCE_WARN_PCT
+    # (default 0.5%) from the latest 5m close, we are reading stale data
+    # somewhere — exactly the failure class behind the 2026-06-29 41-SELL
+    # false-positive storm. Logging it at WARNING surfaces the regression
+    # in ``errors.jsonl`` within minutes instead of requiring manual triage.
+    if _divergence_warn_enabled() and bars_5m is not None and len(bars_5m):
+        try:
+            last_5m_close = float(bars_5m["close"].iloc[-1])
+            threshold_pct = _divergence_warn_pct()
+            if (
+                last_5m_close
+                and not pd.isna(last_5m_close)
+                and abs(today_d.close - last_5m_close) / last_5m_close > threshold_pct / 100.0
+            ):
+                logger.warning(
+                    "fno_intraday_buy_chartink %s: today_d.close=%.2f diverges from "
+                    "latest 5m close=%.2f (>%.2f%%) — possible stale daily source",
+                    sym,
+                    today_d.close,
+                    last_5m_close,
+                    threshold_pct,
+                )
+        except (TypeError, ValueError, KeyError, IndexError):
+            # Don't let a malformed 5m frame turn the observability layer into
+            # a rule-evaluation crash — log and continue.
+            logger.debug("fno_intraday_buy_chartink %s: divergence check skipped", sym)
+
     # --- D-bar-date verify (Tier-1 Fix #1) ---
     # The stale-D defense fires when the LATEST SETTLED bar is itself older
     # than yesterday (Issue #197 reframing — see SELL rule for details).
@@ -282,6 +348,26 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if st_prev < yest_d.close:
         return False
 
+    # --- Gate-snapshot stash (Issue #205) ---
+    # Every value below drove the match. The scanner reads this via
+    # ``get_last_eval_snapshot()`` to enrich its PASS log line so any future
+    # ``derive_today_and_yest``-class regression can be reproduced from logs
+    # alone. Stashed only on a successful evaluation — failures leave the
+    # prior snapshot in place (never read by the scanner, since it only
+    # reads on PASS).
+    _last_eval.snapshot = {
+        "today_d_close": float(today_d.close),
+        "yest_d_close": float(yest_d.close),
+        "today_d_open": float(today_d.open),
+        "today_d_volume": float(today_d.volume),
+        "pivot": float(pivot),
+        "rsi_15m": float(rsi_15m),
+        "st_now": float(st_now),
+        "st_prev": float(st_prev),
+        "weekly_atr": float(weekly_atr),
+        "sma_vol_short": float(sma_vol_50),
+        "sma_vol_long": float(sma_vol_200),
+    }
     return True
 
 
