@@ -57,9 +57,7 @@ def test_editor_functionality():
     logged-in server.
     """
     if os.getenv("OPENALGO_LIVE_INTEGRATION") != "1":
-        pytest.skip(
-            "manual live-server integration test; set OPENALGO_LIVE_INTEGRATION=1 to run"
-        )
+        pytest.skip("manual live-server integration test; set OPENALGO_LIVE_INTEGRATION=1 to run")
 
     print("Python Strategy Editor Test")
     print("-" * 50)
