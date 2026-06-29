@@ -140,15 +140,25 @@ jobs:
             exit 1
           fi
 
-      - name: Build Docker image
-        run: |
-          echo "Building Docker image..."
-          docker compose build --quiet
-          docker image ls openalgo:latest
-          echo "✅ openalgo:latest built"
+      # Set up Buildx so the next step can use GitHub Actions cache (#218).
+      # On unchanged Dockerfile/lockfile this drops the build step from ~80s
+      # to ~15-25s (cache HIT). First run is a cache MISS (full build + write).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (Buildx + GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: openalgo:latest
+          load: true   # load into local daemon so `docker save` can find it
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Save image to tarball
         run: |
+          docker image ls openalgo:latest
           docker save openalgo:latest -o /tmp/openalgo-image.tar
           ls -lh /tmp/openalgo-image.tar
 
