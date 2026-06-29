@@ -657,3 +657,132 @@ def test_rolling_15m_seed_bars_dedups_by_timestamp():
     assert len(out) == 1
     assert out.iloc[0]["close"] == 104.0
     assert out.iloc[0]["volume"] == 9999
+
+
+# --------------------------------------------------------------------------- #
+# Stale-historify regression (issue #203)
+# --------------------------------------------------------------------------- #
+def test_today_d_prefers_5m_close_over_stale_historify():
+    """When bars_daily.iloc[-1] is dated today (post-#199 seeder behaviour —
+    historify has today's D bar) AND bars_5m has live timestamps, the helper
+    MUST derive today_d from 5m, not trust the frozen daily snapshot.
+
+    Regression: scanner_history_provider refreshes once at boot and caches
+    bars_daily. iloc[-1].close becomes a frozen LTP from boot time. The
+    pre-#203 helper trusted that, causing 34/41 false-positive SELL fires
+    on 2026-06-29 — including TCS (live +0.41%) firing because its boot
+    snapshot was -2%.
+    """
+    import pytz
+
+    from services.scan_rules._today_running import derive_today_and_yest
+
+    ist = pytz.timezone("Asia/Kolkata")
+    now = ist.localize(datetime(2026, 6, 29, 15, 10))
+
+    # Daily frame with iloc[-1] dated TODAY but FROZEN close (boot snapshot):
+    # close=2050 (~2% below yest 2094), open=2080.
+    today_ts = int(ist.localize(datetime(2026, 6, 29, 9, 15)).timestamp())
+    yest_ts = int(ist.localize(datetime(2026, 6, 26, 9, 15)).timestamp())
+    daily = pd.DataFrame(
+        [
+            {
+                "timestamp": yest_ts,
+                "open": 2094,
+                "high": 2110,
+                "low": 2080,
+                "close": 2094,
+                "volume": 1_000_000,
+            },
+            {
+                "timestamp": today_ts,
+                "open": 2080,
+                "high": 2110,
+                "low": 2040,
+                "close": 2050,
+                "volume": 2_500_000,
+            },  # frozen boot snapshot
+        ]
+    )
+
+    # Live 5m frame with timestamps + a recovered close (2103 — UP from prev).
+    bars_5m = pd.DataFrame(
+        [
+            {
+                "timestamp": int(
+                    ist.localize(
+                        datetime(2026, 6, 29, 9, 15) + timedelta(minutes=5 * i)
+                    ).timestamp()
+                ),
+                "open": 2080 + i * 0.5,
+                "high": 2085 + i * 0.5,
+                "low": 2078 + i * 0.5,
+                "close": 2080 + i * 0.5,  # rising back; last close = 2103
+                "volume": 10_000,
+            }
+            for i in range(46)  # 09:15 → 13:00, last close 2080 + 45*0.5 = 2102.5
+        ]
+    )
+    # Make the last 5m bar's close 2103 (matches the broker LTP).
+    bars_5m.loc[bars_5m.index[-1], "close"] = 2103
+
+    today_d, yest_d, yest_idx = derive_today_and_yest(daily, bars_5m, now)
+
+    assert today_d is not None
+    # today_d.close MUST be 2103 (the live 5m close), NOT 2050 (the frozen
+    # historify daily). This is the #203 fix.
+    assert today_d["close"] == 2103.0
+    # yest_d is the previous settled bar (iloc[-2] since iloc[-1] is dated today).
+    assert yest_d["close"] == 2094
+    assert yest_idx == -2
+
+
+def test_today_d_falls_back_to_historify_when_5m_lacks_timestamp_column():
+    """Synthetic-test path preserved: if bars_5m has no `timestamp` column
+    (the existing test fixtures), trust bars_daily.iloc[-1] as today_d so
+    the unit tests in test_fno_intraday_{buy,sell}_chartink.py keep working
+    against synthetic frames."""
+    import pytz
+
+    from services.scan_rules._today_running import derive_today_and_yest
+
+    ist = pytz.timezone("Asia/Kolkata")
+    now = ist.localize(datetime(2026, 6, 29, 15, 10))
+
+    today_ts = int(ist.localize(datetime(2026, 6, 29, 9, 15)).timestamp())
+    yest_ts = int(ist.localize(datetime(2026, 6, 26, 9, 15)).timestamp())
+    daily = pd.DataFrame(
+        [
+            {
+                "timestamp": yest_ts,
+                "open": 2094,
+                "high": 2110,
+                "low": 2080,
+                "close": 2094,
+                "volume": 1_000_000,
+            },
+            {
+                "timestamp": today_ts,
+                "open": 2080,
+                "high": 2110,
+                "low": 2040,
+                "close": 2050,
+                "volume": 2_500_000,
+            },
+        ]
+    )
+    # Synthetic 5m frame — no `timestamp` column.
+    bars_5m = pd.DataFrame(
+        [
+            {"open": 2080, "high": 2085, "low": 2078, "close": 2050, "volume": 10_000}
+            for _ in range(20)
+        ]
+    )
+
+    today_d, yest_d, yest_idx = derive_today_and_yest(daily, bars_5m, now)
+
+    assert today_d is not None
+    # No 5m timestamps → trust historify iloc[-1]. close=2050 (the daily value).
+    assert today_d["close"] == 2050
+    assert yest_d["close"] == 2094
+    assert yest_idx == -2
