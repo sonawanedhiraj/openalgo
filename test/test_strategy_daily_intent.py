@@ -12,10 +12,22 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 @pytest.fixture
 def fresh_db(monkeypatch):
-    """Point strategy_daily_intent_db (and the legacy daily_intent table) at one
-    shared in-memory SQLite engine for a single test."""
+    """Point strategy_daily_intent_db, the legacy daily_intent table AND the
+    mode-only ``strategy_mode_db`` at one shared in-memory SQLite engine for a
+    single test.
+
+    The mode-only architecture (issue #197 → ``mode_service.resolve_strategy_mode``)
+    consults ``strategy_mode_db`` first; if that module's engine isn't
+    monkeypatched too, the resolver hits the global temp DB and any
+    ``strategy_mode`` row written by another test (via xdist parallel order
+    shifting) pollutes this test — manifesting as ``source='strategy_mode'``
+    when the test expected ``source='env'``. Pin all three engines to the
+    same per-test in-memory DB so the resolver fall-through cascade runs
+    against a known-empty starting state.
+    """
     from database import daily_intent_db as dim
     from database import strategy_daily_intent_db as sdi
+    from database import strategy_mode_db as smd
 
     eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
@@ -23,10 +35,15 @@ def fresh_db(monkeypatch):
     monkeypatch.setattr(sdi, "engine", eng)
     monkeypatch.setattr(sdi, "db_session", sess)
     sdi.Base.query = sess.query_property()
-    # Both tables live on the same engine so migrate_legacy_daily_intent (which
-    # queries DailyIntent through sdi.db_session) can see the legacy rows.
+    # All three tables live on the same engine so cross-module reads
+    # (mode_service.resolve_strategy_mode → smd.get_mode, then →
+    # sdi.get_intent, then env) all see the same empty starting state.
+    monkeypatch.setattr(smd, "engine", eng)
+    monkeypatch.setattr(smd, "db_session", sess)
+    smd.Base.query = sess.query_property()
     sdi.Base.metadata.create_all(eng)
     dim.Base.metadata.create_all(eng)
+    smd.Base.metadata.create_all(eng)
 
     yield sdi, dim, sess
 
