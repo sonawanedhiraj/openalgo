@@ -194,7 +194,7 @@ def test_buy_rule_does_not_fire_on_crash_day(sym, monkeypatch):
         ts = int(row["timestamp"])
         b5 = _slice_to(bars_5m_full, ts)
         b15 = _slice_to(bars_15m_full, ts)
-        if len(b5) < 10 or len(b15) < 15:
+        if len(b5) < 8 or len(b15) < 15:
             continue
         ind = _build_indicators(sym, daily_no_today, weekly, b5, b15)
         # BUY rule reads CHARTINK_RULE_BUY_GAP_PCT; parameters dict wins.
@@ -204,3 +204,75 @@ def test_buy_rule_does_not_fire_on_crash_day(sym, monkeypatch):
             f"{_RealDateTime.fromtimestamp(ts, tz=_IST).strftime('%H:%M:%S')} — "
             f"today_d derivation may have sign-flipped"
         )
+
+
+def test_buy_rule_fires_on_glenmark_2026_06_29_gap_up():
+    """GLENMARK fired Chartink BUY at 11:48 IST on 2026-06-29 (up +1.56% vs
+    prev close, gap-up open, high daily volume vs SMA(50)/SMA(200), 15m RSI
+    >50 in places). The pre-#197 in-house rule never fired because Gate 13
+    (5m vol > 2 * SMA(5m_vol, 10)) — a phantom gate NOT present in the
+    Chartink BUY screener — blocked it on every bar. Regression: with Gate
+    13 removed, the in-house rule must fire on at least one 5m bar that
+    corresponds to Chartink's fire window.
+    """
+    import pytz
+
+    # GLENMARK fired at 11:48; walk bars up to a few minutes past that. We do
+    # NOT use the _freeze_now fixture here because the regression cares about
+    # the wall-clock at each bar close, not "now".
+    glenmark_now = pytz.timezone("Asia/Kolkata").localize(_RealDateTime(2026, 6, 29, 12, 0))
+
+    import services.scan_rules.fno_intraday_buy_chartink as buy_mod
+
+    class _Frozen:
+        @classmethod
+        def now(cls, tz=None):
+            return glenmark_now.astimezone(tz) if tz else glenmark_now.replace(tzinfo=None)
+
+    import pytest
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(buy_mod, "datetime", _Frozen)
+
+        daily_full = _load_bars("GLENMARK", "D")
+        bars_5m_full = _load_bars("GLENMARK", "5m")
+        bars_15m_full = _load_bars("GLENMARK", "15m")
+        weekly = _roll_weekly(daily_full)
+
+        daily_dates = (
+            pd.to_datetime(daily_full["timestamp"], unit="s", utc=True).dt.tz_convert(_IST).dt.date
+        )
+        daily_no_today = daily_full[daily_dates < _TODAY].reset_index(drop=True)
+        if len(daily_no_today) < 200:
+            pytest.skip(f"need 200+ settled D bars; got {len(daily_no_today)}")
+
+        cap_ts = int(glenmark_now.timestamp())
+        today_5m = bars_5m_full[
+            (
+                pd.to_datetime(bars_5m_full["timestamp"], unit="s", utc=True)
+                .dt.tz_convert(_IST)
+                .dt.date
+                == _TODAY
+            )
+            & (bars_5m_full["timestamp"] <= cap_ts)
+        ]
+
+        any_fires = False
+        for _, row in today_5m.iterrows():
+            ts = int(row["timestamp"])
+            b5 = _slice_to(bars_5m_full, ts)
+            b15 = _slice_to(bars_15m_full, ts)
+            if len(b5) < 8 or len(b15) < 15:
+                continue
+            ind = _build_indicators("GLENMARK", daily_no_today, weekly, b5, b15)
+            if buy_rule(None, ind):
+                any_fires = True
+                break
+
+        assert any_fires, (
+            "BUY rule never fired for GLENMARK on 2026-06-29 — phantom Gate 13 "
+            "regression? Chartink fired this stock as BUY at 11:48 IST."
+        )
+    finally:
+        monkeypatch.undo()

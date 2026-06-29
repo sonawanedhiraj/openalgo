@@ -1,24 +1,33 @@
 """Chartink-equivalent BUY rule.
 
-Mirrors the operator's live Chartink ``fno-intraday-buy`` formula with 12
-AND-gated conditions. All gates must clear; evaluation short-circuits on the
-first miss. Gate 11 of the original formula (``open > low``) is tautological and
-skipped — the internal numbering below is preserved from the source formula for
-traceability, so the order here is intentionally non-sequential.
+Mirrors the operator's live Chartink ``fno-intraday-buy`` formula. All gates
+must clear; evaluation short-circuits on the first miss. Gate 11 of the
+original formula (``open > low``) is tautological and skipped — the internal
+numbering below is preserved from the source formula for traceability, so the
+order here is intentionally non-sequential.
 
 Gates (source frame / lookback):
-  6  daily close > 100                              daily[-1]      1
-  12 daily close < 5000                             daily[-1]      1
-  1  daily close > 1d-ago close * 1.03              daily[-2:]     2
-  9  daily open  > 1d-ago close                     daily[-2:]     2
-  10 daily open  > pivot (H+L+C of [-2]) / 3        daily[-2:]     2
-  2  daily vol   > SMA(daily vol, 50)               daily SMA      50
-  8  daily vol   > SMA(daily vol, 200)              daily SMA      200
-  7  weekly ATR(21) > 5% * daily close              weekly         22
-  13 5m vol > 2 * SMA(5m vol, 10)                   bars_5m        10
-  5  15m RSI(14) > 50                               bars_15m       15
-  3  5m Supertrend(7,3)[-1] < daily close           bars_5m        >=7
-  4  5m Supertrend(7,3)[-2] >= 1d-ago daily close   bars_5m        >=7
+  6  daily close > 100                              today              1
+  12 daily close < 5000                             today              1
+  1  daily close > 1d-ago close * (1+buy_pct/100)   today + settled    2
+  9  daily open  > 1d-ago close                     today + settled    2
+  10 daily open  > pivot (H+L+C of yesterday) / 3   today + settled    2
+  2  daily vol   > SMA(daily vol, 50)               daily SMA          50
+  8  daily vol   > SMA(daily vol, 200)              daily SMA          200
+  7  weekly ATR(21) > 5% * daily close              weekly             22
+  5  15m RSI(14) > 50                               bars_15m           15
+  3  5m Supertrend(7,3)[0]  < today's running close bars_5m            >=8
+  4  5m Supertrend(7,3)[-1] >= 1d-ago daily close   bars_5m            >=8
+
+Today's running close/open/volume are derived from today's 5m bars when
+``bars_daily.iloc[-1]`` is yesterday-or-older (the production case during
+the trading session). See ``services.scan_rules._today_running``.
+
+The earlier Gate 13 (``5m vol > 2 * SMA(5m vol, 10)``) was a phantom — it is
+NOT present in the Chartink BUY screener filter. It was the dominant blocker
+of valid Chartink fires (e.g., GLENMARK on 2026-06-29 cleared every Chartink
+condition at 11:40 IST but failed the in-house Gate 13). Removed under Issue
+#197.
 
 Insufficient warm-up rejects the symbol (no gate skipping). Indicator NaN
 during warm-up is treated as a rejection, not a silent pass — a bare
@@ -128,7 +137,6 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     p = indicators.get("parameters", {})
     buy_pct = float(p.get("gap_pct", os.environ.get("CHARTINK_RULE_BUY_GAP_PCT", "3.0")))
     atr_thresh = float(p.get("atr_pct", "5.0")) / 100.0
-    vol_5m_mult = float(p.get("vol_5m_mult", "2.0"))
     rsi_thresh = float(p.get("rsi_threshold", "50.0"))
     st_period = int(p.get("supertrend_period", "7"))
     st_mult = float(p.get("supertrend_mult", "3.0"))
@@ -159,8 +167,8 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
         return False
     if bars_5m is None:
         return _reject_missing(sym, "bars_5m is None")
-    if len(bars_5m) < 10:  # SMA(5m vol, 10) + Supertrend(7) warm-up
-        logger.debug("fno_intraday_buy_chartink %s: 5m warm-up (%d<10)", sym, len(bars_5m))
+    if len(bars_5m) < 8:  # Supertrend(7) warm-up (period + ATR seed)
+        logger.debug("fno_intraday_buy_chartink %s: 5m warm-up (%d<8)", sym, len(bars_5m))
         return False
     if bars_15m is None:
         return _reject_missing(sym, "bars_15m is None")
@@ -250,14 +258,6 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if _any_nan(weekly_atr):
         return False
     if weekly_atr <= today_d.close * atr_thresh:
-        return False
-
-    # Gate 13: 5m volume > vol_5m_mult * SMA(5m vol, 10)
-    sma_5m_vol_10 = sma(bars_5m["volume"], 10).iloc[-1]
-    last_5m_vol = bars_5m["volume"].iloc[-1]
-    if _any_nan(sma_5m_vol_10, last_5m_vol):
-        return False
-    if last_5m_vol <= sma_5m_vol_10 * vol_5m_mult:
         return False
 
     # Gate 5: 15m RSI(14) > rsi_thresh

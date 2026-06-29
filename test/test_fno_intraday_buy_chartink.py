@@ -171,7 +171,7 @@ def test_warmup_15m_short():
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
     "gate",
-    ["g6", "g12", "g1", "g9", "g10", "g2", "g8", "g7", "g13", "g5", "g3", "g4"],
+    ["g6", "g12", "g1", "g9", "g10", "g2", "g8", "g7", "g5", "g3", "g4"],
 )
 def test_gate_passes(gate):
     assert rule(None, happy()) is True
@@ -237,12 +237,6 @@ def _fail_g7():  # weekly ATR <= 5% * close
     )
 
 
-def _fail_g13():  # 5m vol not > 2x SMA(10)
-    return make_indicators(
-        make_daily_bars(), make_weekly_bars(), make_5m_bars(last_vol=150.0), make_15m_bars()
-    )
-
-
 def _fail_g5():  # 15m RSI <= 50
     return make_indicators(
         make_daily_bars(), make_weekly_bars(), make_5m_bars(), make_15m_bars(rising=False)
@@ -272,7 +266,6 @@ def _fail_g4():  # 5m prior Supertrend line < yest close (prices shifted down)
         _fail_g2,
         _fail_g8,
         _fail_g7,
-        _fail_g13,
         _fail_g5,
         _fail_g3,
         _fail_g4,
