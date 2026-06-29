@@ -531,7 +531,11 @@ def get_cached_regime(max_age_minutes: int = 5) -> MarketRegime | None:
     global _cached_regime
     cutoff = datetime.now(IST) - timedelta(minutes=max_age_minutes)
     with _cache_lock:
-        if _cached_regime is not None and _cached_regime.timestamp >= cutoff:
+        # Strict `>` (not `>=`) so a `max_age_minutes=0` caller forces a recompute
+        # even when `datetime.now()` resolution puts the cached stamp at the same
+        # tick as the cutoff (e.g. Windows ~15ms granularity). Contract documented
+        # in test_get_cached_regime_recomputes_on_stale (#221).
+        if _cached_regime is not None and _cached_regime.timestamp > cutoff:
             return _cached_regime
     try:
         regime = compute_current_regime()
