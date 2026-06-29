@@ -159,51 +159,77 @@ class BootHarness:
         symbol: str,
         interval: str,
         bars: list[dict],
+        exchange: str = "NSE",
     ) -> None:
         """Write synthetic OHLCV rows into the temp historify.duckdb.
 
-        Each bar dict: {timestamp, open, high, low, close, volume}.
-        ``timestamp`` should be a ``datetime`` or ISO string.
+        Each bar dict: {timestamp, open, high, low, close, volume[, oi]}.
+        ``timestamp`` is epoch seconds (int) or any value pandas can parse to a
+        datetime (it is normalized to epoch BIGINT below to match the real
+        schema). Writes go through the production ``upsert_market_data`` so the
+        DuckDB singleton, schema, and data_catalog all match prod.
         """
-        import duckdb
+        self.seed_historify_partial({symbol: bars}, interval=interval, exchange=exchange)
 
-        db_path = os.environ["HISTORIFY_DATABASE_PATH"]
-        con = duckdb.connect(db_path)
-        try:
-            # Ensure table exists (mirrors historify_db schema)
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS market_data (
-                    symbol VARCHAR,
-                    interval VARCHAR,
-                    timestamp TIMESTAMP,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    volume BIGINT,
-                    PRIMARY KEY (symbol, interval, timestamp)
-                )
-            """)
-            for b in bars:
-                con.execute(
-                    """
-                    INSERT OR REPLACE INTO market_data
-                        (symbol, interval, timestamp, open, high, low, close, volume)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        symbol,
-                        interval,
-                        b["timestamp"],
-                        b["open"],
-                        b["high"],
-                        b["low"],
-                        b["close"],
-                        b.get("volume", 0),
-                    ],
-                )
-        finally:
-            con.close()
+    def seed_historify_partial(
+        self,
+        seed_data: dict[str, list[dict]],
+        *,
+        interval: str = "1m",
+        exchange: str = "NSE",
+    ) -> None:
+        """Batch-seed temp historify for a *subset* of symbols (issue #223).
+
+        Why this exists
+        ---------------
+        Production has two symbol universes that are kept fresh on different
+        cadences:
+
+        * ``LOCK_STATIC_30`` (sector_follow's stocks) — backfilled into historify
+          throughout the day.
+        * ``SCANNER_SYMBOLS`` (~227 F&O names) — backfilled only post-close,
+          in the 15:30-17:00 IST window.
+
+        If OpenAlgo restarts at 14:30 IST, historify has bars for ~30 symbols
+        and is *physically empty* for the other ~195. PR #200 (commit
+        ``19b0a4fec``) added a broker-history fallback so the scanner aggregator
+        seeder can fill that gap, but every test mocked the historify reader
+        symbol-by-symbol with the same return value — the asymmetric
+        "some symbols present, others missing" state was never reproduced.
+
+        ``seed_historify_partial`` encodes that state directly: pass a dict of
+        ``{symbol: bars}`` and only those symbols get rows. Any symbol the
+        consumer (seeder, freshness checker, evaluator) reads that is NOT in
+        ``seed_data`` returns an empty DataFrame from ``get_ohlcv`` — exactly
+        like prod at 14:30 IST.
+
+        Each bar dict accepts the same shape as ``seed_historify``:
+        ``{timestamp, open, high, low, close, volume[, oi]}``. ``timestamp``
+        is normalized to epoch seconds (BIGINT) to match the production schema.
+
+        Idempotent: re-seeding the same ``(symbol, exchange, interval, timestamp)``
+        replaces the prior row via the upsert.
+        """
+        if not seed_data:
+            return
+
+        # The conftest-redirected HISTORIFY_DATABASE_PATH is a fresh tempdir; the
+        # historify schema is NOT created by conftest's _isolate_databases fixture
+        # because historify isn't in its init targets. Lazily init here so the
+        # first seed call creates ``market_data`` + ``data_catalog`` in temp.
+        from database.historify_db import init_database, upsert_market_data
+
+        init_database()
+
+        for symbol, bars in seed_data.items():
+            if not bars:
+                continue
+            df = pd.DataFrame(bars)
+            if "volume" not in df.columns:
+                df["volume"] = 0
+            # ``upsert_market_data`` normalizes timestamp → int64 epoch seconds
+            # and adds oi=0 if missing, so callers don't need to.
+            upsert_market_data(df, symbol=symbol, exchange=exchange, interval=interval)
 
     # ---------------------------------------------------------------------- #
     # Tick injection (direct aggregator write — no ZMQ)
