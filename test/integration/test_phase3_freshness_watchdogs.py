@@ -81,25 +81,23 @@ class TestDataFreshnessStaleWritesHealthRow:
         # Convert to UTC epoch (what market_data.timestamp stores)
         stale_ts = int(three_biz_days_ago.timestamp())
 
+        # Use the production schema via init_database so this test cannot
+        # poison the shared temp DuckDB for a sibling test that reads through
+        # ``database.historify_db`` (which expects the real ``exchange``+``oi``
+        # columns + primary key). The prior hand-rolled CREATE TABLE was
+        # missing those columns and broke ``test_scanner_seeder_two_universe``
+        # in CI's parallel run on the same worker.
+        from database.historify_db import init_database as _init_historify_db
+
+        _init_historify_db()
         con = duckdb.connect(db_path)
         try:
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS market_data (
-                    symbol VARCHAR,
-                    interval VARCHAR,
-                    timestamp BIGINT,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    volume BIGINT,
-                    PRIMARY KEY (symbol, interval, timestamp)
-                )
-            """)
             # Seed a single stale row for a test symbol
             con.execute(
-                "INSERT OR REPLACE INTO market_data VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ["RELIANCE", "1m", stale_ts, 100.0, 101.0, 99.0, 100.5, 10000],
+                "INSERT OR REPLACE INTO market_data "
+                "(symbol, exchange, interval, timestamp, open, high, low, close, volume, oi) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ["RELIANCE", "NSE", "1m", stale_ts, 100.0, 101.0, 99.0, 100.5, 10000, 0],
             )
         finally:
             con.close()
@@ -162,24 +160,18 @@ class TestDataFreshnessStaleWritesHealthRow:
         # Seed a bar from today
         today_ts = int(_dt.datetime.now(_IST).replace(hour=15, minute=29).timestamp())
 
+        # Use the production schema via init_database (see same-file rationale
+        # above) so this test cannot poison the shared temp DuckDB.
+        from database.historify_db import init_database as _init_historify_db
+
+        _init_historify_db()
         con = duckdb.connect(db_path)
         try:
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS market_data (
-                    symbol VARCHAR,
-                    interval VARCHAR,
-                    timestamp BIGINT,
-                    open DOUBLE,
-                    high DOUBLE,
-                    low DOUBLE,
-                    close DOUBLE,
-                    volume BIGINT,
-                    PRIMARY KEY (symbol, interval, timestamp)
-                )
-            """)
             con.execute(
-                "INSERT OR REPLACE INTO market_data VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ["INFY", "1m", today_ts, 1500.0, 1510.0, 1495.0, 1505.0, 5000],
+                "INSERT OR REPLACE INTO market_data "
+                "(symbol, exchange, interval, timestamp, open, high, low, close, volume, oi) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ["INFY", "NSE", "1m", today_ts, 1500.0, 1510.0, 1495.0, 1505.0, 5000, 0],
             )
         finally:
             con.close()
