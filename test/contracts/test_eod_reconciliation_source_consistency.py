@@ -295,3 +295,62 @@ def test_sandbox_flat_without_covering_fill_does_not_invent_exit(journal_db, san
         f"flat-but-no-fill divergence produced no structured skip; result.skipped={result.skipped!r}"
     )
     assert any(s.get("symbol") == "OIL" for s in no_fill_skips)
+
+
+# ----------------------------------------------------------------------- #
+# Contract D — runtime Telegram alert fires when the journal-expected
+# closed quantity does not match the sandbox covering-fill quantity
+# (issue #231). The structured skip is the audit trace; the alert is the
+# operator's same-day notification.
+# ----------------------------------------------------------------------- #
+def test_close_qty_divergence_fires_source_divergence_alert(
+    journal_db, sandbox_db, today, monkeypatch
+):
+    """The journal expects ``entry_qty`` closed; sandbox's covering-fill
+    sum is short of that. The two sources of "is this position closed?"
+    disagree, so the runtime helper must dispatch a Telegram alert.
+
+    This contract is sharper than the existing "structured skip exists"
+    test (Contract C above): it pins that operators see the disagreement
+    SAME-DAY via Telegram, not by manual log-grep.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import services.source_divergence_alerts as sda
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    monkeypatch.setenv("SOURCE_DIVERGENCE_ALERTS_ENABLED", "true")
+    monkeypatch.setenv("SOURCE_DIVERGENCE_THRESHOLD_PCT", "0.5")
+    sda.reset_dedup_for_tests()
+
+    # Journal: open SHORT 217. Sandbox: flat position + ONE covering BUY of
+    # 100 (the other 117 are missing). 217 vs 100 = 53.9% divergence —
+    # well above 0.5%.
+    _record_entry("OIL", "SHORT", 217, 460.30, order_id="E-OIL")
+    _set_sandbox_position(sandbox_db, "OIL", 0, 460.30)
+    _add_sandbox_close_fill(sandbox_db, "OIL", "BUY", 100, 427.95, "X-OIL-PART")
+
+    mock_notify_service = MagicMock()
+    with patch(
+        "services.notification_service.get_notification_service",
+        return_value=mock_notify_service,
+    ):
+        result = reconcile_engine_journal(today, strategy_name=SYNTH_STRATEGY)
+
+    # The journal row was NOT closed (no_covering_close_fill skip).
+    assert result.exits_added == 0
+    no_fill_skips = [s for s in result.skipped if s.get("reason") == "no_covering_close_fill"]
+    assert no_fill_skips
+
+    # AND the runtime helper fired a single Telegram alert.
+    notify_calls = [
+        c
+        for c in mock_notify_service.notify.call_args_list
+        if c.args and c.args[0] == "source_divergence"
+    ]
+    assert len(notify_calls) == 1, (
+        f"expected exactly one source_divergence notify; got {len(notify_calls)} "
+        f"({mock_notify_service.notify.call_args_list!r})"
+    )
+    assert "OIL" in notify_calls[0].args[1]
+    sda.reset_dedup_for_tests()

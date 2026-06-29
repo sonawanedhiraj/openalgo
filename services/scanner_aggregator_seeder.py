@@ -322,6 +322,29 @@ def _read_1m_bars_for_symbol(
             min_required,
             len(broker_bars),
         )
+        # Issue #231: alert the operator when the two sources disagree on
+        # the most-recent overlapping bar's close. The fallback is *expected*
+        # when historify is short; what is NOT expected is a >0.5% close
+        # mismatch — that indicates a stale historify slot the seeder is now
+        # silently replacing. The alert dedups per (service, symbol, day).
+        if historify_bars and broker_bars:
+            try:
+                hist_close = float(historify_bars[-1].get("close"))
+                brok_close = float(broker_bars[-1].get("close"))
+                from services.source_divergence_alerts import check_and_alert
+
+                check_and_alert(
+                    service="aggregator_seeder",
+                    symbol=symbol,
+                    source_a_label="historify_last_close",
+                    source_a_value=hist_close,
+                    source_b_label="broker_last_close",
+                    source_b_value=brok_close,
+                )
+            except Exception:  # noqa: BLE001 — observability must never break the read
+                logger.exception(
+                    "aggregator_seeder: divergence alert dispatch failed for %s", symbol
+                )
         return broker_bars
     return historify_bars
 

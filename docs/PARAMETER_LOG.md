@@ -18,6 +18,59 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Runtime source-divergence alerts (issue #231, added 2026-06-29)
+
+#### SOURCE_DIVERGENCE_ALERTS_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services/source_divergence_alerts._flag_enabled` on every call to
+  `check_and_alert`.
+- **What it does:** master gate for the runtime divergence-alert helper
+  used by three integration sites — `services/scanner_aggregator_seeder.py`
+  (historify vs broker most-recent close), `services/engine_eod_reconciliation_service.py`
+  (journal-expected closed quantity vs sandbox covering-fill quantity), and
+  `services/scan_rules/fno_intraday_{buy,sell}_chartink.py` (`bars_daily`
+  today's close vs live 5m last close). When ON, a divergence above the
+  threshold emits `logger.warning` AND a Telegram alert via
+  `notification_service.notify('source_divergence', ...)` with per-(service,
+  symbol, IST-day) dedup so the operator gets one notification within
+  seconds instead of finding the discrepancy in `errors.jsonl` after EOD.
+- **Dedup table reset behaviour:** in-process dict, cleared at boot AND on
+  IST date rollover. A restart re-arms every dedup key (a genuine
+  cross-restart regression alerts immediately on the next divergent read).
+- **Why default true:** this is the runtime sibling of the PR #227 contract
+  tests — the catch-at-PR-time pattern only catches *new* divergence bugs;
+  this catches *operational* divergence (stale historify slot, partial
+  sandbox fills, frozen daily cache) in production. The 2026-06-29 41-SELL
+  false-positive storm is the canonical case where same-day operator
+  visibility would have prevented the recurrence.
+- **Set false to:** silence ALL three integrations from one switch (e.g.
+  during a known-noisy backfill window). The helper short-circuits before
+  the threshold check, so no log + no Telegram fires.
+- **Related:** `NOTIFY_SOURCE_DIVERGENCE` (per-event toggle inside
+  `services/notification_service.py`, default true) gates only the Telegram
+  delivery layer; set it false to keep the `logger.warning` and silence
+  just the Telegram channel.
+
+#### SOURCE_DIVERGENCE_THRESHOLD_PCT
+- **Current value:** unset → defaults **`0.5`** (percent).
+- **Set in:** env; read by
+  `services/source_divergence_alerts._threshold_pct` on every call.
+- **What it does:** the divergence threshold above which the helper fires
+  an alert. The relative divergence is computed as
+  `abs(a - b) / max(|a|, |b|, 1e-9) * 100`. Below this percentage the
+  helper returns silently.
+- **Why default 0.5:** matches the existing `SCANNER_RULE_DIVERGENCE_WARN_PCT`
+  default (the scanner rule's `logger.warning` predates issue #231; this
+  threshold keeps the new alert path consistent with what was already
+  considered "stale source" in the rule layer).
+- **Set higher to:** suppress noise during a volatile / illiquid window
+  where 0.5% drift is plausible without indicating a stale source.
+- **Set lower to:** catch finer divergences (rarely useful; expect false
+  positives at <0.2% on bid/ask noise).
+- **Junk values** (non-numeric, blank) fall back to the 0.5 default rather
+  than crashing the helper.
+
 ### Trading-day funnel diagnostic (issue #159, added 2026-06-28)
 
 #### TRADING_DAY_FUNNEL_ENABLED
