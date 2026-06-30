@@ -132,6 +132,29 @@ def strategies_dir(tmp_path):
         encoding="utf-8",
     )
 
+    # simplified_engine — folder carries config; journal rows live under the
+    # registered name "trending_equity_intraday" (issue #235 bridge).
+    se = tmp_path / "simplified_engine"
+    se.mkdir()
+    (se / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "v1.1",
+                "mode": "sandbox",
+                "deployable": True,
+                "config": {"capital": 20000, "max_trades_per_day": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # trending_equity_intraday — the journal-name twin of simplified_engine.
+    # It has no config_snapshot of its own and MUST be hidden from the list so
+    # it doesn't show up as an empty duplicate row.
+    tei = tmp_path / "trending_equity_intraday"
+    tei.mkdir()
+    (tei / "LEARNINGS.md").write_text("# Trending Equity Intraday\n", encoding="utf-8")
+
     return tmp_path
 
 
@@ -156,17 +179,22 @@ def wired_dbs(monkeypatch):
     from database import (
         strategy_runtime_override_db as srodb,
     )
+    from database import (
+        trade_journal_db as tjdb,
+    )
 
     sf_eng, sf_sess = _mk_engine()
     ff_eng, ff_sess = _mk_engine()
     sm_eng, sm_sess = _mk_engine()
     sr_eng, sr_sess = _mk_engine()
+    tj_eng, tj_sess = _mk_engine()
 
     # Create tables on the in-memory engines
     sfdb.Base.metadata.create_all(sf_eng)
     ffdb.Base.metadata.create_all(ff_eng)
     smdb.Base.metadata.create_all(sm_eng)
     srodb.Base.metadata.create_all(sr_eng)
+    tjdb.Base.metadata.create_all(tj_eng)
 
     # Patch the database modules (for ORM lookups that go through the module)
     monkeypatch.setattr(sfdb, "engine", sf_eng)
@@ -177,6 +205,8 @@ def wired_dbs(monkeypatch):
     monkeypatch.setattr(smdb, "db_session", sm_sess)
     monkeypatch.setattr(srodb, "engine", sr_eng)
     monkeypatch.setattr(srodb, "db_session", sr_sess)
+    monkeypatch.setattr(tjdb, "engine", tj_eng)
+    monkeypatch.setattr(tjdb, "db_session", tj_sess)
 
     # ALSO patch the blueprint's module-level session aliases — these are bound
     # at import time and would otherwise still point at the live-DB sessions.
@@ -184,17 +214,19 @@ def wired_dbs(monkeypatch):
     monkeypatch.setattr(sda, "ff_session", ff_sess)
     monkeypatch.setattr(sda, "mode_session", sm_sess)
     monkeypatch.setattr(sda, "override_session", sr_sess)
+    monkeypatch.setattr(sda, "tj_session", tj_sess)
 
     yield {
         "sf": (sf_eng, sf_sess, sfdb),
         "ff": (ff_eng, ff_sess, ffdb),
         "sm": (sm_eng, sm_sess, smdb),
         "sr": (sr_eng, sr_sess, srodb),
+        "tj": (tj_eng, tj_sess, tjdb),
     }
 
-    for sess in (sf_sess, ff_sess, sm_sess, sr_sess):
+    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess):
         sess.remove()
-    for eng in (sf_eng, ff_eng, sm_eng, sr_eng):
+    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng):
         eng.dispose()
 
 
@@ -535,3 +567,170 @@ def test_expired_override_is_ignored(app, wired_dbs):
     # Expired → should be healthy (no active overrides)
     assert ff["health"] == "healthy"
     assert ff["active_overrides"] == []
+
+
+# ---------------------------------------------------------------------------
+# simplified_engine ↔ trending_equity_intraday journal-name bridge (issue #235)
+# ---------------------------------------------------------------------------
+
+
+def _seed_simplified_journal_row(
+    tj_sess,
+    tjdb,
+    *,
+    symbol: str,
+    direction: str = "LONG",
+    quantity: int = 10,
+    entry_price: float | None = 100.0,
+    placed_at: str,
+    exited_at: str | None = None,
+    exit_price: float | None = None,
+    pnl: float | None = None,
+    exit_reason: str | None = None,
+):
+    """Insert one trade_journal row under the simplified engine's REGISTERED
+    journal name (trending_equity_intraday) — the real persisted name."""
+    row = tjdb.TradeJournal(
+        placed_at=placed_at,
+        symbol=symbol,
+        direction=direction,
+        quantity=quantity,
+        strategy_name="trending_equity_intraday",
+        signal_source="chartink",
+        entry_price=entry_price,
+        exited_at=exited_at,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        pnl=pnl,
+        created_at=placed_at,
+        updated_at=placed_at,
+    )
+    tj_sess.add(row)
+    tj_sess.commit()
+    return row
+
+
+def test_trending_equity_intraday_hidden_from_list(app):
+    """The journal-name twin folder must NOT appear as its own list row."""
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    names = {s["name"] for s in resp.get_json()["data"]}
+    assert "simplified_engine" in names
+    assert "trending_equity_intraday" not in names
+
+
+def test_list_resolves_simplified_engine_journal(app, wired_dbs):
+    """A trade_journal row tagged 'trending_equity_intraday' must surface under
+    the 'simplified_engine' list entry (the folder↔journal name mismatch fix).
+    """
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    # One open entry today + one closed-today with realized P&L.
+    _seed_simplified_journal_row(tj_sess, tjdb, symbol="RVNL", placed_at=f"{today}T09:30:00+05:30")
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="INDIANB",
+        placed_at=f"{today}T09:45:00+05:30",
+        exited_at=f"{today}T15:14:00+05:30",
+        exit_price=110.0,
+        pnl=1244.5,
+        exit_reason="eod_squareoff",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    body = resp.get_json()
+    se = next(s for s in body["data"] if s["name"] == "simplified_engine")
+    assert se["today_trade_count"] == 2
+    assert se["open_positions"] == 1  # only the RVNL entry is still open
+    assert se["today_net_pnl"] == 1244.5
+    assert se["last_trade_at"] == f"{today}T09:45:00+05:30"
+
+
+def test_detail_resolves_simplified_engine_recent_trades(app, wired_dbs):
+    """strategy_detail must return simplified_engine recent_trades from the
+    trending_equity_intraday journal rows."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="PERSISTENT",
+        placed_at=f"{today}T10:00:00+05:30",
+        exited_at=f"{today}T15:14:00+05:30",
+        exit_price=120.0,
+        pnl=200.0,
+        exit_reason="target",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+
+    data = resp.get_json()["data"]
+    assert data["name"] == "simplified_engine"
+    # sandbox performance column is populated from the journal
+    assert data["performance"]["sandbox"]["today_net_pnl"] == 200.0
+    trades = data["recent_trades"]
+    assert len(trades) == 1
+    assert trades[0]["symbol"] == "PERSISTENT"
+    assert trades[0]["pnl"] == 200.0
+    assert trades[0]["exit_reason"] == "target"
+
+
+def test_pnl_curve_resolves_simplified_engine(app, wired_dbs):
+    """The P&L curve for simplified_engine must aggregate closed journal rows by
+    exit date."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="RVNL",
+        placed_at="2026-06-29T09:30:00+05:30",
+        exited_at="2026-06-29T15:14:00+05:30",
+        exit_price=110.0,
+        pnl=500.0,
+        exit_reason="eod_squareoff",
+    )
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="INDIANB",
+        placed_at="2026-06-29T09:45:00+05:30",
+        exited_at="2026-06-29T15:14:00+05:30",
+        exit_price=90.0,
+        pnl=-150.0,
+        exit_reason="stop_loss",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine/pnl-curve")
+
+    points = resp.get_json()["data"]["points"]
+    assert len(points) == 1
+    assert points[0]["date"] == "2026-06-29"
+    assert points[0]["pnl"] == 350.0  # 500 + (-150)
+
+
+def test_other_strategies_unaffected_by_simplified_bridge(app, wired_dbs):
+    """A trending_equity_intraday journal row must NOT leak into sector_follow
+    or futures_follow stats (no regression on the existing branches)."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    _seed_simplified_journal_row(tj_sess, tjdb, symbol="RVNL", placed_at=f"{today}T09:30:00+05:30")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    body = resp.get_json()["data"]
+    sf = next(s for s in body if s["name"] == "sector_follow_cap5_vol")
+    ff = next(s for s in body if s["name"] == "futures_follow_cap50")
+    assert sf["today_trade_count"] == 0
+    assert ff["today_trade_count"] == 0
