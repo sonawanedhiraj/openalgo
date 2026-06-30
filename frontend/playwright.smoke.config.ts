@@ -4,6 +4,19 @@ import { defineConfig } from '@playwright/test'
  * Smoke test config — runs against an already-booted Flask server.
  * Use: npx playwright test --config playwright.smoke.config.ts
  * Or in CI: OPENALGO_URL=http://127.0.0.1:5000 npx playwright test --config playwright.smoke.config.ts
+ *
+ * Specs:
+ *   - smoke.spec.ts          — route reachability + console-error allowlist
+ *
+ * Note: scanner_clone.spec.ts is NOT in this config (issue #229). Although
+ * the spec uses page.route mocks for its API calls, the scanner page itself
+ * requires authenticated session state to render the definition cards the
+ * spec asserts on. The smoke stack boots OpenAlgo unauthenticated, so
+ * those specs fail with "element not found". Including scanner_clone in
+ * the smoke gate would require wiring an auth fixture into the spec —
+ * out of scope for #229, which is the gating-only change.
+ *
+ * The mock-broker happy-path lives in playwright.broker.config.ts.
  */
 export default defineConfig({
   testDir: './e2e',
