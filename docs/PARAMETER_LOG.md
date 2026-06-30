@@ -111,6 +111,26 @@ the latest decisions automatically.
   reads them in causal order.
 - **Set to a different `HH:MM` to:** shift the slot. Junk values fall back
   to the default rather than crashing boot.
+### Telegram inbound poller — disabled (Conflict fix, added 2026-06-30)
+
+#### TELEGRAM_INBOUND_ENABLED
+- **Current value:** `.env` → **`false`** (was `true`).
+- **Set in:** env; read in `services/telegram_inbound_service.py._inbound_enabled`
+  (master gate on `init_telegram_inbound_service`).
+- **What it does:** master on/off switch for the Phase-6 inbound Telegram service.
+  `false` means `init_telegram_inbound_service` is a no-op at boot (no poller, no
+  send-fallback registration).
+- **Why changed `true→false`:** issue #238. With it `true`, the inbound service
+  started a second `getUpdates` poller on the SAME bot token the UI-toggled
+  interactive bot (`telegram_bot_service`, `bot_config.is_active`) already polls,
+  producing a persistent `telegram.error.Conflict: terminated by other getUpdates
+  request` — ~3856 occurrences (~200/hour all day) on 2026-06-30. The operator
+  decision is that the UI bot is the single poller and single sender. The env was
+  flipped to `false` as the immediate fix; a durable **single-poller guard** also
+  landed in code (`telegram_inbound_service.start()` refuses to poll whenever
+  `bot_config.is_active` is true, even if this flag is `true`), so the bug is
+  structurally impossible regardless of the env value. Operator lands the `.env`
+  edit + this log entry direct to `dev`.
 
 ### Preflight error gate — per-signature cap (added 2026-06-19)
 

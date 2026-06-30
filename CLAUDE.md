@@ -1444,8 +1444,16 @@ aliases accepted (`simplified`, `sector`/`sf`).
 - **Halt always two-step:** a halt-triggering input arms a 30-second "reply YES"
   confirmation before the row is written.
 - **Audit:** every change writes `updated_by=telegram:<chat_id>:<message_id>`.
-- **One poller per bot token:** don't run the full interactive outbound bot's
-  poller on the same token while this is enabled (Telegram getUpdates Conflict).
+- **One poller per bot token (structurally enforced — issue #238):** the inbound
+  service refuses to start its `getUpdates` poller whenever the UI-toggled
+  interactive bot (`bot_config.is_active`, `telegram_bot_service`) owns the token.
+  `telegram_inbound_service.start()` checks `_ui_bot_active()` first and returns
+  `(False, …)` with an INFO log (no raise) if the UI bot is active — so even with
+  `TELEGRAM_INBOUND_ENABLED=true` the UI bot wins and two pollers on one token can
+  never both run (the 2026-06-30 `telegram.error.Conflict: terminated by other
+  getUpdates request` storm). The outbound `notify()` fallback is unaffected: when
+  the UI bot is DOWN, `_ui_bot_active()` is false, the inbound poller starts, and
+  `send_message_to_all` works as before. Test: `test/test_telegram_single_poller.py`.
 
 **Operator activation:** `UPDATE bot_config SET telegram_chat_ids='<chat_id>'
 WHERE id=1;` (or `database.telegram_db.add_authorized_chat_id`), set
