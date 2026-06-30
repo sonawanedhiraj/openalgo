@@ -938,68 +938,17 @@ def setup_environment(app):
                 logger.error(f"Failed to initialize Telegram inbound service: {e}")
 
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
-            # scanner and the regime classifier. Replaces the old one-shot 30s
-            # boot poll (which lost the race against the morning Zerodha login,
-            # leaving the scanner with only engine-armed symbols). See
-            # services/scanner_presubscribe.py for the full rationale.
-            def _wire_pre_subscribe(callback_name, pre_subscriber, syms, *, thread_name):
-                import threading as _t
-                import time as _time
-
-                from database.auth_db import (
-                    get_broker_name,
-                    get_first_available_api_key,
-                    verify_api_key,
-                )
-                from services.websocket_service import (
-                    get_websocket_connection,
-                    register_connect_callback,
-                )
-
-                # Fire on every broker WS connect+auth — the first connect after
-                # the morning login and every mid-day reconnect. reset=True
-                # re-subscribes the full list, since a reconnect drops the
-                # broker-side subscriptions.
-                register_connect_callback(
-                    callback_name,
-                    lambda uid, brk: pre_subscriber.ensure(uid, brk, syms, reset=True),
-                )
-
-                # Boot retry: poke the connection until the broker WS is up
-                # (covers the case where the operator logs in AFTER boot), then
-                # do the initial subscribe. The connect callback covers all
-                # later (re)connects, so this thread exits once the WS is up.
-                def _establish():
-                    api_key = get_first_available_api_key()
-                    user_id = verify_api_key(api_key) if api_key else None
-                    if not user_id:
-                        logger.warning(
-                            "%s: no API key configured at boot; connect callback "
-                            "remains armed for when a session appears",
-                            callback_name,
-                        )
-                        return
-                    broker = get_broker_name(api_key) or ""
-                    interval = int(os.environ.get("PRESUBSCRIBE_RETRY_SEC", "15"))
-                    max_wait = int(os.environ.get("PRESUBSCRIBE_MAX_WAIT_SEC", "7200"))
-                    deadline = _time.time() + max_wait
-                    while _time.time() < deadline:
-                        if get_websocket_connection(user_id)[0]:
-                            pre_subscriber.ensure(user_id, broker, syms)
-                            logger.info(
-                                "%s: broker WS up — initial subscribe done",
-                                callback_name,
-                            )
-                            return
-                        _time.sleep(interval)
-                    logger.warning(
-                        "%s: broker WS not up after %ds at boot; connect callback "
-                        "remains armed for the next connect",
-                        callback_name,
-                        max_wait,
-                    )
-
-                _t.Thread(target=_establish, daemon=True, name=thread_name).start()
+            # scanner and the regime classifier. Three triggers (connect callback,
+            # event-bus subscription, boot-retry thread) all converge on the
+            # same idempotent ensure() — see services/scanner_presubscribe.py
+            # ::wire_pre_subscribe for the full rationale.
+            #
+            # Issue #244 fix (2026-06-30): the api_key fetch now happens INSIDE
+            # the boot-retry loop and a broker_session_refreshed event-bus
+            # subscriber is added, so the operator's normal flow (OpenAlgo →
+            # Zerodha login) no longer races the daemon thread and bails on
+            # the first None api_key.
+            from services.scanner_presubscribe import wire_pre_subscribe as _wire_pre_subscribe
 
             # Scanner service (Stage 1.5 item 5) — gated by SCANNER_ENABLED.
             # Off by default. When enabled, it subscribes to the ZMQ tick bus
