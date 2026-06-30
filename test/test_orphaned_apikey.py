@@ -24,21 +24,28 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 def setup_test_db():
     """Create a fresh in-memory database with test data.
 
-    Defensive: closes any prior ``scoped_session`` before rebinding so a
-    previous test's per-thread session does not shadow the new engine.
-    Without this, on Linux CI under xdist parallelization, a sibling test
-    on the same worker can leave behind a thread-local session bound to a
-    different engine; the subsequent ``Auth.query`` / ``ApiKeys.query``
-    resolves through the stale session and yields ``no such table:
-    api_keys`` against a connection that was never ``create_all``-ed for
-    our new in-memory engine. PR #233 added 13 new tests to
-    ``test/contracts/`` which shifted xdist worker grouping enough to
-    surface this latent fragility.
+    Two structural fixes were needed here (#231 surfaced both under Linux CI
+    xdist worker grouping; the prior code happened to pass on Windows local
+    and on most worker groupings but flaked on Linux when PR #233's 13 new
+    contract tests shifted the schedule):
+
+    1. ``sqlite:///:memory:`` + the default ``QueuePool`` gives every
+       connection its OWN isolated in-memory database. ``create_all`` ran on
+       connection A; the session's later query checked out connection B from
+       the pool, which saw an empty DB → ``no such table: api_keys``. Fix:
+       ``poolclass=StaticPool`` so every connection shares the one in-memory
+       DB. Also pass ``check_same_thread=False`` because the scoped_session
+       hands its single SQLite connection across threads.
+
+    2. The prior ``scoped_session`` lingered in the thread-local registry.
+       Even rebinding ``auth_mod.db_session`` left the stale session
+       reachable; we explicitly ``.remove()`` it before rebinding.
     """
     # Re-import to pick up the in-memory DATABASE_URL
     # We need to patch the module's engine before it's used
     from sqlalchemy import create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
+    from sqlalchemy.pool import StaticPool
 
     import database.auth_db as auth_mod
 
@@ -51,7 +58,11 @@ def setup_test_db():
         except Exception:
             pass
 
-    engine = create_engine("sqlite:///:memory:")
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     auth_mod.db_session = scoped_session(
         sessionmaker(autocommit=False, autoflush=False, bind=engine)
     )
