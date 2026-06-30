@@ -106,6 +106,25 @@ _USAGE = (
 )
 
 
+def _default_ui_bot_active() -> bool:
+    """Return True when the UI-toggled interactive bot (``telegram_bot_service``)
+    owns the bot token — i.e. ``bot_config.is_active`` is set.
+
+    Single-poller guard (issue #238): the inbound service must NEVER start a
+    competing ``getUpdates`` poller while the UI bot is active, or Telegram
+    returns a persistent ``Conflict: terminated by other getUpdates request``.
+    The UI bot is the single poller and single sender; the inbound service
+    defers to it. A failure to read the config is treated as "UI bot active"
+    (fail-safe: never start a second poller on an indeterminate state)."""
+    try:
+        from database.telegram_db import get_bot_config
+
+        return bool((get_bot_config() or {}).get("is_active"))
+    except Exception:
+        logger.debug("ui_bot_active check failed — assuming active (fail-safe)", exc_info=True)
+        return True
+
+
 def _canonical_strategy(name: str) -> str | None:
     if not name:
         return None
@@ -131,6 +150,7 @@ class TelegramInboundService:
         delete_intent: Callable | None = None,
         resolve_strategy_mode: Callable | None = None,
         authorized_chat_ids: Callable[[], set] | None = None,
+        ui_bot_active: Callable[[], bool] | None = None,
         now: Callable[[], object] | None = None,
         scheduler=None,
     ):
@@ -163,6 +183,7 @@ class TelegramInboundService:
         self._delete_intent = delete_intent
         self._resolve = resolve_strategy_mode
         self._authorized_chat_ids = authorized_chat_ids
+        self._ui_bot_active = ui_bot_active or _default_ui_bot_active
         self._now = now or (lambda: __import__("datetime").datetime.now(_IST))
 
         self.scheduler = scheduler
@@ -522,6 +543,23 @@ class TelegramInboundService:
     def start(self) -> tuple[bool, str]:
         if self.is_running:
             return False, "Inbound bot already running"
+
+        # Single-poller guard (issue #238): the UI-toggled interactive bot
+        # (telegram_bot_service, controlled by bot_config.is_active) is the one
+        # and only getUpdates poller AND sender. If it owns the token, the
+        # inbound service must NOT start a second poller — two pollers on the
+        # same token produce a persistent telegram.error.Conflict. This guard
+        # lives here (not only in app.py) so it holds regardless of boot order
+        # or how start() is reached. TELEGRAM_INBOUND_ENABLED is honored as a
+        # master off-switch upstream, but even with it true the UI bot wins.
+        if self._ui_bot_active():
+            msg = (
+                "Inbound poller not started — UI bot (bot_config.is_active) owns "
+                "the token; deferring to it as the single poller (issue #238)"
+            )
+            logger.info(msg)
+            return False, msg
+
         try:
             from database.telegram_db import get_bot_config
 
