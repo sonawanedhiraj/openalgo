@@ -23,11 +23,29 @@ import datetime as _dt
 from unittest.mock import MagicMock, patch
 
 import pytest
+import pytz
 
 # BootHarness must be imported before any other app module so OPENALGO_TESTING=1
 # is set before any module-level app code runs.  conftest.py's DB redirect has
 # already run before this file is collected — that ordering is correct.
 from test.harness import BootHarness
+
+# The trade journal stamps ``placed_at`` in IST (``trade_journal_db._now_iso``),
+# and ``reconcile_engine_journal`` defaults its target date to the IST calendar
+# day. The B4 reconciliation tests seed a row and then query/reconcile by date,
+# so the "today" they use MUST be the IST calendar day — NOT ``date.today()``,
+# which returns the machine-local day. On a UTC CI runner during the IST-midnight
+# rollover window (18:30–24:00 UTC) the two diverge by a day, the seeded row's
+# IST ``placed_at`` falls outside the local-date query window, and the tests
+# flake red (issue #252). Using the IST day everywhere keeps the seed and the
+# query on the same clock the production code uses.
+_IST = pytz.timezone("Asia/Kolkata")
+
+
+def _ist_today() -> _dt.date:
+    """The current IST calendar day — the clock the journal + reconciler use."""
+    return _dt.datetime.now(_IST).date()
+
 
 # ============================================================================
 # B1 — EOD watchdog timing cap is at most 15:14 IST
@@ -324,7 +342,7 @@ class TestEodReconciliationStampsExit:
             reconcile_engine_journal,
         )
 
-        today = _dt.date.today()
+        today = _ist_today()
         strategy_name = "b4_recon_close_t1"
 
         # 1. Seed an open journal row (no exit) for today.
@@ -403,7 +421,7 @@ class TestEodReconciliationStampsExit:
             reconcile_engine_journal,
         )
 
-        today = _dt.date.today()
+        today = _ist_today()
         strategy_name = "b4_recon_open_t2"
 
         with harness.app.app_context():
