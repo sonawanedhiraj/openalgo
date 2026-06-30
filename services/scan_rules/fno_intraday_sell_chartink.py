@@ -250,6 +250,24 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
                     last_5m_close,
                     threshold_pct,
                 )
+                # Issue #231: Telegram alert (dedup per-(scanner_rule_sell,
+                # symbol, day) in the helper, so re-firing each 5m bar close
+                # does NOT flood the operator).
+                try:
+                    from services.source_divergence_alerts import check_and_alert
+
+                    check_and_alert(
+                        service="scanner_rule_sell",
+                        symbol=sym,
+                        source_a_label="bars_daily_today_close",
+                        source_a_value=float(today_d.close),
+                        source_b_label="live_5m_last_close",
+                        source_b_value=float(last_5m_close),
+                    )
+                except Exception:  # noqa: BLE001 — observability must never break rule eval
+                    logger.exception(
+                        "fno_intraday_sell_chartink %s: divergence alert dispatch failed", sym
+                    )
         except (TypeError, ValueError, KeyError, IndexError):
             logger.debug("fno_intraday_sell_chartink %s: divergence check skipped", sym)
 

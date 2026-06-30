@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -211,3 +211,61 @@ def test_fallback_gate_off_keeps_historify_source_no_broker_call(monkeypatch):
 
     # Reader returned the short historify result rather than calling the broker.
     assert len(bars) == 10
+
+
+# ----------------------------------------------------------------------- #
+# Contract D — divergence on the most-recent overlapping close
+# triggers the runtime alert (issue #231). The fallback ALWAYS fires the
+# info-line, but the alert MUST only fire when the close-pct divergence
+# exceeds the threshold.
+# ----------------------------------------------------------------------- #
+def test_close_divergence_fires_source_divergence_alert(monkeypatch):
+    """The two-tier reader's broker fallback path now ALSO calls
+    :func:`services.source_divergence_alerts.check_and_alert`; when the
+    historify and broker close prices disagree by more than the threshold,
+    a Telegram alert (mocked) fires. Without the alert, the operator only
+    learns about the divergence by grepping errors.jsonl after EOD.
+    """
+    import services.source_divergence_alerts as sda
+
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    monkeypatch.setenv("SOURCE_DIVERGENCE_ALERTS_ENABLED", "true")
+    monkeypatch.setenv("SOURCE_DIVERGENCE_THRESHOLD_PCT", "0.5")
+    sda.reset_dedup_for_tests()
+
+    # Historify says ~100.10; broker says ~150.10 — a ~33% divergence on the
+    # most recent bar's close. Both sources have valid bars; broker fallback
+    # fires because historify is below min_required.
+    short_hist = _historify_df(10, base_price=100.0)
+    long_broker = _broker_bars(300, base_price=150.0)
+
+    mock_notify_service = MagicMock()
+    with (
+        patch("database.historify_db.get_ohlcv", return_value=short_hist),
+        patch.object(
+            scanner_aggregator_seeder,
+            "_read_1m_bars_from_broker",
+            return_value=long_broker,
+        ),
+        patch(
+            "services.notification_service.get_notification_service",
+            return_value=mock_notify_service,
+        ),
+    ):
+        bars = _read_1m_bars_for_symbol("DIVERGE", "NSE", 500, api_key="dummy")
+
+    # Broker source still wins.
+    assert len(bars) == 300
+    # AND a source_divergence Telegram alert fired — exactly once.
+    notify_calls = [
+        c
+        for c in mock_notify_service.notify.call_args_list
+        if c.args and c.args[0] == "source_divergence"
+    ]
+    assert len(notify_calls) == 1, (
+        f"expected exactly one source_divergence notify; got {len(notify_calls)} "
+        f"({mock_notify_service.notify.call_args_list!r})"
+    )
+    assert "DIVERGE" in notify_calls[0].args[1]
+    sda.reset_dedup_for_tests()

@@ -188,6 +188,13 @@ class NotificationService:
             # an empty journal the operator has to forensic-query the next
             # morning. See services/trading_day_funnel_service.py.
             "trading_day_funnel": _env_bool("NOTIFY_TRADING_DAY_FUNNEL", default=True),
+            # Runtime source-divergence alerts (issue #231). Default ON — the
+            # helper services.source_divergence_alerts.check_and_alert fires
+            # this event_type when two data sources for the same value (e.g.
+            # historify vs broker, trade_journal vs sandbox, cached daily vs
+            # live 5m close) disagree by more than the divergence threshold.
+            # Per-(service, symbol, day) dedup is in the helper, NOT here.
+            "source_divergence": _env_bool("NOTIFY_SOURCE_DIVERGENCE", default=True),
         }
         # Preflight-abort alert de-duplication state (2026-06-03 incident: a
         # 14s DNS blip produced 14 identical "🛑 Preflight aborted" alerts as

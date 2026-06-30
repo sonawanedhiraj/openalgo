@@ -240,6 +240,26 @@ def reconcile_engine_journal(
             if not fills or closed_qty < entry_qty:
                 # Flat per the position row but no covering close fill we can
                 # price from — leave it open rather than invent an exit.
+                # Issue #231: this is a hard divergence — journal expected
+                # ``entry_qty`` closed (it shows the row open against that
+                # quantity) but sandbox's covering fills cover ``closed_qty``.
+                # Alert the operator so the data gap is visible within
+                # seconds instead of waiting for the EOD summary mismatch.
+                try:
+                    from services.source_divergence_alerts import check_and_alert
+
+                    check_and_alert(
+                        service="eod_reconciliation",
+                        symbol=symbol,
+                        source_a_label="journal_expected_closed_qty",
+                        source_a_value=float(entry_qty),
+                        source_b_label="sandbox_covering_fill_qty",
+                        source_b_value=float(closed_qty),
+                    )
+                except Exception:  # noqa: BLE001 — observability must never break reconcile
+                    logger.exception(
+                        "[EOD-RECONCILE] divergence alert dispatch failed for %s", symbol
+                    )
                 result.skipped.append({"symbol": symbol, "reason": "no_covering_close_fill"})
                 continue
 

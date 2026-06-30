@@ -254,6 +254,26 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
                     last_5m_close,
                     threshold_pct,
                 )
+                # Issue #231: also dispatch a Telegram alert so the operator
+                # sees the divergence within seconds instead of grepping
+                # errors.jsonl. Dedup is per-(scanner_rule, symbol, day) in
+                # the helper, so the rule re-firing every 5m bar close does
+                # NOT produce a Telegram flood.
+                try:
+                    from services.source_divergence_alerts import check_and_alert
+
+                    check_and_alert(
+                        service="scanner_rule_buy",
+                        symbol=sym,
+                        source_a_label="bars_daily_today_close",
+                        source_a_value=float(today_d.close),
+                        source_b_label="live_5m_last_close",
+                        source_b_value=float(last_5m_close),
+                    )
+                except Exception:  # noqa: BLE001 — observability must never break rule eval
+                    logger.exception(
+                        "fno_intraday_buy_chartink %s: divergence alert dispatch failed", sym
+                    )
         except (TypeError, ValueError, KeyError, IndexError):
             # Don't let a malformed 5m frame turn the observability layer into
             # a rule-evaluation crash — log and continue.
