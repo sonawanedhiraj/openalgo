@@ -1251,8 +1251,9 @@ Telegrammed every trading day.
   (`database/scanner_comparison_db.py`) — one row per `(date, screener_side)`;
   idempotent delete-then-insert per date+side, so re-running the day overwrites.
 - **Telegram** routes through `notification_service.notify("scanner_comparison", …)`
-  so the Phase 6 inbound-bot fallback delivers; toggle `NOTIFY_SCANNER_COMPARISON`
-  (default `true`).
+  — delivered iff the bot is running (UI Start clicked, `bot_config.is_active=True`);
+  suppressed with an INFO log when stopped (issue #238). Toggle
+  `NOTIFY_SCANNER_COMPARISON` (default `true`).
 - **Flags** `SCANNER_COMPARISON_EOD_ENABLED` (default `true`, per-fire gate) +
   `SCANNER_COMPARISON_EOD_TIME` (default `15:45`). See `docs/PARAMETER_LOG.md`.
 - **Caveat:** the in-house side reflects the *live tick-driven* scanner, which only
@@ -1404,62 +1405,56 @@ updated_by, notes)` in `database/strategy_daily_intent_db.py` (SQL or the
 Telegram inbound bot below). To roll one back: delete its row → instant env
 fall-through.
 
-## Telegram daily intent control (Phase 6)
+## Telegram bot — single UI control (issue #238)
 
-> **RETIRED by the mode-only architecture (B5, 2026-06-12).** There is no per-day
-> intent to set from the phone anymore — strategies run continuously in their
-> persistent `strategy_mode`. In `services/telegram_inbound_service.py` the
-> `/intent`, `/pause`, `/resume`, `/halt`, capital-cap, free-text intent forms, and
-> the inline morning-keyboard buttons all now return a single deprecation notice
-> (mode flips stay laptop-only; emergency pause is the sector_follow `/api/pause`
-> REST endpoint over WireGuard/SSH). **The 08:45 IST `telegram_inbound_morning_prompt`
-> APScheduler job is removed** (`register_jobs` is a no-op that also clears any
-> stale instance). Only `/status` remains — it now reports each strategy's current
-> mode (and any active `strategy_runtime_override`). The section below describes the
-> retired control surface, kept for historical context.
+> **The OpenAlgo UI is the SOLE start/stop control for the Telegram bot.** The
+> Telegram Bot page at `/telegram` has a Start Bot / Stop Bot button; clicking
+> Start spawns the polling thread (`telegram_bot_service.start_bot()`) and sets
+> `bot_config.is_active=True`. Clicking Stop joins the thread and sets
+> `is_active=False`. Nothing else may start the poller — there is no env-var
+> auto-start, no second poller, no fallback path. *Stop means stop.*
 
-The unified `strategy_daily_intent` table can be set **from the phone** via the
-inbound Telegram bot (`services/telegram_inbound_service.py`), the INBOUND
-counterpart to the send-only outbound `telegram_bot_service`. Full design:
-[`docs/design/telegram_inbound.md`](docs/design/telegram_inbound.md).
+**The contract in one table:**
 
-**Feature-flagged off by default** (`TELEGRAM_INBOUND_ENABLED`, default `false`):
-deploying the module starts no poller. When enabled, it polls Telegram on a real
-OS thread (eventlet-safe, like the outbound bot), registers an **08:45 IST**
-morning-prompt APScheduler job, and writes the intent table.
+| `bot_config.is_active` | Polling | `notification_service.notify()` outbound |
+|---|---|---|
+| `True` (UI Start clicked) | Legacy bot polls | Sends via `telegram_bot_service.broadcast_message` |
+| `False` (UI Stop clicked, default on a fresh install) | Nothing polls | Suppressed — INFO log `"telegram notify suppressed: bot stopped (is_active=False, event_type=<type>)"`, returns cleanly |
 
-**Commands:** `/status`, `/intent <strategy> <run|pause|halt>`,
-`/intent <strategy> cap <amount>`, `/intent <strategy> clear`,
-`/pause`/`/resume`/`/halt <strategy>`, `/morning`. Free-text replies
-(`pause sector_follow`) and inline morning-keyboard buttons work too. Strategy
-aliases accepted (`simplified`, `sector`/`sf`).
+**`TELEGRAM_INBOUND_ENABLED` is deprecated** as of issue #238. The env var still
+parses cleanly to avoid breaking existing `.env` files, but its value is
+ignored: nothing reads it at runtime. At boot, if it is set to a truthy value
+(`1`/`true`/`yes`/`on`), `app.py` logs exactly one WARNING line
+(`"TELEGRAM_INBOUND_ENABLED is deprecated and has no effect. The OpenAlgo UI
+(Telegram Bot page) is now the sole start/stop control."`) to surface the
+stale operator config; otherwise it is silent. **Remove the line from `.env`
+at next convenient edit; it does nothing.**
 
-**Safety rails (load-bearing — do not relax):**
-- **Mode flips are NOT exposed.** Only the *intent* axis (run/pause/halt) and the
-  capital cap are settable from Telegram; `live`/`sandbox`/`skip` (HOW orders
-  route) replies *"Mode changes require laptop access for safety."* Setting an
-  intent **preserves** the row's existing mode.
-- **chat_id allowlist** in `bot_config.telegram_chat_ids` (comma-separated);
-  unauthorized chats are silently ignored.
-- **Halt always two-step:** a halt-triggering input arms a 30-second "reply YES"
-  confirmation before the row is written.
-- **Audit:** every change writes `updated_by=telegram:<chat_id>:<message_id>`.
-- **One poller per bot token:** don't run the full interactive outbound bot's
-  poller on the same token while this is enabled (Telegram getUpdates Conflict).
+`services/telegram_inbound_service.py` remains in the tree as dead code (so
+any straggler import does not crash), but is **never auto-started**. The
+`init_telegram_inbound_service` symbol is no longer called from `app.py`.
+The `notify()` inbound fallback branch in `services/notification_service.py`
+has been removed — there is no second channel for outbound delivery.
 
-**Operator activation:** `UPDATE bot_config SET telegram_chat_ids='<chat_id>'
-WHERE id=1;` (or `database.telegram_db.add_authorized_chat_id`), set
-`TELEGRAM_INBOUND_ENABLED=true`, restart.
+**Why this exists.** Before issue #238, two pollers could run on the same bot
+token simultaneously — the legacy `telegram_bot_service` (UI-started) and the
+inbound poller (`TELEGRAM_INBOUND_ENABLED=true`). Telegram's `getUpdates`
+endpoint accepts only one consumer per token, so the second poller logged
+`telegram.error.Conflict` on every poll. On 2026-06-30 that produced 1,031
+Conflict entries in `errors.jsonl` — flooding the auto-truncated last-1000
+window and pushing real anomalies off the tail. With one control surface the
+race is structurally impossible.
 
-**Outbound alerts route through the inbound poller when the legacy bot is
-inactive.** Activating Phase 6 frees the Telegram token to the inbound poller,
-which means `bot_config.is_active=0` and the legacy `telegram_bot_service` stops
-running — so one-way operator alerts would otherwise be silently dropped.
-`services/notification_service.notify()` now falls through to
-`telegram_inbound_service.send_message_to_all()` (same `telegram_chat_ids`
-allowlist) when the legacy bot is down. Legacy stays primary when it's running
-(purely additive); the inbound fallback escalates any send failure via
-`logger.exception` rather than dropping silently.
+**Historical context — Phase 6 inbound poller (RETIRED).** The inbound poller
+shipped to let the operator set the per-day `strategy_daily_intent` row from
+their phone (`/intent`, `/pause`, `/resume`, `/halt`, capital-cap). The
+mode-only architecture (B5, 2026-06-12) had already retired all those commands
+to a single deprecation notice; the morning-prompt APScheduler job was already
+removed. Issue #238 finishes the retirement by also removing the poller
+process. The inbound service module is preserved unchanged for any test that
+still imports `TelegramInboundService` directly; the only user-visible
+behaviour it ever surfaces today is `/status`, and that is not reachable
+because nothing starts the poller.
 
 ## Claude Code Instructions
 

@@ -216,16 +216,24 @@ class NotificationService:
     def notify(self, event_type: str, message: str, **metadata: Any) -> None:
         """Publish ``message`` for ``event_type`` to the Telegram channel.
 
+        Single-control-surface contract (issue #238): when the bot is stopped
+        from the UI, outbound notifications are intentionally suppressed —
+        "Stop" means stop, no fallback. Routing reduces to a 2-row table:
+
+        * ``bot_config.is_active=True`` AND legacy bot running →
+          ``telegram_bot_service.broadcast_message`` is invoked.
+        * Otherwise → log at INFO and return cleanly (no-op).
+
         No-op when:
 
         * the master switch ``NOTIFY_TELEGRAM_ENABLED`` is false;
         * the per-event toggle for ``event_type`` is false;
-        * the Telegram bot is not running / has no live event loop;
-        * the underlying send raises.
+        * the legacy bot is stopped from the UI (``is_active=False``);
+        * the underlying send raises (logged via ``logger.exception``).
 
-        Any failure path is logged at WARNING and swallowed. Callers may
-        assume this method *never* raises and *never* blocks for more than
-        the time it takes to schedule a coroutine onto the bot's event loop.
+        Any failure path is logged and swallowed. Callers may assume this
+        method *never* raises and *never* blocks for more than the time it
+        takes to schedule a coroutine onto the bot's event loop.
         """
         if not self.enabled:
             return
@@ -238,67 +246,44 @@ class NotificationService:
         if not self.per_event[event_type]:
             return
 
+        # Explicit pre-check on the legacy bot's UI-controlled run state —
+        # NOT a try/except swallow. The Phase-6 inbound fallback that used to
+        # sit here is removed (issue #238): Stop Bot from the UI now means
+        # stop, with no second poller silently taking over outbound delivery.
         try:
             from services.telegram_bot_service import telegram_bot_service
-
-            loop = getattr(telegram_bot_service, "bot_loop", None)
-            if loop is not None and getattr(telegram_bot_service, "is_running", False):
-                coro = telegram_bot_service.broadcast_message(
-                    message,
-                    filters={"notifications_enabled": True},
-                )
-                asyncio.run_coroutine_threadsafe(coro, loop)
-                return
-
-            # Legacy outbound bot inactive (e.g. Phase 6 freed the Telegram
-            # token to the inbound poller — bot_config.is_active=0). Fall
-            # through to the inbound bot's live send path so outbound alerts
-            # are not silently dropped. Additive: legacy stays primary above.
-            if self._notify_via_inbound(event_type, message):
-                return
-
-            logger.warning(
-                "notification_service.notify: no live telegram bot "
-                "(legacy inactive, inbound unavailable/no chats; event=%s) "
-                "— dropping notification",
+        except Exception:  # noqa: BLE001 — fail-safe by design
+            logger.exception(
+                "notification_service.notify: telegram_bot_service import failed (event=%s)",
                 event_type,
             )
+            return
+
+        loop = getattr(telegram_bot_service, "bot_loop", None)
+        is_running = bool(getattr(telegram_bot_service, "is_running", False))
+        if loop is None or not is_running:
+            # UI-driven Stop, or bot never started — suppress cleanly. INFO
+            # (not WARNING) so a stopped bot does not flood errors.jsonl; the
+            # operator's intent IS to be quiet here.
+            logger.info(
+                "telegram notify suppressed: bot stopped (is_active=False, event_type=%s)",
+                event_type,
+            )
+            return
+
+        try:
+            coro = telegram_bot_service.broadcast_message(
+                message,
+                filters={"notifications_enabled": True},
+            )
+            asyncio.run_coroutine_threadsafe(coro, loop)
         except Exception:  # noqa: BLE001 — fail-safe by design
+            # Send failure does NOT cascade to a second channel — the inbound
+            # fallback is gone. We just log the traceback and return.
             logger.exception(
                 "notification_service.notify: send failed (event=%s)",
                 event_type,
             )
-
-    def _notify_via_inbound(self, event_type: str, message: str) -> bool:
-        """Send via the Phase 6 inbound poller's bot loop.
-
-        Returns True when the message was scheduled to at least one chat, False
-        when the inbound bot is unavailable or no chats are configured. Failures
-        are escalated via ``logger.exception`` (never a silent drop) and surface
-        as a False return so the caller logs the final dropped-notification
-        warning.
-        """
-        try:
-            from services.telegram_inbound_service import get_service
-
-            inbound = get_service()
-            if inbound is None or not getattr(inbound, "is_running", False):
-                return False
-            sent = inbound.send_message_to_all(message)
-            if sent > 0:
-                return True
-            logger.warning(
-                "notification_service: inbound bot running but 0 chats "
-                "targeted (event=%s) — check bot_config.telegram_chat_ids",
-                event_type,
-            )
-            return False
-        except Exception:  # noqa: BLE001 — fail-safe by design
-            logger.exception(
-                "notification_service: inbound send failed (event=%s)",
-                event_type,
-            )
-            return False
 
     # ------------------------------------------------------------------
     # Convenience publishers — typed event_type + structured formatting.

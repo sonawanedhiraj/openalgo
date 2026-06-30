@@ -925,17 +925,21 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to register Trading day funnel job: {e}")
 
-            # Telegram INBOUND intent bot (Phase 6). Gated by
-            # TELEGRAM_INBOUND_ENABLED (default false), so this is a no-op on
-            # deploy until the operator flips the flag — it then polls Telegram
-            # for /intent commands and writes strategy_daily_intent. Registers an
-            # 08:45 IST morning-prompt job. See services/telegram_inbound_service.py.
-            try:
-                from services.telegram_inbound_service import init_telegram_inbound_service
-
-                init_telegram_inbound_service(app=app)
-            except Exception as e:
-                logger.error(f"Failed to initialize Telegram inbound service: {e}")
+            # Telegram inbound poller is deprecated — the OpenAlgo UI's
+            # Start/Stop button on /telegram is the SOLE start/stop control
+            # for the bot (issue #238). The inbound service module remains
+            # in the tree as dead code so straggler imports don't crash, but
+            # nothing starts it at boot. ``TELEGRAM_INBOUND_ENABLED`` is a
+            # deprecated no-op env var; if it is set to a truthy value we log
+            # exactly one WARNING at boot to surface the operator-side stale
+            # config — no behaviour change.
+            _legacy_inbound_flag = os.getenv("TELEGRAM_INBOUND_ENABLED", "").strip().lower()
+            if _legacy_inbound_flag in ("1", "true", "yes", "on"):
+                logger.warning(
+                    "TELEGRAM_INBOUND_ENABLED is deprecated and has no effect. "
+                    "The OpenAlgo UI (Telegram Bot page) is now the sole "
+                    "start/stop control."
+                )
 
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
             # scanner and the regime classifier. Three triggers (connect callback,

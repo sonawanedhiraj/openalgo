@@ -173,12 +173,15 @@ rules:
   # liveness check (`not ...is_running`) and whose body is `logger.warning(...)`
   # immediately followed by `return` — i.e. a delivery path that drops on a
   # single liveness boolean, warning-only, with no fallback before the return.
-  # The fixed code does NOT match: its condition is the positive
-  # `loop is not None and getattr(..., "is_running", False)` (send path), and
-  # the only liveness-false `return` (in _notify_via_inbound) returns a sentinel
-  # the caller checks rather than logging+dropping. Verified 0 fires across
-  # services/ blueprints/ sandbox/ restx_api/ on the post-fix tree, 1 fire on
-  # 60a466f8^:services/notification_service.py (the original drop).
+  # The fixed code does NOT match: its negative-liveness branch logs at
+  # `logger.info` (not `logger.warning`) before returning, because that drop is
+  # an INTENTIONAL operator action (UI Stop, issue #238) — Stop means stop, no
+  # second channel and no error. The only other liveness check is the positive
+  # send path. Verified 0 fires across services/ blueprints/ sandbox/ restx_api/
+  # on the post-fix tree, 1 fire on 60a466f8^:services/notification_service.py
+  # (the original drop). Historical note: the inbound-fallback branch this rule
+  # was originally written to protect was removed by issue #238 — single UI
+  # control surface makes the two-poller race structurally impossible.
   # E2E proof: scripts/verify_semgrep_silent_notify.sh.
   - id: silent-notification-on-liveness-only
     languages: [python]

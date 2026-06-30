@@ -149,89 +149,23 @@ def test_notify_failsafe_on_telegram_error(monkeypatch, caplog):
 
 
 def test_notify_no_op_when_bot_not_running(monkeypatch, caplog):
+    """Bot stopped from UI → notify suppresses with INFO line, no send.
+
+    Single-UI-control (issue #238): when the legacy bot is not running (the
+    operator clicked Stop, or it never started), notify() returns cleanly
+    with an INFO log. There is no inbound-fallback fall-through anymore.
+    """
     bot = _RecordingBot(is_running=False)
     _install_fake_bot(monkeypatch, bot)
-    # No inbound bot available either → final dropped-notification warning.
-    _install_fake_inbound(monkeypatch, None)
     svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         svc.notify("cycle_summary", "drop me")
 
     assert bot.sent == []
-    assert any("no live telegram bot" in rec.message for rec in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# Phase 6 inbound-bot fallback: when the legacy outbound bot is inactive
-# (bot_config.is_active=0, e.g. token freed to the inbound poller), notify()
-# routes through the inbound bot's live send path instead of dropping.
-# ---------------------------------------------------------------------------
-
-
-class _RecordingInbound:
-    """Stand-in for the Phase 6 inbound poller singleton."""
-
-    def __init__(self, *, is_running: bool = True, sent_count: int = 1) -> None:
-        self.is_running = is_running
-        self.sent: list[str] = []
-        self._sent_count = sent_count
-
-    def send_message_to_all(self, text: str) -> int:
-        self.sent.append(text)
-        return self._sent_count
-
-
-def _install_fake_inbound(monkeypatch, inbound) -> None:
-    """Patch services.telegram_inbound_service.get_service to return ``inbound``."""
-    import services.telegram_inbound_service as tis
-
-    monkeypatch.setattr(tis, "get_service", lambda: inbound, raising=False)
-
-
-def test_notify_falls_through_to_inbound_when_legacy_inactive(monkeypatch):
-    """Legacy bot down + inbound running + chats configured → inbound sends."""
-    legacy = _RecordingBot(is_running=False)
-    _install_fake_bot(monkeypatch, legacy)
-    inbound = _RecordingInbound(is_running=True, sent_count=1)
-    _install_fake_inbound(monkeypatch, inbound)
-    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
-
-    svc.notify("cycle_summary", "via inbound")
-
-    assert legacy.sent == []  # legacy never used
-    assert inbound.sent == ["via inbound"]  # inbound carried it
-
-
-def test_notify_inbound_no_chats_returns_gracefully(monkeypatch, caplog):
-    """Inbound running but 0 chats → no crash, logs the dropped warning."""
-    legacy = _RecordingBot(is_running=False)
-    _install_fake_bot(monkeypatch, legacy)
-    inbound = _RecordingInbound(is_running=True, sent_count=0)
-    _install_fake_inbound(monkeypatch, inbound)
-    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
-
-    with caplog.at_level(logging.WARNING):
-        svc.notify("cycle_summary", "no chats")
-
-    assert inbound.sent == ["no chats"]  # attempted
-    assert any("0 chats targeted" in rec.message for rec in caplog.records)
-    assert any("no live telegram bot" in rec.message for rec in caplog.records)
-
-
-def test_notify_legacy_primary_when_running(monkeypatch):
-    """Regression: legacy bot running → inbound path is never touched."""
-    legacy = _RecordingBot(is_running=True)
-    _install_fake_bot(monkeypatch, legacy)
-    inbound = _RecordingInbound(is_running=True, sent_count=1)
-    _install_fake_inbound(monkeypatch, inbound)
-    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
-
-    svc.notify("cycle_summary", "legacy first")
-
-    assert len(legacy.sent) == 1
-    assert legacy.sent[0][0] == "legacy first"
-    assert inbound.sent == []  # inbound untouched
+    assert any("telegram notify suppressed: bot stopped" in rec.message for rec in caplog.records)
+    # The old WARNING line is gone — Stop means stop, not an error.
+    assert not any("no live telegram bot" in rec.message for rec in caplog.records)
 
 
 def test_notify_unknown_event_type_logs_warning(monkeypatch, caplog):

@@ -202,7 +202,7 @@ need no external scheduler.
 | Job id | Cron (IST) | What it does | Gating / writes |
 |---|---|---|---|
 | `scanner_comparison_eod` | `45 15 * * 1-5` (15:45 IST) | **In-house-scanner-vs-Chartink EOD comparison** — the in-process replacement for the retired Cowork `scanner-vs-chartink-daily-comparison` task (§3). For today: unions the Chartink BUY/SELL webhook lists (`scan_cycle`, `cycle_kind='chartink'`) and the in-house scanner hits (`scan_results`, `source='inhouse'`, grouped by `scan_definition.screener_type`), computes per-side counts/intersection/Jaccard/recall + a tuning verdict, writes one `scanner_comparison` row per side (idempotent delete-then-insert per `(date, side)`), and Telegrams the summary via `notify()`. Read-only on every DB except its own table. | Per-fire gate env `SCANNER_COMPARISON_EOD_ENABLED` (default `true`); fire time env `SCANNER_COMPARISON_EOD_TIME` (default `15:45`); Telegram toggle `NOTIFY_SCANNER_COMPARISON` (default `true`). Body: `services/scanner_comparison_eod_service._eod_comparison_job` (registered by `init_scanner_comparison_eod_service`). |
-| `telegram_inbound_morning_prompt` | ~~`45 8 * * 1-5`~~ | **RETIRED (mode-only, 2026-06-12, B5).** The morning intent prompt is gone — there is no per-day run/pause/halt to set (strategies run continuously in their persistent `strategy_mode`). `register_jobs` no longer schedules this job and removes any stale instance. The Telegram bot now only serves `/status` (reports modes); all intent commands return a deprecation notice pointing at `/api/pause`. | No longer registered. Was gated on `TELEGRAM_INBOUND_ENABLED=true`. |
+| `telegram_inbound_morning_prompt` | ~~`45 8 * * 1-5`~~ | **RETIRED (mode-only, 2026-06-12, B5; poller itself also retired by issue #238, 2026-06-30).** The morning intent prompt was already gone (mode-only) and the inbound poller process itself is now retired — nothing starts the inbound service, so this job cannot register even if a stale code path tried to. The Telegram bot's start/stop is the UI button on `/telegram`. | No longer registered. `TELEGRAM_INBOUND_ENABLED` is a deprecated no-op env var. |
 | `eod_watchdog_<strategy>` | `mon-fri` at `min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)` — default **15:14** for `trending_equity_intraday` | Safety-net EOD flatten for the simplified engine. One cron job per registered intraday strategy; calls `flatten_strategy_positions` (open `trade_journal` rows → opposite-side MARKET via `place_order`, mode-aware sandbox/live). Backstop for the tick-driven `_maybe_flatten_eod`, which can't fire when the broker tick stream dies before close. **Fires at 15:14, one minute before the 15:15 sandbox/broker MIS auto-square-off** — the cap is the 2026-06-10 fix: the watchdog used to fire at the declared 15:20, *after* sandbox had force-closed and started rejecting flatten orders, stranding OIL/HINDZINC/TATAELXSI. Belt to the 15:30 EOD reconciliation suspenders. | Runs on a **dedicated `BackgroundScheduler`** (not the shared instance), `services/eod_watchdog_service.py`. Gated by env `SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED` (default `true`); cap via `SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME` (default `15:14`). `misfire_grace_time=300`. Started from `app.py` boot after journal rehydrate. |
 
 > The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
@@ -258,25 +258,25 @@ periodic-in-the-post-close-window shape as sector_follow, gated by
 -m services.scanner_universe_backfill --from --to --interval {1m|D}`. Writes
 `1m`/`D` bars to `market_data`.
 
-### Telegram inbound intent bot (Phase 6)
+### Telegram inbound intent bot (Phase 6) — RETIRED (issue #238)
 
-- **Process:** `services/telegram_inbound_service.py` — a `python-telegram-bot`
-  poller running on a **real OS thread** with its own asyncio event loop (same
-  eventlet-bypass pattern as `telegram_bot_service`). Started from `app.py` boot
-  ONLY when `TELEGRAM_INBOUND_ENABLED=true` (default `false` → no-op on deploy).
-- **What it does:** polls Telegram for operator commands, gates on the
-  `bot_config.telegram_chat_ids` allowlist, and writes the unified
-  `strategy_daily_intent` table (`run`/`pause`/`halt` + capital cap). It is the
-  INBOUND counterpart to the send-only outbound bot. **Mode flips are not
-  exposed** (laptop-only); intent changes preserve the existing routing mode.
-  Audit trail: `updated_by=telegram:<chat_id>:<message_id>`.
-- **Single poller per token:** Telegram permits one `getUpdates` consumer per bot
-  token — do not run the full interactive `telegram_bot_service` poller on the
-  same token while this is enabled.
-- **DB written:** `db/openalgo.db` → `strategy_daily_intent` (+ reads
-  `bot_config`). A lightweight idempotent migration adds the
-  `bot_config.telegram_chat_ids` column on older DBs.
-- **Design:** [`docs/design/telegram_inbound.md`](design/telegram_inbound.md).
+- **Status:** **RETIRED as a runtime process** (issue #238, 2026-06-30). The
+  `services/telegram_inbound_service.py` module remains in the tree as dead
+  code (so any straggler import does not crash), but `app.py` no longer calls
+  `init_telegram_inbound_service`. Nothing starts the poller.
+- **Why it was retired:** the OpenAlgo UI's Start/Stop button on `/telegram` is
+  now the SOLE start/stop control for the Telegram bot. Two pollers on the
+  same bot token logged 1,031 `telegram.error.Conflict` entries on a single
+  trading day (2026-06-30); a single control surface makes the race
+  structurally impossible.
+- **Env var:** `TELEGRAM_INBOUND_ENABLED` is deprecated to a no-op. A truthy
+  value triggers exactly one WARNING line at boot
+  (`"TELEGRAM_INBOUND_ENABLED is deprecated and has no effect"`); falsy/unset
+  is silent.
+- **Outbound delivery:** `services/notification_service.notify()` no longer
+  has an inbound-bot fallback. When the legacy bot is stopped from the UI,
+  outbound notifications are intentionally suppressed (INFO log
+  `"telegram notify suppressed: bot stopped"`).
 
 ### Simplified-engine EOD journal reconciliation
 

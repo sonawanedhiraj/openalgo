@@ -528,34 +528,36 @@ the next regression of that class in minutes instead of hours.
   `VETO_LAYER_MODE` there at the next convenient edit. The mode-aware default
   needs no env entry to function.
 
-#### TELEGRAM_INBOUND_ENABLED
-- **Current value:** `false` (default; ships cold)
-- **Set in:** env var (not yet in `.sample.env` — operator WIP held that file;
-  add `TELEGRAM_INBOUND_ENABLED=false` there at next convenient edit). Read with
-  a safe default in `services/telegram_inbound_service.py:_inbound_enabled`
-  (default `false`).
-- **Code default:** `false` (`services/telegram_inbound_service._inbound_enabled`)
-- **What it gates:** when `true`, `init_telegram_inbound_service` (called at boot
-  from `app.py`) starts the Phase-6 INBOUND Telegram poller and registers the
-  08:45 IST `telegram_inbound_morning_prompt` APScheduler job. The bot lets the
-  operator set the unified `strategy_daily_intent` row (run/pause/halt + capital
-  cap) from the phone. When `false` (default) the whole module is a no-op — no
-  poller, no scheduler job. **Mode flips are never exposed via Telegram** (intent
-  axis + cap only); a Telegram intent change preserves the row's existing routing
-  mode. Authorization gates on the `bot_config.telegram_chat_ids` allowlist.
+#### TELEGRAM_INBOUND_ENABLED (DEPRECATED — no-op as of 2026-06-30, issue #238)
+- **Current value:** `false` (default; ships cold). **Value is ignored at
+  runtime** — the flag is no longer read by any service.
+- **Set in:** `.sample.env` carries the line for backward compatibility, marked
+  deprecated. Existing `.env` files with this line continue to parse fine.
+- **What it does today:** **nothing functionally.** If set to a truthy value
+  (`1`/`true`/`yes`/`on`), `app.py` logs exactly one WARNING line at boot
+  (`"TELEGRAM_INBOUND_ENABLED is deprecated and has no effect. The OpenAlgo UI
+  (Telegram Bot page) is now the sole start/stop control."`) to surface the
+  stale operator config; otherwise it is silent. The single source of truth
+  for starting/stopping the Telegram bot is the OpenAlgo UI's Start Bot /
+  Stop Bot button on `/telegram`.
 - **History:**
   - **2026-06-10:** Introduced with the Phase-6 inbound bot
-    (feat/sector-rotation-etf → `00737983`). Default `false` so deploy starts no
-    poller; operator opts in by adding their chat_id to
-    `bot_config.telegram_chat_ids` (or `add_authorized_chat_id`) and flipping the
-    flag to `true`, then restarting. Single-poller-per-token caveat: do not run
-    the full interactive `telegram_bot_service` poller on the same bot token
-    while this is enabled. Design: `docs/design/telegram_inbound.md`.
-- **Related state:** `db/openalgo.db` → `bot_config.telegram_chat_ids` (new column,
-  comma-separated allowlist; idempotent ALTER-TABLE migration adds it) and the
-  reused Fernet-encrypted `bot_config.token`; writes `strategy_daily_intent`.
-- **Test coverage:** `test/e2e/test_critical_flows.py`
-  (`TestTelegramInboundEndToEnd`, `TestChatAllowlist`).
+    (feat/sector-rotation-etf → `00737983`). Default `false`; truthy started
+    the inbound poller in addition to the legacy bot.
+  - **2026-06-12 (B5, mode-only):** intent commands retired to a deprecation
+    notice; the poller still ran and served `/status`.
+  - **2026-06-30 (issue #238):** the poller itself is retired as a runtime
+    service. `app.py` no longer calls `init_telegram_inbound_service`; the
+    `notify()` inbound-bot fallback in `notification_service` is removed; the
+    flag is now a no-op. Reason: two pollers on the same bot token logged
+    1,031 `telegram.error.Conflict` entries on a single trading day; a single
+    UI control surface (Start/Stop button) makes the race structurally
+    impossible. Module `services/telegram_inbound_service.py` stays as dead
+    code so straggler imports do not crash.
+- **Test coverage:** `test/test_telegram_single_ui_control.py` asserts the
+  boot-time WARNING-on-truthy, no-WARNING-on-falsy, no inbound init call,
+  notify-suppresses-when-bot-stopped, and the no-fall-through-on-send-failure
+  contract.
 
 ### Scanner — Chartink BUY rule
 
