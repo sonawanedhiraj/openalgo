@@ -259,7 +259,20 @@ def process_zerodha_csv(path):
         + df["instrumenttype"]
     )
 
-    # NSE Index Symbol Mapping (Zerodha tradingsymbol → OpenAlgo format)
+    # NSE Index Symbol Mapping (Zerodha tradingsymbol → OpenAlgo format).
+    #
+    # Two-pass strategy: (1) apply the explicit allowlist for indices whose
+    # OpenAlgo symbol is NOT just a space-stripped form of the Zerodha
+    # tradingsymbol (e.g. ``NIFTY 50 → NIFTY``, ``NIFTY BANK → BANKNIFTY``).
+    # (2) for any remaining NSE_INDEX row that still has spaces, strip them
+    # so a NIFTY sectoral index Zerodha adds in the future (or that wasn't
+    # in the old allowlist — e.g. ``NIFTY OIL AND GAS`` and
+    # ``NIFTY CONSR DURBL``, the two callers in issue #241) gets the
+    # canonical space-stripped OpenAlgo form automatically.
+    #
+    # Pass-2 only runs against rows whose ``exchange`` is ``NSE_INDEX``, so
+    # NSE equities with spaces in their tradingsymbol (unlikely but
+    # theoretically possible) are not touched.
     df["symbol"] = df["symbol"].replace(
         {
             # Major NSE Indices
@@ -278,6 +291,7 @@ def process_zerodha_csv(path):
             "NIFTY ALPHA 50": "NIFTYALPHA50",
             "NIFTY AUTO": "NIFTYAUTO",
             "NIFTY COMMODITIES": "NIFTYCOMMODITIES",
+            "NIFTY CONSR DURBL": "NIFTYCONSRDURBL",
             "NIFTY CONSUMPTION": "NIFTYCONSUMPTION",
             "NIFTY CPSE": "NIFTYCPSE",
             "NIFTY DIV OPPS 50": "NIFTYDIVOPPS50",
@@ -289,6 +303,7 @@ def process_zerodha_csv(path):
             "NIFTY MEDIA": "NIFTYMEDIA",
             "NIFTY METAL": "NIFTYMETAL",
             "NIFTY MNC": "NIFTYMNC",
+            "NIFTY OIL AND GAS": "NIFTYOILANDGAS",
             "NIFTY PHARMA": "NIFTYPHARMA",
             "NIFTY PSE": "NIFTYPSE",
             "NIFTY PSU BANK": "NIFTYPSUBANK",
@@ -326,6 +341,22 @@ def process_zerodha_csv(path):
             "NIFTY GS 8 13YR": "NIFTYGS813YR",
             "NIFTY GS COMPSITE": "NIFTYGSCOMPSITE",
         }
+    )
+
+    # Pass 2: for any NSE_INDEX row whose ``symbol`` still contains a space
+    # (i.e. wasn't caught by the explicit allowlist above), strip the spaces
+    # so a Zerodha tradingsymbol like ``NIFTY OIL AND GAS`` becomes the
+    # canonical OpenAlgo form ``NIFTYOILANDGAS``. Scoped to NSE_INDEX so it
+    # cannot affect NSE equities or futures/options (futures/options live on
+    # NFO and their symbol was already reconstructed above).
+    #
+    # Belt-and-braces: the explicit map's space-stripping pairs above also
+    # remain in place, so symbols Zerodha already lists in the allowlist keep
+    # their well-known OpenAlgo names unchanged. This pass-2 only fires on
+    # *additional* NIFTY indices Zerodha adds (the issue #241 root cause).
+    nse_idx_mask = (df["exchange"] == "NSE_INDEX") & df["symbol"].str.contains(" ", na=False)
+    df.loc[nse_idx_mask, "symbol"] = df.loc[nse_idx_mask, "symbol"].str.replace(
+        " ", "", regex=False
     )
 
     # BSE Index Symbol Mapping (applied only to BSE_INDEX rows to avoid

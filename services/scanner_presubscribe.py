@@ -53,18 +53,59 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Symbols that Zerodha exposes only under the NSE_INDEX exchange. The scanner
-# universe (SCANNER_SYMBOLS) interleaves these 5 indices with ~210 equities;
+# Symbols that the broker exposes only under the NSE_INDEX exchange. The
+# scanner universe (SCANNER_SYMBOLS) and the aggregator union
+# (compute_aggregator_symbols) interleave these indices with ~210 equities;
 # subscribing them under plain "NSE" yields a "token not found" error and they
-# never stream. Kept as a superset (SENSEX/BANKEX/INDIAVIX) so the helper is
-# correct for any index a future config adds.
+# never stream — the issue #241 root cause for the 11 sectoral indices that
+# warned on 2026-06-30.
+#
+# Kept as a superset of every index any in-tree consumer (scanner,
+# sector_follow mapped indices, REGIME_SECTOR_SYMBOLS, ws_recovery default
+# universe) can ask for. Adding a future sectoral index here is cheap; the
+# cost of missing one is a silent feed gap on every restart.
 INDEX_SYMBOLS = {
+    # Major broad-market indices
     "NIFTY",
     "BANKNIFTY",
     "FINNIFTY",
     "MIDCPNIFTY",
     "NIFTYNXT50",
     "INDIAVIX",
+    "NIFTY100",
+    "NIFTY200",
+    "NIFTY500",
+    # Sectoral indices — the issue #241 set (11) plus close siblings that
+    # consumers like REGIME_SECTOR_SYMBOLS and sector_follow's sector_map
+    # already reference today.
+    "NIFTYAUTO",
+    "NIFTYCOMMODITIES",
+    "NIFTYCONSRDURBL",
+    "NIFTYCONSUMPTION",
+    "NIFTYCPSE",
+    "NIFTYENERGY",
+    "NIFTYFMCG",
+    "NIFTYHEALTHCARE",
+    "NIFTYINFRA",
+    "NIFTYIT",
+    "NIFTYMEDIA",
+    "NIFTYMETAL",
+    "NIFTYMNC",
+    "NIFTYOILANDGAS",
+    "NIFTYPHARMA",
+    "NIFTYPSE",
+    "NIFTYPSUBANK",
+    "NIFTYPVTBANK",
+    "NIFTYREALTY",
+    "NIFTYSERVSECTOR",
+    # Market-cap indices
+    "NIFTYMIDCAP50",
+    "NIFTYMIDCAP100",
+    "NIFTYMIDCAP150",
+    "NIFTYSMLCAP50",
+    "NIFTYSMLCAP100",
+    "NIFTYSMLCAP250",
+    # BSE index siblings (kept for any future consumer)
     "SENSEX",
     "BANKEX",
 }

@@ -135,10 +135,41 @@ def test_fire_with_no_callbacks_is_noop():
         ("RELIANCE", "NSE"),
         ("TCS", "NSE"),
         ("HDFCBANK", "NSE"),
+        # ETFs with NIFTY prefix MUST remain on NSE (they are equity
+        # instruments, not indices) — guards against a regression that
+        # naively prefix-matches "NIFTY*" → NSE_INDEX.
+        ("NIFTYBEES", "NSE"),
+        ("NIFTYBETF", "NSE"),
+        ("NIFTYIETF", "NSE"),
     ],
 )
 def test_resolve_exchange_for_symbol(symbol, expected):
     assert sps.resolve_exchange_for_symbol(symbol) == expected
+
+
+# Issue #241: the 11 NSE sectoral indices that warned "Token not found on NSE"
+# on 2026-06-30 must route to NSE_INDEX so pre-subscribe actually reaches the
+# broker-side token. Each warned twice/day (per WS connection attempt) until
+# this routing fix landed.
+_ISSUE_241_NSE_INDEX_SECTORAL = (
+    "NIFTYAUTO",
+    "NIFTYREALTY",
+    "NIFTYPVTBANK",
+    "NIFTYPSUBANK",
+    "NIFTYPHARMA",
+    "NIFTYOILANDGAS",
+    "NIFTYMETAL",
+    "NIFTYIT",
+    "NIFTYFMCG",
+    "NIFTYCONSUMPTION",
+    "NIFTYCONSRDURBL",
+)
+
+
+@pytest.mark.parametrize("symbol", _ISSUE_241_NSE_INDEX_SECTORAL)
+def test_resolve_exchange_routes_issue_241_sectorals_to_nse_index(symbol):
+    """Each of the 11 issue-241 sectoral indices must route to NSE_INDEX."""
+    assert sps.resolve_exchange_for_symbol(symbol) == "NSE_INDEX"
 
 
 # ---------------------------------------------------------------------------
