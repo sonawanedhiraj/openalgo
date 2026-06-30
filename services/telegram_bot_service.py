@@ -801,6 +801,32 @@ class TelegramBotService:
             if self.is_running:
                 return False, "Bot is already running"
 
+            # Issue #238: the inbound poller and this legacy interactive poller
+            # both call getUpdates on the same bot token; Telegram only allows
+            # one. When TELEGRAM_INBOUND_ENABLED is truthy the inbound service
+            # owns the token, so this poller must NOT start — otherwise the
+            # logs fill with `telegram.error.Conflict: terminated by other
+            # getUpdates request`. The legacy bot's *outbound* send paths
+            # (send_alert / send_broadcast / notification_service fallback)
+            # remain available — only the poller is gated. Local helper to
+            # avoid an import cycle with services.telegram_inbound_service;
+            # canonical helper is services.telegram_inbound_service._inbound_enabled.
+            if os.getenv("TELEGRAM_INBOUND_ENABLED", "false").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            ):
+                logger.info(
+                    "Telegram inbound poller owns the token "
+                    "(TELEGRAM_INBOUND_ENABLED=true); legacy interactive bot "
+                    "will not start polling."
+                )
+                # Clear any stale is_active=True row from a prior session so
+                # /telegram and similar status surfaces reflect reality.
+                update_bot_config({"is_active": False})
+                return True, "Inbound poller owns the token; legacy poller suppressed"
+
             config = get_bot_config()
             if not config or not config.get("bot_token"):
                 return False, "Bot token not configured"

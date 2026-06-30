@@ -937,6 +937,40 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Telegram inbound service: {e}")
 
+            # Issue #238: boot-time invariant — when the inbound poller owns
+            # the bot token (TELEGRAM_INBOUND_ENABLED truthy), no other surface
+            # may show the legacy interactive bot as active. A prior session
+            # could have persisted ``bot_config.is_active=True``; if any code
+            # path then auto-starts the legacy poller it would race against
+            # the inbound poller and Telegram would return repeated
+            # `getUpdates Conflict` errors (the 1,031/day flood on
+            # 2026-06-30). Force the row to is_active=False so the state on
+            # disk matches reality.
+            try:
+                if os.getenv("TELEGRAM_INBOUND_ENABLED", "false").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                ):
+                    from database.telegram_db import (
+                        get_bot_config as _get_bot_config_238,
+                    )
+                    from database.telegram_db import (
+                        update_bot_config as _update_bot_config_238,
+                    )
+
+                    _cfg_238 = _get_bot_config_238()
+                    if _cfg_238 and _cfg_238.get("is_active"):
+                        logger.warning(
+                            "TELEGRAM_INBOUND_ENABLED=true but "
+                            "bot_config.is_active=True from a prior session; "
+                            "forcing is_active=False to prevent dual-poller Conflict"
+                        )
+                        _update_bot_config_238({"is_active": False})
+            except Exception as e:
+                logger.error(f"Failed boot-time bot_config.is_active enforcement: {e}")
+
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
             # scanner and the regime classifier. Replaces the old one-shot 30s
             # boot poll (which lost the race against the morning Zerodha login,
