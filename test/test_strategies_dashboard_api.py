@@ -101,6 +101,21 @@ def strategies_dir(tmp_path):
         encoding="utf-8",
     )
 
+    # simplified_engine — folder name only; journal rows live under
+    # strategy_name='trending_equity_intraday' (bridged in the blueprint).
+    se = tmp_path / "simplified_engine"
+    se.mkdir()
+    (se / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "v1.1",
+                "deployable": True,
+                "config": {"mode": "sandbox", "capital": 20000},
+            }
+        ),
+        encoding="utf-8",
+    )
+
     # futures_follow_cap50
     ff = tmp_path / "futures_follow_cap50"
     ff.mkdir()
@@ -156,17 +171,22 @@ def wired_dbs(monkeypatch):
     from database import (
         strategy_runtime_override_db as srodb,
     )
+    from database import (
+        trade_journal_db as tjdb,
+    )
 
     sf_eng, sf_sess = _mk_engine()
     ff_eng, ff_sess = _mk_engine()
     sm_eng, sm_sess = _mk_engine()
     sr_eng, sr_sess = _mk_engine()
+    tj_eng, tj_sess = _mk_engine()
 
     # Create tables on the in-memory engines
     sfdb.Base.metadata.create_all(sf_eng)
     ffdb.Base.metadata.create_all(ff_eng)
     smdb.Base.metadata.create_all(sm_eng)
     srodb.Base.metadata.create_all(sr_eng)
+    tjdb.Base.metadata.create_all(tj_eng)
 
     # Patch the database modules (for ORM lookups that go through the module)
     monkeypatch.setattr(sfdb, "engine", sf_eng)
@@ -177,6 +197,8 @@ def wired_dbs(monkeypatch):
     monkeypatch.setattr(smdb, "db_session", sm_sess)
     monkeypatch.setattr(srodb, "engine", sr_eng)
     monkeypatch.setattr(srodb, "db_session", sr_sess)
+    monkeypatch.setattr(tjdb, "engine", tj_eng)
+    monkeypatch.setattr(tjdb, "db_session", tj_sess)
 
     # ALSO patch the blueprint's module-level session aliases — these are bound
     # at import time and would otherwise still point at the live-DB sessions.
@@ -184,17 +206,19 @@ def wired_dbs(monkeypatch):
     monkeypatch.setattr(sda, "ff_session", ff_sess)
     monkeypatch.setattr(sda, "mode_session", sm_sess)
     monkeypatch.setattr(sda, "override_session", sr_sess)
+    monkeypatch.setattr(sda, "journal_session", tj_sess)
 
     yield {
         "sf": (sf_eng, sf_sess, sfdb),
         "ff": (ff_eng, ff_sess, ffdb),
         "sm": (sm_eng, sm_sess, smdb),
         "sr": (sr_eng, sr_sess, srodb),
+        "tj": (tj_eng, tj_sess, tjdb),
     }
 
-    for sess in (sf_sess, ff_sess, sm_sess, sr_sess):
+    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess):
         sess.remove()
-    for eng in (sf_eng, ff_eng, sm_eng, sr_eng):
+    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng):
         eng.dispose()
 
 
@@ -535,3 +559,141 @@ def test_expired_override_is_ignored(app, wired_dbs):
     # Expired → should be healthy (no active overrides)
     assert ff["health"] == "healthy"
     assert ff["active_overrides"] == []
+
+
+# ---------------------------------------------------------------------------
+# simplified_engine: folder-name vs journal-name bridge (issue #235)
+# ---------------------------------------------------------------------------
+#
+# The simplified_stock_engine writes every trade_journal row under
+# strategy_name='trending_equity_intraday'. The dashboard surfaces these under
+# the folder name 'simplified_engine' via the _SIMPLIFIED_ENGINE_JOURNAL_NAME
+# constant. Regression-guards the bridge: if someone renames either side
+# without updating the other, today's trades vanish from the dashboard.
+
+
+def _seed_journal_row(tjdb, sess, **kwargs):
+    """Insert a trade_journal row with sane defaults."""
+    now_iso = dt.datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
+    defaults = {
+        "placed_at": now_iso,
+        "symbol": "RVNL",
+        "direction": "LONG",
+        "quantity": 100,
+        "strategy_name": "trending_equity_intraday",
+        "signal_source": "chartink",
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    defaults.update(kwargs)
+    sess.add(tjdb.TradeJournal(**defaults))
+    sess.commit()
+
+
+def test_list_simplified_engine_surfaces_today_trades(app, wired_dbs):
+    """A trade_journal row tagged trending_equity_intraday today should appear
+    in the /list response under name='simplified_engine'."""
+    tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today_iso = dt.datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
+    _seed_journal_row(
+        tjdb,
+        tj_sess,
+        placed_at=today_iso,
+        entry_price=240.0,
+        entry_order_id="ord_open",
+    )  # open
+    _seed_journal_row(
+        tjdb,
+        tj_sess,
+        placed_at=today_iso,
+        symbol="INDIANB",
+        entry_price=815.0,
+        exited_at=today_iso,
+        exit_price=820.0,
+        exit_reason="stop_loss",
+        pnl=500.0,
+    )  # closed with realized P&L
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    body = resp.get_json()
+    se = next(s for s in body["data"] if s["name"] == "simplified_engine")
+    assert se["open_positions"] == 1
+    assert se["today_trade_count"] == 2
+    assert se["today_net_pnl"] == 500.0
+    assert se["last_trade_at"] is not None
+
+
+def test_detail_simplified_engine_recent_trades(app, wired_dbs):
+    """A seeded journal row should appear in /<name>'s recent_trades."""
+    tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today_iso = dt.datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
+    _seed_journal_row(
+        tjdb,
+        tj_sess,
+        placed_at=today_iso,
+        symbol="PERSISTENT",
+        direction="SHORT",
+        quantity=20,
+        entry_price=4338.0,
+        exited_at=today_iso,
+        exit_price=4321.0,
+        exit_reason="stop_loss",
+        pnl=340.0,
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+
+    data = resp.get_json()["data"]
+    assert data["name"] == "simplified_engine"
+    sandbox = data["performance"]["sandbox"]
+    assert sandbox["open_positions"] == 0
+    assert sandbox["today_net_pnl"] == 340.0
+    trades = data["recent_trades"]
+    assert len(trades) == 1
+    assert trades[0]["symbol"] == "PERSISTENT"
+    assert trades[0]["side"] == "SHORT"
+    assert trades[0]["exit_reason"] == "stop_loss"
+    assert trades[0]["pnl"] == 340.0
+
+
+def test_pnl_curve_simplified_engine(app, wired_dbs):
+    """Realized-pnl exit rows should aggregate per exit date."""
+    tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_journal_row(
+        tjdb,
+        tj_sess,
+        placed_at="2026-06-28T10:00:00+05:30",
+        exited_at="2026-06-28T14:00:00+05:30",
+        pnl=200.0,
+    )
+    _seed_journal_row(
+        tjdb,
+        tj_sess,
+        placed_at="2026-06-29T10:00:00+05:30",
+        exited_at="2026-06-29T14:00:00+05:30",
+        pnl=300.0,
+    )
+    # Abandoned-watchdog row (no pnl) — must be excluded from the curve
+    _seed_journal_row(
+        tjdb,
+        tj_sess,
+        placed_at="2026-06-29T15:08:00+05:30",
+        exited_at="2026-06-29T15:14:00+05:30",
+        exit_reason="abandoned_eod_watchdog",
+        pnl=None,
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine/pnl-curve")
+
+    points = resp.get_json()["data"]["points"]
+    assert points == [
+        {"date": "2026-06-28", "pnl": 200.0},
+        {"date": "2026-06-29", "pnl": 300.0},
+    ]

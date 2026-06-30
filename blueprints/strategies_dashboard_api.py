@@ -53,6 +53,8 @@ from database.sector_follow_db import db_session as sf_session
 from database.strategy_mode_db import StrategyMode
 from database.strategy_mode_db import db_session as mode_session
 from database.strategy_runtime_override_db import db_session as override_session
+from database.trade_journal_db import TradeJournal
+from database.trade_journal_db import db_session as journal_session
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -65,6 +67,14 @@ _STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"
 
 # Strategies to surface (read from filesystem, filtered below)
 _EXCLUDE_NAMES = {"examples", "scripts", "__pycache__", "STRATEGY_REGISTRY.md", "README.md"}
+
+# Bridge: dashboard folder name → trade_journal.strategy_name. The
+# simplified_stock_engine journals every row as ``trending_equity_intraday``
+# (the registered strategy name; see SimplifiedStockEngineService.JOURNAL_STRATEGY_NAME
+# in services/simplified_stock_engine_service.py). Renaming the journal value is
+# load-bearing across ~28 files (reconciliation, backtest, registry, tests), so
+# the dashboard bridges the two names here instead.
+_SIMPLIFIED_ENGINE_JOURNAL_NAME = "trending_equity_intraday"
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +234,45 @@ def _futures_follow_stats(since: datetime | None = None) -> dict:
         }
 
 
+def _simplified_engine_stats(since: datetime | None = None) -> dict:
+    """Aggregate today's P&L and position stats from trade_journal rows tagged
+    with the simplified_stock_engine's registered name.
+
+    ``placed_at`` / ``exited_at`` are stored as ISO-8601 strings with a fixed
+    ``+05:30`` suffix (the engine writes them via ``datetime.now(IST).isoformat()``),
+    so ``startswith(YYYY-MM-DD)`` is a correct date filter — no timezone math.
+    """
+    name = _SIMPLIFIED_ENGINE_JOURNAL_NAME
+    try:
+        q = journal_session.query(TradeJournal).filter(TradeJournal.strategy_name == name)
+        if since is not None:
+            q = q.filter(TradeJournal.placed_at >= since.isoformat())
+        rows = q.all()
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        open_positions = sum(1 for r in rows if r.exited_at is None)
+        today_entries = [r for r in rows if (r.placed_at or "").startswith(today_str)]
+        today_exits = [
+            r for r in rows if (r.exited_at or "").startswith(today_str) and r.pnl is not None
+        ]
+        today_net_pnl = round(sum(r.pnl for r in today_exits), 2)
+        last_placed = max((r.placed_at for r in rows if r.placed_at), default=None)
+        return {
+            "open_positions": open_positions,
+            "today_net_pnl": today_net_pnl,
+            "today_trade_count": len(today_entries),
+            "last_trade_at": last_placed,
+        }
+    except Exception:
+        logger.exception("Failed to aggregate simplified_engine_stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_trade_count": 0,
+            "last_trade_at": None,
+        }
+
+
 def _pnl_curve_sector_follow(window_days: int | None) -> list[dict]:
     """Daily P&L series from sector_follow_trades (SELL rows carry realized P&L)."""
     try:
@@ -263,6 +312,36 @@ def _pnl_curve_futures_follow(window_days: int | None) -> list[dict]:
         return []
 
 
+def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
+    """Daily realized-P&L series from trade_journal exit rows tagged with the
+    simplified_stock_engine's registered name.
+
+    Only rows with a non-null ``pnl`` count — abandoned EOD-watchdog rows
+    (no exit fill) carry no realized P&L and are intentionally excluded.
+    """
+    name = _SIMPLIFIED_ENGINE_JOURNAL_NAME
+    try:
+        q = journal_session.query(TradeJournal).filter(
+            TradeJournal.strategy_name == name,
+            TradeJournal.exited_at.isnot(None),
+            TradeJournal.pnl.isnot(None),
+        )
+        if window_days:
+            cutoff = (datetime.now(_IST) - timedelta(days=window_days)).isoformat()
+            q = q.filter(TradeJournal.exited_at >= cutoff)
+        rows = q.all()
+        by_date: dict[str, float] = {}
+        for r in rows:
+            d = (r.exited_at or "")[:10]
+            if not d:
+                continue
+            by_date[d] = by_date.get(d, 0.0) + (r.pnl or 0.0)
+        return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
+    except Exception:
+        logger.exception("Failed to build pnl_curve for simplified_engine")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Health LED
 # ---------------------------------------------------------------------------
@@ -296,6 +375,8 @@ def _build_summary(name: str) -> dict:
         stats = _sector_follow_stats()
     elif name == "futures_follow_cap50":
         stats = _futures_follow_stats()
+    elif name == "simplified_engine":
+        stats = _simplified_engine_stats()
 
     return {
         "name": name,
@@ -375,6 +456,13 @@ def strategy_detail(name: str):
             "open_positions": stats["open_positions"],
             "last_trade_at": stats["last_trade_at"],
         }
+    elif name == "simplified_engine":
+        stats = _simplified_engine_stats()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "last_trade_at": stats["last_trade_at"],
+        }
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []
@@ -430,6 +518,32 @@ def strategy_detail(name: str):
             ]
         except Exception:
             logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == "simplified_engine":
+        try:
+            rows = (
+                journal_session.query(TradeJournal)
+                .filter(TradeJournal.strategy_name == _SIMPLIFIED_ENGINE_JOURNAL_NAME)
+                .order_by(TradeJournal.id.desc())
+                .limit(50)
+                .all()
+            )
+            recent_trades = [
+                {
+                    "id": r.id,
+                    "side": r.direction,
+                    "symbol": r.symbol,
+                    "quantity": r.quantity,
+                    "entry_price": r.entry_price,
+                    "exit_price": r.exit_price,
+                    "pnl": r.pnl,
+                    "exit_reason": r.exit_reason,
+                    "placed_at": r.placed_at,
+                    "exited_at": r.exited_at,
+                }
+                for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
 
     return jsonify(
         {
@@ -474,6 +588,8 @@ def pnl_curve(name: str):
         points = _pnl_curve_sector_follow(window_days)
     elif name == "futures_follow_cap50":
         points = _pnl_curve_futures_follow(window_days)
+    elif name == "simplified_engine":
+        points = _pnl_curve_simplified_engine(window_days)
     # Other strategies: empty series (no journal yet)
 
     return jsonify({"status": "success", "data": {"window": window, "points": points}})
