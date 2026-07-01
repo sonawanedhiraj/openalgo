@@ -47,19 +47,14 @@ def check_webhook_strategy_configured() -> PreflightCheck:
     operator sees 0 trades regardless of Chartink activity.
     """
     try:
-        from database.strategy_db import db_session
-        from database.strategy_db import strategy_model as strategy_mod
+        from database.strategy_db import Strategy, db_session
 
         try:
             # Probe for any active strategy. The simplified engine's exact
             # routing keys are operator-configured (per the webhook URL the
             # operator sets in Chartink), so this is a coarse but reliable
             # presence check.
-            n_active = (
-                db_session.query(strategy_mod.Strategy)
-                .filter_by(is_active=True)
-                .count()
-            )
+            n_active = db_session.query(Strategy).filter_by(is_active=True).count()
         finally:
             db_session.remove()
     except Exception:

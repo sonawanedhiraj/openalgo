@@ -242,6 +242,47 @@ def test_se_blocks_when_no_active_strategy_rows(se_preflight):
     assert "active strategy" in (check.blocker_message or "").lower()
 
 
+def test_se_probe_uses_real_strategy_db_import(se_preflight, monkeypatch):
+    """Regression (#162): the probe must import the REAL database.strategy_db
+    symbols (Strategy + db_session). The original code imported a non-existent
+    name (`from database.strategy_db import strategy_model as strategy_mod`),
+    which raised ImportError and failed the check closed with
+    "Could not probe strategy_db ..." — blocking EVERY live flip. The sibling
+    tests missed it because they inject a MagicMock module (auto-creating any
+    attribute name). This exercises the real import against an in-memory DB.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import scoped_session, sessionmaker
+
+    import database.strategy_db as sdb
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(sdb, "engine", eng)
+    monkeypatch.setattr(sdb, "db_session", sess)
+    sdb.Base.query = sess.query_property()
+    sdb.Base.metadata.create_all(eng)
+
+    # No active rows → coarse presence check blocks (NOT the probe-error path).
+    check = se_preflight.check_webhook_strategy_configured()
+    assert check.passed is False
+    assert "no active strategy" in (check.blocker_message or "").lower()
+    assert "could not probe" not in (check.blocker_message or "").lower()
+
+    # An active strategy row → probe passes (proves the real import resolves).
+    sess.add(
+        sdb.Strategy(
+            name="chartink_FnO_intraday_buy",
+            webhook_id="wh-regression-1",
+            user_id="op",
+            is_active=True,
+        )
+    )
+    sess.commit()
+    check2 = se_preflight.check_webhook_strategy_configured()
+    assert check2.passed is True
+
+
 def test_se_composes_defaults_with_webhook_gate(se_preflight):
     """Happy path: defaults pass + active strategy rows → flip allowed."""
     defaults = PreflightResult(can_flip=True, blockers=[], warnings=[], snapshot={"defaults": True})
