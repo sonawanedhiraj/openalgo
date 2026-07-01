@@ -91,6 +91,23 @@ def _divergence_warn_pct() -> float:
         return 0.5
 
 
+def _divergence_block_enabled() -> bool:
+    """``SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED`` env flag (default true).
+
+    When on, a today_d.close that diverges beyond
+    ``SCANNER_RULE_DIVERGENCE_WARN_PCT`` from the latest 5m close REJECTS the
+    symbol (no hit) — a stale-data SELL can never fire on a frozen morning
+    crash even if Path B in ``derive_today_and_yest`` regresses.
+    Defense-in-depth on top of the WARNING.
+    """
+    return os.environ.get("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
 def _reject_missing(symbol: str, reason: str) -> bool:
     """Loudly log a missing-input rejection (Tier-1 Fix #2), then return False.
 
@@ -268,6 +285,19 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
                     logger.exception(
                         "fno_intraday_sell_chartink %s: divergence alert dispatch failed", sym
                     )
+                # Defense-in-depth: REJECT the symbol on divergence when the
+                # block flag is on. A stale morning-crash snapshot can never
+                # fire a SELL after the live price has rebounded, even if the
+                # Path-B `ts`-column fix in derive_today_and_yest regresses.
+                if _divergence_block_enabled():
+                    logger.warning(
+                        "fno_intraday_sell_chartink %s: REJECTING on divergence "
+                        "(block flag on) — today_d.close=%.2f vs 5m=%.2f",
+                        sym,
+                        today_d.close,
+                        last_5m_close,
+                    )
+                    return False
         except (TypeError, ValueError, KeyError, IndexError):
             logger.debug("fno_intraday_sell_chartink %s: divergence check skipped", sym)
 

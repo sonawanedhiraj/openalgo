@@ -40,8 +40,17 @@ def _freeze(monkeypatch, hour, minute=0):
 
 @pytest.fixture(autouse=True)
 def _default_post_close(monkeypatch):
-    """All tests default to 16:00 IST (post-settle → -1/-2 indexing)."""
+    """All tests default to 16:00 IST (post-settle → -1/-2 indexing).
+
+    Also disable the divergence BLOCK flag by default: the synthetic gate-logic
+    fixtures build the daily and 5m frames independently, so today_d.close (from
+    the daily bar via legacy Path A) legitimately diverges from the 5m close —
+    an artifact of the test setup, not a production condition (in production
+    Path B, today_d.close IS the live 5m close). The dedicated divergence-block
+    tests below opt the flag back on explicitly.
+    """
     _freeze(monkeypatch, 16, 0)
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "false")
 
 
 # --------------------------------------------------------------------------- #
@@ -544,3 +553,92 @@ def test_rule_short_history_is_debug_not_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
         assert rule(None, ind) is False
     assert not any("rejecting" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Live `ts`-column frame: morning crash but REBOUNDED by now → NO sell
+#
+# The core bug fix. Historify's daily bar is a frozen ~09:45 morning-crash
+# snapshot; the live tick tape has since recovered. With Path B reading the
+# live `ts`-column 5m aggregate, today_d.close is the rebounded price so the
+# gap-down gate no longer fires. Previously (Path B dead) the frozen crash
+# close fired a spurious SELL (KPITTECH/TATAELXSI 2026-06-29 misfire).
+# --------------------------------------------------------------------------- #
+def _attach_5m_ts_datetime(bars_5m, today_date):
+    """Attach a ``ts`` column of NAIVE IST datetimes (the live aggregator shape,
+    what ``ScannerService._append_bar`` produces), dated ``today_date``."""
+    bars_5m = bars_5m.reset_index(drop=True).copy()
+    start = _RealDateTime(today_date.year, today_date.month, today_date.day, 9, 15)
+    bars_5m["ts"] = [start + _timedelta(minutes=5 * i) for i in range(len(bars_5m))]
+    return bars_5m
+
+
+def test_rebounded_stock_does_not_fire_sell(monkeypatch):
+    """Morning crash frozen in historify, but the LIVE 5m tape has rebounded
+    above the gap-down threshold → the SELL rule must NOT fire (today_d.close
+    reflects the live rebound via the `ts`-column Path B, not the frozen bar)."""
+    _freeze(monkeypatch, 11, 0)
+    today_date = _date(2026, 6, 4)
+    yest_date = today_date - _timedelta(days=1)
+
+    # Historify daily ends YESTERDAY at a flat 2000 (frozen — no today bar yet).
+    daily = make_daily_bars(n=30, flat_close=2000.0).iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, yest_date)
+
+    # Live 5m tape: opened crashing (1900) but has REBOUNDED to ~2010 by now,
+    # well above yest close 2000 → gap-down gate-1 (close < 2000*0.97) fails.
+    rebounded = make_5m_bars(n=20, start_close=1900.0, step=6.0)  # 1900 → 2014
+    bars_5m = _attach_5m_ts_datetime(rebounded, today_date)
+    assert float(bars_5m["close"].iloc[-1]) > 2000.0  # sanity: rebounded
+
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
+    ind["symbol"] = "KPITTECH"
+    assert rule(None, ind) is False
+
+
+# --------------------------------------------------------------------------- #
+# Divergence BLOCK — reject when the flag is on, only WARN when off
+# --------------------------------------------------------------------------- #
+def _divergent_bare_fixture():
+    """A synthetic (Path A) fixture whose today_d.close (daily iloc[-1]) diverges
+    from the latest 5m close by > the default 0.5% threshold. Passes all other
+    SELL gates so the ONLY reason it can be rejected is the divergence block."""
+    ind = happy()
+    b5 = ind["bars_5m"].copy()
+    # today_d.close = daily iloc[-1] close = 1900; push the last 5m close DOWN
+    # (keeps the SELL downtrend + supertrend-above-price gate intact) far enough
+    # to trip the 0.5% divergence threshold: 1870 is ~1.6% below 1900.
+    b5.loc[b5.index[-1], "close"] = 1870.0
+    ind["bars_5m"] = b5
+    ind["symbol"] = "INFY"
+    return ind
+
+
+def test_divergence_block_rejects_when_flag_on(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_PCT", "0.5")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "true")
+
+    ind = _divergent_bare_fixture()
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
+        assert rule(None, ind) is False
+    assert any("REJECTING on divergence" in r.message for r in caplog.records)
+
+
+def test_divergence_only_warns_when_block_flag_off(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_PCT", "0.5")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "false")
+
+    ind = _divergent_bare_fixture()
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
+        result = rule(None, ind)
+    # The divergence WARNING still fires, but the symbol is NOT rejected on
+    # divergence grounds (it passes all real SELL gates in this fixture).
+    assert any("diverges" in r.message for r in caplog.records)
+    assert not any("REJECTING on divergence" in r.message for r in caplog.records)
+    assert result is True
