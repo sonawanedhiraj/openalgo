@@ -156,6 +156,30 @@ def _make_service(mode: str) -> SimplifiedStockEngineService:
     return SimplifiedStockEngineService(config=config)
 
 
+@pytest.fixture(autouse=True)
+def _clear_persistent_mode_row():
+    """Issue #162 Phase 2: _place_entry_order/_place_exit_order now resolve the
+    persistent strategy_mode DB row via services.mode_service.resolve_mode. The
+    conftest temp DB is process-wide, and other suites write a 'simplified_engine'
+    row that would leak in and override these fixed-mode tests (a leaked sandbox
+    row flips a MODE_LIVE service to sandbox → place_order never called). Clear it
+    before AND after each test so routing is driven purely by the config the test
+    builds. Tests that exercise the DB path mock resolve_mode directly and are
+    unaffected by this cleanup."""
+
+    def _clear():
+        try:
+            from database import strategy_mode_db
+
+            strategy_mode_db.delete_mode("simplified_engine")
+        except Exception:
+            pass
+
+    _clear()
+    yield
+    _clear()
+
+
 def test_process_chartink_webhook_empty_returns_empty_status():
     """Zero-stock screener result is 'empty', not 'error' (reserve error for failures)."""
     service = _make_service(MODE_SANDBOX)
