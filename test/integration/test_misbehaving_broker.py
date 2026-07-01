@@ -50,6 +50,20 @@ from utils.event_bus import EventBus
 # --------------------------------------------------------------------------- #
 
 
+# Gap-detection gate (issue #258): every WSRecoveryService in this file models a
+# genuine *mid-session* reconnect (token expiry / 503 / disconnect DURING the
+# session), so pin a clock at 12:00 IST and a last-known-good bar at 11:30 IST
+# to drive the gate to "gap" and let recovery run. Without this, the #258 gate
+# would no-op these misbehaving-broker scenarios before they reach the behavior
+# under test.
+def _midsession_clock() -> dt.datetime:
+    return dt.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+
+
+def _midsession_last_ts() -> dt.datetime:
+    return dt.datetime.now().replace(hour=11, minute=30, second=0, microsecond=0)
+
+
 def _synthetic_bars(n: int = 20, start_minute: int = 15) -> list[dict]:
     """N consecutive 1m OHLCV bars starting at 09:{start_minute} today, in the
     shape ``WSRecoveryService`` expects (ts as naive datetime).
@@ -138,6 +152,8 @@ def test_ws_reinit_resumes_after_token_expiry():
         api_key_provider=lambda: "test-key",  # pragma: allowlist secret
         notifier=notifier,
         bus=bus,
+        clock=_midsession_clock,
+        last_known_ts_provider=_midsession_last_ts,
     )
     svc.register()
 
@@ -394,6 +410,8 @@ def test_ws_drop_triggers_recovery_replay_idempotently():
         api_key_provider=lambda: "test-key",  # pragma: allowlist secret
         notifier=notifier,
         bus=bus,
+        clock=_midsession_clock,
+        last_known_ts_provider=_midsession_last_ts,
     )
     svc.register()
 
@@ -466,6 +484,8 @@ def test_rate_limited_503_logs_and_alerts_never_silent(caplog):
         api_key_provider=lambda: "test-key",  # pragma: allowlist secret
         notifier=notifier,
         bus=bus,
+        clock=_midsession_clock,
+        last_known_ts_provider=_midsession_last_ts,
     )
     svc.register()
 
@@ -524,6 +544,8 @@ def test_recovery_aborts_loud_when_no_api_key():
         api_key_provider=lambda: None,  # token expired, not yet rotated
         notifier=notifier,
         bus=bus,
+        clock=_midsession_clock,
+        last_known_ts_provider=_midsession_last_ts,
     )
     svc.register()
 
