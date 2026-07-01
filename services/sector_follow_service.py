@@ -1482,16 +1482,17 @@ class SectorFollowService:
         # emitted 0 orders at 15:20 in LIVE. Honest gate: also verify index
         # coverage. Indices are looked up via the same intraday_provider
         # so the gate measures exactly what run_entry will see.
-        try:
-            from services.sector_follow_index_backfill import sector_index_symbols
-
-            indices = list(sector_index_symbols())
-        except Exception:
-            logger.exception(
-                "sector_follow smoke check: sector_index_symbols import failed — "
-                "treating as no indices (smoke will report 'index_universe_empty')"
-            )
-            indices = []
+        #
+        # #241 straggler: gate ONLY the indices the active sector_map actually
+        # references (what run_entry consumes via sector_map.get(sym)), NOT
+        # sector_index_symbols() — that appends the two defensive _ALWAYS_INCLUDE
+        # entries (NIFTYCONSRDURBL, NIFTYOILANDGAS) which no stock maps to after
+        # the Phase-3 RELIANCE/DIXON->NIFTY re-map, have no 1m feed, and whose
+        # names don't even match the master contract (NIFTY CONSR DURBL /
+        # NIFTY OIL AND GAS). Including them pinned index_coverage at a permanent
+        # 8/10, so the gate wrote a pause override EVERY day and held live equity
+        # entries. The mapped set is exactly the coverage run_entry requires.
+        indices = sorted(set(self.sector_map.values()))
 
         idx_total = len(indices)
         idx_have = 0

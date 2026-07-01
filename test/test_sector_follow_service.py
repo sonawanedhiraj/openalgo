@@ -1043,20 +1043,46 @@ def test_smoke_check_passes_when_pipeline_healthy(monkeypatch):
 def test_smoke_check_blocks_when_index_aggregator_empty(monkeypatch):
     """Issue #161 regression: stocks 100% covered but indices empty must
     BLOCK the flip (today's 2026-06-26 15:20 failure mode). Pre-#161 this
-    test would have PASSED — that was the bug."""
-    monkeypatch.setattr(
-        "services.sector_follow_index_backfill.sector_index_symbols",
-        lambda: ["NIFTY", "NIFTYAUTO"],
-    )
+    test would have PASSED — that was the bug. The smoke gate derives its
+    index set from the active sector_map (what run_entry consumes), so drive
+    two mapped indices via sector_map here."""
     intraday = {"AAA": (102.0, 2000.0)}  # stocks covered, indices empty
     history = {"AAA": _prior_days_history(close_fri=100.0)}
     svc = _make_real_service(intraday, history)
+    svc.sector_map = {"AAA": "NIFTY", "BBB": "NIFTYAUTO"}
     ok, details = svc.assert_data_pipeline_healthy()
     assert ok is False
     assert details["aggregator_ok"] is True  # stocks fine
     assert details["index_ok"] is False  # indices missing
     assert details["index_coverage"] == "0/2"
     assert set(details["index_missing"]) == {"NIFTY", "NIFTYAUTO"}
+
+
+def test_smoke_check_ignores_defensive_always_include_indices(monkeypatch):
+    """#241 straggler: the defensive _ALWAYS_INCLUDE backfill indices
+    (NIFTYCONSRDURBL / NIFTYOILANDGAS) — which no stock maps to, have no 1m
+    feed, and whose names don't match the master contract — must NOT gate the
+    smoke check. Only sector_map-referenced indices count. Otherwise the gate
+    was pinned at a permanent 8/10 and paused live equity entries every day.
+
+    sector_index_symbols() (backfill set) returns the defensive names, but the
+    smoke gate reads sector_map.values() instead, so those two absent indices
+    do not drop coverage.
+    """
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY", "NIFTYCONSRDURBL", "NIFTYOILANDGAS"],
+    )
+    # Only NIFTY is mapped + covered; the defensive indices are absent from
+    # intraday data but must be ignored by the gate.
+    intraday = {"AAA": (102.0, 2000.0), "NIFTY": (101.5, 0.0)}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history)  # sector_map = {"AAA": "NIFTY"}
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is True, details
+    assert details["index_ok"] is True
+    assert details["index_coverage"] == "1/1"  # only the mapped NIFTY, 100%
+    assert details["index_missing"] == []
 
 
 def test_smoke_check_aborts_entry_if_aggregator_empty_at_1518(monkeypatch):
