@@ -1,9 +1,15 @@
 """Stage-1 LLM veto layer — service-side glue.
 
-Sits between the simplified engine and the Claude Bridge's ``/review-signal``
-endpoint. Builds the operator/market context, calls the bridge with a short
-timeout, persists the result as a ``signal_decision`` row, and returns the
-decision for the engine to act on (or ignore, in shadow mode).
+Builds the operator/market context, invokes ``claude -p`` **in-process** (via
+``services.llm_review_client.invoke_claude_review`` — a blocking subprocess on a
+dedicated real OS thread, eventlet-safe), parses the model's decision block,
+persists the result as a ``signal_decision`` row, and returns the decision for
+the engine to act on (or ignore, in shadow mode).
+
+Phase 1 of #266 retired the Claude Bridge (``http://127.0.0.1:5001/review-signal``)
+from this path: the bridge was never auto-started, so every real veto call failed
+``ConnectError`` and fell safe to 'take' — the veto never actually fired. The
+reasoning call is now made directly, so 'active' finally means active.
 
 Hard rule: every error path returns ``decision='take'`` with
 ``reasoning='review_failed'``. The reviewer being unavailable must never block
@@ -15,25 +21,26 @@ Configuration (env, with defaults):
 * ``VETO_LAYER_MODE`` — 'off' | 'shadow' | 'active'. Default 'shadow'. Read by
   the engine to decide whether to enforce; this service stamps it onto the
   audit row regardless.
-* ``VETO_BRIDGE_URL`` — bridge endpoint. Default
-  ``http://127.0.0.1:5001/review-signal``.
 * ``VETO_CACHE_TTL_SECONDS`` — same (symbol, source) reuses a prior decision
   for this many seconds. Default 300 (5 min).
-* ``VETO_REQUEST_TIMEOUT_SECONDS`` — HTTP read timeout. Slightly longer than
-  the bridge's own 25s wall-clock so the bridge wins the race. Default 30.
+* ``VETO_CLAUDE_TIMEOUT_SECONDS`` — wall-clock budget for the ``claude -p``
+  subprocess. Default 25.
+* ``CLAUDE_CMD`` — override the ``claude`` binary path (read by
+  ``llm_review_client``). Default ``claude`` (resolved against PATH).
 """
 
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime
 from typing import Any
 
-import httpx
 import pytz
 
 from database import signal_decision_db
+from services.llm_review_client import invoke_claude_review
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -85,16 +92,12 @@ def get_veto_layer_mode(effective_mode: str | None = None) -> str:
     return "shadow"
 
 
-def _bridge_url() -> str:
-    return _env("VETO_BRIDGE_URL", "http://127.0.0.1:5001/review-signal")
-
-
 def _cache_ttl_seconds() -> float:
     return _env_float("VETO_CACHE_TTL_SECONDS", 300.0)
 
 
-def _request_timeout_seconds() -> float:
-    return _env_float("VETO_REQUEST_TIMEOUT_SECONDS", 30.0)
+def _claude_timeout_seconds() -> float:
+    return _env_float("VETO_CLAUDE_TIMEOUT_SECONDS", 25.0)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +362,156 @@ def _fetch_regime_snapshot() -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------------------
+# Review prompt + decision-block parsing (ported from bridge/server.py)
+# ---------------------------------------------------------------------------
+
+REVIEW_PROMPT_TEMPLATE = """You are reviewing a candidate trading signal for an Indian F&O intraday strategy.
+
+CANDIDATE:
+- Symbol: {symbol}
+- Source: {source}
+- Direction: {direction}        # BUY = long entry | SELL = short entry
+- Time: {candidate_at}
+
+OPERATOR CONTEXT:
+- Current positions: {positions_count} ({positions_summary})
+- P&L today: ₹{pnl_today}
+- Trades today: {trades_today}/{max_trades_today}
+
+MARKET CONTEXT (today):
+- NIFTY return: {nifty_pct}%
+- India VIX: {india_vix}
+
+REGIME SNAPSHOT:
+{regime_block}
+
+Decide whether the operator should take this signal. Use the stated Direction above — do NOT infer it from the Source string. Be conservative: skip when the broader market regime conflicts with the signal's stated Direction. For a BUY (long): skip on a -1% NIFTY day with elevated VIX, or when the stock's sector is bottom-3 today while leadership is concentrated elsewhere. For a SELL (short) the conflict is inverted: a strongly bullish regime / broad green breadth works against a short, while a weak/bearish regime is favourable for it. Also skip when the operator is already near their daily trade limit.
+
+Respond with a short reasoning paragraph followed by a final JSON block. The JSON block must be the LAST thing in your response and must contain exactly these keys:
+
+{{
+  "decision": "take" | "skip",
+  "reasoning": "1-2 sentence summary",
+  "confidence": 0.0 to 1.0
+}}
+"""
+
+
+def _format_regime_block(regime: dict | None) -> str:
+    """Render the regime snapshot dict as a small bullet list.
+
+    Returns ``"- unavailable"`` when the classifier didn't return data
+    (cache miss or empty universe) so the LLM treats it as missing
+    rather than zero. Only includes fields that are actually populated.
+    """
+    if not regime or not isinstance(regime, dict):
+        return "- unavailable"
+    lines: list[str] = []
+    for key in ("trend", "volatility", "breadth", "time_of_day"):
+        val = regime.get(key)
+        if val:
+            lines.append(f"- {key}: {val}")
+    leaders = regime.get("sector_leaders") or []
+    if leaders:
+        lines.append(f"- sector_leaders (top 3): {', '.join(leaders)}")
+    concentration = regime.get("sector_leader_concentration")
+    if concentration is not None:
+        lines.append(
+            f"- sector_leader_concentration: {float(concentration):.2f} "
+            "(>0.5 dominant, <0.2 broad rotation)"
+        )
+    top_sector_pct = regime.get("top_sector_pct") or {}
+    if top_sector_pct:
+        rendered = ", ".join(f"{sym} {float(pct):+.2f}%" for sym, pct in top_sector_pct.items())
+        lines.append(f"- top sectors today: {rendered}")
+    if not lines:
+        return "- unavailable"
+    return "\n".join(lines)
+
+
+def _format_review_prompt(candidate: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Interpolate the review prompt template.
+
+    Operator-state fields (positions, trades) render missing values as
+    ``unknown``. The three macro/portfolio numbers (nifty_pct, india_vix,
+    pnl_today) instead render as ``unavailable`` — they're best-effort live
+    fetches and the LLM should treat their absence as "data not retrievable",
+    not "value is zero".
+    """
+
+    def _or_unknown(value: Any) -> str:
+        if value is None:
+            return "unknown"
+        return str(value)
+
+    def _or_unavailable(value: Any) -> str:
+        if value is None:
+            return "unavailable"
+        return str(value)
+
+    return REVIEW_PROMPT_TEMPLATE.format(
+        symbol=candidate.get("symbol"),
+        source=candidate.get("source"),
+        direction=_or_unknown(candidate.get("direction")),
+        candidate_at=candidate.get("candidate_at"),
+        positions_count=_or_unknown(ctx.get("positions_count")),
+        positions_summary=_or_unknown(ctx.get("positions_summary")),
+        pnl_today=_or_unavailable(ctx.get("pnl_today")),
+        trades_today=_or_unknown(ctx.get("trades_today")),
+        max_trades_today=_or_unknown(ctx.get("max_trades_today")),
+        nifty_pct=_or_unavailable(ctx.get("nifty_pct")),
+        india_vix=_or_unavailable(ctx.get("india_vix")),
+        regime_block=_format_regime_block(ctx.get("regime_snapshot")),
+    )
+
+
+def _extract_decision_block(text: str) -> dict | None:
+    """Find the LAST balanced ``{...}`` block in ``text`` containing ``"decision"``.
+
+    Walks every ``{`` position, follows brace depth with quote/escape awareness,
+    and keeps the rightmost successfully-parsed block whose object has a
+    ``decision`` key. Returns ``None`` if no such block is present.
+    """
+    if not text:
+        return None
+
+    candidates: list[dict] = []
+    n = len(text)
+    for start_match in re.finditer(r"\{", text):
+        start = start_match.start()
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, n):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    block = text[start : i + 1]
+                    try:
+                        parsed = json.loads(block)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(parsed, dict) and "decision" in parsed:
+                        candidates.append(parsed)
+                    break
+    return candidates[-1] if candidates else None
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -429,84 +582,96 @@ def review_signal(
 
     snapshot = context if context is not None else _build_context(None)
 
-    request_body = {
-        "candidate": {
-            "symbol": symbol,
-            "source": source,
-            "direction": direction,
-            "candidate_at": _now_ist_iso(),
-        },
-        "context": {
-            "positions_count": snapshot.get("positions_count"),
-            "positions_summary": snapshot.get("positions_summary"),
-            "pnl_today": snapshot.get("pnl_today"),
-            "trades_today": snapshot.get("trades_today"),
-            "max_trades_today": snapshot.get("max_trades_today"),
-            "nifty_pct": snapshot.get("nifty_pct"),
-            "india_vix": snapshot.get("india_vix"),
-            "regime_snapshot": snapshot.get("regime_snapshot"),
-        },
+    candidate = {
+        "symbol": symbol,
+        "source": source,
+        "direction": direction,
+        "candidate_at": _now_ist_iso(),
     }
+    prompt = _format_review_prompt(candidate, snapshot)
+    timeout = _claude_timeout_seconds()
 
-    bridge_url = _bridge_url()
-    timeout = _request_timeout_seconds()
-
+    # In-process claude -p invocation (Phase 1 of #266). Any failure — timeout,
+    # missing binary, non-zero exit, unparseable output — falls safe to 'take'
+    # with a tagged reasoning, exactly like the retired bridge transport did.
     started = time.time()
-    response_payload: dict[str, Any] | None = None
+    model_text: str | None = None
+    session_id = ""
     failure_reason: str | None = None
     try:
-        response = httpx.post(bridge_url, json=request_body, timeout=timeout)
-        if 200 <= response.status_code < 300:
-            response_payload = response.json()
-        else:
-            failure_reason = f"bridge_http_{response.status_code}"
-    except httpx.TimeoutException:
-        failure_reason = "bridge_timeout"
-    except httpx.HTTPError as exc:
-        failure_reason = f"bridge_error:{type(exc).__name__}"
+        model_text, session_id = invoke_claude_review(prompt, timeout)
+    except TimeoutError:
+        failure_reason = "claude_timeout"
+    except FileNotFoundError:
+        failure_reason = "claude_cli_missing"
     except Exception as exc:
-        logger.exception("signal_review: unexpected error calling bridge")
-        failure_reason = f"unexpected:{type(exc).__name__}"
+        logger.exception("signal_review: unexpected error invoking claude review")
+        failure_reason = f"claude_error:{type(exc).__name__}"
 
-    latency_ms = int((time.time() - started) * 1000)
+    bridge_latency = int((time.time() - started) * 1000)
 
-    if response_payload is None:
+    if failure_reason is not None:
         logger.warning(
-            "signal_review: bridge call failed (%s); failing safe to take", failure_reason
+            "signal_review: claude review failed (%s); failing safe to take", failure_reason
         )
         decision_id = _persist_decision(
             symbol=symbol,
             source=source,
             direction=direction,
             decision="review_failed",
-            reasoning=failure_reason or "review_failed",
+            reasoning=failure_reason,
             confidence=0.0,
             enforcement_mode=enforcement_mode,
             context_snapshot=snapshot,
-            bridge_latency_ms=latency_ms,
-            bridge_session_id=None,
-            raw_bridge_output=None,
+            bridge_latency_ms=bridge_latency,
+            bridge_session_id=session_id or None,
+            raw_bridge_output=model_text,
         )
-        result = _failsafe_decision(failure_reason or "review_failed")
+        result = _failsafe_decision(failure_reason)
         result["id"] = decision_id
         result["enforcement_mode"] = enforcement_mode
-        result["latency_ms"] = latency_ms
+        result["latency_ms"] = bridge_latency
         return result
 
-    # Normal path — surface whatever the bridge gave us. The bridge already
-    # fail-safes to 'take' on its own errors, so this branch is only "we got
-    # a structured answer back, good or bad."
-    decision = response_payload.get("decision")
-    reasoning = response_payload.get("reasoning", "")
-    confidence = response_payload.get("confidence", 0.0)
-    bridge_latency = response_payload.get("latency_ms", latency_ms)
-    session_id = response_payload.get("claude_session_id", "")
-    raw_output = response_payload.get("raw_output", "")
+    # Parse the decision block out of the model's prose. Missing/malformed →
+    # treat as a review failure rather than trusting bogus output.
+    raw_output = model_text or ""
+    decision_block = _extract_decision_block(raw_output)
+    if decision_block is None:
+        logger.warning("signal_review: could not parse a decision block from claude output")
+        decision_id = _persist_decision(
+            symbol=symbol,
+            source=source,
+            direction=direction,
+            decision="review_failed",
+            reasoning="parse_failed",
+            confidence=0.0,
+            enforcement_mode=enforcement_mode,
+            context_snapshot=snapshot,
+            bridge_latency_ms=bridge_latency,
+            bridge_session_id=session_id or None,
+            raw_bridge_output=raw_output,
+        )
+        result = _failsafe_decision("parse_failed")
+        result["id"] = decision_id
+        result["enforcement_mode"] = enforcement_mode
+        result["latency_ms"] = bridge_latency
+        return result
 
-    if decision not in ("take", "skip"):
-        # Defensive — bridge contract says it can't happen, but if it does we
-        # treat it as a review failure rather than trusting bogus output.
-        logger.warning("signal_review: bridge returned invalid decision=%r", decision)
+    decision = decision_block.get("decision")
+    reasoning = decision_block.get("reasoning", "")
+    confidence = decision_block.get("confidence", 0.0)
+    if not isinstance(reasoning, str):
+        reasoning = str(reasoning)
+    try:
+        confidence = float(confidence) if confidence is not None else 0.0
+    except (TypeError, ValueError):
+        confidence = None
+
+    if decision not in ("take", "skip") or confidence is None or not (0.0 <= confidence <= 1.0):
+        # Contract violation — decision not in {take, skip} or confidence out of
+        # range — fail safe rather than trusting bogus output.
+        logger.warning("signal_review: claude returned invalid decision=%r", decision)
         decision_id = _persist_decision(
             symbol=symbol,
             source=source,
@@ -517,7 +682,7 @@ def review_signal(
             enforcement_mode=enforcement_mode,
             context_snapshot=snapshot,
             bridge_latency_ms=bridge_latency,
-            bridge_session_id=session_id,
+            bridge_session_id=session_id or None,
             raw_bridge_output=raw_output,
         )
         result = _failsafe_decision(f"bad_decision:{decision!r}")
