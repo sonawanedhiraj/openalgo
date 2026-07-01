@@ -42,9 +42,14 @@ restart OpenAlgo manually).
 Secondary fixes folded in here
 ------------------------------
 * **Index exchange.** Zerodha resolves index instruments (NIFTY, BANKNIFTY,
-  …) only under the ``NSE_INDEX`` exchange, not ``NSE``. The scanner symbol
-  universe mixes 5 indices in with the equities; :func:`resolve_exchange_for_symbol`
-  routes those to ``NSE_INDEX`` while everything else stays ``NSE``.
+  the NSE sectoral indices, …) only under the ``NSE_INDEX`` exchange, not
+  ``NSE``. The scanner symbol universe mixes indices in with the equities;
+  :func:`resolve_exchange_for_symbol` routes an index to ``NSE_INDEX`` and
+  everything else to ``NSE``. It does this **master-contract-backed** — a
+  symbol stored under ``NSE_INDEX`` in ``SymToken`` resolves there — so *every*
+  sectoral index (NIFTYAUTO/NIFTYIT/…) routes correctly without hardcoding each
+  name; a small :data:`INDEX_SYMBOLS` set is only a fast-path/boot fallback
+  (issue #241).
 * **Response parsing.** The shared ``subscribe_to_symbols`` service wrapper
   collapses the proxy's per-symbol result into a single ``success``/``partial``
   status and maps ``partial`` to a hard failure — so the proxy's normal
@@ -66,10 +71,16 @@ from utils.logging import get_logger
 logger = get_logger(__name__)
 
 # Symbols that Zerodha exposes only under the NSE_INDEX exchange. The scanner
-# universe (SCANNER_SYMBOLS) interleaves these 5 indices with ~210 equities;
-# subscribing them under plain "NSE" yields a "token not found" error and they
-# never stream. Kept as a superset (SENSEX/BANKEX/INDIAVIX) so the helper is
-# correct for any index a future config adds.
+# universe (SCANNER_SYMBOLS) interleaves indices with ~210 equities; subscribing
+# an index under plain "NSE" yields a "token not found" error and it never
+# streams. This set is only the *fast-path / fallback* for the well-known broad
+# indices: it is consulted first (cheap, no DB) and again if the master-contract
+# lookup below can't run yet (contract not loaded at early boot). It deliberately
+# does NOT enumerate every sectoral index — that is exactly the brittleness the
+# master-contract-backed resolution fixes (issue #241: NIFTYAUTO / NIFTYIT /
+# NIFTYMETAL / NIFTYFMCG / NIFTYPSUBANK / NIFTYPVTBANK / NIFTYOILANDGAS /
+# NIFTYCONSRDURBL / NIFTYCONSUMPTION / NIFTYPHARMA / NIFTYREALTY all fell through
+# to "NSE" and failed to subscribe because they were absent from this list).
 INDEX_SYMBOLS = {
     "NIFTY",
     "BANKNIFTY",
@@ -81,14 +92,99 @@ INDEX_SYMBOLS = {
     "BANKEX",
 }
 
+# Cache of resolved exchanges so the master-contract lookup runs at most once per
+# symbol. A symbol only ever resolves one way per process; the SymToken contract
+# is immutable within a run. Bounded implicitly by the scanner universe size.
+_resolved_exchange_cache: dict[str, str] = {}
+_resolve_lock = threading.Lock()
+
+# Injection point for the master-contract token lookup. Production leaves this
+# None and the live ``database.token_db.get_token`` is imported lazily. Unit
+# tests set it to a fake ``(symbol, exchange) -> token | None`` so the
+# master-contract-backed path is exercised without a live DB.
+_token_lookup: Callable[[str, str], Any] | None = None
+
+
+def _lookup_is_index(symbol_upper: str) -> bool | None:
+    """Master-contract-backed index test for ``symbol_upper``.
+
+    Returns ``True`` if the symbol exists under ``NSE_INDEX`` in the ``SymToken``
+    master contract, ``False`` if it exists under ``NSE`` (an equity) but not
+    ``NSE_INDEX``, and ``None`` when the contract can't answer (not loaded yet,
+    or the symbol is unknown to both) — in which case the caller falls back to
+    the hardcoded :data:`INDEX_SYMBOLS` fast-path / ``NSE`` default.
+
+    ``database.token_db`` is imported lazily so this module stays import-light
+    (its docstring notes the DB-heavy service imports block while the live app
+    holds the SQLite lock). Any failure is swallowed to ``None`` — resolution
+    must never raise into the subscribe path.
+    """
+    get_token = _token_lookup
+    if get_token is None:
+        try:
+            from database.token_db import get_token
+        except Exception:
+            return None
+    try:
+        if get_token(symbol_upper, "NSE_INDEX") is not None:
+            return True
+        if get_token(symbol_upper, "NSE") is not None:
+            return False
+    except Exception:
+        logger.exception(
+            "resolve_exchange_for_symbol: master-contract lookup raised for %s",
+            symbol_upper,
+        )
+        return None
+    # Unknown to both exchanges (contract not loaded, or genuinely absent).
+    return None
+
 
 def resolve_exchange_for_symbol(symbol: str) -> str:
-    """Return the exchange a symbol must be subscribed under.
+    """Return the exchange a symbol must be subscribed under (``NSE`` or ``NSE_INDEX``).
 
-    Indices (see :data:`INDEX_SYMBOLS`) resolve to ``NSE_INDEX``; everything
-    else to ``NSE``.
+    Resolution order (first decisive answer wins):
+
+    1. **Fast-path** — the well-known broad indices in :data:`INDEX_SYMBOLS`
+       resolve straight to ``NSE_INDEX`` with no DB touch.
+    2. **Master-contract lookup** — a symbol that exists under ``NSE_INDEX`` in
+       the ``SymToken`` master contract (and not merely as an ``NSE`` equity)
+       resolves to ``NSE_INDEX``. This is what makes *every* NSE sectoral index
+       (NIFTYAUTO, NIFTYIT, …) route correctly without hardcoding each name
+       (issue #241) — they are all stored under ``NSE_INDEX`` by the broker's
+       master-contract build (``segment == "INDICES"`` → ``NSE_INDEX``).
+    3. **Fallback** — if the contract can't answer (not loaded yet at early
+       boot, or the symbol is unknown to both exchanges), default to ``NSE``.
+
+    The per-symbol result is cached so the DB lookup runs at most once each.
     """
-    return "NSE_INDEX" if symbol.upper() in INDEX_SYMBOLS else "NSE"
+    key = symbol.upper()
+
+    with _resolve_lock:
+        cached = _resolved_exchange_cache.get(key)
+    if cached is not None:
+        return cached
+
+    # 1. Fast-path for the well-known broad indices (no DB).
+    if key in INDEX_SYMBOLS:
+        resolved = "NSE_INDEX"
+    else:
+        # 2. Master-contract-backed lookup.
+        is_index = _lookup_is_index(key)
+        if is_index is True:
+            resolved = "NSE_INDEX"
+        elif is_index is False:
+            resolved = "NSE"
+        else:
+            # 3. Contract couldn't answer — default equity. Do NOT cache an
+            #    unresolved answer: the contract may load moments later, so a
+            #    subsequent call should re-consult it rather than being pinned
+            #    to the boot-time default.
+            return "NSE"
+
+    with _resolve_lock:
+        _resolved_exchange_cache[key] = resolved
+    return resolved
 
 
 class PreSubscriber:
