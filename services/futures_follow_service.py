@@ -425,6 +425,28 @@ def production_data_health_checker(
         return True, {}
 
 
+def futures_smoke_check_enabled() -> bool:
+    """``FUTURES_FOLLOW_SMOKE_CHECK_ENABLED`` env flag (default true).
+
+    When off the 15:18 pre-entry smoke check is a no-op (returns ok=True, no
+    override written). Set ``false`` only to disable the guard entirely — stale
+    data at 15:20 will then be caught only by the per-entry
+    ``_data_is_fresh_for_entry`` gate (which still blocks but does NOT alert)."""
+    return os.getenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true").lower() == "true"
+
+
+def production_broker_session_checker() -> bool:
+    """True iff a broker session (API key) is configured (operator logged in).
+    Best-effort; ``False`` on any error. Used by the 15:18 smoke check."""
+    try:
+        from database.auth_db import get_first_available_api_key
+
+        return bool(get_first_available_api_key())
+    except Exception:
+        logger.debug("futures_follow broker-session check failed", exc_info=True)
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Service
 # --------------------------------------------------------------------------- #
@@ -466,6 +488,7 @@ class FuturesFollowService:
         now: Callable[[], datetime] | None = None,
         intent_resolver: Callable[[], object] | None = None,
         data_health_checker: Callable[..., tuple] | None = None,
+        broker_session_checker: Callable[[], bool] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -485,6 +508,9 @@ class FuturesFollowService:
         # Data-freshness gate. Left None in unit tests (gate skipped, hermetic);
         # the live singleton injects ``production_data_health_checker``.
         self._data_health_checker = data_health_checker
+        # Broker-session checker for the 15:18 smoke check. Left None in unit tests
+        # (treated as live); the live singleton uses ``production_broker_session_checker``.
+        self._broker_session_checker = broker_session_checker or production_broker_session_checker
         self._now = now or (lambda: datetime.now(_IST))
         self.eod_reports_dir = _EOD_REPORTS_DIR
 
@@ -1168,6 +1194,94 @@ class FuturesFollowService:
             stale = sorted(s for s, d in details.items() if not d.get("ok", True))
             logger.warning("futures_follow exits proceeding despite stale index data: %s", stale)
 
+    # ----- 15:18 pre-entry smoke check (#292) ---------------------------- #
+    def assert_data_pipeline_healthy(self) -> tuple[bool, dict]:
+        """15:18 IST pre-entry smoke check for futures_follow_cap50.
+
+        Two checks (self-contained — no aggregator, no historify probe, because
+        futures_follow does not own any historical data pipeline of its own):
+
+        1. **Data freshness**: the sector_follow_cap5_vol feed (which supplies our
+           signal evaluator) is fresh for today's date, via the existing
+           ``self._data_health_checker``.
+        2. **Broker session live**: an API key is configured (operator logged in).
+
+        On failure it writes a same-day ``pause`` runtime override (which the
+        engine's ``_entry_held_by_override`` gate honors, blocking the 15:20
+        entries) and Telegrams the operator. The override expires at 15:30 IST so
+        it self-clears and never disables the strategy beyond today.
+
+        Gated by ``FUTURES_FOLLOW_SMOKE_CHECK_ENABLED`` (default true) AND
+        ``DATA_FRESHNESS_VALIDATION_ENABLED`` (the freshness arm is skipped when
+        the master freshness flag is off). Returns ``(ok, details)``. Never
+        raises — a check failure is logged + alerted, not an exception.
+        """
+        as_of = self._now()
+        as_of_date = as_of.astimezone(_IST).date()
+
+        if not futures_smoke_check_enabled():
+            logger.debug("futures_follow 15:18 smoke check skipped (flag off)")
+            return True, {"skipped": True}
+
+        # ---- Check 1: data freshness (via the shared sector_follow checker) ---- #
+        data_ok = True
+        stale_symbols: list[str] = []
+        if self._data_health_checker is not None and data_freshness_enabled():
+            today_str = as_of_date.isoformat()
+            try:
+                data_ok, details_map = self._data_health_checker(
+                    "sector_follow_cap5_vol", today_str
+                )
+                if not data_ok:
+                    stale_symbols = sorted(
+                        s for s, d in details_map.items() if not d.get("ok", True)
+                    )
+            except Exception:
+                logger.exception("futures_follow smoke check: data-freshness probe raised")
+                data_ok = True  # fail-open on infrastructure error
+
+        # ---- Check 2: broker session live ---- #
+        try:
+            session_ok = bool(self._broker_session_checker())
+        except Exception:
+            logger.exception("futures_follow smoke check: broker-session probe raised")
+            session_ok = False
+
+        ok = data_ok and session_ok
+        details: dict = {
+            "data_ok": data_ok,
+            "stale_symbols": stale_symbols,
+            "broker_session_ok": session_ok,
+        }
+
+        if ok:
+            logger.info("futures_follow 15:18 smoke check PASSED: %s", details)
+            return True, details
+
+        reasons = []
+        if not data_ok:
+            reasons.append(
+                f"sector_follow feed stale ({today_str})"
+                + (f": {stale_symbols}" if stale_symbols else "")
+            )
+        if not session_ok:
+            reasons.append("broker session not live")
+        reason = "; ".join(reasons)
+        logger.error("futures_follow 15:18 SMOKE CHECK FAILED: %s", reason)
+
+        # Hold today's 15:20 entries via a self-expiring pause override (expires 15:30).
+        expires_ist = as_of.replace(hour=15, minute=30, second=0, microsecond=0)
+        self._set_runtime_override("pause", expires_ist, f"smoke_check_failed: {reason}")
+        try:
+            self._notify(
+                f"\U0001f6a8 {STRATEGY_NAME} 15:18 SMOKE CHECK FAILED "
+                f"({as_of_date.isoformat()}): {reason}. Holding today's 15:20 entries "
+                "(self-clears at 15:30)."
+            )
+        except Exception:
+            logger.exception("futures_follow smoke-check alert failed")
+        return False, details
+
     def run_daily_reset(self) -> None:
         """09:00 IST: reset kill switch + daily P&L."""
         self.reset_daily_state()
@@ -1622,10 +1736,21 @@ class FuturesFollowService:
             replace_existing=True,
             name="Futures Follow CAP50 EOD summary (15:30 IST)",
         )
+        if futures_smoke_check_enabled():
+            sched.add_job(
+                _smoke_check_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=18, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_smoke_check",
+                replace_existing=True,
+                name="Futures Follow CAP50 pre-entry smoke check (15:18 IST)",
+            )
         logger.info(
-            "futures_follow jobs registered (mode=%s, strategy_id=%s)",
+            "futures_follow jobs registered (mode=%s, strategy_id=%s, smoke_check=%s)",
             self.mode,
             self.strategy_id,
+            futures_smoke_check_enabled(),
         )
 
 
@@ -1664,12 +1789,27 @@ def _watchdog_job() -> None:
         _SINGLETON.run_eod_watchdog()
 
 
+def _smoke_check_job() -> None:
+    """15:18 IST: run the data + broker-session smoke check.
+
+    Swallows all exceptions so a bug in the smoke check can never crash the
+    APScheduler thread and interrupt other scheduled jobs."""
+    if _SINGLETON is not None:
+        try:
+            _SINGLETON.assert_data_pipeline_healthy()
+        except Exception:
+            logger.exception("futures_follow smoke-check job raised unexpectedly (ignored)")
+
+
 def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowService:
     """Build the singleton and register its scheduler jobs. Default mode=sandbox so
     the strategy actively trades the virtual ₹1Cr sandbox book from boot (no live
     broker orders until the operator flips mode=live)."""
     svc = FuturesFollowService(
-        app=app, scheduler=scheduler, data_health_checker=production_data_health_checker
+        app=app,
+        scheduler=scheduler,
+        data_health_checker=production_data_health_checker,
+        broker_session_checker=production_broker_session_checker,
     )
     svc.register_jobs(scheduler)
     # Boot durability (#265, BOTH modes): rebuild paper_book from the
