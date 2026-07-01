@@ -187,7 +187,7 @@ def test_broker_larger_than_journaled_closes_only_journaled():
 # flag off → no broker call, unchanged
 # --------------------------------------------------------------------------- #
 def test_flag_off_is_noop(monkeypatch):
-    monkeypatch.setenv("LIVE_POSITION_RECONCILE_ENABLED", "false")
+    monkeypatch.setenv("POSITION_RECONCILE_ENABLED", "false")
     with patch("services.openposition_service.get_open_position") as broker:
         d = _call(journaled=2)
     broker.assert_not_called()

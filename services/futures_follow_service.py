@@ -808,16 +808,15 @@ class FuturesFollowService:
             "order_id": order_id,
         }
 
-    def _reconcile_live_exit_qty(self, position: FuturesPosition) -> int | None:
-        """LIVE-only broker-position reconciliation for a T+1 exit (#265).
+    def _reconcile_exit_qty(self, position: FuturesPosition) -> int | None:
+        """Position-store reconciliation for a T+1 exit (#265), BOTH modes.
 
-        Returns the guarded SELL quantity to place, or ``None`` to SUPPRESS the
-        exit (broker flat / opposite side). In sandbox mode this is a no-op that
-        returns the journalled quantity unchanged — the broker positionbook is
-        NEVER consulted, so sandbox behavior is byte-identical to before.
+        Reconciles the journalled close qty against the mode-appropriate position
+        store: the ``sandbox.db`` virtual book in sandbox mode and the broker
+        positionbook in live mode (routing is handled by ``get_open_position``'s
+        own mode-awareness). Returns the guarded SELL quantity to place, or
+        ``None`` to SUPPRESS the exit (store flat / opposite side).
         """
-        if self.mode != "live":
-            return position.quantity
         try:
             from services import live_position_reconciliation_service as recon
 
@@ -833,11 +832,11 @@ class FuturesFollowService:
         except Exception:
             # Guard must never break the exit path; on an unexpected failure fall
             # back to the journalled qty (never MORE than journaled).
-            logger.exception("futures_follow live reconcile raised; proceeding with journaled qty")
+            logger.exception("futures_follow reconcile raised; proceeding with journaled qty")
             return position.quantity
         if not decision.should_place:
             logger.error(
-                "futures_follow EXIT SUPPRESSED for %s (reason=%s, broker_qty=%s, journaled=%d)",
+                "futures_follow EXIT SUPPRESSED for %s (reason=%s, store_qty=%s, journaled=%d)",
                 position.nifty_symbol,
                 decision.reason,
                 decision.broker_qty,
@@ -852,16 +851,17 @@ class FuturesFollowService:
         """Square off one position (mode-aware). Exits are NOT blocked by the kill
         switch — open positions always run to their scheduled T+1 exit.
 
-        In LIVE mode the broker net position is reconciled first (#265): a phantom
-        (broker flat) is SUPPRESSED and a partial (broker < journaled) is CLAMPED.
-        In sandbox mode the guard is a no-op — the journalled quantity is used."""
+        The mode-appropriate position store's net qty is reconciled first (#265,
+        BOTH modes): a phantom (store flat) is SUPPRESSED and a partial
+        (store < journaled) is CLAMPED. Sandbox reads ``sandbox.db``; live reads
+        the broker positionbook (routing handled by ``get_open_position``)."""
         symbol = position.nifty_symbol
         exit_price = price if price is not None else position.entry_price
 
-        exit_qty = self._reconcile_live_exit_qty(position)
+        exit_qty = self._reconcile_exit_qty(position)
         if exit_qty is None:
-            # Phantom / opposite-side: broker holds nothing to close. Drop the
-            # in-memory position (its broker leg is already flat) without placing
+            # Phantom / opposite-side: the store holds nothing to close. Drop the
+            # in-memory position (its store leg is already flat) without placing
             # a SELL, so a repeat exit job doesn't retry it.
             self.paper_book.pop(pos_id, None)
             return None
@@ -1172,23 +1172,21 @@ class FuturesFollowService:
         """09:00 IST: reset kill switch + daily P&L."""
         self.reset_daily_state()
 
-    # ----- boot durability (live-only) ----------------------------------- #
-    def rehydrate_paper_book_from_broker(self) -> int:
-        """LIVE-only: rebuild ``paper_book`` from real broker positions on boot (#265).
+    # ----- boot durability (both modes) ---------------------------------- #
+    def rehydrate_paper_book_from_store(self) -> int:
+        """Rebuild ``paper_book`` from the mode-appropriate position store on boot (#265).
 
-        A restart otherwise loses the in-memory ``paper_book``, stranding a real
-        overnight NIFTY-futures long with no scheduled T+1 exit. On boot in live
-        mode this reads the broker positionbook and reconstructs a position for
-        every open NIFTY*FUT leg on NFO/NRML that the ``paper_book`` doesn't
-        already know about, so the 15:20/15:25/15:14 exit jobs will square it off.
-
-        In sandbox mode this is a NO-OP (returns 0) — the broker is never consulted;
-        the sandbox book is authoritative and rehydrated by sandbox itself.
+        A restart otherwise loses the in-memory ``paper_book``, stranding an open
+        overnight NIFTY-futures long with no scheduled T+1 exit — in EITHER mode
+        (a sandbox restart strands the sandbox.db paper leg exactly as a live
+        restart strands the real broker leg). This reads the mode-appropriate
+        store via ``get_positionbook`` (mode-aware: ``sandbox.db`` in sandbox, the
+        broker positionbook in live) and reconstructs a position for every open
+        NIFTY*FUT leg on NFO/NRML that the ``paper_book`` doesn't already know
+        about, so the 15:20/15:25/15:14 exit jobs will square it off.
 
         Returns the number of positions rehydrated. Never raises.
         """
-        if self.mode != "live":
-            return 0
         try:
             from services.positionbook_service import get_positionbook
 
@@ -1257,8 +1255,9 @@ class FuturesFollowService:
             known_symbols.add(symbol)
             rehydrated += 1
             logger.warning(
-                "futures_follow REHYDRATED open broker position %s qty=%d lots=%d "
+                "futures_follow REHYDRATED open %s position %s qty=%d lots=%d "
                 "(entry_date stamped %s, T+1 exit due today %s)",
+                self.mode,
                 symbol,
                 qty,
                 lots,
@@ -1269,7 +1268,7 @@ class FuturesFollowService:
         if rehydrated:
             try:
                 self._notify(
-                    f"♻️ {STRATEGY_NAME} [live] rehydrated {rehydrated} open broker "
+                    f"♻️ {STRATEGY_NAME} [{self.mode}] rehydrated {rehydrated} open "
                     f"position(s) on boot — T+1 exit scheduled"
                 )
             except Exception:
@@ -1673,11 +1672,12 @@ def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowServic
         app=app, scheduler=scheduler, data_health_checker=production_data_health_checker
     )
     svc.register_jobs(scheduler)
-    # Live-only boot durability (#265): rebuild paper_book from real broker
-    # positions so a restart can't strand an overnight NIFTY-futures long. No-op
-    # in sandbox. Best-effort — a rehydrate failure never blocks boot.
+    # Boot durability (#265, BOTH modes): rebuild paper_book from the
+    # mode-appropriate position store (sandbox.db in sandbox, broker in live) so a
+    # restart can't strand an open overnight NIFTY-futures long. Best-effort — a
+    # rehydrate failure never blocks boot.
     try:
-        svc.rehydrate_paper_book_from_broker()
+        svc.rehydrate_paper_book_from_store()
     except Exception:
         logger.exception("futures_follow boot rehydrate failed (ignored)")
     if app is not None:

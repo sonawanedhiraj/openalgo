@@ -1,34 +1,41 @@
-"""Live-mode broker-position reconciliation (issue #265).
+"""Position-store reconciliation at exit (issue #265).
 
-In LIVE mode the real broker positions are the **source of truth** at exit. This
-module gives every live exit path a single, defensive guard that reconciles the
-strategy's journalled/in-memory close quantity against the broker's actual net
-position **before** the exit order is placed.
+At exit the *mode-appropriate position store* is the **source of truth**: the
+real broker positionbook in ``live`` mode, and the ``sandbox.db`` virtual book in
+``sandbox`` mode. This module gives every exit path a single, defensive guard
+that reconciles the strategy's journalled/in-memory close quantity against that
+store's actual net position **before** the exit order is placed — in BOTH modes.
+
+The position read is routed through
+:func:`services.openposition_service.get_open_position`, which is itself
+mode-aware: it returns the ``sandbox.db`` position in sandbox mode and the broker
+positionbook in live mode. So the guard's semantics are identical in both modes;
+only the underlying store differs.
 
 Why this exists
 ---------------
 Both ``futures_follow_cap50`` and ``simplified_engine`` track open positions in
 process memory (``paper_book`` / ``engine.positions``) and a write-only trade
-journal. Neither consulted the broker at exit, so on a journal↔broker mismatch
-they could:
+journal. Neither consulted the position store at exit, so on a journal↔store
+mismatch they could:
 
 * double-SELL a NIFTY future after a manual/partial exit → net SHORT overnight
   (SPAN + gap risk);
-* fire a phantom exit when the journal reads open but the broker is flat →
+* fire a phantom exit when the journal reads open but the store is flat →
   reject, or worse, reverse the position;
 * exit the wrong quantity on a partial fill.
 
-The fix is to make the broker net qty authoritative at exit. Given the intended
+The fix is to make the store's net qty authoritative at exit. Given the intended
 close, :func:`reconcile_exit` returns a *guarded* decision:
 
-* ``broker_qty == 0`` → **SUPPRESS** the exit (phantom); reason ``broker_flat``.
-* ``abs(broker_qty) < abs(journaled)`` OR the broker position sits on the wrong
-  side of the intended close → **CLAMP** the close qty to ``abs(broker_qty)``;
-  reason ``partial_mismatch``. (A broker position on the *opposite* side of the
+* ``store_qty == 0`` → **SUPPRESS** the exit (phantom); reason ``broker_flat``.
+* ``abs(store_qty) < abs(journaled)`` OR the store position sits on the wrong
+  side of the intended close → **CLAMP** the close qty to ``abs(store_qty)``;
+  reason ``partial_mismatch``. (A store position on the *opposite* side of the
   close means there is nothing to close in the expected direction — clamp to 0,
   i.e. suppress.)
-* broker qty present and consistent → **PROCEED** with the broker qty.
-* broker fetch fails → **FAIL CLOSED for reverse-risk**: never close more than
+* store qty present and consistent → **PROCEED** with the store qty.
+* store fetch fails → **FAIL CLOSED for reverse-risk**: never close more than
   journaled, emit an alert; the caller proceeds with the (unchanged) journalled
   qty rather than an unbounded one. Never raises into the caller.
 
@@ -39,14 +46,15 @@ existing data-drift path).
 
 Design constraints
 ------------------
-* **Live only.** The caller decides whether to invoke this at all: in ``sandbox``
-  mode the guard is a no-op and MUST NOT be consulted (the broker positionbook is
-  never called). :func:`reconcile_exit` additionally short-circuits when the
-  ``LIVE_POSITION_RECONCILE_ENABLED`` flag is off, returning a PROCEED decision
-  with the journalled qty unchanged.
+* **Both modes, mode-aware store.** The guard runs in ``live`` AND ``sandbox`` —
+  the caller no longer gates on mode. The store it consults is chosen by
+  ``get_open_position``'s own mode-awareness (sandbox.db vs broker), so the guard
+  never over-exits against whichever store is authoritative for the running mode.
+  :func:`reconcile_exit` short-circuits only when the ``POSITION_RECONCILE_ENABLED``
+  flag is off, returning a PROCEED decision with the journalled qty unchanged.
 * **Import-light.** All heavy imports are lazy inside the function body so
   importing this module never pulls the order/quote stack.
-* **Exception-safe.** Never raises back into the caller — a broker/alert failure
+* **Exception-safe.** Never raises back into the caller — a store/alert failure
   degrades to the fail-closed PROCEED-with-journalled-qty path.
 """
 
@@ -96,12 +104,13 @@ class ReconcileDecision:
 
 
 def is_enabled() -> bool:
-    """``LIVE_POSITION_RECONCILE_ENABLED`` env flag (default ``true``).
+    """``POSITION_RECONCILE_ENABLED`` env flag (default ``true``).
 
-    The single emergency disable for the whole guard. When off, :func:`reconcile_exit`
-    returns a PROCEED decision with the journalled qty unchanged (legacy behaviour).
+    The single emergency disable for the whole guard (both modes). When off,
+    :func:`reconcile_exit` returns a PROCEED decision with the journalled qty
+    unchanged (legacy behaviour).
     """
-    return os.getenv("LIVE_POSITION_RECONCILE_ENABLED", "true").strip().lower() in (
+    return os.getenv("POSITION_RECONCILE_ENABLED", "true").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -110,11 +119,12 @@ def is_enabled() -> bool:
 
 
 def _fetch_broker_qty(api_key: str, symbol: str, exchange: str, product: str) -> tuple[bool, int]:
-    """Return ``(ok, signed_net_qty)`` from the broker positionbook.
+    """Return ``(ok, signed_net_qty)`` from the mode-appropriate position store.
 
     ``ok`` is ``False`` on any fetch/parse failure — the caller then fails closed.
-    Never raises. Reads the LIVE broker source via ``openposition_service`` (which
-    itself routes to the broker in live mode).
+    Never raises. Reads via ``openposition_service.get_open_position``, which is
+    itself mode-aware: it returns the ``sandbox.db`` net qty in sandbox mode and
+    the broker positionbook net qty in live mode.
     """
     try:
         from services.openposition_service import get_open_position
@@ -173,21 +183,23 @@ def reconcile_exit(
     expected_close_side: str,
     journaled_qty: int,
 ) -> ReconcileDecision:
-    """Reconcile a LIVE exit's close qty against the broker's net position.
+    """Reconcile an exit's close qty against the mode-appropriate store's net position.
 
-    Call this ONLY in live mode (the caller must gate on its own mode; in sandbox
-    this is a no-op and MUST NOT be reached). Returns a :class:`ReconcileDecision`
-    describing whether to proceed, clamp, or suppress. Never raises.
+    Safe to call in BOTH modes: the underlying position read
+    (``openposition_service.get_open_position``) is mode-aware, returning the
+    ``sandbox.db`` net qty in sandbox and the broker positionbook net qty in live.
+    Returns a :class:`ReconcileDecision` describing whether to proceed, clamp, or
+    suppress. Never raises.
 
     Args:
         strategy: strategy name (dedup key + alert label + log tag).
-        api_key: OpenAlgo api key used to read the broker positionbook. When
-            ``None``/empty the guard fails closed (proceeds with journalled qty).
+        api_key: OpenAlgo api key used to read the mode-appropriate position store.
+            When ``None``/empty the guard fails closed (proceeds with journalled qty).
         symbol: OpenAlgo-format symbol of the position being closed.
         exchange: exchange code (e.g. ``NFO``, ``NSE``).
         product: product code (e.g. ``NRML``, ``MIS``, ``CNC``).
         expected_close_side: the exit action — ``SELL`` closes a long, ``BUY``
-            closes a short. Determines which broker-position sign is "closeable".
+            closes a short. Determines which store-position sign is "closeable".
         journaled_qty: the strategy's own (positive) close quantity.
 
     Returns:

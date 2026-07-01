@@ -777,21 +777,72 @@ def test_resolver_returns_none_when_all_expire_within_one_day(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# #265 — LIVE broker-position reconciliation at exit
+# #265 — position-store reconciliation at exit (BOTH modes, mode-aware store)
 # --------------------------------------------------------------------------- #
-def test_sandbox_exit_never_consults_broker():
-    """CRITICAL sandbox regression guard: in sandbox mode the exit path must NOT
-    call the broker positionbook — behavior is byte-identical to before #265."""
-    from services import openposition_service
-
+def test_sandbox_exit_consults_store_and_suppresses_phantom():
+    """SANDBOX: the guard DOES consult the mode-aware position source (sandbox.db
+    via get_open_position). A phantom (store flat) → SUPPRESS the SELL entirely —
+    the same guarded behaviour as live, but against the sandbox store."""
     svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
     _seed_position(svc, "P1", entry_date="2026-06-09")
-    with patch.object(openposition_service, "get_open_position") as broker:
+    flat = (True, {"quantity": 0, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=flat) as store,
+    ):
         exited = svc.run_exit()
-    broker.assert_not_called()
+    store.assert_called()  # the sandbox store IS consulted now
+    # Phantom in the sandbox store → no SELL placed, position dropped.
+    assert svc._test_placed == []
+    assert exited == []
+    assert svc.lots_held() == 0
+
+
+def test_sandbox_exit_partial_store_clamps_qty():
+    """SANDBOX: journal 2 lots (150), sandbox store holds 1 lot (75) → SELL only 75.
+    The clamp is against the sandbox.db book, routed via the mode-aware source."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    partial = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=partial) as store,
+    ):
+        exited = svc.run_exit()
+    store.assert_called()
+    assert svc._test_placed[0][0] == "sandbox"  # routed to the sandbox book
+    assert svc._test_placed[0][1]["action"] == "SELL"
+    assert svc._test_placed[0][1]["quantity"] == 75  # clamped to the sandbox store
     assert len(exited) == 1
+
+
+def test_sandbox_exit_consistent_store_proceeds_full_qty():
+    """SANDBOX: sandbox store matches journal → SELL the full journalled qty."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")  # quantity=75
+    match = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=match),
+    ):
+        svc.run_exit()
     assert len(svc._test_placed) == 1
-    assert svc._test_placed[0][1]["quantity"] == 75  # full journalled qty
+    assert svc._test_placed[0][1]["quantity"] == 75
+
+
+def test_sandbox_exit_store_fetch_failure_fails_closed():
+    """SANDBOX: sandbox store fetch fails → still SELL, but NEVER more than journaled
+    (fail-closed for reverse-risk is preserved in sandbox too)."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    failed = (False, {"status": "error", "message": "down"}, 500)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=failed),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 150  # journalled, not more
 
 
 def test_live_exit_phantom_broker_flat_is_suppressed():
@@ -859,17 +910,40 @@ def test_live_exit_broker_fetch_failure_fails_closed():
 
 
 # --------------------------------------------------------------------------- #
-# #265 — LIVE boot rehydrate of paper_book from broker positions
+# #265 — boot rehydrate of paper_book from the mode-appropriate store (both modes)
 # --------------------------------------------------------------------------- #
-def test_rehydrate_is_noop_in_sandbox():
-    from services import positionbook_service
-
+def test_rehydrate_rebuilds_paper_book_in_sandbox():
+    """SANDBOX: a restart-lost paper_book is rebuilt from the sandbox store
+    (sandbox.db, read via the mode-aware get_positionbook) so a T+1 exit is still
+    scheduled — the sandbox book can strand a paper leg exactly like live."""
     svc = _make_service(mode="sandbox")
-    with patch.object(positionbook_service, "get_positionbook") as book:
-        n = svc.rehydrate_paper_book_from_broker()
-    book.assert_not_called()
-    assert n == 0
-    assert svc.paper_book == {}
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY30JUN26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 150,  # 2 lots
+                    "average_price": "24000.0",
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book) as store,
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    store.assert_called()  # the sandbox store IS consulted now
+    assert n == 1
+    assert svc.lots_held() == 2
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.nifty_symbol == "NIFTY30JUN26FUT"
+    assert pos.quantity == 150
 
 
 def test_rehydrate_rebuilds_paper_book_in_live():
@@ -901,7 +975,7 @@ def test_rehydrate_rebuilds_paper_book_in_live():
         patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
         patch("services.positionbook_service.get_positionbook", return_value=book),
     ):
-        n = svc.rehydrate_paper_book_from_broker()
+        n = svc.rehydrate_paper_book_from_store()
     assert n == 1
     assert svc.lots_held() == 2
     pos = next(iter(svc.paper_book.values()))
@@ -933,7 +1007,7 @@ def test_rehydrate_skips_already_known_symbols():
         patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
         patch("services.positionbook_service.get_positionbook", return_value=book),
     ):
-        n = svc.rehydrate_paper_book_from_broker()
+        n = svc.rehydrate_paper_book_from_store()
     assert n == 0  # already known, not double-counted
     assert svc.lots_held() == 1
 
