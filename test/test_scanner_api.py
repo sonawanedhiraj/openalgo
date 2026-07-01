@@ -647,6 +647,59 @@ def test_delete_with_children_returns_409(client):
     assert res.get_json()["status"] == "error"
 
 
+def test_force_delete_orphan_code_backed(client):
+    """force=true deletes a code-backed ORPHAN (no registered rule) — the
+    _p0_always_true leaked-test-rule case — and it leaves get_scan_definitions.
+    """
+    from services.scanner_service import _clear_rule_registry_for_tests, get_scan_definitions
+
+    tc, sdb = client
+    # Ensure the registry has no rule for this name → it is an orphan.
+    _clear_rule_registry_for_tests()
+    did = _add_definition(sdb, "_p0_always_true", "buy", rule_module="_p0_always_true")
+
+    # get_scan_definitions resolves the DB session dynamically from
+    # database.scanner_db.db_session, which the client fixture already rebinds
+    # to this isolated DB — so no extra patching is needed here.
+
+    # Without force → protected (403).
+    res_noforce = tc.delete(f"/scanner/api/definitions/{did}")
+    assert res_noforce.status_code == 403
+
+    # With force → deleted (orphan).
+    res = tc.delete(f"/scanner/api/definitions/{did}?force=true")
+    assert res.status_code == 200
+    assert res.get_json()["data"]["id"] == did
+
+    # Gone from the list (enabled_only=True) and the single-get.
+    names = {d["name"] for d in get_scan_definitions(enabled_only=True)}
+    assert "_p0_always_true" not in names
+    assert tc.get(f"/scanner/api/definitions/{did}").status_code == 404
+
+
+def test_force_delete_live_code_backed_returns_403(client):
+    """force=true on a code-backed row whose rule IS registered stays protected."""
+    from services.scanner_service import _clear_rule_registry_for_tests, scan_rule
+
+    tc, sdb = client
+    _clear_rule_registry_for_tests()
+
+    @scan_rule("_live_rule_for_test", "buy", "test: live registered rule")
+    def _live(bars, indicators):
+        return True
+
+    try:
+        did = _add_definition(sdb, "live_scanner", "buy", rule_module="_live_rule_for_test")
+
+        res = tc.delete(f"/scanner/api/definitions/{did}?force=true")
+        assert res.status_code == 403
+        assert res.get_json()["status"] == "error"
+        # Still present.
+        assert tc.get(f"/scanner/api/definitions/{did}").status_code == 200
+    finally:
+        _clear_rule_registry_for_tests()
+
+
 # ---------------------------------------------------------------------------
 # Tier-3: auth check — all 4 new endpoints require a logged-in session
 # ---------------------------------------------------------------------------

@@ -401,20 +401,85 @@ def update_params_route(definition_id: int):
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+def _is_orphan_code_backed(defn: ScanDefinition) -> bool:
+    """True if a code-backed definition has no registered production rule.
+
+    A code-backed row (``parent_definition_id`` IS NULL) is safe to delete only
+    when it is an orphan — its ``rule_module`` (falling back to ``name``, which
+    is how the scanner resolves the rule) no longer maps to any registered
+    rule. That is the ``_p0_always_true`` case: a leaked test rule that clutters
+    the list but the live scanner already skips. A code-backed row whose rule IS
+    registered is a real built-in and must stay protected.
+
+    Imported lazily: importing ``services.scanner_service`` pulls in every
+    ``scan_rules`` module (they self-register at import), which we don't want to
+    pay at blueprint import time.
+    """
+    from services.scanner_service import get_rule
+
+    rule_name = defn.rule_module or defn.name
+    return get_rule(rule_name) is None
+
+
+def _delete_force_requested() -> bool:
+    """Whether the caller asked to force-delete a code-backed orphan.
+
+    Accepts ``?force=true`` on the query string or ``{"force": true}`` in a JSON
+    body (either is fine for a DELETE)."""
+    raw = (request.args.get("force") or "").strip().lower()
+    if raw in {"1", "true", "yes"}:
+        return True
+    body = request.get_json(silent=True) or {}
+    return bool(body.get("force"))
+
+
 @scanner_api_bp.route("/api/definitions/<int:definition_id>", methods=["DELETE"])
 @check_session_validity
 def delete_definition_route(definition_id: int):
-    """Hard-delete a cloned scan_definition.
+    """Hard-delete a scan_definition.
+
+    Cloned definitions delete unconditionally. Code-backed definitions
+    (``parent_definition_id`` IS NULL) are protected and return 403 — UNLESS
+    the caller passes ``force`` (query ``?force=true`` or body ``{"force":true}``)
+    AND the row is a verified orphan (no registered production rule), in which
+    case the leaked definition is removed. Historical scan_results are kept.
 
     Returns {status, data: {id}}.
-    Returns 403 if code-backed, 404 if not found, 409 if has children.
+    Returns 403 if code-backed and not a force-deletable orphan, 404 if not
+    found, 409 if has children.
     """
     if not session.get("user"):
         return _unauthorized()
 
     try:
+        allow_code_backed = False
+        if _delete_force_requested():
+            sess = db_session()
+            defn = sess.query(ScanDefinition).filter(ScanDefinition.id == definition_id).first()
+            if defn is None:
+                return jsonify({"status": "error", "message": "Definition not found"}), 404
+            if defn.parent_definition_id is None:
+                # Only allow forcing a code-backed row when it is a harmless orphan.
+                if not _is_orphan_code_backed(defn):
+                    return (
+                        jsonify(
+                            {
+                                "status": "error",
+                                "message": (
+                                    "definition is code-backed by a live registered rule"
+                                    " and cannot be deleted"
+                                ),
+                            }
+                        ),
+                        403,
+                    )
+                allow_code_backed = True
+
         try:
-            delete_definition(definition_id=definition_id)
+            delete_definition(
+                definition_id=definition_id,
+                allow_code_backed=allow_code_backed,
+            )
         except ValueError as exc:
             msg = str(exc)
             if "does not exist" in msg:
@@ -424,7 +489,11 @@ def delete_definition_route(definition_id: int):
             # code-backed
             return jsonify({"status": "error", "message": msg}), 403
 
-        logger.info("scanner delete_definition: id=%s", definition_id)
+        logger.info(
+            "scanner delete_definition: id=%s (force_code_backed=%s)",
+            definition_id,
+            allow_code_backed,
+        )
         return jsonify({"status": "success", "data": {"id": definition_id}})
 
     except Exception as e:

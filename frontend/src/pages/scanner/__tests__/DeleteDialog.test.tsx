@@ -18,6 +18,19 @@ const CLONE_DEF: scanner.ScanDefinitionSummary = {
   parent_definition_id: 1,
 }
 
+const CODE_BACKED_DEF: scanner.ScanDefinitionSummary = {
+  id: 5,
+  name: '_p0_always_true',
+  screener_type: 'buy',
+  rule_module: '_p0_always_true',
+  enabled: true,
+  created_at: '',
+  updated_at: '',
+  latest_signals: [],
+  today_hit_count: 0,
+  parent_definition_id: null,
+}
+
 function Wrapper({ children }: { children: ReactNode }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return <QueryClientProvider client={qc}>{children}</QueryClientProvider>
@@ -40,7 +53,7 @@ describe('DeleteDialog', () => {
     expect(screen.getByText(/fno_buy_custom/)).toBeInTheDocument()
   })
 
-  it('calls deleteDefinition on confirm', async () => {
+  it('calls deleteDefinition (force=false) on confirm for a clone', async () => {
     const user = userEvent.setup()
     render(
       <Wrapper>
@@ -49,7 +62,20 @@ describe('DeleteDialog', () => {
     )
     const confirmBtn = screen.getByRole('button', { name: /^delete$/i })
     await user.click(confirmBtn)
-    expect(scanner.scannerApi.deleteDefinition).toHaveBeenCalledWith(2)
+    expect(scanner.scannerApi.deleteDefinition).toHaveBeenCalledWith(2, false)
+  })
+
+  it('calls deleteDefinition (force=true) on confirm for a code-backed row', async () => {
+    vi.spyOn(scanner.scannerApi, 'deleteDefinition').mockResolvedValue({ id: 5 })
+    const user = userEvent.setup()
+    render(
+      <Wrapper>
+        <DeleteDialog open={true} onOpenChange={vi.fn()} definition={CODE_BACKED_DEF} />
+      </Wrapper>
+    )
+    const confirmBtn = screen.getByRole('button', { name: /^delete$/i })
+    await user.click(confirmBtn)
+    expect(scanner.scannerApi.deleteDefinition).toHaveBeenCalledWith(5, true)
   })
 
   it('calls onOpenChange(false) on cancel', async () => {
