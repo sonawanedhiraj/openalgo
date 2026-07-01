@@ -18,6 +18,7 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Position-store reconciliation at exit (issue #265, proposed 2026-07-01)
 ### LLM veto — in-process `claude -p` transport (#266 Phase 1 / #267, added 2026-07-01)
 
 Phase 1 of #266 moved the Stage-1 LLM veto's reasoning call from an httpx POST
@@ -57,44 +58,52 @@ fell safe to 'take' — the veto never fired. It now runs directly.
 
 > Proposed by feature branch `feat/265-live-position-reconciliation` (staged,
 > operator-reviewed order path). Land the entry on `dev` at merge time.
+>
+> **Revised 2026-07-01:** the guard now runs in **BOTH sandbox AND live** modes,
+> sourced from the mode-appropriate position store (was live-only). The flag was
+> renamed `LIVE_POSITION_RECONCILE_ENABLED` → `POSITION_RECONCILE_ENABLED`.
 
-#### LIVE_POSITION_RECONCILE_ENABLED
+#### POSITION_RECONCILE_ENABLED
 - **Current value:** unset → defaults **`true`**.
 - **Set in:** env; read by
   `services/live_position_reconciliation_service.is_enabled()` inside
-  `reconcile_exit`. The two engine call-sites additionally gate the whole guard
-  on their own **LIVE** mode, so in sandbox the guard is never even invoked.
-- **What it does:** master gate for the LIVE-mode exit reconciliation guard. When
-  ON (and the strategy is in `live` mode), every live exit reconciles its
-  journalled/in-memory close quantity against the real broker net position
-  (`services/openposition_service.get_open_position`) before the exit order is
-  placed:
-  - broker flat (net 0) → **SUPPRESS** the exit (phantom);
-  - broker holds fewer than journaled, or sits on the opposite side → **CLAMP**
-    to the broker qty (opposite side → clamp to 0 = suppress);
-  - broker consistent → **PROCEED** with the journalled qty (never more);
-  - broker fetch fails / no api key → **FAIL CLOSED for reverse-risk** (proceed
+  `reconcile_exit`. The engine call-sites run the guard in both `sandbox` and
+  `live` mode (only `disabled` mode — which never sends orders — skips it).
+- **What it does:** master gate for the exit reconciliation guard. When ON (and
+  the strategy is in `sandbox` or `live` mode), every exit reconciles its
+  journalled/in-memory close quantity against the **mode-appropriate position
+  store** — the `sandbox.db` virtual book in sandbox, the real broker positionbook
+  in live — via the mode-aware `services/openposition_service.get_open_position`,
+  before the exit order is placed:
+  - store flat (net 0) → **SUPPRESS** the exit (phantom);
+  - store holds fewer than journaled, or sits on the opposite side → **CLAMP**
+    to the store qty (opposite side → clamp to 0 = suppress);
+  - store consistent → **PROCEED** with the journalled qty (never more);
+  - store fetch fails / no api key → **FAIL CLOSED for reverse-risk** (proceed
     with the journalled qty, never an unbounded one) + drift alert.
   On any mismatch it emits a position-drift alert via
   `services.source_divergence_alerts.check_and_alert` (`journal_qty` vs
   `broker_qty`, per-(strategy, symbol, IST-day) dedup).
 - **Wired at:** `services/futures_follow_service.py`
   (`place_exit` → covers `run_exit` / `run_eod_watchdog` / `close_all_positions`,
-  plus a live-only boot `rehydrate_paper_book_from_broker`) and
+  plus a both-mode boot `rehydrate_paper_book_from_store`) and
   `services/simplified_stock_engine_service.py` (`_flatten_for_api_key`
   engine-known qty reconcile + phantom suppress, and `flatten_strategy_positions`
-  broker-aware clamp/suppress).
-- **Sandbox invariant:** in `sandbox` mode the guard is a strict no-op — the
-  broker positionbook is NEVER consulted; sandbox keeps reading `sandbox.db` and
-  `engine_eod_reconciliation_service` is unchanged. Proven by regression tests
-  that assert the positionbook mock is not called in sandbox.
-- **Why default true:** live money. The broker must be the source of truth at
-  exit; a journal↔broker mismatch (manual/partial exit, restart-lost `paper_book`,
+  store-aware clamp/suppress). The mode-aware store routing is done by
+  `get_open_position` / `get_positionbook`, so the same call reads sandbox.db in
+  sandbox and the broker in live.
+- **Sandbox complement (unchanged):** the sandbox EOD journal reconciliation
+  (`services/engine_eod_reconciliation_service`, sandbox.db → `trade_journal`) is
+  left untouched and is **complementary** — it stamps sandbox MIS square-offs into
+  the journal, while the #265 per-exit guard clamps/suppresses over-exits against
+  the sandbox store. The two do not overlap.
+- **Why default true:** the mode-appropriate store must be the source of truth at
+  exit; a journal↔store mismatch (manual/partial exit, restart-lost `paper_book`,
   phantom) could otherwise double-SELL into a net-short overnight future or fire a
-  reversing exit. Set `false` only as an emergency disable to fall back to the
-  legacy journal-driven exit path.
+  reversing exit — in the sandbox virtual book as well as live. Set `false` only
+  as an emergency disable to fall back to the legacy journal-driven exit path.
 - **Safety guarantee:** `test/test_live_position_reconciliation_service.py`
-  (helper semantics) + live/sandbox exit + boot-rehydrate cases in
+  (helper semantics) + sandbox/live exit + boot-rehydrate cases in
   `test/test_futures_follow_service.py`, `test/test_simplified_stock_engine_service.py`,
   `test/test_eod_watchdog_service.py`.
 

@@ -370,22 +370,27 @@ def _force_eod_clock(monkeypatch=None):
     return _FixedDateTime
 
 
-def test_eod_flatten_skipped_in_sandbox_mode(monkeypatch):
-    """Sandbox mode never queries the broker positionbook at EOD."""
+def test_eod_flatten_runs_in_sandbox_mode(monkeypatch):
+    """#265: sandbox mode DOES run the EOD flatten and reads the mode-aware store
+    (sandbox.db via get_positionbook). With no orphan/mismatch it dispatches
+    nothing, but it consults the store and marks the once-a-day flag done."""
     service = _make_service(MODE_SANDBOX)
     _seed_service_for_eod(service)
     _force_eod_clock(monkeypatch)
 
+    empty_book = (True, {"status": "success", "data": []}, 200)
     with (
-        patch("services.positionbook_service.get_positionbook") as mock_book,
+        patch(
+            "services.positionbook_service.get_positionbook", return_value=empty_book
+        ) as mock_book,
         patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
     ):
         service._maybe_flatten_eod()
 
-    mock_book.assert_not_called()
-    mock_dispatch.assert_not_called()
-    # Idempotency flag is NOT set in sandbox -- the flatten was a no-op.
-    assert service._eod_flatten_done_date is None
+    mock_book.assert_called()  # the sandbox store IS consulted now
+    mock_dispatch.assert_not_called()  # nothing to reconcile in an empty book
+    # Idempotency flag IS set -- the flatten ran (once-a-day).
+    assert service._eod_flatten_done_date is not None
 
 
 def test_eod_flatten_skipped_in_disabled_mode(monkeypatch):
@@ -1616,7 +1621,8 @@ def test_no_override_allows_entry():
 
 
 # ----------------------------------------------------------------------
-# #265 — _flatten_for_api_key broker reconciliation of engine-known qty
+# #265 — _flatten_for_api_key store reconciliation of engine-known qty
+#        (runs in BOTH sandbox AND live against the mode-aware store)
 # ----------------------------------------------------------------------
 
 
@@ -1709,3 +1715,82 @@ def test_eod_flatten_phantom_suppresses_and_alerts(monkeypatch):
     mock_dispatch.assert_not_called()
     mock_alert.assert_called_once()
     assert "GHOST" not in service.engine.positions
+
+
+def test_eod_flatten_reconciles_engine_qty_mismatch_in_sandbox(monkeypatch):
+    """SANDBOX (#265): engine thinks 10 but the sandbox store holds only 5 ->
+    reconcile to the sandbox store qty (5), routed via the mode-aware source.
+    The guard now runs in sandbox too, not just live."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_SANDBOX)
+    _seed_service_for_eod(service, api_key="sbx-key")
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+
+    # The mode-aware get_positionbook returns the sandbox.db book in sandbox.
+    sandbox_book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 5,
+                    "average_price": "2500.00",
+                }
+            ],
+        },
+        200,
+    )
+    open_pos = (True, {"quantity": 5, "status": "success"}, 200)
+
+    dispatched = []
+
+    def _capture_dispatch(self, payload, api_key, *, is_entry):
+        dispatched.append((payload, api_key, is_entry))
+        return True, {"orderid": "recon-sbx-1"}
+
+    with (
+        patch("services.positionbook_service.get_positionbook", return_value=sandbox_book),
+        patch("services.openposition_service.get_open_position", return_value=open_pos) as store,
+        patch.object(SimplifiedStockEngineService, "_dispatch_order", _capture_dispatch),
+    ):
+        service._maybe_flatten_eod()
+
+    store.assert_called()  # sandbox store IS consulted
+    assert len(dispatched) == 1
+    payload = dispatched[0][0]
+    assert payload["symbol"] == "RELIANCE"
+    assert payload["action"] == "SELL"
+    assert payload["quantity"] == 5  # clamped to the sandbox store
+    assert "RELIANCE" not in service.engine.positions
+
+
+def test_eod_flatten_disabled_mode_no_store_call(monkeypatch):
+    """DISABLED (#265): the flatten is skipped entirely — neither the positionbook
+    nor the reconciliation source is consulted."""
+    service = _make_service(MODE_DISABLED)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    with (
+        patch("services.positionbook_service.get_positionbook") as mock_book,
+        patch("services.openposition_service.get_open_position") as store,
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_book.assert_not_called()
+    store.assert_not_called()
+    mock_dispatch.assert_not_called()
