@@ -122,9 +122,24 @@ def test_fire_with_no_callbacks_is_noop():
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _clean_resolver_state():
+    """Reset the per-symbol resolution cache and the injected token lookup so
+    every test resolves from scratch and never leaks a fake lookup."""
+    with sps._resolve_lock:
+        sps._resolved_exchange_cache.clear()
+    saved = sps._token_lookup
+    sps._token_lookup = None
+    yield
+    sps._token_lookup = saved
+    with sps._resolve_lock:
+        sps._resolved_exchange_cache.clear()
+
+
 @pytest.mark.parametrize(
     "symbol,expected",
     [
+        # Fast-path broad indices (INDEX_SYMBOLS) — resolve with no DB.
         ("NIFTY", "NSE_INDEX"),
         ("BANKNIFTY", "NSE_INDEX"),
         ("FINNIFTY", "NSE_INDEX"),
@@ -132,13 +147,129 @@ def test_fire_with_no_callbacks_is_noop():
         ("NIFTYNXT50", "NSE_INDEX"),
         ("INDIAVIX", "NSE_INDEX"),
         ("nifty", "NSE_INDEX"),  # case-insensitive
+        # Equities — no master contract injected, default to NSE.
         ("RELIANCE", "NSE"),
         ("TCS", "NSE"),
         ("HDFCBANK", "NSE"),
     ],
 )
 def test_resolve_exchange_for_symbol(symbol, expected):
+    # No _token_lookup injected: fast-path handles the broad indices, everything
+    # else falls back to NSE (the master-contract lookup returns None here).
     assert sps.resolve_exchange_for_symbol(symbol) == expected
+
+
+# The 11 NSE sectoral indices from issue #241 — absent from INDEX_SYMBOLS, so
+# they MUST be resolved via the master-contract-backed lookup, not hardcoding.
+_SECTORAL_INDICES_241 = [
+    "NIFTYAUTO",
+    "NIFTYCONSRDURBL",
+    "NIFTYCONSUMPTION",
+    "NIFTYFMCG",
+    "NIFTYIT",
+    "NIFTYMETAL",
+    "NIFTYOILANDGAS",
+    "NIFTYPHARMA",
+    "NIFTYPSUBANK",
+    "NIFTYPVTBANK",
+    "NIFTYREALTY",
+]
+
+
+def _fake_master_contract(index_symbols, equity_symbols):
+    """Return a ``(symbol, exchange) -> token | None`` mimicking SymToken.
+
+    ``index_symbols`` are stored under NSE_INDEX; ``equity_symbols`` under NSE.
+    """
+    index_upper = {s.upper() for s in index_symbols}
+    equity_upper = {s.upper() for s in equity_symbols}
+
+    def _lookup(symbol, exchange):
+        sym = symbol.upper()
+        if exchange == "NSE_INDEX" and sym in index_upper:
+            return f"tok-idx-{sym}"
+        if exchange == "NSE" and sym in equity_upper:
+            return f"tok-eq-{sym}"
+        return None
+
+    return _lookup
+
+
+@pytest.mark.parametrize("symbol", _SECTORAL_INDICES_241)
+def test_sectoral_indices_resolve_to_nse_index_via_master_contract(symbol):
+    # These 11 are NOT in INDEX_SYMBOLS — proof the fix is not just an extended
+    # hardcoded list.
+    assert symbol not in sps.INDEX_SYMBOLS
+    sps._token_lookup = _fake_master_contract(
+        index_symbols=_SECTORAL_INDICES_241, equity_symbols=["RELIANCE", "TCS"]
+    )
+    assert sps.resolve_exchange_for_symbol(symbol) == "NSE_INDEX"
+
+
+def test_equities_resolve_to_nse_when_stored_as_equity():
+    sps._token_lookup = _fake_master_contract(
+        index_symbols=_SECTORAL_INDICES_241, equity_symbols=["RELIANCE", "TCS", "HDFCBANK"]
+    )
+    for eq in ("RELIANCE", "TCS", "HDFCBANK"):
+        assert sps.resolve_exchange_for_symbol(eq) == "NSE"
+
+
+def test_master_contract_wins_over_default_for_new_index():
+    # A brand-new index the hardcoded set has never heard of still routes right
+    # as long as the master contract knows it — the whole point of issue #241.
+    sps._token_lookup = _fake_master_contract(
+        index_symbols=["NIFTYSOMENEWINDEX"], equity_symbols=[]
+    )
+    assert "NIFTYSOMENEWINDEX" not in sps.INDEX_SYMBOLS
+    assert sps.resolve_exchange_for_symbol("NIFTYSOMENEWINDEX") == "NSE_INDEX"
+
+
+def test_falls_back_to_nse_when_contract_absent():
+    # Contract can't answer (get_token returns None for everything) -> NSE, and
+    # the unresolved answer is NOT cached, so a later successful lookup wins.
+    sps._token_lookup = lambda sym, exch: None
+    assert sps.resolve_exchange_for_symbol("NIFTYAUTO") == "NSE"
+    # Now the contract loads and knows NIFTYAUTO as an index.
+    sps._token_lookup = _fake_master_contract(index_symbols=["NIFTYAUTO"], equity_symbols=[])
+    assert sps.resolve_exchange_for_symbol("NIFTYAUTO") == "NSE_INDEX"
+
+
+def test_fast_path_index_never_touches_contract():
+    # INDEX_SYMBOLS members resolve without ever calling the lookup (proven by a
+    # lookup that would raise if invoked).
+    def _boom(sym, exch):
+        raise AssertionError("master-contract lookup must not run for fast-path index")
+
+    sps._token_lookup = _boom
+    assert sps.resolve_exchange_for_symbol("NIFTY") == "NSE_INDEX"
+    assert sps.resolve_exchange_for_symbol("BANKNIFTY") == "NSE_INDEX"
+
+
+def test_lookup_exception_falls_back_to_nse():
+    # A raising lookup for a non-fast-path symbol must be swallowed to NSE, never
+    # propagate into the subscribe path.
+    def _boom(sym, exch):
+        raise RuntimeError("db exploded")
+
+    sps._token_lookup = _boom
+    assert sps.resolve_exchange_for_symbol("SOMEEQUITY") == "NSE"
+
+
+def test_resolution_is_cached_after_first_success():
+    calls = []
+
+    def _counting_lookup(sym, exch):
+        calls.append((sym, exch))
+        if exch == "NSE_INDEX" and sym == "NIFTYIT":
+            return "tok"
+        return None
+
+    sps._token_lookup = _counting_lookup
+    assert sps.resolve_exchange_for_symbol("NIFTYIT") == "NSE_INDEX"
+    n_after_first = len(calls)
+    # Second call is served from cache — no further lookups.
+    assert sps.resolve_exchange_for_symbol("NIFTYIT") == "NSE_INDEX"
+    assert len(calls) == n_after_first
 
 
 # ---------------------------------------------------------------------------
