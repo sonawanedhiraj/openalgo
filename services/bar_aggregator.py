@@ -300,6 +300,14 @@ class BarBuilder:
         bucket), unlike :meth:`on_tick` which derives a delta from cumulative
         volume — historical bars carry absolute per-bar volume.
 
+        Every closing bar fired by replay carries ``is_replay=True`` in its
+        snapshot so downstream ``on_bar`` consumers can warm their rolling state
+        (append to history) WITHOUT treating the bar as a live signal — a
+        replayed/seeded/recovery bar is historical, and evaluating it (or firing
+        a scan hit) is wrong, including for a mid-session restart where the
+        market-hours gate would NOT skip it. Live ticks (:meth:`on_tick`) never
+        set this flag, so the live evaluation path is unchanged.
+
         Returns:
             The number of bars actually folded in (excludes skipped duplicates).
         """
@@ -327,7 +335,7 @@ class BarBuilder:
                     "volume": v,
                 }
             elif bucket != self._current["bucket"]:
-                self._emit(1.0)
+                self._emit(1.0, is_replay=True)
                 self._current = {
                     "bucket": bucket,
                     "open": o,
@@ -344,12 +352,12 @@ class BarBuilder:
             replayed += 1
         return replayed
 
-    def _emit(self, elapsed_pct: float) -> None:
+    def _emit(self, elapsed_pct: float, is_replay: bool = False) -> None:
         if self.on_bar is None:
             return
-        self.on_bar(self._snapshot(elapsed_pct))
+        self.on_bar(self._snapshot(elapsed_pct, is_replay=is_replay))
 
-    def _snapshot(self, elapsed_pct: float) -> dict:
+    def _snapshot(self, elapsed_pct: float, is_replay: bool = False) -> dict:
         c = self._current
         return {
             "symbol": self.symbol,
@@ -361,6 +369,10 @@ class BarBuilder:
             "close": c["close"],
             "volume": int(c["volume"]),
             "elapsed_pct": elapsed_pct,
+            # True only for bars folded in via replay_bars() — historical /
+            # seeded / WS-recovery bars. Live ticks leave this False so the
+            # scanner's live evaluation path is unchanged.
+            "is_replay": is_replay,
         }
 
 

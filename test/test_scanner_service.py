@@ -744,7 +744,12 @@ def _pin_now(monkeypatch, hour, minute=0):
 
 
 def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypatch, caplog):
-    """A bar that closes at 16:00 IST must be skipped (post-close) with an INFO log."""
+    """A bar that closes at 16:00 IST must be skipped (post-close) with a DEBUG log.
+
+    The per-bar skip line is DEBUG (issue #256) — it fires per bar per symbol,
+    so at INFO a restart floods the log. The skip *behavior* (no row, no event)
+    is the load-bearing assertion; the log level is verified at DEBUG.
+    """
     import logging
 
     _pin_now(monkeypatch, 16, 0)
@@ -753,7 +758,7 @@ def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypat
     _enable_buy_definition()
     bar = _seed_matching_buy(svc)
 
-    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
         svc._on_bar_close("RELIANCE", "5m", bar)
 
     # No evaluation happened → no row, no event.
@@ -766,7 +771,7 @@ def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypat
 
 
 def test_scanner_skips_evaluation_before_market_open(fresh_scanner_db, monkeypatch, caplog):
-    """A bar that closes at 08:00 IST must be skipped (pre-open)."""
+    """A bar that closes at 08:00 IST must be skipped (pre-open) with a DEBUG log."""
     import logging
 
     _pin_now(monkeypatch, 8, 0)
@@ -775,7 +780,7 @@ def test_scanner_skips_evaluation_before_market_open(fresh_scanner_db, monkeypat
     _enable_buy_definition()
     bar = _seed_matching_buy(svc)
 
-    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
         svc._on_bar_close("RELIANCE", "5m", bar)
 
     assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
@@ -1058,3 +1063,183 @@ def test_evaluate_definitions_no_params_key_when_parameters_json_empty(fresh_sca
     svc._on_bar_close("RELIANCE", "5m", bar)
 
     assert captured.get("has_parameters") is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #256 — replayed bars warm rolling state WITHOUT firing signals
+#
+# The boot seeder (scanner_aggregator_seeder) and WS-reconnect recovery
+# (ws_recovery_service) both fold historical 1m bars into the live aggregator
+# via MultiIntervalAggregator.replay_bars to warm RSI/SMA windows. Those bars
+# are historical: evaluating them (or firing a ScanHitEvent) is wrong. A
+# mid-session restart replays them DURING market hours where the market-hours
+# gate would NOT skip them, so the fix must protect the path itself — not lean
+# on the gate. Only genuine LIVE bar closes are evaluated.
+# ---------------------------------------------------------------------------
+
+
+def _replay_ohlcv_bars(
+    n: int,
+    start: dt.datetime = dt.datetime(2026, 5, 30, 9, 15),
+) -> list[dict]:
+    """N discrete 1m OHLCV bars (the shape replay_bars expects — not ticks)."""
+    return [
+        {
+            "ts": start + dt.timedelta(minutes=i),
+            "open": 100.0 + i * 0.5,
+            "high": 101.0 + i * 0.5,
+            "low": 99.0 + i * 0.5,
+            "close": 100.0 + i * 0.5,
+            "volume": 1000,
+        }
+        for i in range(n)
+    ]
+
+
+def test_replay_bars_warms_history_but_does_not_evaluate(fresh_scanner_db):
+    """replay_bars folds bars into the rolling window (indicator warm-up) but
+    fires NO scan-evaluation: no scan_results row, no ScanHitEvent."""
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+
+    # 40 one-minute bars → 8 closed 5m buckets folded via the real aggregator
+    # callback path (aggregator.on_bar_close == svc._on_bar_close).
+    folded = svc.aggregator.replay_bars("RELIANCE", _replay_ohlcv_bars(40))
+    assert folded == 40
+
+    # The rolling 5m history window warmed (indicators can be computed later).
+    warmed = svc._bar_history.get(("RELIANCE", "5m"))
+    assert warmed is not None and len(warmed) >= 7
+
+    # But NOTHING was evaluated: no results, no events.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+
+
+def test_live_bar_after_replay_still_evaluates(fresh_scanner_db):
+    """The live path is preserved: a genuine live bar close after a replay
+    warm-up evaluates exactly as before (fires the rule → row + event)."""
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    def_id = _enable_buy_definition()
+
+    # Warm the window via replay (no eval); assert the replay itself is silent.
+    svc.aggregator.replay_bars("RELIANCE", _replay_ohlcv_bars(40))
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+
+    # Seed enough rising history for the rule's 21-bar minimum (the replayed 5m
+    # buckets alone are too few) so the live surge below can actually match —
+    # this test is about the live path still evaluating, not warm-up depth.
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+
+    # A live bar carries no is_replay flag (default False) — full evaluation.
+    live_surge = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 5000,
+        "elapsed_pct": 1.0,
+    }
+    svc._on_bar_close("RELIANCE", "5m", live_surge)
+
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    assert len(rows) == 1
+    assert rows[0]["scan_definition_id"] == def_id
+    assert len(capturing_bus.events) == 1
+    assert isinstance(capturing_bus.events[0], scanner_service.ScanHitEvent)
+
+
+def test_replay_during_market_hours_still_does_not_fire(fresh_scanner_db, monkeypatch):
+    """A mid-session restart replays historical bars DURING market hours, where
+    the _evaluate_definitions market-hours gate does NOT skip. Proves the fix
+    (is_replay suppression) — not the gate — protects the mid-session path."""
+    # 11:00 IST is squarely inside [09:15, 15:30] — the gate would let a live
+    # bar through here.
+    _pin_now(monkeypatch, 11, 0)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+
+    # Seed a rising history and replay a would-be surge bar as a HISTORICAL bar.
+    # If replayed bars were evaluated, this in-hours surge would fire a hit.
+    warm = _replay_ohlcv_bars(100)  # 20 closed 5m buckets — plenty of history
+    # Make the final replayed 1m bar a volume+price surge that WOULD match the
+    # buy rule if it were ever evaluated as a live bar.
+    warm[-1] = {
+        "ts": warm[-1]["ts"],
+        "open": 150.0,
+        "high": 151.0,
+        "low": 149.0,
+        "close": 200.0,
+        "volume": 500000,
+    }
+    svc.aggregator.replay_bars("RELIANCE", warm)
+
+    # In-hours, but replayed → still no evaluation, no signal.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+
+
+def test_ws_recovery_replay_warms_without_firing(fresh_scanner_db):
+    """The ws_recovery path (MultiIntervalAggregator.replay_bars over the live
+    scanner aggregator) updates aggregator + history state without firing
+    signals — the same guarantee as the boot seeder."""
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+
+    # ws_recovery calls aggregator.replay_bars(symbol, bars) exactly like this.
+    n = svc.aggregator.replay_bars("RELIANCE", _replay_ohlcv_bars(30))
+    assert n == 30
+
+    # Aggregator's in-progress bucket advanced (state updated) and history warmed.
+    assert svc.aggregator.current_bar("RELIANCE", "5m") is not None
+    assert svc._bar_history.get(("RELIANCE", "5m")) is not None
+
+    # No signals fired.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+
+
+def test_replay_bars_snapshot_carries_is_replay_flag():
+    """Unit-level guarantee: a bar closed via BarBuilder.replay_bars carries
+    is_replay=True, while a live tick close carries is_replay=False. This is the
+    single flag _on_bar_close keys off to suppress evaluation."""
+    from services.bar_aggregator import BarBuilder
+
+    replay_closes: list[dict] = []
+    b = BarBuilder("INFY", "1m", on_bar=lambda bar: replay_closes.append(bar))
+    # Two 1m bars in different buckets → the first bucket closes on the second.
+    b.replay_bars(
+        [
+            {
+                "ts": dt.datetime(2026, 5, 30, 9, 15),
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "volume": 10,
+            },
+            {
+                "ts": dt.datetime(2026, 5, 30, 9, 16),
+                "open": 2,
+                "high": 2,
+                "low": 2,
+                "close": 2,
+                "volume": 20,
+            },
+        ]
+    )
+    assert replay_closes and all(bar["is_replay"] is True for bar in replay_closes)
+
+    live_closes: list[dict] = []
+    lb = BarBuilder("INFY", "1m", on_bar=lambda bar: live_closes.append(bar))
+    lb.on_tick({"ts": dt.datetime(2026, 5, 30, 9, 15, 0), "price": 1.0, "cumulative_volume": 10})
+    lb.on_tick({"ts": dt.datetime(2026, 5, 30, 9, 16, 0), "price": 2.0, "cumulative_volume": 20})
+    closes = [bar for bar in live_closes if bar["elapsed_pct"] >= 1.0]
+    assert closes and all(bar["is_replay"] is False for bar in closes)

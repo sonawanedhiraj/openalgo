@@ -1050,9 +1050,20 @@ class ScannerService:
         Any exception raised here is caught and logged but does NOT propagate
         back into the aggregator — a single rule blowing up must not kill
         future ticks for other symbols.
+
+        Replayed bars (``bar["is_replay"]``) — folded in by the boot seeder
+        (``scanner_aggregator_seeder``) or the WS-reconnect recovery
+        (``ws_recovery_service``) via ``MultiIntervalAggregator.replay_bars`` —
+        still warm the rolling history window (``_append_bar``) so RSI/SMA are
+        ready when live ticks resume, but they are NEVER evaluated: a historical
+        bar must not fire a scan hit, and a mid-session restart replays bars
+        DURING market hours where the ``_evaluate_definitions`` market-hours gate
+        would not skip them. Only genuine live bar closes are evaluated.
         """
         try:
             bars = self._append_bar(symbol, interval, bar)
+            if bar.get("is_replay"):
+                return
             indicators_dict = self._build_indicators(symbol, bars)
             self._evaluate_definitions(symbol, interval, bars, indicators_dict, bar)
         except Exception:
@@ -1179,7 +1190,11 @@ class ScannerService:
         now_ist = _now_ist()
         if _postclose_gate_enabled() and not _within_market_hours(now_ist):
             phase = "post-close" if now_ist.time() > _MARKET_CLOSE_IST else "pre-open"
-            logger.info(
+            # DEBUG, not INFO: this fires per bar per symbol, so on a restart the
+            # market-hours gate would flood the log with tens of thousands of
+            # identical lines. The phase is obvious from the wall clock; the
+            # backstop itself is unchanged.
+            logger.debug(
                 "scanner evaluation skipped: %s (now=%s IST) for %s/%s",
                 phase,
                 now_ist.strftime("%H:%M"),
