@@ -196,12 +196,17 @@ class SimplifiedStockEngineService:
             candle_seconds=self.config.candle_seconds,
         )
         # Order routing mode: disabled | sandbox | live. See MODE_* in core.
+        # Seeded from the env flag at construction; the persistent strategy_mode
+        # DB row (set via the /strategies UI toggle) is honored at order dispatch
+        # by _apply_persistent_mode() — issue #162 Phase 2. The engine routes on
+        # sandbox.db vs the broker per self.mode, so the resolve lives here (at
+        # dispatch) rather than in place_order_service, which the sandbox path
+        # bypasses.
         self.mode = self.config.mode
-        # Unified daily-intent resolver (services.mode_service). Injectable for
-        # tests; default consults resolve_strategy_mode('simplified_engine').
-        # See docs/design/strategy_daily_intent.md — the gate lives here (order
-        # dispatch) rather than in place_order_service because the engine's own
-        # _dispatch_order bypasses that path in sandbox mode.
+        # Deprecated/unused: the run/pause/halt intent axis was retired
+        # (mode-only architecture). Runtime pause/kill now flows through
+        # strategy_runtime_override (see _entry_held_by_override). Retained as a
+        # no-op so injection sites in older tests don't break.
         self._intent_resolver: Any | None = None
         self.history_source = os.getenv("SIMPLIFIED_ENGINE_HISTORY_SOURCE", "api")
         self.history_lookback_days = _env_int("SIMPLIFIED_ENGINE_HISTORY_LOOKBACK_DAYS", 3)
@@ -572,7 +577,52 @@ class SimplifiedStockEngineService:
             logger.debug("simplified runtime-override resolve failed; not blocking", exc_info=True)
             return False
 
+    def _apply_persistent_mode(self) -> None:
+        """Honor the persistent ``strategy_mode`` DB row (set via the /strategies
+        UI toggle) — issue #162 Phase 2.
+
+        Resolves ``services.mode_service.resolve_mode('simplified_engine')`` and
+        maps its {sandbox, live} onto ``self.mode`` when a persistent row exists
+        (``source == 'strategy_mode'``). With no row the engine keeps its env /
+        default mode, so deploy is a no-op until the operator flips the toggle.
+
+        Safety:
+        * ``MODE_DISABLED`` is a hard local off-switch and is NEVER overridden
+          from the DB — an operator who disabled the engine locally is not
+          surprise-enabled by a stray row.
+        * Fail-open: any DB error keeps the current mode. A trading decision is
+          never blocked on this read.
+        * Mirrors sector_follow/futures_follow ``_apply_mode_override`` so all
+          three engines resolve routing the same way. Mode is expected stable
+          within a session (set pre-market); event-driven mid-session flips are
+          Phase 3.
+        """
+        if self.mode == MODE_DISABLED:
+            return
+        try:
+            from services.mode_service import resolve_mode
+
+            resolved = resolve_mode(self.MODE_STRATEGY_NAME)
+        except Exception:
+            logger.debug("[SIMPLIFIED-MODE] resolve_mode failed — keeping mode=%s", self.mode)
+            return
+        if resolved.source != "strategy_mode":
+            return
+        mapped = resolved.mode if resolved.mode in (MODE_SANDBOX, MODE_LIVE) else None
+        if mapped and mapped != self.mode:
+            logger.warning(
+                "[SIMPLIFIED-MODE] mode override %s -> %s (strategy_mode row)",
+                self.mode,
+                mapped,
+            )
+            self.mode = mapped
+
     def _place_entry_order(self, signal: EntrySignal, api_key: str, strategy_name: str) -> None:
+        # Issue #162 Phase 2: resolve the persistent strategy_mode row before any
+        # mode-dependent gate (disabled short-circuit, live funds check) or
+        # dispatch, so the whole entry flow sees one consistent, UI-controllable
+        # routing mode.
+        self._apply_persistent_mode()
         # Mode-only safety gate: an active runtime override (pause/kill_switch)
         # holds new entries. Exits are never blocked here.
         if self._entry_held_by_override():
@@ -800,6 +850,12 @@ class SimplifiedStockEngineService:
     # off/veto toggle on this.
     LLM_CONFIG_STRATEGY_NAME = "simplified_engine"
 
+    # Dashboard identity used for the persistent order-routing mode
+    # (strategy_mode table / /strategies toggle → services.mode_service.resolve_mode,
+    # issue #162 Phase 2). Same key the UI mode toggle writes; the engine reads
+    # it at order dispatch so a UI sandbox↔live flip actually takes effect.
+    MODE_STRATEGY_NAME = "simplified_engine"
+
     @staticmethod
     def _normalize_exit_reason(reason: str | None) -> str:
         """Map engine exit reasons to the journal's controlled vocabulary."""
@@ -997,6 +1053,10 @@ class SimplifiedStockEngineService:
             )
 
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
+        # Issue #162 Phase 2: honor the persistent strategy_mode row so an exit
+        # routes to the same store the position lives in. Exits are never gated
+        # by it — resolving only picks sandbox.db vs the broker.
+        self._apply_persistent_mode()
         # Mode-only: exits are NEVER gated. Runtime overrides (pause/kill_switch)
         # hold new entries only — a held position must always be allowed to exit.
         if self.mode == MODE_DISABLED:
