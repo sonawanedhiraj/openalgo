@@ -1613,3 +1613,99 @@ def test_no_override_allows_entry():
 
     mock_live.assert_not_called()
     mock_sandbox.assert_called_once()
+
+
+# ----------------------------------------------------------------------
+# #265 — _flatten_for_api_key broker reconciliation of engine-known qty
+# ----------------------------------------------------------------------
+
+
+def test_eod_flatten_reconciles_engine_qty_mismatch(monkeypatch):
+    """LIVE: engine thinks 10, broker holds only 5 -> reconcile to the broker qty
+    (5) rather than only warning. The engine would otherwise over-exit/reverse."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service, api_key="live-key")
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+
+    positionbook_response = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 5,
+                    "average_price": "2500.00",
+                }
+            ],
+        },
+        200,
+    )
+    open_pos = (True, {"quantity": 5, "status": "success"}, 200)
+
+    dispatched = []
+
+    def _capture_dispatch(self, payload, api_key, *, is_entry):
+        dispatched.append((payload, api_key, is_entry))
+        return True, {"orderid": "recon-1"}
+
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=positionbook_response,
+        ),
+        patch("services.openposition_service.get_open_position", return_value=open_pos),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order", _capture_dispatch),
+    ):
+        service._maybe_flatten_eod()
+
+    assert len(dispatched) == 1
+    payload = dispatched[0][0]
+    assert payload["symbol"] == "RELIANCE"
+    assert payload["action"] == "SELL"
+    assert payload["quantity"] == 5
+    assert "RELIANCE" not in service.engine.positions
+
+
+def test_eod_flatten_phantom_suppresses_and_alerts(monkeypatch):
+    """LIVE: engine thinks GHOST open but broker is flat -> SUPPRESS (no order),
+    clear the engine state, and emit a phantom drift alert."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["GHOST"] = Position(
+        symbol="GHOST",
+        entry_price=500.0,
+        qty=5,
+        stop_loss=495.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 11, 0),
+        risk_per_share=5.0,
+    )
+
+    empty_book = (True, {"status": "success", "data": []}, 200)
+    with (
+        patch("services.positionbook_service.get_positionbook", return_value=empty_book),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+        patch("services.simplified_stock_engine_service._emit_phantom_alert") as mock_alert,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_dispatch.assert_not_called()
+    mock_alert.assert_called_once()
+    assert "GHOST" not in service.engine.positions

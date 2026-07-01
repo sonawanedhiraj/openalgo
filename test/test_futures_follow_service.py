@@ -776,5 +776,167 @@ def test_resolver_returns_none_when_all_expire_within_one_day(monkeypatch):
     assert c is None
 
 
+# --------------------------------------------------------------------------- #
+# #265 — LIVE broker-position reconciliation at exit
+# --------------------------------------------------------------------------- #
+def test_sandbox_exit_never_consults_broker():
+    """CRITICAL sandbox regression guard: in sandbox mode the exit path must NOT
+    call the broker positionbook — behavior is byte-identical to before #265."""
+    from services import openposition_service
+
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    with patch.object(openposition_service, "get_open_position") as broker:
+        exited = svc.run_exit()
+    broker.assert_not_called()
+    assert len(exited) == 1
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 75  # full journalled qty
+
+
+def test_live_exit_phantom_broker_flat_is_suppressed():
+    """LIVE: broker reports flat (net 0) → SUPPRESS the SELL entirely."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    flat = (True, {"quantity": 0, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=flat),
+    ):
+        exited = svc.run_exit()
+    # No SELL placed, position dropped.
+    assert svc._test_placed == []
+    assert exited == []
+    assert svc.lots_held() == 0
+
+
+def test_live_exit_partial_broker_clamps_qty():
+    """LIVE: journal 2 lots (150), broker holds 1 lot (75) → SELL only 75."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    partial = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=partial),
+    ):
+        exited = svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["action"] == "SELL"
+    assert svc._test_placed[0][1]["quantity"] == 75  # clamped to broker
+    assert len(exited) == 1
+    # P&L journalled on the clamped qty, not the journalled 150.
+    ex = svc.today_exits[0]
+    assert ex["qty"] == 75
+    assert ex["gross_pnl"] == pytest.approx(100 * 75)
+
+
+def test_live_exit_consistent_broker_proceeds_full_qty():
+    """LIVE: broker matches journal → SELL the full journalled qty."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")  # quantity=75
+    match = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=match),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 75
+
+
+def test_live_exit_broker_fetch_failure_fails_closed():
+    """LIVE: broker fetch fails → still SELL, but NEVER more than journaled."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    failed = (False, {"status": "error", "message": "down"}, 500)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=failed),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 150  # journalled, not more
+
+
+# --------------------------------------------------------------------------- #
+# #265 — LIVE boot rehydrate of paper_book from broker positions
+# --------------------------------------------------------------------------- #
+def test_rehydrate_is_noop_in_sandbox():
+    from services import positionbook_service
+
+    svc = _make_service(mode="sandbox")
+    with patch.object(positionbook_service, "get_positionbook") as book:
+        n = svc.rehydrate_paper_book_from_broker()
+    book.assert_not_called()
+    assert n == 0
+    assert svc.paper_book == {}
+
+
+def test_rehydrate_rebuilds_paper_book_in_live():
+    svc = _make_service(mode="live")
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY30JUN26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 150,  # 2 lots
+                    "average_price": "24000.0",
+                },
+                # Non-NIFTY / option leg — must be ignored.
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 10,
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_broker()
+    assert n == 1
+    assert svc.lots_held() == 2
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.nifty_symbol == "NIFTY30JUN26FUT"
+    assert pos.quantity == 150
+    # Stamped prior-day so today's T+1 exit jobs act on it.
+    assert pos.entry_date != "2026-06-10"
+
+
+def test_rehydrate_skips_already_known_symbols():
+    svc = _make_service(mode="live")
+    _seed_position(svc, "P1", entry_date="2026-06-09")  # NIFTY26JUN24FUT already held
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY26JUN24FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 75,
+                }
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_broker()
+    assert n == 0  # already known, not double-counted
+    assert svc.lots_held() == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

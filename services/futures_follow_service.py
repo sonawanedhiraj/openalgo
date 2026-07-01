@@ -334,6 +334,20 @@ def production_order_placer(mode: str, order: dict) -> dict:
     return response
 
 
+def _resolve_exit_api_key() -> str | None:
+    """First available OpenAlgo api key for the live broker positionbook read (#265).
+
+    Lazily imported so importing this module never pulls the auth stack. ``None``
+    when no key is available — the reconciliation guard then fails closed."""
+    try:
+        from database.auth_db import get_first_available_api_key
+
+        return get_first_available_api_key()
+    except Exception:
+        logger.exception("futures_follow: resolve exit api_key failed")
+        return None
+
+
 def production_price_fetcher(symbol: str, exchange: str) -> float | None:
     """Current LTP for one symbol via the broker quote API. None on any failure.
 
@@ -794,13 +808,64 @@ class FuturesFollowService:
             "order_id": order_id,
         }
 
+    def _reconcile_live_exit_qty(self, position: FuturesPosition) -> int | None:
+        """LIVE-only broker-position reconciliation for a T+1 exit (#265).
+
+        Returns the guarded SELL quantity to place, or ``None`` to SUPPRESS the
+        exit (broker flat / opposite side). In sandbox mode this is a no-op that
+        returns the journalled quantity unchanged — the broker positionbook is
+        NEVER consulted, so sandbox behavior is byte-identical to before.
+        """
+        if self.mode != "live":
+            return position.quantity
+        try:
+            from services import live_position_reconciliation_service as recon
+
+            decision = recon.reconcile_exit(
+                strategy=STRATEGY_NAME,
+                api_key=_resolve_exit_api_key(),
+                symbol=position.nifty_symbol,
+                exchange=self.config.exchange,
+                product=self.config.product,
+                expected_close_side="SELL",
+                journaled_qty=position.quantity,
+            )
+        except Exception:
+            # Guard must never break the exit path; on an unexpected failure fall
+            # back to the journalled qty (never MORE than journaled).
+            logger.exception("futures_follow live reconcile raised; proceeding with journaled qty")
+            return position.quantity
+        if not decision.should_place:
+            logger.error(
+                "futures_follow EXIT SUPPRESSED for %s (reason=%s, broker_qty=%s, journaled=%d)",
+                position.nifty_symbol,
+                decision.reason,
+                decision.broker_qty,
+                position.quantity,
+            )
+            return None
+        return decision.guarded_qty
+
     def place_exit(
         self, pos_id: str, position: FuturesPosition, price: float | None = None
     ) -> dict | None:
         """Square off one position (mode-aware). Exits are NOT blocked by the kill
-        switch — open positions always run to their scheduled T+1 exit."""
+        switch — open positions always run to their scheduled T+1 exit.
+
+        In LIVE mode the broker net position is reconciled first (#265): a phantom
+        (broker flat) is SUPPRESSED and a partial (broker < journaled) is CLAMPED.
+        In sandbox mode the guard is a no-op — the journalled quantity is used."""
         symbol = position.nifty_symbol
         exit_price = price if price is not None else position.entry_price
+
+        exit_qty = self._reconcile_live_exit_qty(position)
+        if exit_qty is None:
+            # Phantom / opposite-side: broker holds nothing to close. Drop the
+            # in-memory position (its broker leg is already flat) without placing
+            # a SELL, so a repeat exit job doesn't retry it.
+            self.paper_book.pop(pos_id, None)
+            return None
+
         order_id = None
         status = "placed"
         error_message = None
@@ -812,7 +877,7 @@ class FuturesFollowService:
                     "exchange": self.config.exchange,
                     "action": "SELL",
                     "product": self.config.product,
-                    "quantity": position.quantity,
+                    "quantity": exit_qty,
                 },
             )
         except Exception as e:
@@ -829,7 +894,7 @@ class FuturesFollowService:
                 self.mode,
                 symbol,
                 position.lots,
-                position.quantity,
+                exit_qty,
                 exit_price,
                 order_id,
             )
@@ -847,16 +912,16 @@ class FuturesFollowService:
                 error_message,
             )
 
-        buy_notional = position.entry_price * position.quantity
-        sell_notional = exit_price * position.quantity
-        gross_pnl = (exit_price - position.entry_price) * position.quantity
+        buy_notional = position.entry_price * exit_qty
+        sell_notional = exit_price * exit_qty
+        gross_pnl = (exit_price - position.entry_price) * exit_qty
         charges = compute_futures_charges(buy_notional, sell_notional)
         net_pnl = gross_pnl - charges
         self._record_trade(
             side="SELL",
             nifty_symbol=symbol,
             lots=position.lots,
-            quantity=position.quantity,
+            quantity=exit_qty,
             entry_price=position.entry_price,
             exit_price=exit_price,
             entry_date=position.entry_date,
@@ -880,7 +945,7 @@ class FuturesFollowService:
                 "exit_price": exit_price,
                 "entry_date": position.entry_date,
                 "lots": position.lots,
-                "qty": position.quantity,
+                "qty": exit_qty,
                 "gross_pnl": gross_pnl,
                 "charges_inr": charges,
                 "net_pnl": net_pnl,
@@ -1106,6 +1171,110 @@ class FuturesFollowService:
     def run_daily_reset(self) -> None:
         """09:00 IST: reset kill switch + daily P&L."""
         self.reset_daily_state()
+
+    # ----- boot durability (live-only) ----------------------------------- #
+    def rehydrate_paper_book_from_broker(self) -> int:
+        """LIVE-only: rebuild ``paper_book`` from real broker positions on boot (#265).
+
+        A restart otherwise loses the in-memory ``paper_book``, stranding a real
+        overnight NIFTY-futures long with no scheduled T+1 exit. On boot in live
+        mode this reads the broker positionbook and reconstructs a position for
+        every open NIFTY*FUT leg on NFO/NRML that the ``paper_book`` doesn't
+        already know about, so the 15:20/15:25/15:14 exit jobs will square it off.
+
+        In sandbox mode this is a NO-OP (returns 0) — the broker is never consulted;
+        the sandbox book is authoritative and rehydrated by sandbox itself.
+
+        Returns the number of positions rehydrated. Never raises.
+        """
+        if self.mode != "live":
+            return 0
+        try:
+            from services.positionbook_service import get_positionbook
+
+            api_key = _resolve_exit_api_key()
+            if not api_key:
+                logger.warning("futures_follow rehydrate: no api_key; skipping")
+                return 0
+            success, resp, _ = get_positionbook(api_key=api_key)
+            if not success or not isinstance(resp, dict):
+                logger.warning("futures_follow rehydrate: positionbook fetch failed: %r", resp)
+                return 0
+            positions = resp.get("data") or []
+        except Exception:
+            logger.exception("futures_follow rehydrate: positionbook read raised")
+            return 0
+
+        exchange = self.config.exchange.upper()
+        product = self.config.product.upper()
+        underlying = self.config.underlying.upper()
+        lot_size = self.config.nifty_lot_size
+        # Symbols already tracked in memory — do not double-count them.
+        known_symbols = {p.nifty_symbol for p in self.paper_book.values()}
+        rehydrated = 0
+        today = self._now().date().isoformat()
+        # Rehydrated positions are stamped with YESTERDAY's date so the T+1 exit
+        # jobs (which square off positions whose entry_date != today) act on them.
+        prior_day = (self._now().date() - timedelta(days=1)).isoformat()
+
+        for pos in positions:
+            try:
+                raw_qty = pos.get("quantity") or pos.get("netqty") or pos.get("net_qty") or 0
+                qty = int(float(raw_qty))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:  # only long NIFTY-futures legs are ours
+                continue
+            symbol = str(pos.get("symbol", "")).strip()
+            pos_exchange = str(pos.get("exchange", "")).strip().upper()
+            pos_product = str(pos.get("product", "")).strip().upper()
+            if pos_exchange and pos_exchange != exchange:
+                continue
+            if pos_product and pos_product != product:
+                continue
+            # Only NIFTY futures (e.g. NIFTY30JUN26FUT), not options / other names.
+            if not (symbol.startswith(underlying) and symbol.endswith("FUT")):
+                continue
+            if symbol in known_symbols:
+                continue
+
+            try:
+                entry_price = float(pos.get("average_price") or pos.get("avgprice") or 0.0)
+            except (TypeError, ValueError):
+                entry_price = 0.0
+            lots = max(1, qty // lot_size) if lot_size else 1
+            pos_id = f"rehydrated:{symbol}:{uuid.uuid4().hex[:8]}"
+            self.paper_book[pos_id] = FuturesPosition(
+                nifty_symbol=symbol,
+                lots=lots,
+                quantity=qty,
+                entry_price=entry_price,
+                entry_date=prior_day,
+                vol_ratio=0.0,
+                margin_inr=lots * self.lot_margin_estimate(),
+                signal_symbol="rehydrated",
+            )
+            known_symbols.add(symbol)
+            rehydrated += 1
+            logger.warning(
+                "futures_follow REHYDRATED open broker position %s qty=%d lots=%d "
+                "(entry_date stamped %s, T+1 exit due today %s)",
+                symbol,
+                qty,
+                lots,
+                prior_day,
+                today,
+            )
+
+        if rehydrated:
+            try:
+                self._notify(
+                    f"♻️ {STRATEGY_NAME} [live] rehydrated {rehydrated} open broker "
+                    f"position(s) on boot — T+1 exit scheduled"
+                )
+            except Exception:
+                logger.exception("futures_follow rehydrate notify failed")
+        return rehydrated
 
     # ----- observability + EOD summary ----------------------------------- #
     def _config_view(self) -> dict:
@@ -1504,6 +1673,13 @@ def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowServic
         app=app, scheduler=scheduler, data_health_checker=production_data_health_checker
     )
     svc.register_jobs(scheduler)
+    # Live-only boot durability (#265): rebuild paper_book from real broker
+    # positions so a restart can't strand an overnight NIFTY-futures long. No-op
+    # in sandbox. Best-effort — a rehydrate failure never blocks boot.
+    try:
+        svc.rehydrate_paper_book_from_broker()
+    except Exception:
+        logger.exception("futures_follow boot rehydrate failed (ignored)")
     if app is not None:
         app.futures_follow_service = svc
     return svc

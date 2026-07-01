@@ -13,6 +13,7 @@ This gate polls ``master_contract_status_db.get_status(broker)`` until
 
 from __future__ import annotations
 
+import datetime as dt
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,6 +34,15 @@ def svc(monkeypatch):
     service._history_fetcher = lambda *a, **kw: []
     service._notifier = MagicMock()  # type: ignore[method-assign]
     service.lookback_min = 20
+    # Gap-detection gate (issue #258): pin a genuine mid-session gap so these
+    # master-contract-gate tests exercise the symbol loop. Without this the
+    # #258 gate would no-op these before the master-contract gate is reached.
+    service._clock = lambda: dt.datetime.now().replace(  # type: ignore[method-assign]
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    service._last_known_ts_provider = lambda: dt.datetime.now().replace(  # type: ignore[method-assign]
+        hour=11, minute=30, second=0, microsecond=0
+    )
     return service
 
 

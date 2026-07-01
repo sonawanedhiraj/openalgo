@@ -339,6 +339,21 @@ def test_at_10_00_post_relogin_replays_missed_bars_into_aggregator(at_10_00_post
 
     captured_alerts: list[str] = []
 
+    # Gap-detection gate (issue #258): recovery only runs after a genuine
+    # mid-session reconnect. This scenario pins 10:00 IST post-relogin with a
+    # live feed that was delivering bars until the drop — model that with a
+    # clock at the pinned IST moment and a last-known-good bar during the
+    # session (09:30 IST), so the gate resolves to "gap" and recovery runs.
+    import datetime as _dt
+
+    pinned = state.now.replace(tzinfo=None)  # naive IST wall-clock the box would read
+
+    def _clock() -> _dt.datetime:
+        return pinned
+
+    def _last_known_ts() -> _dt.datetime:
+        return pinned.replace(hour=9, minute=30, second=0, microsecond=0)
+
     svc = WSRecoveryService(
         aggregator_provider=lambda: mock_agg,
         universe_provider=lambda: list(universe),
@@ -346,6 +361,8 @@ def test_at_10_00_post_relogin_replays_missed_bars_into_aggregator(at_10_00_post
         api_key_provider=lambda: "test-key",  # pragma: allowlist secret
         notifier=captured_alerts.append,
         lookback_min=20,
+        clock=_clock,
+        last_known_ts_provider=_last_known_ts,
     )
 
     # mock_zerodha_login (the fixture already called it) gives the API-key

@@ -17,6 +17,15 @@ historical API and folds them into the live scanner aggregator via
 ``MultiIntervalAggregator.replay_bars`` — replaying the missed bar closes so the
 scanner's rolling state is immediately current.
 
+**Gap-detection gate (issue #258).** The replay only runs after a genuine
+*mid-session* reconnect — i.e. when the live feed was delivering bars during
+today's session and then dropped a measurable interval. On a **pre-market boot**
+(before 09:15 IST) or a **fresh boot with no prior live feed** there is nothing
+to recover: the sweep would just contend with the aggregator seeder against
+Zerodha's 3 req/sec limit and emit a scary ``0/N resynced, gap unknown`` false
+alarm. Those cases now no-op silently (an INFO log, no history fetch, no
+Telegram). See :meth:`WSRecoveryService._gap_to_recover`.
+
 Honest limitations (handled gracefully, never block or crash):
 
 * **Zerodha current-day historical delay (~5-15 min).** If the WS reconnects
@@ -52,6 +61,11 @@ logger = get_logger(__name__)
 _DEFAULT_LOOKBACK_MIN = 20
 
 _TOPIC = "broker_session_refreshed"
+
+# IST market open — the boundary the gap-detection predicate uses to decide
+# whether a reconnect happened *during* a live session (a real, recoverable gap)
+# or on a pre-market / fresh boot (nothing to recover). See ``_gap_to_recover``.
+_MARKET_OPEN_IST = dt.time(9, 15)
 
 
 @dataclass
@@ -196,6 +210,40 @@ def _default_history_fetcher(
     return bars[-lookback_min:] if lookback_min else bars
 
 
+def _default_clock() -> dt.datetime:
+    """Current naive local (IST-on-the-box) wall clock. Indirected for testability."""
+    return dt.datetime.now()
+
+
+def _newest_current_bar_ts(aggregator: Any, universe: list[tuple[str, str]]) -> dt.datetime | None:
+    """Newest live-bar timestamp the aggregator currently holds, or ``None``.
+
+    This is the "last-known-good" signal for gap detection: the aggregator only
+    accumulates timestamps from the live tick feed, so the newest in-progress
+    bar across the universe is the last minute the feed was actually delivering.
+    On a fresh boot the aggregator is empty and this returns ``None`` (→ no gap).
+
+    Best-effort: any per-symbol probe failure is skipped, never raised.
+    """
+    newest: dt.datetime | None = None
+    if aggregator is None:
+        return None
+    for symbol, _exchange in universe:
+        for interval in ("1m", "5m"):
+            try:
+                bar = aggregator.current_bar(symbol, interval)
+            except Exception:  # nosec B112 — best-effort probe: skip this symbol/interval on any error
+                continue
+            if not bar:
+                continue
+            ts = _normalize_ts(bar.get("ts"))
+            if ts is None:
+                continue
+            if newest is None or ts > newest:
+                newest = ts
+    return newest
+
+
 def _default_notifier(message: str) -> None:
     """Send an operator alert via the direct Telegram Bot API.
 
@@ -242,6 +290,8 @@ class WSRecoveryService:
         notifier: Callable[[str], None] | None = None,
         lookback_min: int | None = None,
         bus: Any = None,
+        clock: Callable[[], dt.datetime] | None = None,
+        last_known_ts_provider: Callable[[], dt.datetime | None] | None = None,
     ):
         self._aggregator_provider = aggregator_provider
         self._universe_provider = universe_provider or _default_universe
@@ -249,6 +299,10 @@ class WSRecoveryService:
         self._api_key_provider = api_key_provider or _default_api_key
         self._notifier = notifier or _default_notifier
         self._bus = bus if bus is not None else _default_bus
+        self._clock = clock or _default_clock
+        # When None, defaults (per recover() call) to sampling the resolved
+        # aggregator's current-bar timestamps — the live feed's last-known-good.
+        self._last_known_ts_provider = last_known_ts_provider
         if lookback_min is not None:
             self.lookback_min = int(lookback_min)
         else:
@@ -353,11 +407,59 @@ class WSRecoveryService:
         except Exception:
             return None
 
+    def _gap_to_recover(
+        self, aggregator: Any, universe: list[tuple[str, str]]
+    ) -> tuple[bool, dt.datetime | None, str]:
+        """Decide whether there is a genuine mid-session gap worth replaying.
+
+        Recovery is meaningful only after a *mid-session* reconnect that dropped
+        a measurable interval of live bars. On a pre-market / fresh boot there is
+        nothing real to recover (issue #258): the historical sweep just contends
+        with the aggregator seeder against Zerodha's 3 req/sec limit and produces
+        a scary ``0/N resynced, gap unknown`` false alarm.
+
+        Returns ``(should_recover, last_known_ts, reason)``:
+
+        * ``now`` (the wall clock) is **before market open** → ``(False, None,
+          "pre_market")``. This is the exact 08:08 / 09:46 boot case.
+        * the aggregator has **no live bar yet** (fresh boot, feed never
+          delivered) → ``(False, None, "no_prior_feed")``.
+        * the last-known-good bar is **from a prior day or before today's open**
+          (stale / pre-open state) → ``(False, ts, "last_known_pre_open")``.
+        * otherwise the feed *was* live during the session and there is a
+          measurable gap → ``(True, ts, "gap")``.
+
+        Best-effort: never raises; on any internal error it errs toward the
+        safe no-op (do not sweep, do not alarm).
+        """
+        try:
+            now = self._clock()
+            if now.time() < _MARKET_OPEN_IST:
+                return False, None, "pre_market"
+
+            if self._last_known_ts_provider is not None:
+                last_ts = self._last_known_ts_provider()
+            else:
+                last_ts = _newest_current_bar_ts(aggregator, universe)
+
+            if last_ts is None:
+                return False, None, "no_prior_feed"
+
+            market_open_today = dt.datetime.combine(now.date(), _MARKET_OPEN_IST)
+            if last_ts < market_open_today:
+                return False, last_ts, "last_known_pre_open"
+
+            return True, last_ts, "gap"
+        except Exception:
+            logger.exception("WS recovery: gap-detection failed — treating as no gap (no-op)")
+            return False, None, "gap_detection_error"
+
     def recover(self, username: str = "", broker: str = "") -> dict:
         """Fetch + replay missed bars for the whole tracked universe.
 
-        Returns a summary dict for observability/tests. Always sends one
-        Telegram alert summarizing the run.
+        Returns a summary dict for observability/tests. Sends one Telegram alert
+        summarizing a genuine recovery run; a boot / no-gap no-op is silent
+        (issue #258 — no more ``0/N resynced`` pre-market false alarm).
         """
         start = time.monotonic()
         aggregator = self._resolve_aggregator()
@@ -368,6 +470,27 @@ class WSRecoveryService:
             return {"status": "skipped", "reason": "no_aggregator", "symbols": 0}
 
         universe = self._universe_provider()
+
+        # Gap-detection gate (issue #258). Only a mid-session reconnect with a
+        # measurable gap warrants the full historical sweep + alert. A pre-market
+        # / fresh-boot event no-ops here — no history fetch, no Telegram alarm.
+        should_recover, last_known_ts, gap_reason = self._gap_to_recover(aggregator, universe)
+        if not should_recover:
+            logger.info(
+                "WS recovery: no gap to recover — skipping (reason=%s, last_known_ts=%s, "
+                "symbols=%d). Live feed resumes on the reconnect; the aggregator seeder "
+                "warms the scanner at boot.",
+                gap_reason,
+                last_known_ts.isoformat() if last_known_ts else None,
+                len(universe),
+            )
+            return {
+                "status": "skipped",
+                "reason": gap_reason,
+                "symbols": len(universe),
+                "resynced": 0,
+            }
+
         api_key = self._api_key_provider()
         if not api_key:
             logger.warning("WS recovery: no API key available — cannot fetch history")
