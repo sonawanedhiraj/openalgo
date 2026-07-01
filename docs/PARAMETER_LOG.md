@@ -18,6 +18,26 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### `_CALENDAR_BUFFER` — scanner daily-history query window (issue #280, changed 2026-07-01)
+- **Current value:** **`1.6`** (was `1.4`).
+- **Set in:** code constant `services/scanner_history_provider.py:_CALENDAR_BUFFER`
+  (not env/DB — a threshold default in code).
+- **What it does:** `ScannerHistoryProvider._fetch` sizes its DuckDB date-range
+  query by CALENDAR days = `daily_lookback_bars(205) × _CALENDAR_BUFFER`, then
+  takes the last 205 rows. It's a heuristic proxy: it must span enough calendar
+  days to contain ≥200 *trading* bars for the BUY rule's SMA(200) volume-gate
+  warm-up (`fno_intraday_buy_chartink`).
+- **Why 1.4 → 1.6:** Indian NSE trading days are only ~0.67 of calendar days
+  (weekends + ~14–16 holidays/yr), not the naive 5/7≈0.71. At 1.4 → 288 cal days
+  → only ~193 trading bars → below 200 → the guard silently rejected the WHOLE
+  F&O universe (0 BUY hits). 1.6 → 329 cal days → ~220 trading bars (~15-bar
+  margin over 205, 20 over the 200 guard). Verified arithmetically
+  (GODREJPROP/RECLTD/JSWSTEEL → 220); all NSE F&O share one trading calendar so
+  the ratio is universe-wide. Committed direct to dev `1f5d53e22` (non-order-path
+  scanner read-path). **Note:** heuristic, not a hard bar-count guarantee — a
+  holiday-heavy window could still dip; the robust hardening (bar-count-aware
+  fetch / re-widen-on-short) is a follow-up. #281 added the loud <200 WARNING.
+
 ### Position-store reconciliation at exit (issue #265, proposed 2026-07-01)
 ### LLM veto — in-process `claude -p` transport (#266 Phase 1 / #267, added 2026-07-01)
 
