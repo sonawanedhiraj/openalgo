@@ -628,6 +628,64 @@ the next regression of that class in minutes instead of hours.
   `test_notify_task_complete_enabled_by_default`,
   `test_notify_task_complete_respects_per_event_toggle`).
 
+### Notifications — unknown event_type fallback (issue #243)
+
+#### NOTIFY_UNKNOWN_EVENTS
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_UNKNOWN_EVENTS", default=True)`)
+- **Code default:** `true`
+- **What it gates:** when `true` (default), a `notify(event_type, …)` call where
+  `event_type` is NOT in the registered `per_event` dict still DELIVERS the message
+  (fail-open) — a WARNING is logged to prompt the operator to register the event
+  type, but the alert is never silently dropped. When `false`, the old
+  warn-and-drop behaviour is restored (useful in high-noise dev environments where
+  new event_types are being iterated on).
+- **Why (2026-07-02, issue #243):** on 2026-06-30 three operator alerts were
+  silently dropped because `orphan_exit_reconciliation` and `scanner_aggregator_seed`
+  were not in the registry. A silently-dropped alert is irrecoverable; a
+  misrouted-but-delivered one is not. The flag defaults to the safer
+  (fail-open) direction.
+- **Related:** `NOTIFY_ORPHAN_EXIT_RECONCILIATION`, `NOTIFY_SCANNER_AGGREGATOR_SEED`
+  (the two event types that were missing and triggered this fix).
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_unknown_event_type_delivers_with_warning`,
+  `test_notify_unknown_event_type_drops_when_flag_off`).
+
+#### NOTIFY_ORPHAN_EXIT_RECONCILIATION
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_ORPHAN_EXIT_RECONCILIATION", default=True)`)
+- **Code default:** `true`
+- **What it gates:** per-event toggle for the `orphan_exit_reconciliation` event
+  type. When `true`, the reconciliation summary (N orphans found/reconciled/errored)
+  is delivered via Telegram each time the orphan-exit reconciliation service runs.
+  Caller: `services/orphan_exit_reconciliation_service.py`.
+- **Why (2026-07-02, issue #243):** this event type was missing from the registry;
+  its alert was silently dropped on 2026-06-30 at 08:31:50 IST next to a "9
+  orphan(s) found, 9 reconciled" log line. Registered here with default ON.
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_orphan_exit_reconciliation_routes_through_telegram`,
+  `test_notify_orphan_exit_reconciliation_per_event_toggle`).
+
+#### NOTIFY_SCANNER_AGGREGATOR_SEED
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_SCANNER_AGGREGATOR_SEED", default=True)`)
+- **Code default:** `true`
+- **What it gates:** per-event toggle for the `scanner_aggregator_seed` event type.
+  When `true`, the aggregator-seeding completion/failure notice is delivered via
+  Telegram at boot and on reconnect. The operator needs this to know whether the
+  scanner's in-process bar aggregator has warm bars before the trading session.
+  Caller: `services/scanner_service.py` (aggregator-seeding path).
+- **Why (2026-07-02, issue #243):** this event type was missing from the registry;
+  its alerts were silently dropped on 2026-06-30 at 08:34:26 (boot) and 15:26:33
+  (restart) IST while the operator was actively investigating an empty-aggregator
+  failure. Registered here with default ON.
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_scanner_aggregator_seed_routes_through_telegram`,
+  `test_notify_scanner_aggregator_seed_per_event_toggle`).
+
 ### Strategy control — unified daily intent
 
 #### STRATEGY_DAILY_INTENT_ENABLED
