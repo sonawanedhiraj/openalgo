@@ -198,6 +198,97 @@ def test_config_rejects_unknown_mode():
         SimplifiedEngineConfig(mode="bogus")
 
 
+# --------------------------------------------------------------------------- #
+# Issue #162 Phase 2 — engine honors the persistent strategy_mode DB row
+# --------------------------------------------------------------------------- #
+
+
+def _resolved(mode: str, source: str):
+    from services.mode_service import ResolvedMode
+
+    return ResolvedMode(mode=mode, source=source)
+
+
+def test_apply_persistent_mode_live_row_overrides_env_sandbox(monkeypatch):
+    """A persistent strategy_mode row = live flips an env-sandbox engine to live."""
+    service = _make_service(MODE_SANDBOX)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_LIVE, "strategy_mode"),
+    ) as m:
+        service._apply_persistent_mode()
+    assert service.mode == MODE_LIVE
+    # Resolves under the dashboard/UI key, not the journal name.
+    m.assert_called_once_with("simplified_engine")
+
+
+def test_apply_persistent_mode_sandbox_row_overrides_env_live(monkeypatch):
+    """A persistent row = sandbox flips an env-live engine back to sandbox."""
+    service = _make_service(MODE_LIVE)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_SANDBOX, "strategy_mode"),
+    ):
+        service._apply_persistent_mode()
+    assert service.mode == MODE_SANDBOX
+
+
+def test_apply_persistent_mode_no_row_keeps_env_mode(monkeypatch):
+    """No persistent row (source != strategy_mode) → engine keeps its env mode."""
+    service = _make_service(MODE_LIVE)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_SANDBOX, "env"),
+    ):
+        service._apply_persistent_mode()
+    assert service.mode == MODE_LIVE  # env source ignored
+
+
+def test_apply_persistent_mode_never_overrides_disabled(monkeypatch):
+    """MODE_DISABLED is a hard local off-switch — a stray live row can't enable it."""
+    service = _make_service(MODE_DISABLED)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_LIVE, "strategy_mode"),
+    ) as m:
+        service._apply_persistent_mode()
+    assert service.mode == MODE_DISABLED
+    m.assert_not_called()  # short-circuits before the DB read
+
+
+def test_apply_persistent_mode_fails_open_on_db_error(monkeypatch):
+    """A resolve_mode exception must never change the mode or raise."""
+    service = _make_service(MODE_SANDBOX)
+    with patch("services.mode_service.resolve_mode", side_effect=RuntimeError("db down")):
+        service._apply_persistent_mode()  # must not raise
+    assert service.mode == MODE_SANDBOX
+
+
+def test_entry_dispatch_honors_live_strategy_mode_row(monkeypatch):
+    """End-to-end: an env-sandbox engine with a live persistent row routes the
+    entry through the LIVE place_order path (not sandbox)."""
+    service = _make_service(MODE_SANDBOX)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    monkeypatch.setattr(
+        "services.mode_service.resolve_mode",
+        lambda name: _resolved(MODE_LIVE, "strategy_mode"),
+    )
+    # Live path needs funds; make the funds gate pass deterministically.
+    monkeypatch.setattr(service, "_check_live_funds", lambda api_key: (True, 10_000_000.0, None))
+    with (
+        patch("services.place_order_service.place_order") as mock_live,
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+    ):
+        mock_live.return_value = (True, {"orderid": "live-1", "status": "success"}, 200)
+        service._place_entry_order(signal, api_key="k", strategy_name="s")
+
+    assert service.mode == MODE_LIVE
+    assert mock_live.called, "live persistent row should route through place_order"
+    assert not mock_sandbox.called, "must not hit the sandbox path when row=live"
+
+
 def test_disabled_mode_skips_order_dispatch():
     """In disabled mode, no order is sent but engine state advances locally."""
     service = _make_service(MODE_DISABLED)
