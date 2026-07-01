@@ -1943,6 +1943,32 @@ class SectorFollowService:
             replace_existing=True,
             name="Sector Follow CAP5_VOL pre-entry smoke check (15:18 IST)",
         )
+        # Pre-entry data refresh (#237): fetch any stale intraday just BEFORE the
+        # 15:18 smoke check so the evaluator has today's data at 15:20 — closes
+        # the mid-day gap that produced the 06-29/06-30 zero-order days. Fires
+        # only when enabled; time is configurable (default 15:17, before smoke).
+        from services.sector_follow_backfill_scheduler import (
+            preentry_refresh_enabled,
+            preentry_refresh_time,
+        )
+
+        if preentry_refresh_enabled():
+            _pre_t = preentry_refresh_time()
+            sched.add_job(
+                _preentry_refresh_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=_pre_t.hour,
+                    minute=_pre_t.minute,
+                    timezone="Asia/Kolkata",
+                ),
+                id="sector_follow_preentry_refresh",
+                replace_existing=True,
+                name=(
+                    f"Sector Follow CAP5_VOL pre-entry data refresh "
+                    f"({_pre_t.hour:02d}:{_pre_t.minute:02d} IST)"
+                ),
+            )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
             self.mode,
@@ -1988,6 +2014,18 @@ def _data_health_job() -> None:
 def _smoke_check_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.assert_data_pipeline_healthy()
+
+
+def _preentry_refresh_job() -> None:
+    """15:17 IST: fetch any stale intraday before the 15:18 smoke + 15:20 entry
+    (#237). Module-level + fail-safe so a fetch error never kills the scheduler
+    thread. Independent of the singleton — the backfill convergence is global."""
+    try:
+        from services.sector_follow_backfill_scheduler import run_preentry_backfill_checks
+
+        run_preentry_backfill_checks()
+    except Exception:
+        logger.exception("sector_follow pre-entry refresh job failed")
 
 
 def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:

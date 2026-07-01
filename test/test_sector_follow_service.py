@@ -1213,3 +1213,33 @@ def test_smoke_check_skipped_when_flag_off(monkeypatch):
     assert ok is True
     assert details.get("skipped") is True
     assert sro.list_overrides(include_expired=True) == []
+
+
+# --------------------------------------------------------------------------- #
+# #237 — pre-entry refresh job body wiring
+# --------------------------------------------------------------------------- #
+def test_preentry_refresh_job_calls_backfill(monkeypatch):
+    """The 15:17 job body delegates to run_preentry_backfill_checks (#237)."""
+    import services.sector_follow_service as sfs
+
+    called = {}
+    monkeypatch.setattr(
+        "services.sector_follow_backfill_scheduler.run_preentry_backfill_checks",
+        lambda *a, **k: called.setdefault("hit", True),
+    )
+    sfs._preentry_refresh_job()
+    assert called.get("hit") is True
+
+
+def test_preentry_refresh_job_swallows_errors(monkeypatch):
+    """A refresh failure must never propagate out of the scheduler thread."""
+    import services.sector_follow_service as sfs
+
+    def boom(*a, **k):
+        raise RuntimeError("fetch exploded")
+
+    monkeypatch.setattr(
+        "services.sector_follow_backfill_scheduler.run_preentry_backfill_checks", boom
+    )
+    # Must not raise.
+    sfs._preentry_refresh_job()
