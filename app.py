@@ -1111,6 +1111,21 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize orphan-exit reconciliation: {e}")
 
+            # Issue #262: after the orphan reconciliation marks unfilled exits
+            # 'abandoned_<original>', recover the REAL exit price + P&L for any
+            # such row that sandbox's MIS auto-square-off (or a UI exit) actually
+            # flattened — leaving them NULL under-reports the /strategies
+            # dashboard net P&L. Reads sandbox.db read-only, stamps only exit
+            # columns, idempotent, non-blocking daemon.
+            try:
+                from services.abandoned_exit_recovery_service import (
+                    init_abandoned_exit_recovery,
+                )
+
+                init_abandoned_exit_recovery()
+            except Exception as e:
+                logger.error(f"Failed to initialize abandoned-exit recovery: {e}")
+
             # Scanner history cache warm-up (Task 3) — pre-load daily/weekly
             # bars so the first scan does not pay per-symbol lazy-load latency.
             # Gated by SCANNER_HISTORY_WARMUP_ENABLED (default true). Runs on a
