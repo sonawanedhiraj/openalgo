@@ -1,9 +1,10 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   AlertTriangle,
   ArrowLeft,
   BookOpen,
+  Bot,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -11,8 +12,10 @@ import {
   FileBarChart2,
   GitCompare,
   History,
+  Loader2,
   PauseCircle,
   RefreshCw,
+  ShieldCheck,
   TrendingDown,
   TrendingUp,
 } from 'lucide-react'
@@ -28,6 +31,9 @@ import {
   YAxis,
 } from 'recharts'
 import {
+  type LLMDecisionRow,
+  type LLMFlipOutcome,
+  type LLMMode,
   type PnlWindow,
   type RecentTrade,
   type StrategyDetail,
@@ -111,6 +117,343 @@ function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) 
     >
       Sandbox
     </Badge>
+  )
+}
+
+function LLMModeBadge({ llmMode }: { llmMode: LLMMode }) {
+  if (llmMode === 'veto')
+    return (
+      <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 gap-1">
+        <ShieldCheck className="h-3 w-3" /> LLM veto
+      </Badge>
+    )
+  if (llmMode === 'delegate')
+    return (
+      <Badge className="bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 gap-1">
+        <Bot className="h-3 w-3" /> LLM delegate
+      </Badge>
+    )
+  return (
+    <Badge variant="outline" className="text-muted-foreground gap-1">
+      <Bot className="h-3 w-3" /> LLM off
+    </Badge>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// LLM control (issue #266 Phase 2) — per-strategy off/veto segmented toggle
+// (delegate shown but disabled) + decisions history + reachable health line.
+// ---------------------------------------------------------------------------
+
+const LLM_OPTIONS: { value: LLMMode; label: string; disabled?: boolean; hint?: string }[] = [
+  { value: 'off', label: 'Off', hint: 'No LLM review — orders proceed unreviewed.' },
+  {
+    value: 'veto',
+    label: 'Veto',
+    hint: 'The LLM reviews every entry; a "skip" verdict blocks the order.',
+  },
+  {
+    value: 'delegate',
+    label: 'Delegate',
+    disabled: true,
+    hint: 'Coming soon — requires the LLM-decides engine path (a later phase).',
+  },
+]
+
+export function LLMControlCard({ data }: { data: StrategyDetail }) {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const current = data.llm_mode
+
+  const flip = useMutation({
+    mutationFn: (target: LLMMode) => strategiesDashboardApi.flipLLMMode(data.name, target),
+    onSuccess: (outcome: LLMFlipOutcome) => {
+      if (outcome.accepted) {
+        setError(null)
+        queryClient.invalidateQueries({ queryKey: ['strategy-detail', data.name] })
+        queryClient.invalidateQueries({ queryKey: ['strategies-list'] })
+      } else {
+        setError(outcome.error_message ?? 'LLM mode change refused')
+      }
+    },
+    onError: () => setError('LLM mode request failed — check server logs'),
+  })
+
+  const handleSelect = (target: LLMMode) => {
+    if (target === current || flip.isPending) return
+    // Confirm only when *enabling* enforcement (veto blocks real orders in
+    // active mode). Turning off never needs a confirm.
+    if (target === 'veto') {
+      const ok = window.confirm(
+        `Enable LLM VETO for ${data.display_name}?\n\n` +
+          'The LLM will review every entry signal. In an enforcing mode a "skip" ' +
+          'verdict will BLOCK the order. If the reviewer is unreachable it fails ' +
+          'safe (the trade proceeds) and the decision is logged as review_failed.'
+      )
+      if (!ok) return
+    }
+    setError(null)
+    flip.mutate(target)
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Bot className="h-4 w-4" /> LLM Control
+          {!data.llm_veto_enabled && (
+            <Badge variant="outline" className="ml-auto text-xs text-muted-foreground font-normal">
+              veto not wired for this strategy
+            </Badge>
+          )}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* Segmented toggle */}
+        <div className="inline-flex rounded-md border p-0.5 bg-muted/30">
+          {LLM_OPTIONS.map((opt) => {
+            const active = current === opt.value
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                title={opt.hint}
+                disabled={opt.disabled || flip.isPending}
+                onClick={() => handleSelect(opt.value)}
+                className={[
+                  'px-3 py-1.5 text-xs rounded-[5px] transition-colors flex items-center gap-1',
+                  active
+                    ? 'bg-background shadow-sm font-medium text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                  opt.disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
+                ].join(' ')}
+              >
+                {flip.isPending && active && <Loader2 className="h-3 w-3 animate-spin" />}
+                {opt.label}
+                {opt.disabled && <span className="text-[10px] opacity-70">(soon)</span>}
+              </button>
+            )
+          })}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {LLM_OPTIONS.find((o) => o.value === current)?.hint ??
+            'No LLM review configured for this strategy.'}
+        </p>
+        {!data.llm_veto_enabled && (
+          <p className="text-xs text-muted-foreground italic">
+            This strategy does not call the LLM veto today, so setting a mode has no runtime effect
+            yet and its decisions history is empty.
+          </p>
+        )}
+        {error && (
+          <div className="rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-2 text-xs text-red-700 dark:text-red-300 flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3" /> {error}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function DecisionBadge({ decision }: { decision: string }) {
+  if (decision === 'take')
+    return (
+      <Badge className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 text-xs py-0">
+        take
+      </Badge>
+    )
+  if (decision === 'skip')
+    return (
+      <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs py-0">
+        skip
+      </Badge>
+    )
+  if (decision === 'review_failed')
+    return (
+      <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-xs py-0 gap-1">
+        <AlertTriangle className="h-3 w-3" /> review_failed
+      </Badge>
+    )
+  return (
+    <Badge variant="outline" className="text-xs py-0">
+      {decision}
+    </Badge>
+  )
+}
+
+function DecisionRow({ row }: { row: LLMDecisionRow }) {
+  const [open, setOpen] = useState(false)
+  const reasoning = row.reasoning ?? ''
+  const truncated = reasoning.length > 80
+  return (
+    <>
+      <tr className="border-b last:border-0 hover:bg-muted/20">
+        <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap">
+          {fmtDate(row.candidate_at)}
+        </td>
+        <td className="px-3 py-1.5 font-mono">{row.symbol}</td>
+        <td className="px-3 py-1.5">{row.direction ?? '—'}</td>
+        <td className="px-3 py-1.5">
+          <DecisionBadge decision={row.decision} />
+        </td>
+        <td className="px-3 py-1.5 text-muted-foreground">{row.enforcement_mode}</td>
+        <td className="px-3 py-1.5 text-right tabular-nums">
+          {row.confidence != null ? row.confidence.toFixed(2) : '—'}
+        </td>
+        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+          {row.bridge_latency_ms != null ? `${row.bridge_latency_ms}ms` : '—'}
+        </td>
+        <td className="px-3 py-1.5 max-w-[16rem]">
+          {reasoning ? (
+            <button
+              type="button"
+              className="text-left text-muted-foreground hover:text-foreground"
+              onClick={() => setOpen(!open)}
+            >
+              <span className={open ? '' : 'line-clamp-1'}>{reasoning}</span>
+              {truncated && (
+                <span className="text-[10px] text-primary ml-1">{open ? 'less' : 'more'}</span>
+              )}
+            </button>
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          )}
+        </td>
+      </tr>
+    </>
+  )
+}
+
+const DECISIONS_PAGE = 25
+
+export function LLMDecisionsCard({ name }: { name: string }) {
+  const [page, setPage] = useState(0)
+  const { data, isLoading } = useQuery({
+    queryKey: ['strategy-llm-decisions', name, page],
+    queryFn: () =>
+      strategiesDashboardApi.getLLMDecisions(name, DECISIONS_PAGE, page * DECISIONS_PAGE),
+    refetchInterval: 30_000,
+  })
+
+  const summary = data?.summary
+  const rows = data?.rows ?? []
+  const total = data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / DECISIONS_PAGE))
+
+  // LLM-reachable health hint derived from the recent decisions.
+  const recentFailed = summary?.recent_review_failed ?? 0
+  const reachable = recentFailed === 0
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <History className="h-4 w-4" /> LLM Decisions
+            <span className="text-xs text-muted-foreground font-normal">{total} total</span>
+          </CardTitle>
+          {data?.veto_enabled && summary && summary.total > 0 && (
+            <div
+              className={[
+                'flex items-center gap-1 text-xs rounded-md px-2 py-1',
+                reachable
+                  ? 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20'
+                  : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20',
+              ].join(' ')}
+            >
+              {reachable ? (
+                <>
+                  <CheckCircle2 className="h-3 w-3" /> LLM reachable
+                </>
+              ) : (
+                <>
+                  <AlertTriangle className="h-3 w-3" /> LLM unreachable (last {recentFailed} failed
+                  — run <code className="font-mono">claude login</code>)
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        {summary && summary.total > 0 && (
+          <p className="text-xs text-muted-foreground">
+            take {summary.take} · skip {summary.skip} · review_failed {summary.review_failed}
+            {data?.source_filtered === false && ' · showing all veto rows for this strategy'}
+          </p>
+        )}
+      </CardHeader>
+      <CardContent className="p-0">
+        {isLoading ? (
+          <div className="p-4">
+            <Skeleton className="h-32 w-full" />
+          </div>
+        ) : !data?.veto_enabled ? (
+          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
+            This strategy does not run the LLM veto — no decisions to show.
+          </p>
+        ) : rows.length === 0 ? (
+          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
+            No LLM decisions recorded yet.
+          </p>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b bg-muted/30">
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Time</th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Symbol
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Dir</th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Decision
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Mode</th>
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">Conf</th>
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                      Latency
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Reasoning
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <DecisionRow key={r.id} row={r} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center justify-between px-3 py-2 border-t text-xs text-muted-foreground">
+              <span>
+                Page {page + 1} of {totalPages}
+              </span>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  disabled={page === 0}
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                >
+                  Prev
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  disabled={page + 1 >= totalPages}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
@@ -603,6 +946,7 @@ export default function StrategyDetailPage() {
             <h1 className="text-2xl font-semibold">{data.display_name}</h1>
             <HealthBadge health={data.health} />
             <ModeBadge mode={data.mode} deployable={data.deployable} />
+            <LLMModeBadge llmMode={data.llm_mode} />
           </div>
           <p className="text-sm text-muted-foreground font-mono pl-7">
             {data.name} · v{data.version}
@@ -623,6 +967,9 @@ export default function StrategyDetailPage() {
       {/* Active overrides */}
       <OverridesBanner overrides={data.active_overrides} />
 
+      {/* LLM control (issue #266 Phase 2) */}
+      <LLMControlCard data={data} />
+
       {/* Performance + P&L curve */}
       <div className="grid gap-4 xl:grid-cols-2">
         <PerfTable data={data} />
@@ -631,6 +978,9 @@ export default function StrategyDetailPage() {
 
       {/* Recent trades */}
       <RecentTradesTable trades={data.recent_trades} />
+
+      {/* LLM decisions history */}
+      <LLMDecisionsCard name={data.name} />
 
       {/* Params + Version log */}
       <div className="grid gap-4 xl:grid-cols-2">

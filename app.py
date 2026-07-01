@@ -741,6 +741,9 @@ def setup_environment(app):
             # runtime-override reads and the safety guards' override writes would
             # hit a missing table (and silently fail-open / fail-safe).
             try:
+                from database.strategy_llm_config_db import (
+                    init_db as _init_strategy_llm_config,
+                )
                 from database.strategy_mode_db import init_db as _init_strategy_mode
                 from database.strategy_runtime_override_db import (
                     init_db as _init_strategy_runtime_override,
@@ -748,6 +751,7 @@ def setup_environment(app):
 
                 _init_strategy_mode()
                 _init_strategy_runtime_override()
+                _init_strategy_llm_config()
             except Exception as e:
                 logger.error(f"strategy_mode/runtime_override table init skipped: {e}")
 
