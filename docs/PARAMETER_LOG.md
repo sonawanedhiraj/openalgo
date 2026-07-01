@@ -414,6 +414,26 @@ the next regression of that class in minutes instead of hours.
   back-to-back 5m bars rarely exceeds 0.3%; tune up on high-vol names if the
   WARNING fires routinely.
 
+#### SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED (NEW, 2026-07-01)
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in both
+  `services/scan_rules/fno_intraday_buy_chartink.py` and
+  `services/scan_rules/fno_intraday_sell_chartink.py`
+  (`_divergence_block_enabled`).
+- **What it does:** when on, a `today_d.close` that diverges from the latest 5m
+  close beyond `SCANNER_RULE_DIVERGENCE_WARN_PCT` REJECTS the symbol (returns
+  `False`, no scan hit) — not just a WARNING. Defense-in-depth for the
+  `ts`-vs-`timestamp` Path-B fix in
+  `services/scan_rules/_today_running.py::derive_today_and_yest`: the live
+  scanner's 5m frame carries a `ts` column (naive IST datetimes), but Path B
+  was gated on `"timestamp"` only, so it never engaged and the rules read a
+  FROZEN ~09:45 historify daily bar all session (BUY hits empty, SELL misfired
+  on the frozen morning crash). With the primary fix landed, `today_d.close`
+  now IS the live 5m close so divergence should vanish — but if that path ever
+  regresses, this gate guarantees a stale-data signal can never fire an order.
+- **Set false to:** revert to WARNING-only (observe divergence without blocking
+  the hit) during a known stale-data window, at the cost of the safety net.
+
 #### SCANNER_CONTRACT_TEST_ENABLED
 - **Current value:** unset → defaults **`false`**.
 - **Set in:** env; read by

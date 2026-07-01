@@ -38,8 +38,17 @@ def _freeze(monkeypatch, hour, minute=0):
 
 @pytest.fixture(autouse=True)
 def _default_post_close(monkeypatch):
-    """All tests default to 16:00 IST (post-settle → -1/-2 indexing)."""
+    """All tests default to 16:00 IST (post-settle → -1/-2 indexing).
+
+    Also disable the divergence BLOCK flag by default: the synthetic gate-logic
+    fixtures build the daily and 5m frames independently, so today_d.close (from
+    the daily bar via legacy Path A) can legitimately diverge from the 5m close
+    — an artifact of the test setup, not a production condition (in production
+    Path B, today_d.close IS the live 5m close). The dedicated divergence-block
+    tests below opt the flag back on explicitly.
+    """
     _freeze(monkeypatch, 16, 0)
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "false")
 
 
 # --------------------------------------------------------------------------- #
@@ -508,3 +517,88 @@ def test_rule_short_history_is_debug_not_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
         assert rule(None, ind) is False
     assert not any("rejecting" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Live `ts`-column frame: full-day live volume clears the gates
+#
+# The core bug fix. Historify's daily bar is frozen at ~09:45 with PARTIAL
+# volume that never clears SMA(50)/SMA(200) → 0 buy hits all day (the observed
+# empty-BUY class). With Path B reading the live `ts`-column 5m aggregate, the
+# FULL running-day volume + live gap-up close clears the gates and fires.
+# --------------------------------------------------------------------------- #
+def _attach_5m_ts_datetime(bars_5m, today_date):
+    """Attach a ``ts`` column of NAIVE IST datetimes (the live aggregator shape,
+    what ``ScannerService._append_bar`` produces), dated ``today_date``."""
+    bars_5m = bars_5m.reset_index(drop=True).copy()
+    start = _RealDateTime(today_date.year, today_date.month, today_date.day, 9, 15)
+    bars_5m["ts"] = [start + _timedelta(minutes=5 * i) for i in range(len(bars_5m))]
+    return bars_5m
+
+
+def test_live_volume_clears_gates_via_ts_column(monkeypatch):
+    """Historify daily ends YESTERDAY (frozen — no today bar). The live
+    `ts`-column 5m tape gaps up AND its aggregated full-day volume exceeds the
+    prior SMA(50)/SMA(200) reference → the BUY rule fires. Previously the dead
+    Path B fell to a frozen historify bar and never cleared the volume gates."""
+    _freeze(monkeypatch, 11, 0)
+    today_date = _date(2026, 6, 4)
+    yest_date = today_date - _timedelta(days=1)
+
+    # Historify daily: flat 2000 history, ends yesterday. Prior volume SMA ~1000.
+    daily = make_daily_bars(n=205, flat_close=2000.0).iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, yest_date)
+
+    # Live 5m gap-up tape (2020 → 2096, +4.8% over yest 2000) with per-bar
+    # volume 500 → 20 bars sum to 10,000 >> the ~1000 daily SMA reference.
+    live = make_5m_bars(n=20, start_close=2020.0, step=4.0, last_vol=500.0, base_vol=500.0)
+    bars_5m = _attach_5m_ts_datetime(live, today_date)
+
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
+    ind["symbol"] = "GLENMARK"
+    assert rule(None, ind) is True
+
+
+# --------------------------------------------------------------------------- #
+# Divergence BLOCK — reject when the flag is on, only WARN when off
+# --------------------------------------------------------------------------- #
+def _divergent_bare_fixture():
+    """A synthetic (Path A) BUY fixture whose today_d.close (daily iloc[-1]
+    close) diverges from the latest 5m close by > the default 0.5% threshold,
+    while all other gates pass — so the ONLY rejection cause is the block."""
+    ind = happy()
+    b5 = ind["bars_5m"].copy()
+    # today_d.close = daily iloc[-1] close = 2100; push the last 5m close far
+    # enough to trip the 0.5% threshold WITHOUT breaking gate 3 (st < close).
+    b5.loc[b5.index[-1], "close"] = 2085.0  # ~0.7% below 2100
+    ind["bars_5m"] = b5
+    ind["symbol"] = "INFY"
+    return ind
+
+
+def test_divergence_block_rejects_when_flag_on(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_PCT", "0.5")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "true")
+
+    ind = _divergent_bare_fixture()
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
+        assert rule(None, ind) is False
+    assert any("REJECTING on divergence" in r.message for r in caplog.records)
+
+
+def test_divergence_only_warns_when_block_flag_off(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_WARN_PCT", "0.5")
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "false")
+
+    ind = _divergent_bare_fixture()
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
+        result = rule(None, ind)
+    assert any("diverges" in r.message for r in caplog.records)
+    assert not any("REJECTING on divergence" in r.message for r in caplog.records)
+    assert result is True
