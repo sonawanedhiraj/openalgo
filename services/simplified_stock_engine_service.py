@@ -1161,14 +1161,17 @@ class SimplifiedStockEngineService:
         return True, available, None
 
     def _maybe_flatten_eod(self) -> None:
-        """Trigger broker-position-aware EOD flatten exactly once per day.
+        """Trigger position-store-aware EOD flatten exactly once per day (#265).
 
-        Runs only in live mode and only after the engine's internal
-        eod_exit_time has been reached. Sandbox mode is authoritative (its
-        positions can't drift from the engine's view because both are written
-        by the same process), and disabled mode never sends orders.
+        Runs in BOTH ``live`` AND ``sandbox`` modes, only after the engine's
+        internal eod_exit_time has been reached. It reconciles drift/mismatch
+        against the mode-appropriate position store (``sandbox.db`` in sandbox,
+        the broker positionbook in live — routing handled by ``get_positionbook``)
+        and is additive to the engine's own tick-driven exits and the sandbox EOD
+        journal reconciliation (``engine_eod_reconciliation_service``, which is
+        unchanged). ``disabled`` mode never sends orders, so it is skipped.
         """
-        if self.mode != MODE_LIVE:
+        if self.mode == MODE_DISABLED:
             return
 
         now = dt.datetime.now()
@@ -1188,11 +1191,12 @@ class SimplifiedStockEngineService:
             )
 
         if not api_keys:
-            logger.info("[SIMPLIFIED-EOD] No api_keys registered; skipping broker flatten")
+            logger.info("[SIMPLIFIED-EOD] No api_keys registered; skipping store flatten")
             return
 
         logger.info(
-            "[SIMPLIFIED-EOD] Running broker-position flatten across %d api_key(s)",
+            "[SIMPLIFIED-EOD] Running position-store flatten (mode=%s) across %d api_key(s)",
+            self.mode,
             len(api_keys),
         )
         for api_key in api_keys:
@@ -1210,12 +1214,14 @@ class SimplifiedStockEngineService:
         known_qty_by_symbol: dict[str, int],
         strategy_name: str,
     ) -> None:
-        """Fetch the broker positionbook for one api_key and flatten drift.
+        """Fetch the mode-appropriate position store for one api_key and flatten drift.
 
-        "Drift" here means: the broker reports an open position on the engine's
-        configured exchange/product that the engine has no record of. The
-        engine's own check_eod_exits already emits exits for positions it
-        knows about, so this pass only catches the orphans.
+        The store is read via the mode-aware ``get_positionbook`` (``sandbox.db``
+        in sandbox, the broker positionbook in live). "Drift" here means: the
+        store reports an open position on the engine's configured exchange/product
+        that the engine has no record of. The engine's own check_eod_exits already
+        emits exits for positions it knows about, so this pass only catches the
+        orphans and any engine↔store qty mismatch (reconciled via #265).
         """
         from services.positionbook_service import get_positionbook
 
@@ -1262,16 +1268,16 @@ class SimplifiedStockEngineService:
             engine_qty = known_qty_by_symbol.get(symbol)
 
             if engine_qty is not None and engine_qty != 0:
-                # The engine knows about this position. When engine and broker
+                # The engine knows about this position. When engine and store
                 # AGREE, defer to the engine's own EOD exit path. When they
-                # DISAGREE, reconcile qty against the broker here (#265) — the
-                # broker is the source of truth, so the engine must not exit MORE
-                # than the account actually holds (that would reverse).
+                # DISAGREE, reconcile qty against the store here (#265) — the
+                # mode-appropriate store is the source of truth, so the engine must
+                # not exit MORE than the account actually holds (that would reverse).
                 if abs(engine_qty) == abs(qty):
                     continue
 
                 engine_close_side = "SELL" if engine_qty > 0 else "BUY"
-                decision = _reconcile_live_close(
+                decision = _reconcile_store_close(
                     mode=self.mode,
                     strategy=strategy_name,
                     api_key=api_key,
@@ -1849,11 +1855,11 @@ class SimplifiedStockEngineService:
 
 
 # ----------------------------------------------------------------------
-# Live-mode broker-position reconciliation glue (#265)
+# Position-store reconciliation glue (#265) — runs in sandbox AND live
 # ----------------------------------------------------------------------
 
 
-def _reconcile_live_close(
+def _reconcile_store_close(
     *,
     mode: str,
     strategy: str,
@@ -1864,15 +1870,17 @@ def _reconcile_live_close(
     expected_close_side: str,
     journaled_qty: int,
 ):
-    """Return a broker-reconciled close decision, or ``None`` in sandbox/error.
+    """Return a store-reconciled close decision, or ``None`` in disabled/error mode.
 
-    ``None`` means "no reconciliation ran" (non-LIVE mode or an import failure);
-    the caller then falls back to its legacy (non-reconciled) path. In LIVE mode
-    this returns a ``ReconcileDecision`` (proceed / clamp / suppress). The broker
-    positionbook is consulted ONLY in live mode — sandbox/disabled is a strict
-    no-op. Never raises.
+    Runs in BOTH ``sandbox`` AND ``live`` mode: the underlying position read
+    (``reconcile_exit`` → ``get_open_position``) is mode-aware, so it consults
+    ``sandbox.db`` in sandbox and the broker positionbook in live. Returns a
+    ``ReconcileDecision`` (proceed / clamp / suppress) in those modes. ``None``
+    means "no reconciliation ran" — either ``disabled`` mode (never sends orders)
+    or an import failure — and the caller then falls back to its legacy
+    (non-reconciled) path. Never raises.
     """
-    if mode != MODE_LIVE:
+    if mode == MODE_DISABLED:
         return None
     try:
         from services import live_position_reconciliation_service as recon
@@ -1887,7 +1895,7 @@ def _reconcile_live_close(
             journaled_qty=journaled_qty,
         )
     except Exception:
-        logger.exception("[SIMPLIFIED-EOD] live reconcile raised for %s", symbol)
+        logger.exception("[SIMPLIFIED-EOD] store reconcile raised for %s", symbol)
         return None
 
 
@@ -2011,11 +2019,12 @@ def flatten_strategy_positions(
 
         action = "SELL" if direction == "LONG" else "BUY"
 
-        # LIVE-only broker reconciliation (#265): the journal is not the source
-        # of truth at exit — the broker is. Suppress a phantom (broker flat) and
-        # clamp a partial (broker < journaled) before dispatching. No-op in
-        # sandbox (returns None → journal-driven qty unchanged).
-        decision = _reconcile_live_close(
+        # Position-store reconciliation (#265, BOTH modes): the journal is not the
+        # source of truth at exit — the mode-appropriate store is (sandbox.db in
+        # sandbox, broker in live). Suppress a phantom (store flat) and clamp a
+        # partial (store < journaled) before dispatching. No-op only in disabled
+        # mode (returns None → journal-driven qty unchanged).
+        decision = _reconcile_store_close(
             mode=engine_service.mode,
             strategy=strategy_name,
             api_key=api_key,
@@ -2028,8 +2037,8 @@ def flatten_strategy_positions(
         if decision is not None:
             if not decision.should_place:
                 logger.error(
-                    "[EOD-FLATTEN] %s %s SUPPRESSED by broker reconcile "
-                    "(reason=%s broker_qty=%s journaled=%s)",
+                    "[EOD-FLATTEN] %s %s SUPPRESSED by store reconcile "
+                    "(reason=%s store_qty=%s journaled=%s)",
                     strategy_name,
                     symbol,
                     decision.reason,
@@ -2038,7 +2047,7 @@ def flatten_strategy_positions(
                 )
                 summary["skipped"].append({"symbol": symbol, "reason": decision.reason})
                 # Stamp the journal row closed so the next boot's rehydrate skips
-                # it — the broker already holds nothing to close.
+                # it — the store already holds nothing to close.
                 try:
                     trade_journal_service.record_exit(
                         journal_id,
