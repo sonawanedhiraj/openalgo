@@ -168,6 +168,46 @@ def _get_strategy_mode(name: str) -> str:
     return "sandbox"
 
 
+# ---------------------------------------------------------------------------
+# LLM control (issue #266 Phase 2)
+# ---------------------------------------------------------------------------
+
+# Which strategies actually run the Stage-1 LLM veto today. Only the simplified
+# engine calls _run_pre_order_review; sector_follow / futures_follow have no
+# veto call, so their decisions view is empty by construction. The UI notes
+# this rather than faking rows.
+_VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER}
+
+# Map a dashboard strategy name → the signal_decision.source labels its veto
+# rows carry. The simplified engine reviews with source=<chartink strategy
+# label> (e.g. "chartink_FnO_intraday_buy", "trend-up"), NOT its folder name —
+# so a clean per-strategy source filter isn't available. We therefore return
+# ALL signal_decision rows for the simplified engine (it is the only strategy
+# running the veto today) and the UI notes that. Value None = "no source
+# filter, return everything".
+_LLM_DECISION_SOURCES: dict[str, list[str] | None] = {
+    _SIMPLIFIED_ENGINE_FOLDER: None,
+}
+
+
+def _get_llm_mode(name: str) -> str:
+    """Return the persistent llm_mode for a strategy, default 'off'.
+
+    Reads the strategy_llm_config table directly (read-only). 'off' is the
+    default when no row exists — matches the DB default and the resolver's
+    first-boot behavior.
+    """
+    try:
+        from database.strategy_llm_config_db import get_llm_mode
+
+        row = get_llm_mode(name)
+        if row and row.get("llm_mode"):
+            return row["llm_mode"]
+    except Exception:
+        logger.exception("Failed to query strategy_llm_config for %s", name)
+    return "off"
+
+
 def _get_active_overrides(name: str) -> list[dict]:
     """Return active (non-expired) runtime override rows for a strategy."""
     try:
@@ -402,6 +442,8 @@ def _build_summary(name: str) -> dict:
         "name": name,
         "display_name": name.replace("_", " ").title(),
         "mode": mode_val,
+        "llm_mode": _get_llm_mode(name),
+        "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
         "deployable": config.get("deployable", False),
         "version": config.get("version", "—"),
         "open_positions": stats.get("open_positions", 0),
@@ -573,6 +615,8 @@ def strategy_detail(name: str):
                 "name": name,
                 "display_name": name.replace("_", " ").title(),
                 "mode": mode_val,
+                "llm_mode": _get_llm_mode(name),
+                "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
                 "deployable": config.get("deployable", False),
                 "version": config.get("version", "—"),
                 "config_snapshot": config,
@@ -776,3 +820,145 @@ def strategy_mode_audit(name: str):
         rows = []
 
     return jsonify({"status": "success", "data": {"name": name, "rows": rows, "limit": limit}})
+
+
+# --------------------------------------------------------------------------- #
+# LLM mode flip + decisions history (issue #266 Phase 2)
+# --------------------------------------------------------------------------- #
+
+
+@strategies_dashboard_bp.route("/api/<name>/llm-mode", methods=["POST"])
+@check_session_validity
+def flip_strategy_llm_mode(name: str):
+    """Set a strategy's LLM mode (off | veto) through the guarded writer.
+
+    Body: ``{"llm_mode": "off" | "veto" | "delegate"}``
+
+    ``delegate`` is accepted and stored, but the resolver treats it as ``veto``
+    for now (the LLM-decides path isn't built) — the response ``warnings`` say
+    so. The UI shows delegate as a disabled/"coming soon" option.
+
+    Returns:
+        202 + accepted=True  → llm_mode set, event fired.
+        400                  → bad input (missing/invalid llm_mode).
+    """
+    strategy_dir = _STRATEGIES_DIR / name
+    if not strategy_dir.exists():
+        return jsonify({"status": "error", "message": f"Strategy '{name}' not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    target = (body.get("llm_mode") or "").lower().strip()
+    notes = body.get("notes") or None
+
+    if target not in ("off", "veto", "delegate"):
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "Body must include {'llm_mode': 'off' | 'veto' | 'delegate'}",
+                }
+            ),
+            400,
+        )
+
+    try:
+        from services.strategy_llm_config_service import flip_llm_mode
+    except Exception:
+        logger.exception("flip_strategy_llm_mode: failed to import strategy_llm_config_service")
+        return (
+            jsonify({"status": "error", "message": "LLM config service unavailable — see logs"}),
+            500,
+        )
+
+    outcome = flip_llm_mode(
+        strategy_name=name,
+        target_llm_mode=target,
+        flipped_by=_flipped_by_label(),
+        notes=notes,
+    )
+    payload = outcome.to_dict()
+    payload["status"] = "success" if outcome.accepted else "error"
+    return jsonify(payload), (202 if outcome.accepted else 400)
+
+
+@strategies_dashboard_bp.route("/api/<name>/llm-decisions", methods=["GET"])
+@check_session_validity
+def strategy_llm_decisions(name: str):
+    """Paginated LLM-veto decision history for a strategy + a health summary.
+
+    Query: ``?limit=&offset=`` (limit clamped 1..200, default 50).
+
+    For the simplified engine (the only strategy running the veto today) this
+    returns ALL signal_decision rows — its veto rows are tagged with the
+    chartink source label, not the folder name, so a clean per-strategy source
+    filter isn't available (see _LLM_DECISION_SOURCES). For strategies that
+    don't run the veto, ``veto_enabled=false`` and rows are empty.
+    """
+    strategy_dir = _STRATEGIES_DIR / name
+    if not strategy_dir.exists():
+        return jsonify({"status": "error", "message": f"Strategy '{name}' not found"}), 404
+
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    veto_enabled = name in _VETO_ENABLED_STRATEGIES
+    if not veto_enabled:
+        # No veto call for this strategy — return an honest empty view.
+        return jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "name": name,
+                    "veto_enabled": False,
+                    "llm_mode": _get_llm_mode(name),
+                    "rows": [],
+                    "total": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "summary": None,
+                    "source_filtered": False,
+                },
+            }
+        )
+
+    sources = _LLM_DECISION_SOURCES.get(name)  # None → all sources
+    try:
+        from database.signal_decision_db import (
+            count_signal_decisions,
+            list_signal_decisions,
+            summarize_signal_decisions,
+        )
+
+        rows = list_signal_decisions(sources=sources, limit=limit, offset=offset)
+        total = count_signal_decisions(sources=sources)
+        summary = summarize_signal_decisions(sources=sources)
+    except Exception:
+        logger.exception("strategy_llm_decisions: query failed for %s", name)
+        rows, total, summary = [], 0, None
+
+    return jsonify(
+        {
+            "status": "success",
+            "data": {
+                "name": name,
+                "veto_enabled": True,
+                "llm_mode": _get_llm_mode(name),
+                "rows": rows,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "summary": summary,
+                # True when we could NOT filter to a per-strategy source and so
+                # returned all rows (the UI notes this).
+                "source_filtered": sources is not None,
+            },
+        }
+    )

@@ -54,6 +54,46 @@ fell safe to 'take' — the veto never fired. It now runs directly.
 - **Was:** httpx read timeout for the bridge POST, default `30.0`.
 - **Now:** removed. Superseded by `VETO_CLAUDE_TIMEOUT_SECONDS` (the subprocess
   budget). `VETO_CACHE_TTL_SECONDS` and `VETO_LAYER_MODE` are unchanged.
+
+### LLM control — per-strategy `llm_mode` (#266 Phase 2 / #275, proposed 2026-07-01)
+
+> Proposed by feature branch `feat/275-llm-mode-ui` (staged, operator-reviewed;
+> order-path-adjacent — the veto blocks orders in `active` mode). Raised as a PR,
+> NOT merged. The entry lands on `dev` at merge or as an immediate follow-up.
+
+Replaces the hidden `VETO_LAYER_MODE` env flag as the *operator* control with a
+single per-strategy toggle on `/strategies` (issue #266). New table
+`strategy_llm_config` (`db/openalgo.db`, `database/strategy_llm_config_db.py`):
+one row per strategy, `llm_mode ∈ {off, veto, delegate}`.
+
+#### strategy_llm_config.llm_mode (NEW)
+- **Current value:** no rows → the resolver falls through to `VETO_LAYER_MODE`
+  env, then the mode-aware default (sandbox→active, else shadow) — so **existing
+  behavior is preserved until the operator sets a UI value** (#162 Phase-4
+  pattern).
+- **Set via:** the guarded writer `services.strategy_llm_config_service.flip_llm_mode`
+  (audits + publishes `StrategyLLMModeChangedEvent`), fronted by
+  `POST /strategies/api/<name>/llm-mode {"llm_mode":"off|veto|delegate"}`.
+- **What it does / how it maps to enforcement** (in
+  `signal_review_service.get_veto_layer_mode(effective_mode, strategy_name)`,
+  DB-row-first resolution):
+  - `off` → `off` (no reviewer runs).
+  - `veto` → `active` (a `skip` verdict BLOCKS the order).
+  - `delegate` → stored, but resolved as `active` for now — the LLM-decides
+    engine path isn't built (a later phase); shown disabled/"coming soon" in the
+    UI.
+- **Fixes #274 item 2:** the DB row makes the sandbox enforcement explicit, so
+  the fire that resolved `shadow` when sandbox should have been `active` is now
+  unambiguous once the operator sets `veto`.
+- **`shadow` is env-only:** it stays available via `VETO_LAYER_MODE=shadow`
+  (observe-only) but is **not** operator-selectable from the UI.
+- **Rollback:** delete the strategy's `strategy_llm_config` row → instant
+  env/default fall-through. `DELETE FROM strategy_llm_config WHERE
+  strategy_name='<name>'` or `database.strategy_llm_config_db.delete_llm_mode`.
+- **Scope today:** only `simplified_engine` actually calls the veto
+  (`_run_pre_order_review`), so only its row has runtime effect; other strategies
+  can hold a row but it is inert until Phase 3 wires the veto into them.
+
 ### Live-mode broker-position reconciliation (issue #265, proposed 2026-07-01)
 
 > Proposed by feature branch `feat/265-live-position-reconciliation` (staged,

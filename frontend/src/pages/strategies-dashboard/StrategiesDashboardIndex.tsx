@@ -3,12 +3,14 @@ import {
   Activity,
   AlertTriangle,
   ArrowRight,
+  Bot,
   CheckCircle2,
   Clock,
   Loader2,
   PauseCircle,
   Power,
   RefreshCw,
+  ShieldCheck,
   TrendingDown,
   TrendingUp,
 } from 'lucide-react'
@@ -16,6 +18,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   type FlipModeOutcome,
+  type LLMMode,
   type StrategyHealth,
   type StrategySummary,
   strategiesDashboardApi,
@@ -81,6 +84,30 @@ function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) 
       </Badge>
     )
   return <Badge variant="outline">{mode}</Badge>
+}
+
+// LLM control badge (issue #266 Phase 2) — a compact indicator of the current
+// per-strategy LLM mode. 'off' renders nothing to keep the card uncluttered.
+function LLMBadge({ llmMode }: { llmMode: LLMMode }) {
+  if (llmMode === 'veto')
+    return (
+      <Badge
+        className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 gap-1"
+        title="LLM veto enabled"
+      >
+        <ShieldCheck className="h-3 w-3" /> Veto
+      </Badge>
+    )
+  if (llmMode === 'delegate')
+    return (
+      <Badge
+        className="bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 gap-1"
+        title="LLM delegate"
+      >
+        <Bot className="h-3 w-3" /> Delegate
+      </Badge>
+    )
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +252,10 @@ function StrategyCard({ s }: { s: StrategySummary }) {
             <HealthLed health={s.health} />
             <CardTitle className="text-base truncate">{s.display_name}</CardTitle>
           </div>
-          <ModeBadge mode={s.mode} deployable={s.deployable} />
+          <div className="flex items-center gap-1.5">
+            <LLMBadge llmMode={s.llm_mode} />
+            <ModeBadge mode={s.mode} deployable={s.deployable} />
+          </div>
         </div>
         <p className="text-xs text-muted-foreground font-mono">
           {s.name} · v{s.version}

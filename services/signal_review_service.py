@@ -67,26 +67,82 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def get_veto_layer_mode(effective_mode: str | None = None) -> str:
+def _resolve_llm_mode_from_db(strategy_name: str | None) -> str | None:
+    """Read the strategy's persistent ``llm_mode`` (issue #266 Phase 2) and map
+    it to the internal enforcement mode.
+
+    Mapping (the UI-selectable axis → the engine's enforcement axis):
+
+    * ``off``      → ``off``    (no reviewer runs)
+    * ``veto``     → ``active`` (a ``skip`` verdict blocks the order)
+    * ``delegate`` → ``active`` (stored, but the LLM-decides path isn't built
+                     yet — treated as ``veto``/``active`` for now)
+
+    Returns the mapped enforcement mode, or ``None`` when there is no DB row for
+    the strategy (so the caller falls through to the env/default resolution).
+    ``shadow`` is intentionally NOT reachable from the DB — it stays an
+    env-only internal option.
+    """
+    if not strategy_name:
+        return None
+    try:
+        from database.strategy_llm_config_db import get_llm_mode
+
+        row = get_llm_mode(strategy_name)
+    except Exception:
+        logger.exception(
+            "signal_review: strategy_llm_config lookup failed for %s — env fallback",
+            strategy_name,
+        )
+        return None
+    if not row:
+        return None
+    llm_mode = (row.get("llm_mode") or "").strip().lower()
+    if llm_mode == "off":
+        return "off"
+    if llm_mode in ("veto", "delegate"):
+        return "active"
+    logger.warning(
+        "signal_review: unknown llm_mode=%r for %s — env fallback", llm_mode, strategy_name
+    )
+    return None
+
+
+def get_veto_layer_mode(effective_mode: str | None = None, strategy_name: str | None = None) -> str:
     """Resolve the veto-layer enforcement mode (``off`` / ``shadow`` / ``active``).
 
-    The ``VETO_LAYER_MODE`` env var, when explicitly set, is the single override
-    and wins in every mode (set it to ``off`` for an emergency disable).
+    Resolution order (issue #266 Phase 2):
 
-    When the env var is unset, the default is **mode-aware** (mode-only
-    architecture, 2026-06-12): a strategy routing to ``sandbox`` defaults to
-    ``active`` — the LLM veto *enforces* on the virtual ₹1Cr book, so the layer
-    is exercised for real before it ever gates live money. Any other mode
-    (``live`` / unknown / not provided) defaults to ``shadow`` (observe-only) —
-    live behavior is unchanged. Callers that know the strategy's effective mode
-    pass it in; callers without that context get the safe ``shadow`` default."""
+    1. **Per-strategy DB row** — if ``strategy_name`` is given and the
+       ``strategy_llm_config`` table has a row, that operator-set ``llm_mode``
+       wins (``off``→off, ``veto``/``delegate``→active). This is the single UI
+       control; it replaces the hidden env flag once the operator sets it.
+    2. **``VETO_LAYER_MODE`` env** — the first-boot fallback / emergency
+       override when no DB row exists. Set it to ``off`` for an emergency
+       disable, or ``shadow`` for the env-only observe-only mode (not
+       UI-selectable).
+    3. **Mode-aware default** — env unset and no DB row: a strategy routing to
+       ``sandbox`` defaults to ``active`` (the veto *enforces* on the virtual
+       ₹1Cr book so the layer is exercised before it ever gates live money);
+       any other mode defaults to ``shadow`` (observe-only). This preserves the
+       pre-Phase-2 behavior until the operator sets a UI value, and — because
+       the DB row is now the explicit source of truth for a configured strategy
+       — resolves the #274 shadow-vs-active ambiguity in sandbox.
+    """
+    # 1. Per-strategy DB row is the authoritative operator control.
+    db_mode = _resolve_llm_mode_from_db(strategy_name)
+    if db_mode is not None:
+        return db_mode
+
+    # 2. Env override (first-boot fallback + the env-only 'shadow' option).
     raw = os.getenv("VETO_LAYER_MODE")
     if raw is not None and raw.strip() != "":
         val = raw.strip().lower()
         if val in VALID_VETO_MODES:
             return val
         logger.warning("signal_review: unknown VETO_LAYER_MODE=%r; falling back to default", raw)
-    # Env unset (or invalid) → mode-aware default.
+
+    # 3. Mode-aware default.
     if (effective_mode or "").strip().lower() == "sandbox":
         return "active"
     return "shadow"

@@ -713,10 +713,14 @@ class SimplifiedStockEngineService:
         try:
             from services import signal_review_service
 
-            # Mode-aware veto default: sandbox enforces ('active') by default so
-            # the layer is exercised on the virtual book; live is unchanged
-            # ('shadow'). VETO_LAYER_MODE env overrides in every mode.
-            mode = signal_review_service.get_veto_layer_mode(self.mode)
+            # Resolve the LLM enforcement mode. The per-strategy operator control
+            # (strategy_llm_config, issue #266 Phase 2) is keyed on the dashboard
+            # identity ("simplified_engine"); it wins over the env/mode-aware
+            # default. off→off, veto/delegate→active. VETO_LAYER_MODE env is the
+            # first-boot fallback only.
+            mode = signal_review_service.get_veto_layer_mode(
+                self.mode, strategy_name=self.LLM_CONFIG_STRATEGY_NAME
+            )
             if mode == "off":
                 return True, None
 
@@ -789,6 +793,12 @@ class SimplifiedStockEngineService:
     # ------------------------------------------------------------------
 
     JOURNAL_STRATEGY_NAME = "trending_equity_intraday"
+
+    # Dashboard identity used for the per-strategy LLM control
+    # (strategy_llm_config table / /strategies UI, issue #266 Phase 2). This is
+    # the strategies/ folder name, NOT the journal name — the UI keys the
+    # off/veto toggle on this.
+    LLM_CONFIG_STRATEGY_NAME = "simplified_engine"
 
     @staticmethod
     def _normalize_exit_reason(reason: str | None) -> str:

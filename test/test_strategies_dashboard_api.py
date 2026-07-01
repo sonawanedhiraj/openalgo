@@ -734,3 +734,146 @@ def test_other_strategies_unaffected_by_simplified_bridge(app, wired_dbs):
     ff = next(s for s in body if s["name"] == "futures_follow_cap50")
     assert sf["today_trade_count"] == 0
     assert ff["today_trade_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# LLM mode toggle + decisions history (issue #266 Phase 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def wired_llm_dbs(monkeypatch):
+    """Rebind strategy_llm_config_db + signal_decision_db to in-memory engines."""
+    from database import signal_decision_db as sddb
+    from database import strategy_llm_config_db as llmdb
+
+    llm_eng, llm_sess = _mk_engine()
+    sd_eng, sd_sess = _mk_engine()
+    llmdb.Base.metadata.create_all(llm_eng)
+    sddb.Base.metadata.create_all(sd_eng)
+
+    monkeypatch.setattr(llmdb, "engine", llm_eng)
+    monkeypatch.setattr(llmdb, "db_session", llm_sess)
+    monkeypatch.setattr(sddb, "engine", sd_eng)
+    monkeypatch.setattr(sddb, "db_session", sd_sess)
+    monkeypatch.setattr(sddb, "_tables_ensured_for_engine", None)
+
+    yield {"llm": (llm_eng, llm_sess, llmdb), "sd": (sd_eng, sd_sess, sddb)}
+
+    for sess in (llm_sess, sd_sess):
+        sess.remove()
+    for eng in (llm_eng, sd_eng):
+        eng.dispose()
+
+
+def _seed_decision(sddb, symbol, source, decision):
+    sddb.insert_signal_decision(
+        symbol=symbol,
+        source=source,
+        decision=decision,
+        reasoning="because",
+        confidence=0.6,
+        enforcement_mode="shadow",
+        context_snapshot=None,
+        bridge_latency_ms=12,
+        bridge_session_id="sess",
+        raw_bridge_output=None,
+    )
+
+
+def test_detail_includes_llm_fields(app, wired_llm_dbs):
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+    body = resp.get_json()["data"]
+    assert body["llm_mode"] == "off"  # default, no row
+    assert body["llm_veto_enabled"] is True
+
+
+def test_list_includes_llm_fields(app, wired_llm_dbs):
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+    body = resp.get_json()["data"]
+    se = next(s for s in body if s["name"] == "simplified_engine")
+    assert se["llm_veto_enabled"] is True
+    sf = next(s for s in body if s["name"] == "sector_follow_cap5_vol")
+    assert sf["llm_veto_enabled"] is False
+
+
+def test_post_llm_mode_accepts_veto(app, wired_llm_dbs, monkeypatch):
+    from services import strategy_llm_config_service as svc
+
+    monkeypatch.setattr(svc, "_telegram_notify", lambda *a, **k: None)
+    monkeypatch.setattr(svc._default_bus, "publish", lambda ev: None)
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.post("/strategies/api/simplified_engine/llm-mode", json={"llm_mode": "veto"})
+    assert resp.status_code == 202
+    body = resp.get_json()
+    assert body["accepted"] is True
+    assert body["new_llm_mode"] == "veto"
+    # Row persisted → subsequent GET reflects it.
+    with app.test_client() as client:
+        _login(client)
+        detail = client.get("/strategies/api/simplified_engine").get_json()["data"]
+    assert detail["llm_mode"] == "veto"
+
+
+def test_post_llm_mode_rejects_bad_value(app, wired_llm_dbs):
+    with app.test_client() as client:
+        _login(client)
+        resp = client.post(
+            "/strategies/api/simplified_engine/llm-mode", json={"llm_mode": "shadow"}
+        )
+    assert resp.status_code == 400
+
+
+def test_llm_decisions_returns_rows_for_veto_strategy(app, wired_llm_dbs):
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _seed_decision(sddb, "ASTRAL", "chartink_FnO_intraday_buy", "take")
+    _seed_decision(sddb, "FORTIS", "trend-up", "skip")
+    _seed_decision(sddb, "RBLBANK", "trend-up", "review_failed")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine/llm-decisions")
+    body = resp.get_json()["data"]
+    assert body["veto_enabled"] is True
+    assert body["total"] == 3
+    assert len(body["rows"]) == 3
+    assert body["summary"]["review_failed"] == 1
+    assert body["summary"]["recent_review_failed"] >= 1
+
+
+def test_llm_decisions_pagination(app, wired_llm_dbs):
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    for i in range(5):
+        _seed_decision(sddb, f"SYM{i}", "trend-up", "take")
+
+    with app.test_client() as client:
+        _login(client)
+        p1 = client.get(
+            "/strategies/api/simplified_engine/llm-decisions?limit=2&offset=0"
+        ).get_json()["data"]
+        p2 = client.get(
+            "/strategies/api/simplified_engine/llm-decisions?limit=2&offset=2"
+        ).get_json()["data"]
+    assert p1["total"] == 5
+    assert len(p1["rows"]) == 2 and len(p2["rows"]) == 2
+    assert {r["id"] for r in p1["rows"]}.isdisjoint({r["id"] for r in p2["rows"]})
+
+
+def test_llm_decisions_empty_for_non_veto_strategy(app, wired_llm_dbs):
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _seed_decision(sddb, "ASTRAL", "chartink_FnO_intraday_buy", "take")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/sector_follow_cap5_vol/llm-decisions")
+    body = resp.get_json()["data"]
+    assert body["veto_enabled"] is False
+    assert body["rows"] == []
+    assert body["total"] == 0
+    assert body["summary"] is None

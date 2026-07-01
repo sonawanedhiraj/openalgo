@@ -18,10 +18,14 @@ export interface ActiveOverride {
 // List endpoint
 // ---------------------------------------------------------------------------
 
+export type LLMMode = 'off' | 'veto' | 'delegate'
+
 export interface StrategySummary {
   name: string
   display_name: string
   mode: string
+  llm_mode: LLMMode
+  llm_veto_enabled: boolean
   deployable: boolean
   version: string
   open_positions: number
@@ -85,6 +89,8 @@ export interface StrategyDetail {
   name: string
   display_name: string
   mode: string
+  llm_mode: LLMMode
+  llm_veto_enabled: boolean
   deployable: boolean
   version: string
   config_snapshot: Record<string, unknown>
@@ -206,6 +212,32 @@ export const strategiesDashboardApi = {
     }>(`/strategies/api/${name}/mode/audit`, { params: { limit } })
     return res.data.data.rows
   },
+
+  /**
+   * Set a strategy's LLM mode (off | veto). `delegate` is accepted by the
+   * server but treated as veto for now (the response `warnings` say so) — the
+   * UI shows it disabled/"coming soon".
+   *
+   * A 400 (bad value) is NOT thrown here — the response body has
+   * `accepted=false` and an `error_message`. Transport failures throw normally.
+   */
+  flipLLMMode: async (name: string, llmMode: LLMMode, notes?: string): Promise<LLMFlipOutcome> => {
+    const res = await webClient.post<LLMFlipOutcome>(
+      `/strategies/api/${name}/llm-mode`,
+      { llm_mode: llmMode, notes },
+      { validateStatus: (s) => s === 202 || s === 400 }
+    )
+    return res.data
+  },
+
+  /** Paginated LLM-veto decision history + a health summary. */
+  getLLMDecisions: async (name: string, limit = 25, offset = 0): Promise<LLMDecisionsResponse> => {
+    const res = await webClient.get<{ status: string; data: LLMDecisionsResponse }>(
+      `/strategies/api/${name}/llm-decisions`,
+      { params: { limit, offset } }
+    )
+    return res.data.data
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -237,4 +269,57 @@ export interface ModeAuditRow {
   flipped_at: string | null
   flipped_by: string
   error_message: string | null
+}
+
+// ---------------------------------------------------------------------------
+// LLM control types (issue #266 Phase 2)
+// ---------------------------------------------------------------------------
+
+export interface LLMFlipOutcome {
+  status: 'success' | 'error'
+  accepted: boolean
+  strategy_name: string
+  target_llm_mode: LLMMode
+  previous_llm_mode: LLMMode | null
+  new_llm_mode: LLMMode | null
+  warnings: string[]
+  error_message: string | null
+}
+
+export type LLMDecisionVerdict = 'take' | 'skip' | 'review_failed' | string
+
+export interface LLMDecisionRow {
+  id: number
+  candidate_at: string
+  symbol: string
+  source: string
+  direction: string | null
+  decision: LLMDecisionVerdict
+  reasoning: string | null
+  confidence: number | null
+  enforcement_mode: string
+  actually_taken: boolean | null
+  bridge_latency_ms: number | null
+}
+
+export interface LLMDecisionsSummary {
+  total: number
+  take: number
+  skip: number
+  review_failed: number
+  other: number
+  last_decision: LLMDecisionRow | null
+  recent_review_failed: number
+}
+
+export interface LLMDecisionsResponse {
+  name: string
+  veto_enabled: boolean
+  llm_mode: LLMMode
+  rows: LLMDecisionRow[]
+  total: number
+  limit: number
+  offset: number
+  summary: LLMDecisionsSummary | null
+  source_filtered: boolean
 }
