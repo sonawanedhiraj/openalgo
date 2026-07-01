@@ -448,9 +448,11 @@ class TestThreeStrategyModeRoundtrip:
         for name in STRATS:
             harness.set_strategy_mode(name, "sandbox")
 
-        # Flip each one to live; verify the others stay sandbox
+        # Flip each one to live; verify the others stay sandbox.
+        # force: this test checks per-strategy isolation of a seeded live row,
+        # not the flip preflight gate.
         for target in STRATS:
-            harness.set_strategy_mode(target, "live")
+            harness.set_strategy_mode(target, "live", force=True)
             for name in STRATS:
                 expected = "live" if name == target else "sandbox"
                 actual = harness.get_strategy_mode(name)
@@ -474,13 +476,13 @@ class TestThreeStrategyModeRoundtrip:
         """Verify that set_strategy_mode writes to strategy_mode_db in a way
         that get_mode reads back correctly (validates the DB seam directly).
         """
-        from database.strategy_mode_db import get_mode, set_mode
+        from database.strategy_mode_db import _set_mode_unchecked, get_mode
 
         with harness.app.app_context():
-            set_mode("c3_direct_test", "live", updated_by="c3_test")
+            _set_mode_unchecked("c3_direct_test", "live", updated_by="c3_test")
             result = get_mode("c3_direct_test")
 
-        assert result is not None, "get_mode must return a dict after set_mode"
+        assert result is not None, "get_mode must return a dict after _set_mode_unchecked"
         assert result.get("mode") == "live", (
             f"Expected mode='live' from direct DB write, got {result!r}"
         )

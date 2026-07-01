@@ -271,8 +271,9 @@ class TestStrategyModeChangePropagates:
         # Authenticate the test client so @check_session_validity passes.
         harness.set_auth_session()
 
-        # 1. Set mode to 'live' directly in the DB.
-        harness.set_strategy_mode("sector_follow_cap5_vol", "live")
+        # 1. Seed mode to 'live' directly in the temp DB (force: this test checks
+        #    DB→API propagation of a live row, not the flip preflight gate).
+        harness.set_strategy_mode("sector_follow_cap5_vol", "live", force=True)
 
         # 2. Verify the DB layer agrees.
         mode_in_db = harness.get_strategy_mode("sector_follow_cap5_vol")
@@ -295,7 +296,7 @@ class TestStrategyModeChangePropagates:
         # above already proves propagation; skip the API assertion in that case.
         if sf_entry is not None:
             assert sf_entry.get("mode") == "live", (
-                f"API should return mode='live' after set_mode(), got: {sf_entry}"
+                f"API should return mode='live' after seeding, got: {sf_entry}"
             )
 
     def test_mode_change_sandbox_to_live_and_back(self, harness):
@@ -303,7 +304,7 @@ class TestStrategyModeChangePropagates:
         harness.set_strategy_mode("futures_follow_cap50", "sandbox")
         assert harness.get_strategy_mode("futures_follow_cap50") == "sandbox"
 
-        harness.set_strategy_mode("futures_follow_cap50", "live")
+        harness.set_strategy_mode("futures_follow_cap50", "live", force=True)
         assert harness.get_strategy_mode("futures_follow_cap50") == "live"
 
         harness.set_strategy_mode("futures_follow_cap50", "sandbox")

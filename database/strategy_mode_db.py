@@ -101,15 +101,22 @@ def get_mode(strategy_name: str) -> dict | None:
         db_session.remove()
 
 
-def set_mode(
+def _set_mode_unchecked(
     strategy_name: str,
     mode: str,
     updated_by: str = "operator",
     notes: str | None = None,
 ) -> dict:
-    """Upsert the persistent mode row for ``strategy_name``. Returns the row dict.
+    """UNCHECKED — bypasses preflight/audit. Upsert the persistent mode row.
 
-    Validation errors raise ``ValueError`` (programming/operator-input errors).
+    The ONLY sanctioned caller is ``services.strategy_mode_service.flip_mode``
+    (and the one-shot migration script). Do NOT call this from tests/harness/app
+    code — use ``flip_mode``, which runs the preflight gate + audit trail +
+    publishes ``StrategyModeChangedEvent`` before the row is written. Calling
+    this directly is how the 2026-06-24 silent ``live`` flip happened.
+
+    Returns the row dict. Validation errors raise ``ValueError``
+    (programming/operator-input errors).
     """
     if mode not in VALID_MODES:
         raise ValueError(f"mode must be one of {VALID_MODES}, got {mode!r}")

@@ -23,11 +23,11 @@ going forward. Every flip:
 Sandbox flips are always allowed (preflight returns ``can_flip=True``
 unconditionally for ``target_mode="sandbox"``) but are still audited.
 
-The raw write helper ``database.strategy_mode_db.set_mode`` is preserved for
-the boot-time migration script and tests. Production callers should never use
-it directly — use :func:`flip_mode` from this module instead. (A future PR
-may move ``set_mode`` to a private ``_set_mode_unchecked`` once existing
-callers are audited.)
+The raw write helper is ``database.strategy_mode_db._set_mode_unchecked`` —
+UNCHECKED and preflight-bypassing. Its only sanctioned callers are this module's
+:func:`flip_mode` (the guarded path below) and the one-shot boot-time migration
+script. Production and test/harness code must never call it directly — use
+:func:`flip_mode` instead, so preflight + audit + the change event always run.
 """
 
 from __future__ import annotations
@@ -301,18 +301,19 @@ def flip_mode(
         )
         return outcome
 
-    # Preflight passed — write the row.
+    # Preflight passed — write the row via the unchecked helper (this guarded
+    # path is the only sanctioned caller of _set_mode_unchecked).
     try:
-        from database.strategy_mode_db import set_mode
+        from database.strategy_mode_db import _set_mode_unchecked
 
-        set_mode(
+        _set_mode_unchecked(
             strategy_name=strategy_name,
             mode=target_mode,
             updated_by=flipped_by,
             notes=notes,
         )
     except Exception as e:
-        logger.exception("flip_mode: set_mode raised for %s", strategy_name)
+        logger.exception("flip_mode: _set_mode_unchecked raised for %s", strategy_name)
         outcome = FlipOutcome(
             accepted=False,
             strategy_name=strategy_name,
