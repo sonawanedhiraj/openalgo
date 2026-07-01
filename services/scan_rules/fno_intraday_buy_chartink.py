@@ -118,6 +118,44 @@ def _reject_missing(symbol: str, reason: str) -> bool:
     return False
 
 
+# Per-(symbol, IST-day) dedup for the SMA(200) daily-depth WARNING (issue #280).
+# The rule re-fires every 5m bar close for every symbol, so a bare WARNING would
+# flood the log with the same line hundreds of times a day. We emit exactly one
+# WARNING per (symbol, day); the dedup is an in-process set keyed on the IST date
+# so a process restart or IST date rollover re-arms it.
+_shallow_daily_warned: set[tuple[str, str]] = set()
+_shallow_daily_lock = threading.Lock()
+
+
+def _warn_shallow_daily_once(symbol: str, n_rows: int, required: int, day_ist: str) -> None:
+    """Emit a once-per-(symbol, IST-day) WARNING for a too-short daily frame.
+
+    This is the observability half of issue #280: the BUY rule's SMA(``vol_sma_l``)
+    volume gate needs ``required`` (default 200) settled daily bars, but the
+    scanner's ``ScannerHistoryProvider`` reads stored historify-D, which is often
+    short for the F&O universe (the 'stored-D short/stale' data-supply gap). The
+    old ``logger.debug`` warm-up line was invisible at production ``LOG_LEVEL=INFO``,
+    so a whole universe silently rejecting looked byte-identical to a quiet market
+    (0 BUY hits, no signal). A dedup'd WARNING surfaces the depth gap in
+    ``errors.jsonl`` within one cycle so the deep scanner_universe_D backfill can
+    be triggered. Best-effort — never raises into rule evaluation.
+    """
+    key = (symbol, day_ist)
+    with _shallow_daily_lock:
+        if key in _shallow_daily_warned:
+            return
+        _shallow_daily_warned.add(key)
+    logger.warning(
+        "fno_intraday_buy_chartink %s: daily frame too short for SMA(%d) volume gate "
+        "(%d<%d rows) — stored historify-D depth gap; BUY cannot evaluate. Deep "
+        "scanner_universe_D backfill needed (issue #280).",
+        symbol,
+        required,
+        n_rows,
+        required,
+    )
+
+
 def _dbar_date_verify_enabled() -> bool:
     """``SCANNER_DBAR_DATE_VERIFY_ENABLED`` env flag (default true). Gates the
     post-settle daily-bar-date staleness guard below."""
@@ -207,12 +245,16 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     if bars_daily is None:
         return _reject_missing(sym, "bars_daily is None (no daily-D data)")
     if len(bars_daily) < vol_sma_l:
-        logger.debug(
-            "fno_intraday_buy_chartink %s: daily warm-up (%d<%d rows)",
-            sym,
-            len(bars_daily),
-            vol_sma_l,
-        )
+        # Issue #280: this is NOT ordinary warm-up — during a live session the
+        # scanner reads stored historify-D via ScannerHistoryProvider, which is
+        # short/stale for much of the F&O universe. A silent DEBUG here made the
+        # BUY screener emit 0 hits for the whole universe indistinguishably from
+        # a quiet market. Surface it as a dedup'd WARNING so the depth gap is
+        # visible in errors.jsonl and the deep scanner_universe_D backfill can be
+        # triggered. Still a rejection (the SMA(vol_sma_l) reference is genuinely
+        # not computable), but now an observable one.
+        now_ist = datetime.now(_IST)
+        _warn_shallow_daily_once(sym, len(bars_daily), vol_sma_l, now_ist.date().isoformat())
         return False
     if bars_weekly is None:
         return _reject_missing(sym, "bars_weekly is None")

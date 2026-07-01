@@ -602,3 +602,91 @@ def test_divergence_only_warns_when_block_flag_off(monkeypatch, caplog):
     assert any("diverges" in r.message for r in caplog.records)
     assert not any("REJECTING on divergence" in r.message for r in caplog.records)
     assert result is True
+
+
+# --------------------------------------------------------------------------- #
+# Issue #280 — SMA(200) daily-depth warm-up is OBSERVABLE, not silent, and the
+# real live-aggregator frame shape (naive-datetime ``ts`` 5m column) is covered.
+#
+# #279 fixed derive_today_and_yest's Path B for the live ``ts`` column, but its
+# tests used the historify epoch ``timestamp`` column on the 5m frame. The real
+# in-process aggregator frame (ScannerService._append_bar) carries a NAIVE IST
+# ``datetime`` ``ts`` column. And the actual 0-BUY-all-session cause was upstream
+# of Path B entirely: the scanner's stored historify-D is short (<200 rows) for
+# the F&O universe, so the BUY rule bailed at the SMA(vol_sma_l) daily warm-up —
+# silently, at DEBUG — indistinguishable from a quiet market.
+# --------------------------------------------------------------------------- #
+def _attach_5m_ts_naive(bars_5m, today_date):
+    """Attach a NAIVE-datetime ``ts`` column dated ``today_date`` — EXACTLY the
+    shape ``ScannerService._append_bar`` produces from ``bar.get("ts")`` (a naive
+    IST ``datetime`` bucket). Distinct from ``_attach_5m_timestamps`` which
+    attaches the historify epoch ``timestamp`` column."""
+    bars_5m = bars_5m.reset_index(drop=True).copy()
+    start = _RealDateTime(today_date.year, today_date.month, today_date.day, 9, 15)
+    bars_5m["ts"] = [start + _timedelta(minutes=5 * i) for i in range(len(bars_5m))]
+    return bars_5m
+
+
+def test_buy_short_daily_warns_and_rejects_with_live_ts_frame(monkeypatch, caplog):
+    """Issue #280 core: a live aggregator 5m frame (naive ``ts``) present, but a
+    SHORT daily (<200 rows) → the rule REJECTS and emits a dedup'd WARNING naming
+    the SMA-depth gap. Previously this was a silent DEBUG (0 BUY, invisible)."""
+    import logging
+
+    _freeze(monkeypatch, 11, 0)
+    monkeypatch.setattr(rulemod, "_shallow_daily_warned", set())  # reset dedup
+    today_date = _date(2026, 6, 4)
+    yest_date = today_date - _timedelta(days=1)
+
+    # 150 daily rows (< SMA(200)); latest bar dated yesterday (production case).
+    daily = make_daily_bars(n=150, flat_close=2000.0).iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, yest_date)
+    bars_5m = _attach_5m_ts_naive(make_5m_bars(start_close=2020.0, step=4.0), today_date)
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
+    ind["symbol"] = "ETERNAL"
+
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
+        assert rule(None, ind) is False
+    msgs = [r.message for r in caplog.records]
+    assert any("ETERNAL" in m and "too short for SMA(200)" in m for m in msgs), msgs
+
+
+def test_buy_short_daily_warning_is_deduped_per_symbol_day(monkeypatch, caplog):
+    """The short-daily WARNING fires at most once per (symbol, day) — the rule
+    re-fires every 5m bar close, so a bare WARNING would flood the log."""
+    import logging
+
+    _freeze(monkeypatch, 11, 0)
+    monkeypatch.setattr(rulemod, "_shallow_daily_warned", set())
+    today_date = _date(2026, 6, 4)
+    daily = make_daily_bars(n=120).iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, today_date - _timedelta(days=1))
+    bars_5m = _attach_5m_ts_naive(make_5m_bars(), today_date)
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
+    ind["symbol"] = "TCS"
+
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
+        for _ in range(5):  # five successive scan cycles
+            assert rule(None, ind) is False
+    warns = [
+        r for r in caplog.records if "too short for SMA(200)" in r.message and "TCS" in r.message
+    ]
+    assert len(warns) == 1, f"expected 1 dedup'd warning, got {len(warns)}"
+
+
+def test_buy_full_daily_with_live_ts_frame_engages_path_b_and_fires(monkeypatch):
+    """With a FULL daily (>=200 rows) AND a live naive-``ts`` 5m frame, Path B
+    engages (today_d = live 5m aggregate) and a genuine gap-up setup fires — the
+    exact production shape #279's fix targets, now on the real ``ts`` frame."""
+    _freeze(monkeypatch, 11, 0)
+    monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "true")  # block ON: must NOT reject
+    today_date = _date(2026, 6, 4)
+    yest_date = today_date - _timedelta(days=1)
+
+    daily = make_daily_bars(n=205, flat_close=2000.0).iloc[:-1].reset_index(drop=True)
+    daily = _attach_timestamps(daily, yest_date)
+    # Rising tape: today_d.close is the last 5m close, so divergence == 0 → no block.
+    bars_5m = _attach_5m_ts_naive(make_5m_bars(start_close=2020.0, step=4.0), today_date)
+    ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
+    ind["symbol"] = "ETERNAL"
+    assert rule(None, ind) is True
