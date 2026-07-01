@@ -34,9 +34,14 @@ logger = get_logger(__name__)
 
 # Seconds per calendar day; used to size the DuckDB date-range query.
 _SECONDS_PER_DAY = 86_400
-# Buffer factor over lookback bars to absorb weekends/holidays (trading days
-# are ~5/7 of calendar days, so 1.4 comfortably covers the gap).
-_CALENDAR_BUFFER = 1.4
+# Buffer factor over lookback bars to absorb weekends/holidays. Indian trading
+# days are only ~0.67 of calendar days (weekends + ~14-16 NSE holidays/year),
+# so the naive 5/7≈0.71 → 1.4 buffer fell ~12 bars short of the daily_lookback
+# (205): it yielded only 193 trading bars, tripping the SMA(200) volume-gate
+# warm-up guard in fno_intraday_buy_chartink and producing 0 BUY hits for the
+# whole F&O universe (issue #280/#281). 1.6 spans ~329 calendar days → ~220
+# trading bars, a comfortable margin over 205.
+_CALENDAR_BUFFER = 1.6
 
 
 class ScannerHistoryProvider:
