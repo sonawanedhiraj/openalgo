@@ -159,9 +159,14 @@ export const scannerApi = {
     return res.data.data
   },
 
-  deleteDefinition: async (id: number): Promise<{ id: number }> => {
+  deleteDefinition: async (id: number, force = false): Promise<{ id: number }> => {
+    // force=true asks the backend to delete a code-backed *orphan* definition
+    // (a leaked rule like _p0_always_true with no registered production rule).
+    // Cloned definitions delete without force. Live built-ins stay protected —
+    // the backend still returns 403 for a code-backed row with a registered rule.
     const res = await webClient.delete<{ status: string; data: { id: number } }>(
-      `/scanner/api/definitions/${id}`
+      `/scanner/api/definitions/${id}`,
+      force ? { params: { force: 'true' } } : undefined
     )
     return res.data.data
   },

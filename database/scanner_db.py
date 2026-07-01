@@ -245,20 +245,34 @@ def update_definition_params(
         db_session.remove()
 
 
-def delete_definition(definition_id: int) -> None:
-    """Hard-delete a cloned definition.
+def delete_definition(definition_id: int, allow_code_backed: bool = False) -> None:
+    """Hard-delete a definition.
 
-    Raises ValueError if the row does not exist OR if parent_definition_id IS NULL
-    (code-backed rows cannot be deleted via the UI).
-    Raises ValueError with 'has children' message if other rows have
-    parent_definition_id = definition_id.
+    By default only cloned definitions (``parent_definition_id`` is set) may be
+    deleted; code-backed rows (``parent_definition_id`` IS NULL) are protected
+    because they back a live built-in scan rule.
+
+    ``allow_code_backed=True`` lifts that protection so a caller that has
+    already verified the row is a harmless orphan — a code-backed definition
+    whose ``rule_module`` no longer maps to any registered production rule
+    (e.g. a leaked test rule like ``_p0_always_true``) — can remove it. The
+    caller owns that safety decision; this function does not inspect the rule
+    registry (it must stay dependency-light to avoid a circular import with
+    ``services.scanner_service``).
+
+    Historical ``scan_results`` rows are intentionally left in place — they are
+    a keyed audit trail and are not FK-cascaded here.
+
+    Raises ValueError if the row does not exist, if it is code-backed and
+    ``allow_code_backed`` is False, or (always) if other rows reference it as
+    ``parent_definition_id`` ('has children').
     """
     sess = db_session()
     try:
         row = sess.query(ScanDefinition).filter(ScanDefinition.id == definition_id).first()
         if row is None:
             raise ValueError(f"definition_id {definition_id} does not exist")
-        if row.parent_definition_id is None:
+        if row.parent_definition_id is None and not allow_code_backed:
             raise ValueError(
                 f"definition_id {definition_id} is code-backed (parent_definition_id is NULL)"
                 " and cannot be deleted"

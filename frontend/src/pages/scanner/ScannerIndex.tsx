@@ -257,8 +257,13 @@ export function DeleteDialog({ open, onOpenChange, definition }: DeleteDialogPro
   const queryClient = useQueryClient()
   const [error, setError] = useState<string | null>(null)
 
+  // Code-backed rows (no parent) need a force flag; the backend only honours it
+  // for orphans (a leaked rule with no registered production rule). Cloned
+  // definitions delete without force.
+  const isCodeBacked = definition.parent_definition_id === null
+
   const deleteMutation = useMutation({
-    mutationFn: () => scannerApi.deleteDefinition(definition.id),
+    mutationFn: () => scannerApi.deleteDefinition(definition.id, isCodeBacked),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['scanner-definitions'] })
       onOpenChange(false)
@@ -279,8 +284,9 @@ export function DeleteDialog({ open, onOpenChange, definition }: DeleteDialogPro
         <AlertDialogHeader>
           <AlertDialogTitle>Delete &quot;{definition.name}&quot;?</AlertDialogTitle>
           <AlertDialogDescription>
-            This removes the custom definition and its parameter overrides. Built-in definitions
-            cannot be deleted.
+            {isCodeBacked
+              ? 'This is a code-backed definition. It can only be removed if it is an orphan (a leaked rule with no live code). Definitions backed by an active built-in rule stay protected.'
+              : 'This removes the custom definition and its parameter overrides. Built-in definitions cannot be deleted.'}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {error && <p className="text-sm text-destructive px-1">{error}</p>}
@@ -371,22 +377,22 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
                 </TooltipTrigger>
                 <TooltipContent side="top">Clone definition</TooltipContent>
               </Tooltip>
-              {isClone && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 text-destructive hover:text-destructive"
-                      onClick={() => setDeleteOpen(true)}
-                      aria-label={`Delete ${def.name}`}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">Delete definition</TooltipContent>
-                </Tooltip>
-              )}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-destructive hover:text-destructive"
+                    onClick={() => setDeleteOpen(true)}
+                    aria-label={`Delete ${def.name}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {isClone ? 'Delete definition' : 'Delete definition (orphan rules only)'}
+                </TooltipContent>
+              </Tooltip>
               <Switch
                 checked={optimisticEnabled}
                 onCheckedChange={() => toggleMutation.mutate()}
