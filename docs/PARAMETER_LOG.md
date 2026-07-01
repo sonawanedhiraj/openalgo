@@ -18,6 +18,51 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Live-mode broker-position reconciliation (issue #265, proposed 2026-07-01)
+
+> Proposed by feature branch `feat/265-live-position-reconciliation` (staged,
+> operator-reviewed order path). Land the entry on `dev` at merge time.
+
+#### LIVE_POSITION_RECONCILE_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services/live_position_reconciliation_service.is_enabled()` inside
+  `reconcile_exit`. The two engine call-sites additionally gate the whole guard
+  on their own **LIVE** mode, so in sandbox the guard is never even invoked.
+- **What it does:** master gate for the LIVE-mode exit reconciliation guard. When
+  ON (and the strategy is in `live` mode), every live exit reconciles its
+  journalled/in-memory close quantity against the real broker net position
+  (`services/openposition_service.get_open_position`) before the exit order is
+  placed:
+  - broker flat (net 0) → **SUPPRESS** the exit (phantom);
+  - broker holds fewer than journaled, or sits on the opposite side → **CLAMP**
+    to the broker qty (opposite side → clamp to 0 = suppress);
+  - broker consistent → **PROCEED** with the journalled qty (never more);
+  - broker fetch fails / no api key → **FAIL CLOSED for reverse-risk** (proceed
+    with the journalled qty, never an unbounded one) + drift alert.
+  On any mismatch it emits a position-drift alert via
+  `services.source_divergence_alerts.check_and_alert` (`journal_qty` vs
+  `broker_qty`, per-(strategy, symbol, IST-day) dedup).
+- **Wired at:** `services/futures_follow_service.py`
+  (`place_exit` → covers `run_exit` / `run_eod_watchdog` / `close_all_positions`,
+  plus a live-only boot `rehydrate_paper_book_from_broker`) and
+  `services/simplified_stock_engine_service.py` (`_flatten_for_api_key`
+  engine-known qty reconcile + phantom suppress, and `flatten_strategy_positions`
+  broker-aware clamp/suppress).
+- **Sandbox invariant:** in `sandbox` mode the guard is a strict no-op — the
+  broker positionbook is NEVER consulted; sandbox keeps reading `sandbox.db` and
+  `engine_eod_reconciliation_service` is unchanged. Proven by regression tests
+  that assert the positionbook mock is not called in sandbox.
+- **Why default true:** live money. The broker must be the source of truth at
+  exit; a journal↔broker mismatch (manual/partial exit, restart-lost `paper_book`,
+  phantom) could otherwise double-SELL into a net-short overnight future or fire a
+  reversing exit. Set `false` only as an emergency disable to fall back to the
+  legacy journal-driven exit path.
+- **Safety guarantee:** `test/test_live_position_reconciliation_service.py`
+  (helper semantics) + live/sandbox exit + boot-rehydrate cases in
+  `test/test_futures_follow_service.py`, `test/test_simplified_stock_engine_service.py`,
+  `test/test_eod_watchdog_service.py`.
+
 ### Runtime source-divergence alerts (issue #231, added 2026-06-29)
 
 #### SOURCE_DIVERGENCE_ALERTS_ENABLED

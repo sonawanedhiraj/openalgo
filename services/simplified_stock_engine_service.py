@@ -1262,18 +1262,67 @@ class SimplifiedStockEngineService:
             engine_qty = known_qty_by_symbol.get(symbol)
 
             if engine_qty is not None and engine_qty != 0:
-                # The engine knows about this position; its own EOD path will
-                # close it. Skip to avoid double-issuing an exit. Log a hint if
-                # quantities disagree (likely a partial-fill drift we are not
-                # reconciling in v1).
-                if abs(engine_qty) != abs(qty):
-                    logger.warning(
-                        "[SIMPLIFIED-EOD] Qty mismatch on %s: engine=%s broker=%s "
-                        "(engine's exit will close the engine's view only)",
+                # The engine knows about this position. When engine and broker
+                # AGREE, defer to the engine's own EOD exit path. When they
+                # DISAGREE, reconcile qty against the broker here (#265) — the
+                # broker is the source of truth, so the engine must not exit MORE
+                # than the account actually holds (that would reverse).
+                if abs(engine_qty) == abs(qty):
+                    continue
+
+                engine_close_side = "SELL" if engine_qty > 0 else "BUY"
+                decision = _reconcile_live_close(
+                    mode=self.mode,
+                    strategy=strategy_name,
+                    api_key=api_key,
+                    symbol=symbol,
+                    exchange=engine_exchange,
+                    product=engine_product,
+                    expected_close_side=engine_close_side,
+                    journaled_qty=abs(engine_qty),
+                )
+                if decision is None or not decision.should_place:
+                    logger.error(
+                        "[SIMPLIFIED-EOD] Reconcile SUPPRESSED exit on %s (engine=%s broker=%s)",
                         symbol,
                         engine_qty,
                         qty,
                     )
+                    try:
+                        self.engine.positions.pop(symbol, None)
+                    except Exception:  # noqa: BLE001 — best-effort state clear
+                        pass  # nosec B110
+                    continue
+
+                reconciled_qty = decision.guarded_qty
+                logger.warning(
+                    "[SIMPLIFIED-EOD] Qty mismatch on %s: engine=%s broker=%s — "
+                    "reconciling to broker qty=%s (%s)",
+                    symbol,
+                    engine_qty,
+                    qty,
+                    reconciled_qty,
+                    engine_close_side,
+                )
+                payload = {
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "exchange": engine_exchange,
+                    "action": engine_close_side,
+                    "quantity": reconciled_qty,
+                    "pricetype": self.config.order_pricetype,
+                    "product": engine_product,
+                    "price": 0,
+                    "trigger_price": 0,
+                    "disclosed_quantity": 0,
+                }
+                self._dispatch_order(payload, api_key, is_entry=False)
+                # Drop the engine's now-flattened view so its own exit path can't
+                # re-issue against a broker we've already squared to the truth.
+                try:
+                    self.engine.positions.pop(symbol, None)
+                except Exception:  # noqa: BLE001 — best-effort state clear
+                    pass  # nosec B110
                 continue
 
             # Drift case: broker has it, engine doesn't know.
@@ -1300,18 +1349,24 @@ class SimplifiedStockEngineService:
             }
             self._dispatch_order(payload, api_key, is_entry=False)
 
-        # Surface engine-only orphans for visibility (positions the engine
-        # thinks are open but the broker doesn't show). We don't issue any
-        # orders here -- there's nothing to flatten -- just warn so operators
-        # can investigate.
+        # Phantom (engine-only) positions: the engine thinks a symbol is open but
+        # the broker doesn't show it. SUPPRESS — issue NO order (an exit here
+        # would OPEN a real reverse position against a flat broker, #265) — and
+        # clear the engine's stale internal state so its own exit path can't
+        # fire a phantom order on the next tick.
         for symbol, engine_qty in known_qty_by_symbol.items():
             if engine_qty != 0 and symbol not in broker_open_symbols:
-                logger.warning(
-                    "[SIMPLIFIED-EOD] Engine thinks %s qty=%s is open but broker "
-                    "reports nothing; clearing internal state",
+                logger.error(
+                    "[SIMPLIFIED-EOD] Phantom: engine thinks %s qty=%s is open but broker "
+                    "reports nothing; SUPPRESSING exit and clearing internal state",
                     symbol,
                     engine_qty,
                 )
+                _emit_phantom_alert(strategy_name, symbol, abs(engine_qty))
+                try:
+                    self.engine.positions.pop(symbol, None)
+                except Exception:  # noqa: BLE001 — best-effort state clear
+                    pass  # nosec B110
 
     # ------------------------------------------------------------------
     # EOD trading summary (step 4)
@@ -1794,6 +1849,66 @@ class SimplifiedStockEngineService:
 
 
 # ----------------------------------------------------------------------
+# Live-mode broker-position reconciliation glue (#265)
+# ----------------------------------------------------------------------
+
+
+def _reconcile_live_close(
+    *,
+    mode: str,
+    strategy: str,
+    api_key: str | None,
+    symbol: str,
+    exchange: str,
+    product: str,
+    expected_close_side: str,
+    journaled_qty: int,
+):
+    """Return a broker-reconciled close decision, or ``None`` in sandbox/error.
+
+    ``None`` means "no reconciliation ran" (non-LIVE mode or an import failure);
+    the caller then falls back to its legacy (non-reconciled) path. In LIVE mode
+    this returns a ``ReconcileDecision`` (proceed / clamp / suppress). The broker
+    positionbook is consulted ONLY in live mode — sandbox/disabled is a strict
+    no-op. Never raises.
+    """
+    if mode != MODE_LIVE:
+        return None
+    try:
+        from services import live_position_reconciliation_service as recon
+
+        return recon.reconcile_exit(
+            strategy=strategy,
+            api_key=api_key,
+            symbol=symbol,
+            exchange=exchange,
+            product=product,
+            expected_close_side=expected_close_side,
+            journaled_qty=journaled_qty,
+        )
+    except Exception:
+        logger.exception("[SIMPLIFIED-EOD] live reconcile raised for %s", symbol)
+        return None
+
+
+def _emit_phantom_alert(strategy: str, symbol: str, journaled_qty: int) -> None:
+    """Position-drift alert for a phantom (engine open / broker flat). Never raises."""
+    try:
+        from services.source_divergence_alerts import check_and_alert
+
+        check_and_alert(
+            service=strategy,
+            symbol=symbol,
+            source_a_label="journal_qty",
+            source_a_value=float(journaled_qty),
+            source_b_label="broker_qty",
+            source_b_value=0.0,
+        )
+    except Exception:
+        logger.exception("[SIMPLIFIED-EOD] phantom drift alert failed for %s", symbol)
+
+
+# ----------------------------------------------------------------------
 # P0 — module-level EOD flatten entry point. The watchdog
 # (services/eod_watchdog_service.py) calls this; the order path here is
 # the in-process ``services.place_order_service.place_order`` so the
@@ -1895,6 +2010,51 @@ def flatten_strategy_positions(
             continue
 
         action = "SELL" if direction == "LONG" else "BUY"
+
+        # LIVE-only broker reconciliation (#265): the journal is not the source
+        # of truth at exit — the broker is. Suppress a phantom (broker flat) and
+        # clamp a partial (broker < journaled) before dispatching. No-op in
+        # sandbox (returns None → journal-driven qty unchanged).
+        decision = _reconcile_live_close(
+            mode=engine_service.mode,
+            strategy=strategy_name,
+            api_key=api_key,
+            symbol=symbol,
+            exchange=exchange,
+            product=product,
+            expected_close_side=action,
+            journaled_qty=qty,
+        )
+        if decision is not None:
+            if not decision.should_place:
+                logger.error(
+                    "[EOD-FLATTEN] %s %s SUPPRESSED by broker reconcile "
+                    "(reason=%s broker_qty=%s journaled=%s)",
+                    strategy_name,
+                    symbol,
+                    decision.reason,
+                    decision.broker_qty,
+                    qty,
+                )
+                summary["skipped"].append({"symbol": symbol, "reason": decision.reason})
+                # Stamp the journal row closed so the next boot's rehydrate skips
+                # it — the broker already holds nothing to close.
+                try:
+                    trade_journal_service.record_exit(
+                        journal_id,
+                        exit_price=None,
+                        exit_order_id=None,
+                        exit_reason=f"{reason}:{decision.reason}",
+                    )
+                except Exception:
+                    logger.exception("[EOD-FLATTEN] record_exit (suppress) failed for %s", symbol)
+                try:
+                    engine_service.engine.positions.pop(symbol, None)
+                except Exception:  # noqa: BLE001 — best-effort state clear
+                    pass  # nosec B110
+                continue
+            qty = decision.guarded_qty
+
         payload = {
             "strategy": strategy_name,
             "symbol": symbol,
@@ -1956,8 +2116,8 @@ def flatten_strategy_positions(
         # don't re-trigger an exit against a now-flat broker.
         try:
             engine_service.engine.positions.pop(symbol, None)
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — best-effort state clear
+            pass  # nosec B110
 
         logger.warning(
             "[EOD-FLATTEN] %s %s flattened: %s %s qty=%s orderid=%s",
