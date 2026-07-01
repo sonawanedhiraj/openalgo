@@ -3,6 +3,7 @@ Shared httpx client module with connection pooling support for all broker APIs
 with automatic protocol negotiation (HTTP/2 when available, HTTP/1.1 fallback)
 """
 
+import threading
 from typing import Optional
 
 import httpx
@@ -14,6 +15,51 @@ logger = get_logger(__name__)
 
 # Global httpx client for connection pooling
 _httpx_client = None
+
+# Guards lazy creation of the shared client (double-checked below). NOT the same
+# as the per-send lock inside LockedClient — this only protects the singleton
+# init race, not the request path.
+_client_init_lock = threading.Lock()
+
+
+class LockedClient(httpx.Client):
+    """A drop-in ``httpx.Client`` whose request path is serialized by a lock.
+
+    A single shared ``httpx.Client`` with ``http2=True`` is NOT safe for
+    concurrent use across threads: HTTP/2 multiplexes many streams over one TCP
+    connection, and the connection's ``hpack`` header-compression encoder keeps
+    its dynamic header table in a ``collections.deque``. When two threads send on
+    the same connection at once, one thread's ``HeaderTable.add()`` mutates that
+    deque (``popleft``/``append``) while another thread's ``search()`` is
+    iterating it, raising ``RuntimeError: deque mutated during iteration``
+    (issue #240). This is a known ``hpack``/``h2`` limitation — the library is
+    documented as single-thread-per-connection.
+
+    OpenAlgo funnels every broker HTTP call through one process-wide shared client
+    (for connection pooling / keep-alive), and concurrent history fetches (seeder +
+    WS-recovery + scanner backfill hitting the broker at boot) race exactly this
+    path. Rather than disable HTTP/2 (losing multiplexing) or give every thread its
+    own client (losing the shared pool), we serialize only the actual network send.
+
+    ``httpx.Client.get``/``post``/``request``/``stream`` all funnel through
+    ``send()``, so guarding ``send()`` covers every caller — both the module-level
+    ``request()`` helper and the direct ``client.get()``/``client.post()`` call
+    sites in the broker data modules. The lock is held only for the duration of the
+    request; connection pooling, keep-alive, and HTTP/2 are all preserved. The
+    broker's own 3-req/sec rate limit already serializes these calls, so the added
+    serialization is not a meaningful throughput cost.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # RLock, not Lock: httpx internals may re-enter send() (e.g. redirects
+        # call send() recursively on the same thread), which would deadlock a
+        # plain Lock.
+        self._send_lock = threading.RLock()
+
+    def send(self, *args, **kwargs):
+        with self._send_lock:
+            return super().send(*args, **kwargs)
 
 
 def get_httpx_client() -> httpx.Client:
@@ -27,11 +73,16 @@ def get_httpx_client() -> httpx.Client:
     """
     global _httpx_client
 
+    # Double-checked locking: avoid two threads each building a client (and
+    # leaking one) during the boot burst of concurrent history fetches.
     if _httpx_client is None:
-        _httpx_client = _create_http_client()
-        logger.info(
-            "Created HTTP client with automatic protocol negotiation (HTTP/2 preferred, HTTP/1.1 fallback)"
-        )
+        with _client_init_lock:
+            if _httpx_client is None:
+                _httpx_client = _create_http_client()
+                logger.info(
+                    "Created HTTP client with automatic protocol negotiation "
+                    "(HTTP/2 preferred, HTTP/1.1 fallback)"
+                )
     return _httpx_client
 
 
@@ -181,7 +232,9 @@ def _create_http_client() -> httpx.Client:
         # Disable HTTP/2 in standalone/Docker environments to avoid protocol negotiation issues
         http2_enabled = not is_standalone
 
-        client = httpx.Client(
+        # LockedClient serializes send() so concurrent threads sharing this one
+        # HTTP/2 client cannot race the hpack dynamic-table deque (issue #240).
+        client = LockedClient(
             http2=http2_enabled,  # Disable HTTP/2 in standalone mode, enable in integrated mode
             http1=True,  # Always enable HTTP/1.1 for compatibility
             timeout=120.0,  # Increased timeout for large historical data requests
@@ -220,7 +273,8 @@ def cleanup_httpx_client() -> None:
     """
     global _httpx_client
 
-    if _httpx_client is not None:
-        _httpx_client.close()
-        _httpx_client = None
-        logger.info("Closed HTTP client")
+    with _client_init_lock:
+        if _httpx_client is not None:
+            _httpx_client.close()
+            _httpx_client = None
+            logger.info("Closed HTTP client")
