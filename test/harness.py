@@ -267,12 +267,39 @@ class BootHarness:
     # Strategy mode helpers
     # ---------------------------------------------------------------------- #
 
-    def set_strategy_mode(self, strategy_name: str, mode: str) -> None:
-        """Set a strategy's persistent mode directly in the DB."""
-        from database.strategy_mode_db import set_mode
+    def set_strategy_mode(self, strategy_name: str, mode: str, force: bool = False) -> None:
+        """Set a strategy's persistent mode.
 
+        By default this routes through the guarded
+        ``services.strategy_mode_service.flip_mode`` path, so preflight is
+        enforced and a ``live`` flip can NEVER happen silently — this closes the
+        2026-06-24 harness bypass where ``set_mode(..., updated_by='harness')``
+        silently set ``sector_follow_cap5_vol`` to ``live`` in production.
+
+        ``force=True`` is a TEST-ONLY escape hatch for tests that must seed a
+        mode (e.g. verifying that a persisted ``live`` row is READABLE, where the
+        preflight gate is not what's under test). It calls the unchecked writer
+        but ONLY after asserting the bound DB is a throwaway temp DB — it must
+        never run against the live ``db/openalgo.db``.
+        """
         with self._app.app_context():
-            set_mode(strategy_name, mode, updated_by="harness")
+            if not force:
+                from services.strategy_mode_service import flip_mode
+
+                flip_mode(strategy_name, mode, flipped_by="harness")
+                return
+
+            # force=True — seed directly, but refuse to touch the live DB.
+            db_url = os.getenv("DATABASE_URL", "")
+            if "db/openalgo.db" in db_url.replace("\\", "/"):
+                raise RuntimeError(
+                    "Harness.set_strategy_mode(force=True) refused: DATABASE_URL "
+                    f"points at the live DB ({db_url!r}). force-seeding a mode is "
+                    "test-only and must run against a temp DB (conftest redirect)."
+                )
+            from database.strategy_mode_db import _set_mode_unchecked
+
+            _set_mode_unchecked(strategy_name, mode, updated_by="harness")
 
     def get_strategy_mode(self, strategy_name: str) -> str | None:
         """Return a strategy's current mode from the DB."""

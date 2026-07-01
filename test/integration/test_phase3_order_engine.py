@@ -238,7 +238,8 @@ class TestStrategyModeSetAndVisibleRoundTrip:
 
     def test_mode_set_live_readable(self, harness):
         """set_strategy_mode('simplified_engine', 'live') → readable as 'live'."""
-        harness.set_strategy_mode("simplified_engine", "live")
+        # force: this test checks that a seeded live row reads back, not the gate.
+        harness.set_strategy_mode("simplified_engine", "live", force=True)
         assert harness.get_strategy_mode("simplified_engine") == "live"
 
     def test_mode_toggle_sandbox_live_sandbox(self, harness):
@@ -246,7 +247,7 @@ class TestStrategyModeSetAndVisibleRoundTrip:
         harness.set_strategy_mode("futures_follow_cap50", "sandbox")
         assert harness.get_strategy_mode("futures_follow_cap50") == "sandbox"
 
-        harness.set_strategy_mode("futures_follow_cap50", "live")
+        harness.set_strategy_mode("futures_follow_cap50", "live", force=True)
         assert harness.get_strategy_mode("futures_follow_cap50") == "live"
 
         harness.set_strategy_mode("futures_follow_cap50", "sandbox")

@@ -55,7 +55,7 @@ def test_invalid_target_mode_is_blocked():
 def test_sandbox_flip_accepted_writes_mode_and_publishes_event():
     with (
         patch.object(strategy_mode_service, "_current_mode", return_value="live"),
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
         patch.object(strategy_mode_service._default_bus, "publish") as publish,
         patch(
             "database.strategy_mode_audit_db.record_attempt",
@@ -100,7 +100,7 @@ def test_live_flip_blocked_does_not_mutate():
                 snapshot={"path": "strategies.sector_follow_cap5_vol.preflight"},
             ),
         ),
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
         patch.object(strategy_mode_service._default_bus, "publish") as publish,
         patch(
             "database.strategy_mode_audit_db.record_attempt",
@@ -134,7 +134,7 @@ def test_live_flip_accepted_mutates_audits_and_publishes():
                 snapshot={"all_checks_passed": True},
             ),
         ),
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
         patch.object(strategy_mode_service._default_bus, "publish") as publish,
         patch(
             "database.strategy_mode_audit_db.record_attempt",
@@ -161,7 +161,7 @@ def test_same_mode_is_a_noop_no_event_no_preflight():
     with (
         patch.object(strategy_mode_service, "_current_mode", return_value="live"),
         patch("services.strategy_preflight.run_preflight") as preflight,
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
         patch.object(strategy_mode_service._default_bus, "publish") as publish,
         patch(
             "database.strategy_mode_audit_db.record_attempt",
@@ -194,7 +194,7 @@ def test_preflight_unexpected_exception_is_treated_as_blocker():
             "services.strategy_preflight.run_preflight",
             side_effect=RuntimeError("preflight totally broken"),
         ),
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
     ):
         out = flip_mode("strat_pfraises", "live", flipped_by="ui")
 
@@ -212,7 +212,7 @@ def test_db_set_mode_failure_audits_block_does_not_raise():
             return_value=PreflightResult(can_flip=True, blockers=[], warnings=[], snapshot={}),
         ),
         patch(
-            "database.strategy_mode_db.set_mode",
+            "database.strategy_mode_db._set_mode_unchecked",
             side_effect=RuntimeError("DB write failed"),
         ),
         patch.object(strategy_mode_service._default_bus, "publish") as publish,
@@ -237,7 +237,7 @@ def test_event_publish_failure_does_not_roll_back_flip():
             "services.strategy_preflight.run_preflight",
             return_value=PreflightResult(can_flip=True, blockers=[], warnings=[], snapshot={}),
         ),
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
         patch.object(
             strategy_mode_service._default_bus,
             "publish",
@@ -267,7 +267,7 @@ def test_audit_failure_does_not_block_flip():
             "database.strategy_mode_audit_db.record_attempt",
             side_effect=RuntimeError("audit DB down"),
         ),
-        patch("database.strategy_mode_db.set_mode") as set_mode,
+        patch("database.strategy_mode_db._set_mode_unchecked") as set_mode,
         patch.object(strategy_mode_service._default_bus, "publish") as publish,
     ):
         out = flip_mode("strat_auditfail", "live", flipped_by="op")
