@@ -19,6 +19,42 @@ the latest decisions automatically.
 ## Active parameters
 
 ### Position-store reconciliation at exit (issue #265, proposed 2026-07-01)
+### LLM veto — in-process `claude -p` transport (#266 Phase 1 / #267, added 2026-07-01)
+
+Phase 1 of #266 moved the Stage-1 LLM veto's reasoning call from an httpx POST
+to the Claude Bridge (`http://127.0.0.1:5001/review-signal`) to an **in-process**
+`claude -p "<prompt>" --output-format json` subprocess run on a dedicated real
+OS thread (`services/llm_review_client.invoke_claude_review`, eventlet-safe). The
+bridge was never auto-started, so every real veto call failed `ConnectError` and
+fell safe to 'take' — the veto never fired. It now runs directly.
+
+#### VETO_CLAUDE_TIMEOUT_SECONDS (NEW)
+- **Current value:** unset → defaults **`25.0`**.
+- **Set in:** env; read by
+  `services/signal_review_service._claude_timeout_seconds` and passed as
+  `timeout_s` to `invoke_claude_review`.
+- **What it does:** wall-clock budget for the `claude -p` subprocess. On expiry
+  the subprocess is killed and the veto fails safe to `decision='take'`,
+  `reasoning='claude_timeout'`. Matches the bridge's old 25s wall-clock.
+
+#### CLAUDE_CMD (NEW, optional)
+- **Current value:** unset → defaults **`claude`** (resolved against `PATH`).
+- **Set in:** env; read by `services/llm_review_client._claude_cmd`.
+- **What it does:** overrides the `claude` binary path for the veto subprocess
+  (e.g. an absolute path to a non-PATH install). The operator's install is
+  authenticated by the Claude subscription CLI login — no `ANTHROPIC_API_KEY`.
+
+#### VETO_BRIDGE_URL (RETIRED)
+- **Was:** bridge endpoint, default `http://127.0.0.1:5001/review-signal`.
+- **Now:** removed from `signal_review_service`. The veto no longer uses the
+  bridge. (`bridge/server.py`'s `/review-signal` endpoint and the Cowork
+  automation endpoints are untouched, but the veto path no longer calls them.)
+
+#### VETO_REQUEST_TIMEOUT_SECONDS (RETIRED)
+- **Was:** httpx read timeout for the bridge POST, default `30.0`.
+- **Now:** removed. Superseded by `VETO_CLAUDE_TIMEOUT_SECONDS` (the subprocess
+  budget). `VETO_CACHE_TTL_SECONDS` and `VETO_LAYER_MODE` are unchanged.
+### Live-mode broker-position reconciliation (issue #265, proposed 2026-07-01)
 
 > Proposed by feature branch `feat/265-live-position-reconciliation` (staged,
 > operator-reviewed order path). Land the entry on `dev` at merge time.

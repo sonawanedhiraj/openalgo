@@ -1,14 +1,12 @@
 """Tests for the Stage-1 ``signal_review_service`` + ``signal_decision`` table.
 
 Every test rebinds ``database.signal_decision_db.engine`` and ``db_session`` to
-a fresh in-memory SQLite so we never touch ``db/openalgo.db``. The ``httpx``
-client is mocked so no network call ever fires.
+a fresh in-memory SQLite so we never touch ``db/openalgo.db``. The in-process
+``invoke_claude_review`` call is mocked so no subprocess / claude CLI ever runs.
 """
 
 import json
-from unittest.mock import patch
 
-import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -63,22 +61,20 @@ def _ctx_override() -> dict:
     }
 
 
-def _mock_bridge_response(monkeypatch, payload: dict, status_code: int = 200):
-    """Patch httpx.post to return a stub response object with the given payload."""
+def _decision_block(decision: str, reasoning: str = "r", confidence: float = 0.5) -> str:
+    """Render a claude-style prose reply ending in a JSON decision block."""
+    block = json.dumps({"decision": decision, "reasoning": reasoning, "confidence": confidence})
+    return f"Some reasoning prose here.\n\n{block}"
+
+
+def _mock_claude_review(monkeypatch, model_text: str, session_id: str = "sess-1"):
+    """Patch invoke_claude_review to return (model_text, session_id) — no subprocess."""
     import services.signal_review_service as srs
 
-    class _StubResponse:
-        def __init__(self, payload, status_code):
-            self._payload = payload
-            self.status_code = status_code
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001 — signature stub
+        return model_text, session_id
 
-        def json(self):
-            return self._payload
-
-    def fake_post(url, json=None, timeout=None):  # noqa: ARG001 — signature stub
-        return _StubResponse(payload, status_code)
-
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
 
 # ---------------------------------------------------------------------------
@@ -89,16 +85,10 @@ def _mock_bridge_response(monkeypatch, payload: dict, status_code: int = 200):
 def test_review_signal_returns_take_in_happy_path(fresh_signal_db, shadow_mode, monkeypatch):
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
+    _mock_claude_review(
         monkeypatch,
-        {
-            "decision": "take",
-            "reasoning": "regime aligned",
-            "confidence": 0.82,
-            "latency_ms": 1500,
-            "claude_session_id": "sess-1",
-            "raw_output": "...prose...",
-        },
+        _decision_block("take", "regime aligned", 0.82),
+        session_id="sess-1",
     )
 
     result = review_signal("RELIANCE", "chartink_buy", context=_ctx_override())
@@ -115,16 +105,10 @@ def test_review_signal_writes_signal_decision_row(fresh_signal_db, shadow_mode, 
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
+    _mock_claude_review(
         monkeypatch,
-        {
-            "decision": "skip",
-            "reasoning": "vix elevated, breadth negative",
-            "confidence": 0.74,
-            "latency_ms": 9100,
-            "claude_session_id": "sess-2",
-            "raw_output": "prose...{...}",
-        },
+        _decision_block("skip", "vix elevated, breadth negative", 0.74),
+        session_id="sess-2",
     )
 
     result = review_signal("INFY", "chartink_buy", context=_ctx_override())
@@ -138,6 +122,7 @@ def test_review_signal_writes_signal_decision_row(fresh_signal_db, shadow_mode, 
     assert row["confidence"] == 0.74
     assert row["enforcement_mode"] == "shadow"
     assert row["actually_taken"] is None
+    # bridge_session_id column carries the claude session id.
     assert row["bridge_session_id"] == "sess-2"
     # context_snapshot is JSON-serialised in the row
     snapshot = json.loads(row["context_snapshot"])
@@ -145,34 +130,19 @@ def test_review_signal_writes_signal_decision_row(fresh_signal_db, shadow_mode, 
     assert snapshot["nifty_pct"] == -0.3
 
 
-def test_review_signal_includes_direction_in_request_body(
-    fresh_signal_db, shadow_mode, monkeypatch
-):
-    """TATAELXSI fix: the explicit ``direction`` rides the bridge request body
-    AND lands on the audit row, so a SELL candidate is never framed as a BUY."""
+def test_review_signal_includes_direction_in_prompt(fresh_signal_db, shadow_mode, monkeypatch):
+    """TATAELXSI fix: the explicit ``direction`` rides the claude prompt AND
+    lands on the audit row, so a SELL candidate is never framed as a BUY."""
     import services.signal_review_service as srs
     from database.signal_decision_db import get_signal_decision
 
     captured: dict = {}
 
-    class _StubResponse:
-        status_code = 200
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        captured["prompt"] = prompt
+        return _decision_block("skip", "bullish regime conflicts with the short", 0.7), "sess-dir"
 
-        def json(self):
-            return {
-                "decision": "skip",
-                "reasoning": "bullish regime conflicts with the short",
-                "confidence": 0.7,
-                "latency_ms": 1200,
-                "claude_session_id": "sess-dir",
-                "raw_output": "...",
-            }
-
-    def fake_post(url, json=None, timeout=None):  # noqa: A002, ARG001
-        captured["body"] = json
-        return _StubResponse()
-
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     result = srs.review_signal(
         "TATAELXSI",
@@ -181,9 +151,9 @@ def test_review_signal_includes_direction_in_request_body(
         context=_ctx_override(),
     )
 
-    # 1. Direction is in the request body the bridge receives.
-    assert captured["body"]["candidate"]["direction"] == "SELL"
-    assert captured["body"]["candidate"]["source"] == "chartink_FnO_intraday_buy"
+    # 1. Direction is in the prompt sent to claude.
+    assert "Direction: SELL" in captured["prompt"]
+    assert "chartink_FnO_intraday_buy" in captured["prompt"]
     # 2. Direction is persisted on the audit row.
     row = get_signal_decision(result["id"])
     assert row["direction"] == "SELL"
@@ -196,29 +166,13 @@ def test_review_signal_direction_in_cache_key(fresh_signal_db, shadow_mode, monk
 
     calls: list[str | None] = []
 
-    class _StubResponse:
-        status_code = 200
-
-        def __init__(self, decision):
-            self._decision = decision
-
-        def json(self):
-            return {
-                "decision": self._decision,
-                "reasoning": "r",
-                "confidence": 0.5,
-                "latency_ms": 1,
-                "claude_session_id": "s",
-                "raw_output": "",
-            }
-
-    def fake_post(url, json=None, timeout=None):  # noqa: A002, ARG001
-        direction = json["candidate"]["direction"]
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        direction = "BUY" if "Direction: BUY" in prompt else "SELL"
         calls.append(direction)
         # BUY → take, SELL → skip, so a collision would surface as the wrong one.
-        return _StubResponse("take" if direction == "BUY" else "skip")
+        return _decision_block("take" if direction == "BUY" else "skip"), "s"
 
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     buy = srs.review_signal(
         "SBIN", "chartink_FnO_intraday_buy", direction="BUY", context=_ctx_override()
@@ -229,7 +183,7 @@ def test_review_signal_direction_in_cache_key(fresh_signal_db, shadow_mode, monk
 
     assert buy["decision"] == "take"
     assert sell["decision"] == "skip"
-    assert calls == ["BUY", "SELL"]  # both hit the bridge; no cross-direction reuse
+    assert calls == ["BUY", "SELL"]  # both invoked claude; no cross-direction reuse
 
 
 # ---------------------------------------------------------------------------
@@ -237,33 +191,19 @@ def test_review_signal_direction_in_cache_key(fresh_signal_db, shadow_mode, monk
 # ---------------------------------------------------------------------------
 
 
-def test_review_signal_cache_hit_skips_bridge(fresh_signal_db, shadow_mode, monkeypatch):
-    """Second call within TTL must NOT hit the bridge."""
+def test_review_signal_cache_hit_skips_invocation(fresh_signal_db, shadow_mode, monkeypatch):
+    """Second call within TTL must NOT invoke claude again."""
     from services.signal_review_service import review_signal
 
     call_count = {"n": 0}
 
-    class _StubResponse:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {
-                "decision": "take",
-                "reasoning": "fresh",
-                "confidence": 0.6,
-                "latency_ms": 100,
-                "claude_session_id": "sid",
-                "raw_output": "",
-            }
-
-    def fake_post(url, json=None, timeout=None):  # noqa: ARG001
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
         call_count["n"] += 1
-        return _StubResponse()
+        return _decision_block("take", "fresh", 0.6), "sid"
 
     import services.signal_review_service as srs
 
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     first = review_signal("TCS", "chartink_buy", context=_ctx_override())
     second = review_signal("TCS", "chartink_buy", context=_ctx_override())
@@ -275,34 +215,20 @@ def test_review_signal_cache_hit_skips_bridge(fresh_signal_db, shadow_mode, monk
 
 
 def test_review_signal_cache_ttl_zero_disables_caching(fresh_signal_db, shadow_mode, monkeypatch):
-    """VETO_CACHE_TTL_SECONDS=0 should mean every call hits the bridge."""
+    """VETO_CACHE_TTL_SECONDS=0 should mean every call invokes claude."""
     from services.signal_review_service import review_signal
 
     monkeypatch.setenv("VETO_CACHE_TTL_SECONDS", "0")
 
     call_count = {"n": 0}
 
-    class _StubResponse:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return {
-                "decision": "take",
-                "reasoning": "fresh",
-                "confidence": 0.5,
-                "latency_ms": 10,
-                "claude_session_id": "sid",
-                "raw_output": "",
-            }
-
-    def fake_post(url, json=None, timeout=None):  # noqa: ARG001
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
         call_count["n"] += 1
-        return _StubResponse()
+        return _decision_block("take", "fresh", 0.5), "sid"
 
     import services.signal_review_service as srs
 
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     review_signal("HDFC", "chartink_buy", context=_ctx_override())
     review_signal("HDFC", "chartink_buy", context=_ctx_override())
@@ -315,35 +241,41 @@ def test_review_signal_cache_ttl_zero_disables_caching(fresh_signal_db, shadow_m
 # ---------------------------------------------------------------------------
 
 
-def test_review_signal_bridge_unreachable_returns_take(fresh_signal_db, shadow_mode, monkeypatch):
+def test_review_signal_invoke_error_returns_take(fresh_signal_db, shadow_mode, monkeypatch):
+    """A raised error from the claude invoker must fail-safe to take."""
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
-    def fake_post(*args, **kwargs):  # noqa: ARG001
-        raise httpx.ConnectError("Connection refused")
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        raise RuntimeError("claude review exited 1: boom")
 
     import services.signal_review_service as srs
 
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     result = review_signal("WIPRO", "chartink_buy", context=_ctx_override())
 
     assert result["decision"] == "take"
-    assert "bridge_error" in result["reasoning"]
+    assert result["reasoning"] == "claude_error:RuntimeError"
     row = get_signal_decision(result["id"])
     assert row["decision"] == "review_failed"
 
 
-def test_review_signal_bridge_5xx_returns_take(fresh_signal_db, shadow_mode, monkeypatch):
+def test_review_signal_cli_missing_returns_take(fresh_signal_db, shadow_mode, monkeypatch):
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(monkeypatch, {"detail": "boom"}, status_code=503)
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        raise FileNotFoundError("claude not on PATH")
+
+    import services.signal_review_service as srs
+
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     result = review_signal("SBIN", "chartink_buy", context=_ctx_override())
 
     assert result["decision"] == "take"
-    assert result["reasoning"] == "bridge_http_503"
+    assert result["reasoning"] == "claude_cli_missing"
     row = get_signal_decision(result["id"])
     assert row["decision"] == "review_failed"
 
@@ -352,37 +284,42 @@ def test_review_signal_timeout_returns_take(fresh_signal_db, shadow_mode, monkey
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
-    def fake_post(*args, **kwargs):  # noqa: ARG001
-        raise httpx.TimeoutException("read timed out")
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        raise TimeoutError("claude review timed out")
 
     import services.signal_review_service as srs
 
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     result = review_signal("AXIS", "chartink_buy", context=_ctx_override())
 
     assert result["decision"] == "take"
-    assert result["reasoning"] == "bridge_timeout"
+    assert result["reasoning"] == "claude_timeout"
     row = get_signal_decision(result["id"])
     assert row["decision"] == "review_failed"
 
 
-def test_review_signal_bridge_returns_garbage_decision(fresh_signal_db, shadow_mode, monkeypatch):
-    """Bridge contract violation — decision not in {take, skip} — must fail-safe."""
+def test_review_signal_unparseable_output_returns_take(fresh_signal_db, shadow_mode, monkeypatch):
+    """No JSON decision block in the model output → fail-safe (parse_failed)."""
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
-        monkeypatch,
-        {
-            "decision": "MAYBE",
-            "reasoning": "x",
-            "confidence": 0.5,
-            "latency_ms": 100,
-            "claude_session_id": "sid",
-            "raw_output": "",
-        },
-    )
+    _mock_claude_review(monkeypatch, "I could not reach a conclusion, sorry.")
+
+    result = review_signal("HCLTECH", "chartink_buy", context=_ctx_override())
+
+    assert result["decision"] == "take"
+    assert result["reasoning"] == "parse_failed"
+    row = get_signal_decision(result["id"])
+    assert row["decision"] == "review_failed"
+
+
+def test_review_signal_returns_garbage_decision(fresh_signal_db, shadow_mode, monkeypatch):
+    """Contract violation — decision not in {take, skip} — must fail-safe."""
+    from database.signal_decision_db import get_signal_decision
+    from services.signal_review_service import review_signal
+
+    _mock_claude_review(monkeypatch, _decision_block("MAYBE", "x", 0.5))
 
     result = review_signal("ITC", "chartink_buy", context=_ctx_override())
 
@@ -633,17 +570,7 @@ def test_mark_actually_taken_updates_row(fresh_signal_db, shadow_mode, monkeypat
     from database.signal_decision_db import get_signal_decision
     from services.signal_review_service import mark_actually_taken, review_signal
 
-    _mock_bridge_response(
-        monkeypatch,
-        {
-            "decision": "take",
-            "reasoning": "ok",
-            "confidence": 0.7,
-            "latency_ms": 200,
-            "claude_session_id": "sid",
-            "raw_output": "",
-        },
-    )
+    _mock_claude_review(monkeypatch, _decision_block("take", "ok", 0.7), session_id="sid")
 
     result = review_signal("HDFCBANK", "chartink_buy", context=_ctx_override())
     assert get_signal_decision(result["id"])["actually_taken"] is None
@@ -673,19 +600,13 @@ def test_mark_actually_taken_handles_none_id(fresh_signal_db, shadow_mode):
 
 
 def test_fresh_skip_decision_fires_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
-    """A fresh bridge call returning skip must invoke publish_veto_decision_alert."""
+    """A fresh skip verdict must invoke publish_veto_decision_alert."""
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
+    _mock_claude_review(
         monkeypatch,
-        {
-            "decision": "skip",
-            "reasoning": "vix elevated, breadth negative",
-            "confidence": 0.74,
-            "latency_ms": 9100,
-            "claude_session_id": "sess-x",
-            "raw_output": "prose...",
-        },
+        _decision_block("skip", "vix elevated, breadth negative", 0.74),
+        session_id="sess-x",
     )
 
     captured: list[dict] = []
@@ -718,16 +639,8 @@ def test_fresh_take_decision_calls_helper_but_helper_no_ops(
     """
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
-        monkeypatch,
-        {
-            "decision": "take",
-            "reasoning": "regime aligned",
-            "confidence": 0.82,
-            "latency_ms": 1500,
-            "claude_session_id": "sess-y",
-            "raw_output": "",
-        },
+    _mock_claude_review(
+        monkeypatch, _decision_block("take", "regime aligned", 0.82), session_id="sess-y"
     )
 
     captured: list[dict] = []
@@ -747,17 +660,7 @@ def test_cache_hit_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, mo
     """Cache replays must NOT spam the operator with old decisions."""
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
-        monkeypatch,
-        {
-            "decision": "skip",
-            "reasoning": "fresh skip",
-            "confidence": 0.6,
-            "latency_ms": 100,
-            "claude_session_id": "sid",
-            "raw_output": "",
-        },
-    )
+    _mock_claude_review(monkeypatch, _decision_block("skip", "fresh skip", 0.6), session_id="sid")
 
     captured: list[dict] = []
 
@@ -775,16 +678,16 @@ def test_cache_hit_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, mo
     assert captured[0]["symbol"] == "TCS"
 
 
-def test_bridge_failure_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
+def test_review_failure_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode, monkeypatch):
     """review_failed rows must not produce a Telegram alert."""
     from services.signal_review_service import review_signal
 
-    def fake_post(*args, **kwargs):  # noqa: ARG001
-        raise httpx.ConnectError("Connection refused")
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        raise RuntimeError("claude exited nonzero")
 
     import services.signal_review_service as srs
 
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     captured: list[dict] = []
 
@@ -802,17 +705,7 @@ def test_bad_decision_does_not_fire_telegram_alert(fresh_signal_db, shadow_mode,
     """Contract-violation responses must not produce a Telegram alert."""
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
-        monkeypatch,
-        {
-            "decision": "MAYBE",
-            "reasoning": "x",
-            "confidence": 0.5,
-            "latency_ms": 100,
-            "claude_session_id": "sid",
-            "raw_output": "",
-        },
-    )
+    _mock_claude_review(monkeypatch, _decision_block("MAYBE", "x", 0.5))
 
     captured: list[dict] = []
 
@@ -830,17 +723,7 @@ def test_alert_failure_does_not_break_review(fresh_signal_db, shadow_mode, monke
     """A blow-up inside the alert helper must NOT propagate into review_signal."""
     from services.signal_review_service import review_signal
 
-    _mock_bridge_response(
-        monkeypatch,
-        {
-            "decision": "skip",
-            "reasoning": "trigger boom",
-            "confidence": 0.7,
-            "latency_ms": 100,
-            "claude_session_id": "sid",
-            "raw_output": "",
-        },
-    )
+    _mock_claude_review(monkeypatch, _decision_block("skip", "trigger boom", 0.7), session_id="sid")
 
     def _boom(**kw):
         raise RuntimeError("downstream notification failure")
@@ -1024,34 +907,20 @@ def test_build_context_regime_failure_yields_none(monkeypatch):
     assert ctx["regime_snapshot"] is None
 
 
-def test_review_signal_forwards_regime_snapshot_to_bridge(
+def test_review_signal_forwards_regime_snapshot_into_prompt(
     fresh_signal_db, shadow_mode, monkeypatch
 ):
-    """The HTTP request body sent to the bridge must include regime_snapshot."""
+    """The prompt sent to claude must render the regime snapshot."""
     import services.signal_review_service as srs
     from services.signal_review_service import review_signal
 
     captured: dict = {}
 
-    class _StubResponse:
-        status_code = 200
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        captured["prompt"] = prompt
+        return _decision_block("take", "sector aligned", 0.7), "sid"
 
-        @staticmethod
-        def json():
-            return {
-                "decision": "take",
-                "reasoning": "sector aligned",
-                "confidence": 0.7,
-                "latency_ms": 200,
-                "claude_session_id": "sid",
-                "raw_output": "",
-            }
-
-    def fake_post(url, json=None, timeout=None):  # noqa: ARG001
-        captured["body"] = json
-        return _StubResponse()
-
-    monkeypatch.setattr(srs.httpx, "post", fake_post)
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
 
     ctx = _ctx_override()
     ctx["regime_snapshot"] = {
@@ -1066,5 +935,6 @@ def test_review_signal_forwards_regime_snapshot_to_bridge(
 
     review_signal("RELIANCE", "chartink_buy", context=ctx)
 
-    assert "regime_snapshot" in captured["body"]["context"]
-    assert captured["body"]["context"]["regime_snapshot"]["sector_leaders"][0] == "NIFTYIT"
+    prompt = captured["prompt"]
+    assert "trend: bullish" in prompt
+    assert "NIFTYIT" in prompt

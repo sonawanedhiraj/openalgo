@@ -37,7 +37,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 | `/run-tests` | POST | Spawns Claude Code subprocess → also runs `uv run pytest {test_target} -v` (`server.py:449,456`) |
 | `/restart-app` | POST | Kills PID on port 5000 via PowerShell `Stop-Process -Force` → respawns `uv run app.py` (`server.py:494-516`) |
 | `/run` | POST | Arbitrary Claude Code prompt — may mutate files |
-| `/review-signal`, `/reflect` | POST | LLM calls; review/journal helpers. `/review-signal` candidate now carries an explicit `direction` (`BUY`/`SELL`) so the veto prompt frames the side correctly instead of inferring it from the `source` string |
+| `/review-signal`, `/reflect` | POST | LLM calls; review/journal helpers. **`/review-signal` is no longer called by the LLM veto** — as of #266 Phase 1 (#267) the veto invokes `claude -p` in-process via `services/llm_review_client.py` (dedicated real OS thread), retiring the bridge dependency for the veto path. The endpoint still exists but is unused by the veto; `/reflect` still backs `journal_reflection_service` |
 | `/status`, `/read-errors`, `/engine-status` | GET | Read-only |
 
 - **Busy lock:** all task endpoints 409 if `state.status == BUSY`. A wedged task
