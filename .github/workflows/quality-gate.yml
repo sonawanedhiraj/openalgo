@@ -194,10 +194,17 @@ jobs:
           API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
           APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
           FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
+          # Passed via env, NOT inline ${{ }} interpolation: the output is a
+          # NEWLINE-separated list, so inline interpolation would inject raw
+          # newlines into the script — with 2+ files, line 1 runs pytest on
+          # the first file only (no -x -q) and line 2 tries to EXECUTE the
+          # second test file as a shell command. Env + IFS word-splitting
+          # handles the newlines (and is injection-safe).
+          TEST_FILES: ${{ steps.changed_tests.outputs.files }}
         run: |
+          # word-splitting on $TEST_FILES is intentional (newline-separated list)
           # shellcheck disable=SC2086
-          uv run pytest ${{ steps.changed_tests.outputs.files }} -x -q
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          uv run pytest $TEST_FILES -x -q
 
       - name: Report verdict
         if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
