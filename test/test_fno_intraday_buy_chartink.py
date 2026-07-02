@@ -690,3 +690,74 @@ def test_buy_full_daily_with_live_ts_frame_engages_path_b_and_fires(monkeypatch)
     ind = make_indicators(daily, make_weekly_bars(), bars_5m, make_15m_bars())
     ind["symbol"] = "ETERNAL"
     assert rule(None, ind) is True
+
+
+# --------------------------------------------------------------------------- #
+# Reference certificate gate (issue #305)
+# --------------------------------------------------------------------------- #
+def test_reference_uncertified_rejects_and_alerts(monkeypatch):
+    """indicators['reference_certified'] is False → early rejection + the
+    scanner_reference CRIT divergence alert (the 2026-07-02 DELHIVERY
+    42x-false-BUY regression)."""
+    import services.source_divergence_alerts as sda
+
+    calls = []
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: calls.append(kw) or True)
+    rulemod._uncertified_warned.clear()
+
+    ind = happy()
+    ind["symbol"] = "DELHIVERY"
+    ind["reference_certified"] = False
+    ind["reference_settled_close"] = 475.4
+    ind["reference_broker_prev_close"] = 510.0
+    ind["reference_divergence_pct"] = 6.78
+
+    assert rule(None, ind) is False
+    assert len(calls) == 1
+    assert calls[0]["service"] == "scanner_reference"
+    assert calls[0]["symbol"] == "DELHIVERY"
+    assert calls[0]["source_a_value"] == 475.4
+    assert calls[0]["source_b_value"] == 510.0
+
+
+def test_reference_certified_true_passes(monkeypatch):
+    """An explicitly-certified reference does not block a valid setup."""
+    ind = happy()
+    ind["reference_certified"] = True
+    assert rule(None, ind) is True
+
+
+def test_reference_missing_key_treated_as_certified():
+    """Backward compat: an indicators dict WITHOUT the reference keys (unit
+    tests / other callers) evaluates exactly as before."""
+    ind = happy()
+    assert "reference_certified" not in ind
+    assert rule(None, ind) is True
+
+
+def test_reference_uncertified_warning_deduped_per_symbol_day(monkeypatch, caplog):
+    """The rejection WARNING fires once per (symbol, IST-day) even though the
+    rule re-fires every 5m bar close; the rejection itself always holds."""
+    import logging
+
+    import services.source_divergence_alerts as sda
+
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: True)
+    rulemod._uncertified_warned.clear()
+
+    ind = happy()
+    ind["symbol"] = "DELHIVERY"
+    ind["reference_certified"] = False
+    ind["reference_settled_close"] = 475.4
+    ind["reference_broker_prev_close"] = 510.0
+    ind["reference_divergence_pct"] = 6.78
+
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_buy_chartink"):
+        for _ in range(5):
+            assert rule(None, ind) is False
+    warns = [
+        r
+        for r in caplog.records
+        if "NOT certified against broker prev-close" in r.message and "DELHIVERY" in r.message
+    ]
+    assert len(warns) == 1, f"expected 1 dedup'd warning, got {len(warns)}"

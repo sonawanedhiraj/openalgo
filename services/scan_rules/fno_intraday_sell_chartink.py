@@ -130,6 +130,65 @@ def _dbar_date_verify_enabled() -> bool:
     )
 
 
+# Per-(symbol, IST-day) dedup for the uncertified-reference rejection WARNING
+# (issue #305). Mirrors the BUY rule's ``_uncertified_warned`` — the rule
+# re-fires every 5m bar close, so a bare WARNING would flood the log.
+_uncertified_warned: set[tuple[str, str]] = set()
+_uncertified_lock = threading.Lock()
+
+
+def _reject_uncertified_reference(indicators: dict) -> None:
+    """Log a dedup'd once-per-(symbol, IST-day) WARNING + fire the CRIT
+    source-divergence Telegram for an explicitly-uncertified settled
+    reference (issue #305). See the BUY rule's helper for the rationale —
+    a stale yest_d.close manufactures phantom gap signals in BOTH
+    directions. Best-effort — never raises into rule evaluation."""
+    sym = indicators.get("symbol", "?")
+    try:
+        settled = indicators.get("reference_settled_close")
+        broker = indicators.get("reference_broker_prev_close")
+        div = indicators.get("reference_divergence_pct")
+        day_ist = datetime.now(_IST).date().isoformat()
+        key = (sym, day_ist)
+        with _uncertified_lock:
+            first_today = key not in _uncertified_warned
+            _uncertified_warned.add(key)
+        if first_today:
+            logger.warning(
+                "fno_intraday_sell_chartink %s: REJECTING — settled reference close "
+                "NOT certified against broker prev-close (settled=%s broker=%s "
+                "divergence=%s%%) — stale historify-D reference (issue #305)",
+                sym,
+                settled,
+                broker,
+                div,
+            )
+        # CRIT Telegram — dedup is per-(service, symbol, day) inside the
+        # helper (shared 'scanner_reference' service key with the BUY rule so
+        # the operator gets ONE alert per symbol per day, not one per side).
+        if settled is not None and broker is not None:
+            try:
+                from services.source_divergence_alerts import check_and_alert
+
+                check_and_alert(
+                    service="scanner_reference",
+                    symbol=sym,
+                    source_a_label="settled_reference_close",
+                    source_a_value=float(settled),
+                    source_b_label="broker_prev_close",
+                    source_b_value=float(broker),
+                )
+            except Exception:  # noqa: BLE001 — observability must never break rule eval
+                logger.exception(
+                    "fno_intraday_sell_chartink %s: reference divergence alert dispatch failed",
+                    sym,
+                )
+    except Exception:  # noqa: BLE001 — observability must never break rule eval
+        logger.exception(
+            "fno_intraday_sell_chartink %s: uncertified-reference reporting failed", sym
+        )
+
+
 def _daily_bar_date(bars_daily: pd.DataFrame, idx: int):
     """IST calendar date of the daily bar at ``idx``, or ``None`` when it cannot
     be derived.
@@ -179,6 +238,16 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     # every 5m bar close emits "bars_daily is None (no daily-D data)" for
     # NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNXT50 → 470 daily WARNINGs.
     if indicators.get("exchange") == "NSE_INDEX":
+        return False
+
+    # --- Reference certificate gate (issue #305) ---
+    # The scanner validated the settled reference close (yest_d.close) against
+    # the broker prev-close captured at boot and passed the verdict in. An
+    # EXPLICIT False means a confirmed stale reference — reject before any
+    # gate can fire on it. A MISSING key is certified (backward compat: unit
+    # tests / other callers build the indicators dict without it).
+    if indicators.get("reference_certified") is False:
+        _reject_uncertified_reference(indicators)
         return False
 
     bars_5m = indicators.get("bars_5m")

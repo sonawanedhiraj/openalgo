@@ -440,7 +440,23 @@ def _periodic_tick(now: datetime, end_t: time) -> tuple[bool, dict | None]:
     res = run_backfill_checks(now.date())
     _persist_health(res)
     _log_and_alert(res, phase="periodic")
+    _maybe_release_smoke_hold()
     return True, res
+
+
+def _maybe_release_smoke_hold() -> None:
+    """Issue #305: after a convergence tick refreshed the stored 1m/D data,
+    re-run the scanner smoke check IF its post-hold is armed — a passing
+    re-check releases the hold without waiting for the 15:35 IST expiry.
+    No-op when no hold is armed. Never raises into the periodic loop."""
+    try:
+        from services.scanner_smoke_check_service import re_check_and_release
+
+        res = re_check_and_release()
+        if res is not None:
+            logger.info("scanner backfill: smoke re-check after convergence → ok=%s", res[0])
+    except Exception:
+        logger.exception("scanner backfill: smoke-hold re-check failed")
 
 
 def _gate_on_broker_session() -> bool:
