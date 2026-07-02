@@ -360,6 +360,46 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
             "bars_daily has no today-dated bar)",
         )
 
+    # --- Rule-side reference cross-check (issue #305, fallback path) ---
+    # The scanner passes a centrally-computed verdict via
+    # indicators["reference_certified"] (see scanner_reference_data). When the
+    # key is MISSING — direct rule callers: golden replay tests, backtests,
+    # any harness that bypasses scanner_service — consult the broker
+    # prev-close registry directly so the rule stays safe on its own.
+    # Fail-open when no broker prev-close was recorded today; fail-closed on a
+    # confirmed divergence. Never raises into rule evaluation.
+    if "reference_certified" not in indicators:
+        try:
+            from services.scanner_reference_data import (
+                get_broker_prev_close,
+                reference_check_enabled,
+                reference_divergence_max_pct,
+            )
+
+            if reference_check_enabled() and not pd.isna(yest_d.close):
+                entry = get_broker_prev_close(sym)
+                if entry is not None:
+                    broker_close = float(entry[0])
+                    div_pct = (
+                        abs(float(yest_d.close) - broker_close)
+                        / max(abs(broker_close), 1e-9)
+                        * 100.0
+                    )
+                    if div_pct > reference_divergence_max_pct():
+                        _reject_uncertified_reference(
+                            {
+                                **indicators,
+                                "reference_settled_close": float(yest_d.close),
+                                "reference_broker_prev_close": broker_close,
+                                "reference_divergence_pct": round(div_pct, 4),
+                            }
+                        )
+                        return False
+        except Exception:  # noqa: BLE001 — the cross-check must never break rule eval
+            logger.exception(
+                "fno_intraday_buy_chartink %s: rule-side reference cross-check failed", sym
+            )
+
     # --- Divergence WARNING (Issue #205) ---
     # If today_d.close drifts more than SCANNER_RULE_DIVERGENCE_WARN_PCT
     # (default 0.5%) from the latest 5m close, we are reading stale data

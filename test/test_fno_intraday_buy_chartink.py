@@ -761,3 +761,41 @@ def test_reference_uncertified_warning_deduped_per_symbol_day(monkeypatch, caplo
         if "NOT certified against broker prev-close" in r.message and "DELHIVERY" in r.message
     ]
     assert len(warns) == 1, f"expected 1 dedup'd warning, got {len(warns)}"
+
+
+def test_reference_fallback_consults_registry_when_no_verdict(monkeypatch):
+    """Option (a) of issue #305: with NO reference keys in the indicators dict
+    (direct rule callers), the rule consults the broker prev-close registry
+    itself and rejects on a confirmed divergence."""
+    import services.scanner_reference_data as refdata
+    import services.source_divergence_alerts as sda
+
+    calls = []
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: calls.append(kw) or True)
+    rulemod._uncertified_warned.clear()
+    refdata.reset_for_tests()
+    try:
+        # happy() yest_d.close is 2000.0; a broker prev-close of 2100 → ~4.76%
+        # divergence > 1.0% default → reject.
+        refdata.record_broker_prev_close("DELHIVERY", 2100.0)
+        ind = happy()
+        ind["symbol"] = "DELHIVERY"
+        assert "reference_certified" not in ind
+        assert rule(None, ind) is False
+        assert len(calls) == 1
+        assert calls[0]["service"] == "scanner_reference"
+        assert calls[0]["source_a_value"] == 2000.0
+        assert calls[0]["source_b_value"] == 2100.0
+    finally:
+        refdata.reset_for_tests()
+
+
+def test_reference_fallback_fail_open_when_registry_empty():
+    """No broker prev-close recorded → the fallback is a no-op (fail-open on
+    the missing cross-check) and a valid setup still fires."""
+    import services.scanner_reference_data as refdata
+
+    refdata.reset_for_tests()
+    ind = happy()
+    ind["symbol"] = "DELHIVERY"
+    assert rule(None, ind) is True
