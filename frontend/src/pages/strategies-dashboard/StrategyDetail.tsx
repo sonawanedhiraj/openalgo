@@ -31,6 +31,7 @@ import {
   YAxis,
 } from 'recharts'
 import {
+  type DataHealth,
   type LLMDecisionRow,
   type LLMFlipOutcome,
   type LLMMode,
@@ -99,6 +100,39 @@ function HealthBadge({ health }: { health: string }) {
       </Badge>
     )
   return <Badge variant="outline">Unknown</Badge>
+}
+
+// Data-freshness tile (issue #237): surfaces the latest data_health_check state
+// for the strategy's feed so "no signals" (quiet market) is distinguishable from
+// "feed stale". Renders nothing for strategies without a feed check (e.g. the
+// webhook-driven simplified engine).
+function DataHealthBadge({ dataHealth }: { dataHealth: DataHealth }) {
+  if (!dataHealth?.available) return null
+  const at = dataHealth.check_at
+    ? new Date(dataHealth.check_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '—'
+  if (dataHealth.overall_ok) {
+    return (
+      <Badge
+        className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 gap-1"
+        title={`Feed fresh (checked ${at})${dataHealth.shared ? ` — shares ${dataHealth.feed} feed` : ''}`}
+      >
+        <CheckCircle2 className="h-3 w-3" /> Feed OK{dataHealth.shared ? ' (shared)' : ''}
+      </Badge>
+    )
+  }
+  const staleCount = dataHealth.stale_count ?? 0
+  const staleList = dataHealth.stale_symbols?.length
+    ? `: ${dataHealth.stale_symbols.join(', ')}`
+    : ''
+  return (
+    <Badge
+      className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 gap-1"
+      title={`${staleCount} stale symbol(s) as of ${at}${staleList}`}
+    >
+      <AlertTriangle className="h-3 w-3" /> Feed stale ({staleCount})
+    </Badge>
+  )
 }
 
 function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) {
@@ -945,6 +979,7 @@ export default function StrategyDetailPage() {
             <Activity className="h-5 w-5 text-primary" />
             <h1 className="text-2xl font-semibold">{data.display_name}</h1>
             <HealthBadge health={data.health} />
+            <DataHealthBadge dataHealth={data.data_health} />
             <ModeBadge mode={data.mode} deployable={data.deployable} />
             <LLMModeBadge llmMode={data.llm_mode} />
           </div>
