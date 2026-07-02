@@ -18,6 +18,30 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Scanner daily-D re-settle (issue #299, added 2026-07-02)
+Once-per-day non-incremental overwrite re-fetch of the trailing settled daily-D
+window for the scanner universe, run before the stale-check at boot + post-close
+convergence (`services.scanner_universe_backfill.resettle_recent_daily`, wired via
+`scanner_backfill_scheduler._maybe_resettle_daily`). Corrects a daily bar written
+intraday as a provisional/running close (the #277 freeze class) that the
+incremental convergence can never fix (it skips a day whose bar already exists),
+which otherwise persists into the scanner's `yest_d` gate and fires phantom gap
+signals (2026-07-02 DELHIVERY false BUY: stored 07-01 close 475.4 vs settled
+507.7). Also refreshes `ScannerHistoryProvider` so the corrected close reaches
+the live scanner without a restart. Additive, idempotent, fail-graceful.
+
+#### SCANNER_DAILY_RESETTLE_ENABLED (NEW)
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services.scanner_universe_backfill._daily_resettle_enabled`. When off,
+  `resettle_recent_daily` returns `status="disabled"` and no re-fetch happens.
+
+#### SCANNER_DAILY_RESETTLE_DAYS (NEW)
+- **Current value:** unset → defaults **`2`** (trailing settled trading days).
+- **Set in:** env; read by
+  `services.scanner_universe_backfill._daily_resettle_days`. Bounded to >= 1;
+  malformed → falls back to `2`.
+
 ### Pre-entry data refresh (sector_follow + futures) (issue #237, added 2026-07-02)
 A 15:17 IST APScheduler job (`sector_follow_preentry_refresh`) that runs the
 existing `run_backfill_checks` (fetch stale index+stock intraday tail) and waits

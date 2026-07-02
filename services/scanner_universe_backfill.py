@@ -66,6 +66,7 @@ from datetime import date, datetime, timedelta
 
 from services.data_freshness_service import (
     _DEFAULT_DUCKDB_PATH,
+    _prev_or_same_business_day,
     compute_incremental_start_date,
     compute_stale_symbols,
     is_transient_lock_error,
@@ -116,19 +117,26 @@ def backfill_scanner_universe(
     interval: str = "1m",
     api_key: str | None = None,
     symbols: list[str] | None = None,
+    incremental: bool = True,
 ) -> dict:
     """Download ``interval`` bars for the scanner universe over [start, end].
 
-    Additive — routes through the historify job pipeline (incremental, so it
-    only fetches the missing tail). Each symbol carries its own exchange so the
-    interleaved indices download under ``NSE_INDEX``. Per-symbol failures (e.g.
-    an expired broker session, or an index with no history) are handled inside
-    ``create_and_start_job`` and never raise here.
+    Additive — routes through the historify job pipeline. Each symbol carries its
+    own exchange so the interleaved indices download under ``NSE_INDEX``.
+    Per-symbol failures (e.g. an expired broker session, or an index with no
+    history) are handled inside ``create_and_start_job`` and never raise here.
 
     ``symbols`` restricts the fetch to a subset (used by the stale-check
     convergence path, which only re-fetches the symbols that are behind). When
     ``None`` the full ``SCANNER_SYMBOLS`` universe is fetched (lookback wrapper /
     CLI).
+
+    ``incremental`` (default True) fetches only the missing tail — correct for
+    the convergence path that just closes a gap. Pass ``incremental=False`` to
+    force a **full re-download** of [start, end] that OVERWRITES bars already
+    present. This is required by ``resettle_recent_daily`` to correct a daily bar
+    that was written intraday as a provisional/running value (the incremental
+    path SKIPS any day whose bar already exists, so it can never re-settle it).
 
     Returns a small status dict: ``{status, symbols, interval, job_id?, message?}``.
     """
@@ -175,7 +183,7 @@ def backfill_scanner_universe(
             end_date=end_date,
             api_key=api_key,
             config={"source": "scanner_universe_backfill"},
-            incremental=True,
+            incremental=incremental,
         )
     except Exception as e:  # never let a feed hiccup crash the caller
         logger.exception("[scanner_universe_backfill] failed to start: %s", e)
@@ -329,6 +337,143 @@ def check_and_refresh_if_stale(
     return result
 
 
+# --------------------------------------------------------------------------- #
+# Daily-D re-settle — correct provisional (intraday-captured) daily closes
+# --------------------------------------------------------------------------- #
+def _daily_resettle_enabled() -> bool:
+    """``SCANNER_DAILY_RESETTLE_ENABLED`` env flag (default true)."""
+    return os.getenv("SCANNER_DAILY_RESETTLE_ENABLED", "true").lower() == "true"
+
+
+def _daily_resettle_days() -> int:
+    """How many trailing settled trading days to re-fetch (``SCANNER_DAILY_RESETTLE_DAYS``,
+    default 2). Bounded to >= 1."""
+    try:
+        return max(1, int(os.getenv("SCANNER_DAILY_RESETTLE_DAYS", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _nth_prev_business_day(d: date, n: int) -> date:
+    """The business day ``n`` trading days at/before ``d`` (``n``>=0).
+
+    ``n=0`` rolls a weekend back to the preceding Friday; each further step goes
+    back one more trading day. Holidays are not modelled (matches
+    ``data_freshness_service``) — a holiday just widens the fetch window by a day,
+    which is harmless for an overwrite re-fetch.
+    """
+    cur = _prev_or_same_business_day(d)
+    for _ in range(max(0, n)):
+        cur = _prev_or_same_business_day(cur - timedelta(days=1))
+    return cur
+
+
+def resettle_recent_daily(
+    today: date | None = None,
+    *,
+    days: int | None = None,
+    refresh_provider: bool = True,
+) -> dict:
+    """Re-fetch and OVERWRITE the last ``days`` settled trading days of daily-D
+    bars for the whole scanner universe, then refresh ``ScannerHistoryProvider``.
+
+    Why this exists — a daily-D bar written *intraday* (the historify feed
+    captured a running/provisional close, e.g. the #277 09:45 freeze) is never
+    corrected by the normal convergence: ``compute_stale_symbols`` sees "a bar
+    for that day exists → fresh" and the incremental download SKIPS any day
+    already present. So the provisional close persists all the way into the
+    scanner's ``yest_d`` gate and manufactures phantom gap-ups/downs (the
+    2026-07-02 DELHIVERY false BUY: stored 07-01 close 475.4 vs settled 507.7).
+
+    This forces a **non-incremental** re-download of the trailing settled window
+    (the broker's daily API returns the settled close post-close), which the
+    upsert write path overwrites in place. It then calls ``get_provider().refresh()``
+    so the in-memory daily cache — warmed at boot from the corrupt bar and never
+    re-read during the session — serves the corrected values.
+
+    Idempotent (a re-fetch of already-correct bars is a harmless overwrite),
+    fail-graceful (a dead broker session / fetch error is logged, never raised).
+    Gated by ``SCANNER_DAILY_RESETTLE_ENABLED`` (default true).
+
+    Returns ``{status, interval, window, resettled, job_id?, provider_symbols_loaded?, errors}``.
+    """
+    result: dict = {
+        "status": "ok",
+        "interval": "D",
+        "window": None,
+        "resettled": False,
+        "errors": [],
+    }
+    if not _daily_resettle_enabled():
+        logger.info("scanner daily-D resettle disabled (SCANNER_DAILY_RESETTLE_ENABLED!=true)")
+        result["status"] = "disabled"
+        return result
+
+    universe = scanner_universe_symbols()
+    if not universe:
+        logger.info("scanner daily-D resettle: empty universe (SCANNER_SYMBOLS unset) — no-op")
+        return result
+
+    ref = today or date.today()
+    n = days if days is not None else _daily_resettle_days()
+    start = _nth_prev_business_day(ref, n).strftime("%Y-%m-%d")
+    end = ref.strftime("%Y-%m-%d")
+    result["window"] = f"{start}..{end}"
+    logger.info(
+        "scanner daily-D resettle: overwrite re-fetch of settled daily bars %s..%s (%d symbols)",
+        start,
+        end,
+        len(universe),
+    )
+
+    try:
+        bf = backfill_scanner_universe(start, end, interval="D", incremental=False)
+    except Exception as e:  # backfill is defensive; belt-and-braces
+        logger.exception("scanner daily-D resettle: backfill raised: %s", e)
+        result["status"] = "error"
+        result["errors"].append(str(e))
+        return result
+
+    if bf.get("status") not in ("success", "ok"):
+        msg = bf.get("message", "unknown backfill error")
+        logger.warning("scanner daily-D resettle: backfill did not start cleanly — %s", msg)
+        result["status"] = "error"
+        result["errors"].append(msg)
+        return result
+
+    job_id = bf.get("job_id")
+    if job_id:
+        result["job_id"] = job_id
+        # Wait for the re-download to LAND before refreshing the in-memory cache,
+        # otherwise the provider re-reads the pre-resettle (still-corrupt) rows.
+        try:
+            from services.historify_service import wait_for_jobs
+
+            finals = wait_for_jobs([job_id])
+            logger.info("scanner daily-D resettle: job final status: %s", finals)
+        except Exception:  # waiting must never break the resettle path
+            logger.exception("scanner daily-D resettle: wait_for_jobs raised (continuing)")
+
+    result["resettled"] = True
+
+    if refresh_provider:
+        try:
+            from services.scanner_history_provider import get_provider
+
+            refreshed = get_provider().refresh()
+            result["provider_symbols_loaded"] = refreshed.get("symbols_loaded", 0)
+            logger.info(
+                "scanner daily-D resettle: provider daily cache refreshed (%d symbols, %d errors)",
+                refreshed.get("symbols_loaded", 0),
+                len(refreshed.get("errors", [])),
+            )
+        except Exception as e:  # provider refresh failure must not raise
+            logger.exception("scanner daily-D resettle: provider refresh failed: %s", e)
+            result["errors"].append(f"provider_refresh: {e}")
+
+    return result
+
+
 def _main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -336,8 +481,22 @@ def _main(argv: list[str] | None = None) -> int:
         prog="scanner_universe_backfill",
         description="One-shot 1m or D backfill for the in-house scanner SCANNER_SYMBOLS universe.",
     )
-    parser.add_argument("--from", dest="from_date", required=True, help="start date YYYY-MM-DD")
-    parser.add_argument("--to", dest="to_date", required=True, help="end date YYYY-MM-DD")
+    parser.add_argument(
+        "--resettle",
+        action="store_true",
+        help="force a non-incremental overwrite re-fetch of the last N settled daily-D "
+        "days for the whole universe + refresh the scanner provider cache "
+        "(corrects provisional intraday-captured closes); ignores --from/--to/--interval",
+    )
+    parser.add_argument(
+        "--resettle-days",
+        type=int,
+        default=None,
+        help="trailing settled trading days to re-fetch with --resettle "
+        "(default SCANNER_DAILY_RESETTLE_DAYS or 2)",
+    )
+    parser.add_argument("--from", dest="from_date", required=False, help="start date YYYY-MM-DD")
+    parser.add_argument("--to", dest="to_date", required=False, help="end date YYYY-MM-DD")
     parser.add_argument(
         "--interval",
         default="1m",
@@ -345,6 +504,14 @@ def _main(argv: list[str] | None = None) -> int:
         help="storage interval to backfill (default 1m)",
     )
     args = parser.parse_args(argv)
+
+    if args.resettle:
+        result = resettle_recent_daily(days=args.resettle_days)
+        print(json.dumps(result, default=str, indent=2))
+        return 0 if result.get("status") in ("success", "ok", "disabled") else 1
+
+    if not args.from_date or not args.to_date:
+        parser.error("--from and --to are required unless --resettle is used")
 
     result = backfill_scanner_universe(args.from_date, args.to_date, interval=args.interval)
     print(json.dumps(result, default=str, indent=2))

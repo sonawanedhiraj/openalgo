@@ -1181,6 +1181,27 @@ intervals** (`1m` AND `D`):
   daily by resampling the continuous stored 1m series (Approach 2, single source
   of truth) — that only becomes viable once the full-universe 1m deep backfill
   has landed.
+- **Daily-D re-settle (issue #299, 2026-07-02):** the incremental convergence
+  above can *never* correct a daily bar that was written **intraday** as a
+  provisional/running close (the #277 09:45-freeze class) — `compute_stale_symbols`
+  sees a bar for the day already present and the incremental download SKIPS it, so
+  the provisional close persists into the scanner's `yest_d` gate and manufactures
+  phantom gap signals (the 2026-07-02 DELHIVERY false BUY: stored 07-01 close
+  475.4 vs broker-settled 507.7). `resettle_recent_daily` fixes this: once per
+  process per date (before the stale-check, at boot + post-close), it forces a
+  **non-incremental** overwrite re-fetch of the last `SCANNER_DAILY_RESETTLE_DAYS`
+  (default 2) settled trading days for the whole universe — the broker's daily API
+  returns the settled close post-close, and the `upsert_market_data`
+  ON-CONFLICT-DO-UPDATE write overwrites the provisional bar in place — then calls
+  `ScannerHistoryProvider.refresh()` so the corrected close reaches the live
+  scanner **without** a restart (the provider caches daily-D at boot and never
+  re-reads during the session). Gated by `SCANNER_DAILY_RESETTLE_ENABLED` (default
+  `true`); wired via `scanner_backfill_scheduler._maybe_resettle_daily`. Manual
+  one-shot: `uv run python -m services.scanner_universe_backfill --resettle`.
+  Additive, idempotent, fail-graceful. A follow-up (not yet shipped) adds a
+  defense-in-depth rule-level guard that rejects when the derived `yest_d` bar is
+  not the actual previous trading day, for the case where the re-settle can't run
+  (broker session down).
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
