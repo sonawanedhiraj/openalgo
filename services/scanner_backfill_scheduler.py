@@ -59,6 +59,12 @@ _BOOT_WAIT_POLL_SEC = 15
 _stop_event = threading.Event()
 _periodic_thread: threading.Thread | None = None
 
+# Once-per-process-per-date guard for the daily-D re-settle (see
+# _maybe_resettle_daily). A settled daily bar only needs correcting once per day;
+# without this the periodic loop would re-fetch the whole universe every 30 min.
+# A restart clears it (fine — the boot convergence then re-settles once).
+_resettled_dates: set = set()
+
 # Pre-entry refresh (#239): a single convergence fetch just before the 09:18
 # smoke check so a cold boot at 08:31 IST has fresh historify data AND the
 # WS subscription is established before evaluation begins.  The boot check
@@ -172,14 +178,57 @@ def _health_strategy_name(interval: str) -> str:
 # --------------------------------------------------------------------------- #
 # Convergence check + health persistence + alerting
 # --------------------------------------------------------------------------- #
+def _maybe_resettle_daily(today) -> None:
+    """Re-settle the trailing daily-D window once per day (before the stale-check).
+
+    A daily bar written intraday as a provisional/running close is never fixed by
+    the incremental convergence (it sees the day's bar already present and skips
+    it), so a stale close persists into the scanner's ``yest_d`` gate and fires
+    phantom signals (2026-07-02 DELHIVERY false BUY — issue #299). This forces a
+    non-incremental overwrite re-fetch of the settled window + a provider cache
+    refresh, bounded to once per process per date. Only runs when ``D`` is a
+    configured interval. Fully fail-graceful — never raises into the caller.
+    """
+    ref = today or datetime.now(_IST).date()
+    if "D" not in _intervals():
+        return
+    if ref in _resettled_dates:
+        return
+    try:
+        from services.scanner_universe_backfill import resettle_recent_daily
+
+        res = resettle_recent_daily(ref)
+        # Mark done unless the attempt failed for a transient reason (no broker
+        # session yet / fetch error) — a failed attempt should retry on the next
+        # convergence tick rather than be suppressed for the rest of the day.
+        if res.get("status") in ("ok", "disabled") or res.get("resettled"):
+            _resettled_dates.add(ref)
+        logger.info(
+            "scanner daily-D resettle [%s]: status=%s window=%s resettled=%s errors=%d",
+            ref,
+            res.get("status"),
+            res.get("window"),
+            res.get("resettled"),
+            len(res.get("errors", [])),
+        )
+    except Exception:  # a resettle failure must never break the convergence path
+        logger.exception("scanner daily-D resettle raised")
+
+
 def run_backfill_checks(today=None) -> dict:
     """Run the per-interval stale-check (1m then D); return the combined verdict.
 
     ``all_fresh`` is True iff no interval found a stale symbol (the convergence
     signal that lets the periodic loop back off). ``errors`` unions every
     interval's fail-graceful error list. Never raises.
+
+    Before the stale-check, a once-per-day daily-D re-settle corrects any
+    provisional (intraday-captured) daily close so the scanner's ``yest_d`` gate
+    reads the settled value (issue #299).
     """
     from services.scanner_universe_backfill import check_and_refresh_if_stale
+
+    _maybe_resettle_daily(today)
 
     per_interval: dict[str, dict] = {}
     errors: list[str] = []
