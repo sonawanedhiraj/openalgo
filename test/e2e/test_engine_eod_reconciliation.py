@@ -86,7 +86,16 @@ def _record_entry(symbol, direction, qty, entry_price, order_id="E-" + "0"):
 
 
 def _add_sandbox_fill(sandbox_db, symbol, action, qty, price, orderid, when=None):
-    """Insert a sandbox executed-trade (fill) row. ``trade_timestamp`` naive-now."""
+    """Insert a sandbox executed-trade (fill) row.
+
+    ``trade_timestamp`` defaults to IST **wall-clock** now (naive), matching the
+    live sandbox convention. Using a bare naive ``datetime.now()`` here was a
+    time-of-day flake: on a CI runner (UTC) a run after 18:30 UTC (= IST
+    midnight) stamped the fill on the IST-previous day, so the reconciled exit's
+    ``exited_at`` fell outside ``get_today_summary``'s IST-today window and the
+    summary count came back 0 (``assert 0 == 1``). The reconciliation service and
+    the today-summary both work in IST, so the fill must be IST-consistent too.
+    """
     sess = sandbox_db.db_session
     tid = f"T-{symbol}-{action}-{orderid}"
     row = sandbox_db.SandboxTrades(
@@ -100,7 +109,7 @@ def _add_sandbox_fill(sandbox_db, symbol, action, qty, price, orderid, when=None
         price=price,
         product="MIS",
         strategy="trending_equity_intraday",
-        trade_timestamp=when or dt.datetime.now(),
+        trade_timestamp=when or dt.datetime.now(IST).replace(tzinfo=None),
     )
     sess.add(row)
     sess.commit()
