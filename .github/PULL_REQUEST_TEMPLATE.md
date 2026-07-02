@@ -8,6 +8,10 @@ Closes #<!-- issue number; required so the issue links to this PR + the merge SH
 ## Implementation
 <!-- Key changes per file; notable design decisions / trade-offs. -->
 
+## If this is a bug fix: what did the previous fix miss?
+<!-- Link the prior PR/issue that touched this area and state the gap.
+     "First fix in this area" is a valid answer. Required for type:bug PRs. -->
+
 ## Tests & verification
 <!-- Tests added/updated and how you verified (counts, results). -->
 

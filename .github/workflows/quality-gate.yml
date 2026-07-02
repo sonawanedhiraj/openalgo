@@ -26,6 +26,10 @@ on:
   push:
     branches: [dev]
 
+permissions:
+  contents: read
+  pull-requests: read   # prefix-regression-check reads PR labels
+
 jobs:
   silent-drops:
     # The ONLY job that's required (or to-be-required) on main today.
@@ -76,3 +80,135 @@ jobs:
       # third-party false positives).
       - name: Semgrep public rulesets (best effort)
         run: uvx semgrep --config=auto --severity=ERROR --error services/ blueprints/ sandbox/ restx_api/ || true
+
+  prefix-regression-check:
+    # Informational only (issue #307) — deliberately its OWN job so it can
+    # never affect the `silent-drops` required check (GitHub gates required
+    # status checks at the job level, not the step level — see the header
+    # note above). Never required, never blocking: every step that can fail
+    # is wrapped in continue-on-error or `|| true`.
+    #
+    # What it checks: for a PR labelled type:bug, does the PR's own new/
+    # changed test coverage actually demonstrate the bug? It runs the PR's
+    # new/changed test files against the pre-fix tree (the merge-base commit)
+    # in an isolated checkout. If they ALL pass there too, the tests don't
+    # prove the fix did anything — emits a ::warning:: annotation. If at
+    # least one fails (or fails to collect — a new test importing a module
+    # that doesn't exist pre-fix is an expected "fails on pre-fix"), the
+    # tests demonstrate the regression as intended.
+    #
+    # Grounded in outputs/2026-07-02_scanner_deep_analysis.md #4: 50-55% of
+    # scanner PRs in 06-21..07-02 fixed a defect a previous scanner PR
+    # introduced/missed. This does not prevent that class of bug — it is a
+    # cheap, non-blocking signal that a bug-fix PR's tests are load-bearing.
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: pr-head
+
+      - name: Skip if type:bug label is absent
+        id: has_label
+        continue-on-error: true
+        run: |
+          has_bug_label=$(printf '%s' '${{ toJSON(github.event.pull_request.labels.*.name) }}' \
+              | python3 -c "import sys,json; print('type:bug' in json.load(sys.stdin))" 2>/dev/null || echo "False")
+          echo "value=$has_bug_label" >> "$GITHUB_OUTPUT"
+          if [ "$has_bug_label" != "True" ]; then
+            echo "::notice::PR has no type:bug label — skipping pre-fix regression check."
+          fi
+
+      - name: Determine changed test files
+        id: changed_tests
+        if: steps.has_label.outputs.value == 'True'
+        continue-on-error: true
+        working-directory: pr-head
+        run: |
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          merge_base=$(git merge-base "$base_sha" "$head_sha" 2>/dev/null || echo "$base_sha")
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          files=$(git diff --name-only --diff-filter=ACMR "$merge_base" "$head_sha" -- 'test/' | grep -E '\.py$' || true)
+          if [ -z "$files" ]; then
+            echo "::notice::No test/*.py files added or modified by this PR — skipping pre-fix regression check."
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_files=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "files<<PREFIX_EOF"
+              echo "$files"
+              echo "PREFIX_EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout merge-base (pre-fix tree)
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.changed_tests.outputs.merge_base }}
+          path: pre-fix
+
+      - name: Install uv
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        uses: astral-sh/setup-uv@v3
+
+      - name: Setup Python 3.12
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        run: uv python install 3.12
+
+      - name: Copy PR's new/changed test files onto the pre-fix tree
+        id: copy_tests
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        run: |
+          copied=""
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "pr-head/$f" ]; then
+              mkdir -p "pre-fix/$(dirname "$f")"
+              cp "pr-head/$f" "pre-fix/$f"
+              copied="$copied $f"
+            fi
+          done <<< "${{ steps.changed_tests.outputs.files }}"
+          echo "copied=$copied" >> "$GITHUB_OUTPUT"
+          echo "Copied test files onto pre-fix tree:$copied"
+
+      - name: Install deps (pre-fix tree)
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        working-directory: pre-fix
+        run: uv sync --group dev
+
+      - name: Run PR's new/changed tests against the pre-fix tree
+        id: prefix_run
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        working-directory: pre-fix
+        env:
+          API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
+          FERNET_SALT: "test-fernet-salt-for-ci-only-not-for-production"  # pragma: allowlist secret
+        run: |
+          # shellcheck disable=SC2086
+          uv run pytest ${{ steps.changed_tests.outputs.files }} -x -q
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Report verdict
+        if: steps.has_label.outputs.value == 'True' && steps.changed_tests.outputs.has_files == 'true'
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.prefix_run.outcome }}" = "success" ]; then
+            echo "::warning::type:bug PR — the new/changed test(s) in this PR ALL PASS on the pre-fix tree (merge-base ${{ steps.changed_tests.outputs.merge_base }}). This suggests the tests do not demonstrate the bug being fixed. Consider adding/adjusting a test that fails without this PR's code change."
+          else
+            echo "Tests fail (or fail to collect) on the pre-fix tree as expected — they demonstrate the regression this PR fixes."
+          fi
+
+      - name: Always succeed
+        if: always()
+        run: echo "prefix-regression-check is informational only — this job never fails the PR."

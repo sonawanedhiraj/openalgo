@@ -239,3 +239,61 @@ rules:
       path — does not reach errors.jsonl or Telegram. Use logger.exception. See
       audit/silent_drop_audit_2026-06-11.md#recommended-pre-commit-hook-checks (#5).
     severity: WARNING
+
+  # --- Issue #307: warn-only fall-through on the in-house scanner signal path
+  # 50-55% of scanner PRs in 06-21..07-02 fixed a defect introduced/missed by a
+  # previous scanner PR (outputs/2026-07-02_scanner_deep_analysis.md #4). One
+  # recurring shape: a logger.warning(...) that names a real data problem
+  # (stale/missing/divergent input) but does NOT abort evaluation — the
+  # scanner silently keeps going and can fire a signal off the same bad input
+  # it just warned about. This is the #206/#233 "warn-only shipping-divergence"
+  # lesson (a stale signal traded while only a WARNING was logged, with no
+  # return/raise/guard to stop it) applied to the scan-rule/scanner path.
+  #
+  # Compliant shapes are excluded via pattern-not-inside:
+  #   - logger.warning(...) immediately followed by return/raise in the same
+  #     block (both same-line-after and the `if ...: logger.warning(...);
+  #     return ...` one-liner-guard idiom).
+  #   - logger.warning(...) as the last statement of an `if:` block whose
+  #     body ends in return/raise (the dominant pattern in this codebase —
+  #     see fno_intraday_*_chartink.py's D-bar-date-verify and
+  #     REJECTING-on-divergence blocks).
+  #
+  # WARNING severity only (informational, quality job) — per the audit's own
+  # "warn, not block, these have legitimate uses" convention for cross-cutting
+  # heuristics. Scoped narrowly to the scanner signal path so it never touches
+  # the ERROR-only required silent-drops gate's globs (services/ blueprints/
+  # sandbox/ restx_api/ minus this rule's own findings, since this rule never
+  # runs at ERROR severity).
+  - id: warn-only-guard-on-signal-path
+    languages: [python]
+    patterns:
+      - pattern: logger.warning(...)
+      - pattern-not-inside: |
+          logger.warning(...)
+          return ...
+      - pattern-not-inside: |
+          logger.warning(...)
+          raise ...
+      - pattern-not-inside: |
+          if ...:
+              logger.warning(...)
+              return ...
+      - pattern-not-inside: |
+          if ...:
+              logger.warning(...)
+              raise ...
+    paths:
+      include:
+        - "**/services/scan_rules/"
+        - "**/services/scanner_service.py"
+    message: >-
+      logger.warning(...) on the scanner signal path with no return/raise/
+      guarded block immediately after — evaluation falls through and can act
+      on the same bad input the warning just flagged. See the #206/#233
+      warn-only-divergence lesson (a stale signal traded while only a WARNING
+      was logged) and issue #307. If the fall-through is intentional
+      (e.g. a dedup'd/rate-limited observability warning that must not affect
+      rule outcome), leave a comment explaining why — this rule is WARNING
+      severity / informational, not a required gate.
+    severity: WARNING
