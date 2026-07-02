@@ -18,6 +18,27 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Pre-entry data refresh (sector_follow + futures) (issue #237, added 2026-07-02)
+A 15:17 IST APScheduler job (`sector_follow_preentry_refresh`) that runs the
+existing `run_backfill_checks` (fetch stale index+stock intraday tail) and waits
+`_PREENTRY_WAIT_SEC` (90s, bounded so it can't overrun the 15:20 entry) so
+today's bars land in historify before the 15:18 smoke + 15:20 entry. Closes the
+mid-day gap that produced the 06-29/06-30 zero-order days (boot check runs hours
+earlier; the periodic loop only runs 15:30–17:00). Benefits futures_follow too
+(shared sector_follow data). Additive, idempotent (fresh → no-op), fail-graceful.
+
+#### SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED (NEW)
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services.sector_follow_backfill_scheduler.preentry_refresh_enabled`. When off,
+  the 15:17 job is not registered and `run_preentry_backfill_checks` no-ops.
+
+#### SECTOR_FOLLOW_PREENTRY_REFRESH_TIME (NEW)
+- **Current value:** unset → defaults **`15:17`** (IST; must be < 15:18 smoke).
+- **Set in:** env; read by
+  `services.sector_follow_backfill_scheduler.preentry_refresh_time`. Malformed →
+  falls back to `15:17`.
+
 ### `_CALENDAR_BUFFER` — scanner daily-history query window (issue #280, changed 2026-07-01)
 - **Current value:** **`1.6`** (was `1.4`).
 - **Set in:** code constant `services/scanner_history_provider.py:_CALENDAR_BUFFER`
