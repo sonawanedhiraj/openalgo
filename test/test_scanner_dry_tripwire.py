@@ -440,16 +440,162 @@ def test_details_include_subscribed_at_and_warmup(monkeypatch):
 def test_subscribed_at_provider_exception_falls_back_safely(monkeypatch):
     """If the subscribed_at_provider raises (shouldn't happen, but guard
     against module-state corruption), the check still completes and treats
-    subscribe state as unknown — same as no-subscribe-signal."""
+    subscribe state as unknown (subscribed_at=None).
+
+    With issue #239: subscribed_at=None AND gap_min=90 > 60 → the WS-absence
+    escalation fires CRIT (the provider exception is treated as "WS never came
+    up"). This is the safer behaviour — unknown subscribe state is treated as
+    absent rather than silently defaulting to WARN.
+    """
     monkeypatch.setenv("SCANNER_DRY_SUBSCRIBE_WARMUP_MIN", "5")
     now = _ist(2026, 6, 26, 11, 0)
 
-    providers, _n, _h = _stub(latest_inhouse=None, chartink_alive=False)
+    providers, _n, health = _stub(latest_inhouse=None, chartink_alive=False)
 
     def explode():
         raise RuntimeError("module state corrupted")
 
     res = svc.check_dry_scanner(as_of=now, subscribed_at_provider=explode, **providers)
-    # Without subscribe info AND no row, falls back to 09:30 cutoff → 90 min
-    # gap → WARN (chartink dry).
-    assert res["status"] == "alerted_warn"
+    # subscribed_at=None AND gap_min=90 > 60 → WS-absence escalation → CRIT
+    # (issue #239: unknown subscribe state escalates, not silently WARNs).
+    assert res["status"] == "alerted_crit"
+    assert res["severity"] == "CRIT"
+    assert health[-1]["details"].get("escalation_reason") == "ws_subscription_absent"
+
+
+# --------------------------------------------------------------------------- #
+# WS-absence CRITICAL escalation (issue #239)
+# --------------------------------------------------------------------------- #
+
+
+def test_ws_absent_and_large_gap_escalates_to_crit():
+    """``scanner_subscribed_at=None`` AND ``gap_min > 60`` must escalate to
+    CRITICAL without querying Chartink.  This is the exact 2026-06-30 failure
+    fingerprint: ``gap_min=7745, scanner_subscribed_at=None, severity=WARN``
+    — the WARN meant no page fired despite a 5-day drought.  After this fix
+    the same payload yields CRIT."""
+    # Do NOT call mark_scanner_subscribed — _scanner_subscribed_at stays None.
+    now = _ist(2026, 6, 30, 9, 30)
+    # last_inhouse_at 5 days ago → gap = 7200+ min >> 60
+    last = _ist(2026, 6, 25, 0, 25)
+
+    chartink_called = []
+
+    providers, notified, health = _stub(
+        latest_inhouse=last,
+        chartink_alive=False,  # not queried for this path
+    )
+    providers["chartink_has_rows_since"] = lambda _c: (chartink_called.append(True), False)[1]
+    # subscribed_at=None (module state reset by autouse fixture)
+    providers["subscribed_at_provider"] = lambda: None
+
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    assert res["severity"] == "CRIT", f"Expected CRIT, got {res}"
+    assert res["status"] == "alerted_crit"
+    # Chartink must NOT be queried — the subscription absence is the signal
+    assert not chartink_called, "chartink_has_rows_since must not be called for ws_absent path"
+    # Telegram alert fired
+    assert len(notified) == 1
+    sev, msg = notified[0]
+    assert sev == "CRIT"
+    assert "WS subscription" in msg or "ws_subscription_absent" in msg or "tick feed" in msg
+    # Payload carries escalation reason
+    health_row = health[-1]
+    assert health_row["details"].get("escalation_reason") == "ws_subscription_absent"
+
+
+def test_ws_absent_but_small_gap_does_not_escalate():
+    """``scanner_subscribed_at=None`` with ``gap_min <= 60`` should NOT trigger
+    the escalation path — a short gap may be normal warmup."""
+    # Do NOT call mark_scanner_subscribed.
+    now = _ist(2026, 6, 30, 10, 0)
+    # last_inhouse_at 40 minutes ago — gap = 40 min, below the 60-min escalation threshold
+    last = now - timedelta(minutes=40)
+
+    providers, notified, health = _stub(
+        latest_inhouse=last,
+        chartink_alive=True,  # would be CRIT via normal path
+    )
+    providers["subscribed_at_provider"] = lambda: None
+
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    # gap_min=40, threshold=30 → fires, but no ws_absent escalation (gap ≤ 60)
+    # chartink_alive=True → normal CRIT path
+    assert res["severity"] == "CRIT"
+    # Normal diagnosis message (not the WS-absence one)
+    sev, msg = notified[0]
+    assert "Chartink HAS recent hits" in msg
+    # escalation_reason should NOT be set
+    assert health[-1]["details"].get("escalation_reason") is None
+
+
+def test_ws_absent_escalation_deduped_on_same_day():
+    """Second call on the same day with ws_absent escalation → dedup_silent."""
+    now = _ist(2026, 6, 30, 10, 30)
+    last = _ist(2026, 6, 25, 0, 25)
+
+    providers, notified, _h = _stub(latest_inhouse=last)
+    providers["subscribed_at_provider"] = lambda: None
+
+    # First call: alerts
+    res1 = svc.check_dry_scanner(as_of=now, **providers)
+    assert res1["status"] == "alerted_crit"
+    assert len(notified) == 1
+
+    # Second call same day: dedup_silent (no second alert)
+    res2 = svc.check_dry_scanner(as_of=now + timedelta(minutes=5), **providers)
+    assert res2["status"] == "dedup_silent"
+    assert res2["severity"] == "CRIT"
+    assert len(notified) == 1  # no new notification
+
+
+def test_format_alert_ws_absence_diagnosis():
+    """``_format_alert`` with ``escalation_reason='ws_subscription_absent'``
+    produces a human-readable WS-absence message (not the chartink copy)."""
+    msg = svc._format_alert(
+        "CRIT",
+        7745.0,
+        _ist(2026, 6, 25, 0, 25),
+        False,
+        escalation_reason="ws_subscription_absent",
+    )
+    assert "WS subscription" in msg or "tick feed" in msg
+    assert "🚨" in msg
+    assert "Chartink" not in msg  # must NOT use the chartink copy for this path
+
+
+def test_format_alert_normal_crit_path():
+    """``_format_alert`` with no escalation_reason and chartink_alive=True
+    uses the standard 'Chartink HAS recent hits' diagnosis."""
+    msg = svc._format_alert(
+        "CRIT",
+        35.0,
+        _ist(2026, 6, 22, 10, 25),
+        True,
+        escalation_reason=None,
+    )
+    assert "Chartink HAS recent hits" in msg
+    assert "🚨" in msg
+
+
+def test_ws_present_but_subscribed_chartink_alive_is_still_crit():
+    """Control: when ``subscribed_at`` IS set (WS came up), normal CRIT
+    logic applies even if the gap is huge."""
+    subscribe_at = _ist(2026, 6, 30, 9, 11)
+    svc.mark_scanner_subscribed(subscribe_at)
+
+    now = _ist(2026, 6, 30, 11, 0)
+    # last_inhouse_at 61 minutes ago — well above 30-min threshold
+    last = now - timedelta(minutes=61)
+
+    providers, notified, health = _stub(latest_inhouse=last, chartink_alive=True)
+    # subscribed_at is set — escalation path must NOT fire
+    res = svc.check_dry_scanner(as_of=now, **providers)
+
+    assert res["severity"] == "CRIT"
+    sev, msg = notified[0]
+    assert "Chartink HAS recent hits" in msg  # normal diagnosis
+    # escalation_reason should NOT be set
+    assert health[-1]["details"].get("escalation_reason") is None

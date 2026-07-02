@@ -1350,6 +1350,60 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     Friday 2026-06-19 outage. 13 hermetic E2E tests in
     `test/test_scanner_dry_tripwire.py`.
 
+## `SCANNER_PREENTRY_REFRESH_*` — scanner pre-entry data refresh + WS nudge (issue #239)
+
+- **Files:** `services/scanner_backfill_scheduler.py` (functions
+  `preentry_refresh_enabled`, `preentry_refresh_time`,
+  `run_preentry_scanner_refresh`, `init_scanner_preentry_refresh`,
+  `_scanner_preentry_refresh_job`), `app.py` (wire-in next to smoke check),
+  `test/test_scanner_backfill_scheduler.py`.
+- **What it controls:** a daily 09:16 IST APScheduler job that closes the
+  cold-boot gap where the in-process scanner aggregator is still 0/216 at the
+  09:18 smoke check — the root of the 2026-06-30 5-day signal drought
+  (`scanner_subscribed_at=None`, `gap_min=7745`). The job runs the same
+  `check_and_refresh_if_stale` convergence the boot/periodic paths use (for
+  BOTH `1m` AND `D` intervals), waits up to `_PREENTRY_WAIT_SEC` (120s) for
+  the download jobs, and — if `scanner_pre_subscriber.subscribed` is empty —
+  nudges the broker WS subscription via `scanner_pre_subscriber.ensure` so the
+  tick aggregator starts filling before the first evaluatable 5m bar at 09:30.
+- **Knobs:**
+  - `SCANNER_PREENTRY_REFRESH_ENABLED` (default `true`) — master gate. When
+    false the APScheduler job is still registered so toggling at runtime takes
+    effect without a restart; the per-fire `preentry_refresh_enabled()` check
+    makes it a no-op immediately.
+  - `SCANNER_PREENTRY_REFRESH_TIME` (default `09:16`) — cron fire time in
+    `HH:MM` IST. Must be before the 09:18 smoke check (`SCANNER_SMOKE_CHECK_TIME`)
+    and early enough to allow the 120s bounded wait to complete before 09:18.
+- **Failure path:** always fail-graceful — historify download errors are logged
+  and produce anomaly alerts via `notification_service.publish_anomaly`; the WS
+  nudge failure is `logger.exception`-logged but never propagates. A fresh → no-op
+  (idempotent).
+- **History:**
+  - **2026-07-02:** Introduced to close the cold-boot gap that produced the
+    2026-06-30 5-day signal drought (issue #239). Mirrors the sector_follow
+    pre-entry refresh pattern (`SECTOR_FOLLOW_PREENTRY_REFRESH_*`, issue #237).
+
+## `scanner_dry_tripwire` — WS-absence CRITICAL escalation (issue #239)
+
+- **Files:** `services/scanner_dry_tripwire_service.py` (`check_dry_scanner`,
+  `_format_alert`), `test/test_scanner_dry_tripwire.py`.
+- **What it controls:** an additive severity-escalation path in the existing
+  `scanner_dry_tripwire_service`. When `scanner_subscribed_at is None` (the WS
+  connect callback from `ws_connect_callbacks` never fired in this process, so
+  the broker WS subscription never came up) AND `gap_min > 60`, the severity
+  is forced to **CRITICAL** — overriding the normal chartink cross-check — and
+  a Telegram alert fires with `escalation_reason='ws_subscription_absent'` in
+  the payload. This is the exact condition of the 2026-06-30 tripwire log
+  (`gap_min=7745, scanner_subscribed_at=None, severity=WARN`): the WARN meant
+  no page fired despite a 5-day drought.
+- **No new flags** — the change is purely additive to the existing
+  `SCANNER_DRY_TRIPWIRE_ENABLED` and `SCANNER_DRY_THRESHOLD_MIN` flags. The
+  chartink cross-check is still used when `subscribed_at is not None`
+  (normal path unchanged).
+- **History:**
+  - **2026-07-02:** Introduced as part of issue #239. Paired with the
+    `SCANNER_PREENTRY_REFRESH_*` job above.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
