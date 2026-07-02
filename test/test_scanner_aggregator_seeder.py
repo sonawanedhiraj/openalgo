@@ -22,6 +22,20 @@ from services.scanner_aggregator_seeder import (
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
+@pytest.fixture(autouse=True)
+def _reset_reference_registry():
+    """Issue #305: the broker-fallback arm of ``_read_1m_bars_for_symbol`` now
+    records a broker prev-close into the module-global reference registry as a
+    side effect. Reset it around every test so a recording here (e.g. for
+    RELIANCE) cannot leak into rule-evaluation tests running later on the same
+    xdist worker (the CI-only ``test_scanner_chartink_integration`` failure)."""
+    from services import scanner_reference_data as refdata
+
+    refdata.reset_for_tests()
+    yield
+    refdata.reset_for_tests()
+
+
 # --------------------------------------------------------------------------- #
 # Bar reader
 # --------------------------------------------------------------------------- #

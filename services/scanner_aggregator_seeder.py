@@ -314,6 +314,19 @@ def _read_1m_bars_for_symbol(
         return historify_bars
 
     broker_bars = _read_1m_bars_from_broker(symbol, exchange, lookback_min, key)
+    # Issue #305: the broker series carries the symbol's REAL T-1 settled
+    # close (the last bar dated before today) — record it in the reference
+    # registry so the scanner can certify the rules' yest_d.close against it.
+    # Recorded regardless of which source wins below: the cross-check is the
+    # whole point when historify is the (possibly stale) chosen source.
+    # Reuses this fetch — adds no broker API load. Never raises.
+    if broker_bars:
+        try:
+            from services.scanner_reference_data import record_prev_close_from_bars
+
+            record_prev_close_from_bars(symbol, broker_bars)
+        except Exception:  # noqa: BLE001 — observability must never break the read
+            logger.exception("aggregator_seeder: broker prev-close record failed for %s", symbol)
     if len(broker_bars) > len(historify_bars):
         logger.info(
             "aggregator_seeder: %s — historify had %d bars (<%d), broker fallback returned %d",

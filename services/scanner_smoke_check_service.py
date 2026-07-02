@@ -44,8 +44,10 @@ the APScheduler thread, and the flag-off path is a no-op.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as _dtime
 
 from utils.logging import get_logger
 
@@ -58,6 +60,28 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 # misconfigured catch-up) doesn't double-alert. Reset at boot, which is fine —
 # a fresh alert after a restart is desirable, not noise.
 _last_alert_date: date | None = None
+
+# --------------------------------------------------------------------------- #
+# Smoke-fail post-hold (issue #305)
+#
+# The 09:18 check historically FAILED loudly and enforced nothing — on
+# 2026-07-02 it flagged the whole universe stale and 118 BUY rows posted
+# anyway. The post-hold turns the FAIL into enforcement: while armed,
+# ScannerService still evaluates + logs rule PASSes (observability) but does
+# NOT persist scan_results or publish ScanHitEvents. Day-scoped + self-
+# expiring at end of session (15:35 IST) so a transient morning failure can
+# never silently disable the scanner beyond today. A later passing re-check
+# (``re_check_and_release`` — wired into the scanner backfill convergence
+# loop) clears it; consult-time enforcement is gated by
+# ``SCANNER_SMOKE_BLOCK_ENABLED`` (default true) so the operator has a
+# runtime kill switch without a restart.
+# --------------------------------------------------------------------------- #
+_HOLD_EXPIRY_IST = _dtime(15, 35)
+
+_hold_lock = threading.Lock()
+_hold_day: date | None = None
+_hold_reason: str = ""
+_hold_set_at: datetime | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -88,6 +112,121 @@ def smoke_check_time() -> tuple[int, int]:
         return int(hh), int(mm)
     except (ValueError, TypeError):
         return 9, 18
+
+
+def smoke_block_enabled() -> bool:
+    """``SCANNER_SMOKE_BLOCK_ENABLED`` env flag (default true). Gates the
+    ENFORCEMENT of the smoke-fail post-hold at consult time — the hold state
+    is always recorded on a failed check, but ``is_post_hold_active`` returns
+    False when this flag is off, so a runtime flip takes effect immediately."""
+    return os.getenv("SCANNER_SMOKE_BLOCK_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Post-hold API (issue #305)
+# --------------------------------------------------------------------------- #
+
+
+def set_post_hold(reason: str, day: date | None = None) -> None:
+    """Arm the smoke-fail post-hold for ``day`` (default today IST).
+
+    Called by the FAIL path of ``assert_scanner_pipeline_healthy``. Idempotent
+    — re-arming on a repeat failure just refreshes the reason/timestamp."""
+    global _hold_day, _hold_reason, _hold_set_at
+    if day is None:
+        day = datetime.now(_IST).date()
+    with _hold_lock:
+        _hold_day = day
+        _hold_reason = reason
+        _hold_set_at = datetime.now(_IST)
+    logger.warning(
+        "scanner smoke-check post-hold ARMED for %s (%s) — rule PASSes will be "
+        "logged but hits NOT persisted/posted until a re-check passes or the hold "
+        "expires at %s IST (enforcement gated by SCANNER_SMOKE_BLOCK_ENABLED=%s)",
+        day.isoformat(),
+        reason,
+        _HOLD_EXPIRY_IST.strftime("%H:%M"),
+        smoke_block_enabled(),
+    )
+
+
+def clear_post_hold(reason: str = "check passed") -> None:
+    """Release the post-hold (PASS path / operator action). No-op when idle."""
+    global _hold_day, _hold_reason, _hold_set_at
+    with _hold_lock:
+        was_armed = _hold_day is not None
+        _hold_day = None
+        _hold_reason = ""
+        _hold_set_at = None
+    if was_armed:
+        logger.info("scanner smoke-check post-hold RELEASED (%s)", reason)
+
+
+def is_post_hold_active(now: datetime | None = None) -> bool:
+    """True iff hit-posting must be held right now.
+
+    Consult-time semantics: enforcement flag on AND the hold was armed for
+    ``now``'s IST date AND the session-end expiry (15:35 IST) has not passed.
+    A hold armed on a prior day never carries over (day-scoped)."""
+    if not smoke_block_enabled():
+        return False
+    with _hold_lock:
+        day = _hold_day
+    if day is None:
+        return False
+    if now is None:
+        now = datetime.now(_IST)
+    if now.date() != day:
+        return False
+    if now.time() >= _HOLD_EXPIRY_IST:
+        return False
+    return True
+
+
+def get_post_hold() -> dict | None:
+    """Observability snapshot of the raw hold state (ignores flag/expiry), or
+    None when idle."""
+    with _hold_lock:
+        if _hold_day is None:
+            return None
+        return {
+            "day": _hold_day.isoformat(),
+            "reason": _hold_reason,
+            "set_at": _hold_set_at.isoformat() if _hold_set_at else None,
+        }
+
+
+def re_check_and_release(**kwargs) -> tuple[bool, dict] | None:
+    """Re-run the pipeline health check ONLY when a post-hold is armed.
+
+    The PASS path of ``assert_scanner_pipeline_healthy`` clears the hold, so a
+    recovered pipeline (e.g. after the backfill convergence refreshed the
+    stale 1m/D data the 09:18 check tripped on) lifts the hold without
+    waiting for the 15:35 expiry. A still-failing re-check re-arms the hold
+    (idempotent). Returns None when no hold is armed. Never raises."""
+    with _hold_lock:
+        armed = _hold_day is not None
+    if not armed:
+        return None
+    try:
+        return assert_scanner_pipeline_healthy(**kwargs)
+    except Exception:
+        logger.exception("scanner smoke-check re_check_and_release raised")
+        return None
+
+
+def _reset_hold_for_tests() -> None:
+    """Wipe the post-hold state (test helper, NOT for production use)."""
+    global _hold_day, _hold_reason, _hold_set_at
+    with _hold_lock:
+        _hold_day = None
+        _hold_reason = ""
+        _hold_set_at = None
 
 
 # --------------------------------------------------------------------------- #
@@ -263,6 +402,9 @@ def assert_scanner_pipeline_healthy(
         # path leaves args=() and is filter-safe by construction.
         logger.info(f"scanner smoke check 09:18 PASSED: {details}")
         health_writer(True, [], details, False)
+        # Issue #305: a passing check releases any armed post-hold (e.g. a
+        # re-check after the backfill convergence refreshed the stale data).
+        clear_post_hold(reason="smoke check passed")
         return True, details
 
     # FAIL — build the reason string and alert (deduped to once per day).
@@ -277,6 +419,12 @@ def assert_scanner_pipeline_healthy(
         reasons.append("broker session not live")
     reason = "; ".join(reasons)
     logger.error(f"scanner smoke check 09:18 FAILED: {reason}")
+
+    # Issue #305: a failed check ARMS the post-hold — ScannerService keeps
+    # evaluating (observability) but stops persisting/posting hits until a
+    # re-check passes or the hold expires at 15:35 IST. Enforcement is
+    # consult-time gated by SCANNER_SMOKE_BLOCK_ENABLED.
+    set_post_hold(reason=reason, day=today)
 
     alert_already_sent_today = _last_alert_date == today
     if not alert_already_sent_today:

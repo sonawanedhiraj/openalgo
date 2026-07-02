@@ -1243,3 +1243,139 @@ def test_replay_bars_snapshot_carries_is_replay_flag():
     lb.on_tick({"ts": dt.datetime(2026, 5, 30, 9, 16, 0), "price": 2.0, "cumulative_volume": 20})
     closes = [bar for bar in live_closes if bar["elapsed_pct"] >= 1.0]
     assert closes and all(bar["is_replay"] is False for bar in closes)
+
+
+# ---------------------------------------------------------------------------
+# Issue #305 — smoke-fail post-hold: a failed 09:18 smoke check blocks hit
+# persistence/posting (PASS still logged); release/expiry restores posting.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_smoke_hold():
+    """Keep the module-level post-hold state clean so an armed hold from one
+    test (or another test file) never bleeds into the fire/no-fire contracts
+    above."""
+    from services import scanner_smoke_check_service as smoke
+
+    smoke._reset_hold_for_tests()
+    yield
+    smoke._reset_hold_for_tests()
+
+
+# The autouse ``_pin_market_hours`` pins the scanner clock to 2026-05-30 11:00
+# IST — the hold must be armed for that same day to be consulted as active.
+_PINNED_DAY = dt.date(2026, 5, 30)
+
+
+def _matching_bar(minute=0):
+    return {
+        "ts": dt.datetime(2026, 5, 30, 11, minute),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,  # well above the trailing EMA
+        "volume": 5000,  # 5× the 1000 baseline
+        "elapsed_pct": 1.0,
+    }
+
+
+def test_smoke_hold_blocks_persist_and_post_but_logs_pass(fresh_scanner_db, caplog):
+    """Hold armed → the rule PASS is still logged, but NO scan_results row is
+    written and NO ScanHitEvent is published; a dedup'd 'scanner HELD'
+    WARNING names the symbol."""
+    import logging
+
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar())
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    assert any("scanner PASS RELIANCE" in r.getMessage() for r in caplog.records)
+    held = [r for r in caplog.records if "scanner HELD RELIANCE" in r.getMessage()]
+    assert len(held) == 1
+    assert "smoke_check_failed" in held[0].getMessage()
+
+
+def test_smoke_hold_warning_deduped_per_symbol_day(fresh_scanner_db, caplog):
+    """Two held PASSes on the same day → both blocked, but only ONE 'scanner
+    HELD' WARNING (per-symbol-per-day dedup)."""
+    import logging
+
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+
+    with caplog.at_level(logging.WARNING, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=0))
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=5))
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    held = [r for r in caplog.records if "scanner HELD RELIANCE" in r.getMessage()]
+    assert len(held) == 1
+
+
+def test_smoke_hold_release_restores_posting(fresh_scanner_db):
+    """Clearing the hold (a passing re-check) restores normal persistence."""
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=0))
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+
+    smoke.clear_post_hold(reason="re-check passed (test)")
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=5))
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    assert len(rows) == 1
+    assert len(capturing_bus.events) == 1
+
+
+def test_smoke_hold_prior_day_does_not_block(fresh_scanner_db):
+    """A hold armed for a PRIOR day never gates today's hits (day-scoped)."""
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="stale hold from yesterday", day=_PINNED_DAY - dt.timedelta(days=1))
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar())
+    assert len(scanner_service.get_scan_results(hours=24, source="inhouse")) == 1
+
+
+def test_smoke_hold_flag_off_does_not_block(fresh_scanner_db, monkeypatch):
+    """SCANNER_SMOKE_BLOCK_ENABLED=false → the hold is never enforced."""
+    from services import scanner_smoke_check_service as smoke
+
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "false")
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar())
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    assert len(rows) == 1
+    assert len(capturing_bus.events) == 1

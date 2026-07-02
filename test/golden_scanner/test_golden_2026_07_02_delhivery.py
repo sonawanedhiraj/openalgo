@@ -29,24 +29,22 @@ Two closely-related fixes bracket this incident and this test's status:
   in a running system the 2026-06-30 bar would no longer be stuck at the
   stale 475.4 value. That fix operates on ``historify.duckdb`` — it does NOT
   touch ``fno_intraday_buy_chartink.py``'s gate logic at all.
-* **Issue #305 (OPEN at the time this test was written)** — proposes a
-  *rule-level* reference-data validation choke point: cross-check
-  ``yest_d.close`` against an independently-captured broker prev-close and
-  REJECT on divergence, so even if a stale value somehow reaches the rule
-  (pipeline fix bypassed, race, or a future regression of #299), the rule
-  itself refuses to fire on it. That defense-in-depth layer does not exist
-  yet.
+* **Issue #305 (SHIPPED — this PR)** — the *rule-level* reference-data
+  validation choke point: cross-check ``yest_d.close`` against an
+  independently-captured broker prev-close
+  (``services/scanner_reference_data.py``) and REJECT on divergence, so even
+  if a stale value somehow reaches the rule (pipeline fix bypassed, race, or
+  a future regression of #299), the rule itself refuses to fire on it. The
+  scanner passes the verdict via the indicators dict; direct rule callers
+  (this test, backtests) are covered by the rule-side fallback that consults
+  the broker prev-close registry itself.
 
 Because this test operates purely at the rule level — it hands the rule a
 frame that already carries the stale reference value, exactly as the rule
 saw it in production before #299 — it is unaffected by #299 (a pipeline fix,
-not a rule fix) and demonstrates the current gap #305 is meant to close.
-
-DESIRED behavior asserted below: BUY must NOT fire when its reference value
-is this stale. That is #305's job. Until #305 lands, this is
-``xfail(strict=False)`` — non-strict so it flips silently to XPASS (not a
-CI failure) once #305 merges. **Remove the xfail marker as part of the #305
-PR** — the comment on the marker says so explicitly.
+not a rule fix) and pins #305's enforcement: with the broker prev-close
+(~510, the real 07-01 settle) recorded the way the boot aggregator_seeder
+records it, BUY must NOT fire on the stale 475.4 reference.
 """
 
 from __future__ import annotations
@@ -56,6 +54,7 @@ from datetime import date, datetime
 import pytest
 
 import services.scan_rules.fno_intraday_buy_chartink as rulemod
+import services.scanner_reference_data as refdata
 from services.scan_rules.fno_intraday_buy_chartink import rule
 from test.fixtures.frame_factory import (
     flat_closes,
@@ -73,6 +72,19 @@ _STALE_YEST_SETTLE_DATE = date(2026, 6, 30)  # the never-re-settled provisional 
 _TODAY_D_CLOSE = 505.8
 _TODAY_D_OPEN = 507.7
 _STALE_YEST_D_CLOSE = 475.4
+# The REAL 2026-07-01 broker-settled close (what the aggregator_seeder's
+# divergence log recorded as broker_last_close) — the value the stale 475.4
+# reference should have been.
+_REAL_BROKER_PREV_CLOSE = 510.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_reference_registry():
+    """Clean broker prev-close registry per test — the module-global registry
+    must not leak the DELHIVERY recording into other test files."""
+    refdata.reset_for_tests()
+    yield
+    refdata.reset_for_tests()
 
 
 def _freeze(monkeypatch, hour, minute=0):
@@ -130,25 +142,23 @@ def _delhivery_incident_frames():
     }
 
 
-@pytest.mark.xfail(
-    reason=(
-        "reference-value validation (cross-checking yest_d.close against an "
-        "independently-captured broker prev-close) lands with issue #305 — "
-        "until then the rule has no way to know its reference is stale. "
-        "REMOVE this marker as part of the #305 PR, once the rule rejects "
-        "this fixture."
-    ),
-    strict=False,
-)
 def test_delhivery_2026_07_02_stale_reference_must_not_fire(monkeypatch):
-    """DESIRED behavior: BUY must NOT fire when yest_d_close is a stale,
-    never-re-settled provisional daily bar — even though every other gate
-    (gap-up math, volume, RSI, ATR, Supertrend) clears against that stale
-    reference, exactly as it did in the live 2026-07-02 incident.
+    """BUY must NOT fire when yest_d_close is a stale, never-re-settled
+    provisional daily bar — even though every other gate (gap-up math,
+    volume, RSI, ATR, Supertrend) clears against that stale reference,
+    exactly as it did in the live 2026-07-02 incident.
     """
     _freeze(monkeypatch, 9, 55)  # mid-morning, matches the incident's 09:30-09:55 firing window
     monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "true")
     monkeypatch.setenv("SCANNER_DBAR_DATE_VERIFY_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_REFERENCE_CHECK_ENABLED", "true")
+
+    # #305: record the broker-known T-1 settled close the way the boot
+    # aggregator_seeder records it in production. The rule's reference
+    # cross-check (rule-side fallback — this test bypasses scanner_service)
+    # compares yest_d.close (475.4) against this and rejects on the ~6.8%
+    # divergence.
+    refdata.record_broker_prev_close("DELHIVERY", _REAL_BROKER_PREV_CLOSE)
 
     ind = _delhivery_incident_frames()
 

@@ -22,10 +22,14 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 @pytest.fixture(autouse=True)
 def _reset_dedup_state():
     """Each test starts with the per-process dedup state clean so a CRIT
-    Telegram in one test cannot block the assertion in the next."""
+    Telegram in one test cannot block the assertion in the next. The issue
+    #305 post-hold is module state too — reset it so an armed hold from a
+    FAIL-path test cannot leak into other tests (or other test files)."""
     svc._last_alert_date = None
+    svc._reset_hold_for_tests()
     yield
     svc._last_alert_date = None
+    svc._reset_hold_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -321,6 +325,109 @@ def test_multiple_gate_failures_all_listed_in_alert():
     assert "scanner_universe_1m stale" in msg
     assert "scanner_universe_D stale" in msg
     assert "broker session not live" in msg
+
+
+# --------------------------------------------------------------------------- #
+# Issue #305 — smoke-fail post-hold
+# --------------------------------------------------------------------------- #
+
+_FAIL_DAY = datetime(2026, 7, 2, 9, 18, tzinfo=_IST)
+
+
+def _mid_session(hour=10, minute=0, day=2):
+    return datetime(2026, 7, day, hour, minute, tzinfo=_IST)
+
+
+def test_fail_arms_post_hold(monkeypatch):
+    """A FAILED check arms the day-scoped post-hold."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    providers, _n, _r = _stub_providers(universe=["A"], aggregator_covered=[])
+    ok, _ = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert ok is False
+    assert svc.is_post_hold_active(now=_mid_session()) is True
+    hold = svc.get_post_hold()
+    assert hold is not None
+    assert hold["day"] == "2026-07-02"
+    assert "aggregator coverage" in hold["reason"]
+
+
+def test_pass_clears_post_hold(monkeypatch):
+    """A later PASSING check releases the hold (the re-check path)."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    fail_providers, _n, _r = _stub_providers(universe=["A"], aggregator_covered=[])
+    svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **fail_providers)
+    assert svc.is_post_hold_active(now=_mid_session()) is True
+
+    pass_providers, _n2, _r2 = _stub_providers(universe=["A"], aggregator_covered=["A"])
+    ok, _ = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **pass_providers)
+    assert ok is True
+    assert svc.is_post_hold_active(now=_mid_session()) is False
+    assert svc.get_post_hold() is None
+
+
+def test_post_hold_expires_at_end_of_session(monkeypatch):
+    """The hold self-expires at 15:35 IST — a transient morning failure can
+    never gate anything beyond the session."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    svc.set_post_hold(reason="test", day=_FAIL_DAY.date())
+    assert svc.is_post_hold_active(now=_mid_session(15, 34)) is True
+    assert svc.is_post_hold_active(now=_mid_session(15, 35)) is False
+    assert svc.is_post_hold_active(now=_mid_session(16, 0)) is False
+
+
+def test_post_hold_is_day_scoped(monkeypatch):
+    """A hold armed yesterday never carries into today."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    svc.set_post_hold(reason="test", day=_FAIL_DAY.date())
+    assert svc.is_post_hold_active(now=_mid_session(day=3)) is False
+
+
+def test_post_hold_flag_off_disables_enforcement(monkeypatch):
+    """SCANNER_SMOKE_BLOCK_ENABLED=false → hold state may exist but is never
+    enforced (consult-time gate → runtime flip works without re-init)."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "false")
+    providers, _n, _r = _stub_providers(universe=["A"], aggregator_covered=[])
+    svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert svc.is_post_hold_active(now=_mid_session()) is False
+
+
+def test_clear_post_hold_releases():
+    svc.set_post_hold(reason="test", day=_FAIL_DAY.date())
+    svc.clear_post_hold(reason="operator")
+    assert svc.get_post_hold() is None
+    assert svc.is_post_hold_active(now=_mid_session()) is False
+
+
+def test_re_check_and_release_noop_without_hold():
+    """No hold armed → re_check_and_release does nothing (no provider calls,
+    no health row) and returns None."""
+    assert svc.re_check_and_release() is None
+
+
+def test_re_check_and_release_lifts_hold_on_pass(monkeypatch):
+    """FAIL at 09:18 → hold armed; a passing re-check (e.g. after the backfill
+    convergence refreshed the stale data) releases it."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    fail_providers, _n, _r = _stub_providers(universe=["A"], aggregator_covered=[])
+    svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **fail_providers)
+    assert svc.is_post_hold_active(now=_mid_session()) is True
+
+    pass_providers, _n2, _r2 = _stub_providers(universe=["A"], aggregator_covered=["A"])
+    res = svc.re_check_and_release(as_of=_FAIL_DAY, **pass_providers)
+    assert res is not None
+    assert res[0] is True
+    assert svc.is_post_hold_active(now=_mid_session()) is False
+
+
+def test_re_check_and_release_keeps_hold_on_repeat_failure(monkeypatch):
+    """A still-failing re-check re-arms the hold — posting stays blocked."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    fail_providers, _n, _r = _stub_providers(universe=["A"], aggregator_covered=[])
+    svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **fail_providers)
+    res = svc.re_check_and_release(as_of=_FAIL_DAY, **fail_providers)
+    assert res is not None
+    assert res[0] is False
+    assert svc.is_post_hold_active(now=_mid_session()) is True
 
 
 # --------------------------------------------------------------------------- #

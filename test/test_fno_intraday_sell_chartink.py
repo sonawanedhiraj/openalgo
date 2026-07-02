@@ -48,9 +48,19 @@ def _default_post_close(monkeypatch):
     an artifact of the test setup, not a production condition (in production
     Path B, today_d.close IS the live 5m close). The dedicated divergence-block
     tests below opt the flag back on explicitly.
+
+    Issue #305: also reset the module-global broker prev-close registry —
+    the rule's fallback cross-check consults it whenever the indicators dict
+    carries no explicit verdict, so a recording leaked from another test file
+    on the same xdist worker would reject these synthetic setups.
     """
+    from services import scanner_reference_data as refdata
+
+    refdata.reset_for_tests()
     _freeze(monkeypatch, 16, 0)
     monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "false")
+    yield
+    refdata.reset_for_tests()
 
 
 # --------------------------------------------------------------------------- #
@@ -642,3 +652,112 @@ def test_divergence_only_warns_when_block_flag_off(monkeypatch, caplog):
     assert any("diverges" in r.message for r in caplog.records)
     assert not any("REJECTING on divergence" in r.message for r in caplog.records)
     assert result is True
+
+
+# --------------------------------------------------------------------------- #
+# Reference certificate gate (issue #305)
+# --------------------------------------------------------------------------- #
+def test_reference_uncertified_rejects_and_alerts(monkeypatch):
+    """indicators['reference_certified'] is False → early rejection + the
+    scanner_reference CRIT divergence alert (SELL mirror of the 2026-07-02
+    DELHIVERY stale-reference class)."""
+    import services.source_divergence_alerts as sda
+
+    calls = []
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: calls.append(kw) or True)
+    rulemod._uncertified_warned.clear()
+
+    ind = happy()
+    ind["symbol"] = "DELHIVERY"
+    ind["reference_certified"] = False
+    ind["reference_settled_close"] = 475.4
+    ind["reference_broker_prev_close"] = 510.0
+    ind["reference_divergence_pct"] = 6.78
+
+    assert rule(None, ind) is False
+    assert len(calls) == 1
+    assert calls[0]["service"] == "scanner_reference"
+    assert calls[0]["symbol"] == "DELHIVERY"
+    assert calls[0]["source_a_value"] == 475.4
+    assert calls[0]["source_b_value"] == 510.0
+
+
+def test_reference_certified_true_passes():
+    """An explicitly-certified reference does not block a valid setup."""
+    ind = happy()
+    ind["reference_certified"] = True
+    assert rule(None, ind) is True
+
+
+def test_reference_missing_key_treated_as_certified():
+    """Backward compat: an indicators dict WITHOUT the reference keys (unit
+    tests / other callers) evaluates exactly as before."""
+    ind = happy()
+    assert "reference_certified" not in ind
+    assert rule(None, ind) is True
+
+
+def test_reference_uncertified_warning_deduped_per_symbol_day(monkeypatch, caplog):
+    """The rejection WARNING fires once per (symbol, IST-day); the rejection
+    itself always holds on every re-fire."""
+    import logging
+
+    import services.source_divergence_alerts as sda
+
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: True)
+    rulemod._uncertified_warned.clear()
+
+    ind = happy()
+    ind["symbol"] = "DELHIVERY"
+    ind["reference_certified"] = False
+    ind["reference_settled_close"] = 475.4
+    ind["reference_broker_prev_close"] = 510.0
+    ind["reference_divergence_pct"] = 6.78
+
+    with caplog.at_level(logging.WARNING, logger="services.scan_rules.fno_intraday_sell_chartink"):
+        for _ in range(5):
+            assert rule(None, ind) is False
+    warns = [
+        r
+        for r in caplog.records
+        if "NOT certified against broker prev-close" in r.message and "DELHIVERY" in r.message
+    ]
+    assert len(warns) == 1, f"expected 1 dedup'd warning, got {len(warns)}"
+
+
+def test_reference_fallback_consults_registry_when_no_verdict(monkeypatch):
+    """Option (a) of issue #305: with NO reference keys in the indicators dict
+    (direct rule callers), the rule consults the broker prev-close registry
+    itself and rejects on a confirmed divergence."""
+    import services.scanner_reference_data as refdata
+    import services.source_divergence_alerts as sda
+
+    calls = []
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: calls.append(kw) or True)
+    rulemod._uncertified_warned.clear()
+    refdata.reset_for_tests()
+    try:
+        # happy() yest_d.close is 2000.0; a broker prev-close of 2100 → ~4.76%
+        # divergence > 1.0% default → reject.
+        refdata.record_broker_prev_close("DELHIVERY", 2100.0)
+        ind = happy()
+        ind["symbol"] = "DELHIVERY"
+        assert "reference_certified" not in ind
+        assert rule(None, ind) is False
+        assert len(calls) == 1
+        assert calls[0]["service"] == "scanner_reference"
+        assert calls[0]["source_a_value"] == 2000.0
+        assert calls[0]["source_b_value"] == 2100.0
+    finally:
+        refdata.reset_for_tests()
+
+
+def test_reference_fallback_fail_open_when_registry_empty():
+    """No broker prev-close recorded → the fallback is a no-op (fail-open on
+    the missing cross-check) and a valid setup still fires."""
+    import services.scanner_reference_data as refdata
+
+    refdata.reset_for_tests()
+    ind = happy()
+    ind["symbol"] = "DELHIVERY"
+    assert rule(None, ind) is True
