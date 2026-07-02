@@ -85,6 +85,18 @@ export interface RecentTrade {
   created_at: string | null
 }
 
+// Latest data-freshness (data_health_check) state for the strategy's feed (#237).
+export interface DataHealth {
+  available: boolean
+  reason?: string
+  feed?: string
+  shared?: boolean
+  overall_ok?: boolean
+  check_at?: string | null
+  stale_count?: number
+  stale_symbols?: string[]
+}
+
 export interface StrategyDetail {
   name: string
   display_name: string
@@ -96,6 +108,7 @@ export interface StrategyDetail {
   config_snapshot: Record<string, unknown>
   active_overrides: ActiveOverride[]
   health: StrategyHealth
+  data_health: DataHealth
   performance: StrategyPerformance
   recent_trades: RecentTrade[]
   version_log: VersionLogEntry[]

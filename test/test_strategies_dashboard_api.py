@@ -877,3 +877,88 @@ def test_llm_decisions_empty_for_non_veto_strategy(app, wired_llm_dbs):
     assert body["rows"] == []
     assert body["total"] == 0
     assert body["summary"] is None
+
+
+# --------------------------------------------------------------------------- #
+# _data_health_summary — dashboard data-freshness tile (issue #237 Part 3)
+# --------------------------------------------------------------------------- #
+
+
+def test_data_health_summary_ok(monkeypatch):
+    import blueprints.strategies_dashboard_api as sda
+
+    monkeypatch.setattr(
+        "database.data_health_db.get_latest_check",
+        lambda feed: {
+            "check_at": "2026-07-02T11:00:00",
+            "overall_ok": True,
+            "stale_symbols": [],
+        },
+    )
+    out = sda._data_health_summary("sector_follow_cap5_vol")
+    assert out["available"] is True
+    assert out["overall_ok"] is True
+    assert out["feed"] == "sector_follow_cap5_vol"
+    assert out["shared"] is False
+    assert out["stale_count"] == 0
+
+
+def test_data_health_summary_stale(monkeypatch):
+    import blueprints.strategies_dashboard_api as sda
+
+    monkeypatch.setattr(
+        "database.data_health_db.get_latest_check",
+        lambda feed: {
+            "check_at": "2026-07-02T16:30:00",
+            "overall_ok": False,
+            "stale_symbols": ["NIFTYAUTO", "NIFTYIT"],
+        },
+    )
+    out = sda._data_health_summary("sector_follow_cap5_vol")
+    assert out["available"] is True
+    assert out["overall_ok"] is False
+    assert out["stale_count"] == 2
+    assert out["stale_symbols"] == ["NIFTYAUTO", "NIFTYIT"]
+
+
+def test_data_health_summary_futures_is_shared_feed(monkeypatch):
+    """futures_follow reuses the sector_follow feed → shared=True, feed relabelled."""
+    import blueprints.strategies_dashboard_api as sda
+
+    monkeypatch.setattr(
+        "database.data_health_db.get_latest_check",
+        lambda feed: {"check_at": "x", "overall_ok": True, "stale_symbols": []},
+    )
+    out = sda._data_health_summary("futures_follow_cap50")
+    assert out["available"] is True
+    assert out["feed"] == "sector_follow_cap5_vol"
+    assert out["shared"] is True
+
+
+def test_data_health_summary_no_feed_check_for_simplified():
+    import blueprints.strategies_dashboard_api as sda
+
+    out = sda._data_health_summary("simplified_engine")
+    assert out["available"] is False
+    assert out["reason"] == "no_feed_check"
+
+
+def test_data_health_summary_no_row_yet(monkeypatch):
+    import blueprints.strategies_dashboard_api as sda
+
+    monkeypatch.setattr("database.data_health_db.get_latest_check", lambda feed: None)
+    out = sda._data_health_summary("sector_follow_cap5_vol")
+    assert out["available"] is False
+    assert out["reason"] == "no_check_yet"
+
+
+def test_data_health_summary_read_error_is_swallowed(monkeypatch):
+    import blueprints.strategies_dashboard_api as sda
+
+    def boom(feed):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("database.data_health_db.get_latest_check", boom)
+    out = sda._data_health_summary("sector_follow_cap5_vol")
+    assert out["available"] is False
+    assert out["reason"] == "read_error"

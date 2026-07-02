@@ -420,6 +420,48 @@ def _health_led(name: str, overrides: list[dict], config: dict) -> str:
     return "healthy"
 
 
+# Dashboard folder name -> the strategy_name the data_health_check row is keyed
+# under. futures_follow reuses the sector_follow feed (its evaluator is shared),
+# so its freshness IS the sector_follow feed's freshness. The simplified engine
+# is webhook-driven and runs no data-freshness check, so it has no row.
+_DATA_HEALTH_FEED = {
+    "sector_follow_cap5_vol": "sector_follow_cap5_vol",
+    "futures_follow_cap50": "sector_follow_cap5_vol",
+}
+
+
+def _data_health_summary(name: str) -> dict:
+    """Compact latest data-freshness state for the dashboard tile (issue #237).
+
+    Surfaces the most recent ``data_health_check`` row for the strategy's feed:
+    ``overall_ok`` + ``check_at`` + a stale-symbol count (+ a short sample). Never
+    raises — returns ``{"available": False, ...}`` when the strategy has no feed
+    check or the read fails, so the tile renders "no check" rather than erroring.
+    """
+    feed = _DATA_HEALTH_FEED.get(name)
+    if feed is None:
+        return {"available": False, "reason": "no_feed_check"}
+    try:
+        from database.data_health_db import get_latest_check
+
+        row = get_latest_check(feed)
+    except Exception:
+        logger.exception("data_health tile: get_latest_check failed for %s", name)
+        return {"available": False, "reason": "read_error"}
+    if not row:
+        return {"available": False, "reason": "no_check_yet", "feed": feed}
+    stale = row.get("stale_symbols") or []
+    return {
+        "available": True,
+        "feed": feed,
+        "shared": feed != name,
+        "overall_ok": bool(row.get("overall_ok")),
+        "check_at": row.get("check_at"),
+        "stale_count": len(stale),
+        "stale_symbols": stale[:10],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Strategy summary builder
 # ---------------------------------------------------------------------------
@@ -622,6 +664,7 @@ def strategy_detail(name: str):
                 "config_snapshot": config,
                 "active_overrides": overrides,
                 "health": _health_led(name, overrides, config),
+                "data_health": _data_health_summary(name),
                 "performance": performance,
                 "recent_trades": recent_trades,
                 "version_log": version_log,
