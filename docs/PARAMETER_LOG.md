@@ -1428,6 +1428,52 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
   - **2026-07-02:** Introduced as part of issue #239. Paired with the
     `SCANNER_PREENTRY_REFRESH_*` job above.
 
+## `SCANNER_REFERENCE_*` — reference-data certificate (issue #305)
+
+- **`SCANNER_REFERENCE_CHECK_ENABLED`** (default `true`): master gate for the
+  reference-data certificate + rule-side cross-check
+  (`services/scanner_reference_data.py`). The scanner validates the rules'
+  settled reference close (`yest_d.close`) against the broker prev-close the
+  aggregator_seeder records at boot; a confirmed divergence REJECTS the symbol
+  (fail-closed) while a missing broker prev-close fail-opens with a dedup'd
+  WARNING. `false` -> no verdict computed or consulted anywhere (pre-#305
+  behavior).
+- **`SCANNER_REFERENCE_DIVERGENCE_MAX_PCT`** (default `1.0`): max settled-reference
+  vs broker-prev-close divergence (percent) before the reference is NOT
+  certified. The 2026-07-02 DELHIVERY incident divergence was 6.78%.
+- **History:**
+  - **2026-07-02:** Introduced by issue #305 / PR #312 after the DELHIVERY
+    42x false-BUY on a stale historify-D reference (475.4 vs real 510.0).
+
+## `SCANNER_SMOKE_BLOCK_ENABLED` — smoke-fail post-hold enforcement (issue #305)
+
+- **`SCANNER_SMOKE_BLOCK_ENABLED`** (default `true`): consult-time enforcement
+  gate for the 09:18 smoke-check post-hold. While a failed smoke check's hold
+  is armed, rule PASSes are still logged but hits are NOT persisted to
+  scan_results or posted to the engine; the hold releases on a passing
+  re-check (wired into the backfill convergence tick) and self-expires at
+  15:35 IST. `false` -> the 09:18 FAIL is alert-only (pre-#305 behavior).
+  Runtime flips take effect immediately (no restart).
+- **History:**
+  - **2026-07-02:** Introduced by issue #305 / PR #312 — on 2026-07-02 the
+    09:18 check FAILED loudly ("scanner_universe_1m stale; scanner_universe_D
+    stale") and 118 BUY rows posted anyway; this flag turns that class of
+    failure into enforcement.
+
+## `SCANNER_BACKFILL_MAX_CATCHUP_DAYS` — backfill catch-up ceiling (issue #304)
+
+- **`SCANNER_BACKFILL_MAX_CATCHUP_DAYS`** (default `7`, floor 1): explicit,
+  operator-tunable ceiling on the scanner-universe backfill's incremental
+  catch-up window, on top of the per-interval `_LOOKBACK_DAYS` floor (4 for
+  `1m`, 15 for `D`). When the gap is wider than the cap, the window is
+  clamped and a WARNING names the affected symbols and the manual CLI
+  (`uv run python -m services.scanner_universe_backfill --from --to
+  --interval`) for the deeper backfill.
+- **History:**
+  - **2026-07-02:** Introduced by issue #304 / PR #311, alongside
+    verified-refresh reporting (refreshed counts are post-job verified reads,
+    never submission counts).
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
