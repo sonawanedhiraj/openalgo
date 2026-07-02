@@ -157,6 +157,27 @@ def _list_backtest_refs(name: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _ist_date_str(created_at: datetime | None) -> str | None:
+    """IST calendar date (YYYY-MM-DD) for a trade row's ``created_at`` timestamp.
+
+    ``created_at`` is stored as a naive UTC datetime (``datetime.utcnow`` default),
+    so it must be localized to UTC and converted to IST before taking the date —
+    this is the *execution* date of the order leg, used to bucket a T+1 exit under
+    the day it actually filled (see ``_futures_follow_stats``). Returns None on a
+    missing/unparseable value.
+    """
+    if created_at is None:
+        return None
+    try:
+        return pytz.utc.localize(created_at).astimezone(_IST).strftime("%Y-%m-%d")
+    except Exception:
+        # Already tz-aware or otherwise odd — best-effort direct format.
+        try:
+            return created_at.astimezone(_IST).strftime("%Y-%m-%d")
+        except Exception:
+            return created_at.strftime("%Y-%m-%d")
+
+
 def _get_strategy_mode(name: str) -> str:
     """Return current mode from strategy_mode table, default 'sandbox'."""
     try:
@@ -261,23 +282,42 @@ def _sector_follow_stats(since: datetime | None = None) -> dict:
 
 
 def _futures_follow_stats(since: datetime | None = None) -> dict:
-    """Aggregate P&L and position stats from futures_follow_trades."""
+    """Aggregate P&L and position stats from futures_follow_trades.
+
+    Bucketing note (issue #301): the strategy holds T+1, so an **exit (SELL)** row
+    carries the *original entry session* in ``entry_date`` (yesterday), NOT the day
+    it filled. Today's realized P&L and trade count must therefore key an exit off
+    its **execution timestamp** (``created_at``, IST date), while an **entry (BUY)**
+    row is correctly keyed by ``entry_date`` (which IS its execution date). Keying
+    exits off ``entry_date`` was the bug that showed ₹0 today despite a profitable
+    T+1 sell.
+    """
     try:
         q = ff_session.query(FuturesFollowTrade)
         if since:
             q = q.filter(FuturesFollowTrade.created_at >= since)
         trades = q.all()
         today_str = datetime.now(_IST).strftime("%Y-%m-%d")
-        entries = [t for t in trades if t.side == "BUY" and t.entry_date == today_str]
-        exits = [t for t in trades if t.side == "SELL" and t.entry_date == today_str]
-        open_count = max(0, len(entries) - len(exits))
-        today_pnl = sum((t.net_pnl or 0.0) for t in exits if t.net_pnl is not None)
+        entries_today = [t for t in trades if t.side == "BUY" and t.entry_date == today_str]
+        exits_today = [
+            t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
+        ]
+        today_pnl = sum((t.net_pnl or 0.0) for t in exits_today if t.net_pnl is not None)
+        # Open = net placed legs across ALL sessions (placed BUYs − placed SELLs),
+        # so an overnight-held position stays counted until its T+1 exit fills.
+        # (Pairing today's exits against today's entries is wrong: today's SELL
+        # closes YESTERDAY's entry, not one of today's.)
+        placed = [t for t in trades if (t.status or "") == "placed"]
+        open_count = max(
+            0,
+            sum(1 for t in placed if t.side == "BUY") - sum(1 for t in placed if t.side == "SELL"),
+        )
         last = max((t.created_at for t in trades), default=None)
         return {
             "open_positions": open_count,
             "today_net_pnl": round(today_pnl, 2),
             "last_trade_at": last.isoformat() if last else None,
-            "today_trade_count": len(entries) + len(exits),
+            "today_trade_count": len(entries_today) + len(exits_today),
         }
     except Exception:
         logger.exception("Failed to aggregate futures_follow_stats")
@@ -382,7 +422,12 @@ def _pnl_curve_sector_follow(window_days: int | None) -> list[dict]:
 
 
 def _pnl_curve_futures_follow(window_days: int | None) -> list[dict]:
-    """Daily P&L series from futures_follow_trades (net_pnl on exit rows)."""
+    """Daily realized-P&L series from futures_follow_trades (net_pnl on exit rows).
+
+    Keyed by the exit's **execution date** (``created_at`` IST) — the day the P&L
+    was realized — not ``entry_date`` (the original entry session for a T+1 exit),
+    so the curve agrees with the ``today_net_pnl`` shown on the card (issue #301).
+    """
     try:
         q = ff_session.query(FuturesFollowTrade).filter(
             FuturesFollowTrade.side == "SELL",
@@ -394,7 +439,7 @@ def _pnl_curve_futures_follow(window_days: int | None) -> list[dict]:
         rows = q.order_by(FuturesFollowTrade.created_at).all()
         by_date: dict[str, float] = {}
         for r in rows:
-            d = r.entry_date
+            d = _ist_date_str(r.created_at) or r.entry_date
             by_date[d] = by_date.get(d, 0.0) + (r.net_pnl or 0.0)
         return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
     except Exception:
