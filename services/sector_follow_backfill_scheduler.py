@@ -171,14 +171,20 @@ def run_backfill_checks(today=None) -> dict:
 def _log_and_alert(res: dict, phase: str) -> None:
     idx = res.get("index", {})
     stk = res.get("stock", {})
+    # Issue #313 (ports #304) — refreshed/still_stale are now VERIFIED post-job
+    # counts (re-read MAX(timestamp) after the job completes), not submission
+    # counts, so "refreshed=N errors=0" can no longer be logged purely because
+    # a download job was accepted.
     logger.info(
-        "sector_follow backfill %s: index(stale=%d refreshed=%d) "
-        "stock(stale=%d refreshed=%d) all_fresh=%s errors=%d",
+        "sector_follow backfill %s: index(stale=%d verified_fresh=%d still_stale=%d) "
+        "stock(stale=%d verified_fresh=%d still_stale=%d) all_fresh=%s errors=%d",
         phase,
         len(idx.get("stale_symbols", [])),
         len(idx.get("refreshed", [])),
+        len(idx.get("still_stale", [])),
         len(stk.get("stale_symbols", [])),
         len(stk.get("refreshed", [])),
+        len(stk.get("still_stale", [])),
         res.get("all_fresh"),
         len(res.get("errors", [])),
     )
