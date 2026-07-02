@@ -1255,7 +1255,11 @@ class FuturesFollowService:
         }
 
         if ok:
-            logger.info("futures_follow 15:18 smoke check PASSED: %s", details)
+            # f-string (not %-args): a cross-suite logging-filter interaction can
+            # leave a stray format arg on the record and make lazy "%s"-arg
+            # formatting raise "not all arguments converted" here; eager
+            # interpolation sidesteps it (details has no % chars).
+            logger.info(f"futures_follow 15:18 smoke check PASSED: {details}")
             return True, details
 
         reasons = []
@@ -1267,7 +1271,7 @@ class FuturesFollowService:
         if not session_ok:
             reasons.append("broker session not live")
         reason = "; ".join(reasons)
-        logger.error("futures_follow 15:18 SMOKE CHECK FAILED: %s", reason)
+        logger.error(f"futures_follow 15:18 SMOKE CHECK FAILED: {reason}")
 
         # Hold today's 15:20 entries via a self-expiring pause override (expires 15:30).
         expires_ist = as_of.replace(hour=15, minute=30, second=0, microsecond=0)
