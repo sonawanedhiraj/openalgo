@@ -46,9 +46,19 @@ def _default_post_close(monkeypatch):
     — an artifact of the test setup, not a production condition (in production
     Path B, today_d.close IS the live 5m close). The dedicated divergence-block
     tests below opt the flag back on explicitly.
+
+    Issue #305: also reset the module-global broker prev-close registry —
+    the rule's fallback cross-check consults it whenever the indicators dict
+    carries no explicit verdict, so a recording leaked from another test file
+    on the same xdist worker would reject these synthetic setups.
     """
+    from services import scanner_reference_data as refdata
+
+    refdata.reset_for_tests()
     _freeze(monkeypatch, 16, 0)
     monkeypatch.setenv("SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED", "false")
+    yield
+    refdata.reset_for_tests()
 
 
 # --------------------------------------------------------------------------- #
