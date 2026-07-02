@@ -267,6 +267,7 @@ def _persist_health(res: dict) -> None:
                 details={
                     "interval": interval,
                     "refreshed": ires.get("refreshed", []),
+                    "still_stale": ires.get("still_stale", []),
                     "skipped_fresh_count": len(ires.get("skipped_fresh", [])),
                     "errors": ires.get("errors", []),
                 },
@@ -278,12 +279,18 @@ def _persist_health(res: dict) -> None:
 
 def _log_and_alert(res: dict, phase: str) -> None:
     for interval, ires in res.get("intervals", {}).items():
+        # Issue #304 — refreshed/still_stale are now VERIFIED post-job counts
+        # (re-read MAX(timestamp) after the job completes), not submission
+        # counts, so "refreshed=N errors=0" can no longer be logged purely
+        # because a download job was accepted.
         logger.info(
-            "scanner backfill %s [%s]: stale=%d refreshed=%d skipped_fresh=%d errors=%d",
+            "scanner backfill %s [%s]: stale=%d verified_fresh=%d still_stale=%d "
+            "skipped_fresh=%d errors=%d",
             phase,
             interval,
             len(ires.get("stale_symbols", [])),
             len(ires.get("refreshed", [])),
+            len(ires.get("still_stale", [])),
             len(ires.get("skipped_fresh", [])),
             len(ires.get("errors", [])),
         )
