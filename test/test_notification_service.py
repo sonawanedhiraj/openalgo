@@ -234,16 +234,104 @@ def test_notify_legacy_primary_when_running(monkeypatch):
     assert inbound.sent == []  # inbound untouched
 
 
-def test_notify_unknown_event_type_logs_warning(monkeypatch, caplog):
+def test_notify_unknown_event_type_delivers_with_warning(monkeypatch, caplog):
+    """Unknown event_type is now fail-open: message is DELIVERED, not dropped.
+
+    The WARNING is still emitted (to prompt registration), but the message
+    reaches the operator — a misrouted alert is recoverable; a silently-dropped
+    one is not (issue #243).
+    """
     bot = _RecordingBot(is_running=True)
     _install_fake_bot(monkeypatch, bot)
     svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
 
     with caplog.at_level(logging.WARNING):
-        svc.notify("not_a_real_event", "anything")
+        svc.notify("not_a_real_event", "should still arrive")
+
+    # Fail-open: message must reach the bot.
+    assert len(bot.sent) == 1
+    assert "should still arrive" in bot.sent[0][0]
+    # Warning is still emitted so operators know to register the event_type.
+    assert any("unknown event_type" in rec.message for rec in caplog.records)
+
+
+def test_notify_unknown_event_type_drops_when_flag_off(monkeypatch, caplog):
+    """NOTIFY_UNKNOWN_EVENTS=false restores old warn-and-drop behaviour."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(
+        monkeypatch,
+        NOTIFY_TELEGRAM_ENABLED="true",
+        NOTIFY_UNKNOWN_EVENTS="false",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        svc.notify("not_a_real_event", "should be dropped")
 
     assert bot.sent == []
     assert any("unknown event_type" in rec.message for rec in caplog.records)
+
+
+def test_notify_orphan_exit_reconciliation_routes_through_telegram(monkeypatch, caplog):
+    """orphan_exit_reconciliation is registered → delivers, no drop warning."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    with caplog.at_level(logging.WARNING):
+        svc.notify("orphan_exit_reconciliation", "9 orphan(s) found, 9 reconciled, 0 errors")
+
+    assert len(bot.sent) == 1
+    assert "9 orphan(s)" in bot.sent[0][0]
+    assert not any("unknown event_type" in rec.message for rec in caplog.records)
+
+
+def test_notify_scanner_aggregator_seed_routes_through_telegram(monkeypatch, caplog):
+    """scanner_aggregator_seed is registered → delivers, no drop warning."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(monkeypatch, NOTIFY_TELEGRAM_ENABLED="true")
+
+    with caplog.at_level(logging.WARNING):
+        svc.notify("scanner_aggregator_seed", "aggregator seeded: 238 symbols")
+
+    assert len(bot.sent) == 1
+    assert "aggregator seeded" in bot.sent[0][0]
+    assert not any("unknown event_type" in rec.message for rec in caplog.records)
+
+
+def test_notify_orphan_exit_reconciliation_per_event_toggle(monkeypatch):
+    """NOTIFY_ORPHAN_EXIT_RECONCILIATION=false suppresses orphan_exit_reconciliation."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(
+        monkeypatch,
+        NOTIFY_TELEGRAM_ENABLED="true",
+        NOTIFY_ORPHAN_EXIT_RECONCILIATION="false",
+    )
+
+    svc.notify("orphan_exit_reconciliation", "should be silent")
+    svc.notify("cycle_summary", "should fire")
+
+    assert len(bot.sent) == 1
+    assert "should fire" in bot.sent[0][0]
+
+
+def test_notify_scanner_aggregator_seed_per_event_toggle(monkeypatch):
+    """NOTIFY_SCANNER_AGGREGATOR_SEED=false suppresses scanner_aggregator_seed."""
+    bot = _RecordingBot(is_running=True)
+    _install_fake_bot(monkeypatch, bot)
+    svc = _fresh_service(
+        monkeypatch,
+        NOTIFY_TELEGRAM_ENABLED="true",
+        NOTIFY_SCANNER_AGGREGATOR_SEED="false",
+    )
+
+    svc.notify("scanner_aggregator_seed", "should be silent")
+    svc.notify("cycle_summary", "should fire")
+
+    assert len(bot.sent) == 1
+    assert "should fire" in bot.sent[0][0]
 
 
 # ---------------------------------------------------------------------------

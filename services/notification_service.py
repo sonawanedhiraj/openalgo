@@ -195,7 +195,29 @@ class NotificationService:
             # live 5m close) disagree by more than the divergence threshold.
             # Per-(service, symbol, day) dedup is in the helper, NOT here.
             "source_divergence": _env_bool("NOTIFY_SOURCE_DIVERGENCE", default=True),
+            # Orphan-exit reconciliation summary (issue #243). Fires once per
+            # trading day when the reconciliation service finds and stamps
+            # orphaned exit rows. Default ON — the operator wants confirmation
+            # that orphan recovery ran (or a gap if it didn't). Caller:
+            # services/orphan_exit_reconciliation_service.py.
+            "orphan_exit_reconciliation": _env_bool(
+                "NOTIFY_ORPHAN_EXIT_RECONCILIATION", default=True
+            ),
+            # Scanner aggregator seeding completion (issue #243). Fires at boot
+            # and on reconnect when the in-process bar aggregator is seeded from
+            # historify. Default ON — seeding success/failure determines whether
+            # the scanner has warm bars going into the trading day, so the
+            # operator needs visibility. Caller: services/scanner_service.py
+            # (aggregator-seeding path).
+            "scanner_aggregator_seed": _env_bool("NOTIFY_SCANNER_AGGREGATOR_SEED", default=True),
         }
+        # Whether to deliver messages for event_types NOT in per_event (i.e.
+        # future callers that ship without a registry entry). When True (default)
+        # the message is still sent — with a WARNING logged — so no operator
+        # alert is silently lost. Set NOTIFY_UNKNOWN_EVENTS=false to restore
+        # the old warn-and-drop behaviour (useful in high-noise test/dev
+        # environments where new event_types are being explored).
+        self.deliver_unknown: bool = _env_bool("NOTIFY_UNKNOWN_EVENTS", default=True)
         # Preflight-abort alert de-duplication state (2026-06-03 incident: a
         # 14s DNS blip produced 14 identical "🛑 Preflight aborted" alerts as
         # every scan slot re-tripped the same rolling-hour error gate). All
@@ -230,12 +252,24 @@ class NotificationService:
         if not self.enabled:
             return
         if event_type not in self.per_event:
-            logger.warning(
-                "notification_service.notify: unknown event_type=%r — dropping",
-                event_type,
-            )
-            return
-        if not self.per_event[event_type]:
+            if self.deliver_unknown:
+                # Fail-open: deliver the message anyway so no alert is silently
+                # lost. The WARNING tells the operator to register the event_type
+                # in per_event. Set NOTIFY_UNKNOWN_EVENTS=false to drop instead.
+                logger.warning(
+                    "notification_service.notify: unknown event_type=%r — "
+                    "delivering via generic fallback (set NOTIFY_UNKNOWN_EVENTS=false "
+                    "to suppress unknown events)",
+                    event_type,
+                )
+            else:
+                logger.warning(
+                    "notification_service.notify: unknown event_type=%r — dropping "
+                    "(NOTIFY_UNKNOWN_EVENTS=false)",
+                    event_type,
+                )
+                return
+        elif not self.per_event[event_type]:
             return
 
         try:
