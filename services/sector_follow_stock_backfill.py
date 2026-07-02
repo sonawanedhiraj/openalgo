@@ -156,7 +156,16 @@ def check_and_refresh_if_stale(
     broker session) is ``logger.exception``-logged and recorded in ``errors``,
     never raised.
 
-    Returns ``{status, stale_symbols, refreshed, errors, skipped_fresh}``.
+    Issue #313 (ports the #304 scanner fix) — ``refreshed`` is no longer set
+    purely because the download job was *submitted*: after the job reaches a
+    terminal state, MAX(timestamp) per stock is re-read and a stock only counts
+    as refreshed if its coverage actually advanced. Stocks that remain behind
+    after a completed job are reported in ``still_stale`` rather than silently
+    counted as done, and a >20% still-stale rate after a completed run lands in
+    ``errors`` so the scheduler's anomaly-alert path fires.
+
+    Returns ``{status, stale_symbols, refreshed, still_stale, errors,
+    skipped_fresh}``.
     """
     ref = today or date.today()
     path = duckdb_path or _DEFAULT_DUCKDB_PATH
@@ -166,6 +175,7 @@ def check_and_refresh_if_stale(
         "status": "ok",
         "stale_symbols": [],
         "refreshed": [],
+        "still_stale": [],
         "errors": [],
         "skipped_fresh": [],
     }
@@ -221,11 +231,100 @@ def check_and_refresh_if_stale(
     if bf.get("job_id"):
         result["job_id"] = bf["job_id"]
     if bf.get("status") == "success":
-        result["refreshed"] = stale
+        # Issue #313 (ports #304) — submission success is NOT completion. Block
+        # until the job reaches a terminal state, then re-read freshness and
+        # only count a stock as refreshed if its coverage actually advanced.
+        # Without this, a job that starts cleanly but fails/partially completes
+        # mid-download (dead token mid-batch, per-symbol broker error) was
+        # reported `errors=0` with every stale stock marked refreshed.
+        _verify_and_report_refresh(result, bf.get("job_id"), path, stale, ref)
     else:
+        logger.warning(
+            "sector_follow stock catch-up FAILED for %d stock(s) — %s — symbols=%s",
+            len(stale),
+            bf.get("message", "unknown backfill error"),
+            stale,
+        )
         result["status"] = "error"
         result["errors"].append(bf.get("message", "unknown backfill error"))
+        result["still_stale"] = list(stale)
     return result
+
+
+def _verify_and_report_refresh(
+    result: dict,
+    job_id: str | None,
+    duckdb_path: str,
+    stale: list[str],
+    ref: date,
+) -> None:
+    """Wait for the submitted job, then verify each stale stock actually advanced.
+
+    Mutates ``result`` in place: ``refreshed`` only contains stocks whose
+    MAX(timestamp) advanced to (or past) ``ref``'s business day after the job
+    finished; the remainder land in ``still_stale``. A verification read failure
+    is fail-graceful — it falls back to submission-based reporting (the
+    pre-#313 behavior) rather than raising, but is loudly logged so the
+    degraded verification is diagnosable.
+    """
+    if job_id:
+        try:
+            from services.historify_service import wait_for_jobs
+
+            wait_for_jobs([job_id])
+        except Exception:  # waiting must never break the caller
+            logger.exception(
+                "sector_follow stock catch-up: wait_for_jobs raised for job_id=%s — "
+                "verifying freshness anyway",
+                job_id,
+            )
+
+    try:
+        # compute_stale_symbols returns (stale, fresh, details) — "stale" here
+        # means "still behind after the completed job", "fresh" means "verified
+        # refreshed". max_staleness_business_days=0 always re-checks against
+        # today's expected close, independent of the caller's original threshold
+        # (a job is either caught all the way up or it isn't).
+        still_stale, verified_fresh, _details = compute_stale_symbols(
+            duckdb_path,
+            stale,
+            today=ref,
+            max_staleness_business_days=0,
+        )
+    except Exception as e:  # verification read failure — fail open to submission-based
+        logger.exception(
+            "sector_follow stock catch-up: post-job freshness verification failed (%s) — "
+            "falling back to submission-based reporting for %d stock(s)",
+            e,
+            len(stale),
+        )
+        result["refreshed"] = list(stale)
+        return
+
+    result["refreshed"] = verified_fresh
+    result["still_stale"] = still_stale
+    logger.info(
+        "sector_follow stock catch-up verified: verified_fresh=%d still_stale=%d",
+        len(verified_fresh),
+        len(still_stale),
+    )
+
+    if not stale:
+        return
+    still_stale_pct = len(still_stale) / len(stale)
+    if still_stale_pct > 0.20:
+        msg = (
+            f"sector_follow stock catch-up: {len(still_stale)}/{len(stale)} "
+            f"({still_stale_pct:.0%}) stocks still stale after a completed job — "
+            f"symbols={still_stale[:20]}"
+        )
+        logger.warning(msg)
+        # Land in `errors` (and flip status) so the scheduler's existing
+        # _log_and_alert (services.sector_follow_backfill_scheduler) picks this
+        # up in its batch anomaly alert — no separate publish_anomaly call here
+        # to avoid double-alerting the same run.
+        result["errors"].append(msg)
+        result["status"] = "error"
 
 
 def _main(argv: list[str] | None = None) -> int:

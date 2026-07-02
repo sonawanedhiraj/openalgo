@@ -25,17 +25,28 @@ from services import (
 
 def test_sector_follow_index_propagates_job_id():
     """When backfill submits a job, check_and_refresh_if_stale must include
-    its job_id in the returned dict so the caller can wait on it."""
+    its job_id in the returned dict so the caller can wait on it.
+
+    Issue #313: compute_stale_symbols is now read twice — the initial
+    stale-check plus the post-job verification — so the second read must show
+    the symbols advanced for them to count as refreshed."""
     with (
         patch.object(
             sector_follow_index_backfill,
             "compute_stale_symbols",
-            return_value=(["NIFTY", "BANKNIFTY"], [], {}),
+            side_effect=[
+                (["NIFTY", "BANKNIFTY"], [], {}),  # initial stale-check
+                ([], ["NIFTY", "BANKNIFTY"], {}),  # post-job verification: advanced
+            ],
         ),
         patch.object(
             sector_follow_index_backfill,
             "backfill_sector_indices",
             return_value={"status": "success", "job_id": "test-job-abc", "symbols": []},
+        ),
+        patch(
+            "services.historify_service.wait_for_jobs",
+            return_value={"test-job-abc": "completed"},
         ),
     ):
         result = sector_follow_index_backfill.check_and_refresh_if_stale(date(2026, 6, 26))
@@ -43,6 +54,7 @@ def test_sector_follow_index_propagates_job_id():
     assert result.get("job_id") == "test-job-abc"
     assert result["status"] == "ok"
     assert result["refreshed"] == ["NIFTY", "BANKNIFTY"]
+    assert result["still_stale"] == []
 
 
 def test_sector_follow_index_no_job_id_when_fresh():
@@ -64,18 +76,26 @@ def test_sector_follow_stock_propagates_job_id():
         patch.object(
             sector_follow_stock_backfill,
             "compute_stale_symbols",
-            return_value=(["INFY", "TCS"], [], {}),
+            side_effect=[
+                (["INFY", "TCS"], [], {}),  # initial stale-check
+                ([], ["INFY", "TCS"], {}),  # post-job verification: advanced (#313)
+            ],
         ),
         patch.object(
             sector_follow_stock_backfill,
             "backfill_sector_follow_stocks",
             return_value={"status": "success", "job_id": "stock-job-xyz", "symbols": []},
         ),
+        patch(
+            "services.historify_service.wait_for_jobs",
+            return_value={"stock-job-xyz": "completed"},
+        ),
     ):
         result = sector_follow_stock_backfill.check_and_refresh_if_stale(date(2026, 6, 26))
 
     assert result.get("job_id") == "stock-job-xyz"
     assert result["refreshed"] == ["INFY", "TCS"]
+    assert result["still_stale"] == []
 
 
 def test_sector_follow_stock_no_job_id_when_fresh():
@@ -202,13 +222,17 @@ def test_sector_follow_stock_passes_incremental_window_when_friday_data_present(
         patch.object(
             sector_follow_stock_backfill,
             "compute_stale_symbols",
-            return_value=(["INFY", "TCS"], [], details),
+            side_effect=[
+                (["INFY", "TCS"], [], details),  # initial stale-check
+                ([], ["INFY", "TCS"], {}),  # post-job verification (#313)
+            ],
         ),
         patch.object(
             sector_follow_stock_backfill,
             "backfill_sector_follow_stocks",
             side_effect=fake_backfill,
         ),
+        patch("services.historify_service.wait_for_jobs", return_value={"test-job": "completed"}),
     ):
         sector_follow_stock_backfill.check_and_refresh_if_stale(date(2026, 6, 28))
 
@@ -234,13 +258,17 @@ def test_sector_follow_stock_falls_back_to_full_lookback_when_no_stored_data():
         patch.object(
             sector_follow_stock_backfill,
             "compute_stale_symbols",
-            return_value=(["NEW_STOCK"], [], details),
+            side_effect=[
+                (["NEW_STOCK"], [], details),  # initial stale-check
+                ([], ["NEW_STOCK"], {}),  # post-job verification (#313)
+            ],
         ),
         patch.object(
             sector_follow_stock_backfill,
             "backfill_sector_follow_stocks",
             side_effect=fake_backfill,
         ),
+        patch("services.historify_service.wait_for_jobs", return_value={"test-job": "completed"}),
     ):
         sector_follow_stock_backfill.check_and_refresh_if_stale(date(2026, 6, 28))
 
@@ -261,13 +289,17 @@ def test_sector_follow_index_passes_incremental_window_when_friday_data_present(
         patch.object(
             sector_follow_index_backfill,
             "compute_stale_symbols",
-            return_value=(["NIFTY"], [], details),
+            side_effect=[
+                (["NIFTY"], [], details),  # initial stale-check
+                ([], ["NIFTY"], {}),  # post-job verification (#313)
+            ],
         ),
         patch.object(
             sector_follow_index_backfill,
             "backfill_sector_indices",
             side_effect=fake_backfill,
         ),
+        patch("services.historify_service.wait_for_jobs", return_value={"test-job": "completed"}),
     ):
         sector_follow_index_backfill.check_and_refresh_if_stale(date(2026, 6, 28))
 
