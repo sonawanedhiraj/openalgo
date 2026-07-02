@@ -1012,5 +1012,221 @@ def test_rehydrate_skips_already_known_symbols():
     assert svc.lots_held() == 1
 
 
+# --------------------------------------------------------------------------- #
+# #292 — 15:18 pre-entry smoke check for futures_follow_cap50
+# --------------------------------------------------------------------------- #
+
+
+def _make_smoke_service(
+    *,
+    data_ok: bool = True,
+    stale: list[str] | None = None,
+    session_ok: bool = True,
+    notifier=None,
+    now_dt: datetime | None = None,
+) -> FuturesFollowService:
+    """Build a FuturesFollowService wired for smoke-check testing.
+
+    data_health_checker is injected with a fake that returns ``(data_ok, details_map)``
+    where details_map has one entry per stale symbol (ok=False). broker_session_checker
+    is a lambda returning ``session_ok``. All other effects are no-ops."""
+    stale = stale or []
+
+    def fake_health_checker(strategy_name, date_str=None, index_only=False):
+        details_map = {}
+        if not data_ok:
+            for sym in stale or ["NIFTY"]:
+                details_map[sym] = {"ok": False}
+        return data_ok, details_map
+
+    alerts = []
+
+    def _notifier(msg):
+        alerts.append(msg)
+        if notifier:
+            notifier(msg)
+
+    svc = FuturesFollowService(
+        config=_config(),
+        mode="sandbox",
+        signal_evaluator=lambda as_of=None: [],
+        contract_resolver=lambda u="NIFTY", e="NFO", as_of=None: dict(_CONTRACT),
+        order_placer=lambda mode, order: {"status": "success", "orderid": "X"},
+        price_fetcher=lambda s, e: 24000.0,
+        notifier=_notifier,
+        trade_recorder=lambda **kw: 1,
+        now=lambda: now_dt or datetime(2026, 7, 2, 15, 18, tzinfo=_IST),
+        intent_resolver=None,
+        data_health_checker=fake_health_checker,
+        broker_session_checker=lambda: session_ok,
+    )
+    svc._test_alerts = alerts
+    return svc
+
+
+def test_smoke_check_passes_when_data_fresh_and_session_live(monkeypatch):
+    """All checks green → ok=True, no override written."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=True, session_ok=True)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details["data_ok"] is True
+    assert details["broker_session_ok"] is True
+    # No override should have been written.
+    overrides = sro.list_overrides(include_expired=True)
+    smoke_pauses = [r for r in overrides if "smoke_check_failed" in (r.get("reason") or "")]
+    assert smoke_pauses == [], f"unexpected smoke-check override: {smoke_pauses}"
+
+
+def test_smoke_check_blocks_and_alerts_when_data_stale(monkeypatch):
+    """Stale feed → ok=False, pause override written, Telegram alert sent."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=False, stale=["NIFTYBANK", "NIFTYAUTO"], session_ok=True)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["data_ok"] is False
+    assert "NIFTYBANK" in details["stale_symbols"] or "NIFTYAUTO" in details["stale_symbols"]
+
+    # A pause override must be written so the entry gate blocks.
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+
+    # The entry gate must honor the override.
+    from database.strategy_runtime_override_db import is_entry_blocked
+
+    blocked, _ov = is_entry_blocked("futures_follow_cap50")
+    assert blocked is True
+
+    # Telegram alert must mention the strategy name and failure.
+    assert any("SMOKE CHECK FAILED" in a for a in svc._test_alerts), svc._test_alerts
+
+
+def test_smoke_check_blocks_and_alerts_when_broker_session_down(monkeypatch):
+    """No broker session → ok=False, pause override written, alert sent."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=True, session_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["broker_session_ok"] is False
+
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+    assert any("broker session not live" in a for a in svc._test_alerts), svc._test_alerts
+
+
+def test_smoke_check_skipped_when_flag_off(monkeypatch):
+    """Flag off → ok=True, no override written, no alert."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "false")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=False, session_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details.get("skipped") is True
+    overrides = sro.list_overrides(include_expired=True)
+    assert overrides == [], f"unexpected overrides when flag off: {overrides}"
+    assert svc._test_alerts == []
+
+
+def test_smoke_check_skips_freshness_when_master_flag_off(monkeypatch):
+    """DATA_FRESHNESS_VALIDATION_ENABLED=false → freshness arm skipped (data_ok=True)
+    but broker check still runs."""
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "false")
+    # data_health_checker would return False but the flag bypasses it.
+    svc = _make_smoke_service(data_ok=False, stale=["NIFTY"], session_ok=True)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    # Fresh flag is off so data arm is treated as OK; broker is live → overall pass.
+    assert ok is True
+    assert details["data_ok"] is True
+
+
+def test_smoke_check_job_body_calls_method_and_swallows_exceptions():
+    """The _smoke_check_job module function calls the singleton's method and
+    must not propagate exceptions from a buggy smoke check."""
+    from services.futures_follow_service import _smoke_check_job, get_service
+
+    # With no singleton, the job is a no-op.
+    _smoke_check_job()  # must not raise
+
+    # With a singleton whose smoke check raises, the job still must not raise.
+    svc = _make_smoke_service()
+
+    def _exploding_check():
+        raise RuntimeError("deliberate boom")
+
+    svc.assert_data_pipeline_healthy = _exploding_check  # type: ignore[assignment]
+
+    import services.futures_follow_service as _ffs_mod
+
+    original_singleton = _ffs_mod._SINGLETON
+    try:
+        _ffs_mod._SINGLETON = svc
+        _smoke_check_job()  # must not raise despite the boom
+    finally:
+        _ffs_mod._SINGLETON = original_singleton
+
+
+def test_register_jobs_includes_smoke_check_when_enabled(monkeypatch):
+    """When FUTURES_FOLLOW_SMOKE_CHECK_ENABLED=true the scheduler gets the
+    futures_follow_smoke_check job registered."""
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+
+    job_ids: list[str] = []
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, id, replace_existing, name):
+            job_ids.append(id)
+
+    svc = _make_smoke_service()
+    svc.strategy_id = 77  # avoid seed_strategy DB call
+    svc.register_jobs(FakeScheduler())
+
+    assert "futures_follow_smoke_check" in job_ids
+
+
+def test_register_jobs_skips_smoke_check_when_flag_off(monkeypatch):
+    """When FUTURES_FOLLOW_SMOKE_CHECK_ENABLED=false the smoke-check job is NOT
+    registered (no 15:18 job ID in the scheduler)."""
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "false")
+
+    job_ids: list[str] = []
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, id, replace_existing, name):
+            job_ids.append(id)
+
+    svc = _make_smoke_service()
+    svc.strategy_id = 77
+    svc.register_jobs(FakeScheduler())
+
+    assert "futures_follow_smoke_check" not in job_ids
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

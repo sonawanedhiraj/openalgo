@@ -606,6 +606,29 @@ the next regression of that class in minutes instead of hours.
   + `MAX_STALENESS_BUSINESS_DAYS` (documented under sector_follow) since the futures
   sleeve fires on the sector_follow signal feed.
 
+#### FUTURES_FOLLOW_SMOKE_CHECK_ENABLED (added 2026-07-02, #292)
+- **Current value:** unset → defaults **`true`**
+- **Set in:** env; read in `services/futures_follow_service.futures_smoke_check_enabled()`.
+- **What it gates:** the 15:18 IST pre-entry smoke check
+  (`FuturesFollowService.assert_data_pipeline_healthy`). When `true`, an
+  APScheduler job fires at 15:18 IST (mon-fri) and verifies two things before the
+  15:20 entry job runs:
+  1. The sector_follow_cap5_vol feed is fresh (via `DATA_FRESHNESS_VALIDATION_ENABLED`
+     + the existing `_data_health_checker` — the same check the entry gate calls
+     but 2 minutes earlier, giving time to alert).
+  2. A broker session (API key) is live.
+  On failure it writes a self-expiring `pause` runtime override (expires 15:30 IST,
+  honored by `_entry_held_by_override`) and Telegrams the operator with the reason.
+  A passing check logs `INFO futures_follow 15:18 smoke check PASSED`.
+- **When to set `false`:** only to silence the guard entirely (e.g. during
+  non-market testing). The entry gate (`_data_is_fresh_for_entry`) still blocks on
+  stale data; the smoke check just adds an early-alert + proactive pause 2 min
+  before the trade window.
+- **History:**
+  - **2026-07-02 (introduced, #292):** Mirrors the `SECTOR_FOLLOW_SMOKE_CHECK_ENABLED`
+    pattern (issue #237 / 2026-06-30 observed silent 0-lot day when sector_follow
+    feed was stale).
+
 ### Build/runtime environment
 
 #### `.python-version` = `3.12` (new file, 2026-06-13)
