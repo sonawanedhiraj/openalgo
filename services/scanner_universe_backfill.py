@@ -86,6 +86,25 @@ STORAGE_INTERVALS = ("1m", "D")
 # without needing the CLI. Deep history (never-fetched symbols) is a CLI job.
 _LOOKBACK_DAYS = {"1m": 4, "D": 15}
 
+# Issue #304 — a second, explicit ceiling on how far back a single convergence
+# catch-up may reach, independent of the per-interval _LOOKBACK_DAYS above.
+# compute_incremental_start_date already caps at ref-lookback_days, but that cap
+# is silent and interval-specific; this one is operator-tunable and logs a
+# WARNING (pointing at the manual CLI) whenever a stale symbol's gap is wider
+# than the cap, so a months-stale symbol can never trigger a huge automatic
+# fetch and the clamp is diagnosable from the logs.
+_DEFAULT_MAX_CATCHUP_DAYS = 7
+
+
+def max_catchup_days() -> int:
+    """``SCANNER_BACKFILL_MAX_CATCHUP_DAYS`` env override (default 7, floor 1)."""
+    try:
+        return max(
+            1, int(os.getenv("SCANNER_BACKFILL_MAX_CATCHUP_DAYS", str(_DEFAULT_MAX_CATCHUP_DAYS)))
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_MAX_CATCHUP_DAYS
+
 
 def scanner_universe_symbols() -> list[str]:
     """Unique scanner-universe symbols to keep fresh, sorted for stability.
@@ -215,6 +234,44 @@ def refresh_scanner_universe(interval: str = "1m") -> dict:
     return backfill_scanner_universe(start, end, interval=interval)
 
 
+def _apply_catchup_cap(
+    start_date: date,
+    ref: date,
+    interval: str,
+    stale: list[str],
+) -> date:
+    """Clamp ``start_date`` to ``max_catchup_days()`` before ``ref`` (issue #304).
+
+    ``compute_incremental_start_date`` already caps at the per-interval
+    ``_LOOKBACK_DAYS`` floor, but that cap is silent and was never wide enough
+    to surface *why* a months-stale symbol only got a partial catch-up. This is
+    a second, operator-tunable ceiling (``SCANNER_BACKFILL_MAX_CATCHUP_DAYS``,
+    default 7) that logs a WARNING naming the affected symbols and pointing at
+    the manual CLI whenever it actually clamps the window.
+    """
+    cap_days = max_catchup_days()
+    cap_floor = ref - timedelta(days=cap_days)
+    if start_date >= cap_floor:
+        return start_date
+    logger.warning(
+        "scanner universe %s catch-up window clamped to SCANNER_BACKFILL_MAX_CATCHUP_DAYS=%d "
+        "(would have started %s, clamped to %s) for %d symbol(s) — the automatic convergence "
+        "will not close this gap; back-fill it manually with "
+        "`uv run python -m services.scanner_universe_backfill --from %s --to %s --interval %s` "
+        "— symbols=%s",
+        interval,
+        cap_days,
+        start_date.isoformat(),
+        cap_floor.isoformat(),
+        len(stale),
+        start_date.isoformat(),
+        ref.isoformat(),
+        interval,
+        stale,
+    )
+    return cap_floor
+
+
 def check_and_refresh_if_stale(
     today: date | None = None,
     *,
@@ -228,12 +285,22 @@ def check_and_refresh_if_stale(
     MAX(timestamp) per symbol for ``interval`` from ``historify.duckdb``; any
     symbol more than ``max_staleness_business_days`` business days behind the
     latest trading day (default 0 — wants today's close) is queued for an
-    incremental catch-up over the per-interval lookback window; the rest are
-    skipped. **Idempotent** — when every symbol is fresh this is a no-op.
-    **Fail-graceful** — a fetch failure (e.g. an expired broker session) is
+    incremental catch-up over the per-interval lookback window, capped at
+    ``SCANNER_BACKFILL_MAX_CATCHUP_DAYS`` (default 7); the rest are skipped.
+    **Idempotent** — when every symbol is fresh this is a no-op. **Fail-graceful**
+    — a fetch failure (e.g. an expired broker session) is
     ``logger.exception``-logged and recorded in ``errors``, never raised.
 
-    Returns ``{status, interval, stale_symbols, refreshed, errors, skipped_fresh}``.
+    Issue #304 — ``refreshed`` is no longer set purely because the download job
+    was *submitted*: after the job reaches a terminal state, MAX(timestamp) per
+    symbol is re-read and a symbol only counts as refreshed if its coverage
+    actually advanced to (or past) the requested ``end`` date. Symbols that
+    remain behind after a completed job are reported in ``still_stale`` rather
+    than silently counted as done, and a >20% still-stale rate after a completed
+    run escalates via ``services.notification_service``.
+
+    Returns ``{status, interval, stale_symbols, refreshed, still_stale, errors,
+    skipped_fresh}``.
     """
     ref = today or date.today()
     path = duckdb_path or _DEFAULT_DUCKDB_PATH
@@ -244,6 +311,7 @@ def check_and_refresh_if_stale(
         "interval": interval,
         "stale_symbols": [],
         "refreshed": [],
+        "still_stale": [],
         "errors": [],
         "skipped_fresh": [],
     }
@@ -291,6 +359,9 @@ def check_and_refresh_if_stale(
     lookback = _LOOKBACK_DAYS.get(interval, 4)
     end = ref.strftime("%Y-%m-%d")
     start_date = compute_incremental_start_date(details, stale, ref, lookback)
+    # Issue #304 — a second, explicit, operator-tunable ceiling on top of the
+    # per-interval lookback floor above; logs a WARNING when it actually clamps.
+    start_date = _apply_catchup_cap(start_date, ref, interval, stale)
     start = start_date.strftime("%Y-%m-%d")
     logger.info(
         "scanner universe %s feed stale: %d/%d behind — catching up %s..%s",
@@ -315,7 +386,13 @@ def check_and_refresh_if_stale(
     if bf.get("job_id"):
         result["job_id"] = bf["job_id"]
     if bf.get("status") == "success":
-        result["refreshed"] = stale
+        # Issue #304 — submission success is NOT completion. Block until the
+        # job reaches a terminal state, then re-read freshness and only count a
+        # symbol as refreshed if its coverage actually advanced. Without this,
+        # a job that starts cleanly but fails/partially-completes mid-download
+        # (dead token mid-batch, per-symbol broker error) was reported
+        # `errors=0` with every stale symbol marked refreshed.
+        _verify_and_report_refresh(result, bf.get("job_id"), path, stale, ref, interval)
     elif bf.get("status") == "ok":
         # Empty-universe / no-op success variant — nothing to refresh, not an error.
         pass
@@ -334,7 +411,89 @@ def check_and_refresh_if_stale(
         )
         result["status"] = "error"
         result["errors"].append(msg)
+        result["still_stale"] = list(stale)
     return result
+
+
+def _verify_and_report_refresh(
+    result: dict,
+    job_id: str | None,
+    duckdb_path: str,
+    stale: list[str],
+    ref: date,
+    interval: str,
+) -> None:
+    """Wait for the submitted job, then verify each stale symbol actually advanced.
+
+    Mutates ``result`` in place: ``refreshed`` only contains symbols whose
+    MAX(timestamp) advanced to (or past) ``ref``'s business day after the job
+    finished; the remainder land in ``still_stale``. A verification read failure
+    is fail-graceful — it falls back to submission-based reporting (the
+    pre-#304 behavior) rather than raising, but is loudly logged so the
+    degraded verification is diagnosable.
+    """
+    if job_id:
+        try:
+            from services.historify_service import wait_for_jobs
+
+            wait_for_jobs([job_id])
+        except Exception:  # waiting must never break the caller
+            logger.exception(
+                "scanner universe %s catch-up: wait_for_jobs raised for job_id=%s — "
+                "verifying freshness anyway",
+                interval,
+                job_id,
+            )
+
+    try:
+        # compute_stale_symbols returns (stale, fresh, details) — "stale" here
+        # means "still behind after the completed job", "fresh" means "verified
+        # refreshed". max_staleness_business_days=0 always re-checks against
+        # today's expected close, independent of the caller's original threshold
+        # (a job is either caught all the way up or it isn't).
+        still_stale, verified_fresh, _details = compute_stale_symbols(
+            duckdb_path,
+            stale,
+            today=ref,
+            max_staleness_business_days=0,
+            interval=interval,
+        )
+    except Exception as e:  # verification read failure — fail open to submission-based
+        logger.exception(
+            "scanner universe %s catch-up: post-job freshness verification failed (%s) — "
+            "falling back to submission-based reporting for %d symbol(s)",
+            interval,
+            e,
+            len(stale),
+        )
+        result["refreshed"] = list(stale)
+        return
+
+    result["refreshed"] = verified_fresh
+    result["still_stale"] = still_stale
+    logger.info(
+        "scanner universe %s catch-up verified: verified_fresh=%d still_stale=%d",
+        interval,
+        len(verified_fresh),
+        len(still_stale),
+    )
+
+    if not stale:
+        return
+    still_stale_pct = len(still_stale) / len(stale)
+    if still_stale_pct > 0.20:
+        msg = (
+            f"scanner universe {interval} catch-up: {len(still_stale)}/{len(stale)} "
+            f"({still_stale_pct:.0%}) symbols still stale after a completed job — "
+            f"symbols={still_stale[:20]}"
+        )
+        logger.warning(msg)
+        # Land in `errors` (and flip status) so the scheduler's existing
+        # _log_and_alert (services.scanner_backfill_scheduler) picks this up in
+        # its batch anomaly alert — no separate publish_anomaly call here to
+        # avoid double-alerting the same run.
+        result["errors"].append(msg)
+        result["status"] = "error"
 
 
 # --------------------------------------------------------------------------- #
