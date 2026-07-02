@@ -272,3 +272,84 @@ def test_periodic_loop_exits_cleanly_when_stopped():
         sched._periodic_loop()  # while-not-set is immediately False → returns
     finally:
         sched._stop_event.clear()
+
+
+# --------------------------------------------------------------------------- #
+# 7. Pre-entry refresh (#237) — fetch stale intraday before the 15:20 entry
+# --------------------------------------------------------------------------- #
+def test_preentry_refresh_runs_backfill_and_waits(monkeypatch):
+    """The 15:17 pre-entry refresh runs the same stale-check the boot/periodic
+    paths use and waits (bounded) for the download jobs (#237)."""
+    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED", "true")
+    waited = {}
+
+    def fake_wait(job_ids, timeout_sec=600, poll_sec=1.0):
+        waited["job_ids"] = job_ids
+        waited["timeout_sec"] = timeout_sec
+        return {}
+
+    with (
+        patch.object(
+            sched,
+            "run_backfill_checks",
+            return_value={
+                "index": {"job_id": "J-idx"},
+                "stock": {"job_id": "J-stk"},
+                "all_fresh": False,
+                "errors": [],
+            },
+        ) as m_run,
+        patch("services.historify_service.wait_for_jobs", side_effect=fake_wait),
+    ):
+        res = sched.run_preentry_backfill_checks(THURS)
+
+    m_run.assert_called_once_with(THURS)
+    assert res["all_fresh"] is False
+    assert set(waited["job_ids"]) == {"J-idx", "J-stk"}
+    # Bounded wait must be short enough not to overrun the 15:20 entry window.
+    assert waited["timeout_sec"] == sched._PREENTRY_WAIT_SEC
+    assert sched._PREENTRY_WAIT_SEC <= 120
+
+
+def test_preentry_refresh_skipped_when_flag_off(monkeypatch):
+    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED", "false")
+    with patch.object(sched, "run_backfill_checks") as m_run:
+        res = sched.run_preentry_backfill_checks(THURS)
+    assert res == {"skipped": True}
+    m_run.assert_not_called()
+
+
+def test_preentry_refresh_wait_failure_is_swallowed(monkeypatch):
+    """A wait_for_jobs error must never break the entry path."""
+    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED", "true")
+    with (
+        patch.object(
+            sched,
+            "run_backfill_checks",
+            return_value={"index": {}, "stock": {}, "all_fresh": True, "errors": []},
+        ),
+        patch(
+            "services.historify_service.wait_for_jobs",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
+        # Must not raise.
+        res = sched.run_preentry_backfill_checks(THURS)
+    assert res["all_fresh"] is True
+
+
+def test_preentry_refresh_time_default_and_override(monkeypatch):
+    monkeypatch.delenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", raising=False)
+    assert sched.preentry_refresh_time() == time(15, 17)
+    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", "15:10")
+    assert sched.preentry_refresh_time() == time(15, 10)
+    # Malformed → safe default.
+    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", "notatime")
+    assert sched.preentry_refresh_time() == time(15, 17)
+
+
+def test_preentry_refresh_time_before_smoke_check():
+    """The refresh must fire strictly before the 15:18 smoke check so the smoke
+    sees fresh data."""
+    t = sched.preentry_refresh_time()
+    assert (t.hour, t.minute) < (15, 18)
