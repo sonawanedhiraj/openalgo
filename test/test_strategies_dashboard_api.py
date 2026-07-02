@@ -962,3 +962,83 @@ def test_data_health_summary_read_error_is_swallowed(monkeypatch):
     out = sda._data_health_summary("sector_follow_cap5_vol")
     assert out["available"] is False
     assert out["reason"] == "read_error"
+
+
+# ---------------------------------------------------------------------------
+# GET /strategies/api/llm/health (issue #297)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_health_requires_session(app):
+    with app.test_client() as client:
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code in (301, 302, 401)
+
+
+def test_llm_health_reachable(app, monkeypatch):
+    """A clean probe reply surfaces reachable=true + latency + checked_at."""
+    monkeypatch.setattr(
+        "services.llm_review_client.probe_claude_health",
+        lambda timeout_s: {
+            "reachable": True,
+            "latency_ms": 1234,
+            "reason": "ok",
+            "detail": "OK",
+        },
+    )
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["reachable"] is True
+    assert data["reason"] == "ok"
+    assert data["latency_ms"] == 1234
+    assert data["checked_at"]  # server-stamped IST timestamp
+
+
+def test_llm_health_not_logged_in(app, monkeypatch):
+    """An auth failure classifies as not_logged_in and is a 200 (not a 5xx)."""
+    monkeypatch.setattr(
+        "services.llm_review_client.probe_claude_health",
+        lambda timeout_s: {
+            "reachable": False,
+            "latency_ms": 40,
+            "reason": "not_logged_in",
+            "detail": "claude review exited 1: not logged in",
+        },
+    )
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["reachable"] is False
+    assert data["reason"] == "not_logged_in"
+
+
+def test_llm_health_probe_exception_is_swallowed(app, monkeypatch):
+    """If the probe itself raises, the endpoint still returns a clean error view."""
+
+    def boom(timeout_s):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr("services.llm_review_client.probe_claude_health", boom)
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["reachable"] is False
+    assert data["reason"] == "error"
+
+
+def test_llm_health_probe_timeout_clamped(monkeypatch):
+    import blueprints.strategies_dashboard_api as sda
+
+    monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "999")
+    assert sda._llm_health_probe_timeout() == 60.0
+    monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "0.1")
+    assert sda._llm_health_probe_timeout() == 3.0
+    monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "not-a-number")
+    assert sda._llm_health_probe_timeout() == 12.0

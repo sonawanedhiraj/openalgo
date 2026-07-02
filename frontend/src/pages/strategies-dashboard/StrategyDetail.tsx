@@ -64,16 +64,19 @@ function fmtPnl(v: number | null | undefined) {
   )
 }
 
+// Matches a trailing timezone designator: `Z`, or a numeric offset like
+// `+05:30` / `-0800`. Timestamps WITH an offset (e.g. signal_decision.candidate_at
+// = `datetime.now(Asia/Kolkata).isoformat()`) must be parsed as-is; only naive
+// timestamps (assumed UTC) get a `Z` appended.
+const TZ_SUFFIX = /(?:Z|[+-]\d{2}:?\d{2})$/
+
 function fmtDate(iso: string | null | undefined) {
   if (!iso) return '—'
-  try {
-    return new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).toLocaleString('en-IN', {
-      dateStyle: 'short',
-      timeStyle: 'short',
-    })
-  } catch {
-    return iso
-  }
+  const d = new Date(TZ_SUFFIX.test(iso) ? iso : iso + 'Z')
+  // Invalid dates don't throw here — toLocaleString() would render the literal
+  // string "Invalid Date". Guard explicitly and fall back to the raw value.
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('en-IN', { dateStyle: 'short', timeStyle: 'short' })
 }
 
 // ---------------------------------------------------------------------------
