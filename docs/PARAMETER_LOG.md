@@ -18,6 +18,22 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### LLM health probe timeout (issue #297, added 2026-07-02)
+The Strategies-page LLM health chip (`GET /strategies/api/llm/health`) spawns a
+lightweight `claude -p` liveness probe on demand (operator clicks the chip's
+refresh icon — never auto-polled). This bounds that subprocess.
+
+#### LLM_HEALTH_PROBE_TIMEOUT_SECONDS (NEW)
+- **Current value:** unset → defaults **`12`** (seconds).
+- **Set in:** env; read by
+  `blueprints.strategies_dashboard_api._llm_health_probe_timeout`. Clamped to
+  `[3, 60]`; malformed → `12`.
+- **What it does:** wall-clock budget passed to
+  `services.llm_review_client.probe_claude_health`. On expiry the probe reports
+  `reason='timeout'`, `reachable=false`. Distinct from
+  `VETO_CLAUDE_TIMEOUT_SECONDS` (25s, the real veto call) — the probe is a
+  smaller "is claude alive/logged-in" check and should return fast.
+
 ### Pre-entry data refresh (sector_follow + futures) (issue #237, added 2026-07-02)
 A 15:17 IST APScheduler job (`sector_follow_preentry_refresh`) that runs the
 existing `run_backfill_checks` (fetch stale index+stock intraday tail) and waits

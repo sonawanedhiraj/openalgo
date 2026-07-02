@@ -138,3 +138,75 @@ def test_invoke_uses_claude_cmd_override_in_argv(monkeypatch):
 
     lrc.invoke_claude_review("PROMPT", timeout_s=5.0)
     assert seen["cmd"][0] == "/custom/claude"
+
+
+# ---------------------------------------------------------------------------
+# probe_claude_health classification (issue #297)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_health_ok(monkeypatch):
+    from services import llm_review_client as lrc
+
+    monkeypatch.setattr(lrc, "invoke_claude_review", lambda prompt, t: ("OK", "sess"))
+    out = lrc.probe_claude_health(timeout_s=5.0)
+    assert out["reachable"] is True
+    assert out["reason"] == "ok"
+    assert out["latency_ms"] >= 0
+
+
+def test_probe_health_empty_reply_is_error(monkeypatch):
+    from services import llm_review_client as lrc
+
+    monkeypatch.setattr(lrc, "invoke_claude_review", lambda prompt, t: ("   ", ""))
+    out = lrc.probe_claude_health(timeout_s=5.0)
+    assert out["reachable"] is False
+    assert out["reason"] == "error"
+
+
+def test_probe_health_timeout(monkeypatch):
+    from services import llm_review_client as lrc
+
+    def boom(prompt, t):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(lrc, "invoke_claude_review", boom)
+    out = lrc.probe_claude_health(timeout_s=5.0)
+    assert out["reachable"] is False
+    assert out["reason"] == "timeout"
+
+
+def test_probe_health_cli_missing(monkeypatch):
+    from services import llm_review_client as lrc
+
+    def boom(prompt, t):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(lrc, "invoke_claude_review", boom)
+    out = lrc.probe_claude_health(timeout_s=5.0)
+    assert out["reachable"] is False
+    assert out["reason"] == "cli_missing"
+
+
+def test_probe_health_not_logged_in(monkeypatch):
+    from services import llm_review_client as lrc
+
+    def boom(prompt, t):
+        raise RuntimeError("claude review exited 1: Please run 'claude login' to authenticate")
+
+    monkeypatch.setattr(lrc, "invoke_claude_review", boom)
+    out = lrc.probe_claude_health(timeout_s=5.0)
+    assert out["reachable"] is False
+    assert out["reason"] == "not_logged_in"
+
+
+def test_probe_health_generic_runtime_error_is_error(monkeypatch):
+    from services import llm_review_client as lrc
+
+    def boom(prompt, t):
+        raise RuntimeError("claude review exited 2: segfault in model runtime")
+
+    monkeypatch.setattr(lrc, "invoke_claude_review", boom)
+    out = lrc.probe_claude_health(timeout_s=5.0)
+    assert out["reachable"] is False
+    assert out["reason"] == "error"

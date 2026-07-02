@@ -38,6 +38,7 @@ via the audited service path.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1005,3 +1006,49 @@ def strategy_llm_decisions(name: str):
             },
         }
     )
+
+
+def _llm_health_probe_timeout() -> float:
+    """Wall-clock budget for the on-demand LLM health probe (env-tunable)."""
+    raw = os.getenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "12")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return 12.0
+    # Clamp to a sane band: too short falsely reports timeouts; too long makes
+    # the operator's manual click hang.
+    return max(3.0, min(val, 60.0))
+
+
+@strategies_dashboard_bp.route("/api/llm/health", methods=["GET"])
+@check_session_validity
+def strategy_llm_health():
+    """On-demand liveness probe of the shared ``claude`` CLI used by the LLM veto.
+
+    Reachability is install-global — every strategy's Stage-1 veto calls the same
+    ``claude`` binary/login — so this is a single shared check, not per-strategy.
+
+    This spawns a real ``claude -p`` subprocess (seconds, consumes tokens), so it
+    is deliberately built for **manual** invocation: the Strategies-page chip
+    probes only when the operator clicks its refresh icon. Do NOT auto-poll it.
+
+    Returns ``{reachable, latency_ms, reason, detail, checked_at}`` where
+    ``reason`` ∈ ``ok`` | ``timeout`` | ``cli_missing`` | ``not_logged_in`` |
+    ``error``. Never 5xx's on an unreachable LLM — an unreachable model is a
+    successful probe with ``reachable=false``.
+    """
+    checked_at = datetime.now(_IST).isoformat()
+    try:
+        from services.llm_review_client import probe_claude_health
+
+        result = probe_claude_health(_llm_health_probe_timeout())
+    except Exception as exc:
+        logger.exception("strategy_llm_health: probe raised")
+        result = {
+            "reachable": False,
+            "latency_ms": 0,
+            "reason": "error",
+            "detail": f"{type(exc).__name__}: {str(exc)[:280]}",
+        }
+    result["checked_at"] = checked_at
+    return jsonify({"status": "success", "data": result})
