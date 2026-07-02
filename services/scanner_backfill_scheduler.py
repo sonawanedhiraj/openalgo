@@ -59,6 +59,40 @@ _BOOT_WAIT_POLL_SEC = 15
 _stop_event = threading.Event()
 _periodic_thread: threading.Thread | None = None
 
+# Pre-entry refresh (#239): a single convergence fetch just before the 09:18
+# smoke check so a cold boot at 08:31 IST has fresh historify data AND the
+# WS subscription is established before evaluation begins.  The boot check
+# runs once (can be hours earlier) and the periodic loop only runs 15:30-17:00,
+# so the early-morning gap stays open through the 09:18 smoke check — the
+# 2026-06-30 all-day signal drought.  This closes it: run the same stale-check
+# the boot/periodic paths use, then wait (bounded to ``_PREENTRY_WAIT_SEC``,
+# short enough not to overrun 09:18) for the download jobs and optionally
+# trigger the WS subscription if it has not come up yet.
+# Additive, idempotent (fresh → no-op), fail-graceful.
+_DEFAULT_PREENTRY_TIME = "09:16"
+# Bounded wait for the pre-entry download jobs.  Must be short enough that a
+# slow fetch cannot overrun the 09:18 smoke check — if it does, the smoke check
+# still catches the stale data.  120s = 2m of headroom before 09:18.
+_PREENTRY_WAIT_SEC = 120
+
+
+def preentry_refresh_enabled() -> bool:
+    """``SCANNER_PREENTRY_REFRESH_ENABLED`` env flag (default true)."""
+    return os.getenv("SCANNER_PREENTRY_REFRESH_ENABLED", "true").lower() == "true"
+
+
+def preentry_refresh_time() -> time:
+    """Pre-entry refresh fire time (default 09:16 IST — before the 09:18 smoke).
+
+    ``SCANNER_PREENTRY_REFRESH_TIME`` env var, ``HH:MM`` format.
+    """
+    raw = os.getenv("SCANNER_PREENTRY_REFRESH_TIME", _DEFAULT_PREENTRY_TIME)
+    try:
+        hh, mm = (int(x) for x in raw.split(":", 1))
+        return time(hh, mm)
+    except (TypeError, ValueError):
+        return time(9, 16)
+
 
 # --------------------------------------------------------------------------- #
 # Env-configurable knobs
@@ -252,6 +286,78 @@ def run_boot_backfill_checks(today=None) -> dict:
     return res
 
 
+def run_preentry_scanner_refresh(today=None) -> dict:
+    """Pre-09:18-smoke-check convergence: fetch whatever is stale so the smoke
+    check passes and the scanner has fresh historify data from the start of the
+    session (issue #239).
+
+    The boot check runs once at startup (can be hours earlier) and the periodic
+    loop only runs 15:30-17:00, so a cold boot at 08:31 IST produces 0/216
+    aggregator coverage by 09:18.  This closes it: run the same stale-check
+    the boot/periodic paths use, wait (bounded to ``_PREENTRY_WAIT_SEC``) for
+    the download jobs so today's bars land in historify before the smoke check,
+    and — if the WS subscription has not come up yet — trigger it via
+    ``scanner_pre_subscriber.ensure`` so the aggregator starts filling.
+
+    Returns the ``run_backfill_checks`` verdict, or ``{"skipped": True}`` when
+    the feature flag is off.  Never raises.
+    """
+    if not preentry_refresh_enabled():
+        logger.info("scanner pre-entry refresh disabled (SCANNER_PREENTRY_REFRESH_ENABLED!=true)")
+        return {"skipped": True}
+
+    _pre_t = preentry_refresh_time()
+    logger.info(
+        "scanner backfill: pre-entry (%02d:%02d) convergence check starting",
+        _pre_t.hour,
+        _pre_t.minute,
+    )
+    res = run_backfill_checks(today)
+    _persist_health(res)
+    _log_and_alert(res, phase="preentry")
+
+    try:
+        from services.historify_service import wait_for_jobs
+
+        intervals = res.get("intervals") or {}
+        job_ids = [ires.get("job_id") for ires in intervals.values()]
+        finals = wait_for_jobs(job_ids, timeout_sec=_PREENTRY_WAIT_SEC)
+        if finals:
+            logger.info("scanner backfill: pre-entry jobs final status: %s", finals)
+    except Exception:  # waiting must never break the entry path
+        logger.exception("scanner backfill: pre-entry wait_for_jobs raised")
+
+    # Trigger WS subscription if the scanner has not yet subscribed.  The boot
+    # wire_pre_subscribe daemon already handles the normal path; this is a
+    # defensive nudge for the race where the boot retry has not yet fired by
+    # 09:16 (slow broker login, cold start late in the morning).  Fail-safe:
+    # ensure() is idempotent and the import is deferred so test contexts that
+    # never wire app.py stay clean.
+    try:
+        from database.auth_db import get_first_available_api_key, verify_api_key
+        from services.scanner_presubscribe import scanner_pre_subscriber
+
+        if not scanner_pre_subscriber.subscribed:
+            api_key = get_first_available_api_key()
+            if api_key:
+                user_id = verify_api_key(api_key)
+                if user_id:
+                    from database.auth_db import get_broker_name
+
+                    broker = get_broker_name(user_id)
+                    raw = os.getenv("SCANNER_SYMBOLS", "")
+                    symbols = sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+                    if symbols:
+                        n = scanner_pre_subscriber.ensure(user_id, broker, symbols)
+                        logger.info(
+                            "scanner pre-entry refresh: triggered WS subscribe for %d symbols", n
+                        )
+    except Exception:  # WS nudge must never break the historify path
+        logger.exception("scanner pre-entry refresh: WS subscription nudge failed (non-fatal)")
+
+    return res
+
+
 # --------------------------------------------------------------------------- #
 # Periodic loop
 # --------------------------------------------------------------------------- #
@@ -402,3 +508,69 @@ def init_scanner_backfill_scheduler(app=None) -> None:
     _stop_event.clear()
     threading.Thread(target=_boot_worker, daemon=True, name="ScannerBackfillBoot").start()
     logger.info("scanner backfill boot+periodic convergence initialized")
+
+
+# --------------------------------------------------------------------------- #
+# Pre-entry refresh APScheduler registration (#239)
+# --------------------------------------------------------------------------- #
+
+
+def _scanner_preentry_refresh_job() -> None:
+    """09:16 IST: fetch stale historify data + nudge WS subscription before the
+    09:18 smoke check (issue #239).  Module-level + fail-safe so a fetch error
+    never kills the scheduler thread.  Independent of the boot lock — 09:16 is
+    a quiet window with no sibling convergence running."""
+    try:
+        run_preentry_scanner_refresh()
+    except Exception:
+        logger.exception("scanner pre-entry refresh job failed")
+
+
+def init_scanner_preentry_refresh(app=None, scheduler=None) -> None:
+    """Register the 09:16 IST APScheduler job for the scanner pre-entry refresh.
+
+    Registered even when the flag is off so toggling ``SCANNER_PREENTRY_REFRESH_ENABLED``
+    at runtime takes effect without a restart; the per-fire ``preentry_refresh_enabled()``
+    check gates the work.
+
+    Args:
+        app: Flask app instance (not used; kept for interface parity with other init fns).
+        scheduler: APScheduler instance. Defaults to the shared historify scheduler.
+    """
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+
+        if scheduler is None:
+            from services.historify_scheduler_service import get_historify_scheduler
+
+            scheduler = get_historify_scheduler()
+        if scheduler is None:
+            logger.warning(
+                "scanner pre-entry refresh: no scheduler available — skipping job registration"
+            )
+            return
+
+        _pre_t = preentry_refresh_time()
+        scheduler.add_job(
+            _scanner_preentry_refresh_job,
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=_pre_t.hour,
+                minute=_pre_t.minute,
+                timezone="Asia/Kolkata",
+            ),
+            id="scanner_preentry_refresh",
+            replace_existing=True,
+            name=(
+                f"Scanner pre-entry data refresh + WS subscribe nudge "
+                f"({_pre_t.hour:02d}:{_pre_t.minute:02d} IST)"
+            ),
+        )
+        logger.info(
+            "scanner_preentry_refresh registered (enabled=%s, time=%02d:%02d IST)",
+            preentry_refresh_enabled(),
+            _pre_t.hour,
+            _pre_t.minute,
+        )
+    except Exception:
+        logger.exception("init_scanner_preentry_refresh failed")

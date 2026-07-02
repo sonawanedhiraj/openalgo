@@ -404,15 +404,30 @@ def check_dry_scanner(
         return {"status": "ok", "gap_min": gap_min}
 
     # Tripwire fires — distinguish CRIT (broken pipeline) from WARN (quiet market).
-    cutoff = now - timedelta(minutes=threshold)
-    try:
-        chartink_alive = chartink_has_rows_since(cutoff)
-    except Exception:
-        # If chartink probe fails, default to WARN (don't escalate on telemetry).
-        chartink_alive = False
-    severity = "CRIT" if chartink_alive else "WARN"
-    details["chartink_has_rows_since_cutoff"] = chartink_alive
-    details["severity"] = severity
+    #
+    # Severity escalation when WS subscription never came up (issue #239).
+    # ``scanner_subscribed_at is None`` AND ``gap_min > 60`` is the fingerprint
+    # of the 2026-06-30 5-day silent drought: the scanner WS subscription never
+    # came up (subscribed_at=None means _scanner_subscribed_at was never set by
+    # the connect callback), so there has been no feed for >1h regardless of what
+    # Chartink is doing.  Force CRIT without querying chartink — the pipeline is
+    # structurally broken and must page.
+    if subscribed_at is None and gap_min > 60:
+        severity = "CRIT"
+        chartink_alive = False  # not queried — subscription absence is the signal
+        details["chartink_has_rows_since_cutoff"] = None
+        details["severity"] = severity
+        details["escalation_reason"] = "ws_subscription_absent"
+    else:
+        cutoff = now - timedelta(minutes=threshold)
+        try:
+            chartink_alive = chartink_has_rows_since(cutoff)
+        except Exception:
+            # If chartink probe fails, default to WARN (don't escalate on telemetry).
+            chartink_alive = False
+        severity = "CRIT" if chartink_alive else "WARN"
+        details["chartink_has_rows_since_cutoff"] = chartink_alive
+        details["severity"] = severity
 
     today = now.astimezone(_IST).date()
     global _last_crit_date, _last_warn_date  # noqa: PLW0603 — module-level dedup
@@ -426,7 +441,13 @@ def check_dry_scanner(
             logger.debug("scanner dry tripwire dedup-silent write failed", exc_info=True)
         return {"status": "dedup_silent", "severity": severity, "gap_min": gap_min}
 
-    message = _format_alert(severity, gap_min, last, chartink_alive)
+    message = _format_alert(
+        severity,
+        gap_min,
+        last,
+        chartink_alive,
+        escalation_reason=details.get("escalation_reason"),
+    )
     # f-string (not %s + args) — see scanner_smoke_check_service for the
     # SensitiveDataFilter + record.args desync rationale.
     logger.error(f"scanner_dry tripwire {severity}: {details}")
@@ -455,15 +476,24 @@ def check_dry_scanner(
 
 
 def _format_alert(
-    severity: str, gap_min: float, last: datetime | None, chartink_alive: bool
+    severity: str,
+    gap_min: float,
+    last: datetime | None,
+    chartink_alive: bool,
+    escalation_reason: str | None = None,
 ) -> str:
     last_str = last.astimezone(_IST).strftime("%H:%M:%S") if last else "never (no rows today)"
     icon = "🚨" if severity == "CRIT" else "⚠️"
-    diagnosis = (
-        "Chartink HAS recent hits — in-house pipeline is degraded."
-        if chartink_alive
-        else "Chartink is also dry — market likely quiet; surfaced for visibility only."
-    )
+    if escalation_reason == "ws_subscription_absent":
+        diagnosis = (
+            "WS subscription never came up (scanner_subscribed_at=None) — "
+            "the tick feed has been absent for the entire gap. "
+            "Check broker login and the scanner pre-subscribe path."
+        )
+    elif chartink_alive:
+        diagnosis = "Chartink HAS recent hits — in-house pipeline is degraded."
+    else:
+        diagnosis = "Chartink is also dry — market likely quiet; surfaced for visibility only."
     return (
         f"{icon} SCANNER {severity}: no in-house scan_results for {gap_min:.0f} min "
         f"(last: {last_str}). {diagnosis}"

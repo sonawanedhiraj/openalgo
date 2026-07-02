@@ -865,6 +865,23 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize scanner smoke check: {e}")
 
+            # Scanner pre-entry refresh (issue #239): an 09:16 IST APScheduler
+            # job that runs the same stale-check the boot+periodic paths use,
+            # waits for the download jobs (≤120s), and nudges the WS
+            # subscription if the scanner has not yet subscribed.  Closes the
+            # cold-boot gap where the aggregator is still 0/216 at the 09:18
+            # smoke check.  See services/scanner_backfill_scheduler.py and the
+            # SCANNER_PREENTRY_REFRESH_* flags in PARAMETER_LOG.
+            try:
+                from services.scanner_backfill_scheduler import (
+                    init_scanner_preentry_refresh,
+                )
+
+                init_scanner_preentry_refresh(app=app)
+                logger.debug("Scanner pre-entry refresh initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize scanner pre-entry refresh: {e}")
+
             # In-house scanner zero-results tripwire (issue #33). Downstream
             # silent-failure detector that catches the Friday 2026-06-19 gap
             # the per-cycle completeness metric missed (56% coverage but 0 BUY
