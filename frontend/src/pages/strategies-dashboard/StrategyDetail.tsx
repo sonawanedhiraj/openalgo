@@ -756,7 +756,10 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                     </th>
                   )}
                   {hasFinancials && (
-                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Round-trip charges for both legs, deducted once on the exit"
+                    >
                       Charges
                     </th>
                   )}
@@ -764,7 +767,10 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                     Net P&L
                   </th>
                   {hasFinancials && (
-                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="SPAN margin committed by the entry (BUY); released on the T+1 exit"
+                    >
                       Capital
                     </th>
                   )}
@@ -838,8 +844,13 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                         )}
                       </td>
                       {hasFinancials && (
+                        // Capital (SPAN margin) is committed by the entry (BUY) and
+                        // released by the T+1 exit (SELL) — so show it on the entry
+                        // leg only. On an exit the position is closing, and a merged
+                        // multi-lot SELL carries just one leg's margin, which would
+                        // under-report. P&L + round-trip charges live on the SELL.
                         <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
-                          {t.margin_inr != null ? fmtInr(t.margin_inr) : '—'}
+                          {t.side === 'BUY' && t.margin_inr != null ? fmtInr(t.margin_inr) : '—'}
                         </td>
                       )}
                       <td className="px-3 py-1.5">
