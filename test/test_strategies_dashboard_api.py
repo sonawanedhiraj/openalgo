@@ -777,7 +777,36 @@ def test_list_resolves_simplified_engine_journal(app, wired_dbs):
     assert se["today_trade_count"] == 2
     assert se["open_positions"] == 1  # only the RVNL entry is still open
     assert se["today_net_pnl"] == 1244.5
-    assert se["last_trade_at"] == f"{today}T09:45:00+05:30"
+    # last_trade_at is normalized to naive-UTC for the frontend's `+ 'Z'` parse
+    # (issue #317): 09:45 IST → 04:15 UTC, no offset suffix.
+    assert se["last_trade_at"] == f"{today}T04:15:00"
+
+
+def test_simplified_last_trade_at_is_naive_utc_for_frontend(app, wired_dbs):
+    """The card renders `new Date(last_trade_at + 'Z')`, so last_trade_at must be
+    naive-UTC (no offset). The simplified engine's placed_at is tz-aware IST
+    (…+05:30); it must be normalized or the UI shows "Invalid Date" (issue #317).
+    """
+    import datetime as _dt
+
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    # placed_at carries a +05:30 offset, exactly like production rows.
+    _seed_simplified_journal_row(
+        tj_sess, tjdb, symbol="RVNL", placed_at=f"{today}T10:59:06.567689+05:30"
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    se = next(s for s in resp.get_json()["data"] if s["name"] == "simplified_engine")
+    lta = se["last_trade_at"]
+    # No timezone suffix — appending 'Z' must yield a valid UTC instant.
+    assert "+" not in lta and not lta.endswith("Z")
+    parsed = _dt.datetime.fromisoformat(lta + "+00:00")  # frontend's `+ 'Z'`, in Python
+    # 10:59 IST == 05:29 UTC.
+    assert parsed.hour == 5 and parsed.minute == 29
 
 
 def test_detail_resolves_simplified_engine_recent_trades(app, wired_dbs):
@@ -1090,3 +1119,83 @@ def test_data_health_summary_read_error_is_swallowed(monkeypatch):
     out = sda._data_health_summary("sector_follow_cap5_vol")
     assert out["available"] is False
     assert out["reason"] == "read_error"
+
+
+# ---------------------------------------------------------------------------
+# GET /strategies/api/llm/health (issue #297)
+# ---------------------------------------------------------------------------
+
+
+def test_llm_health_requires_session(app):
+    with app.test_client() as client:
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code in (301, 302, 401)
+
+
+def test_llm_health_reachable(app, monkeypatch):
+    """A clean probe reply surfaces reachable=true + latency + checked_at."""
+    monkeypatch.setattr(
+        "services.llm_review_client.probe_claude_health",
+        lambda timeout_s: {
+            "reachable": True,
+            "latency_ms": 1234,
+            "reason": "ok",
+            "detail": "OK",
+        },
+    )
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["reachable"] is True
+    assert data["reason"] == "ok"
+    assert data["latency_ms"] == 1234
+    assert data["checked_at"]  # server-stamped IST timestamp
+
+
+def test_llm_health_not_logged_in(app, monkeypatch):
+    """An auth failure classifies as not_logged_in and is a 200 (not a 5xx)."""
+    monkeypatch.setattr(
+        "services.llm_review_client.probe_claude_health",
+        lambda timeout_s: {
+            "reachable": False,
+            "latency_ms": 40,
+            "reason": "not_logged_in",
+            "detail": "claude review exited 1: not logged in",
+        },
+    )
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["reachable"] is False
+    assert data["reason"] == "not_logged_in"
+
+
+def test_llm_health_probe_exception_is_swallowed(app, monkeypatch):
+    """If the probe itself raises, the endpoint still returns a clean error view."""
+
+    def boom(timeout_s):
+        raise RuntimeError("spawn failed")
+
+    monkeypatch.setattr("services.llm_review_client.probe_claude_health", boom)
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/llm/health")
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["reachable"] is False
+    assert data["reason"] == "error"
+
+
+def test_llm_health_probe_timeout_clamped(monkeypatch):
+    import blueprints.strategies_dashboard_api as sda
+
+    monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "999")
+    assert sda._llm_health_probe_timeout() == 60.0
+    monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "0.1")
+    assert sda._llm_health_probe_timeout() == 3.0
+    monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "not-a-number")
+    assert sda._llm_health_probe_timeout() == 12.0

@@ -24,6 +24,7 @@ import os
 import queue as _queue
 import subprocess  # noqa: S404  # nosec B404 — spawning the claude CLI is the whole point of this module
 import sys
+import time
 from typing import Any
 
 from utils.logging import get_logger
@@ -136,3 +137,95 @@ def invoke_claude_review(prompt: str, timeout_s: float) -> tuple[str, str]:
         raise RuntimeError(f"claude review exited {completed.returncode}: {stderr[:500]}")
 
     return _parse_envelope(completed.stdout or "")
+
+
+# Substrings that mark a non-zero ``claude`` exit as an auth/login problem rather
+# than a generic error — surfaced to the operator as "run claude login".
+_AUTH_MARKERS = (
+    "login",
+    "logged in",
+    "log in",
+    "authenticat",
+    "unauthor",
+    "not authenticated",
+    "credential",
+    "api key",
+    "oauth",
+    "invalid token",
+    "expired",
+)
+
+
+def probe_claude_health(timeout_s: float = 12.0) -> dict[str, Any]:
+    """Run a lightweight ``claude -p`` liveness probe of the veto's LLM transport.
+
+    This is the ground-truth reachability check for the Stage-1 LLM veto: it
+    spawns the same ``claude`` CLI the veto uses (via ``invoke_claude_review``)
+    with a trivial prompt, and classifies the outcome. Because it spawns a real
+    subprocess (seconds, and it consumes tokens), callers should invoke it
+    **on demand only** — never on a fast poll.
+
+    Args:
+        timeout_s: Wall-clock budget for the probe subprocess.
+
+    Returns:
+        A dict with:
+          * ``reachable`` (bool) — True only on a clean, non-empty reply.
+          * ``latency_ms`` (int) — round-trip time.
+          * ``reason`` — one of ``ok`` | ``timeout`` | ``cli_missing`` |
+            ``not_logged_in`` | ``error``.
+          * ``detail`` — short human-readable context (truncated).
+    """
+    started = time.time()
+
+    def _elapsed_ms() -> int:
+        return int((time.time() - started) * 1000)
+
+    try:
+        model_text, _session_id = invoke_claude_review("Reply with only: OK", timeout_s)
+    except TimeoutError:
+        return {
+            "reachable": False,
+            "latency_ms": _elapsed_ms(),
+            "reason": "timeout",
+            "detail": f"claude did not respond within {timeout_s:.0f}s",
+        }
+    except FileNotFoundError:
+        return {
+            "reachable": False,
+            "latency_ms": _elapsed_ms(),
+            "reason": "cli_missing",
+            "detail": "claude CLI not found on PATH (set CLAUDE_CMD to its full path)",
+        }
+    except RuntimeError as exc:
+        msg = str(exc)
+        reason = "not_logged_in" if any(m in msg.lower() for m in _AUTH_MARKERS) else "error"
+        return {
+            "reachable": False,
+            "latency_ms": _elapsed_ms(),
+            "reason": reason,
+            "detail": msg[:300],
+        }
+    except Exception as exc:  # noqa: BLE001 — probe must never raise into the caller
+        logger.exception("probe_claude_health: unexpected failure")
+        return {
+            "reachable": False,
+            "latency_ms": _elapsed_ms(),
+            "reason": "error",
+            "detail": f"{type(exc).__name__}: {str(exc)[:280]}",
+        }
+
+    text = (model_text or "").strip()
+    if not text:
+        return {
+            "reachable": False,
+            "latency_ms": _elapsed_ms(),
+            "reason": "error",
+            "detail": "claude returned an empty response",
+        }
+    return {
+        "reachable": True,
+        "latency_ms": _elapsed_ms(),
+        "reason": "ok",
+        "detail": text[:120],
+    }

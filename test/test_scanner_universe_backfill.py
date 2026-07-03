@@ -22,7 +22,15 @@ THURS = date(2026, 6, 11)
 WED = date(2026, 6, 10)
 SAT = date(2026, 6, 13)
 
-_RESULT_KEYS = {"status", "interval", "stale_symbols", "refreshed", "errors", "skipped_fresh"}
+_RESULT_KEYS = {
+    "status",
+    "interval",
+    "stale_symbols",
+    "refreshed",
+    "still_stale",
+    "errors",
+    "skipped_fresh",
+}
 
 
 def _epoch(d: date, hh: int = 15, mm: int = 29) -> int:
@@ -36,21 +44,28 @@ def _epoch(d: date, hh: int = 15, mm: int = 29) -> int:
 def test_stale_triggers_refresh_of_stale_subset_1m():
     universe = ["RELIANCE", "SBIN", "TCS"]
     captured: dict = {}
+    # Mutable freshness store so the fake backfill can simulate the download
+    # actually landing new bars — the post-#304 verification re-reads this via
+    # get_data_freshness after the job "completes".
+    freshness = {s: _epoch(WED) for s in universe}
 
     def fake_backfill(start, end, interval="1m", symbols=None):
         captured["symbols"] = symbols
         captured["start"] = start
         captured["end"] = end
         captured["interval"] = interval
+        for s in symbols or []:
+            freshness[s] = _epoch(THURS)
         return {"status": "success", "job_id": "j1", "symbols": symbols, "interval": interval}
 
     with (
         patch.object(sub, "scanner_universe_symbols", return_value=universe),
         patch(
             "services.data_freshness_service.get_data_freshness",
-            return_value={s: _epoch(WED) for s in universe},
+            side_effect=lambda *a, **k: dict(freshness),
         ),
         patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
     ):
         res = sub.check_and_refresh_if_stale(THURS, interval="1m")
 
@@ -61,6 +76,7 @@ def test_stale_triggers_refresh_of_stale_subset_1m():
     assert res["interval"] == "1m"
     assert set(res["stale_symbols"]) == set(universe)
     assert set(res["refreshed"]) == set(universe)
+    assert res["still_stale"] == []
     assert res["skipped_fresh"] == []
     assert res["errors"] == []
     assert set(captured["symbols"]) == set(universe)
@@ -73,6 +89,91 @@ def test_stale_triggers_refresh_of_stale_subset_1m():
     # regression: only today's bars are fetched, not a fixed 4-day window.
     assert captured["start"] == "2026-06-11"
     assert captured["start"] <= captured["end"]
+
+
+def test_two_days_stale_range_starts_from_last_stored_plus_one():
+    """Issue #304 defect 1 — the real-world scenario: symbols 2 business days
+    behind (last stored WED-1, ref THURS) must fetch from last_stored+1, not
+    from ref..ref (the today-only bug that permanently skipped the interim day)."""
+    universe = ["RELIANCE", "SBIN"]
+    two_days_stale = WED - timedelta(days=1)  # Tuesday
+    captured: dict = {}
+    freshness = {s: _epoch(two_days_stale) for s in universe}
+
+    def fake_backfill(start, end, interval="1m", symbols=None):
+        captured["start"] = start
+        captured["end"] = end
+        for s in symbols or []:
+            freshness[s] = _epoch(THURS)
+        return {"status": "success", "job_id": "j1", "symbols": symbols, "interval": interval}
+
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            side_effect=lambda *a, **k: dict(freshness),
+        ),
+        patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    assert res["stale_symbols"] == sorted(universe)
+    # Range must cover the interim day: start = two_days_stale + 1 day, not
+    # ref..ref (the reported bug fetched 2026-07-02..2026-07-02 while symbols
+    # were last stored 2026-06-30 — permanently skipping 07-01).
+    expected_start = (two_days_stale + timedelta(days=1)).strftime("%Y-%m-%d")
+    assert captured["start"] == expected_start
+    assert captured["start"] < captured["end"]
+    assert captured["end"] == THURS.strftime("%Y-%m-%d")
+    assert res["refreshed"] == sorted(universe)
+
+
+def test_max_catchup_days_cap_clamps_and_warns(monkeypatch, caplog):
+    """Issue #304 — a symbol stale far beyond SCANNER_BACKFILL_MAX_CATCHUP_DAYS
+    must have its fetch window clamped to the cap (not reach back to the true
+    last-stored date), and a WARNING naming the symbols + pointing at the manual
+    CLI must be logged."""
+    import logging
+
+    monkeypatch.setenv("SCANNER_BACKFILL_MAX_CATCHUP_DAYS", "3")
+    universe = ["RELIANCE"]
+    months_stale = THURS - timedelta(days=60)
+    captured: dict = {}
+
+    def fake_backfill(start, end, interval="1m", symbols=None):
+        captured["start"] = start
+        captured["end"] = end
+        return {"status": "success", "job_id": "j1", "symbols": symbols, "interval": interval}
+
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            return_value={s: _epoch(months_stale) for s in universe},
+        ),
+        patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+        caplog.at_level(logging.WARNING, logger="services.scanner_universe_backfill"),
+    ):
+        sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    expected_start = (THURS - timedelta(days=3)).strftime("%Y-%m-%d")
+    assert captured["start"] == expected_start
+    assert any(
+        "clamped" in r.message and "RELIANCE" in r.message and "--from" in r.message
+        for r in caplog.records
+    )
+
+
+def test_max_catchup_days_default_and_env_override(monkeypatch):
+    assert sub.max_catchup_days() == 7
+    monkeypatch.setenv("SCANNER_BACKFILL_MAX_CATCHUP_DAYS", "14")
+    assert sub.max_catchup_days() == 14
+    monkeypatch.setenv("SCANNER_BACKFILL_MAX_CATCHUP_DAYS", "not-a-number")
+    assert sub.max_catchup_days() == 7
+    monkeypatch.setenv("SCANNER_BACKFILL_MAX_CATCHUP_DAYS", "0")
+    assert sub.max_catchup_days() == 1  # floored at 1
 
 
 # --------------------------------------------------------------------------- #
@@ -111,15 +212,19 @@ def test_partial_staleness_fetches_only_stale_subset_daily():
     def fake_backfill(start, end, interval="1m", symbols=None):
         captured["symbols"] = symbols
         captured["interval"] = interval
+        # Simulate the download landing new bars for the requested symbols.
+        for s in symbols or []:
+            freshness[s] = _epoch(THURS)
         return {"status": "success", "job_id": "j", "symbols": symbols, "interval": interval}
 
     with (
         patch.object(sub, "scanner_universe_symbols", return_value=universe),
         patch(
             "services.data_freshness_service.get_data_freshness",
-            return_value=freshness,
+            side_effect=lambda *a, **k: dict(freshness),
         ),
         patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j": "completed"}),
     ):
         res = sub.check_and_refresh_if_stale(THURS, interval="D")
 
@@ -127,9 +232,46 @@ def test_partial_staleness_fetches_only_stale_subset_daily():
     assert set(res["stale_symbols"]) == set(stale)
     assert set(res["skipped_fresh"]) == set(fresh)
     assert set(res["refreshed"]) == set(stale)
+    assert res["still_stale"] == []
     # The fresh half is never re-fetched.
     assert set(captured["symbols"]) == set(stale)
     assert captured["interval"] == "D"
+
+
+def test_verification_reports_still_stale_when_job_completes_without_advancing():
+    """Issue #304 defect 2 — a symbol whose MAX(timestamp) does NOT advance
+    after the job completes must be reported still_stale/failed, not refreshed.
+    Reproduces the observed 'refreshed=216 errors=0' false-success report: the
+    job is accepted (status=success, job_id set) but the underlying fetch never
+    actually lands new bars for one symbol (e.g. a per-symbol broker rejection
+    mid-batch)."""
+    universe = ["RELIANCE", "SBIN"]
+    # RELIANCE's fetch will "land" (simulated in fake_backfill); SBIN's won't —
+    # the freshness read after the job never advances for SBIN.
+    freshness = {s: _epoch(WED) for s in universe}
+
+    def fake_backfill(start, end, interval="1m", symbols=None):
+        freshness["RELIANCE"] = _epoch(THURS)
+        # SBIN deliberately left stale — simulates a partial download failure
+        # that still reports job status "success" at submission time.
+        return {"status": "success", "job_id": "j1", "symbols": symbols, "interval": interval}
+
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            side_effect=lambda *a, **k: dict(freshness),
+        ),
+        patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    assert res["refreshed"] == ["RELIANCE"]
+    assert res["still_stale"] == ["SBIN"]
+    # SBIN is 1/2 = 50% still-stale > the 20% escalation threshold.
+    assert res["status"] == "error"
+    assert any("still stale" in e for e in res["errors"])
 
 
 # --------------------------------------------------------------------------- #

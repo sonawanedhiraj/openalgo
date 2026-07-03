@@ -26,7 +26,7 @@ THURS = date(2026, 6, 11)
 WED = date(2026, 6, 10)
 SAT = date(2026, 6, 13)
 
-_RESULT_KEYS = {"status", "stale_symbols", "refreshed", "errors", "skipped_fresh"}
+_RESULT_KEYS = {"status", "stale_symbols", "refreshed", "still_stale", "errors", "skipped_fresh"}
 
 
 def _epoch(d: date, hh: int = 15, mm: int = 29) -> int:
@@ -40,20 +40,27 @@ def _epoch(d: date, hh: int = 15, mm: int = 29) -> int:
 def test_index_stale_triggers_refresh_of_every_symbol():
     universe = ["NIFTYAUTO", "NIFTYBANK", "NIFTYIT"]
     captured: dict = {}
+    # Mutable freshness store so the fake backfill can simulate the download
+    # actually landing new bars — the post-#313 verification re-reads this via
+    # get_data_freshness after the job "completes".
+    freshness = {s: _epoch(WED) for s in universe}
 
     def fake_backfill(start, end, symbols=None):
         captured["symbols"] = symbols
         captured["start"] = start
         captured["end"] = end
+        for s in symbols or []:
+            freshness[s] = _epoch(THURS)
         return {"status": "success", "job_id": "j1", "symbols": symbols}
 
     with (
         patch.object(idx, "sector_index_symbols", return_value=universe),
         patch(
             "services.data_freshness_service.get_data_freshness",
-            return_value={s: _epoch(WED) for s in universe},
+            side_effect=lambda *a, **k: dict(freshness),
         ),
         patch.object(idx, "backfill_sector_indices", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
     ):
         res = idx.check_and_refresh_if_stale(THURS)
 
@@ -63,6 +70,7 @@ def test_index_stale_triggers_refresh_of_every_symbol():
     assert res["status"] == "ok"
     assert set(res["stale_symbols"]) == set(universe)
     assert set(res["refreshed"]) == set(universe)
+    assert res["still_stale"] == []
     assert res["skipped_fresh"] == []
     assert res["errors"] == []
     # Only the stale symbols are handed to the fetch; window ends on the ref day.
@@ -110,21 +118,26 @@ def test_index_partial_staleness_fetches_only_stale_subset():
 
     def fake_backfill(start, end, symbols=None):
         captured["symbols"] = symbols
+        # Simulate the download landing new bars for the requested symbols.
+        for s in symbols or []:
+            freshness[s] = _epoch(THURS)
         return {"status": "success", "job_id": "j", "symbols": symbols}
 
     with (
         patch.object(idx, "sector_index_symbols", return_value=universe),
         patch(
             "services.data_freshness_service.get_data_freshness",
-            return_value=freshness,
+            side_effect=lambda *a, **k: dict(freshness),
         ),
         patch.object(idx, "backfill_sector_indices", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j": "completed"}),
     ):
         res = idx.check_and_refresh_if_stale(THURS)
 
     assert set(res["stale_symbols"]) == set(stale)
     assert set(res["skipped_fresh"]) == set(fresh)
     assert set(res["refreshed"]) == set(stale)
+    assert res["still_stale"] == []
     # The fresh half is never re-fetched.
     assert set(captured["symbols"]) == set(stale)
 
@@ -181,6 +194,100 @@ def test_backfill_error_status_surfaces_as_error():
     assert res["status"] == "error"
     assert any("no api key" in e for e in res["errors"])
     assert res["refreshed"] == []
+    assert res["still_stale"] == universe
+
+
+# --------------------------------------------------------------------------- #
+# 4b. Issue #313 (ports #304) — submission success is NOT completion: a symbol
+# whose MAX(timestamp) does NOT advance after the job completes must be
+# reported still_stale, not refreshed.
+# --------------------------------------------------------------------------- #
+def test_index_verification_reports_still_stale_when_job_completes_without_advancing():
+    """A job accepted cleanly (status=success, job_id set) whose underlying
+    fetch never lands new bars for one index (e.g. a per-symbol broker
+    rejection mid-batch) must report that index still_stale/errored — the
+    pre-#313 code marked every stale index refreshed at submission time."""
+    universe = ["NIFTYAUTO", "NIFTYBANK"]
+    # NIFTYAUTO's fetch will "land" (simulated in fake_backfill); NIFTYBANK's
+    # won't — the freshness read after the job never advances for it.
+    freshness = {s: _epoch(WED) for s in universe}
+
+    def fake_backfill(start, end, symbols=None):
+        freshness["NIFTYAUTO"] = _epoch(THURS)
+        return {"status": "success", "job_id": "j1", "symbols": symbols}
+
+    with (
+        patch.object(idx, "sector_index_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            side_effect=lambda *a, **k: dict(freshness),
+        ),
+        patch.object(idx, "backfill_sector_indices", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+    ):
+        res = idx.check_and_refresh_if_stale(THURS)
+
+    assert res["refreshed"] == ["NIFTYAUTO"]
+    assert res["still_stale"] == ["NIFTYBANK"]
+    # NIFTYBANK is 1/2 = 50% still-stale > the 20% escalation threshold.
+    assert res["status"] == "error"
+    assert any("still stale" in e for e in res["errors"])
+
+
+def test_stock_verification_reports_still_stale_when_job_completes_without_advancing():
+    universe = ["INFY", "SBIN"]
+    freshness = {s: _epoch(WED) for s in universe}
+
+    def fake_backfill(start, end, symbols=None):
+        freshness["INFY"] = _epoch(THURS)
+        # SBIN deliberately left stale — simulates a partial download failure
+        # that still reports job status "success" at submission time.
+        return {"status": "success", "job_id": "j1", "symbols": symbols}
+
+    with (
+        patch.object(stk, "sector_follow_stock_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            side_effect=lambda *a, **k: dict(freshness),
+        ),
+        patch.object(stk, "backfill_sector_follow_stocks", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+    ):
+        res = stk.check_and_refresh_if_stale(THURS)
+
+    assert res["refreshed"] == ["INFY"]
+    assert res["still_stale"] == ["SBIN"]
+    assert res["status"] == "error"
+    assert any("still stale" in e for e in res["errors"])
+
+
+def test_stock_verification_read_failure_falls_back_to_submission_reporting():
+    """A verification-read failure must fail open to the pre-#313 submission-
+    based reporting (loudly logged), never raise into the convergence path."""
+    universe = ["INFY", "SBIN"]
+    reads = {"n": 0}
+
+    def flaky_freshness(*a, **k):
+        reads["n"] += 1
+        if reads["n"] == 1:  # the initial stale-check read succeeds
+            return {s: _epoch(WED) for s in universe}
+        raise RuntimeError("duckdb read failed mid-verification")
+
+    with (
+        patch.object(stk, "sector_follow_stock_symbols", return_value=universe),
+        patch("services.data_freshness_service.get_data_freshness", side_effect=flaky_freshness),
+        patch.object(
+            stk,
+            "backfill_sector_follow_stocks",
+            return_value={"status": "success", "job_id": "j1", "symbols": universe},
+        ),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+    ):
+        res = stk.check_and_refresh_if_stale(THURS)  # must NOT raise
+
+    # Fallback: every submitted symbol reported refreshed (degraded mode).
+    assert set(res["refreshed"]) == set(universe)
+    assert res["status"] == "ok"
 
 
 # --------------------------------------------------------------------------- #
