@@ -73,6 +73,19 @@ def get_last_eval_snapshot() -> dict | None:
     return getattr(_last_eval, "snapshot", None)
 
 
+def get_last_fail_snapshot() -> dict | None:
+    """Return the calling thread's last-evaluation FAIL snapshot (Issue #321), or
+    ``None`` if no failing evaluation has run on this thread yet or the most
+    recent evaluation PASSED.
+
+    A **separate** thread-local attribute from ``get_last_eval_snapshot()``
+    (#205, PASS-only) so that contract is untouched. Set at every ``_fail()``
+    call site and explicitly cleared on a successful evaluation, so a consumer
+    can never read a stale fail reason for a symbol that just passed.
+    """
+    return getattr(_last_eval, "snapshot_fail", None)
+
+
 def _divergence_warn_enabled() -> bool:
     """``SCANNER_RULE_DIVERGENCE_WARN_ENABLED`` env flag (default true)."""
     return os.environ.get("SCANNER_RULE_DIVERGENCE_WARN_ENABLED", "true").strip().lower() in (
@@ -107,6 +120,21 @@ def _divergence_block_enabled() -> bool:
     )
 
 
+def _fail(gate: str, **values) -> bool:
+    """Stash a machine-readable FAIL snapshot (Issue #321) and return False.
+
+    ``gate`` is a short, stable, machine-readable gate name (e.g. ``"gap_up"``,
+    ``"rsi_15m"``); ``**values`` are the small set of gate-relevant values
+    already computed at the call site — this stashes, it never computes
+    anything extra, so it cannot change any gate outcome. Consumed via
+    ``get_last_fail_snapshot()`` by the scanner's Chartink-miss diagnostic log
+    (issue #321), which is separate from the #205 PASS-only snapshot so that
+    contract stays untouched.
+    """
+    _last_eval.snapshot_fail = {"passed": False, "failed_gate": gate, **values}
+    return False
+
+
 def _reject_missing(symbol: str, reason: str) -> bool:
     """Loudly log a missing-input rejection (Tier-1 Fix #2), then return False.
 
@@ -115,7 +143,7 @@ def _reject_missing(symbol: str, reason: str) -> bool:
     that made the 2026-06-15 failures look like ordinary quiet days. (Short-but-
     present frames are normal warm-up and stay at DEBUG below.)"""
     logger.warning("fno_intraday_buy_chartink %s: rejecting — %s", symbol, reason)
-    return False
+    return _fail("missing_input", reason=reason)
 
 
 # Per-(symbol, IST-day) dedup for the SMA(200) daily-depth WARNING (issue #280).
@@ -266,7 +294,7 @@ def rule(bars: pd.DataFrame, indicators: dict) -> bool:
         # An indicator computation raised (e.g. ATR over a NaN-laden series).
         # Reject this symbol rather than crash the scan loop.
         logger.debug("fno_intraday_buy_chartink: evaluation raised, rejecting", exc_info=True)
-        return False
+        return _fail("evaluation_exception")
 
 
 def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
@@ -276,7 +304,7 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     # every 5m bar close emits "bars_daily is None (no daily-D data)" for
     # NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNXT50 → 470 daily WARNINGs.
     if indicators.get("exchange") == "NSE_INDEX":
-        return False
+        return _fail("index_symbol")
 
     # --- Reference certificate gate (issue #305) ---
     # The scanner validated the settled reference close (yest_d.close) against
@@ -287,7 +315,7 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     # build the indicators dict without it).
     if indicators.get("reference_certified") is False:
         _reject_uncertified_reference(indicators)
-        return False
+        return _fail("reference_uncertified")
 
     bars_5m = indicators.get("bars_5m")
     if bars_5m is None:
@@ -326,22 +354,22 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
         # not computable), but now an observable one.
         now_ist = datetime.now(_IST)
         _warn_shallow_daily_once(sym, len(bars_daily), vol_sma_l, now_ist.date().isoformat())
-        return False
+        return _fail("daily_warmup", n_rows=len(bars_daily), required=vol_sma_l)
     if bars_weekly is None:
         return _reject_missing(sym, "bars_weekly is None")
     if len(bars_weekly) < 22:
         logger.debug("fno_intraday_buy_chartink %s: weekly warm-up (%d<22)", sym, len(bars_weekly))
-        return False
+        return _fail("weekly_warmup", n_rows=len(bars_weekly), required=22)
     if bars_5m is None:
         return _reject_missing(sym, "bars_5m is None")
     if len(bars_5m) < 8:  # Supertrend(7) warm-up (period + ATR seed)
         logger.debug("fno_intraday_buy_chartink %s: 5m warm-up (%d<8)", sym, len(bars_5m))
-        return False
+        return _fail("5m_warmup", n_rows=len(bars_5m), required=8)
     if bars_15m is None:
         return _reject_missing(sym, "bars_15m is None")
     if len(bars_15m) < 15:  # RSI(14) warm-up
         logger.debug("fno_intraday_buy_chartink %s: 15m warm-up (%d<15)", sym, len(bars_15m))
-        return False
+        return _fail("15m_warmup", n_rows=len(bars_15m), required=15)
 
     # --- Today's running daily snapshot + yesterday's settled bar (Issue #197) ---
     # Production ``bars_daily`` is the ScannerHistoryProvider cache backfilled
@@ -394,7 +422,10 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
                                 "reference_divergence_pct": round(div_pct, 4),
                             }
                         )
-                        return False
+                        return _fail(
+                            "reference_uncertified",
+                            reference_divergence_pct=round(div_pct, 4),
+                        )
         except Exception:  # noqa: BLE001 — the cross-check must never break rule eval
             logger.exception(
                 "fno_intraday_buy_chartink %s: rule-side reference cross-check failed", sym
@@ -454,7 +485,11 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
                         today_d.close,
                         last_5m_close,
                     )
-                    return False
+                    return _fail(
+                        "divergence_block",
+                        today_d_close=float(today_d.close),
+                        last_5m_close=float(last_5m_close),
+                    )
         except (TypeError, ValueError, KeyError, IndexError):
             # Don't let a malformed 5m frame turn the observability layer into
             # a rule-evaluation crash — log and continue.
@@ -473,7 +508,7 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
                 bar_date,
                 now_ist.date(),
             )
-            return False
+            return _fail("dbar_stale", bar_date=str(bar_date), today=str(now_ist.date()))
 
     # Reject if any required daily field is NaN.
     if _any_nan(
@@ -484,26 +519,33 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
         yest_d.high,
         yest_d.low,
     ):
-        return False
+        return _fail("nan_daily_fields")
 
     # Gate 6: daily close > price_min
     if today_d.close <= price_min:
-        return False
+        return _fail("price_min", today_d_close=float(today_d.close), price_min=price_min)
     # Gate 12: daily close < price_max
     if today_d.close >= price_max:
-        return False
+        return _fail("price_max", today_d_close=float(today_d.close), price_max=price_max)
     # Gate 1: daily close > 1d-ago close * buy_mult (default 3% gap). Threshold is
     # read via three-tier resolution: parameters dict → env var → hardcoded default.
     buy_mult = 1.0 + buy_pct / 100.0
     if today_d.close <= yest_d.close * buy_mult:
-        return False
+        return _fail(
+            "gap_up",
+            today_d_close=float(today_d.close),
+            yest_d_close=float(yest_d.close),
+            buy_mult=buy_mult,
+        )
     # Gate 9: daily open > 1d-ago close
     if today_d.open <= yest_d.close:
-        return False
+        return _fail(
+            "open_gt_yest_close", today_d_open=float(today_d.open), yest_d_close=float(yest_d.close)
+        )
     # Gate 10: daily open > typical pivot = (H + L + C of 1d-ago) / 3
     pivot = (yest_d.high + yest_d.low + yest_d.close) / 3.0
     if today_d.open <= pivot:
-        return False
+        return _fail("pivot", today_d_open=float(today_d.open), pivot=float(pivot))
 
     # Gates 2 + 8: daily volume vs SMA(vol_sma_s) and SMA(vol_sma_l). The SMA
     # is computed at the LATEST SETTLED bar (yest_idx) so the reference is a
@@ -512,42 +554,50 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
     sma_vol_50 = sma(bars_daily["volume"], vol_sma_s).iloc[yest_idx]
     sma_vol_200 = sma(bars_daily["volume"], vol_sma_l).iloc[yest_idx]
     if _any_nan(sma_vol_50, sma_vol_200):
-        return False
+        return _fail("vol_sma_nan")
     if today_d.volume <= sma_vol_50:
-        return False
+        return _fail(
+            "vol_sma50", today_d_volume=float(today_d.volume), sma_vol_short=float(sma_vol_50)
+        )
     if today_d.volume <= sma_vol_200:
-        return False
+        return _fail(
+            "vol_sma200", today_d_volume=float(today_d.volume), sma_vol_long=float(sma_vol_200)
+        )
 
     # Gate 7: weekly ATR(21) > atr_thresh * daily close.
     # Exclude the current (potentially partial) week when we have a spare row.
     weekly_for_atr = bars_weekly.iloc[:-1] if len(bars_weekly) > 22 else bars_weekly
     weekly_atr = atr(weekly_for_atr, period=21).iloc[-1]
     if _any_nan(weekly_atr):
-        return False
+        return _fail("weekly_atr_nan")
     if weekly_atr <= today_d.close * atr_thresh:
-        return False
+        return _fail(
+            "weekly_atr",
+            weekly_atr=float(weekly_atr),
+            threshold=float(today_d.close * atr_thresh),
+        )
 
     # Gate 5: 15m RSI(14) > rsi_thresh
     rsi_15m = rsi(bars_15m["close"], period=14).iloc[-1]
     if _any_nan(rsi_15m):
-        return False
+        return _fail("rsi_15m_nan")
     if rsi_15m <= rsi_thresh:
-        return False
+        return _fail("rsi_15m", rsi_15m=float(rsi_15m), rsi_thresh=rsi_thresh)
 
     # Gates 3 + 4: 5m Supertrend(st_period, st_mult). [0] = iloc[-1] (current), [-1] = iloc[-2].
     st = supertrend(bars_5m, period=st_period, multiplier=st_mult)
     if len(st) < 2:
-        return False
+        return _fail("supertrend_warmup", n_rows=len(st))
     st_now = st["line"].iloc[-1]
     st_prev = st["line"].iloc[-2]
     if _any_nan(st_now, st_prev):
-        return False
+        return _fail("supertrend_nan")
     # Gate 3: current 5m Supertrend < daily close (price above the trend line)
     if st_now >= today_d.close:
-        return False
+        return _fail("supertrend_now", st_now=float(st_now), today_d_close=float(today_d.close))
     # Gate 4: prior 5m Supertrend >= 1d-ago daily close
     if st_prev < yest_d.close:
-        return False
+        return _fail("supertrend_prev", st_prev=float(st_prev), yest_d_close=float(yest_d.close))
 
     # --- Gate-snapshot stash (Issue #205) ---
     # Every value below drove the match. The scanner reads this via
@@ -569,6 +619,10 @@ def _evaluate(bars: pd.DataFrame, indicators: dict) -> bool:
         "sma_vol_short": float(sma_vol_50),
         "sma_vol_long": float(sma_vol_200),
     }
+    # Issue #321: a PASS clears any stale FAIL snapshot from a prior evaluation
+    # on this thread, so ``get_last_fail_snapshot()`` never returns a stale
+    # reason for a symbol that just passed.
+    _last_eval.snapshot_fail = None
     return True
 
 
