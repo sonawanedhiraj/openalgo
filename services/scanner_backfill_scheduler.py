@@ -339,6 +339,13 @@ def run_boot_backfill_checks(today=None) -> dict:
             logger.info("scanner backfill: boot jobs final status: %s", finals)
     except Exception:  # waiting must never break the boot path
         logger.exception("scanner backfill: wait_for_jobs raised")
+
+    # Issue #319: the boot convergence can itself be the refresh that resolves
+    # a smoke-check post-hold armed earlier in the process lifetime (e.g. a
+    # restart mid-morning after a stale-data FAIL). Re-check regardless of
+    # ``all_fresh`` — the re-check itself is the source of truth on whether
+    # the data is now healthy.
+    _maybe_release_smoke_hold()
     return res
 
 
@@ -382,6 +389,14 @@ def run_preentry_scanner_refresh(today=None) -> dict:
             logger.info("scanner backfill: pre-entry jobs final status: %s", finals)
     except Exception:  # waiting must never break the entry path
         logger.exception("scanner backfill: pre-entry wait_for_jobs raised")
+
+    # Issue #319: the 09:16 pre-entry refresh races the 09:18 smoke check —
+    # the smoke check can FAIL and arm the post-hold mid-refresh, then this
+    # refresh finishes seconds later with fresh data but nothing re-checks
+    # until the 15:30+ periodic loop, holding a healthy day all session.
+    # Re-check right after the verified-refresh reporting above (regardless
+    # of the stale/fresh counts — the re-check itself decides).
+    _maybe_release_smoke_hold()
 
     # Trigger WS subscription if the scanner has not yet subscribed.  The boot
     # wire_pre_subscribe daemon already handles the normal path; this is a

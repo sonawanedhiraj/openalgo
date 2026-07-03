@@ -880,6 +880,211 @@ def test_scanner_logs_fail_with_reason_for_disqualifying_symbol(fresh_scanner_db
     assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
 
 
+# ---------------------------------------------------------------------------
+# Issue #321 — Chartink-miss diagnostic (FAIL gate-snapshot at INFO)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_scan_cycle_db(monkeypatch):
+    """Point ``database.scan_cycle_db`` at a clean in-memory SQLite for one
+    test — the Chartink-miss tests below need per-test isolation of
+    ``scan_cycle`` rows (unlike most of this file, which never touches that
+    table), so a shared session-lifetime DB would leak Chartink symbol sets
+    across tests.
+    """
+    from database import scan_cycle_db as scdb
+
+    test_engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
+
+    monkeypatch.setattr(scdb, "engine", test_engine)
+    monkeypatch.setattr(scdb, "db_session", test_session)
+    scdb.init_db()
+    yield scdb
+
+    test_session.remove()
+    test_engine.dispose()
+
+
+def _seed_chartink_cycle(*, buy: list[str] | None = None, sell: list[str] | None = None) -> None:
+    """Write a ``scan_cycle`` row with ``cycle_kind='chartink'`` carrying the
+    given BUY/SELL symbol lists — mirrors the shape the real webhook handler
+    writes via ``scan_cycle_service.complete_cycle``.
+
+    ``started_at`` is stamped to match the suite's pinned IST clock
+    (``_pin_market_hours`` — 2026-05-30 11:00) rather than the real wall
+    clock, since ``_today_chartink_symbols`` matches on ``scanner_service``'s
+    ``_now_ist()`` date, not ``scan_cycle_db``'s real-time ``_now_iso()``.
+    """
+    import json as _json
+
+    from database import scan_cycle_db as scdb
+
+    sess = scdb.db_session
+    row = scdb.ScanCycle(
+        started_at="2026-05-30T11:00:00+05:30",
+        completed_at="2026-05-30T11:00:05+05:30",
+        cycle_kind="chartink",
+        screener_buy=_json.dumps(buy or []),
+        screener_sell=_json.dumps(sell or []),
+        post_status="ok",
+    )
+    sess.add(row)
+    sess.commit()
+    sess.remove()
+
+
+@pytest.fixture(autouse=True)
+def _reset_chartink_miss_cache():
+    """The Chartink-symbol-set cache and per-gate dedup set are module-level
+    globals (issue #321) — reset both before/after every test so one test's
+    cache/dedup state can never leak into another."""
+    scanner_service._chartink_set_cache["date"] = None
+    scanner_service._chartink_set_cache["symbols"] = frozenset()
+    scanner_service._chartink_set_cache["fetched_at"] = None
+    scanner_service._chartink_miss_logged.clear()
+    yield
+    scanner_service._chartink_set_cache["date"] = None
+    scanner_service._chartink_set_cache["symbols"] = frozenset()
+    scanner_service._chartink_set_cache["fetched_at"] = None
+    scanner_service._chartink_miss_logged.clear()
+
+
+def test_chartink_listed_miss_logs_info_once_with_dedup(
+    fresh_scanner_db, fresh_scan_cycle_db, caplog
+):
+    """A symbol Chartink also flagged today, that FAILs the in-house rule,
+    logs 'scanner MISS' at INFO — and re-firing the identical FAIL does not
+    re-log (dedup per symbol/rule/gate/day)."""
+    import logging
+
+    _seed_chartink_cycle(buy=["RELIANCE"])
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,  # no surge → no match
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+        svc._on_bar_close("RELIANCE", "5m", non_matching)  # identical FAIL — must dedup
+
+    miss_lines = [r for r in caplog.records if "scanner MISS RELIANCE" in r.message]
+    assert len(miss_lines) == 1
+    assert miss_lines[0].levelno == logging.INFO
+    assert "rule=_test_buy_surge_ema" in miss_lines[0].message
+    assert "failed_gate=" in miss_lines[0].message
+
+
+def test_non_chartink_listed_symbol_stays_debug_only(fresh_scanner_db, fresh_scan_cycle_db, caplog):
+    """A symbol Chartink did NOT flag today keeps the plain DEBUG FAIL line —
+    no 'scanner MISS' INFO log is emitted for it."""
+    import logging
+
+    _seed_chartink_cycle(buy=["SOMEOTHERSYMBOL"])  # RELIANCE is NOT listed
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
+    assert not any("scanner MISS RELIANCE" in r.message for r in caplog.records)
+
+
+def test_chartink_miss_debug_flag_off_suppresses_info_log(
+    fresh_scanner_db, fresh_scan_cycle_db, monkeypatch, caplog
+):
+    """``SCANNER_CHARTINK_MISS_DEBUG_ENABLED=false`` disables the MISS log even
+    for a Chartink-listed symbol."""
+    import logging
+
+    monkeypatch.setenv("SCANNER_CHARTINK_MISS_DEBUG_ENABLED", "false")
+    _seed_chartink_cycle(buy=["RELIANCE"])
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert not any("scanner MISS" in r.message for r in caplog.records)
+
+
+def test_chartink_set_read_failure_is_fail_graceful(fresh_scanner_db, monkeypatch, caplog):
+    """A scan_cycle read failure must never crash evaluation and must never
+    produce a spurious MISS log — it degrades to 'not listed today'."""
+    import logging
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(scanner_service, "_today_chartink_symbols", _boom)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+
+    # Must not raise.
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert not any("scanner MISS" in r.message for r in caplog.records)
+    # The plain DEBUG FAIL line still fires — the diagnostic's failure is isolated.
+    assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
+
+
 def test_get_today_ohlcv_logs_reason_when_no_bars(caplog):
     """A symbol with no bars today logs a reason instead of a silent (None, None)."""
     import logging

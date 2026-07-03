@@ -157,6 +157,179 @@ def _default_completeness_notifier(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Chartink-miss diagnostic (Issue #321).
+#
+# 2026-07-03 live evidence (issue #242): a fully-healthy data day (0 warm-up
+# rejects, 0 missing inputs, reference certificate active) still produced
+# in-house recall = 0 while Chartink fired 10+ unique symbols by 13:00. Rule
+# FAILs only ever logged at DEBUG, and the #205 gate snapshot is PASS-only, so
+# production INFO logs could not say WHICH gate killed each Chartink-listed
+# miss. This closes that gap: on a rule FAIL for a symbol that Chartink ALSO
+# flagged today (via the webhook-posted ``scan_cycle`` rows), log the FAIL
+# gate snapshot (issue #321's ``get_last_fail_snapshot()``) at INFO instead of
+# DEBUG. Non-listed symbols are unaffected — they keep the DEBUG-only FAIL log.
+# ---------------------------------------------------------------------------
+
+
+def _chartink_miss_debug_enabled() -> bool:
+    """``SCANNER_CHARTINK_MISS_DEBUG_ENABLED`` env flag (default true)."""
+    return os.environ.get("SCANNER_CHARTINK_MISS_DEBUG_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+# Module-level (date, symbol_set, fetched_at) cache — refreshed at most every
+# ``_CHARTINK_SET_REFRESH_SEC`` seconds so every bar-close evaluation does not
+# hit the DB. Reset (implicitly) when the IST date rolls, since the cached set
+# is keyed to a specific date and a stale date never matches "today" again.
+_CHARTINK_SET_REFRESH_SEC = 300  # 5 minutes
+_chartink_set_cache: dict[str, Any] = {"date": None, "symbols": frozenset(), "fetched_at": None}
+_chartink_set_lock = threading.Lock()
+
+# Per-(symbol, rule, failed_gate, IST-day) dedup — same in-process-set pattern
+# as ``_warn_shallow_daily_once`` in the rule modules: a stock stuck failing
+# the same gate would otherwise log once per bar close (a flood). A gate
+# CHANGE (different failed_gate) is a new key, so it logs again.
+_chartink_miss_logged: set[tuple[str, str, str, str]] = set()
+_chartink_miss_lock = threading.Lock()
+
+
+def _today_chartink_symbols(now_ist: _dt.datetime) -> frozenset[str]:
+    """Union of today's Chartink-webhook BUY + SELL symbols, module-cached.
+
+    Reads ``scan_cycle`` rows with ``cycle_kind='chartink'`` whose
+    ``started_at`` IST date-prefix matches today (mirrors
+    ``scanner_comparison_eod_service._chartink_sets``). Fail-graceful: any DB
+    error returns an empty set (never raises into the evaluation hot path)
+    and logs once via ``logger.exception`` rather than per-call.
+    """
+    today = now_ist.date().isoformat()
+    with _chartink_set_lock:
+        cached_date = _chartink_set_cache.get("date")
+        fetched_at = _chartink_set_cache.get("fetched_at")
+        if (
+            cached_date == today
+            and fetched_at is not None
+            and (now_ist - fetched_at).total_seconds() < _CHARTINK_SET_REFRESH_SEC
+        ):
+            return _chartink_set_cache["symbols"]
+
+    symbols: frozenset[str] = frozenset()
+    try:
+        from database import scan_cycle_db as scdb
+
+        sess = scdb.db_session
+        try:
+            rows = sess.query(scdb.ScanCycle).filter(scdb.ScanCycle.cycle_kind == "chartink").all()
+            found: set[str] = set()
+            for row in rows:
+                if (row.started_at or "")[:10] != today:
+                    continue
+                for blob in (row.screener_buy, row.screener_sell):
+                    if not blob:
+                        continue
+                    try:
+                        items = json.loads(blob)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(items, list):
+                        continue
+                    for s in items:
+                        if s is None:
+                            continue
+                        sym = str(s).strip().upper()
+                        if sym:
+                            found.add(sym)
+            symbols = frozenset(found)
+        finally:
+            sess.remove()
+    except Exception:
+        logger.exception("scanner: failed to read today's Chartink symbol set for miss-debug")
+        symbols = frozenset()
+
+    with _chartink_set_lock:
+        _chartink_set_cache["date"] = today
+        _chartink_set_cache["symbols"] = symbols
+        _chartink_set_cache["fetched_at"] = now_ist
+    return symbols
+
+
+def _resolve_fail_snapshot(rule_fn: Callable[..., bool]) -> dict | None:
+    """Look up the rule module's ``get_last_fail_snapshot`` (Issue #321).
+
+    Mirrors ``_resolve_eval_snapshot`` (#205, PASS-only) but reads the
+    separate FAIL-snapshot thread-local. Returns ``None`` for un-instrumented
+    rules or when the helper raises/returns something unusable.
+    """
+    module_name = getattr(rule_fn, "__module__", None)
+    if not module_name:
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    helper = getattr(module, "get_last_fail_snapshot", None)
+    if helper is None or not callable(helper):
+        return None
+    try:
+        snapshot = helper()
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, dict) and snapshot else None
+
+
+def _log_chartink_miss_if_applicable(
+    symbol: str, rule_name: str, rule_fn: Callable[..., bool], now_ist: _dt.datetime
+) -> None:
+    """On a rule FAIL, log at INFO (once per gate per day) when ``symbol`` is
+    also in today's Chartink webhook lists (issue #321). Best-effort — a
+    failure anywhere in this path must never break rule evaluation, so it logs
+    the exception and returns rather than raising.
+    """
+    try:
+        if not _chartink_miss_debug_enabled():
+            return
+        chartink_symbols = _today_chartink_symbols(now_ist)
+        sym_upper = (symbol or "").strip().upper()
+        if not sym_upper or sym_upper not in chartink_symbols:
+            return
+        snapshot = _resolve_fail_snapshot(rule_fn)
+        failed_gate = (snapshot or {}).get("failed_gate", "unknown")
+        day_ist = now_ist.date().isoformat()
+        key = (sym_upper, rule_name, str(failed_gate), day_ist)
+        with _chartink_miss_lock:
+            if key in _chartink_miss_logged:
+                return
+            _chartink_miss_logged.add(key)
+        if snapshot:
+            kv = " ".join(
+                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in snapshot.items()
+                if k != "failed_gate"
+            )
+            logger.info(
+                "scanner MISS %s rule=%s failed_gate=%s %s",
+                symbol,
+                rule_name,
+                failed_gate,
+                kv,
+            )
+        else:
+            logger.info(
+                "scanner MISS %s rule=%s failed_gate=%s",
+                symbol,
+                rule_name,
+                failed_gate,
+            )
+    except Exception:
+        logger.exception(
+            "scanner: Chartink-miss diagnostic logging failed for %s/%s", symbol, rule_name
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rule registry — code-backed scan rules self-register via @scan_rule.
 # ---------------------------------------------------------------------------
 #
@@ -1288,6 +1461,12 @@ class ScannerService:
                     )
             else:
                 logger.debug("scanner FAIL %s rule=%s interval=%s", symbol, rule_name, interval)
+                # Issue #321: on a Chartink-listed miss, also log the FAIL gate
+                # snapshot at INFO (deduped per symbol/rule/gate/day) so a
+                # production log tells us WHICH gate killed each real Chartink
+                # hit — the DEBUG line above fires for ~every symbol/bar and is
+                # not enough on its own for that diagnosis.
+                _log_chartink_miss_if_applicable(symbol, rule_name, rule_fn, now_ist)
                 continue
 
             # Issue #305: smoke-fail post-hold — when the 09:18 smoke check
