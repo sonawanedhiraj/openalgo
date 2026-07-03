@@ -31,6 +31,7 @@
   "charge_model_inr_per_lot_round_trip": 530,
   "signal_source": "sector_follow_cap5_vol C1xW2+E4 (reuses services/sector_follow_service evaluator)",
   "signal_universe": "LOCK_STATIC_30 (inherited from sector_follow_cap5_vol)",
+  "intraday_source": "quotes (FUTURES_FOLLOW_INTRADAY_SOURCE, default; issue #332) — 15:20 decision snapshot via ONE batched broker get_multiquotes call (stocks NSE, sector indices NSE_INDEX); fallback chain quotes -> aggregator -> historify, WARNING per hop; set 'aggregator' to restore the pre-#332 WS-fed path; 20d lookback stays on historify",
   "position_sizing": "1 NIFTY lot per signal, greedy in vol-ratio order, hard-capped at 50% of capital as overnight SPAN margin; late signals beyond the cap are skipped",
   "broker": "zerodha",
   "backtest_reference": "docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md (NIFTY-only CAP50 control)",

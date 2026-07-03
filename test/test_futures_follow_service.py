@@ -1022,6 +1022,7 @@ def _make_smoke_service(
     data_ok: bool = True,
     stale: list[str] | None = None,
     session_ok: bool = True,
+    quote_ok: bool = True,
     notifier=None,
     now_dt: datetime | None = None,
 ) -> FuturesFollowService:
@@ -1029,7 +1030,9 @@ def _make_smoke_service(
 
     data_health_checker is injected with a fake that returns ``(data_ok, details_map)``
     where details_map has one entry per stale symbol (ok=False). broker_session_checker
-    is a lambda returning ``session_ok``. All other effects are no-ops."""
+    is a lambda returning ``session_ok``; quote_probe is a lambda returning
+    ``quote_ok`` (issue #332 — keeps the default quotes source hermetic). All
+    other effects are no-ops."""
     stale = stale or []
 
     def fake_health_checker(strategy_name, date_str=None, index_only=False):
@@ -1059,6 +1062,7 @@ def _make_smoke_service(
         intent_resolver=None,
         data_health_checker=fake_health_checker,
         broker_session_checker=lambda: session_ok,
+        quote_probe=lambda: quote_ok,
     )
     svc._test_alerts = alerts
     return svc
@@ -1230,6 +1234,71 @@ def test_register_jobs_skips_smoke_check_when_flag_off(monkeypatch):
     svc.register_jobs(FakeScheduler())
 
     assert "futures_follow_smoke_check" not in job_ids
+
+
+# --------------------------------------------------------------------------- #
+# #332 — quotes-snapshot intraday source: smoke-check quote probe
+# --------------------------------------------------------------------------- #
+
+
+def test_smoke_check_blocks_and_alerts_when_quote_probe_fails(monkeypatch):
+    """AC #9: with source=quotes, a failed dry-run quote probe at 15:18 writes
+    the same self-expiring pause override + Telegram alert as feed-staleness."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "quotes")
+    svc = _make_smoke_service(data_ok=True, session_ok=True, quote_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["quote_probe_ok"] is False
+    assert details["intraday_source"] == "quotes"
+    # The freshness + session arms were green — the probe alone must block.
+    assert details["data_ok"] is True
+    assert details["broker_session_ok"] is True
+
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+    assert any("quote probe" in (r.get("reason") or "") for r in pauses)
+    assert any("quote probe" in a for a in svc._test_alerts)
+
+
+def test_smoke_check_skips_quote_probe_when_source_aggregator(monkeypatch):
+    """With FUTURES_FOLLOW_INTRADAY_SOURCE=aggregator the probe never runs —
+    a failing probe fake must not block (pre-#332 smoke behavior preserved)."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "aggregator")
+    svc = _make_smoke_service(data_ok=True, session_ok=True, quote_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details["intraday_source"] == "aggregator"
+    assert details["quote_probe_ok"] is True  # skipped ⇒ treated as ok
+    overrides = sro.list_overrides(include_expired=True)
+    smoke_pauses = [r for r in overrides if "smoke_check_failed" in (r.get("reason") or "")]
+    assert smoke_pauses == [], f"unexpected smoke-check override: {smoke_pauses}"
+
+
+def test_futures_intraday_source_defaults_and_validates(monkeypatch):
+    """Default is quotes; unknown values fall back to quotes; aggregator honored."""
+    from services.futures_follow_service import futures_intraday_source
+
+    monkeypatch.delenv("FUTURES_FOLLOW_INTRADAY_SOURCE", raising=False)
+    assert futures_intraday_source() == "quotes"
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "aggregator")
+    assert futures_intraday_source() == "aggregator"
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "bogus")
+    assert futures_intraday_source() == "quotes"
 
 
 if __name__ == "__main__":

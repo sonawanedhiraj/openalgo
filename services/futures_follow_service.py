@@ -165,15 +165,41 @@ def compute_futures_charges(buy_notional: float, sell_notional: float) -> float:
 # --------------------------------------------------------------------------- #
 # Production signal evaluator — reuses the sector_follow_cap5_vol evaluator
 # --------------------------------------------------------------------------- #
+def futures_intraday_source() -> str:
+    """``FUTURES_FOLLOW_INTRADAY_SOURCE`` env flag: ``quotes`` (default) |
+    ``aggregator`` (issue #332).
+
+    ``quotes``: today's per-symbol (close, volume) comes from ONE batched broker
+    quote snapshot at decision time (``get_multiquotes``) — the single-decision
+    strategy no longer depends on the all-day WS-fed scanner aggregator being
+    healthy at 15:20. ``aggregator``: the pre-#332 behavior (byte-identical).
+    Unknown values fall back to ``quotes`` with a WARNING. Applies ONLY to
+    futures_follow_cap50 — the sector_follow_cap5_vol equity book is untouched.
+    """
+    val = os.getenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "quotes").strip().lower()
+    if val not in ("quotes", "aggregator"):
+        logger.warning("Unknown FUTURES_FOLLOW_INTRADAY_SOURCE=%s — falling back to 'quotes'", val)
+        return "quotes"
+    return val
+
+
 def production_signal_evaluator(as_of: datetime | None = None) -> list[dict]:
     """Today's ≤5 gate-passing stock signals, via the LIVE sector_follow evaluator.
 
     Reuses ``services.sector_follow_service`` (the canonical production gate
-    evaluator) — config, sector map, DuckDB metrics provider, ``passes_gates`` and
+    evaluator) — config, sector map, metrics provider, ``passes_gates`` and
     ``select_entries`` — so the futures sleeve fires on exactly the signal set the
     equity book sees. Each returned dict carries ``symbol`` + ``vol_ratio`` (the
     greedy ordering key for the margin cap). Lazily imported so importing this
     module never pulls the DuckDB stack.
+
+    Issue #332: today's intraday (close, volume) source is selected by
+    ``FUTURES_FOLLOW_INTRADAY_SOURCE``. With ``quotes`` (default) the metrics
+    provider is built around the batched quotes-snapshot intraday provider
+    (fallback chain quotes → aggregator → historify → none, WARNING per hop);
+    with ``aggregator`` the pre-#332 ``duckdb_metrics_provider`` path runs
+    unchanged. Gate logic, selection (K5 / vol-ratio greedy), and sizing are
+    identical in both cases.
 
     NOTE: the production sector_follow evaluator ships the C1 base gate; the
     W2+E4 refinements that define the backtested "C1×W2+E4 K5" set live in the
@@ -182,6 +208,8 @@ def production_signal_evaluator(as_of: datetime | None = None) -> list[dict]:
     """
     from services.sector_follow_service import (
         duckdb_metrics_provider,
+        make_duckdb_metrics_provider,
+        make_quotes_intraday_provider,
         passes_gates,
         select_entries,
     )
@@ -195,7 +223,32 @@ def production_signal_evaluator(as_of: datetime | None = None) -> list[dict]:
     as_of = as_of or datetime.now(_IST)
     sf_config = _sf_load_config()
     sector_map = _sf_load_sector_map()
-    metrics = duckdb_metrics_provider(as_of, sf_config.universe, sector_map, sf_config)
+    source = futures_intraday_source()
+    if source == "quotes":
+        quotes_provider = make_quotes_intraday_provider(
+            universe=sf_config.universe, sector_map=sector_map
+        )
+        metrics_provider = make_duckdb_metrics_provider(intraday_provider=quotes_provider)
+        metrics = metrics_provider(as_of, sf_config.universe, sector_map, sf_config)
+        # Observability (issue #332): one INFO line per eval summarizing where
+        # each symbol's intraday data actually came from.
+        n_by_src = {"quotes": 0, "aggregator": 0, "historify": 0, "none": 0}
+        for m in metrics.values():
+            src = m.get("intraday_source")
+            if src in n_by_src:
+                n_by_src[src] += 1
+        logger.info(
+            "futures_follow intraday source=quotes fetched=%d/%d fallback_aggregator=%d "
+            "fallback_historify=%d none=%d",
+            n_by_src["quotes"],
+            len(metrics),
+            n_by_src["aggregator"],
+            n_by_src["historify"],
+            n_by_src["none"],
+        )
+    else:
+        # aggregator: the pre-#332 path, byte-identical.
+        metrics = duckdb_metrics_provider(as_of, sf_config.universe, sector_map, sf_config)
     candidates: list[dict] = []
     for symbol, m in metrics.items():
         if passes_gates(m, sf_config):
@@ -447,6 +500,44 @@ def production_broker_session_checker() -> bool:
         return False
 
 
+def production_quote_probe() -> bool:
+    """Dry-run quote probe for the 15:18 smoke check (issue #332).
+
+    Fetches ONE universe symbol through the same quotes-snapshot provider path
+    the 15:20 evaluator uses and asserts a sane ``ltp > 0`` served by the
+    ``quotes`` source (an internal fallback to the aggregator means the session
+    cannot serve quotes — that must FAIL the probe at 15:18, not silently
+    degrade at 15:20). ``False`` on any failure; never raises.
+    """
+    try:
+        from services.sector_follow_service import (
+            load_config as _sf_load_config,
+        )
+        from services.sector_follow_service import (
+            make_quotes_intraday_provider,
+        )
+
+        universe = _sf_load_config().universe
+        if not universe:
+            logger.warning("futures_follow quote probe: empty sector_follow universe")
+            return False
+        sym = universe[0]
+        provider = make_quotes_intraday_provider(universe=[sym], sector_map={sym: "NIFTY"})
+        close, _vol, src = provider(sym, datetime.now(_IST))
+        ok = src == "quotes" and close is not None and float(close) > 0
+        if not ok:
+            logger.warning(
+                "futures_follow quote probe FAILED for %s (close=%s source=%s)",
+                sym,
+                close,
+                src,
+            )
+        return ok
+    except Exception:
+        logger.exception("futures_follow quote probe raised")
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Service
 # --------------------------------------------------------------------------- #
@@ -489,6 +580,7 @@ class FuturesFollowService:
         intent_resolver: Callable[[], object] | None = None,
         data_health_checker: Callable[..., tuple] | None = None,
         broker_session_checker: Callable[[], bool] | None = None,
+        quote_probe: Callable[[], bool] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -511,6 +603,9 @@ class FuturesFollowService:
         # Broker-session checker for the 15:18 smoke check. Left None in unit tests
         # (treated as live); the live singleton uses ``production_broker_session_checker``.
         self._broker_session_checker = broker_session_checker or production_broker_session_checker
+        # Dry-run quote probe for the 15:18 smoke check (issue #332) — only
+        # consulted when FUTURES_FOLLOW_INTRADAY_SOURCE resolves to "quotes".
+        self._quote_probe = quote_probe or production_quote_probe
         self._now = now or (lambda: datetime.now(_IST))
         self.eod_reports_dir = _EOD_REPORTS_DIR
 
@@ -1198,13 +1293,21 @@ class FuturesFollowService:
     def assert_data_pipeline_healthy(self) -> tuple[bool, dict]:
         """15:18 IST pre-entry smoke check for futures_follow_cap50.
 
-        Two checks (self-contained — no aggregator, no historify probe, because
+        Three checks (self-contained — no aggregator probe, because
         futures_follow does not own any historical data pipeline of its own):
 
-        1. **Data freshness**: the sector_follow_cap5_vol feed (which supplies our
-           signal evaluator) is fresh for today's date, via the existing
-           ``self._data_health_checker``.
-        2. **Broker session live**: an API key is configured (operator logged in).
+        1. **Historify lookback freshness**: the sector_follow_cap5_vol historify
+           feed is fresh for today's date, via the existing
+           ``self._data_health_checker``. Under the ``quotes`` intraday source
+           (issue #332) this arm guards ONLY the 20-day lookback (prior close,
+           avg volume) — today's snapshot no longer depends on it.
+        2. **Broker session live**: an API key is configured (operator logged
+           in). Under ``quotes`` this is load-bearing for DATA, not just orders.
+        3. **Dry-run quote probe** (only when ``FUTURES_FOLLOW_INTRADAY_SOURCE``
+           resolves to ``quotes``): fetch 1 universe symbol through the quotes
+           provider path and assert ``ltp > 0``. A session that authenticates
+           but cannot serve quotes must fail here at 15:18, not silently
+           degrade at 15:20.
 
         On failure it writes a same-day ``pause`` runtime override (which the
         engine's ``_entry_held_by_override`` gate honors, blocking the 15:20
@@ -1218,16 +1321,16 @@ class FuturesFollowService:
         """
         as_of = self._now()
         as_of_date = as_of.astimezone(_IST).date()
+        today_str = as_of_date.isoformat()
 
         if not futures_smoke_check_enabled():
             logger.debug("futures_follow 15:18 smoke check skipped (flag off)")
             return True, {"skipped": True}
 
-        # ---- Check 1: data freshness (via the shared sector_follow checker) ---- #
+        # ---- Check 1: historify lookback freshness (shared sector_follow checker) #
         data_ok = True
         stale_symbols: list[str] = []
         if self._data_health_checker is not None and data_freshness_enabled():
-            today_str = as_of_date.isoformat()
             try:
                 data_ok, details_map = self._data_health_checker(
                     "sector_follow_cap5_vol", today_str
@@ -1247,11 +1350,23 @@ class FuturesFollowService:
             logger.exception("futures_follow smoke check: broker-session probe raised")
             session_ok = False
 
-        ok = data_ok and session_ok
+        # ---- Check 3: dry-run quote probe (issue #332, quotes source only) ---- #
+        intraday_source = futures_intraday_source()
+        quote_probe_ok = True
+        if intraday_source == "quotes":
+            try:
+                quote_probe_ok = bool(self._quote_probe())
+            except Exception:
+                logger.exception("futures_follow smoke check: quote probe raised")
+                quote_probe_ok = False
+
+        ok = data_ok and session_ok and quote_probe_ok
         details: dict = {
             "data_ok": data_ok,
             "stale_symbols": stale_symbols,
             "broker_session_ok": session_ok,
+            "intraday_source": intraday_source,
+            "quote_probe_ok": quote_probe_ok,
         }
 
         if ok:
@@ -1265,11 +1380,13 @@ class FuturesFollowService:
         reasons = []
         if not data_ok:
             reasons.append(
-                f"sector_follow feed stale ({today_str})"
+                f"sector_follow historify feed stale ({today_str}) — guards the 20d lookback"
                 + (f": {stale_symbols}" if stale_symbols else "")
             )
         if not session_ok:
             reasons.append("broker session not live")
+        if not quote_probe_ok:
+            reasons.append("dry-run quote probe failed (session cannot serve quotes)")
         reason = "; ".join(reasons)
         logger.error(f"futures_follow 15:18 SMOKE CHECK FAILED: {reason}")
 

@@ -958,7 +958,12 @@ the master contract: 30-JUN-26 / 28-JUL-26 / 25-AUG-26, all Tuesdays — NSE mov
 NIFTY expiry off Thursday)),
 HARD-CAPPED at **50% of capital as overnight SPAN margin** (₹10L book ⇒ ~2
 lots; late signals beyond the cap are skipped). Product **NRML**, exchange **NFO**,
-MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. **No stop loss** (Phase-1
+MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. As of 2026-07-04 (#332)
+the 15:20 decision snapshot (today's close+volume per symbol) comes from **one
+batched broker quote call** (`get_multiquotes`) behind
+`FUTURES_FOLLOW_INTRADAY_SOURCE` (default `quotes`; `aggregator` restores the
+WS-fed scanner-aggregator path) — fallback chain quotes→aggregator→historify with
+a WARNING per hop, plus a 15:18 dry-run quote probe in the smoke check. **No stop loss** (Phase-1
 proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**
 is the only backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
 (0.03% notional) round-trip charges.
