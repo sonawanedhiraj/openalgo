@@ -527,6 +527,139 @@ def _nth_prev_business_day(d: date, n: int) -> date:
     return cur
 
 
+# --------------------------------------------------------------------------- #
+# Issue #314 — feed the re-settle's broker-verified closes into the
+# scanner_reference_data prev-close registry, unconditionally on every
+# boot/convergence run (not just when the aggregator_seeder's broker
+# fallback happens to fire).
+# --------------------------------------------------------------------------- #
+def _daily_bar_ist_date(ts) -> date | None:
+    """IST calendar date of a historify daily-bar ``timestamp`` (epoch seconds).
+
+    Mirrors ``services.scan_rules._today_running._to_ist_date`` without
+    importing the rules package (this module sits below scan_rules in the
+    dependency graph — the backfill/registry layer must not depend on rule
+    code). Returns ``None`` on anything unparseable.
+    """
+    if ts is None:
+        return None
+    try:
+        import pandas as pd  # noqa: PLC0415 — keep module import light
+
+        if pd.isna(ts):
+            return None
+        return pd.Timestamp(float(ts), unit="s", tz="UTC").tz_convert("Asia/Kolkata").date()
+    except (TypeError, ValueError):
+        return None
+    except Exception:  # noqa: BLE001 — this is an observability helper, never raise
+        return None
+
+
+def _record_prev_closes_from_provider(universe: list[str], today: date) -> dict:
+    """Record each symbol's T-1 settled close from the just-refreshed
+    ``ScannerHistoryProvider`` daily cache into the broker prev-close registry
+    (``services.scanner_reference_data``).
+
+    Reuses the daily-D bars the re-settle already fetched and the provider
+    already re-read from DuckDB — zero new broker API load. This is what
+    makes registry coverage unconditional: today it is populated ONLY when
+    ``scanner_aggregator_seeder``'s broker fallback fires (historify 1m short
+    at boot); the re-settle runs at BOTH boot and post-close regardless of 1m
+    health, so wiring it here closes that coverage gap on every run.
+
+    CRITICAL semantic trap (do not regress): the re-settle runs post-close too,
+    where the most recent SETTLED bar is TODAY's own close, not yesterday's.
+    Recording that as "today's prev-close" would poison the registry for the
+    rest of today's rule evaluations (today's T-1 is yesterday's close, never
+    today's own). So only the close of the latest bar dated STRICTLY BEFORE
+    ``today`` is ever recorded — mirroring
+    ``scanner_reference_data.record_prev_close_from_bars``'s ``bar_day < today``
+    semantics exactly, just sourced from the provider's DataFrame instead of a
+    raw broker bar list.
+
+    Fail-graceful: a per-symbol read/parse failure is logged and skipped; the
+    whole helper never raises into ``resettle_recent_daily``.
+
+    Returns ``{"recorded": [...], "skipped": [...], "errors": int}``.
+    """
+    outcome: dict = {"recorded": [], "skipped": [], "errors": 0}
+    try:
+        from datetime import time as _time
+
+        from services.scanner_history_provider import get_provider
+        from services.scanner_reference_data import _IST, record_broker_prev_close
+    except Exception:
+        logger.exception(
+            "scanner daily-D resettle: prev-close registry wiring unavailable — skipping"
+        )
+        outcome["errors"] += 1
+        return outcome
+
+    # Anchor the recording's day-scoping to `today` (the resettle's own
+    # reference day), not wall-clock `datetime.now()` — the registry's
+    # same-day-only serving contract (services.scanner_reference_data) must
+    # key off the day the resettle considers "today", so a boot run that
+    # crosses midnight (or a test driving a fixed `today`) records under the
+    # correct day rather than whatever instant the process happens to run at.
+    record_as_of = datetime.combine(today, _time(hour=8, minute=30), tzinfo=_IST)
+
+    try:
+        provider = get_provider()
+    except Exception:
+        logger.exception(
+            "scanner daily-D resettle: could not obtain ScannerHistoryProvider — "
+            "prev-close registry not updated"
+        )
+        outcome["errors"] += 1
+        return outcome
+
+    for sym in universe:
+        try:
+            daily = provider.get_daily(sym)
+            if daily is None or daily.empty or "timestamp" not in daily.columns:
+                outcome["skipped"].append(sym)
+                continue
+
+            prev_close = None
+            # Ascending-by-construction (ScannerHistoryProvider._fetch tails the
+            # DuckDB query), but iterate defensively rather than assume order.
+            for _, row in daily.iterrows():
+                bar_day = _daily_bar_ist_date(row.get("timestamp"))
+                if bar_day is None or bar_day >= today:
+                    continue
+                close = row.get("close")
+                if close is None:
+                    continue
+                try:
+                    close_f = float(close)
+                except (TypeError, ValueError):
+                    continue
+                if prev_close is None or bar_day >= prev_close[1]:
+                    prev_close = (close_f, bar_day)
+
+            if prev_close is None:
+                outcome["skipped"].append(sym)
+                continue
+
+            record_broker_prev_close(sym, prev_close[0], as_of=record_as_of)
+            outcome["recorded"].append(sym)
+        except Exception:  # noqa: BLE001 — one bad symbol must never break the batch
+            logger.exception(
+                "scanner daily-D resettle: prev-close registry record failed for %s", sym
+            )
+            outcome["errors"] += 1
+
+    logger.info(
+        "scanner daily-D resettle: prev-close registry updated for %d/%d symbols "
+        "(%d skipped, %d errors)",
+        len(outcome["recorded"]),
+        len(universe),
+        len(outcome["skipped"]),
+        outcome["errors"],
+    )
+    return outcome
+
+
 def resettle_recent_daily(
     today: date | None = None,
     *,
@@ -629,6 +762,21 @@ def resettle_recent_daily(
         except Exception as e:  # provider refresh failure must not raise
             logger.exception("scanner daily-D resettle: provider refresh failed: %s", e)
             result["errors"].append(f"provider_refresh: {e}")
+        else:
+            # Issue #314 — feed the broker-verified settled closes the re-settle
+            # just fetched (and the provider just re-read) into the prev-close
+            # registry, so certificate coverage no longer depends on the
+            # aggregator_seeder's broker fallback ever firing. Only attempted
+            # after a successful provider refresh — a stale/pre-resettle daily
+            # cache must never seed the registry. Never raises.
+            try:
+                registry_outcome = _record_prev_closes_from_provider(universe, ref)
+                result["prev_close_registry"] = registry_outcome
+            except Exception as e:  # belt-and-braces — helper is already defensive
+                logger.exception(
+                    "scanner daily-D resettle: prev-close registry wiring raised: %s", e
+                )
+                result["errors"].append(f"prev_close_registry: {e}")
 
     return result
 
