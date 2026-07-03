@@ -59,6 +59,12 @@ _BOOT_WAIT_POLL_SEC = 15
 _stop_event = threading.Event()
 _periodic_thread: threading.Thread | None = None
 
+# Once-per-process-per-date guard for the daily-D re-settle (see
+# _maybe_resettle_daily). A settled daily bar only needs correcting once per day;
+# without this the periodic loop would re-fetch the whole universe every 30 min.
+# A restart clears it (fine — the boot convergence then re-settles once).
+_resettled_dates: set = set()
+
 # Pre-entry refresh (#239): a single convergence fetch just before the 09:18
 # smoke check so a cold boot at 08:31 IST has fresh historify data AND the
 # WS subscription is established before evaluation begins.  The boot check
@@ -172,14 +178,57 @@ def _health_strategy_name(interval: str) -> str:
 # --------------------------------------------------------------------------- #
 # Convergence check + health persistence + alerting
 # --------------------------------------------------------------------------- #
+def _maybe_resettle_daily(today) -> None:
+    """Re-settle the trailing daily-D window once per day (before the stale-check).
+
+    A daily bar written intraday as a provisional/running close is never fixed by
+    the incremental convergence (it sees the day's bar already present and skips
+    it), so a stale close persists into the scanner's ``yest_d`` gate and fires
+    phantom signals (2026-07-02 DELHIVERY false BUY — issue #299). This forces a
+    non-incremental overwrite re-fetch of the settled window + a provider cache
+    refresh, bounded to once per process per date. Only runs when ``D`` is a
+    configured interval. Fully fail-graceful — never raises into the caller.
+    """
+    ref = today or datetime.now(_IST).date()
+    if "D" not in _intervals():
+        return
+    if ref in _resettled_dates:
+        return
+    try:
+        from services.scanner_universe_backfill import resettle_recent_daily
+
+        res = resettle_recent_daily(ref)
+        # Mark done unless the attempt failed for a transient reason (no broker
+        # session yet / fetch error) — a failed attempt should retry on the next
+        # convergence tick rather than be suppressed for the rest of the day.
+        if res.get("status") in ("ok", "disabled") or res.get("resettled"):
+            _resettled_dates.add(ref)
+        logger.info(
+            "scanner daily-D resettle [%s]: status=%s window=%s resettled=%s errors=%d",
+            ref,
+            res.get("status"),
+            res.get("window"),
+            res.get("resettled"),
+            len(res.get("errors", [])),
+        )
+    except Exception:  # a resettle failure must never break the convergence path
+        logger.exception("scanner daily-D resettle raised")
+
+
 def run_backfill_checks(today=None) -> dict:
     """Run the per-interval stale-check (1m then D); return the combined verdict.
 
     ``all_fresh`` is True iff no interval found a stale symbol (the convergence
     signal that lets the periodic loop back off). ``errors`` unions every
     interval's fail-graceful error list. Never raises.
+
+    Before the stale-check, a once-per-day daily-D re-settle corrects any
+    provisional (intraday-captured) daily close so the scanner's ``yest_d`` gate
+    reads the settled value (issue #299).
     """
     from services.scanner_universe_backfill import check_and_refresh_if_stale
+
+    _maybe_resettle_daily(today)
 
     per_interval: dict[str, dict] = {}
     errors: list[str] = []
@@ -218,6 +267,7 @@ def _persist_health(res: dict) -> None:
                 details={
                     "interval": interval,
                     "refreshed": ires.get("refreshed", []),
+                    "still_stale": ires.get("still_stale", []),
                     "skipped_fresh_count": len(ires.get("skipped_fresh", [])),
                     "errors": ires.get("errors", []),
                 },
@@ -229,12 +279,18 @@ def _persist_health(res: dict) -> None:
 
 def _log_and_alert(res: dict, phase: str) -> None:
     for interval, ires in res.get("intervals", {}).items():
+        # Issue #304 — refreshed/still_stale are now VERIFIED post-job counts
+        # (re-read MAX(timestamp) after the job completes), not submission
+        # counts, so "refreshed=N errors=0" can no longer be logged purely
+        # because a download job was accepted.
         logger.info(
-            "scanner backfill %s [%s]: stale=%d refreshed=%d skipped_fresh=%d errors=%d",
+            "scanner backfill %s [%s]: stale=%d verified_fresh=%d still_stale=%d "
+            "skipped_fresh=%d errors=%d",
             phase,
             interval,
             len(ires.get("stale_symbols", [])),
             len(ires.get("refreshed", [])),
+            len(ires.get("still_stale", [])),
             len(ires.get("skipped_fresh", [])),
             len(ires.get("errors", [])),
         )
@@ -391,7 +447,23 @@ def _periodic_tick(now: datetime, end_t: time) -> tuple[bool, dict | None]:
     res = run_backfill_checks(now.date())
     _persist_health(res)
     _log_and_alert(res, phase="periodic")
+    _maybe_release_smoke_hold()
     return True, res
+
+
+def _maybe_release_smoke_hold() -> None:
+    """Issue #305: after a convergence tick refreshed the stored 1m/D data,
+    re-run the scanner smoke check IF its post-hold is armed — a passing
+    re-check releases the hold without waiting for the 15:35 IST expiry.
+    No-op when no hold is armed. Never raises into the periodic loop."""
+    try:
+        from services.scanner_smoke_check_service import re_check_and_release
+
+        res = re_check_and_release()
+        if res is not None:
+            logger.info("scanner backfill: smoke re-check after convergence → ok=%s", res[0])
+    except Exception:
+        logger.exception("scanner backfill: smoke-hold re-check failed")
 
 
 def _gate_on_broker_session() -> bool:

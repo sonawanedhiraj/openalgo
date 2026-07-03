@@ -55,6 +55,20 @@ def _freeze_post_close(monkeypatch):
     monkeypatch.setattr(rulemod, "datetime", _FrozenDateTime)
 
 
+@pytest.fixture(autouse=True)
+def _reset_reference_registry():
+    """Issue #305: the rule consults the module-global broker prev-close
+    registry when the indicators dict carries no explicit verdict. Reset it so
+    a recording left behind by another test on the same xdist worker (e.g. the
+    seeder broker-fallback tests recording RELIANCE) cannot fail the
+    happy-path assertions here."""
+    from services import scanner_reference_data as refdata
+
+    refdata.reset_for_tests()
+    yield
+    refdata.reset_for_tests()
+
+
 def _make_service(symbols, provider=None):
     """Construct a ScannerService without touching the real history provider.
 

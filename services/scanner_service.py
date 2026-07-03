@@ -829,6 +829,9 @@ class ScannerService:
         self._completeness_window_start: _dt.datetime | None = None
         self._completeness_alert_day: _dt.date | None = None
         self._completeness_alert_severities: set[str] = set()
+        # Issue #305: per-(symbol, IST-day) dedup for the "scanner HELD" WARNING
+        # emitted while the smoke-fail post-hold blocks hit persistence/posting.
+        self._held_warned: set[tuple[str, str]] = set()
 
         # Ensure the example rule modules are imported so they self-register
         # before any bar close lands. Import here (not at module top) to keep
@@ -1206,6 +1209,14 @@ class ScannerService:
         if _completeness_enabled():
             self._record_completeness(symbol, now_ist)
 
+        # Issue #305: reference certificate — validate the settled daily
+        # reference close (the rules' yest_d.close) against the broker
+        # prev-close recorded at boot. Computed ONCE per (symbol, bar close)
+        # here at the choke point so the rules stay pure — they read the
+        # pre-computed verdict from the indicators dict; a MISSING key is
+        # treated as certified (backward compat for tests/other callers).
+        ref_cert = self._reference_certificate(symbol, bars, indicators_dict, now_ist)
+
         for definition in get_scan_definitions(enabled_only=True):
             rule_name = definition.get("rule_module") or definition.get("name")
             if not rule_name:
@@ -1229,9 +1240,10 @@ class ScannerService:
                         params = {}
                 else:
                     params = {}
-                eff_indicators = (
-                    {**indicators_dict, "parameters": params} if params else indicators_dict
-                )
+                extra: dict[str, Any] = dict(ref_cert)
+                if params:
+                    extra["parameters"] = params
+                eff_indicators = {**indicators_dict, **extra} if extra else indicators_dict
                 matched = bool(rule_fn(bars, eff_indicators))
             except Exception:
                 logger.exception(
@@ -1278,6 +1290,13 @@ class ScannerService:
                 logger.debug("scanner FAIL %s rule=%s interval=%s", symbol, rule_name, interval)
                 continue
 
+            # Issue #305: smoke-fail post-hold — when the 09:18 smoke check
+            # FAILED, the PASS above is still logged (observability) but the
+            # hit is NOT persisted to scan_results and NOT posted to the
+            # engine until a re-check passes or the hold expires (15:35 IST).
+            if self._hit_held_by_smoke(symbol, now_ist):
+                continue
+
             scan_result_id = 0
             try:
                 scan_result_id = record_scan_result(
@@ -1312,6 +1331,63 @@ class ScannerService:
                     symbol,
                     interval,
                 )
+
+    # -- reference certificate + smoke post-hold (issue #305) ----------------
+
+    def _reference_certificate(
+        self,
+        symbol: str,
+        bars: pd.DataFrame,
+        indicators_dict: dict[str, Any],
+        now_ist: _dt.datetime,
+    ) -> dict[str, Any]:
+        """Compute the reference-data certificate for ``symbol`` at this bar
+        close (see ``services.scanner_reference_data``). Returns ``{}`` when
+        the check is disabled or the computation fails — the rules treat a
+        missing key as certified, so an internal error is always fail-open.
+        Never raises back into the evaluation loop."""
+        try:
+            from services.scanner_reference_data import (  # noqa: PLC0415
+                compute_reference_certificate,
+            )
+
+            bars_5m = indicators_dict.get("bars_5m")
+            return compute_reference_certificate(
+                symbol=symbol,
+                bars_5m=bars_5m if bars_5m is not None else bars,
+                bars_daily=indicators_dict.get("bars_daily"),
+                exchange=indicators_dict.get("exchange"),
+                now_ist=now_ist,
+            )
+        except Exception:
+            logger.exception(
+                "ScannerService: reference certificate computation failed for %s", symbol
+            )
+            return {}
+
+    def _hit_held_by_smoke(self, symbol: str, now_ist: _dt.datetime) -> bool:
+        """True iff the smoke-fail post-hold is active — the caller must skip
+        persisting/posting the hit. Emits a once-per-(symbol, IST-day)
+        WARNING so the held PASS is visible without flooding. Fail-open on a
+        probe error (never blocks on a broken import). Never raises."""
+        try:
+            from services.scanner_smoke_check_service import is_post_hold_active  # noqa: PLC0415
+
+            if not is_post_hold_active(now=now_ist):
+                return False
+        except Exception:
+            logger.exception("ScannerService: smoke post-hold probe failed — not holding")
+            return False
+        key = (symbol, now_ist.date().isoformat())
+        if key not in self._held_warned:
+            self._held_warned.add(key)
+            logger.warning(
+                "scanner HELD %s reason=smoke_check_failed — rule PASS logged but hit "
+                "NOT persisted/posted (hold lifts on a passing re-check or expires "
+                "15:35 IST; flag SCANNER_SMOKE_BLOCK_ENABLED)",
+                symbol,
+            )
+        return True
 
     # -- decision-input completeness (Tier-1 Fix #3) ------------------------
 

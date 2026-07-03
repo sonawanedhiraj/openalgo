@@ -10,7 +10,7 @@ journal). Operator runs `uv run pytest test/test_futures_follow_service.py -v`
 post-close to verify before merging to dev.
 """
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -1104,10 +1104,14 @@ def test_smoke_check_blocks_and_alerts_when_data_stale(monkeypatch):
     ]
     assert pauses, f"expected smoke-check pause override; got {overrides}"
 
-    # The entry gate must honor the override.
+    # The entry gate must honor the override. Check against the SAME simulated
+    # clock the service used (15:18 IST on the pinned date), not real wall-clock:
+    # the override self-expires at 15:30 IST that day, so a real-time check would
+    # spuriously report "expired" whenever the suite runs after 15:30 IST (#303).
     from database.strategy_runtime_override_db import is_entry_blocked
 
-    blocked, _ov = is_entry_blocked("futures_follow_cap50")
+    svc_now_utc = datetime(2026, 7, 2, 15, 18, tzinfo=_IST).astimezone(UTC).replace(tzinfo=None)
+    blocked, _ov = is_entry_blocked("futures_follow_cap50", now=svc_now_utc)
     assert blocked is True
 
     # Telegram alert must mention the strategy name and failure.

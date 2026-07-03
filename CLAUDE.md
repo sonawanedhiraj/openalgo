@@ -1181,6 +1181,27 @@ intervals** (`1m` AND `D`):
   daily by resampling the continuous stored 1m series (Approach 2, single source
   of truth) — that only becomes viable once the full-universe 1m deep backfill
   has landed.
+- **Daily-D re-settle (issue #299, 2026-07-02):** the incremental convergence
+  above can *never* correct a daily bar that was written **intraday** as a
+  provisional/running close (the #277 09:45-freeze class) — `compute_stale_symbols`
+  sees a bar for the day already present and the incremental download SKIPS it, so
+  the provisional close persists into the scanner's `yest_d` gate and manufactures
+  phantom gap signals (the 2026-07-02 DELHIVERY false BUY: stored 07-01 close
+  475.4 vs broker-settled 507.7). `resettle_recent_daily` fixes this: once per
+  process per date (before the stale-check, at boot + post-close), it forces a
+  **non-incremental** overwrite re-fetch of the last `SCANNER_DAILY_RESETTLE_DAYS`
+  (default 2) settled trading days for the whole universe — the broker's daily API
+  returns the settled close post-close, and the `upsert_market_data`
+  ON-CONFLICT-DO-UPDATE write overwrites the provisional bar in place — then calls
+  `ScannerHistoryProvider.refresh()` so the corrected close reaches the live
+  scanner **without** a restart (the provider caches daily-D at boot and never
+  re-reads during the session). Gated by `SCANNER_DAILY_RESETTLE_ENABLED` (default
+  `true`); wired via `scanner_backfill_scheduler._maybe_resettle_daily`. Manual
+  one-shot: `uv run python -m services.scanner_universe_backfill --resettle`.
+  Additive, idempotent, fail-graceful. A follow-up (not yet shipped) adds a
+  defense-in-depth rule-level guard that rejects when the derived `yest_d` bar is
+  not the actual previous trading day, for the case where the re-settle can't run
+  (broker session down).
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
@@ -1229,6 +1250,44 @@ is observed/skipped*, never *which signals fire***:
   produces no bar closes at all, so this path never fires — that case is the 15:18
   smoke check's job (Tier 2, not yet shipped). The metric catches *partial*
   degradation and reports coverage. See `docs/PARAMETER_LOG.md` for all flags.
+
+**Tier-2 — reference-data contract (issue #305, 2026-07-02).** Tier-1 made
+failures *visible*; Tier-2 makes the reference data *enforceable* — the durable
+fix for the 2026-07-02 DELHIVERY incident (BUY fired 42× while DOWN because the
+rule's `yest_d.close` came from a stale historify-D slot diverging 6.8% from the
+broker-known prior close, with every existing guard alert-only). Three parts:
+
+- **Broker prev-close registry** (`services/scanner_reference_data.py`): the
+  boot `aggregator_seeder` already fetches broker 1m bars per symbol (broker
+  fallback arm) — it now also records each symbol's **T-1 settled close** (the
+  last broker bar dated before today) into an in-process, day-scoped registry
+  (only same-IST-day recordings are served; no new broker API load).
+- **Reference certificate at the choke point**:
+  `ScannerService._evaluate_definitions` computes — once per (symbol, bar
+  close), centrally, so the rules stay pure — the settled reference the rules
+  will use (shared `derive_today_and_yest` helper) and cross-checks it against
+  the registry. The verdict rides the indicators dict (`reference_certified`,
+  `reference_divergence_pct`, value keys). Both Chartink rules gate on it early:
+  an **explicit `False`** (divergence > `SCANNER_REFERENCE_DIVERGENCE_MAX_PCT`,
+  default 1.0) rejects the symbol with a dedup'd per-(symbol, day) WARNING + a
+  CRIT Telegram via `source_divergence_alerts.check_and_alert`
+  (service=`scanner_reference`, shared BUY/SELL so one alert per symbol/day). A
+  **missing key is certified** (backward compat) and a missing broker prev-close
+  is **fail-open** (certified + dedup'd WARNING) — fail-closed only on a
+  *confirmed* divergence. Flag `SCANNER_REFERENCE_CHECK_ENABLED` (default `true`).
+- **Smoke-fail post-hold**: a FAILED 09:18 smoke check
+  (`scanner_smoke_check_service`) now arms an in-process, day-scoped hold —
+  the scanner keeps evaluating and logs `scanner PASS`, but the hit is NOT
+  written to `scan_results` nor posted to the engine (`scanner HELD <sym>
+  reason=smoke_check_failed` WARNING, dedup'd per symbol/day). The hold lifts
+  when a re-check passes (`re_check_and_release`, invoked by the
+  `scanner_backfill_scheduler` periodic convergence tick after it refreshes the
+  stored 1m/D data) or self-expires at 15:35 IST. Exits/other strategies are
+  unaffected — only scanner hit posting is gated. Flag
+  `SCANNER_SMOKE_BLOCK_ENABLED` (default `true`, consult-time so a runtime flip
+  takes effect immediately). Tests: `test/test_scanner_reference_data.py`,
+  `test/test_scanner_smoke_check.py`, and the golden-incident cases in
+  `test/test_fno_intraday_{buy,sell}_chartink.py`.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 

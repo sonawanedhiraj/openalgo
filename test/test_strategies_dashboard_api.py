@@ -476,6 +476,134 @@ def test_pnl_curve_404_unknown(app):
 
 
 # ---------------------------------------------------------------------------
+# T+1 exit "today" attribution (issue #301)
+# ---------------------------------------------------------------------------
+
+
+def _utc_naive_for_ist_today(hour_ist: int = 15, minute_ist: int = 14) -> dt.datetime:
+    """A naive-UTC datetime whose IST calendar date is *today* (mirrors how the
+    engine stamps created_at via datetime.utcnow at ~15:14 IST)."""
+    now_ist = dt.datetime.now(pytz.timezone("Asia/Kolkata"))
+    ist_ts = now_ist.replace(hour=hour_ist, minute=minute_ist, second=0, microsecond=0)
+    return ist_ts.astimezone(pytz.utc).replace(tzinfo=None)
+
+
+def test_futures_today_pnl_counts_t1_exit_filled_today(app, wired_dbs):
+    """A T+1 SELL that fills TODAY (entry_date = yesterday) must be counted in
+    today's realized P&L and trade count, and its yesterday-entered position must
+    NOT still show as open (issue #301)."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    yesterday = (dt.datetime.now(pytz.timezone("Asia/Kolkata")) - dt.timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
+
+    # Yesterday's entry (BUY, placed yesterday).
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            nifty_symbol="NIFTY28JUL26FUT",
+            exchange="NFO",
+            product="NRML",
+            lots=1,
+            quantity=65,
+            entry_price=24090.0,
+            entry_date=yesterday,
+            status="placed",
+            created_at=_utc_naive_for_ist_today() - dt.timedelta(days=1),
+        )
+    )
+    # Today's T+1 exit (SELL) — entry_date carries YESTERDAY (the entry session).
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="SELL",
+            nifty_symbol="NIFTY28JUL26FUT",
+            exchange="NFO",
+            product="NRML",
+            lots=1,
+            quantity=65,
+            entry_price=24092.6,
+            exit_price=24266.0,
+            entry_date=yesterday,
+            gross_pnl=11271.0,
+            charges_inr=468.16,
+            net_pnl=10802.84,
+            status="placed",
+            created_at=_utc_naive_for_ist_today(),
+        )
+    )
+    # Two fresh entries opened today (still open).
+    for _ in range(2):
+        ff_sess.add(
+            ffdb.FuturesFollowTrade(
+                mode="sandbox",
+                side="BUY",
+                nifty_symbol="NIFTY28JUL26FUT",
+                exchange="NFO",
+                product="NRML",
+                lots=1,
+                quantity=65,
+                entry_price=24254.0,
+                entry_date=today,
+                status="placed",
+                created_at=_utc_naive_for_ist_today(hour_ist=15, minute_ist=20),
+            )
+        )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    ff = next(s for s in resp.get_json()["data"] if s["name"] == "futures_follow_cap50")
+    # Realized P&L from today's T+1 exit is attributed to today.
+    assert ff["today_net_pnl"] == 10802.84
+    # 3 placed BUYs − 1 placed SELL = 2 net open positions.
+    assert ff["open_positions"] == 2
+    # 2 entries today + 1 exit today = 3 legs executed today.
+    assert ff["today_trade_count"] == 3
+
+
+def test_futures_pnl_curve_keys_exit_by_execution_date(app, wired_dbs):
+    """The P&L curve must attribute a T+1 exit's net_pnl to the day it FILLED
+    (created_at IST), not to entry_date (yesterday) — issue #301."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    yesterday = (dt.datetime.now(pytz.timezone("Asia/Kolkata")) - dt.timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="SELL",
+            nifty_symbol="NIFTY28JUL26FUT",
+            exchange="NFO",
+            product="NRML",
+            lots=1,
+            quantity=65,
+            entry_date=yesterday,
+            gross_pnl=11271.0,
+            charges_inr=468.16,
+            net_pnl=10802.84,
+            status="placed",
+            created_at=_utc_naive_for_ist_today(),
+        )
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50/pnl-curve")
+
+    points = resp.get_json()["data"]["points"]
+    assert len(points) == 1
+    assert points[0]["date"] == today  # exit date, NOT yesterday
+    assert points[0]["pnl"] == 10802.84
+
+
+# ---------------------------------------------------------------------------
 # GET /strategies/api/<name>/parameters/diff
 # ---------------------------------------------------------------------------
 
