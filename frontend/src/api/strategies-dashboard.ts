@@ -251,6 +251,19 @@ export const strategiesDashboardApi = {
     )
     return res.data.data
   },
+
+  /**
+   * On-demand liveness probe of the shared claude CLI used by every strategy's
+   * LLM veto. Spawns a real `claude -p` subprocess server-side, so the caller
+   * must only invoke this manually (never on a poll). Reachability is
+   * install-global — one result covers all strategies.
+   */
+  getLLMHealth: async (): Promise<LLMHealth> => {
+    const res = await webClient.get<{ status: string; data: LLMHealth }>(
+      '/strategies/api/llm/health'
+    )
+    return res.data.data
+  },
 }
 
 // ---------------------------------------------------------------------------
@@ -335,4 +348,18 @@ export interface LLMDecisionsResponse {
   offset: number
   summary: LLMDecisionsSummary | null
   source_filtered: boolean
+}
+
+// ---------------------------------------------------------------------------
+// LLM health probe (issue #297)
+// ---------------------------------------------------------------------------
+
+export type LLMHealthReason = 'ok' | 'timeout' | 'cli_missing' | 'not_logged_in' | 'error'
+
+export interface LLMHealth {
+  reachable: boolean
+  latency_ms: number
+  reason: LLMHealthReason
+  detail: string
+  checked_at: string
 }

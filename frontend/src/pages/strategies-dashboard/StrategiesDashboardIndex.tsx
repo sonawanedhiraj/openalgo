@@ -18,6 +18,7 @@ import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
   type FlipModeOutcome,
+  type LLMHealth,
   type LLMMode,
   type StrategyHealth,
   type StrategySummary,
@@ -108,6 +109,94 @@ function LLMBadge({ llmMode }: { llmMode: LLMMode }) {
       </Badge>
     )
   return null
+}
+
+// ---------------------------------------------------------------------------
+// LLM health chip (issue #297)
+// ---------------------------------------------------------------------------
+//
+// A single, install-global liveness indicator for the shared `claude` CLI that
+// every strategy's Stage-1 veto calls. Because the probe spawns a real
+// `claude -p` subprocess server-side (seconds, consumes tokens), this is
+// MANUAL-ONLY: the query is `enabled: false` with no refetchInterval, so it
+// runs solely when the operator clicks the chip's own refresh icon.
+
+function llmUnreachableHint(reason: LLMHealth['reason']): string {
+  switch (reason) {
+    case 'not_logged_in':
+      return 'run claude login'
+    case 'cli_missing':
+      return 'claude CLI not found'
+    case 'timeout':
+      return 'timed out'
+    default:
+      return 'error'
+  }
+}
+
+function LLMHealthChip() {
+  const { data, isFetching, isError, refetch, dataUpdatedAt } = useQuery({
+    queryKey: ['llm-health'],
+    queryFn: () => strategiesDashboardApi.getLLMHealth(),
+    enabled: false, // manual-only — the probe spawns a claude subprocess
+    refetchInterval: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: Number.POSITIVE_INFINITY,
+    retry: false,
+  })
+
+  const checkedAt =
+    dataUpdatedAt > 0
+      ? new Date(dataUpdatedAt).toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })
+      : null
+
+  let tone = 'text-muted-foreground bg-muted/60'
+  let icon = <Bot className="h-3.5 w-3.5" />
+  let label = 'LLM: not checked'
+
+  if (isFetching) {
+    icon = <Loader2 className="h-3.5 w-3.5 animate-spin" />
+    label = 'Checking LLM…'
+  } else if (isError) {
+    tone = 'text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20'
+    icon = <AlertTriangle className="h-3.5 w-3.5" />
+    label = 'LLM check failed'
+  } else if (data) {
+    if (data.reachable) {
+      tone = 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20'
+      icon = <CheckCircle2 className="h-3.5 w-3.5" />
+      label = `LLM reachable · ${data.latency_ms}ms`
+    } else {
+      tone = 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20'
+      icon = <AlertTriangle className="h-3.5 w-3.5" />
+      label = `LLM unreachable — ${llmUnreachableHint(data.reason)}`
+    }
+  }
+
+  const title = data
+    ? `${data.reason}${data.detail ? ` — ${data.detail}` : ''}${checkedAt ? ` (checked ${checkedAt})` : ''}`
+    : 'Click the refresh icon to probe the LLM (spawns a claude subprocess — not auto-polled)'
+
+  return (
+    <div className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-xs ${tone}`} title={title}>
+      {icon}
+      <span className="whitespace-nowrap">{label}</span>
+      <button
+        type="button"
+        onClick={() => refetch()}
+        disabled={isFetching}
+        title="Check LLM reachability now"
+        className="ml-0.5 rounded p-0.5 hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-50"
+      >
+        <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
+      </button>
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +472,8 @@ export default function StrategiesDashboardIndex() {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <LLMHealthChip />
           {lastUpdated && (
             <span className="text-xs text-muted-foreground">Updated {lastUpdated}</span>
           )}
