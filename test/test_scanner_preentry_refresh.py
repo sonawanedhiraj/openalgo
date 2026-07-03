@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import services.scanner_backfill_scheduler as sched
+import services.scanner_smoke_check_service as smoke_svc
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -364,3 +365,130 @@ def test_scanner_preentry_refresh_job_swallows_exceptions(monkeypatch):
         side_effect=RuntimeError("boom"),
     ):
         sched._scanner_preentry_refresh_job()  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# 11. Issue #319 — pre-entry refresh completion releases the smoke post-hold
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_smoke_hold_state():
+    """Isolate the module-level smoke-check post-hold state per test — it must
+    not leak into/out of test_scanner_smoke_check.py or between tests here."""
+    smoke_svc._last_alert_date = None
+    smoke_svc._reset_hold_for_tests()
+    yield
+    smoke_svc._last_alert_date = None
+    smoke_svc._reset_hold_for_tests()
+
+
+def _minimal_backfill_res() -> dict:
+    """A backfill result with no jobs and no WS-nudge side effects, so a test
+    can focus purely on the smoke-hold release call."""
+    return {"intervals": {}, "all_fresh": True, "errors": []}
+
+
+def test_preentry_refresh_releases_false_arm_hold(monkeypatch):
+    """The 09:18 smoke check races the 09:16 pre-entry refresh: the check can
+    FAIL (arm the hold) on stale-looking data, then the pre-entry refresh
+    finishes moments later with the data now fresh. The refresh's completion
+    must re-check and RELEASE the false-armed hold — the bug in issue #319.
+
+    ``re_check_and_release`` (the real, unpatched function under test) calls
+    ``assert_scanner_pipeline_healthy()`` with no overrides, which resolves
+    its production providers via default-argument binding — patching the
+    ``production_*`` module attributes doesn't reach those bound defaults, so
+    the test drives the real production call chain directly (broker session +
+    freshness DB read + scanner aggregator), the same way it looks in prod.
+    """
+    monkeypatch.setenv("SCANNER_PREENTRY_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SYMBOLS", "A")
+
+    # Simulate the race: smoke check FAILED moments ago and armed the hold.
+    smoke_svc.set_post_hold(reason="scanner_universe_1m stale; scanner_universe_D stale")
+    assert smoke_svc.is_post_hold_active() is True
+
+    with (
+        patch.object(sched, "run_backfill_checks", return_value=_minimal_backfill_res()),
+        patch.object(sched, "_persist_health"),
+        patch.object(sched, "_log_and_alert"),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+        patch.object(
+            sched, "scanner_pre_subscriber", new=MagicMock(subscribed={"SYM1"}), create=True
+        ),
+        # The re-check's production providers — now report healthy, mirroring
+        # "the pre-entry refresh just made the feed fresh."
+        patch("database.auth_db.get_first_available_api_key", return_value="test_api_key"),
+        patch("database.data_health_db.get_latest_check", return_value={"overall_ok": True}),
+        patch(
+            "services.scanner_service.get_scanner_service",
+            return_value=MagicMock(get_today_ohlcv=MagicMock(return_value=(100.0, 1000))),
+        ),
+    ):
+        sched.run_preentry_scanner_refresh()
+
+    assert smoke_svc.is_post_hold_active() is False, (
+        "pre-entry refresh completion must release a false-armed hold once "
+        "the re-check finds the data healthy"
+    )
+
+
+def test_preentry_refresh_keeps_hold_when_genuinely_stale(monkeypatch):
+    """When the re-check STILL finds the data unhealthy after the refresh
+    (a genuine outage, not a race), the hold must remain armed — the refresh
+    completion must never blindly clear the hold."""
+    monkeypatch.setenv("SCANNER_PREENTRY_REFRESH_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SYMBOLS", "A")
+
+    smoke_svc.set_post_hold(reason="scanner_universe_1m stale; scanner_universe_D stale")
+    assert smoke_svc.is_post_hold_active() is True
+
+    with (
+        patch.object(sched, "run_backfill_checks", return_value=_minimal_backfill_res()),
+        patch.object(sched, "_persist_health"),
+        patch.object(sched, "_log_and_alert"),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+        patch.object(
+            sched, "scanner_pre_subscriber", new=MagicMock(subscribed={"SYM1"}), create=True
+        ),
+        # No broker session / stale freshness → re-check still fails.
+        patch("database.auth_db.get_first_available_api_key", return_value=None),
+        patch("database.data_health_db.get_latest_check", return_value={"overall_ok": False}),
+        patch(
+            "services.scanner_service.get_scanner_service",
+            return_value=None,
+        ),
+    ):
+        sched.run_preentry_scanner_refresh()
+
+    assert smoke_svc.is_post_hold_active() is True, (
+        "a genuinely-still-stale re-check must keep the hold armed"
+    )
+
+
+def test_preentry_refresh_release_is_noop_without_armed_hold(monkeypatch):
+    """When no hold is armed, the pre-entry refresh's release call is a no-op
+    (``re_check_and_release`` short-circuits on the armed-check before running
+    any gate) — verified by asserting the underlying pipeline check function
+    is never invoked, and the hold stays inactive throughout."""
+    monkeypatch.setenv("SCANNER_PREENTRY_REFRESH_ENABLED", "true")
+    assert smoke_svc.is_post_hold_active() is False
+
+    with (
+        patch.object(sched, "run_backfill_checks", return_value=_minimal_backfill_res()),
+        patch.object(sched, "_persist_health"),
+        patch.object(sched, "_log_and_alert"),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+        patch.object(
+            sched, "scanner_pre_subscriber", new=MagicMock(subscribed={"SYM1"}), create=True
+        ),
+        patch.object(smoke_svc, "assert_scanner_pipeline_healthy") as mock_check,
+    ):
+        res = sched.run_preentry_scanner_refresh()
+
+    assert res is not None
+    mock_check.assert_not_called()
+    assert smoke_svc.is_post_hold_active() is False
