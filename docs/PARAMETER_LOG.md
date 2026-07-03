@@ -1490,6 +1490,20 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     verified-refresh reporting (refreshed counts are post-job verified reads,
     never submission counts).
 
+## `SCANNER_CHARTINK_MISS_DEBUG_ENABLED` — Chartink-miss gate diagnostics (issue #321)
+
+- **`SCANNER_CHARTINK_MISS_DEBUG_ENABLED`** (default `true`): when a symbol on
+  TODAY's Chartink webhook lists (`scan_cycle`, cycle_kind='chartink') FAILs an
+  in-house scan rule, log `scanner MISS <sym> rule=<rule> failed_gate=<gate>
+  <values>` at INFO (dedup'd per symbol/rule/gate/day; non-listed symbols stay
+  at DEBUG). Pure observability — zero gate-outcome change. Purpose: one
+  trading day of logs pinpoints the exact failing gate per Chartink-parity
+  miss (issue #242 diagnosis).
+- **History:**
+  - **2026-07-03:** Introduced by issue #321 / PR #322 after the first
+    fully-healthy data day still showed in-house recall 0 vs 10+ Chartink
+    symbols, with FAIL reasons invisible at production LOG_LEVEL=INFO.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
