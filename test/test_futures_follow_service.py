@@ -103,6 +103,8 @@ def _make_service(signals=None, **overrides):
     data_health_checker = overrides.pop("data_health_checker", None)
     contract_resolver = overrides.pop("contract_resolver", fake_contract_resolver)
     signal_evaluator = overrides.pop("signal_evaluator", fake_signal_evaluator)
+    signal_reviewer = overrides.pop("signal_reviewer", None)
+    market_context_provider = overrides.pop("market_context_provider", None)
 
     intent_resolver = overrides.pop("intent_resolver", None)
     if intent_resolver is None:
@@ -124,6 +126,8 @@ def _make_service(signals=None, **overrides):
         now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
         intent_resolver=intent_resolver,
         data_health_checker=data_health_checker,
+        signal_reviewer=signal_reviewer,
+        market_context_provider=market_context_provider,
     )
     svc._test_placed = placed_orders
     svc._test_journal = journal
@@ -1230,6 +1234,208 @@ def test_register_jobs_skips_smoke_check_when_flag_off(monkeypatch):
     svc.register_jobs(FakeScheduler())
 
     assert "futures_follow_smoke_check" not in job_ids
+
+
+# --------------------------------------------------------------------------- #
+# Stage-1 LLM veto gate in run_entry (issue #318)
+# --------------------------------------------------------------------------- #
+
+
+def _fake_reviewer(decisions: dict[str, str], calls: list[dict]):
+    """Reviewer stub: decides per signal-symbol; records every call's kwargs."""
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        symbol = kwargs.get("symbol")
+        return {
+            "id": len(calls),
+            "decision": decisions.get(symbol, "take"),
+            "reasoning": f"reviewed {symbol}",
+            "confidence": 0.6,
+            "latency_ms": 5,
+            "enforcement_mode": "active",
+        }
+
+    return fake
+
+
+def test_run_entry_veto_off_bypasses_reviewer(monkeypatch):
+    monkeypatch.setenv("VETO_LAYER_MODE", "off")
+    calls: list[dict] = []
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_reviewer=_fake_reviewer({}, calls))
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert calls == []  # reviewer never invoked in off mode
+
+
+def test_run_entry_no_reviewer_injected_skips_veto(monkeypatch):
+    """Default construction (signal_reviewer=None) never reviews — mirrors the
+    data_health_checker pattern so existing behavior/tests are untouched."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    svc = _make_service(signals=[_sig("RELIANCE")])
+    placed = svc.run_entry()
+    assert len(placed) == 1
+
+
+def test_run_entry_active_skip_blocks_lot_and_does_not_consume_cap(monkeypatch):
+    """An enforcing 'skip' drops that lot only — the margin cap slot stays free
+    for later signals, the skip is journalled, and no phantom position exists."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    calls: list[dict] = []
+    # Cap = 50% of ₹10L = ₹5L = 2 lots. Three signals; the FIRST is vetoed.
+    # If the veto consumed the cap, only one of B/C would fit — both must fill.
+    svc = _make_service(
+        signals=[_sig("AAA", vol=3.0), _sig("BBB", vol=2.0), _sig("CCC", vol=1.5)],
+        signal_reviewer=_fake_reviewer({"AAA": "skip"}, calls),
+    )
+    placed = svc.run_entry()
+
+    assert [p["signal_symbol"] for p in placed] == ["BBB", "CCC"]
+    assert svc.lots_held() == 2
+    assert len(calls) == 3  # every in-cap signal was reviewed
+    # The veto skip is journalled with status='veto_skip' and no margin.
+    veto_rows = [j for j in svc._test_journal if j.get("status") == "veto_skip"]
+    assert len(veto_rows) == 1
+    assert veto_rows[0]["signal_id"] == "AAA"
+    assert veto_rows[0]["margin_inr"] == 0.0
+    assert veto_rows[0]["order_id"] is None
+    # No phantom position for the vetoed signal.
+    assert all(p.signal_symbol != "AAA" for p in svc.paper_book.values())
+    # And only two orders reached the placer.
+    assert len(svc._test_placed) == 2
+
+
+def test_run_entry_shadow_logs_but_places_anyway(monkeypatch):
+    monkeypatch.setenv("VETO_LAYER_MODE", "shadow")
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("RELIANCE")],
+        signal_reviewer=_fake_reviewer({"RELIANCE": "skip"}, calls),
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 1  # skip verdict NOT enforced in shadow
+    assert len(calls) == 1  # but the reviewer ran and the decision is recorded
+    assert not any(j.get("status") == "veto_skip" for j in svc._test_journal)
+
+
+def test_run_entry_reviewer_failure_fails_open(monkeypatch):
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+
+    def boom(**kwargs):
+        raise RuntimeError("reviewer infrastructure down")
+
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_reviewer=boom)
+    placed = svc.run_entry()
+    assert len(placed) == 1  # failsafe philosophy: any reviewer failure → take
+
+
+def test_run_entry_budget_zero_places_all_unreviewed(monkeypatch):
+    """R3: once the cumulative review budget is exhausted the remaining signals
+    are placed UNREVIEWED (fail-open)."""
+    import services.futures_follow_service as ffs
+
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    monkeypatch.setattr(ffs, "VETO_REVIEW_BUDGET_SECONDS", 0.0)
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("AAA"), _sig("BBB")],
+        signal_reviewer=_fake_reviewer({"AAA": "skip", "BBB": "skip"}, calls),
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 2  # both placed despite skip verdicts — never reviewed
+    assert calls == []
+
+
+def test_run_entry_budget_exhausts_mid_batch(monkeypatch):
+    """R3: reviews that consume the 180s budget stop mid-batch; the rest place
+    unreviewed. Fake time makes each review 'cost' 100s."""
+    import services.futures_follow_service as ffs
+
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+
+    class FakeTime:
+        _t = 0.0
+
+        @classmethod
+        def monotonic(cls):
+            cls._t += 100.0  # each call advances 100s → one review = 100s
+            return cls._t
+
+    monkeypatch.setattr(ffs, "time", FakeTime)
+    calls: list[dict] = []
+    # ₹20L capital → cap ₹10L → 4 lots, so all 3 signals fit under the cap.
+    svc = _make_service(
+        signals=[_sig("AAA"), _sig("BBB"), _sig("CCC")],
+        signal_reviewer=_fake_reviewer({}, calls),
+        capital_inr=2_000_000.0,
+    )
+    placed = svc.run_entry()
+    # Review 1 (AAA): elapsed 0 < 180 → reviewed (now 100s).
+    # Review 2 (BBB): elapsed 100 < 180 → reviewed (now 200s).
+    # Review 3 (CCC): elapsed 200 >= 180 → UNREVIEWED, placed anyway.
+    assert len(calls) == 2
+    assert [c["symbol"] for c in calls] == ["AAA", "BBB"]
+    assert len(placed) == 3
+
+
+def test_run_entry_marks_actually_taken(monkeypatch):
+    """mark_actually_taken records True after placement, False on a veto skip."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+
+    marked: list[tuple] = []
+    import services.signal_review_service as srs
+
+    monkeypatch.setattr(srs, "mark_actually_taken", lambda did, taken: marked.append((did, taken)))
+
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("AAA", vol=3.0), _sig("BBB", vol=2.0)],
+        signal_reviewer=_fake_reviewer({"AAA": "skip"}, calls),
+    )
+    svc.run_entry()
+    # AAA (decision id 1) vetoed → False; BBB (id 2) placed → True.
+    assert (1, False) in marked
+    assert (2, True) in marked
+
+
+def test_run_entry_reviewer_passes_strategy_identity_and_context(monkeypatch):
+    """The review call carries source/strategy_name='futures_follow_cap50',
+    direction='BUY', and a combined context (signal metrics + contract + book)."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("RELIANCE", vol=2.5)],
+        signal_reviewer=_fake_reviewer({}, calls),
+        market_context_provider=lambda: {"nifty_pct": 0.4, "india_vix": 13.0},
+    )
+    svc.run_entry()
+
+    assert len(calls) == 1
+    kw = calls[0]
+    assert kw["symbol"] == "RELIANCE"
+    assert kw["source"] == "futures_follow_cap50"
+    assert kw["strategy_name"] == "futures_follow_cap50"
+    assert kw["direction"] == "BUY"
+    ctx = kw["context"]
+    assert ctx["vol_ratio"] == 2.5
+    assert ctx["stock_ret"] == 0.01
+    assert ctx["sector_ret"] == 0.02
+    assert ctx["contract_symbol"] == _CONTRACT["symbol"]
+    assert ctx["margin_cap_inr"] == 500_000.0
+    assert ctx["kill_switch_active"] is False
+    assert ctx["nifty_pct"] == 0.4  # injected market context merged in
+
+
+def test_run_entry_kill_switch_skips_review_entirely(monkeypatch):
+    """With the kill switch armed no LLM call is burned (place_entry refuses
+    the order anyway)."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    calls: list[dict] = []
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_reviewer=_fake_reviewer({}, calls))
+    svc.kill_switch_active = True
+    placed = svc.run_entry()
+    assert placed == []
+    assert calls == []
 
 
 if __name__ == "__main__":

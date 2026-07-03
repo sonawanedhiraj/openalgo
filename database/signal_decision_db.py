@@ -220,9 +220,26 @@ def get_signal_decision(decision_id: int) -> dict[str, Any] | None:
         db_session.remove()
 
 
+def _apply_source_filters(q, sources: list[str] | None, exclude_sources: list[str] | None):
+    """Apply the inclusion / exclusion ``source`` filters to a query (R1, #318).
+
+    ``sources`` is an inclusion allowlist; ``exclude_sources`` removes rows
+    whose ``source`` is in the list. The exclusion arm exists because the
+    simplified engine's rows span several chartink ``source`` labels (no clean
+    inclusion list), so its dashboard view is "everything EXCEPT the strategies
+    that tag rows with their own name" (today: ``futures_follow_cap50``).
+    """
+    if sources:
+        q = q.filter(SignalDecision.source.in_(sources))
+    if exclude_sources:
+        q = q.filter(~SignalDecision.source.in_(exclude_sources))
+    return q
+
+
 def list_signal_decisions(
     *,
     sources: list[str] | None = None,
+    exclude_sources: list[str] | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
@@ -233,6 +250,9 @@ def list_signal_decisions(
             (or empty) returns rows from every source — used for the
             simplified engine, whose decisions span several chartink ``source``
             labels (``chartink_FnO_intraday_buy``, ``trend-up``, …).
+        exclude_sources: If given, rows whose ``source`` is in this list are
+            dropped (R1, #318 — keeps futures_follow rows out of the simplified
+            engine's all-sources view).
         limit: Max rows (clamped 1..500).
         offset: Rows to skip for pagination (clamped >= 0).
     """
@@ -240,28 +260,32 @@ def list_signal_decisions(
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
     try:
-        q = db_session.query(SignalDecision)
-        if sources:
-            q = q.filter(SignalDecision.source.in_(sources))
+        q = _apply_source_filters(db_session.query(SignalDecision), sources, exclude_sources)
         rows = q.order_by(SignalDecision.id.desc()).limit(limit).offset(offset).all()
         return [_row_to_dict(r) for r in rows]
     finally:
         db_session.remove()
 
 
-def count_signal_decisions(*, sources: list[str] | None = None) -> int:
+def count_signal_decisions(
+    *,
+    sources: list[str] | None = None,
+    exclude_sources: list[str] | None = None,
+) -> int:
     """Total decision rows (optionally filtered by ``source``)."""
     _ensure_tables()
     try:
-        q = db_session.query(SignalDecision)
-        if sources:
-            q = q.filter(SignalDecision.source.in_(sources))
+        q = _apply_source_filters(db_session.query(SignalDecision), sources, exclude_sources)
         return q.count()
     finally:
         db_session.remove()
 
 
-def summarize_signal_decisions(*, sources: list[str] | None = None) -> dict[str, Any]:
+def summarize_signal_decisions(
+    *,
+    sources: list[str] | None = None,
+    exclude_sources: list[str] | None = None,
+) -> dict[str, Any]:
     """Return decision counts by verdict + the latest decision row.
 
     Shape::
@@ -279,9 +303,7 @@ def summarize_signal_decisions(*, sources: list[str] | None = None) -> dict[str,
     """
     _ensure_tables()
     try:
-        q = db_session.query(SignalDecision)
-        if sources:
-            q = q.filter(SignalDecision.source.in_(sources))
+        q = _apply_source_filters(db_session.query(SignalDecision), sources, exclude_sources)
         counts = {"take": 0, "skip": 0, "review_failed": 0, "other": 0}
         total = 0
         for (decision,) in q.with_entities(SignalDecision.decision).all():
