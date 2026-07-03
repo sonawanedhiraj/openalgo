@@ -777,7 +777,36 @@ def test_list_resolves_simplified_engine_journal(app, wired_dbs):
     assert se["today_trade_count"] == 2
     assert se["open_positions"] == 1  # only the RVNL entry is still open
     assert se["today_net_pnl"] == 1244.5
-    assert se["last_trade_at"] == f"{today}T09:45:00+05:30"
+    # last_trade_at is normalized to naive-UTC for the frontend's `+ 'Z'` parse
+    # (issue #317): 09:45 IST → 04:15 UTC, no offset suffix.
+    assert se["last_trade_at"] == f"{today}T04:15:00"
+
+
+def test_simplified_last_trade_at_is_naive_utc_for_frontend(app, wired_dbs):
+    """The card renders `new Date(last_trade_at + 'Z')`, so last_trade_at must be
+    naive-UTC (no offset). The simplified engine's placed_at is tz-aware IST
+    (…+05:30); it must be normalized or the UI shows "Invalid Date" (issue #317).
+    """
+    import datetime as _dt
+
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    # placed_at carries a +05:30 offset, exactly like production rows.
+    _seed_simplified_journal_row(
+        tj_sess, tjdb, symbol="RVNL", placed_at=f"{today}T10:59:06.567689+05:30"
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    se = next(s for s in resp.get_json()["data"] if s["name"] == "simplified_engine")
+    lta = se["last_trade_at"]
+    # No timezone suffix — appending 'Z' must yield a valid UTC instant.
+    assert "+" not in lta and not lta.endswith("Z")
+    parsed = _dt.datetime.fromisoformat(lta + "+00:00")  # frontend's `+ 'Z'`, in Python
+    # 10:59 IST == 05:29 UTC.
+    assert parsed.hour == 5 and parsed.minute == 29
 
 
 def test_detail_resolves_simplified_engine_recent_trades(app, wired_dbs):

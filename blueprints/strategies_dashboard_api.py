@@ -40,7 +40,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytz
@@ -177,6 +177,30 @@ def _ist_date_str(created_at: datetime | None) -> str | None:
             return created_at.astimezone(_IST).strftime("%Y-%m-%d")
         except Exception:
             return created_at.strftime("%Y-%m-%d")
+
+
+def _normalize_last_trade_at(value: str | None) -> str | None:
+    """Normalize a dashboard ``last_trade_at`` to a **naive-UTC** ISO string.
+
+    Contract (issue #317): the strategy cards render this value as
+    ``new Date(last_trade_at + 'Z')`` — i.e. they treat it as UTC. The
+    futures/sector paths already emit ``created_at.isoformat()`` from
+    ``datetime.utcnow()`` (naive UTC), but the simplified engine's
+    ``trade_journal.placed_at`` is a **tz-aware IST** string (``…+05:30``);
+    appending ``'Z'`` to that yields ``…+05:30Z`` → JS "Invalid Date".
+
+    So: a tz-aware value is converted to naive UTC; a naive value is returned
+    unchanged (already the assumed-UTC form). Unparseable input is passed through.
+    """
+    if not value:
+        return value
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return value
+    if dt.tzinfo is None:
+        return value
+    return dt.astimezone(UTC).replace(tzinfo=None).isoformat()
 
 
 def _get_strategy_mode(name: str) -> str:
@@ -364,7 +388,9 @@ def _simplified_engine_stats() -> dict:
         return {
             "open_positions": open_count,
             "today_net_pnl": round(today_pnl, 2),
-            "last_trade_at": last_at,
+            # placed_at is a tz-aware IST string; the card appends 'Z', so emit
+            # naive-UTC to match futures/sector and avoid "Invalid Date" (#317).
+            "last_trade_at": _normalize_last_trade_at(last_at),
             "today_trade_count": today_trade_count,
         }
     except Exception:
