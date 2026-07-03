@@ -439,7 +439,7 @@ def test_detail_recent_trades_empty(app):
 def test_detail_recent_trades_with_data(app, wired_dbs):
     """Seed a futures trade and verify it shows up in recent_trades."""
     ff_eng, ff_sess, ffdb = wired_dbs["ff"]
-    trade = ffdb.FuturesFollowTrade(
+    entry = ffdb.FuturesFollowTrade(
         mode="sandbox",
         side="BUY",
         nifty_symbol="NIFTY30JUN26FUT",
@@ -449,10 +449,29 @@ def test_detail_recent_trades_with_data(app, wired_dbs):
         quantity=75,
         entry_price=24500.0,
         entry_date="2026-06-21",
+        margin_inr=250000.0,
         status="placed",
         created_at=dt.datetime(2026, 6, 21, 10, 0, 0),
     )
-    ff_sess.add(trade)
+    exit_row = ffdb.FuturesFollowTrade(
+        mode="sandbox",
+        side="SELL",
+        nifty_symbol="NIFTY30JUN26FUT",
+        exchange="NFO",
+        product="NRML",
+        lots=1,
+        quantity=75,
+        entry_price=24500.0,
+        exit_price=24650.0,
+        entry_date="2026-06-21",
+        margin_inr=250000.0,
+        gross_pnl=11250.0,
+        charges_inr=468.16,
+        net_pnl=10781.84,
+        status="placed",
+        created_at=dt.datetime(2026, 6, 22, 15, 25, 0),
+    )
+    ff_sess.add_all([entry, exit_row])
     ff_sess.commit()
 
     with app.test_client() as client:
@@ -460,10 +479,21 @@ def test_detail_recent_trades_with_data(app, wired_dbs):
         resp = client.get("/strategies/api/futures_follow_cap50")
 
     trades = resp.get_json()["data"]["recent_trades"]
-    assert len(trades) == 1
-    assert trades[0]["side"] == "BUY"
-    assert trades[0]["symbol"] == "NIFTY30JUN26FUT"
-    assert trades[0]["lots"] == 1
+    assert len(trades) == 2
+    # Ordered created_at DESC -> the SELL exit is first and carries the financials.
+    sell = trades[0]
+    assert sell["side"] == "SELL"
+    assert sell["symbol"] == "NIFTY30JUN26FUT"
+    assert sell["lots"] == 1
+    assert sell["gross_pnl"] == 11250.0
+    assert sell["charges_inr"] == 468.16
+    assert sell["net_pnl"] == 10781.84
+    assert sell["margin_inr"] == 250000.0
+    # The BUY entry has no realized P&L but still reports capital deployed.
+    buy = trades[1]
+    assert buy["side"] == "BUY"
+    assert buy["net_pnl"] is None
+    assert buy["margin_inr"] == 250000.0
 
 
 # ---------------------------------------------------------------------------
