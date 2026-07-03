@@ -476,7 +476,7 @@ def test_boot_backfill_releases_smoke_hold_when_recheck_passes(monkeypatch):
     smoke_svc._last_alert_date = None
     try:
         smoke_svc.set_post_hold(reason="test: pre-armed before boot convergence")
-        assert smoke_svc.is_post_hold_active() is True
+        assert smoke_svc.get_post_hold() is not None
 
         def fake_check(today=None, *, interval="1m"):
             return _fresh_result(interval)
@@ -499,7 +499,7 @@ def test_boot_backfill_releases_smoke_hold_when_recheck_passes(monkeypatch):
         ):
             sched.run_boot_backfill_checks(THURS)
 
-        assert smoke_svc.is_post_hold_active() is False
+        assert smoke_svc.get_post_hold() is None
     finally:
         smoke_svc._reset_hold_for_tests()
         smoke_svc._last_alert_date = None
@@ -514,7 +514,7 @@ def test_boot_backfill_keeps_smoke_hold_when_genuinely_stale(monkeypatch):
     smoke_svc._last_alert_date = None
     try:
         smoke_svc.set_post_hold(reason="test: pre-armed before boot convergence")
-        assert smoke_svc.is_post_hold_active() is True
+        assert smoke_svc.get_post_hold() is not None
 
         def fake_check(today=None, *, interval="1m"):
             return _fresh_result(interval)
@@ -534,7 +534,7 @@ def test_boot_backfill_keeps_smoke_hold_when_genuinely_stale(monkeypatch):
         ):
             sched.run_boot_backfill_checks(THURS)
 
-        assert smoke_svc.is_post_hold_active() is True
+        assert smoke_svc.get_post_hold() is not None
     finally:
         smoke_svc._reset_hold_for_tests()
         smoke_svc._last_alert_date = None
@@ -546,7 +546,7 @@ def test_boot_backfill_smoke_release_noop_without_hold():
     invoked (``re_check_and_release`` short-circuits on the armed-check)."""
     smoke_svc._reset_hold_for_tests()
     smoke_svc._last_alert_date = None
-    assert smoke_svc.is_post_hold_active() is False
+    assert smoke_svc.get_post_hold() is None
 
     def fake_check(today=None, *, interval="1m"):
         return _fresh_result(interval)
@@ -565,7 +565,7 @@ def test_boot_backfill_smoke_release_noop_without_hold():
 
     assert res["all_fresh"] is True
     mock_check.assert_not_called()
-    assert smoke_svc.is_post_hold_active() is False
+    assert smoke_svc.get_post_hold() is None
 
 
 def test_run_backfill_checks_marks_not_fresh_when_any_interval_stale():

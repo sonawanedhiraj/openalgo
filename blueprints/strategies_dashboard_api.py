@@ -403,6 +403,78 @@ def _simplified_engine_stats() -> dict:
         }
 
 
+def _lifetime_from_pnls(pnls: list[float]) -> dict:
+    """Since-inception cumulative realized P&L + running win-rate over a list of
+    closed-trade net P&L values.
+
+    ``win_rate_pct`` counts a strictly-positive P&L as a win. Both ``cum_net_pnl``
+    and ``win_rate_pct`` are ``None`` when there are no closed trades yet, so the
+    UI renders '—' rather than a misleading ₹0 / 0%. ``closed_trades`` is the
+    realized-trade denominator (pairs against the backtest's ``n_trades``).
+    """
+    n = len(pnls)
+    if n == 0:
+        return {"cum_net_pnl": None, "closed_trades": 0, "win_rate_pct": None}
+    wins = sum(1 for p in pnls if p > 0)
+    return {
+        "cum_net_pnl": round(sum(pnls), 2),
+        "closed_trades": n,
+        "win_rate_pct": round(100.0 * wins / n, 1),
+    }
+
+
+def _futures_follow_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized P&L + win-rate from
+    ``futures_follow_trades`` closed exits (SELL rows carrying ``net_pnl``).
+
+    Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
+    columns honest once the strategy is flipped live — sandbox history never
+    leaks into the live column and vice-versa.
+    """
+    out = {"sandbox": _lifetime_from_pnls([]), "live": _lifetime_from_pnls([])}
+    try:
+        rows = (
+            ff_session.query(FuturesFollowTrade)
+            .filter(
+                FuturesFollowTrade.side == "SELL",
+                FuturesFollowTrade.net_pnl.isnot(None),
+            )
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        for r in rows:
+            m = (r.mode or "").lower()
+            if m in buckets:
+                buckets[m].append(float(r.net_pnl or 0.0))
+        out = {m: _lifetime_from_pnls(p) for m, p in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate futures_follow lifetime stats")
+    return out
+
+
+def _simplified_engine_lifetime() -> dict:
+    """Since-inception realized P&L + win-rate from the simplified engine's closed
+    ``trade_journal`` rows (``exited_at`` + ``pnl`` present).
+
+    ``trade_journal`` has no mode column, so the caller attributes this to the
+    strategy's current resolved mode (the engine is sandbox by default).
+    """
+    try:
+        rows = (
+            tj_session.query(TradeJournal)
+            .filter(
+                TradeJournal.strategy_name == _SIMPLIFIED_ENGINE_JOURNAL_NAME,
+                TradeJournal.exited_at.isnot(None),
+                TradeJournal.pnl.isnot(None),
+            )
+            .all()
+        )
+        return _lifetime_from_pnls([float(r.pnl) for r in rows])
+    except Exception:
+        logger.exception("Failed to aggregate simplified_engine lifetime stats")
+        return _lifetime_from_pnls([])
+
+
 def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
     """Daily realized-P&L series from ``trade_journal`` rows for the simplified
     engine (closed rows carry ``pnl``; the date key is the ``exited_at`` IST
@@ -618,15 +690,25 @@ def strategy_detail(name: str):
         "live": None,
     }
 
-    # Sandbox live stats
+    # Sandbox / live stats. Today's open+P&L come from the per-day aggregators;
+    # the since-inception cumulative P&L + running win-rate come from the lifetime
+    # helpers (issue #323). The Live column is populated only when that mode has
+    # realized history, so it stays '—' until the strategy is actually flipped live.
     if name == "futures_follow_cap50":
         stats = _futures_follow_stats()
+        lifetime = _futures_follow_lifetime()
         performance["sandbox"] = {
             "open_positions": stats["open_positions"],
             "today_net_pnl": stats["today_net_pnl"],
             "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
         }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
     elif name == "sector_follow_cap5_vol":
+        # sector_follow journals no realized net P&L (its curve uses price as a
+        # proxy), so cumulative P&L / win-rate aren't meaningful here — only
+        # open positions are surfaced.
         stats = _sector_follow_stats()
         performance["sandbox"] = {
             "open_positions": stats["open_positions"],
@@ -634,11 +716,16 @@ def strategy_detail(name: str):
         }
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
-        performance["sandbox"] = {
+        lifetime = _simplified_engine_lifetime()
+        perf = {
             "open_positions": stats["open_positions"],
             "today_net_pnl": stats["today_net_pnl"],
             "last_trade_at": stats["last_trade_at"],
+            **lifetime,
         }
+        # trade_journal carries no mode column, so attribute the whole view to the
+        # strategy's current resolved mode (sandbox by default).
+        performance["live" if mode_val == "live" else "sandbox"] = perf
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []

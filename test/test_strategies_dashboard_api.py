@@ -357,6 +357,61 @@ def test_detail_performance_columns(app):
     assert bt["n_trades"] == 149
 
 
+def test_detail_sandbox_lifetime_pnl_and_winrate(app, wired_dbs):
+    """Sandbox column shows since-inception cumulative realized P&L, running
+    win-rate, and the closed-trade denominator; live history stays isolated in
+    the Live column (issue #323)."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    # Two closed sandbox exits: one win (+10802.84), one loss (-1500.0).
+    for npnl in (10802.84, -1500.0):
+        ff_sess.add(
+            ffdb.FuturesFollowTrade(
+                mode="sandbox",
+                side="SELL",
+                nifty_symbol="NIFTY28JUL26FUT",
+                exchange="NFO",
+                product="NRML",
+                lots=1,
+                quantity=65,
+                entry_date="2026-06-20",
+                net_pnl=npnl,
+                status="placed",
+                created_at=_utc_naive_for_ist_today(),
+            )
+        )
+    # A live-mode exit must NOT leak into the sandbox column.
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="live",
+            side="SELL",
+            nifty_symbol="NIFTY28JUL26FUT",
+            exchange="NFO",
+            product="NRML",
+            lots=1,
+            quantity=65,
+            entry_date="2026-06-20",
+            net_pnl=999.0,
+            status="placed",
+            created_at=_utc_naive_for_ist_today(),
+        )
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50")
+
+    perf = resp.get_json()["data"]["performance"]
+    sb = perf["sandbox"]
+    assert sb["cum_net_pnl"] == 9302.84  # 10802.84 - 1500.0
+    assert sb["closed_trades"] == 2
+    assert sb["win_rate_pct"] == 50.0
+    # Live column surfaces its own realized history, isolated from sandbox.
+    assert perf["live"]["cum_net_pnl"] == 999.0
+    assert perf["live"]["closed_trades"] == 1
+    assert perf["live"]["win_rate_pct"] == 100.0
+
+
 def test_detail_version_log_parsed(app):
     with app.test_client() as client:
         _login(client)
