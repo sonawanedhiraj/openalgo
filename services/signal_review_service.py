@@ -694,7 +694,7 @@ MARKET CONTEXT (today):
 REGIME SNAPSHOT:
 {regime_block}
 
-Decide whether the operator should take this entry. Your job is OVERNIGHT-REGIME FIT for a leveraged LONG NIFTY-futures carry — NOT per-name stock analysis. The stock signal above only tells you a bullish signal-day fired; the position's P&L is driven entirely by NIFTY's overnight move. Skip when the overnight regime is hostile to a leveraged long NIFTY hold: a strongly bearish NIFTY day, elevated or spiking India VIX, or a clear risk-off close. Take when the regime is neutral-to-bullish. The confidence score must reflect how well the overnight regime fits this leveraged long carry.
+Decide whether the operator should take this entry. Your job is OVERNIGHT-REGIME FIT for a leveraged LONG NIFTY-futures carry — NOT per-name stock analysis. The stock signal above only tells you a bullish signal-day fired; the position's P&L is driven entirely by NIFTY's overnight move. Skip when the overnight regime is hostile to a leveraged long NIFTY hold: a strongly bearish NIFTY day, elevated or spiking India VIX, or a clear risk-off close. Take when the regime is neutral-to-bullish. The confidence score must reflect how well the overnight regime fits this leveraged long carry. The margin cap and kill switch are enforced by code before this review reaches you — they are shown for context only. Do NOT skip on capital-utilization or lots-already-held grounds; judge overnight-regime fit only.
 
 Respond with a short reasoning paragraph followed by a final JSON block. The JSON block must be the LAST thing in your response and must contain exactly these keys:
 

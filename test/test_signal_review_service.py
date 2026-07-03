@@ -969,6 +969,10 @@ def test_futures_follow_prompt_contains_strategy_context(fresh_signal_db, shadow
     assert "Kill switch: inactive" in prompt
     # NOT the simplified-engine stock-breakout wording.
     assert "bottom-3 today" not in prompt
+    # Guardrail (#318 review): book-state lines are informational only — the LLM
+    # must not invent an unbacktested "portfolio prudence" veto on utilization.
+    assert "enforced by code before this review" in prompt
+    assert "Do NOT skip on capital-utilization" in prompt
     assert "near their daily trade limit" not in prompt
     # Audit row tagged with the strategy's own source.
     from database.signal_decision_db import get_signal_decision
