@@ -295,6 +295,35 @@ def test_gate_fails(builder):
 
 
 # --------------------------------------------------------------------------- #
+# FAIL gate-snapshot contract (Issue #321)
+# --------------------------------------------------------------------------- #
+def test_fail_snapshot_carries_failed_gate():
+    """A known-gate failure (gap-up gate, g1) stashes the exact gate name."""
+    assert rule(None, _fail_g1()) is False
+    snapshot = rulemod.get_last_fail_snapshot()
+    assert snapshot is not None
+    assert snapshot["failed_gate"] == "gap_up"
+    assert snapshot["passed"] is False
+
+
+def test_fail_snapshot_reflects_latest_gate():
+    """A different gate failure updates ``failed_gate`` to the new gate name."""
+    rule(None, _fail_g1())
+    assert rulemod.get_last_fail_snapshot()["failed_gate"] == "gap_up"
+    rule(None, _fail_g5())
+    assert rulemod.get_last_fail_snapshot()["failed_gate"] == "rsi_15m"
+
+
+def test_pass_clears_fail_snapshot():
+    """A PASS clears any stale FAIL snapshot — a consumer can never read a
+    stale fail reason for a symbol that just passed."""
+    rule(None, _fail_g1())
+    assert rulemod.get_last_fail_snapshot() is not None
+    assert rule(None, happy()) is True
+    assert rulemod.get_last_fail_snapshot() is None
+
+
+# --------------------------------------------------------------------------- #
 # Golden full-pass
 # --------------------------------------------------------------------------- #
 def test_golden_full_pass():
