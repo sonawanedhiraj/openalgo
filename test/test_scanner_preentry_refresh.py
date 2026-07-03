@@ -408,7 +408,7 @@ def test_preentry_refresh_releases_false_arm_hold(monkeypatch):
 
     # Simulate the race: smoke check FAILED moments ago and armed the hold.
     smoke_svc.set_post_hold(reason="scanner_universe_1m stale; scanner_universe_D stale")
-    assert smoke_svc.is_post_hold_active() is True
+    assert smoke_svc.get_post_hold() is not None
 
     with (
         patch.object(sched, "run_backfill_checks", return_value=_minimal_backfill_res()),
@@ -429,7 +429,7 @@ def test_preentry_refresh_releases_false_arm_hold(monkeypatch):
     ):
         sched.run_preentry_scanner_refresh()
 
-    assert smoke_svc.is_post_hold_active() is False, (
+    assert smoke_svc.get_post_hold() is None, (
         "pre-entry refresh completion must release a false-armed hold once "
         "the re-check finds the data healthy"
     )
@@ -444,7 +444,7 @@ def test_preentry_refresh_keeps_hold_when_genuinely_stale(monkeypatch):
     monkeypatch.setenv("SCANNER_SYMBOLS", "A")
 
     smoke_svc.set_post_hold(reason="scanner_universe_1m stale; scanner_universe_D stale")
-    assert smoke_svc.is_post_hold_active() is True
+    assert smoke_svc.get_post_hold() is not None
 
     with (
         patch.object(sched, "run_backfill_checks", return_value=_minimal_backfill_res()),
@@ -464,7 +464,7 @@ def test_preentry_refresh_keeps_hold_when_genuinely_stale(monkeypatch):
     ):
         sched.run_preentry_scanner_refresh()
 
-    assert smoke_svc.is_post_hold_active() is True, (
+    assert smoke_svc.get_post_hold() is not None, (
         "a genuinely-still-stale re-check must keep the hold armed"
     )
 
@@ -475,7 +475,7 @@ def test_preentry_refresh_release_is_noop_without_armed_hold(monkeypatch):
     any gate) — verified by asserting the underlying pipeline check function
     is never invoked, and the hold stays inactive throughout."""
     monkeypatch.setenv("SCANNER_PREENTRY_REFRESH_ENABLED", "true")
-    assert smoke_svc.is_post_hold_active() is False
+    assert smoke_svc.get_post_hold() is None
 
     with (
         patch.object(sched, "run_backfill_checks", return_value=_minimal_backfill_res()),
@@ -491,4 +491,4 @@ def test_preentry_refresh_release_is_noop_without_armed_hold(monkeypatch):
 
     assert res is not None
     mock_check.assert_not_called()
-    assert smoke_svc.is_post_hold_active() is False
+    assert smoke_svc.get_post_hold() is None
