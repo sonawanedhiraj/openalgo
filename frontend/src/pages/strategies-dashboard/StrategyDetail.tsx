@@ -64,6 +64,17 @@ function fmtPnl(v: number | null | undefined) {
   )
 }
 
+// Plain unsigned INR amount (for costs like charges and capital deployed), no
+// leading +/-. `null` renders as an em-dash.
+function fmtInr(v: number | null | undefined) {
+  if (v == null) return '—'
+  return v.toLocaleString('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 0,
+  })
+}
+
 // Matches a trailing timezone designator: `Z`, or a numeric offset like
 // `+05:30` / `-0800`. Timestamps WITH an offset (e.g. signal_decision.candidate_at
 // = `datetime.now(Asia/Kolkata).isoformat()`) must be parsed as-is; only naive
@@ -709,6 +720,13 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
     return sortAsc ? ta.localeCompare(tb) : tb.localeCompare(ta)
   })
 
+  // Gross P&L / Charges / Capital are only populated for strategies that journal
+  // them per leg (futures_follow_cap50). Show those columns only when present so
+  // the sector_follow / simplified views stay compact.
+  const hasFinancials = trades.some(
+    (t) => t.gross_pnl != null || t.charges_inr != null || t.margin_inr != null
+  )
+
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -732,9 +750,24 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Side</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Symbol</th>
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">Qty</th>
+                  {hasFinancials && (
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                      Gross P&L
+                    </th>
+                  )}
+                  {hasFinancials && (
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                      Charges
+                    </th>
+                  )}
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">
                     Net P&L
                   </th>
+                  {hasFinancials && (
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                      Capital
+                    </th>
+                  )}
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Mode</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Status</th>
                   <th
@@ -767,6 +800,28 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                       </td>
                       <td className="px-3 py-1.5 font-mono">{t.symbol}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums">{t.quantity}</td>
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.gross_pnl != null ? (
+                            <span
+                              className={
+                                t.gross_pnl >= 0
+                                  ? 'text-green-600 dark:text-green-400'
+                                  : 'text-red-600 dark:text-red-400'
+                              }
+                            >
+                              {fmtPnl(t.gross_pnl)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
+                          {t.charges_inr != null ? fmtInr(t.charges_inr) : '—'}
+                        </td>
+                      )}
                       <td className="px-3 py-1.5 text-right tabular-nums font-mono">
                         {netPnl != null ? (
                           <span
@@ -782,6 +837,11 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                           <span className="text-muted-foreground">—</span>
                         )}
                       </td>
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
+                          {t.margin_inr != null ? fmtInr(t.margin_inr) : '—'}
+                        </td>
+                      )}
                       <td className="px-3 py-1.5">
                         <Badge variant="outline" className="text-xs py-0">
                           {t.mode}

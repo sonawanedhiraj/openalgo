@@ -83,7 +83,9 @@ export interface RecentTrade {
   entry_price?: number | null
   exit_price?: number | null
   gross_pnl?: number | null
+  charges_inr?: number | null
   net_pnl?: number | null
+  margin_inr?: number | null
   mode: string
   status: string
   entry_date: string
