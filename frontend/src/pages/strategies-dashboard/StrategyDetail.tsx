@@ -507,13 +507,34 @@ function PerfTable({ data }: { data: StrategyDetail }) {
     { label: 'CAGR', bt: fmt(bt.cagr_pct, '%'), sb: '—', lv: '—' },
     { label: 'Sharpe', bt: fmt(bt.sharpe), sb: '—', lv: '—' },
     { label: 'Max DD', bt: fmt(bt.max_dd_pct, '%'), sb: '—', lv: '—' },
-    { label: 'Win Rate', bt: fmt(bt.win_rate_pct, '%'), sb: '—', lv: '—' },
-    { label: 'N Trades', bt: fmt(bt.n_trades), sb: '—', lv: '—' },
+    // Backtest win-rate is the 2.5yr figure; Sandbox/Live show the *running*
+    // win-rate over closed trades so far (issue #323).
+    {
+      label: 'Win Rate',
+      bt: fmt(bt.win_rate_pct, '%'),
+      sb: fmt(sb?.win_rate_pct, '%'),
+      lv: fmt(lv?.win_rate_pct, '%'),
+    },
+    // Backtest N is the window trade count; Sandbox/Live show closed trades so
+    // far, the denominator behind the running win-rate + cumulative P&L.
+    {
+      label: 'N Trades',
+      bt: fmt(bt.n_trades),
+      sb: sb?.closed_trades != null ? String(sb.closed_trades) : '—',
+      lv: lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+    },
     {
       label: 'Open Pos',
       bt: '—',
       sb: sb?.open_positions != null ? String(sb.open_positions) : '—',
       lv: lv?.open_positions != null ? String(lv.open_positions) : '—',
+    },
+    // Cumulative realized P&L since the strategy started trading in that mode.
+    {
+      label: 'Cum P&L',
+      bt: '—',
+      sb: fmtPnl(sb?.cum_net_pnl),
+      lv: fmtPnl(lv?.cum_net_pnl),
     },
     {
       label: 'Today P&L',

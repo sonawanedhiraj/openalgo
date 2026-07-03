@@ -54,6 +54,11 @@ export interface LivePerf {
   open_positions?: number
   today_net_pnl?: number | null
   last_trade_at?: string | null
+  // Since-inception (issue #323): cumulative realized P&L, running win-rate, and
+  // the closed-trade denominator. Null when the mode has no closed trades yet.
+  cum_net_pnl?: number | null
+  win_rate_pct?: number | null
+  closed_trades?: number
 }
 
 export interface StrategyPerformance {
