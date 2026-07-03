@@ -489,11 +489,17 @@ def test_detail_recent_trades_with_data(app, wired_dbs):
     assert sell["charges_inr"] == 468.16
     assert sell["net_pnl"] == 10781.84
     assert sell["margin_inr"] == 250000.0
-    # The BUY entry has no realized P&L but still reports capital deployed.
+    # The exit leg carries both the buy and sell price of the NIFTY future.
+    assert sell["entry_price"] == 24500.0
+    assert sell["exit_price"] == 24650.0
+    # The BUY entry has no realized P&L but still reports capital deployed and
+    # its buy price (no sell price yet).
     buy = trades[1]
     assert buy["side"] == "BUY"
     assert buy["net_pnl"] is None
     assert buy["margin_inr"] == 250000.0
+    assert buy["entry_price"] == 24500.0
+    assert buy["exit_price"] is None
 
 
 # ---------------------------------------------------------------------------
