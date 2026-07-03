@@ -577,17 +577,38 @@ def _record_prev_closes_from_provider(universe: list[str], today: date) -> dict:
     semantics exactly, just sourced from the provider's DataFrame instead of a
     raw broker bar list.
 
+    PROVENANCE RULE (do not regress): the registry has two possible sources
+    with different trust levels — the aggregator_seeder's
+    ``record_prev_close_from_bars`` is **broker-DIRECT** (an independent broker
+    1m fetch, deliberately decoupled from historify — that independence is the
+    whole point of the #305 cross-check), while this path is
+    **historify-DERIVED** (the provider cache after the re-settle). Broker-direct
+    wins; historify-derived only fills gaps. So if a same-day entry already
+    exists, we SKIP (counted as ``kept_existing``) rather than overwrite:
+    otherwise a re-settle that PARTIALLY fails for a symbol (per-symbol broker
+    error — ``provider.refresh()`` still succeeds because refresh success only
+    means the cache re-read worked) would serve the OLD stale daily row and
+    clobber the seeder's true broker value, making the certificate compare
+    stale-vs-stale and CERTIFY the exact 2026-07-02 incident class it exists to
+    reject. The reverse ordering is safe as-is: if this path records first, the
+    seeder's later unconditional record correctly replaces the historify-derived
+    value with the broker-direct one (an upgrade).
+
     Fail-graceful: a per-symbol read/parse failure is logged and skipped; the
     whole helper never raises into ``resettle_recent_daily``.
 
-    Returns ``{"recorded": [...], "skipped": [...], "errors": int}``.
+    Returns ``{"recorded": [...], "kept_existing": [...], "skipped": [...], "errors": int}``.
     """
-    outcome: dict = {"recorded": [], "skipped": [], "errors": 0}
+    outcome: dict = {"recorded": [], "kept_existing": [], "skipped": [], "errors": 0}
     try:
         from datetime import time as _time
 
         from services.scanner_history_provider import get_provider
-        from services.scanner_reference_data import _IST, record_broker_prev_close
+        from services.scanner_reference_data import (
+            _IST,
+            get_broker_prev_close,
+            record_broker_prev_close,
+        )
     except Exception:
         logger.exception(
             "scanner daily-D resettle: prev-close registry wiring unavailable — skipping"
@@ -615,6 +636,13 @@ def _record_prev_closes_from_provider(universe: list[str], today: date) -> dict:
 
     for sym in universe:
         try:
+            # Provenance guard: a same-day entry already in the registry is
+            # broker-direct (seeder) or an earlier run of this path — never
+            # overwrite it with a historify-derived value (see docstring).
+            if get_broker_prev_close(sym, today=today) is not None:
+                outcome["kept_existing"].append(sym)
+                continue
+
             daily = provider.get_daily(sym)
             if daily is None or daily.empty or "timestamp" not in daily.columns:
                 outcome["skipped"].append(sym)
@@ -651,9 +679,10 @@ def _record_prev_closes_from_provider(universe: list[str], today: date) -> dict:
 
     logger.info(
         "scanner daily-D resettle: prev-close registry updated for %d/%d symbols "
-        "(%d skipped, %d errors)",
+        "(%d kept broker-direct, %d skipped, %d errors)",
         len(outcome["recorded"]),
         len(universe),
+        len(outcome["kept_existing"]),
         len(outcome["skipped"]),
         outcome["errors"],
     )

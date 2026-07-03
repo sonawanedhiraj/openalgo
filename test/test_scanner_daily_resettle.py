@@ -330,6 +330,46 @@ def test_resettle_post_close_case_does_not_poison_registry_with_todays_own_close
     assert got[0] != 520.0
 
 
+def test_resettle_never_overwrites_broker_direct_value_with_historify_derived():
+    """Provenance rule: broker-direct wins; historify-derived only fills gaps.
+
+    Scenario (the degradation path this guards against): at boot the seeder's
+    broker fallback records the TRUE broker T-1 (510.0). The re-settle then
+    partially fails for this symbol (per-symbol broker error — the job can
+    partially fail while ``provider.refresh()`` still succeeds, since refresh
+    success only means the cache re-read worked), so the provider serves the
+    OLD stale daily row (475.4). Without the guard, this path would record
+    475.4 over the seeder's 510.0 → the certificate compares stale-vs-stale →
+    CERTIFIED → the exact 2026-07-02 incident class passes silently. The
+    existing broker-direct entry must be KEPT."""
+    today = date(2026, 7, 2)
+    universe = ["DELHIVERY"]
+
+    # Seeder ran first: broker-direct T-1 close recorded for today.
+    refdata.record_broker_prev_close(
+        "DELHIVERY", 510.0, as_of=datetime(2026, 7, 2, 8, 40, tzinfo=refdata._IST)
+    )
+
+    # Re-settle partially failed for DELHIVERY: the provider cache still serves
+    # the stale (pre-resettle) daily row ending at 475.4.
+    daily = {"DELHIVERY": make_historify_daily_frame([470.0, 475.4], end_date=date(2026, 7, 1))}
+    provider = _FakeProviderWithDaily(daily)
+
+    p1, p2, p3, p4 = _patch_resettle_pipeline(universe, provider)
+    with p1, p2, p3, p4:
+        res = sub.resettle_recent_daily(today, days=2)
+
+    assert res["prev_close_registry"]["kept_existing"] == ["DELHIVERY"]
+    assert res["prev_close_registry"]["recorded"] == []
+    got = refdata.get_broker_prev_close("DELHIVERY", today=today)
+    assert got is not None
+    assert got[0] == 510.0, (
+        "broker-direct prev-close was overwritten by a historify-derived value — "
+        "the certificate would now compare stale-vs-stale and certify the "
+        "2026-07-02 DELHIVERY incident class"
+    )
+
+
 def test_resettle_registry_fail_graceful_never_breaks_resettle():
     """A registry-record failure (e.g. a symbol's frame is malformed) must
     never surface as a resettle failure — only that symbol is skipped/errored,
