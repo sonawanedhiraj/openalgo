@@ -10,9 +10,10 @@ so no real broker download or DuckDB access happens.
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import services.scanner_backfill_scheduler as sched
+import services.scanner_smoke_check_service as smoke_svc
 import services.scanner_universe_backfill as sub
 
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -456,6 +457,115 @@ def test_boot_runs_both_intervals_and_persists_health():
     # One health row per interval, both healthy.
     assert ("scanner_universe_1m", True) in health_rows
     assert ("scanner_universe_D", True) in health_rows
+
+
+def test_boot_backfill_releases_smoke_hold_when_recheck_passes(monkeypatch):
+    """Issue #319: boot convergence completion must also re-check + release a
+    smoke-check post-hold armed earlier in the process (e.g. armed pre-restart
+    or by a prior 09:18 FAIL), not just the 15:30+ periodic loop.
+
+    ``re_check_and_release`` calls ``assert_scanner_pipeline_healthy()`` with
+    no overrides, so its providers resolve via default-argument binding —
+    patching the module's ``production_*`` names doesn't reach those already-
+    bound defaults. The test drives the real production call chain instead
+    (broker session + freshness DB read + scanner aggregator), matching prod.
+    """
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SYMBOLS", "A")
+    smoke_svc._reset_hold_for_tests()
+    smoke_svc._last_alert_date = None
+    try:
+        smoke_svc.set_post_hold(reason="test: pre-armed before boot convergence")
+        assert smoke_svc.is_post_hold_active() is True
+
+        def fake_check(today=None, *, interval="1m"):
+            return _fresh_result(interval)
+
+        with (
+            patch.object(sched, "_intervals", return_value=["1m", "D"]),
+            patch(
+                "services.scanner_universe_backfill.check_and_refresh_if_stale",
+                side_effect=fake_check,
+            ),
+            patch("database.data_health_db.insert_check", return_value=1),
+            patch("services.historify_service.wait_for_jobs", return_value={}),
+            # The re-check's production providers — now report healthy.
+            patch("database.auth_db.get_first_available_api_key", return_value="test_api_key"),
+            patch("database.data_health_db.get_latest_check", return_value={"overall_ok": True}),
+            patch(
+                "services.scanner_service.get_scanner_service",
+                return_value=MagicMock(get_today_ohlcv=MagicMock(return_value=(100.0, 1000))),
+            ),
+        ):
+            sched.run_boot_backfill_checks(THURS)
+
+        assert smoke_svc.is_post_hold_active() is False
+    finally:
+        smoke_svc._reset_hold_for_tests()
+        smoke_svc._last_alert_date = None
+
+
+def test_boot_backfill_keeps_smoke_hold_when_genuinely_stale(monkeypatch):
+    """A re-check that still fails after the boot convergence must keep the
+    hold armed — the boot completion must never blindly clear it."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SYMBOLS", "A")
+    smoke_svc._reset_hold_for_tests()
+    smoke_svc._last_alert_date = None
+    try:
+        smoke_svc.set_post_hold(reason="test: pre-armed before boot convergence")
+        assert smoke_svc.is_post_hold_active() is True
+
+        def fake_check(today=None, *, interval="1m"):
+            return _fresh_result(interval)
+
+        with (
+            patch.object(sched, "_intervals", return_value=["1m", "D"]),
+            patch(
+                "services.scanner_universe_backfill.check_and_refresh_if_stale",
+                side_effect=fake_check,
+            ),
+            patch("database.data_health_db.insert_check", return_value=1),
+            patch("services.historify_service.wait_for_jobs", return_value={}),
+            # Still genuinely unhealthy — no broker session.
+            patch("database.auth_db.get_first_available_api_key", return_value=None),
+            patch("database.data_health_db.get_latest_check", return_value={"overall_ok": False}),
+            patch("services.scanner_service.get_scanner_service", return_value=None),
+        ):
+            sched.run_boot_backfill_checks(THURS)
+
+        assert smoke_svc.is_post_hold_active() is True
+    finally:
+        smoke_svc._reset_hold_for_tests()
+        smoke_svc._last_alert_date = None
+
+
+def test_boot_backfill_smoke_release_noop_without_hold():
+    """No hold armed at boot time → the release call is a silent no-op,
+    verified by asserting the underlying pipeline check function is never
+    invoked (``re_check_and_release`` short-circuits on the armed-check)."""
+    smoke_svc._reset_hold_for_tests()
+    smoke_svc._last_alert_date = None
+    assert smoke_svc.is_post_hold_active() is False
+
+    def fake_check(today=None, *, interval="1m"):
+        return _fresh_result(interval)
+
+    with (
+        patch.object(sched, "_intervals", return_value=["1m", "D"]),
+        patch(
+            "services.scanner_universe_backfill.check_and_refresh_if_stale",
+            side_effect=fake_check,
+        ),
+        patch("database.data_health_db.insert_check", return_value=1),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+        patch.object(smoke_svc, "assert_scanner_pipeline_healthy") as mock_check,
+    ):
+        res = sched.run_boot_backfill_checks(THURS)
+
+    assert res["all_fresh"] is True
+    mock_check.assert_not_called()
+    assert smoke_svc.is_post_hold_active() is False
 
 
 def test_run_backfill_checks_marks_not_fresh_when_any_interval_stale():
