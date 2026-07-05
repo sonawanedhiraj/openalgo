@@ -70,6 +70,24 @@ inherited E4 sector-5d-vol p80 catastrophe filter zeroes January entries).
 
 ## Implementation notes
 
+### 2026-07-05 — #334: watchdog moved to 15:28 — the 15:25 exit is primary again
+
+The 15:14 EOD watchdog and the 15:25 T+1 exit share the selection predicate
+(`entry_date != today`), and the watchdog fired FIRST — so on every normal day
+the watchdog flattened the book at 15:14 and the "primary" 15:25 exit found
+nothing. De-facto exit 15:14 vs the backtested/documented 15:25 (economically
+likely immaterial — both near-close MARKET fills — but a systematic spec-vs-code
+divergence). The 15:14 slot was inherited from the simplified engine's MIS
+constraint (sandbox rejects MIS at/after 15:15); futures_follow trades **NRML**,
+accepted until the 15:30 NFO close, so it never applied here. Fix: watchdog cron
+→ **15:28 IST** (after the primary exit, 2 min before close), predicate
+unchanged — with correct ordering anything it finds SHOULD be flattened
+(rejected exit order, failed/missed 15:25 job). Supporting change: a
+rejected/exception exit SELL now KEEPS the position in `paper_book` so the
+15:28 watchdog retries it (the #265 store-reconcile guard suppresses a double
+SELL if the order actually filled). The simplified engine's own 15:14 MIS
+watchdog is untouched — its cap is load-bearing there. See VERSION_LOG v0.3.1.
+
 ### 2026-07-04 — #332: 15:20 decision snapshot from broker quotes (get_multiquotes)
 
 futures_follow makes exactly ONE decision per day (the 15:20 IST entry eval), yet
@@ -143,7 +161,8 @@ data-freshness + kill-switch rails are unchanged and remain the operational safe
   `compute_futures_charges` (the ~₹530/lot model). Near-month NIFTY contract
   resolved from the master contract (`production_contract_resolver` →
   `fno_search_symbols_db`, nearest non-expired monthly FUT). 5 APScheduler jobs
-  (09:00 reset / 15:14 watchdog / 15:20 entry / 15:25 exit / 15:30 EOD). Mode-aware
+  (09:00 reset / 15:20 entry / 15:25 exit / 15:28 watchdog (was 15:14 — moved by
+  #334) / 15:30 EOD). Mode-aware
   order placement, kill switch, pause/resume/close_all, runtime-override gate
   (entry-only), data-freshness gate (delegates to sector_follow's check). All I/O
   injected → hermetic tests.

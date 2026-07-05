@@ -682,8 +682,10 @@ the next regression of that class in minutes instead of hours.
 - **Times (was: `FUTURES_FOLLOW_ENTRY_TIME_IST` / `..._EXIT_TIME_IST` /
   `..._EOD_WATCHDOG_TIME_IST`):** scheduler-fixed cron times in
   `FuturesFollowService.register_jobs` — entry **15:20**, exit **15:25**, EOD
-  watchdog **15:14**, daily reset 09:00, EOD summary 15:30 IST (all `mon-fri`,
-  `Asia/Kolkata`). The watchdog at 15:14 fires before any auto-square-off window.
+  watchdog **15:28** (was 15:14 — moved by #334 so the 15:25 exit is primary;
+  the watchdog is the post-primary-exit retry backstop before the 15:30 NFO
+  close), daily reset 09:00, EOD summary 15:30 IST (all `mon-fri`,
+  `Asia/Kolkata`).
 - **Product/exchange:** `product` NRML (futures carry — not MIS/CNC), `exchange`
   NFO, MARKET orders. `cost_pct_round_trip` 0.030 (~₹530/lot).
 - **Who changes:** operator, recorded in
