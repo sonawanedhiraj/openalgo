@@ -6,7 +6,8 @@ stock signals, and for each signal — greedily in vol-ratio order — buys **on
 NIFTY near-month index future lot**, subject to a HARD CAP of 50% of capital as
 overnight SPAN margin. Positions are held to the **next trading day 15:25 IST**
 (T+1) MARKET sell. NO stop loss (Phase-1 proved hard stops are net-negative on this
-signal class); the EOD watchdog at 15:14 IST is the only safety backstop.
+signal class); the EOD watchdog at 15:28 IST — AFTER the 15:25 primary exit,
+before the 15:30 NFO close — is the only safety backstop (#334).
 
 **It is ACTIVELY trading in sandbox by default** — from boot it places real orders
 into ``sandbox.db`` (the virtual ₹1Cr book). There is no observe-only / scaffold
@@ -1138,7 +1139,20 @@ class FuturesFollowService:
                 "net_pnl": net_pnl,
             }
         )
-        self.paper_book.pop(pos_id, None)
+        if status == "placed":
+            self.paper_book.pop(pos_id, None)
+        else:
+            # #334: a rejected/exception SELL keeps the position in the book so
+            # the 15:28 watchdog (or the next day's exit job) retries the
+            # square-off. Safe against a double SELL: _reconcile_exit_qty checks
+            # the position store first and SUPPRESSES the retry if the store is
+            # already flat (the order actually filled despite the error reply).
+            logger.warning(
+                "futures_follow EXIT %s for %s — position retained in book for the "
+                "15:28 watchdog retry",
+                status,
+                symbol,
+            )
         return {
             "pos_id": pos_id,
             "nifty_symbol": symbol,
@@ -1744,7 +1758,7 @@ class FuturesFollowService:
         store via ``get_positionbook`` (mode-aware: ``sandbox.db`` in sandbox, the
         broker positionbook in live) and reconstructs a position for every open
         NIFTY*FUT leg on NFO/NRML that the ``paper_book`` doesn't already know
-        about, so the 15:20/15:25/15:14 exit jobs will square it off.
+        about, so the 15:25/15:28 exit jobs will square it off.
 
         Returns the number of positions rehydrated. Never raises.
         """
@@ -2112,11 +2126,17 @@ class FuturesFollowService:
 
     # ----- EOD watchdog (tick-independent flatten backstop) -------------- #
     def run_eod_watchdog(self) -> list[dict]:
-        """15:14 IST: tick-independent backstop that flattens any still-open T+1
-        position the scheduled 15:25 exit would handle, BEFORE the broker MIS
-        auto-square-off window. NRML futures are not MIS-squared-off, but the
-        watchdog guarantees a held position is flattened even if the 15:25 job or
-        the tick stream fails. Exits are never gated."""
+        """15:28 IST: post-primary-exit retry backstop (#334).
+
+        Flattens any prior-day position STILL open after the 15:25 primary exit
+        — a rejected exit order or a failed/missed 15:25 job — before the 15:30
+        NFO close. It shares the exit predicate (``entry_date != today``) by
+        design: with the 15:25 → 15:28 ordering, anything it finds SHOULD be
+        flattened. (The old 15:14 slot was inherited from the simplified
+        engine's MIS constraint; futures_follow trades NRML, accepted until the
+        15:30 close, so that constraint does not apply — and firing before the
+        primary exit made the watchdog the de-facto exit.) Exits are never
+        gated."""
         today = self._now().date().isoformat()
         to_flatten = [(pid, p) for pid, p in list(self.paper_book.items()) if p.entry_date != today]
         if not to_flatten:
@@ -2157,10 +2177,10 @@ class FuturesFollowService:
         )
         sched.add_job(
             _watchdog_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=14, timezone="Asia/Kolkata"),
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=28, timezone="Asia/Kolkata"),
             id="futures_follow_eod_watchdog",
             replace_existing=True,
-            name="Futures Follow CAP50 EOD watchdog (15:14 IST)",
+            name="Futures Follow CAP50 EOD watchdog (15:28 IST)",
         )
         sched.add_job(
             _entry_job,

@@ -1,5 +1,24 @@
 # Futures Follow CAP50 — Version Log
 
+## v0.3.1 — 2026-07-05
+EOD watchdog moved 15:14 → 15:28 so the 15:25 T+1 exit is primary (issue #334).
+Mode: **sandbox (default)** · Deployable: **true**
+
+- Bug: the watchdog and the 15:25 exit share the predicate `entry_date != today`;
+  firing at 15:14 the watchdog flattened every prior-day position FIRST, making
+  the de-facto exit 15:14 — an 11-minute divergence from the backtested/
+  documented 15:25 exit. The 15:14 slot was inherited from the simplified
+  engine's MIS constraint; futures_follow is NRML (accepted till the 15:30 NFO
+  close), so it never applied.
+- `futures_follow_eod_watchdog` cron now 15:28 IST (after the 15:25 primary
+  exit, 2 min before close, matching the entry-deadline buffer). Selection
+  predicate UNCHANGED — with correct ordering it is exactly right.
+- Supporting change: a REJECTED/exception exit SELL now KEEPS the position in
+  `paper_book` (was: silently dropped) so the 15:28 watchdog retries it; the
+  #265 store-reconcile guard suppresses the retry if the order actually filled.
+- The simplified engine's MIS watchdog (`services/eod_watchdog_service.py`,
+  15:14 cap) is untouched — its constraint is load-bearing there.
+
 ## v0.3.0 — 2026-07-03
 Stage-1 LLM veto wired, strategy-aware (issue #318).
 Mode: **sandbox (default)** · Deployable: **true**

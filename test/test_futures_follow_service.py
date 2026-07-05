@@ -105,6 +105,7 @@ def _make_service(signals=None, **overrides):
     signal_evaluator = overrides.pop("signal_evaluator", fake_signal_evaluator)
     signal_reviewer = overrides.pop("signal_reviewer", None)
     market_context_provider = overrides.pop("market_context_provider", None)
+    order_placer = overrides.pop("order_placer", fake_placer)
 
     intent_resolver = overrides.pop("intent_resolver", None)
     now = overrides.pop("now", lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
@@ -120,7 +121,7 @@ def _make_service(signals=None, **overrides):
         mode=mode,
         signal_evaluator=signal_evaluator,
         contract_resolver=contract_resolver,
-        order_placer=fake_placer,
+        order_placer=order_placer,
         price_fetcher=price_fetcher,
         notifier=notifier,
         trade_recorder=fake_recorder,
@@ -1602,6 +1603,74 @@ def test_run_entry_kill_switch_skips_review_entirely(monkeypatch):
     placed = svc.run_entry()
     assert placed == []
     assert calls == []
+
+
+# --------------------------------------------------------------------------- #
+# #334 — watchdog moved to 15:28 (after the 15:25 primary exit)
+# --------------------------------------------------------------------------- #
+
+
+def test_register_jobs_watchdog_at_1528():
+    """The EOD watchdog cron is registered at 15:28 IST (post-primary-exit
+    backstop), not the old 15:14 inherited from the simplified engine's MIS
+    constraint. The simplified engine's own watchdog is untouched by #334."""
+    jobs: dict[str, tuple] = {}
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, id, replace_existing, name):
+            jobs[id] = (trigger, name)
+
+    svc = _make_smoke_service()
+    svc.strategy_id = 77
+    svc.register_jobs(FakeScheduler())
+
+    trigger, name = jobs["futures_follow_eod_watchdog"]
+    assert "15:28" in name
+    assert "minute='28'" in str(trigger) and "hour='15'" in str(trigger)
+    # Ordering sanity: primary exit stays at 15:25, before the watchdog.
+    exit_trigger, _exit_name = jobs["futures_follow_exit"]
+    assert "minute='25'" in str(exit_trigger)
+
+
+def test_watchdog_finds_nothing_after_successful_primary_exit():
+    """#334 AC-2a: on a normal day the 15:25 primary exit squares off the T+1
+    position; the 15:28 watchdog then finds an empty book and does nothing —
+    the primary exit is primary again."""
+    svc = _make_service()
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+
+    exited = svc.run_exit()  # 15:25 primary
+    assert len(exited) == 1
+    assert svc.paper_book == {}
+
+    flattened = svc.run_eod_watchdog()  # 15:28 backstop
+    assert flattened == []
+
+
+def test_watchdog_flattens_position_left_by_rejected_primary_exit():
+    """#334 AC-2b: a REJECTED 15:25 exit keeps the position in the book; the
+    15:28 watchdog retries and flattens it before the 15:30 close."""
+    sell_attempts: list[dict] = []
+
+    def flaky_placer(mode, order):
+        if order["action"] != "SELL":
+            return {"status": "success", "orderid": "OID-BUY"}
+        sell_attempts.append(order)
+        if len(sell_attempts) == 1:
+            return {"status": "error", "message": "exchange rejected"}
+        return {"status": "success", "orderid": "OID-RETRY"}
+
+    svc = _make_service(order_placer=flaky_placer)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+
+    exited = svc.run_exit()  # 15:25 primary — SELL rejected
+    assert len(exited) == 1  # journalled as rejected
+    assert len(svc.paper_book) == 1, "rejected exit must stay in book for the retry"
+
+    flattened = svc.run_eod_watchdog()  # 15:28 retry backstop
+    assert len(flattened) == 1
+    assert svc.paper_book == {}
+    assert len(sell_attempts) == 2  # one rejected attempt + one successful retry
 
 
 if __name__ == "__main__":
