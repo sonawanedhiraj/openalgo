@@ -163,6 +163,31 @@ data-freshness + kill-switch rails are unchanged and remain the operational safe
   `/api/status` for observability only — never used for the cap math. Operator
   refreshes the config estimate from the broker SPAN margin.
 
+### 2026-07-05 — R42: the SHORT mirror REJECTS — the overnight edge is long-only
+
+Operator asked whether the opposite trade works (SHORT NIFTY futures when the
+market trends down into the close: sector < −1.5%, stock < −0.5%, vol > 1×,
+top-5, CAP50, T+1 cover). It does not:
+
+| Variant | CAGR | Sharpe | MaxDD | Worst day |
+|---|---:|---:|---:|---:|
+| LONG control (proxy, matched window) | 15.48% | 1.27 | −6.1% | −₹46k |
+| SHORT mirror +E4 | **+1.05%** | 0.15 | −11.3% | −₹69k |
+| SHORT mirror no-E4 | **−7.82%** | −0.24 | −25.1% | −₹111k |
+
+Mechanism: after a down-signal day the signal stock *bounces* (+0.38% mean
+next-day, only 45.6% continue down) while after an up-signal day it continues
+(+0.51%, 59.2%) — panic closes mean-revert overnight, and NIFTY's upward drift
+turns from tailwind to headwind (down only 48.5% of post-signal days). E4 is
+the only thing keeping the short above water — "don't trade when the signal is
+strongest" as the best filter is the tell that there is no edge underneath.
+Run on a public-data daily proxy (historify locked by the live app); the LONG
+control reproduced the canonical study's Sharpe **exactly** (1.27), so the
+proxy is trusted. With MIS-T+0 and option buying already rejected, every
+wrapper except LONG delta-1 overnight has now failed on this signal family.
+Report: `docs/research/strategy/futures_follow_cap50/2026-07-05_inverse_short_futures_backtest.md`
+(R42, issue #336).
+
 ## Live Learnings
 
 _(populate as the sandbox pilot produces evidence)_
