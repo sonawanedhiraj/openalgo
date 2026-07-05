@@ -45,7 +45,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from utils.logging import get_logger
@@ -476,6 +476,35 @@ def production_data_health_checker(
     except Exception:
         logger.exception("futures_follow data-health checker failed (failing open)")
         return True, {}
+
+
+_DEFAULT_ENTRY_DEADLINE = "15:28"
+
+
+def futures_entry_deadline_ist() -> time:
+    """``FUTURES_FOLLOW_ENTRY_DEADLINE_IST`` env tunable (HH:MM IST, default 15:28).
+
+    Wall-clock deadline for the 15:20 entry job (#332 follow-up). A misfired
+    cron (app down at 15:20 → APScheduler fires it on restart) must never place
+    entries near/after the 15:30 NFO close: at ~15:35 the exchange rejects the
+    order; after ~15:45 it could queue as an AMO and execute at tomorrow's open
+    — an unintended overnight entry. Consult-time (re-read every fire).
+    Fail-safe parse: a malformed value falls back to 15:28 with a WARNING — a
+    typo must never disable the guard. No early-side check (cron cannot fire
+    early; misfires only fire late).
+    """
+    raw = os.getenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", _DEFAULT_ENTRY_DEADLINE)
+    try:
+        hh, mm = str(raw).strip().split(":")
+        return time(int(hh), int(mm))
+    except (ValueError, TypeError):
+        logger.warning(
+            "Malformed FUTURES_FOLLOW_ENTRY_DEADLINE_IST=%r — falling back to %s",
+            raw,
+            _DEFAULT_ENTRY_DEADLINE,
+        )
+        hh, mm = _DEFAULT_ENTRY_DEADLINE.split(":")
+        return time(int(hh), int(mm))
 
 
 def futures_smoke_check_enabled() -> bool:
@@ -1143,7 +1172,37 @@ class FuturesFollowService:
     # ----- scheduled job bodies ------------------------------------------ #
     def run_entry(self) -> list[dict]:
         """15:20 IST: evaluate signals, resolve the contract, buy 1 lot/signal up to
-        the 50%-margin cap (subject to the override gate, kill switch + freshness)."""
+        the 50%-margin cap (subject to the lateness guard, override gate, kill
+        switch + freshness)."""
+        # Wall-clock entry-lateness guard (#332 follow-up) — FIRST, before any
+        # gate/evaluation/order. A misfired cron (app down at 15:20 →
+        # APScheduler fires on restart) must never place entries near/after the
+        # 15:30 NFO close: at ~15:35 the exchange rejects; after ~15:45 the
+        # order could queue as an AMO and execute at tomorrow's open. Entries
+        # ONLY — run_exit / run_eod_watchdog / close_all are never gated (a
+        # held T+1 position is riskier than a rejected exit order).
+        now = self._now()
+        now_ist = now.astimezone(_IST) if now.tzinfo else now
+        deadline = futures_entry_deadline_ist()
+        if now_ist.time() > deadline:
+            fired_at = now_ist.strftime("%H:%M:%S")
+            deadline_str = deadline.strftime("%H:%M")
+            logger.error(
+                "futures_follow ENTRY SKIPPED — entry job fired LATE at %s IST "
+                "(deadline %s); likely restart/scheduler misfire. No orders placed.",
+                fired_at,
+                deadline_str,
+            )
+            try:
+                self._notify(
+                    f"🚫 {STRATEGY_NAME} entry job fired LATE at {fired_at} IST "
+                    f"(deadline {deadline_str}) — skipping today's entries (likely "
+                    "restart/scheduler misfire); no orders placed"
+                )
+            except Exception:
+                logger.exception("futures_follow late-entry alert failed")
+            return []
+
         decision = self._resolve_decision()
         if self._entry_held_by_override():
             return []

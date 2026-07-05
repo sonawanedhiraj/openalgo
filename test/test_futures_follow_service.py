@@ -105,6 +105,7 @@ def _make_service(signals=None, **overrides):
     signal_evaluator = overrides.pop("signal_evaluator", fake_signal_evaluator)
 
     intent_resolver = overrides.pop("intent_resolver", None)
+    now = overrides.pop("now", lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
     if intent_resolver is None:
         from services.mode_service import EffectiveDecision
 
@@ -121,7 +122,7 @@ def _make_service(signals=None, **overrides):
         price_fetcher=price_fetcher,
         notifier=notifier,
         trade_recorder=fake_recorder,
-        now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
+        now=now,
         intent_resolver=intent_resolver,
         data_health_checker=data_health_checker,
     )
@@ -1299,6 +1300,102 @@ def test_futures_intraday_source_defaults_and_validates(monkeypatch):
     assert futures_intraday_source() == "aggregator"
     monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "bogus")
     assert futures_intraday_source() == "quotes"
+
+
+# --------------------------------------------------------------------------- #
+# #332 follow-up — wall-clock entry-lateness guard (default deadline 15:28 IST)
+# --------------------------------------------------------------------------- #
+
+
+def _make_late_guard_service(fire_at: datetime, signals=None):
+    """Service with a pinned clock + counting evaluator/notifier for guard tests."""
+    eval_calls = []
+    alerts = []
+
+    def counting_evaluator(as_of=None):
+        eval_calls.append(as_of)
+        return list(signals or [_sig("AAA")])
+
+    svc = _make_service(
+        signal_evaluator=counting_evaluator,
+        notifier=lambda msg: alerts.append(msg),
+        now=lambda: fire_at,
+    )
+    svc._test_eval_calls = eval_calls
+    svc._test_alerts = alerts
+    return svc
+
+
+@pytest.mark.parametrize("fire_hm", [(15, 29), (15, 35)])
+def test_entry_skipped_when_fired_after_deadline(monkeypatch, fire_hm):
+    """A late-fired entry job (post-15:28 default deadline) places NOTHING:
+    no evaluation, no orders, returns [], and Telegrams the operator."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    h, m = fire_hm
+    svc = _make_late_guard_service(datetime(2026, 6, 10, h, m, 5, tzinfo=_IST))
+    placed = svc.run_entry()
+
+    assert placed == []
+    assert svc._test_eval_calls == [], "evaluator must not run on a late fire"
+    assert svc._test_placed == [], "no orders may be placed on a late fire"
+    assert any("fired LATE" in a and "no orders placed" in a for a in svc._test_alerts), (
+        svc._test_alerts
+    )
+
+
+def test_entry_proceeds_at_scheduled_1520(monkeypatch):
+    """The normal 15:20 fire is untouched by the guard (regression)."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    svc = _make_late_guard_service(datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert len(svc._test_eval_calls) == 1
+
+
+def test_entry_deadline_custom_env_respected(monkeypatch):
+    """FUTURES_FOLLOW_ENTRY_DEADLINE_IST=15:25 → a 15:26 fire is skipped, a
+    15:24 fire proceeds."""
+    monkeypatch.setenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", "15:25")
+    late = _make_late_guard_service(datetime(2026, 6, 10, 15, 26, tzinfo=_IST))
+    assert late.run_entry() == []
+    assert late._test_placed == []
+    assert any("deadline 15:25" in a for a in late._test_alerts)
+
+    on_time = _make_late_guard_service(datetime(2026, 6, 10, 15, 24, tzinfo=_IST))
+    assert len(on_time.run_entry()) == 1
+
+
+def test_entry_deadline_malformed_env_falls_back_to_default(monkeypatch):
+    """A typo'd deadline value must never disable the guard: 'banana' → the
+    default 15:28 stays active (15:29 fire skipped, 15:20 fire proceeds)."""
+    from services.futures_follow_service import futures_entry_deadline_ist
+
+    monkeypatch.setenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", "banana")
+    assert futures_entry_deadline_ist().strftime("%H:%M") == "15:28"
+
+    late = _make_late_guard_service(datetime(2026, 6, 10, 15, 29, tzinfo=_IST))
+    assert late.run_entry() == []
+    assert late._test_placed == []
+
+    on_time = _make_late_guard_service(datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
+    assert len(on_time.run_entry()) == 1
+
+
+def test_exit_and_watchdog_not_gated_by_entry_deadline(monkeypatch):
+    """Repo invariant: exits are NEVER gated. run_exit and run_eod_watchdog
+    still square off a held T+1 position at 15:40, well past the deadline."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    fire_at = datetime(2026, 6, 10, 15, 40, tzinfo=_IST)
+
+    svc = _make_service(now=lambda: fire_at)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    exited = svc.run_exit()
+    assert len(exited) == 1, "run_exit must not be gated by the entry deadline"
+
+    svc2 = _make_service(now=lambda: fire_at)
+    _seed_position(svc2, "P1", entry_date="2026-06-09")
+    flattened = svc2.run_eod_watchdog()
+    assert len(flattened) == 1, "run_eod_watchdog must not be gated by the entry deadline"
 
 
 if __name__ == "__main__":

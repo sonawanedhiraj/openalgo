@@ -107,6 +107,19 @@ symbol/exchange routing as `sector_follow_index_backfill`) in a single
   broker-down fallback chain, index close-only path, source propagation +
   completeness, aggregator regression guard, aggregator-empty-all-day
   independence) + smoke-probe cases in `test/test_futures_follow_service.py`.
+- **2026-07-05 follow-up — wall-clock entry-lateness guard**: `run_entry` now
+  checks `self._now()` (IST) against `FUTURES_FOLLOW_ENTRY_DEADLINE_IST`
+  (default **15:28**, consult-time; a malformed value falls back to 15:28 with
+  a WARNING — a typo must never disable the guard) **before** any
+  gate/evaluation/order placement. Why: the 15:20 entry cron can misfire LATE
+  (app down at 15:20 → APScheduler fires it on restart) — at ~15:35 the
+  exchange rejects the order, but after ~15:45 it could queue as an **AMO and
+  execute at tomorrow's open**, an unintended overnight entry (NFO hard close
+  is 15:30). A late fire skips all entries, logs an ERROR with the actual fire
+  time vs the deadline, and Telegrams the operator. Entries ONLY — `run_exit` /
+  `run_eod_watchdog` / `close_all` are never gated (repo invariant: a held T+1
+  position is riskier than a rejected exit order). No early-side check (cron
+  cannot fire early; misfires only fire late).
 
 ### 2026-06-15 — v0.2.0: sandbox is the structural default (deployable: true)
 
