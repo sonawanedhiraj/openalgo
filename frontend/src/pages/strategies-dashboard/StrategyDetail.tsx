@@ -75,6 +75,18 @@ function fmtInr(v: number | null | undefined) {
   })
 }
 
+// Instrument price with 2 decimals (NIFTY futures trade in 0.05 ticks), ₹ prefix.
+// `null` renders as an em-dash.
+function fmtPrice(v: number | null | undefined) {
+  if (v == null) return '—'
+  return v.toLocaleString('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
+
 // Matches a trailing timezone designator: `Z`, or a numeric offset like
 // `+05:30` / `-0800`. Timestamps WITH an offset (e.g. signal_decision.candidate_at
 // = `datetime.now(Asia/Kolkata).isoformat()`) must be parsed as-is; only naive
@@ -751,6 +763,22 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Symbol</th>
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">Qty</th>
                   {hasFinancials && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Entry (BUY) price of the NIFTY future"
+                    >
+                      Buy Price
+                    </th>
+                  )}
+                  {hasFinancials && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Exit (SELL) price of the NIFTY future"
+                    >
+                      Sell Price
+                    </th>
+                  )}
+                  {hasFinancials && (
                     <th className="text-right px-3 py-2 font-medium text-muted-foreground">
                       Gross P&L
                     </th>
@@ -806,6 +834,24 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                       </td>
                       <td className="px-3 py-1.5 font-mono">{t.symbol}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums">{t.quantity}</td>
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.entry_price != null ? (
+                            fmtPrice(t.entry_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.exit_price != null ? (
+                            fmtPrice(t.exit_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
                       {hasFinancials && (
                         <td className="px-3 py-1.5 text-right tabular-nums font-mono">
                           {t.gross_pnl != null ? (

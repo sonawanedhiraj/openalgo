@@ -489,11 +489,17 @@ def test_detail_recent_trades_with_data(app, wired_dbs):
     assert sell["charges_inr"] == 468.16
     assert sell["net_pnl"] == 10781.84
     assert sell["margin_inr"] == 250000.0
-    # The BUY entry has no realized P&L but still reports capital deployed.
+    # The exit leg carries both the buy and sell price of the NIFTY future.
+    assert sell["entry_price"] == 24500.0
+    assert sell["exit_price"] == 24650.0
+    # The BUY entry has no realized P&L but still reports capital deployed and
+    # its buy price (no sell price yet).
     buy = trades[1]
     assert buy["side"] == "BUY"
     assert buy["net_pnl"] is None
     assert buy["margin_inr"] == 250000.0
+    assert buy["entry_price"] == 24500.0
+    assert buy["exit_price"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1105,6 +1111,55 @@ def test_llm_decisions_pagination(app, wired_llm_dbs):
     assert p1["total"] == 5
     assert len(p1["rows"]) == 2 and len(p2["rows"]) == 2
     assert {r["id"] for r in p1["rows"]}.isdisjoint({r["id"] for r in p2["rows"]})
+
+
+def test_detail_includes_llm_fields_futures_follow(app, wired_llm_dbs):
+    """#318: the futures_follow card's LLM Control panel enables (veto wired)."""
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50")
+    body = resp.get_json()["data"]
+    assert body["llm_veto_enabled"] is True
+
+
+def test_llm_decisions_futures_follow_filters_to_own_source(app, wired_llm_dbs):
+    """#318: the futures view is a clean inclusion filter on its own source."""
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _seed_decision(sddb, "ASTRAL", "chartink_FnO_intraday_buy", "take")
+    _seed_decision(sddb, "RELIANCE", "futures_follow_cap50", "skip")
+    _seed_decision(sddb, "FORTIS", "trend-up", "take")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50/llm-decisions")
+    body = resp.get_json()["data"]
+    assert body["veto_enabled"] is True
+    assert body["total"] == 1
+    assert len(body["rows"]) == 1
+    assert body["rows"][0]["source"] == "futures_follow_cap50"
+    assert body["rows"][0]["symbol"] == "RELIANCE"
+    assert body["summary"]["skip"] == 1
+    assert body["source_filtered"] is True
+
+
+def test_llm_decisions_simplified_excludes_futures_rows(app, wired_llm_dbs):
+    """R1 (#318): futures_follow rows must NOT leak into the simplified
+    engine's all-sources decisions view."""
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _seed_decision(sddb, "ASTRAL", "chartink_FnO_intraday_buy", "take")
+    _seed_decision(sddb, "RELIANCE", "futures_follow_cap50", "skip")
+    _seed_decision(sddb, "FORTIS", "trend-up", "take")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine/llm-decisions")
+    body = resp.get_json()["data"]
+    assert body["total"] == 2
+    assert all(r["source"] != "futures_follow_cap50" for r in body["rows"])
+    assert body["summary"]["total"] == 2
+    assert body["summary"]["skip"] == 0  # the skip row was the futures one
+    # Simplified is an exclusion view, not a clean per-strategy source filter.
+    assert body["source_filtered"] is False
 
 
 def test_llm_decisions_empty_for_non_veto_strategy(app, wired_llm_dbs):

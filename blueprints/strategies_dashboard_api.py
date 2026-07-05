@@ -218,21 +218,25 @@ def _get_strategy_mode(name: str) -> str:
 # LLM control (issue #266 Phase 2)
 # ---------------------------------------------------------------------------
 
-# Which strategies actually run the Stage-1 LLM veto today. Only the simplified
-# engine calls _run_pre_order_review; sector_follow / futures_follow have no
-# veto call, so their decisions view is empty by construction. The UI notes
-# this rather than faking rows.
-_VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER}
+# Which strategies actually run the Stage-1 LLM veto today. The simplified
+# engine calls _run_pre_order_review; futures_follow_cap50 reviews each
+# selected signal in run_entry (issue #318, strategy-aware prompt/context).
+# sector_follow still has no veto call, so its decisions view is empty by
+# construction. The UI notes this rather than faking rows.
+_FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
+_VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
-# Map a dashboard strategy name → the signal_decision.source labels its veto
-# rows carry. The simplified engine reviews with source=<chartink strategy
-# label> (e.g. "chartink_FnO_intraday_buy", "trend-up"), NOT its folder name —
-# so a clean per-strategy source filter isn't available. We therefore return
-# ALL signal_decision rows for the simplified engine (it is the only strategy
-# running the veto today) and the UI notes that. Value None = "no source
-# filter, return everything".
-_LLM_DECISION_SOURCES: dict[str, list[str] | None] = {
-    _SIMPLIFIED_ENGINE_FOLDER: None,
+# Map a dashboard strategy name → the signal_decision source filters its veto
+# rows need (kwargs for list/count/summarize_signal_decisions). The simplified
+# engine reviews with source=<chartink strategy label> (e.g.
+# "chartink_FnO_intraday_buy", "trend-up"), NOT its folder name — so a clean
+# inclusion filter isn't available; its view is ALL rows EXCEPT the strategies
+# that tag rows with their own name (R1, #318 — keeps futures_follow rows out).
+# futures_follow_cap50 tags rows source='futures_follow_cap50', so its view is
+# a clean inclusion filter.
+_LLM_DECISION_SOURCES: dict[str, dict[str, list[str]]] = {
+    _SIMPLIFIED_ENGINE_FOLDER: {"exclude_sources": [_FUTURES_FOLLOW_FOLDER]},
+    _FUTURES_FOLLOW_FOLDER: {"sources": [_FUTURES_FOLLOW_FOLDER]},
 }
 
 
@@ -1092,11 +1096,12 @@ def strategy_llm_decisions(name: str):
 
     Query: ``?limit=&offset=`` (limit clamped 1..200, default 50).
 
-    For the simplified engine (the only strategy running the veto today) this
-    returns ALL signal_decision rows — its veto rows are tagged with the
-    chartink source label, not the folder name, so a clean per-strategy source
-    filter isn't available (see _LLM_DECISION_SOURCES). For strategies that
-    don't run the veto, ``veto_enabled=false`` and rows are empty.
+    Per-strategy filtering (see _LLM_DECISION_SOURCES): the simplified engine's
+    veto rows are tagged with chartink source labels, not the folder name, so
+    its view is all rows EXCEPT strategies that tag rows with their own name
+    (today: futures_follow_cap50). futures_follow_cap50 (#318) filters cleanly
+    to source='futures_follow_cap50'. For strategies that don't run the veto,
+    ``veto_enabled=false`` and rows are empty.
     """
     strategy_dir = _STRATEGIES_DIR / name
     if not strategy_dir.exists():
@@ -1133,7 +1138,8 @@ def strategy_llm_decisions(name: str):
             }
         )
 
-    sources = _LLM_DECISION_SOURCES.get(name)  # None → all sources
+    # Per-strategy source filter kwargs; {} → all sources (no filter).
+    filters = _LLM_DECISION_SOURCES.get(name) or {}
     try:
         from database.signal_decision_db import (
             count_signal_decisions,
@@ -1141,9 +1147,9 @@ def strategy_llm_decisions(name: str):
             summarize_signal_decisions,
         )
 
-        rows = list_signal_decisions(sources=sources, limit=limit, offset=offset)
-        total = count_signal_decisions(sources=sources)
-        summary = summarize_signal_decisions(sources=sources)
+        rows = list_signal_decisions(limit=limit, offset=offset, **filters)
+        total = count_signal_decisions(**filters)
+        summary = summarize_signal_decisions(**filters)
     except Exception:
         logger.exception("strategy_llm_decisions: query failed for %s", name)
         rows, total, summary = [], 0, None
@@ -1160,9 +1166,10 @@ def strategy_llm_decisions(name: str):
                 "limit": limit,
                 "offset": offset,
                 "summary": summary,
-                # True when we could NOT filter to a per-strategy source and so
-                # returned all rows (the UI notes this).
-                "source_filtered": sources is not None,
+                # True when the view is a clean per-strategy source filter
+                # (futures_follow). False for the simplified engine, whose view
+                # is all-rows-except-other-strategies (the UI notes this).
+                "source_filtered": bool(filters.get("sources")),
             },
         }
     )

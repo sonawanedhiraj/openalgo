@@ -907,6 +907,293 @@ def test_build_context_regime_failure_yields_none(monkeypatch):
     assert ctx["regime_snapshot"] is None
 
 
+# ---------------------------------------------------------------------------
+# Strategy-aware review (issue #318) — futures_follow_cap50 profile
+# ---------------------------------------------------------------------------
+
+
+FUTURES = "futures_follow_cap50"
+
+
+def _futures_ctx() -> dict:
+    """A complete futures_follow context (operator + signal + market)."""
+    return {
+        "vol_ratio": 2.1,
+        "stock_ret": 0.012,  # fractions, as the sector_follow evaluator emits
+        "sector_ret": 0.015,
+        "contract_symbol": "NIFTY28JUL26FUT",
+        "lots_held": 1,
+        "margin_used_inr": 250000.0,
+        "margin_cap_inr": 500000.0,
+        "pnl_today": 1500.0,
+        "kill_switch_active": False,
+        "kill_switch_reason": None,
+        "nifty_pct": 0.4,
+        "india_vix": 13.2,
+        "regime_snapshot": None,
+    }
+
+
+def test_futures_follow_prompt_contains_strategy_context(fresh_signal_db, shadow_mode, monkeypatch):
+    """The futures prompt carries the strategy thesis + gates + leveraged-beta
+    caveat AND both halves of the combined review (stock signal + NIFTY future
+    context) — and NONE of the simplified engine's stock-breakout wording."""
+    import services.signal_review_service as srs
+
+    captured: dict = {}
+
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        captured["prompt"] = prompt
+        return _decision_block("take", "regime fine", 0.8), "sess-fut"
+
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
+
+    result = srs.review_signal(
+        "RELIANCE", FUTURES, direction="BUY", context=_futures_ctx(), strategy_name=FUTURES
+    )
+
+    prompt = captured["prompt"]
+    # Strategy-context block: thesis + gates + honest caveat.
+    assert "LEVERAGED BROAD-MARKET-BETA" in prompt
+    assert "sector index up >1% intraday" in prompt
+    assert "hit-rate 53.4" in prompt
+    assert "OVERNIGHT-REGIME FIT" in prompt
+    # Combined review (locked operator decision): source stock signal…
+    assert "Signal stock: RELIANCE" in prompt
+    assert "+1.20%" in prompt  # stock_ret 0.012 rendered as percent
+    assert "+1.50%" in prompt  # sector_ret
+    assert "2.1" in prompt  # vol_ratio
+    # …AND the resolved NIFTY-future/book context.
+    assert "NIFTY28JUL26FUT" in prompt
+    assert "250000.0" in prompt and "500000.0" in prompt  # margin used vs cap
+    assert "Kill switch: inactive" in prompt
+    # NOT the simplified-engine stock-breakout wording.
+    assert "bottom-3 today" not in prompt
+    # Guardrail (#318 review): book-state lines are informational only — the LLM
+    # must not invent an unbacktested "portfolio prudence" veto on utilization.
+    assert "enforced by code before this review" in prompt
+    assert "Do NOT skip on capital-utilization" in prompt
+    assert "near their daily trade limit" not in prompt
+    # Audit row tagged with the strategy's own source.
+    from database.signal_decision_db import get_signal_decision
+
+    row = get_signal_decision(result["id"])
+    assert row["source"] == FUTURES
+    assert row["direction"] == "BUY"
+
+
+def test_simplified_prompt_unchanged_when_strategy_name_absent(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """Regression: strategy_name=None keeps the simplified-engine template —
+    stock-breakout wording present, no futures strategy-context block."""
+    import services.signal_review_service as srs
+
+    captured: dict = {}
+
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        captured["prompt"] = prompt
+        return _decision_block("take", "ok", 0.7), "sess-se"
+
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
+
+    srs.review_signal("RELIANCE", "chartink_buy", direction="BUY", context=_ctx_override())
+
+    prompt = captured["prompt"]
+    assert "bottom-3 today" in prompt
+    assert "near their daily trade limit" in prompt
+    assert "OVERNIGHT-REGIME FIT" not in prompt
+    assert "STRATEGY CONTEXT" not in prompt
+
+
+def test_unregistered_strategy_name_falls_back_to_default_prompt(
+    fresh_signal_db, shadow_mode, monkeypatch
+):
+    """An unknown strategy_name uses the simplified-engine defaults (fail-safe)."""
+    import services.signal_review_service as srs
+
+    captured: dict = {}
+
+    def fake_invoke(prompt, timeout_s):  # noqa: ARG001
+        captured["prompt"] = prompt
+        return _decision_block("take", "ok", 0.7), "s"
+
+    monkeypatch.setattr(srs, "invoke_claude_review", fake_invoke)
+
+    srs.review_signal(
+        "SBIN",
+        "some_source",
+        direction="BUY",
+        context=_ctx_override(),
+        strategy_name="not_a_registered_strategy",
+    )
+
+    assert "bottom-3 today" in captured["prompt"]
+    assert "OVERNIGHT-REGIME FIT" not in captured["prompt"]
+
+
+def test_build_context_futures_uses_futures_status_not_simplified_engine(monkeypatch):
+    """Operator-context dispatch: the futures profile pulls from the
+    futures_follow singleton's get_status(), never the simplified engine."""
+    from services import signal_review_service as srs
+
+    engine_calls = {"n": 0}
+
+    def _engine_spy():
+        engine_calls["n"] += 1
+        raise AssertionError("simplified engine must not be consulted for futures_follow")
+
+    monkeypatch.setattr(
+        "services.simplified_stock_engine_service.get_simplified_stock_engine_service",
+        _engine_spy,
+    )
+
+    class FakeFuturesSvc:
+        @staticmethod
+        def get_status():
+            return {
+                "lots_held": 2,
+                "margin_used_inr": 500000.0,
+                "margin_cap_inr": 500000.0,
+                "today_pnl_net": -1200.0,
+                "kill_switch_active": False,
+                "kill_switch_reason": None,
+                "mode": "sandbox",
+            }
+
+    monkeypatch.setattr("services.futures_follow_service.get_service", lambda: FakeFuturesSvc())
+    # Stub the macro fetches so no live quotes are attempted.
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.3)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 12.5)
+    monkeypatch.setattr(srs, "_fetch_regime_snapshot", lambda: None)
+
+    ctx = srs._build_context(None, FUTURES)
+
+    assert ctx["lots_held"] == 2
+    assert ctx["margin_used_inr"] == 500000.0
+    assert ctx["pnl_today"] == -1200.0
+    assert ctx["nifty_pct"] == 0.3
+    assert ctx["india_vix"] == 12.5
+    assert engine_calls["n"] == 0
+
+
+def test_build_context_futures_degrades_when_service_unavailable(monkeypatch):
+    """No futures singleton → operator slots stay None, macros still filled."""
+    from services import signal_review_service as srs
+
+    monkeypatch.setattr("services.futures_follow_service.get_service", lambda: None)
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: -0.9)
+    monkeypatch.setattr(srs, "_fetch_india_vix", lambda: 17.8)
+    monkeypatch.setattr(srs, "_fetch_regime_snapshot", lambda: None)
+
+    ctx = srs._build_context(None, FUTURES)
+
+    assert ctx["lots_held"] is None
+    assert ctx["margin_used_inr"] is None
+    assert ctx["nifty_pct"] == -0.9
+    assert ctx["india_vix"] == 17.8
+
+
+def test_build_market_context_helper(monkeypatch):
+    """Public helper returns the three macro slots best-effort."""
+    from services import signal_review_service as srs
+
+    monkeypatch.setattr(srs, "_fetch_nifty_pct", lambda: 0.7)
+
+    def _boom():
+        raise RuntimeError("vix down")
+
+    monkeypatch.setattr(srs, "_fetch_india_vix", _boom)
+    monkeypatch.setattr(srs, "_fetch_regime_snapshot", lambda: {"trend": "bullish"})
+
+    ctx = srs.build_market_context()
+    assert ctx["nifty_pct"] == 0.7
+    assert ctx["india_vix"] is None  # one failure doesn't blank the rest
+    assert ctx["regime_snapshot"] == {"trend": "bullish"}
+
+
+def test_llm_context_loader_falls_back_when_snapshot_missing(monkeypatch, tmp_path):
+    from services import signal_review_service as srs
+
+    monkeypatch.setattr(srs, "_FUTURES_FOLLOW_SNAPSHOT_PATH", tmp_path / "missing.json")
+    assert srs._load_futures_follow_llm_context() == srs.FUTURES_FOLLOW_LLM_CONTEXT_FALLBACK
+
+
+def test_llm_context_loader_prefers_snapshot_key(monkeypatch, tmp_path):
+    """config_snapshot.json's llm_context key is the single source of truth."""
+    from services import signal_review_service as srs
+
+    snap = tmp_path / "config_snapshot.json"
+    snap.write_text(json.dumps({"llm_context": "CUSTOM STRATEGY TEXT FROM SNAPSHOT"}))
+    monkeypatch.setattr(srs, "_FUTURES_FOLLOW_SNAPSHOT_PATH", snap)
+    assert srs._load_futures_follow_llm_context() == "CUSTOM STRATEGY TEXT FROM SNAPSHOT"
+    # And it lands in the rendered prompt.
+    prompt = srs._format_futures_follow_prompt(
+        {"symbol": "X", "source": FUTURES, "direction": "BUY", "candidate_at": "t"},
+        _futures_ctx(),
+    )
+    assert "CUSTOM STRATEGY TEXT FROM SNAPSHOT" in prompt
+
+
+def test_shipped_snapshot_llm_context_in_sync_with_fallback():
+    """The tracked config_snapshot.json llm_context must stay in sync with the
+    code fallback (both carry the load-bearing caveat + the veto's job)."""
+    from services import signal_review_service as srs
+
+    snapshot_text = srs._load_futures_follow_llm_context()
+    for marker in ("LEVERAGED BROAD-MARKET-BETA", "hit-rate 53.4", "OVERNIGHT-REGIME FIT"):
+        assert marker in snapshot_text
+        assert marker in srs.FUTURES_FOLLOW_LLM_CONTEXT_FALLBACK
+
+
+# ---------------------------------------------------------------------------
+# R1 (#318): exclude_sources filtering in signal_decision_db
+# ---------------------------------------------------------------------------
+
+
+def _seed_row(sdb, symbol, source):
+    return sdb.insert_signal_decision(
+        symbol=symbol,
+        source=source,
+        decision="take",
+        reasoning="r",
+        confidence=0.5,
+        enforcement_mode="shadow",
+        context_snapshot=None,
+        bridge_latency_ms=1,
+        bridge_session_id="s",
+        raw_bridge_output=None,
+    )
+
+
+def test_exclude_sources_filters_rows_out(fresh_signal_db):
+    sdb = fresh_signal_db
+    _seed_row(sdb, "ASTRAL", "chartink_FnO_intraday_buy")
+    _seed_row(sdb, "FORTIS", "trend-up")
+    _seed_row(sdb, "RELIANCE", FUTURES)
+
+    rows = sdb.list_signal_decisions(exclude_sources=[FUTURES])
+    assert len(rows) == 2
+    assert all(r["source"] != FUTURES for r in rows)
+    assert sdb.count_signal_decisions(exclude_sources=[FUTURES]) == 2
+    summary = sdb.summarize_signal_decisions(exclude_sources=[FUTURES])
+    assert summary["total"] == 2
+    assert summary["last_decision"]["source"] != FUTURES
+
+    # Inclusion filter still works and is exact.
+    only = sdb.list_signal_decisions(sources=[FUTURES])
+    assert len(only) == 1 and only[0]["symbol"] == "RELIANCE"
+    assert sdb.count_signal_decisions(sources=[FUTURES]) == 1
+
+
+def test_exclude_sources_none_returns_everything(fresh_signal_db):
+    sdb = fresh_signal_db
+    _seed_row(sdb, "A", "trend-up")
+    _seed_row(sdb, "B", FUTURES)
+    assert sdb.count_signal_decisions() == 2
+    assert len(sdb.list_signal_decisions()) == 2
+
+
 def test_review_signal_forwards_regime_snapshot_into_prompt(
     fresh_signal_db, shadow_mode, monkeypatch
 ):

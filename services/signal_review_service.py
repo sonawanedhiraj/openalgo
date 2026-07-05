@@ -16,6 +16,13 @@ Hard rule: every error path returns ``decision='take'`` with
 the engine. Enforcement mode is a separate concern owned by the caller — this
 service always records the row, the caller decides whether to enforce it.
 
+Strategy-aware review (issue #318): ``review_signal(strategy_name=...)`` selects
+a per-strategy prompt + operator-context provider from
+``_STRATEGY_REVIEW_PROFILES`` so the LLM scores each signal against THAT
+strategy's own logic. ``strategy_name=None`` (or an unregistered name) keeps the
+original simplified-engine prompt/context byte-for-byte — the simplified engine
+is the regression baseline and must not change behavior.
+
 Configuration (env, with defaults):
 
 * ``VETO_LAYER_MODE`` — 'off' | 'shadow' | 'active'. Default 'shadow'. Read by
@@ -35,6 +42,7 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pytz
@@ -291,15 +299,75 @@ def _fetch_pnl_today() -> float:
     return total
 
 
-def _build_context(override: dict[str, Any] | None) -> dict[str, Any]:
+def build_market_context() -> dict[str, Any]:
+    """Best-effort market/macros slots — ``nifty_pct``, ``india_vix``,
+    ``regime_snapshot``.
+
+    Public helper for callers (e.g. ``futures_follow_service``) that assemble
+    their own operator context and want the shared macro fetches merged in.
+    Each slot is wrapped in its own try/except so one failure doesn't blank
+    the others; a failed fetch lands as ``None``.
+    """
+    ctx: dict[str, Any] = {
+        "nifty_pct": None,
+        "india_vix": None,
+        "regime_snapshot": None,
+    }
+    try:
+        ctx["nifty_pct"] = _fetch_nifty_pct()
+    except Exception as exc:
+        logger.warning("signal_review: nifty_pct fetch failed: %s", exc)
+        ctx["nifty_pct"] = None
+
+    try:
+        ctx["india_vix"] = _fetch_india_vix()
+    except Exception as exc:
+        logger.warning("signal_review: india_vix fetch failed: %s", exc)
+        ctx["india_vix"] = None
+
+    try:
+        ctx["regime_snapshot"] = _fetch_regime_snapshot()
+    except Exception as exc:
+        logger.warning("signal_review: regime_snapshot fetch failed: %s", exc)
+        ctx["regime_snapshot"] = None
+
+    return ctx
+
+
+def _build_profiled_context(profile: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the context for a strategy registered in
+    ``_STRATEGY_REVIEW_PROFILES`` — its own operator-context provider plus the
+    shared macro slots. Best-effort throughout (a failed provider degrades to
+    the profile's ``None`` defaults, never raises)."""
+    ctx: dict[str, Any] = dict(profile.get("context_defaults") or {})
+    provider = profile.get("operator_context_provider")
+    if provider is not None:
+        stats = _safe_call("strategy_operator_context", provider)
+        if isinstance(stats, dict):
+            ctx.update(stats)
+    ctx.update(build_market_context())
+    return ctx
+
+
+def _build_context(
+    override: dict[str, Any] | None, strategy_name: str | None = None
+) -> dict[str, Any]:
     """Assemble the operator + market context dict shipped to the bridge.
 
     Pulls live data lazily so unit tests can opt out by supplying an override.
     Every field is best-effort: missing data lands as ``None`` and the LLM is
     instructed to tolerate that.
+
+    ``strategy_name`` (issue #318): a strategy registered in
+    ``_STRATEGY_REVIEW_PROFILES`` gets its own operator-context provider;
+    ``None`` / unregistered keeps the simplified-engine default below.
     """
     if override is not None:
         return dict(override)
+
+    profile = _STRATEGY_REVIEW_PROFILES.get(strategy_name or "")
+    if profile is not None:
+        return _build_profiled_context(profile)
 
     # All imports here are intentionally lazy — pulling these at module import
     # time would create cycles (engine ↔ services ↔ this module) and would
@@ -485,7 +553,9 @@ def _format_regime_block(regime: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _format_review_prompt(candidate: dict[str, Any], ctx: dict[str, Any]) -> str:
+def _format_review_prompt(
+    candidate: dict[str, Any], ctx: dict[str, Any], strategy_name: str | None = None
+) -> str:
     """Interpolate the review prompt template.
 
     Operator-state fields (positions, trades) render missing values as
@@ -493,7 +563,14 @@ def _format_review_prompt(candidate: dict[str, Any], ctx: dict[str, Any]) -> str
     pnl_today) instead render as ``unavailable`` — they're best-effort live
     fetches and the LLM should treat their absence as "data not retrievable",
     not "value is zero".
+
+    ``strategy_name`` (issue #318): a strategy registered in
+    ``_STRATEGY_REVIEW_PROFILES`` gets its own prompt formatter; ``None`` /
+    unregistered renders the original simplified-engine template unchanged.
     """
+    profile = _STRATEGY_REVIEW_PROFILES.get(strategy_name or "")
+    if profile is not None:
+        return profile["prompt_formatter"](candidate, ctx)
 
     def _or_unknown(value: Any) -> str:
         if value is None:
@@ -519,6 +596,219 @@ def _format_review_prompt(candidate: dict[str, Any], ctx: dict[str, Any]) -> str
         india_vix=_or_unavailable(ctx.get("india_vix")),
         regime_block=_format_regime_block(ctx.get("regime_snapshot")),
     )
+
+
+# ---------------------------------------------------------------------------
+# Strategy-aware review profiles (issue #318)
+#
+# The prompt/context above is the simplified engine's (the original veto
+# user) — ``strategy_name=None`` keeps that path byte-for-byte unchanged.
+# A strategy registered in ``_STRATEGY_REVIEW_PROFILES`` gets (a) its own
+# prompt template with a STRATEGY CONTEXT block sourced from its
+# ``config_snapshot.json`` (code fallback kept in sync below), and (b) its own
+# operator-context provider — so the LLM scores each signal against THAT
+# strategy's own logic instead of the stock-breakout framing.
+# ---------------------------------------------------------------------------
+
+FUTURES_FOLLOW_STRATEGY_NAME = "futures_follow_cap50"
+
+_FUTURES_FOLLOW_SNAPSHOT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "strategies"
+    / "futures_follow_cap50"
+    / "config_snapshot.json"
+)
+
+# Code fallback for the strategy-context block. The preferred source is the
+# ``llm_context`` key in strategies/futures_follow_cap50/config_snapshot.json
+# (single source of truth, tracks parameter changes) — KEEP THE TWO IN SYNC.
+FUTURES_FOLLOW_LLM_CONTEXT_FALLBACK = (
+    "futures_follow_cap50 is a LEVERAGED BROAD-MARKET-BETA sleeve, not a stock-picking "
+    "strategy. At 15:20 IST it buys ONE NIFTY near-month index future lot per "
+    "sector_follow C1 stock signal (mapped sector index up >1% intraday AND stock up "
+    ">0.5% AND volume >1x its 20-day average; greedy in vol-ratio order; <=5 signals/day), "
+    "HARD-CAPPED at 50% of capital as overnight SPAN margin (~2 lots on a Rs10L book). "
+    "Product NRML, T+1 hold: buy 15:20 IST, sell next trading day 15:25 IST MARKET. "
+    "NO stop loss (hard stops proved net-negative on this signal class); the 15:14 IST "
+    "EOD watchdog is the only backstop; 3%-of-capital daily kill switch. "
+    "HONEST CAVEAT (load-bearing): the stock signal does NOT predict NIFTY direction "
+    "(hit-rate 53.4%, correlation 0.295) — the return is leveraged broad-market drift on "
+    "bullish signal-days, NOT stock-selection alpha. The reviewer's job is therefore "
+    "OVERNIGHT-REGIME FIT for a leveraged long NIFTY-futures carry (skip into a strongly "
+    "bearish NIFTY, elevated/spiking India VIX, or a risk-off close), NOT per-name stock "
+    "analysis."
+)
+
+
+def _load_futures_follow_llm_context() -> str:
+    """Strategy-context text for the futures_follow prompt.
+
+    Prefers the ``llm_context`` key in the strategy's ``config_snapshot.json``
+    (single source of truth); falls back to the in-code constant on any read
+    failure or a missing/empty key.
+    """
+    try:
+        raw = json.loads(_FUTURES_FOLLOW_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        text = str(raw.get("llm_context") or "").strip()
+        if text:
+            return text
+        logger.warning(
+            "signal_review: no llm_context key in %s — using code fallback",
+            _FUTURES_FOLLOW_SNAPSHOT_PATH,
+        )
+    except Exception:
+        logger.warning(
+            "signal_review: could not read %s — using code fallback",
+            _FUTURES_FOLLOW_SNAPSHOT_PATH,
+            exc_info=True,
+        )
+    return FUTURES_FOLLOW_LLM_CONTEXT_FALLBACK
+
+
+FUTURES_FOLLOW_REVIEW_PROMPT_TEMPLATE = """You are reviewing a candidate entry for the futures_follow_cap50 strategy (Indian F&O, NIFTY index futures).
+
+STRATEGY CONTEXT (score the candidate against THIS strategy's own logic):
+{strategy_context}
+
+CANDIDATE (the source sector_follow stock signal that triggered this entry):
+- Signal stock: {symbol}
+- Source: {source}
+- Direction: {direction}        # BUY = one NIFTY near-month future lot (long carry)
+- Time: {candidate_at}
+- Stock return today: {stock_ret_pct}%
+- Mapped sector-index return today: {sector_ret_pct}%
+- Volume ratio vs 20-day average: {vol_ratio}
+
+INSTRUMENT BEING BOUGHT (NOT the stock above):
+- NIFTY future contract: {contract_symbol}
+- Hold: T+1 overnight (buy 15:20 IST, sell next trading day 15:25 IST MARKET, NO stop loss)
+- Lots already held: {lots_held}
+- Overnight margin used: ₹{margin_used_inr} of ₹{margin_cap_inr} cap (50% of capital)
+- Strategy P&L today: ₹{pnl_today}
+- Kill switch: {kill_switch}
+
+MARKET CONTEXT (today):
+- NIFTY return: {nifty_pct}%
+- India VIX: {india_vix}
+
+REGIME SNAPSHOT:
+{regime_block}
+
+Decide whether the operator should take this entry. Your job is OVERNIGHT-REGIME FIT for a leveraged LONG NIFTY-futures carry — NOT per-name stock analysis. The stock signal above only tells you a bullish signal-day fired; the position's P&L is driven entirely by NIFTY's overnight move. Skip when the overnight regime is hostile to a leveraged long NIFTY hold: a strongly bearish NIFTY day, elevated or spiking India VIX, or a clear risk-off close. Take when the regime is neutral-to-bullish. The confidence score must reflect how well the overnight regime fits this leveraged long carry. The margin cap and kill switch are enforced by code before this review reaches you — they are shown for context only. Do NOT skip on capital-utilization or lots-already-held grounds; judge overnight-regime fit only.
+
+Respond with a short reasoning paragraph followed by a final JSON block. The JSON block must be the LAST thing in your response and must contain exactly these keys:
+
+{{
+  "decision": "take" | "skip",
+  "reasoning": "1-2 sentence summary",
+  "confidence": 0.0 to 1.0
+}}
+"""
+
+
+def _fmt_or_unknown(value: Any) -> str:
+    if value is None:
+        return "unknown"
+    return str(value)
+
+
+def _fmt_or_unavailable(value: Any) -> str:
+    if value is None:
+        return "unavailable"
+    return str(value)
+
+
+def _fmt_fraction_as_pct(value: Any) -> str:
+    """Render an evaluator return FRACTION (0.012) as a percent string (+1.20).
+
+    The sector_follow evaluator emits ``stock_ret`` / ``sector_ret`` as
+    fractions; the prompt renders them with a trailing ``%``. ``unavailable``
+    when missing, verbatim when unparsable.
+    """
+    if value is None:
+        return "unavailable"
+    try:
+        return f"{float(value) * 100.0:+.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_futures_follow_prompt(candidate: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Interpolate the futures_follow_cap50 review prompt (issue #318).
+
+    Reviews BOTH combined (locked operator decision): the source sector_follow
+    stock signal (symbol + vol_ratio/stock_ret/sector_ret) AND the resolved
+    NIFTY near-month future context (contract, T+1 hold, 50% margin cap,
+    current lots/margin/P&L/kill-switch).
+    """
+    ks_active = ctx.get("kill_switch_active")
+    if ks_active is None:
+        kill_switch = "unknown"
+    elif ks_active:
+        kill_switch = f"ACTIVE ({ctx.get('kill_switch_reason') or 'daily loss'})"
+    else:
+        kill_switch = "inactive"
+
+    return FUTURES_FOLLOW_REVIEW_PROMPT_TEMPLATE.format(
+        strategy_context=_load_futures_follow_llm_context(),
+        symbol=candidate.get("symbol"),
+        source=candidate.get("source"),
+        direction=_fmt_or_unknown(candidate.get("direction")),
+        candidate_at=candidate.get("candidate_at"),
+        stock_ret_pct=_fmt_fraction_as_pct(ctx.get("stock_ret")),
+        sector_ret_pct=_fmt_fraction_as_pct(ctx.get("sector_ret")),
+        vol_ratio=_fmt_or_unknown(ctx.get("vol_ratio")),
+        contract_symbol=_fmt_or_unknown(ctx.get("contract_symbol")),
+        lots_held=_fmt_or_unknown(ctx.get("lots_held")),
+        margin_used_inr=_fmt_or_unavailable(ctx.get("margin_used_inr")),
+        margin_cap_inr=_fmt_or_unavailable(ctx.get("margin_cap_inr")),
+        pnl_today=_fmt_or_unavailable(ctx.get("pnl_today")),
+        kill_switch=kill_switch,
+        nifty_pct=_fmt_or_unavailable(ctx.get("nifty_pct")),
+        india_vix=_fmt_or_unavailable(ctx.get("india_vix")),
+        regime_block=_format_regime_block(ctx.get("regime_snapshot")),
+    )
+
+
+def _futures_follow_operator_context() -> dict[str, Any]:
+    """Operator context from futures_follow's OWN live status — not the
+    simplified engine. Raises on an unavailable service; ``_safe_call`` in the
+    profiled context builder degrades that to the ``None`` defaults."""
+    from services.futures_follow_service import get_service
+
+    svc = get_service()
+    if svc is None:
+        raise RuntimeError("futures_follow service not initialised")
+    status = svc.get_status()
+    return {
+        "lots_held": status.get("lots_held"),
+        "margin_used_inr": status.get("margin_used_inr"),
+        "margin_cap_inr": status.get("margin_cap_inr"),
+        "pnl_today": status.get("today_pnl_net"),
+        "kill_switch_active": status.get("kill_switch_active"),
+        "kill_switch_reason": status.get("kill_switch_reason"),
+        "mode": status.get("mode"),
+    }
+
+
+_STRATEGY_REVIEW_PROFILES: dict[str, dict[str, Any]] = {
+    FUTURES_FOLLOW_STRATEGY_NAME: {
+        "prompt_formatter": _format_futures_follow_prompt,
+        "operator_context_provider": _futures_follow_operator_context,
+        "context_defaults": {
+            "lots_held": None,
+            "margin_used_inr": None,
+            "margin_cap_inr": None,
+            "pnl_today": None,
+            "kill_switch_active": None,
+            "kill_switch_reason": None,
+            "vol_ratio": None,
+            "stock_ret": None,
+            "sector_ret": None,
+            "contract_symbol": None,
+        },
+    },
+}
 
 
 def _extract_decision_block(text: str) -> dict | None:
@@ -592,6 +882,7 @@ def review_signal(
     source: str,
     direction: str | None = None,
     context: dict[str, Any] | None = None,
+    strategy_name: str | None = None,
 ) -> dict[str, Any]:
     """Ask the LLM whether the operator should take this signal.
 
@@ -601,6 +892,11 @@ def review_signal(
     explicit direction the reviewer cannot tell a short candidate from a long
     one. It rides the request body, the cache key, and the audit row.
 
+    ``strategy_name`` (issue #318) selects a per-strategy review profile: the
+    prompt template, the operator-context provider, and the audit-row
+    enforcement-mode stamp (via the strategy's ``strategy_llm_config`` row).
+    ``None`` / unregistered keeps the simplified-engine defaults byte-for-byte.
+
     Returns a dict with ``decision`` (``'take' | 'skip'``), ``reasoning``,
     ``confidence``, ``id`` (signal_decision row id), ``enforcement_mode``, and
     a few diagnostic fields. The row is always written, including for the
@@ -609,7 +905,7 @@ def review_signal(
     ``'review_failed'`` in that case, even though the returned ``decision``
     key is ``'take'`` for the engine's convenience).
     """
-    enforcement_mode = get_veto_layer_mode()
+    enforcement_mode = get_veto_layer_mode(strategy_name=strategy_name)
 
     # Cache check — same (symbol, source, direction) within TTL reuses the prior
     # decision.
@@ -625,7 +921,7 @@ def review_signal(
             reasoning=f"cache_hit: {cached.get('reasoning', '')}",
             confidence=cached.get("confidence", 0.0),
             enforcement_mode=enforcement_mode,
-            context_snapshot=context or _build_context(None),
+            context_snapshot=context or _build_context(None, strategy_name),
             bridge_latency_ms=0,
             bridge_session_id=cached.get("claude_session_id", ""),
             raw_bridge_output="(cache hit)",
@@ -636,7 +932,7 @@ def review_signal(
         result["cache_hit"] = True
         return result
 
-    snapshot = context if context is not None else _build_context(None)
+    snapshot = context if context is not None else _build_context(None, strategy_name)
 
     candidate = {
         "symbol": symbol,
@@ -644,7 +940,7 @@ def review_signal(
         "direction": direction,
         "candidate_at": _now_ist_iso(),
     }
-    prompt = _format_review_prompt(candidate, snapshot)
+    prompt = _format_review_prompt(candidate, snapshot, strategy_name)
     timeout = _claude_timeout_seconds()
 
     # In-process claude -p invocation (Phase 1 of #266). Any failure — timeout,
