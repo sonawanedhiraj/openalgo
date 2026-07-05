@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -62,6 +63,13 @@ _EOD_REPORTS_DIR = _STRATEGY_DIR / "eod_reports"
 
 STRATEGY_NAME = "futures_follow_cap50"
 VALID_MODES = ("sandbox", "live")
+
+# R3 (#318): cumulative wall-clock budget for the Stage-1 LLM reviews inside one
+# 15:20 entry batch. Worst case 5 signals × VETO_CLAUDE_TIMEOUT_SECONDS (25s)
+# ≈ 125s sequential; once the batch has spent this budget the remaining signals
+# are placed UNREVIEWED with a WARNING (fail-open — MARKET fills must land well
+# before the close). Code constant by design (no new env var per the review).
+VETO_REVIEW_BUDGET_SECONDS = 180.0
 
 
 # --------------------------------------------------------------------------- #
@@ -448,6 +456,27 @@ def production_broker_session_checker() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Stage-1 LLM veto (issue #318) — injected defaults
+# --------------------------------------------------------------------------- #
+def production_signal_reviewer(**kwargs) -> dict:
+    """Strategy-aware Stage-1 LLM review (issue #318). Lazily imported so
+    importing this module never pulls the LLM review stack. Injected into the
+    live singleton by ``init_futures_follow_service``; ``None`` in unit tests
+    (veto skipped entirely, hermetic — mirrors ``data_health_checker``)."""
+    from services import signal_review_service
+
+    return signal_review_service.review_signal(**kwargs)
+
+
+def production_market_context() -> dict:
+    """Best-effort ``{nifty_pct, india_vix, regime_snapshot}`` for the veto
+    prompt, via the shared macro fetches in ``signal_review_service``."""
+    from services import signal_review_service
+
+    return signal_review_service.build_market_context()
+
+
+# --------------------------------------------------------------------------- #
 # Service
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -489,6 +518,8 @@ class FuturesFollowService:
         intent_resolver: Callable[[], object] | None = None,
         data_health_checker: Callable[..., tuple] | None = None,
         broker_session_checker: Callable[[], bool] | None = None,
+        signal_reviewer: Callable[..., dict] | None = None,
+        market_context_provider: Callable[[], dict] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -511,6 +542,11 @@ class FuturesFollowService:
         # Broker-session checker for the 15:18 smoke check. Left None in unit tests
         # (treated as live); the live singleton uses ``production_broker_session_checker``.
         self._broker_session_checker = broker_session_checker or production_broker_session_checker
+        # Stage-1 LLM veto (issue #318). Left None in unit tests (veto skipped,
+        # hermetic — mirrors data_health_checker); the live singleton injects
+        # ``production_signal_reviewer`` + ``production_market_context``.
+        self._signal_reviewer = signal_reviewer
+        self._market_context_provider = market_context_provider
         self._now = now or (lambda: datetime.now(_IST))
         self.eod_reports_dir = _EOD_REPORTS_DIR
 
@@ -1045,6 +1081,203 @@ class FuturesFollowService:
             return base
         return max(0.0, min(base, float(cap)))
 
+    # ----- Stage-1 LLM veto (issue #318) ---------------------------------- #
+    def _resolve_veto_mode(self) -> str:
+        """Resolve the LLM veto enforcement mode for this strategy.
+
+        Resolution (issue #266 Phase 2): per-strategy ``strategy_llm_config``
+        row → ``VETO_LAYER_MODE`` env → mode-aware default where **sandbox =
+        active/enforcing** (B4 — the veto is exercised on the virtual book
+        before it ever gates live money). Returns ``'off'`` when no reviewer is
+        wired (unit tests) or on any resolver error (fail-open).
+        """
+        if self._signal_reviewer is None:
+            return "off"
+        try:
+            from services.signal_review_service import get_veto_layer_mode
+
+            return get_veto_layer_mode(self.mode, strategy_name=STRATEGY_NAME)
+        except Exception:
+            logger.exception("futures_follow veto-mode resolve failed; failing open (off)")
+            return "off"
+
+    def _build_review_context(self, signal: dict, contract: dict) -> dict:
+        """Operator + signal + market context for the strategy-aware veto prompt.
+
+        Combines (locked operator decision, #318) the source sector_follow stock
+        signal metrics AND the resolved NIFTY-future/book state from
+        ``get_status()``. Best-effort — a status/market failure degrades to a
+        partial context (missing fields render 'unknown'/'unavailable'), never
+        raises into the entry path.
+        """
+        ctx: dict = {
+            "vol_ratio": signal.get("vol_ratio"),
+            "stock_ret": signal.get("stock_ret"),
+            "sector_ret": signal.get("sector_ret"),
+            "contract_symbol": contract.get("symbol"),
+            "lots_held": None,
+            "margin_used_inr": None,
+            "margin_cap_inr": None,
+            "pnl_today": None,
+            "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reason": self.kill_switch_reason,
+            "mode": self.mode,
+        }
+        try:
+            status = self.get_status()
+            ctx["lots_held"] = status.get("lots_held")
+            ctx["margin_used_inr"] = status.get("margin_used_inr")
+            ctx["margin_cap_inr"] = status.get("margin_cap_inr")
+            ctx["pnl_today"] = status.get("today_pnl_net")
+        except Exception:
+            logger.exception("futures_follow veto context: get_status failed (partial context)")
+        if self._market_context_provider is not None:
+            try:
+                market = self._market_context_provider()
+                if isinstance(market, dict):
+                    ctx.update(market)
+            except Exception:
+                logger.exception("futures_follow veto context: market fetch failed (partial)")
+        return ctx
+
+    def _review_entry_signal(
+        self,
+        signal: dict,
+        contract: dict,
+        lots: int,
+        entry_price: float,
+        veto_mode: str,
+        elapsed_s: float,
+    ) -> tuple[bool, int | None, float]:
+        """Run the Stage-1 LLM veto for one selected signal (issue #318).
+
+        Returns ``(proceed, decision_id, cumulative_review_seconds)``:
+
+        * ``veto_mode='off'`` / kill-switch / pause / review budget exhausted →
+          ``(True, None, ...)`` — no review runs.
+        * ``shadow`` → decision logged, always proceed.
+        * ``active`` + ``'skip'`` → ``(False, id, ...)`` — the lot is NOT
+          placed, the margin cap is NOT consumed (later signals may use it),
+          the skip is journalled (``status='veto_skip'``) and
+          ``actually_taken=False`` is recorded.
+        * any reviewer failure → fail-open ``(True, None, ...)`` with an
+          exception log — mirrors the simplified engine's failsafe philosophy.
+        """
+        symbol = signal.get("symbol")
+        if veto_mode == "off" or self._signal_reviewer is None:
+            return True, None, elapsed_s
+        if self.kill_switch_active or self.manual_pause:
+            # place_entry refuses these anyway — don't burn an LLM call.
+            return True, None, elapsed_s
+        if elapsed_s >= VETO_REVIEW_BUDGET_SECONDS:
+            # R3: bounded 15:20 latency — place the remaining signals UNREVIEWED.
+            logger.warning(
+                "futures_follow veto review budget exhausted (%.1fs >= %.0fs) — "
+                "placing %s UNREVIEWED (fail-open)",
+                elapsed_s,
+                VETO_REVIEW_BUDGET_SECONDS,
+                symbol,
+            )
+            return True, None, elapsed_s
+        review_s = 0.0
+        try:
+            context = self._build_review_context(signal, contract)
+            started = time.monotonic()
+            review = self._signal_reviewer(
+                symbol=symbol,
+                source=STRATEGY_NAME,
+                direction="BUY",
+                context=context,
+                strategy_name=STRATEGY_NAME,
+            )
+            review_s = time.monotonic() - started
+            elapsed_s += review_s
+        except Exception:
+            logger.exception("futures_follow veto layer raised for %s; failing open", symbol)
+            return True, None, elapsed_s
+        review = review or {}
+        decision_id = review.get("id")
+        decision = review.get("decision")
+        reasoning = (review.get("reasoning") or "")[:160]
+        # R3: per-review latency is logged so the 15:20 budget is observable.
+        logger.info(
+            "futures_follow veto review %s -> %s (mode=%s, %.1fs this review, "
+            "%.1fs cumulative of %.0fs budget): %s",
+            symbol,
+            decision,
+            veto_mode,
+            review_s,
+            elapsed_s,
+            VETO_REVIEW_BUDGET_SECONDS,
+            reasoning,
+        )
+        if veto_mode == "shadow":
+            return True, decision_id, elapsed_s
+        # veto_mode == "active"
+        if decision == "skip":
+            logger.warning(
+                "futures_follow VETO SKIP %s — NIFTY lot NOT placed (margin cap not consumed): %s",
+                symbol,
+                reasoning,
+            )
+            self._journal_veto_skip(signal, contract, lots, entry_price, reasoning)
+            self._mark_review_outcome(decision_id, taken=False)
+            return False, decision_id, elapsed_s
+        return True, decision_id, elapsed_s
+
+    def _journal_veto_skip(
+        self,
+        signal: dict,
+        contract: dict,
+        lots: int,
+        entry_price: float,
+        reasoning: str | None = None,
+    ) -> None:
+        """Audit-trail a veto-skipped entry in ``futures_follow_trades``.
+
+        ``status='veto_skip'`` with NO order id, NO margin consumed and NO
+        in-memory position — a pure audit row (never a phantom position).
+        """
+        try:
+            self._record_trade(
+                side="BUY",
+                nifty_symbol=contract.get("symbol"),
+                lots=lots,
+                quantity=lots * int(contract.get("lot_size") or self.config.nifty_lot_size),
+                entry_price=entry_price,
+                entry_date=self._now().date().isoformat(),
+                exchange=self.config.exchange,
+                product=self.config.product,
+                signal_id=signal.get("signal_id") or signal.get("symbol"),
+                vol_ratio=signal.get("vol_ratio") or 0.0,
+                margin_inr=0.0,
+                order_id=None,
+                status="veto_skip",
+                error_message=(reasoning or "LLM veto skip")[:255],
+                note="llm_veto_skip",
+            )
+        except Exception:
+            logger.exception(
+                "futures_follow: failed to journal veto skip for %s", signal.get("symbol")
+            )
+
+    @staticmethod
+    def _mark_review_outcome(decision_id: int | None, *, taken: bool) -> None:
+        """Record the placement outcome on the ``signal_decision`` audit row.
+
+        Best-effort — the order path must never break on a bookkeeping miss.
+        """
+        if decision_id is None:
+            return
+        try:
+            from services import signal_review_service
+
+            signal_review_service.mark_actually_taken(decision_id, taken)
+        except Exception:
+            logger.exception(
+                "futures_follow: mark_actually_taken failed for decision_id=%s", decision_id
+            )
+
     # ----- scheduled job bodies ------------------------------------------ #
     def run_entry(self) -> list[dict]:
         """15:20 IST: evaluate signals, resolve the contract, buy 1 lot/signal up to
@@ -1073,6 +1306,19 @@ class FuturesFollowService:
             return []
 
         signals = self.evaluate_signals()
+        veto_mode = self._resolve_veto_mode()
+        if signals:
+            # R2 (#318): make the resolved enforcement mode loud at every entry —
+            # with no strategy_llm_config row and no VETO_LAYER_MODE env, sandbox
+            # defaults to ACTIVE (enforcing) per B4. Operator disable: dashboard
+            # LLM toggle (llm_mode=off) or VETO_LAYER_MODE=off.
+            logger.info(
+                "futures_follow Stage-1 LLM veto mode=%s for %d signal(s) [mode=%s] "
+                "(sandbox defaults to ACTIVE when no llm_mode row is set — B4)",
+                veto_mode,
+                len(signals),
+                self.mode,
+            )
         cap_margin = self._effective_cap_margin(decision)
         lot_margin = self.lot_margin_estimate()
         # Greedy in vol-ratio order (signals already sorted vol-ratio-desc), filling
@@ -1080,6 +1326,8 @@ class FuturesFollowService:
         lots_filled = self.lots_held()  # count any positions held into the session
         placed: list[dict] = []
         skipped = 0
+        vetoed = 0
+        review_elapsed_s = 0.0
         for sig in signals:
             lots = compute_lots_to_buy(
                 lots_filled,
@@ -1098,14 +1346,26 @@ class FuturesFollowService:
                     cap_margin,
                 )
                 continue
+            # Stage-1 LLM veto (#318): an active 'skip' drops this lot WITHOUT
+            # consuming the margin cap (lots_filled unchanged — later signals
+            # may use the freed cap). Shadow logs only; failures fail open.
+            proceed, decision_id, review_elapsed_s = self._review_entry_signal(
+                sig, contract, lots, entry_price, veto_mode, review_elapsed_s
+            )
+            if not proceed:
+                vetoed += 1
+                continue
             r = self.place_entry(sig, contract, lots, entry_price)
+            self._mark_review_outcome(decision_id, taken=bool(r))
             if r:
                 placed.append(r)
                 lots_filled += lots
         logger.info(
-            "futures_follow entry job placed %d lot-order(s), skipped %d (cap), [mode=%s]",
+            "futures_follow entry job placed %d lot-order(s), skipped %d (cap), "
+            "vetoed %d (LLM), [mode=%s]",
             len(placed),
             skipped,
+            vetoed,
             self.mode,
         )
         if placed:
@@ -1114,6 +1374,12 @@ class FuturesFollowService:
                 f"{sum(p['lots'] for p in placed)} NIFTY lot(s) on "
                 + ", ".join(p["signal_symbol"] or "?" for p in placed)
                 + (f" (skipped {skipped} at 50% cap)" if skipped else "")
+                + (f" (LLM vetoed {vetoed})" if vetoed else "")
+            )
+        elif vetoed:
+            self._notify(
+                f"🛑 {STRATEGY_NAME} [{self.mode}] Stage-1 LLM veto (mode={veto_mode}) "
+                f"skipped all {vetoed} signal(s) today — no NIFTY lots bought"
             )
         return placed
 
@@ -1814,8 +2080,22 @@ def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowServic
         scheduler=scheduler,
         data_health_checker=production_data_health_checker,
         broker_session_checker=production_broker_session_checker,
+        signal_reviewer=production_signal_reviewer,
+        market_context_provider=production_market_context,
     )
     svc.register_jobs(scheduler)
+    # R2 (#318): surface the veto enforcement default loudly at boot. With no
+    # strategy_llm_config row and no VETO_LAYER_MODE env, sandbox resolves to
+    # ACTIVE (enforcing) per B4 — a 'skip' verdict blocks the sandbox entry.
+    try:
+        logger.info(
+            "futures_follow Stage-1 LLM veto wired (issue #318): enforcement mode=%s "
+            "(resolution: strategy_llm_config row -> VETO_LAYER_MODE env -> mode-aware "
+            "default, sandbox=ACTIVE per B4)",
+            svc._resolve_veto_mode(),
+        )
+    except Exception:
+        logger.exception("futures_follow veto boot log failed (ignored)")
     # Boot durability (#265, BOTH modes): rebuild paper_book from the
     # mode-appropriate position store (sandbox.db in sandbox, broker in live) so a
     # restart can't strand an open overnight NIFTY-futures long. Best-effort — a

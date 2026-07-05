@@ -973,6 +973,20 @@ a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a
 `strategy_mode` row); operator can pause active trading via
 `POST /futures_follow_cap50/api/pause` (durable `strategy_runtime_override`) without
 changing mode.
+**Stage-1 LLM veto (strategy-aware, issue #318):** `run_entry` reviews every
+in-cap signal via `signal_review_service.review_signal(strategy_name=
+'futures_follow_cap50')` before `place_entry`. The prompt is the strategy's OWN
+framing (STRATEGY CONTEXT block from `config_snapshot.json`'s `llm_context` key,
+code fallback in `signal_review_service.py`): the veto's job is
+**overnight-regime fit for a leveraged long NIFTY carry**, not per-name stock
+analysis; it reviews BOTH the source stock signal and the resolved NIFTY-future
+book state (from `get_status()`) combined. Enforcement resolves per-strategy
+(`strategy_llm_config` row → `VETO_LAYER_MODE` env → B4 mode-aware default,
+**sandbox = active/enforcing**). An enforcing `skip` drops that lot without
+consuming the 50% margin cap and journals `status='veto_skip'`; cumulative
+review time is budgeted at 180s/batch (beyond it remaining signals place
+UNREVIEWED); every reviewer failure fails OPEN. The simplified engine's veto
+path (`strategy_name=None`) is unchanged.
 **Honest caveat (load-bearing — do not lose):** the backtest clears 12% (CAGR
 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L, 2024-01..2026-06) but the signal does
 **NOT** predict NIFTY direction (hit-rate 53.4% < 55%, corr 0.295). The return is
