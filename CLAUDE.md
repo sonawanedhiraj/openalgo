@@ -964,14 +964,16 @@ batched broker quote call** (`get_multiquotes`) behind
 `FUTURES_FOLLOW_INTRADAY_SOURCE` (default `quotes`; `aggregator` restores the
 WS-fed scanner-aggregator path) — fallback chain quotes→aggregator→historify with
 a WARNING per hop, plus a 15:18 dry-run quote probe in the smoke check. **No stop loss** (Phase-1
-proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**
-is the only backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
+proved hard stops net-negative on this signal class); the **15:28 IST EOD watchdog**
+(post-primary-exit retry backstop, #334 — after the 15:25 exit, before the 15:30
+NFO close; a rejected 15:25 SELL stays in the book for it to retry) is the only
+backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
 (0.03% notional) round-trip charges.
 **ACTIVELY TRADING IN SANDBOX** (`mode: sandbox`, `deployable: true`) — there is **no
 scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
 `FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
-registers 5 APScheduler jobs (reset 09:00 / watchdog 15:14 / entry 15:20 / exit 15:25
-/ EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
+registers 6 APScheduler jobs (reset 09:00 / smoke-check 15:18 / entry 15:20 /
+exit 15:25 / watchdog 15:28 / EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
 real orders into `sandbox.db` (the virtual ₹1Cr book) from boot** — the first sandbox
 cycle is **Monday 2026-06-15 15:20 IST** (the session's first sector_follow signal →
 a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a

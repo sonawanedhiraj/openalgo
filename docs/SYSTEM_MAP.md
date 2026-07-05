@@ -167,7 +167,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   | Job id | Cron (IST) | What it does |
   |---|---|---|
   | `futures_follow_daily_reset` | 09:00 | Clear kill switch + daily P&L + intraday journals (manual pause persists) |
-  | `futures_follow_eod_watchdog` | 15:14 | Tick-independent backstop: flatten any still-open T+1 position before the auto-square-off window. Exits are never gated |
+  | `futures_follow_eod_watchdog` | 15:28 | Post-primary-exit retry backstop (#334): flatten any prior-day position still open after the 15:25 exit (rejected order / missed job) before the 15:30 NFO close. Exits are never gated |
   | `futures_follow_entry` | 15:20 | Reuse the sector_follow evaluator, resolve the NIFTY near-month future, **place** 1 lot/signal BUY up to the 50% margin cap (sandbox/live; honors override gate + kill switch + freshness). First sandbox cycle 2026-06-15 |
   | `futures_follow_exit` | 15:25 | Square off every position opened on a prior trading day (T+1). Never blocked by the kill switch / override |
   | `futures_follow_eod_summary` | 15:30 | Best-effort Telegram EOD summary **+** writes a Day-N markdown report to `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md` (independent sinks) |
@@ -208,7 +208,7 @@ need no external scheduler.
 > The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
 > EOD jobs on this same scheduler — see the SectorFollowService process entry.
 > The `futures_follow_cap50` strategy likewise registers its own
-> reset/watchdog/entry/exit/EOD jobs (09:00/15:14/15:20/15:25/15:30 IST) — see the
+> reset/entry/exit/watchdog/EOD jobs (09:00/15:20/15:25/15:28/15:30 IST) — see the
 > FuturesFollowService process entry (§5).
 
 **sector_follow 1m feed: boot-time + periodic state-convergence (not a cron).**
@@ -551,7 +551,7 @@ in-band cross-process channel. Tests: `test/test_broker_session_auto_reconnect.p
   cycle 2026-06-15). FuturesFollowService (`services/futures_follow_service.py`)
   reuses the
   sector_follow evaluator and registers 5 APScheduler jobs
-  (reset/watchdog/entry/exit/EOD, 09:00/15:14/15:20/15:25/15:30 IST); control API at
+  (reset/entry/exit/watchdog/EOD, 09:00/15:20/15:25/15:28/15:30 IST); control API at
   `/futures_follow_cap50/api/*`; trade journal in `db/openalgo.db`
   `futures_follow_trades`. Caveat: leveraged beta, not alpha (signal does not predict
   NIFTY). Plan/decisions: `strategies/futures_follow_cap50/PLAN.md`.

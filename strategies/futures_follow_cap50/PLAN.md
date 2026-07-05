@@ -62,7 +62,8 @@ and **REJECTED** (costs 0.74pp CAGR, no correlation gain). NIFTY-only is the veh
      `expiry` field, so it is correct regardless of the weekday — but plan
      around 30-JUN, not 25-JUN.
 4. **Product:** NRML (futures carry). **Not MIS, not CNC.**
-5. **Stop loss:** NONE (per backtest). EOD watchdog at 15:14 IST is the backstop.
+5. **Stop loss:** NONE (per backtest). EOD watchdog at 15:28 IST (post-primary-exit
+   retry backstop, #334) is the backstop.
 6. **Daily loss kill switch:** 3.0% of capital (halt new entries, hold to T+1 exit).
 7. **Signal source:** REUSE the live `sector_follow_cap5_vol` evaluator — do not
    reimplement gates.
@@ -97,9 +98,10 @@ automatically.
 
 ### Day 1+ — daily cycle
 - **09:00 IST:** daily reset (kill switch + journals).
-- **15:14 IST:** EOD watchdog (flatten any stranded T+1 position).
 - **15:20 IST:** entry (new signals).
 - **15:25 IST:** T+1 exit (square off prior-day positions) with realized P&L.
+- **15:28 IST:** EOD watchdog (retry backstop: flatten anything still open after
+  the 15:25 primary exit — rejected exit order / missed job — before the 15:30 close, #334).
 - **15:30 IST:** EOD summary + reconciliation report.
 
 ### Sandbox validation window → live decision gate
@@ -128,8 +130,9 @@ automatically.
 4. **Per-lot margin drift** — the cap uses a fixed `nifty_lot_margin_inr` estimate;
    real SPAN varies intraday. *Mitigation:* operator refreshes the config estimate
    from the broker margin API; the 50% cap is conservative.
-5. **Stranded T+1 holds if broker WS dies** — *Mitigation:* the 15:14 IST EOD
-   watchdog flattens open positions tick-independently before any auto-square-off.
+5. **Stranded T+1 holds if broker WS dies** — *Mitigation:* the 15:28 IST EOD
+   watchdog flattens open positions tick-independently after the 15:25 primary
+   exit, before the 15:30 NFO close (#334).
 
 ## Decision gates
 
