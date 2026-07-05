@@ -70,6 +70,57 @@ inherited E4 sector-5d-vol p80 catastrophe filter zeroes January entries).
 
 ## Implementation notes
 
+### 2026-07-04 — #332: 15:20 decision snapshot from broker quotes (get_multiquotes)
+
+futures_follow makes exactly ONE decision per day (the 15:20 IST entry eval), yet
+its today's-(close, volume) inputs depended on the **all-day WS-fed scanner
+aggregator** being healthy at that moment — a tick-stream dependency a
+single-decision strategy doesn't need (the 2026-06-15 "aggregator empty, 0 signals"
+failure class). Now `production_signal_evaluator` sources today's per-symbol data
+from **one batched broker quote snapshot** at decision time:
+`make_quotes_intraday_provider` (in `services/sector_follow_service.py`) fetches
+all ~30 universe stocks (NSE) + mapped sector indices (NSE_INDEX, same
+symbol/exchange routing as `sector_follow_index_backfill`) in a single
+`get_multiquotes` call, memoized per eval cycle. Stocks yield
+`(ltp, cumulative_day_volume)`; indices `(ltp, None)` — index volume is unused.
+
+- **Flag**: `FUTURES_FOLLOW_INTRADAY_SOURCE = quotes (default) | aggregator`.
+  `aggregator` restores the pre-#332 path byte-identically (regression-tested).
+  Applies ONLY to this sleeve — `sector_follow_cap5_vol` (the equity alpha book)
+  is untouched; accepted divergence: the two books may see marginally different
+  `t_close` (quote at 15:20:xx vs last aggregator bar close).
+- **Fail-safe chain**: quotes → aggregator → historify → none, WARNING per hop;
+  the provider never raises. `intraday_source="quotes"` counts as LIVE coverage
+  for the <50%/<20% completeness Telegram alerting. One INFO line per eval:
+  `futures_follow intraday source=quotes fetched=<n>/<total> ...`.
+- **15:18 smoke check reworked** (issue #332 AC-9): the historify-freshness arm
+  now guards only the 20-day lookback (prior close, avg vol — reworded message);
+  the broker-session arm is load-bearing for DATA, not just orders; NEW dry-run
+  quote probe (1 universe symbol via the provider path, assert ltp > 0, only when
+  source=quotes) writes the same self-expiring pause override + Telegram alert on
+  failure. `_data_is_fresh_for_entry` / `_warn_if_stale_for_exit` stay (they guard
+  the historify lookback).
+- The 20-day lookback stays on historify; sourcing it from the broker daily API
+  was explicitly deferred (breaks the "fires on exactly the signal set the equity
+  book sees" invariant). No gate/selection/sizing/contract-resolver change.
+- Tests: `test/test_sector_follow_quotes_provider.py` (batched+memoized mapping,
+  broker-down fallback chain, index close-only path, source propagation +
+  completeness, aggregator regression guard, aggregator-empty-all-day
+  independence) + smoke-probe cases in `test/test_futures_follow_service.py`.
+- **2026-07-05 follow-up — wall-clock entry-lateness guard**: `run_entry` now
+  checks `self._now()` (IST) against `FUTURES_FOLLOW_ENTRY_DEADLINE_IST`
+  (default **15:28**, consult-time; a malformed value falls back to 15:28 with
+  a WARNING — a typo must never disable the guard) **before** any
+  gate/evaluation/order placement. Why: the 15:20 entry cron can misfire LATE
+  (app down at 15:20 → APScheduler fires it on restart) — at ~15:35 the
+  exchange rejects the order, but after ~15:45 it could queue as an **AMO and
+  execute at tomorrow's open**, an unintended overnight entry (NFO hard close
+  is 15:30). A late fire skips all entries, logs an ERROR with the actual fire
+  time vs the deadline, and Telegrams the operator. Entries ONLY — `run_exit` /
+  `run_eod_watchdog` / `close_all` are never gated (repo invariant: a held T+1
+  position is riskier than a rejected exit order). No early-side check (cron
+  cannot fire early; misfires only fire late).
+
 ### 2026-06-15 — v0.2.0: sandbox is the structural default (deployable: true)
 
 Per the operator redirect (must trade in sandbox from Monday's open), the scaffold

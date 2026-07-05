@@ -287,6 +287,158 @@ def production_broker_session_checker() -> bool:
         return False
 
 
+# ----- quotes-snapshot intraday provider (issue #332) ---------------------- #
+def _fetch_quotes_snapshot(symbol_payload: list[dict]) -> dict[str, tuple]:
+    """ONE batched broker quote call for ``[{symbol, exchange}, ...]``.
+
+    Returns ``{symbol: (ltp, cumulative_day_volume)}`` for every symbol the
+    broker answered with a usable ``ltp > 0``. NEVER raises — any failure (no
+    API key / broker session down, broker error, malformed response) logs a
+    WARNING and returns ``{}`` so the caller's fallback chain (aggregator →
+    historify) takes over. Lazily imported so this module never pulls the
+    quote/auth stack at import time.
+    """
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_multiquotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            logger.warning(
+                "sector_follow quotes snapshot: no API key available (broker session "
+                "down?) — falling back to aggregator/historify"
+            )
+            return {}
+        success, resp, _status = get_multiquotes(symbol_payload, api_key=api_key)
+        if not success:
+            logger.warning(
+                "sector_follow quotes snapshot: get_multiquotes failed: %s — falling "
+                "back to aggregator/historify",
+                (resp or {}).get("message", "unknown error"),
+            )
+            return {}
+        out: dict[str, tuple] = {}
+        for item in (resp or {}).get("results") or []:
+            sym = item.get("symbol")
+            data = item.get("data")
+            if not sym or not isinstance(data, dict):
+                continue
+            ltp = data.get("ltp") or data.get("last_price") or data.get("close")
+            try:
+                ltp = float(ltp) if ltp else None
+            except (TypeError, ValueError):
+                ltp = None
+            if ltp is None or ltp <= 0:
+                continue
+            vol = data.get("volume")
+            try:
+                vol = float(vol) if vol else None
+            except (TypeError, ValueError):
+                vol = None
+            out[sym] = (ltp, vol)
+        return out
+    except Exception:
+        logger.exception("sector_follow quotes snapshot fetch raised (falling back)")
+        return {}
+
+
+def make_quotes_intraday_provider(
+    universe: list[str] | None = None,
+    sector_map: dict[str, str] | None = None,
+    *,
+    quotes_fetcher: Callable[[list[dict]], dict[str, tuple]] | None = None,
+    fallback: Callable | None = None,
+):
+    """Build an intraday provider sourcing TODAY's (close, volume) from a single
+    batched broker quote snapshot at decision time (issue #332).
+
+    Returns a callable ``(symbol, as_of) -> (close, volume, source)`` with
+    ``source ∈ {"quotes", "aggregator", "none"}``. On the FIRST call of an eval
+    cycle (memo key: as_of truncated to the minute) it fetches ALL universe
+    stocks (exchange ``NSE``) plus the mapped sector indices (exchange
+    ``NSE_INDEX`` — the same symbol/exchange routing the
+    ``sector_follow_index_backfill`` feed uses; the index symbols come straight
+    from ``sector_map`` values, no new mapping invented) in ONE
+    ``get_multiquotes`` round trip, memoized so the ~38 per-symbol calls hit one
+    HTTP request. Stocks yield ``(ltp, cumulative_day_volume)``; indices yield
+    ``(ltp, None)`` — index volume is unused by the gates.
+
+    Fail-safe contract: NEVER raises. A failed/partial quote fetch degrades per
+    symbol to the ``fallback`` provider (default: the scanner-aggregator
+    ``production_intraday_provider``) with a WARNING per hop; when that also has
+    nothing it returns ``(None, None, "none")`` so ``_compute_metrics``
+    continues to its existing historify fallback + loud-WARNING path.
+    """
+    if universe is None or sector_map is None:
+        universe = list(universe) if universe is not None else list(load_config().universe)
+        sector_map = dict(sector_map) if sector_map is not None else load_sector_map()
+    else:
+        universe = list(universe)
+        sector_map = dict(sector_map)
+    fetch = quotes_fetcher or _fetch_quotes_snapshot
+    fb = fallback or production_intraday_provider
+
+    # Same index derivation as _compute_metrics, so the snapshot covers exactly
+    # the symbols the evaluator will ask for.
+    index_syms = sorted({sector_map.get(s, "NIFTY") for s in universe})
+    stock_set = set(universe)
+    index_set = set(index_syms)
+    cache: dict[tuple, dict[str, tuple]] = {}
+
+    def _cycle_quotes(as_of: datetime) -> dict[str, tuple]:
+        ist = as_of.astimezone(_IST) if as_of.tzinfo else as_of
+        key = (ist.date(), ist.hour, ist.minute)
+        if key not in cache:
+            payload = [{"symbol": s, "exchange": "NSE"} for s in sorted(stock_set)]
+            payload += [
+                {"symbol": i, "exchange": "NSE_INDEX"} for i in index_syms if i not in stock_set
+            ]
+            try:
+                raw = fetch(payload) or {}
+            except Exception:
+                # The production fetcher never raises; guard injected ones too so a
+                # failure is memoized (ONE batched attempt per cycle, no retry storm).
+                logger.exception("sector_follow quotes snapshot fetcher raised (falling back)")
+                raw = {}
+            # Indices carry no meaningful cumulative volume — normalize to None.
+            cache[key] = {
+                sym: (ltp, None if sym in index_set and sym not in stock_set else vol)
+                for sym, (ltp, vol) in raw.items()
+            }
+            logger.info(
+                "sector_follow quotes snapshot: %d/%d symbols answered in one batched call",
+                len(cache[key]),
+                len(payload),
+            )
+        return cache[key]
+
+    def provider(symbol: str, as_of: datetime):
+        try:
+            quotes = _cycle_quotes(as_of)
+        except Exception:  # belt-and-braces — _cycle_quotes is already defensive
+            logger.exception("sector_follow quotes provider cycle fetch raised for %s", symbol)
+            quotes = {}
+        entry = quotes.get(symbol)
+        if entry is not None and entry[0] is not None:
+            return entry[0], entry[1], "quotes"
+        logger.warning(
+            "sector_follow quotes provider: no quote for %s — falling back to aggregator",
+            symbol,
+        )
+        try:
+            close, vol = fb(symbol, as_of)
+        except Exception:
+            logger.exception(
+                "sector_follow quotes provider: aggregator fallback raised for %s", symbol
+            )
+            close, vol = None, None
+        if close is not None:
+            return close, vol, "aggregator"
+        return None, None, "none"
+
+    return provider
+
+
 def _compute_metrics(
     as_of: datetime,
     universe: list[str],
@@ -299,10 +451,12 @@ def _compute_metrics(
     """Assemble per-symbol gate metrics from the two data sources.
 
     ``intraday_provider(symbol, as_of) -> (close, volume)`` supplies today's data
-    (aggregator). ``history_reader(all_syms, window_start) -> {sym: [(ts, close,
-    volume)]}`` supplies the lookback (historify). Today's data falls back to
-    historify per-symbol with a LOUD warning when the aggregator is empty. Every
-    returned metric carries ``intraday_source`` ∈ {aggregator, historify, none}
+    (aggregator). A provider may instead return a 3-tuple ``(close, volume,
+    source)`` to tag its own source (the quotes-snapshot provider, issue #332).
+    ``history_reader(all_syms, window_start) -> {sym: [(ts, close, volume)]}``
+    supplies the lookback (historify). Today's data falls back to historify
+    per-symbol with a LOUD warning when the provider is empty. Every returned
+    metric carries ``intraday_source`` ∈ {quotes, aggregator, historify, none}
     so the caller can report decision-input completeness.
     """
     as_of_epoch = as_of.timestamp()
@@ -315,15 +469,21 @@ def _compute_metrics(
     raw = history_reader(all_syms, window_start)
 
     def _today(sym: str):
-        """(close, volume, source) for today — aggregator first, historify fallback."""
+        """(close, volume, source) for today — injected provider first (a 3-tuple
+        provider tags its own source, e.g. "quotes"), historify fallback second."""
         close = vol = None
+        src = "aggregator"
         try:
-            close, vol = intraday_provider(sym, as_of)
+            res = intraday_provider(sym, as_of)
+            if isinstance(res, tuple) and len(res) == 3:
+                close, vol, src = res
+            else:
+                close, vol = res
         except Exception:
             logger.exception("sector_follow intraday provider raised for %s", sym)
             close = vol = None
         if close is not None:
-            return close, vol, "aggregator"
+            return close, vol, src
         h_close, h_vol = _today_metrics_from_bars(raw.get(sym, []), as_of_epoch, as_of_date)
         if h_close is not None:
             logger.warning(
@@ -734,7 +894,9 @@ class SectorFollowService:
         total = len(self.config.universe) or len(metrics)
         n_sector_ret_none = 0
         for symbol, m in metrics.items():
-            if m.get("intraday_source") == "aggregator":
+            # "quotes" (broker quote snapshot, issue #332) counts as a live
+            # intraday source alongside the aggregator.
+            if m.get("intraday_source") in ("aggregator", "quotes"):
                 n_intraday += 1
             if m.get("sector_ret") is None:
                 n_sector_ret_none += 1
@@ -808,9 +970,10 @@ class SectorFollowService:
             logger.exception("sector_follow all-indices-empty alert failed")
 
     def _emit_completeness_metric(self, n_intraday: int, total: int, as_of: datetime) -> None:
-        """Log + Telegram the share of universe symbols served by the LIVE
-        aggregator (vs. historify fallback / no data). Below 50% warns; below 20%
-        is critical — the pipeline is effectively producing fail-closed signals."""
+        """Log + Telegram the share of universe symbols served by a LIVE intraday
+        source (aggregator or quotes snapshot, vs. historify fallback / no data).
+        Below 50% warns; below 20% is critical — the pipeline is effectively
+        producing fail-closed signals."""
         if total <= 0:
             return
         frac = n_intraday / total

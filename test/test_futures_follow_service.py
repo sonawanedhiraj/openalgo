@@ -107,6 +107,7 @@ def _make_service(signals=None, **overrides):
     market_context_provider = overrides.pop("market_context_provider", None)
 
     intent_resolver = overrides.pop("intent_resolver", None)
+    now = overrides.pop("now", lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
     if intent_resolver is None:
         from services.mode_service import EffectiveDecision
 
@@ -123,7 +124,7 @@ def _make_service(signals=None, **overrides):
         price_fetcher=price_fetcher,
         notifier=notifier,
         trade_recorder=fake_recorder,
-        now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
+        now=now,
         intent_resolver=intent_resolver,
         data_health_checker=data_health_checker,
         signal_reviewer=signal_reviewer,
@@ -1026,6 +1027,7 @@ def _make_smoke_service(
     data_ok: bool = True,
     stale: list[str] | None = None,
     session_ok: bool = True,
+    quote_ok: bool = True,
     notifier=None,
     now_dt: datetime | None = None,
 ) -> FuturesFollowService:
@@ -1033,7 +1035,9 @@ def _make_smoke_service(
 
     data_health_checker is injected with a fake that returns ``(data_ok, details_map)``
     where details_map has one entry per stale symbol (ok=False). broker_session_checker
-    is a lambda returning ``session_ok``. All other effects are no-ops."""
+    is a lambda returning ``session_ok``; quote_probe is a lambda returning
+    ``quote_ok`` (issue #332 — keeps the default quotes source hermetic). All
+    other effects are no-ops."""
     stale = stale or []
 
     def fake_health_checker(strategy_name, date_str=None, index_only=False):
@@ -1063,6 +1067,7 @@ def _make_smoke_service(
         intent_resolver=None,
         data_health_checker=fake_health_checker,
         broker_session_checker=lambda: session_ok,
+        quote_probe=lambda: quote_ok,
     )
     svc._test_alerts = alerts
     return svc
@@ -1234,6 +1239,167 @@ def test_register_jobs_skips_smoke_check_when_flag_off(monkeypatch):
     svc.register_jobs(FakeScheduler())
 
     assert "futures_follow_smoke_check" not in job_ids
+
+
+# --------------------------------------------------------------------------- #
+# #332 — quotes-snapshot intraday source: smoke-check quote probe
+# --------------------------------------------------------------------------- #
+
+
+def test_smoke_check_blocks_and_alerts_when_quote_probe_fails(monkeypatch):
+    """AC #9: with source=quotes, a failed dry-run quote probe at 15:18 writes
+    the same self-expiring pause override + Telegram alert as feed-staleness."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "quotes")
+    svc = _make_smoke_service(data_ok=True, session_ok=True, quote_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["quote_probe_ok"] is False
+    assert details["intraday_source"] == "quotes"
+    # The freshness + session arms were green — the probe alone must block.
+    assert details["data_ok"] is True
+    assert details["broker_session_ok"] is True
+
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+    assert any("quote probe" in (r.get("reason") or "") for r in pauses)
+    assert any("quote probe" in a for a in svc._test_alerts)
+
+
+def test_smoke_check_skips_quote_probe_when_source_aggregator(monkeypatch):
+    """With FUTURES_FOLLOW_INTRADAY_SOURCE=aggregator the probe never runs —
+    a failing probe fake must not block (pre-#332 smoke behavior preserved)."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "aggregator")
+    svc = _make_smoke_service(data_ok=True, session_ok=True, quote_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details["intraday_source"] == "aggregator"
+    assert details["quote_probe_ok"] is True  # skipped ⇒ treated as ok
+    overrides = sro.list_overrides(include_expired=True)
+    smoke_pauses = [r for r in overrides if "smoke_check_failed" in (r.get("reason") or "")]
+    assert smoke_pauses == [], f"unexpected smoke-check override: {smoke_pauses}"
+
+
+def test_futures_intraday_source_defaults_and_validates(monkeypatch):
+    """Default is quotes; unknown values fall back to quotes; aggregator honored."""
+    from services.futures_follow_service import futures_intraday_source
+
+    monkeypatch.delenv("FUTURES_FOLLOW_INTRADAY_SOURCE", raising=False)
+    assert futures_intraday_source() == "quotes"
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "aggregator")
+    assert futures_intraday_source() == "aggregator"
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "bogus")
+    assert futures_intraday_source() == "quotes"
+
+
+# --------------------------------------------------------------------------- #
+# #332 follow-up — wall-clock entry-lateness guard (default deadline 15:28 IST)
+# --------------------------------------------------------------------------- #
+
+
+def _make_late_guard_service(fire_at: datetime, signals=None):
+    """Service with a pinned clock + counting evaluator/notifier for guard tests."""
+    eval_calls = []
+    alerts = []
+
+    def counting_evaluator(as_of=None):
+        eval_calls.append(as_of)
+        return list(signals or [_sig("AAA")])
+
+    svc = _make_service(
+        signal_evaluator=counting_evaluator,
+        notifier=lambda msg: alerts.append(msg),
+        now=lambda: fire_at,
+    )
+    svc._test_eval_calls = eval_calls
+    svc._test_alerts = alerts
+    return svc
+
+
+@pytest.mark.parametrize("fire_hm", [(15, 29), (15, 35)])
+def test_entry_skipped_when_fired_after_deadline(monkeypatch, fire_hm):
+    """A late-fired entry job (post-15:28 default deadline) places NOTHING:
+    no evaluation, no orders, returns [], and Telegrams the operator."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    h, m = fire_hm
+    svc = _make_late_guard_service(datetime(2026, 6, 10, h, m, 5, tzinfo=_IST))
+    placed = svc.run_entry()
+
+    assert placed == []
+    assert svc._test_eval_calls == [], "evaluator must not run on a late fire"
+    assert svc._test_placed == [], "no orders may be placed on a late fire"
+    assert any("fired LATE" in a and "no orders placed" in a for a in svc._test_alerts), (
+        svc._test_alerts
+    )
+
+
+def test_entry_proceeds_at_scheduled_1520(monkeypatch):
+    """The normal 15:20 fire is untouched by the guard (regression)."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    svc = _make_late_guard_service(datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert len(svc._test_eval_calls) == 1
+
+
+def test_entry_deadline_custom_env_respected(monkeypatch):
+    """FUTURES_FOLLOW_ENTRY_DEADLINE_IST=15:25 → a 15:26 fire is skipped, a
+    15:24 fire proceeds."""
+    monkeypatch.setenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", "15:25")
+    late = _make_late_guard_service(datetime(2026, 6, 10, 15, 26, tzinfo=_IST))
+    assert late.run_entry() == []
+    assert late._test_placed == []
+    assert any("deadline 15:25" in a for a in late._test_alerts)
+
+    on_time = _make_late_guard_service(datetime(2026, 6, 10, 15, 24, tzinfo=_IST))
+    assert len(on_time.run_entry()) == 1
+
+
+def test_entry_deadline_malformed_env_falls_back_to_default(monkeypatch):
+    """A typo'd deadline value must never disable the guard: 'banana' → the
+    default 15:28 stays active (15:29 fire skipped, 15:20 fire proceeds)."""
+    from services.futures_follow_service import futures_entry_deadline_ist
+
+    monkeypatch.setenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", "banana")
+    assert futures_entry_deadline_ist().strftime("%H:%M") == "15:28"
+
+    late = _make_late_guard_service(datetime(2026, 6, 10, 15, 29, tzinfo=_IST))
+    assert late.run_entry() == []
+    assert late._test_placed == []
+
+    on_time = _make_late_guard_service(datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
+    assert len(on_time.run_entry()) == 1
+
+
+def test_exit_and_watchdog_not_gated_by_entry_deadline(monkeypatch):
+    """Repo invariant: exits are NEVER gated. run_exit and run_eod_watchdog
+    still square off a held T+1 position at 15:40, well past the deadline."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    fire_at = datetime(2026, 6, 10, 15, 40, tzinfo=_IST)
+
+    svc = _make_service(now=lambda: fire_at)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    exited = svc.run_exit()
+    assert len(exited) == 1, "run_exit must not be gated by the entry deadline"
+
+    svc2 = _make_service(now=lambda: fire_at)
+    _seed_position(svc2, "P1", entry_date="2026-06-09")
+    flattened = svc2.run_eod_watchdog()
+    assert len(flattened) == 1, "run_eod_watchdog must not be gated by the entry deadline"
 
 
 # --------------------------------------------------------------------------- #
