@@ -18,6 +18,52 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### futures_follow quotes-snapshot data source (issue #332, added 2026-07-05)
+`futures_follow_cap50` makes exactly one decision per day (15:20 IST); PR #333
+moved its decision snapshot (today's per-symbol close + cumulative volume) off
+the all-day WS-fed scanner aggregator onto a point-in-time broker quote call,
+and added a wall-clock lateness guard on the entry job. Merged 2026-07-05
+(`6ea8fe322`); entries below are the immediate follow-up direct commit proposed
+in the PR body.
+
+#### FUTURES_FOLLOW_INTRADAY_SOURCE (NEW)
+- **Current value:** unset → defaults **`quotes`** (unknown values fall back to
+  `quotes` with a WARNING).
+- **Set in:** env; read by `services.futures_follow_service.futures_intraday_source`
+  (consumed by `production_signal_evaluator` and `assert_data_pipeline_healthy`);
+  provider lives in `services.sector_follow_service.make_quotes_intraday_provider`.
+- **What it does:** selects the source of the 15:20 IST decision snapshot.
+  `quotes`: ONE batched `get_multiquotes` call at decision time (universe stocks
+  on NSE + mapped sector indices on NSE_INDEX), memoized per eval cycle, with
+  fail-safe fallback quotes → aggregator → historify (WARNING per hop) and a
+  15:18 dry-run quote probe in the smoke check. `aggregator`: the pre-#332
+  WS-fed path, byte-identical (regression-tested) — the rollback switch.
+- **Why:** depending on the all-day WS tick stream being healthy at the single
+  decision moment was the 2026-06-15 "aggregator empty → silent 0-signal day"
+  failure class. A REST snapshot through the same broker session removes that
+  dependency. Scope: futures_follow_cap50 ONLY — sector_follow_cap5_vol (the
+  equity alpha book) still uses the aggregator; accepted divergence is a
+  marginally different `t_close` (quote at 15:20:xx vs last aggregator bar close).
+
+#### FUTURES_FOLLOW_ENTRY_DEADLINE_IST (NEW)
+- **Current value:** unset → defaults **`15:28`** (HH:MM IST); consult-time
+  (re-read on every entry fire). Malformed value falls back to `15:28` with a
+  WARNING — a typo can never disable the guard.
+- **Set in:** env; read by
+  `services.futures_follow_service.futures_entry_deadline_ist` (`run_entry`).
+- **What it does:** wall-clock lateness deadline for the 15:20 IST entry job,
+  checked FIRST in `run_entry` — before the override gate, kill switch,
+  freshness gate, evaluation, or any order. A fire past the deadline skips ALL
+  of today's entries, logs an ERROR, and Telegrams the operator. Exits
+  (`run_exit`), the EOD watchdog, and `close_all` are NEVER gated (repo
+  invariant: a held T+1 position is riskier than a rejected exit order).
+- **Why:** the entry cron can misfire LATE (app down at 15:20 → APScheduler
+  fires on restart). NFO hard close is 15:30: at ~15:35 the exchange rejects
+  (noisy but harmless), but after ~15:45 the MARKET order could queue as an AMO
+  and execute at tomorrow's open — an unintended, unmonitored overnight entry.
+  15:28 leaves the normal 15:20 fire (plus jitter) untouched while guaranteeing
+  no order is dispatched into/after the close.
+
 ### LLM health probe timeout (issue #297, added 2026-07-02)
 The Strategies-page LLM health chip (`GET /strategies/api/llm/health`) spawns a
 lightweight `claude -p` liveness probe on demand (operator clicks the chip's
