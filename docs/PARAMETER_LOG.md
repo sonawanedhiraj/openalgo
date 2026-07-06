@@ -1570,6 +1570,19 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     bars, ample margin over the 15 needed even across a holiday (holiday
     calendar itself is issue #253).
 
+## `SCANNER_ACTIVE_TTL_MIN` — /scanner currently-matching window (issue #342)
+
+- **`SCANNER_ACTIVE_TTL_MIN`** (default `12`, floor 1, read at request time):
+  the /scanner UI's "Currently matching" list shows a symbol while it has an
+  in-house scan_results row within the last N minutes. The rules re-fire every
+  5m bar close while conditions hold, so ~2 bar intervals means a symbol drops
+  off within a couple of cycles of conditions breaking — Chartink-style live
+  semantics with no new scanner state. Signal HISTORY is unaffected (scan_results
+  is never filtered/mutated by this TTL).
+- **History:**
+  - **2026-07-06:** Introduced by issue #342 / PR #343 (operator request:
+    stocks shown only while conditions are met; fired signals stay in history).
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
