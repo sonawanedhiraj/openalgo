@@ -1552,6 +1552,24 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     fully-healthy data day still showed in-house recall 0 vs 10+ Chartink
     symbols, with FAIL reasons invisible at production LOG_LEVEL=INFO.
 
+## `SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN` — semantics change to trading minutes (issue #340)
+
+- **`SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN`** (default `500`, unchanged): as of
+  issue #340 / PR #341 the value means **trading-session minutes** (09:15-15:30
+  IST, weekdays), not wall-clock minutes. The boot seeder walks backward
+  through prior sessions until the window contains the requested trading
+  minutes, so a pre-market boot seeds prior-day bars instead of an empty
+  overnight window. Pre-fix, every pre-market boot seeded 0/227 symbols
+  (live-log proof 2026-07-06: "seeded 0/227 symbols, 0 bars total"), which
+  starved the 15m RSI(14) warm-up gate until ~13:00 IST and rejected the whole
+  universe every morning (first #321 MISS-diagnostic finding: GODREJCP
+  failed_gate=15m_warmup 7/15 bars at 10:35).
+- **History:**
+  - **2026-07-06:** Semantics changed wall-clock → trading minutes (issue
+    #340 / PR #341). Default value untouched; 500 trading minutes ≈ 33 15m
+    bars, ample margin over the 15 needed even across a holiday (holiday
+    calendar itself is issue #253).
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
