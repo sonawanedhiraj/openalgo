@@ -927,6 +927,7 @@ class FuturesFollowService:
         lots: int,
         entry_price: float,
         entry_date: str | None = None,
+        decision_id: int | None = None,
     ) -> dict | None:
         """Buy ``lots`` NIFTY future lot(s) for one signal in the active mode.
 
@@ -1007,6 +1008,7 @@ class FuturesFollowService:
                 exchange=self.config.exchange,
                 product=self.config.product,
                 signal_id=signal_id,
+                decision_id=decision_id,
                 vol_ratio=vol_ratio,
                 margin_inr=margin,
                 order_id=None,
@@ -1037,6 +1039,7 @@ class FuturesFollowService:
             exchange=self.config.exchange,
             product=self.config.product,
             signal_id=signal_id,
+            decision_id=decision_id,
             vol_ratio=vol_ratio,
             margin_inr=margin,
             order_id=order_id,
@@ -1429,7 +1432,7 @@ class FuturesFollowService:
                 symbol,
                 reasoning,
             )
-            self._journal_veto_skip(signal, contract, lots, entry_price, reasoning)
+            self._journal_veto_skip(signal, contract, lots, entry_price, reasoning, decision_id)
             self._mark_review_outcome(decision_id, taken=False)
             return False, decision_id, elapsed_s
         return True, decision_id, elapsed_s
@@ -1441,6 +1444,7 @@ class FuturesFollowService:
         lots: int,
         entry_price: float,
         reasoning: str | None = None,
+        decision_id: int | None = None,
     ) -> None:
         """Audit-trail a veto-skipped entry in ``futures_follow_trades``.
 
@@ -1458,6 +1462,7 @@ class FuturesFollowService:
                 exchange=self.config.exchange,
                 product=self.config.product,
                 signal_id=signal.get("signal_id") or signal.get("symbol"),
+                decision_id=decision_id,
                 vol_ratio=signal.get("vol_ratio") or 0.0,
                 margin_inr=0.0,
                 order_id=None,
@@ -1602,7 +1607,7 @@ class FuturesFollowService:
                 if symbol:
                     signal_outcomes[symbol] = "vetoed"
                 continue
-            r = self.place_entry(sig, contract, lots, entry_price)
+            r = self.place_entry(sig, contract, lots, entry_price, decision_id=decision_id)
             self._mark_review_outcome(decision_id, taken=bool(r))
             if r:
                 placed.append(r)

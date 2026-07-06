@@ -974,6 +974,7 @@ def _seed_simplified_journal_row(
     exit_price: float | None = None,
     pnl: float | None = None,
     exit_reason: str | None = None,
+    signal_decision_id: int | None = None,
 ):
     """Insert one trade_journal row under the simplified engine's REGISTERED
     journal name (trending_equity_intraday) — the real persisted name."""
@@ -989,6 +990,7 @@ def _seed_simplified_journal_row(
         exit_price=exit_price,
         exit_reason=exit_reason,
         pnl=pnl,
+        signal_decision_id=signal_decision_id,
         created_at=placed_at,
         updated_at=placed_at,
     )
@@ -1507,3 +1509,201 @@ def test_llm_health_probe_timeout_clamped(monkeypatch):
     assert sda._llm_health_probe_timeout() == 3.0
     monkeypatch.setenv("LLM_HEALTH_PROBE_TIMEOUT_SECONDS", "not-a-number")
     assert sda._llm_health_probe_timeout() == 12.0
+
+
+# ---------------------------------------------------------------------------
+# Merged trades + LLM decisions (issue #358)
+# ---------------------------------------------------------------------------
+
+
+def _seed_decision_full(
+    sddb,
+    symbol,
+    source,
+    decision,
+    *,
+    enforcement_mode="shadow",
+    direction="BUY",
+    reasoning="regime fine",
+):
+    """Seed one signal_decision row and return its id."""
+    return sddb.insert_signal_decision(
+        symbol=symbol,
+        source=source,
+        decision=decision,
+        direction=direction,
+        reasoning=reasoning,
+        confidence=0.8,
+        enforcement_mode=enforcement_mode,
+        context_snapshot=None,
+        bridge_latency_ms=10,
+        bridge_session_id="s",
+        raw_bridge_output=None,
+    )
+
+
+def test_futures_trades_carry_llm_decision_via_fk(app, wired_dbs, wired_llm_dbs):
+    """A futures_follow BUY row with a decision_id FK embeds the veto verdict;
+    the SELL exit leg carries no LLM fields (exits are never reviewed)."""
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    did = _seed_decision_full(sddb, "TCS", "futures_follow_cap50", "take")
+
+    ff_sess.add_all(
+        [
+            ffdb.FuturesFollowTrade(
+                mode="sandbox",
+                side="BUY",
+                nifty_symbol="NIFTY28JUL26FUT",
+                lots=1,
+                quantity=75,
+                entry_price=24500.0,
+                entry_date="2026-07-06",
+                signal_id="TCS",
+                decision_id=did,
+                status="placed",
+                created_at=dt.datetime(2026, 7, 6, 9, 50, 0),
+            ),
+            ffdb.FuturesFollowTrade(
+                mode="sandbox",
+                side="SELL",
+                nifty_symbol="NIFTY28JUL26FUT",
+                lots=1,
+                quantity=75,
+                entry_price=24500.0,
+                exit_price=24600.0,
+                entry_date="2026-07-06",
+                net_pnl=7000.0,
+                status="placed",
+                created_at=dt.datetime(2026, 7, 7, 9, 55, 0),
+            ),
+        ]
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/futures_follow_cap50").get_json()["data"]
+
+    trades = data["recent_trades"]
+    sell, buy = trades[0], trades[1]
+    assert sell["llm"] is None
+    assert buy["llm"]["decision"] == "take"
+    assert buy["llm"]["decision_id"] == did
+    assert buy["llm"]["confidence"] == 0.8
+    # The matched decision must NOT re-surface as an unmatched pseudo-row.
+    assert data["llm_unmatched_skips"] == []
+
+
+def test_futures_trades_fuzzy_match_pre_fk_rows(app, wired_dbs, wired_llm_dbs):
+    """A pre-FK BUY row (decision_id NULL) still gets its verdict via the
+    symbol+day fuzzy fallback (decision.symbol == row.signal_id)."""
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    did = _seed_decision_full(sddb, "INFY", "futures_follow_cap50", "take")
+    day = sddb.get_signal_decision(did)["candidate_at"][:10]
+
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            nifty_symbol="NIFTY28JUL26FUT",
+            lots=1,
+            quantity=75,
+            entry_price=24500.0,
+            entry_date=day,
+            signal_id="INFY",
+            decision_id=None,
+            status="placed",
+            created_at=dt.datetime(2026, 7, 6, 9, 50, 0),
+        )
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/futures_follow_cap50").get_json()["data"]
+
+    assert data["recent_trades"][0]["llm"]["decision_id"] == did
+
+
+def test_simplified_trades_carry_llm_decision_via_fk(app, wired_dbs, wired_llm_dbs):
+    """A trade_journal row's existing signal_decision_id FK embeds the verdict,
+    and the normalized aliases (net_pnl/created_at/mode/status) are present."""
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    did = _seed_decision_full(sddb, "PERSISTENT", "chartink_FnO_intraday_buy", "take")
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="PERSISTENT",
+        placed_at="2026-07-06T10:00:00+05:30",
+        exited_at="2026-07-06T15:14:00+05:30",
+        exit_price=120.0,
+        pnl=200.0,
+        exit_reason="target",
+        signal_decision_id=did,
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/simplified_engine").get_json()["data"]
+
+    row = data["recent_trades"][0]
+    assert row["llm"]["decision_id"] == did
+    assert row["llm"]["decision"] == "take"
+    # Normalized aliases for the shared merged-table UI (#358).
+    assert row["net_pnl"] == 200.0
+    assert row["created_at"] == "2026-07-06T10:00:00+05:30"
+    assert row["mode"] == "chartink"
+    assert row["status"] == "closed"
+
+
+def test_unmatched_active_skips_surface_as_pseudo_rows(app, wired_dbs, wired_llm_dbs):
+    """An enforced (active) skip with no journal row surfaces in
+    llm_unmatched_skips; a shadow skip (order still placed) does not."""
+    _sd_eng, _sd_sess, sddb = wired_llm_dbs["sd"]
+    active_id = _seed_decision_full(
+        sddb,
+        "ASTRAL",
+        "trend-up",
+        "skip",
+        enforcement_mode="active",
+        reasoning="regime hostile",
+    )
+    _seed_decision_full(sddb, "FORTIS", "trend-up", "skip", enforcement_mode="shadow")
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/simplified_engine").get_json()["data"]
+
+    skips = data["llm_unmatched_skips"]
+    assert [s["decision_id"] for s in skips] == [active_id]
+    assert skips[0]["symbol"] == "ASTRAL"
+    assert skips[0]["decision"] == "skip"
+    assert skips[0]["reasoning"] == "regime hostile"
+
+
+def test_non_veto_strategy_has_no_llm_enrichment(app, wired_dbs, wired_llm_dbs):
+    """sector_follow (no veto wired) returns no llm fields and no pseudo-rows."""
+    _sf_eng, sf_sess, sfdb = wired_dbs["sf"]
+    sf_sess.add(
+        sfdb.SectorFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            symbol="TCS",
+            quantity=10,
+            price=4000.0,
+            entry_date="2026-07-06",
+            status="placed",
+            created_at=dt.datetime(2026, 7, 6, 15, 20, 0),
+        )
+    )
+    sf_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/sector_follow_cap5_vol").get_json()["data"]
+
+    assert data["llm_unmatched_skips"] == []
+    assert "llm" not in data["recent_trades"][0] or data["recent_trades"][0]["llm"] is None

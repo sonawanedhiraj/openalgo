@@ -73,9 +73,26 @@ export interface VersionLogEntry {
   body: string
 }
 
+// Compact Stage-1 LLM veto decision embedded on a trade row (issue #358).
+export interface TradeLLMReview {
+  decision_id: number | null
+  decision: string
+  confidence: number | null
+  reasoning: string | null
+  enforcement_mode: string
+  candidate_at: string | null
+}
+
+// An enforced LLM skip that blocked an entry and therefore has no trade row —
+// rendered as a pseudo-row in the merged trades table (issue #358).
+export interface UnmatchedSkipDecision extends TradeLLMReview {
+  symbol: string
+  direction: string | null
+}
+
 export interface RecentTrade {
   id: number
-  side: 'BUY' | 'SELL'
+  side: 'BUY' | 'SELL' | 'LONG' | 'SHORT'
   symbol: string
   quantity: number
   lots?: number
@@ -90,6 +107,7 @@ export interface RecentTrade {
   status: string
   entry_date: string
   created_at: string | null
+  llm?: TradeLLMReview | null
 }
 
 // Latest data-freshness (data_health_check) state for the strategy's feed (#237).
@@ -118,6 +136,7 @@ export interface StrategyDetail {
   data_health: DataHealth
   performance: StrategyPerformance
   recent_trades: RecentTrade[]
+  llm_unmatched_skips?: UnmatchedSkipDecision[]
   version_log: VersionLogEntry[]
   backtest_refs: string[]
 }

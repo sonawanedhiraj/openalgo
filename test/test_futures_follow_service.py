@@ -1518,6 +1518,12 @@ def test_run_entry_active_skip_blocks_lot_and_does_not_consume_cap(monkeypatch):
     assert veto_rows[0]["signal_id"] == "AAA"
     assert veto_rows[0]["margin_inr"] == 0.0
     assert veto_rows[0]["order_id"] is None
+    # The veto_skip row links back to its signal_decision audit row (#358).
+    assert veto_rows[0]["decision_id"] == 1
+    # Placed entries carry their reviewer's decision id too (reviewer stub
+    # returns id=call-ordinal: AAA=1, BBB=2, CCC=3).
+    placed_rows = [j for j in svc._test_journal if j.get("status") == "placed"]
+    assert sorted(r["decision_id"] for r in placed_rows) == [2, 3]
     # No phantom position for the vetoed signal.
     assert all(p.signal_symbol != "AAA" for p in svc.paper_book.values())
     # And only two orders reached the placer.
