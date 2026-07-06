@@ -21,8 +21,8 @@ The fix is to **seed the aggregator's rolling state at boot** from
 historical 1m bars. The scanner runs against a pre-warmed window the
 moment the first live tick lands.
 
-Session-aware lookback (issue #340)
-------------------------------------
+Session-aware lookback (issue #340; holiday-aware since #253)
+---------------------------------------------------------------
 The lookback window used to be computed as raw WALL-CLOCK minutes
 (``now - lookback_min``). That is fine for a mid-session restart (most of
 the window is inside today's live session) but is silently empty for a
@@ -32,13 +32,17 @@ This produced the 2026-07-06 incident: the seeder recorded 0/227 symbols
 seeded, and the 15m RSI warm-up gate then rejected the ENTIRE universe
 until enough LIVE 15m bars accumulated intra-session (~13:00 IST for a
 09:15 open). ``session_aware_start_ts`` fixes this by walking backward
-through TRADING SESSIONS (09:15-15:30 IST, weekdays only — holidays are
-not modelled, matching ``services.data_freshness_service``'s existing
-business-day convention) instead of raw wall-clock time, so
-``SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN`` now means **trading minutes**,
+through TRADING SESSIONS (09:15-15:30 IST) instead of raw wall-clock time,
+so ``SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN`` now means **trading minutes**,
 not wall-clock minutes. The unchanged default of 500 trading minutes
 yields ~33 closed 15m bars (well above the 15-bar RSI(14)+margin floor)
 regardless of what time of day the seeder runs.
+
+``_is_trading_day`` now delegates to
+``services.data_freshness_service.is_trading_day`` (issue #253) — the shared,
+NSE-holiday-aware predicate — instead of a bare weekday check, so a holiday
+inside the walk contributes 0 session minutes exactly like a weekend does.
+The 30-day safety valve on the walk is unchanged.
 
 Data source (issue #199)
 ------------------------
@@ -130,7 +134,7 @@ _DEFAULT_POLL_SEC = 5
 # Resolution of how often we re-check broker session readiness while waiting.
 
 # --------------------------------------------------------------------------- #
-# Session-aware lookback (issue #340)
+# Session-aware lookback (issue #340; holiday-aware since #253)
 # --------------------------------------------------------------------------- #
 # The NSE cash session is 09:15-15:30 IST = 375 minutes/day. A wall-clock
 # ``now - lookback_min`` window (the pre-#340 behaviour) is fine for an
@@ -139,19 +143,27 @@ _DEFAULT_POLL_SEC = 5
 # lookback of 500 minutes, ``now - 500min`` lands at ~00:06 IST — a window
 # that contains ZERO trading bars. The seeder recorded 0/227 symbols seeded
 # on the 2026-07-06 boot for exactly this reason (see issue #340 investigation
-# notes). The fix walks backward through TRADING SESSIONS (weekdays only —
-# holidays are not modelled, matching the existing business-day convention in
-# ``services.data_freshness_service``) rather than raw wall-clock minutes, so
-# the requested number of *trading* minutes is always available regardless of
-# what time of day (or how early in the morning) the seeder runs.
+# notes). The fix walks backward through TRADING SESSIONS rather than raw
+# wall-clock minutes, so the requested number of *trading* minutes is always
+# available regardless of what time of day (or how early in the morning) the
+# seeder runs. ``_is_trading_day`` delegates to the shared, NSE-holiday-aware
+# ``services.data_freshness_service.is_trading_day`` (issue #253) so a holiday
+# inside the walk contributes 0 session minutes exactly like a weekend does.
 _SESSION_START = (9, 15)
 _SESSION_END = (15, 30)
 _SESSION_MINUTES = (15 * 60 + 30) - (9 * 60 + 15)  # 375
 
 
 def _is_trading_day(d: date) -> bool:
-    """Weekday check only — holidays are not modelled (existing convention)."""
-    return d.weekday() < 5  # 0=Mon .. 4=Fri
+    """Weekday AND not an NSE market holiday (issue #253).
+
+    Delegates to ``services.data_freshness_service.is_trading_day``, the
+    shared trading-day predicate — fail-open (weekday-only) if the holiday
+    calendar is unavailable or has no rows for ``d.year``; never raises.
+    """
+    from services.data_freshness_service import is_trading_day as _shared_is_trading_day
+
+    return _shared_is_trading_day(d)
 
 
 def _session_bounds(d: date) -> tuple[datetime, datetime]:
@@ -239,9 +251,9 @@ def _now_naive_ist() -> datetime:
 def _today_session_elapsed_min(now: datetime) -> float:
     """TRADING minutes elapsed in TODAY's session as of naive-IST ``now``.
 
-    0.0 pre-open, on weekends, and (by convention — holidays are not
-    modelled) on non-trading weekdays before open. Capped at the full
-    session length after 15:30.
+    0.0 pre-open, on weekends, and on NSE holidays (issue #253 —
+    ``_is_trading_day`` is holiday-aware, fail-open to weekday-only). Capped
+    at the full session length after 15:30.
     """
     if not _is_trading_day(now.date()):
         return 0.0

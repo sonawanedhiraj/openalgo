@@ -5,7 +5,7 @@ strategy DB), drives the pure freshness logic, and monkeypatches the
 strategy→symbols resolver so the check is hermetic.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import duckdb
 import pytest
@@ -71,6 +71,95 @@ def test_prev_or_same_business_day_rolls_back_weekend():
     assert dfs._prev_or_same_business_day(sat) == fri
     assert dfs._prev_or_same_business_day(sun) == fri
     assert dfs._prev_or_same_business_day(fri) == fri  # weekday unchanged
+
+
+# --------------------------------------------------------------------------- #
+# Issue #253 — holiday-aware trading-day predicate.
+#
+# The market_calendar_db seed data (database/market_calendar_db.py) ships
+# 2026-01-26 (Republic Day, TRADING_HOLIDAY) — a real, already-seeded NSE
+# holiday we can assert against without injecting fixture rows. The
+# conftest.py `_isolate_databases` fixture calls `market_calendar_db.init_db()`
+# for every test session, which seeds 2025+2026 into the isolated temp DB.
+# --------------------------------------------------------------------------- #
+def test_is_trading_day_true_for_ordinary_weekday():
+    # 2026-01-27 (Tue) — ordinary trading day, no holiday row.
+    assert dfs.is_trading_day(date(2026, 1, 27)) is True
+
+
+def test_is_trading_day_false_for_weekend():
+    assert dfs.is_trading_day(date(2026, 6, 13)) is False  # Saturday
+
+
+def test_is_trading_day_false_for_seeded_nse_holiday():
+    # 2026-01-26 is Republic Day — a seeded TRADING_HOLIDAY, and also happens
+    # to be a Monday (a genuine weekday), so this proves the holiday check
+    # fires independently of the weekend check.
+    d = date(2026, 1, 26)
+    assert d.weekday() < 5, "sanity: Republic Day 2026 must be a weekday for this test"
+    assert dfs.is_trading_day(d) is False
+
+
+def test_is_trading_day_fail_open_when_year_has_no_calendar_rows(caplog):
+    """No seed_holidays_2027() exists yet — the predicate must degrade to
+    weekday-only behavior and log a WARNING once, never raise or brick the
+    freshness check (load-bearing per issue #253)."""
+    caplog.set_level("WARNING", logger="services.data_freshness_service")
+    # Clear this module's per-process caches so the test is independent of
+    # ordering/caching from other tests in this file.
+    dfs._year_has_rows_cache.pop(2027, None)
+    dfs._warned_missing_years.discard(2027)
+
+    tue = date(2027, 1, 5)  # an ordinary Tuesday in a year with zero rows
+    sat = date(2027, 1, 9)  # a Saturday in the same unseeded year
+
+    assert dfs.is_trading_day(tue) is True  # weekday fallback
+    assert dfs.is_trading_day(sat) is False  # weekend still correctly rejected
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("2027" in r.message for r in warnings), (
+        f"expected a WARNING naming the missing year 2027; got: {[r.message for r in warnings]}"
+    )
+    # Dedup: calling again must not add a second warning for the same year.
+    n_before = len(caplog.records)
+    dfs.is_trading_day(date(2027, 1, 6))
+    assert len(caplog.records) == n_before, "expected the missing-year warning to be deduped"
+
+
+def test_is_trading_day_fail_open_when_calendar_lookup_raises(monkeypatch, caplog):
+    """A raising calendar backend must never propagate — fail open to the
+    weekday check and log via logger.exception (not crash the caller)."""
+    caplog.set_level("WARNING", logger="services.data_freshness_service")
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("calendar backend unavailable")
+
+    # Force the "has rows" check to succeed (so we reach the is_market_holiday
+    # call) but make the holiday lookup itself explode.
+    dfs._year_has_rows_cache[2026] = True
+    monkeypatch.setattr("database.market_calendar_db.is_market_holiday", _boom)
+
+    # Tuesday, ordinary weekday — must resolve True despite the raise.
+    assert dfs.is_trading_day(date(2026, 6, 16)) is True
+    dfs._year_has_rows_cache.pop(2026, None)  # restore for later tests
+
+
+# --------------------------------------------------------------------------- #
+# Issue #253 — business-day math is now holiday-aware via is_trading_day.
+# --------------------------------------------------------------------------- #
+def test_prev_or_same_business_day_rolls_back_holiday():
+    # 2026-01-26 (Mon) is Republic Day; the preceding trading day is Fri 01-23.
+    holiday = date(2026, 1, 26)
+    fri = date(2026, 1, 23)
+    assert dfs._prev_or_same_business_day(holiday) == fri
+
+
+def test_business_days_between_excludes_seeded_holiday():
+    # Fri 2026-01-23 -> Tue 2026-01-27, spanning weekend (Sat/Sun) + Republic
+    # Day (Mon 01-26). Only Tue counts as a new business day.
+    fri = date(2026, 1, 23)
+    tue = date(2026, 1, 27)
+    assert dfs.business_days_between(fri, tue) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -247,6 +336,62 @@ def test_weekend_is_not_stale(tmp_duckdb, patch_symbols):
     )
     assert ok is True
     assert details["AAA"]["staleness_days"] == 1
+
+
+def test_holiday_gap_is_not_stale(tmp_duckdb, patch_symbols):
+    """Issue #253 — last bar Fri 2026-01-23 (D), Mon 2026-01-26 is Republic Day
+    (D+1, a seeded NSE TRADING_HOLIDAY), checked on Tue 2026-01-27 (D+2).
+
+    With max_staleness_business_days=1 this must read FRESH: the only new
+    TRADING day between D and D+2 is D+2 itself (D+1 is a holiday, not a
+    trading day), so staleness == 1 <= threshold 1.
+
+    Pre-#253 (holidays not modelled), D+1 would count as a missed business
+    day too, giving staleness == 2 > threshold 1 -> STALE. Verified by
+    stashing services/data_freshness_service.py and re-running this test —
+    it fails (``ok is False``) on the pre-fix tree.
+    """
+    patch_symbols(["AAA"], ["NIFTY"])
+    path = tmp_duckdb({"AAA": (2026, 1, 23), "NIFTY": (2026, 1, 23)})
+    ok, details = dfs.check_strategy_data_ready(
+        "x", date="2026-01-27", duckdb_path=path, max_staleness_business_days=1
+    )
+    assert ok is True
+    assert details["AAA"]["staleness_days"] == 1
+
+
+def test_real_trading_gap_still_stale(tmp_duckdb, patch_symbols):
+    """Control for the holiday test above — an ordinary (non-holiday) gap of
+    the same shape must still read STALE. Last bar Mon 2026-01-19, reference
+    Wed 2026-01-21: Tue 01-20 and Wed 01-21 are both ordinary trading days,
+    so staleness == 2 > threshold 1 -> STALE."""
+    patch_symbols(["AAA"], ["NIFTY"])
+    path = tmp_duckdb({"AAA": (2026, 1, 19), "NIFTY": (2026, 1, 19)})
+    ok, details = dfs.check_strategy_data_ready(
+        "x", date="2026-01-21", duckdb_path=path, max_staleness_business_days=1
+    )
+    assert ok is False
+    assert details["AAA"]["staleness_days"] == 2
+
+
+def test_weekend_plus_holiday_bridge_is_not_stale(tmp_duckdb, patch_symbols):
+    """Issue #253 — the weekend-then-holiday bridge: last bar Fri 2026-01-23,
+    then Sat/Sun (weekend) immediately followed by Mon 2026-01-26 (Republic
+    Day, a seeded NSE TRADING_HOLIDAY), checked on Tue 2026-01-27.
+
+    Only Tue is a genuine trading day in the gap, so with threshold 0
+    (the strictest — "today's close required") staleness must be exactly 1,
+    never 2 (weekday-only counting would count Mon as a missed business day
+    too: Mon+Tue == 2). This is the calendar shape the issue names explicitly
+    ("Fri last bar, Sat/Sun + Mon holiday, check Tue").
+    """
+    patch_symbols(["AAA"], ["NIFTY"])
+    path = tmp_duckdb({"AAA": (2026, 1, 23), "NIFTY": (2026, 1, 23)})
+    ok, details = dfs.check_strategy_data_ready(
+        "x", date="2026-01-27", duckdb_path=path, max_staleness_business_days=1
+    )
+    assert details["AAA"]["staleness_days"] == 1  # NOT 2 — the bridge collapses correctly
+    assert ok is True  # threshold 1 -> staleness 1 is FRESH
 
 
 def test_threshold_is_configurable(tmp_duckdb, patch_symbols):

@@ -84,16 +84,25 @@ def make_historify(tmp_path):
 # many-day-old row.
 # ----------------------------------------------------------------------- #
 def test_5_business_day_old_row_is_stale_not_silently_fresh(make_historify):
-    """A symbol whose last bar is 2026-06-22 (Monday), evaluated on
-    2026-06-29 (Monday), is 5 business days behind. ``compute_stale_symbols``
+    """A symbol whose last bar is 2026-07-06 (Monday), evaluated on
+    2026-07-13 (Monday), is 5 trading days behind. ``compute_stale_symbols``
     must report it as stale at threshold=1 — never silently fresh.
 
-    The divergence: market_data thinks "last bar = 2026-06-22"; the
-    reference clock thinks "today = 2026-06-29". The verdict must reflect
+    The divergence: market_data thinks "last bar = 2026-07-06"; the
+    reference clock thinks "today = 2026-07-13". The verdict must reflect
     that gap.
+
+    Window choice (issue #253): the original window (2026-06-22 → 06-29)
+    crossed Muharram (Fri 2026-06-26, a seeded NSE TRADING_HOLIDAY), so when
+    the staleness math became holiday-aware the hardcoded ``== 5`` broke
+    (holiday-aware count: 4). This window sits in July 2026 — verified free
+    of every seeded 2025/2026 holiday (the seed gap runs Muharram 06-26 →
+    Ganesh Chaturthi 09-14) — so the literal 5 stays a genuine, hardcoded
+    expectation rather than a value computed from the code under test. The
+    holiday-crossing variant is pinned separately below.
     """
-    last_bar = date(2026, 6, 22)  # Monday, 7 calendar days = 5 business days back.
-    ref_today = date(2026, 6, 29)  # Monday.
+    last_bar = date(2026, 7, 6)  # Monday, 7 calendar days = 5 trading days back.
+    ref_today = date(2026, 7, 13)  # Monday.
 
     path = make_historify({"STALE_SYM": _epoch_at(last_bar.year, last_bar.month, last_bar.day)})
 
@@ -110,6 +119,38 @@ def test_5_business_day_old_row_is_stale_not_silently_fresh(make_historify):
     )
     assert "STALE_SYM" not in fresh
     assert details["STALE_SYM"]["staleness_days"] == 5
+    assert details["STALE_SYM"]["stale"] is True
+
+
+def test_week_old_row_across_holiday_counts_trading_days_and_stays_stale(make_historify):
+    """Issue #253 companion to the test above — the SAME calendar shape
+    (Monday last bar → next-Monday reference) but crossing Muharram
+    (Fri 2026-06-26, a seeded NSE TRADING_HOLIDAY). Holiday-aware counting
+    gives 4 trading days (Tue 23 + Wed 24 + Thu 25 + Mon 29; the holiday
+    Friday contributes nothing), NOT the weekday-only 5.
+
+    Both numbers here are hardcoded — nothing is computed from
+    ``is_trading_day`` — so this is a real expectation, not a tautology.
+    The load-bearing part of the original contract is unchanged: a
+    week-old row must STILL be flagged stale at threshold=1. Holiday
+    awareness reduces the *count*; it must never flip the *verdict* on a
+    genuinely week-old row.
+    """
+    last_bar = date(2026, 6, 22)  # Monday.
+    ref_today = date(2026, 6, 29)  # Monday; Fri 06-26 in between is Muharram.
+
+    path = make_historify({"STALE_SYM": _epoch_at(last_bar.year, last_bar.month, last_bar.day)})
+
+    stale, fresh, details = dfs.compute_stale_symbols(
+        path,
+        ["STALE_SYM"],
+        today=ref_today,
+        max_staleness_business_days=1,
+    )
+
+    assert "STALE_SYM" in stale
+    assert "STALE_SYM" not in fresh
+    assert details["STALE_SYM"]["staleness_days"] == 4  # NOT 5 — Muharram excluded
     assert details["STALE_SYM"]["stale"] is True
 
 
@@ -159,9 +200,15 @@ def test_friday_close_on_monday_morning_at_default_threshold_is_fresh(make_histo
     counting calendar days rather than business days), this assertion
     flips — the cross-source verdict would be broken in the
     over-alerting direction (every Monday morning).
+
+    Anchor choice (issue #253): originally Fri 2026-06-26 — which is
+    Muharram, a seeded NSE TRADING_HOLIDAY, i.e. a day this bar could not
+    exist. The interval never crossed the holiday so the numbers happened
+    to hold, but the premise was unreal; re-anchored to a genuine trading
+    Friday in the holiday-free July 2026 stretch.
     """
-    fri_close = _epoch_at(2026, 6, 26, hh=15, mm=29)  # Friday 15:29 IST
-    monday = date(2026, 6, 29)
+    fri_close = _epoch_at(2026, 7, 10, hh=15, mm=29)  # Friday 15:29 IST (trading day)
+    monday = date(2026, 7, 13)
 
     path = make_historify({"WEEKEND_OK": fri_close})
 

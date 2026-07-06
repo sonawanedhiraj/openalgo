@@ -1254,13 +1254,18 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
 - **Values:** non-negative integer. `1` == "yesterday's close is acceptable" (the
   realistic state at 15:20 IST, before today's after-close backfill runs);
   day-before-yesterday is stale.
-- **Effect:** the per-symbol staleness threshold (business days behind the
-  reference trading day) above which a symbol is flagged stale. Weekend-aware;
-  market holidays are NOT modelled (a mid-week holiday inflates measured staleness
-  by one business day — the default-1 threshold absorbs the common case).
+- **Effect:** the per-symbol staleness threshold (trading days behind the
+  reference trading day) above which a symbol is flagged stale. Weekend- and
+  NSE-holiday-aware since issue #253 (`is_trading_day()` consults
+  `database.market_calendar_db.is_market_holiday()`; fails open to the prior
+  weekday-only behavior with a once-per-year WARNING if the calendar has no
+  rows for a given year — e.g. a future year before its yearly seed lands).
 - **Who flips:** operator only.
 - **History:**
   - **2026-06-10:** Introduced with `DATA_FRESHNESS_VALIDATION_ENABLED`. Default 1.
+  - **2026-07-06 (#253):** Staleness math became holiday-aware (previously
+    weekend-only) — no default/threshold change, just a more accurate
+    trading-day count. No new env flag; fail-open is behavior, not a toggle.
 
 ### Simplified engine — EOD journal reconciliation
 
