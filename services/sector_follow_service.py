@@ -886,10 +886,45 @@ class SectorFollowService:
         scanner aggregator had no intraday bars for the mapped sector
         indices. The boot-time fix in ``compute_aggregator_symbols`` prevents
         this from recurring, but we also fail-loud here so the operator sees
-        a CRITICAL Telegram alert if it ever happens again."""
+        a CRITICAL Telegram alert if it ever happens again.
+
+        STRICTLY unchanged behavior (issue #352) — this now delegates to
+        ``_evaluate_candidates_impl`` and discards the per-symbol details it also
+        computes. Every log line, the completeness metric, and the all-indices-empty
+        alert fire exactly as before, in the same order, from the same call site.
+        """
+        candidates, _details = self._evaluate_candidates_impl(as_of)
+        return candidates
+
+    def evaluate_candidates_with_details(
+        self, as_of: datetime | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        """Same selection as ``evaluate_candidates`` PLUS the per-symbol decision
+        inputs it already computes for the PASS/FAIL log (issue #352).
+
+        Additive only — callers that don't need the breakdown should keep calling
+        ``evaluate_candidates()``; this method exists so ``futures_follow_service``
+        can capture the "why zero signals" breakdown at its own call site without
+        changing sector_follow's own gate logic, selection, or logging.
+
+        Returns ``(candidates, details)`` where ``details`` is one dict per
+        universe symbol: ``{symbol, sector_index, sector_ret, stock_ret,
+        vol_ratio, current_price, intraday_source, passed}``.
+        """
+        return self._evaluate_candidates_impl(as_of)
+
+    def _evaluate_candidates_impl(
+        self, as_of: datetime | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        """Shared implementation behind ``evaluate_candidates`` /
+        ``evaluate_candidates_with_details`` — computes candidates AND the
+        per-symbol details in one pass so the two public methods can never drift
+        apart. Do not change gate order, log lines, or the completeness/alert
+        calls without re-verifying every existing sector_follow test."""
         as_of = as_of or self._now()
         metrics = self._metrics_provider(as_of, self.config.universe, self.sector_map, self.config)
         candidates: list[dict] = []
+        details: list[dict] = []
         n_intraday = 0
         total = len(self.config.universe) or len(metrics)
         n_sector_ret_none = 0
@@ -900,7 +935,8 @@ class SectorFollowService:
                 n_intraday += 1
             if m.get("sector_ret") is None:
                 n_sector_ret_none += 1
-            if passes_gates(m, self.config):
+            passed = passes_gates(m, self.config)
+            if passed:
                 logger.info(
                     "sector_follow PASS %s: sector_ret=%.4f stock_ret=%.4f vol_ratio=%.2f src=%s",
                     symbol,
@@ -922,6 +958,19 @@ class SectorFollowService:
                 logger.info(
                     "sector_follow FAIL %s: reason=%s", symbol, _gate_fail_reason(m, self.config)
                 )
+            details.append(
+                {
+                    "symbol": symbol,
+                    "sector_index": self.sector_map.get(symbol, "NIFTY"),
+                    "sector_ret": m.get("sector_ret"),
+                    "stock_ret": m.get("stock_ret"),
+                    "vol_ratio": m.get("vol_ratio"),
+                    "current_price": m.get("current_price"),
+                    "intraday_source": m.get("intraday_source"),
+                    "passed": passed,
+                    "fail_reason": None if passed else _gate_fail_reason(m, self.config),
+                }
+            )
         logger.info(
             "sector_follow eval @ %s: %d/%d candidates passed gates",
             as_of.isoformat(),
@@ -936,7 +985,7 @@ class SectorFollowService:
         # data at all is a different problem the completeness metric covers).
         if total and n_sector_ret_none == total:
             self._alert_all_indices_empty(as_of)
-        return candidates
+        return candidates, details
 
     def _alert_all_indices_empty(self, as_of: datetime) -> None:
         """Issue #161 CRITICAL: every metric had sector_ret=None — the

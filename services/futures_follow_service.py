@@ -274,6 +274,71 @@ def production_signal_evaluator(as_of: datetime | None = None) -> list[dict]:
     return select_entries(candidates, set(), sf_config.max_concurrent_positions)
 
 
+def production_signal_evaluator_details(as_of: datetime | None = None) -> dict:
+    """Per-symbol decision-input breakdown for the SAME evaluation cycle
+    ``production_signal_evaluator`` runs (issue #352).
+
+    STRICTLY additive / observability-only — this rebuilds the identical metrics
+    dict (same config, sector map, intraday source, metrics provider) that
+    ``production_signal_evaluator`` uses and reports gate-level detail for every
+    universe symbol. It does NOT feed back into gate logic, signal selection, or
+    order placement; ``run_entry`` calls this separately (best-effort, after
+    ``evaluate_signals``) purely to persist "why zero/N signals today".
+
+    Returns ``{n_by_source: {...}, symbols: [{symbol, sector_index, sector_ret,
+    stock_ret, vol_ratio, current_price, intraday_source, passed, fail_reason}]}``.
+    """
+    from services.sector_follow_service import (
+        _gate_fail_reason,
+        duckdb_metrics_provider,
+        make_duckdb_metrics_provider,
+        make_quotes_intraday_provider,
+        passes_gates,
+    )
+    from services.sector_follow_service import (
+        load_config as _sf_load_config,
+    )
+    from services.sector_follow_service import (
+        load_sector_map as _sf_load_sector_map,
+    )
+
+    as_of = as_of or datetime.now(_IST)
+    sf_config = _sf_load_config()
+    sector_map = _sf_load_sector_map()
+    source = futures_intraday_source()
+    if source == "quotes":
+        quotes_provider = make_quotes_intraday_provider(
+            universe=sf_config.universe, sector_map=sector_map
+        )
+        metrics_provider = make_duckdb_metrics_provider(intraday_provider=quotes_provider)
+        metrics = metrics_provider(as_of, sf_config.universe, sector_map, sf_config)
+    else:
+        metrics = duckdb_metrics_provider(as_of, sf_config.universe, sector_map, sf_config)
+
+    n_by_src = {"quotes": 0, "aggregator": 0, "historify": 0, "none": 0}
+    symbols: list[dict] = []
+    for symbol in sf_config.universe:
+        m = metrics.get(symbol, {})
+        src = m.get("intraday_source")
+        if src in n_by_src:
+            n_by_src[src] += 1
+        passed = passes_gates(m, sf_config)
+        symbols.append(
+            {
+                "symbol": symbol,
+                "sector_index": sector_map.get(symbol, "NIFTY"),
+                "sector_ret": m.get("sector_ret"),
+                "stock_ret": m.get("stock_ret"),
+                "vol_ratio": m.get("vol_ratio"),
+                "current_price": m.get("current_price"),
+                "intraday_source": src,
+                "passed": passed,
+                "fail_reason": None if passed else _gate_fail_reason(m, sf_config),
+            }
+        )
+    return {"n_by_source": n_by_src, "symbols": symbols}
+
+
 # --------------------------------------------------------------------------- #
 # Production NIFTY near-month future contract resolver — injected default
 # --------------------------------------------------------------------------- #
@@ -631,6 +696,7 @@ class FuturesFollowService:
         config: FuturesFollowConfig | None = None,
         mode: str | None = None,
         signal_evaluator: Callable[..., list[dict]] | None = None,
+        signal_evaluator_details: Callable[..., dict] | None = None,
         contract_resolver: Callable[..., dict | None] | None = None,
         order_placer: Callable[[str, dict], dict] | None = None,
         price_fetcher: Callable[[str, str], float | None] | None = None,
@@ -653,6 +719,10 @@ class FuturesFollowService:
             self.mode = "sandbox"
 
         self._signal_evaluator = signal_evaluator or production_signal_evaluator
+        # Entry-breakdown capture (issue #352). ``None`` in unit tests by default
+        # (observability capture skipped, hermetic — mirrors data_health_checker);
+        # the live singleton injects ``production_signal_evaluator_details``.
+        self._signal_evaluator_details = signal_evaluator_details
         self._contract_resolver = contract_resolver or production_contract_resolver
         self._order_placer = order_placer or production_order_placer
         self._price_fetcher = price_fetcher or production_price_fetcher
@@ -1497,7 +1567,11 @@ class FuturesFollowService:
         skipped = 0
         vetoed = 0
         review_elapsed_s = 0.0
+        # Issue #352: per-symbol outcome for the entry-breakdown snapshot —
+        # observability only, never consulted by the placement logic above.
+        signal_outcomes: dict[str, str] = {}
         for sig in signals:
+            symbol = sig.get("symbol")
             lots = compute_lots_to_buy(
                 lots_filled,
                 self.config.capital_inr,
@@ -1509,6 +1583,8 @@ class FuturesFollowService:
             )
             if lots <= 0:
                 skipped += 1
+                if symbol:
+                    signal_outcomes[symbol] = "cap_skipped"
                 logger.info(
                     "futures_follow CAP HIT — skipping signal %s (margin cap %.0f)",
                     sig.get("symbol"),
@@ -1523,12 +1599,18 @@ class FuturesFollowService:
             )
             if not proceed:
                 vetoed += 1
+                if symbol:
+                    signal_outcomes[symbol] = "vetoed"
                 continue
             r = self.place_entry(sig, contract, lots, entry_price)
             self._mark_review_outcome(decision_id, taken=bool(r))
             if r:
                 placed.append(r)
                 lots_filled += lots
+                if symbol:
+                    signal_outcomes[symbol] = "in_cap_placed"
+            elif symbol:
+                signal_outcomes[symbol] = "placement_failed"
         logger.info(
             "futures_follow entry job placed %d lot-order(s), skipped %d (cap), "
             "vetoed %d (LLM), [mode=%s]",
@@ -1550,7 +1632,150 @@ class FuturesFollowService:
                 f"🛑 {STRATEGY_NAME} [{self.mode}] Stage-1 LLM veto (mode={veto_mode}) "
                 f"skipped all {vetoed} signal(s) today — no NIFTY lots bought"
             )
+        # Issue #352: capture + persist the entry-evaluation breakdown AFTER all
+        # placement decisions are final. Wrapped fail-graceful — a capture/persist
+        # failure must never affect the entries already placed above.
+        try:
+            self._capture_entry_breakdown(
+                now_ist=now_ist,
+                signals=signals,
+                signal_outcomes=signal_outcomes,
+                skipped=skipped,
+                vetoed=vetoed,
+            )
+        except Exception:
+            logger.exception("futures_follow: entry-breakdown capture/persist failed (ignored)")
         return placed
+
+    def _capture_entry_breakdown(
+        self,
+        *,
+        now_ist: datetime,
+        signals: list[dict],
+        signal_outcomes: dict[str, str],
+        skipped: int,
+        vetoed: int,
+    ) -> None:
+        """Build + persist the "why zero/N signals today" snapshot (issue #352).
+
+        Best-effort observability: if no ``signal_evaluator_details`` is injected
+        (unit tests, or a future evaluator swap that doesn't support it) this is a
+        silent no-op — it never raises, and ``run_entry`` already wraps this call
+        in a try/except as a second layer of defense.
+        """
+        if self._signal_evaluator_details is None:
+            return
+        details = self._signal_evaluator_details(now_ist) or {}
+        n_by_source = details.get("n_by_source") or {}
+        symbols_payload = []
+        for row in details.get("symbols") or []:
+            symbol = row.get("symbol")
+            passed = bool(row.get("passed"))
+            if symbol in signal_outcomes:
+                # Every symbol in `signals` (the K5-selected candidates) reaches
+                # exactly one outcome in the run_entry loop above — cap_skipped,
+                # vetoed, in_cap_placed, or placement_failed.
+                outcome = signal_outcomes[symbol]
+            elif passed:
+                # Passed the sector_follow gates but fell outside the K5
+                # selection (e.g. a lower vol_ratio than the top-5 cut).
+                outcome = "not_selected"
+            else:
+                reason = row.get("fail_reason") or ""
+                outcome = "missing_data" if reason.startswith("None data") else "first_failed_gate"
+            symbols_payload.append(
+                {
+                    "symbol": symbol,
+                    "sector_index": row.get("sector_index"),
+                    "sector_ret": row.get("sector_ret"),
+                    "stock_ret": row.get("stock_ret"),
+                    "vol_ratio": row.get("vol_ratio"),
+                    "intraday_source": row.get("intraday_source"),
+                    "outcome": outcome,
+                    "fail_reason": row.get("fail_reason"),
+                }
+            )
+
+        # Sort by "closeness to passing": placed/passing symbols first, then
+        # symbols that failed exactly one gate ranked by how close their metrics
+        # were to the thresholds (smallest shortfall first), then symbols missing
+        # data last (nothing to rank them by). This is what makes the "closeness
+        # to passing" table in the UI actually useful for the operator.
+        placed_first = {
+            "in_cap_placed": 0,
+            "vetoed": 1,
+            "cap_skipped": 1,
+            "placement_failed": 1,
+            "not_selected": 1,
+        }
+
+        def _shortfall(row: dict) -> float:
+            """Fractional shortfall vs the tightest-missed gate threshold (issue
+            #352's "closeness to passing" — lower is closer). Missing-data rows
+            sort last via a large sentinel."""
+            sector_ret, stock_ret, vol_ratio = (
+                row.get("sector_ret"),
+                row.get("stock_ret"),
+                row.get("vol_ratio"),
+            )
+            if sector_ret is None or stock_ret is None or vol_ratio is None:
+                return float("inf")
+            try:
+                from services.sector_follow_service import load_config as _sf_load_config
+
+                sf_cfg = _sf_load_config()
+                gaps = [
+                    (sf_cfg.gate_sector_ret - sector_ret) / max(abs(sf_cfg.gate_sector_ret), 1e-9),
+                    (sf_cfg.gate_stock_ret - stock_ret) / max(abs(sf_cfg.gate_stock_ret), 1e-9),
+                    (sf_cfg.gate_vol_mult - vol_ratio) / max(abs(sf_cfg.gate_vol_mult), 1e-9),
+                ]
+                return max(gaps)
+            except Exception:
+                return float("inf")
+
+        symbols_payload.sort(key=lambda r: (placed_first.get(r["outcome"], 2), _shortfall(r)))
+
+        per_gate_fail_counts = {"sector": 0, "stock": 0, "vol": 0, "missing_data": 0}
+        for row in symbols_payload:
+            reason = row.get("fail_reason") or ""
+            if row["outcome"] == "missing_data" or reason.startswith("None data"):
+                per_gate_fail_counts["missing_data"] += 1
+                continue
+            if "sector " in reason:
+                per_gate_fail_counts["sector"] += 1
+            if "stock " in reason:
+                per_gate_fail_counts["stock"] += 1
+            if "vol " in reason:
+                per_gate_fail_counts["vol"] += 1
+
+        payload = {
+            "eval_at": now_ist.isoformat(),
+            "mode": self.mode,
+            "n_signals": len(signals),
+            "intraday_source_counts": {
+                "quotes": n_by_source.get("quotes", 0),
+                "aggregator": n_by_source.get("aggregator", 0),
+                "historify": n_by_source.get("historify", 0),
+                "none": n_by_source.get("none", 0),
+            },
+            "cap_skipped": skipped,
+            "vetoed": vetoed,
+            "per_gate_fail_counts": per_gate_fail_counts,
+            "symbols": symbols_payload,
+        }
+
+        from database.futures_follow_eval_db import init_db as _init_eval_db
+        from database.futures_follow_eval_db import upsert_snapshot
+
+        _init_eval_db()
+        eval_date = (
+            now_ist.astimezone(_IST).date().isoformat()
+            if now_ist.tzinfo
+            else now_ist.date().isoformat()
+        )
+        ok = upsert_snapshot(STRATEGY_NAME, eval_date, payload, eval_at=now_ist)
+        if not ok:
+            logger.warning("futures_follow: entry-breakdown snapshot upsert reported failure")
 
     def run_exit(self) -> list[dict]:
         """15:25 IST: square off every position opened on a prior trading day (T+1).
@@ -2279,6 +2504,7 @@ def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowServic
         broker_session_checker=production_broker_session_checker,
         signal_reviewer=production_signal_reviewer,
         market_context_provider=production_market_context,
+        signal_evaluator_details=production_signal_evaluator_details,
     )
     svc.register_jobs(scheduler)
     # R2 (#318): surface the veto enforcement default loudly at boot. With no

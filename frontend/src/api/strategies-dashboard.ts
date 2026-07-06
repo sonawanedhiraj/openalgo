@@ -156,10 +156,79 @@ export interface ParametersDiff {
 }
 
 // ---------------------------------------------------------------------------
+// Entry-evaluation breakdown (issue #352) — futures_follow_cap50 only
+// ---------------------------------------------------------------------------
+
+export type EntryBreakdownOutcome =
+  | 'in_cap_placed'
+  | 'cap_skipped'
+  | 'vetoed'
+  | 'placement_failed'
+  | 'not_selected'
+  | 'first_failed_gate'
+  | 'missing_data'
+
+export interface EntryBreakdownSymbol {
+  symbol: string
+  sector_index: string | null
+  sector_ret: number | null
+  stock_ret: number | null
+  vol_ratio: number | null
+  intraday_source: string | null
+  outcome: EntryBreakdownOutcome
+  fail_reason: string | null
+}
+
+export interface EntryBreakdownPayload {
+  eval_at: string
+  mode: string
+  n_signals: number
+  intraday_source_counts: {
+    quotes: number
+    aggregator: number
+    historify: number
+    none: number
+  }
+  cap_skipped: number
+  vetoed: number
+  per_gate_fail_counts: {
+    sector: number
+    stock: number
+    vol: number
+    missing_data: number
+  }
+  symbols: EntryBreakdownSymbol[]
+}
+
+export interface EntryBreakdownSnapshot {
+  id: number
+  strategy_name: string
+  eval_date: string
+  eval_at: string | null
+  payload: EntryBreakdownPayload
+  created_at: string | null
+}
+
+// ---------------------------------------------------------------------------
 // API client
 // ---------------------------------------------------------------------------
 
 export const strategiesDashboardApi = {
+  /**
+   * Today's 15:20 entry-evaluation breakdown (issue #352) — served by the
+   * futures_follow control blueprint (session-cookie auth accepted for this
+   * read-only endpoint). `null` data means no evaluation recorded yet.
+   */
+  getEntryBreakdown: async (date?: string): Promise<EntryBreakdownSnapshot | null> => {
+    const params: Record<string, string> = {}
+    if (date) params.date = date
+    const res = await webClient.get<{ status: string; data: EntryBreakdownSnapshot | null }>(
+      '/futures_follow_cap50/api/entry_breakdown',
+      { params }
+    )
+    return res.data.data
+  },
+
   /** List all strategies with summary metrics. */
   listStrategies: async (): Promise<StrategySummary[]> => {
     const res = await webClient.get<{ status: string; data: StrategySummary[] }>(

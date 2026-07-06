@@ -12,6 +12,7 @@ import {
   FileBarChart2,
   GitCompare,
   History,
+  ListChecks,
   Loader2,
   PauseCircle,
   RefreshCw,
@@ -32,6 +33,8 @@ import {
 } from 'recharts'
 import {
   type DataHealth,
+  type EntryBreakdownOutcome,
+  type EntryBreakdownSymbol,
   type LLMDecisionRow,
   type LLMFlipOutcome,
   type LLMMode,
@@ -928,6 +931,214 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
 }
 
 // ---------------------------------------------------------------------------
+// Entry-evaluation breakdown card (issue #352) — futures_follow_cap50 only.
+// Answers "why zero signals today" from the persisted 15:20 evaluation snapshot
+// without reading logs. Data starts with the first post-deploy 15:20 run.
+// ---------------------------------------------------------------------------
+
+function fmtPct(v: number | null | undefined) {
+  if (v == null) return '—'
+  return `${(v * 100).toFixed(2)}%`
+}
+
+function OutcomeBadge({ outcome }: { outcome: EntryBreakdownOutcome }) {
+  if (outcome === 'in_cap_placed')
+    return (
+      <Badge className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 text-xs py-0">
+        placed
+      </Badge>
+    )
+  if (outcome === 'not_selected')
+    return (
+      <Badge className="bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400 text-xs py-0">
+        passed (not selected)
+      </Badge>
+    )
+  if (outcome === 'cap_skipped')
+    return (
+      <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-xs py-0">
+        cap skipped
+      </Badge>
+    )
+  if (outcome === 'vetoed')
+    return (
+      <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 text-xs py-0">
+        LLM vetoed
+      </Badge>
+    )
+  if (outcome === 'placement_failed')
+    return (
+      <Badge variant="destructive" className="text-xs py-0">
+        placement failed
+      </Badge>
+    )
+  if (outcome === 'missing_data')
+    return (
+      <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs py-0 gap-1">
+        <AlertTriangle className="h-3 w-3" /> missing data
+      </Badge>
+    )
+  return (
+    <Badge variant="outline" className="text-xs py-0 text-muted-foreground">
+      failed gate
+    </Badge>
+  )
+}
+
+function BreakdownSymbolRow({ row }: { row: EntryBreakdownSymbol }) {
+  return (
+    <tr className="border-b last:border-0 hover:bg-muted/20">
+      <td className="px-3 py-1.5 font-mono">{row.symbol}</td>
+      <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap">
+        {row.sector_index ?? '—'}
+      </td>
+      <td className="px-3 py-1.5 text-right tabular-nums font-mono">{fmtPct(row.sector_ret)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums font-mono">{fmtPct(row.stock_ret)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+        {row.vol_ratio != null ? row.vol_ratio.toFixed(2) : '—'}
+      </td>
+      <td className="px-3 py-1.5">
+        <OutcomeBadge outcome={row.outcome} />
+      </td>
+      <td
+        className="px-3 py-1.5 text-muted-foreground max-w-[16rem] truncate"
+        title={row.fail_reason ?? undefined}
+      >
+        {row.fail_reason ?? '—'}
+      </td>
+      <td className="px-3 py-1.5 text-muted-foreground">{row.intraday_source ?? '—'}</td>
+    </tr>
+  )
+}
+
+export function EntryBreakdownCard() {
+  const [expanded, setExpanded] = useState(false)
+
+  const { data: snapshot, isLoading } = useQuery({
+    queryKey: ['futures-follow-entry-breakdown'],
+    queryFn: () => strategiesDashboardApi.getEntryBreakdown(),
+    refetchInterval: 60_000,
+  })
+
+  const payload = snapshot?.payload
+  const gateFails = payload?.per_gate_fail_counts
+  const sources = payload?.intraday_source_counts
+  const total = payload?.symbols.length ?? 0
+  const liveCount = (sources?.quotes ?? 0) + (sources?.aggregator ?? 0)
+  // The source most symbols were served by (mirrors the 'source=quotes
+  // fetched=30/30' log line).
+  const dominantSource = sources
+    ? (Object.entries(sources).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'none')
+    : 'none'
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2">
+          <ListChecks className="h-4 w-4" /> Today's 15:20 Evaluation
+          {payload && (
+            <span className="text-xs text-muted-foreground font-normal">
+              {fmtDate(payload.eval_at)} · mode {payload.mode}
+            </span>
+          )}
+        </CardTitle>
+        {payload && (
+          <p className="text-xs text-muted-foreground">
+            {payload.n_signals} signal{payload.n_signals !== 1 ? 's' : ''} · source {dominantSource}{' '}
+            {liveCount}/{total}
+            {payload.cap_skipped > 0 && ` · ${payload.cap_skipped} cap-skipped`}
+            {payload.vetoed > 0 && ` · ${payload.vetoed} LLM-vetoed`}
+          </p>
+        )}
+      </CardHeader>
+      <CardContent className="p-0">
+        {isLoading ? (
+          <div className="p-4">
+            <Skeleton className="h-24 w-full" />
+          </div>
+        ) : !payload ? (
+          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
+            No evaluation recorded yet — the breakdown is captured at the next 15:20 IST entry run.
+          </p>
+        ) : (
+          <>
+            {/* Per-gate summary */}
+            <div className="flex flex-wrap gap-2 px-4 pb-3">
+              <Badge variant="outline" className="text-xs text-muted-foreground">
+                sector &gt;1%: {gateFails?.sector ?? 0} failed
+              </Badge>
+              <Badge variant="outline" className="text-xs text-muted-foreground">
+                stock &gt;0.5%: {gateFails?.stock ?? 0} failed
+              </Badge>
+              <Badge variant="outline" className="text-xs text-muted-foreground">
+                vol &gt;1x: {gateFails?.vol ?? 0} failed
+              </Badge>
+              {(gateFails?.missing_data ?? 0) > 0 && (
+                <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs">
+                  missing data: {gateFails?.missing_data}
+                </Badge>
+              )}
+            </div>
+            {/* Expandable per-symbol table (sorted by closeness to passing) */}
+            <button
+              type="button"
+              className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
+              onClick={() => setExpanded(!expanded)}
+            >
+              <span>Per-symbol breakdown ({total} symbols, sorted by closeness to passing)</span>
+              {expanded ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+            </button>
+            {expanded && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b bg-muted/30">
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Symbol
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Sector Index
+                      </th>
+                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                        Sector Ret
+                      </th>
+                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                        Stock Ret
+                      </th>
+                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                        Vol Ratio
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Outcome
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Fail Reason
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Source
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payload.symbols.map((row) => (
+                      <BreakdownSymbolRow key={row.symbol} row={row} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Parameter snapshot
 // ---------------------------------------------------------------------------
 
@@ -1151,6 +1362,9 @@ export default function StrategyDetailPage() {
         <PerfTable data={data} />
         <PnlCurve name={data.name} />
       </div>
+
+      {/* Today's 15:20 entry-evaluation breakdown (issue #352) */}
+      {data.name === 'futures_follow_cap50' && <EntryBreakdownCard />}
 
       {/* Recent trades */}
       <RecentTradesTable trades={data.recent_trades} />

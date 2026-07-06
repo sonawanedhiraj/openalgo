@@ -39,6 +39,24 @@ def _authed() -> bool:
     return bool(key and verify_api_key(key))
 
 
+def _authed_for_read() -> bool:
+    """API key (control-API pattern) OR a valid logged-in browser session.
+
+    Used ONLY by the read-only ``entry_breakdown`` endpoint (issue #352) so the
+    React strategy page — which authenticates via the Flask session cookie, not
+    an API key — can render the card. Every mutating endpoint above keeps the
+    strict API-key-only ``_authed()``.
+    """
+    if _authed():
+        return True
+    try:
+        from utils.session import is_session_valid
+
+        return bool(is_session_valid())
+    except Exception:
+        return False
+
+
 def _unauthorized():
     return jsonify({"status": "error", "message": "Invalid or missing API key"}), 401
 
@@ -95,6 +113,38 @@ def data_health():
         )
     except Exception as e:
         logger.exception("futures_follow data_health failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@futures_follow_bp.route("/api/entry_breakdown", methods=["GET"])
+def entry_breakdown():
+    """The 15:20 entry-evaluation breakdown snapshot for a given date (issue #352).
+
+    Read-only on ``futures_follow_eval_snapshots`` — this endpoint never triggers
+    an evaluation, it only reads whatever ``FuturesFollowService.run_entry``
+    already persisted that day. Defaults to today's (IST) row; ``?date=YYYY-MM-DD``
+    reads any past day. ``data`` is ``null`` when no evaluation has been recorded
+    yet for that date (e.g. before the first post-deploy 15:20 run) — the UI shows
+    "no evaluation recorded yet" rather than treating that as an error.
+    """
+    if not _authed_for_read():
+        return _unauthorized()
+    try:
+        from datetime import date as _date
+        from datetime import datetime, timedelta, timezone
+
+        from database.futures_follow_eval_db import get_snapshot
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        date_str = request.args.get("date") or datetime.now(ist).date().isoformat()
+        try:
+            _date.fromisoformat(date_str)
+        except ValueError:
+            return jsonify({"status": "error", "message": f"invalid date: {date_str}"}), 400
+        snapshot = get_snapshot("futures_follow_cap50", date_str)
+        return jsonify({"status": "success", "data": snapshot})
+    except Exception as e:
+        logger.exception("futures_follow entry_breakdown failed: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
