@@ -7,7 +7,7 @@ the 100-min silent warmup window after every restart.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -15,8 +15,10 @@ import pytest
 
 from services import scanner_aggregator_seeder
 from services.scanner_aggregator_seeder import (
+    _calendar_days_for_lookback,
     _read_1m_bars_for_symbol,
     seed_aggregator,
+    session_aware_start_ts,
 )
 
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -800,3 +802,341 @@ def test_today_d_falls_back_to_historify_when_5m_lacks_timestamp_column():
     assert today_d["close"] == 2050
     assert yest_d["close"] == 2094
     assert yest_idx == -2
+
+
+# --------------------------------------------------------------------------- #
+# session_aware_start_ts (issue #340)
+# --------------------------------------------------------------------------- #
+# Reproduces the 2026-07-06 incident: boot 08:26 IST (pre-market), default
+# lookback 500min. The old wall-clock computation gave start_ts = now - 500min
+# = ~00:06 IST — a window with ZERO trading bars, which is why the seeder
+# recorded 0/227 symbols seeded and the 15m warm-up gate then rejected the
+# whole universe until ~13:00 IST (n_rows=7 at 10:35 vs required=15).
+
+
+def test_session_aware_start_ts_premarket_boot_walks_back_to_prior_session():
+    """A pre-market boot (before 09:15 IST) must NOT anchor the window inside
+    the empty overnight gap — it should walk back into the prior trading
+    session(s), same as if the boot had happened right at yesterday's close."""
+    # Monday 2026-07-06, 08:26 IST — the exact incident boot time.
+    now = datetime(2026, 7, 6, 8, 26)
+    start_ts = session_aware_start_ts(now, 500)
+    start_dt = datetime.fromtimestamp(start_ts, _IST)
+
+    # Must land on a WEEKDAY, inside a session window [09:15, 15:30], and
+    # strictly before `now` (so the fetch window is non-degenerate).
+    assert start_dt.weekday() < 5
+    assert (9, 15) <= (start_dt.hour, start_dt.minute) <= (15, 30)
+    assert start_dt.replace(tzinfo=None) < now
+
+    # Pre-fix behaviour would have been ~00:06 IST same-day — assert we do NOT
+    # land inside the dead overnight window.
+    dead_zone_start = datetime(2026, 7, 6, 0, 0, tzinfo=_IST)
+    dead_zone_end = datetime(2026, 7, 6, 9, 15, tzinfo=_IST)
+    assert not (dead_zone_start <= start_dt < dead_zone_end)
+
+    # 500 trading minutes back from a Monday pre-market boot must reach back
+    # past the weekend into Thursday/Friday of the prior week (walks back
+    # Fri 375min + Thu remainder = 500min total).
+    assert start_dt.date() == date(2026, 7, 2)  # Thursday
+
+
+def test_session_aware_start_ts_midsession_restart_uses_today_plus_prior_day():
+    """A mid-session restart should pull today's already-elapsed session bars
+    FIRST, then reach back into the prior day only for the remainder — so the
+    window is contiguous ('today's earlier bars + prior day'), not two
+    disjoint chunks."""
+    # Monday 2026-07-06, 10:35 IST — today has elapsed 80 minutes (09:15-10:35).
+    now = datetime(2026, 7, 6, 10, 35)
+    start_ts = session_aware_start_ts(now, 500)
+    start_dt = datetime.fromtimestamp(start_ts, _IST)
+
+    # 500 - 80 = 420 minutes still needed; walks back through the weekend to
+    # Thursday (Friday's 375 covers 375, remaining 45 min end at 14:45 Thu).
+    assert start_dt.date() == date(2026, 7, 2)
+    assert (start_dt.hour, start_dt.minute) == (14, 45)
+
+
+def test_session_aware_start_ts_small_lookback_stays_within_today():
+    """When the elapsed session already covers the lookback, the window must
+    stay entirely inside today — no unnecessary reach into prior days."""
+    # Monday 2026-07-06, 12:00 IST — 165 minutes elapsed since 09:15.
+    now = datetime(2026, 7, 6, 12, 0)
+    start_ts = session_aware_start_ts(now, 60)
+    start_dt = datetime.fromtimestamp(start_ts, _IST)
+
+    assert start_dt.date() == date(2026, 7, 6)
+    assert (start_dt.hour, start_dt.minute) == (11, 0)
+
+
+def test_session_aware_start_ts_weekend_boot_walks_back_to_friday():
+    """A boot on a weekend (e.g. a Sunday maintenance restart) must skip
+    Saturday/Sunday entirely — today contributes 0 trading minutes."""
+    # Sunday 2026-07-05, any time of day.
+    now = datetime(2026, 7, 5, 10, 0)
+    start_ts = session_aware_start_ts(now, 100)
+    start_dt = datetime.fromtimestamp(start_ts, _IST)
+
+    assert start_dt.weekday() == 4  # Friday
+    assert start_dt.date() == date(2026, 7, 3)
+
+
+def test_session_aware_start_ts_never_raises_on_degenerate_lookback():
+    """lookback_min <= 0 must not raise — falls back to a safe wall-clock
+    computation rather than looping or crashing."""
+    now = datetime(2026, 7, 6, 8, 26)
+    start_ts = session_aware_start_ts(now, 0)
+    assert isinstance(start_ts, int)
+    assert start_ts < int(now.timestamp())
+
+
+# --------------------------------------------------------------------------- #
+# _calendar_days_for_lookback (issue #340 — broker-arm trim fix)
+# --------------------------------------------------------------------------- #
+
+
+def test_calendar_days_for_lookback_covers_requested_trading_minutes():
+    """The broker arm's fetch window must span enough CALENDAR days to
+    guarantee `lookback_min` TRADING minutes are actually present to trim —
+    the old fixed 2-day window silently under-covered anything bigger than
+    the original ~210min 15m-warmup use case."""
+    # 500 trading minutes needs ceil(500/375) = 2 trading days; padded for
+    # weekends + slack. Must be strictly more than the old fixed "2".
+    days = _calendar_days_for_lookback(500)
+    assert days > 2
+    # A much larger lookback must ask for correspondingly more days.
+    assert _calendar_days_for_lookback(3000) > _calendar_days_for_lookback(500)
+
+
+def test_calendar_days_for_lookback_small_request_still_gets_a_useful_window():
+    days = _calendar_days_for_lookback(60)
+    assert days >= 3  # at least "yesterday + today" plus slack
+
+
+# --------------------------------------------------------------------------- #
+# Historify arm — session-aware window (issue #340)
+# --------------------------------------------------------------------------- #
+
+
+class _FixedDatetime(datetime):
+    """``datetime`` subclass whose ``.now(tz)`` returns a fixed instant.
+
+    Used to pin ``scanner_aggregator_seeder``'s ``datetime.now(_IST)`` calls
+    during a test without disturbing any other ``datetime`` usage (this
+    subclass inherits everything else — ``fromtimestamp``, arithmetic, etc.
+    — unchanged), unlike patching the whole module with a bare ``MagicMock``.
+    """
+
+    _fixed: datetime | None = None
+
+    @classmethod
+    def now(cls, tz=None):
+        fixed = cls._fixed
+        if fixed is None:
+            return super().now(tz)
+        return fixed if tz is None else fixed.astimezone(tz)
+
+
+def _pin_seeder_now(monkeypatch, fixed_ist: datetime) -> None:
+    """Pin ``scanner_aggregator_seeder.datetime.now(_IST)`` to ``fixed_ist``
+    (a tz-aware IST datetime) for the duration of a test."""
+    pinned = type("_Pinned", (_FixedDatetime,), {"_fixed": fixed_ist})
+    monkeypatch.setattr(scanner_aggregator_seeder, "datetime", pinned)
+
+
+def test_historify_arm_uses_session_aware_window_on_premarket_boot(monkeypatch):
+    """The historify read must ask for a session-aware start_ts, not a raw
+    wall-clock one — verified by capturing the actual start_timestamp/
+    end_timestamp passed to get_ohlcv during a simulated pre-market boot."""
+    captured = {}
+
+    def fake_get_ohlcv(symbol, exchange, interval, start_timestamp=None, end_timestamp=None):
+        captured["start_timestamp"] = start_timestamp
+        captured["end_timestamp"] = end_timestamp
+        return pd.DataFrame()
+
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 8, 26, tzinfo=_IST))
+    with patch("database.historify_db.get_ohlcv", side_effect=fake_get_ohlcv):
+        scanner_aggregator_seeder._read_1m_bars_from_historify("GODREJCP", "NSE", 500)
+
+    assert "start_timestamp" in captured
+    start_dt = datetime.fromtimestamp(captured["start_timestamp"], _IST)
+    # Must NOT be the pre-fix ~00:06 IST same-day dead zone.
+    dead_zone_start = datetime(2026, 7, 6, 0, 0, tzinfo=_IST)
+    dead_zone_end = datetime(2026, 7, 6, 9, 15, tzinfo=_IST)
+    assert not (dead_zone_start <= start_dt < dead_zone_end)
+    assert start_dt.weekday() < 5
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end: pre-market-boot seeding clears the 15m warm-up gate
+# (issue #340 acceptance criteria — drives the REAL _Rolling15mBars path)
+# --------------------------------------------------------------------------- #
+
+
+def _historify_1m_bars_for_session(day: date, n_minutes: int = 375) -> pd.DataFrame:
+    """Production-shaped historify 1m frame: `timestamp` (epoch seconds) +
+    OHLCV, one row per trading minute of `day`'s session (09:15 start),
+    capped at n_minutes rows. Mirrors `database.historify_db.get_ohlcv`'s
+    documented return shape."""
+    base = datetime(day.year, day.month, day.day, 9, 15, tzinfo=_IST)
+    rows = []
+    close = 1090.0
+    for i in range(n_minutes):
+        ts = base + timedelta(minutes=i)
+        close += 0.05
+        rows.append(
+            {
+                "timestamp": int(ts.timestamp()),
+                "open": close - 0.05,
+                "high": close + 0.2,
+                "low": close - 0.2,
+                "close": close,
+                "volume": 500,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_premarket_boot_seed_clears_15m_warmup_immediately(monkeypatch):
+    """Full acceptance scenario (issue #340): seed with prior-day data at a
+    pre-market boot → the 15m frame holds >=15 bars IMMEDIATELY after
+    seeding (no live ticks needed) — the exact condition that clears the
+    `15m_warmup` gate (`n_rows >= required=15`) that rejected GODREJCP at
+    10:35 IST on 2026-07-06.
+
+    Drives the real `_Rolling15mBars` via `seed_aggregator`'s
+    `bar_15m_history` param — not a synthetic shortcut — plus the real
+    `MultiIntervalAggregator.replay_bars` fan-out for the 5m side.
+    """
+    from services.bar_aggregator import MultiIntervalAggregator
+    from services.scanner_service import _Rolling15mBars
+
+    # Prior trading day (Friday 2026-07-03) has a full session of 1m bars.
+    prior_day = date(2026, 7, 3)
+    historify_frame = _historify_1m_bars_for_session(prior_day, n_minutes=375)
+
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 8, 26, tzinfo=_IST))  # Monday pre-market
+
+    with patch("database.historify_db.get_ohlcv", return_value=historify_frame):
+        bars = scanner_aggregator_seeder._read_1m_bars_for_symbol("GODREJCP", "NSE", 500)
+
+    # The session-aware read must actually find bars (pre-fix: 0 — the
+    # 2026-07-06 incident: "seeded 0/227 symbols").
+    assert len(bars) > 0
+
+    agg = MultiIntervalAggregator(symbols=["GODREJCP"], intervals=["5m"])
+    roll15 = _Rolling15mBars("GODREJCP")
+    bar_15m_history = {"GODREJCP": roll15}
+
+    with patch.object(scanner_aggregator_seeder, "_read_1m_bars_for_symbol", return_value=bars):
+        summary = scanner_aggregator_seeder.seed_aggregator(
+            agg, ["GODREJCP"], bar_15m_history=bar_15m_history
+        )
+
+    assert summary["seeded_symbols"] == 1
+    # >=15 closed 15m bars available IMMEDIATELY post-seed — the acceptance
+    # bar the 15m_warmup gate checks (`len(bars_15m) < 15` in
+    # services/scan_rules/fno_intraday_{buy,sell}_chartink.py).
+    recent_15m = roll15.get_recent_bars(50)
+    assert len(recent_15m) >= 15
+
+
+def test_midsession_restart_seed_spans_today_and_prior_day_no_double_count(monkeypatch):
+    """Mid-session-restart scenario: seed spans today's earlier bars + prior
+    day, >=15 bars, and re-seeding (simulating a duplicate boot-worker fire)
+    does NOT double-count — BarBuilder/seed_bars timestamp dedup holds."""
+    from services.scanner_service import _Rolling15mBars
+
+    prior_day = date(2026, 7, 3)  # Friday
+    today = date(2026, 7, 6)  # Monday
+
+    prior_frame = _historify_1m_bars_for_session(prior_day, n_minutes=375)
+    today_frame = _historify_1m_bars_for_session(today, n_minutes=80)  # 09:15-10:35
+    combined = pd.concat([prior_frame, today_frame], ignore_index=True)
+
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 10, 35, tzinfo=_IST))  # mid-session
+
+    with patch("database.historify_db.get_ohlcv", return_value=combined):
+        bars = scanner_aggregator_seeder._read_1m_bars_for_symbol("GODREJCP", "NSE", 500)
+
+    assert len(bars) > 0
+
+    roll15 = _Rolling15mBars("GODREJCP")
+    bars_15m = scanner_aggregator_seeder._aggregate_1m_to_15m(bars)
+    first_seed = roll15.seed_bars(bars_15m)
+    assert first_seed >= 15
+
+    # Re-seed with the SAME bars (simulating a duplicate boot fire / retry) —
+    # must add ZERO new bars (dedup by timestamp holds).
+    second_seed = roll15.seed_bars(bars_15m)
+    assert second_seed == 0
+    assert len(roll15.get_recent_bars(50)) == first_seed
+
+
+# --------------------------------------------------------------------------- #
+# #257 regression — seeded/replayed bars still never fire evaluations
+# --------------------------------------------------------------------------- #
+
+
+def test_seeded_bars_do_not_trigger_evaluation_end_to_end(monkeypatch):
+    """End-to-end guarantee (issue #257, re-verified after the #340 change):
+    folding session-aware-windowed historical bars into the LIVE scanner via
+    `seed_aggregator` (both the 5m `aggregator.replay_bars` fan-out and the
+    15m `_Rolling15mBars.seed_bars` direct-append) must fire NO evaluation —
+    only a genuine live tick/bar-close does. This exercises the real
+    `ScannerService` + `MultiIntervalAggregator`, not a mock."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import scoped_session, sessionmaker
+
+    from database import scanner_db as sdb
+    from services import scan_rules  # noqa: F401 — self-registers example rules
+    from services import scanner_service as ss
+
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
+    monkeypatch.setattr(sdb, "engine", test_engine)
+    monkeypatch.setattr(sdb, "db_session", test_session)
+    ss.init_scanner_db()
+
+    class _CapturingBus:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def publish(self, event) -> None:
+            self.events.append(event)
+
+    capturing_bus = _CapturingBus()
+    svc = ss.ScannerService(symbols=["GODREJCP"], bus=capturing_bus)
+
+    def_id = ss.create_scan_definition(
+        name="_seeder_test_buy",
+        screener_type="buy",
+        expression_json=None,
+        rule_module="fno_intraday_buy_chartink",
+        enabled=True,
+    )
+
+    prior_day = date(2026, 7, 3)
+    historify_frame = _historify_1m_bars_for_session(prior_day, n_minutes=375)
+
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 8, 26, tzinfo=_IST))
+    with patch("database.historify_db.get_ohlcv", return_value=historify_frame):
+        bars = scanner_aggregator_seeder._read_1m_bars_for_symbol("GODREJCP", "NSE", 500)
+
+    assert len(bars) > 0
+
+    with patch.object(scanner_aggregator_seeder, "_read_1m_bars_for_symbol", return_value=bars):
+        summary = scanner_aggregator_seeder.seed_aggregator(
+            svc.aggregator, ["GODREJCP"], bar_15m_history=svc._bar_15m_history
+        )
+
+    assert summary["seeded_symbols"] == 1
+    assert summary["seeded_15m_bars"] >= 15
+    # The whole point of #257: warming state via replay/seed fires NOTHING.
+    assert ss.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    assert def_id is not None
+
+    test_session.remove()
+    test_engine.dispose()
