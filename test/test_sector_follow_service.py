@@ -167,6 +167,57 @@ def test_passes_gates_fails_closed_on_none():
 
 
 # --------------------------------------------------------------------------- #
+# evaluate_candidates_with_details (issue #352) — additive capture, no behavior
+# change to evaluate_candidates() itself.
+# --------------------------------------------------------------------------- #
+def test_evaluate_candidates_with_details_returns_same_candidates_as_plain():
+    """The details-capturing variant selects EXACTLY the same candidates as the
+    normal evaluate_candidates() path — the additive capture must never diverge
+    from (or influence) the production selection."""
+    metrics = {
+        "AAA": _hit(sector=0.02, stock=0.01, vol=1.5),  # passes
+        "BBB": _hit(sector=0.005, stock=0.01, vol=1.5),  # fails sector gate
+        "CCC": _miss(),  # missing data
+    }
+    svc = _make_service(metrics=metrics, universe=["AAA", "BBB", "CCC"])
+    plain = svc.evaluate_candidates()
+    cands, details = svc.evaluate_candidates_with_details()
+    assert [c["symbol"] for c in cands] == [c["symbol"] for c in plain]
+    assert {c["symbol"] for c in cands} == {"AAA"}
+
+
+def test_evaluate_candidates_with_details_per_symbol_shape():
+    metrics = {
+        "AAA": _hit(sector=0.02, stock=0.01, vol=1.5),  # passes
+        "BBB": _hit(sector=0.005, stock=0.01, vol=1.5),  # fails sector gate only
+        "CCC": _miss(),  # missing data
+    }
+    svc = _make_service(metrics=metrics, universe=["AAA", "BBB", "CCC"])
+    _cands, details = svc.evaluate_candidates_with_details()
+    by_symbol = {d["symbol"]: d for d in details}
+
+    assert by_symbol["AAA"]["passed"] is True
+    assert by_symbol["AAA"]["fail_reason"] is None
+    assert by_symbol["AAA"]["sector_index"] == "NIFTY"
+
+    assert by_symbol["BBB"]["passed"] is False
+    assert "sector" in by_symbol["BBB"]["fail_reason"]
+
+    assert by_symbol["CCC"]["passed"] is False
+    assert "None data" in by_symbol["CCC"]["fail_reason"]
+    assert by_symbol["CCC"]["sector_ret"] is None
+
+
+def test_evaluate_candidates_unchanged_when_details_variant_exists():
+    """Guard against accidental behavior drift: calling evaluate_candidates()
+    directly (ignoring the new method entirely) still returns exactly the
+    gate-passing candidates, unaffected by the existence of the details path."""
+    svc = _make_service(metrics={"AAA": _hit()})
+    cands = svc.evaluate_candidates()
+    assert [c["symbol"] for c in cands] == ["AAA"]
+
+
+# --------------------------------------------------------------------------- #
 # Position selector
 # --------------------------------------------------------------------------- #
 def test_position_selector_caps_at_5():

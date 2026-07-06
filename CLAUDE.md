@@ -1005,8 +1005,15 @@ gain — NIFTY-only is the vehicle). Keep `sector_follow_cap5_vol` (CNC T+1 equi
 the alpha primary; run this as a separate, leverage-bounded beta sleeve. Key files:
 `services/futures_follow_service.py` (evaluator reuse + sizing + scheduler glue),
 `blueprints/futures_follow.py` (control API at `/futures_follow_cap50/api/*` —
-status/positions/pause/resume/close_all/data_health),
-`database/futures_follow_db.py` (`futures_follow_trades` journal). Plan + locked
+status/positions/pause/resume/close_all/data_health/entry_breakdown),
+`database/futures_follow_db.py` (`futures_follow_trades` journal),
+`database/futures_follow_eval_db.py` (`futures_follow_eval_snapshots` — the
+per-day 15:20 entry-evaluation breakdown, issue #352: `run_entry` persists the
+sector_follow evaluator's per-symbol gate inputs/outcomes after placement
+decisions, fail-graceful; read via `GET /futures_follow_cap50/api/entry_breakdown`
+— API-key OR logged-in-session auth, read-only — and rendered as the "Today's
+15:20 Evaluation" card on `/strategies/futures_follow_cap50`, so a zero-signal
+day is explainable without reading logs). Plan + locked
 decisions: [`strategies/futures_follow_cap50/PLAN.md`](strategies/futures_follow_cap50/PLAN.md).
 Backtest reports:
 [`docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md`](docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md)

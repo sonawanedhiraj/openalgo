@@ -103,6 +103,7 @@ def _make_service(signals=None, **overrides):
     data_health_checker = overrides.pop("data_health_checker", None)
     contract_resolver = overrides.pop("contract_resolver", fake_contract_resolver)
     signal_evaluator = overrides.pop("signal_evaluator", fake_signal_evaluator)
+    signal_evaluator_details = overrides.pop("signal_evaluator_details", None)
     signal_reviewer = overrides.pop("signal_reviewer", None)
     market_context_provider = overrides.pop("market_context_provider", None)
     order_placer = overrides.pop("order_placer", fake_placer)
@@ -120,6 +121,7 @@ def _make_service(signals=None, **overrides):
         config=cfg,
         mode=mode,
         signal_evaluator=signal_evaluator,
+        signal_evaluator_details=signal_evaluator_details,
         contract_resolver=contract_resolver,
         order_placer=order_placer,
         price_fetcher=price_fetcher,
@@ -1721,6 +1723,150 @@ def test_watchdog_flattens_position_left_by_rejected_primary_exit():
     assert len(flattened) == 1
     assert svc.paper_book == {}
     assert len(sell_attempts) == 2  # one rejected attempt + one successful retry
+
+
+# --------------------------------------------------------------------------- #
+# Issue #352 — entry-evaluation breakdown snapshot
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def _isolated_eval_db(monkeypatch):
+    """Rebind database.futures_follow_eval_db to a fresh in-memory DB per test so
+    snapshot writes never touch the live openalgo.db and never leak across tests."""
+    from database import futures_follow_eval_db as eval_db
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(eval_db, "engine", eng)
+    monkeypatch.setattr(eval_db, "db_session", sess)
+    eval_db.Base.query = sess.query_property()
+    eval_db.Base.metadata.create_all(eng)
+    yield eval_db
+    sess.remove()
+    eng.dispose()
+
+
+def _fake_details(symbols_meta: dict) -> callable:
+    """Build a fake ``signal_evaluator_details`` returning a fixed breakdown.
+
+    ``symbols_meta``: {symbol: {sector_ret, stock_ret, vol_ratio, passed,
+    fail_reason, intraday_source}}.
+    """
+
+    def _details(as_of=None):
+        n_by_source = {"quotes": 0, "aggregator": 0, "historify": 0, "none": 0}
+        rows = []
+        for sym, meta in symbols_meta.items():
+            src = meta.get("intraday_source", "quotes")
+            if src in n_by_source:
+                n_by_source[src] += 1
+            rows.append(
+                {
+                    "symbol": sym,
+                    "sector_index": meta.get("sector_index", "NIFTY"),
+                    "sector_ret": meta.get("sector_ret"),
+                    "stock_ret": meta.get("stock_ret"),
+                    "vol_ratio": meta.get("vol_ratio"),
+                    "current_price": meta.get("current_price", 100.0),
+                    "intraday_source": src,
+                    "passed": meta.get("passed", False),
+                    "fail_reason": meta.get("fail_reason"),
+                }
+            )
+        return {"n_by_source": n_by_source, "symbols": rows}
+
+    return _details
+
+
+def test_run_entry_persists_snapshot_with_known_metrics(_isolated_eval_db):
+    """run_entry captures + persists a snapshot row with the injected evaluator's
+    per-symbol metrics — the WHY-zero-signals breakdown the operator reads."""
+    details_fn = _fake_details(
+        {
+            "RELIANCE": {
+                "sector_ret": 0.02,
+                "stock_ret": 0.01,
+                "vol_ratio": 1.5,
+                "passed": True,
+            },
+            "TCS": {
+                "sector_ret": 0.003,
+                "stock_ret": 0.01,
+                "vol_ratio": 1.5,
+                "passed": False,
+                "fail_reason": "sector 0.30% <= 1.0%",
+            },
+            "INFY": {
+                "sector_ret": None,
+                "stock_ret": None,
+                "vol_ratio": None,
+                "passed": False,
+                "fail_reason": "None data [sector_ret, stock_ret, vol_ratio] (src=none)",
+            },
+        }
+    )
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_evaluator_details=details_fn)
+
+    placed = svc.run_entry()
+    assert len(placed) == 1  # sanity — entries still place normally
+
+    row = _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-06-10")
+    assert row is not None
+    payload = row["payload"]
+    assert payload["n_signals"] == 1
+    by_symbol = {s["symbol"]: s for s in payload["symbols"]}
+    assert by_symbol["RELIANCE"]["outcome"] == "in_cap_placed"
+    assert by_symbol["TCS"]["outcome"] == "first_failed_gate"
+    assert by_symbol["INFY"]["outcome"] == "missing_data"
+    assert payload["per_gate_fail_counts"]["sector"] == 1
+    assert payload["per_gate_fail_counts"]["missing_data"] == 1
+
+
+def test_run_entry_persist_failure_does_not_break_entry_placement(_isolated_eval_db, monkeypatch):
+    """A persist failure in the breakdown capture must never affect the entries
+    already placed — run_entry wraps the capture in a try/except."""
+
+    def _raising_details(as_of=None):
+        raise RuntimeError("boom — details provider exploded")
+
+    svc = _make_service(
+        signals=[_sig("RELIANCE")],
+        signal_evaluator_details=_raising_details,
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 1  # entry placement unaffected by the capture failure
+    assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-06-10") is None
+
+
+def test_run_entry_no_evaluator_details_injected_is_a_noop(_isolated_eval_db):
+    """The default (no signal_evaluator_details injected, as in every other
+    existing test) must not attempt any DB write — purely additive capture."""
+    svc = _make_service(signals=[_sig("RELIANCE")])
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-06-10") is None
+
+
+def test_run_entry_snapshot_idempotent_on_rerun(_isolated_eval_db):
+    """Re-running run_entry for the same trading day overwrites the row rather
+    than creating a duplicate (idempotent upsert per (strategy, date))."""
+    details_fn = _fake_details(
+        {"RELIANCE": {"sector_ret": 0.02, "stock_ret": 0.01, "vol_ratio": 1.5, "passed": True}}
+    )
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_evaluator_details=details_fn)
+    svc.run_entry()
+    svc.run_entry()  # second run same day (e.g. a scheduler retry)
+
+    from database.futures_follow_eval_db import FuturesFollowEvalSnapshot
+
+    rows = _isolated_eval_db.db_session.query(FuturesFollowEvalSnapshot).all()
+    assert len(rows) == 1
+    _isolated_eval_db.db_session.remove()
+
+
+def test_entry_breakdown_snapshot_none_when_not_yet_evaluated(_isolated_eval_db):
+    """No evaluation recorded yet for a given date -> get_snapshot returns None
+    (the endpoint's contract: data=null means 'no evaluation recorded yet')."""
+    assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-01-01") is None
 
 
 if __name__ == "__main__":

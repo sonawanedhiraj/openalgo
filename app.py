@@ -113,6 +113,7 @@ from database.daily_intent_db import init_db as ensure_daily_intent_tables_exist
 from database.data_health_db import init_db as ensure_data_health_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.futures_follow_db import init_db as ensure_futures_follow_tables_exists
+from database.futures_follow_eval_db import init_db as ensure_futures_follow_eval_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -708,6 +709,7 @@ def setup_environment(app):
                 ("Historify DB", ensure_historify_tables_exists),
                 ("Flow DB", ensure_flow_tables_exists),
                 ("Futures Follow DB", ensure_futures_follow_tables_exists),
+                ("Futures Follow Eval DB", ensure_futures_follow_eval_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
             ]

@@ -154,5 +154,88 @@ def test_close_all_with_confirm(client, monkeypatch):
     assert svc.closed is True
 
 
+# --------------------------------------------------------------------------- #
+# Entry-evaluation breakdown (issue #352)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def _eval_db(monkeypatch):
+    """Rebind database.futures_follow_eval_db to a fresh in-memory DB per test."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import scoped_session, sessionmaker
+
+    from database import futures_follow_eval_db as eval_db
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(eval_db, "engine", eng)
+    monkeypatch.setattr(eval_db, "db_session", sess)
+    eval_db.Base.query = sess.query_property()
+    eval_db.Base.metadata.create_all(eng)
+    yield eval_db
+    sess.remove()
+    eng.dispose()
+
+
+def test_entry_breakdown_requires_auth(client, _eval_db):
+    assert client.get("/futures_follow_cap50/api/entry_breakdown").status_code == 401
+
+
+def test_entry_breakdown_rejects_bad_key(client, _eval_db):
+    resp = client.get("/futures_follow_cap50/api/entry_breakdown", headers={"X-API-KEY": "BAD"})
+    assert resp.status_code == 401
+
+
+def test_entry_breakdown_null_when_no_snapshot(client, _eval_db):
+    """No evaluation recorded yet -> {status: success, data: null} (the UI shows
+    'no evaluation recorded yet', not an error)."""
+    resp = client.get("/futures_follow_cap50/api/entry_breakdown", headers={"X-API-KEY": "GOOD"})
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "success"
+    assert body["data"] is None
+
+
+def test_entry_breakdown_returns_payload_for_date(client, _eval_db):
+    payload = {
+        "eval_at": "2026-07-06T15:20:00+05:30",
+        "mode": "sandbox",
+        "n_signals": 0,
+        "intraday_source_counts": {"quotes": 30, "aggregator": 0, "historify": 0, "none": 0},
+        "cap_skipped": 0,
+        "vetoed": 0,
+        "per_gate_fail_counts": {"sector": 25, "stock": 3, "vol": 8, "missing_data": 0},
+        "symbols": [],
+    }
+    assert _eval_db.upsert_snapshot("futures_follow_cap50", "2026-07-06", payload)
+    resp = client.get(
+        "/futures_follow_cap50/api/entry_breakdown?date=2026-07-06",
+        headers={"X-API-KEY": "GOOD"},
+    )
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "success"
+    assert body["data"]["eval_date"] == "2026-07-06"
+    assert body["data"]["payload"]["intraday_source_counts"]["quotes"] == 30
+
+
+def test_entry_breakdown_invalid_date_400(client, _eval_db):
+    resp = client.get(
+        "/futures_follow_cap50/api/entry_breakdown?date=not-a-date",
+        headers={"X-API-KEY": "GOOD"},
+    )
+    assert resp.status_code == 400
+
+
+def test_entry_breakdown_session_auth_allows_read(client, _eval_db, monkeypatch):
+    """A valid logged-in browser session (no API key) can read the breakdown —
+    that's how the React strategy page calls it."""
+    import blueprints.futures_follow as bp  # noqa: F401 (imported for parity)
+
+    monkeypatch.setattr("utils.session.is_session_valid", lambda: True)
+    resp = client.get("/futures_follow_cap50/api/entry_breakdown")
+    assert resp.status_code == 200
+    assert resp.get_json()["data"] is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
