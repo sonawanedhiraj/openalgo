@@ -402,8 +402,14 @@ def test_read_1m_bars_falls_back_to_broker_when_historify_short(monkeypatch):
 
 
 def test_read_1m_bars_skips_broker_when_historify_has_enough(monkeypatch):
-    """If historify has >=lookback/3 bars, no broker call is made."""
+    """If historify has >=lookback/3 bars AND covers today's session, no
+    broker call is made. (#344: the clock is pinned mid-session on the bars'
+    own date so the today-coverage check passes deterministically — the bars
+    reach 14:14, well past the pinned 12:00.)"""
     monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    monkeypatch.setattr(
+        scanner_aggregator_seeder, "_now_naive_ist", lambda: datetime(2026, 6, 26, 12, 0)
+    )
     plenty = [
         {
             "ts": datetime(2026, 6, 26, 9, 15) + timedelta(minutes=mi),
@@ -1140,3 +1146,321 @@ def test_seeded_bars_do_not_trigger_evaluation_end_to_end(monkeypatch):
 
     test_session.remove()
     test_engine.dispose()
+
+
+# --------------------------------------------------------------------------- #
+# Issue #344 — mid-session restart: the seed must contain TODAY's session,
+# and the rule-facing 5m frame must aggregate it (volume/open) correctly.
+# --------------------------------------------------------------------------- #
+#
+# Root cause of the 2026-07-06 12:30/12:52 incident: the two-tier source
+# selection accepted historify on raw BAR COUNT (>= lookback/3), which a
+# mid-session historify always satisfies with PRIOR-day bars while holding
+# (almost) none of today's (the scanner-side 1m backfill only runs post-close).
+# The broker fallback — the only source that has today's bars mid-session —
+# was skipped for every stock, so the seed reaching the aggregator/15m
+# builders simply did not contain today's session, and the rules'
+# today-aggregation (derive_today_and_yest Path B) starved.
+
+
+def _mk_1m(day: date, hh: int, mm: int, *, minutes: int, volume: int = 1000) -> list[dict]:
+    """``minutes`` consecutive 1m bars starting at day hh:mm (naive IST),
+    constant OHLC (open 1060 / close 1060.5) and per-bar ``volume``."""
+    base = datetime(day.year, day.month, day.day, hh, mm)
+    return [
+        {
+            "ts": base + timedelta(minutes=i),
+            "open": 1060.0,
+            "high": 1061.0,
+            "low": 1059.0,
+            "close": 1060.5,
+            "volume": volume,
+        }
+        for i in range(minutes)
+    ]
+
+
+_MONDAY = date(2026, 7, 6)
+_FRIDAY = date(2026, 7, 3)
+
+
+def test_read_1m_bars_broker_fallback_when_historify_count_rich_but_today_stale(monkeypatch):
+    """THE #344 unit case: historify is count-sufficient (prior-day rich) but
+    covers only the first 2 minutes of today's session at a 12:52 restart →
+    the broker fallback MUST run and its today-covering series MUST win.
+
+    Pre-fix behaviour (verified via git stash): historify passes the raw
+    count check, the broker is never called, and the seed contains 2 minutes
+    of today — this test FAILS on the pre-fix tree.
+    """
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 12, 52, tzinfo=_IST))  # Monday mid-session
+
+    # ~300 Friday bars + ONLY the first 2 Monday bars (the 09:16 backfill) —
+    # the exact 2026-07-06 12:52 historify state for LODHA.
+    historify = _mk_1m(_FRIDAY, 10, 30, minutes=300) + _mk_1m(_MONDAY, 9, 15, minutes=2, volume=800)
+    broker = _mk_1m(_MONDAY, 9, 15, minutes=210)  # 09:15 → 12:44 (broker lag)
+
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=historify,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+            return_value=broker,
+        ) as broker_fn,
+    ):
+        out = _read_1m_bars_for_symbol(
+            "LODHA",
+            "NSE",
+            500,
+            api_key="test-key",  # pragma: allowlist secret
+        )
+
+    broker_fn.assert_called_once()
+    assert out == broker  # today-covering source wins even though it's SHORTER
+    # Sanity: the chosen seed actually contains today's full elapsed session.
+    today_vol = sum(b["volume"] for b in out if b["ts"].date() == _MONDAY)
+    assert today_vol == 210 * 1000
+
+
+def test_read_1m_bars_premarket_prior_day_only_historify_still_wins(monkeypatch):
+    """#340 pre-market behaviour preserved: before open there is no today
+    session to cover, so a prior-days-only historify series stays sufficient
+    and NO broker call is made."""
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 8, 26, tzinfo=_IST))  # Monday pre-market
+
+    historify = _mk_1m(_FRIDAY, 10, 30, minutes=300)
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=historify,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+        ) as broker_fn,
+    ):
+        out = _read_1m_bars_for_symbol(
+            "LODHA",
+            "NSE",
+            500,
+            api_key="test-key",  # pragma: allowlist secret
+        )
+
+    broker_fn.assert_not_called()
+    assert out == historify
+
+
+def test_read_1m_bars_historify_covering_today_needs_no_broker(monkeypatch):
+    """Mid-session, a historify series that DOES cover today's elapsed session
+    (within the broker-lag grace) is accepted without a broker call."""
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 12, 52, tzinfo=_IST))
+
+    # Friday tail + Monday 09:15 → 12:45 (211 bars) — covers elapsed-15.
+    historify = _mk_1m(_FRIDAY, 13, 0, minutes=150) + _mk_1m(_MONDAY, 9, 15, minutes=211)
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=historify,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+        ) as broker_fn,
+    ):
+        out = _read_1m_bars_for_symbol(
+            "LODHA",
+            "NSE",
+            500,
+            api_key="test-key",  # pragma: allowlist secret
+        )
+
+    broker_fn.assert_not_called()
+    assert out == historify
+
+
+def test_today_coverage_helpers():
+    """Unit coverage for the #344 helpers: grace window, pre-open, weekend."""
+    f = scanner_aggregator_seeder._has_sufficient_today_coverage
+
+    # Pre-open Monday: trivially sufficient with no today bars.
+    assert f([], datetime(2026, 7, 6, 8, 26)) is True
+    # First minutes after open (elapsed <= grace): still sufficient.
+    assert f([], datetime(2026, 7, 6, 9, 25)) is True
+    # Weekend: no session, trivially sufficient.
+    assert f([], datetime(2026, 7, 5, 12, 0)) is True  # Sunday
+    # Mid-session with no today bars: NOT sufficient.
+    assert f([], datetime(2026, 7, 6, 12, 52)) is False
+    # Mid-session with bars through (now - grace): sufficient.
+    bars = _mk_1m(_MONDAY, 9, 15, minutes=210)  # through 12:44
+    assert f(bars, datetime(2026, 7, 6, 12, 52)) is True
+    # Post-close boot (16:00) with a full-session series: sufficient.
+    full = _mk_1m(_MONDAY, 9, 15, minutes=375)
+    assert f(full, datetime(2026, 7, 6, 16, 0)) is True
+    # Post-close boot with only the morning: not sufficient.
+    morning = _mk_1m(_MONDAY, 9, 15, minutes=60)
+    assert f(morning, datetime(2026, 7, 6, 16, 0)) is False
+
+
+# --------------------------------------------------------------------------- #
+# Issue #344 acceptance — mid-session restart, REAL ScannerService objects:
+# seeded (broker) bars + live ticks → rule-facing frame's today-aggregation
+# yields the full-session volume and the true 09:15 open.
+# --------------------------------------------------------------------------- #
+
+
+class _NullBus:
+    def publish(self, event):
+        pass
+
+    def subscribe(self, *a, **k):
+        pass
+
+
+def _tick(price: float, cum_vol: int, ts: datetime) -> dict:
+    return {"price": price, "cumulative_volume": cum_vol, "ts": ts}
+
+
+def test_midsession_restart_seeded_bars_reach_rule_facing_today_aggregation(monkeypatch):
+    """The #344 acceptance scenario, end-to-end on real objects:
+
+    12:52 restart → live ticks land first (12:50 bucket) → the boot seeder
+    runs (historify prior-day-rich/today-stale, broker has 09:15→12:44) →
+    a live 5m close at 12:55. The rule-facing frame
+    (``ScannerService._bar_history`` — what ``indicators['bars_5m']`` is) must
+    then let ``derive_today_and_yest`` Path B compute:
+
+    * ``today_d.volume`` = FULL session sum (seeded 210×1000 + live 20,000)
+    * ``today_d.open``   = the real 09:15 open (1060.0), NOT the first
+      post-boot bar's open (1063.0)
+    * ``today_d.close``  = the latest live close (1063.5)
+
+    Pre-fix (git stash) this fails twice over: historify wins the source
+    pick (today volume = live-only + the 2 backfill minutes), and the frame
+    is append-ordered so today's open reads from the 12:50 live bar.
+    """
+    from services.scan_rules._today_running import derive_today_and_yest
+    from services.scanner_service import ScannerService
+    from test.fixtures.frame_factory import make_historify_daily_frame
+
+    monkeypatch.setenv("SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED", "true")
+    _pin_seeder_now(monkeypatch, datetime(2026, 7, 6, 12, 52, 30, tzinfo=_IST))
+
+    svc = ScannerService(symbols=["LODHA"], bus=_NullBus())
+
+    # 1. Restart at 12:52 — live ticks arrive BEFORE the seeder finishes
+    #    (production ordering: ticks at boot, seed summary ~15s later).
+    svc.aggregator.on_tick("LODHA", _tick(1063.0, 5_000_000, datetime(2026, 7, 6, 12, 52, 13)))
+    svc.aggregator.on_tick("LODHA", _tick(1063.5, 5_020_000, datetime(2026, 7, 6, 12, 53, 40)))
+
+    # 2. Boot seed. historify = Friday-rich + first 2 Monday minutes (the
+    #    incident state); broker = Monday 09:15 → 12:44 (210 bars × 1000).
+    historify = _mk_1m(_FRIDAY, 10, 30, minutes=300) + _mk_1m(_MONDAY, 9, 15, minutes=2, volume=800)
+    broker = _mk_1m(_MONDAY, 9, 15, minutes=210)
+    with (
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_historify",
+            return_value=historify,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._read_1m_bars_from_broker",
+            return_value=broker,
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._get_api_key",
+            return_value="test-key",  # pragma: allowlist secret
+        ),
+        patch(
+            "services.scanner_aggregator_seeder._resolve_exchange_for_symbol",
+            return_value="NSE",
+        ),
+    ):
+        summary = seed_aggregator(svc.aggregator, ["LODHA"], bar_15m_history=svc._bar_15m_history)
+    assert summary["seeded_symbols"] == 1
+    assert summary["seeded_15m_bars"] > 0  # 15m warm-up still served (no regression)
+
+    # 3. Live 5m close at 12:55 (closes the 12:50 bucket, vol 20,000 delta).
+    svc.aggregator.on_tick("LODHA", _tick(1064.5, 5_030_000, datetime(2026, 7, 6, 12, 55, 1)))
+
+    frame = svc._bar_history.get(("LODHA", "5m"))
+    assert frame is not None and not frame.empty
+
+    # The frame is the rules' bars_5m — run the rules' own Path B on it.
+    bars_daily = make_historify_daily_frame([1050.0, 1057.0], _FRIDAY)
+    now_ist = datetime(2026, 7, 6, 12, 55, 5, tzinfo=_IST)
+    today_d, yest_d, yest_idx = derive_today_and_yest(bars_daily, frame, now_ist=now_ist)
+
+    assert today_d is not None
+    # FULL-session volume: 210 seeded 1m bars × 1000 + the live 12:50 bucket's
+    # 20,000 cum-vol delta. Pre-fix: 22,000 (2 backfill minutes + live).
+    assert today_d["volume"] == 210 * 1000 + 20_000
+    # True 09:15 open — pre-fix this read 1063.0 (the first post-boot bar,
+    # append-ordered at iloc[0]).
+    assert today_d["open"] == 1060.0
+    # Latest live close.
+    assert today_d["close"] == 1063.5
+    # yest is Friday's settled bar.
+    assert yest_idx == -1
+    assert yest_d["close"] == 1057.0
+
+
+def test_live_bar_for_already_seeded_bucket_counted_once():
+    """Double-count guard: a live tick landing in the bucket the seed left
+    open (the trailing partial) folds INTO that bucket — one frame row, and
+    today's volume counts the seeded portion exactly once."""
+    from services.scanner_service import ScannerService
+
+    svc = ScannerService(symbols=["LODHA"], bus=_NullBus())
+
+    # Seed first (no live ticks yet): 09:15 → 12:49 = 215 bars × 1000.
+    # 42 full 5m buckets (09:15..12:40) close during replay; the 12:45 bucket
+    # (5 bars, 5000 vol) stays open as the trailing partial.
+    n = svc.aggregator.replay_bars("LODHA", _mk_1m(_MONDAY, 9, 15, minutes=215))
+    assert n == 215
+
+    # Live ticks INSIDE the already-seeded 12:45 bucket: first tick sets the
+    # cum-vol baseline (delta 0), second adds 3,000 on top of the seeded 5,000.
+    svc.aggregator.on_tick("LODHA", _tick(1061.0, 1_000_000, datetime(2026, 7, 6, 12, 49, 30)))
+    svc.aggregator.on_tick("LODHA", _tick(1061.5, 1_003_000, datetime(2026, 7, 6, 12, 49, 50)))
+    # Bucket rolls to 12:50 → the 12:45 bucket closes (5,000 seeded + 3,000 live).
+    svc.aggregator.on_tick("LODHA", _tick(1062.0, 1_004_000, datetime(2026, 7, 6, 12, 50, 5)))
+
+    frame = svc._bar_history.get(("LODHA", "5m"))
+    assert frame is not None
+    today_rows = frame[frame["ts"].apply(lambda x: x.date() == _MONDAY)]
+
+    # Exactly ONE 12:45 row — the live continuation did not duplicate it.
+    rows_1245 = today_rows[today_rows["ts"] == datetime(2026, 7, 6, 12, 45)]
+    assert len(rows_1245) == 1
+    assert rows_1245["volume"].iloc[0] == 5_000 + 3_000
+    # Total = 42 replay-closed buckets × 5000 + the merged 12:45 bucket.
+    assert today_rows["volume"].sum() == 42 * 5_000 + 8_000
+
+    # Idempotency (existing BarBuilder dedup): re-replaying the same bars
+    # adds nothing.
+    assert svc.aggregator.replay_bars("LODHA", _mk_1m(_MONDAY, 9, 15, minutes=215)) == 0
+    frame2 = svc._bar_history.get(("LODHA", "5m"))
+    today2 = frame2[frame2["ts"].apply(lambda x: x.date() == _MONDAY)]
+    assert today2["volume"].sum() == 42 * 5_000 + 8_000
+
+
+def test_preopen_boot_live_only_accumulation_unchanged():
+    """Pre-open-boot scenario: with no seed at all, live-only accumulation
+    still builds the frame exactly as before (#344 must not regress it)."""
+    from services.scanner_service import ScannerService
+
+    svc = ScannerService(symbols=["LODHA"], bus=_NullBus())
+
+    svc.aggregator.on_tick("LODHA", _tick(1060.0, 10_000, datetime(2026, 7, 6, 9, 15, 1)))
+    svc.aggregator.on_tick("LODHA", _tick(1061.0, 25_000, datetime(2026, 7, 6, 9, 17, 0)))
+    svc.aggregator.on_tick("LODHA", _tick(1062.0, 40_000, datetime(2026, 7, 6, 9, 20, 2)))
+
+    frame = svc._bar_history.get(("LODHA", "5m"))
+    assert frame is not None and len(frame) == 1
+    row = frame.iloc[0]
+    assert row["ts"] == datetime(2026, 7, 6, 9, 15)
+    assert row["open"] == 1060.0
+    assert row["close"] == 1061.0
+    assert row["volume"] == 15_000  # delta from the first tick's baseline

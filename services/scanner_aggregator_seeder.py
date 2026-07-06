@@ -51,6 +51,25 @@ recent 1m bars in historify during market hours — the scanner-side
 the broker's historical API via ``services.history_service.get_history``.
 The broker fetch is rate-limited (~3 req/sec) so 227 symbols take ~75s.
 
+Today-session coverage (issue #344)
+-----------------------------------
+"Sufficient" used to mean a raw BAR COUNT (``>= lookback_min // 3``). On a
+MID-SESSION restart that check is satisfied by a historify series that is
+rich in PRIOR-day bars but has (almost) none of TODAY's — exactly the
+normal mid-session state, because the scanner-side 1m backfill only runs
+post-close (15:30+). The 2026-07-06 12:30/12:52 restarts: historify held
+~300 Friday bars + 2 Monday bars (the 09:16 backfill), passed the count
+check, and the broker fallback — the only source that HAS today's bars
+mid-session — was skipped for every stock. The seed then warmed the 15m
+RSI window fine (prior-day bars suffice, which masked the gap) while the
+rules' today-aggregation (``derive_today_and_yest`` Path B: today_d
+volume/open/high/low from the rule-facing 5m frame) was starved: every
+volume gate compared ~3 minutes of live volume against full-day SMAs and
+structurally failed for the rest of the session. The fix: a source is only
+sufficient when it ALSO covers today's elapsed session (within a grace for
+the broker's ~5-15 min current-day lag); otherwise the broker fallback
+runs, and whichever source covers more of today wins.
+
 Implementation outline
 ----------------------
 1. Wait for a broker session to come up (mirrors the sector_follow boot
@@ -201,6 +220,71 @@ def session_aware_start_ts(now: datetime, lookback_min: int) -> int:
     # Exhausted the safety valve (pathological input) — fall back to a wide
     # wall-clock window rather than raising.
     return int((now - timedelta(minutes=lookback_min * 3)).timestamp())
+
+
+# --------------------------------------------------------------------------- #
+# Today-session coverage (issue #344)
+# --------------------------------------------------------------------------- #
+# The broker's current-day historical API lags ~5-15 minutes (documented in
+# the ws_recovery_service limitation), so a source can never be expected to
+# cover today right up to `now`. Coverage within this grace counts as full.
+_TODAY_COVERAGE_GRACE_MIN = 15
+
+
+def _now_naive_ist() -> datetime:
+    """Naive-IST wall clock, indirected so tests can pin the session moment."""
+    return datetime.now(_IST).replace(tzinfo=None)
+
+
+def _today_session_elapsed_min(now: datetime) -> float:
+    """TRADING minutes elapsed in TODAY's session as of naive-IST ``now``.
+
+    0.0 pre-open, on weekends, and (by convention — holidays are not
+    modelled) on non-trading weekdays before open. Capped at the full
+    session length after 15:30.
+    """
+    if not _is_trading_day(now.date()):
+        return 0.0
+    start, end = _session_bounds(now.date())
+    if now <= start:
+        return 0.0
+    return (min(now, end) - start).total_seconds() / 60.0
+
+
+def _today_coverage_min(bars: list[dict], today: date) -> float:
+    """Minutes of TODAY's session covered by ``bars``.
+
+    Measured as (latest today-dated bar ts - 09:15) + 1 — each 1m bar covers
+    its own minute. 0.0 when the series has no today-dated bar at all.
+    """
+    latest: datetime | None = None
+    for b in bars:
+        ts = b.get("ts")
+        # Duck-typed (not isinstance) so a test-pinned ``datetime`` subclass on
+        # this module can't make real-datetime bar timestamps invisible.
+        if ts is None or getattr(ts, "date", lambda: None)() != today:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    if latest is None:
+        return 0.0
+    start, _end = _session_bounds(today)
+    return max(0.0, (latest - start).total_seconds() / 60.0 + 1.0)
+
+
+def _has_sufficient_today_coverage(bars: list[dict], now: datetime) -> bool:
+    """Does ``bars`` cover today's elapsed session (within the lag grace)?
+
+    Trivially True pre-open / on non-trading days / in the first
+    ``_TODAY_COVERAGE_GRACE_MIN`` minutes after open — there is nothing (or
+    nothing fetchable, given the broker lag) to cover yet, which preserves
+    the #340 pre-market behaviour: a prior-days-only historify series stays
+    sufficient and no broker call is made.
+    """
+    elapsed = _today_session_elapsed_min(now)
+    if elapsed <= _TODAY_COVERAGE_GRACE_MIN:
+        return True
+    return _today_coverage_min(bars, now.date()) >= elapsed - _TODAY_COVERAGE_GRACE_MIN
 
 
 def _flag_enabled() -> bool:
@@ -434,9 +518,13 @@ def _read_1m_bars_for_symbol(
 
     Two-tier (issue #199):
       1. Try historify.duckdb (fast, free, no rate limit).
-      2. If historify returned < ``lookback_min // 3`` bars AND the broker
-         fallback is enabled AND an API key is available, fetch from the
-         broker historical API and use that instead.
+      2. If historify returned < ``lookback_min // 3`` bars — OR (issue #344)
+         it fails the today-session coverage check (count-rich in prior-day
+         bars but missing today's elapsed session, the normal mid-session
+         historify state) — AND the broker fallback is enabled AND an API key
+         is available, fetch from the broker historical API. Whichever source
+         covers more of today's session wins (ties break on bar count, broker
+         preferred on a strictly greater count — the pre-#344 rule).
 
     Returns a list of ``{ts, open, high, low, close, volume}`` records in the
     shape ``MultiIntervalAggregator.replay_bars`` expects.
@@ -445,8 +533,23 @@ def _read_1m_bars_for_symbol(
     """
     historify_bars = _read_1m_bars_from_historify(symbol, exchange, lookback_min)
     min_required = max(60, lookback_min // 3)
-    if len(historify_bars) >= min_required:
+    now = _now_naive_ist()
+    count_ok = len(historify_bars) >= min_required
+    today_ok = _has_sufficient_today_coverage(historify_bars, now)
+    if count_ok and today_ok:
         return historify_bars
+    if count_ok and not today_ok:
+        # Issue #344: loud — this is exactly the mid-session-restart state
+        # that silently starved the rules' today-aggregation on 2026-07-06.
+        logger.warning(
+            "aggregator_seeder: %s — historify has %d bars but covers only "
+            "%.0f/%.0f min of today's session; trying broker fallback for "
+            "today's bars (issue #344)",
+            symbol,
+            len(historify_bars),
+            _today_coverage_min(historify_bars, now.date()),
+            _today_session_elapsed_min(now),
+        )
 
     if not _broker_fallback_enabled():
         return historify_bars
@@ -469,12 +572,23 @@ def _read_1m_bars_for_symbol(
             record_prev_close_from_bars(symbol, broker_bars)
         except Exception:  # noqa: BLE001 — observability must never break the read
             logger.exception("aggregator_seeder: broker prev-close record failed for %s", symbol)
-    if len(broker_bars) > len(historify_bars):
+    # Issue #344: the broker wins on strictly-greater bar count (the pre-#344
+    # rule) OR on strictly-better today-session coverage — a shorter broker
+    # series that actually contains today's bars must beat a longer historify
+    # series that is missing today (the mid-session-restart starvation class).
+    broker_wins = len(broker_bars) > len(historify_bars) or (
+        broker_bars
+        and _today_coverage_min(broker_bars, now.date())
+        > _today_coverage_min(historify_bars, now.date())
+    )
+    if broker_wins:
         logger.info(
-            "aggregator_seeder: %s — historify had %d bars (<%d), broker fallback returned %d",
+            "aggregator_seeder: %s — historify had %d bars (min_required=%d, today_ok=%s), "
+            "broker fallback returned %d and wins",
             symbol,
             len(historify_bars),
             min_required,
+            today_ok,
             len(broker_bars),
         )
         # Issue #231: alert the operator when the two sources disagree on
@@ -482,20 +596,32 @@ def _read_1m_bars_for_symbol(
         # when historify is short; what is NOT expected is a >0.5% close
         # mismatch — that indicates a stale historify slot the seeder is now
         # silently replacing. The alert dedups per (service, symbol, day).
+        # Issue #344: compare at the most-recent OVERLAPPING ts (as the
+        # contract above says) — comparing each source's *last* bar measures
+        # intraday drift when historify legitimately ends hours earlier
+        # (the normal mid-session state that now routes here for the whole
+        # universe), which would false-alert on any stock that moved >0.5%.
         if historify_bars and broker_bars:
             try:
-                hist_close = float(historify_bars[-1].get("close"))
-                brok_close = float(broker_bars[-1].get("close"))
-                from services.source_divergence_alerts import check_and_alert
+                hist_by_ts = {b.get("ts"): b.get("close") for b in historify_bars}
+                hist_close = brok_close = None
+                for b in reversed(broker_bars):
+                    ts = b.get("ts")
+                    if ts in hist_by_ts:
+                        hist_close = float(hist_by_ts[ts])
+                        brok_close = float(b.get("close"))
+                        break
+                if hist_close is not None:
+                    from services.source_divergence_alerts import check_and_alert
 
-                check_and_alert(
-                    service="aggregator_seeder",
-                    symbol=symbol,
-                    source_a_label="historify_last_close",
-                    source_a_value=hist_close,
-                    source_b_label="broker_last_close",
-                    source_b_value=brok_close,
-                )
+                    check_and_alert(
+                        service="aggregator_seeder",
+                        symbol=symbol,
+                        source_a_label="historify_last_close",
+                        source_a_value=hist_close,
+                        source_b_label="broker_last_close",
+                        source_b_value=brok_close,
+                    )
             except Exception:  # noqa: BLE001 — observability must never break the read
                 logger.exception(
                     "aggregator_seeder: divergence alert dispatch failed for %s", symbol
