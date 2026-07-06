@@ -303,3 +303,188 @@ def test_requires_session(client, monkeypatch):
     res = tc.get("/scanner/api/currently-matching")
     assert res.status_code == 401
     assert res.get_json()["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# %-change enrichment + sort (issue #348)
+# ---------------------------------------------------------------------------
+#
+# Enrichment reads two independent accessors:
+#   - services.scanner_reference_data.get_broker_prev_close (registry lookup)
+#   - services.scanner_service.get_scanner_service().get_today_ohlcv (aggregator)
+# Both are patched at the blueprint's call sites so these tests never touch a
+# real ScannerService/ZMQ singleton.
+
+
+def _patch_prev_close(monkeypatch, values: dict[str, float]):
+    """Patch blueprints.scanner_api._get_prev_close's underlying registry read."""
+
+    def fake_get_broker_prev_close(symbol, today=None):
+        if symbol in values:
+            return values[symbol], None
+        return None
+
+    monkeypatch.setattr(
+        "services.scanner_reference_data.get_broker_prev_close",
+        fake_get_broker_prev_close,
+    )
+
+
+def _patch_last_price(monkeypatch, values: dict[str, float], scanner_running: bool = True):
+    """Patch blueprints.scanner_api._get_last_price's underlying scanner accessor."""
+
+    class _FakeScannerService:
+        def get_today_ohlcv(self, symbol, as_of_date):
+            if symbol in values:
+                return values[symbol], 1000.0
+            return None, None
+
+    def fake_get_scanner_service():
+        return _FakeScannerService() if scanner_running else None
+
+    monkeypatch.setattr(
+        "services.scanner_service.get_scanner_service",
+        fake_get_scanner_service,
+    )
+
+
+def test_buy_side_sorted_pct_desc(client, monkeypatch):
+    """BUY side: biggest gainers (highest pct_change) sort first."""
+    tc, sdb = client
+    did = _add_definition(sdb, "buy_def", "buy")
+    _add_result(sdb, did, ["A", "B", "C"], run_at=_ago(1))
+
+    _patch_prev_close(monkeypatch, {"A": 100.0, "B": 100.0, "C": 100.0})
+    _patch_last_price(monkeypatch, {"A": 102.0, "B": 110.0, "C": 101.0})  # +2%, +10%, +1%
+
+    res = tc.get("/scanner/api/currently-matching")
+    data = res.get_json()["data"]
+    syms = data["definitions"][0]["symbols"]
+    assert [s["symbol"] for s in syms] == ["B", "A", "C"]
+    assert syms[0]["pct_change"] == 10.0
+    assert syms[1]["pct_change"] == 2.0
+    assert syms[2]["pct_change"] == 1.0
+
+
+def test_sell_side_sorted_pct_asc(client, monkeypatch):
+    """SELL side: biggest losers (lowest/most-negative pct_change) sort first."""
+    tc, sdb = client
+    did = _add_definition(sdb, "sell_def", "sell")
+    _add_result(sdb, did, ["A", "B", "C"], run_at=_ago(1))
+
+    _patch_prev_close(monkeypatch, {"A": 100.0, "B": 100.0, "C": 100.0})
+    _patch_last_price(monkeypatch, {"A": 98.0, "B": 90.0, "C": 99.0})  # -2%, -10%, -1%
+
+    res = tc.get("/scanner/api/currently-matching")
+    data = res.get_json()["data"]
+    syms = data["definitions"][0]["symbols"]
+    assert [s["symbol"] for s in syms] == ["B", "A", "C"]
+    assert syms[0]["pct_change"] == -10.0
+    assert syms[1]["pct_change"] == -2.0
+    assert syms[2]["pct_change"] == -1.0
+
+
+def test_null_pct_change_sorts_last(client, monkeypatch):
+    """Symbols with a null pct_change (missing prev_close/last_price) always
+    sort after every symbol with a real value, regardless of side, and are
+    tie-broken alphabetically among themselves."""
+    tc, sdb = client
+    did = _add_definition(sdb, "buy_def", "buy")
+    _add_result(sdb, did, ["ZNULL", "A", "ANULL"], run_at=_ago(1))
+
+    # Only "A" gets both prev_close and last_price -> real pct_change.
+    _patch_prev_close(monkeypatch, {"A": 100.0})
+    _patch_last_price(monkeypatch, {"A": 105.0})
+
+    res = tc.get("/scanner/api/currently-matching")
+    data = res.get_json()["data"]
+    syms = data["definitions"][0]["symbols"]
+    assert [s["symbol"] for s in syms] == ["A", "ANULL", "ZNULL"]
+    assert syms[0]["pct_change"] == 5.0
+    assert syms[1]["pct_change"] is None
+    assert syms[2]["pct_change"] is None
+
+
+def test_registry_miss_yields_null_symbol_still_listed(client, monkeypatch):
+    """A missing prev_close registry entry -> pct_change null, but the symbol
+    is never dropped from the list."""
+    tc, sdb = client
+    did = _add_definition(sdb, "buy_def", "buy")
+    _add_result(sdb, did, ["NOREG"], run_at=_ago(1))
+
+    _patch_prev_close(monkeypatch, {})  # no registry entries at all
+    _patch_last_price(monkeypatch, {"NOREG": 105.0})
+
+    res = tc.get("/scanner/api/currently-matching")
+    data = res.get_json()["data"]
+    syms = data["definitions"][0]["symbols"]
+    assert len(syms) == 1
+    assert syms[0]["symbol"] == "NOREG"
+    assert syms[0]["prev_close"] is None
+    assert syms[0]["last_price"] == 105.0
+    assert syms[0]["pct_change"] is None
+
+
+def test_aggregator_down_all_null_but_200_ok(client, monkeypatch):
+    """When the scanner singleton isn't running (e.g. headless/tests), every
+    symbol's last_price/pct_change is null but the endpoint still returns
+    200 with every symbol listed — enrichment never errors the endpoint."""
+    tc, sdb = client
+    did = _add_definition(sdb, "buy_def", "buy")
+    _add_result(sdb, did, ["A", "B"], run_at=_ago(1))
+
+    _patch_prev_close(monkeypatch, {"A": 100.0, "B": 100.0})
+    _patch_last_price(monkeypatch, {}, scanner_running=False)
+
+    res = tc.get("/scanner/api/currently-matching")
+    assert res.status_code == 200
+    data = res.get_json()["data"]
+    syms = data["definitions"][0]["symbols"]
+    assert len(syms) == 2
+    for s in syms:
+        assert s["last_price"] is None
+        assert s["pct_change"] is None
+
+
+def test_enrichment_values_correct_with_seeded_registry(client, monkeypatch):
+    """End-to-end value correctness: prev_close from the (mocked) registry,
+    last_price from the (mocked) aggregator accessor, pct_change computed and
+    rounded to 2dp."""
+    tc, sdb = client
+    did = _add_definition(sdb, "buy_def", "buy")
+    _add_result(sdb, did, ["INFY"], run_at=_ago(1))
+
+    _patch_prev_close(monkeypatch, {"INFY": 1500.0})
+    _patch_last_price(monkeypatch, {"INFY": 1523.456})
+
+    res = tc.get("/scanner/api/currently-matching")
+    data = res.get_json()["data"]
+    entry = data["definitions"][0]["symbols"][0]
+    assert entry["prev_close"] == 1500.0
+    assert entry["last_price"] == 1523.456
+    # (1523.456 / 1500 - 1) * 100 = 1.56373... -> rounds to 1.56
+    assert entry["pct_change"] == 1.56
+
+
+def test_history_endpoints_still_unaffected_by_enrichment(client, monkeypatch):
+    """Load-bearing (extends the existing #342 guarantee): /signals and
+    /hits-by-symbol are untouched by the #348 enrichment/sort — they never
+    call the enrichment accessors and their payload shape is unchanged."""
+    tc, sdb = client
+    did = _add_definition(sdb, "buy_def", "buy")
+    _add_result(sdb, did, ["INFY"], run_at=_ago(1))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("history endpoints must never call enrichment accessors")
+
+    monkeypatch.setattr("services.scanner_reference_data.get_broker_prev_close", _boom)
+    monkeypatch.setattr("services.scanner_service.get_scanner_service", _boom)
+
+    sig_res = tc.get(
+        f"/scanner/api/definitions/{did}/signals",
+        query_string={"since": "2000-01-01T00:00:00+05:30"},
+    )
+    assert sig_res.status_code == 200
+
+    hbs_res = tc.get("/scanner/api/hits-by-symbol")
+    assert hbs_res.status_code == 200
