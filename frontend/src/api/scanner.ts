@@ -87,6 +87,29 @@ export interface HitsBySymbolResponse {
   symbols: SymbolHit[]
 }
 
+// "Currently matching" (issue #342) — a live/ephemeral view over scan_results:
+// symbols with an in-house row within the last SCANNER_ACTIVE_TTL_MIN minutes.
+// Purely additive — never filters or truncates the signal history endpoints
+// above (getSignals / getHitsBySymbol), which remain the permanent audit trail.
+export interface ActiveSymbol {
+  symbol: string
+  first_seen_at: string
+  last_confirmed_at: string
+}
+
+export interface CurrentlyMatchingDefinition {
+  id: number
+  name: string
+  screener_type: ScreenerType
+  symbols: ActiveSymbol[]
+}
+
+export interface CurrentlyMatchingResponse {
+  ttl_minutes: number
+  as_of: string
+  definitions: CurrentlyMatchingDefinition[]
+}
+
 export const scannerApi = {
   getDefinitions: async (): Promise<ScanDefinitionSummary[]> => {
     const res = await webClient.get<{ status: string; data: ScanDefinitionSummary[] }>(
@@ -126,6 +149,13 @@ export const scannerApi = {
     const res = await webClient.get<{ status: string; data: HitsBySymbolResponse }>(
       '/scanner/api/hits-by-symbol',
       { params }
+    )
+    return res.data.data
+  },
+
+  getCurrentlyMatching: async (): Promise<CurrentlyMatchingResponse> => {
+    const res = await webClient.get<{ status: string; data: CurrentlyMatchingResponse }>(
+      '/scanner/api/currently-matching'
     )
     return res.data.data
   },

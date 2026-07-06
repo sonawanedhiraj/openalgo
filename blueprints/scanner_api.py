@@ -19,6 +19,17 @@ Endpoints consumed by the React /scanner page:
       Returns [{symbol, hit_count, definitions, latest_hit}] sorted by
       hit_count descending.
 
+  GET  /scanner/api/currently-matching
+      Per enabled scan_definition, the symbols currently matching its rule —
+      i.e. with an in-house (source='inhouse') scan_results row within the
+      last ``SCANNER_ACTIVE_TTL_MIN`` minutes (env, default 12; read at
+      request time). This is a live/ephemeral view (issue #342, "TTL over
+      re-fires" design): the scan rules re-fire a scan_results row every 5m
+      bar close while conditions hold, so a symbol ages out of this list
+      within ~1 TTL window of the conditions no longer holding. It does NOT
+      alter or filter ``scan_results`` — the full history remains the
+      permanent audit trail via /signals and /hits-by-symbol.
+
 Authentication: Flask session (same as /chartink/api/scanner-comparison).
 This is a React-facing endpoint served inside the authenticated app, so
 session auth is the natural fit — no API key header required.
@@ -27,6 +38,7 @@ session auth is the natural fit — no API key header required.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -52,6 +64,7 @@ scanner_api_bp = Blueprint("scanner_api_bp", __name__, url_prefix="/scanner")
 _SIGNAL_LIMIT_MAX = 500
 _SIGNAL_LIMIT_DEFAULT = 200
 _LATEST_SIGNAL_COUNT = 5
+_ACTIVE_TTL_MIN_DEFAULT = 12
 
 
 def _now_ist_iso() -> str:
@@ -61,6 +74,18 @@ def _now_ist_iso() -> str:
 def _iso_minus_hours(hours: int) -> str:
     """Return an ISO-8601 string for now-minus-hours in IST."""
     return (datetime.now(_IST) - timedelta(hours=hours)).isoformat()
+
+
+def _active_ttl_min() -> int:
+    """``SCANNER_ACTIVE_TTL_MIN`` (default 12) — read at request time (not import
+    time) so an operator env change takes effect without a restart. ~2 bar
+    intervals of the 5m scan cadence — long enough that a single missed
+    re-fire doesn't drop a symbol, short enough that a symbol whose
+    conditions stopped holding ages out within a couple of cycles."""
+    try:
+        return max(1, int(os.environ.get("SCANNER_ACTIVE_TTL_MIN", str(_ACTIVE_TTL_MIN_DEFAULT))))
+    except ValueError:
+        return _ACTIVE_TTL_MIN_DEFAULT
 
 
 def _today_ist() -> str:
@@ -560,4 +585,103 @@ def hits_by_symbol():
 
     except Exception as e:
         logger.exception("scanner hits_by_symbol failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@scanner_api_bp.route("/api/currently-matching", methods=["GET"])
+@check_session_validity
+def currently_matching():
+    """Per enabled scan_definition, symbols currently matching (issue #342).
+
+    "Currently matching" = symbols with an in-house (source='inhouse')
+    scan_results row for that definition within the last
+    ``SCANNER_ACTIVE_TTL_MIN`` minutes (default 12, read at request time).
+    This is a read-only, ephemeral projection over scan_results — it never
+    mutates or filters the underlying rows, which remain the permanent
+    signal-history audit trail (unaffected by this TTL).
+
+    A symbol with multiple rows in the window aggregates to one entry:
+    ``first_seen_at`` = earliest row in the window (today's streak start —
+    the simpler variant the issue calls out as acceptable), ``last_confirmed_at``
+    = latest row in the window.
+
+    No re-fires after conditions stop holding -> the symbol ages out of this
+    list within ~1 TTL window, with zero new scanner state. After market
+    close (no re-fires past 15:30 IST) the list naturally empties once the
+    last day's rows age past the TTL — no special-casing required.
+
+    Returns:
+        {status, data: {ttl_minutes, as_of, definitions: [
+            {id, name, screener_type, symbols: [
+                {symbol, first_seen_at, last_confirmed_at}
+            ]}
+        ]}}
+    """
+    if not session.get("user"):
+        return _unauthorized()
+
+    try:
+        ttl_min = _active_ttl_min()
+        now = datetime.now(_IST)
+        cutoff = (now - timedelta(minutes=ttl_min)).isoformat()
+
+        sess = db_session()
+        defs = (
+            sess.query(ScanDefinition)
+            .filter(ScanDefinition.enabled == 1)
+            .order_by(ScanDefinition.name)
+            .all()
+        )
+
+        result = []
+        for d in defs:
+            rows = (
+                sess.query(ScanResult)
+                .filter(
+                    ScanResult.scan_definition_id == d.id,
+                    ScanResult.source == "inhouse",
+                    ScanResult.run_at >= cutoff,
+                )
+                .order_by(ScanResult.run_at.asc())
+                .all()
+            )
+
+            symbol_map: dict[str, dict] = {}
+            for r in rows:
+                for sym in _parse_symbols(r.symbols):
+                    entry = symbol_map.get(sym)
+                    if entry is None:
+                        symbol_map[sym] = {
+                            "symbol": sym,
+                            "first_seen_at": r.run_at,
+                            "last_confirmed_at": r.run_at,
+                        }
+                    else:
+                        # rows are ascending by run_at, so this row is >= last_confirmed_at
+                        entry["last_confirmed_at"] = r.run_at
+
+            symbols_list = sorted(symbol_map.values(), key=lambda x: x["symbol"])
+
+            result.append(
+                {
+                    "id": d.id,
+                    "name": d.name,
+                    "screener_type": d.screener_type,
+                    "symbols": symbols_list,
+                }
+            )
+
+        return jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "ttl_minutes": ttl_min,
+                    "as_of": now.isoformat(),
+                    "definitions": result,
+                },
+            }
+        )
+
+    except Exception as e:
+        logger.exception("scanner currently_matching failed: %s", e)
         return jsonify({"status": "error", "message": str(e)}), 500
