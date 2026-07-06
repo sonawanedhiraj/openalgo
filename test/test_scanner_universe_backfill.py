@@ -540,6 +540,206 @@ def test_boot_backfill_keeps_smoke_hold_when_genuinely_stale(monkeypatch):
         smoke_svc._last_alert_date = None
 
 
+def test_morning_scenario_verified_refresh_persists_ok_and_releases_hold(monkeypatch):
+    """Issue #338 acceptance test — the exact 2026-07-06 morning failure,
+    end-to-end through the REAL ``data_health_db`` (isolated per-process temp
+    DB via test/conftest.py, not mocked) so the persisted-row semantics are
+    genuinely exercised rather than stubbed away.
+
+    Scenario: both intervals are stale at the start (a normal morning that
+    needs catch-up); ``check_and_refresh_if_stale`` verifies every symbol
+    caught up (``still_stale=[]``, ``errors=[]``) — matching the real #304
+    verified-refresh contract. ``run_boot_backfill_checks`` must:
+      1. persist ``data_health_check`` rows with ``overall_ok=1`` for both
+         ``scanner_universe_1m`` and ``scanner_universe_D`` (not 0 — the
+         pre-fix bug), and
+      2. release a pre-armed smoke-check post-hold via the real
+         ``re_check_and_release`` → ``production_freshness_reader`` →
+         ``get_latest_check`` chain (gates 2+3 of the smoke check), because
+         the rows it reads now say verified-fresh.
+
+    MUST FAIL on the pre-fix tree: pre-fix, ``_persist_health`` wrote
+    ``overall_ok = (status=='ok' and not stale_symbols and not errors)``,
+    and ``stale_symbols`` here is the PRE-refresh list (non-empty) — so both
+    rows would be written ``overall_ok=0`` and the hold would stay armed.
+    """
+    from database.data_health_db import get_latest_check
+
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SYMBOLS", "RELIANCE,SBIN")
+    smoke_svc._reset_hold_for_tests()
+    smoke_svc._last_alert_date = None
+    try:
+        smoke_svc.set_post_hold(reason="test: 09:18 FAILED — stale feed at boot")
+        assert smoke_svc.get_post_hold() is not None
+
+        def fake_check(today=None, *, interval="1m"):
+            # Stale at the start (found_stale non-empty)...
+            return {
+                "status": "ok",
+                "interval": interval,
+                "stale_symbols": ["RELIANCE", "SBIN"],
+                "refreshed": ["RELIANCE", "SBIN"],
+                # ...but the #304 post-job verification confirms full catch-up.
+                "still_stale": [],
+                "errors": [],
+                "skipped_fresh": [],
+            }
+
+        with (
+            patch.object(sched, "_intervals", return_value=["1m", "D"]),
+            patch(
+                "services.scanner_universe_backfill.check_and_refresh_if_stale",
+                side_effect=fake_check,
+            ),
+            patch("services.historify_service.wait_for_jobs", return_value={}),
+            # Real production chain for the re-check's other gates.
+            patch("database.auth_db.get_first_available_api_key", return_value="test_api_key"),
+            patch(
+                "services.scanner_service.get_scanner_service",
+                return_value=MagicMock(get_today_ohlcv=MagicMock(return_value=(100.0, 1000))),
+            ),
+        ):
+            sched.run_boot_backfill_checks(THURS)
+
+        # 1. Persisted rows are verified-fresh (overall_ok=1), reading straight
+        #    from the real data_health_check table.
+        row_1m = get_latest_check("scanner_universe_1m")
+        row_d = get_latest_check("scanner_universe_D")
+        assert row_1m is not None and row_1m["overall_ok"] is True
+        assert row_d is not None and row_d["overall_ok"] is True
+        # stale_symbols column now holds the POST-refresh still_stale list.
+        assert row_1m["stale_symbols"] == []
+        # found_stale (pre-refresh) is kept in details for observability.
+        assert row_1m["details"]["found_stale"] == ["RELIANCE", "SBIN"]
+        assert row_1m["details"]["still_stale"] == []
+
+        # 2. The smoke-check post-hold is RELEASED — the re-check read these
+        #    exact rows and saw verified-fresh.
+        assert smoke_svc.get_post_hold() is None
+    finally:
+        smoke_svc._reset_hold_for_tests()
+        smoke_svc._last_alert_date = None
+
+
+def test_morning_scenario_genuinely_still_stale_keeps_hold_armed(monkeypatch):
+    """Companion to the acceptance test above: when the post-job verification
+    shows symbols genuinely still stale, the persisted row must be
+    ``overall_ok=0`` and a pre-armed hold must stay armed."""
+    from database.data_health_db import get_latest_check
+
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SYMBOLS", "RELIANCE,SBIN")
+    smoke_svc._reset_hold_for_tests()
+    smoke_svc._last_alert_date = None
+    try:
+        smoke_svc.set_post_hold(reason="test: 09:18 FAILED — stale feed at boot")
+        assert smoke_svc.get_post_hold() is not None
+
+        def fake_check(today=None, *, interval="1m"):
+            return {
+                "status": "ok",
+                "interval": interval,
+                "stale_symbols": ["RELIANCE", "SBIN"],
+                "refreshed": [],
+                "still_stale": ["RELIANCE", "SBIN"],  # verification: still behind
+                "errors": [],
+                "skipped_fresh": [],
+            }
+
+        with (
+            patch.object(sched, "_intervals", return_value=["1m", "D"]),
+            patch(
+                "services.scanner_universe_backfill.check_and_refresh_if_stale",
+                side_effect=fake_check,
+            ),
+            patch("services.historify_service.wait_for_jobs", return_value={}),
+            patch("database.auth_db.get_first_available_api_key", return_value="test_api_key"),
+            patch(
+                "services.scanner_service.get_scanner_service",
+                return_value=MagicMock(get_today_ohlcv=MagicMock(return_value=(100.0, 1000))),
+            ),
+        ):
+            sched.run_boot_backfill_checks(THURS)
+
+        row_1m = get_latest_check("scanner_universe_1m")
+        assert row_1m is not None and row_1m["overall_ok"] is False
+        assert row_1m["stale_symbols"] == ["RELIANCE", "SBIN"]
+
+        # Hold must stay armed — the data is genuinely still stale.
+        assert smoke_svc.get_post_hold() is not None
+    finally:
+        smoke_svc._reset_hold_for_tests()
+        smoke_svc._last_alert_date = None
+
+
+def test_already_fresh_noop_path_persists_ok(monkeypatch):
+    """Already-fresh no-op path (no stale symbols found at all) must also
+    persist verified overall_ok=1 rows."""
+    from database.data_health_db import get_latest_check
+
+    monkeypatch.setenv("SCANNER_SYMBOLS", "RELIANCE,SBIN")
+
+    def fake_check(today=None, *, interval="1m"):
+        return {
+            "status": "ok",
+            "interval": interval,
+            "stale_symbols": [],
+            "refreshed": [],
+            "still_stale": [],
+            "errors": [],
+            "skipped_fresh": ["RELIANCE", "SBIN"],
+        }
+
+    with (
+        patch.object(sched, "_intervals", return_value=["1m", "D"]),
+        patch(
+            "services.scanner_universe_backfill.check_and_refresh_if_stale",
+            side_effect=fake_check,
+        ),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+    ):
+        res = sched.run_boot_backfill_checks(THURS)
+
+    assert res["all_fresh"] is True
+    row_1m = get_latest_check("scanner_universe_1m")
+    assert row_1m is not None and row_1m["overall_ok"] is True
+
+
+def test_skipped_locked_path_persists_not_ok(monkeypatch):
+    """A transient DuckDB-lock skip (``status='skipped_locked'``) verified
+    nothing — it must NOT be persisted as overall_ok=1, so the periodic loop
+    keeps retrying rather than backing off on a read that never happened."""
+    from database.data_health_db import get_latest_check
+
+    monkeypatch.setenv("SCANNER_SYMBOLS", "RELIANCE,SBIN")
+
+    def fake_check(today=None, *, interval="1m"):
+        return {
+            "status": "skipped_locked",
+            "interval": interval,
+            "stale_symbols": [],
+            "refreshed": [],
+            "still_stale": [],
+            "errors": [],
+            "skipped_fresh": [],
+        }
+
+    with (
+        patch.object(sched, "_intervals", return_value=["1m", "D"]),
+        patch(
+            "services.scanner_universe_backfill.check_and_refresh_if_stale",
+            side_effect=fake_check,
+        ),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+    ):
+        res = sched.run_boot_backfill_checks(THURS)
+
+    assert res["all_fresh"] is False
+    row_1m = get_latest_check("scanner_universe_1m")
+    assert row_1m is not None and row_1m["overall_ok"] is False
+
+
 def test_boot_backfill_smoke_release_noop_without_hold():
     """No hold armed at boot time → the release call is a silent no-op,
     verified by asserting the underlying pipeline check function is never
@@ -568,11 +768,43 @@ def test_boot_backfill_smoke_release_noop_without_hold():
     assert smoke_svc.get_post_hold() is None
 
 
-def test_run_backfill_checks_marks_not_fresh_when_any_interval_stale():
+def test_run_backfill_checks_verified_fresh_after_successful_catchup():
+    """Issue #338 — finding stale symbols and then VERIFYING they all caught up
+    (still_stale empty, no errors) is a fresh outcome. Pre-fix this asserted
+    ``all_fresh is False`` purely because ``stale_symbols`` (the PRE-refresh
+    list) was non-empty — the exact bug: every normal morning that needed ANY
+    catch-up reported not-fresh even when the catch-up fully succeeded."""
+
+    def fake_check(today=None, *, interval="1m"):
+        r = _fresh_result(interval)
+        if interval == "D":
+            r["stale_symbols"] = ["RELIANCE"]  # found stale at the start...
+            r["still_stale"] = []  # ...but verified fully caught up.
+        return r
+
+    with (
+        patch.object(sched, "_intervals", return_value=["1m", "D"]),
+        patch(
+            "services.scanner_universe_backfill.check_and_refresh_if_stale",
+            side_effect=fake_check,
+        ),
+    ):
+        res = sched.run_backfill_checks(THURS)
+
+    assert res["all_fresh"] is True
+    assert res["intervals"]["D"]["stale_symbols"] == ["RELIANCE"]
+    assert res["intervals"]["D"]["still_stale"] == []
+
+
+def test_run_backfill_checks_marks_not_fresh_when_genuinely_still_stale():
+    """A symbol that is STILL stale after the post-job (#304) verification
+    must keep ``all_fresh=False`` — the catch-up genuinely didn't work."""
+
     def fake_check(today=None, *, interval="1m"):
         r = _fresh_result(interval)
         if interval == "D":
             r["stale_symbols"] = ["RELIANCE"]
+            r["still_stale"] = ["RELIANCE"]  # verification says still behind.
         return r
 
     with (
@@ -585,7 +817,7 @@ def test_run_backfill_checks_marks_not_fresh_when_any_interval_stale():
         res = sched.run_backfill_checks(THURS)
 
     assert res["all_fresh"] is False
-    assert res["intervals"]["D"]["stale_symbols"] == ["RELIANCE"]
+    assert res["intervals"]["D"]["still_stale"] == ["RELIANCE"]
 
 
 # --------------------------------------------------------------------------- #
@@ -627,6 +859,63 @@ def test_periodic_tick_skips_outside_window_runs_inside():
     ):
         ran, res = sched._periodic_tick(datetime(2026, 6, 11, 16, 0, tzinfo=_IST), end_t)
     assert ran is True and res["all_fresh"] is True
+
+
+def test_periodic_loop_backs_off_only_on_verified_fresh(monkeypatch):
+    """Issue #338 — the periodic loop's backoff must key off VERIFIED
+    freshness, end-to-end through the real ``run_backfill_checks`` (not a
+    stubbed ``all_fresh``). A tick that found stale symbols but verified them
+    all caught up must back off; a tick with genuinely still-stale symbols
+    must NOT back off (keep the short retry interval)."""
+    monkeypatch.setenv("SCANNER_SYMBOLS", "RELIANCE,SBIN")
+
+    def fake_check_verified(today=None, *, interval="1m"):
+        return {
+            "status": "ok",
+            "interval": interval,
+            "stale_symbols": ["RELIANCE"],
+            "refreshed": ["RELIANCE"],
+            "still_stale": [],
+            "errors": [],
+            "skipped_fresh": [],
+        }
+
+    with (
+        patch("services.broker_session_health.is_live_broker_session", return_value=True),
+        patch.object(sched, "_intervals", return_value=["1m", "D"]),
+        patch(
+            "services.scanner_universe_backfill.check_and_refresh_if_stale",
+            side_effect=fake_check_verified,
+        ),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+    ):
+        ran, res = sched._periodic_tick(datetime(2026, 6, 11, 16, 0, tzinfo=_IST), time(17, 0))
+    assert ran is True
+    assert res["all_fresh"] is True  # verified fresh → loop should back off
+
+    def fake_check_still_stale(today=None, *, interval="1m"):
+        return {
+            "status": "ok",
+            "interval": interval,
+            "stale_symbols": ["RELIANCE"],
+            "refreshed": [],
+            "still_stale": ["RELIANCE"],
+            "errors": [],
+            "skipped_fresh": [],
+        }
+
+    with (
+        patch("services.broker_session_health.is_live_broker_session", return_value=True),
+        patch.object(sched, "_intervals", return_value=["1m", "D"]),
+        patch(
+            "services.scanner_universe_backfill.check_and_refresh_if_stale",
+            side_effect=fake_check_still_stale,
+        ),
+        patch("services.historify_service.wait_for_jobs", return_value={}),
+    ):
+        ran, res = sched._periodic_tick(datetime(2026, 6, 11, 16, 0, tzinfo=_IST), time(17, 0))
+    assert ran is True
+    assert res["all_fresh"] is False  # still genuinely stale → keep retrying
 
 
 def test_periodic_loop_exits_cleanly_when_stopped():
