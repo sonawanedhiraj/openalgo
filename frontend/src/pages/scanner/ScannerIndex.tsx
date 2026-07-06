@@ -45,6 +45,7 @@ import {
 } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { CurrentlyMatching } from './CurrentlyMatching'
 import { ParamForm } from './ParamForm'
 
 const REFRESH_MS = 30_000
@@ -618,6 +619,12 @@ export default function ScannerIndex() {
           Failed to load definitions: {error instanceof Error ? error.message : 'Unknown error'}
         </div>
       )}
+
+      {/* Currently matching — live list, symbols drop off when conditions stop
+          holding (issue #342). This is a separate, ephemeral view; the tabs
+          below (signal history, hits-by-symbol) remain the permanent,
+          never-filtered audit trail of every fired signal. */}
+      <CurrentlyMatching />
 
       <Tabs defaultValue="definitions">
         <TabsList>
