@@ -397,6 +397,48 @@ def get_open_trades_for_date(date_iso: str, strategy_name: str | None = None) ->
             pass
 
 
+def get_unpriced_exits_for_date(
+    date_iso: str,
+    strategy_name: str | None = None,
+    exit_reason: str = "eod_watchdog",
+) -> list[dict]:
+    """Return CLOSED journal rows entered on ``date_iso`` whose exit was never
+    priced: ``exited_at IS NOT NULL AND pnl IS NULL AND exit_reason == exit_reason``.
+
+    The EOD watchdog stamps ``record_exit(exit_price=None)`` right after placing
+    its MARKET flatten (it deliberately doesn't wait for the fill), leaving the
+    row closed but unpriced — invisible to the ``exited_at IS NULL`` reconcile
+    pass, so its P&L read as ₹0 everywhere (issue #350). EOD reconciliation uses
+    this to find those rows and backfill the fill price from sandbox.
+
+    The ``exit_reason`` match is EXACT, so suppressed watchdog stamps
+    (``eod_watchdog:<suppress-reason>`` — nothing was placed, there is no fill)
+    are excluded by construction. Newest first. Returns ``[]`` on DB failure.
+    """
+    sess = _session()
+    try:
+        q = (
+            sess.query(TradeJournal)
+            .filter(TradeJournal.exited_at.isnot(None))
+            .filter(TradeJournal.pnl.is_(None))
+            .filter(TradeJournal.exit_reason == exit_reason)
+            .filter(TradeJournal.placed_at >= date_iso)
+            .filter(TradeJournal.placed_at < date_iso + "~")  # ASCII '~' > digits/'T'
+        )
+        if strategy_name:
+            q = q.filter(TradeJournal.strategy_name == strategy_name)
+        rows = q.order_by(TradeJournal.placed_at.desc()).all()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as e:
+        logger.exception("trade_journal.get_unpriced_exits_for_date failed: %s", e)
+        return []
+    finally:
+        try:
+            sess.remove()
+        except Exception:
+            pass
+
+
 def get_open_journal_id_for_symbol(symbol: str) -> int | None:
     """Returns the journal id of the most recent open entry on ``symbol``
     (i.e. ``exited_at IS NULL``). Used by the engine at exit time to find

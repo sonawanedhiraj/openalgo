@@ -1379,7 +1379,13 @@ under-counted trades and P&L (the 2026-06-10 bug: +₹352 shown vs +₹8,327 rea
 that gap: before the Telegram EOD summary fires, `_maybe_log_eod_summary` calls
 `_maybe_reconcile_eod_journal(today)` (reconcile → summarize), which reads
 `sandbox.db` **read-only** and stamps the missing exit rows
-(`exit_reason='sandbox_eod_squareoff'`, gross P&L). Idempotent, mid-day safe,
+(`exit_reason='sandbox_eod_squareoff'`, gross P&L). A second pass (issue #350)
+prices **watchdog-stamped exits**: the EOD watchdog closes journal rows with
+`exit_price=None` (it doesn't wait for the fill), which made their P&L read ₹0
+on the strategies dashboard while `/positions` had the real number — the pass
+backfills `exit_price`+`pnl` from the sandbox fill matching the stamped
+`exit_order_id` (order-id matching, so a same-symbol earlier stop-loss fill is
+never blended in). Idempotent, mid-day safe,
 sandbox-only, gated by `ENGINE_EOD_RECONCILIATION_ENABLED` (default true). A
 past-date operator backfill lives in
 `services/engine_eod_reconciliation_backfill.py` (dry-run by default; `--apply`

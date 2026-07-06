@@ -18,8 +18,13 @@ Examples::
     # After review, actually write the exit rows:
     uv run python -m services.engine_eod_reconciliation_backfill --from 2026-06-10 --to 2026-06-10 --apply
 
-Idempotent: the underlying reconciliation only closes ``exited_at IS NULL`` rows,
-so applying twice is a no-op. Read-only on ``sandbox.db`` either way.
+Also runs the watchdog price backfill (issue #350): rows the EOD watchdog closed
+with ``exit_price=None`` get their fill price + P&L written from the sandbox
+trade matching their ``exit_order_id``.
+
+Idempotent: pass 1 only closes ``exited_at IS NULL`` rows and pass 2 only prices
+``pnl IS NULL`` rows, so applying twice is a no-op. Read-only on ``sandbox.db``
+either way.
 """
 
 from __future__ import annotations
@@ -65,15 +70,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"# range {start} .. {end}  strategy={args.strategy}\n")
 
     grand_added = 0
+    grand_backfilled = 0
     for day in _daterange(start, end):
         result = reconcile_engine_journal(day, strategy_name=args.strategy, dry_run=dry_run)
         grand_added += result.exits_added
-        if result.entries_checked == 0 and result.exits_added == 0:
-            print(f"{day}: no open entries to reconcile")
+        grand_backfilled += result.backfills_added
+        if (
+            result.entries_checked == 0
+            and result.exits_added == 0
+            and result.backfills_checked == 0
+        ):
+            print(f"{day}: nothing to reconcile")
             continue
         print(
             f"{day}: checked={result.entries_checked} "
             f"{'would_add' if dry_run else 'added'}={result.exits_added} "
+            f"backfill_checked={result.backfills_checked} "
+            f"{'would_backfill' if dry_run else 'backfilled'}={result.backfills_added} "
             f"skipped={len(result.skipped)}"
         )
         for d in result.exit_details:
@@ -82,13 +95,20 @@ def main(argv: list[str] | None = None) -> int:
                 f"exit={d['exit_price']} pnl={d['pnl']} fills={d['fills']} "
                 f"order={d['exit_order_id']}"
             )
+        for d in result.backfill_details:
+            print(
+                f"    ~ {d['symbol']:<12} {d['direction']:<5} qty={d['quantity']:<4} "
+                f"exit={d['exit_price']} pnl={d['pnl']} fills={d['fills']} "
+                f"order={d['exit_order_id']} (watchdog price backfill)"
+            )
         for s in result.skipped:
             print(f"    - {s.get('symbol')}: {s.get('reason')}")
-        print(f"    detail_json={json.dumps(result.exit_details)}")
+        print(f"    detail_json={json.dumps(result.exit_details + result.backfill_details)}")
 
-    verb = "would be added" if dry_run else "added"
-    print(f"\n# total exit rows {verb}: {grand_added}")
-    if dry_run and grand_added:
+    verb = "would be" if dry_run else ""
+    print(f"\n# total exit rows {verb} added: {grand_added}".replace("  ", " "))
+    print(f"# total watchdog exits {verb} price-backfilled: {grand_backfilled}".replace("  ", " "))
+    if dry_run and (grand_added or grand_backfilled):
         print("# review the rows above, then re-run with --apply to write them.")
     return 0
 

@@ -377,6 +377,7 @@ def _simplified_engine_stats() -> dict:
         open_count = 0
         today_trade_count = 0
         today_pnl = 0.0
+        unpriced_exits = 0
         last_at: str | None = None
         for r in rows:
             placed = r.placed_at or ""
@@ -387,11 +388,18 @@ def _simplified_engine_stats() -> dict:
             if last_at is None or placed > last_at:
                 last_at = placed
             exited = r.exited_at or ""
-            if exited.startswith(today_str) and r.pnl is not None:
-                today_pnl += float(r.pnl)
+            if exited.startswith(today_str):
+                if r.pnl is not None:
+                    today_pnl += float(r.pnl)
+                else:
+                    # Closed today but never priced (e.g. a watchdog exit whose
+                    # fill wasn't reconciled yet — issue #350). Surfaced so ₹X
+                    # with N unpriced trades can't masquerade as a complete ₹X.
+                    unpriced_exits += 1
         return {
             "open_positions": open_count,
             "today_net_pnl": round(today_pnl, 2),
+            "today_unpriced_exits": unpriced_exits,
             # placed_at is a tz-aware IST string; the card appends 'Z', so emit
             # naive-UTC to match futures/sector and avoid "Invalid Date" (#317).
             "last_trade_at": _normalize_last_trade_at(last_at),
@@ -402,6 +410,7 @@ def _simplified_engine_stats() -> dict:
         return {
             "open_positions": 0,
             "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
             "last_trade_at": None,
             "today_trade_count": 0,
         }
@@ -638,6 +647,7 @@ def _build_summary(name: str) -> dict:
         "version": config.get("version", "—"),
         "open_positions": stats.get("open_positions", 0),
         "today_net_pnl": stats.get("today_net_pnl", None),
+        "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
         "today_trade_count": stats.get("today_trade_count", 0),
         "last_trade_at": stats.get("last_trade_at"),
         "active_overrides": overrides,
@@ -724,6 +734,7 @@ def strategy_detail(name: str):
         perf = {
             "open_positions": stats["open_positions"],
             "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
             "last_trade_at": stats["last_trade_at"],
             **lifetime,
         }
