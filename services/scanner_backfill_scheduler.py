@@ -218,9 +218,18 @@ def _maybe_resettle_daily(today) -> None:
 def run_backfill_checks(today=None) -> dict:
     """Run the per-interval stale-check (1m then D); return the combined verdict.
 
-    ``all_fresh`` is True iff no interval found a stale symbol (the convergence
-    signal that lets the periodic loop back off). ``errors`` unions every
-    interval's fail-graceful error list. Never raises.
+    ``all_fresh`` is **verified-fresh** semantics (issue #338): True iff no
+    interval has any symbol left ``still_stale`` (i.e. genuinely behind *after*
+    the #304 post-job verification, or never found stale in the first place)
+    AND no interval hit an error. It is NOT "no interval found stale symbols at
+    the start" — a normal morning that finds 216 stale symbols and then
+    successfully catches all of them up is ``all_fresh=True``. This is the
+    single meaning of ``all_fresh`` for every consumer (logging, the periodic
+    loop's backoff, ``_persist_health``'s per-interval ``overall_ok``) — see
+    the #338 fix write-up for why a pre-refresh definition made the smoke-check
+    re-check unable to ever pass on a normal morning.
+
+    ``errors`` unions every interval's fail-graceful error list. Never raises.
 
     Before the stale-check, a once-per-day daily-D re-settle corrects any
     provisional (intraday-captured) daily close so the scanner's ``yest_d`` gate
@@ -237,15 +246,39 @@ def run_backfill_checks(today=None) -> dict:
         res = check_and_refresh_if_stale(today, interval=interval)
         per_interval[interval] = res
         errors.extend(res.get("errors", []))
-        # A "skipped_locked" arm read nothing (historify briefly locked) — not
-        # proof of freshness, so don't let the periodic loop back off on it.
-        if res.get("stale_symbols") or res.get("status") == "skipped_locked":
+        # Verified-fresh (#338): an interval is fresh iff the check actually ran
+        # ("ok" status — a "skipped_locked" read proved nothing, so it must not
+        # let the loop back off), nothing is still_stale after the post-job
+        # verification, and no error occurred. Note this deliberately ignores
+        # the PRE-refresh "stale_symbols" list — finding stale symbols and then
+        # successfully catching them all up is a fresh outcome.
+        interval_verified_ok = (
+            res.get("status") == "ok" and not res.get("still_stale") and not res.get("errors")
+        )
+        if not interval_verified_ok:
             all_fresh = False
     return {"intervals": per_interval, "all_fresh": all_fresh, "errors": errors}
 
 
 def _persist_health(res: dict) -> None:
-    """Write one ``data_health_check`` row per interval (best-effort)."""
+    """Write one ``data_health_check`` row per interval (best-effort).
+
+    Issue #338 — ``overall_ok`` (and the ``stale_symbols`` column) now carry
+    **verified** (post-refresh) freshness, not the pre-refresh "did we find any
+    stale symbols at the start" signal. The smoke check
+    (``scanner_smoke_check_service.production_freshness_reader``) reads exactly
+    these rows, so a row that says ``overall_ok=0`` must mean "still actually
+    stale after the catch-up ran" — not "a catch-up was needed and it ran fine".
+    Pre-fix, every normal morning that needed ANY catch-up wrote ``overall_ok=0``
+    at refresh completion, so the 09:18 smoke check (and its #319 re-check) both
+    read "stale" and the post-hold could never release intra-session.
+
+    ``stale_symbols`` column = POST-refresh ``still_stale`` (what "stale" means
+    to a reader of this table). The PRE-refresh list is kept in
+    ``details["found_stale"]`` for observability (how much catch-up work this
+    run actually did) — ``details["still_stale"]`` duplicates the column value
+    for symmetry with the log line in ``_log_and_alert``.
+    """
     try:
         from database.data_health_db import insert_check
     except Exception:  # DB layer unavailable (e.g. some test contexts) — skip silently
@@ -253,21 +286,26 @@ def _persist_health(res: dict) -> None:
         return
 
     for interval, ires in res.get("intervals", {}).items():
-        stale = ires.get("stale_symbols", [])
+        found_stale = ires.get("stale_symbols", [])
+        still_stale = ires.get("still_stale", [])
         had_error = bool(ires.get("errors"))
-        # overall_ok: the feed is healthy iff the check actually ran (status "ok"),
-        # nothing was stale, AND no fetch error. A "skipped_locked" read is not a
-        # health signal, so it must not record a falsely-healthy row.
-        overall_ok = ires.get("status") == "ok" and not stale and not had_error
+        # verified_ok (#338): the feed is healthy iff the check actually ran
+        # (status "ok"), nothing is still_stale AFTER the post-job (#304)
+        # verification, AND no fetch error. A "skipped_locked" read proved
+        # nothing, so it must not record a falsely-healthy row. Deliberately
+        # does NOT look at found_stale — finding stale symbols and then
+        # successfully catching them up is a healthy outcome.
+        verified_ok = ires.get("status") == "ok" and not still_stale and not had_error
         try:
             insert_check(
                 strategy_name=_health_strategy_name(interval),
-                overall_ok=overall_ok,
-                stale_symbols=stale,
+                overall_ok=verified_ok,
+                stale_symbols=still_stale,
                 details={
                     "interval": interval,
+                    "found_stale": found_stale,
                     "refreshed": ires.get("refreshed", []),
-                    "still_stale": ires.get("still_stale", []),
+                    "still_stale": still_stale,
                     "skipped_fresh_count": len(ires.get("skipped_fresh", [])),
                     "errors": ires.get("errors", []),
                 },
