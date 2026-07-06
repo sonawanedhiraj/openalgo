@@ -30,6 +30,19 @@ Endpoints consumed by the React /scanner page:
       alter or filter ``scan_results`` — the full history remains the
       permanent audit trail via /signals and /hits-by-symbol.
 
+      Issue #348: each symbol is additionally enriched with ``prev_close``
+      (from ``services.scanner_reference_data.get_broker_prev_close``),
+      ``last_price`` (from the live in-process scanner aggregator via
+      ``services.scanner_service.get_scanner_service().get_today_ohlcv``),
+      and ``pct_change`` = round((last/prev - 1) * 100, 2). Per-symbol
+      enrichment is best-effort: a missing prev_close/last_price yields
+      ``pct_change=null`` but the symbol is still listed — enrichment never
+      errors the endpoint. Within each definition the symbol list is sorted
+      server-side to mirror Chartink: ``screener_type='buy'`` sorts by
+      pct_change DESCENDING (biggest gainers first), ``'sell'`` ASCENDING
+      (biggest losers first); symbols with a null pct_change always sort
+      last, tie-broken alphabetically by symbol.
+
 Authentication: Flask session (same as /chartink/api/scanner-comparison).
 This is a React-facing endpoint served inside the authenticated app, so
 session auth is the natural fit — no API key header required.
@@ -91,6 +104,99 @@ def _active_ttl_min() -> int:
 def _today_ist() -> str:
     """Return today's date string in IST (YYYY-MM-DD)."""
     return datetime.now(_IST).strftime("%Y-%m-%d")
+
+
+def _get_last_price(symbol: str, as_of: datetime) -> float | None:
+    """Best-effort read of TODAY's latest close for ``symbol`` from the live
+    in-process scanner aggregator singleton (issue #348).
+
+    Reuses the exact accessor `services.sector_follow_service.
+    production_intraday_provider` already established for this purpose
+    (``get_scanner_service()`` -> ``ScannerService.get_today_ohlcv``) rather
+    than adding any new scanner state. Lazily imported so this blueprint
+    never pulls the scanner stack at import time. Fails gracefully to
+    ``None`` when the scanner singleton isn't running (e.g. tests, headless,
+    or the symbol isn't tracked) — never raises.
+    """
+    try:
+        from services.scanner_service import get_scanner_service
+
+        svc = get_scanner_service()
+        if svc is None:
+            return None
+        as_of_date = as_of.astimezone(_IST).date() if as_of.tzinfo else as_of.date()
+        last_close, _volume = svc.get_today_ohlcv(symbol, as_of_date)
+        return last_close
+    except Exception:
+        logger.debug("currently_matching: last_price lookup failed for %s", symbol, exc_info=True)
+        return None
+
+
+def _get_prev_close(symbol: str, as_of: datetime) -> float | None:
+    """Best-effort read of ``symbol``'s broker-known T-1 settled close from
+    the day-scoped registry (issue #348). Never raises."""
+    try:
+        from services.scanner_reference_data import get_broker_prev_close
+
+        today = as_of.astimezone(_IST).date() if as_of.tzinfo else as_of.date()
+        entry = get_broker_prev_close(symbol, today=today)
+        if entry is None:
+            return None
+        prev_close, _as_of = entry
+        return prev_close
+    except Exception:
+        logger.debug("currently_matching: prev_close lookup failed for %s", symbol, exc_info=True)
+        return None
+
+
+def _enrich_symbol_entry(entry: dict, as_of: datetime) -> dict:
+    """Attach ``prev_close``/``last_price``/``pct_change`` to a currently-matching
+    symbol entry. Best-effort per symbol: any failure or missing input leaves
+    ``pct_change=None`` (the symbol is still listed, never dropped, and the
+    endpoint never 500s because of enrichment)."""
+    symbol = entry["symbol"]
+    prev_close = _get_prev_close(symbol, as_of)
+    last_price = _get_last_price(symbol, as_of)
+
+    pct_change: float | None = None
+    if prev_close is not None and last_price is not None and prev_close != 0:
+        try:
+            pct_change = round((last_price / prev_close - 1) * 100, 2)
+        except Exception:
+            logger.debug(
+                "currently_matching: pct_change compute failed for %s", symbol, exc_info=True
+            )
+            pct_change = None
+
+    enriched = dict(entry)
+    enriched["prev_close"] = prev_close
+    enriched["last_price"] = last_price
+    enriched["pct_change"] = pct_change
+    return enriched
+
+
+def _sort_symbols_by_pct_change(symbols: list[dict], screener_type: str) -> list[dict]:
+    """Server-side sort mirroring Chartink (issue #348): ``buy`` sorts by
+    pct_change DESCENDING (biggest gainers on top), ``sell`` ASCENDING
+    (biggest losers on top). Entries with a null pct_change always sort
+    last regardless of side, tie-broken alphabetically by symbol."""
+    is_buy = (screener_type or "").strip().lower() == "buy"
+
+    def sort_key(entry: dict):
+        pct = entry.get("pct_change")
+        has_value = pct is not None
+        # Nulls last: primary key is "is null" (False sorts before True).
+        # For non-null values, sort descending for buy / ascending for sell
+        # by negating the pct for the buy side (Python sorts ascending).
+        if not has_value:
+            primary = 1
+            ordering_value = 0.0
+        else:
+            primary = 0
+            ordering_value = -pct if is_buy else pct
+        return (primary, ordering_value, entry["symbol"])
+
+    return sorted(symbols, key=sort_key)
 
 
 def _parse_symbols(raw: str | None) -> list[str]:
@@ -613,9 +719,14 @@ def currently_matching():
     Returns:
         {status, data: {ttl_minutes, as_of, definitions: [
             {id, name, screener_type, symbols: [
-                {symbol, first_seen_at, last_confirmed_at}
+                {symbol, first_seen_at, last_confirmed_at,
+                 prev_close, last_price, pct_change}
             ]}
         ]}}
+
+        ``symbols`` is sorted server-side per issue #348 (see module docstring):
+        buy -> pct_change desc, sell -> pct_change asc, nulls last, tie
+        alphabetical by symbol.
     """
     if not session.get("user"):
         return _unauthorized()
@@ -660,7 +771,8 @@ def currently_matching():
                         # rows are ascending by run_at, so this row is >= last_confirmed_at
                         entry["last_confirmed_at"] = r.run_at
 
-            symbols_list = sorted(symbol_map.values(), key=lambda x: x["symbol"])
+            symbols_list = [_enrich_symbol_entry(e, now) for e in symbol_map.values()]
+            symbols_list = _sort_symbols_by_pct_change(symbols_list, d.screener_type)
 
             result.append(
                 {

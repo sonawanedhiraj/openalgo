@@ -91,10 +91,19 @@ export interface HitsBySymbolResponse {
 // symbols with an in-house row within the last SCANNER_ACTIVE_TTL_MIN minutes.
 // Purely additive — never filters or truncates the signal history endpoints
 // above (getSignals / getHitsBySymbol), which remain the permanent audit trail.
+//
+// Issue #348: each symbol carries prev_close/last_price/pct_change enrichment
+// (null-safe — a missing broker prev-close or live aggregator price yields
+// pct_change=null rather than dropping the symbol). The API sorts `symbols`
+// server-side (buy: pct_change desc, sell: pct_change asc, nulls last, tie
+// alphabetical) — the frontend must render the order as-is, no client sort.
 export interface ActiveSymbol {
   symbol: string
   first_seen_at: string
   last_confirmed_at: string
+  prev_close: number | null
+  last_price: number | null
+  pct_change: number | null
 }
 
 export interface CurrentlyMatchingDefinition {

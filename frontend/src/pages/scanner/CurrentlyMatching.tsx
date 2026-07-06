@@ -17,6 +17,23 @@ function fmtTime(ts: string): string {
   return m ? `${m[1]} ${m[2]}` : ts
 }
 
+// %-change column (issue #348) — matches the app's existing green/red +sign
+// convention (see Positions.tsx: text-green-600 / text-red-600, "+" prefix on
+// non-negative, 2dp) with an em-dash for a null (missing prev_close/last_price
+// enrichment) rather than a client-side fallback value.
+function PctChangeCell({ pct }: { pct: number | null }) {
+  if (pct === null) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const isPositive = pct >= 0
+  return (
+    <span className={isPositive ? 'text-green-600' : 'text-red-600'}>
+      {isPositive ? '+' : ''}
+      {pct.toFixed(2)}%
+    </span>
+  )
+}
+
 function DefinitionBlock({ def }: { def: CurrentlyMatchingDefinition }) {
   const isBuy = def.screener_type === 'buy'
   const Icon = isBuy ? TrendingUp : TrendingDown
@@ -42,14 +59,20 @@ function DefinitionBlock({ def }: { def: CurrentlyMatchingDefinition }) {
             <thead>
               <tr className="bg-muted/40 text-muted-foreground">
                 <th className="text-left font-medium px-3 py-1.5">Symbol</th>
+                <th className="text-right font-medium px-3 py-1.5">% chg</th>
                 <th className="text-left font-medium px-3 py-1.5">Since</th>
                 <th className="text-left font-medium px-3 py-1.5">Last confirmed</th>
               </tr>
             </thead>
             <tbody>
+              {/* Order comes straight from the API (buy: pct desc / sell: pct
+                  asc, nulls last, tie alphabetical) — no client-side sort. */}
               {def.symbols.map((s) => (
                 <tr key={s.symbol} className="border-t">
                   <td className="px-3 py-1.5 font-mono font-medium">{s.symbol}</td>
+                  <td className="px-3 py-1.5 text-right tabular-nums">
+                    <PctChangeCell pct={s.pct_change} />
+                  </td>
                   <td className="px-3 py-1.5 tabular-nums text-muted-foreground">
                     {fmtTime(s.first_seen_at)}
                   </td>
