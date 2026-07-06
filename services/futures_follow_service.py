@@ -1815,7 +1815,16 @@ class FuturesFollowService:
                 entry_price = float(pos.get("average_price") or pos.get("avgprice") or 0.0)
             except (TypeError, ValueError):
                 entry_price = 0.0
-            lots = max(1, qty // lot_size) if lot_size else 1
+            # Ceiling-divide, not floor (#353): the store's net qty can cover
+            # MULTIPLE journaled BUY lots that don't line up with the currently
+            # configured ``nifty_lot_size`` (e.g. two legacy 65-qty BUYs nets to
+            # a 130-qty store position; the current config's lot size is 75, and
+            # floor division 130 // 75 == 1 silently drops a whole lot). Ceiling
+            # division guarantees the derived lot count never undercounts open
+            # exposure — worst case it overstates by a fraction of a lot when qty
+            # isn't a clean multiple, which is safer than the previous
+            # undercount for a value that only feeds sizing/observability here.
+            lots = max(1, -(-qty // lot_size)) if lot_size else 1
             pos_id = f"rehydrated:{symbol}:{uuid.uuid4().hex[:8]}"
             self.paper_book[pos_id] = FuturesPosition(
                 nifty_symbol=symbol,

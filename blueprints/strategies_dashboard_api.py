@@ -288,7 +288,32 @@ def _get_active_overrides(name: str) -> list[dict]:
 
 
 def _sector_follow_stats(since: datetime | None = None) -> dict:
-    """Aggregate P&L and position stats from sector_follow_trades."""
+    """Aggregate P&L and position stats from sector_follow_trades.
+
+    Open-position count (issue #353 same-class audit): computed **per-symbol**
+    from signed quantity sums over ALL placed rows, not a same-day row-count
+    pairing. sector_follow is also a T+1 strategy — a SELL row's
+    ``entry_date`` carries the *original entry session* (see
+    ``database/sector_follow_db.py`` and the mirrored bucketing note on
+    ``_futures_follow_stats``), so the previous ``today_entries vs
+    today_exits`` (both filtered on ``entry_date == today``) never actually
+    matched a T+1 exit against the entry it closes — a same-day exit's
+    ``entry_date`` is always a **prior** day, so ``today_exits`` was
+    structurally empty and ``open_count`` only ever grew regardless of actual
+    book state.
+
+    Unlike futures_follow (single NIFTY-future instrument, sized in
+    lots), sector_follow holds up to 5 *different* equity symbols at varying
+    quantities (₹50k/position sizing means qty differs per stock) — there is
+    no single "lot size" to divide by, and "open positions" means "distinct
+    symbols with a net-long placed quantity". So this sums BUY − SELL
+    quantity **within each symbol** and counts a symbol as open when its net
+    is positive, rather than dividing a strategy-wide quantity total by a lot
+    size (that conversion is futures_follow-specific, see
+    ``_lot_size_from_rows``). This also happens to be immune to the same
+    batched-exit-row class documented on ``_futures_follow_stats``, should
+    sector_follow ever batch an exit the same way.
+    """
     try:
         q = sf_session.query(SectorFollowTrade)
         if since:
@@ -296,9 +321,17 @@ def _sector_follow_stats(since: datetime | None = None) -> dict:
         trades = q.all()
         today_str = datetime.now(_IST).strftime("%Y-%m-%d")
         today_entries = [t for t in trades if t.side == "BUY" and t.entry_date == today_str]
-        today_exits = [t for t in trades if t.side == "SELL" and t.entry_date == today_str]
-        open_count = max(0, len(today_entries) - len(today_exits))
-        # Best-effort net P&L: price diff on matched entry/exit pairs
+        today_exits = [
+            t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
+        ]
+        placed = [t for t in trades if (t.status or "") == "placed"]
+        net_qty_by_symbol: dict[str, int] = {}
+        for t in placed:
+            sign = 1 if t.side == "BUY" else -1
+            net_qty_by_symbol[t.symbol] = net_qty_by_symbol.get(t.symbol, 0) + sign * int(
+                t.quantity or 0
+            )
+        open_count = sum(1 for qty in net_qty_by_symbol.values() if qty > 0)
         last = max((t.created_at for t in trades), default=None)
         return {
             "open_positions": open_count,
@@ -308,6 +341,23 @@ def _sector_follow_stats(since: datetime | None = None) -> dict:
     except Exception:
         logger.exception("Failed to aggregate sector_follow_stats")
         return {"open_positions": 0, "last_trade_at": None, "today_trade_count": 0}
+
+
+def _lot_size_from_rows(rows: list) -> int:
+    """Derive a display lot size from a set of trade rows (issue #353).
+
+    Uses the smallest *positive* BUY ``quantity`` seen across the rows as the
+    per-lot unit, rather than a hardcoded/config lot size — the journal's
+    historical rows may not agree with the strategy's current configured lot
+    size (e.g. legacy 65-qty rows vs. the post-2024-11-20 75-unit NIFTY lot),
+    and a single BUY row is always exactly 1 lot by construction
+    (``place_entry`` journals one row per signal at ``lots * lot_size``). This
+    is a *display* concern only — it never feeds back into order sizing.
+    Falls back to 1 (treat quantity as lot count) when no positive BUY
+    quantity exists.
+    """
+    buy_qtys = [int(t.quantity) for t in rows if t.side == "BUY" and (t.quantity or 0) > 0]
+    return min(buy_qtys) if buy_qtys else 1
 
 
 def _futures_follow_stats(since: datetime | None = None) -> dict:
@@ -320,6 +370,17 @@ def _futures_follow_stats(since: datetime | None = None) -> dict:
     row is correctly keyed by ``entry_date`` (which IS its execution date). Keying
     exits off ``entry_date`` was the bug that showed ₹0 today despite a profitable
     T+1 sell.
+
+    Open-position count (issue #353): computed from **signed quantity sums**,
+    not row counts. A single SELL row can square off more than one BUY lot in
+    one order (a batched T+1 exit, e.g. two 65-qty BUYs closed by one 130-qty
+    SELL) — row-count parity (``len(BUYs) - len(SELLs)``) then overcounts the
+    open book by exactly the number of lots the batched exit covered, showing
+    a phantom open position on an otherwise flat book. Summing quantity is
+    immune to how many order legs the exit was split across. The quantity
+    total is converted to a lot/position count for display using
+    ``_lot_size_from_rows`` (see there for why it isn't the hardcoded config
+    lot size).
     """
     try:
         q = ff_session.query(FuturesFollowTrade)
@@ -332,15 +393,18 @@ def _futures_follow_stats(since: datetime | None = None) -> dict:
             t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
         ]
         today_pnl = sum((t.net_pnl or 0.0) for t in exits_today if t.net_pnl is not None)
-        # Open = net placed legs across ALL sessions (placed BUYs − placed SELLs),
-        # so an overnight-held position stays counted until its T+1 exit fills.
-        # (Pairing today's exits against today's entries is wrong: today's SELL
-        # closes YESTERDAY's entry, not one of today's.)
+        # Open = net placed QUANTITY across ALL sessions (placed BUY qty − placed
+        # SELL qty), so an overnight-held position stays counted until its T+1
+        # exit fills. (Pairing today's exits against today's entries is wrong:
+        # today's SELL closes YESTERDAY's entry, not one of today's.)
         placed = [t for t in trades if (t.status or "") == "placed"]
-        open_count = max(
+        open_qty = max(
             0,
-            sum(1 for t in placed if t.side == "BUY") - sum(1 for t in placed if t.side == "SELL"),
+            sum(int(t.quantity or 0) for t in placed if t.side == "BUY")
+            - sum(int(t.quantity or 0) for t in placed if t.side == "SELL"),
         )
+        lot_size = _lot_size_from_rows(placed)
+        open_count = (open_qty + lot_size - 1) // lot_size if lot_size else 0
         last = max((t.created_at for t in trades), default=None)
         return {
             "open_positions": open_count,

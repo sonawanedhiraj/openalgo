@@ -1018,6 +1018,56 @@ def test_rehydrate_skips_already_known_symbols():
     assert svc.lots_held() == 1
 
 
+def test_rehydrate_derives_lots_by_ceiling_not_floor(monkeypatch):
+    """#353: a store position whose net qty (130) doesn't divide evenly by the
+    CURRENTLY CONFIGURED lot size (75) must not silently undercount lots via
+    floor division (130 // 75 == 1). This is exactly the 2026-07-06 incident
+    shape — two legacy 65-qty BUYs net to a 130-qty store position, and the
+    strategy's lot size later became 75 — so ceiling division must derive 2
+    lots, and the batched T+1 exit journaled off that rehydrated position must
+    record lots=2 (not the hardcoded/undercounted 1)."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY30JUN26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 130,  # NOT a clean multiple of the 75 lot size
+                    "average_price": "24000.0",
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    assert n == 1
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.quantity == 130
+    # Ceiling(130 / 75) == 2, not floor(130 / 75) == 1.
+    assert pos.lots == 2
+
+    # The subsequent T+1 exit must journal the same corrected lots=2 on its
+    # single batched SELL row (quantity still 130 — one order, no re-split).
+    match = (True, {"quantity": 130, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=match),
+    ):
+        svc.run_exit()
+    sell_rows = [r for r in svc._test_journal if r.get("side") == "SELL"]
+    assert len(sell_rows) == 1
+    assert sell_rows[0]["quantity"] == 130
+    assert sell_rows[0]["lots"] == 2
+
+
 # --------------------------------------------------------------------------- #
 # #292 — 15:18 pre-entry smoke check for futures_follow_cap50
 # --------------------------------------------------------------------------- #
