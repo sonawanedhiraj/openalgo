@@ -1246,7 +1246,20 @@ class ScannerService:
             logger.exception("ScannerService: _on_bar_close failed for %s/%s", symbol, interval)
 
     def _append_bar(self, symbol: str, interval: str, bar: dict[str, Any]) -> pd.DataFrame:
-        """Push the closed bar onto the rolling window and return the frame."""
+        """Push the closed bar onto the rolling window and return the frame.
+
+        The frame is kept TIMESTAMP-SORTED (issue #344): on a mid-session
+        restart, live ticks land before the boot seeder's replay, so the
+        in-progress live bar (e.g. 12:50) is appended BEFORE the seeded
+        session bars (09:15→12:45). An append-ordered frame then reports the
+        live bar as ``iloc[0]`` — which ``derive_today_and_yest`` Path B reads
+        as ``today_d.open`` — and feeds order-sensitive indicators (RSI/EMA)
+        a shuffled series. A stable sort by ``ts`` fixes both while keeping
+        duplicate-ts rows (a bucket split across replay + live close) in
+        append order so ``iloc[-1]``'s close stays the latest value. The trim
+        to ``history_size`` runs after the sort so the newest bars by ts are
+        the ones kept.
+        """
         import pandas as pd  # noqa: PLC0415
 
         row = {
@@ -1265,6 +1278,13 @@ class ScannerService:
                 combined = new_frame
             else:
                 combined = pd.concat([existing, new_frame], ignore_index=True)
+                try:
+                    if combined["ts"].notna().all():
+                        combined = combined.sort_values("ts", kind="stable", ignore_index=True)
+                except TypeError:
+                    # Mixed/unorderable ts values (synthetic test frames) —
+                    # keep append order, exactly the pre-#344 behaviour.
+                    pass
             if len(combined) > self.history_size:
                 combined = combined.iloc[-self.history_size :].reset_index(drop=True)
             self._bar_history[key] = combined
