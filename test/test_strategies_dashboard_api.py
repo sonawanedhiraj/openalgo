@@ -657,6 +657,174 @@ def test_futures_today_pnl_counts_t1_exit_filled_today(app, wired_dbs):
     assert ff["today_trade_count"] == 3
 
 
+# ---------------------------------------------------------------------------
+# Batched-exit open-count fix (issue #353)
+# ---------------------------------------------------------------------------
+
+
+def test_futures_batched_exit_leaves_no_phantom_open_position(app, wired_dbs):
+    """Row-count parity (BUY rows − SELL rows) overcounts open positions when a
+    single exit order squares off more than one BUY lot. Mirrors the 2026-07-06
+    evidence: BUY 65 (07-01) + BUY 65 + BUY 65 (07-02) = 3 rows / 195 qty, closed
+    by SELL 65 (07-02) + SELL 130 (07-03, one order covering both 07-02 lots) =
+    2 rows / 195 qty. Book is flat (195 - 195 = 0), but the old
+    ``len(BUYs) - len(SELLs)`` = 3 - 2 = 1 phantom open position. The fix sums
+    signed quantity instead, so a flat book always reads 0 regardless of how
+    many order legs the exits were split across."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    rows = [
+        # 07-01 entry
+        {"side": "BUY", "quantity": 65, "entry_date": "2026-07-01"},
+        # 07-02 entries (two lots opened same day)
+        {"side": "BUY", "quantity": 65, "entry_date": "2026-07-02"},
+        {"side": "BUY", "quantity": 65, "entry_date": "2026-07-02"},
+        # 07-02 exit of the 07-01 lot
+        {"side": "SELL", "quantity": 65, "entry_date": "2026-07-01"},
+        # 07-03 BATCHED exit — one order closes BOTH 07-02 lots (qty=130)
+        {"side": "SELL", "quantity": 130, "entry_date": "2026-07-02"},
+    ]
+    for i, r in enumerate(rows):
+        ff_sess.add(
+            ffdb.FuturesFollowTrade(
+                mode="sandbox",
+                side=r["side"],
+                nifty_symbol="NIFTY28JUL26FUT",
+                exchange="NFO",
+                product="NRML",
+                lots=1,
+                quantity=r["quantity"],
+                entry_price=24000.0,
+                exit_price=24100.0 if r["side"] == "SELL" else None,
+                entry_date=r["entry_date"],
+                status="placed",
+                created_at=_utc_naive_for_ist_today() - dt.timedelta(days=(4 - i)),
+            )
+        )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    ff = next(s for s in resp.get_json()["data"] if s["name"] == "futures_follow_cap50")
+    assert ff["open_positions"] == 0
+
+
+def test_futures_single_lot_lifecycle_open_then_flat(app, wired_dbs):
+    """A single BUY then its matching SELL: open goes 1 -> 0 (sanity check that
+    the quantity-sum rewrite doesn't regress the simple, non-batched case)."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            nifty_symbol="NIFTY28JUL26FUT",
+            exchange="NFO",
+            product="NRML",
+            lots=1,
+            quantity=75,
+            entry_price=24000.0,
+            entry_date="2026-07-05",
+            status="placed",
+            created_at=_utc_naive_for_ist_today() - dt.timedelta(days=1),
+        )
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+    ff = next(s for s in resp.get_json()["data"] if s["name"] == "futures_follow_cap50")
+    assert ff["open_positions"] == 1
+
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="SELL",
+            nifty_symbol="NIFTY28JUL26FUT",
+            exchange="NFO",
+            product="NRML",
+            lots=1,
+            quantity=75,
+            entry_price=24000.0,
+            exit_price=24100.0,
+            entry_date="2026-07-05",
+            net_pnl=7500.0,
+            status="placed",
+            created_at=_utc_naive_for_ist_today(),
+        )
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+    ff = next(s for s in resp.get_json()["data"] if s["name"] == "futures_follow_cap50")
+    assert ff["open_positions"] == 0
+
+
+def test_sector_follow_open_positions_per_symbol_signed_quantity(app, wired_dbs):
+    """sector_follow's open-position count must also be quantity-based, not a
+    same-day-entry_date row pairing (which — for a T+1 strategy where an exit
+    row's entry_date carries the ORIGINAL entry session — never actually
+    matched, see the docstring on _sector_follow_stats). Two symbols entered
+    on different days, one since exited: exactly 1 should read open."""
+    _sf_eng, sf_sess, sfdb = wired_dbs["sf"]
+
+    sf_sess.add(
+        sfdb.SectorFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            symbol="RELIANCE",
+            exchange="NSE",
+            product="CNC",
+            quantity=20,
+            price=2500.0,
+            entry_date="2026-07-01",
+            status="placed",
+            created_at=_utc_naive_for_ist_today() - dt.timedelta(days=3),
+        )
+    )
+    sf_sess.add(
+        sfdb.SectorFollowTrade(
+            mode="sandbox",
+            side="SELL",
+            symbol="RELIANCE",
+            exchange="NSE",
+            product="CNC",
+            quantity=20,
+            price=2550.0,
+            entry_date="2026-07-01",
+            status="placed",
+            created_at=_utc_naive_for_ist_today() - dt.timedelta(days=2),
+        )
+    )
+    sf_sess.add(
+        sfdb.SectorFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            symbol="TCS",
+            exchange="NSE",
+            product="CNC",
+            quantity=10,
+            price=3800.0,
+            entry_date="2026-07-05",
+            status="placed",
+            created_at=_utc_naive_for_ist_today() - dt.timedelta(days=1),
+        )
+    )
+    sf_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    # RELIANCE round-tripped (flat), TCS still open -> exactly 1 open position.
+    assert sf["open_positions"] == 1
+
+
 def test_futures_pnl_curve_keys_exit_by_execution_date(app, wired_dbs):
     """The P&L curve must attribute a T+1 exit's net_pnl to the day it FILLED
     (created_at IST), not to entry_date (yesterday) — issue #301."""
