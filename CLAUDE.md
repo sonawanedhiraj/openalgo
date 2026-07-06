@@ -958,21 +958,42 @@ the master contract: 30-JUN-26 / 28-JUL-26 / 25-AUG-26, all Tuesdays — NSE mov
 NIFTY expiry off Thursday)),
 HARD-CAPPED at **50% of capital as overnight SPAN margin** (₹10L book ⇒ ~2
 lots; late signals beyond the cap are skipped). Product **NRML**, exchange **NFO**,
-MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. **No stop loss** (Phase-1
-proved hard stops net-negative on this signal class); the **15:14 IST EOD watchdog**
-is the only backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
+MARKET orders. Held to a **T+1 15:25 IST** MARKET sell. As of 2026-07-04 (#332)
+the 15:20 decision snapshot (today's close+volume per symbol) comes from **one
+batched broker quote call** (`get_multiquotes`) behind
+`FUTURES_FOLLOW_INTRADAY_SOURCE` (default `quotes`; `aggregator` restores the
+WS-fed scanner-aggregator path) — fallback chain quotes→aggregator→historify with
+a WARNING per hop, plus a 15:18 dry-run quote probe in the smoke check. **No stop loss** (Phase-1
+proved hard stops net-negative on this signal class); the **15:28 IST EOD watchdog**
+(post-primary-exit retry backstop, #334 — after the 15:25 exit, before the 15:30
+NFO close; a rejected 15:25 SELL stays in the book for it to retry) is the only
+backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
 (0.03% notional) round-trip charges.
 **ACTIVELY TRADING IN SANDBOX** (`mode: sandbox`, `deployable: true`) — there is **no
 scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
 `FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
-registers 5 APScheduler jobs (reset 09:00 / watchdog 15:14 / entry 15:20 / exit 15:25
-/ EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
+registers 6 APScheduler jobs (reset 09:00 / smoke-check 15:18 / entry 15:20 /
+exit 15:25 / watchdog 15:28 / EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
 real orders into `sandbox.db` (the virtual ₹1Cr book) from boot** — the first sandbox
 cycle is **Monday 2026-06-15 15:20 IST** (the session's first sector_follow signal →
 a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a
 `strategy_mode` row); operator can pause active trading via
 `POST /futures_follow_cap50/api/pause` (durable `strategy_runtime_override`) without
 changing mode.
+**Stage-1 LLM veto (strategy-aware, issue #318):** `run_entry` reviews every
+in-cap signal via `signal_review_service.review_signal(strategy_name=
+'futures_follow_cap50')` before `place_entry`. The prompt is the strategy's OWN
+framing (STRATEGY CONTEXT block from `config_snapshot.json`'s `llm_context` key,
+code fallback in `signal_review_service.py`): the veto's job is
+**overnight-regime fit for a leveraged long NIFTY carry**, not per-name stock
+analysis; it reviews BOTH the source stock signal and the resolved NIFTY-future
+book state (from `get_status()`) combined. Enforcement resolves per-strategy
+(`strategy_llm_config` row → `VETO_LAYER_MODE` env → B4 mode-aware default,
+**sandbox = active/enforcing**). An enforcing `skip` drops that lot without
+consuming the 50% margin cap and journals `status='veto_skip'`; cumulative
+review time is budgeted at 180s/batch (beyond it remaining signals place
+UNREVIEWED); every reviewer failure fails OPEN. The simplified engine's veto
+path (`strategy_name=None`) is unchanged.
 **Honest caveat (load-bearing — do not lose):** the backtest clears 12% (CAGR
 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L, 2024-01..2026-06) but the signal does
 **NOT** predict NIFTY direction (hit-rate 53.4% < 55%, corr 0.295). The return is
@@ -984,8 +1005,15 @@ gain — NIFTY-only is the vehicle). Keep `sector_follow_cap5_vol` (CNC T+1 equi
 the alpha primary; run this as a separate, leverage-bounded beta sleeve. Key files:
 `services/futures_follow_service.py` (evaluator reuse + sizing + scheduler glue),
 `blueprints/futures_follow.py` (control API at `/futures_follow_cap50/api/*` —
-status/positions/pause/resume/close_all/data_health),
-`database/futures_follow_db.py` (`futures_follow_trades` journal). Plan + locked
+status/positions/pause/resume/close_all/data_health/entry_breakdown),
+`database/futures_follow_db.py` (`futures_follow_trades` journal),
+`database/futures_follow_eval_db.py` (`futures_follow_eval_snapshots` — the
+per-day 15:20 entry-evaluation breakdown, issue #352: `run_entry` persists the
+sector_follow evaluator's per-symbol gate inputs/outcomes after placement
+decisions, fail-graceful; read via `GET /futures_follow_cap50/api/entry_breakdown`
+— API-key OR logged-in-session auth, read-only — and rendered as the "Today's
+15:20 Evaluation" card on `/strategies/futures_follow_cap50`, so a zero-signal
+day is explainable without reading logs). Plan + locked
 decisions: [`strategies/futures_follow_cap50/PLAN.md`](strategies/futures_follow_cap50/PLAN.md).
 Backtest reports:
 [`docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md`](docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md)
@@ -1039,8 +1067,15 @@ the entire time. The fix splits market data by its natural source:
 - **Pure service** `services/data_freshness_service.py` — read-only on
   `historify.duckdb`. `check_strategy_data_ready(strategy, date,
   max_staleness_business_days=1)` returns `(ok, per-symbol details)`;
-  business-day aware (weekend gap ≠ stale; holidays NOT modelled). For
-  sector_follow it checks the 8 mapped indices + 30 universe stocks. All
+  trading-day aware (weekend gap ≠ stale; NSE holidays are now modelled too,
+  issue #253 — the module's own `is_trading_day()` consults
+  `database.market_calendar_db.is_market_holiday()`, weekday AND not a market
+  holiday; fails open to weekday-only behavior with a once-per-year WARNING
+  if the calendar has no rows for a given year, e.g. a future year before its
+  yearly seed lands. `scanner_aggregator_seeder`, `scanner_backfill_scheduler`,
+  and `sector_follow_backfill_scheduler` all delegate their own
+  `_is_trading_day` to this same predicate). For sector_follow it checks the
+  8 mapped indices + 30 universe stocks. All
   read-only DuckDB reads go through **`connect_historify_readonly()`**, which
   tries `read_only=True` first but falls back to a config-matching connect when
   the live app already holds `historify.duckdb` open read-write **in the same
@@ -1181,6 +1216,27 @@ intervals** (`1m` AND `D`):
   daily by resampling the continuous stored 1m series (Approach 2, single source
   of truth) — that only becomes viable once the full-universe 1m deep backfill
   has landed.
+- **Daily-D re-settle (issue #299, 2026-07-02):** the incremental convergence
+  above can *never* correct a daily bar that was written **intraday** as a
+  provisional/running close (the #277 09:45-freeze class) — `compute_stale_symbols`
+  sees a bar for the day already present and the incremental download SKIPS it, so
+  the provisional close persists into the scanner's `yest_d` gate and manufactures
+  phantom gap signals (the 2026-07-02 DELHIVERY false BUY: stored 07-01 close
+  475.4 vs broker-settled 507.7). `resettle_recent_daily` fixes this: once per
+  process per date (before the stale-check, at boot + post-close), it forces a
+  **non-incremental** overwrite re-fetch of the last `SCANNER_DAILY_RESETTLE_DAYS`
+  (default 2) settled trading days for the whole universe — the broker's daily API
+  returns the settled close post-close, and the `upsert_market_data`
+  ON-CONFLICT-DO-UPDATE write overwrites the provisional bar in place — then calls
+  `ScannerHistoryProvider.refresh()` so the corrected close reaches the live
+  scanner **without** a restart (the provider caches daily-D at boot and never
+  re-reads during the session). Gated by `SCANNER_DAILY_RESETTLE_ENABLED` (default
+  `true`); wired via `scanner_backfill_scheduler._maybe_resettle_daily`. Manual
+  one-shot: `uv run python -m services.scanner_universe_backfill --resettle`.
+  Additive, idempotent, fail-graceful. A follow-up (not yet shipped) adds a
+  defense-in-depth rule-level guard that rejects when the derived `yest_d` bar is
+  not the actual previous trading day, for the case where the re-settle can't run
+  (broker session down).
 
 The learning loop: Morning scan → Arm engine → Monitor trades → EOD results →
 Compare vs backtest → Record in LEARNINGS.md → Improve strategy → Repeat.
@@ -1229,6 +1285,44 @@ is observed/skipped*, never *which signals fire***:
   produces no bar closes at all, so this path never fires — that case is the 15:18
   smoke check's job (Tier 2, not yet shipped). The metric catches *partial*
   degradation and reports coverage. See `docs/PARAMETER_LOG.md` for all flags.
+
+**Tier-2 — reference-data contract (issue #305, 2026-07-02).** Tier-1 made
+failures *visible*; Tier-2 makes the reference data *enforceable* — the durable
+fix for the 2026-07-02 DELHIVERY incident (BUY fired 42× while DOWN because the
+rule's `yest_d.close` came from a stale historify-D slot diverging 6.8% from the
+broker-known prior close, with every existing guard alert-only). Three parts:
+
+- **Broker prev-close registry** (`services/scanner_reference_data.py`): the
+  boot `aggregator_seeder` already fetches broker 1m bars per symbol (broker
+  fallback arm) — it now also records each symbol's **T-1 settled close** (the
+  last broker bar dated before today) into an in-process, day-scoped registry
+  (only same-IST-day recordings are served; no new broker API load).
+- **Reference certificate at the choke point**:
+  `ScannerService._evaluate_definitions` computes — once per (symbol, bar
+  close), centrally, so the rules stay pure — the settled reference the rules
+  will use (shared `derive_today_and_yest` helper) and cross-checks it against
+  the registry. The verdict rides the indicators dict (`reference_certified`,
+  `reference_divergence_pct`, value keys). Both Chartink rules gate on it early:
+  an **explicit `False`** (divergence > `SCANNER_REFERENCE_DIVERGENCE_MAX_PCT`,
+  default 1.0) rejects the symbol with a dedup'd per-(symbol, day) WARNING + a
+  CRIT Telegram via `source_divergence_alerts.check_and_alert`
+  (service=`scanner_reference`, shared BUY/SELL so one alert per symbol/day). A
+  **missing key is certified** (backward compat) and a missing broker prev-close
+  is **fail-open** (certified + dedup'd WARNING) — fail-closed only on a
+  *confirmed* divergence. Flag `SCANNER_REFERENCE_CHECK_ENABLED` (default `true`).
+- **Smoke-fail post-hold**: a FAILED 09:18 smoke check
+  (`scanner_smoke_check_service`) now arms an in-process, day-scoped hold —
+  the scanner keeps evaluating and logs `scanner PASS`, but the hit is NOT
+  written to `scan_results` nor posted to the engine (`scanner HELD <sym>
+  reason=smoke_check_failed` WARNING, dedup'd per symbol/day). The hold lifts
+  when a re-check passes (`re_check_and_release`, invoked by the
+  `scanner_backfill_scheduler` periodic convergence tick after it refreshes the
+  stored 1m/D data) or self-expires at 15:35 IST. Exits/other strategies are
+  unaffected — only scanner hit posting is gated. Flag
+  `SCANNER_SMOKE_BLOCK_ENABLED` (default `true`, consult-time so a runtime flip
+  takes effect immediately). Tests: `test/test_scanner_reference_data.py`,
+  `test/test_scanner_smoke_check.py`, and the golden-incident cases in
+  `test/test_fno_intraday_{buy,sell}_chartink.py`.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
@@ -1299,7 +1393,13 @@ under-counted trades and P&L (the 2026-06-10 bug: +₹352 shown vs +₹8,327 rea
 that gap: before the Telegram EOD summary fires, `_maybe_log_eod_summary` calls
 `_maybe_reconcile_eod_journal(today)` (reconcile → summarize), which reads
 `sandbox.db` **read-only** and stamps the missing exit rows
-(`exit_reason='sandbox_eod_squareoff'`, gross P&L). Idempotent, mid-day safe,
+(`exit_reason='sandbox_eod_squareoff'`, gross P&L). A second pass (issue #350)
+prices **watchdog-stamped exits**: the EOD watchdog closes journal rows with
+`exit_price=None` (it doesn't wait for the fill), which made their P&L read ₹0
+on the strategies dashboard while `/positions` had the real number — the pass
+backfills `exit_price`+`pnl` from the sandbox fill matching the stamped
+`exit_order_id` (order-id matching, so a same-symbol earlier stop-loss fill is
+never blended in). Idempotent, mid-day safe,
 sandbox-only, gated by `ENGINE_EOD_RECONCILIATION_ENABLED` (default true). A
 past-date operator backfill lives in
 `services/engine_eod_reconciliation_backfill.py` (dry-run by default; `--apply`
@@ -1444,8 +1544,16 @@ aliases accepted (`simplified`, `sector`/`sf`).
 - **Halt always two-step:** a halt-triggering input arms a 30-second "reply YES"
   confirmation before the row is written.
 - **Audit:** every change writes `updated_by=telegram:<chat_id>:<message_id>`.
-- **One poller per bot token:** don't run the full interactive outbound bot's
-  poller on the same token while this is enabled (Telegram getUpdates Conflict).
+- **One poller per bot token (structurally enforced — issue #238):** the inbound
+  service refuses to start its `getUpdates` poller whenever the UI-toggled
+  interactive bot (`bot_config.is_active`, `telegram_bot_service`) owns the token.
+  `telegram_inbound_service.start()` checks `_ui_bot_active()` first and returns
+  `(False, …)` with an INFO log (no raise) if the UI bot is active — so even with
+  `TELEGRAM_INBOUND_ENABLED=true` the UI bot wins and two pollers on one token can
+  never both run (the 2026-06-30 `telegram.error.Conflict: terminated by other
+  getUpdates request` storm). The outbound `notify()` fallback is unaffected: when
+  the UI bot is DOWN, `_ui_bot_active()` is false, the inbound poller starts, and
+  `send_message_to_all` works as before. Test: `test/test_telegram_single_poller.py`.
 
 **Operator activation:** `UPDATE bot_config SET telegram_chat_ids='<chat_id>'
 WHERE id=1;` (or `database.telegram_db.add_authorized_chat_id`), set

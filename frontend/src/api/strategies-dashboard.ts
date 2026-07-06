@@ -18,10 +18,14 @@ export interface ActiveOverride {
 // List endpoint
 // ---------------------------------------------------------------------------
 
+export type LLMMode = 'off' | 'veto' | 'delegate'
+
 export interface StrategySummary {
   name: string
   display_name: string
   mode: string
+  llm_mode: LLMMode
+  llm_veto_enabled: boolean
   deployable: boolean
   version: string
   open_positions: number
@@ -50,6 +54,11 @@ export interface LivePerf {
   open_positions?: number
   today_net_pnl?: number | null
   last_trade_at?: string | null
+  // Since-inception (issue #323): cumulative realized P&L, running win-rate, and
+  // the closed-trade denominator. Null when the mode has no closed trades yet.
+  cum_net_pnl?: number | null
+  win_rate_pct?: number | null
+  closed_trades?: number
 }
 
 export interface StrategyPerformance {
@@ -74,22 +83,39 @@ export interface RecentTrade {
   entry_price?: number | null
   exit_price?: number | null
   gross_pnl?: number | null
+  charges_inr?: number | null
   net_pnl?: number | null
+  margin_inr?: number | null
   mode: string
   status: string
   entry_date: string
   created_at: string | null
 }
 
+// Latest data-freshness (data_health_check) state for the strategy's feed (#237).
+export interface DataHealth {
+  available: boolean
+  reason?: string
+  feed?: string
+  shared?: boolean
+  overall_ok?: boolean
+  check_at?: string | null
+  stale_count?: number
+  stale_symbols?: string[]
+}
+
 export interface StrategyDetail {
   name: string
   display_name: string
   mode: string
+  llm_mode: LLMMode
+  llm_veto_enabled: boolean
   deployable: boolean
   version: string
   config_snapshot: Record<string, unknown>
   active_overrides: ActiveOverride[]
   health: StrategyHealth
+  data_health: DataHealth
   performance: StrategyPerformance
   recent_trades: RecentTrade[]
   version_log: VersionLogEntry[]
@@ -130,10 +156,79 @@ export interface ParametersDiff {
 }
 
 // ---------------------------------------------------------------------------
+// Entry-evaluation breakdown (issue #352) — futures_follow_cap50 only
+// ---------------------------------------------------------------------------
+
+export type EntryBreakdownOutcome =
+  | 'in_cap_placed'
+  | 'cap_skipped'
+  | 'vetoed'
+  | 'placement_failed'
+  | 'not_selected'
+  | 'first_failed_gate'
+  | 'missing_data'
+
+export interface EntryBreakdownSymbol {
+  symbol: string
+  sector_index: string | null
+  sector_ret: number | null
+  stock_ret: number | null
+  vol_ratio: number | null
+  intraday_source: string | null
+  outcome: EntryBreakdownOutcome
+  fail_reason: string | null
+}
+
+export interface EntryBreakdownPayload {
+  eval_at: string
+  mode: string
+  n_signals: number
+  intraday_source_counts: {
+    quotes: number
+    aggregator: number
+    historify: number
+    none: number
+  }
+  cap_skipped: number
+  vetoed: number
+  per_gate_fail_counts: {
+    sector: number
+    stock: number
+    vol: number
+    missing_data: number
+  }
+  symbols: EntryBreakdownSymbol[]
+}
+
+export interface EntryBreakdownSnapshot {
+  id: number
+  strategy_name: string
+  eval_date: string
+  eval_at: string | null
+  payload: EntryBreakdownPayload
+  created_at: string | null
+}
+
+// ---------------------------------------------------------------------------
 // API client
 // ---------------------------------------------------------------------------
 
 export const strategiesDashboardApi = {
+  /**
+   * Today's 15:20 entry-evaluation breakdown (issue #352) — served by the
+   * futures_follow control blueprint (session-cookie auth accepted for this
+   * read-only endpoint). `null` data means no evaluation recorded yet.
+   */
+  getEntryBreakdown: async (date?: string): Promise<EntryBreakdownSnapshot | null> => {
+    const params: Record<string, string> = {}
+    if (date) params.date = date
+    const res = await webClient.get<{ status: string; data: EntryBreakdownSnapshot | null }>(
+      '/futures_follow_cap50/api/entry_breakdown',
+      { params }
+    )
+    return res.data.data
+  },
+
   /** List all strategies with summary metrics. */
   listStrategies: async (): Promise<StrategySummary[]> => {
     const res = await webClient.get<{ status: string; data: StrategySummary[] }>(
@@ -169,4 +264,178 @@ export const strategiesDashboardApi = {
     )
     return res.data.data
   },
+
+  /**
+   * Flip a strategy's mode (sandbox <-> live) through the preflight gate.
+   *
+   * Returns the {@link FlipModeOutcome}. A 409 (preflight refused) is NOT
+   * thrown as an error here — the response body has `accepted=false` and a
+   * `blockers` list the UI surfaces to the operator. Other HTTP failures
+   * (400/404/5xx) throw normally.
+   *
+   * Resolves the today's-failure scenario from issue #162: the UI calls this
+   * and either gets `accepted=true` (mode mutated, event published) or
+   * `accepted=false` (mode unchanged, blockers explain why). Operator never
+   * silently ends up in a broken LIVE state.
+   */
+  flipMode: async (
+    name: string,
+    mode: 'live' | 'sandbox',
+    notes?: string
+  ): Promise<FlipModeOutcome> => {
+    const res = await webClient.post<FlipModeOutcome>(
+      `/strategies/api/${name}/mode`,
+      { mode, notes },
+      // Don't throw on 409 — that's the "blocked by preflight" response,
+      // not a transport-level failure. The UI inspects accepted/blockers.
+      { validateStatus: (s) => s === 202 || s === 409 }
+    )
+    return res.data
+  },
+
+  /** Recent mode flip attempts (accepted + blocked). */
+  getModeAudit: async (name: string, limit = 10): Promise<ModeAuditRow[]> => {
+    const res = await webClient.get<{
+      status: string
+      data: { name: string; rows: ModeAuditRow[]; limit: number }
+    }>(`/strategies/api/${name}/mode/audit`, { params: { limit } })
+    return res.data.data.rows
+  },
+
+  /**
+   * Set a strategy's LLM mode (off | veto). `delegate` is accepted by the
+   * server but treated as veto for now (the response `warnings` say so) — the
+   * UI shows it disabled/"coming soon".
+   *
+   * A 400 (bad value) is NOT thrown here — the response body has
+   * `accepted=false` and an `error_message`. Transport failures throw normally.
+   */
+  flipLLMMode: async (name: string, llmMode: LLMMode, notes?: string): Promise<LLMFlipOutcome> => {
+    const res = await webClient.post<LLMFlipOutcome>(
+      `/strategies/api/${name}/llm-mode`,
+      { llm_mode: llmMode, notes },
+      { validateStatus: (s) => s === 202 || s === 400 }
+    )
+    return res.data
+  },
+
+  /** Paginated LLM-veto decision history + a health summary. */
+  getLLMDecisions: async (name: string, limit = 25, offset = 0): Promise<LLMDecisionsResponse> => {
+    const res = await webClient.get<{ status: string; data: LLMDecisionsResponse }>(
+      `/strategies/api/${name}/llm-decisions`,
+      { params: { limit, offset } }
+    )
+    return res.data.data
+  },
+
+  /**
+   * On-demand liveness probe of the shared claude CLI used by every strategy's
+   * LLM veto. Spawns a real `claude -p` subprocess server-side, so the caller
+   * must only invoke this manually (never on a poll). Reachability is
+   * install-global — one result covers all strategies.
+   */
+  getLLMHealth: async (): Promise<LLMHealth> => {
+    const res = await webClient.get<{ status: string; data: LLMHealth }>(
+      '/strategies/api/llm/health'
+    )
+    return res.data.data
+  },
+}
+
+// ---------------------------------------------------------------------------
+// Mode flip types (issue #162)
+// ---------------------------------------------------------------------------
+
+export interface FlipModeOutcome {
+  status: 'success' | 'blocked'
+  accepted: boolean
+  strategy_name: string
+  target_mode: 'live' | 'sandbox'
+  previous_mode: string | null
+  new_mode: string | null
+  blockers: string[]
+  warnings: string[]
+  audit_id: number | null
+  error_message: string | null
+}
+
+export interface ModeAuditRow {
+  id: number
+  strategy_name: string
+  target_mode: string
+  previous_mode: string | null
+  accepted: boolean
+  blockers: string[]
+  warnings: string[]
+  snapshot: Record<string, unknown>
+  flipped_at: string | null
+  flipped_by: string
+  error_message: string | null
+}
+
+// ---------------------------------------------------------------------------
+// LLM control types (issue #266 Phase 2)
+// ---------------------------------------------------------------------------
+
+export interface LLMFlipOutcome {
+  status: 'success' | 'error'
+  accepted: boolean
+  strategy_name: string
+  target_llm_mode: LLMMode
+  previous_llm_mode: LLMMode | null
+  new_llm_mode: LLMMode | null
+  warnings: string[]
+  error_message: string | null
+}
+
+export type LLMDecisionVerdict = 'take' | 'skip' | 'review_failed' | string
+
+export interface LLMDecisionRow {
+  id: number
+  candidate_at: string
+  symbol: string
+  source: string
+  direction: string | null
+  decision: LLMDecisionVerdict
+  reasoning: string | null
+  confidence: number | null
+  enforcement_mode: string
+  actually_taken: boolean | null
+  bridge_latency_ms: number | null
+}
+
+export interface LLMDecisionsSummary {
+  total: number
+  take: number
+  skip: number
+  review_failed: number
+  other: number
+  last_decision: LLMDecisionRow | null
+  recent_review_failed: number
+}
+
+export interface LLMDecisionsResponse {
+  name: string
+  veto_enabled: boolean
+  llm_mode: LLMMode
+  rows: LLMDecisionRow[]
+  total: number
+  limit: number
+  offset: number
+  summary: LLMDecisionsSummary | null
+  source_filtered: boolean
+}
+
+// ---------------------------------------------------------------------------
+// LLM health probe (issue #297)
+// ---------------------------------------------------------------------------
+
+export type LLMHealthReason = 'ok' | 'timeout' | 'cli_missing' | 'not_logged_in' | 'error'
+
+export interface LLMHealth {
+  reachable: boolean
+  latency_ms: number
+  reason: LLMHealthReason
+  detail: string
+  checked_at: string
 }

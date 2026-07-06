@@ -204,3 +204,67 @@ def test_record_scan_result_rejects_bad_source(fresh_scanner_db):
 
     with pytest.raises(ValueError):
         scanner_service.record_scan_result(def_id, ["A"], source="bogus")
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: parameters_json + parent_definition_id schema tests
+# ---------------------------------------------------------------------------
+
+
+def test_schema_has_new_columns(fresh_scanner_db):
+    """Both Tier-3 columns exist in scan_definitions after init."""
+    from sqlalchemy import inspect as sa_inspect
+
+    from services import scanner_service
+
+    scanner_service.init_scanner_db()
+    cols = {c["name"] for c in sa_inspect(fresh_scanner_db.engine).get_columns("scan_definitions")}
+    assert "parameters_json" in cols
+    assert "parent_definition_id" in cols
+
+
+def test_create_definition_without_params(fresh_scanner_db):
+    """Creating a definition without Tier-3 kwargs stores NULL and is backwards-compatible."""
+    from services import scanner_service
+
+    scanner_service.init_scanner_db()
+    def_id = scanner_service.create_scan_definition(
+        name="base_buy",
+        screener_type="buy",
+        rule_module="fno_intraday_buy_chartink",
+    )
+    rows = scanner_service.get_scan_definitions(enabled_only=False)
+    row = next(r for r in rows if r["id"] == def_id)
+    assert row["parameters_json"] is None
+    assert row["parent_definition_id"] is None
+
+
+def test_create_definition_with_params_dict(fresh_scanner_db):
+    """parameters_json dict and parent_definition_id round-trip correctly."""
+    import json
+
+    from services import scanner_service
+
+    scanner_service.init_scanner_db()
+    parent_id = scanner_service.create_scan_definition(
+        name="base", screener_type="buy", rule_module="fno_intraday_buy_chartink"
+    )
+    clone_id = scanner_service.create_scan_definition(
+        name="custom_gap1",
+        screener_type="buy",
+        rule_module="fno_intraday_buy_chartink",
+        parameters_json={"gap_pct": 1.5, "vol_5m_mult": 1.8},
+        parent_definition_id=parent_id,
+    )
+    rows = scanner_service.get_scan_definitions(enabled_only=False)
+    clone = next(r for r in rows if r["id"] == clone_id)
+    assert clone["parent_definition_id"] == parent_id
+    assert json.loads(clone["parameters_json"]) == {"gap_pct": 1.5, "vol_5m_mult": 1.8}
+
+
+def test_init_db_idempotent_with_existing_columns(fresh_scanner_db):
+    """Calling init_scanner_db() twice does not raise even after columns exist."""
+    from services import scanner_service
+
+    scanner_service.init_scanner_db()
+    scanner_service.init_scanner_db()  # second call must not raise

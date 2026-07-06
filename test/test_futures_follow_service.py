@@ -10,7 +10,7 @@ journal). Operator runs `uv run pytest test/test_futures_follow_service.py -v`
 post-close to verify before merging to dev.
 """
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -103,8 +103,13 @@ def _make_service(signals=None, **overrides):
     data_health_checker = overrides.pop("data_health_checker", None)
     contract_resolver = overrides.pop("contract_resolver", fake_contract_resolver)
     signal_evaluator = overrides.pop("signal_evaluator", fake_signal_evaluator)
+    signal_evaluator_details = overrides.pop("signal_evaluator_details", None)
+    signal_reviewer = overrides.pop("signal_reviewer", None)
+    market_context_provider = overrides.pop("market_context_provider", None)
+    order_placer = overrides.pop("order_placer", fake_placer)
 
     intent_resolver = overrides.pop("intent_resolver", None)
+    now = overrides.pop("now", lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
     if intent_resolver is None:
         from services.mode_service import EffectiveDecision
 
@@ -116,14 +121,17 @@ def _make_service(signals=None, **overrides):
         config=cfg,
         mode=mode,
         signal_evaluator=signal_evaluator,
+        signal_evaluator_details=signal_evaluator_details,
         contract_resolver=contract_resolver,
-        order_placer=fake_placer,
+        order_placer=order_placer,
         price_fetcher=price_fetcher,
         notifier=notifier,
         trade_recorder=fake_recorder,
-        now=lambda: datetime(2026, 6, 10, 15, 20, tzinfo=_IST),
+        now=now,
         intent_resolver=intent_resolver,
         data_health_checker=data_health_checker,
+        signal_reviewer=signal_reviewer,
+        market_context_provider=market_context_provider,
     )
     svc._test_placed = placed_orders
     svc._test_journal = journal
@@ -774,6 +782,1091 @@ def test_resolver_returns_none_when_all_expire_within_one_day(monkeypatch):
     as_of = datetime(2026, 6, 30, 15, 20, tzinfo=_IST)  # today == 30-JUN expiry
     c = ffs.production_contract_resolver("NIFTY", "NFO", as_of)
     assert c is None
+
+
+# --------------------------------------------------------------------------- #
+# #265 — position-store reconciliation at exit (BOTH modes, mode-aware store)
+# --------------------------------------------------------------------------- #
+def test_sandbox_exit_consults_store_and_suppresses_phantom():
+    """SANDBOX: the guard DOES consult the mode-aware position source (sandbox.db
+    via get_open_position). A phantom (store flat) → SUPPRESS the SELL entirely —
+    the same guarded behaviour as live, but against the sandbox store."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    flat = (True, {"quantity": 0, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=flat) as store,
+    ):
+        exited = svc.run_exit()
+    store.assert_called()  # the sandbox store IS consulted now
+    # Phantom in the sandbox store → no SELL placed, position dropped.
+    assert svc._test_placed == []
+    assert exited == []
+    assert svc.lots_held() == 0
+
+
+def test_sandbox_exit_partial_store_clamps_qty():
+    """SANDBOX: journal 2 lots (150), sandbox store holds 1 lot (75) → SELL only 75.
+    The clamp is against the sandbox.db book, routed via the mode-aware source."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    partial = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=partial) as store,
+    ):
+        exited = svc.run_exit()
+    store.assert_called()
+    assert svc._test_placed[0][0] == "sandbox"  # routed to the sandbox book
+    assert svc._test_placed[0][1]["action"] == "SELL"
+    assert svc._test_placed[0][1]["quantity"] == 75  # clamped to the sandbox store
+    assert len(exited) == 1
+
+
+def test_sandbox_exit_consistent_store_proceeds_full_qty():
+    """SANDBOX: sandbox store matches journal → SELL the full journalled qty."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")  # quantity=75
+    match = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=match),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 75
+
+
+def test_sandbox_exit_store_fetch_failure_fails_closed():
+    """SANDBOX: sandbox store fetch fails → still SELL, but NEVER more than journaled
+    (fail-closed for reverse-risk is preserved in sandbox too)."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    failed = (False, {"status": "error", "message": "down"}, 500)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=failed),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 150  # journalled, not more
+
+
+def test_live_exit_phantom_broker_flat_is_suppressed():
+    """LIVE: broker reports flat (net 0) → SUPPRESS the SELL entirely."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    flat = (True, {"quantity": 0, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=flat),
+    ):
+        exited = svc.run_exit()
+    # No SELL placed, position dropped.
+    assert svc._test_placed == []
+    assert exited == []
+    assert svc.lots_held() == 0
+
+
+def test_live_exit_partial_broker_clamps_qty():
+    """LIVE: journal 2 lots (150), broker holds 1 lot (75) → SELL only 75."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    partial = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=partial),
+    ):
+        exited = svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["action"] == "SELL"
+    assert svc._test_placed[0][1]["quantity"] == 75  # clamped to broker
+    assert len(exited) == 1
+    # P&L journalled on the clamped qty, not the journalled 150.
+    ex = svc.today_exits[0]
+    assert ex["qty"] == 75
+    assert ex["gross_pnl"] == pytest.approx(100 * 75)
+
+
+def test_live_exit_consistent_broker_proceeds_full_qty():
+    """LIVE: broker matches journal → SELL the full journalled qty."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")  # quantity=75
+    match = (True, {"quantity": 75, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=match),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 75
+
+
+def test_live_exit_broker_fetch_failure_fails_closed():
+    """LIVE: broker fetch fails → still SELL, but NEVER more than journaled."""
+    svc = _make_service(mode="live", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # quantity=150
+    failed = (False, {"status": "error", "message": "down"}, 500)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=failed),
+    ):
+        svc.run_exit()
+    assert len(svc._test_placed) == 1
+    assert svc._test_placed[0][1]["quantity"] == 150  # journalled, not more
+
+
+# --------------------------------------------------------------------------- #
+# #265 — boot rehydrate of paper_book from the mode-appropriate store (both modes)
+# --------------------------------------------------------------------------- #
+def test_rehydrate_rebuilds_paper_book_in_sandbox():
+    """SANDBOX: a restart-lost paper_book is rebuilt from the sandbox store
+    (sandbox.db, read via the mode-aware get_positionbook) so a T+1 exit is still
+    scheduled — the sandbox book can strand a paper leg exactly like live."""
+    svc = _make_service(mode="sandbox")
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY30JUN26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 150,  # 2 lots
+                    "average_price": "24000.0",
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book) as store,
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    store.assert_called()  # the sandbox store IS consulted now
+    assert n == 1
+    assert svc.lots_held() == 2
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.nifty_symbol == "NIFTY30JUN26FUT"
+    assert pos.quantity == 150
+
+
+def test_rehydrate_rebuilds_paper_book_in_live():
+    svc = _make_service(mode="live")
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY30JUN26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 150,  # 2 lots
+                    "average_price": "24000.0",
+                },
+                # Non-NIFTY / option leg — must be ignored.
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 10,
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    assert n == 1
+    assert svc.lots_held() == 2
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.nifty_symbol == "NIFTY30JUN26FUT"
+    assert pos.quantity == 150
+    # Stamped prior-day so today's T+1 exit jobs act on it.
+    assert pos.entry_date != "2026-06-10"
+
+
+def test_rehydrate_skips_already_known_symbols():
+    svc = _make_service(mode="live")
+    _seed_position(svc, "P1", entry_date="2026-06-09")  # NIFTY26JUN24FUT already held
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY26JUN24FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 75,
+                }
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    assert n == 0  # already known, not double-counted
+    assert svc.lots_held() == 1
+
+
+def test_rehydrate_derives_lots_by_ceiling_not_floor(monkeypatch):
+    """#353: a store position whose net qty (130) doesn't divide evenly by the
+    CURRENTLY CONFIGURED lot size (75) must not silently undercount lots via
+    floor division (130 // 75 == 1). This is exactly the 2026-07-06 incident
+    shape — two legacy 65-qty BUYs net to a 130-qty store position, and the
+    strategy's lot size later became 75 — so ceiling division must derive 2
+    lots, and the batched T+1 exit journaled off that rehydrated position must
+    record lots=2 (not the hardcoded/undercounted 1)."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY30JUN26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 130,  # NOT a clean multiple of the 75 lot size
+                    "average_price": "24000.0",
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    assert n == 1
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.quantity == 130
+    # Ceiling(130 / 75) == 2, not floor(130 / 75) == 1.
+    assert pos.lots == 2
+
+    # The subsequent T+1 exit must journal the same corrected lots=2 on its
+    # single batched SELL row (quantity still 130 — one order, no re-split).
+    match = (True, {"quantity": 130, "status": "success"}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.openposition_service.get_open_position", return_value=match),
+    ):
+        svc.run_exit()
+    sell_rows = [r for r in svc._test_journal if r.get("side") == "SELL"]
+    assert len(sell_rows) == 1
+    assert sell_rows[0]["quantity"] == 130
+    assert sell_rows[0]["lots"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# #292 — 15:18 pre-entry smoke check for futures_follow_cap50
+# --------------------------------------------------------------------------- #
+
+
+def _make_smoke_service(
+    *,
+    data_ok: bool = True,
+    stale: list[str] | None = None,
+    session_ok: bool = True,
+    quote_ok: bool = True,
+    notifier=None,
+    now_dt: datetime | None = None,
+) -> FuturesFollowService:
+    """Build a FuturesFollowService wired for smoke-check testing.
+
+    data_health_checker is injected with a fake that returns ``(data_ok, details_map)``
+    where details_map has one entry per stale symbol (ok=False). broker_session_checker
+    is a lambda returning ``session_ok``; quote_probe is a lambda returning
+    ``quote_ok`` (issue #332 — keeps the default quotes source hermetic). All
+    other effects are no-ops."""
+    stale = stale or []
+
+    def fake_health_checker(strategy_name, date_str=None, index_only=False):
+        details_map = {}
+        if not data_ok:
+            for sym in stale or ["NIFTY"]:
+                details_map[sym] = {"ok": False}
+        return data_ok, details_map
+
+    alerts = []
+
+    def _notifier(msg):
+        alerts.append(msg)
+        if notifier:
+            notifier(msg)
+
+    svc = FuturesFollowService(
+        config=_config(),
+        mode="sandbox",
+        signal_evaluator=lambda as_of=None: [],
+        contract_resolver=lambda u="NIFTY", e="NFO", as_of=None: dict(_CONTRACT),
+        order_placer=lambda mode, order: {"status": "success", "orderid": "X"},
+        price_fetcher=lambda s, e: 24000.0,
+        notifier=_notifier,
+        trade_recorder=lambda **kw: 1,
+        now=lambda: now_dt or datetime(2026, 7, 2, 15, 18, tzinfo=_IST),
+        intent_resolver=None,
+        data_health_checker=fake_health_checker,
+        broker_session_checker=lambda: session_ok,
+        quote_probe=lambda: quote_ok,
+    )
+    svc._test_alerts = alerts
+    return svc
+
+
+def test_smoke_check_passes_when_data_fresh_and_session_live(monkeypatch):
+    """All checks green → ok=True, no override written."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=True, session_ok=True)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details["data_ok"] is True
+    assert details["broker_session_ok"] is True
+    # No override should have been written.
+    overrides = sro.list_overrides(include_expired=True)
+    smoke_pauses = [r for r in overrides if "smoke_check_failed" in (r.get("reason") or "")]
+    assert smoke_pauses == [], f"unexpected smoke-check override: {smoke_pauses}"
+
+
+def test_smoke_check_blocks_and_alerts_when_data_stale(monkeypatch):
+    """Stale feed → ok=False, pause override written, Telegram alert sent."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=False, stale=["NIFTYBANK", "NIFTYAUTO"], session_ok=True)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["data_ok"] is False
+    assert "NIFTYBANK" in details["stale_symbols"] or "NIFTYAUTO" in details["stale_symbols"]
+
+    # A pause override must be written so the entry gate blocks.
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+
+    # The entry gate must honor the override. Check against the SAME simulated
+    # clock the service used (15:18 IST on the pinned date), not real wall-clock:
+    # the override self-expires at 15:30 IST that day, so a real-time check would
+    # spuriously report "expired" whenever the suite runs after 15:30 IST (#303).
+    from database.strategy_runtime_override_db import is_entry_blocked
+
+    svc_now_utc = datetime(2026, 7, 2, 15, 18, tzinfo=_IST).astimezone(UTC).replace(tzinfo=None)
+    blocked, _ov = is_entry_blocked("futures_follow_cap50", now=svc_now_utc)
+    assert blocked is True
+
+    # Telegram alert must mention the strategy name and failure.
+    assert any("SMOKE CHECK FAILED" in a for a in svc._test_alerts), svc._test_alerts
+
+
+def test_smoke_check_blocks_and_alerts_when_broker_session_down(monkeypatch):
+    """No broker session → ok=False, pause override written, alert sent."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=True, session_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["broker_session_ok"] is False
+
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+    assert any("broker session not live" in a for a in svc._test_alerts), svc._test_alerts
+
+
+def test_smoke_check_skipped_when_flag_off(monkeypatch):
+    """Flag off → ok=True, no override written, no alert."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "false")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    svc = _make_smoke_service(data_ok=False, session_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details.get("skipped") is True
+    overrides = sro.list_overrides(include_expired=True)
+    assert overrides == [], f"unexpected overrides when flag off: {overrides}"
+    assert svc._test_alerts == []
+
+
+def test_smoke_check_skips_freshness_when_master_flag_off(monkeypatch):
+    """DATA_FRESHNESS_VALIDATION_ENABLED=false → freshness arm skipped (data_ok=True)
+    but broker check still runs."""
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "false")
+    # data_health_checker would return False but the flag bypasses it.
+    svc = _make_smoke_service(data_ok=False, stale=["NIFTY"], session_ok=True)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    # Fresh flag is off so data arm is treated as OK; broker is live → overall pass.
+    assert ok is True
+    assert details["data_ok"] is True
+
+
+def test_smoke_check_job_body_calls_method_and_swallows_exceptions():
+    """The _smoke_check_job module function calls the singleton's method and
+    must not propagate exceptions from a buggy smoke check."""
+    from services.futures_follow_service import _smoke_check_job, get_service
+
+    # With no singleton, the job is a no-op.
+    _smoke_check_job()  # must not raise
+
+    # With a singleton whose smoke check raises, the job still must not raise.
+    svc = _make_smoke_service()
+
+    def _exploding_check():
+        raise RuntimeError("deliberate boom")
+
+    svc.assert_data_pipeline_healthy = _exploding_check  # type: ignore[assignment]
+
+    import services.futures_follow_service as _ffs_mod
+
+    original_singleton = _ffs_mod._SINGLETON
+    try:
+        _ffs_mod._SINGLETON = svc
+        _smoke_check_job()  # must not raise despite the boom
+    finally:
+        _ffs_mod._SINGLETON = original_singleton
+
+
+def test_register_jobs_includes_smoke_check_when_enabled(monkeypatch):
+    """When FUTURES_FOLLOW_SMOKE_CHECK_ENABLED=true the scheduler gets the
+    futures_follow_smoke_check job registered."""
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+
+    job_ids: list[str] = []
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, id, replace_existing, name):
+            job_ids.append(id)
+
+    svc = _make_smoke_service()
+    svc.strategy_id = 77  # avoid seed_strategy DB call
+    svc.register_jobs(FakeScheduler())
+
+    assert "futures_follow_smoke_check" in job_ids
+
+
+def test_register_jobs_skips_smoke_check_when_flag_off(monkeypatch):
+    """When FUTURES_FOLLOW_SMOKE_CHECK_ENABLED=false the smoke-check job is NOT
+    registered (no 15:18 job ID in the scheduler)."""
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "false")
+
+    job_ids: list[str] = []
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, id, replace_existing, name):
+            job_ids.append(id)
+
+    svc = _make_smoke_service()
+    svc.strategy_id = 77
+    svc.register_jobs(FakeScheduler())
+
+    assert "futures_follow_smoke_check" not in job_ids
+
+
+# --------------------------------------------------------------------------- #
+# #332 — quotes-snapshot intraday source: smoke-check quote probe
+# --------------------------------------------------------------------------- #
+
+
+def test_smoke_check_blocks_and_alerts_when_quote_probe_fails(monkeypatch):
+    """AC #9: with source=quotes, a failed dry-run quote probe at 15:18 writes
+    the same self-expiring pause override + Telegram alert as feed-staleness."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "quotes")
+    svc = _make_smoke_service(data_ok=True, session_ok=True, quote_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is False
+    assert details["quote_probe_ok"] is False
+    assert details["intraday_source"] == "quotes"
+    # The freshness + session arms were green — the probe alone must block.
+    assert details["data_ok"] is True
+    assert details["broker_session_ok"] is True
+
+    overrides = sro.list_overrides(include_expired=True)
+    pauses = [
+        r
+        for r in overrides
+        if r["override_type"] == "pause" and "smoke_check_failed" in (r.get("reason") or "")
+    ]
+    assert pauses, f"expected smoke-check pause override; got {overrides}"
+    assert any("quote probe" in (r.get("reason") or "") for r in pauses)
+    assert any("quote probe" in a for a in svc._test_alerts)
+
+
+def test_smoke_check_skips_quote_probe_when_source_aggregator(monkeypatch):
+    """With FUTURES_FOLLOW_INTRADAY_SOURCE=aggregator the probe never runs —
+    a failing probe fake must not block (pre-#332 smoke behavior preserved)."""
+    from database import strategy_runtime_override_db as sro
+
+    monkeypatch.setenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true")
+    monkeypatch.setenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true")
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "aggregator")
+    svc = _make_smoke_service(data_ok=True, session_ok=True, quote_ok=False)
+    ok, details = svc.assert_data_pipeline_healthy()
+
+    assert ok is True
+    assert details["intraday_source"] == "aggregator"
+    assert details["quote_probe_ok"] is True  # skipped ⇒ treated as ok
+    overrides = sro.list_overrides(include_expired=True)
+    smoke_pauses = [r for r in overrides if "smoke_check_failed" in (r.get("reason") or "")]
+    assert smoke_pauses == [], f"unexpected smoke-check override: {smoke_pauses}"
+
+
+def test_futures_intraday_source_defaults_and_validates(monkeypatch):
+    """Default is quotes; unknown values fall back to quotes; aggregator honored."""
+    from services.futures_follow_service import futures_intraday_source
+
+    monkeypatch.delenv("FUTURES_FOLLOW_INTRADAY_SOURCE", raising=False)
+    assert futures_intraday_source() == "quotes"
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "aggregator")
+    assert futures_intraday_source() == "aggregator"
+    monkeypatch.setenv("FUTURES_FOLLOW_INTRADAY_SOURCE", "bogus")
+    assert futures_intraday_source() == "quotes"
+
+
+# --------------------------------------------------------------------------- #
+# #332 follow-up — wall-clock entry-lateness guard (default deadline 15:28 IST)
+# --------------------------------------------------------------------------- #
+
+
+def _make_late_guard_service(fire_at: datetime, signals=None):
+    """Service with a pinned clock + counting evaluator/notifier for guard tests."""
+    eval_calls = []
+    alerts = []
+
+    def counting_evaluator(as_of=None):
+        eval_calls.append(as_of)
+        return list(signals or [_sig("AAA")])
+
+    svc = _make_service(
+        signal_evaluator=counting_evaluator,
+        notifier=lambda msg: alerts.append(msg),
+        now=lambda: fire_at,
+    )
+    svc._test_eval_calls = eval_calls
+    svc._test_alerts = alerts
+    return svc
+
+
+@pytest.mark.parametrize("fire_hm", [(15, 29), (15, 35)])
+def test_entry_skipped_when_fired_after_deadline(monkeypatch, fire_hm):
+    """A late-fired entry job (post-15:28 default deadline) places NOTHING:
+    no evaluation, no orders, returns [], and Telegrams the operator."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    h, m = fire_hm
+    svc = _make_late_guard_service(datetime(2026, 6, 10, h, m, 5, tzinfo=_IST))
+    placed = svc.run_entry()
+
+    assert placed == []
+    assert svc._test_eval_calls == [], "evaluator must not run on a late fire"
+    assert svc._test_placed == [], "no orders may be placed on a late fire"
+    assert any("fired LATE" in a and "no orders placed" in a for a in svc._test_alerts), (
+        svc._test_alerts
+    )
+
+
+def test_entry_proceeds_at_scheduled_1520(monkeypatch):
+    """The normal 15:20 fire is untouched by the guard (regression)."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    svc = _make_late_guard_service(datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert len(svc._test_eval_calls) == 1
+
+
+def test_entry_deadline_custom_env_respected(monkeypatch):
+    """FUTURES_FOLLOW_ENTRY_DEADLINE_IST=15:25 → a 15:26 fire is skipped, a
+    15:24 fire proceeds."""
+    monkeypatch.setenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", "15:25")
+    late = _make_late_guard_service(datetime(2026, 6, 10, 15, 26, tzinfo=_IST))
+    assert late.run_entry() == []
+    assert late._test_placed == []
+    assert any("deadline 15:25" in a for a in late._test_alerts)
+
+    on_time = _make_late_guard_service(datetime(2026, 6, 10, 15, 24, tzinfo=_IST))
+    assert len(on_time.run_entry()) == 1
+
+
+def test_entry_deadline_malformed_env_falls_back_to_default(monkeypatch):
+    """A typo'd deadline value must never disable the guard: 'banana' → the
+    default 15:28 stays active (15:29 fire skipped, 15:20 fire proceeds)."""
+    from services.futures_follow_service import futures_entry_deadline_ist
+
+    monkeypatch.setenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", "banana")
+    assert futures_entry_deadline_ist().strftime("%H:%M") == "15:28"
+
+    late = _make_late_guard_service(datetime(2026, 6, 10, 15, 29, tzinfo=_IST))
+    assert late.run_entry() == []
+    assert late._test_placed == []
+
+    on_time = _make_late_guard_service(datetime(2026, 6, 10, 15, 20, tzinfo=_IST))
+    assert len(on_time.run_entry()) == 1
+
+
+def test_exit_and_watchdog_not_gated_by_entry_deadline(monkeypatch):
+    """Repo invariant: exits are NEVER gated. run_exit and run_eod_watchdog
+    still square off a held T+1 position at 15:40, well past the deadline."""
+    monkeypatch.delenv("FUTURES_FOLLOW_ENTRY_DEADLINE_IST", raising=False)
+    fire_at = datetime(2026, 6, 10, 15, 40, tzinfo=_IST)
+
+    svc = _make_service(now=lambda: fire_at)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    exited = svc.run_exit()
+    assert len(exited) == 1, "run_exit must not be gated by the entry deadline"
+
+    svc2 = _make_service(now=lambda: fire_at)
+    _seed_position(svc2, "P1", entry_date="2026-06-09")
+    flattened = svc2.run_eod_watchdog()
+    assert len(flattened) == 1, "run_eod_watchdog must not be gated by the entry deadline"
+
+
+# --------------------------------------------------------------------------- #
+# Stage-1 LLM veto gate in run_entry (issue #318)
+# --------------------------------------------------------------------------- #
+
+
+def _fake_reviewer(decisions: dict[str, str], calls: list[dict]):
+    """Reviewer stub: decides per signal-symbol; records every call's kwargs."""
+
+    def fake(**kwargs):
+        calls.append(kwargs)
+        symbol = kwargs.get("symbol")
+        return {
+            "id": len(calls),
+            "decision": decisions.get(symbol, "take"),
+            "reasoning": f"reviewed {symbol}",
+            "confidence": 0.6,
+            "latency_ms": 5,
+            "enforcement_mode": "active",
+        }
+
+    return fake
+
+
+def test_run_entry_veto_off_bypasses_reviewer(monkeypatch):
+    monkeypatch.setenv("VETO_LAYER_MODE", "off")
+    calls: list[dict] = []
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_reviewer=_fake_reviewer({}, calls))
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert calls == []  # reviewer never invoked in off mode
+
+
+def test_run_entry_no_reviewer_injected_skips_veto(monkeypatch):
+    """Default construction (signal_reviewer=None) never reviews — mirrors the
+    data_health_checker pattern so existing behavior/tests are untouched."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    svc = _make_service(signals=[_sig("RELIANCE")])
+    placed = svc.run_entry()
+    assert len(placed) == 1
+
+
+def test_run_entry_active_skip_blocks_lot_and_does_not_consume_cap(monkeypatch):
+    """An enforcing 'skip' drops that lot only — the margin cap slot stays free
+    for later signals, the skip is journalled, and no phantom position exists."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    calls: list[dict] = []
+    # Cap = 50% of ₹10L = ₹5L = 2 lots. Three signals; the FIRST is vetoed.
+    # If the veto consumed the cap, only one of B/C would fit — both must fill.
+    svc = _make_service(
+        signals=[_sig("AAA", vol=3.0), _sig("BBB", vol=2.0), _sig("CCC", vol=1.5)],
+        signal_reviewer=_fake_reviewer({"AAA": "skip"}, calls),
+    )
+    placed = svc.run_entry()
+
+    assert [p["signal_symbol"] for p in placed] == ["BBB", "CCC"]
+    assert svc.lots_held() == 2
+    assert len(calls) == 3  # every in-cap signal was reviewed
+    # The veto skip is journalled with status='veto_skip' and no margin.
+    veto_rows = [j for j in svc._test_journal if j.get("status") == "veto_skip"]
+    assert len(veto_rows) == 1
+    assert veto_rows[0]["signal_id"] == "AAA"
+    assert veto_rows[0]["margin_inr"] == 0.0
+    assert veto_rows[0]["order_id"] is None
+    # No phantom position for the vetoed signal.
+    assert all(p.signal_symbol != "AAA" for p in svc.paper_book.values())
+    # And only two orders reached the placer.
+    assert len(svc._test_placed) == 2
+
+
+def test_run_entry_shadow_logs_but_places_anyway(monkeypatch):
+    monkeypatch.setenv("VETO_LAYER_MODE", "shadow")
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("RELIANCE")],
+        signal_reviewer=_fake_reviewer({"RELIANCE": "skip"}, calls),
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 1  # skip verdict NOT enforced in shadow
+    assert len(calls) == 1  # but the reviewer ran and the decision is recorded
+    assert not any(j.get("status") == "veto_skip" for j in svc._test_journal)
+
+
+def test_run_entry_reviewer_failure_fails_open(monkeypatch):
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+
+    def boom(**kwargs):
+        raise RuntimeError("reviewer infrastructure down")
+
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_reviewer=boom)
+    placed = svc.run_entry()
+    assert len(placed) == 1  # failsafe philosophy: any reviewer failure → take
+
+
+def test_run_entry_budget_zero_places_all_unreviewed(monkeypatch):
+    """R3: once the cumulative review budget is exhausted the remaining signals
+    are placed UNREVIEWED (fail-open)."""
+    import services.futures_follow_service as ffs
+
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    monkeypatch.setattr(ffs, "VETO_REVIEW_BUDGET_SECONDS", 0.0)
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("AAA"), _sig("BBB")],
+        signal_reviewer=_fake_reviewer({"AAA": "skip", "BBB": "skip"}, calls),
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 2  # both placed despite skip verdicts — never reviewed
+    assert calls == []
+
+
+def test_run_entry_budget_exhausts_mid_batch(monkeypatch):
+    """R3: reviews that consume the 180s budget stop mid-batch; the rest place
+    unreviewed. Fake time makes each review 'cost' 100s."""
+    import services.futures_follow_service as ffs
+
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+
+    class FakeTime:
+        _t = 0.0
+
+        @classmethod
+        def monotonic(cls):
+            cls._t += 100.0  # each call advances 100s → one review = 100s
+            return cls._t
+
+    monkeypatch.setattr(ffs, "time", FakeTime)
+    calls: list[dict] = []
+    # ₹20L capital → cap ₹10L → 4 lots, so all 3 signals fit under the cap.
+    svc = _make_service(
+        signals=[_sig("AAA"), _sig("BBB"), _sig("CCC")],
+        signal_reviewer=_fake_reviewer({}, calls),
+        capital_inr=2_000_000.0,
+    )
+    placed = svc.run_entry()
+    # Review 1 (AAA): elapsed 0 < 180 → reviewed (now 100s).
+    # Review 2 (BBB): elapsed 100 < 180 → reviewed (now 200s).
+    # Review 3 (CCC): elapsed 200 >= 180 → UNREVIEWED, placed anyway.
+    assert len(calls) == 2
+    assert [c["symbol"] for c in calls] == ["AAA", "BBB"]
+    assert len(placed) == 3
+
+
+def test_run_entry_marks_actually_taken(monkeypatch):
+    """mark_actually_taken records True after placement, False on a veto skip."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+
+    marked: list[tuple] = []
+    import services.signal_review_service as srs
+
+    monkeypatch.setattr(srs, "mark_actually_taken", lambda did, taken: marked.append((did, taken)))
+
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("AAA", vol=3.0), _sig("BBB", vol=2.0)],
+        signal_reviewer=_fake_reviewer({"AAA": "skip"}, calls),
+    )
+    svc.run_entry()
+    # AAA (decision id 1) vetoed → False; BBB (id 2) placed → True.
+    assert (1, False) in marked
+    assert (2, True) in marked
+
+
+def test_run_entry_reviewer_passes_strategy_identity_and_context(monkeypatch):
+    """The review call carries source/strategy_name='futures_follow_cap50',
+    direction='BUY', and a combined context (signal metrics + contract + book)."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    calls: list[dict] = []
+    svc = _make_service(
+        signals=[_sig("RELIANCE", vol=2.5)],
+        signal_reviewer=_fake_reviewer({}, calls),
+        market_context_provider=lambda: {"nifty_pct": 0.4, "india_vix": 13.0},
+    )
+    svc.run_entry()
+
+    assert len(calls) == 1
+    kw = calls[0]
+    assert kw["symbol"] == "RELIANCE"
+    assert kw["source"] == "futures_follow_cap50"
+    assert kw["strategy_name"] == "futures_follow_cap50"
+    assert kw["direction"] == "BUY"
+    ctx = kw["context"]
+    assert ctx["vol_ratio"] == 2.5
+    assert ctx["stock_ret"] == 0.01
+    assert ctx["sector_ret"] == 0.02
+    assert ctx["contract_symbol"] == _CONTRACT["symbol"]
+    assert ctx["margin_cap_inr"] == 500_000.0
+    assert ctx["kill_switch_active"] is False
+    assert ctx["nifty_pct"] == 0.4  # injected market context merged in
+
+
+def test_run_entry_kill_switch_skips_review_entirely(monkeypatch):
+    """With the kill switch armed no LLM call is burned (place_entry refuses
+    the order anyway)."""
+    monkeypatch.setenv("VETO_LAYER_MODE", "active")
+    calls: list[dict] = []
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_reviewer=_fake_reviewer({}, calls))
+    svc.kill_switch_active = True
+    placed = svc.run_entry()
+    assert placed == []
+    assert calls == []
+
+
+# --------------------------------------------------------------------------- #
+# #334 — watchdog moved to 15:28 (after the 15:25 primary exit)
+# --------------------------------------------------------------------------- #
+
+
+def test_register_jobs_watchdog_at_1528():
+    """The EOD watchdog cron is registered at 15:28 IST (post-primary-exit
+    backstop), not the old 15:14 inherited from the simplified engine's MIS
+    constraint. The simplified engine's own watchdog is untouched by #334."""
+    jobs: dict[str, tuple] = {}
+
+    class FakeScheduler:
+        def add_job(self, fn, trigger, id, replace_existing, name):
+            jobs[id] = (trigger, name)
+
+    svc = _make_smoke_service()
+    svc.strategy_id = 77
+    svc.register_jobs(FakeScheduler())
+
+    trigger, name = jobs["futures_follow_eod_watchdog"]
+    assert "15:28" in name
+    assert "minute='28'" in str(trigger) and "hour='15'" in str(trigger)
+    # Ordering sanity: primary exit stays at 15:25, before the watchdog.
+    exit_trigger, _exit_name = jobs["futures_follow_exit"]
+    assert "minute='25'" in str(exit_trigger)
+
+
+def test_watchdog_finds_nothing_after_successful_primary_exit():
+    """#334 AC-2a: on a normal day the 15:25 primary exit squares off the T+1
+    position; the 15:28 watchdog then finds an empty book and does nothing —
+    the primary exit is primary again."""
+    svc = _make_service()
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+
+    exited = svc.run_exit()  # 15:25 primary
+    assert len(exited) == 1
+    assert svc.paper_book == {}
+
+    flattened = svc.run_eod_watchdog()  # 15:28 backstop
+    assert flattened == []
+
+
+def test_watchdog_flattens_position_left_by_rejected_primary_exit():
+    """#334 AC-2b: a REJECTED 15:25 exit keeps the position in the book; the
+    15:28 watchdog retries and flattens it before the 15:30 close."""
+    sell_attempts: list[dict] = []
+
+    def flaky_placer(mode, order):
+        if order["action"] != "SELL":
+            return {"status": "success", "orderid": "OID-BUY"}
+        sell_attempts.append(order)
+        if len(sell_attempts) == 1:
+            return {"status": "error", "message": "exchange rejected"}
+        return {"status": "success", "orderid": "OID-RETRY"}
+
+    svc = _make_service(order_placer=flaky_placer)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+
+    exited = svc.run_exit()  # 15:25 primary — SELL rejected
+    assert len(exited) == 1  # journalled as rejected
+    assert len(svc.paper_book) == 1, "rejected exit must stay in book for the retry"
+
+    flattened = svc.run_eod_watchdog()  # 15:28 retry backstop
+    assert len(flattened) == 1
+    assert svc.paper_book == {}
+    assert len(sell_attempts) == 2  # one rejected attempt + one successful retry
+
+
+# --------------------------------------------------------------------------- #
+# Issue #352 — entry-evaluation breakdown snapshot
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def _isolated_eval_db(monkeypatch):
+    """Rebind database.futures_follow_eval_db to a fresh in-memory DB per test so
+    snapshot writes never touch the live openalgo.db and never leak across tests."""
+    from database import futures_follow_eval_db as eval_db
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(eval_db, "engine", eng)
+    monkeypatch.setattr(eval_db, "db_session", sess)
+    eval_db.Base.query = sess.query_property()
+    eval_db.Base.metadata.create_all(eng)
+    yield eval_db
+    sess.remove()
+    eng.dispose()
+
+
+def _fake_details(symbols_meta: dict) -> callable:
+    """Build a fake ``signal_evaluator_details`` returning a fixed breakdown.
+
+    ``symbols_meta``: {symbol: {sector_ret, stock_ret, vol_ratio, passed,
+    fail_reason, intraday_source}}.
+    """
+
+    def _details(as_of=None):
+        n_by_source = {"quotes": 0, "aggregator": 0, "historify": 0, "none": 0}
+        rows = []
+        for sym, meta in symbols_meta.items():
+            src = meta.get("intraday_source", "quotes")
+            if src in n_by_source:
+                n_by_source[src] += 1
+            rows.append(
+                {
+                    "symbol": sym,
+                    "sector_index": meta.get("sector_index", "NIFTY"),
+                    "sector_ret": meta.get("sector_ret"),
+                    "stock_ret": meta.get("stock_ret"),
+                    "vol_ratio": meta.get("vol_ratio"),
+                    "current_price": meta.get("current_price", 100.0),
+                    "intraday_source": src,
+                    "passed": meta.get("passed", False),
+                    "fail_reason": meta.get("fail_reason"),
+                }
+            )
+        return {"n_by_source": n_by_source, "symbols": rows}
+
+    return _details
+
+
+def test_run_entry_persists_snapshot_with_known_metrics(_isolated_eval_db):
+    """run_entry captures + persists a snapshot row with the injected evaluator's
+    per-symbol metrics — the WHY-zero-signals breakdown the operator reads."""
+    details_fn = _fake_details(
+        {
+            "RELIANCE": {
+                "sector_ret": 0.02,
+                "stock_ret": 0.01,
+                "vol_ratio": 1.5,
+                "passed": True,
+            },
+            "TCS": {
+                "sector_ret": 0.003,
+                "stock_ret": 0.01,
+                "vol_ratio": 1.5,
+                "passed": False,
+                "fail_reason": "sector 0.30% <= 1.0%",
+            },
+            "INFY": {
+                "sector_ret": None,
+                "stock_ret": None,
+                "vol_ratio": None,
+                "passed": False,
+                "fail_reason": "None data [sector_ret, stock_ret, vol_ratio] (src=none)",
+            },
+        }
+    )
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_evaluator_details=details_fn)
+
+    placed = svc.run_entry()
+    assert len(placed) == 1  # sanity — entries still place normally
+
+    row = _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-06-10")
+    assert row is not None
+    payload = row["payload"]
+    assert payload["n_signals"] == 1
+    by_symbol = {s["symbol"]: s for s in payload["symbols"]}
+    assert by_symbol["RELIANCE"]["outcome"] == "in_cap_placed"
+    assert by_symbol["TCS"]["outcome"] == "first_failed_gate"
+    assert by_symbol["INFY"]["outcome"] == "missing_data"
+    assert payload["per_gate_fail_counts"]["sector"] == 1
+    assert payload["per_gate_fail_counts"]["missing_data"] == 1
+
+
+def test_run_entry_persist_failure_does_not_break_entry_placement(_isolated_eval_db, monkeypatch):
+    """A persist failure in the breakdown capture must never affect the entries
+    already placed — run_entry wraps the capture in a try/except."""
+
+    def _raising_details(as_of=None):
+        raise RuntimeError("boom — details provider exploded")
+
+    svc = _make_service(
+        signals=[_sig("RELIANCE")],
+        signal_evaluator_details=_raising_details,
+    )
+    placed = svc.run_entry()
+    assert len(placed) == 1  # entry placement unaffected by the capture failure
+    assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-06-10") is None
+
+
+def test_run_entry_no_evaluator_details_injected_is_a_noop(_isolated_eval_db):
+    """The default (no signal_evaluator_details injected, as in every other
+    existing test) must not attempt any DB write — purely additive capture."""
+    svc = _make_service(signals=[_sig("RELIANCE")])
+    placed = svc.run_entry()
+    assert len(placed) == 1
+    assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-06-10") is None
+
+
+def test_run_entry_snapshot_idempotent_on_rerun(_isolated_eval_db):
+    """Re-running run_entry for the same trading day overwrites the row rather
+    than creating a duplicate (idempotent upsert per (strategy, date))."""
+    details_fn = _fake_details(
+        {"RELIANCE": {"sector_ret": 0.02, "stock_ret": 0.01, "vol_ratio": 1.5, "passed": True}}
+    )
+    svc = _make_service(signals=[_sig("RELIANCE")], signal_evaluator_details=details_fn)
+    svc.run_entry()
+    svc.run_entry()  # second run same day (e.g. a scheduler retry)
+
+    from database.futures_follow_eval_db import FuturesFollowEvalSnapshot
+
+    rows = _isolated_eval_db.db_session.query(FuturesFollowEvalSnapshot).all()
+    assert len(rows) == 1
+    _isolated_eval_db.db_session.remove()
+
+
+def test_entry_breakdown_snapshot_none_when_not_yet_evaluated(_isolated_eval_db):
+    """No evaluation recorded yet for a given date -> get_snapshot returns None
+    (the endpoint's contract: data=null means 'no evaluation recorded yet')."""
+    assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-01-01") is None
 
 
 if __name__ == "__main__":

@@ -86,7 +86,16 @@ def _record_entry(symbol, direction, qty, entry_price, order_id="E-" + "0"):
 
 
 def _add_sandbox_fill(sandbox_db, symbol, action, qty, price, orderid, when=None):
-    """Insert a sandbox executed-trade (fill) row. ``trade_timestamp`` naive-now."""
+    """Insert a sandbox executed-trade (fill) row.
+
+    ``trade_timestamp`` defaults to IST **wall-clock** now (naive), matching the
+    live sandbox convention. Using a bare naive ``datetime.now()`` here was a
+    time-of-day flake: on a CI runner (UTC) a run after 18:30 UTC (= IST
+    midnight) stamped the fill on the IST-previous day, so the reconciled exit's
+    ``exited_at`` fell outside ``get_today_summary``'s IST-today window and the
+    summary count came back 0 (``assert 0 == 1``). The reconciliation service and
+    the today-summary both work in IST, so the fill must be IST-consistent too.
+    """
     sess = sandbox_db.db_session
     tid = f"T-{symbol}-{action}-{orderid}"
     row = sandbox_db.SandboxTrades(
@@ -100,7 +109,7 @@ def _add_sandbox_fill(sandbox_db, symbol, action, qty, price, orderid, when=None
         price=price,
         product="MIS",
         strategy="trending_equity_intraday",
-        trade_timestamp=when or dt.datetime.now(),
+        trade_timestamp=when or dt.datetime.now(IST).replace(tzinfo=None),
     )
     sess.add(row)
     sess.commit()
@@ -348,3 +357,162 @@ def test_orphan_fill_does_not_create_entry(journal_db, sandbox_db, today):
     assert result.entries_checked == 0  # nothing in the journal to examine
     # Entry creation is the engine's job — reconciliation must not invent one.
     assert _journal_summary()["count"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Pass 2 (issue #350) — watchdog-closed rows with NULL exit_price/pnl get their
+# fill price backfilled from the sandbox trade matching exit_order_id.
+# --------------------------------------------------------------------------- #
+
+
+def _record_watchdog_exit(jid, exit_order_id):
+    """Stamp a row exactly the way flatten_strategy_positions does: exited, with
+    the placed order id, but NO price (the watchdog doesn't wait for the fill)."""
+    from services import trade_journal_service
+
+    trade_journal_service.record_exit(
+        jid,
+        exit_price=None,
+        exit_order_id=exit_order_id,
+        exit_reason="eod_watchdog",
+    )
+
+
+def _read_journal_row(journal_db, jid):
+    from database.trade_journal_db import TradeJournal
+
+    sess = journal_db.db_session
+    try:
+        row = sess.query(TradeJournal).filter_by(id=jid).first()
+        return {
+            "exited_at": row.exited_at,
+            "exit_price": row.exit_price,
+            "exit_reason": row.exit_reason,
+            "pnl": row.pnl,
+        }
+    finally:
+        sess.remove()
+
+
+def test_watchdog_unpriced_exit_backfilled(journal_db, sandbox_db, today):
+    """The 2026-07-06 RADICO shape: an earlier stop-loss SELL fill AND a later
+    watchdog SELL fill on the same symbol/day. The backfill must price from the
+    watchdog's own order id only — a date-window action scan would blend the
+    stop-loss fill into the average and corrupt the P&L."""
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    # Earlier round-trip: its SELL close fill sits in sandbox under X-STOP.
+    _add_sandbox_fill(sandbox_db, "RADICO", "SELL", 24, 4060.10, "X-STOP")
+
+    # The watchdog trade: LONG 24 @ 4066, flattened by order W-RAD @ 4102.20.
+    jid = _record_entry("RADICO", "LONG", 24, 4066.0, order_id="E-RAD")
+    _record_watchdog_exit(jid, "W-RAD")
+    _add_sandbox_fill(sandbox_db, "RADICO", "SELL", 24, 4102.20, "W-RAD")
+    _set_sandbox_position(sandbox_db, "RADICO", 0, 4066.0)
+
+    before = _read_journal_row(journal_db, jid)
+    assert before["pnl"] is None
+
+    result = reconcile_engine_journal(today)
+
+    assert result.backfills_checked == 1
+    assert result.backfills_added == 1
+    after = _read_journal_row(journal_db, jid)
+    assert after["exit_price"] == pytest.approx(4102.20)  # NOT blended with 4060.10
+    assert after["pnl"] == pytest.approx((4102.20 - 4066.0) * 24, abs=0.01)
+    # The watchdog's stamps are preserved — only the price/outcome were missing.
+    assert after["exit_reason"] == "eod_watchdog"
+    assert after["exited_at"] == before["exited_at"]
+
+
+def test_watchdog_suppressed_exit_left_unpriced(journal_db, sandbox_db, today):
+    """A suppressed watchdog stamp (eod_watchdog:<reason>) placed no order — there
+    is no fill and the row must stay untouched (exact exit_reason match)."""
+    from services import trade_journal_service
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    jid = _record_entry("OIL", "LONG", 10, 400.0, order_id="E-OIL")
+    trade_journal_service.record_exit(
+        jid, exit_price=None, exit_order_id=None, exit_reason="eod_watchdog:store_flat"
+    )
+
+    result = reconcile_engine_journal(today)
+
+    assert result.backfills_checked == 0
+    assert result.backfills_added == 0
+    assert _read_journal_row(journal_db, jid)["pnl"] is None
+
+
+def test_watchdog_backfill_idempotent(journal_db, sandbox_db, today):
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    jid = _record_entry("LODHA", "LONG", 91, 1092.40, order_id="E-LOD")
+    _record_watchdog_exit(jid, "W-LOD")
+    _add_sandbox_fill(sandbox_db, "LODHA", "SELL", 91, 1096.85, "W-LOD")
+    _set_sandbox_position(sandbox_db, "LODHA", 0, 1092.40)
+
+    first = reconcile_engine_journal(today)
+    assert first.backfills_added == 1
+    priced = _read_journal_row(journal_db, jid)
+
+    second = reconcile_engine_journal(today)
+    assert second.backfills_checked == 0  # pnl set → no longer matches the filter
+    assert second.backfills_added == 0
+    assert _read_journal_row(journal_db, jid) == priced
+
+
+def test_watchdog_backfill_dry_run_writes_nothing(journal_db, sandbox_db, today):
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    jid = _record_entry("LODHA", "LONG", 91, 1092.40, order_id="E-LOD")
+    _record_watchdog_exit(jid, "W-LOD")
+    _add_sandbox_fill(sandbox_db, "LODHA", "SELL", 91, 1096.85, "W-LOD")
+    _set_sandbox_position(sandbox_db, "LODHA", 0, 1092.40)
+
+    result = reconcile_engine_journal(today, dry_run=True)
+
+    assert result.backfills_added == 1
+    assert result.backfill_details[0]["pnl"] == pytest.approx((1096.85 - 1092.40) * 91, abs=0.01)
+    assert _read_journal_row(journal_db, jid)["pnl"] is None  # nothing written
+
+
+def test_watchdog_backfill_no_order_id_skipped(journal_db, sandbox_db, today):
+    """exit_reason='eod_watchdog' but no order id (rejected order) — no fill to
+    price from; skip loudly rather than invent."""
+    from services import trade_journal_service
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    jid = _record_entry("OIL", "LONG", 10, 400.0, order_id="E-OIL")
+    trade_journal_service.record_exit(
+        jid, exit_price=None, exit_order_id=None, exit_reason="eod_watchdog"
+    )
+
+    result = reconcile_engine_journal(today)
+
+    assert result.backfills_checked == 1
+    assert result.backfills_added == 0
+    assert any(s["reason"] == "backfill_no_exit_order_id" for s in result.skipped)
+    assert _read_journal_row(journal_db, jid)["pnl"] is None
+
+
+def test_watchdog_backfill_qty_mismatch_alerts_and_skips(
+    journal_db, sandbox_db, today, monkeypatch
+):
+    """Fill quantity ≠ journaled quantity (e.g. the store reconcile clamped the
+    flatten) — a P&L against the journal qty would be invented. Alert + skip."""
+    import services.source_divergence_alerts as sda
+    from services.engine_eod_reconciliation_service import reconcile_engine_journal
+
+    alerts = []
+    monkeypatch.setattr(sda, "check_and_alert", lambda **kw: alerts.append(kw))
+
+    jid = _record_entry("DELHIVERY", "LONG", 193, 516.15, order_id="E-DEL")
+    _record_watchdog_exit(jid, "W-DEL")
+    _add_sandbox_fill(sandbox_db, "DELHIVERY", "SELL", 100, 518.65, "W-DEL")  # partial
+
+    result = reconcile_engine_journal(today)
+
+    assert result.backfills_added == 0
+    assert any(s["reason"] == "backfill_qty_mismatch" for s in result.skipped)
+    assert len(alerts) == 1 and alerts[0]["symbol"] == "DELHIVERY"
+    assert _read_journal_row(journal_db, jid)["pnl"] is None

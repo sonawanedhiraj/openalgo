@@ -67,7 +67,7 @@ def test_get_returns_none_when_no_row(fresh_sm):
 
 def test_set_get_roundtrip(fresh_sm):
     sm, _ = fresh_sm
-    sm.set_mode("simplified_engine", "live", updated_by="cli", notes="armed")
+    sm._set_mode_unchecked("simplified_engine", "live", updated_by="cli", notes="armed")
     row = sm.get_mode("simplified_engine")
     assert row["mode"] == "live"
     assert row["updated_by"] == "cli"
@@ -76,8 +76,8 @@ def test_set_get_roundtrip(fresh_sm):
 
 def test_set_updates_existing(fresh_sm):
     sm, _ = fresh_sm
-    sm.set_mode("simplified_engine", "live", updated_by="a")
-    sm.set_mode("simplified_engine", "sandbox", updated_by="b")
+    sm._set_mode_unchecked("simplified_engine", "live", updated_by="a")
+    sm._set_mode_unchecked("simplified_engine", "sandbox", updated_by="b")
     row = sm.get_mode("simplified_engine")
     assert row["mode"] == "sandbox"
     assert row["updated_by"] == "b"
@@ -86,21 +86,21 @@ def test_set_updates_existing(fresh_sm):
 def test_set_rejects_invalid_mode(fresh_sm):
     sm, _ = fresh_sm
     with pytest.raises(ValueError):
-        sm.set_mode("x", "skip", updated_by="cli")  # 'skip' is not a valid mode here
+        sm._set_mode_unchecked("x", "skip", updated_by="cli")  # 'skip' is not a valid mode here
     with pytest.raises(ValueError):
-        sm.set_mode("x", "yolo", updated_by="cli")
+        sm._set_mode_unchecked("x", "yolo", updated_by="cli")
 
 
 def test_set_requires_updated_by(fresh_sm):
     sm, _ = fresh_sm
     with pytest.raises(ValueError):
-        sm.set_mode("x", "sandbox", updated_by="")
+        sm._set_mode_unchecked("x", "sandbox", updated_by="")
 
 
 def test_list_and_delete(fresh_sm):
     sm, _ = fresh_sm
-    sm.set_mode("a", "sandbox", updated_by="cli")
-    sm.set_mode("b", "live", updated_by="cli")
+    sm._set_mode_unchecked("a", "sandbox", updated_by="cli")
+    sm._set_mode_unchecked("b", "live", updated_by="cli")
     names = {r["strategy_name"] for r in sm.list_modes()}
     assert names == {"a", "b"}
     assert sm.delete_mode("a") is True
@@ -150,7 +150,7 @@ def test_migration_is_idempotent_and_preserves_operator_edits(fresh_both):
 
     assert migrate()["inserted"] == 1
     # Operator overrides the migrated row to sandbox.
-    sm.set_mode("simplified_engine", "sandbox", updated_by="operator")
+    sm._set_mode_unchecked("simplified_engine", "sandbox", updated_by="operator")
     # Re-running the migration must NOT clobber the operator edit.
     second = migrate()
     assert second["inserted"] == 0

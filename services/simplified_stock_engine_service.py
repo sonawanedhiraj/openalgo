@@ -196,12 +196,17 @@ class SimplifiedStockEngineService:
             candle_seconds=self.config.candle_seconds,
         )
         # Order routing mode: disabled | sandbox | live. See MODE_* in core.
+        # Seeded from the env flag at construction; the persistent strategy_mode
+        # DB row (set via the /strategies UI toggle) is honored at order dispatch
+        # by _apply_persistent_mode() — issue #162 Phase 2. The engine routes on
+        # sandbox.db vs the broker per self.mode, so the resolve lives here (at
+        # dispatch) rather than in place_order_service, which the sandbox path
+        # bypasses.
         self.mode = self.config.mode
-        # Unified daily-intent resolver (services.mode_service). Injectable for
-        # tests; default consults resolve_strategy_mode('simplified_engine').
-        # See docs/design/strategy_daily_intent.md — the gate lives here (order
-        # dispatch) rather than in place_order_service because the engine's own
-        # _dispatch_order bypasses that path in sandbox mode.
+        # Deprecated/unused: the run/pause/halt intent axis was retired
+        # (mode-only architecture). Runtime pause/kill now flows through
+        # strategy_runtime_override (see _entry_held_by_override). Retained as a
+        # no-op so injection sites in older tests don't break.
         self._intent_resolver: Any | None = None
         self.history_source = os.getenv("SIMPLIFIED_ENGINE_HISTORY_SOURCE", "api")
         self.history_lookback_days = _env_int("SIMPLIFIED_ENGINE_HISTORY_LOOKBACK_DAYS", 3)
@@ -477,8 +482,14 @@ class SimplifiedStockEngineService:
     def _log_keyless_throttled(self, symbol: str, kind: str) -> None:
         """Log the unresolvable-key case at most once per symbol per
         ``_KEYLESS_LOG_INTERVAL_SEC``, so it can never become a per-tick storm."""
+        # The first-sight case must log unconditionally — using a default of
+        # ``0.0`` in ``dict.get`` reduces the guard to ``now >= INTERVAL`` for
+        # an unseen symbol, which fails silently on freshly-booted hosts where
+        # ``time.monotonic()`` is small (CI VMs, containers). Distinguish
+        # "never logged" from "logged ≥ INTERVAL ago" explicitly.
         now = time.monotonic()
-        if now - self._keyless_logged_at.get(symbol, 0.0) >= self._KEYLESS_LOG_INTERVAL_SEC:
+        last = self._keyless_logged_at.get(symbol)
+        if last is None or now - last >= self._KEYLESS_LOG_INTERVAL_SEC:
             self._keyless_logged_at[symbol] = now
             logger.error(
                 "[SIMPLIFIED-ENGINE] No api_key resolvable for %s %s — order skipped "
@@ -566,7 +577,52 @@ class SimplifiedStockEngineService:
             logger.debug("simplified runtime-override resolve failed; not blocking", exc_info=True)
             return False
 
+    def _apply_persistent_mode(self) -> None:
+        """Honor the persistent ``strategy_mode`` DB row (set via the /strategies
+        UI toggle) — issue #162 Phase 2.
+
+        Resolves ``services.mode_service.resolve_mode('simplified_engine')`` and
+        maps its {sandbox, live} onto ``self.mode`` when a persistent row exists
+        (``source == 'strategy_mode'``). With no row the engine keeps its env /
+        default mode, so deploy is a no-op until the operator flips the toggle.
+
+        Safety:
+        * ``MODE_DISABLED`` is a hard local off-switch and is NEVER overridden
+          from the DB — an operator who disabled the engine locally is not
+          surprise-enabled by a stray row.
+        * Fail-open: any DB error keeps the current mode. A trading decision is
+          never blocked on this read.
+        * Mirrors sector_follow/futures_follow ``_apply_mode_override`` so all
+          three engines resolve routing the same way. Mode is expected stable
+          within a session (set pre-market); event-driven mid-session flips are
+          Phase 3.
+        """
+        if self.mode == MODE_DISABLED:
+            return
+        try:
+            from services.mode_service import resolve_mode
+
+            resolved = resolve_mode(self.MODE_STRATEGY_NAME)
+        except Exception:
+            logger.debug("[SIMPLIFIED-MODE] resolve_mode failed — keeping mode=%s", self.mode)
+            return
+        if resolved.source != "strategy_mode":
+            return
+        mapped = resolved.mode if resolved.mode in (MODE_SANDBOX, MODE_LIVE) else None
+        if mapped and mapped != self.mode:
+            logger.warning(
+                "[SIMPLIFIED-MODE] mode override %s -> %s (strategy_mode row)",
+                self.mode,
+                mapped,
+            )
+            self.mode = mapped
+
     def _place_entry_order(self, signal: EntrySignal, api_key: str, strategy_name: str) -> None:
+        # Issue #162 Phase 2: resolve the persistent strategy_mode row before any
+        # mode-dependent gate (disabled short-circuit, live funds check) or
+        # dispatch, so the whole entry flow sees one consistent, UI-controllable
+        # routing mode.
+        self._apply_persistent_mode()
         # Mode-only safety gate: an active runtime override (pause/kill_switch)
         # holds new entries. Exits are never blocked here.
         if self._entry_held_by_override():
@@ -707,10 +763,14 @@ class SimplifiedStockEngineService:
         try:
             from services import signal_review_service
 
-            # Mode-aware veto default: sandbox enforces ('active') by default so
-            # the layer is exercised on the virtual book; live is unchanged
-            # ('shadow'). VETO_LAYER_MODE env overrides in every mode.
-            mode = signal_review_service.get_veto_layer_mode(self.mode)
+            # Resolve the LLM enforcement mode. The per-strategy operator control
+            # (strategy_llm_config, issue #266 Phase 2) is keyed on the dashboard
+            # identity ("simplified_engine"); it wins over the env/mode-aware
+            # default. off→off, veto/delegate→active. VETO_LAYER_MODE env is the
+            # first-boot fallback only.
+            mode = signal_review_service.get_veto_layer_mode(
+                self.mode, strategy_name=self.LLM_CONFIG_STRATEGY_NAME
+            )
             if mode == "off":
                 return True, None
 
@@ -783,6 +843,18 @@ class SimplifiedStockEngineService:
     # ------------------------------------------------------------------
 
     JOURNAL_STRATEGY_NAME = "trending_equity_intraday"
+
+    # Dashboard identity used for the per-strategy LLM control
+    # (strategy_llm_config table / /strategies UI, issue #266 Phase 2). This is
+    # the strategies/ folder name, NOT the journal name — the UI keys the
+    # off/veto toggle on this.
+    LLM_CONFIG_STRATEGY_NAME = "simplified_engine"
+
+    # Dashboard identity used for the persistent order-routing mode
+    # (strategy_mode table / /strategies toggle → services.mode_service.resolve_mode,
+    # issue #162 Phase 2). Same key the UI mode toggle writes; the engine reads
+    # it at order dispatch so a UI sandbox↔live flip actually takes effect.
+    MODE_STRATEGY_NAME = "simplified_engine"
 
     @staticmethod
     def _normalize_exit_reason(reason: str | None) -> str:
@@ -981,6 +1053,10 @@ class SimplifiedStockEngineService:
             )
 
     def _place_exit_order(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
+        # Issue #162 Phase 2: honor the persistent strategy_mode row so an exit
+        # routes to the same store the position lives in. Exits are never gated
+        # by it — resolving only picks sandbox.db vs the broker.
+        self._apply_persistent_mode()
         # Mode-only: exits are NEVER gated. Runtime overrides (pause/kill_switch)
         # hold new entries only — a held position must always be allowed to exit.
         if self.mode == MODE_DISABLED:
@@ -1155,14 +1231,17 @@ class SimplifiedStockEngineService:
         return True, available, None
 
     def _maybe_flatten_eod(self) -> None:
-        """Trigger broker-position-aware EOD flatten exactly once per day.
+        """Trigger position-store-aware EOD flatten exactly once per day (#265).
 
-        Runs only in live mode and only after the engine's internal
-        eod_exit_time has been reached. Sandbox mode is authoritative (its
-        positions can't drift from the engine's view because both are written
-        by the same process), and disabled mode never sends orders.
+        Runs in BOTH ``live`` AND ``sandbox`` modes, only after the engine's
+        internal eod_exit_time has been reached. It reconciles drift/mismatch
+        against the mode-appropriate position store (``sandbox.db`` in sandbox,
+        the broker positionbook in live — routing handled by ``get_positionbook``)
+        and is additive to the engine's own tick-driven exits and the sandbox EOD
+        journal reconciliation (``engine_eod_reconciliation_service``, which is
+        unchanged). ``disabled`` mode never sends orders, so it is skipped.
         """
-        if self.mode != MODE_LIVE:
+        if self.mode == MODE_DISABLED:
             return
 
         now = dt.datetime.now()
@@ -1182,11 +1261,12 @@ class SimplifiedStockEngineService:
             )
 
         if not api_keys:
-            logger.info("[SIMPLIFIED-EOD] No api_keys registered; skipping broker flatten")
+            logger.info("[SIMPLIFIED-EOD] No api_keys registered; skipping store flatten")
             return
 
         logger.info(
-            "[SIMPLIFIED-EOD] Running broker-position flatten across %d api_key(s)",
+            "[SIMPLIFIED-EOD] Running position-store flatten (mode=%s) across %d api_key(s)",
+            self.mode,
             len(api_keys),
         )
         for api_key in api_keys:
@@ -1204,12 +1284,14 @@ class SimplifiedStockEngineService:
         known_qty_by_symbol: dict[str, int],
         strategy_name: str,
     ) -> None:
-        """Fetch the broker positionbook for one api_key and flatten drift.
+        """Fetch the mode-appropriate position store for one api_key and flatten drift.
 
-        "Drift" here means: the broker reports an open position on the engine's
-        configured exchange/product that the engine has no record of. The
-        engine's own check_eod_exits already emits exits for positions it
-        knows about, so this pass only catches the orphans.
+        The store is read via the mode-aware ``get_positionbook`` (``sandbox.db``
+        in sandbox, the broker positionbook in live). "Drift" here means: the
+        store reports an open position on the engine's configured exchange/product
+        that the engine has no record of. The engine's own check_eod_exits already
+        emits exits for positions it knows about, so this pass only catches the
+        orphans and any engine↔store qty mismatch (reconciled via #265).
         """
         from services.positionbook_service import get_positionbook
 
@@ -1256,18 +1338,67 @@ class SimplifiedStockEngineService:
             engine_qty = known_qty_by_symbol.get(symbol)
 
             if engine_qty is not None and engine_qty != 0:
-                # The engine knows about this position; its own EOD path will
-                # close it. Skip to avoid double-issuing an exit. Log a hint if
-                # quantities disagree (likely a partial-fill drift we are not
-                # reconciling in v1).
-                if abs(engine_qty) != abs(qty):
-                    logger.warning(
-                        "[SIMPLIFIED-EOD] Qty mismatch on %s: engine=%s broker=%s "
-                        "(engine's exit will close the engine's view only)",
+                # The engine knows about this position. When engine and store
+                # AGREE, defer to the engine's own EOD exit path. When they
+                # DISAGREE, reconcile qty against the store here (#265) — the
+                # mode-appropriate store is the source of truth, so the engine must
+                # not exit MORE than the account actually holds (that would reverse).
+                if abs(engine_qty) == abs(qty):
+                    continue
+
+                engine_close_side = "SELL" if engine_qty > 0 else "BUY"
+                decision = _reconcile_store_close(
+                    mode=self.mode,
+                    strategy=strategy_name,
+                    api_key=api_key,
+                    symbol=symbol,
+                    exchange=engine_exchange,
+                    product=engine_product,
+                    expected_close_side=engine_close_side,
+                    journaled_qty=abs(engine_qty),
+                )
+                if decision is None or not decision.should_place:
+                    logger.error(
+                        "[SIMPLIFIED-EOD] Reconcile SUPPRESSED exit on %s (engine=%s broker=%s)",
                         symbol,
                         engine_qty,
                         qty,
                     )
+                    try:
+                        self.engine.positions.pop(symbol, None)
+                    except Exception:  # noqa: BLE001 — best-effort state clear
+                        pass  # nosec B110
+                    continue
+
+                reconciled_qty = decision.guarded_qty
+                logger.warning(
+                    "[SIMPLIFIED-EOD] Qty mismatch on %s: engine=%s broker=%s — "
+                    "reconciling to broker qty=%s (%s)",
+                    symbol,
+                    engine_qty,
+                    qty,
+                    reconciled_qty,
+                    engine_close_side,
+                )
+                payload = {
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "exchange": engine_exchange,
+                    "action": engine_close_side,
+                    "quantity": reconciled_qty,
+                    "pricetype": self.config.order_pricetype,
+                    "product": engine_product,
+                    "price": 0,
+                    "trigger_price": 0,
+                    "disclosed_quantity": 0,
+                }
+                self._dispatch_order(payload, api_key, is_entry=False)
+                # Drop the engine's now-flattened view so its own exit path can't
+                # re-issue against a broker we've already squared to the truth.
+                try:
+                    self.engine.positions.pop(symbol, None)
+                except Exception:  # noqa: BLE001 — best-effort state clear
+                    pass  # nosec B110
                 continue
 
             # Drift case: broker has it, engine doesn't know.
@@ -1294,18 +1425,24 @@ class SimplifiedStockEngineService:
             }
             self._dispatch_order(payload, api_key, is_entry=False)
 
-        # Surface engine-only orphans for visibility (positions the engine
-        # thinks are open but the broker doesn't show). We don't issue any
-        # orders here -- there's nothing to flatten -- just warn so operators
-        # can investigate.
+        # Phantom (engine-only) positions: the engine thinks a symbol is open but
+        # the broker doesn't show it. SUPPRESS — issue NO order (an exit here
+        # would OPEN a real reverse position against a flat broker, #265) — and
+        # clear the engine's stale internal state so its own exit path can't
+        # fire a phantom order on the next tick.
         for symbol, engine_qty in known_qty_by_symbol.items():
             if engine_qty != 0 and symbol not in broker_open_symbols:
-                logger.warning(
-                    "[SIMPLIFIED-EOD] Engine thinks %s qty=%s is open but broker "
-                    "reports nothing; clearing internal state",
+                logger.error(
+                    "[SIMPLIFIED-EOD] Phantom: engine thinks %s qty=%s is open but broker "
+                    "reports nothing; SUPPRESSING exit and clearing internal state",
                     symbol,
                     engine_qty,
                 )
+                _emit_phantom_alert(strategy_name, symbol, abs(engine_qty))
+                try:
+                    self.engine.positions.pop(symbol, None)
+                except Exception:  # noqa: BLE001 — best-effort state clear
+                    pass  # nosec B110
 
     # ------------------------------------------------------------------
     # EOD trading summary (step 4)
@@ -1624,7 +1761,7 @@ class SimplifiedStockEngineService:
                     )
                 if isinstance(value, str):
                     return date_parser.parse(value).replace(tzinfo=None)
-            except Exception:
+            except Exception:  # nosec B112 — best-effort field-fallback; try the next key on any parse failure
                 continue
         return dt.datetime.now()
 
@@ -1788,6 +1925,68 @@ class SimplifiedStockEngineService:
 
 
 # ----------------------------------------------------------------------
+# Position-store reconciliation glue (#265) — runs in sandbox AND live
+# ----------------------------------------------------------------------
+
+
+def _reconcile_store_close(
+    *,
+    mode: str,
+    strategy: str,
+    api_key: str | None,
+    symbol: str,
+    exchange: str,
+    product: str,
+    expected_close_side: str,
+    journaled_qty: int,
+):
+    """Return a store-reconciled close decision, or ``None`` in disabled/error mode.
+
+    Runs in BOTH ``sandbox`` AND ``live`` mode: the underlying position read
+    (``reconcile_exit`` → ``get_open_position``) is mode-aware, so it consults
+    ``sandbox.db`` in sandbox and the broker positionbook in live. Returns a
+    ``ReconcileDecision`` (proceed / clamp / suppress) in those modes. ``None``
+    means "no reconciliation ran" — either ``disabled`` mode (never sends orders)
+    or an import failure — and the caller then falls back to its legacy
+    (non-reconciled) path. Never raises.
+    """
+    if mode == MODE_DISABLED:
+        return None
+    try:
+        from services import live_position_reconciliation_service as recon
+
+        return recon.reconcile_exit(
+            strategy=strategy,
+            api_key=api_key,
+            symbol=symbol,
+            exchange=exchange,
+            product=product,
+            expected_close_side=expected_close_side,
+            journaled_qty=journaled_qty,
+        )
+    except Exception:
+        logger.exception("[SIMPLIFIED-EOD] store reconcile raised for %s", symbol)
+        return None
+
+
+def _emit_phantom_alert(strategy: str, symbol: str, journaled_qty: int) -> None:
+    """Position-drift alert for a phantom (engine open / broker flat). Never raises."""
+    try:
+        from services.source_divergence_alerts import check_and_alert
+
+        check_and_alert(
+            service=strategy,
+            symbol=symbol,
+            source_a_label="journal_qty",
+            source_a_value=float(journaled_qty),
+            source_b_label="broker_qty",
+            source_b_value=0.0,
+        )
+    except Exception:
+        logger.exception("[SIMPLIFIED-EOD] phantom drift alert failed for %s", symbol)
+
+
+# ----------------------------------------------------------------------
 # P0 — module-level EOD flatten entry point. The watchdog
 # (services/eod_watchdog_service.py) calls this; the order path here is
 # the in-process ``services.place_order_service.place_order`` so the
@@ -1889,6 +2088,52 @@ def flatten_strategy_positions(
             continue
 
         action = "SELL" if direction == "LONG" else "BUY"
+
+        # Position-store reconciliation (#265, BOTH modes): the journal is not the
+        # source of truth at exit — the mode-appropriate store is (sandbox.db in
+        # sandbox, broker in live). Suppress a phantom (store flat) and clamp a
+        # partial (store < journaled) before dispatching. No-op only in disabled
+        # mode (returns None → journal-driven qty unchanged).
+        decision = _reconcile_store_close(
+            mode=engine_service.mode,
+            strategy=strategy_name,
+            api_key=api_key,
+            symbol=symbol,
+            exchange=exchange,
+            product=product,
+            expected_close_side=action,
+            journaled_qty=qty,
+        )
+        if decision is not None:
+            if not decision.should_place:
+                logger.error(
+                    "[EOD-FLATTEN] %s %s SUPPRESSED by store reconcile "
+                    "(reason=%s store_qty=%s journaled=%s)",
+                    strategy_name,
+                    symbol,
+                    decision.reason,
+                    decision.broker_qty,
+                    qty,
+                )
+                summary["skipped"].append({"symbol": symbol, "reason": decision.reason})
+                # Stamp the journal row closed so the next boot's rehydrate skips
+                # it — the store already holds nothing to close.
+                try:
+                    trade_journal_service.record_exit(
+                        journal_id,
+                        exit_price=None,
+                        exit_order_id=None,
+                        exit_reason=f"{reason}:{decision.reason}",
+                    )
+                except Exception:
+                    logger.exception("[EOD-FLATTEN] record_exit (suppress) failed for %s", symbol)
+                try:
+                    engine_service.engine.positions.pop(symbol, None)
+                except Exception:  # noqa: BLE001 — best-effort state clear
+                    pass  # nosec B110
+                continue
+            qty = decision.guarded_qty
+
         payload = {
             "strategy": strategy_name,
             "symbol": symbol,
@@ -1950,8 +2195,8 @@ def flatten_strategy_positions(
         # don't re-trigger an exit against a now-flat broker.
         try:
             engine_service.engine.positions.pop(symbol, None)
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — best-effort state clear
+            pass  # nosec B110
 
         logger.warning(
             "[EOD-FLATTEN] %s %s flattened: %s %s qty=%s orderid=%s",

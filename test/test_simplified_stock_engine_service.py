@@ -156,6 +156,30 @@ def _make_service(mode: str) -> SimplifiedStockEngineService:
     return SimplifiedStockEngineService(config=config)
 
 
+@pytest.fixture(autouse=True)
+def _clear_persistent_mode_row():
+    """Issue #162 Phase 2: _place_entry_order/_place_exit_order now resolve the
+    persistent strategy_mode DB row via services.mode_service.resolve_mode. The
+    conftest temp DB is process-wide, and other suites write a 'simplified_engine'
+    row that would leak in and override these fixed-mode tests (a leaked sandbox
+    row flips a MODE_LIVE service to sandbox → place_order never called). Clear it
+    before AND after each test so routing is driven purely by the config the test
+    builds. Tests that exercise the DB path mock resolve_mode directly and are
+    unaffected by this cleanup."""
+
+    def _clear():
+        try:
+            from database import strategy_mode_db
+
+            strategy_mode_db.delete_mode("simplified_engine")
+        except Exception:
+            pass
+
+    _clear()
+    yield
+    _clear()
+
+
 def test_process_chartink_webhook_empty_returns_empty_status():
     """Zero-stock screener result is 'empty', not 'error' (reserve error for failures)."""
     service = _make_service(MODE_SANDBOX)
@@ -196,6 +220,97 @@ def test_dry_run_env_is_ignored(monkeypatch):
 def test_config_rejects_unknown_mode():
     with pytest.raises(ValueError):
         SimplifiedEngineConfig(mode="bogus")
+
+
+# --------------------------------------------------------------------------- #
+# Issue #162 Phase 2 — engine honors the persistent strategy_mode DB row
+# --------------------------------------------------------------------------- #
+
+
+def _resolved(mode: str, source: str):
+    from services.mode_service import ResolvedMode
+
+    return ResolvedMode(mode=mode, source=source)
+
+
+def test_apply_persistent_mode_live_row_overrides_env_sandbox(monkeypatch):
+    """A persistent strategy_mode row = live flips an env-sandbox engine to live."""
+    service = _make_service(MODE_SANDBOX)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_LIVE, "strategy_mode"),
+    ) as m:
+        service._apply_persistent_mode()
+    assert service.mode == MODE_LIVE
+    # Resolves under the dashboard/UI key, not the journal name.
+    m.assert_called_once_with("simplified_engine")
+
+
+def test_apply_persistent_mode_sandbox_row_overrides_env_live(monkeypatch):
+    """A persistent row = sandbox flips an env-live engine back to sandbox."""
+    service = _make_service(MODE_LIVE)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_SANDBOX, "strategy_mode"),
+    ):
+        service._apply_persistent_mode()
+    assert service.mode == MODE_SANDBOX
+
+
+def test_apply_persistent_mode_no_row_keeps_env_mode(monkeypatch):
+    """No persistent row (source != strategy_mode) → engine keeps its env mode."""
+    service = _make_service(MODE_LIVE)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_SANDBOX, "env"),
+    ):
+        service._apply_persistent_mode()
+    assert service.mode == MODE_LIVE  # env source ignored
+
+
+def test_apply_persistent_mode_never_overrides_disabled(monkeypatch):
+    """MODE_DISABLED is a hard local off-switch — a stray live row can't enable it."""
+    service = _make_service(MODE_DISABLED)
+    with patch(
+        "services.mode_service.resolve_mode",
+        return_value=_resolved(MODE_LIVE, "strategy_mode"),
+    ) as m:
+        service._apply_persistent_mode()
+    assert service.mode == MODE_DISABLED
+    m.assert_not_called()  # short-circuits before the DB read
+
+
+def test_apply_persistent_mode_fails_open_on_db_error(monkeypatch):
+    """A resolve_mode exception must never change the mode or raise."""
+    service = _make_service(MODE_SANDBOX)
+    with patch("services.mode_service.resolve_mode", side_effect=RuntimeError("db down")):
+        service._apply_persistent_mode()  # must not raise
+    assert service.mode == MODE_SANDBOX
+
+
+def test_entry_dispatch_honors_live_strategy_mode_row(monkeypatch):
+    """End-to-end: an env-sandbox engine with a live persistent row routes the
+    entry through the LIVE place_order path (not sandbox)."""
+    service = _make_service(MODE_SANDBOX)
+    signal = _make_entry_signal()
+    service.engine.pending_entries[signal.symbol] = signal
+
+    monkeypatch.setattr(
+        "services.mode_service.resolve_mode",
+        lambda name: _resolved(MODE_LIVE, "strategy_mode"),
+    )
+    # Live path needs funds; make the funds gate pass deterministically.
+    monkeypatch.setattr(service, "_check_live_funds", lambda api_key: (True, 10_000_000.0, None))
+    with (
+        patch("services.place_order_service.place_order") as mock_live,
+        patch("services.sandbox_service.sandbox_place_order") as mock_sandbox,
+    ):
+        mock_live.return_value = (True, {"orderid": "live-1", "status": "success"}, 200)
+        service._place_entry_order(signal, api_key="k", strategy_name="s")
+
+    assert service.mode == MODE_LIVE
+    assert mock_live.called, "live persistent row should route through place_order"
+    assert not mock_sandbox.called, "must not hit the sandbox path when row=live"
 
 
 def test_disabled_mode_skips_order_dispatch():
@@ -370,22 +485,27 @@ def _force_eod_clock(monkeypatch=None):
     return _FixedDateTime
 
 
-def test_eod_flatten_skipped_in_sandbox_mode(monkeypatch):
-    """Sandbox mode never queries the broker positionbook at EOD."""
+def test_eod_flatten_runs_in_sandbox_mode(monkeypatch):
+    """#265: sandbox mode DOES run the EOD flatten and reads the mode-aware store
+    (sandbox.db via get_positionbook). With no orphan/mismatch it dispatches
+    nothing, but it consults the store and marks the once-a-day flag done."""
     service = _make_service(MODE_SANDBOX)
     _seed_service_for_eod(service)
     _force_eod_clock(monkeypatch)
 
+    empty_book = (True, {"status": "success", "data": []}, 200)
     with (
-        patch("services.positionbook_service.get_positionbook") as mock_book,
+        patch(
+            "services.positionbook_service.get_positionbook", return_value=empty_book
+        ) as mock_book,
         patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
     ):
         service._maybe_flatten_eod()
 
-    mock_book.assert_not_called()
-    mock_dispatch.assert_not_called()
-    # Idempotency flag is NOT set in sandbox -- the flatten was a no-op.
-    assert service._eod_flatten_done_date is None
+    mock_book.assert_called()  # the sandbox store IS consulted now
+    mock_dispatch.assert_not_called()  # nothing to reconcile in an empty book
+    # Idempotency flag IS set -- the flatten ran (once-a-day).
+    assert service._eod_flatten_done_date is not None
 
 
 def test_eod_flatten_skipped_in_disabled_mode(monkeypatch):
@@ -1613,3 +1733,179 @@ def test_no_override_allows_entry():
 
     mock_live.assert_not_called()
     mock_sandbox.assert_called_once()
+
+
+# ----------------------------------------------------------------------
+# #265 — _flatten_for_api_key store reconciliation of engine-known qty
+#        (runs in BOTH sandbox AND live against the mode-aware store)
+# ----------------------------------------------------------------------
+
+
+def test_eod_flatten_reconciles_engine_qty_mismatch(monkeypatch):
+    """LIVE: engine thinks 10, broker holds only 5 -> reconcile to the broker qty
+    (5) rather than only warning. The engine would otherwise over-exit/reverse."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service, api_key="live-key")
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+
+    positionbook_response = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 5,
+                    "average_price": "2500.00",
+                }
+            ],
+        },
+        200,
+    )
+    open_pos = (True, {"quantity": 5, "status": "success"}, 200)
+
+    dispatched = []
+
+    def _capture_dispatch(self, payload, api_key, *, is_entry):
+        dispatched.append((payload, api_key, is_entry))
+        return True, {"orderid": "recon-1"}
+
+    with (
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=positionbook_response,
+        ),
+        patch("services.openposition_service.get_open_position", return_value=open_pos),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order", _capture_dispatch),
+    ):
+        service._maybe_flatten_eod()
+
+    assert len(dispatched) == 1
+    payload = dispatched[0][0]
+    assert payload["symbol"] == "RELIANCE"
+    assert payload["action"] == "SELL"
+    assert payload["quantity"] == 5
+    assert "RELIANCE" not in service.engine.positions
+
+
+def test_eod_flatten_phantom_suppresses_and_alerts(monkeypatch):
+    """LIVE: engine thinks GHOST open but broker is flat -> SUPPRESS (no order),
+    clear the engine state, and emit a phantom drift alert."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_LIVE)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["GHOST"] = Position(
+        symbol="GHOST",
+        entry_price=500.0,
+        qty=5,
+        stop_loss=495.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 11, 0),
+        risk_per_share=5.0,
+    )
+
+    empty_book = (True, {"status": "success", "data": []}, 200)
+    with (
+        patch("services.positionbook_service.get_positionbook", return_value=empty_book),
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+        patch("services.simplified_stock_engine_service._emit_phantom_alert") as mock_alert,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_dispatch.assert_not_called()
+    mock_alert.assert_called_once()
+    assert "GHOST" not in service.engine.positions
+
+
+def test_eod_flatten_reconciles_engine_qty_mismatch_in_sandbox(monkeypatch):
+    """SANDBOX (#265): engine thinks 10 but the sandbox store holds only 5 ->
+    reconcile to the sandbox store qty (5), routed via the mode-aware source.
+    The guard now runs in sandbox too, not just live."""
+    from services.simplified_stock_engine_core import Position
+
+    service = _make_service(MODE_SANDBOX)
+    _seed_service_for_eod(service, api_key="sbx-key")
+    _force_eod_clock(monkeypatch)
+
+    service.engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=2500.0,
+        qty=10,
+        stop_loss=2490.0,
+        entry_time=_eod_dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+
+    # The mode-aware get_positionbook returns the sandbox.db book in sandbox.
+    sandbox_book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "RELIANCE",
+                    "exchange": "NSE",
+                    "product": "MIS",
+                    "quantity": 5,
+                    "average_price": "2500.00",
+                }
+            ],
+        },
+        200,
+    )
+    open_pos = (True, {"quantity": 5, "status": "success"}, 200)
+
+    dispatched = []
+
+    def _capture_dispatch(self, payload, api_key, *, is_entry):
+        dispatched.append((payload, api_key, is_entry))
+        return True, {"orderid": "recon-sbx-1"}
+
+    with (
+        patch("services.positionbook_service.get_positionbook", return_value=sandbox_book),
+        patch("services.openposition_service.get_open_position", return_value=open_pos) as store,
+        patch.object(SimplifiedStockEngineService, "_dispatch_order", _capture_dispatch),
+    ):
+        service._maybe_flatten_eod()
+
+    store.assert_called()  # sandbox store IS consulted
+    assert len(dispatched) == 1
+    payload = dispatched[0][0]
+    assert payload["symbol"] == "RELIANCE"
+    assert payload["action"] == "SELL"
+    assert payload["quantity"] == 5  # clamped to the sandbox store
+    assert "RELIANCE" not in service.engine.positions
+
+
+def test_eod_flatten_disabled_mode_no_store_call(monkeypatch):
+    """DISABLED (#265): the flatten is skipped entirely — neither the positionbook
+    nor the reconciliation source is consulted."""
+    service = _make_service(MODE_DISABLED)
+    _seed_service_for_eod(service)
+    _force_eod_clock(monkeypatch)
+
+    with (
+        patch("services.positionbook_service.get_positionbook") as mock_book,
+        patch("services.openposition_service.get_open_position") as store,
+        patch.object(SimplifiedStockEngineService, "_dispatch_order") as mock_dispatch,
+    ):
+        service._maybe_flatten_eod()
+
+    mock_book.assert_not_called()
+    store.assert_not_called()
+    mock_dispatch.assert_not_called()

@@ -236,6 +236,7 @@ markers = [
     "unit: fast deterministic test, no DB/network/broker (safe for `pytest -m unit`)",
     "integration: touches DB, services, or multiple modules together",
     "live: requires a running OpenAlgo instance or live broker session",
+    "e2e: Playwright/HTTP browser smoke test — requires a running OpenAlgo + Docker E2E pipeline",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

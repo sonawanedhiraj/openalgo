@@ -287,6 +287,158 @@ def production_broker_session_checker() -> bool:
         return False
 
 
+# ----- quotes-snapshot intraday provider (issue #332) ---------------------- #
+def _fetch_quotes_snapshot(symbol_payload: list[dict]) -> dict[str, tuple]:
+    """ONE batched broker quote call for ``[{symbol, exchange}, ...]``.
+
+    Returns ``{symbol: (ltp, cumulative_day_volume)}`` for every symbol the
+    broker answered with a usable ``ltp > 0``. NEVER raises — any failure (no
+    API key / broker session down, broker error, malformed response) logs a
+    WARNING and returns ``{}`` so the caller's fallback chain (aggregator →
+    historify) takes over. Lazily imported so this module never pulls the
+    quote/auth stack at import time.
+    """
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_multiquotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            logger.warning(
+                "sector_follow quotes snapshot: no API key available (broker session "
+                "down?) — falling back to aggregator/historify"
+            )
+            return {}
+        success, resp, _status = get_multiquotes(symbol_payload, api_key=api_key)
+        if not success:
+            logger.warning(
+                "sector_follow quotes snapshot: get_multiquotes failed: %s — falling "
+                "back to aggregator/historify",
+                (resp or {}).get("message", "unknown error"),
+            )
+            return {}
+        out: dict[str, tuple] = {}
+        for item in (resp or {}).get("results") or []:
+            sym = item.get("symbol")
+            data = item.get("data")
+            if not sym or not isinstance(data, dict):
+                continue
+            ltp = data.get("ltp") or data.get("last_price") or data.get("close")
+            try:
+                ltp = float(ltp) if ltp else None
+            except (TypeError, ValueError):
+                ltp = None
+            if ltp is None or ltp <= 0:
+                continue
+            vol = data.get("volume")
+            try:
+                vol = float(vol) if vol else None
+            except (TypeError, ValueError):
+                vol = None
+            out[sym] = (ltp, vol)
+        return out
+    except Exception:
+        logger.exception("sector_follow quotes snapshot fetch raised (falling back)")
+        return {}
+
+
+def make_quotes_intraday_provider(
+    universe: list[str] | None = None,
+    sector_map: dict[str, str] | None = None,
+    *,
+    quotes_fetcher: Callable[[list[dict]], dict[str, tuple]] | None = None,
+    fallback: Callable | None = None,
+):
+    """Build an intraday provider sourcing TODAY's (close, volume) from a single
+    batched broker quote snapshot at decision time (issue #332).
+
+    Returns a callable ``(symbol, as_of) -> (close, volume, source)`` with
+    ``source ∈ {"quotes", "aggregator", "none"}``. On the FIRST call of an eval
+    cycle (memo key: as_of truncated to the minute) it fetches ALL universe
+    stocks (exchange ``NSE``) plus the mapped sector indices (exchange
+    ``NSE_INDEX`` — the same symbol/exchange routing the
+    ``sector_follow_index_backfill`` feed uses; the index symbols come straight
+    from ``sector_map`` values, no new mapping invented) in ONE
+    ``get_multiquotes`` round trip, memoized so the ~38 per-symbol calls hit one
+    HTTP request. Stocks yield ``(ltp, cumulative_day_volume)``; indices yield
+    ``(ltp, None)`` — index volume is unused by the gates.
+
+    Fail-safe contract: NEVER raises. A failed/partial quote fetch degrades per
+    symbol to the ``fallback`` provider (default: the scanner-aggregator
+    ``production_intraday_provider``) with a WARNING per hop; when that also has
+    nothing it returns ``(None, None, "none")`` so ``_compute_metrics``
+    continues to its existing historify fallback + loud-WARNING path.
+    """
+    if universe is None or sector_map is None:
+        universe = list(universe) if universe is not None else list(load_config().universe)
+        sector_map = dict(sector_map) if sector_map is not None else load_sector_map()
+    else:
+        universe = list(universe)
+        sector_map = dict(sector_map)
+    fetch = quotes_fetcher or _fetch_quotes_snapshot
+    fb = fallback or production_intraday_provider
+
+    # Same index derivation as _compute_metrics, so the snapshot covers exactly
+    # the symbols the evaluator will ask for.
+    index_syms = sorted({sector_map.get(s, "NIFTY") for s in universe})
+    stock_set = set(universe)
+    index_set = set(index_syms)
+    cache: dict[tuple, dict[str, tuple]] = {}
+
+    def _cycle_quotes(as_of: datetime) -> dict[str, tuple]:
+        ist = as_of.astimezone(_IST) if as_of.tzinfo else as_of
+        key = (ist.date(), ist.hour, ist.minute)
+        if key not in cache:
+            payload = [{"symbol": s, "exchange": "NSE"} for s in sorted(stock_set)]
+            payload += [
+                {"symbol": i, "exchange": "NSE_INDEX"} for i in index_syms if i not in stock_set
+            ]
+            try:
+                raw = fetch(payload) or {}
+            except Exception:
+                # The production fetcher never raises; guard injected ones too so a
+                # failure is memoized (ONE batched attempt per cycle, no retry storm).
+                logger.exception("sector_follow quotes snapshot fetcher raised (falling back)")
+                raw = {}
+            # Indices carry no meaningful cumulative volume — normalize to None.
+            cache[key] = {
+                sym: (ltp, None if sym in index_set and sym not in stock_set else vol)
+                for sym, (ltp, vol) in raw.items()
+            }
+            logger.info(
+                "sector_follow quotes snapshot: %d/%d symbols answered in one batched call",
+                len(cache[key]),
+                len(payload),
+            )
+        return cache[key]
+
+    def provider(symbol: str, as_of: datetime):
+        try:
+            quotes = _cycle_quotes(as_of)
+        except Exception:  # belt-and-braces — _cycle_quotes is already defensive
+            logger.exception("sector_follow quotes provider cycle fetch raised for %s", symbol)
+            quotes = {}
+        entry = quotes.get(symbol)
+        if entry is not None and entry[0] is not None:
+            return entry[0], entry[1], "quotes"
+        logger.warning(
+            "sector_follow quotes provider: no quote for %s — falling back to aggregator",
+            symbol,
+        )
+        try:
+            close, vol = fb(symbol, as_of)
+        except Exception:
+            logger.exception(
+                "sector_follow quotes provider: aggregator fallback raised for %s", symbol
+            )
+            close, vol = None, None
+        if close is not None:
+            return close, vol, "aggregator"
+        return None, None, "none"
+
+    return provider
+
+
 def _compute_metrics(
     as_of: datetime,
     universe: list[str],
@@ -299,10 +451,12 @@ def _compute_metrics(
     """Assemble per-symbol gate metrics from the two data sources.
 
     ``intraday_provider(symbol, as_of) -> (close, volume)`` supplies today's data
-    (aggregator). ``history_reader(all_syms, window_start) -> {sym: [(ts, close,
-    volume)]}`` supplies the lookback (historify). Today's data falls back to
-    historify per-symbol with a LOUD warning when the aggregator is empty. Every
-    returned metric carries ``intraday_source`` ∈ {aggregator, historify, none}
+    (aggregator). A provider may instead return a 3-tuple ``(close, volume,
+    source)`` to tag its own source (the quotes-snapshot provider, issue #332).
+    ``history_reader(all_syms, window_start) -> {sym: [(ts, close, volume)]}``
+    supplies the lookback (historify). Today's data falls back to historify
+    per-symbol with a LOUD warning when the provider is empty. Every returned
+    metric carries ``intraday_source`` ∈ {quotes, aggregator, historify, none}
     so the caller can report decision-input completeness.
     """
     as_of_epoch = as_of.timestamp()
@@ -315,15 +469,21 @@ def _compute_metrics(
     raw = history_reader(all_syms, window_start)
 
     def _today(sym: str):
-        """(close, volume, source) for today — aggregator first, historify fallback."""
+        """(close, volume, source) for today — injected provider first (a 3-tuple
+        provider tags its own source, e.g. "quotes"), historify fallback second."""
         close = vol = None
+        src = "aggregator"
         try:
-            close, vol = intraday_provider(sym, as_of)
+            res = intraday_provider(sym, as_of)
+            if isinstance(res, tuple) and len(res) == 3:
+                close, vol, src = res
+            else:
+                close, vol = res
         except Exception:
             logger.exception("sector_follow intraday provider raised for %s", sym)
             close = vol = None
         if close is not None:
-            return close, vol, "aggregator"
+            return close, vol, src
         h_close, h_vol = _today_metrics_from_bars(raw.get(sym, []), as_of_epoch, as_of_date)
         if h_close is not None:
             logger.warning(
@@ -719,16 +879,64 @@ class SectorFollowService:
         Emits a loud per-symbol PASS/FAIL diagnostic (Part B.2) and a
         decision-input completeness metric (Part B.3) so a silently-degraded data
         pipeline — the 2026-06-15 class of bug — surfaces immediately instead of
-        looking like a genuine zero-signal day."""
+        looking like a genuine zero-signal day.
+
+        Issue #161 (today's 2026-06-26 15:20 IST failure): the LIVE flip
+        emitted 0 orders because every metric had ``sector_ret=None`` — the
+        scanner aggregator had no intraday bars for the mapped sector
+        indices. The boot-time fix in ``compute_aggregator_symbols`` prevents
+        this from recurring, but we also fail-loud here so the operator sees
+        a CRITICAL Telegram alert if it ever happens again.
+
+        STRICTLY unchanged behavior (issue #352) — this now delegates to
+        ``_evaluate_candidates_impl`` and discards the per-symbol details it also
+        computes. Every log line, the completeness metric, and the all-indices-empty
+        alert fire exactly as before, in the same order, from the same call site.
+        """
+        candidates, _details = self._evaluate_candidates_impl(as_of)
+        return candidates
+
+    def evaluate_candidates_with_details(
+        self, as_of: datetime | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        """Same selection as ``evaluate_candidates`` PLUS the per-symbol decision
+        inputs it already computes for the PASS/FAIL log (issue #352).
+
+        Additive only — callers that don't need the breakdown should keep calling
+        ``evaluate_candidates()``; this method exists so ``futures_follow_service``
+        can capture the "why zero signals" breakdown at its own call site without
+        changing sector_follow's own gate logic, selection, or logging.
+
+        Returns ``(candidates, details)`` where ``details`` is one dict per
+        universe symbol: ``{symbol, sector_index, sector_ret, stock_ret,
+        vol_ratio, current_price, intraday_source, passed}``.
+        """
+        return self._evaluate_candidates_impl(as_of)
+
+    def _evaluate_candidates_impl(
+        self, as_of: datetime | None = None
+    ) -> tuple[list[dict], list[dict]]:
+        """Shared implementation behind ``evaluate_candidates`` /
+        ``evaluate_candidates_with_details`` — computes candidates AND the
+        per-symbol details in one pass so the two public methods can never drift
+        apart. Do not change gate order, log lines, or the completeness/alert
+        calls without re-verifying every existing sector_follow test."""
         as_of = as_of or self._now()
         metrics = self._metrics_provider(as_of, self.config.universe, self.sector_map, self.config)
         candidates: list[dict] = []
+        details: list[dict] = []
         n_intraday = 0
         total = len(self.config.universe) or len(metrics)
+        n_sector_ret_none = 0
         for symbol, m in metrics.items():
-            if m.get("intraday_source") == "aggregator":
+            # "quotes" (broker quote snapshot, issue #332) counts as a live
+            # intraday source alongside the aggregator.
+            if m.get("intraday_source") in ("aggregator", "quotes"):
                 n_intraday += 1
-            if passes_gates(m, self.config):
+            if m.get("sector_ret") is None:
+                n_sector_ret_none += 1
+            passed = passes_gates(m, self.config)
+            if passed:
                 logger.info(
                     "sector_follow PASS %s: sector_ret=%.4f stock_ret=%.4f vol_ratio=%.2f src=%s",
                     symbol,
@@ -750,6 +958,19 @@ class SectorFollowService:
                 logger.info(
                     "sector_follow FAIL %s: reason=%s", symbol, _gate_fail_reason(m, self.config)
                 )
+            details.append(
+                {
+                    "symbol": symbol,
+                    "sector_index": self.sector_map.get(symbol, "NIFTY"),
+                    "sector_ret": m.get("sector_ret"),
+                    "stock_ret": m.get("stock_ret"),
+                    "vol_ratio": m.get("vol_ratio"),
+                    "current_price": m.get("current_price"),
+                    "intraday_source": m.get("intraday_source"),
+                    "passed": passed,
+                    "fail_reason": None if passed else _gate_fail_reason(m, self.config),
+                }
+            )
         logger.info(
             "sector_follow eval @ %s: %d/%d candidates passed gates",
             as_of.isoformat(),
@@ -757,12 +978,51 @@ class SectorFollowService:
             len(self.config.universe),
         )
         self._emit_completeness_metric(n_intraday, total, as_of)
-        return candidates
+        # Issue #161 fail-loud: if EVERY metric had sector_ret=None the
+        # index aggregator is empty — exact today's-failure signature. Fire
+        # a CRITICAL Telegram so the operator sees it the same minute,
+        # not in next-day forensics. Skip when the universe is empty (no
+        # data at all is a different problem the completeness metric covers).
+        if total and n_sector_ret_none == total:
+            self._alert_all_indices_empty(as_of)
+        return candidates, details
+
+    def _alert_all_indices_empty(self, as_of: datetime) -> None:
+        """Issue #161 CRITICAL: every metric had sector_ret=None — the
+        index aggregator is empty. This is today's exact failure mode.
+        Fail-loud so the operator can't miss it.
+
+        Once per day (dedup by date) so a multi-cycle outage doesn't spam.
+        """
+        ist_date = as_of.astimezone(_IST).date() if as_of.tzinfo else as_of.date()
+        if getattr(self, "_indices_empty_alert_date", None) == ist_date:
+            return
+        self._indices_empty_alert_date = ist_date
+        try:
+            from services.sector_follow_index_backfill import sector_index_symbols
+
+            indices = list(sector_index_symbols())
+        except Exception:
+            indices = []
+        msg = (
+            "🚨 CRITICAL sector_follow_cap5_vol: ALL mapped sector indices have "
+            f"sector_ret=None at {as_of.isoformat()}. The scanner aggregator is not "
+            f"producing intraday bars for the index universe ({indices}). "
+            "Strategy will emit 0 candidates — same root cause as 2026-06-26 15:20 "
+            "(issue #161). Check that compute_aggregator_symbols ran at boot AND "
+            "that the broker WS adapter is subscribing NSE_INDEX symbols."
+        )
+        logger.error(msg)
+        try:
+            self._notify(msg)
+        except Exception:
+            logger.exception("sector_follow all-indices-empty alert failed")
 
     def _emit_completeness_metric(self, n_intraday: int, total: int, as_of: datetime) -> None:
-        """Log + Telegram the share of universe symbols served by the LIVE
-        aggregator (vs. historify fallback / no data). Below 50% warns; below 20%
-        is critical — the pipeline is effectively producing fail-closed signals."""
+        """Log + Telegram the share of universe symbols served by a LIVE intraday
+        source (aggregator or quotes snapshot, vs. historify fallback / no data).
+        Below 50% warns; below 20% is critical — the pipeline is effectively
+        producing fail-closed signals."""
         if total <= 0:
             return
         frac = n_intraday / total
@@ -1428,17 +1688,56 @@ class SectorFollowService:
         agg_frac = (n_have / total) if total else 0.0
         agg_ok = agg_frac >= min_cov
 
+        # Issue #161: this smoke check used to verify ONLY stock coverage and
+        # passed at 15:18 IST on 2026-06-26 with 30/30 stocks while ALL 8
+        # mapped sector indices had today_close=None. The strategy then
+        # emitted 0 orders at 15:20 in LIVE. Honest gate: also verify index
+        # coverage. Indices are looked up via the same intraday_provider
+        # so the gate measures exactly what run_entry will see.
+        #
+        # #241 straggler: gate ONLY the indices the active sector_map actually
+        # references (what run_entry consumes via sector_map.get(sym)), NOT
+        # sector_index_symbols() — that appends the two defensive _ALWAYS_INCLUDE
+        # entries (NIFTYCONSRDURBL, NIFTYOILANDGAS) which no stock maps to after
+        # the Phase-3 RELIANCE/DIXON->NIFTY re-map, have no 1m feed, and whose
+        # names don't even match the master contract (NIFTY CONSR DURBL /
+        # NIFTY OIL AND GAS). Including them pinned index_coverage at a permanent
+        # 8/10, so the gate wrote a pause override EVERY day and held live equity
+        # entries. The mapped set is exactly the coverage run_entry requires.
+        indices = sorted(set(self.sector_map.values()))
+
+        idx_total = len(indices)
+        idx_have = 0
+        idx_missing: list[str] = []
+        for sym in indices:
+            try:
+                close, _vol = self._intraday_provider(sym, as_of)
+            except Exception:
+                close = None
+            if close is None:
+                idx_missing.append(sym)
+            else:
+                idx_have += 1
+        # Indices need 100% coverage — every mapped index contributes to a
+        # different stock subset's sector_ret. Even one missing index drops
+        # all stocks mapped to it from the candidate pool. Empty index
+        # universe (sector_map missing) is also a block.
+        idx_ok = bool(indices) and idx_have == idx_total
+
         hist_ok = self._historify_probe_ok()
         try:
             session_ok = bool(self._broker_session_checker())
         except Exception:
             session_ok = False
 
-        ok = agg_ok and hist_ok and session_ok
+        ok = agg_ok and idx_ok and hist_ok and session_ok
         details = {
             "aggregator_coverage": f"{n_have}/{total}",
             "aggregator_frac": round(agg_frac, 3),
             "aggregator_ok": agg_ok,
+            "index_coverage": f"{idx_have}/{idx_total}",
+            "index_ok": idx_ok,
+            "index_missing": idx_missing,
             "historify_ok": hist_ok,
             "broker_session_ok": session_ok,
             "min_coverage": min_cov,
@@ -1450,6 +1749,11 @@ class SectorFollowService:
         reasons = []
         if not agg_ok:
             reasons.append(f"aggregator coverage {n_have}/{total} (<{min_cov:.0%})")
+        if not idx_ok:
+            if not indices:
+                reasons.append("index universe empty (sector_map.json missing?)")
+            else:
+                reasons.append(f"index coverage {idx_have}/{idx_total} (missing {idx_missing})")
         if not hist_ok:
             reasons.append("historify lookback unavailable")
         if not session_ok:
@@ -1852,6 +2156,32 @@ class SectorFollowService:
             replace_existing=True,
             name="Sector Follow CAP5_VOL pre-entry smoke check (15:18 IST)",
         )
+        # Pre-entry data refresh (#237): fetch any stale intraday just BEFORE the
+        # 15:18 smoke check so the evaluator has today's data at 15:20 — closes
+        # the mid-day gap that produced the 06-29/06-30 zero-order days. Fires
+        # only when enabled; time is configurable (default 15:17, before smoke).
+        from services.sector_follow_backfill_scheduler import (
+            preentry_refresh_enabled,
+            preentry_refresh_time,
+        )
+
+        if preentry_refresh_enabled():
+            _pre_t = preentry_refresh_time()
+            sched.add_job(
+                _preentry_refresh_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri",
+                    hour=_pre_t.hour,
+                    minute=_pre_t.minute,
+                    timezone="Asia/Kolkata",
+                ),
+                id="sector_follow_preentry_refresh",
+                replace_existing=True,
+                name=(
+                    f"Sector Follow CAP5_VOL pre-entry data refresh "
+                    f"({_pre_t.hour:02d}:{_pre_t.minute:02d} IST)"
+                ),
+            )
         logger.info(
             "sector_follow jobs registered (mode=%s, strategy_id=%s)",
             self.mode,
@@ -1897,6 +2227,18 @@ def _data_health_job() -> None:
 def _smoke_check_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.assert_data_pipeline_healthy()
+
+
+def _preentry_refresh_job() -> None:
+    """15:17 IST: fetch any stale intraday before the 15:18 smoke + 15:20 entry
+    (#237). Module-level + fail-safe so a fetch error never kills the scheduler
+    thread. Independent of the singleton — the backfill convergence is global."""
+    try:
+        from services.sector_follow_backfill_scheduler import run_preentry_backfill_checks
+
+        run_preentry_backfill_checks()
+    except Exception:
+        logger.exception("sector_follow pre-entry refresh job failed")
 
 
 def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:

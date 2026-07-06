@@ -165,7 +165,7 @@ def test_all_checks_pass_yields_go(preflight_env):
     from services import preflight_service
 
     sm = _rebind_strategy_mode(preflight_env)
-    sm.set_mode("simplified_engine", "live", updated_by="operator")
+    sm._set_mode_unchecked("simplified_engine", "live", updated_by="operator")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))  # 5 min ago
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
@@ -1101,7 +1101,7 @@ def test_effective_mode_sourced_from_strategy_mode(preflight_env):
     from services import preflight_service
 
     sm = _rebind_strategy_mode(preflight_env)
-    sm.set_mode("simplified_engine", "live", updated_by="operator")
+    sm._set_mode_unchecked("simplified_engine", "live", updated_by="operator")
     recent = IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0))
     _insert_cycle(preflight_env.scdb, recent.isoformat())
 
@@ -1121,7 +1121,7 @@ def test_strategy_mode_sandbox_resolves(preflight_env):
     from services import preflight_service
 
     sm = _rebind_strategy_mode(preflight_env)
-    sm.set_mode("simplified_engine", "sandbox", updated_by="operator")
+    sm._set_mode_unchecked("simplified_engine", "sandbox", updated_by="operator")
     _insert_cycle(
         preflight_env.scdb,
         IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),
@@ -1141,7 +1141,7 @@ def test_mode_only_never_aborts_on_mode_or_intent(preflight_env):
     from services import preflight_service
 
     sm = _rebind_strategy_mode(preflight_env)
-    sm.set_mode("simplified_engine", "live", updated_by="operator")
+    sm._set_mode_unchecked("simplified_engine", "live", updated_by="operator")
     _insert_cycle(
         preflight_env.scdb,
         IST.localize(dt.datetime(2026, 5, 28, 11, 25, 0)).isoformat(),

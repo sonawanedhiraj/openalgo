@@ -74,6 +74,24 @@ def get_websocket_connection(username: str) -> tuple[bool, WebSocketClient | Non
                 "No API key found. Please generate an API key from the API Key page (/apikey) to use WebSocket features.",
             )
 
+        # Freshness gate (issue #141): if the broker session for this user is
+        # stale (e.g. yesterday's expired Zerodha token, login flow has shown
+        # the broker-login button) skip the WS authenticate attempt. Without
+        # this gate, the app.py boot poll calls us every 15s for up to 2h and
+        # each call triggers a WS-proxy adapter create against the stale
+        # token, 403ing into errors.jsonl. The register_connect_callback path
+        # drives the post-login subscribe so a quiet skip here is safe.
+        # When the BROKER_FRESHNESS_GATE_ENABLED flag is off, the predicate is
+        # permissive and the call falls through (legacy behaviour).
+        from services.broker_session_state import is_broker_session_fresh
+
+        if not is_broker_session_fresh(username):
+            return (
+                False,
+                None,
+                "No live broker session — log in to the broker before opening a WebSocket.",
+            )
+
         # Get or create WebSocket client
         client = get_websocket_client(api_key, WS_HOST, WS_PORT)
 

@@ -315,3 +315,88 @@ def test_close_trade_unknown_id_is_silent(fresh_backtest_db):
         pnl_pct=0.1,
         hold_duration_seconds=60,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Migration table-existence guard (issue #160)
+# --------------------------------------------------------------------------- #
+
+
+def test_migrate_skips_when_table_missing(monkeypatch, caplog):
+    """Issue #160: migration must not log 'no such table' on a fresh DB
+    where ``create_all`` hasn't yet created the target table.
+
+    Reproduces the regression: rebind to a fresh in-memory engine WITHOUT
+    calling create_all, then invoke the migration directly. Pre-fix this
+    would log a WARNING for every ALTER ('no such table: backtest_runs',
+    'no such table: backtest_trades' x2). Post-fix: silent — the _table_exists
+    guard skips the column add and CREATE TABLE handles it later.
+    """
+    from database import backtest_db as bdb
+
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    monkeypatch.setattr(bdb, "engine", test_engine)
+
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="database.backtest_db")
+    # Direct invocation, no create_all first → tables are absent.
+    bdb._migrate_add_methodology_columns()
+
+    no_such_table_warnings = [rec for rec in caplog.records if "no such table" in rec.getMessage()]
+    assert no_such_table_warnings == [], (
+        "Migration must skip absent tables silently, but logged: "
+        + str([r.getMessage() for r in no_such_table_warnings])
+    )
+
+    test_engine.dispose()
+
+
+def test_migrate_still_adds_missing_column_when_table_exists(monkeypatch):
+    """Sanity: the table-existence guard doesn't break the happy path.
+
+    Create the backtest_trades table WITHOUT the scanner_hit_timestamp column
+    (simulating an older deploy upgrading to the new schema), run the
+    migration, verify the column was added.
+    """
+    from sqlalchemy import text as _text
+
+    from database import backtest_db as bdb
+
+    test_engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    monkeypatch.setattr(bdb, "engine", test_engine)
+
+    # Create an OLD-style backtest_trades schema (no scanner_hit_timestamp).
+    with test_engine.connect() as conn:
+        conn.execute(
+            _text("CREATE TABLE backtest_trades (id INTEGER PRIMARY KEY, symbol VARCHAR(40))")
+        )
+        conn.commit()
+
+    bdb._migrate_add_methodology_columns()
+
+    # Column should now exist.
+    with test_engine.connect() as conn:
+        rows = conn.execute(_text("PRAGMA table_info(backtest_trades)")).fetchall()
+        cols = [r[1] for r in rows]
+    assert "scanner_hit_timestamp" in cols
+    assert "methodology" in cols
+
+    test_engine.dispose()
+
+
+def test_table_exists_detects_present_and_absent():
+    """The internal guard correctly distinguishes present-vs-absent tables."""
+    from sqlalchemy import text as _text
+
+    from database.backtest_db import _table_exists
+
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    with eng.connect() as conn:
+        assert _table_exists(conn, "backtest_trades") is False
+        conn.execute(_text("CREATE TABLE backtest_trades (id INTEGER)"))
+        conn.commit()
+    with eng.connect() as conn:
+        assert _table_exists(conn, "backtest_trades") is True
+
+    eng.dispose()

@@ -9,8 +9,8 @@ C1×W2+E4 evaluator to find today's ≤5 gate-passing stock signals, and for eac
 greedily in vol-ratio order — buys **one NIFTY near-month index future lot**,
 HARD-CAPPED at **50% of capital as overnight SPAN margin**. Positions are held to
 the **next trading day 15:25 IST** (T+1) and sold MARKET. **No stop loss** (Phase-1
-proved hard stops are net-negative on this signal class); the **15:14 IST EOD
-watchdog** is the only safety backstop. **First sandbox cycle: Monday 2026-06-15
+proved hard stops are net-negative on this signal class); the **15:28 IST EOD
+watchdog** (post-primary-exit retry backstop, #334) is the only safety backstop. **First sandbox cycle: Monday 2026-06-15
 15:20 IST.**
 
 ## ⚠️ Honest classification — leveraged beta, NOT alpha
@@ -53,9 +53,9 @@ The operator can still pause active trading via `POST /futures_follow_cap50/api/
 | Job | Time | What |
 | --- | --- | --- |
 | `futures_follow_daily_reset` | 09:00 | clear kill switch + daily P&L + journals |
-| `futures_follow_eod_watchdog` | 15:14 | flatten any still-open T+1 position (backstop) |
 | `futures_follow_entry` | 15:20 | evaluate signals, buy 1 NIFTY lot/signal up to 50% cap |
-| `futures_follow_exit` | 15:25 | square off positions opened on a prior trading day |
+| `futures_follow_exit` | 15:25 | square off positions opened on a prior trading day (primary) |
+| `futures_follow_eod_watchdog` | 15:28 | retry backstop: flatten anything still open after the 15:25 exit (#334) |
 | `futures_follow_eod_summary` | 15:30 | Telegram summary + Day-N markdown report |
 
 See `PLAN.md` for the delivery plan and `LEARNINGS.md` for the cumulative record.

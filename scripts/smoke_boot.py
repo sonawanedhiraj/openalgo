@@ -10,6 +10,7 @@ Exits non-zero on any failure with a clear one-line reason. Suitable for
 the CI pre-merge gate — no HTTP, no DB writes, no broker session needed.
 """
 
+import gc
 import os
 import sys
 import traceback
@@ -139,8 +140,46 @@ def main():
         for name, _err, tb in FAILURES:
             print(f"\n--- {name} ---")
             print(tb)
-        sys.exit(1)
+
+
+def shutdown_background_schedulers():
+    # Importing app.py eagerly starts ~10 BackgroundScheduler instances across
+    # blueprints and services (python_strategy, chartink, strategy, eod_watchdog,
+    # news_ingest, journal_reflection, sector_follow, futures_follow, ...). None
+    # registers an atexit shutdown, so a clean return runs straight into the
+    # interpreter teardown closing the ThreadPoolExecutor backing each scheduler
+    # while the scheduler's daemon thread is still alive — the next interval
+    # tick raises RuntimeError("cannot schedule new futures after interpreter
+    # shutdown") and the dying scheduler threads trigger Fatal Python error:
+    # PyEval_SaveThread on a finalized interpreter. On CI that held the gate job
+    # open until the 30-minute timeout (#217). gc.get_objects() finds every live
+    # instance without us tracking them by hand. Smoke-harness only — production
+    # code paths unchanged.
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+    except Exception:
+        return
+    for obj in gc.get_objects():
+        if isinstance(obj, BackgroundScheduler):
+            try:
+                if obj.running:
+                    obj.shutdown(wait=False)
+            except Exception:  # noqa: BLE001 — best-effort shutdown
+                pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        shutdown_background_schedulers()
+        # Bypass interpreter teardown. The WebSocket proxy starts a non-daemon
+        # thread (websocket_proxy/app_integration.py:310, daemon=False) running
+        # an infinite asyncio loop that no atexit hook can stop, so a normal
+        # return blocks forever on threading._shutdown waiting for it. The
+        # project's own signal_handler uses the same os._exit pattern for the
+        # same reason. The smoke check has no DB writes / broker session, so
+        # skipping atexit is safe here.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1 if CHECKS_FAILED > 0 else 0)

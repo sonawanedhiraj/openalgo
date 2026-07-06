@@ -18,6 +18,376 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### futures_follow quotes-snapshot data source (issue #332, added 2026-07-05)
+`futures_follow_cap50` makes exactly one decision per day (15:20 IST); PR #333
+moved its decision snapshot (today's per-symbol close + cumulative volume) off
+the all-day WS-fed scanner aggregator onto a point-in-time broker quote call,
+and added a wall-clock lateness guard on the entry job. Merged 2026-07-05
+(`6ea8fe322`); entries below are the immediate follow-up direct commit proposed
+in the PR body.
+
+#### FUTURES_FOLLOW_INTRADAY_SOURCE (NEW)
+- **Current value:** unset → defaults **`quotes`** (unknown values fall back to
+  `quotes` with a WARNING).
+- **Set in:** env; read by `services.futures_follow_service.futures_intraday_source`
+  (consumed by `production_signal_evaluator` and `assert_data_pipeline_healthy`);
+  provider lives in `services.sector_follow_service.make_quotes_intraday_provider`.
+- **What it does:** selects the source of the 15:20 IST decision snapshot.
+  `quotes`: ONE batched `get_multiquotes` call at decision time (universe stocks
+  on NSE + mapped sector indices on NSE_INDEX), memoized per eval cycle, with
+  fail-safe fallback quotes → aggregator → historify (WARNING per hop) and a
+  15:18 dry-run quote probe in the smoke check. `aggregator`: the pre-#332
+  WS-fed path, byte-identical (regression-tested) — the rollback switch.
+- **Why:** depending on the all-day WS tick stream being healthy at the single
+  decision moment was the 2026-06-15 "aggregator empty → silent 0-signal day"
+  failure class. A REST snapshot through the same broker session removes that
+  dependency. Scope: futures_follow_cap50 ONLY — sector_follow_cap5_vol (the
+  equity alpha book) still uses the aggregator; accepted divergence is a
+  marginally different `t_close` (quote at 15:20:xx vs last aggregator bar close).
+
+#### FUTURES_FOLLOW_ENTRY_DEADLINE_IST (NEW)
+- **Current value:** unset → defaults **`15:28`** (HH:MM IST); consult-time
+  (re-read on every entry fire). Malformed value falls back to `15:28` with a
+  WARNING — a typo can never disable the guard.
+- **Set in:** env; read by
+  `services.futures_follow_service.futures_entry_deadline_ist` (`run_entry`).
+- **What it does:** wall-clock lateness deadline for the 15:20 IST entry job,
+  checked FIRST in `run_entry` — before the override gate, kill switch,
+  freshness gate, evaluation, or any order. A fire past the deadline skips ALL
+  of today's entries, logs an ERROR, and Telegrams the operator. Exits
+  (`run_exit`), the EOD watchdog, and `close_all` are NEVER gated (repo
+  invariant: a held T+1 position is riskier than a rejected exit order).
+- **Why:** the entry cron can misfire LATE (app down at 15:20 → APScheduler
+  fires on restart). NFO hard close is 15:30: at ~15:35 the exchange rejects
+  (noisy but harmless), but after ~15:45 the MARKET order could queue as an AMO
+  and execute at tomorrow's open — an unintended, unmonitored overnight entry.
+  15:28 leaves the normal 15:20 fire (plus jitter) untouched while guaranteeing
+  no order is dispatched into/after the close.
+
+### LLM health probe timeout (issue #297, added 2026-07-02)
+The Strategies-page LLM health chip (`GET /strategies/api/llm/health`) spawns a
+lightweight `claude -p` liveness probe on demand (operator clicks the chip's
+refresh icon — never auto-polled). This bounds that subprocess.
+
+#### LLM_HEALTH_PROBE_TIMEOUT_SECONDS (NEW)
+- **Current value:** unset → defaults **`12`** (seconds).
+- **Set in:** env; read by
+  `blueprints.strategies_dashboard_api._llm_health_probe_timeout`. Clamped to
+  `[3, 60]`; malformed → `12`.
+- **What it does:** wall-clock budget passed to
+  `services.llm_review_client.probe_claude_health`. On expiry the probe reports
+  `reason='timeout'`, `reachable=false`. Distinct from
+  `VETO_CLAUDE_TIMEOUT_SECONDS` (25s, the real veto call) — the probe is a
+  smaller "is claude alive/logged-in" check and should return fast.
+
+### Scanner daily-D re-settle (issue #299, added 2026-07-02)
+Once-per-day non-incremental overwrite re-fetch of the trailing settled daily-D
+window for the scanner universe, run before the stale-check at boot + post-close
+convergence (`services.scanner_universe_backfill.resettle_recent_daily`, wired via
+`scanner_backfill_scheduler._maybe_resettle_daily`). Corrects a daily bar written
+intraday as a provisional/running close (the #277 freeze class) that the
+incremental convergence can never fix (it skips a day whose bar already exists),
+which otherwise persists into the scanner's `yest_d` gate and fires phantom gap
+signals (2026-07-02 DELHIVERY false BUY: stored 07-01 close 475.4 vs settled
+507.7). Also refreshes `ScannerHistoryProvider` so the corrected close reaches
+the live scanner without a restart. Additive, idempotent, fail-graceful.
+
+#### SCANNER_DAILY_RESETTLE_ENABLED (NEW)
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services.scanner_universe_backfill._daily_resettle_enabled`. When off,
+  `resettle_recent_daily` returns `status="disabled"` and no re-fetch happens.
+
+#### SCANNER_DAILY_RESETTLE_DAYS (NEW)
+- **Current value:** unset → defaults **`2`** (trailing settled trading days).
+- **Set in:** env; read by
+  `services.scanner_universe_backfill._daily_resettle_days`. Bounded to >= 1;
+  malformed → falls back to `2`.
+
+### Pre-entry data refresh (sector_follow + futures) (issue #237, added 2026-07-02)
+A 15:17 IST APScheduler job (`sector_follow_preentry_refresh`) that runs the
+existing `run_backfill_checks` (fetch stale index+stock intraday tail) and waits
+`_PREENTRY_WAIT_SEC` (90s, bounded so it can't overrun the 15:20 entry) so
+today's bars land in historify before the 15:18 smoke + 15:20 entry. Closes the
+mid-day gap that produced the 06-29/06-30 zero-order days (boot check runs hours
+earlier; the periodic loop only runs 15:30–17:00). Benefits futures_follow too
+(shared sector_follow data). Additive, idempotent (fresh → no-op), fail-graceful.
+
+#### SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED (NEW)
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services.sector_follow_backfill_scheduler.preentry_refresh_enabled`. When off,
+  the 15:17 job is not registered and `run_preentry_backfill_checks` no-ops.
+
+#### SECTOR_FOLLOW_PREENTRY_REFRESH_TIME (NEW)
+- **Current value:** unset → defaults **`15:17`** (IST; must be < 15:18 smoke).
+- **Set in:** env; read by
+  `services.sector_follow_backfill_scheduler.preentry_refresh_time`. Malformed →
+  falls back to `15:17`.
+
+### `_CALENDAR_BUFFER` — scanner daily-history query window (issue #280, changed 2026-07-01)
+- **Current value:** **`1.6`** (was `1.4`).
+- **Set in:** code constant `services/scanner_history_provider.py:_CALENDAR_BUFFER`
+  (not env/DB — a threshold default in code).
+- **What it does:** `ScannerHistoryProvider._fetch` sizes its DuckDB date-range
+  query by CALENDAR days = `daily_lookback_bars(205) × _CALENDAR_BUFFER`, then
+  takes the last 205 rows. It's a heuristic proxy: it must span enough calendar
+  days to contain ≥200 *trading* bars for the BUY rule's SMA(200) volume-gate
+  warm-up (`fno_intraday_buy_chartink`).
+- **Why 1.4 → 1.6:** Indian NSE trading days are only ~0.67 of calendar days
+  (weekends + ~14–16 holidays/yr), not the naive 5/7≈0.71. At 1.4 → 288 cal days
+  → only ~193 trading bars → below 200 → the guard silently rejected the WHOLE
+  F&O universe (0 BUY hits). 1.6 → 329 cal days → ~220 trading bars (~15-bar
+  margin over 205, 20 over the 200 guard). Verified arithmetically
+  (GODREJPROP/RECLTD/JSWSTEEL → 220); all NSE F&O share one trading calendar so
+  the ratio is universe-wide. Committed direct to dev `1f5d53e22` (non-order-path
+  scanner read-path). **Note:** heuristic, not a hard bar-count guarantee — a
+  holiday-heavy window could still dip; the robust hardening (bar-count-aware
+  fetch / re-widen-on-short) is a follow-up. #281 added the loud <200 WARNING.
+
+### Position-store reconciliation at exit (issue #265, proposed 2026-07-01)
+### LLM veto — in-process `claude -p` transport (#266 Phase 1 / #267, added 2026-07-01)
+
+Phase 1 of #266 moved the Stage-1 LLM veto's reasoning call from an httpx POST
+to the Claude Bridge (`http://127.0.0.1:5001/review-signal`) to an **in-process**
+`claude -p "<prompt>" --output-format json` subprocess run on a dedicated real
+OS thread (`services/llm_review_client.invoke_claude_review`, eventlet-safe). The
+bridge was never auto-started, so every real veto call failed `ConnectError` and
+fell safe to 'take' — the veto never fired. It now runs directly.
+
+#### VETO_CLAUDE_TIMEOUT_SECONDS (NEW)
+- **Current value:** unset → defaults **`25.0`**.
+- **Set in:** env; read by
+  `services/signal_review_service._claude_timeout_seconds` and passed as
+  `timeout_s` to `invoke_claude_review`.
+- **What it does:** wall-clock budget for the `claude -p` subprocess. On expiry
+  the subprocess is killed and the veto fails safe to `decision='take'`,
+  `reasoning='claude_timeout'`. Matches the bridge's old 25s wall-clock.
+
+#### CLAUDE_CMD (NEW, optional)
+- **Current value:** unset → defaults **`claude`** (resolved against `PATH`).
+- **Set in:** env; read by `services/llm_review_client._claude_cmd`.
+- **What it does:** overrides the `claude` binary path for the veto subprocess
+  (e.g. an absolute path to a non-PATH install). The operator's install is
+  authenticated by the Claude subscription CLI login — no `ANTHROPIC_API_KEY`.
+
+#### VETO_BRIDGE_URL (RETIRED)
+- **Was:** bridge endpoint, default `http://127.0.0.1:5001/review-signal`.
+- **Now:** removed from `signal_review_service`. The veto no longer uses the
+  bridge. (`bridge/server.py`'s `/review-signal` endpoint and the Cowork
+  automation endpoints are untouched, but the veto path no longer calls them.)
+
+#### VETO_REQUEST_TIMEOUT_SECONDS (RETIRED)
+- **Was:** httpx read timeout for the bridge POST, default `30.0`.
+- **Now:** removed. Superseded by `VETO_CLAUDE_TIMEOUT_SECONDS` (the subprocess
+  budget). `VETO_CACHE_TTL_SECONDS` and `VETO_LAYER_MODE` are unchanged.
+
+### LLM control — per-strategy `llm_mode` (#266 Phase 2 / #275, proposed 2026-07-01)
+
+> Proposed by feature branch `feat/275-llm-mode-ui` (staged, operator-reviewed;
+> order-path-adjacent — the veto blocks orders in `active` mode). Raised as a PR,
+> NOT merged. The entry lands on `dev` at merge or as an immediate follow-up.
+
+Replaces the hidden `VETO_LAYER_MODE` env flag as the *operator* control with a
+single per-strategy toggle on `/strategies` (issue #266). New table
+`strategy_llm_config` (`db/openalgo.db`, `database/strategy_llm_config_db.py`):
+one row per strategy, `llm_mode ∈ {off, veto, delegate}`.
+
+#### strategy_llm_config.llm_mode (NEW)
+- **Current value:** no rows → the resolver falls through to `VETO_LAYER_MODE`
+  env, then the mode-aware default (sandbox→active, else shadow) — so **existing
+  behavior is preserved until the operator sets a UI value** (#162 Phase-4
+  pattern).
+- **Set via:** the guarded writer `services.strategy_llm_config_service.flip_llm_mode`
+  (audits + publishes `StrategyLLMModeChangedEvent`), fronted by
+  `POST /strategies/api/<name>/llm-mode {"llm_mode":"off|veto|delegate"}`.
+- **What it does / how it maps to enforcement** (in
+  `signal_review_service.get_veto_layer_mode(effective_mode, strategy_name)`,
+  DB-row-first resolution):
+  - `off` → `off` (no reviewer runs).
+  - `veto` → `active` (a `skip` verdict BLOCKS the order).
+  - `delegate` → stored, but resolved as `active` for now — the LLM-decides
+    engine path isn't built (a later phase); shown disabled/"coming soon" in the
+    UI.
+- **Fixes #274 item 2:** the DB row makes the sandbox enforcement explicit, so
+  the fire that resolved `shadow` when sandbox should have been `active` is now
+  unambiguous once the operator sets `veto`.
+- **`shadow` is env-only:** it stays available via `VETO_LAYER_MODE=shadow`
+  (observe-only) but is **not** operator-selectable from the UI.
+- **Rollback:** delete the strategy's `strategy_llm_config` row → instant
+  env/default fall-through. `DELETE FROM strategy_llm_config WHERE
+  strategy_name='<name>'` or `database.strategy_llm_config_db.delete_llm_mode`.
+- **Scope today:** only `simplified_engine` actually calls the veto
+  (`_run_pre_order_review`), so only its row has runtime effect; other strategies
+  can hold a row but it is inert until Phase 3 wires the veto into them.
+
+### Live-mode broker-position reconciliation (issue #265, proposed 2026-07-01)
+
+> Proposed by feature branch `feat/265-live-position-reconciliation` (staged,
+> operator-reviewed order path). Land the entry on `dev` at merge time.
+>
+> **Revised 2026-07-01:** the guard now runs in **BOTH sandbox AND live** modes,
+> sourced from the mode-appropriate position store (was live-only). The flag was
+> renamed `LIVE_POSITION_RECONCILE_ENABLED` → `POSITION_RECONCILE_ENABLED`.
+
+#### POSITION_RECONCILE_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services/live_position_reconciliation_service.is_enabled()` inside
+  `reconcile_exit`. The engine call-sites run the guard in both `sandbox` and
+  `live` mode (only `disabled` mode — which never sends orders — skips it).
+- **What it does:** master gate for the exit reconciliation guard. When ON (and
+  the strategy is in `sandbox` or `live` mode), every exit reconciles its
+  journalled/in-memory close quantity against the **mode-appropriate position
+  store** — the `sandbox.db` virtual book in sandbox, the real broker positionbook
+  in live — via the mode-aware `services/openposition_service.get_open_position`,
+  before the exit order is placed:
+  - store flat (net 0) → **SUPPRESS** the exit (phantom);
+  - store holds fewer than journaled, or sits on the opposite side → **CLAMP**
+    to the store qty (opposite side → clamp to 0 = suppress);
+  - store consistent → **PROCEED** with the journalled qty (never more);
+  - store fetch fails / no api key → **FAIL CLOSED for reverse-risk** (proceed
+    with the journalled qty, never an unbounded one) + drift alert.
+  On any mismatch it emits a position-drift alert via
+  `services.source_divergence_alerts.check_and_alert` (`journal_qty` vs
+  `broker_qty`, per-(strategy, symbol, IST-day) dedup).
+- **Wired at:** `services/futures_follow_service.py`
+  (`place_exit` → covers `run_exit` / `run_eod_watchdog` / `close_all_positions`,
+  plus a both-mode boot `rehydrate_paper_book_from_store`) and
+  `services/simplified_stock_engine_service.py` (`_flatten_for_api_key`
+  engine-known qty reconcile + phantom suppress, and `flatten_strategy_positions`
+  store-aware clamp/suppress). The mode-aware store routing is done by
+  `get_open_position` / `get_positionbook`, so the same call reads sandbox.db in
+  sandbox and the broker in live.
+- **Sandbox complement (unchanged):** the sandbox EOD journal reconciliation
+  (`services/engine_eod_reconciliation_service`, sandbox.db → `trade_journal`) is
+  left untouched and is **complementary** — it stamps sandbox MIS square-offs into
+  the journal, while the #265 per-exit guard clamps/suppresses over-exits against
+  the sandbox store. The two do not overlap.
+- **Why default true:** the mode-appropriate store must be the source of truth at
+  exit; a journal↔store mismatch (manual/partial exit, restart-lost `paper_book`,
+  phantom) could otherwise double-SELL into a net-short overnight future or fire a
+  reversing exit — in the sandbox virtual book as well as live. Set `false` only
+  as an emergency disable to fall back to the legacy journal-driven exit path.
+- **Safety guarantee:** `test/test_live_position_reconciliation_service.py`
+  (helper semantics) + sandbox/live exit + boot-rehydrate cases in
+  `test/test_futures_follow_service.py`, `test/test_simplified_stock_engine_service.py`,
+  `test/test_eod_watchdog_service.py`.
+
+### Runtime source-divergence alerts (issue #231, added 2026-06-29)
+
+#### SOURCE_DIVERGENCE_ALERTS_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read by
+  `services/source_divergence_alerts._flag_enabled` on every call to
+  `check_and_alert`.
+- **What it does:** master gate for the runtime divergence-alert helper
+  used by three integration sites — `services/scanner_aggregator_seeder.py`
+  (historify vs broker most-recent close), `services/engine_eod_reconciliation_service.py`
+  (journal-expected closed quantity vs sandbox covering-fill quantity), and
+  `services/scan_rules/fno_intraday_{buy,sell}_chartink.py` (`bars_daily`
+  today's close vs live 5m last close). When ON, a divergence above the
+  threshold emits `logger.warning` AND a Telegram alert via
+  `notification_service.notify('source_divergence', ...)` with per-(service,
+  symbol, IST-day) dedup so the operator gets one notification within
+  seconds instead of finding the discrepancy in `errors.jsonl` after EOD.
+- **Dedup table reset behaviour:** in-process dict, cleared at boot AND on
+  IST date rollover. A restart re-arms every dedup key (a genuine
+  cross-restart regression alerts immediately on the next divergent read).
+- **Why default true:** this is the runtime sibling of the PR #227 contract
+  tests — the catch-at-PR-time pattern only catches *new* divergence bugs;
+  this catches *operational* divergence (stale historify slot, partial
+  sandbox fills, frozen daily cache) in production. The 2026-06-29 41-SELL
+  false-positive storm is the canonical case where same-day operator
+  visibility would have prevented the recurrence.
+- **Set false to:** silence ALL three integrations from one switch (e.g.
+  during a known-noisy backfill window). The helper short-circuits before
+  the threshold check, so no log + no Telegram fires.
+- **Related:** `NOTIFY_SOURCE_DIVERGENCE` (per-event toggle inside
+  `services/notification_service.py`, default true) gates only the Telegram
+  delivery layer; set it false to keep the `logger.warning` and silence
+  just the Telegram channel.
+
+#### SOURCE_DIVERGENCE_THRESHOLD_PCT
+- **Current value:** unset → defaults **`0.5`** (percent).
+- **Set in:** env; read by
+  `services/source_divergence_alerts._threshold_pct` on every call.
+- **What it does:** the divergence threshold above which the helper fires
+  an alert. The relative divergence is computed as
+  `abs(a - b) / max(|a|, |b|, 1e-9) * 100`. Below this percentage the
+  helper returns silently.
+- **Why default 0.5:** matches the existing `SCANNER_RULE_DIVERGENCE_WARN_PCT`
+  default (the scanner rule's `logger.warning` predates issue #231; this
+  threshold keeps the new alert path consistent with what was already
+  considered "stale source" in the rule layer).
+- **Set higher to:** suppress noise during a volatile / illiquid window
+  where 0.5% drift is plausible without indicating a stale source.
+- **Set lower to:** catch finer divergences (rarely useful; expect false
+  positives at <0.2% on bid/ask noise).
+- **Junk values** (non-numeric, blank) fall back to the 0.5 default rather
+  than crashing the helper.
+
+### Trading-day funnel diagnostic (issue #159, added 2026-06-28)
+
+#### TRADING_DAY_FUNNEL_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read each fire in
+  `services/trading_day_funnel_service._funnel_job`.
+- **What it does:** master gate for the daily 15:35 IST end-of-session funnel
+  summary that walks the signal → engine → order → journal pipeline and
+  Telegrams the per-layer counts (scanner hits, engine signals taken/vetoed,
+  per-strategy orders attempted/filled/open-EOD, sandbox cross-check) plus a
+  drop-off verdict naming the first layer where `K < M`. The next "zero
+  trades on a healthy-looking day" surfaces as a single Telegram message at
+  15:35 IST instead of empty-journal forensic-SQL the next morning.
+- **Why default true:** the failure class this catches is **silent**
+  (2026-06-26 produced 0 trades while every individual subsystem reported
+  healthy). The funnel itself is read-only and never raises into the
+  scheduler, so the operational cost of being on is zero and the diagnostic
+  payoff is large.
+- **Set false to:** suppress the daily Telegram (e.g. during a scheduler dev
+  window or to silence noisy notifications); the service still registers but
+  the per-fire body is a no-op.
+- **Related:** `NOTIFY_TRADING_DAY_FUNNEL` (per-event toggle inside
+  `services/notification_service.py`, default true) gates the Telegram
+  delivery layer; set it false to silence only the Telegram while still
+  letting the structured INFO log fire.
+
+#### TRADING_DAY_FUNNEL_TIME
+- **Current value:** unset → defaults **`15:35`** (IST).
+- **Set in:** env; read by
+  `services/trading_day_funnel_service.register_jobs` at boot.
+- **What it does:** the IST fire time `HH:MM` for the daily funnel job. Sits
+  between the 15:14 EOD watchdog / 15:25 sector_follow exit / 15:30 sandbox
+  MIS auto-square-off / 15:30 EOD reconciliation, and the 15:45 IST
+  `scanner_comparison_eod` job, so the funnel reads a fully-settled day.
+- **Why default 15:35:** late enough to capture every entry/exit/journal
+  write the EOD reconciliation made (15:30 trigger window), early enough
+  that the Telegram lands before the 15:45 comparison alert so the operator
+  reads them in causal order.
+- **Set to a different `HH:MM` to:** shift the slot. Junk values fall back
+  to the default rather than crashing boot.
+### Telegram inbound poller — disabled (Conflict fix, added 2026-06-30)
+
+#### TELEGRAM_INBOUND_ENABLED
+- **Current value:** `.env` → **`false`** (was `true`).
+- **Set in:** env; read in `services/telegram_inbound_service.py._inbound_enabled`
+  (master gate on `init_telegram_inbound_service`).
+- **What it does:** master on/off switch for the Phase-6 inbound Telegram service.
+  `false` means `init_telegram_inbound_service` is a no-op at boot (no poller, no
+  send-fallback registration).
+- **Why changed `true→false`:** issue #238. With it `true`, the inbound service
+  started a second `getUpdates` poller on the SAME bot token the UI-toggled
+  interactive bot (`telegram_bot_service`, `bot_config.is_active`) already polls,
+  producing a persistent `telegram.error.Conflict: terminated by other getUpdates
+  request` — ~3856 occurrences (~200/hour all day) on 2026-06-30. The operator
+  decision is that the UI bot is the single poller and single sender. The env was
+  flipped to `false` as the immediate fix; a durable **single-poller guard** also
+  landed in code (`telegram_inbound_service.start()` refuses to poll whenever
+  `bot_config.is_active` is true, even if this flag is `true`), so the bug is
+  structurally impossible regardless of the env value. Operator lands the `.env`
+  edit + this log entry direct to `dev`.
+
 ### Preflight error gate — per-signature cap (added 2026-06-19)
 
 #### PREFLIGHT_ERROR_PER_SIGNATURE_CAP
@@ -64,12 +434,18 @@ signals fire. Source: `services/scanner_service.py` + the two
 - **Current value:** unset → defaults **`true`**.
 - **Set in:** env; read in both `fno_intraday_buy_chartink.py` /
   `fno_intraday_sell_chartink.py` (`_dbar_date_verify_enabled()`).
-- **What it does:** post-settle (`today_idx == -1`), the rule aborts with a
-  WARNING when its latest daily-D bar is dated before today (stale-D guard). Only
-  fires when the daily frame carries a `timestamp` column (production reads);
-  `false` → legacy behavior (no date check).
-- **Why added:** defense-in-depth for FM-6 — a future change to the market-hours
-  gate must not be able to re-open the stale-bar post-close path on its own.
+- **What it does:** **Reframed for Issue #197 (2026-06-29).** The rule now
+  derives today's running daily snapshot from today's 5m bars when
+  `bars_daily.iloc[-1]` is dated before today (the production state during
+  the trading session), so the original AUROPHARMA-style "fire on
+  stale-as-today" bug class is structurally impossible. The guard now
+  defends against the LATEST SETTLED bar being more than **5 calendar days**
+  behind today (backfill broken across multiple sessions), in which case
+  the rule aborts with a WARNING. Only fires when the daily frame carries
+  a `timestamp` column (production reads); `false` → no staleness check.
+- **Why added:** original Tier-1 defense for FM-6. Threshold widened to 5
+  days as part of Issue #197 because `iloc[-1]` is naturally 1-4 days
+  behind today during normal Mon-Fri operation (post-weekend / post-holiday).
 
 #### SCANNER_COMPLETENESS_ENABLED
 - **Current value:** unset → defaults **`true`**.
@@ -108,6 +484,113 @@ signals fire. Source: `services/scanner_service.py` + the two
 - **What it does:** per-event toggle for the `scanner_completeness` Telegram
   alert. `false` → the metric still logs but no Telegram is sent. (Master switch
   `NOTIFY_TELEGRAM_ENABLED` still applies.)
+
+### scanner_aggregator_seeder — broker fallback (issue #199, added 2026-06-29)
+
+#### SCANNER_AGGREGATOR_SEED_BROKER_FALLBACK_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in `services/scanner_aggregator_seeder.py`
+  (`_broker_fallback_enabled()`), gating the broker-history fetch in
+  `_read_1m_bars_for_symbol`.
+- **What it does:** when historify returns < `lookback_min / 3` 1m bars for a
+  scanner symbol at boot, the seeder falls back to
+  `services.history_service.get_history` (broker API, `source='api'`) to fetch
+  the missing window. `false` → broker fallback disabled; the seeder uses only
+  historify (pre-#199 behaviour — leaves ~195/227 scanner symbols un-seeded
+  on a mid-session restart because the scanner-side 1m backfill only runs in
+  the 15:30-17:00 IST window).
+- **Why added:** Issue #199. On 2026-06-29 the seeder reported only `32/227
+  symbols seeded` at the 12:45 IST restart (boot log:
+  `aggregator_seeder: seeded 32/227 symbols, 6752 bars total (avg 211.0/symbol,
+  195 empty, 0 errors)`). The 195 empty symbols had no recent 1m bars in
+  historify because the scanner-universe 1m backfill is post-close only. With
+  the broker fallback, every scanner symbol gets ~500 min of 1m bars seeded —
+  enough to clear the 15m RSI(14) warm-up (needs 14×15m = 210 min) so the
+  rules can evaluate from the first 5m bar close after a mid-session restart.
+
+### Scanner rule-vs-broker observability (issue #205, added 2026-06-29)
+
+Follow-up to the four scanner-rule fixes shipped 2026-06-29 (#198 / #200 /
+#202 / #204). 147+ unit tests verified gate logic on internally-consistent
+synthetic data; none caught the class of bug where two data sources for the
+same value DISAGREE (a frozen historify daily snapshot vs the live 5m
+aggregator). These knobs gate the three observability additions that surface
+the next regression of that class in minutes instead of hours.
+
+#### SCANNER_RULE_DIVERGENCE_WARN_ENABLED
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in both
+  `services/scan_rules/fno_intraday_buy_chartink.py` and
+  `services/scan_rules/fno_intraday_sell_chartink.py`
+  (`_divergence_warn_enabled`), gating the WARNING that fires when
+  `today_d.close` drifts from the latest 5m close by more than
+  `SCANNER_RULE_DIVERGENCE_WARN_PCT`.
+- **What it does:** the 2026-06-29 41-SELL false-positive storm was caused by
+  `today_d.close` being a frozen 14:28 snapshot while live 5m closes had
+  advanced ~3%. With this guard on, the same condition logs a WARNING into
+  `errors.jsonl` on every evaluation (per-symbol, per-bar-close) — a `grep
+  diverges log/errors.jsonl` becomes the first-look diagnostic.
+- **Set false to:** silence the WARNING during a known stale-data window
+  (post-close backfill catching up) without disabling the rule.
+
+#### SCANNER_RULE_DIVERGENCE_WARN_PCT
+- **Current value:** unset → defaults **`0.5`** (%).
+- **Set in:** env; read in both rule modules (`_divergence_warn_pct`).
+- **What it does:** the divergence threshold above which the WARNING fires.
+  0.5% is calibrated to TCS-class stocks where intraday drift between
+  back-to-back 5m bars rarely exceeds 0.3%; tune up on high-vol names if the
+  WARNING fires routinely.
+
+#### SCANNER_RULE_DIVERGENCE_BLOCK_ENABLED (NEW, 2026-07-01)
+- **Current value:** unset → defaults **`true`**.
+- **Set in:** env; read in both
+  `services/scan_rules/fno_intraday_buy_chartink.py` and
+  `services/scan_rules/fno_intraday_sell_chartink.py`
+  (`_divergence_block_enabled`).
+- **What it does:** when on, a `today_d.close` that diverges from the latest 5m
+  close beyond `SCANNER_RULE_DIVERGENCE_WARN_PCT` REJECTS the symbol (returns
+  `False`, no scan hit) — not just a WARNING. Defense-in-depth for the
+  `ts`-vs-`timestamp` Path-B fix in
+  `services/scan_rules/_today_running.py::derive_today_and_yest`: the live
+  scanner's 5m frame carries a `ts` column (naive IST datetimes), but Path B
+  was gated on `"timestamp"` only, so it never engaged and the rules read a
+  FROZEN ~09:45 historify daily bar all session (BUY hits empty, SELL misfired
+  on the frozen morning crash). With the primary fix landed, `today_d.close`
+  now IS the live 5m close so divergence should vanish — but if that path ever
+  regresses, this gate guarantees a stale-data signal can never fire an order.
+- **Set false to:** revert to WARNING-only (observe divergence without blocking
+  the hit) during a known stale-data window, at the cost of the safety net.
+
+#### SCANNER_CONTRACT_TEST_ENABLED
+- **Current value:** unset → defaults **`false`**.
+- **Set in:** env; read by
+  `test/test_scanner_rule_vs_broker_contract.py` as a pytest module-level
+  `skipif` gate.
+- **What it does:** opt-in for the live-data contract test. When true, the
+  test reads recent in-house `scan_results` rows directly from
+  `db/openalgo.db` (read-only `file:` URI, bypassing the conftest temp-DB
+  redirect), re-fetches broker bars via `services.history_service.get_history`,
+  re-invokes the rule, and fails if divergence rate > `SCANNER_CONTRACT_TEST_MAX_DIVERGENCE_PCT`.
+- **Why default false:** the test depends on a live broker session and live
+  in-house fires. Default-off keeps unit CI hermetic and fast; the operator
+  runs it manually after a session or wires it into an hourly cron.
+
+#### SCANNER_CONTRACT_TEST_WINDOW_MIN
+- **Current value:** unset → defaults **`60`** (minutes).
+- **Set in:** env; read in
+  `test/test_scanner_rule_vs_broker_contract.py`.
+- **What it does:** look-back window for in-house fires the contract test
+  will verify. 60 min covers a normal manual run; a 5-min cron loop should
+  set it to `10` so signal-expiry false positives are minimized.
+
+#### SCANNER_CONTRACT_TEST_MAX_DIVERGENCE_PCT
+- **Current value:** unset → defaults **`5`** (%).
+- **Set in:** env; read in
+  `test/test_scanner_rule_vs_broker_contract.py`.
+- **What it does:** divergence-rate ceiling for a passing contract test.
+  Below ceiling → test passes (some signal expiry is normal); above → test
+  fails with a per-row breakdown naming the symbol, today_d.close, latest
+  5m close, and the offending `scan_results.id` for triage.
 
 ### sector_follow_cap5_vol — Fix 1b smoke check (added 2026-06-15)
 
@@ -199,8 +682,10 @@ signals fire. Source: `services/scanner_service.py` + the two
 - **Times (was: `FUTURES_FOLLOW_ENTRY_TIME_IST` / `..._EXIT_TIME_IST` /
   `..._EOD_WATCHDOG_TIME_IST`):** scheduler-fixed cron times in
   `FuturesFollowService.register_jobs` — entry **15:20**, exit **15:25**, EOD
-  watchdog **15:14**, daily reset 09:00, EOD summary 15:30 IST (all `mon-fri`,
-  `Asia/Kolkata`). The watchdog at 15:14 fires before any auto-square-off window.
+  watchdog **15:28** (was 15:14 — moved by #334 so the 15:25 exit is primary;
+  the watchdog is the post-primary-exit retry backstop before the 15:30 NFO
+  close), daily reset 09:00, EOD summary 15:30 IST (all `mon-fri`,
+  `Asia/Kolkata`).
 - **Product/exchange:** `product` NRML (futures carry — not MIS/CNC), `exchange`
   NFO, MARKET orders. `cost_pct_round_trip` 0.030 (~₹530/lot).
 - **Who changes:** operator, recorded in
@@ -208,6 +693,29 @@ signals fire. Source: `services/scanner_service.py` + the two
 - **Shared flag:** the data-freshness gate reuses `DATA_FRESHNESS_VALIDATION_ENABLED`
   + `MAX_STALENESS_BUSINESS_DAYS` (documented under sector_follow) since the futures
   sleeve fires on the sector_follow signal feed.
+
+#### FUTURES_FOLLOW_SMOKE_CHECK_ENABLED (added 2026-07-02, #292)
+- **Current value:** unset → defaults **`true`**
+- **Set in:** env; read in `services/futures_follow_service.futures_smoke_check_enabled()`.
+- **What it gates:** the 15:18 IST pre-entry smoke check
+  (`FuturesFollowService.assert_data_pipeline_healthy`). When `true`, an
+  APScheduler job fires at 15:18 IST (mon-fri) and verifies two things before the
+  15:20 entry job runs:
+  1. The sector_follow_cap5_vol feed is fresh (via `DATA_FRESHNESS_VALIDATION_ENABLED`
+     + the existing `_data_health_checker` — the same check the entry gate calls
+     but 2 minutes earlier, giving time to alert).
+  2. A broker session (API key) is live.
+  On failure it writes a self-expiring `pause` runtime override (expires 15:30 IST,
+  honored by `_entry_held_by_override`) and Telegrams the operator with the reason.
+  A passing check logs `INFO futures_follow 15:18 smoke check PASSED`.
+- **When to set `false`:** only to silence the guard entirely (e.g. during
+  non-market testing). The entry gate (`_data_is_fresh_for_entry`) still blocks on
+  stale data; the smoke check just adds an early-alert + proactive pause 2 min
+  before the trade window.
+- **History:**
+  - **2026-07-02 (introduced, #292):** Mirrors the `SECTOR_FOLLOW_SMOKE_CHECK_ENABLED`
+    pattern (issue #237 / 2026-06-30 observed silent 0-lot day when sector_follow
+    feed was stale).
 
 ### Build/runtime environment
 
@@ -251,6 +759,64 @@ signals fire. Source: `services/scanner_service.py` + the two
   (`test_notify_task_complete_routes_through_telegram`,
   `test_notify_task_complete_enabled_by_default`,
   `test_notify_task_complete_respects_per_event_toggle`).
+
+### Notifications — unknown event_type fallback (issue #243)
+
+#### NOTIFY_UNKNOWN_EVENTS
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_UNKNOWN_EVENTS", default=True)`)
+- **Code default:** `true`
+- **What it gates:** when `true` (default), a `notify(event_type, …)` call where
+  `event_type` is NOT in the registered `per_event` dict still DELIVERS the message
+  (fail-open) — a WARNING is logged to prompt the operator to register the event
+  type, but the alert is never silently dropped. When `false`, the old
+  warn-and-drop behaviour is restored (useful in high-noise dev environments where
+  new event_types are being iterated on).
+- **Why (2026-07-02, issue #243):** on 2026-06-30 three operator alerts were
+  silently dropped because `orphan_exit_reconciliation` and `scanner_aggregator_seed`
+  were not in the registry. A silently-dropped alert is irrecoverable; a
+  misrouted-but-delivered one is not. The flag defaults to the safer
+  (fail-open) direction.
+- **Related:** `NOTIFY_ORPHAN_EXIT_RECONCILIATION`, `NOTIFY_SCANNER_AGGREGATOR_SEED`
+  (the two event types that were missing and triggered this fix).
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_unknown_event_type_delivers_with_warning`,
+  `test_notify_unknown_event_type_drops_when_flag_off`).
+
+#### NOTIFY_ORPHAN_EXIT_RECONCILIATION
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_ORPHAN_EXIT_RECONCILIATION", default=True)`)
+- **Code default:** `true`
+- **What it gates:** per-event toggle for the `orphan_exit_reconciliation` event
+  type. When `true`, the reconciliation summary (N orphans found/reconciled/errored)
+  is delivered via Telegram each time the orphan-exit reconciliation service runs.
+  Caller: `services/orphan_exit_reconciliation_service.py`.
+- **Why (2026-07-02, issue #243):** this event type was missing from the registry;
+  its alert was silently dropped on 2026-06-30 at 08:31:50 IST next to a "9
+  orphan(s) found, 9 reconciled" log line. Registered here with default ON.
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_orphan_exit_reconciliation_routes_through_telegram`,
+  `test_notify_orphan_exit_reconciliation_per_event_toggle`).
+
+#### NOTIFY_SCANNER_AGGREGATOR_SEED
+- **Current value:** unset → defaults `true`
+- **Set in:** env var (read in `services/notification_service.NotificationService.__init__`
+  via `_env_bool("NOTIFY_SCANNER_AGGREGATOR_SEED", default=True)`)
+- **Code default:** `true`
+- **What it gates:** per-event toggle for the `scanner_aggregator_seed` event type.
+  When `true`, the aggregator-seeding completion/failure notice is delivered via
+  Telegram at boot and on reconnect. The operator needs this to know whether the
+  scanner's in-process bar aggregator has warm bars before the trading session.
+  Caller: `services/scanner_service.py` (aggregator-seeding path).
+- **Why (2026-07-02, issue #243):** this event type was missing from the registry;
+  its alerts were silently dropped on 2026-06-30 at 08:34:26 (boot) and 15:26:33
+  (restart) IST while the operator was actively investigating an empty-aggregator
+  failure. Registered here with default ON.
+- **Test coverage:** `test/test_notification_service.py`
+  (`test_notify_scanner_aggregator_seed_routes_through_telegram`,
+  `test_notify_scanner_aggregator_seed_per_event_toggle`).
 
 ### Strategy control — unified daily intent
 
@@ -688,13 +1254,18 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
 - **Values:** non-negative integer. `1` == "yesterday's close is acceptable" (the
   realistic state at 15:20 IST, before today's after-close backfill runs);
   day-before-yesterday is stale.
-- **Effect:** the per-symbol staleness threshold (business days behind the
-  reference trading day) above which a symbol is flagged stale. Weekend-aware;
-  market holidays are NOT modelled (a mid-week holiday inflates measured staleness
-  by one business day — the default-1 threshold absorbs the common case).
+- **Effect:** the per-symbol staleness threshold (trading days behind the
+  reference trading day) above which a symbol is flagged stale. Weekend- and
+  NSE-holiday-aware since issue #253 (`is_trading_day()` consults
+  `database.market_calendar_db.is_market_holiday()`; fails open to the prior
+  weekday-only behavior with a once-per-year WARNING if the calendar has no
+  rows for a given year — e.g. a future year before its yearly seed lands).
 - **Who flips:** operator only.
 - **History:**
   - **2026-06-10:** Introduced with `DATA_FRESHNESS_VALIDATION_ENABLED`. Default 1.
+  - **2026-07-06 (#253):** Staleness math became holiday-aware (previously
+    weekend-only) — no default/threshold change, just a more accurate
+    trading-day count. No new env flag; fail-open is behavior, not a toggle.
 
 ### Simplified engine — EOD journal reconciliation
 
@@ -871,6 +1442,151 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
     paired with the smoke check (`SCANNER_SMOKE_CHECK_*` above) for the
     Friday 2026-06-19 outage. 13 hermetic E2E tests in
     `test/test_scanner_dry_tripwire.py`.
+
+## `SCANNER_PREENTRY_REFRESH_*` — scanner pre-entry data refresh + WS nudge (issue #239)
+
+- **Files:** `services/scanner_backfill_scheduler.py` (functions
+  `preentry_refresh_enabled`, `preentry_refresh_time`,
+  `run_preentry_scanner_refresh`, `init_scanner_preentry_refresh`,
+  `_scanner_preentry_refresh_job`), `app.py` (wire-in next to smoke check),
+  `test/test_scanner_backfill_scheduler.py`.
+- **What it controls:** a daily 09:16 IST APScheduler job that closes the
+  cold-boot gap where the in-process scanner aggregator is still 0/216 at the
+  09:18 smoke check — the root of the 2026-06-30 5-day signal drought
+  (`scanner_subscribed_at=None`, `gap_min=7745`). The job runs the same
+  `check_and_refresh_if_stale` convergence the boot/periodic paths use (for
+  BOTH `1m` AND `D` intervals), waits up to `_PREENTRY_WAIT_SEC` (120s) for
+  the download jobs, and — if `scanner_pre_subscriber.subscribed` is empty —
+  nudges the broker WS subscription via `scanner_pre_subscriber.ensure` so the
+  tick aggregator starts filling before the first evaluatable 5m bar at 09:30.
+- **Knobs:**
+  - `SCANNER_PREENTRY_REFRESH_ENABLED` (default `true`) — master gate. When
+    false the APScheduler job is still registered so toggling at runtime takes
+    effect without a restart; the per-fire `preentry_refresh_enabled()` check
+    makes it a no-op immediately.
+  - `SCANNER_PREENTRY_REFRESH_TIME` (default `09:16`) — cron fire time in
+    `HH:MM` IST. Must be before the 09:18 smoke check (`SCANNER_SMOKE_CHECK_TIME`)
+    and early enough to allow the 120s bounded wait to complete before 09:18.
+- **Failure path:** always fail-graceful — historify download errors are logged
+  and produce anomaly alerts via `notification_service.publish_anomaly`; the WS
+  nudge failure is `logger.exception`-logged but never propagates. A fresh → no-op
+  (idempotent).
+- **History:**
+  - **2026-07-02:** Introduced to close the cold-boot gap that produced the
+    2026-06-30 5-day signal drought (issue #239). Mirrors the sector_follow
+    pre-entry refresh pattern (`SECTOR_FOLLOW_PREENTRY_REFRESH_*`, issue #237).
+
+## `scanner_dry_tripwire` — WS-absence CRITICAL escalation (issue #239)
+
+- **Files:** `services/scanner_dry_tripwire_service.py` (`check_dry_scanner`,
+  `_format_alert`), `test/test_scanner_dry_tripwire.py`.
+- **What it controls:** an additive severity-escalation path in the existing
+  `scanner_dry_tripwire_service`. When `scanner_subscribed_at is None` (the WS
+  connect callback from `ws_connect_callbacks` never fired in this process, so
+  the broker WS subscription never came up) AND `gap_min > 60`, the severity
+  is forced to **CRITICAL** — overriding the normal chartink cross-check — and
+  a Telegram alert fires with `escalation_reason='ws_subscription_absent'` in
+  the payload. This is the exact condition of the 2026-06-30 tripwire log
+  (`gap_min=7745, scanner_subscribed_at=None, severity=WARN`): the WARN meant
+  no page fired despite a 5-day drought.
+- **No new flags** — the change is purely additive to the existing
+  `SCANNER_DRY_TRIPWIRE_ENABLED` and `SCANNER_DRY_THRESHOLD_MIN` flags. The
+  chartink cross-check is still used when `subscribed_at is not None`
+  (normal path unchanged).
+- **History:**
+  - **2026-07-02:** Introduced as part of issue #239. Paired with the
+    `SCANNER_PREENTRY_REFRESH_*` job above.
+
+## `SCANNER_REFERENCE_*` — reference-data certificate (issue #305)
+
+- **`SCANNER_REFERENCE_CHECK_ENABLED`** (default `true`): master gate for the
+  reference-data certificate + rule-side cross-check
+  (`services/scanner_reference_data.py`). The scanner validates the rules'
+  settled reference close (`yest_d.close`) against the broker prev-close the
+  aggregator_seeder records at boot; a confirmed divergence REJECTS the symbol
+  (fail-closed) while a missing broker prev-close fail-opens with a dedup'd
+  WARNING. `false` -> no verdict computed or consulted anywhere (pre-#305
+  behavior).
+- **`SCANNER_REFERENCE_DIVERGENCE_MAX_PCT`** (default `1.0`): max settled-reference
+  vs broker-prev-close divergence (percent) before the reference is NOT
+  certified. The 2026-07-02 DELHIVERY incident divergence was 6.78%.
+- **History:**
+  - **2026-07-02:** Introduced by issue #305 / PR #312 after the DELHIVERY
+    42x false-BUY on a stale historify-D reference (475.4 vs real 510.0).
+
+## `SCANNER_SMOKE_BLOCK_ENABLED` — smoke-fail post-hold enforcement (issue #305)
+
+- **`SCANNER_SMOKE_BLOCK_ENABLED`** (default `true`): consult-time enforcement
+  gate for the 09:18 smoke-check post-hold. While a failed smoke check's hold
+  is armed, rule PASSes are still logged but hits are NOT persisted to
+  scan_results or posted to the engine; the hold releases on a passing
+  re-check (wired into the backfill convergence tick) and self-expires at
+  15:35 IST. `false` -> the 09:18 FAIL is alert-only (pre-#305 behavior).
+  Runtime flips take effect immediately (no restart).
+- **History:**
+  - **2026-07-02:** Introduced by issue #305 / PR #312 — on 2026-07-02 the
+    09:18 check FAILED loudly ("scanner_universe_1m stale; scanner_universe_D
+    stale") and 118 BUY rows posted anyway; this flag turns that class of
+    failure into enforcement.
+
+## `SCANNER_BACKFILL_MAX_CATCHUP_DAYS` — backfill catch-up ceiling (issue #304)
+
+- **`SCANNER_BACKFILL_MAX_CATCHUP_DAYS`** (default `7`, floor 1): explicit,
+  operator-tunable ceiling on the scanner-universe backfill's incremental
+  catch-up window, on top of the per-interval `_LOOKBACK_DAYS` floor (4 for
+  `1m`, 15 for `D`). When the gap is wider than the cap, the window is
+  clamped and a WARNING names the affected symbols and the manual CLI
+  (`uv run python -m services.scanner_universe_backfill --from --to
+  --interval`) for the deeper backfill.
+- **History:**
+  - **2026-07-02:** Introduced by issue #304 / PR #311, alongside
+    verified-refresh reporting (refreshed counts are post-job verified reads,
+    never submission counts).
+
+## `SCANNER_CHARTINK_MISS_DEBUG_ENABLED` — Chartink-miss gate diagnostics (issue #321)
+
+- **`SCANNER_CHARTINK_MISS_DEBUG_ENABLED`** (default `true`): when a symbol on
+  TODAY's Chartink webhook lists (`scan_cycle`, cycle_kind='chartink') FAILs an
+  in-house scan rule, log `scanner MISS <sym> rule=<rule> failed_gate=<gate>
+  <values>` at INFO (dedup'd per symbol/rule/gate/day; non-listed symbols stay
+  at DEBUG). Pure observability — zero gate-outcome change. Purpose: one
+  trading day of logs pinpoints the exact failing gate per Chartink-parity
+  miss (issue #242 diagnosis).
+- **History:**
+  - **2026-07-03:** Introduced by issue #321 / PR #322 after the first
+    fully-healthy data day still showed in-house recall 0 vs 10+ Chartink
+    symbols, with FAIL reasons invisible at production LOG_LEVEL=INFO.
+
+## `SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN` — semantics change to trading minutes (issue #340)
+
+- **`SCANNER_AGGREGATOR_SEED_LOOKBACK_MIN`** (default `500`, unchanged): as of
+  issue #340 / PR #341 the value means **trading-session minutes** (09:15-15:30
+  IST, weekdays), not wall-clock minutes. The boot seeder walks backward
+  through prior sessions until the window contains the requested trading
+  minutes, so a pre-market boot seeds prior-day bars instead of an empty
+  overnight window. Pre-fix, every pre-market boot seeded 0/227 symbols
+  (live-log proof 2026-07-06: "seeded 0/227 symbols, 0 bars total"), which
+  starved the 15m RSI(14) warm-up gate until ~13:00 IST and rejected the whole
+  universe every morning (first #321 MISS-diagnostic finding: GODREJCP
+  failed_gate=15m_warmup 7/15 bars at 10:35).
+- **History:**
+  - **2026-07-06:** Semantics changed wall-clock → trading minutes (issue
+    #340 / PR #341). Default value untouched; 500 trading minutes ≈ 33 15m
+    bars, ample margin over the 15 needed even across a holiday (holiday
+    calendar itself is issue #253).
+
+## `SCANNER_ACTIVE_TTL_MIN` — /scanner currently-matching window (issue #342)
+
+- **`SCANNER_ACTIVE_TTL_MIN`** (default `12`, floor 1, read at request time):
+  the /scanner UI's "Currently matching" list shows a symbol while it has an
+  in-house scan_results row within the last N minutes. The rules re-fire every
+  5m bar close while conditions hold, so ~2 bar intervals means a symbol drops
+  off within a couple of cycles of conditions breaking — Chartink-style live
+  semantics with no new scanner state. Signal HISTORY is unaffected (scan_results
+  is never filtered/mutated by this TTL).
+- **History:**
+  - **2026-07-06:** Introduced by issue #342 / PR #343 (operator request:
+    stocks shown only while conditions are met; fired signals stay in history).
 
 ## Other tunables (placeholder — populate as discovered)
 

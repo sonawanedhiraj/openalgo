@@ -396,10 +396,11 @@ def _patched_engine_service(svc_mock):
     )
 
 
-def _make_svc_mock(api_key="test-key"):
+def _make_svc_mock(api_key="test-key", mode="sandbox"):
     svc = MagicMock()
     svc.config.exchange = "NSE"
     svc.config.product = "MIS"
+    svc.mode = mode  # gates #265 broker reconciliation (only live consults broker)
     svc._lock = MagicMock()
     svc._lock.__enter__ = MagicMock(return_value=None)
     svc._lock.__exit__ = MagicMock(return_value=None)
@@ -860,3 +861,208 @@ def test_rehydrate_without_resolvable_key_still_restores_position(fresh_journal_
     assert added == 1
     assert "TCS" in svc.engine.positions
     assert "TCS" not in svc._api_key_by_symbol
+
+
+# ---------------------------------------------------------------------------
+# #265 — flatten_strategy_positions position-store reconciliation (BOTH modes)
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_sandbox_consults_store_and_clamps(fresh_journal_db):
+    """SANDBOX: the journal-driven watchdog flatten DOES consult the mode-aware
+    position source (sandbox.db via get_open_position) and clamps a partial —
+    the same guarded behaviour as live, but against the sandbox store."""
+    from services import simplified_stock_engine_service as ses
+
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="sandbox")
+    partial = (True, {"quantity": 200, "status": "success"}, 200)
+    with (
+        _patched_engine_service(svc),
+        patch("services.openposition_service.get_open_position", return_value=partial) as store,
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-1", "status": "success"}, 200),
+        ) as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    store.assert_called()  # the sandbox store IS consulted now
+    assert mock_po.called
+    assert mock_po.call_args.args[0]["quantity"] == 200  # clamped to the sandbox store
+    assert result["succeeded"] == 1
+
+
+def test_flatten_sandbox_phantom_store_flat_is_suppressed(fresh_journal_db):
+    """SANDBOX: journal open but the sandbox store is flat → SUPPRESS the order and
+    close the row (fail-safe suppress applies in sandbox exactly as in live)."""
+    from services import simplified_stock_engine_service as ses
+
+    jid = _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="sandbox")
+    flat = (True, {"quantity": 0, "status": "success"}, 200)
+    with (
+        _patched_engine_service(svc),
+        patch("services.openposition_service.get_open_position", return_value=flat),
+        patch("services.place_order_service.place_order") as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    mock_po.assert_not_called()  # phantom in the sandbox store → no order
+    assert result["succeeded"] == 0
+    assert any(s["reason"] == "broker_flat" for s in result["skipped"])
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
+    assert row.exited_at is not None
+
+
+def test_flatten_sandbox_fetch_failure_fails_closed(fresh_journal_db):
+    """SANDBOX: sandbox store fetch fails → still SELL, but NEVER more than journaled
+    (fail-closed for reverse-risk is preserved in sandbox too)."""
+    from services import simplified_stock_engine_service as ses
+
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="sandbox")
+    failed = (False, {"status": "error", "message": "down"}, 500)
+    with (
+        _patched_engine_service(svc),
+        patch("services.openposition_service.get_open_position", return_value=failed),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-F", "status": "success"}, 200),
+        ) as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    assert mock_po.called
+    assert mock_po.call_args.args[0]["quantity"] == 500  # journalled, not more
+    assert result["succeeded"] == 1
+
+
+def test_flatten_disabled_mode_never_consults_store(fresh_journal_db):
+    """DISABLED: the guard is a strict no-op — the store is never consulted and the
+    legacy journal-driven qty is used unchanged."""
+    from services import openposition_service
+    from services import simplified_stock_engine_service as ses
+
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="disabled")
+    with (
+        _patched_engine_service(svc),
+        patch.object(openposition_service, "get_open_position") as store,
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-D", "status": "success"}, 200),
+        ) as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    store.assert_not_called()  # disabled mode → no reconciliation
+    assert mock_po.called
+    assert mock_po.call_args.args[0]["quantity"] == 500  # full journalled qty
+    assert result["succeeded"] == 1
+
+
+def test_flatten_live_phantom_broker_flat_is_suppressed(fresh_journal_db):
+    """LIVE: journal open but broker flat → SUPPRESS the order, close the row."""
+    from services import simplified_stock_engine_service as ses
+
+    jid = _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="live")
+    flat = (True, {"quantity": 0, "status": "success"}, 200)
+    with (
+        _patched_engine_service(svc),
+        patch("services.openposition_service.get_open_position", return_value=flat),
+        patch("services.place_order_service.place_order") as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    mock_po.assert_not_called()  # phantom → no order
+    assert result["succeeded"] == 0
+    assert any(s["reason"] == "broker_flat" for s in result["skipped"])
+    # Row is stamped closed so a future boot won't re-flatten it.
+    row = fresh_journal_db.db_session.query(fresh_journal_db.TradeJournal).filter_by(id=jid).first()
+    assert row.exited_at is not None
+
+
+def test_flatten_live_partial_broker_clamps_qty(fresh_journal_db):
+    """LIVE: journal 500, broker holds 200 → SELL only 200."""
+    from services import simplified_stock_engine_service as ses
+
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="live")
+    partial = (True, {"quantity": 200, "status": "success"}, 200)
+    with (
+        _patched_engine_service(svc),
+        patch("services.openposition_service.get_open_position", return_value=partial),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-2", "status": "success"}, 200),
+        ) as mock_po,
+    ):
+        result = ses.flatten_strategy_positions("trending_equity_intraday")
+
+    assert mock_po.called
+    assert mock_po.call_args.args[0]["quantity"] == 200  # clamped to broker
+    assert result["succeeded"] == 1
+
+
+def test_flatten_live_consistent_broker_proceeds(fresh_journal_db):
+    """LIVE: broker matches journal → SELL full qty."""
+    from services import simplified_stock_engine_service as ses
+
+    _seed_open_row(
+        fresh_journal_db,
+        symbol="NBCC",
+        strategy="trending_equity_intraday",
+        qty=500,
+        direction="LONG",
+    )
+    svc = _make_svc_mock(mode="live")
+    match = (True, {"quantity": 500, "status": "success"}, 200)
+    with (
+        _patched_engine_service(svc),
+        patch("services.openposition_service.get_open_position", return_value=match),
+        patch(
+            "services.place_order_service.place_order",
+            return_value=(True, {"orderid": "WD-3", "status": "success"}, 200),
+        ) as mock_po,
+    ):
+        ses.flatten_strategy_positions("trending_equity_intraday")
+
+    assert mock_po.call_args.args[0]["quantity"] == 500

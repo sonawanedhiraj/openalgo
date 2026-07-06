@@ -13,24 +13,24 @@ if [ -f "$ENV_FILE" ] && [ -r "$ENV_FILE" ] && [ -s "$ENV_FILE" ]; then
     echo "[OpenAlgo] Using existing .env file"
 else
     echo "[OpenAlgo] No .env file found or file is empty. Checking for environment variables..."
-    
+
     # Check if we're on Railway/Cloud (HOST_SERVER is the key indicator)
     if [ -n "$HOST_SERVER" ]; then
         echo "[OpenAlgo] Environment variables detected. Generating .env file..."
-        
+
         # Extract domain without https:// for WebSocket URL
         HOST_DOMAIN="${HOST_SERVER#https://}"
         HOST_DOMAIN="${HOST_DOMAIN#http://}"
-        
+
         # Try to write to /app/.env, fallback to /tmp/.env if permission denied
         if ! touch "$ENV_FILE" 2>/dev/null; then
             echo "[OpenAlgo] Cannot write to /app/.env, using /tmp/.env"
             ENV_FILE="/tmp/.env"
         fi
-        
+
         # Use Railway's PORT, default to 5000 for local development
         APP_PORT="${PORT:-5000}"
-        
+
         cat > "$ENV_FILE" << EOF
 # OpenAlgo Environment Configuration File
 # Auto-generated from environment variables
@@ -144,7 +144,7 @@ EOF
 
         echo "[OpenAlgo] .env file generated at $ENV_FILE"
         echo "[OpenAlgo] Configuration: HOST_SERVER=${HOST_SERVER}"
-        
+
         # If we wrote to /tmp, create symlink to /app/.env (or copy if symlink fails)
         if [ "$ENV_FILE" = "/tmp/.env" ]; then
             ln -sf /tmp/.env /app/.env 2>/dev/null || cp /tmp/.env /app/.env 2>/dev/null || true
@@ -328,6 +328,19 @@ echo "[OpenAlgo] Starting application on port ${APP_PORT} with eventlet..."
 
 # Create gunicorn worker temp directory (must be inside container, not mounted volume)
 mkdir -p /tmp/gunicorn_workers
+
+# Run the singleton-guard ONCE in this shell before gunicorn binds the port.
+# After this succeeds, export OPENALGO_SKIP_SINGLETON_GUARD=1 so the gunicorn
+# workers' app.py import does NOT re-run the bind probe — that probe would
+# fail (master has bound :5000 → worker can't bind 127.0.0.1:5000), the
+# worker would exit 1, gunicorn would restart it, and the container would
+# crashloop while never serving /auth/check-setup. See utils/singleton_guard.py.
+echo "[OpenAlgo] Running singleton guard (pre-gunicorn)..."
+if ! /app/.venv/bin/python -c "from utils.singleton_guard import check_singleton_or_abort; check_singleton_or_abort()"; then
+    echo "[OpenAlgo] Singleton guard failed — refusing to boot."
+    exit 1
+fi
+export OPENALGO_SKIP_SINGLETON_GUARD=1
 
 exec /app/.venv/bin/gunicorn \
     --worker-class eventlet \

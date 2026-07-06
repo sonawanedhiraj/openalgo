@@ -1,9 +1,10 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   AlertTriangle,
   ArrowLeft,
   BookOpen,
+  Bot,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -11,8 +12,11 @@ import {
   FileBarChart2,
   GitCompare,
   History,
+  ListChecks,
+  Loader2,
   PauseCircle,
   RefreshCw,
+  ShieldCheck,
   TrendingDown,
   TrendingUp,
 } from 'lucide-react'
@@ -28,6 +32,12 @@ import {
   YAxis,
 } from 'recharts'
 import {
+  type DataHealth,
+  type EntryBreakdownOutcome,
+  type EntryBreakdownSymbol,
+  type LLMDecisionRow,
+  type LLMFlipOutcome,
+  type LLMMode,
   type PnlWindow,
   type RecentTrade,
   type StrategyDetail,
@@ -57,16 +67,42 @@ function fmtPnl(v: number | null | undefined) {
   )
 }
 
+// Plain unsigned INR amount (for costs like charges and capital deployed), no
+// leading +/-. `null` renders as an em-dash.
+function fmtInr(v: number | null | undefined) {
+  if (v == null) return '—'
+  return v.toLocaleString('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 0,
+  })
+}
+
+// Instrument price with 2 decimals (NIFTY futures trade in 0.05 ticks), ₹ prefix.
+// `null` renders as an em-dash.
+function fmtPrice(v: number | null | undefined) {
+  if (v == null) return '—'
+  return v.toLocaleString('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
+
+// Matches a trailing timezone designator: `Z`, or a numeric offset like
+// `+05:30` / `-0800`. Timestamps WITH an offset (e.g. signal_decision.candidate_at
+// = `datetime.now(Asia/Kolkata).isoformat()`) must be parsed as-is; only naive
+// timestamps (assumed UTC) get a `Z` appended.
+const TZ_SUFFIX = /(?:Z|[+-]\d{2}:?\d{2})$/
+
 function fmtDate(iso: string | null | undefined) {
   if (!iso) return '—'
-  try {
-    return new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).toLocaleString('en-IN', {
-      dateStyle: 'short',
-      timeStyle: 'short',
-    })
-  } catch {
-    return iso
-  }
+  const d = new Date(TZ_SUFFIX.test(iso) ? iso : iso + 'Z')
+  // Invalid dates don't throw here — toLocaleString() would render the literal
+  // string "Invalid Date". Guard explicitly and fall back to the raw value.
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('en-IN', { dateStyle: 'short', timeStyle: 'short' })
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +131,39 @@ function HealthBadge({ health }: { health: string }) {
   return <Badge variant="outline">Unknown</Badge>
 }
 
+// Data-freshness tile (issue #237): surfaces the latest data_health_check state
+// for the strategy's feed so "no signals" (quiet market) is distinguishable from
+// "feed stale". Renders nothing for strategies without a feed check (e.g. the
+// webhook-driven simplified engine).
+function DataHealthBadge({ dataHealth }: { dataHealth: DataHealth }) {
+  if (!dataHealth?.available) return null
+  const at = dataHealth.check_at
+    ? new Date(dataHealth.check_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '—'
+  if (dataHealth.overall_ok) {
+    return (
+      <Badge
+        className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 gap-1"
+        title={`Feed fresh (checked ${at})${dataHealth.shared ? ` — shares ${dataHealth.feed} feed` : ''}`}
+      >
+        <CheckCircle2 className="h-3 w-3" /> Feed OK{dataHealth.shared ? ' (shared)' : ''}
+      </Badge>
+    )
+  }
+  const staleCount = dataHealth.stale_count ?? 0
+  const staleList = dataHealth.stale_symbols?.length
+    ? `: ${dataHealth.stale_symbols.join(', ')}`
+    : ''
+  return (
+    <Badge
+      className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 gap-1"
+      title={`${staleCount} stale symbol(s) as of ${at}${staleList}`}
+    >
+      <AlertTriangle className="h-3 w-3" /> Feed stale ({staleCount})
+    </Badge>
+  )
+}
+
 function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) {
   if (!deployable || mode.includes('scaffold'))
     return (
@@ -114,6 +183,343 @@ function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) 
   )
 }
 
+function LLMModeBadge({ llmMode }: { llmMode: LLMMode }) {
+  if (llmMode === 'veto')
+    return (
+      <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 gap-1">
+        <ShieldCheck className="h-3 w-3" /> LLM veto
+      </Badge>
+    )
+  if (llmMode === 'delegate')
+    return (
+      <Badge className="bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 gap-1">
+        <Bot className="h-3 w-3" /> LLM delegate
+      </Badge>
+    )
+  return (
+    <Badge variant="outline" className="text-muted-foreground gap-1">
+      <Bot className="h-3 w-3" /> LLM off
+    </Badge>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// LLM control (issue #266 Phase 2) — per-strategy off/veto segmented toggle
+// (delegate shown but disabled) + decisions history + reachable health line.
+// ---------------------------------------------------------------------------
+
+const LLM_OPTIONS: { value: LLMMode; label: string; disabled?: boolean; hint?: string }[] = [
+  { value: 'off', label: 'Off', hint: 'No LLM review — orders proceed unreviewed.' },
+  {
+    value: 'veto',
+    label: 'Veto',
+    hint: 'The LLM reviews every entry; a "skip" verdict blocks the order.',
+  },
+  {
+    value: 'delegate',
+    label: 'Delegate',
+    disabled: true,
+    hint: 'Coming soon — requires the LLM-decides engine path (a later phase).',
+  },
+]
+
+export function LLMControlCard({ data }: { data: StrategyDetail }) {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+  const current = data.llm_mode
+
+  const flip = useMutation({
+    mutationFn: (target: LLMMode) => strategiesDashboardApi.flipLLMMode(data.name, target),
+    onSuccess: (outcome: LLMFlipOutcome) => {
+      if (outcome.accepted) {
+        setError(null)
+        queryClient.invalidateQueries({ queryKey: ['strategy-detail', data.name] })
+        queryClient.invalidateQueries({ queryKey: ['strategies-list'] })
+      } else {
+        setError(outcome.error_message ?? 'LLM mode change refused')
+      }
+    },
+    onError: () => setError('LLM mode request failed — check server logs'),
+  })
+
+  const handleSelect = (target: LLMMode) => {
+    if (target === current || flip.isPending) return
+    // Confirm only when *enabling* enforcement (veto blocks real orders in
+    // active mode). Turning off never needs a confirm.
+    if (target === 'veto') {
+      const ok = window.confirm(
+        `Enable LLM VETO for ${data.display_name}?\n\n` +
+          'The LLM will review every entry signal. In an enforcing mode a "skip" ' +
+          'verdict will BLOCK the order. If the reviewer is unreachable it fails ' +
+          'safe (the trade proceeds) and the decision is logged as review_failed.'
+      )
+      if (!ok) return
+    }
+    setError(null)
+    flip.mutate(target)
+  }
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2">
+          <Bot className="h-4 w-4" /> LLM Control
+          {!data.llm_veto_enabled && (
+            <Badge variant="outline" className="ml-auto text-xs text-muted-foreground font-normal">
+              veto not wired for this strategy
+            </Badge>
+          )}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {/* Segmented toggle */}
+        <div className="inline-flex rounded-md border p-0.5 bg-muted/30">
+          {LLM_OPTIONS.map((opt) => {
+            const active = current === opt.value
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                title={opt.hint}
+                disabled={opt.disabled || flip.isPending}
+                onClick={() => handleSelect(opt.value)}
+                className={[
+                  'px-3 py-1.5 text-xs rounded-[5px] transition-colors flex items-center gap-1',
+                  active
+                    ? 'bg-background shadow-sm font-medium text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                  opt.disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer',
+                ].join(' ')}
+              >
+                {flip.isPending && active && <Loader2 className="h-3 w-3 animate-spin" />}
+                {opt.label}
+                {opt.disabled && <span className="text-[10px] opacity-70">(soon)</span>}
+              </button>
+            )
+          })}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {LLM_OPTIONS.find((o) => o.value === current)?.hint ??
+            'No LLM review configured for this strategy.'}
+        </p>
+        {!data.llm_veto_enabled && (
+          <p className="text-xs text-muted-foreground italic">
+            This strategy does not call the LLM veto today, so setting a mode has no runtime effect
+            yet and its decisions history is empty.
+          </p>
+        )}
+        {error && (
+          <div className="rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-2 text-xs text-red-700 dark:text-red-300 flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3" /> {error}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function DecisionBadge({ decision }: { decision: string }) {
+  if (decision === 'take')
+    return (
+      <Badge className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 text-xs py-0">
+        take
+      </Badge>
+    )
+  if (decision === 'skip')
+    return (
+      <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs py-0">
+        skip
+      </Badge>
+    )
+  if (decision === 'review_failed')
+    return (
+      <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-xs py-0 gap-1">
+        <AlertTriangle className="h-3 w-3" /> review_failed
+      </Badge>
+    )
+  return (
+    <Badge variant="outline" className="text-xs py-0">
+      {decision}
+    </Badge>
+  )
+}
+
+function DecisionRow({ row }: { row: LLMDecisionRow }) {
+  const [open, setOpen] = useState(false)
+  const reasoning = row.reasoning ?? ''
+  const truncated = reasoning.length > 80
+  return (
+    <>
+      <tr className="border-b last:border-0 hover:bg-muted/20">
+        <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap">
+          {fmtDate(row.candidate_at)}
+        </td>
+        <td className="px-3 py-1.5 font-mono">{row.symbol}</td>
+        <td className="px-3 py-1.5">{row.direction ?? '—'}</td>
+        <td className="px-3 py-1.5">
+          <DecisionBadge decision={row.decision} />
+        </td>
+        <td className="px-3 py-1.5 text-muted-foreground">{row.enforcement_mode}</td>
+        <td className="px-3 py-1.5 text-right tabular-nums">
+          {row.confidence != null ? row.confidence.toFixed(2) : '—'}
+        </td>
+        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+          {row.bridge_latency_ms != null ? `${row.bridge_latency_ms}ms` : '—'}
+        </td>
+        <td className="px-3 py-1.5 max-w-[16rem]">
+          {reasoning ? (
+            <button
+              type="button"
+              className="text-left text-muted-foreground hover:text-foreground"
+              onClick={() => setOpen(!open)}
+            >
+              <span className={open ? '' : 'line-clamp-1'}>{reasoning}</span>
+              {truncated && (
+                <span className="text-[10px] text-primary ml-1">{open ? 'less' : 'more'}</span>
+              )}
+            </button>
+          ) : (
+            <span className="text-muted-foreground">—</span>
+          )}
+        </td>
+      </tr>
+    </>
+  )
+}
+
+const DECISIONS_PAGE = 25
+
+export function LLMDecisionsCard({ name }: { name: string }) {
+  const [page, setPage] = useState(0)
+  const { data, isLoading } = useQuery({
+    queryKey: ['strategy-llm-decisions', name, page],
+    queryFn: () =>
+      strategiesDashboardApi.getLLMDecisions(name, DECISIONS_PAGE, page * DECISIONS_PAGE),
+    refetchInterval: 30_000,
+  })
+
+  const summary = data?.summary
+  const rows = data?.rows ?? []
+  const total = data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / DECISIONS_PAGE))
+
+  // LLM-reachable health hint derived from the recent decisions.
+  const recentFailed = summary?.recent_review_failed ?? 0
+  const reachable = recentFailed === 0
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <History className="h-4 w-4" /> LLM Decisions
+            <span className="text-xs text-muted-foreground font-normal">{total} total</span>
+          </CardTitle>
+          {data?.veto_enabled && summary && summary.total > 0 && (
+            <div
+              className={[
+                'flex items-center gap-1 text-xs rounded-md px-2 py-1',
+                reachable
+                  ? 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20'
+                  : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20',
+              ].join(' ')}
+            >
+              {reachable ? (
+                <>
+                  <CheckCircle2 className="h-3 w-3" /> LLM reachable
+                </>
+              ) : (
+                <>
+                  <AlertTriangle className="h-3 w-3" /> LLM unreachable (last {recentFailed} failed
+                  — run <code className="font-mono">claude login</code>)
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        {summary && summary.total > 0 && (
+          <p className="text-xs text-muted-foreground">
+            take {summary.take} · skip {summary.skip} · review_failed {summary.review_failed}
+            {data?.source_filtered === false && ' · showing all veto rows for this strategy'}
+          </p>
+        )}
+      </CardHeader>
+      <CardContent className="p-0">
+        {isLoading ? (
+          <div className="p-4">
+            <Skeleton className="h-32 w-full" />
+          </div>
+        ) : !data?.veto_enabled ? (
+          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
+            This strategy does not run the LLM veto — no decisions to show.
+          </p>
+        ) : rows.length === 0 ? (
+          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
+            No LLM decisions recorded yet.
+          </p>
+        ) : (
+          <>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b bg-muted/30">
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Time</th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Symbol
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Dir</th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Decision
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Mode</th>
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">Conf</th>
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                      Latency
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Reasoning
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <DecisionRow key={r.id} row={r} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center justify-between px-3 py-2 border-t text-xs text-muted-foreground">
+              <span>
+                Page {page + 1} of {totalPages}
+              </span>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  disabled={page === 0}
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                >
+                  Prev
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-2 text-xs"
+                  disabled={page + 1 >= totalPages}
+                  onClick={() => setPage((p) => p + 1)}
+                >
+                  Next
+                </Button>
+              </div>
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Performance comparison table
 // ---------------------------------------------------------------------------
@@ -127,13 +533,34 @@ function PerfTable({ data }: { data: StrategyDetail }) {
     { label: 'CAGR', bt: fmt(bt.cagr_pct, '%'), sb: '—', lv: '—' },
     { label: 'Sharpe', bt: fmt(bt.sharpe), sb: '—', lv: '—' },
     { label: 'Max DD', bt: fmt(bt.max_dd_pct, '%'), sb: '—', lv: '—' },
-    { label: 'Win Rate', bt: fmt(bt.win_rate_pct, '%'), sb: '—', lv: '—' },
-    { label: 'N Trades', bt: fmt(bt.n_trades), sb: '—', lv: '—' },
+    // Backtest win-rate is the 2.5yr figure; Sandbox/Live show the *running*
+    // win-rate over closed trades so far (issue #323).
+    {
+      label: 'Win Rate',
+      bt: fmt(bt.win_rate_pct, '%'),
+      sb: fmt(sb?.win_rate_pct, '%'),
+      lv: fmt(lv?.win_rate_pct, '%'),
+    },
+    // Backtest N is the window trade count; Sandbox/Live show closed trades so
+    // far, the denominator behind the running win-rate + cumulative P&L.
+    {
+      label: 'N Trades',
+      bt: fmt(bt.n_trades),
+      sb: sb?.closed_trades != null ? String(sb.closed_trades) : '—',
+      lv: lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+    },
     {
       label: 'Open Pos',
       bt: '—',
       sb: sb?.open_positions != null ? String(sb.open_positions) : '—',
       lv: lv?.open_positions != null ? String(lv.open_positions) : '—',
+    },
+    // Cumulative realized P&L since the strategy started trading in that mode.
+    {
+      label: 'Cum P&L',
+      bt: '—',
+      sb: fmtPnl(sb?.cum_net_pnl),
+      lv: fmtPnl(lv?.cum_net_pnl),
     },
     {
       label: 'Today P&L',
@@ -308,6 +735,13 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
     return sortAsc ? ta.localeCompare(tb) : tb.localeCompare(ta)
   })
 
+  // Gross P&L / Charges / Capital are only populated for strategies that journal
+  // them per leg (futures_follow_cap50). Show those columns only when present so
+  // the sector_follow / simplified views stay compact.
+  const hasFinancials = trades.some(
+    (t) => t.gross_pnl != null || t.charges_inr != null || t.margin_inr != null
+  )
+
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -331,9 +765,46 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Side</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Symbol</th>
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">Qty</th>
+                  {hasFinancials && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Entry (BUY) price of the NIFTY future"
+                    >
+                      Buy Price
+                    </th>
+                  )}
+                  {hasFinancials && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Exit (SELL) price of the NIFTY future"
+                    >
+                      Sell Price
+                    </th>
+                  )}
+                  {hasFinancials && (
+                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                      Gross P&L
+                    </th>
+                  )}
+                  {hasFinancials && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Round-trip charges for both legs, deducted once on the exit"
+                    >
+                      Charges
+                    </th>
+                  )}
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">
                     Net P&L
                   </th>
+                  {hasFinancials && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="SPAN margin committed by the entry (BUY); released on the T+1 exit"
+                    >
+                      Capital
+                    </th>
+                  )}
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Mode</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Status</th>
                   <th
@@ -366,6 +837,46 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                       </td>
                       <td className="px-3 py-1.5 font-mono">{t.symbol}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums">{t.quantity}</td>
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.entry_price != null ? (
+                            fmtPrice(t.entry_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.exit_price != null ? (
+                            fmtPrice(t.exit_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.gross_pnl != null ? (
+                            <span
+                              className={
+                                t.gross_pnl >= 0
+                                  ? 'text-green-600 dark:text-green-400'
+                                  : 'text-red-600 dark:text-red-400'
+                              }
+                            >
+                              {fmtPnl(t.gross_pnl)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasFinancials && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
+                          {t.charges_inr != null ? fmtInr(t.charges_inr) : '—'}
+                        </td>
+                      )}
                       <td className="px-3 py-1.5 text-right tabular-nums font-mono">
                         {netPnl != null ? (
                           <span
@@ -381,6 +892,16 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                           <span className="text-muted-foreground">—</span>
                         )}
                       </td>
+                      {hasFinancials && (
+                        // Capital (SPAN margin) is committed by the entry (BUY) and
+                        // released by the T+1 exit (SELL) — so show it on the entry
+                        // leg only. On an exit the position is closing, and a merged
+                        // multi-lot SELL carries just one leg's margin, which would
+                        // under-report. P&L + round-trip charges live on the SELL.
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
+                          {t.side === 'BUY' && t.margin_inr != null ? fmtInr(t.margin_inr) : '—'}
+                        </td>
+                      )}
                       <td className="px-3 py-1.5">
                         <Badge variant="outline" className="text-xs py-0">
                           {t.mode}
@@ -403,6 +924,214 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
               </tbody>
             </table>
           </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Entry-evaluation breakdown card (issue #352) — futures_follow_cap50 only.
+// Answers "why zero signals today" from the persisted 15:20 evaluation snapshot
+// without reading logs. Data starts with the first post-deploy 15:20 run.
+// ---------------------------------------------------------------------------
+
+function fmtPct(v: number | null | undefined) {
+  if (v == null) return '—'
+  return `${(v * 100).toFixed(2)}%`
+}
+
+function OutcomeBadge({ outcome }: { outcome: EntryBreakdownOutcome }) {
+  if (outcome === 'in_cap_placed')
+    return (
+      <Badge className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 text-xs py-0">
+        placed
+      </Badge>
+    )
+  if (outcome === 'not_selected')
+    return (
+      <Badge className="bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400 text-xs py-0">
+        passed (not selected)
+      </Badge>
+    )
+  if (outcome === 'cap_skipped')
+    return (
+      <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-xs py-0">
+        cap skipped
+      </Badge>
+    )
+  if (outcome === 'vetoed')
+    return (
+      <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 text-xs py-0">
+        LLM vetoed
+      </Badge>
+    )
+  if (outcome === 'placement_failed')
+    return (
+      <Badge variant="destructive" className="text-xs py-0">
+        placement failed
+      </Badge>
+    )
+  if (outcome === 'missing_data')
+    return (
+      <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs py-0 gap-1">
+        <AlertTriangle className="h-3 w-3" /> missing data
+      </Badge>
+    )
+  return (
+    <Badge variant="outline" className="text-xs py-0 text-muted-foreground">
+      failed gate
+    </Badge>
+  )
+}
+
+function BreakdownSymbolRow({ row }: { row: EntryBreakdownSymbol }) {
+  return (
+    <tr className="border-b last:border-0 hover:bg-muted/20">
+      <td className="px-3 py-1.5 font-mono">{row.symbol}</td>
+      <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap">
+        {row.sector_index ?? '—'}
+      </td>
+      <td className="px-3 py-1.5 text-right tabular-nums font-mono">{fmtPct(row.sector_ret)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums font-mono">{fmtPct(row.stock_ret)}</td>
+      <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+        {row.vol_ratio != null ? row.vol_ratio.toFixed(2) : '—'}
+      </td>
+      <td className="px-3 py-1.5">
+        <OutcomeBadge outcome={row.outcome} />
+      </td>
+      <td
+        className="px-3 py-1.5 text-muted-foreground max-w-[16rem] truncate"
+        title={row.fail_reason ?? undefined}
+      >
+        {row.fail_reason ?? '—'}
+      </td>
+      <td className="px-3 py-1.5 text-muted-foreground">{row.intraday_source ?? '—'}</td>
+    </tr>
+  )
+}
+
+export function EntryBreakdownCard() {
+  const [expanded, setExpanded] = useState(false)
+
+  const { data: snapshot, isLoading } = useQuery({
+    queryKey: ['futures-follow-entry-breakdown'],
+    queryFn: () => strategiesDashboardApi.getEntryBreakdown(),
+    refetchInterval: 60_000,
+  })
+
+  const payload = snapshot?.payload
+  const gateFails = payload?.per_gate_fail_counts
+  const sources = payload?.intraday_source_counts
+  const total = payload?.symbols.length ?? 0
+  const liveCount = (sources?.quotes ?? 0) + (sources?.aggregator ?? 0)
+  // The source most symbols were served by (mirrors the 'source=quotes
+  // fetched=30/30' log line).
+  const dominantSource = sources
+    ? (Object.entries(sources).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'none')
+    : 'none'
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle className="text-sm flex items-center gap-2">
+          <ListChecks className="h-4 w-4" /> Today's 15:20 Evaluation
+          {payload && (
+            <span className="text-xs text-muted-foreground font-normal">
+              {fmtDate(payload.eval_at)} · mode {payload.mode}
+            </span>
+          )}
+        </CardTitle>
+        {payload && (
+          <p className="text-xs text-muted-foreground">
+            {payload.n_signals} signal{payload.n_signals !== 1 ? 's' : ''} · source {dominantSource}{' '}
+            {liveCount}/{total}
+            {payload.cap_skipped > 0 && ` · ${payload.cap_skipped} cap-skipped`}
+            {payload.vetoed > 0 && ` · ${payload.vetoed} LLM-vetoed`}
+          </p>
+        )}
+      </CardHeader>
+      <CardContent className="p-0">
+        {isLoading ? (
+          <div className="p-4">
+            <Skeleton className="h-24 w-full" />
+          </div>
+        ) : !payload ? (
+          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
+            No evaluation recorded yet — the breakdown is captured at the next 15:20 IST entry run.
+          </p>
+        ) : (
+          <>
+            {/* Per-gate summary */}
+            <div className="flex flex-wrap gap-2 px-4 pb-3">
+              <Badge variant="outline" className="text-xs text-muted-foreground">
+                sector &gt;1%: {gateFails?.sector ?? 0} failed
+              </Badge>
+              <Badge variant="outline" className="text-xs text-muted-foreground">
+                stock &gt;0.5%: {gateFails?.stock ?? 0} failed
+              </Badge>
+              <Badge variant="outline" className="text-xs text-muted-foreground">
+                vol &gt;1x: {gateFails?.vol ?? 0} failed
+              </Badge>
+              {(gateFails?.missing_data ?? 0) > 0 && (
+                <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs">
+                  missing data: {gateFails?.missing_data}
+                </Badge>
+              )}
+            </div>
+            {/* Expandable per-symbol table (sorted by closeness to passing) */}
+            <button
+              type="button"
+              className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
+              onClick={() => setExpanded(!expanded)}
+            >
+              <span>Per-symbol breakdown ({total} symbols, sorted by closeness to passing)</span>
+              {expanded ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+            </button>
+            {expanded && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b bg-muted/30">
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Symbol
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Sector Index
+                      </th>
+                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                        Sector Ret
+                      </th>
+                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                        Stock Ret
+                      </th>
+                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                        Vol Ratio
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Outcome
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Fail Reason
+                      </th>
+                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                        Source
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {payload.symbols.map((row) => (
+                      <BreakdownSymbolRow key={row.symbol} row={row} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
@@ -602,7 +1331,9 @@ export default function StrategyDetailPage() {
             <Activity className="h-5 w-5 text-primary" />
             <h1 className="text-2xl font-semibold">{data.display_name}</h1>
             <HealthBadge health={data.health} />
+            <DataHealthBadge dataHealth={data.data_health} />
             <ModeBadge mode={data.mode} deployable={data.deployable} />
+            <LLMModeBadge llmMode={data.llm_mode} />
           </div>
           <p className="text-sm text-muted-foreground font-mono pl-7">
             {data.name} · v{data.version}
@@ -623,14 +1354,23 @@ export default function StrategyDetailPage() {
       {/* Active overrides */}
       <OverridesBanner overrides={data.active_overrides} />
 
+      {/* LLM control (issue #266 Phase 2) */}
+      <LLMControlCard data={data} />
+
       {/* Performance + P&L curve */}
       <div className="grid gap-4 xl:grid-cols-2">
         <PerfTable data={data} />
         <PnlCurve name={data.name} />
       </div>
 
+      {/* Today's 15:20 entry-evaluation breakdown (issue #352) */}
+      {data.name === 'futures_follow_cap50' && <EntryBreakdownCard />}
+
       {/* Recent trades */}
       <RecentTradesTable trades={data.recent_trades} />
+
+      {/* LLM decisions history */}
+      <LLMDecisionsCard name={data.name} />
 
       {/* Params + Version log */}
       <div className="grid gap-4 xl:grid-cols-2">

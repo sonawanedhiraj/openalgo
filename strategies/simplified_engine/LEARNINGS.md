@@ -163,6 +163,62 @@ trailing. All positions flatten at 15:20 IST.
   - `get_funds` raised error in simplified_stock_engine_service — needs investigation
   - Telegram bot placeholder token errors (known config issue)
 
+### July 1, 2026 (Day 5 — Sandbox; first logged entry since June 1)
+- **Note on gap**: No daily entries were recorded between June 1 and today. Interim
+  sessions are not captured here — this entry resumes the log and does not imply only
+  one trading day passed.
+- **Market regime**: Mixed, two-sided. BUY-side fills across broad F&O names
+  (PHOENIXLTD, ETERNAL, COLPAL, PRESTIGE); SELL/SHORT side active on TATAELXSI,
+  JINDALSTEL, KPITTECH. Armed watches at close were all SELL (HCLTECH, JINDALSTEL,
+  KPITTECH), so the late-session bias was bearish.
+- **Engine mode**: `sandbox`. Config: atr_sl_mult=1.5, max_trades_per_day=6,
+  cooldown_candles=3. Both BUY and SELL directions enabled.
+- **Engine self-report vs sandbox reality**: The engine reported
+  `completed_trades_today=0`, `positions={}`, `trades_today=0` at EOD — yet the
+  sandbox tradebook shows **18 fills / 9 round-trips**. This is the known
+  engine-vs-sandbox reconciliation gap (positions squared off by sandbox MIS
+  auto-square-off at ~15:14 that the engine never journaled). P&L below is
+  reconstructed from the tradebook by pairing BUY/SELL fills per symbol, so
+  entry/exit matching is approximate for symbols with multiple round-trips.
+- **Reconstructed result**: **9 trades, 5W/4L (1 flat), net +₹368.8, win rate 56%**.
+- **Trade breakdown** (reconstructed):
+  - PHOENIXLTD (LONG): 2007.9 → 2017.5 × 49 | **+₹470.4** | best long, ~1h10m hold
+  - ETERNAL (LONG): 278.2 → 279.95 × 359 | **+₹628.3** | largest winner (high qty)
+  - COLPAL (LONG): 2070.7 → 2070.7 × 48 | **₹0** | flat, exited at entry price
+  - PRESTIGE (LONG): 1624.3 → 1626.9 × 61 | **+₹158.6** | ~10m scalp near close
+  - TATAELXSI (SHORT #1): 3591.5 → 3584.9 × 27 | **+₹178.2**
+  - TATAELXSI (SHORT #2): 3630.8 → 3619.9 × 27 | **+₹294.3** | best short
+  - JINDALSTEL (SHORT): 1025.7 → 1029.3 × 97 | **−₹349.2** | short went against, covered higher
+  - KPITTECH (SHORT #1): 557.75 → 560.75 × 171 | **−₹513.0** | worst trade
+  - KPITTECH (SHORT #2): 562.4 → 566.7 × 116 | **−₹498.8** | re-entry also lost
+- **Notable observations**:
+  - **SHORT results were split by symbol, not uniformly good** — TATAELXSI shorts both
+    won (+₹472.5 combined) while JINDALSTEL and KPITTECH shorts all lost (−₹1,361.0
+    combined). Contrasts with the strong SHORT-side runs of May 22/26; a persistent
+    downtrend is required, and these names reversed up intraday.
+    (Qualifies Learning #10 — SHORT edge is name-specific, not a blanket rule.)
+    Notably these three (HCLTECH/JINDALSTEL/KPITTECH) remained SELL-armed at close,
+    yet the KPITTECH/JINDALSTEL shorts had already lost — armed ≠ profitable.
+  - **KPITTECH re-entry lost twice** (−₹513.0 then −₹498.8) — SHORT re-entry on a
+    stock that keeps bouncing repeated the re-entry-risk pattern (Learning #7/#9).
+    Reinforces that SHORT re-entry only tolerates *persistent* losers.
+  - **LONG side carried the day** — all four longs were non-losers (+₹1,257.3
+    combined incl. one flat); the two-sided book netted positive only because longs
+    offset the JINDALSTEL/KPITTECH short losses.
+- **Tick log**: 22,039 ticks written, ~1.78 MB (1,867,399 bytes), 0 drops.
+- **Armed watches at close**: SELL — HCLTECH, JINDALSTEL, KPITTECH. BUY — none.
+- **Symbols in cooldown at close**: none.
+- **Errors**:
+  - `broker.zerodha.api.data` "Unsupported timeframe: W" at 14:45 IST (2×) — a weekly
+    history request the Zerodha adapter can't serve. Already logged to
+    `audit/proposed_fixes.jsonl` by earlier sessions today; no trading impact.
+  - `telegram_bot_service` RetryAfter "Flood control exceeded" at 14:00 (benign
+    rate-limit; already logged earlier today).
+  - `sector_follow` 15:18 smoke check: index coverage 8/10, missing NIFTYCONSRDURBL
+    and NIFTYOILANDGAS. Above the 50% abort threshold (entries not held). Newly
+    logged to `audit/proposed_fixes.jsonl` this cycle. Unrelated to the simplified
+    engine but noted for the operator.
+
 ---
 
 ## Key Learnings

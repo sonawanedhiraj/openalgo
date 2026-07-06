@@ -113,6 +113,7 @@ from database.daily_intent_db import init_db as ensure_daily_intent_tables_exist
 from database.data_health_db import init_db as ensure_data_health_tables_exists
 from database.flow_db import init_db as ensure_flow_tables_exists
 from database.futures_follow_db import init_db as ensure_futures_follow_tables_exists
+from database.futures_follow_eval_db import init_db as ensure_futures_follow_eval_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
@@ -139,6 +140,7 @@ from extensions import socketio  # Import SocketIO
 from limiter import limiter  # Import the Limiter instance
 from restx_api import api, api_v1_bp
 from services.telegram_bot_service import telegram_bot_service
+from services.thread_watchdog_service import init_thread_watchdog  # Thread-count watchdog
 from utils.health_monitor import init_health_monitoring  # Import health monitoring
 from utils.latency_monitor import init_latency_monitoring  # Import latency monitoring
 from utils.logging import (  # Import centralized logging
@@ -161,9 +163,10 @@ from websocket_proxy.app_integration import start_websocket_proxy
 logger = get_logger(__name__)
 
 
-def create_app():
+def create_app(testing: bool = False):
     # Initialize Flask application
     app = Flask(__name__)
+    app.config["TESTING"] = testing
 
     # Initialize SocketIO
     socketio.init_app(app)  # Link SocketIO to the Flask app
@@ -431,11 +434,15 @@ def create_app():
         csrf.exempt(app.view_functions["health_bp.simple_health"])
         csrf.exempt(app.view_functions["health_bp.detailed_health_check"])
 
-        # Initialize latency monitoring (after registering API blueprint)
-        init_latency_monitoring(app)
+        if not testing:
+            # Initialize latency monitoring (after registering API blueprint)
+            init_latency_monitoring(app)
 
-        # Initialize health monitoring (background daemon thread)
-        init_health_monitoring(app)
+            # Initialize health monitoring (background daemon thread)
+            init_health_monitoring(app)
+
+            # Initialize thread-count watchdog (WARN>100, CRIT>200, Telegram via anomaly_alert)
+            init_thread_watchdog(app)
 
         # NOTE: Python strategy scheduler is initialized in setup_environment()
         # AFTER database tables are created, to avoid "no such table" errors on fresh install
@@ -596,10 +603,47 @@ def create_app():
 
         # Determine if webhook URL is externally accessible
         is_localhost = any(
-            local in host_server.lower() for local in ["localhost", "127.0.0.1", "0.0.0.0"]
+            local in host_server.lower()
+            for local in ["localhost", "127.0.0.1", "0.0.0.0"]  # nosec B104
         )
 
         return jsonify({"host_server": host_server, "is_localhost": is_localhost})
+
+    @app.teardown_appcontext
+    def shutdown_database_sessions(exception=None):
+        """Remove all scoped sessions after each request to prevent FD leaks"""
+        _sessions = [
+            ("database.auth_db", "db_session"),
+            ("database.traffic_db", "logs_session"),
+            ("database.apilog_db", "db_session"),
+            ("database.latency_db", "latency_session"),
+            ("database.health_db", "health_session"),
+            ("database.settings_db", "db_session"),
+            ("database.strategy_db", "db_session"),
+            ("database.user_db", "db_session"),
+            ("database.action_center_db", "db_session"),
+            ("database.qty_freeze_db", "db_session"),
+            ("database.sandbox_db", "db_session"),
+            ("database.analyzer_db", "db_session"),
+            ("database.chart_prefs_db", "db_session"),
+            ("database.chartink_db", "db_session"),
+            ("database.flow_db", "db_session"),
+            ("database.leverage_db", "db_session"),
+            ("database.strategy_portfolio_db", "db_session"),
+            ("database.market_calendar_db", "db_session"),
+            ("database.telegram_db", "db_session"),
+            ("database.symbol", "db_session"),
+        ]
+        for module_name, session_attr in _sessions:
+            try:
+                import importlib
+
+                mod = importlib.import_module(module_name)
+                session = getattr(mod, session_attr, None)
+                if session is not None:
+                    session.remove()
+            except Exception:
+                pass
 
     return app
 
@@ -665,6 +709,7 @@ def setup_environment(app):
                 ("Historify DB", ensure_historify_tables_exists),
                 ("Flow DB", ensure_flow_tables_exists),
                 ("Futures Follow DB", ensure_futures_follow_tables_exists),
+                ("Futures Follow Eval DB", ensure_futures_follow_eval_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
             ]
@@ -698,6 +743,9 @@ def setup_environment(app):
             # runtime-override reads and the safety guards' override writes would
             # hit a missing table (and silently fail-open / fail-safe).
             try:
+                from database.strategy_llm_config_db import (
+                    init_db as _init_strategy_llm_config,
+                )
                 from database.strategy_mode_db import init_db as _init_strategy_mode
                 from database.strategy_runtime_override_db import (
                     init_db as _init_strategy_runtime_override,
@@ -705,6 +753,7 @@ def setup_environment(app):
 
                 _init_strategy_mode()
                 _init_strategy_runtime_override()
+                _init_strategy_llm_config()
             except Exception as e:
                 logger.error(f"strategy_mode/runtime_override table init skipped: {e}")
 
@@ -733,6 +782,22 @@ def setup_environment(app):
                 logger.debug("Historify scheduler initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
+
+            # Probe historify.duckdb for orphan-process contention BEFORE wiring
+            # any backfill scheduler. If a foreign python.exe is holding the
+            # file (a prior OpenAlgo that didn't fully die, a stuck backtester),
+            # the four boot backfill jobs would otherwise pile 200+ lock-error
+            # retries into errors.jsonl against a file they can never write to.
+            # Aborts boot loud with the holder PID. See services/boot_db_probe.py
+            # and issue #139.
+            try:
+                from services.boot_db_probe import assert_historify_unlocked
+
+                assert_historify_unlocked()
+            except SystemExit:
+                raise  # propagate the abort — the probe already logged + alerted
+            except Exception as e:
+                logger.error(f"boot_db_probe wiring failed (non-fatal): {e}")
 
             # sector_follow_cap5_vol 1m feed convergence (replaces the 16:05/16:10
             # IST cron backfill jobs). On boot — after a broker session appears —
@@ -802,6 +867,23 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize scanner smoke check: {e}")
 
+            # Scanner pre-entry refresh (issue #239): an 09:16 IST APScheduler
+            # job that runs the same stale-check the boot+periodic paths use,
+            # waits for the download jobs (≤120s), and nudges the WS
+            # subscription if the scanner has not yet subscribed.  Closes the
+            # cold-boot gap where the aggregator is still 0/216 at the 09:18
+            # smoke check.  See services/scanner_backfill_scheduler.py and the
+            # SCANNER_PREENTRY_REFRESH_* flags in PARAMETER_LOG.
+            try:
+                from services.scanner_backfill_scheduler import (
+                    init_scanner_preentry_refresh,
+                )
+
+                init_scanner_preentry_refresh(app=app)
+                logger.debug("Scanner pre-entry refresh initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize scanner pre-entry refresh: {e}")
+
             # In-house scanner zero-results tripwire (issue #33). Downstream
             # silent-failure detector that catches the Friday 2026-06-19 gap
             # the per-cycle completeness metric missed (56% coverage but 0 BUY
@@ -850,6 +932,22 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
 
+            # Trading-day funnel (issue #159). Registers a single 15:35 IST
+            # mon-fri job that walks the signal → engine → order → journal
+            # pipeline, computes per-layer counts, and Telegrams the verdict
+            # so the next "zero trades" day produces an immediate alert
+            # naming the drop-off layer. Read-only on every DB; gated
+            # per-fire by TRADING_DAY_FUNNEL_ENABLED.
+            try:
+                from services.trading_day_funnel_service import (
+                    init_trading_day_funnel_service,
+                )
+
+                init_trading_day_funnel_service()
+                logger.debug("Trading day funnel job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Trading day funnel job: {e}")
+
             # Telegram INBOUND intent bot (Phase 6). Gated by
             # TELEGRAM_INBOUND_ENABLED (default false), so this is a no-op on
             # deploy until the operator flips the flag — it then polls Telegram
@@ -863,68 +961,17 @@ def setup_environment(app):
                 logger.error(f"Failed to initialize Telegram inbound service: {e}")
 
             # Event-driven broker-WebSocket pre-subscribe wiring shared by the
-            # scanner and the regime classifier. Replaces the old one-shot 30s
-            # boot poll (which lost the race against the morning Zerodha login,
-            # leaving the scanner with only engine-armed symbols). See
-            # services/scanner_presubscribe.py for the full rationale.
-            def _wire_pre_subscribe(callback_name, pre_subscriber, syms, *, thread_name):
-                import threading as _t
-                import time as _time
-
-                from database.auth_db import (
-                    get_broker_name,
-                    get_first_available_api_key,
-                    verify_api_key,
-                )
-                from services.websocket_service import (
-                    get_websocket_connection,
-                    register_connect_callback,
-                )
-
-                # Fire on every broker WS connect+auth — the first connect after
-                # the morning login and every mid-day reconnect. reset=True
-                # re-subscribes the full list, since a reconnect drops the
-                # broker-side subscriptions.
-                register_connect_callback(
-                    callback_name,
-                    lambda uid, brk: pre_subscriber.ensure(uid, brk, syms, reset=True),
-                )
-
-                # Boot retry: poke the connection until the broker WS is up
-                # (covers the case where the operator logs in AFTER boot), then
-                # do the initial subscribe. The connect callback covers all
-                # later (re)connects, so this thread exits once the WS is up.
-                def _establish():
-                    api_key = get_first_available_api_key()
-                    user_id = verify_api_key(api_key) if api_key else None
-                    if not user_id:
-                        logger.warning(
-                            "%s: no API key configured at boot; connect callback "
-                            "remains armed for when a session appears",
-                            callback_name,
-                        )
-                        return
-                    broker = get_broker_name(api_key) or ""
-                    interval = int(os.environ.get("PRESUBSCRIBE_RETRY_SEC", "15"))
-                    max_wait = int(os.environ.get("PRESUBSCRIBE_MAX_WAIT_SEC", "7200"))
-                    deadline = _time.time() + max_wait
-                    while _time.time() < deadline:
-                        if get_websocket_connection(user_id)[0]:
-                            pre_subscriber.ensure(user_id, broker, syms)
-                            logger.info(
-                                "%s: broker WS up — initial subscribe done",
-                                callback_name,
-                            )
-                            return
-                        _time.sleep(interval)
-                    logger.warning(
-                        "%s: broker WS not up after %ds at boot; connect callback "
-                        "remains armed for the next connect",
-                        callback_name,
-                        max_wait,
-                    )
-
-                _t.Thread(target=_establish, daemon=True, name=thread_name).start()
+            # scanner and the regime classifier. Three triggers (connect callback,
+            # event-bus subscription, boot-retry thread) all converge on the
+            # same idempotent ensure() — see services/scanner_presubscribe.py
+            # ::wire_pre_subscribe for the full rationale.
+            #
+            # Issue #244 fix (2026-06-30): the api_key fetch now happens INSIDE
+            # the boot-retry loop and a broker_session_refreshed event-bus
+            # subscriber is added, so the operator's normal flow (OpenAlgo →
+            # Zerodha login) no longer races the daemon thread and bails on
+            # the first None api_key.
+            from services.scanner_presubscribe import wire_pre_subscribe as _wire_pre_subscribe
 
             # Scanner service (Stage 1.5 item 5) — gated by SCANNER_ENABLED.
             # Off by default. When enabled, it subscribes to the ZMQ tick bus
@@ -933,14 +980,25 @@ def setup_environment(app):
             # webhook poster as a scan_hit consumer).
             try:
                 if os.environ.get("SCANNER_ENABLED", "false").lower() == "true":
+                    from services.scanner_aggregator_symbols import (
+                        compute_aggregator_symbols,
+                    )
                     from services.scanner_service import ScannerService
 
-                    raw_symbols = os.environ.get("SCANNER_SYMBOLS", "")
-                    symbols = [s.strip() for s in raw_symbols.split(",") if s.strip()]
+                    # Issue #161: the scanner aggregator must track every
+                    # symbol any downstream consumer queries. SCANNER_SYMBOLS
+                    # alone is NOT enough — sector_follow's mapped sector
+                    # indices (NIFTYAUTO/FMCG/IT/METAL/PSUBANK/PVTBANK +
+                    # NIFTY/BANKNIFTY) and REGIME_SECTOR_SYMBOLS are
+                    # WS-subscribed elsewhere but never seen by the
+                    # aggregator. compute_aggregator_symbols unions all
+                    # required sources and logs the per-source breakdown.
+                    symbols = compute_aggregator_symbols()
                     if not symbols:
                         logger.warning(
-                            "SCANNER_ENABLED=true but SCANNER_SYMBOLS is empty — "
-                            "scanner will idle (no symbols to watch)"
+                            "SCANNER_ENABLED=true but no symbols across "
+                            "SCANNER_SYMBOLS + REGIME_SECTOR_SYMBOLS + sector_follow — "
+                            "scanner will idle (nothing to watch)"
                         )
                     scanner_intervals = [
                         i.strip()
@@ -962,6 +1020,35 @@ def setup_environment(app):
                         len(symbols),
                         scanner_intervals,
                     )
+
+                    # Issue #156 Phase 2 (R3): seed the aggregator's rolling
+                    # bars from historify at boot so RSI(14)/SMA(20) windows
+                    # are full by the time the first live tick arrives —
+                    # eliminates the ~25k pandas_ta_classic verify_series
+                    # warnings per restart AND the 100-min silent warmup
+                    # period that looks identical to 'no setups today'.
+                    # Non-blocking daemon: waits for the broker session, then
+                    # folds last N min of 1m bars per symbol via
+                    # aggregator.replay_bars (idempotent, ws_recovery's later
+                    # replay never double-counts).
+                    try:
+                        from services.scanner_aggregator_seeder import (
+                            init_scanner_aggregator_seeder,
+                        )
+
+                        # Issue #201: also pass the per-symbol 15m bar
+                        # builders so the seeder pre-warms them from the
+                        # same 1m series; otherwise the rules' 15m RSI(14)
+                        # warm-up guard (needs 14 closed 15m bars =
+                        # ~3h30min of live ticks) blocks every signal
+                        # after a mid-session restart.
+                        init_scanner_aggregator_seeder(
+                            app.scanner_service.aggregator,
+                            symbols,
+                            bar_15m_history=getattr(app.scanner_service, "_bar_15m_history", None),
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to start aggregator seeder: {e}")
 
                     # Pre-subscribe scanner symbols to the broker WebSocket so
                     # ticks flow from market open without waiting for a Chartink
@@ -1027,6 +1114,36 @@ def setup_environment(app):
                 logger.info("WS recovery service registered")
             except Exception as e:
                 logger.error(f"Failed to initialize WS recovery service: {e}")
+
+            # Issue #157 (R4 of #156): boot-time orphan-exit reconciliation.
+            # Marks pre-existing trade_journal rows where exit_reason was set
+            # but exit_price never landed (broker rejection at 15:14 IST etc.)
+            # as 'abandoned_<original>' so the engine stops re-attempting them
+            # on every restart. Idempotent; non-blocking daemon; waits for the
+            # broker session before scanning.
+            try:
+                from services.orphan_exit_reconciliation_service import (
+                    init_orphan_exit_reconciliation,
+                )
+
+                init_orphan_exit_reconciliation()
+            except Exception as e:
+                logger.error(f"Failed to initialize orphan-exit reconciliation: {e}")
+
+            # Issue #262: after the orphan reconciliation marks unfilled exits
+            # 'abandoned_<original>', recover the REAL exit price + P&L for any
+            # such row that sandbox's MIS auto-square-off (or a UI exit) actually
+            # flattened — leaving them NULL under-reports the /strategies
+            # dashboard net P&L. Reads sandbox.db read-only, stamps only exit
+            # columns, idempotent, non-blocking daemon.
+            try:
+                from services.abandoned_exit_recovery_service import (
+                    init_abandoned_exit_recovery,
+                )
+
+                init_abandoned_exit_recovery()
+            except Exception as e:
+                logger.error(f"Failed to initialize abandoned-exit recovery: {e}")
 
             # Scanner history cache warm-up (Task 3) — pre-load daily/weekly
             # bars so the first scan does not pay per-symbol lazy-load latency.
@@ -1314,108 +1431,65 @@ def setup_environment(app):
     threading.Thread(target=_init_databases_and_schedulers, daemon=True).start()
 
 
-# Refuse to boot a second concurrent instance before any Flask init — two
-# writers on the SQLite DBs corrupt them. See utils/singleton_guard.py.
-from utils.singleton_guard import check_singleton_or_abort as _check_singleton_or_abort
+# Module-level initialization — skipped when OPENALGO_TESTING=1 so that
+# ``from app import create_app`` in test/harness.py is safe (no singleton
+# check, no background daemons, no WS proxy).
+if os.environ.get("OPENALGO_TESTING") != "1":
+    # Refuse to boot a second concurrent instance before any Flask init — two
+    # writers on the SQLite DBs corrupt them. See utils/singleton_guard.py.
+    from utils.singleton_guard import check_singleton_or_abort as _check_singleton_or_abort
 
-_check_singleton_or_abort()
+    _check_singleton_or_abort()
 
-app = create_app()
+    app = create_app()
 
-# Explicitly call the setup environment function
-setup_environment(app)
+    # Explicitly call the setup environment function
+    setup_environment(app)
 
-# Restore caches from database in background (not needed until first trade/lookup)
-import threading
+    # Restore caches from database in background (not needed until first trade/lookup)
+    import threading
 
+    def _restore_caches_background():
+        # Wait for DB tables to be created before querying
+        app.db_ready.wait()
+        with app.app_context():
+            try:
+                from database.cache_restoration import restore_all_caches
 
-def _restore_caches_background():
-    # Wait for DB tables to be created before querying
-    app.db_ready.wait()
-    with app.app_context():
-        try:
-            from database.cache_restoration import restore_all_caches
+                cache_result = restore_all_caches()
 
-            cache_result = restore_all_caches()
+                if cache_result["success"]:
+                    symbol_count = cache_result["symbol_cache"].get("symbols_loaded", 0)
+                    auth_count = cache_result["auth_cache"].get("tokens_loaded", 0)
+                    if symbol_count > 0 or auth_count > 0:
+                        logger.debug(
+                            f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens"
+                        )
+            except Exception as e:
+                logger.debug(f"Cache restoration skipped: {e}")
 
-            if cache_result["success"]:
-                symbol_count = cache_result["symbol_cache"].get("symbols_loaded", 0)
-                auth_count = cache_result["auth_cache"].get("tokens_loaded", 0)
-                if symbol_count > 0 or auth_count > 0:
-                    logger.debug(
-                        f"Cache restoration: {symbol_count} symbols, {auth_count} auth tokens"
-                    )
-        except Exception as e:
-            logger.debug(f"Cache restoration skipped: {e}")
+    threading.Thread(target=_restore_caches_background, daemon=True).start()
 
-
-threading.Thread(target=_restore_caches_background, daemon=True).start()
-
-
-# Database session cleanup (teardown handler)
-@app.teardown_appcontext
-def shutdown_database_sessions(exception=None):
-    """Remove all scoped sessions after each request to prevent FD leaks"""
-    # All (module, session_variable_name) pairs that use scoped_session.
-    # Each must be removed per-request to release the underlying DB connection
-    # and prevent file descriptor accumulation.
-    _sessions = [
-        # --- Previously cleaned up ---
-        ("database.auth_db", "db_session"),
-        ("database.traffic_db", "logs_session"),
-        ("database.apilog_db", "db_session"),
-        ("database.latency_db", "latency_session"),
-        ("database.health_db", "health_session"),
-        # --- Previously missing (caused FD leak) ---
-        ("database.settings_db", "db_session"),
-        ("database.strategy_db", "db_session"),
-        ("database.user_db", "db_session"),
-        ("database.action_center_db", "db_session"),
-        ("database.qty_freeze_db", "db_session"),
-        ("database.sandbox_db", "db_session"),
-        ("database.analyzer_db", "db_session"),
-        ("database.chart_prefs_db", "db_session"),
-        ("database.chartink_db", "db_session"),
-        ("database.flow_db", "db_session"),
-        ("database.leverage_db", "db_session"),
-        ("database.strategy_portfolio_db", "db_session"),
-        ("database.market_calendar_db", "db_session"),
-        ("database.telegram_db", "db_session"),
-        ("database.symbol", "db_session"),
-    ]
-
-    for module_name, session_attr in _sessions:
-        try:
-            import importlib
-
-            mod = importlib.import_module(module_name)
-            session = getattr(mod, session_attr, None)
-            if session is not None:
-                session.remove()
-        except Exception:
-            pass
-
-
-# Integrate the WebSocket proxy server with the Flask app
-# Check if running in Docker (standalone mode) or local (integrated mode)
-# Docker is detected by checking for /.dockerenv file or APP_MODE override
-is_docker = (
-    os.path.exists("/.dockerenv")
-    or os.environ.get("APP_MODE", "").strip().strip("'\"") == "standalone"
-)
-
-if is_docker:
-    logger.debug(
-        "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
+    # Integrate the WebSocket proxy server with the Flask app
+    # Check if running in Docker (standalone mode) or local (integrated mode)
+    # Docker is detected by checking for /.dockerenv file or APP_MODE override
+    is_docker = (
+        os.path.exists("/.dockerenv")
+        or os.environ.get("APP_MODE", "").strip().strip("'\"") == "standalone"
     )
-else:
-    # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
-    # (not a thread) so the WS asyncio loop never shares an eventlet hub with
-    # gunicorn — closes the greenlet.error cross-thread crash class entirely
-    # (including GitHub issue #1421). Under the dev server (no eventlet) it
-    # still uses a real OS thread, as before.
-    logger.debug("Starting WebSocket proxy")
-    start_websocket_proxy(app)
+
+    if is_docker:
+        logger.debug(
+            "Running in Docker/standalone mode - WebSocket server started separately by start.sh"
+        )
+    else:
+        # Under gunicorn+eventlet, start_websocket_proxy() spawns a child *process*
+        # (not a thread) so the WS asyncio loop never shares an eventlet hub with
+        # gunicorn — closes the greenlet.error cross-thread crash class entirely
+        # (including GitHub issue #1421). Under the dev server (no eventlet) it
+        # still uses a real OS thread, as before.
+        logger.debug("Starting WebSocket proxy")
+        start_websocket_proxy(app)
 
 
 def _warn_if_dirty_working_tree():
@@ -1429,10 +1503,10 @@ def _warn_if_dirty_working_tree():
     if os.getenv("OPENALGO_BOOT_DIRTY_CHECK_ENABLED", "True").lower() not in ("true", "1", "t"):
         return
     try:
-        import subprocess
+        import subprocess  # nosec B404
 
         repo_root = os.path.dirname(os.path.abspath(__file__))
-        result = subprocess.run(
+        result = subprocess.run(  # nosec
             ["git", "status", "--porcelain"],
             cwd=repo_root,
             capture_output=True,
@@ -1519,7 +1593,7 @@ if __name__ == "__main__":
 
         _ver = _get_ver()
         _dip = host_ip
-        if host_ip == "0.0.0.0":
+        if host_ip == "0.0.0.0":  # nosec B104
             import socket as _sk
 
             try:

@@ -10,10 +10,40 @@ Run locally:
 
 All endpoints honour state.token_valid: when False, bearer-authenticated routes
 return 401 with the standard Kite error envelope.
+
+Misbehaving-broker admin endpoints (issue #230)
+-----------------------------------------------
+The mock starts in happy-path mode. These admin endpoints let a test inject
+controlled failure modes that real Zerodha exhibits in production:
+
+* ``POST /_mock/expire_token`` — flip the current token to invalid; next
+  authed request returns 401 with the Kite ``TokenException`` envelope.
+  (Daily 3 AM IST expiry → WS reinit + ZMQ ``CACHE_INVALIDATE`` — commit
+  ``c5f88a8cf``.)
+* ``POST /_mock/inject_latency {ms, paths}`` — add ``asyncio.sleep`` before
+  responding on matching path prefixes. Send ``{ms: 0}`` to clear.
+  (Intermittent 502s / latency under load — boot-burst DuckDB singleton
+  bug, commit ``c5b973c91``.)
+* ``POST /_mock/drop_ws`` — terminates the active mock WS connection, if
+  any. Returns ``501`` with a note if no WS endpoint is exposed (current
+  state — the production WS feed is a separate path).
+* ``POST /_mock/partial_fill {symbol, ratio}`` — one-shot: the next
+  ``POST /orders/regular`` for that symbol returns a partial fill at the
+  given ratio (e.g. ``0.5`` → ``filled_quantity = quantity * 0.5``,
+  ``status="OPEN"``). Cleared after consumption.
+* ``POST /_mock/fail_next {path, status, count}`` — return ``status`` (e.g.
+  ``503``) on the next ``count`` requests matching ``path``. One-shot
+  (decrements with each match). Lets a test drive the rate-limit /
+  ``503`` retry-or-abort-loud path.
+
+All admin endpoints are minimal (in-memory state, ~15-30 LOC each). Default
+state preserves the existing happy-path contract so existing tests don't
+break.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -37,6 +67,18 @@ class _State:
         self.orders: list[dict[str, Any]] = []
         self.holdings: list[dict[str, Any]] = []
         self._order_seq: int = 0
+        # Misbehaving-broker fixtures (issue #230).
+        # ``latency_ms`` applies to any request whose path starts with one of
+        # ``latency_paths``. Empty paths list => apply to ALL bearer-authed
+        # requests. ``latency_ms == 0`` => disabled (the default).
+        self.latency_ms: int = 0
+        self.latency_paths: list[str] = []
+        # One-shot per-symbol partial-fill plan. The next ``/orders/regular``
+        # for that symbol consumes the entry (popped from the dict).
+        self.partial_fill_plan: dict[str, float] = {}
+        # One-shot fail-next plan. Keyed by path prefix → ``[status, count]``.
+        # Decremented on each match; entry removed when count hits 0.
+        self.fail_next_plan: dict[str, list[int]] = {}
 
     def reset(self) -> None:
         self.__init__()
@@ -97,7 +139,104 @@ def reset_state() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Auth gate helper
+# Misbehaving-broker admin endpoints (issue #230)
+# ---------------------------------------------------------------------------
+
+
+class _InjectLatency(BaseModel):
+    ms: int
+    paths: list[str] = []
+
+
+class _PartialFill(BaseModel):
+    symbol: str
+    ratio: float
+
+
+class _FailNext(BaseModel):
+    path: str
+    status: int = 503
+    count: int = 1
+
+
+@app.post("/_mock/expire_token")
+def expire_token() -> dict[str, Any]:
+    """Invalidate the current access token.
+
+    Subsequent bearer-authed requests return the Kite ``TokenException`` 401
+    envelope. Mirrors Zerodha's daily 3 AM IST token rotation: from the
+    server's perspective the token suddenly stops working mid-session and
+    every authed call 401s until the operator re-logs-in.
+    """
+    state.token_valid = False
+    return {"status": "ok", "token_valid": False}
+
+
+@app.post("/_mock/inject_latency")
+def inject_latency(req: _InjectLatency) -> dict[str, Any]:
+    """Add ``ms`` of latency before responding to matching paths.
+
+    ``paths`` is a list of path prefixes; an empty list applies the latency
+    to ALL bearer-authed requests. Send ``{ms: 0}`` to clear. State is in
+    memory — survives until the next ``/_mock/inject_latency`` or
+    ``/_mock/reset``.
+    """
+    state.latency_ms = max(0, int(req.ms))
+    state.latency_paths = list(req.paths or [])
+    return {"status": "ok", "latency_ms": state.latency_ms, "paths": state.latency_paths}
+
+
+@app.post("/_mock/drop_ws")
+def drop_ws() -> JSONResponse:
+    """Terminate any active mock WS connection.
+
+    The current mock broker exposes only the REST surface — the production
+    WS feed is a separate Zerodha endpoint (kws.kite.trade) that this mock
+    does NOT serve. Return 501 with a note so a test can branch on it; once
+    a mock WS endpoint is added here this will switch to "ok".
+    """
+    return JSONResponse(
+        status_code=501,
+        content={
+            "status": "not_implemented",
+            "message": (
+                "mock broker has no WS endpoint to drop; WS recovery tests "
+                "must inject failure at the recovery-service seam"
+            ),
+        },
+    )
+
+
+@app.post("/_mock/partial_fill")
+def partial_fill(req: _PartialFill) -> dict[str, Any]:
+    """Plan the next ``/orders/regular`` for ``symbol`` to return a partial
+    fill at the given ratio (e.g. ``0.5`` → ``filled_quantity = qty * 0.5``,
+    ``status='OPEN'``). One-shot: consumed (popped) by the next matching
+    order. The order envelope returns ``status=success`` with a real
+    ``order_id`` — the partial-ness is visible only on the subsequent
+    ``GET /orders`` row.
+    """
+    if not 0.0 <= req.ratio <= 1.0:
+        raise HTTPException(status_code=400, detail="ratio must be in [0.0, 1.0]")
+    state.partial_fill_plan[req.symbol.upper()] = float(req.ratio)
+    return {"status": "ok", "symbol": req.symbol.upper(), "ratio": req.ratio}
+
+
+@app.post("/_mock/fail_next")
+def fail_next(req: _FailNext) -> dict[str, Any]:
+    """Return ``status`` on the next ``count`` requests whose path starts
+    with ``path``. One-shot per request (decrements ``count``). Lets a test
+    drive a rate-limit ``503`` / boot-burst path without coordinating clock
+    or load.
+    """
+    if req.count <= 0:
+        raise HTTPException(status_code=400, detail="count must be > 0")
+    state.fail_next_plan[req.path] = [int(req.status), int(req.count)]
+    return {"status": "ok", "path": req.path, "http_status": req.status, "count": req.count}
+
+
+# ---------------------------------------------------------------------------
+# Auth gate + misbehavior gate helpers
 # ---------------------------------------------------------------------------
 
 
@@ -114,6 +253,40 @@ def _require_token(authorization: str | None) -> None:
                 "error_type": "TokenException",
             },
         )
+
+
+def _consume_fail_next(path: str) -> None:
+    """If a fail-next plan matches ``path``, raise its HTTPException and decrement.
+
+    Called as the first thing inside any authed endpoint, AFTER token validation
+    so a 503 plan doesn't shadow a token-expired 401. Matched on path-prefix to
+    cover both ``/orders/regular`` and ``/orders/regular/{id}``.
+    """
+    for plan_path, plan in list(state.fail_next_plan.items()):
+        if not path.startswith(plan_path):
+            continue
+        status_code, remaining = plan
+        if remaining <= 1:
+            state.fail_next_plan.pop(plan_path, None)
+        else:
+            state.fail_next_plan[plan_path] = [status_code, remaining - 1]
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "status": "error",
+                "message": f"mock broker returned {status_code} for {path}",
+                "error_type": "NetworkException",
+            },
+        )
+
+
+async def _maybe_inject_latency(path: str) -> None:
+    """If the latency plan matches ``path``, await ``state.latency_ms``."""
+    if state.latency_ms <= 0:
+        return
+    if state.latency_paths and not any(path.startswith(p) for p in state.latency_paths):
+        return
+    await asyncio.sleep(state.latency_ms / 1000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +475,30 @@ async def place_order(
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
     _require_token(authorization)
+    _consume_fail_next("/orders/regular")
+    await _maybe_inject_latency("/orders/regular")
     form = await request.form()
     order_id = state.next_order_id()
+    tradingsymbol = str(form.get("tradingsymbol", ""))
+    quantity = int(form.get("quantity", 0))
+    # Honour one-shot partial-fill plan (issue #230).
+    ratio = state.partial_fill_plan.pop(tradingsymbol.upper(), None)
+    if ratio is not None and 0.0 <= ratio < 1.0:
+        filled = int(quantity * ratio)
+        order_status = "OPEN"
+    else:
+        filled = quantity
+        order_status = "COMPLETE"
     order = {
         "order_id": order_id,
-        "status": "COMPLETE",
-        "tradingsymbol": form.get("tradingsymbol", ""),
+        "status": order_status,
+        "tradingsymbol": tradingsymbol,
         "exchange": form.get("exchange", "NSE"),
         "transaction_type": form.get("transaction_type", "BUY"),
         "order_type": form.get("order_type", "MARKET"),
-        "quantity": int(form.get("quantity", 0)),
+        "quantity": quantity,
+        "filled_quantity": filled,
+        "pending_quantity": quantity - filled,
         "product": form.get("product", "CNC"),
         "price": float(form.get("price", 0)),
     }
@@ -402,12 +589,14 @@ def get_ohlc(
 
 
 @app.get("/instruments/historical/{instrument_token}/{interval}")
-def get_historical(
+async def get_historical(
     instrument_token: str,
     interval: str,
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
     _require_token(authorization)
+    _consume_fail_next("/instruments/historical")
+    await _maybe_inject_latency("/instruments/historical")
     # Return a minimal set of synthetic candles so the caller doesn't crash
     candles = [
         ["2024-01-02T09:15:00+0530", 500.0, 510.0, 490.0, 505.0, 100000, 0],

@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import sys
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable
@@ -156,6 +157,179 @@ def _default_completeness_notifier(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Chartink-miss diagnostic (Issue #321).
+#
+# 2026-07-03 live evidence (issue #242): a fully-healthy data day (0 warm-up
+# rejects, 0 missing inputs, reference certificate active) still produced
+# in-house recall = 0 while Chartink fired 10+ unique symbols by 13:00. Rule
+# FAILs only ever logged at DEBUG, and the #205 gate snapshot is PASS-only, so
+# production INFO logs could not say WHICH gate killed each Chartink-listed
+# miss. This closes that gap: on a rule FAIL for a symbol that Chartink ALSO
+# flagged today (via the webhook-posted ``scan_cycle`` rows), log the FAIL
+# gate snapshot (issue #321's ``get_last_fail_snapshot()``) at INFO instead of
+# DEBUG. Non-listed symbols are unaffected — they keep the DEBUG-only FAIL log.
+# ---------------------------------------------------------------------------
+
+
+def _chartink_miss_debug_enabled() -> bool:
+    """``SCANNER_CHARTINK_MISS_DEBUG_ENABLED`` env flag (default true)."""
+    return os.environ.get("SCANNER_CHARTINK_MISS_DEBUG_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+# Module-level (date, symbol_set, fetched_at) cache — refreshed at most every
+# ``_CHARTINK_SET_REFRESH_SEC`` seconds so every bar-close evaluation does not
+# hit the DB. Reset (implicitly) when the IST date rolls, since the cached set
+# is keyed to a specific date and a stale date never matches "today" again.
+_CHARTINK_SET_REFRESH_SEC = 300  # 5 minutes
+_chartink_set_cache: dict[str, Any] = {"date": None, "symbols": frozenset(), "fetched_at": None}
+_chartink_set_lock = threading.Lock()
+
+# Per-(symbol, rule, failed_gate, IST-day) dedup — same in-process-set pattern
+# as ``_warn_shallow_daily_once`` in the rule modules: a stock stuck failing
+# the same gate would otherwise log once per bar close (a flood). A gate
+# CHANGE (different failed_gate) is a new key, so it logs again.
+_chartink_miss_logged: set[tuple[str, str, str, str]] = set()
+_chartink_miss_lock = threading.Lock()
+
+
+def _today_chartink_symbols(now_ist: _dt.datetime) -> frozenset[str]:
+    """Union of today's Chartink-webhook BUY + SELL symbols, module-cached.
+
+    Reads ``scan_cycle`` rows with ``cycle_kind='chartink'`` whose
+    ``started_at`` IST date-prefix matches today (mirrors
+    ``scanner_comparison_eod_service._chartink_sets``). Fail-graceful: any DB
+    error returns an empty set (never raises into the evaluation hot path)
+    and logs once via ``logger.exception`` rather than per-call.
+    """
+    today = now_ist.date().isoformat()
+    with _chartink_set_lock:
+        cached_date = _chartink_set_cache.get("date")
+        fetched_at = _chartink_set_cache.get("fetched_at")
+        if (
+            cached_date == today
+            and fetched_at is not None
+            and (now_ist - fetched_at).total_seconds() < _CHARTINK_SET_REFRESH_SEC
+        ):
+            return _chartink_set_cache["symbols"]
+
+    symbols: frozenset[str] = frozenset()
+    try:
+        from database import scan_cycle_db as scdb
+
+        sess = scdb.db_session
+        try:
+            rows = sess.query(scdb.ScanCycle).filter(scdb.ScanCycle.cycle_kind == "chartink").all()
+            found: set[str] = set()
+            for row in rows:
+                if (row.started_at or "")[:10] != today:
+                    continue
+                for blob in (row.screener_buy, row.screener_sell):
+                    if not blob:
+                        continue
+                    try:
+                        items = json.loads(blob)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(items, list):
+                        continue
+                    for s in items:
+                        if s is None:
+                            continue
+                        sym = str(s).strip().upper()
+                        if sym:
+                            found.add(sym)
+            symbols = frozenset(found)
+        finally:
+            sess.remove()
+    except Exception:
+        logger.exception("scanner: failed to read today's Chartink symbol set for miss-debug")
+        symbols = frozenset()
+
+    with _chartink_set_lock:
+        _chartink_set_cache["date"] = today
+        _chartink_set_cache["symbols"] = symbols
+        _chartink_set_cache["fetched_at"] = now_ist
+    return symbols
+
+
+def _resolve_fail_snapshot(rule_fn: Callable[..., bool]) -> dict | None:
+    """Look up the rule module's ``get_last_fail_snapshot`` (Issue #321).
+
+    Mirrors ``_resolve_eval_snapshot`` (#205, PASS-only) but reads the
+    separate FAIL-snapshot thread-local. Returns ``None`` for un-instrumented
+    rules or when the helper raises/returns something unusable.
+    """
+    module_name = getattr(rule_fn, "__module__", None)
+    if not module_name:
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    helper = getattr(module, "get_last_fail_snapshot", None)
+    if helper is None or not callable(helper):
+        return None
+    try:
+        snapshot = helper()
+    except Exception:
+        return None
+    return snapshot if isinstance(snapshot, dict) and snapshot else None
+
+
+def _log_chartink_miss_if_applicable(
+    symbol: str, rule_name: str, rule_fn: Callable[..., bool], now_ist: _dt.datetime
+) -> None:
+    """On a rule FAIL, log at INFO (once per gate per day) when ``symbol`` is
+    also in today's Chartink webhook lists (issue #321). Best-effort — a
+    failure anywhere in this path must never break rule evaluation, so it logs
+    the exception and returns rather than raising.
+    """
+    try:
+        if not _chartink_miss_debug_enabled():
+            return
+        chartink_symbols = _today_chartink_symbols(now_ist)
+        sym_upper = (symbol or "").strip().upper()
+        if not sym_upper or sym_upper not in chartink_symbols:
+            return
+        snapshot = _resolve_fail_snapshot(rule_fn)
+        failed_gate = (snapshot or {}).get("failed_gate", "unknown")
+        day_ist = now_ist.date().isoformat()
+        key = (sym_upper, rule_name, str(failed_gate), day_ist)
+        with _chartink_miss_lock:
+            if key in _chartink_miss_logged:
+                return
+            _chartink_miss_logged.add(key)
+        if snapshot:
+            kv = " ".join(
+                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in snapshot.items()
+                if k != "failed_gate"
+            )
+            logger.info(
+                "scanner MISS %s rule=%s failed_gate=%s %s",
+                symbol,
+                rule_name,
+                failed_gate,
+                kv,
+            )
+        else:
+            logger.info(
+                "scanner MISS %s rule=%s failed_gate=%s",
+                symbol,
+                rule_name,
+                failed_gate,
+            )
+    except Exception:
+        logger.exception(
+            "scanner: Chartink-miss diagnostic logging failed for %s/%s", symbol, rule_name
+        )
+
+
+# ---------------------------------------------------------------------------
 # Rule registry — code-backed scan rules self-register via @scan_rule.
 # ---------------------------------------------------------------------------
 #
@@ -224,6 +398,35 @@ def _clear_rule_registry_for_tests() -> None:
     _rule_metadata.clear()
 
 
+def _resolve_eval_snapshot(rule_fn: Callable[..., bool]) -> dict | None:
+    """Look up the rule module's ``get_last_eval_snapshot`` (Issue #205).
+
+    The rule modules optionally expose a thread-local ``get_last_eval_snapshot``
+    helper that returns the gate values that drove the last successful
+    evaluation. The scanner folds those values into the PASS log line so a
+    future ``derive_today_and_yest``-class regression can be reproduced from
+    logs alone, without a re-instrument-and-restart cycle.
+
+    Returns ``None`` for un-instrumented rules; the caller falls back to the
+    prior ``close=...`` log shape.
+    """
+    module_name = getattr(rule_fn, "__module__", None)
+    if not module_name:
+        return None
+    module = sys.modules.get(module_name)
+    if module is None:
+        return None
+    helper = getattr(module, "get_last_eval_snapshot", None)
+    if helper is None or not callable(helper):
+        return None
+    try:
+        snapshot = helper()
+    except Exception:
+        # An un-trusted helper must not break the log site.
+        return None
+    return snapshot if isinstance(snapshot, dict) and snapshot else None
+
+
 def _session():
     """Resolve the live session from the DB module on each call.
 
@@ -252,6 +455,8 @@ def create_scan_definition(
     expression_json: str | dict | list | None = None,
     rule_module: str | None = None,
     enabled: bool = True,
+    parameters_json: str | dict | None = None,
+    parent_definition_id: int | None = None,
 ) -> int:
     """Insert a scan definition and return its id.
 
@@ -260,6 +465,9 @@ def create_scan_definition(
     rules that live entirely in ``rule_module``; the column stores an
     empty JSON object in that case so the NOT NULL constraint is satisfied
     without callers needing to know.
+
+    ``parameters_json`` — optional Tier-3 override dict (or JSON string).
+    ``parent_definition_id`` — optional Tier-3 FK to the source definition.
 
     Raises ``IntegrityError`` on duplicate name.
     """
@@ -273,6 +481,13 @@ def create_scan_definition(
     else:
         encoded_expression = json.dumps(expression_json)
 
+    if parameters_json is None:
+        encoded_params = None
+    elif isinstance(parameters_json, str):
+        encoded_params = parameters_json
+    else:
+        encoded_params = json.dumps(parameters_json)
+
     now = _now_iso()
     sess = _session()
     try:
@@ -284,6 +499,8 @@ def create_scan_definition(
             enabled=1 if enabled else 0,
             created_at=now,
             updated_at=now,
+            parameters_json=encoded_params,
+            parent_definition_id=parent_definition_id,
         )
         sess.add(row)
         sess.commit()
@@ -698,6 +915,51 @@ class _Rolling15mBars:
             rows = rows[-n:]
         return pd.DataFrame(rows)
 
+    def seed_bars(self, bars: list[dict[str, Any]]) -> int:
+        """Append pre-built 15m bars directly to the rolling deque (issue #201).
+
+        Bypasses the tick-simulation path so a boot-time seeder can pre-warm
+        the per-symbol 15m history from historical data without having to
+        replay every constituent 1m tick. ``bars`` are appended in order;
+        anything beyond ``maxlen`` is dropped by the deque.
+
+        Each bar dict must carry ``ts/open/high/low/close/volume``. The
+        ``elapsed_pct`` check from the live ``on_bar`` callback is skipped —
+        the caller is asserting these are already-closed bars.
+
+        Idempotent enough for retries: a duplicate ts replaces the prior
+        entry of the same timestamp before append, so a partial-then-full
+        seed converges without double-counting.
+
+        Returns the number of bars actually folded in (after de-dup).
+        """
+        if not bars:
+            return 0
+        seen_ts = {row.get("ts") for row in self._closed}
+        added = 0
+        for b in bars:
+            ts = b.get("ts")
+            row = {
+                "ts": ts,
+                "open": b.get("open"),
+                "high": b.get("high"),
+                "low": b.get("low"),
+                "close": b.get("close"),
+                "volume": b.get("volume"),
+            }
+            if ts is not None and ts in seen_ts:
+                # Replace the earlier bar with the new one (e.g. a
+                # partial-then-full re-seed). Maintain deque order.
+                self._closed = deque(
+                    (r if r.get("ts") != ts else row for r in self._closed),
+                    maxlen=self._closed.maxlen,
+                )
+            else:
+                self._closed.append(row)
+                seen_ts.add(ts)
+                added += 1
+        return added
+
 
 class ScannerService:
     """Subscribes to the ZMQ tick bus, builds bars per (symbol, interval),
@@ -740,6 +1002,9 @@ class ScannerService:
         self._completeness_window_start: _dt.datetime | None = None
         self._completeness_alert_day: _dt.date | None = None
         self._completeness_alert_severities: set[str] = set()
+        # Issue #305: per-(symbol, IST-day) dedup for the "scanner HELD" WARNING
+        # emitted while the smoke-fail post-hold blocks hit persistence/posting.
+        self._held_warned: set[tuple[str, str]] = set()
 
         # Ensure the example rule modules are imported so they self-register
         # before any bar close lands. Import here (not at module top) to keep
@@ -961,16 +1226,40 @@ class ScannerService:
         Any exception raised here is caught and logged but does NOT propagate
         back into the aggregator — a single rule blowing up must not kill
         future ticks for other symbols.
+
+        Replayed bars (``bar["is_replay"]``) — folded in by the boot seeder
+        (``scanner_aggregator_seeder``) or the WS-reconnect recovery
+        (``ws_recovery_service``) via ``MultiIntervalAggregator.replay_bars`` —
+        still warm the rolling history window (``_append_bar``) so RSI/SMA are
+        ready when live ticks resume, but they are NEVER evaluated: a historical
+        bar must not fire a scan hit, and a mid-session restart replays bars
+        DURING market hours where the ``_evaluate_definitions`` market-hours gate
+        would not skip them. Only genuine live bar closes are evaluated.
         """
         try:
             bars = self._append_bar(symbol, interval, bar)
+            if bar.get("is_replay"):
+                return
             indicators_dict = self._build_indicators(symbol, bars)
             self._evaluate_definitions(symbol, interval, bars, indicators_dict, bar)
         except Exception:
             logger.exception("ScannerService: _on_bar_close failed for %s/%s", symbol, interval)
 
     def _append_bar(self, symbol: str, interval: str, bar: dict[str, Any]) -> pd.DataFrame:
-        """Push the closed bar onto the rolling window and return the frame."""
+        """Push the closed bar onto the rolling window and return the frame.
+
+        The frame is kept TIMESTAMP-SORTED (issue #344): on a mid-session
+        restart, live ticks land before the boot seeder's replay, so the
+        in-progress live bar (e.g. 12:50) is appended BEFORE the seeded
+        session bars (09:15→12:45). An append-ordered frame then reports the
+        live bar as ``iloc[0]`` — which ``derive_today_and_yest`` Path B reads
+        as ``today_d.open`` — and feeds order-sensitive indicators (RSI/EMA)
+        a shuffled series. A stable sort by ``ts`` fixes both while keeping
+        duplicate-ts rows (a bucket split across replay + live close) in
+        append order so ``iloc[-1]``'s close stays the latest value. The trim
+        to ``history_size`` runs after the sort so the newest bars by ts are
+        the ones kept.
+        """
         import pandas as pd  # noqa: PLC0415
 
         row = {
@@ -989,6 +1278,13 @@ class ScannerService:
                 combined = new_frame
             else:
                 combined = pd.concat([existing, new_frame], ignore_index=True)
+                try:
+                    if combined["ts"].notna().all():
+                        combined = combined.sort_values("ts", kind="stable", ignore_index=True)
+                except TypeError:
+                    # Mixed/unorderable ts values (synthetic test frames) —
+                    # keep append order, exactly the pre-#344 behaviour.
+                    pass
             if len(combined) > self.history_size:
                 combined = combined.iloc[-self.history_size :].reset_index(drop=True)
             self._bar_history[key] = combined
@@ -1038,10 +1334,23 @@ class ScannerService:
             except Exception:
                 logger.exception("ScannerService: history provider lookup failed for %s", symbol)
 
+        # Resolve the symbol's exchange so rules can quickly skip non-stock
+        # universes (e.g. NSE_INDEX) without firing missing-input warnings
+        # against indices that were never meant to be evaluated. Issue #158 D2.
+        try:
+            from services.scanner_presubscribe import resolve_exchange_for_symbol
+
+            exchange = resolve_exchange_for_symbol(symbol)
+        except Exception:
+            # Resolver failure is non-fatal — rules that care will treat
+            # missing exchange as "unknown" and proceed as before.
+            exchange = None
+
         return {
             # The symbol is threaded into the bundle so rules can name it in
             # their loud-failure / D-bar-date-verify logs (Tier-1 Fix #1/#2).
             "symbol": symbol,
+            "exchange": exchange,
             "ema_20": ema_20,
             "atr_14": atr_14,
             "rsi_14": rsi_14,
@@ -1077,7 +1386,11 @@ class ScannerService:
         now_ist = _now_ist()
         if _postclose_gate_enabled() and not _within_market_hours(now_ist):
             phase = "post-close" if now_ist.time() > _MARKET_CLOSE_IST else "pre-open"
-            logger.info(
+            # DEBUG, not INFO: this fires per bar per symbol, so on a restart the
+            # market-hours gate would flood the log with tens of thousands of
+            # identical lines. The phase is obvious from the wall clock; the
+            # backstop itself is unchanged.
+            logger.debug(
                 "scanner evaluation skipped: %s (now=%s IST) for %s/%s",
                 phase,
                 now_ist.strftime("%H:%M"),
@@ -1088,6 +1401,14 @@ class ScannerService:
 
         if _completeness_enabled():
             self._record_completeness(symbol, now_ist)
+
+        # Issue #305: reference certificate — validate the settled daily
+        # reference close (the rules' yest_d.close) against the broker
+        # prev-close recorded at boot. Computed ONCE per (symbol, bar close)
+        # here at the choke point so the rules stay pure — they read the
+        # pre-computed verdict from the indicators dict; a MISSING key is
+        # treated as certified (backward compat for tests/other callers).
+        ref_cert = self._reference_certificate(symbol, bars, indicators_dict, now_ist)
 
         for definition in get_scan_definitions(enabled_only=True):
             rule_name = definition.get("rule_module") or definition.get("name")
@@ -1102,7 +1423,21 @@ class ScannerService:
                 )
                 continue
             try:
-                matched = bool(rule_fn(bars, indicators_dict))
+                raw_params = definition.get("parameters_json")
+                if raw_params:
+                    try:
+                        params = (
+                            json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                        )
+                    except (ValueError, TypeError):
+                        params = {}
+                else:
+                    params = {}
+                extra: dict[str, Any] = dict(ref_cert)
+                if params:
+                    extra["parameters"] = params
+                eff_indicators = {**indicators_dict, **extra} if extra else indicators_dict
+                matched = bool(rule_fn(bars, eff_indicators))
             except Exception:
                 logger.exception(
                     "ScannerService: rule %r raised for %s/%s",
@@ -1117,15 +1452,48 @@ class ScannerService:
             # reason (None daily-D etc.) is logged at WARNING inside the rule itself,
             # and the per-cycle completeness metric (Fix #3) surfaces aggregate gaps.
             if matched:
-                logger.info(
-                    "scanner PASS %s rule=%s interval=%s close=%s",
-                    symbol,
-                    rule_name,
-                    interval,
-                    bar.get("close"),
-                )
+                # Issue #205: enrich the PASS line with the gate values that drove
+                # the match. We pull the snapshot from a thread-local exposed by
+                # the rule module (``get_last_eval_snapshot``). When a rule hasn't
+                # been instrumented yet, we fall back to the prior ``close=...``
+                # shape so the log site never crashes on an un-instrumented rule.
+                snapshot = _resolve_eval_snapshot(rule_fn)
+                if snapshot:
+                    kv = " ".join(
+                        f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                        for k, v in snapshot.items()
+                    )
+                    logger.info(
+                        "scanner PASS %s rule=%s interval=%s close=%s %s",
+                        symbol,
+                        rule_name,
+                        interval,
+                        bar.get("close"),
+                        kv,
+                    )
+                else:
+                    logger.info(
+                        "scanner PASS %s rule=%s interval=%s close=%s",
+                        symbol,
+                        rule_name,
+                        interval,
+                        bar.get("close"),
+                    )
             else:
                 logger.debug("scanner FAIL %s rule=%s interval=%s", symbol, rule_name, interval)
+                # Issue #321: on a Chartink-listed miss, also log the FAIL gate
+                # snapshot at INFO (deduped per symbol/rule/gate/day) so a
+                # production log tells us WHICH gate killed each real Chartink
+                # hit — the DEBUG line above fires for ~every symbol/bar and is
+                # not enough on its own for that diagnosis.
+                _log_chartink_miss_if_applicable(symbol, rule_name, rule_fn, now_ist)
+                continue
+
+            # Issue #305: smoke-fail post-hold — when the 09:18 smoke check
+            # FAILED, the PASS above is still logged (observability) but the
+            # hit is NOT persisted to scan_results and NOT posted to the
+            # engine until a re-check passes or the hold expires (15:35 IST).
+            if self._hit_held_by_smoke(symbol, now_ist):
                 continue
 
             scan_result_id = 0
@@ -1162,6 +1530,63 @@ class ScannerService:
                     symbol,
                     interval,
                 )
+
+    # -- reference certificate + smoke post-hold (issue #305) ----------------
+
+    def _reference_certificate(
+        self,
+        symbol: str,
+        bars: pd.DataFrame,
+        indicators_dict: dict[str, Any],
+        now_ist: _dt.datetime,
+    ) -> dict[str, Any]:
+        """Compute the reference-data certificate for ``symbol`` at this bar
+        close (see ``services.scanner_reference_data``). Returns ``{}`` when
+        the check is disabled or the computation fails — the rules treat a
+        missing key as certified, so an internal error is always fail-open.
+        Never raises back into the evaluation loop."""
+        try:
+            from services.scanner_reference_data import (  # noqa: PLC0415
+                compute_reference_certificate,
+            )
+
+            bars_5m = indicators_dict.get("bars_5m")
+            return compute_reference_certificate(
+                symbol=symbol,
+                bars_5m=bars_5m if bars_5m is not None else bars,
+                bars_daily=indicators_dict.get("bars_daily"),
+                exchange=indicators_dict.get("exchange"),
+                now_ist=now_ist,
+            )
+        except Exception:
+            logger.exception(
+                "ScannerService: reference certificate computation failed for %s", symbol
+            )
+            return {}
+
+    def _hit_held_by_smoke(self, symbol: str, now_ist: _dt.datetime) -> bool:
+        """True iff the smoke-fail post-hold is active — the caller must skip
+        persisting/posting the hit. Emits a once-per-(symbol, IST-day)
+        WARNING so the held PASS is visible without flooding. Fail-open on a
+        probe error (never blocks on a broken import). Never raises."""
+        try:
+            from services.scanner_smoke_check_service import is_post_hold_active  # noqa: PLC0415
+
+            if not is_post_hold_active(now=now_ist):
+                return False
+        except Exception:
+            logger.exception("ScannerService: smoke post-hold probe failed — not holding")
+            return False
+        key = (symbol, now_ist.date().isoformat())
+        if key not in self._held_warned:
+            self._held_warned.add(key)
+            logger.warning(
+                "scanner HELD %s reason=smoke_check_failed — rule PASS logged but hit "
+                "NOT persisted/posted (hold lifts on a passing re-check or expires "
+                "15:35 IST; flag SCANNER_SMOKE_BLOCK_ENABLED)",
+                symbol,
+            )
+        return True
 
     # -- decision-input completeness (Tier-1 Fix #3) ------------------------
 

@@ -6,6 +6,7 @@ High-performance columnar storage for historical market data.
 Optimized for backtesting and analytical queries.
 """
 
+import functools
 import os
 import threading
 from contextlib import contextmanager
@@ -16,29 +17,43 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 from dotenv import load_dotenv
 
+from services.data_freshness_service import connect_historify_readonly
 from utils.logging import get_logger
 
 # Initialize logger
 logger = get_logger(__name__)
+
+# Write lock to serialize DuckDB writes and prevent Windows file locking conflicts
+# DuckDB doesn't handle concurrent writes well on Windows; this serializes write ops
+# Use RLock (reentrant) to allow same thread to acquire multiple times (for nested calls)
+_write_lock = threading.RLock()
+
+
+def _synchronized_write(func):
+    """Decorator to serialize DuckDB write operations.
+
+    Wraps all database write functions with a lock to prevent concurrent
+    access from multiple threads (ThreadPoolExecutor workers + Flask request
+    handlers) causing Windows file locking conflicts.
+
+    DuckDB doesn't handle concurrent writes well on Windows due to exclusive
+    file locking at the OS level. This decorator ensures only one write
+    operation executes at a time.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with _write_lock:
+            return func(*args, **kwargs)
+
+    return wrapper
+
 
 # Load environment variables
 load_dotenv()
 
 # Database path - in /db folder like other OpenAlgo databases
 HISTORIFY_DB_PATH = os.getenv("HISTORIFY_DATABASE_PATH", "db/historify.duckdb")
-
-# Windows uses mandatory exclusive write locks (LockFileEx) for the duration of a
-# DuckDB connection, unlike Linux where flock is advisory. Concurrent
-# duckdb.connect() calls from different threads in the same process race for the
-# OS lock and produce "could not set lock on file" bursts during the post-close
-# backfill window when sector_follow (38 symbols) + scanner (238+ symbols) both
-# feed the same ThreadPoolExecutor (max_workers=5). This lock ensures only one
-# duckdb.connect() call is in flight at any time from this process.
-#
-# Reads via data_freshness_service.connect_historify_readonly() bypass this lock
-# intentionally — they go through DuckDB's in-process instance reuse and never
-# hold the OS write lock.
-_db_write_lock = threading.Lock()
 
 
 def get_db_path() -> str:
@@ -59,62 +74,112 @@ def ensure_db_directory():
         logger.info(f"Created database directory: {db_dir}")
 
 
-@contextmanager
-def get_connection(max_retries: int = 10, retry_delay: float = 1.0):
+# --------------------------------------------------------------------------- #
+# Per-process shared connection — issue #191 / #156 Phase 1.
+#
+# Why this exists
+# ---------------
+# DuckDB keeps *one* database instance per file per process and refuses a
+# second connection that requests a different configuration ("Can't open a
+# connection to same database file with a different configuration than
+# existing connections"). The pre-#191 ``get_connection`` opened a brand-new
+# ``duckdb.connect(db_path)`` on every call, so any thread that opened with
+# ``read_only=True`` (the freshness service) plus any other thread opening
+# with the default writeable config (a backfill writer) would race on first
+# connect and the loser hit ``ConnectionException`` or ``IOException``.
+# Retry-with-the-same-config never resolved it, hence the recurring
+# ``Failed to connect to DuckDB after 3 attempts`` bursts at every boot.
+#
+# The structural fix: every reader and writer in this process shares ONE
+# long-lived, writeable ``DuckDBPyConnection``. Each call gets a cheap
+# cursor (``DuckDBPyConnection.cursor()``); cursors are themselves DuckDB
+# connections that share the underlying database — closing a cursor releases
+# only its own resources, never the shared file handle. With one process =
+# one config, the "different configuration" error becomes mathematically
+# impossible. See issue #191 for the full investigation; #156 prescribed this
+# fix as "Phase 1" and labelled the patches that landed without it as
+# symptom-on-the-edges.
+#
+# Per-pytest-process safety
+# -------------------------
+# ``test/conftest.py``'s ``_isolate_databases`` fixture redirects
+# ``HISTORIFY_DATABASE_PATH`` to a per-process ``tempfile.mkdtemp`` BEFORE any
+# ``database.*`` import binds. Since the singleton initialises lazily on the
+# first ``_get_shared_conn()`` call, it picks up the redirected path. Tests
+# that swap the path *mid-process* (subdir conftests rebinding to another
+# tmpdir) call :func:`_reset_for_tests` to drop the cached connection so the
+# next caller opens against the new path.
+# --------------------------------------------------------------------------- #
+_shared_conn: Any = None
+_shared_conn_lock = threading.Lock()
+
+
+def _get_shared_conn():
+    """Return the per-process shared writeable DuckDB connection.
+
+    Lazy + double-checked-locking init so the first caller from any thread
+    opens the file exactly once, and every subsequent caller (including
+    callers racing with the first) gets the same instance. The instance
+    survives until process exit (or :func:`_reset_for_tests` is called).
     """
-    Get a DuckDB connection with proper resource management and retry logic.
-
-    On Windows, DuckDB holds a mandatory exclusive write lock (LockFileEx) for
-    the lifetime of each connection. ``_db_write_lock`` serialises all
-    ``duckdb.connect()`` calls within this process so only one connection is
-    open at a time, preventing the "could not set lock" burst that occurs when
-    the sector_follow and scanner backfill jobs drive the shared
-    ThreadPoolExecutor with up to 5 concurrent workers.
-
-    The retry loop is retained as defence-in-depth for the cross-process case
-    (e.g. a manual CLI backfill running alongside the app). Default retries are
-    raised from 3 → 10 and base delay from 0.5 → 1.0 s so brief cross-process
-    contention is handled gracefully.
-
-    Args:
-        max_retries: Maximum number of connection attempts (default: 10)
-        retry_delay: Base delay in seconds between retries (default: 1.0)
-
-    Usage:
-        with get_connection() as conn:
-            result = conn.execute("SELECT * FROM market_data").fetchdf()
-    """
-    import time
-
-    ensure_db_directory()
-    db_path = get_db_path()
-    conn = None
-    last_error = None
-
-    with _db_write_lock:
-        for attempt in range(max_retries):
-            try:
+    global _shared_conn
+    if _shared_conn is None:
+        with _shared_conn_lock:
+            if _shared_conn is None:
+                ensure_db_directory()
                 import duckdb
 
-                conn = duckdb.connect(db_path)
-                break
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    logger.debug(f"DuckDB connection attempt {attempt + 1} failed, retrying: {e}")
-                    time.sleep(retry_delay * (attempt + 1))  # linear backoff
-                else:
-                    logger.exception(
-                        f"Failed to connect to DuckDB after {max_retries} attempts: {e}"
-                    )
+                _shared_conn = duckdb.connect(get_db_path())
+                logger.info(
+                    "historify singleton initialised: path=%s (all cursors share this connection)",
+                    get_db_path(),
+                )
+    return _shared_conn
 
-        if conn is None:
-            raise last_error or Exception("Failed to connect to DuckDB")
 
+def _reset_for_tests() -> None:
+    """Drop the cached connection so the next call re-opens against the
+    current ``HISTORIFY_DATABASE_PATH``.
+
+    The global ``test/conftest.py`` redirect lands the singleton on a
+    per-pytest-process tmpdir automatically — no test needs to call this for
+    that case. Use it only when a subdir conftest (e.g. ``test/e2e/conftest.py``)
+    rebinds the path to *another* tmpdir partway through a process.
+    """
+    global _shared_conn
+    with _shared_conn_lock:
+        if _shared_conn is not None:
+            try:
+                _shared_conn.close()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            _shared_conn = None
+
+
+@contextmanager
+def get_connection(max_retries: int = 3, retry_delay: float = 0.5):
+    """Yield a cursor on the per-process shared DuckDB connection.
+
+    API-compatible with the prior bare-``duckdb.connect()`` version: every
+    existing call site uses ``conn.execute(...)`` / ``conn.fetchdf(...)`` /
+    ``conn.executemany(...)``, which all work identically on a cursor (in the
+    DuckDB Python API a cursor is itself a connection sharing the underlying
+    database). When the ``with`` block exits the cursor is closed, releasing
+    only its own resources — the shared connection's file handle stays open.
+
+    ``max_retries`` / ``retry_delay`` are kept on the signature for backwards
+    compatibility but are no longer load-bearing: with a single config per
+    process there is nothing transient to retry past. They will be removed in
+    a follow-up once every caller stops passing them.
+    """
+    cursor = _get_shared_conn().cursor()
+    try:
+        yield cursor
+    finally:
         try:
-            yield conn
-        finally:
-            conn.close()
+            cursor.close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
 
 
 def init_database():
@@ -334,6 +399,8 @@ def get_watchlist() -> list[dict[str, Any]]:
         return result.to_dict("records")
 
 
+@_synchronized_write
+@_synchronized_write
 def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tuple[bool, str]:
     """
     Add a symbol to the watchlist.
@@ -373,6 +440,8 @@ def add_to_watchlist(symbol: str, exchange: str, display_name: str = None) -> tu
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def bulk_add_to_watchlist(symbols: list[dict[str, str]]) -> tuple[int, int, list[dict[str, str]]]:
     """
     Add multiple symbols to the watchlist in a single transaction.
@@ -555,8 +624,8 @@ def clear_watchlist() -> tuple[bool, str]:
 # =============================================================================
 # Market Data Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def upsert_market_data(df: pd.DataFrame, symbol: str, exchange: str, interval: str) -> int:
     """
     Insert or update OHLCV data from a pandas DataFrame.
@@ -904,7 +973,7 @@ def get_ohlcv(
 
         query += " ORDER BY timestamp ASC"
 
-        with get_connection() as conn:
+        with connect_historify_readonly(get_db_path()) as conn:
             result = conn.execute(query, params).fetchdf()
 
         return result
@@ -1052,7 +1121,7 @@ def _get_aggregated_ohlcv(
             ORDER BY timestamp ASC
         """
 
-        with get_connection() as conn:
+        with connect_historify_readonly(get_db_path()) as conn:
             result = conn.execute(query, params).fetchdf()
 
         return result
@@ -1177,7 +1246,7 @@ def _get_daily_aggregated_ohlcv(
             ORDER BY timestamp ASC
         """
 
-        with get_connection() as conn:
+        with connect_historify_readonly(get_db_path()) as conn:
             result = conn.execute(query, params).fetchdf()
 
         return result
@@ -1272,6 +1341,8 @@ def get_data_range(symbol: str, exchange: str, interval: str) -> dict[str, Any] 
         return None
 
 
+@_synchronized_write
+@_synchronized_write
 def delete_market_data(symbol: str, exchange: str, interval: str | None = None) -> tuple[bool, str]:
     """
     Delete market data for a symbol.
@@ -1327,6 +1398,8 @@ def delete_market_data(symbol: str, exchange: str, interval: str | None = None) 
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def bulk_delete_market_data(
     symbols: list[dict[str, str]],
 ) -> tuple[int, int, list[dict[str, str]]]:
@@ -1824,8 +1897,8 @@ def import_from_parquet(
 # =============================================================================
 # Download Job Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def create_download_job(
     job_id: str,
     job_type: str,
@@ -2078,6 +2151,8 @@ def get_job_items(job_id: str, status: str = None) -> list[dict[str, Any]]:
         return []
 
 
+@_synchronized_write
+@_synchronized_write
 def update_job_status(job_id: str, status: str, error_message: str = None) -> bool:
     """Update the status of a download job."""
     try:
@@ -2118,6 +2193,8 @@ def update_job_status(job_id: str, status: str, error_message: str = None) -> bo
         return False
 
 
+@_synchronized_write
+@_synchronized_write
 def update_job_item_status(
     item_id: int, status: str, records_downloaded: int = 0, error_message: str = None
 ) -> bool:
@@ -2160,6 +2237,8 @@ def update_job_item_status(
         return False
 
 
+@_synchronized_write
+@_synchronized_write
 def update_job_progress(job_id: str, completed: int, failed: int) -> bool:
     """Update job progress counters."""
     try:
@@ -2179,6 +2258,8 @@ def update_job_progress(job_id: str, completed: int, failed: int) -> bool:
         return False
 
 
+@_synchronized_write
+@_synchronized_write
 def delete_download_job(job_id: str) -> tuple[bool, str]:
     """Delete a download job and its items."""
     try:
@@ -2197,8 +2278,8 @@ def delete_download_job(job_id: str) -> tuple[bool, str]:
 # =============================================================================
 # Symbol Metadata Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def upsert_symbol_metadata(symbols: list[dict[str, Any]]) -> int:
     """
     Insert or update symbol metadata.
@@ -3181,8 +3262,8 @@ def get_export_preview(
 # =============================================================================
 # Scheduler Operations
 # =============================================================================
-
-
+@_synchronized_write
+@_synchronized_write
 def create_schedule(
     schedule_id: str,
     name: str,
@@ -3326,6 +3407,8 @@ def get_all_schedules() -> list[dict[str, Any]]:
         return []
 
 
+@_synchronized_write
+@_synchronized_write
 def update_schedule(
     schedule_id: str,
     name: str | None = None,
@@ -3416,6 +3499,8 @@ def update_schedule(
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def delete_schedule(schedule_id: str) -> tuple[bool, str]:
     """Delete a schedule and its execution history."""
     try:
@@ -3469,6 +3554,8 @@ def increment_schedule_run_counts(schedule_id: str, is_success: bool) -> tuple[b
         return False, str(e)
 
 
+@_synchronized_write
+@_synchronized_write
 def create_schedule_execution(schedule_id: str, download_job_id: str | None = None) -> int | None:
     """
     Create a new execution record for a schedule.
@@ -3510,6 +3597,8 @@ def create_schedule_execution(schedule_id: str, download_job_id: str | None = No
         return None
 
 
+@_synchronized_write
+@_synchronized_write
 def update_schedule_execution(
     execution_id: int,
     status: str | None = None,

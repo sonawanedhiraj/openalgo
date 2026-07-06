@@ -220,6 +220,115 @@ def get_signal_decision(decision_id: int) -> dict[str, Any] | None:
         db_session.remove()
 
 
+def _apply_source_filters(q, sources: list[str] | None, exclude_sources: list[str] | None):
+    """Apply the inclusion / exclusion ``source`` filters to a query (R1, #318).
+
+    ``sources`` is an inclusion allowlist; ``exclude_sources`` removes rows
+    whose ``source`` is in the list. The exclusion arm exists because the
+    simplified engine's rows span several chartink ``source`` labels (no clean
+    inclusion list), so its dashboard view is "everything EXCEPT the strategies
+    that tag rows with their own name" (today: ``futures_follow_cap50``).
+    """
+    if sources:
+        q = q.filter(SignalDecision.source.in_(sources))
+    if exclude_sources:
+        q = q.filter(~SignalDecision.source.in_(exclude_sources))
+    return q
+
+
+def list_signal_decisions(
+    *,
+    sources: list[str] | None = None,
+    exclude_sources: list[str] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """Return decision rows newest-first, optionally filtered by ``source``.
+
+    Args:
+        sources: If given, only rows whose ``source`` is in this list. ``None``
+            (or empty) returns rows from every source — used for the
+            simplified engine, whose decisions span several chartink ``source``
+            labels (``chartink_FnO_intraday_buy``, ``trend-up``, …).
+        exclude_sources: If given, rows whose ``source`` is in this list are
+            dropped (R1, #318 — keeps futures_follow rows out of the simplified
+            engine's all-sources view).
+        limit: Max rows (clamped 1..500).
+        offset: Rows to skip for pagination (clamped >= 0).
+    """
+    _ensure_tables()
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    try:
+        q = _apply_source_filters(db_session.query(SignalDecision), sources, exclude_sources)
+        rows = q.order_by(SignalDecision.id.desc()).limit(limit).offset(offset).all()
+        return [_row_to_dict(r) for r in rows]
+    finally:
+        db_session.remove()
+
+
+def count_signal_decisions(
+    *,
+    sources: list[str] | None = None,
+    exclude_sources: list[str] | None = None,
+) -> int:
+    """Total decision rows (optionally filtered by ``source``)."""
+    _ensure_tables()
+    try:
+        q = _apply_source_filters(db_session.query(SignalDecision), sources, exclude_sources)
+        return q.count()
+    finally:
+        db_session.remove()
+
+
+def summarize_signal_decisions(
+    *,
+    sources: list[str] | None = None,
+    exclude_sources: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return decision counts by verdict + the latest decision row.
+
+    Shape::
+
+        {
+          "total": int,
+          "take": int, "skip": int, "review_failed": int, "other": int,
+          "last_decision": {row dict} | None,
+          "recent_review_failed": int,   # among the last 10 rows
+        }
+
+    Used by the UI to render an LLM-reachable health hint: a run of recent
+    ``review_failed`` rows means the reviewer was unreachable (run
+    ``claude login``).
+    """
+    _ensure_tables()
+    try:
+        q = _apply_source_filters(db_session.query(SignalDecision), sources, exclude_sources)
+        counts = {"take": 0, "skip": 0, "review_failed": 0, "other": 0}
+        total = 0
+        for (decision,) in q.with_entities(SignalDecision.decision).all():
+            total += 1
+            key = decision if decision in counts else "other"
+            counts[key] += 1
+
+        last_q = q.order_by(SignalDecision.id.desc())
+        last_row = last_q.first()
+        recent = last_q.limit(10).all()
+        recent_failed = sum(1 for r in recent if r.decision == "review_failed")
+
+        return {
+            "total": total,
+            "take": counts["take"],
+            "skip": counts["skip"],
+            "review_failed": counts["review_failed"],
+            "other": counts["other"],
+            "last_decision": _row_to_dict(last_row) if last_row else None,
+            "recent_review_failed": recent_failed,
+        }
+    finally:
+        db_session.remove()
+
+
 def mark_actually_taken(decision_id: int, taken: bool) -> None:
     """Update ``actually_taken`` for the given decision row.
 

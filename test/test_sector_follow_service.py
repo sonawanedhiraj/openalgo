@@ -167,6 +167,57 @@ def test_passes_gates_fails_closed_on_none():
 
 
 # --------------------------------------------------------------------------- #
+# evaluate_candidates_with_details (issue #352) — additive capture, no behavior
+# change to evaluate_candidates() itself.
+# --------------------------------------------------------------------------- #
+def test_evaluate_candidates_with_details_returns_same_candidates_as_plain():
+    """The details-capturing variant selects EXACTLY the same candidates as the
+    normal evaluate_candidates() path — the additive capture must never diverge
+    from (or influence) the production selection."""
+    metrics = {
+        "AAA": _hit(sector=0.02, stock=0.01, vol=1.5),  # passes
+        "BBB": _hit(sector=0.005, stock=0.01, vol=1.5),  # fails sector gate
+        "CCC": _miss(),  # missing data
+    }
+    svc = _make_service(metrics=metrics, universe=["AAA", "BBB", "CCC"])
+    plain = svc.evaluate_candidates()
+    cands, details = svc.evaluate_candidates_with_details()
+    assert [c["symbol"] for c in cands] == [c["symbol"] for c in plain]
+    assert {c["symbol"] for c in cands} == {"AAA"}
+
+
+def test_evaluate_candidates_with_details_per_symbol_shape():
+    metrics = {
+        "AAA": _hit(sector=0.02, stock=0.01, vol=1.5),  # passes
+        "BBB": _hit(sector=0.005, stock=0.01, vol=1.5),  # fails sector gate only
+        "CCC": _miss(),  # missing data
+    }
+    svc = _make_service(metrics=metrics, universe=["AAA", "BBB", "CCC"])
+    _cands, details = svc.evaluate_candidates_with_details()
+    by_symbol = {d["symbol"]: d for d in details}
+
+    assert by_symbol["AAA"]["passed"] is True
+    assert by_symbol["AAA"]["fail_reason"] is None
+    assert by_symbol["AAA"]["sector_index"] == "NIFTY"
+
+    assert by_symbol["BBB"]["passed"] is False
+    assert "sector" in by_symbol["BBB"]["fail_reason"]
+
+    assert by_symbol["CCC"]["passed"] is False
+    assert "None data" in by_symbol["CCC"]["fail_reason"]
+    assert by_symbol["CCC"]["sector_ret"] is None
+
+
+def test_evaluate_candidates_unchanged_when_details_variant_exists():
+    """Guard against accidental behavior drift: calling evaluate_candidates()
+    directly (ignoring the new method entirely) still returns exactly the
+    gate-passing candidates, unaffected by the existence of the details path."""
+    svc = _make_service(metrics={"AAA": _hit()})
+    cands = svc.evaluate_candidates()
+    assert [c["symbol"] for c in cands] == ["AAA"]
+
+
+# --------------------------------------------------------------------------- #
 # Position selector
 # --------------------------------------------------------------------------- #
 def test_position_selector_caps_at_5():
@@ -1019,23 +1070,81 @@ def test_make_duckdb_metrics_provider_assembles_two_sources():
 # --------------------------------------------------------------------------- #
 # Fix 1b Part C — 15:18 pre-entry pipeline smoke check
 # --------------------------------------------------------------------------- #
-def test_smoke_check_passes_when_pipeline_healthy():
-    """All three checks green -> ok, no override written."""
-    intraday = {"AAA": (102.0, 2000.0)}
+def test_smoke_check_passes_when_pipeline_healthy(monkeypatch):
+    """All four checks green -> ok, no override written. Issue #161: smoke
+    now also verifies INDEX coverage — mock sector_index_symbols and the
+    intraday provider to cover them too."""
+    # Mock the mapped indices to just NIFTY for this test
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY"],
+    )
+    intraday = {"AAA": (102.0, 2000.0), "NIFTY": (101.5, 0.0)}
     history = {"AAA": _prior_days_history(close_fri=100.0)}
     svc = _make_real_service(intraday, history)
     ok, details = svc.assert_data_pipeline_healthy()
     assert ok is True
     assert details["aggregator_ok"] is True
+    assert details["index_ok"] is True
+    assert details["index_coverage"] == "1/1"
     assert details["historify_ok"] is True
     assert details["broker_session_ok"] is True
 
 
-def test_smoke_check_aborts_entry_if_aggregator_empty_at_1518():
+def test_smoke_check_blocks_when_index_aggregator_empty(monkeypatch):
+    """Issue #161 regression: stocks 100% covered but indices empty must
+    BLOCK the flip (today's 2026-06-26 15:20 failure mode). Pre-#161 this
+    test would have PASSED — that was the bug. The smoke gate derives its
+    index set from the active sector_map (what run_entry consumes), so drive
+    two mapped indices via sector_map here."""
+    intraday = {"AAA": (102.0, 2000.0)}  # stocks covered, indices empty
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history)
+    svc.sector_map = {"AAA": "NIFTY", "BBB": "NIFTYAUTO"}
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is False
+    assert details["aggregator_ok"] is True  # stocks fine
+    assert details["index_ok"] is False  # indices missing
+    assert details["index_coverage"] == "0/2"
+    assert set(details["index_missing"]) == {"NIFTY", "NIFTYAUTO"}
+
+
+def test_smoke_check_ignores_defensive_always_include_indices(monkeypatch):
+    """#241 straggler: the defensive _ALWAYS_INCLUDE backfill indices
+    (NIFTYCONSRDURBL / NIFTYOILANDGAS) — which no stock maps to, have no 1m
+    feed, and whose names don't match the master contract — must NOT gate the
+    smoke check. Only sector_map-referenced indices count. Otherwise the gate
+    was pinned at a permanent 8/10 and paused live equity entries every day.
+
+    sector_index_symbols() (backfill set) returns the defensive names, but the
+    smoke gate reads sector_map.values() instead, so those two absent indices
+    do not drop coverage.
+    """
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY", "NIFTYCONSRDURBL", "NIFTYOILANDGAS"],
+    )
+    # Only NIFTY is mapped + covered; the defensive indices are absent from
+    # intraday data but must be ignored by the gate.
+    intraday = {"AAA": (102.0, 2000.0), "NIFTY": (101.5, 0.0)}
+    history = {"AAA": _prior_days_history(close_fri=100.0)}
+    svc = _make_real_service(intraday, history)  # sector_map = {"AAA": "NIFTY"}
+    ok, details = svc.assert_data_pipeline_healthy()
+    assert ok is True, details
+    assert details["index_ok"] is True
+    assert details["index_coverage"] == "1/1"  # only the mapped NIFTY, 100%
+    assert details["index_missing"] == []
+
+
+def test_smoke_check_aborts_entry_if_aggregator_empty_at_1518(monkeypatch):
     """Aggregator empty -> smoke check fails AND writes a pause runtime override
     that holds the 15:20 entries."""
     from database import strategy_runtime_override_db as sro
 
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY"],
+    )
     intraday = {}  # aggregator has no today data for any symbol
     history = {"AAA": _prior_days_history(close_fri=100.0)}  # lookback fine
     svc = _make_real_service(intraday, history)
@@ -1053,8 +1162,12 @@ def test_smoke_check_aborts_entry_if_aggregator_empty_at_1518():
     assert blocked is True
 
 
-def test_smoke_check_telegrams_on_failure():
+def test_smoke_check_telegrams_on_failure(monkeypatch):
     """A failing smoke check alerts the operator over Telegram."""
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY"],
+    )
     alerts = []
     intraday = {}
     history = {"AAA": _prior_days_history(close_fri=100.0)}
@@ -1064,10 +1177,14 @@ def test_smoke_check_telegrams_on_failure():
     assert any("SMOKE CHECK FAILED" in a for a in alerts)
 
 
-def test_smoke_check_fails_when_broker_session_down():
+def test_smoke_check_fails_when_broker_session_down(monkeypatch):
     """Live aggregator + historify but no broker session -> fail + alert."""
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY"],
+    )
     alerts = []
-    intraday = {"AAA": (102.0, 2000.0)}
+    intraday = {"AAA": (102.0, 2000.0), "NIFTY": (101.5, 0.0)}
     history = {"AAA": _prior_days_history(close_fri=100.0)}
     svc = _make_real_service(
         intraday, history, notifier=lambda m: alerts.append(m), broker_session_checker=lambda: False
@@ -1076,6 +1193,91 @@ def test_smoke_check_fails_when_broker_session_down():
     assert ok is False
     assert details["broker_session_ok"] is False
     assert any("broker session not live" in a for a in alerts)
+
+
+def _service_with_metrics(metrics_provider, notifier, universe=("AAA",)):
+    """A SectorFollowService built directly with a custom metrics_provider
+    (bypasses the intraday/history-reader pipeline)."""
+    cfg = _config(universe=list(universe))
+    from services.mode_service import EffectiveDecision
+
+    return SectorFollowService(
+        config=cfg,
+        sector_map=dict.fromkeys(cfg.universe, "NIFTY"),
+        mode="scaffold",
+        metrics_provider=metrics_provider,
+        order_placer=lambda mode, order: {"status": "success", "orderid": "X"},
+        price_fetcher=lambda s, e: None,
+        notifier=notifier,
+        trade_recorder=lambda **kw: 1,
+        now=lambda: datetime(2026, 6, 26, 15, 20, tzinfo=_IST),
+        intent_resolver=lambda: EffectiveDecision(
+            mode="sandbox", intent="run", daily_capital_cap=None, source="env"
+        ),
+        broker_session_checker=lambda: True,
+    )
+
+
+def test_evaluate_candidates_fires_critical_when_all_sector_ret_none(monkeypatch):
+    """Issue #161 regression: today's 2026-06-26 15:20 failure (every metric
+    had sector_ret=None) must fire a CRITICAL Telegram alert. The 0-orders
+    day will not be silent again."""
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY", "NIFTYAUTO"],
+    )
+
+    def metrics_provider(as_of, universe, sector_map, _cfg):
+        return {
+            sym: {
+                "sector_ret": None,
+                "stock_ret": 0.01,
+                "vol_ratio": 1.5,
+                "current_price": 100.0,
+                "intraday_source": "aggregator",
+            }
+            for sym in universe
+        }
+
+    alerts: list[str] = []
+    svc = _service_with_metrics(
+        metrics_provider,
+        notifier=lambda m: alerts.append(m),
+        universe=("AAA", "BBB", "CCC"),
+    )
+    candidates = svc.evaluate_candidates(as_of=datetime(2026, 6, 26, 15, 20, tzinfo=_IST))
+    assert candidates == []  # all rejected by gates (sector_ret=None)
+    assert any("CRITICAL sector_follow" in a for a in alerts), f"got alerts={alerts}"
+    assert any("ALL mapped sector indices" in a for a in alerts)
+
+
+def test_evaluate_candidates_critical_alert_deduped_per_day(monkeypatch):
+    """Multi-cycle outage shouldn't spam the same CRITICAL — one per day."""
+    monkeypatch.setattr(
+        "services.sector_follow_index_backfill.sector_index_symbols",
+        lambda: ["NIFTY"],
+    )
+
+    def metrics_provider(as_of, universe, sector_map, _cfg):
+        return {
+            sym: {
+                "sector_ret": None,
+                "stock_ret": 0.01,
+                "vol_ratio": 1.5,
+                "current_price": 100.0,
+                "intraday_source": "aggregator",
+            }
+            for sym in universe
+        }
+
+    alerts: list[str] = []
+    svc = _service_with_metrics(metrics_provider, notifier=lambda m: alerts.append(m))
+    same_day_t1 = datetime(2026, 6, 26, 15, 20, tzinfo=_IST)
+    same_day_t2 = datetime(2026, 6, 26, 15, 25, tzinfo=_IST)
+    svc.evaluate_candidates(as_of=same_day_t1)
+    svc.evaluate_candidates(as_of=same_day_t2)
+    crit_alerts = [a for a in alerts if "CRITICAL sector_follow" in a]
+    assert len(crit_alerts) == 1
 
 
 def test_smoke_check_skipped_when_flag_off(monkeypatch):
@@ -1088,3 +1290,33 @@ def test_smoke_check_skipped_when_flag_off(monkeypatch):
     assert ok is True
     assert details.get("skipped") is True
     assert sro.list_overrides(include_expired=True) == []
+
+
+# --------------------------------------------------------------------------- #
+# #237 — pre-entry refresh job body wiring
+# --------------------------------------------------------------------------- #
+def test_preentry_refresh_job_calls_backfill(monkeypatch):
+    """The 15:17 job body delegates to run_preentry_backfill_checks (#237)."""
+    import services.sector_follow_service as sfs
+
+    called = {}
+    monkeypatch.setattr(
+        "services.sector_follow_backfill_scheduler.run_preentry_backfill_checks",
+        lambda *a, **k: called.setdefault("hit", True),
+    )
+    sfs._preentry_refresh_job()
+    assert called.get("hit") is True
+
+
+def test_preentry_refresh_job_swallows_errors(monkeypatch):
+    """A refresh failure must never propagate out of the scheduler thread."""
+    import services.sector_follow_service as sfs
+
+    def boom(*a, **k):
+        raise RuntimeError("fetch exploded")
+
+    monkeypatch.setattr(
+        "services.sector_follow_backfill_scheduler.run_preentry_backfill_checks", boom
+    )
+    # Must not raise.
+    sfs._preentry_refresh_job()

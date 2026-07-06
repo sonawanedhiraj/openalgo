@@ -1,17 +1,25 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Activity,
   AlertTriangle,
   ArrowRight,
+  Bot,
   CheckCircle2,
   Clock,
+  Loader2,
   PauseCircle,
+  Power,
   RefreshCw,
+  ShieldCheck,
   TrendingDown,
   TrendingUp,
 } from 'lucide-react'
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import {
+  type FlipModeOutcome,
+  type LLMHealth,
+  type LLMMode,
   type StrategyHealth,
   type StrategySummary,
   strategiesDashboardApi,
@@ -20,6 +28,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { showToast } from '@/utils/toast'
 
 const REFRESH_MS = 30_000
 
@@ -78,6 +87,118 @@ function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) 
   return <Badge variant="outline">{mode}</Badge>
 }
 
+// LLM control badge (issue #266 Phase 2) — a compact indicator of the current
+// per-strategy LLM mode. 'off' renders nothing to keep the card uncluttered.
+function LLMBadge({ llmMode }: { llmMode: LLMMode }) {
+  if (llmMode === 'veto')
+    return (
+      <Badge
+        className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 gap-1"
+        title="LLM veto enabled"
+      >
+        <ShieldCheck className="h-3 w-3" /> Veto
+      </Badge>
+    )
+  if (llmMode === 'delegate')
+    return (
+      <Badge
+        className="bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 gap-1"
+        title="LLM delegate"
+      >
+        <Bot className="h-3 w-3" /> Delegate
+      </Badge>
+    )
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// LLM health chip (issue #297)
+// ---------------------------------------------------------------------------
+//
+// A single, install-global liveness indicator for the shared `claude` CLI that
+// every strategy's Stage-1 veto calls. Because the probe spawns a real
+// `claude -p` subprocess server-side (seconds, consumes tokens), this is
+// MANUAL-ONLY: the query is `enabled: false` with no refetchInterval, so it
+// runs solely when the operator clicks the chip's own refresh icon.
+
+function llmUnreachableHint(reason: LLMHealth['reason']): string {
+  switch (reason) {
+    case 'not_logged_in':
+      return 'run claude login'
+    case 'cli_missing':
+      return 'claude CLI not found'
+    case 'timeout':
+      return 'timed out'
+    default:
+      return 'error'
+  }
+}
+
+function LLMHealthChip() {
+  const { data, isFetching, isError, refetch, dataUpdatedAt } = useQuery({
+    queryKey: ['llm-health'],
+    queryFn: () => strategiesDashboardApi.getLLMHealth(),
+    enabled: false, // manual-only — the probe spawns a claude subprocess
+    refetchInterval: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    gcTime: Number.POSITIVE_INFINITY,
+    retry: false,
+  })
+
+  const checkedAt =
+    dataUpdatedAt > 0
+      ? new Date(dataUpdatedAt).toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        })
+      : null
+
+  let tone = 'text-muted-foreground bg-muted/60'
+  let icon = <Bot className="h-3.5 w-3.5" />
+  let label = 'LLM: not checked'
+
+  if (isFetching) {
+    icon = <Loader2 className="h-3.5 w-3.5 animate-spin" />
+    label = 'Checking LLM…'
+  } else if (isError) {
+    tone = 'text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-900/20'
+    icon = <AlertTriangle className="h-3.5 w-3.5" />
+    label = 'LLM check failed'
+  } else if (data) {
+    if (data.reachable) {
+      tone = 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20'
+      icon = <CheckCircle2 className="h-3.5 w-3.5" />
+      label = `LLM reachable · ${data.latency_ms}ms`
+    } else {
+      tone = 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20'
+      icon = <AlertTriangle className="h-3.5 w-3.5" />
+      label = `LLM unreachable — ${llmUnreachableHint(data.reason)}`
+    }
+  }
+
+  const title = data
+    ? `${data.reason}${data.detail ? ` — ${data.detail}` : ''}${checkedAt ? ` (checked ${checkedAt})` : ''}`
+    : 'Click the refresh icon to probe the LLM (spawns a claude subprocess — not auto-polled)'
+
+  return (
+    <div className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-xs ${tone}`} title={title}>
+      {icon}
+      <span className="whitespace-nowrap">{label}</span>
+      <button
+        type="button"
+        onClick={() => refetch()}
+        disabled={isFetching}
+        title="Check LLM reachability now"
+        className="ml-0.5 rounded p-0.5 hover:bg-black/10 dark:hover:bg-white/10 disabled:opacity-50"
+      >
+        <RefreshCw className={`h-3 w-3 ${isFetching ? 'animate-spin' : ''}`} />
+      </button>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // P&L display
 // ---------------------------------------------------------------------------
@@ -100,6 +221,112 @@ function PnlDisplay({ pnl }: { pnl: number | null | undefined }) {
 }
 
 // ---------------------------------------------------------------------------
+// Mode toggle button (issue #162)
+// ---------------------------------------------------------------------------
+//
+// One-click sandbox<->live flip routed through POST /strategies/api/<name>/mode.
+// The server runs the preflight; on a 409 ("blocked"), the response carries a
+// `blockers` list which we display to the operator so they know exactly what
+// to fix before retrying — not silent.
+
+function ModeToggleButton({ s }: { s: StrategySummary }) {
+  const queryClient = useQueryClient()
+  const [blockers, setBlockers] = useState<string[] | null>(null)
+
+  // Scaffold-only strategies have no LIVE path — disable the toggle entirely.
+  const isScaffold = !s.deployable || s.mode.includes('scaffold')
+  const targetMode: 'live' | 'sandbox' = s.mode === 'live' ? 'sandbox' : 'live'
+
+  const flip = useMutation({
+    mutationFn: () => strategiesDashboardApi.flipMode(s.name, targetMode),
+    onSuccess: (outcome: FlipModeOutcome) => {
+      if (outcome.accepted) {
+        setBlockers(null)
+        showToast.success(`${s.display_name} → ${outcome.new_mode?.toUpperCase()}`, 'strategy')
+        queryClient.invalidateQueries({ queryKey: ['strategies-list'] })
+      } else {
+        // Preflight refused — surface the blockers list to the operator.
+        setBlockers(outcome.blockers)
+        showToast.error(
+          `Cannot enable ${targetMode.toUpperCase()} (${outcome.blockers.length} blocker${outcome.blockers.length === 1 ? '' : 's'})`,
+          'strategy'
+        )
+      }
+    },
+    onError: () => {
+      showToast.error('Mode flip request failed — check server logs', 'strategy')
+    },
+  })
+
+  const handleClick = () => {
+    if (isScaffold) return
+    // Light confirm for the LIVE direction only; sandbox is always safe.
+    if (targetMode === 'live') {
+      const ok = window.confirm(
+        `Enable LIVE mode for ${s.display_name}?\n\n` +
+          'The server will run a preflight check first. If any condition is not met ' +
+          '(broker session, data freshness, orphan trades, etc.) the flip will be ' +
+          'refused with a clear blocker message.'
+      )
+      if (!ok) return
+    }
+    setBlockers(null)
+    flip.mutate()
+  }
+
+  if (isScaffold) {
+    return (
+      <Button
+        variant="ghost"
+        size="sm"
+        className="w-full text-xs text-muted-foreground"
+        disabled
+        title="Scaffold strategy — no LIVE path"
+      >
+        <Power className="h-3 w-3 mr-1.5" />
+        Scaffold only
+      </Button>
+    )
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <Button
+        variant={targetMode === 'live' ? 'default' : 'outline'}
+        size="sm"
+        className="w-full text-xs"
+        onClick={handleClick}
+        disabled={flip.isPending}
+        title={
+          targetMode === 'live'
+            ? 'Enable LIVE mode (preflight will refuse if not ready)'
+            : 'Switch back to SANDBOX'
+        }
+      >
+        {flip.isPending ? (
+          <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+        ) : (
+          <Power className="h-3 w-3 mr-1.5" />
+        )}
+        {flip.isPending ? 'Flipping…' : `Switch to ${targetMode.toUpperCase()}`}
+      </Button>
+      {blockers && blockers.length > 0 && (
+        <div className="rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-2 space-y-1">
+          <p className="text-xs font-semibold text-red-700 dark:text-red-300 flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3" /> Cannot enable {targetMode.toUpperCase()}
+          </p>
+          <ul className="text-xs text-red-700 dark:text-red-300 space-y-0.5 ml-4 list-disc">
+            {blockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Strategy card
 // ---------------------------------------------------------------------------
 
@@ -114,7 +341,10 @@ function StrategyCard({ s }: { s: StrategySummary }) {
             <HealthLed health={s.health} />
             <CardTitle className="text-base truncate">{s.display_name}</CardTitle>
           </div>
-          <ModeBadge mode={s.mode} deployable={s.deployable} />
+          <div className="flex items-center gap-1.5">
+            <LLMBadge llmMode={s.llm_mode} />
+            <ModeBadge mode={s.mode} deployable={s.deployable} />
+          </div>
         </div>
         <p className="text-xs text-muted-foreground font-mono">
           {s.name} · v{s.version}
@@ -165,6 +395,11 @@ function StrategyCard({ s }: { s: StrategySummary }) {
             })}
           </p>
         )}
+
+        {/* Mode flip toggle (issue #162) — gated by server-side preflight.
+            On block, the blockers list is rendered below the button so the
+            operator sees exactly why the flip was refused. */}
+        <ModeToggleButton s={s} />
 
         <Link to={`/strategies/${s.name}`}>
           <Button variant="outline" size="sm" className="w-full gap-1.5">
@@ -237,7 +472,8 @@ export default function StrategiesDashboardIndex() {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <LLMHealthChip />
           {lastUpdated && (
             <span className="text-xs text-muted-foreground">Updated {lastUpdated}</span>
           )}

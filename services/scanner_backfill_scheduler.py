@@ -59,6 +59,46 @@ _BOOT_WAIT_POLL_SEC = 15
 _stop_event = threading.Event()
 _periodic_thread: threading.Thread | None = None
 
+# Once-per-process-per-date guard for the daily-D re-settle (see
+# _maybe_resettle_daily). A settled daily bar only needs correcting once per day;
+# without this the periodic loop would re-fetch the whole universe every 30 min.
+# A restart clears it (fine — the boot convergence then re-settles once).
+_resettled_dates: set = set()
+
+# Pre-entry refresh (#239): a single convergence fetch just before the 09:18
+# smoke check so a cold boot at 08:31 IST has fresh historify data AND the
+# WS subscription is established before evaluation begins.  The boot check
+# runs once (can be hours earlier) and the periodic loop only runs 15:30-17:00,
+# so the early-morning gap stays open through the 09:18 smoke check — the
+# 2026-06-30 all-day signal drought.  This closes it: run the same stale-check
+# the boot/periodic paths use, then wait (bounded to ``_PREENTRY_WAIT_SEC``,
+# short enough not to overrun 09:18) for the download jobs and optionally
+# trigger the WS subscription if it has not come up yet.
+# Additive, idempotent (fresh → no-op), fail-graceful.
+_DEFAULT_PREENTRY_TIME = "09:16"
+# Bounded wait for the pre-entry download jobs.  Must be short enough that a
+# slow fetch cannot overrun the 09:18 smoke check — if it does, the smoke check
+# still catches the stale data.  120s = 2m of headroom before 09:18.
+_PREENTRY_WAIT_SEC = 120
+
+
+def preentry_refresh_enabled() -> bool:
+    """``SCANNER_PREENTRY_REFRESH_ENABLED`` env flag (default true)."""
+    return os.getenv("SCANNER_PREENTRY_REFRESH_ENABLED", "true").lower() == "true"
+
+
+def preentry_refresh_time() -> time:
+    """Pre-entry refresh fire time (default 09:16 IST — before the 09:18 smoke).
+
+    ``SCANNER_PREENTRY_REFRESH_TIME`` env var, ``HH:MM`` format.
+    """
+    raw = os.getenv("SCANNER_PREENTRY_REFRESH_TIME", _DEFAULT_PREENTRY_TIME)
+    try:
+        hh, mm = (int(x) for x in raw.split(":", 1))
+        return time(hh, mm)
+    except (TypeError, ValueError):
+        return time(9, 16)
+
 
 # --------------------------------------------------------------------------- #
 # Env-configurable knobs
@@ -110,8 +150,15 @@ def _end_time() -> time:
 # Pure helpers (testable without threads/clocks)
 # --------------------------------------------------------------------------- #
 def _is_trading_day(d) -> bool:
-    """Weekday check (holidays not modelled — matches data_freshness_service)."""
-    return d.weekday() < 5
+    """Weekday AND not an NSE market holiday (issue #253).
+
+    Delegates to the shared ``services.data_freshness_service.is_trading_day``
+    predicate — fail-open (weekday-only) if the holiday calendar is
+    unavailable or has no rows for ``d.year``; never raises.
+    """
+    from services.data_freshness_service import is_trading_day as _shared_is_trading_day
+
+    return _shared_is_trading_day(d)
 
 
 def _within_window(now_t: time, end_t: time) -> bool:
@@ -138,14 +185,66 @@ def _health_strategy_name(interval: str) -> str:
 # --------------------------------------------------------------------------- #
 # Convergence check + health persistence + alerting
 # --------------------------------------------------------------------------- #
+def _maybe_resettle_daily(today) -> None:
+    """Re-settle the trailing daily-D window once per day (before the stale-check).
+
+    A daily bar written intraday as a provisional/running close is never fixed by
+    the incremental convergence (it sees the day's bar already present and skips
+    it), so a stale close persists into the scanner's ``yest_d`` gate and fires
+    phantom signals (2026-07-02 DELHIVERY false BUY — issue #299). This forces a
+    non-incremental overwrite re-fetch of the settled window + a provider cache
+    refresh, bounded to once per process per date. Only runs when ``D`` is a
+    configured interval. Fully fail-graceful — never raises into the caller.
+    """
+    ref = today or datetime.now(_IST).date()
+    if "D" not in _intervals():
+        return
+    if ref in _resettled_dates:
+        return
+    try:
+        from services.scanner_universe_backfill import resettle_recent_daily
+
+        res = resettle_recent_daily(ref)
+        # Mark done unless the attempt failed for a transient reason (no broker
+        # session yet / fetch error) — a failed attempt should retry on the next
+        # convergence tick rather than be suppressed for the rest of the day.
+        if res.get("status") in ("ok", "disabled") or res.get("resettled"):
+            _resettled_dates.add(ref)
+        logger.info(
+            "scanner daily-D resettle [%s]: status=%s window=%s resettled=%s errors=%d",
+            ref,
+            res.get("status"),
+            res.get("window"),
+            res.get("resettled"),
+            len(res.get("errors", [])),
+        )
+    except Exception:  # a resettle failure must never break the convergence path
+        logger.exception("scanner daily-D resettle raised")
+
+
 def run_backfill_checks(today=None) -> dict:
     """Run the per-interval stale-check (1m then D); return the combined verdict.
 
-    ``all_fresh`` is True iff no interval found a stale symbol (the convergence
-    signal that lets the periodic loop back off). ``errors`` unions every
-    interval's fail-graceful error list. Never raises.
+    ``all_fresh`` is **verified-fresh** semantics (issue #338): True iff no
+    interval has any symbol left ``still_stale`` (i.e. genuinely behind *after*
+    the #304 post-job verification, or never found stale in the first place)
+    AND no interval hit an error. It is NOT "no interval found stale symbols at
+    the start" — a normal morning that finds 216 stale symbols and then
+    successfully catches all of them up is ``all_fresh=True``. This is the
+    single meaning of ``all_fresh`` for every consumer (logging, the periodic
+    loop's backoff, ``_persist_health``'s per-interval ``overall_ok``) — see
+    the #338 fix write-up for why a pre-refresh definition made the smoke-check
+    re-check unable to ever pass on a normal morning.
+
+    ``errors`` unions every interval's fail-graceful error list. Never raises.
+
+    Before the stale-check, a once-per-day daily-D re-settle corrects any
+    provisional (intraday-captured) daily close so the scanner's ``yest_d`` gate
+    reads the settled value (issue #299).
     """
     from services.scanner_universe_backfill import check_and_refresh_if_stale
+
+    _maybe_resettle_daily(today)
 
     per_interval: dict[str, dict] = {}
     errors: list[str] = []
@@ -154,15 +253,39 @@ def run_backfill_checks(today=None) -> dict:
         res = check_and_refresh_if_stale(today, interval=interval)
         per_interval[interval] = res
         errors.extend(res.get("errors", []))
-        # A "skipped_locked" arm read nothing (historify briefly locked) — not
-        # proof of freshness, so don't let the periodic loop back off on it.
-        if res.get("stale_symbols") or res.get("status") == "skipped_locked":
+        # Verified-fresh (#338): an interval is fresh iff the check actually ran
+        # ("ok" status — a "skipped_locked" read proved nothing, so it must not
+        # let the loop back off), nothing is still_stale after the post-job
+        # verification, and no error occurred. Note this deliberately ignores
+        # the PRE-refresh "stale_symbols" list — finding stale symbols and then
+        # successfully catching them all up is a fresh outcome.
+        interval_verified_ok = (
+            res.get("status") == "ok" and not res.get("still_stale") and not res.get("errors")
+        )
+        if not interval_verified_ok:
             all_fresh = False
     return {"intervals": per_interval, "all_fresh": all_fresh, "errors": errors}
 
 
 def _persist_health(res: dict) -> None:
-    """Write one ``data_health_check`` row per interval (best-effort)."""
+    """Write one ``data_health_check`` row per interval (best-effort).
+
+    Issue #338 — ``overall_ok`` (and the ``stale_symbols`` column) now carry
+    **verified** (post-refresh) freshness, not the pre-refresh "did we find any
+    stale symbols at the start" signal. The smoke check
+    (``scanner_smoke_check_service.production_freshness_reader``) reads exactly
+    these rows, so a row that says ``overall_ok=0`` must mean "still actually
+    stale after the catch-up ran" — not "a catch-up was needed and it ran fine".
+    Pre-fix, every normal morning that needed ANY catch-up wrote ``overall_ok=0``
+    at refresh completion, so the 09:18 smoke check (and its #319 re-check) both
+    read "stale" and the post-hold could never release intra-session.
+
+    ``stale_symbols`` column = POST-refresh ``still_stale`` (what "stale" means
+    to a reader of this table). The PRE-refresh list is kept in
+    ``details["found_stale"]`` for observability (how much catch-up work this
+    run actually did) — ``details["still_stale"]`` duplicates the column value
+    for symmetry with the log line in ``_log_and_alert``.
+    """
     try:
         from database.data_health_db import insert_check
     except Exception:  # DB layer unavailable (e.g. some test contexts) — skip silently
@@ -170,20 +293,26 @@ def _persist_health(res: dict) -> None:
         return
 
     for interval, ires in res.get("intervals", {}).items():
-        stale = ires.get("stale_symbols", [])
+        found_stale = ires.get("stale_symbols", [])
+        still_stale = ires.get("still_stale", [])
         had_error = bool(ires.get("errors"))
-        # overall_ok: the feed is healthy iff the check actually ran (status "ok"),
-        # nothing was stale, AND no fetch error. A "skipped_locked" read is not a
-        # health signal, so it must not record a falsely-healthy row.
-        overall_ok = ires.get("status") == "ok" and not stale and not had_error
+        # verified_ok (#338): the feed is healthy iff the check actually ran
+        # (status "ok"), nothing is still_stale AFTER the post-job (#304)
+        # verification, AND no fetch error. A "skipped_locked" read proved
+        # nothing, so it must not record a falsely-healthy row. Deliberately
+        # does NOT look at found_stale — finding stale symbols and then
+        # successfully catching them up is a healthy outcome.
+        verified_ok = ires.get("status") == "ok" and not still_stale and not had_error
         try:
             insert_check(
                 strategy_name=_health_strategy_name(interval),
-                overall_ok=overall_ok,
-                stale_symbols=stale,
+                overall_ok=verified_ok,
+                stale_symbols=still_stale,
                 details={
                     "interval": interval,
+                    "found_stale": found_stale,
                     "refreshed": ires.get("refreshed", []),
+                    "still_stale": still_stale,
                     "skipped_fresh_count": len(ires.get("skipped_fresh", [])),
                     "errors": ires.get("errors", []),
                 },
@@ -195,12 +324,18 @@ def _persist_health(res: dict) -> None:
 
 def _log_and_alert(res: dict, phase: str) -> None:
     for interval, ires in res.get("intervals", {}).items():
+        # Issue #304 — refreshed/still_stale are now VERIFIED post-job counts
+        # (re-read MAX(timestamp) after the job completes), not submission
+        # counts, so "refreshed=N errors=0" can no longer be logged purely
+        # because a download job was accepted.
         logger.info(
-            "scanner backfill %s [%s]: stale=%d refreshed=%d skipped_fresh=%d errors=%d",
+            "scanner backfill %s [%s]: stale=%d verified_fresh=%d still_stale=%d "
+            "skipped_fresh=%d errors=%d",
             phase,
             interval,
             len(ires.get("stale_symbols", [])),
             len(ires.get("refreshed", [])),
+            len(ires.get("still_stale", [])),
             len(ires.get("skipped_fresh", [])),
             len(ires.get("errors", [])),
         )
@@ -224,11 +359,118 @@ def _log_and_alert(res: dict, phase: str) -> None:
 
 
 def run_boot_backfill_checks(today=None) -> dict:
-    """One-shot boot convergence: catch up whatever is stale, persist + log + alert."""
+    """One-shot boot convergence: catch up whatever is stale, persist + log + alert.
+
+    Blocks until any submitted download jobs reach a terminal status so the
+    sibling scheduler's lock-protected boot worker doesn't start its writes
+    while this one's 5-worker pool is still mid-download (issue #151 —
+    in-process DuckDB write contention).
+    """
     logger.info("scanner backfill: boot convergence check starting")
     res = run_backfill_checks(today)
     _persist_health(res)
     _log_and_alert(res, phase="boot")
+
+    # Wait inside the boot_convergence_lock for both interval arms' jobs to
+    # finish. check_and_refresh_if_stale returns ``{"job_id": ...}`` per
+    # interval when work was submitted; a stale-free arm contributes nothing.
+    try:
+        from services.historify_service import wait_for_jobs
+
+        intervals = res.get("intervals") or {}
+        job_ids = [ires.get("job_id") for ires in intervals.values()]
+        finals = wait_for_jobs(job_ids)
+        if finals:
+            logger.info("scanner backfill: boot jobs final status: %s", finals)
+    except Exception:  # waiting must never break the boot path
+        logger.exception("scanner backfill: wait_for_jobs raised")
+
+    # Issue #319: the boot convergence can itself be the refresh that resolves
+    # a smoke-check post-hold armed earlier in the process lifetime (e.g. a
+    # restart mid-morning after a stale-data FAIL). Re-check regardless of
+    # ``all_fresh`` — the re-check itself is the source of truth on whether
+    # the data is now healthy.
+    _maybe_release_smoke_hold()
+    return res
+
+
+def run_preentry_scanner_refresh(today=None) -> dict:
+    """Pre-09:18-smoke-check convergence: fetch whatever is stale so the smoke
+    check passes and the scanner has fresh historify data from the start of the
+    session (issue #239).
+
+    The boot check runs once at startup (can be hours earlier) and the periodic
+    loop only runs 15:30-17:00, so a cold boot at 08:31 IST produces 0/216
+    aggregator coverage by 09:18.  This closes it: run the same stale-check
+    the boot/periodic paths use, wait (bounded to ``_PREENTRY_WAIT_SEC``) for
+    the download jobs so today's bars land in historify before the smoke check,
+    and — if the WS subscription has not come up yet — trigger it via
+    ``scanner_pre_subscriber.ensure`` so the aggregator starts filling.
+
+    Returns the ``run_backfill_checks`` verdict, or ``{"skipped": True}`` when
+    the feature flag is off.  Never raises.
+    """
+    if not preentry_refresh_enabled():
+        logger.info("scanner pre-entry refresh disabled (SCANNER_PREENTRY_REFRESH_ENABLED!=true)")
+        return {"skipped": True}
+
+    _pre_t = preentry_refresh_time()
+    logger.info(
+        "scanner backfill: pre-entry (%02d:%02d) convergence check starting",
+        _pre_t.hour,
+        _pre_t.minute,
+    )
+    res = run_backfill_checks(today)
+    _persist_health(res)
+    _log_and_alert(res, phase="preentry")
+
+    try:
+        from services.historify_service import wait_for_jobs
+
+        intervals = res.get("intervals") or {}
+        job_ids = [ires.get("job_id") for ires in intervals.values()]
+        finals = wait_for_jobs(job_ids, timeout_sec=_PREENTRY_WAIT_SEC)
+        if finals:
+            logger.info("scanner backfill: pre-entry jobs final status: %s", finals)
+    except Exception:  # waiting must never break the entry path
+        logger.exception("scanner backfill: pre-entry wait_for_jobs raised")
+
+    # Issue #319: the 09:16 pre-entry refresh races the 09:18 smoke check —
+    # the smoke check can FAIL and arm the post-hold mid-refresh, then this
+    # refresh finishes seconds later with fresh data but nothing re-checks
+    # until the 15:30+ periodic loop, holding a healthy day all session.
+    # Re-check right after the verified-refresh reporting above (regardless
+    # of the stale/fresh counts — the re-check itself decides).
+    _maybe_release_smoke_hold()
+
+    # Trigger WS subscription if the scanner has not yet subscribed.  The boot
+    # wire_pre_subscribe daemon already handles the normal path; this is a
+    # defensive nudge for the race where the boot retry has not yet fired by
+    # 09:16 (slow broker login, cold start late in the morning).  Fail-safe:
+    # ensure() is idempotent and the import is deferred so test contexts that
+    # never wire app.py stay clean.
+    try:
+        from database.auth_db import get_first_available_api_key, verify_api_key
+        from services.scanner_presubscribe import scanner_pre_subscriber
+
+        if not scanner_pre_subscriber.subscribed:
+            api_key = get_first_available_api_key()
+            if api_key:
+                user_id = verify_api_key(api_key)
+                if user_id:
+                    from database.auth_db import get_broker_name
+
+                    broker = get_broker_name(user_id)
+                    raw = os.getenv("SCANNER_SYMBOLS", "")
+                    symbols = sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+                    if symbols:
+                        n = scanner_pre_subscriber.ensure(user_id, broker, symbols)
+                        logger.info(
+                            "scanner pre-entry refresh: triggered WS subscribe for %d symbols", n
+                        )
+    except Exception:  # WS nudge must never break the historify path
+        logger.exception("scanner pre-entry refresh: WS subscription nudge failed (non-fatal)")
+
     return res
 
 
@@ -240,13 +482,60 @@ def _periodic_tick(now: datetime, end_t: time) -> tuple[bool, dict | None]:
 
     ``ran`` is False (and ``result`` None) when ``now`` is outside the trading-day
     post-close window — the loop just sleeps an interval and retries.
+
+    Issue #158 D3: also short-circuits when no broker session is live —
+    without this, the periodic tick fires every interval during the morning
+    re-login gap (3 AM rotation, operator not yet logged in), and the
+    backfill submits with no api_key, logging a noisy ``WARNING`` for every
+    stale symbol it found. With this gate, the loop quietly waits for the
+    broker session and runs the catch-up cleanly when ready.
     """
     if not (_is_trading_day(now.date()) and _within_window(now.time(), end_t)):
         return False, None
+    # Quiet-skip when no broker session — same fail-graceful pattern as the
+    # other backfill / convergence services. Logged at INFO (single line per
+    # tick) so it's diagnosable but doesn't flood. Honors a flag to disable.
+    if _gate_on_broker_session():
+        try:
+            from services.broker_session_health import is_live_broker_session
+
+            if not is_live_broker_session():
+                logger.info("scanner backfill periodic tick: no broker session yet — skipping")
+                return False, None
+        except Exception:
+            logger.exception("scanner backfill: live-session probe raised — proceeding anyway")
     res = run_backfill_checks(now.date())
     _persist_health(res)
     _log_and_alert(res, phase="periodic")
+    _maybe_release_smoke_hold()
     return True, res
+
+
+def _maybe_release_smoke_hold() -> None:
+    """Issue #305: after a convergence tick refreshed the stored 1m/D data,
+    re-run the scanner smoke check IF its post-hold is armed — a passing
+    re-check releases the hold without waiting for the 15:35 IST expiry.
+    No-op when no hold is armed. Never raises into the periodic loop."""
+    try:
+        from services.scanner_smoke_check_service import re_check_and_release
+
+        res = re_check_and_release()
+        if res is not None:
+            logger.info("scanner backfill: smoke re-check after convergence → ok=%s", res[0])
+    except Exception:
+        logger.exception("scanner backfill: smoke-hold re-check failed")
+
+
+def _gate_on_broker_session() -> bool:
+    """``SCANNER_BACKFILL_GATE_ON_BROKER_SESSION`` env flag (default true).
+    When True, the periodic tick skips when no broker session is live so
+    'no api key available' warnings stop flooding the morning logs."""
+    return os.environ.get("SCANNER_BACKFILL_GATE_ON_BROKER_SESSION", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
 
 
 def _periodic_loop() -> None:
@@ -323,7 +612,13 @@ def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
 
 def _boot_worker() -> None:
     if _wait_for_broker_session():
-        run_boot_backfill_checks()
+        # Serialise the convergence work against sibling schedulers so the four
+        # boot backfill jobs don't burst onto historify.duckdb simultaneously
+        # (see services/boot_convergence.py and issue #140).
+        from services.boot_convergence import boot_convergence_lock
+
+        with boot_convergence_lock(name="scanner"):
+            run_boot_backfill_checks()
     else:
         logger.warning(
             "scanner backfill: no broker session appeared at boot; "
@@ -345,3 +640,69 @@ def init_scanner_backfill_scheduler(app=None) -> None:
     _stop_event.clear()
     threading.Thread(target=_boot_worker, daemon=True, name="ScannerBackfillBoot").start()
     logger.info("scanner backfill boot+periodic convergence initialized")
+
+
+# --------------------------------------------------------------------------- #
+# Pre-entry refresh APScheduler registration (#239)
+# --------------------------------------------------------------------------- #
+
+
+def _scanner_preentry_refresh_job() -> None:
+    """09:16 IST: fetch stale historify data + nudge WS subscription before the
+    09:18 smoke check (issue #239).  Module-level + fail-safe so a fetch error
+    never kills the scheduler thread.  Independent of the boot lock — 09:16 is
+    a quiet window with no sibling convergence running."""
+    try:
+        run_preentry_scanner_refresh()
+    except Exception:
+        logger.exception("scanner pre-entry refresh job failed")
+
+
+def init_scanner_preentry_refresh(app=None, scheduler=None) -> None:
+    """Register the 09:16 IST APScheduler job for the scanner pre-entry refresh.
+
+    Registered even when the flag is off so toggling ``SCANNER_PREENTRY_REFRESH_ENABLED``
+    at runtime takes effect without a restart; the per-fire ``preentry_refresh_enabled()``
+    check gates the work.
+
+    Args:
+        app: Flask app instance (not used; kept for interface parity with other init fns).
+        scheduler: APScheduler instance. Defaults to the shared historify scheduler.
+    """
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+
+        if scheduler is None:
+            from services.historify_scheduler_service import get_historify_scheduler
+
+            scheduler = get_historify_scheduler()
+        if scheduler is None:
+            logger.warning(
+                "scanner pre-entry refresh: no scheduler available — skipping job registration"
+            )
+            return
+
+        _pre_t = preentry_refresh_time()
+        scheduler.add_job(
+            _scanner_preentry_refresh_job,
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=_pre_t.hour,
+                minute=_pre_t.minute,
+                timezone="Asia/Kolkata",
+            ),
+            id="scanner_preentry_refresh",
+            replace_existing=True,
+            name=(
+                f"Scanner pre-entry data refresh + WS subscribe nudge "
+                f"({_pre_t.hour:02d}:{_pre_t.minute:02d} IST)"
+            ),
+        )
+        logger.info(
+            "scanner_preentry_refresh registered (enabled=%s, time=%02d:%02d IST)",
+            preentry_refresh_enabled(),
+            _pre_t.hour,
+            _pre_t.minute,
+        )
+    except Exception:
+        logger.exception("init_scanner_preentry_refresh failed")

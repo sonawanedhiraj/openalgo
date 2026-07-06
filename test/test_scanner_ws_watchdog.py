@@ -115,9 +115,16 @@ def test_no_ticks_yet_no_action():
 
 
 def test_stale_90s_triggers_soft_recovery():
+    """Original scenario: 120s-old tick triggers soft recovery.
+
+    Thresholds pinned to the LEGACY 90/180/60 defaults so this test
+    continues to exercise the scenario it was designed for. The runtime
+    defaults were bumped to 180/360/120 in #158 D1 (env-overridable) to
+    cut the ~121 false soft-recoveries per day on a healthy live feed.
+    """
     clock = Clock(1000.0)
     holder = [clock() - 120]  # 120s old > 90s soft threshold
-    wd, soft, hard = _make(clock, holder)
+    wd, soft, hard = _make(clock, holder, soft_threshold=90.0, hard_threshold=180.0, cooldown=60.0)
     assert wd.check() == "soft"
     assert soft.calls == 1 and hard.calls == 0
 
@@ -125,7 +132,7 @@ def test_stale_90s_triggers_soft_recovery():
 def test_cooldown_blocks_double_trigger():
     clock = Clock(1000.0)
     holder = [clock() - 120]
-    wd, soft, hard = _make(clock, holder)
+    wd, soft, hard = _make(clock, holder, soft_threshold=90.0, hard_threshold=180.0, cooldown=60.0)
     assert wd.check() == "soft"  # first stall -> soft
     clock.tick(30)  # 30s later, still inside 60s cooldown
     holder[0] = clock() - 150  # still stale
@@ -137,7 +144,7 @@ def test_cooldown_blocks_double_trigger():
 def test_still_stale_after_cooldown_triggers_hard_recovery():
     clock = Clock(1000.0)
     holder = [clock() - 120]
-    wd, soft, hard = _make(clock, holder)
+    wd, soft, hard = _make(clock, holder, soft_threshold=90.0, hard_threshold=180.0, cooldown=60.0)
     assert wd.check() == "soft"
     clock.tick(70)  # past the 60s cooldown
     holder[0] = clock() - 200  # 200s old > 180s hard threshold
@@ -148,7 +155,7 @@ def test_still_stale_after_cooldown_triggers_hard_recovery():
 def test_recovery_resets_after_feed_returns():
     clock = Clock(1000.0)
     holder = [clock() - 120]
-    wd, soft, hard = _make(clock, holder)
+    wd, soft, hard = _make(clock, holder, soft_threshold=90.0, hard_threshold=180.0, cooldown=60.0)
     assert wd.check() == "soft"
     # Feed comes back fresh — cooldown state should clear.
     clock.tick(10)

@@ -13,18 +13,31 @@ check.
 The functions here are **pure / read-only** on DuckDB and the strategy config —
 they never place orders, mutate the feed, or write the freshness verdict (the
 caller persists it via ``database.data_health_db``). Staleness is **business-day
-aware**: a weekend gap is not stale, only missing trading days are.
+and holiday aware**: a gap spanning only weekends and/or NSE holidays is not
+stale, only missing genuine trading days are.
 
 Timestamp convention: ``market_data.timestamp`` is a UTC epoch (e.g.
 ``1780048740`` == ``2026-05-29 15:29 IST`` == ``09:59 UTC``). We derive the IST
 calendar date of the last bar via the IST tzinfo and compare trading days.
 
-Note: market holidays are NOT modelled — only weekends. A single mid-week NSE
-holiday inflates measured staleness by one business day, which the default
-1-business-day threshold (yesterday's close acceptable) absorbs for the common
-case; a holiday immediately followed by a missed backfill could produce a
-false-positive alert. The cost of a false positive is an auto-pause the operator
-overrides, which is the safe direction.
+Holiday-awareness (issue #253)
+-------------------------------
+The NSE holiday calendar already exists (``database.market_calendar_db`` /
+``services.market_calendar_service``) but used to be unconsulted here — the
+business-day math only ever skipped weekends, so a mid-week NSE holiday
+inflated measured staleness by one business day. ``is_trading_day`` below is
+the single shared trading-day predicate: weekday AND NOT a market holiday.
+
+**Fail-open, load-bearing:** the holiday calendar is seeded per-year in code
+(``database/market_calendar_db.py``'s ``seed_holidays_2025`` /
+``seed_holidays_2026``) — a future year (e.g. 2027) has NO rows until a code
+change adds them, and the calendar lookup can raise for other reasons too
+(DB not migrated yet, table missing on a fresh install). Either case must
+degrade to the pre-#253 weekday-only behavior, never brick a freshness check
+that used to work. ``is_trading_day`` therefore treats "the calendar lookup
+raised" and "the calendar has zero rows for this date's year" identically: log
+a WARNING (deduped once per process per year) and fall back to
+``weekday < 5``.
 """
 
 from __future__ import annotations
@@ -53,7 +66,73 @@ def default_max_staleness_business_days() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Business-day helpers (weekend-aware; holidays not modelled — see module note)
+# Trading-day predicate (issue #253) — weekday AND not an NSE holiday.
+# Fail-open + per-process-per-year dedup'd warning; see module docstring.
+# --------------------------------------------------------------------------- #
+_warned_missing_years: set[int] = set()
+_year_has_rows_cache: dict[int, bool] = {}
+
+
+def _year_has_holiday_rows(year: int) -> bool:
+    """Cached check: does the calendar table have ANY row for ``year``?
+
+    Cached per-process (the table changes ~yearly, at most). A cache miss
+    queries once; the result — including a confirmed "no rows" — is memoized
+    so a missing year doesn't re-query (and re-warn-check) on every call.
+    """
+    if year in _year_has_rows_cache:
+        return _year_has_rows_cache[year]
+    from database.market_calendar_db import get_holidays_by_year
+
+    has_rows = bool(get_holidays_by_year(year))
+    _year_has_rows_cache[year] = has_rows
+    return has_rows
+
+
+def _warn_missing_year_once(year: int) -> None:
+    if year in _warned_missing_years:
+        return
+    _warned_missing_years.add(year)
+    logger.warning(
+        "data_freshness_service.is_trading_day: no market-holiday calendar rows "
+        "found for year %d — falling back to weekday-only trading-day check "
+        "(pre-#253 behavior) for all dates in %d. Add a seed_holidays_%d() to "
+        "database/market_calendar_db.py to restore holiday-awareness.",
+        year,
+        year,
+        year,
+    )
+
+
+def is_trading_day(d: date, exchange: str | None = None) -> bool:
+    """Is ``d`` a genuine NSE trading day — weekday AND not a market holiday?
+
+    Fail-open (load-bearing, issue #253): if the holiday calendar lookup
+    raises, or the calendar has no rows at all for ``d.year`` (e.g. a future
+    year before its yearly seed lands), this degrades to the pre-#253
+    weekday-only check (``d.weekday() < 5``) and logs a WARNING once per
+    process per missing year — never raises into the caller.
+    """
+    if d.weekday() >= 5:
+        return False
+    try:
+        if not _year_has_holiday_rows(d.year):
+            _warn_missing_year_once(d.year)
+            return True  # weekday, no calendar data for this year -> trading day
+        from database.market_calendar_db import is_market_holiday
+
+        return not is_market_holiday(d, exchange)
+    except Exception:
+        logger.exception(
+            "data_freshness_service.is_trading_day: calendar lookup failed for %s "
+            "— falling back to weekday-only trading-day check",
+            d,
+        )
+        return True  # already confirmed weekday above
+
+
+# --------------------------------------------------------------------------- #
+# Business-day helpers (weekend + NSE-holiday aware via is_trading_day)
 # --------------------------------------------------------------------------- #
 def _ist_date_of_epoch(ts: float) -> date:
     """IST calendar date of a UTC-epoch market_data timestamp."""
@@ -61,17 +140,25 @@ def _ist_date_of_epoch(ts: float) -> date:
 
 
 def _prev_or_same_business_day(d: date) -> date:
-    """Roll a weekend date back to the preceding Friday; weekdays unchanged."""
-    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+    """Roll ``d`` back to the preceding trading day; a trading day is unchanged.
+
+    Weekend- and NSE-holiday-aware (issue #253) via ``is_trading_day``. Bounded
+    to 30 calendar days back as a defensive safety valve (mirrors the seeder's
+    walk) so a pathological/empty calendar can never loop indefinitely.
+    """
+    for _ in range(30):
+        if is_trading_day(d):
+            return d
         d -= timedelta(days=1)
     return d
 
 
 def business_days_between(d_from: date, d_to: date) -> int:
-    """Count business days in the half-open interval ``(d_from, d_to]``.
+    """Count trading days in the half-open interval ``(d_from, d_to]``.
 
-    Returns 0 when ``d_to <= d_from`` (the last bar is at or ahead of the
-    reference day — never negative).
+    Weekend- and NSE-holiday-aware (issue #253). Returns 0 when ``d_to <=
+    d_from`` (the last bar is at or ahead of the reference day — never
+    negative).
     """
     if d_to <= d_from:
         return 0
@@ -79,9 +166,67 @@ def business_days_between(d_from: date, d_to: date) -> int:
     cur = d_from
     while cur < d_to:
         cur += timedelta(days=1)
-        if cur.weekday() < 5:
+        if is_trading_day(cur):
             n += 1
     return n
+
+
+def compute_incremental_start_date(
+    details: dict[str, dict],
+    stale_symbols: list[str],
+    ref: date,
+    lookback_days: int,
+) -> date:
+    """Earliest date the catch-up needs to fetch — issue #193.
+
+    The three convergence schedulers (``sector_follow_stock_backfill``,
+    ``sector_follow_index_backfill``, ``scanner_universe_backfill``) all used
+    to compute ``start = ref - lookback_days`` regardless of what data was
+    already on disk. On a Sunday boot with Friday's bars already stored, this
+    meant re-fetching 4 calendar days from the broker every restart even
+    though zero new data could exist. ``compute_stale_symbols`` already
+    returns each symbol's ``last_date`` in its ``details`` dict — this helper
+    folds those into the smallest necessary fetch window:
+
+    * If every stale symbol has at least one stored bar, return
+      ``max(min(last_dates) + 1 day, ref - lookback_days)``. The ``+1 day``
+      offset skips the day already covered (the broker's per-day fetch
+      includes the end date inclusively, and ``INSERT OR REPLACE`` would
+      dedupe a re-fetch anyway — but the broker call still costs quota).
+    * If ANY stale symbol has no data at all (``last_date`` is None — the
+      ``"never fetched"`` case), fall back to the full ``ref - lookback_days``
+      so the no-data symbol still gets a useful initial window. Mixing
+      windows per-symbol would require an API change to the backfill helpers;
+      this conservative fallback is the same behavior the bug originally
+      produced for that symbol class, just unavoidable.
+    * The ``lookback_days`` cap is a hard ceiling — even if the last_date is
+      months old (deep-gap recovery), we never reach further back than the
+      caller asked, preserving the existing manual-CLI-catch-up contract for
+      true historical gaps.
+
+    Returns the start ``date`` for the catch-up ``[start, ref]`` window.
+    """
+    if not stale_symbols:
+        return ref  # caller short-circuits before calling; defensive
+
+    lookback_floor = ref - timedelta(days=lookback_days)
+    last_dates: list[date] = []
+    for sym in stale_symbols:
+        info = details.get(sym) or {}
+        raw = info.get("last_date")
+        if not raw:
+            # At least one symbol has no data — fall back to full lookback.
+            return lookback_floor
+        try:
+            last_dates.append(date.fromisoformat(raw))
+        except (TypeError, ValueError):
+            # Malformed date string — treat the same as "no data" defensively.
+            return lookback_floor
+
+    incremental = min(last_dates) + timedelta(days=1)
+    # Never reach earlier than the lookback floor (deep-gap CLI territory) AND
+    # never start past the reference date (a same-day catch-up still wants today).
+    return min(max(incremental, lookback_floor), ref)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,7 +238,8 @@ def is_transient_lock_error(exc: BaseException) -> bool:
 
     Covers the in-process instance-cache config mismatch (the live app holds
     ``historify.duckdb`` open read-write while a backfill thread opens it
-    read-only) and the classic file-lock messages a *separate* process hits.
+    read-only), the classic file-lock messages a *separate* process hits, and
+    the attach-conflict surfaced when a read query tries to re-attach the file.
     """
     msg = str(exc).lower()
     return (
@@ -101,39 +247,79 @@ def is_transient_lock_error(exc: BaseException) -> bool:
         or "could not set lock" in msg
         or "conflicting lock" in msg
         or "being used by another process" in msg
+        or "unique file handle conflict" in msg
     )
 
 
-def connect_historify_readonly(duckdb_path: str):
-    """Open historify for a read-only query, tolerant of an existing read-write
-    connection held elsewhere in **this** process.
+def connect_historify_readonly(duckdb_path: str, max_retries: int = 3):
+    """Return a cursor on the historify per-process singleton (or a fresh
+    read-only connection for unit-test paths).
 
-    DuckDB keeps one database instance per file per process and refuses a second
-    connection that requests a *different* configuration ("Can't open a connection
-    to same database file with a different configuration than existing
-    connections"). The live OpenAlgo process holds ``historify.duckdb`` open
-    read-write (the historify writer), so a plain ``read_only=True`` open from a
-    backfill/evaluator thread collides — this was the recurring 15:30+ post-close
-    lock-warning spam.
+    Per issue #191 / #156 Phase 1: in production every caller passes the
+    same path (``HISTORIFY_DATABASE_PATH``), so they all share one
+    writeable connection — the only configuration that eliminates the
+    config-mismatch race the pre-#191 code suffered. The cursor returned
+    by :meth:`DuckDBPyConnection.cursor` is itself a DuckDB connection
+    that shares the underlying database; callers may use it as a context
+    manager (``with X as c:``) or as a direct assignment (``c = X(...)``);
+    closing the cursor releases only its own resources, never the shared
+    file handle.
 
-    Strategy: try ``read_only=True`` first (the cross-process-friendly path when no
-    writer is attached); on that specific config-mismatch error, fall back to a
-    default (config-matching) connect that reuses the already-open shared instance
-    — the read-only SELECT still succeeds. The caller still closes the returned
-    connection as usual.
+    Path-mismatch fallthrough — unit-test ergonomics
+    -----------------------------------------------
+    Tests routinely pass a per-test tmpdir DB and need this function to
+    actually open *that* file (each test populates its own ``market_data``
+    rows there). When the resolved absolute path differs from the
+    singleton's path, fall through to a fresh read-only connect on the
+    requested path. This branch is exclusively a test ergonomic — in
+    production every caller's resolved path matches the singleton's, so
+    the fallthrough never fires. A WARNING is logged when it does so a
+    misrouted production caller surfaces immediately in ``errors.jsonl``
+    rather than silently re-introducing the #191 race.
+
+    The ``max_retries`` argument is kept for API compatibility but is no
+    longer load-bearing — there is nothing transient to retry past once
+    everything in the process shares one connection. Will be removed in
+    a follow-up once every caller stops passing it.
+
+    Read-only enforcement is sacrificed for the singleton path (the
+    shared connection is writeable). None of the three current production
+    callers (``sector_follow_service``, ``sector_rotation_etf_service``,
+    this module's own freshness check) write through the cursor by
+    design; a future caller that does will hit the live DB rather than
+    failing closed. This trade-off was acknowledged in issue #156
+    ("read-only safety lost; all callers are read-only by convention").
+
+    History
+    -------
+    * PR #118 introduced the first fallback (one exception class).
+    * PR #126 broadened to three exception classes + retry/backoff.
+    * Issue #191 fix (this commit): replaced both with the singleton; the
+      path-mismatch fallthrough preserves test ergonomics.
     """
+    import os
+
+    from database.historify_db import _get_shared_conn, get_db_path
+
+    singleton_path = os.path.abspath(get_db_path())
+    requested = os.path.abspath(duckdb_path) if duckdb_path else singleton_path
+
+    if requested == singleton_path:
+        # Production happy-path — every live caller hits this branch.
+        return _get_shared_conn().cursor()
+
+    # Unit-test fallthrough. WARNING logs the mismatch so a misrouted
+    # production caller is immediately visible.
+    logger.warning(
+        "connect_historify_readonly: requested path %r != singleton path %r "
+        "— opening a separate read-only connection (test ergonomic; in "
+        "production this re-introduces the #191 config-mismatch risk)",
+        duckdb_path,
+        get_db_path(),
+    )
     import duckdb
 
-    try:
-        return duckdb.connect(duckdb_path, read_only=True)
-    except duckdb.ConnectionException as e:
-        if "different configuration" not in str(e):
-            raise
-        logger.info(
-            "historify already open read-write in this process; reusing the shared "
-            "connection for a read-only query (read_only mode unavailable)"
-        )
-        return duckdb.connect(duckdb_path)
+    return duckdb.connect(duckdb_path, read_only=True)
 
 
 # --------------------------------------------------------------------------- #

@@ -2,6 +2,38 @@ import { webClient } from './client'
 
 export type ScreenerType = 'buy' | 'sell'
 
+// Tier-3 additions
+export interface ScanDefinitionFull extends ScanDefinitionDetail {
+  parameters_json: string | null
+  parent_definition_id: number | null
+}
+
+// Keys accepted by each rule
+export interface BuyRuleParams {
+  gap_pct?: number
+  atr_pct?: number
+  vol_5m_mult?: number
+  rsi_threshold?: number
+  supertrend_period?: number
+  supertrend_mult?: number
+  price_min?: number
+  price_max?: number
+  vol_sma_short?: number
+  vol_sma_long?: number
+}
+
+export interface SellRuleParams {
+  gap_pct?: number
+  atr_pct?: number
+  rsi_threshold?: number
+  supertrend_period?: number
+  supertrend_mult?: number
+  price_min?: number
+  price_max?: number
+}
+
+export type RuleParams = BuyRuleParams | SellRuleParams
+
 export interface ScanSignal {
   id: number
   run_at: string
@@ -21,6 +53,7 @@ export interface ScanDefinitionSummary {
   updated_at: string
   latest_signals: Omit<ScanSignal, 'notes'>[]
   today_hit_count: number
+  parent_definition_id: number | null
 }
 
 export interface ScanDefinitionDetail {
@@ -52,6 +85,38 @@ export interface SymbolHit {
 export interface HitsBySymbolResponse {
   date: string
   symbols: SymbolHit[]
+}
+
+// "Currently matching" (issue #342) — a live/ephemeral view over scan_results:
+// symbols with an in-house row within the last SCANNER_ACTIVE_TTL_MIN minutes.
+// Purely additive — never filters or truncates the signal history endpoints
+// above (getSignals / getHitsBySymbol), which remain the permanent audit trail.
+//
+// Issue #348: each symbol carries prev_close/last_price/pct_change enrichment
+// (null-safe — a missing broker prev-close or live aggregator price yields
+// pct_change=null rather than dropping the symbol). The API sorts `symbols`
+// server-side (buy: pct_change desc, sell: pct_change asc, nulls last, tie
+// alphabetical) — the frontend must render the order as-is, no client sort.
+export interface ActiveSymbol {
+  symbol: string
+  first_seen_at: string
+  last_confirmed_at: string
+  prev_close: number | null
+  last_price: number | null
+  pct_change: number | null
+}
+
+export interface CurrentlyMatchingDefinition {
+  id: number
+  name: string
+  screener_type: ScreenerType
+  symbols: ActiveSymbol[]
+}
+
+export interface CurrentlyMatchingResponse {
+  ttl_minutes: number
+  as_of: string
+  definitions: CurrentlyMatchingDefinition[]
 }
 
 export const scannerApi = {
@@ -93,6 +158,54 @@ export const scannerApi = {
     const res = await webClient.get<{ status: string; data: HitsBySymbolResponse }>(
       '/scanner/api/hits-by-symbol',
       { params }
+    )
+    return res.data.data
+  },
+
+  getCurrentlyMatching: async (): Promise<CurrentlyMatchingResponse> => {
+    const res = await webClient.get<{ status: string; data: CurrentlyMatchingResponse }>(
+      '/scanner/api/currently-matching'
+    )
+    return res.data.data
+  },
+
+  getDefinition: async (id: number): Promise<ScanDefinitionFull> => {
+    const res = await webClient.get<{ status: string; data: ScanDefinitionFull }>(
+      `/scanner/api/definitions/${id}`
+    )
+    return res.data.data
+  },
+
+  cloneDefinition: async (
+    id: number,
+    body: { name: string; parameters_json?: RuleParams | null }
+  ): Promise<{ id: number; name: string }> => {
+    const res = await webClient.post<{ status: string; data: { id: number; name: string } }>(
+      `/scanner/api/definitions/${id}/clone`,
+      body
+    )
+    return res.data.data
+  },
+
+  updateParams: async (
+    id: number,
+    parameters_json: RuleParams | null
+  ): Promise<{ id: number; parameters_json: string | null }> => {
+    const res = await webClient.put<{
+      status: string
+      data: { id: number; parameters_json: string | null }
+    }>(`/scanner/api/definitions/${id}/params`, { parameters_json })
+    return res.data.data
+  },
+
+  deleteDefinition: async (id: number, force = false): Promise<{ id: number }> => {
+    // force=true asks the backend to delete a code-backed *orphan* definition
+    // (a leaked rule like _p0_always_true with no registered production rule).
+    // Cloned definitions delete without force. Live built-ins stay protected —
+    // the backend still returns 403 for a code-backed row with a registered rule.
+    const res = await webClient.delete<{ status: string; data: { id: number } }>(
+      `/scanner/api/definitions/${id}`,
+      force ? { params: { force: 'true' } } : undefined
     )
     return res.data.data
   },

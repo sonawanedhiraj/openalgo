@@ -60,3 +60,44 @@ personal test branch retargeted to `dev` (or temporarily point the workflow's
 `branches:` at a throwaway branch), then watch the run under the **Actions** tab
 and confirm the Telegram message arrives. A docs-only or `test/`-only push
 should produce a "No code paths touched — no alert." log line and send nothing.
+
+## `ci-cd.yml` — smoke-stack gate (issue #229)
+
+Tier 1 of the test-infrastructure plan landed in-process integration tests via
+`BootHarness` — fast, but blind to anything at a **process boundary**: Flask ↔
+WS-proxy subprocess, ZMQ socket lifecycle, eventlet monkey-patching under
+Gunicorn, real HTTP through middleware, ConnectionPool predicates. The 2026-06-22
+WS-proxy-down cascading 0-signal day and the ConnectionPool predicate bug were
+both this class.
+
+`ci-cd.yml` carries the **smoke-stack** gate that closes that gap. It runs on
+every PR to `dev`/`main` and every push to those branches. Layout:
+
+- **`cd-build`** — builds `openalgo:latest` once, uploads it as an artifact so
+  every downstream stack-boot consumes the same image (no rebuild thrash).
+- **`cd-pytest-e2e`** — `docker compose up --wait` on `docker-compose.yml`
+  (main stack), runs `test/e2e` against it.
+- **`cd-playwright-smoke`** — same main stack, runs `smoke.spec.ts` +
+  `scanner_clone.spec.ts` against the real Flask + WS-proxy. Both specs are
+  broker-independent (smoke is route-reachability; scanner_clone uses
+  Playwright `page.route` mocks).
+- **`cd-playwright-broker`** — `docker compose -f docker-compose.test.yml -p
+  mock_test up --wait` on the **mock-broker stack** (`docker-compose.test.yml`),
+  runs `broker_happy_path.spec.ts` end-to-end through the FastAPI mock broker
+  (`test/fixtures/mock_broker`). Exercises the full setup → login → broker auth
+  → funds path with no real Kite OAuth.
+
+All three downstream jobs run in parallel on the `cd-build` artifact. Each has
+its own healthcheck-gated boot (`--wait`), a `failure()` diagnostics step that
+dumps the last 300 lines of container logs + the healthcheck state, and an
+`if: always()` teardown that runs `docker compose down -v --remove-orphans`
+even on cancellation.
+
+**Total wall clock per PR is ~5 minutes** (build ~80s on a cache miss / ~15-25s
+on hit, then three ~2-3 min parallel test jobs).
+
+**Branch protection (operator-only — GitHub UI step):** the smoke-stack gate is
+not enforced on `main` until the operator marks the six job names listed at
+the bottom of `ci-cd.yml` as required status checks under **Settings →
+Branches → Branch protection rules**. The workflow itself is already triggered
+on the right events; only the "required check" gating lives in the UI.

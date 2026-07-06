@@ -189,7 +189,7 @@ def fresh_mode_db(monkeypatch):
 def test_resolve_mode_strategy_row_primary(fresh_mode_db):
     from services.mode_service import resolve_mode
 
-    fresh_mode_db.set_mode("simplified_engine", "live", updated_by="op")
+    fresh_mode_db._set_mode_unchecked("simplified_engine", "live", updated_by="op")
     rm = resolve_mode("simplified_engine")
     assert rm.mode == "live"
     assert rm.source == "strategy_mode"
@@ -226,7 +226,7 @@ def test_resolve_strategy_mode_shim_intent_always_run(fresh_mode_db):
     """The deprecated shim always reports intent='run' — the intent axis is gone."""
     from services.mode_service import resolve_strategy_mode
 
-    fresh_mode_db.set_mode("simplified_engine", "sandbox", updated_by="op")
+    fresh_mode_db._set_mode_unchecked("simplified_engine", "sandbox", updated_by="op")
     d = resolve_strategy_mode("simplified_engine")
     assert d.mode == "sandbox"
     assert d.intent == "run"
@@ -239,7 +239,7 @@ def test_global_strategy_mode_live_routes_live(fresh_mode_db, fresh_intent_db):
     (analyze off)."""
     from services.mode_service import GLOBAL_MODE_KEY, EffectiveMode, resolve_effective_mode
 
-    fresh_mode_db.set_mode(GLOBAL_MODE_KEY, "live", updated_by="op")
+    fresh_mode_db._set_mode_unchecked(GLOBAL_MODE_KEY, "live", updated_by="op")
     with patch("services.mode_service.get_analyze_mode", return_value=False):
         assert resolve_effective_mode() == EffectiveMode.LIVE
 
@@ -247,7 +247,7 @@ def test_global_strategy_mode_live_routes_live(fresh_mode_db, fresh_intent_db):
 def test_global_strategy_mode_live_downgraded_by_analyze(fresh_mode_db, fresh_intent_db):
     from services.mode_service import GLOBAL_MODE_KEY, EffectiveMode, resolve_effective_mode
 
-    fresh_mode_db.set_mode(GLOBAL_MODE_KEY, "live", updated_by="op")
+    fresh_mode_db._set_mode_unchecked(GLOBAL_MODE_KEY, "live", updated_by="op")
     with patch("services.mode_service.get_analyze_mode", return_value=True):
         assert resolve_effective_mode() == EffectiveMode.SANDBOX
 
@@ -262,7 +262,7 @@ def test_global_strategy_mode_primary_over_legacy_daily_intent(fresh_mode_db, fr
         set_daily_intent,
     )
 
-    fresh_mode_db.set_mode(GLOBAL_MODE_KEY, "sandbox", updated_by="op")
+    fresh_mode_db._set_mode_unchecked(GLOBAL_MODE_KEY, "sandbox", updated_by="op")
     set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     with patch("services.mode_service.get_analyze_mode", return_value=False):
         assert resolve_effective_mode("2026-05-28") == EffectiveMode.SANDBOX

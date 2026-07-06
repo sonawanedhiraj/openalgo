@@ -1,5 +1,56 @@
 # Futures Follow CAP50 — Version Log
 
+## v0.3.1 — 2026-07-05
+EOD watchdog moved 15:14 → 15:28 so the 15:25 T+1 exit is primary (issue #334).
+Mode: **sandbox (default)** · Deployable: **true**
+
+- Bug: the watchdog and the 15:25 exit share the predicate `entry_date != today`;
+  firing at 15:14 the watchdog flattened every prior-day position FIRST, making
+  the de-facto exit 15:14 — an 11-minute divergence from the backtested/
+  documented 15:25 exit. The 15:14 slot was inherited from the simplified
+  engine's MIS constraint; futures_follow is NRML (accepted till the 15:30 NFO
+  close), so it never applied.
+- `futures_follow_eod_watchdog` cron now 15:28 IST (after the 15:25 primary
+  exit, 2 min before close, matching the entry-deadline buffer). Selection
+  predicate UNCHANGED — with correct ordering it is exactly right.
+- Supporting change: a REJECTED/exception exit SELL now KEEPS the position in
+  `paper_book` (was: silently dropped) so the 15:28 watchdog retries it; the
+  #265 store-reconcile guard suppresses the retry if the order actually filled.
+- The simplified engine's MIS watchdog (`services/eod_watchdog_service.py`,
+  15:14 cap) is untouched — its constraint is load-bearing there.
+
+## v0.3.0 — 2026-07-03
+Stage-1 LLM veto wired, strategy-aware (issue #318).
+Mode: **sandbox (default)** · Deployable: **true**
+
+- `run_entry` now reviews every in-cap signal via
+  `signal_review_service.review_signal(strategy_name='futures_follow_cap50')`
+  BEFORE `place_entry`. The prompt is strategy-aware: a STRATEGY CONTEXT block
+  (sourced from this folder's `config_snapshot.json` `llm_context` key, code
+  fallback in `services/signal_review_service.py` — keep in sync) frames the
+  review as **overnight-regime fit for a leveraged long NIFTY carry**, carrying
+  the honest caveat (hit-rate 53.4%, corr 0.295 — leveraged beta, not alpha).
+  The review combines BOTH the source stock signal (vol_ratio/stock_ret/
+  sector_ret) and the resolved NIFTY-future/book state from `get_status()`
+  (locked operator decision).
+- Enforcement mode resolution: `strategy_llm_config` row → `VETO_LAYER_MODE`
+  env → mode-aware default where **sandbox = active/enforcing** (B4). With no
+  row and no env, the veto ENFORCES on the sandbox book from the first cycle
+  (R2 — intended; disable via the dashboard LLM toggle / `VETO_LAYER_MODE=off`).
+- An enforcing `skip` drops that lot WITHOUT consuming the 50% margin cap
+  (later signals may use the freed slot), journals `status='veto_skip'`
+  (no order id, no margin, no phantom position), and records
+  `actually_taken=false` on the `signal_decision` audit row.
+- R3 latency bound: cumulative review wall-time per entry batch is capped at
+  180s (`VETO_REVIEW_BUDGET_SECONDS`, code constant); beyond it the remaining
+  signals place UNREVIEWED with a WARNING. Per-review latency is logged.
+  Any reviewer failure fails OPEN (take), mirroring the simplified engine.
+- Dashboard: `futures_follow_cap50` added to `_VETO_ENABLED_STRATEGIES`; its
+  LLM decisions view filters to `source='futures_follow_cap50'`; the simplified
+  engine's view now EXCLUDES futures rows (R1, `exclude_sources`).
+- Simplified-engine veto path unchanged (`strategy_name=None` default is
+  byte-for-byte the old prompt/context).
+
 ## v0.2.0 — 2026-06-15
 Sandbox is the structural default — scaffold mode dropped entirely (operator
 redirect: must trade in sandbox from Monday 2026-06-15 open).

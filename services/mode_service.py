@@ -54,7 +54,7 @@ def set_daily_intent_safe(
 
     Retained for callers/tests that still write the legacy table directly. The
     legacy table is being retired; new code should set the persistent mode via
-    ``database.strategy_mode_db.set_mode``."""
+    ``services.strategy_mode_service.flip_mode`` (the only sanctioned writer)."""
     return set_daily_intent(intent, set_by, notes=notes, date_str=date_str, locked=locked)
 
 

@@ -90,12 +90,43 @@ def _end_time() -> time:
         return time(17, 0)
 
 
+# Pre-entry refresh (#237): a single convergence fetch just before the 15:20
+# entry, since the boot check runs hours earlier and the periodic loop only runs
+# 15:30-17:00 — a mid-day intraday gap otherwise stays open through entry.
+_DEFAULT_PREENTRY_TIME = "15:17"
+# Bounded wait for the pre-entry download jobs. Must be short enough that a slow
+# fetch cannot overrun the 15:20 entry — if it does, the 15:18 smoke check still
+# catches the stale data and pauses.
+_PREENTRY_WAIT_SEC = 90
+
+
+def preentry_refresh_enabled() -> bool:
+    return os.getenv("SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED", "true").lower() == "true"
+
+
+def preentry_refresh_time() -> time:
+    """Pre-entry refresh fire time (default 15:17 IST — before the 15:18 smoke)."""
+    raw = os.getenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", _DEFAULT_PREENTRY_TIME)
+    try:
+        hh, mm = (int(x) for x in raw.split(":", 1))
+        return time(hh, mm)
+    except (TypeError, ValueError):
+        return time(15, 17)
+
+
 # --------------------------------------------------------------------------- #
 # Pure helpers (testable without threads/clocks)
 # --------------------------------------------------------------------------- #
 def _is_trading_day(d) -> bool:
-    """Weekday check (holidays not modelled — matches data_freshness_service)."""
-    return d.weekday() < 5
+    """Weekday AND not an NSE market holiday (issue #253).
+
+    Delegates to the shared ``services.data_freshness_service.is_trading_day``
+    predicate — fail-open (weekday-only) if the holiday calendar is
+    unavailable or has no rows for ``d.year``; never raises.
+    """
+    from services.data_freshness_service import is_trading_day as _shared_is_trading_day
+
+    return _shared_is_trading_day(d)
 
 
 def _within_window(now_t: time, end_t: time) -> bool:
@@ -147,14 +178,20 @@ def run_backfill_checks(today=None) -> dict:
 def _log_and_alert(res: dict, phase: str) -> None:
     idx = res.get("index", {})
     stk = res.get("stock", {})
+    # Issue #313 (ports #304) — refreshed/still_stale are now VERIFIED post-job
+    # counts (re-read MAX(timestamp) after the job completes), not submission
+    # counts, so "refreshed=N errors=0" can no longer be logged purely because
+    # a download job was accepted.
     logger.info(
-        "sector_follow backfill %s: index(stale=%d refreshed=%d) "
-        "stock(stale=%d refreshed=%d) all_fresh=%s errors=%d",
+        "sector_follow backfill %s: index(stale=%d verified_fresh=%d still_stale=%d) "
+        "stock(stale=%d verified_fresh=%d still_stale=%d) all_fresh=%s errors=%d",
         phase,
         len(idx.get("stale_symbols", [])),
         len(idx.get("refreshed", [])),
+        len(idx.get("still_stale", [])),
         len(stk.get("stale_symbols", [])),
         len(stk.get("refreshed", [])),
+        len(stk.get("still_stale", [])),
         res.get("all_fresh"),
         len(res.get("errors", [])),
     )
@@ -172,11 +209,80 @@ def _log_and_alert(res: dict, phase: str) -> None:
 
 
 def run_boot_backfill_checks(today=None) -> dict:
-    """One-shot boot convergence: catch up whatever is stale, log + alert."""
+    """One-shot boot convergence: catch up whatever is stale, log + alert.
+
+    Blocks until any submitted download jobs reach a terminal status so the
+    sibling scheduler's lock-protected boot worker doesn't start its writes
+    while this one's 5-worker pool is still mid-download (issue #151 —
+    in-process DuckDB write contention).
+    """
     logger.info("sector_follow backfill: boot convergence check starting")
     res = run_backfill_checks(today)
     _log_and_alert(res, phase="boot")
+
+    # Wait inside the boot_convergence_lock for the submitted jobs to finish.
+    # check_and_refresh_if_stale returns ``{"job_id": ...}`` when work was
+    # submitted; an empty/stale-free arm has no job_id and contributes nothing.
+    try:
+        from services.historify_service import wait_for_jobs
+
+        job_ids = [
+            (res.get("index") or {}).get("job_id"),
+            (res.get("stock") or {}).get("job_id"),
+        ]
+        finals = wait_for_jobs(job_ids)
+        if finals:
+            logger.info("sector_follow backfill: boot jobs final status: %s", finals)
+    except Exception:  # waiting must never break the boot path
+        logger.exception("sector_follow backfill: wait_for_jobs raised")
     return res
+
+
+def run_preentry_backfill_checks(today=None) -> dict:
+    """Pre-15:20-entry convergence: fetch whatever intraday is behind so the
+    evaluator has today's data at the 15:20 entry (issue #237).
+
+    The boot check runs once (hours earlier) and the periodic loop only runs
+    15:30-17:00, so a mid-day intraday gap stays open through the entry window —
+    the 06-29/06-30 zero-order days. This closes it: run the same stale-check the
+    boot/periodic paths use, then wait (bounded to ``_PREENTRY_WAIT_SEC``, short
+    enough not to overrun 15:20) for the download jobs so today's bars land in
+    historify (the evaluator's fallback source) before the 15:18 smoke + 15:20
+    entry. Additive, idempotent (fresh → no-op), and fail-graceful. Mirrors
+    ``run_boot_backfill_checks`` minus the boot serialisation lock — 15:17 is a
+    quiet window with no sibling convergence running.
+
+    Returns the ``run_backfill_checks`` verdict, or ``{"skipped": True}`` when the
+    feature flag is off.
+    """
+    if not preentry_refresh_enabled():
+        logger.info(
+            "sector_follow pre-entry refresh disabled "
+            "(SECTOR_FOLLOW_PREENTRY_REFRESH_ENABLED!=true)"
+        )
+        return {"skipped": True}
+
+    logger.info("sector_follow backfill: pre-entry (%s) convergence check starting", _now_hhmm())
+    res = run_backfill_checks(today)
+    _log_and_alert(res, phase="preentry")
+
+    try:
+        from services.historify_service import wait_for_jobs
+
+        job_ids = [
+            (res.get("index") or {}).get("job_id"),
+            (res.get("stock") or {}).get("job_id"),
+        ]
+        finals = wait_for_jobs(job_ids, timeout_sec=_PREENTRY_WAIT_SEC)
+        if finals:
+            logger.info("sector_follow backfill: pre-entry jobs final status: %s", finals)
+    except Exception:  # waiting must never break the entry path
+        logger.exception("sector_follow backfill: pre-entry wait_for_jobs raised")
+    return res
+
+
+def _now_hhmm() -> str:
+    return preentry_refresh_time().strftime("%H:%M")
 
 
 # --------------------------------------------------------------------------- #
@@ -270,7 +376,13 @@ def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
 
 def _boot_worker() -> None:
     if _wait_for_broker_session():
-        run_boot_backfill_checks()
+        # Serialise the convergence work against sibling schedulers so the four
+        # boot backfill jobs don't burst onto historify.duckdb simultaneously
+        # (see services/boot_convergence.py and issue #140).
+        from services.boot_convergence import boot_convergence_lock
+
+        with boot_convergence_lock(name="sector_follow"):
+            run_boot_backfill_checks()
     else:
         logger.warning(
             "sector_follow backfill: no broker session appeared at boot; "

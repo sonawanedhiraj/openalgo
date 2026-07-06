@@ -27,25 +27,37 @@ jobs:
   # ============================================================================
   ci-unit-tests:
     name: "CI: Unit + Integration Tests"
-    runs-on: self-hosted
+    # Runs on GitHub-hosted ubuntu-latest — repo is public so minutes are free
+    # and unlimited. This frees the single-slot self-hosted runner for the one
+    # job that genuinely needs the laptop's Docker (cd-docker-e2e), and lets
+    # the two CI/CD stages run truly in parallel on independent infra pools.
+    runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install uv
-        run: |
-          pip install uv --quiet
+      # Matches ci-self-hosted.yml's setup so the uv wheel cache is reused.
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install dependencies (incl. dev for pytest-xdist)
+        run: uv sync --dev
 
       - name: Run unit + integration tests (parallelized)
+        # `test_bridge_server.py` is in-process FastAPI TestClient — no broker /
+        # network deps — so it's safe to include here.
+        # `test_email_functionality.py` remains skipped: it uses `input()` and
+        # needs real SMTP creds — operator-only script, not a test.
         run: |
           uv run python -m pytest test/ \
             -n auto \
             --ignore=test/e2e \
-            --ignore=test/test_bridge_server.py \
             --ignore=test/test_email_functionality.py \
-            -v --tb=short
+            --tb=short
         env:
           API_KEY_PEPPER: "test-pepper-key-for-ci-only-not-for-production"  # pragma: allowlist secret
           APP_KEY: "test-app-key-for-ci-only-not-for-production"  # pragma: allowlist secret
@@ -55,29 +67,61 @@ jobs:
         if: always()
         run: |
           echo "✅ CI Stage Complete"
-          echo "Unit tests passed on self-hosted runner"
+          echo "Unit tests passed on ubuntu-latest"
 
   # ============================================================================
-  # STAGE 2: CD - Docker Build, Boot, and E2E Tests
+  # STAGE 1b: CI - Frontend Unit Tests (vitest)
   # ============================================================================
-  cd-docker-e2e:
-    name: "CD: Docker + E2E Tests"
-    runs-on: self-hosted
-    needs: ci-unit-tests
-    timeout-minutes: 15
+  # Runs in parallel with ci-unit-tests and cd-docker-e2e on its own free
+  # ubuntu-latest slot. Previously only fired via the manual workflow_dispatch
+  # in ci.yml, so frontend regressions slipped to dev unnoticed.
+  ci-frontend-tests:
+    name: "CI: Frontend Tests (vitest)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run vitest
+        working-directory: frontend
+        run: npm run test:run
+
+  # ============================================================================
+  # STAGE 2a: CD-BUILD — build the Docker image once, share via artifact (#213)
+  # ============================================================================
+  # Split from the monolithic cd-docker-e2e job so subsequent test jobs can
+  # consume the same built image without rebuilding. PR A validates the
+  # mechanic with one consumer (cd-docker-e2e); PR B will fan out the test
+  # stage into parallel jobs (pytest / Playwright smoke / mock-broker
+  # Playwright) all needing this same artifact.
+  cd-build:
+    name: "CD: Build Docker image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install uv
-        run: |
-          pip install uv --quiet
+        run: pip install uv --quiet
 
-      - name: Generate throwaway .env for testing
+      - name: Generate throwaway .env (compose build reads it)
         run: |
           cp .sample.env .env
-          # Generate random secrets (throwaway for testing only)
           uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
           uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
           uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
@@ -85,7 +129,76 @@ jobs:
           sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
           sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
           sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
-          # Ensure sandbox mode
+
+      - name: Preflight — Docker daemon + disk space
+        run: |
+          docker version --format 'Daemon: {{.Server.Version}}'
+          AVAIL=$(df / --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G ' || echo 999)
+          echo "Disk free: ${AVAIL}GB"
+          if [ "${AVAIL:-999}" -lt 5 ]; then
+            echo "::error::Disk has only ${AVAIL}GB free."
+            exit 1
+          fi
+
+      # Set up Buildx so the next step can use GitHub Actions cache (#218).
+      # On unchanged Dockerfile/lockfile this drops the build step from ~80s
+      # to ~15-25s (cache HIT). First run is a cache MISS (full build + write).
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (Buildx + GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: openalgo:latest
+          load: true   # load into local daemon so `docker save` can find it
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save image to tarball
+        run: |
+          docker image ls openalgo:latest
+          docker save openalgo:latest -o /tmp/openalgo-image.tar
+          ls -lh /tmp/openalgo-image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp/openalgo-image.tar
+          retention-days: 1
+          compression-level: 0  # already-compressed Docker layers; skip re-gzip
+
+  # ============================================================================
+  # STAGE 2b: CD-PYTEST-E2E — pytest test/e2e against the booted main stack
+  # ============================================================================
+  # PR B (#215): fanned out from the monolithic cd-docker-e2e job into 3
+  # parallel consumers of the cd-build artifact. Each runs on its own VM
+  # with its own compose, eliminating the prior port-swap teardown dance.
+  cd-pytest-e2e:
+    name: "CD: pytest E2E"
+    needs: cd-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Generate throwaway .env for testing
+        run: |
+          cp .sample.env .env
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
           sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
           if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
             echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
@@ -93,83 +206,253 @@ jobs:
           if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
             echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
           fi
-          # Verify .env file was created and is readable
-          test -f .env && echo "✅ .env file created successfully" || echo "❌ .env file creation failed"
-          ls -lh .env
 
-      - name: Preflight — runner can reach Docker daemon
+      - name: Download + load image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp
+      - name: Load Docker image
         run: |
-          if ! docker version --format '{{.Server.Version}}' 2>/dev/null; then
-            echo "::error::Runner cannot reach the Docker daemon."
-            echo "::error::Likely cause: /var/run/docker.sock not mounted in the runner container."
-            echo "::error::Fix: add docker-compose.override.yml in C:\\actions-runner\\ with:"
-            echo "::error::  services: {gh-runner: {volumes: [/var/run/docker.sock:/var/run/docker.sock]}}"
-            echo "::error::Then: docker rm -f openalgo-gh-runner && cd C:\\actions-runner && docker compose up -d"
-            exit 1
-          fi
-          AVAIL=$(df / --output=avail -BG 2>/dev/null | tail -1 | tr -d 'G ' || echo 999)
-          if [ "${AVAIL:-999}" -lt 5 ]; then
-            echo "::error::Runner disk has only ${AVAIL}GB free (need ≥5 GB for Docker build)."
-            echo "::error::Run: docker system prune -f"
-            exit 1
-          fi
-          echo "✅ Preflight: Docker $(docker version --format '{{.Server.Version}}'), ${AVAIL}GB disk free"
+          docker load -i /tmp/openalgo-image.tar
+          rm /tmp/openalgo-image.tar
+          echo "✅ openalgo:latest loaded from artifact"
 
-      - name: Build Docker image
+      - name: Boot main container with health check
         run: |
-          echo "Building Docker image..."
-          docker compose build --quiet
-          echo "✅ Docker image built successfully"
-
-      - name: Boot container with health check
-        run: |
-          echo "Starting OpenAlgo container..."
-          docker compose up -d
-
-          # Wait for app to be ready (up to 2 minutes)
-          echo "Waiting for application to be ready..."
-          for i in {1..60}; do
-            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:5000/ 2>/dev/null || echo "000")
-            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
-              echo "✅ Application is ready (HTTP $STATUS)"
-              break
-            fi
-            echo "  [$i/60] Waiting... (HTTP $STATUS)"
-            sleep 2
-          done
-
-          # Final status check
+          docker compose up -d --wait
           docker compose ps
-          echo "✅ Container is running"
+          echo "✅ Container is running and healthy"
 
-      - name: Run E2E tests against running application
+      - name: Dump container diagnostics on boot failure
+        if: failure()
         run: |
-          echo "Running E2E tests..."
-          pip install uv --quiet
-          uv run python -m pytest test/e2e -v --tb=short
-          echo "✅ E2E tests passed"
+          echo "::group::compose ps -a"
+          docker compose ps -a || true
+          echo "::endgroup::"
+          echo "::group::openalgo-web logs (last 300 lines)"
+          docker logs --tail=300 openalgo-web 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::container health inspect"
+          docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
+          echo "::endgroup::"
 
-      - name: Teardown containers
+      - name: Run pytest E2E
+        env:
+          OPENALGO_URL: http://localhost:5000
+        run: |
+          echo "Running pytest E2E tests..."
+          uv run python -m pytest test/e2e --tb=short
+
+      - name: Final teardown
         if: always()
         run: |
-          echo "Cleaning up Docker containers..."
           docker compose down -v --remove-orphans || true
-          rm -f .env
-          echo "✅ Cleanup complete"
 
-      - name: Report CD status
+  # ============================================================================
+  # STAGE 2c: CD-PLAYWRIGHT-SMOKE — Playwright smoke against the main stack
+  # ============================================================================
+  cd-playwright-smoke:
+    name: "CD: Playwright smoke"
+    needs: cd-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Generate throwaway .env for testing
+        run: |
+          cp .sample.env .env
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+          sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
+          if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
+            echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
+          fi
+          if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
+            echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
+          fi
+
+      - name: Download + load image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp
+      - name: Load Docker image
+        run: |
+          docker load -i /tmp/openalgo-image.tar
+          rm /tmp/openalgo-image.tar
+
+      - name: Boot main container with health check
+        run: |
+          docker compose up -d --wait
+          docker compose ps
+
+      - name: Dump container diagnostics on boot failure
+        if: failure()
+        run: |
+          docker compose ps -a || true
+          docker logs --tail=300 openalgo-web 2>&1 || true
+          docker inspect --format '{{json .State.Health}}' openalgo-web 2>/dev/null || true
+
+      - name: Run Playwright smoke (MS image)
+        # Microsoft's official Playwright image — chromium + system deps baked
+        # in. Tag must match @playwright/test pinned in frontend/package-lock.json
+        # (1.58.0); bump together. `--network host` lets the container reach
+        # openalgo on localhost:5000.
+        env:
+          OPENALGO_URL: http://localhost:5000
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/frontend:/frontend" -w /frontend \
+            -e OPENALGO_URL="$OPENALGO_URL" \
+            -e CI=true \
+            mcr.microsoft.com/playwright:v1.58.0-jammy \
+            sh -c 'npm ci --no-audit --no-fund && npx playwright test --config playwright.smoke.config.ts'
+
+      - name: Upload Playwright smoke report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Final teardown
         if: always()
         run: |
-          echo "✅ CD Stage Complete"
-          echo "Docker image built, booted, and E2E tests passed"
+          docker compose down -v --remove-orphans || true
+
+  # ============================================================================
+  # STAGE 2d: CD-PLAYWRIGHT-BROKER — Playwright happy-path against mock stack
+  # ============================================================================
+  # The mock-broker stack (docker-compose.test.yml) references
+  # `image: openalgo:latest` with no build directive, so it consumes the
+  # artifact-loaded image directly. Only the small mock_broker FastAPI
+  # fixture has its own build context.
+  cd-playwright-broker:
+    name: "CD: Playwright broker happy-path"
+    needs: cd-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install uv --quiet
+
+      - name: Generate throwaway .env for testing
+        run: |
+          cp .sample.env .env
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k1
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k2
+          uv run python -c "import secrets; print(secrets.token_hex(32))" > /tmp/k3
+          sed -i "s|^APP_KEY = .*|APP_KEY = '$(cat /tmp/k1)'|" .env
+          sed -i "s|^API_KEY_PEPPER = .*|API_KEY_PEPPER = '$(cat /tmp/k2)'|" .env
+          sed -i "s|^FERNET_SALT = .*|FERNET_SALT = '$(cat /tmp/k3)'|" .env
+          sed -i "s|^REDIRECT_URL = .*|REDIRECT_URL = 'http://127.0.0.1:5000/zerodha/callback'|" .env
+          sed -i "s|^SIMPLIFIED_ENGINE_MODE = .*|SIMPLIFIED_ENGINE_MODE = 'sandbox'|" .env
+          if ! grep -q "SECTOR_FOLLOW_CAP5_VOL_MODE" .env; then
+            echo "SECTOR_FOLLOW_CAP5_VOL_MODE='sandbox'" >> .env
+          fi
+          if ! grep -q "FUTURES_FOLLOW_MODE" .env; then
+            echo "FUTURES_FOLLOW_MODE='sandbox'" >> .env
+          fi
+
+      - name: Download + load image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: openalgo-image
+          path: /tmp
+      - name: Load Docker image
+        run: |
+          docker load -i /tmp/openalgo-image.tar
+          rm /tmp/openalgo-image.tar
+
+      - name: Build + boot mock-broker stack
+        run: |
+          # Only the mock_broker fixture needs building; openalgo uses the
+          # artifact-loaded image.
+          docker compose -f docker-compose.test.yml -p mock_test build --quiet mock_broker
+          docker compose -f docker-compose.test.yml -p mock_test up -d --wait
+          docker compose -f docker-compose.test.yml -p mock_test ps
+
+      - name: Dump mock-broker stack diagnostics on boot failure
+        if: failure()
+        run: |
+          echo "::group::compose ps -a (mock_test project)"
+          docker compose -f docker-compose.test.yml -p mock_test ps -a || true
+          echo "::endgroup::"
+          echo "::group::mock_test-openalgo-1 logs (last 300 lines)"
+          docker logs --tail=300 mock_test-openalgo-1 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::mock_test-openalgo-1 health inspect"
+          docker inspect --format '{{json .State.Health}}' mock_test-openalgo-1 2>/dev/null || true
+          echo "::endgroup::"
+          echo "::group::mock_test-mock_broker-1 logs (last 100 lines)"
+          docker logs --tail=100 mock_test-mock_broker-1 2>&1 || true
+          echo "::endgroup::"
+
+      - name: Run Playwright broker happy-path (MS image)
+        env:
+          OPENALGO_URL: http://localhost:5099
+          MOCK_BROKER_URL: http://localhost:8001
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/frontend:/frontend" -w /frontend \
+            -e OPENALGO_URL="$OPENALGO_URL" \
+            -e MOCK_BROKER_URL="$MOCK_BROKER_URL" \
+            -e CI=true \
+            mcr.microsoft.com/playwright:v1.58.0-jammy \
+            sh -c 'npm ci --no-audit --no-fund && npx playwright test --config playwright.broker.config.ts'
+
+      - name: Upload Playwright broker report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-broker-report
+          path: frontend/playwright-report/
+          retention-days: 7
+
+      - name: Final teardown
+        if: always()
+        run: |
+          docker compose -f docker-compose.test.yml -p mock_test down -v --remove-orphans || true
 
 # ============================================================================
 # Branch Protection Requirements
 # ============================================================================
-# Add these as required status checks on dev/main branches:
-# - ci-unit-tests
-# - cd-docker-e2e
+# Add these as required status checks on dev/main branches (PR B post-#215;
+# smoke-stack scope tightened by #229):
+# - CI: Unit + Integration Tests
+# - CI: Frontend Tests (vitest)
+# - CD: Build Docker image
+# - CD: pytest E2E
+# - CD: Playwright smoke              ← smoke.spec.ts + scanner_clone.spec.ts
+# - CD: Playwright broker happy-path  ← broker_happy_path.spec.ts on mock stack
 #
-# Command to add via GitHub CLI:
-# gh api repos/sonawanedhiraj/openalgo/branches/dev/protection/required_status_checks \
-#   --input - <<< '{"strict": true, "contexts": ["ci-unit-tests", "cd-docker-e2e"]}'
+# The last three jobs together form the "smoke-stack" gate from issue #229:
+# they bring the real Flask + WS-proxy subprocess + ZMQ + mock-broker stack
+# up via docker-compose (`docker-compose.yml` for the main stack,
+# `docker-compose.test.yml` for the mock-broker stack), wait on each
+# container's healthcheck, and exercise the cross-process boundaries that
+# the in-process BootHarness suite (Tier 1) cannot see. They are the durable
+# guard against the 2026-06-22 WS-proxy-down cascading 0-signal class of
+# failure (see memory: `ws-proxy-down-cascading-failure`,
+# `connection-pool-untested-integration-glue`).
+#
+# `cd-docker-e2e` was retired in #215 (PR B) — replaced by the three parallel
+# test jobs above. Operator must update branch protection accordingly (this
+# is a GitHub UI change, not code).

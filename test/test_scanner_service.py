@@ -39,12 +39,20 @@ from utils.event_bus import Event
 # ``fno_intraday_*_chartink`` rules require multi-timeframe daily/weekly frames
 # and 200+ daily bars, so we register self-contained test rules here rather than
 # coupling these service tests to a production rule's predicate.
+#
+# These rules are registered fresh on every test via the ``_register_test_rules``
+# autouse fixture below — NOT at module import time. The rule registry is a
+# module-global dict shared across the whole pytest session, and another suite
+# (``test/integration/test_phase2_p0.py``) calls
+# ``scanner_service._clear_rule_registry_for_tests()`` in its teardown. Under
+# ``pytest -n auto`` (CI), if that suite happens to run earlier in the same
+# xdist worker our module-import-time registrations get wiped and the rules
+# vanish before our tests evaluate, producing the 7 failures originally seen on
+# PR #206 (no scan_results row, no PASS log, etc.). Re-registering per-test
+# closes that ordering hole — see issue #207.
 # ---------------------------------------------------------------------------
 
 
-@scanner_service.scan_rule(
-    "_test_buy_surge_ema", "buy", "test-only: vol surge >=2x AND close above EMA20"
-)
 def _test_buy_surge_ema(bars, indicators):
     if len(bars) < 21:
         return False
@@ -59,9 +67,6 @@ def _test_buy_surge_ema(bars, indicators):
     return bool(bars["close"].iloc[-1] > ema20.iloc[-1])
 
 
-@scanner_service.scan_rule(
-    "_test_sell_surge_ema", "sell", "test-only: vol surge >=2x AND close below EMA20"
-)
 def _test_sell_surge_ema(bars, indicators):
     if len(bars) < 21:
         return False
@@ -104,6 +109,32 @@ def fresh_scanner_db(monkeypatch):
 
     test_session.remove()
     test_engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _register_test_rules():
+    """Re-register the two test-only rules before every test.
+
+    The rule registry is a module-global dict (``scanner_service._rule_registry``)
+    shared across the whole pytest session. Another suite —
+    ``test/integration/test_phase2_p0.py`` — calls
+    ``scanner_service._clear_rule_registry_for_tests()`` in its teardown to
+    wipe its own ``_p0_always_true`` rule, which under ``pytest -n auto`` also
+    wipes the rules a previously-loaded ``test_scanner_service`` module
+    registered at import time. Registering per-test makes this file's contract
+    robust to that ordering hazard (issue #207).
+    """
+    scanner_service.scan_rule(
+        "_test_buy_surge_ema",
+        "buy",
+        "test-only: vol surge >=2x AND close above EMA20",
+    )(_test_buy_surge_ema)
+    scanner_service.scan_rule(
+        "_test_sell_surge_ema",
+        "sell",
+        "test-only: vol surge >=2x AND close below EMA20",
+    )(_test_sell_surge_ema)
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -458,8 +489,10 @@ def test_indicators_dict_populated_with_expected_keys():
     result = svc._build_indicators("RELIANCE", bars)
     # Backward-compat indicator keys, the four Task-4 multi-timeframe keys, plus
     # the ``symbol`` key (Tier-1 Fix #1/#2 — rules name the symbol in their logs).
+    # Issue #158 D2 added the ``exchange`` key so F&O rules can skip indices.
     assert set(result.keys()) == {
         "symbol",
+        "exchange",
         "ema_20",
         "atr_14",
         "rsi_14",
@@ -711,7 +744,12 @@ def _pin_now(monkeypatch, hour, minute=0):
 
 
 def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypatch, caplog):
-    """A bar that closes at 16:00 IST must be skipped (post-close) with an INFO log."""
+    """A bar that closes at 16:00 IST must be skipped (post-close) with a DEBUG log.
+
+    The per-bar skip line is DEBUG (issue #256) — it fires per bar per symbol,
+    so at INFO a restart floods the log. The skip *behavior* (no row, no event)
+    is the load-bearing assertion; the log level is verified at DEBUG.
+    """
     import logging
 
     _pin_now(monkeypatch, 16, 0)
@@ -720,7 +758,7 @@ def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypat
     _enable_buy_definition()
     bar = _seed_matching_buy(svc)
 
-    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
         svc._on_bar_close("RELIANCE", "5m", bar)
 
     # No evaluation happened → no row, no event.
@@ -733,7 +771,7 @@ def test_scanner_skips_evaluation_after_market_close(fresh_scanner_db, monkeypat
 
 
 def test_scanner_skips_evaluation_before_market_open(fresh_scanner_db, monkeypatch, caplog):
-    """A bar that closes at 08:00 IST must be skipped (pre-open)."""
+    """A bar that closes at 08:00 IST must be skipped (pre-open) with a DEBUG log."""
     import logging
 
     _pin_now(monkeypatch, 8, 0)
@@ -742,7 +780,7 @@ def test_scanner_skips_evaluation_before_market_open(fresh_scanner_db, monkeypat
     _enable_buy_definition()
     bar = _seed_matching_buy(svc)
 
-    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
         svc._on_bar_close("RELIANCE", "5m", bar)
 
     assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
@@ -839,6 +877,211 @@ def test_scanner_logs_fail_with_reason_for_disqualifying_symbol(fresh_scanner_db
         svc._on_bar_close("RELIANCE", "5m", non_matching)
 
     assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Issue #321 — Chartink-miss diagnostic (FAIL gate-snapshot at INFO)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_scan_cycle_db(monkeypatch):
+    """Point ``database.scan_cycle_db`` at a clean in-memory SQLite for one
+    test — the Chartink-miss tests below need per-test isolation of
+    ``scan_cycle`` rows (unlike most of this file, which never touches that
+    table), so a shared session-lifetime DB would leak Chartink symbol sets
+    across tests.
+    """
+    from database import scan_cycle_db as scdb
+
+    test_engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
+
+    monkeypatch.setattr(scdb, "engine", test_engine)
+    monkeypatch.setattr(scdb, "db_session", test_session)
+    scdb.init_db()
+    yield scdb
+
+    test_session.remove()
+    test_engine.dispose()
+
+
+def _seed_chartink_cycle(*, buy: list[str] | None = None, sell: list[str] | None = None) -> None:
+    """Write a ``scan_cycle`` row with ``cycle_kind='chartink'`` carrying the
+    given BUY/SELL symbol lists — mirrors the shape the real webhook handler
+    writes via ``scan_cycle_service.complete_cycle``.
+
+    ``started_at`` is stamped to match the suite's pinned IST clock
+    (``_pin_market_hours`` — 2026-05-30 11:00) rather than the real wall
+    clock, since ``_today_chartink_symbols`` matches on ``scanner_service``'s
+    ``_now_ist()`` date, not ``scan_cycle_db``'s real-time ``_now_iso()``.
+    """
+    import json as _json
+
+    from database import scan_cycle_db as scdb
+
+    sess = scdb.db_session
+    row = scdb.ScanCycle(
+        started_at="2026-05-30T11:00:00+05:30",
+        completed_at="2026-05-30T11:00:05+05:30",
+        cycle_kind="chartink",
+        screener_buy=_json.dumps(buy or []),
+        screener_sell=_json.dumps(sell or []),
+        post_status="ok",
+    )
+    sess.add(row)
+    sess.commit()
+    sess.remove()
+
+
+@pytest.fixture(autouse=True)
+def _reset_chartink_miss_cache():
+    """The Chartink-symbol-set cache and per-gate dedup set are module-level
+    globals (issue #321) — reset both before/after every test so one test's
+    cache/dedup state can never leak into another."""
+    scanner_service._chartink_set_cache["date"] = None
+    scanner_service._chartink_set_cache["symbols"] = frozenset()
+    scanner_service._chartink_set_cache["fetched_at"] = None
+    scanner_service._chartink_miss_logged.clear()
+    yield
+    scanner_service._chartink_set_cache["date"] = None
+    scanner_service._chartink_set_cache["symbols"] = frozenset()
+    scanner_service._chartink_set_cache["fetched_at"] = None
+    scanner_service._chartink_miss_logged.clear()
+
+
+def test_chartink_listed_miss_logs_info_once_with_dedup(
+    fresh_scanner_db, fresh_scan_cycle_db, caplog
+):
+    """A symbol Chartink also flagged today, that FAILs the in-house rule,
+    logs 'scanner MISS' at INFO — and re-firing the identical FAIL does not
+    re-log (dedup per symbol/rule/gate/day)."""
+    import logging
+
+    _seed_chartink_cycle(buy=["RELIANCE"])
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,  # no surge → no match
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+        svc._on_bar_close("RELIANCE", "5m", non_matching)  # identical FAIL — must dedup
+
+    miss_lines = [r for r in caplog.records if "scanner MISS RELIANCE" in r.message]
+    assert len(miss_lines) == 1
+    assert miss_lines[0].levelno == logging.INFO
+    assert "rule=_test_buy_surge_ema" in miss_lines[0].message
+    assert "failed_gate=" in miss_lines[0].message
+
+
+def test_non_chartink_listed_symbol_stays_debug_only(fresh_scanner_db, fresh_scan_cycle_db, caplog):
+    """A symbol Chartink did NOT flag today keeps the plain DEBUG FAIL line —
+    no 'scanner MISS' INFO log is emitted for it."""
+    import logging
+
+    _seed_chartink_cycle(buy=["SOMEOTHERSYMBOL"])  # RELIANCE is NOT listed
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
+    assert not any("scanner MISS RELIANCE" in r.message for r in caplog.records)
+
+
+def test_chartink_miss_debug_flag_off_suppresses_info_log(
+    fresh_scanner_db, fresh_scan_cycle_db, monkeypatch, caplog
+):
+    """``SCANNER_CHARTINK_MISS_DEBUG_ENABLED=false`` disables the MISS log even
+    for a Chartink-listed symbol."""
+    import logging
+
+    monkeypatch.setenv("SCANNER_CHARTINK_MISS_DEBUG_ENABLED", "false")
+    _seed_chartink_cycle(buy=["RELIANCE"])
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert not any("scanner MISS" in r.message for r in caplog.records)
+
+
+def test_chartink_set_read_failure_is_fail_graceful(fresh_scanner_db, monkeypatch, caplog):
+    """A scan_cycle read failure must never crash evaluation and must never
+    produce a spurious MISS log — it degrades to 'not listed today'."""
+    import logging
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(scanner_service, "_today_chartink_symbols", _boom)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    non_matching = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+
+    # Must not raise.
+    with caplog.at_level(logging.DEBUG, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", non_matching)
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert not any("scanner MISS" in r.message for r in caplog.records)
+    # The plain DEBUG FAIL line still fires — the diagnostic's failure is isolated.
     assert any("scanner FAIL RELIANCE" in r.message for r in caplog.records)
 
 
@@ -942,3 +1185,402 @@ def test_completeness_disabled_does_not_record(monkeypatch, fresh_scanner_db):
     bar = _seed_matching_buy(svc)
     svc._on_bar_close("RELIANCE", "5m", bar)
     assert svc._completeness_window_syms == set()
+
+
+# ---------------------------------------------------------------------------
+# Chunk C — rule parameterisation via indicators["parameters"]
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_definitions_injects_params_into_indicators(fresh_scanner_db):
+    """A definition with parameters_json passes a 'parameters' key to the rule."""
+    captured = {}
+
+    @scanner_service.scan_rule(
+        "_test_capture_params", "buy", "test-only: captures the indicators dict"
+    )
+    def _capture_params(bars, indicators):
+        captured["parameters"] = indicators.get("parameters")
+        return False  # never fires a hit; we only care about what is passed in
+
+    scanner_service.create_scan_definition(
+        name="parameterised_def",
+        screener_type="buy",
+        expression_json=None,
+        rule_module="_test_capture_params",
+        enabled=True,
+        parameters_json='{"gap_pct": 1.5}',
+    )
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    bar = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 100.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+    svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert captured.get("parameters") == {"gap_pct": 1.5}
+
+
+def test_evaluate_definitions_no_params_key_when_parameters_json_empty(fresh_scanner_db):
+    """A definition without parameters_json reuses indicators_dict unchanged (no 'parameters' key)."""
+    captured = {}
+
+    @scanner_service.scan_rule(
+        "_test_capture_no_params", "buy", "test-only: captures indicators when no params"
+    )
+    def _capture_no_params(bars, indicators):
+        captured["has_parameters"] = "parameters" in indicators
+        return False
+
+    scanner_service.create_scan_definition(
+        name="unparameterised_def",
+        screener_type="buy",
+        expression_json=None,
+        rule_module="_test_capture_no_params",
+        enabled=True,
+        parameters_json=None,
+    )
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+    bar = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 100.0,
+        "volume": 1000,
+        "elapsed_pct": 1.0,
+    }
+    svc._on_bar_close("RELIANCE", "5m", bar)
+
+    assert captured.get("has_parameters") is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #256 — replayed bars warm rolling state WITHOUT firing signals
+#
+# The boot seeder (scanner_aggregator_seeder) and WS-reconnect recovery
+# (ws_recovery_service) both fold historical 1m bars into the live aggregator
+# via MultiIntervalAggregator.replay_bars to warm RSI/SMA windows. Those bars
+# are historical: evaluating them (or firing a ScanHitEvent) is wrong. A
+# mid-session restart replays them DURING market hours where the market-hours
+# gate would NOT skip them, so the fix must protect the path itself — not lean
+# on the gate. Only genuine LIVE bar closes are evaluated.
+# ---------------------------------------------------------------------------
+
+
+def _replay_ohlcv_bars(
+    n: int,
+    start: dt.datetime = dt.datetime(2026, 5, 30, 9, 15),
+) -> list[dict]:
+    """N discrete 1m OHLCV bars (the shape replay_bars expects — not ticks)."""
+    return [
+        {
+            "ts": start + dt.timedelta(minutes=i),
+            "open": 100.0 + i * 0.5,
+            "high": 101.0 + i * 0.5,
+            "low": 99.0 + i * 0.5,
+            "close": 100.0 + i * 0.5,
+            "volume": 1000,
+        }
+        for i in range(n)
+    ]
+
+
+def test_replay_bars_warms_history_but_does_not_evaluate(fresh_scanner_db):
+    """replay_bars folds bars into the rolling window (indicator warm-up) but
+    fires NO scan-evaluation: no scan_results row, no ScanHitEvent."""
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+
+    # 40 one-minute bars → 8 closed 5m buckets folded via the real aggregator
+    # callback path (aggregator.on_bar_close == svc._on_bar_close).
+    folded = svc.aggregator.replay_bars("RELIANCE", _replay_ohlcv_bars(40))
+    assert folded == 40
+
+    # The rolling 5m history window warmed (indicators can be computed later).
+    warmed = svc._bar_history.get(("RELIANCE", "5m"))
+    assert warmed is not None and len(warmed) >= 7
+
+    # But NOTHING was evaluated: no results, no events.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+
+
+def test_live_bar_after_replay_still_evaluates(fresh_scanner_db):
+    """The live path is preserved: a genuine live bar close after a replay
+    warm-up evaluates exactly as before (fires the rule → row + event)."""
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    def_id = _enable_buy_definition()
+
+    # Warm the window via replay (no eval); assert the replay itself is silent.
+    svc.aggregator.replay_bars("RELIANCE", _replay_ohlcv_bars(40))
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+
+    # Seed enough rising history for the rule's 21-bar minimum (the replayed 5m
+    # buckets alone are too few) so the live surge below can actually match —
+    # this test is about the live path still evaluating, not warm-up depth.
+    closes = [100.0 + i * 0.5 for i in range(20)]
+    volumes = [1000.0] * 20
+    _seed_history(svc, "RELIANCE", "5m", closes, volumes)
+
+    # A live bar carries no is_replay flag (default False) — full evaluation.
+    live_surge = {
+        "ts": dt.datetime(2026, 5, 30, 11, 0),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,
+        "volume": 5000,
+        "elapsed_pct": 1.0,
+    }
+    svc._on_bar_close("RELIANCE", "5m", live_surge)
+
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    assert len(rows) == 1
+    assert rows[0]["scan_definition_id"] == def_id
+    assert len(capturing_bus.events) == 1
+    assert isinstance(capturing_bus.events[0], scanner_service.ScanHitEvent)
+
+
+def test_replay_during_market_hours_still_does_not_fire(fresh_scanner_db, monkeypatch):
+    """A mid-session restart replays historical bars DURING market hours, where
+    the _evaluate_definitions market-hours gate does NOT skip. Proves the fix
+    (is_replay suppression) — not the gate — protects the mid-session path."""
+    # 11:00 IST is squarely inside [09:15, 15:30] — the gate would let a live
+    # bar through here.
+    _pin_now(monkeypatch, 11, 0)
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+
+    # Seed a rising history and replay a would-be surge bar as a HISTORICAL bar.
+    # If replayed bars were evaluated, this in-hours surge would fire a hit.
+    warm = _replay_ohlcv_bars(100)  # 20 closed 5m buckets — plenty of history
+    # Make the final replayed 1m bar a volume+price surge that WOULD match the
+    # buy rule if it were ever evaluated as a live bar.
+    warm[-1] = {
+        "ts": warm[-1]["ts"],
+        "open": 150.0,
+        "high": 151.0,
+        "low": 149.0,
+        "close": 200.0,
+        "volume": 500000,
+    }
+    svc.aggregator.replay_bars("RELIANCE", warm)
+
+    # In-hours, but replayed → still no evaluation, no signal.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+
+
+def test_ws_recovery_replay_warms_without_firing(fresh_scanner_db):
+    """The ws_recovery path (MultiIntervalAggregator.replay_bars over the live
+    scanner aggregator) updates aggregator + history state without firing
+    signals — the same guarantee as the boot seeder."""
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+
+    # ws_recovery calls aggregator.replay_bars(symbol, bars) exactly like this.
+    n = svc.aggregator.replay_bars("RELIANCE", _replay_ohlcv_bars(30))
+    assert n == 30
+
+    # Aggregator's in-progress bucket advanced (state updated) and history warmed.
+    assert svc.aggregator.current_bar("RELIANCE", "5m") is not None
+    assert svc._bar_history.get(("RELIANCE", "5m")) is not None
+
+    # No signals fired.
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+
+
+def test_replay_bars_snapshot_carries_is_replay_flag():
+    """Unit-level guarantee: a bar closed via BarBuilder.replay_bars carries
+    is_replay=True, while a live tick close carries is_replay=False. This is the
+    single flag _on_bar_close keys off to suppress evaluation."""
+    from services.bar_aggregator import BarBuilder
+
+    replay_closes: list[dict] = []
+    b = BarBuilder("INFY", "1m", on_bar=lambda bar: replay_closes.append(bar))
+    # Two 1m bars in different buckets → the first bucket closes on the second.
+    b.replay_bars(
+        [
+            {
+                "ts": dt.datetime(2026, 5, 30, 9, 15),
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "volume": 10,
+            },
+            {
+                "ts": dt.datetime(2026, 5, 30, 9, 16),
+                "open": 2,
+                "high": 2,
+                "low": 2,
+                "close": 2,
+                "volume": 20,
+            },
+        ]
+    )
+    assert replay_closes and all(bar["is_replay"] is True for bar in replay_closes)
+
+    live_closes: list[dict] = []
+    lb = BarBuilder("INFY", "1m", on_bar=lambda bar: live_closes.append(bar))
+    lb.on_tick({"ts": dt.datetime(2026, 5, 30, 9, 15, 0), "price": 1.0, "cumulative_volume": 10})
+    lb.on_tick({"ts": dt.datetime(2026, 5, 30, 9, 16, 0), "price": 2.0, "cumulative_volume": 20})
+    closes = [bar for bar in live_closes if bar["elapsed_pct"] >= 1.0]
+    assert closes and all(bar["is_replay"] is False for bar in closes)
+
+
+# ---------------------------------------------------------------------------
+# Issue #305 — smoke-fail post-hold: a failed 09:18 smoke check blocks hit
+# persistence/posting (PASS still logged); release/expiry restores posting.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_smoke_hold():
+    """Keep the module-level post-hold state clean so an armed hold from one
+    test (or another test file) never bleeds into the fire/no-fire contracts
+    above."""
+    from services import scanner_smoke_check_service as smoke
+
+    smoke._reset_hold_for_tests()
+    yield
+    smoke._reset_hold_for_tests()
+
+
+# The autouse ``_pin_market_hours`` pins the scanner clock to 2026-05-30 11:00
+# IST — the hold must be armed for that same day to be consulted as active.
+_PINNED_DAY = dt.date(2026, 5, 30)
+
+
+def _matching_bar(minute=0):
+    return {
+        "ts": dt.datetime(2026, 5, 30, 11, minute),
+        "open": 110.0,
+        "high": 111.5,
+        "low": 109.5,
+        "close": 150.0,  # well above the trailing EMA
+        "volume": 5000,  # 5× the 1000 baseline
+        "elapsed_pct": 1.0,
+    }
+
+
+def test_smoke_hold_blocks_persist_and_post_but_logs_pass(fresh_scanner_db, caplog):
+    """Hold armed → the rule PASS is still logged, but NO scan_results row is
+    written and NO ScanHitEvent is published; a dedup'd 'scanner HELD'
+    WARNING names the symbol."""
+    import logging
+
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar())
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    assert any("scanner PASS RELIANCE" in r.getMessage() for r in caplog.records)
+    held = [r for r in caplog.records if "scanner HELD RELIANCE" in r.getMessage()]
+    assert len(held) == 1
+    assert "smoke_check_failed" in held[0].getMessage()
+
+
+def test_smoke_hold_warning_deduped_per_symbol_day(fresh_scanner_db, caplog):
+    """Two held PASSes on the same day → both blocked, but only ONE 'scanner
+    HELD' WARNING (per-symbol-per-day dedup)."""
+    import logging
+
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+
+    with caplog.at_level(logging.WARNING, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=0))
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=5))
+
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+    assert capturing_bus.events == []
+    held = [r for r in caplog.records if "scanner HELD RELIANCE" in r.getMessage()]
+    assert len(held) == 1
+
+
+def test_smoke_hold_release_restores_posting(fresh_scanner_db):
+    """Clearing the hold (a passing re-check) restores normal persistence."""
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=0))
+    assert scanner_service.get_scan_results(hours=24, source="inhouse") == []
+
+    smoke.clear_post_hold(reason="re-check passed (test)")
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=5))
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    assert len(rows) == 1
+    assert len(capturing_bus.events) == 1
+
+
+def test_smoke_hold_prior_day_does_not_block(fresh_scanner_db):
+    """A hold armed for a PRIOR day never gates today's hits (day-scoped)."""
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="stale hold from yesterday", day=_PINNED_DAY - dt.timedelta(days=1))
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar())
+    assert len(scanner_service.get_scan_results(hours=24, source="inhouse")) == 1
+
+
+def test_smoke_hold_flag_off_does_not_block(fresh_scanner_db, monkeypatch):
+    """SCANNER_SMOKE_BLOCK_ENABLED=false → the hold is never enforced."""
+    from services import scanner_smoke_check_service as smoke
+
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "false")
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    smoke.set_post_hold(reason="smoke check failed (test)", day=_PINNED_DAY)
+    svc._on_bar_close("RELIANCE", "5m", _matching_bar())
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    assert len(rows) == 1
+    assert len(capturing_bus.events) == 1

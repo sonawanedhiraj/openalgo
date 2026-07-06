@@ -85,7 +85,7 @@ def test_mode_status_sources_from_strategy_mode_row(client):
     test_client, didb, sdidb, smdb = client
     today = _today(didb)
 
-    smdb.set_mode("simplified_engine", "live", updated_by="test")
+    smdb._set_mode_unchecked("simplified_engine", "live", updated_by="test")
 
     resp = test_client.get("/mode/status")
     assert resp.status_code == 200

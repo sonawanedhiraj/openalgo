@@ -1,11 +1,38 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowRight, RefreshCw, ScanLine, TrendingDown, TrendingUp } from 'lucide-react'
+import {
+  ArrowRight,
+  Copy,
+  RefreshCw,
+  ScanLine,
+  Trash2,
+  TrendingDown,
+  TrendingUp,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { type ScanDefinitionSummary, scannerApi } from '@/api/scanner'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import {
@@ -17,17 +44,256 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { CurrentlyMatching } from './CurrentlyMatching'
+import { ParamForm } from './ParamForm'
 
 const REFRESH_MS = 30_000
+const WS_HEALTH_POLL_MS = 15_000
 
+type WsStatus = 'healthy' | 'degraded' | 'down'
+
+interface WsProxyHealth {
+  status: WsStatus
+  last_tick_age_sec: number | null
+  thread_count: number
+  subscribed_symbols: number | null
+}
+
+async function fetchWsHealth(): Promise<WsProxyHealth> {
+  const res = await fetch('/health/ws_proxy')
+  if (!res.ok) throw new Error(`ws_proxy health ${res.status}`)
+  return res.json()
+}
+
+const LED_CLS: Record<WsStatus, string> = {
+  healthy: 'bg-green-500',
+  degraded: 'bg-amber-400',
+  down: 'bg-red-500',
+}
+
+const LED_LBL: Record<WsStatus, string> = {
+  healthy: 'WS healthy',
+  degraded: 'WS degraded',
+  down: 'WS down',
+}
+
+function WsHealthLed() {
+  const { data, isError } = useQuery<WsProxyHealth>({
+    queryKey: ['ws-proxy-health'],
+    queryFn: fetchWsHealth,
+    refetchInterval: WS_HEALTH_POLL_MS,
+    retry: 1,
+  })
+
+  const status: WsStatus = isError ? 'down' : (data?.status ?? 'down')
+  const dotCls = LED_CLS[status]
+
+  const tipLines: string[] = [`Status: ${status}`]
+  if (data) {
+    if (data.last_tick_age_sec !== null) tipLines.push(`Last tick: ${data.last_tick_age_sec}s ago`)
+    else tipLines.push('Last tick: unknown')
+    if (data.subscribed_symbols !== null)
+      tipLines.push(`Subscribed: ${data.subscribed_symbols} symbols`)
+    tipLines.push(`Threads: ${data.thread_count}`)
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={LED_LBL[status]}
+          className="flex items-center gap-1.5 cursor-default focus:outline-none"
+        >
+          <span
+            className={`inline-block h-2.5 w-2.5 rounded-full ${dotCls} ${status === 'healthy' ? 'animate-pulse' : ''}`}
+          />
+          <span className="text-xs text-muted-foreground">{LED_LBL[status]}</span>
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">
+        <div className="space-y-0.5">
+          {tipLines.map((l) => (
+            <p key={l}>{l}</p>
+          ))}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+// Always render the signal's DATE and time, parsed straight from the IST
+// ISO-8601 string (no Date()/Intl timezone conversion — the browser may not be
+// on IST, and run_at already carries +05:30). Previously same-day signals showed
+// time only, so a stale prior-day "latest signal" was indistinguishable from a
+// fresh one (issue #299 — the DELHIVERY confusion).
 function fmtTime(ts: string): string {
-  const m = ts.match(/T(\d{2}:\d{2}:\d{2})/)
-  return m ? m[1] : ts
+  const m = ts.match(/(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/)
+  return m ? `${m[1]} ${m[2]}` : ts
 }
 
 function todayStr(): string {
   const d = new Date()
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+// ---------------------------------------------------------------------------
+// Clone dialog
+// ---------------------------------------------------------------------------
+
+interface CloneDialogProps {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  source: ScanDefinitionSummary
+}
+
+export function CloneDialog({ open, onOpenChange, source }: CloneDialogProps) {
+  const queryClient = useQueryClient()
+  const [name, setName] = useState('')
+  const [params, setParams] = useState<Record<string, number>>({})
+  const [error, setError] = useState<string | null>(null)
+
+  // reset state when dialog opens
+  useEffect(() => {
+    if (open) {
+      setName(`${source.name}_custom`)
+      setParams({})
+      setError(null)
+    }
+  }, [open, source.name])
+
+  const cloneMutation = useMutation({
+    mutationFn: () =>
+      scannerApi.cloneDefinition(source.id, {
+        name,
+        parameters_json: Object.keys(params).length > 0 ? params : null,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scanner-definitions'] })
+      onOpenChange(false)
+    },
+    onError: (err: unknown) => {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : ((err as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+            'Clone failed')
+      setError(msg)
+    },
+  })
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Clone &quot;{source.name}&quot;</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-1.5">
+            <Label htmlFor="clone-name">New name</Label>
+            <Input
+              id="clone-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. fno_intraday_buy_tight_gap"
+              disabled={cloneMutation.isPending}
+            />
+          </div>
+          <div className="space-y-2">
+            <p className="text-sm font-medium">Parameter overrides (leave at default to inherit)</p>
+            <ParamForm
+              screenerType={source.screener_type}
+              value={params}
+              onChange={setParams}
+              disabled={cloneMutation.isPending}
+            />
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={cloneMutation.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            onClick={() => cloneMutation.mutate()}
+            disabled={cloneMutation.isPending || !name.trim()}
+          >
+            {cloneMutation.isPending ? 'Cloning…' : 'Clone'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Delete dialog
+// ---------------------------------------------------------------------------
+
+interface DeleteDialogProps {
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  definition: ScanDefinitionSummary
+}
+
+export function DeleteDialog({ open, onOpenChange, definition }: DeleteDialogProps) {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+
+  // Code-backed rows (no parent) need a force flag; the backend only honours it
+  // for orphans (a leaked rule with no registered production rule). Cloned
+  // definitions delete without force.
+  const isCodeBacked = definition.parent_definition_id === null
+
+  const deleteMutation = useMutation({
+    mutationFn: () => scannerApi.deleteDefinition(definition.id, isCodeBacked),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scanner-definitions'] })
+      onOpenChange(false)
+    },
+    onError: (err: unknown) => {
+      const msg =
+        err instanceof Error
+          ? err.message
+          : ((err as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+            'Delete failed')
+      setError(msg)
+    },
+  })
+
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete &quot;{definition.name}&quot;?</AlertDialogTitle>
+          <AlertDialogDescription>
+            {isCodeBacked
+              ? 'This is a code-backed definition. It can only be removed if it is an orphan (a leaked rule with no live code). Definitions backed by an active built-in rule stay protected.'
+              : 'This removes the custom definition and its parameter overrides. Built-in definitions cannot be deleted.'}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {error && <p className="text-sm text-destructive px-1">{error}</p>}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={deleteMutation.isPending}>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={(e) => {
+              e.preventDefault()
+              deleteMutation.mutate()
+            }}
+            disabled={deleteMutation.isPending}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+          >
+            {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -37,6 +303,8 @@ function todayStr(): string {
 function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
   const queryClient = useQueryClient()
   const [optimisticEnabled, setOptimisticEnabled] = useState(def.enabled)
+  const [cloneOpen, setCloneOpen] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
 
   useEffect(() => {
     setOptimisticEnabled(def.enabled)
@@ -64,79 +332,119 @@ function DefinitionCard({ def }: { def: ScanDefinitionSummary }) {
       : 'border-red-500/30 bg-red-500/5'
     : 'border-muted bg-muted/20 opacity-60'
   const badgeVariant = isBuy ? 'default' : 'destructive'
+  const isClone = def.parent_definition_id !== null
 
   return (
-    <Card className={`border ${accent} hover:shadow-md transition-shadow`}>
-      <CardHeader className="pb-3">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-center gap-2 min-w-0">
-            <Icon
-              className={`h-5 w-5 shrink-0 ${isBuy ? 'text-green-500' : 'text-red-500'} ${!optimisticEnabled ? 'opacity-50' : ''}`}
-            />
-            <CardTitle className="text-base truncate">{def.name}</CardTitle>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <Switch
-              checked={optimisticEnabled}
-              onCheckedChange={() => toggleMutation.mutate()}
-              disabled={toggleMutation.isPending}
-              aria-label={`Toggle ${def.name}`}
-            />
-            <Badge variant={badgeVariant} className="uppercase text-xs">
-              {def.screener_type}
-            </Badge>
-            <Badge variant="outline" className="tabular-nums">
-              {def.today_hit_count} today
-            </Badge>
-          </div>
-        </div>
-        {!optimisticEnabled && (
-          <p className="text-xs text-muted-foreground mt-1 italic">Disabled — not scanning</p>
-        )}
-        {def.rule_module && optimisticEnabled && (
-          <p className="text-xs text-muted-foreground mt-1 truncate">
-            Rule: {def.rule_module.replace('services.scan_rules.', '')}
-          </p>
-        )}
-      </CardHeader>
-
-      <CardContent className="space-y-3">
-        {def.latest_signals.length === 0 ? (
-          <p className="text-sm text-muted-foreground italic">No signals yet</p>
-        ) : (
-          <div className="space-y-1.5">
-            <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
-              Latest signals
-            </p>
-            {def.latest_signals.map((sig) => (
-              <div
-                key={sig.id}
-                className="flex items-start gap-2 text-xs border rounded-md px-2 py-1.5 bg-muted/30"
-              >
-                <span className="text-muted-foreground shrink-0 tabular-nums">
-                  {fmtTime(sig.run_at)}
-                </span>
-                <span className="truncate">
-                  {sig.symbols.length > 0 ? sig.symbols.join(', ') : '—'}
-                </span>
-                <Badge variant="outline" className="ml-auto shrink-0 text-xs">
-                  {sig.symbols.length}
+    <>
+      <Card className={`border ${accent} hover:shadow-md transition-shadow`}>
+        <CardHeader className="pb-3">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Icon
+                className={`h-5 w-5 shrink-0 ${isBuy ? 'text-green-500' : 'text-red-500'} ${!optimisticEnabled ? 'opacity-50' : ''}`}
+              />
+              <CardTitle className="text-base truncate">{def.name}</CardTitle>
+              {isClone && (
+                <Badge variant="outline" className="text-xs text-muted-foreground shrink-0">
+                  custom
                 </Badge>
-              </div>
-            ))}
+              )}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7"
+                    onClick={() => setCloneOpen(true)}
+                    aria-label={`Clone ${def.name}`}
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Clone definition</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-destructive hover:text-destructive"
+                    onClick={() => setDeleteOpen(true)}
+                    aria-label={`Delete ${def.name}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">
+                  {isClone ? 'Delete definition' : 'Delete definition (orphan rules only)'}
+                </TooltipContent>
+              </Tooltip>
+              <Switch
+                checked={optimisticEnabled}
+                onCheckedChange={() => toggleMutation.mutate()}
+                disabled={toggleMutation.isPending}
+                aria-label={`Toggle ${def.name}`}
+              />
+              <Badge variant={badgeVariant} className="uppercase text-xs">
+                {def.screener_type}
+              </Badge>
+              <Badge variant="outline" className="tabular-nums">
+                {def.today_hit_count} today
+              </Badge>
+            </div>
           </div>
-        )}
+          {!optimisticEnabled && (
+            <p className="text-xs text-muted-foreground mt-1 italic">Disabled — not scanning</p>
+          )}
+          {def.rule_module && optimisticEnabled && (
+            <p className="text-xs text-muted-foreground mt-1 truncate">
+              Rule: {def.rule_module.replace('services.scan_rules.', '')}
+            </p>
+          )}
+        </CardHeader>
 
-        <div className="pt-1">
-          <Link to={`/scanner/${def.id}`}>
-            <Button variant="outline" size="sm" className="w-full gap-1.5">
-              View history
-              <ArrowRight className="h-3.5 w-3.5" />
-            </Button>
-          </Link>
-        </div>
-      </CardContent>
-    </Card>
+        <CardContent className="space-y-3">
+          {def.latest_signals.length === 0 ? (
+            <p className="text-sm text-muted-foreground italic">No signals yet</p>
+          ) : (
+            <div className="space-y-1.5">
+              <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                Latest signals
+              </p>
+              {def.latest_signals.map((sig) => (
+                <div
+                  key={sig.id}
+                  className="flex items-start gap-2 text-xs border rounded-md px-2 py-1.5 bg-muted/30"
+                >
+                  <span className="text-muted-foreground shrink-0 tabular-nums">
+                    {fmtTime(sig.run_at)}
+                  </span>
+                  <span className="truncate">
+                    {sig.symbols.length > 0 ? sig.symbols.join(', ') : '—'}
+                  </span>
+                  <Badge variant="outline" className="ml-auto shrink-0 text-xs">
+                    {sig.symbols.length}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="pt-1">
+            <Link to={`/scanner/${def.id}`}>
+              <Button variant="outline" size="sm" className="w-full gap-1.5">
+                View history
+                <ArrowRight className="h-3.5 w-3.5" />
+              </Button>
+            </Link>
+          </div>
+        </CardContent>
+      </Card>
+      <CloneDialog open={cloneOpen} onOpenChange={setCloneOpen} source={def} />
+      <DeleteDialog open={deleteOpen} onOpenChange={setDeleteOpen} definition={def} />
+    </>
   )
 }
 
@@ -288,6 +596,7 @@ export default function ScannerIndex() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          <WsHealthLed />
           {lastUpdated && (
             <span className="text-xs text-muted-foreground">Updated {lastUpdated}</span>
           )}
@@ -310,6 +619,12 @@ export default function ScannerIndex() {
           Failed to load definitions: {error instanceof Error ? error.message : 'Unknown error'}
         </div>
       )}
+
+      {/* Currently matching — live list, symbols drop off when conditions stop
+          holding (issue #342). This is a separate, ephemeral view; the tabs
+          below (signal history, hits-by-symbol) remain the permanent,
+          never-filtered audit trail of every fired signal. */}
+      <CurrentlyMatching />
 
       <Tabs defaultValue="definitions">
         <TabsList>

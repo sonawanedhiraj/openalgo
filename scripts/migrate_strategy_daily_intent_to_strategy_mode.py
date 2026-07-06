@@ -91,7 +91,9 @@ def migrate() -> dict:
                 skipped_existing += 1
                 details.append({"strategy": name, "action": "skipped_existing"})
                 continue
-            sm.set_mode(
+            # One-shot migration is a documented, allowed unchecked caller
+            # (no live signals fire during migration; preflight is irrelevant).
+            sm._set_mode_unchecked(
                 name,
                 target_mode,
                 updated_by="migration",
