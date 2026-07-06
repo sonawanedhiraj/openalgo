@@ -35,13 +35,14 @@ import {
   type DataHealth,
   type EntryBreakdownOutcome,
   type EntryBreakdownSymbol,
-  type LLMDecisionRow,
   type LLMFlipOutcome,
   type LLMMode,
   type PnlWindow,
   type RecentTrade,
   type StrategyDetail,
   strategiesDashboardApi,
+  type TradeLLMReview,
+  type UnmatchedSkipDecision,
   type VersionLogEntry,
 } from '@/api/strategies-dashboard'
 import { Badge } from '@/components/ui/badge'
@@ -344,179 +345,66 @@ function DecisionBadge({ decision }: { decision: string }) {
   )
 }
 
-function DecisionRow({ row }: { row: LLMDecisionRow }) {
+// Epoch millis for merged-table sorting. created_at (naive UTC) and
+// candidate_at (IST offset) must be compared as instants, not as strings.
+function parseTs(iso: string | null | undefined): number {
+  if (!iso) return 0
+  const d = new Date(TZ_SUFFIX.test(iso) ? iso : `${iso}Z`)
+  return Number.isNaN(d.getTime()) ? 0 : d.getTime()
+}
+
+function ReasoningCell({ reasoning }: { reasoning: string | null | undefined }) {
   const [open, setOpen] = useState(false)
-  const reasoning = row.reasoning ?? ''
-  const truncated = reasoning.length > 80
+  const text = reasoning ?? ''
+  if (!text) return <span className="text-muted-foreground">—</span>
+  const truncated = text.length > 80
   return (
-    <>
-      <tr className="border-b last:border-0 hover:bg-muted/20">
-        <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap">
-          {fmtDate(row.candidate_at)}
-        </td>
-        <td className="px-3 py-1.5 font-mono">{row.symbol}</td>
-        <td className="px-3 py-1.5">{row.direction ?? '—'}</td>
-        <td className="px-3 py-1.5">
-          <DecisionBadge decision={row.decision} />
-        </td>
-        <td className="px-3 py-1.5 text-muted-foreground">{row.enforcement_mode}</td>
-        <td className="px-3 py-1.5 text-right tabular-nums">
-          {row.confidence != null ? row.confidence.toFixed(2) : '—'}
-        </td>
-        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
-          {row.bridge_latency_ms != null ? `${row.bridge_latency_ms}ms` : '—'}
-        </td>
-        <td className="px-3 py-1.5 max-w-[16rem]">
-          {reasoning ? (
-            <button
-              type="button"
-              className="text-left text-muted-foreground hover:text-foreground"
-              onClick={() => setOpen(!open)}
-            >
-              <span className={open ? '' : 'line-clamp-1'}>{reasoning}</span>
-              {truncated && (
-                <span className="text-[10px] text-primary ml-1">{open ? 'less' : 'more'}</span>
-              )}
-            </button>
-          ) : (
-            <span className="text-muted-foreground">—</span>
-          )}
-        </td>
-      </tr>
-    </>
+    <button
+      type="button"
+      className="text-left text-muted-foreground hover:text-foreground"
+      onClick={() => setOpen(!open)}
+    >
+      <span className={open ? '' : 'line-clamp-1'}>{text}</span>
+      {truncated && <span className="text-[10px] text-primary ml-1">{open ? 'less' : 'more'}</span>}
+    </button>
   )
 }
 
-const DECISIONS_PAGE = 25
-
-export function LLMDecisionsCard({ name }: { name: string }) {
-  const [page, setPage] = useState(0)
-  const { data, isLoading } = useQuery({
-    queryKey: ['strategy-llm-decisions', name, page],
-    queryFn: () =>
-      strategiesDashboardApi.getLLMDecisions(name, DECISIONS_PAGE, page * DECISIONS_PAGE),
-    refetchInterval: 30_000,
-  })
-
-  const summary = data?.summary
-  const rows = data?.rows ?? []
-  const total = data?.total ?? 0
-  const totalPages = Math.max(1, Math.ceil(total / DECISIONS_PAGE))
-
-  // LLM-reachable health hint derived from the recent decisions.
-  const recentFailed = summary?.recent_review_failed ?? 0
-  const reachable = recentFailed === 0
-
+function LLMVerdictCell({ llm }: { llm: TradeLLMReview | null | undefined }) {
+  if (!llm) return <span className="text-muted-foreground">—</span>
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between gap-2 flex-wrap">
-          <CardTitle className="text-sm flex items-center gap-2">
-            <History className="h-4 w-4" /> LLM Decisions
-            <span className="text-xs text-muted-foreground font-normal">{total} total</span>
-          </CardTitle>
-          {data?.veto_enabled && summary && summary.total > 0 && (
-            <div
-              className={[
-                'flex items-center gap-1 text-xs rounded-md px-2 py-1',
-                reachable
-                  ? 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20'
-                  : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20',
-              ].join(' ')}
-            >
-              {reachable ? (
-                <>
-                  <CheckCircle2 className="h-3 w-3" /> LLM reachable
-                </>
-              ) : (
-                <>
-                  <AlertTriangle className="h-3 w-3" /> LLM unreachable (last {recentFailed} failed
-                  — run <code className="font-mono">claude login</code>)
-                </>
-              )}
-            </div>
-          )}
-        </div>
-        {summary && summary.total > 0 && (
-          <p className="text-xs text-muted-foreground">
-            take {summary.take} · skip {summary.skip} · review_failed {summary.review_failed}
-            {data?.source_filtered === false && ' · showing all veto rows for this strategy'}
-          </p>
-        )}
-      </CardHeader>
-      <CardContent className="p-0">
-        {isLoading ? (
-          <div className="p-4">
-            <Skeleton className="h-32 w-full" />
-          </div>
-        ) : !data?.veto_enabled ? (
-          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
-            This strategy does not run the LLM veto — no decisions to show.
-          </p>
-        ) : rows.length === 0 ? (
-          <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
-            No LLM decisions recorded yet.
-          </p>
-        ) : (
-          <>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b bg-muted/30">
-                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Time</th>
-                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                      Symbol
-                    </th>
-                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Dir</th>
-                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                      Decision
-                    </th>
-                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">Mode</th>
-                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">Conf</th>
-                    <th className="text-right px-3 py-2 font-medium text-muted-foreground">
-                      Latency
-                    </th>
-                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                      Reasoning
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((r) => (
-                    <DecisionRow key={r.id} row={r} />
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="flex items-center justify-between px-3 py-2 border-t text-xs text-muted-foreground">
-              <span>
-                Page {page + 1} of {totalPages}
-              </span>
-              <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-2 text-xs"
-                  disabled={page === 0}
-                  onClick={() => setPage((p) => Math.max(0, p - 1))}
-                >
-                  Prev
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-2 text-xs"
-                  disabled={page + 1 >= totalPages}
-                  onClick={() => setPage((p) => p + 1)}
-                >
-                  Next
-                </Button>
-              </div>
-            </div>
-          </>
-        )}
-      </CardContent>
-    </Card>
+    <span className="flex items-center gap-1">
+      <DecisionBadge decision={llm.decision} />
+      {llm.confidence != null && (
+        <span className="tabular-nums text-muted-foreground">{llm.confidence.toFixed(2)}</span>
+      )}
+    </span>
+  )
+}
+
+function TradeStatusBadge({ status }: { status: string }) {
+  if (status === 'veto_skip' || status === 'vetoed')
+    return (
+      <Badge className="bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300 text-xs py-0">
+        vetoed
+      </Badge>
+    )
+  if (status === 'rejected' || status === 'exception' || status === 'failed')
+    return (
+      <Badge variant="destructive" className="text-xs py-0">
+        {status}
+      </Badge>
+    )
+  if (status === 'open')
+    return (
+      <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 text-xs py-0">
+        open
+      </Badge>
+    )
+  return (
+    <Badge variant={status === 'placed' ? 'default' : 'outline'} className="text-xs py-0">
+      {status}
+    </Badge>
   )
 }
 
@@ -723,17 +611,37 @@ function PnlCurve({ name }: { name: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Recent trades table
+// Trades & LLM decisions — merged table (issue #358). One row per entry event:
+// trade rows carry their matched veto verdict; enforced skips that never
+// journaled render as pseudo-rows so "what the LLM blocked" sits next to
+// "what actually traded".
 // ---------------------------------------------------------------------------
 
-function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
-  const [sortAsc, setSortAsc] = useState(false)
+type MergedRow =
+  | { kind: 'trade'; ts: number; trade: RecentTrade }
+  | { kind: 'skip'; ts: number; skip: UnmatchedSkipDecision }
 
-  const sorted = [...trades].sort((a, b) => {
-    const ta = a.created_at ?? ''
-    const tb = b.created_at ?? ''
-    return sortAsc ? ta.localeCompare(tb) : tb.localeCompare(ta)
+export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
+  const [sortAsc, setSortAsc] = useState(false)
+  const trades = data.recent_trades
+  const skips = data.llm_unmatched_skips ?? []
+
+  // LLM health summary for the header (same source the old decisions card used;
+  // rows are not needed — the table below is fed by the detail payload).
+  const { data: decisions } = useQuery({
+    queryKey: ['strategy-llm-decisions-summary', data.name],
+    queryFn: () => strategiesDashboardApi.getLLMDecisions(data.name, 1, 0),
+    enabled: data.llm_veto_enabled,
+    refetchInterval: 30_000,
   })
+  const summary = decisions?.summary
+  const recentFailed = summary?.recent_review_failed ?? 0
+  const reachable = recentFailed === 0
+
+  const rows: MergedRow[] = [
+    ...trades.map((t): MergedRow => ({ kind: 'trade', ts: parseTs(t.created_at), trade: t })),
+    ...skips.map((s): MergedRow => ({ kind: 'skip', ts: parseTs(s.candidate_at), skip: s })),
+  ].sort((a, b) => (sortAsc ? a.ts - b.ts : b.ts - a.ts))
 
   // Gross P&L / Charges / Capital are only populated for strategies that journal
   // them per leg (futures_follow_cap50). Show those columns only when present so
@@ -741,19 +649,53 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
   const hasFinancials = trades.some(
     (t) => t.gross_pnl != null || t.charges_inr != null || t.margin_inr != null
   )
+  // LLM columns render for veto-wired strategies (or whenever a verdict/skip
+  // actually exists) — sector_follow stays compact.
+  const hasLLM = data.llm_veto_enabled || skips.length > 0 || trades.some((t) => t.llm)
 
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <History className="h-4 w-4" /> Recent Trades
-          <span className="ml-auto text-xs text-muted-foreground font-normal">
-            last {trades.length}
-          </span>
-        </CardTitle>
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <History className="h-4 w-4" /> Trades &amp; LLM Decisions
+            <span className="text-xs text-muted-foreground font-normal">
+              last {trades.length} trade{trades.length !== 1 ? 's' : ''}
+              {skips.length > 0 &&
+                ` · ${skips.length} vetoed signal${skips.length !== 1 ? 's' : ''}`}
+            </span>
+          </CardTitle>
+          {data.llm_veto_enabled && summary && summary.total > 0 && (
+            <div
+              className={[
+                'flex items-center gap-1 text-xs rounded-md px-2 py-1',
+                reachable
+                  ? 'text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-900/20'
+                  : 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20',
+              ].join(' ')}
+            >
+              {reachable ? (
+                <>
+                  <CheckCircle2 className="h-3 w-3" /> LLM reachable
+                </>
+              ) : (
+                <>
+                  <AlertTriangle className="h-3 w-3" /> LLM unreachable (last {recentFailed} failed
+                  — run <code className="font-mono">claude login</code>)
+                </>
+              )}
+            </div>
+          )}
+        </div>
+        {data.llm_veto_enabled && summary && summary.total > 0 && (
+          <p className="text-xs text-muted-foreground">
+            LLM decisions: take {summary.take} · skip {summary.skip} · review_failed{' '}
+            {summary.review_failed} · {summary.total} total
+          </p>
+        )}
       </CardHeader>
       <CardContent className="p-0">
-        {trades.length === 0 ? (
+        {rows.length === 0 ? (
           <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
             No trades yet
           </p>
@@ -805,6 +747,19 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                       Capital
                     </th>
                   )}
+                  {hasLLM && (
+                    <th
+                      className="text-left px-3 py-2 font-medium text-muted-foreground"
+                      title="Stage-1 LLM veto verdict for this entry (exits are never reviewed)"
+                    >
+                      LLM
+                    </th>
+                  )}
+                  {hasLLM && (
+                    <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                      Reasoning
+                    </th>
+                  )}
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Mode</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Status</th>
                   <th
@@ -823,11 +778,68 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                 </tr>
               </thead>
               <tbody>
-                {sorted.map((t) => {
-                  const isBuy = t.side === 'BUY'
+                {rows.map((row) => {
+                  if (row.kind === 'skip') {
+                    const s = row.skip
+                    // A vetoed entry: no order, no fill, no P&L — the verdict
+                    // and reasoning ARE the event.
+                    return (
+                      <tr
+                        key={`skip-${s.decision_id}`}
+                        className="border-b last:border-0 hover:bg-muted/20 bg-indigo-50/30 dark:bg-indigo-900/5"
+                      >
+                        <td className="px-3 py-1.5">
+                          <span className="font-medium text-muted-foreground">
+                            {s.direction ?? '—'}
+                          </span>
+                        </td>
+                        <td className="px-3 py-1.5 font-mono">{s.symbol}</td>
+                        <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        {hasFinancials && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasFinancials && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasFinancials && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasFinancials && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        {hasFinancials && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasLLM && (
+                          <td className="px-3 py-1.5 whitespace-nowrap">
+                            <LLMVerdictCell llm={s} />
+                          </td>
+                        )}
+                        {hasLLM && (
+                          <td className="px-3 py-1.5 max-w-[16rem]">
+                            <ReasoningCell reasoning={s.reasoning} />
+                          </td>
+                        )}
+                        <td className="px-3 py-1.5">
+                          <Badge variant="outline" className="text-xs py-0">
+                            {s.enforcement_mode}
+                          </Badge>
+                        </td>
+                        <td className="px-3 py-1.5">
+                          <TradeStatusBadge status="vetoed" />
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-muted-foreground whitespace-nowrap">
+                          {fmtDate(s.candidate_at)}
+                        </td>
+                      </tr>
+                    )
+                  }
+                  const t = row.trade
+                  const isBuy = t.side === 'BUY' || t.side === 'LONG'
                   const netPnl = t.net_pnl
                   return (
-                    <tr key={t.id} className="border-b last:border-0 hover:bg-muted/20">
+                    <tr key={`trade-${t.id}`} className="border-b last:border-0 hover:bg-muted/20">
                       <td className="px-3 py-1.5">
                         <span
                           className={`font-medium ${isBuy ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}
@@ -902,18 +914,23 @@ function RecentTradesTable({ trades }: { trades: RecentTrade[] }) {
                           {t.side === 'BUY' && t.margin_inr != null ? fmtInr(t.margin_inr) : '—'}
                         </td>
                       )}
+                      {hasLLM && (
+                        <td className="px-3 py-1.5 whitespace-nowrap">
+                          <LLMVerdictCell llm={t.llm} />
+                        </td>
+                      )}
+                      {hasLLM && (
+                        <td className="px-3 py-1.5 max-w-[16rem]">
+                          <ReasoningCell reasoning={t.llm?.reasoning} />
+                        </td>
+                      )}
                       <td className="px-3 py-1.5">
                         <Badge variant="outline" className="text-xs py-0">
                           {t.mode}
                         </Badge>
                       </td>
                       <td className="px-3 py-1.5">
-                        <Badge
-                          variant={t.status === 'placed' ? 'default' : 'destructive'}
-                          className="text-xs py-0"
-                        >
-                          {t.status}
-                        </Badge>
+                        <TradeStatusBadge status={t.status} />
                       </td>
                       <td className="px-3 py-1.5 text-right text-muted-foreground whitespace-nowrap">
                         {fmtDate(t.created_at)}
@@ -1366,11 +1383,8 @@ export default function StrategyDetailPage() {
       {/* Today's 15:20 entry-evaluation breakdown (issue #352) */}
       {data.name === 'futures_follow_cap50' && <EntryBreakdownCard />}
 
-      {/* Recent trades */}
-      <RecentTradesTable trades={data.recent_trades} />
-
-      {/* LLM decisions history */}
-      <LLMDecisionsCard name={data.name} />
+      {/* Trades + LLM decisions (merged, issue #358) */}
+      <TradesAndDecisionsCard data={data} />
 
       {/* Params + Version log */}
       <div className="grid gap-4 xl:grid-cols-2">

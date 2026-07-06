@@ -240,6 +240,124 @@ _LLM_DECISION_SOURCES: dict[str, dict[str, list[str]]] = {
 }
 
 
+def _llm_review_fields(d: dict) -> dict:
+    """Project a signal_decision row to the compact shape the trades table embeds."""
+    return {
+        "decision_id": d.get("id"),
+        "decision": d.get("decision"),
+        "confidence": d.get("confidence"),
+        "reasoning": d.get("reasoning"),
+        "enforcement_mode": d.get("enforcement_mode"),
+        "candidate_at": d.get("candidate_at"),
+    }
+
+
+# Journal direction (LONG/SHORT) → decision direction (BUY/SELL) for the fuzzy join.
+_JOURNAL_DIRECTION_TO_DECISION = {"LONG": "BUY", "SHORT": "SELL"}
+
+
+def _attach_llm_reviews(name: str, recent_trades: list[dict]) -> set[int]:
+    """Embed the matched Stage-1 LLM veto decision on each trade row (issue #358).
+
+    Sets ``row['llm']`` (or ``None``) on every row, entry legs only — exits are
+    never reviewed. Exact join first (the ``decision_id`` /
+    ``signal_decision_id`` FK the services stamp at placement time), then a
+    fuzzy fallback for rows that predate the FK: same strategy source filter,
+    same symbol (futures_follow journals the SOURCE STOCK in ``signal_id``; the
+    decision row's ``symbol`` is that stock), same entry day, direction-compatible.
+    Returns the set of decision ids consumed so the unmatched-skip pass can
+    exclude them. Fail-graceful: any error leaves the rows untouched.
+    """
+    matched: set[int] = set()
+    if name not in _VETO_ENABLED_STRATEGIES or not recent_trades:
+        return matched
+    try:
+        from database.signal_decision_db import (
+            get_signal_decisions_by_ids,
+            list_signal_decisions,
+        )
+
+        fk_key = "signal_decision_id" if name == _SIMPLIFIED_ENGINE_FOLDER else "decision_id"
+        by_id = get_signal_decisions_by_ids(
+            [r.get(fk_key) for r in recent_trades if r.get(fk_key) is not None]
+        )
+        # Fuzzy pool for pre-FK rows: recent decisions under the strategy's
+        # source filter, newest first (bounded — one query).
+        filters = _LLM_DECISION_SOURCES.get(name) or {}
+        fuzzy_pool = list_signal_decisions(limit=500, **filters)
+
+        for row in recent_trades:
+            row.setdefault("llm", None)
+            if row.get("side") == "SELL":  # exit legs are never reviewed
+                continue
+            fk = row.get(fk_key)
+            if fk is not None and fk in by_id:
+                row["llm"] = _llm_review_fields(by_id[fk])
+                matched.add(fk)
+                continue
+            # Fuzzy fallback: symbol + same day (+ direction when both known).
+            if name == _FUTURES_FOLLOW_FOLDER:
+                sym, day = row.get("signal_id"), row.get("entry_date")
+                want_dir = "BUY"
+            else:
+                sym = row.get("symbol")
+                day = (row.get("created_at") or "")[:10]
+                want_dir = _JOURNAL_DIRECTION_TO_DECISION.get(row.get("side") or "")
+            if not sym or not day:
+                continue
+            for d in fuzzy_pool:
+                if d["id"] in matched:
+                    continue
+                if d.get("symbol") != sym or (d.get("candidate_at") or "")[:10] != day:
+                    continue
+                if want_dir and d.get("direction") and d["direction"] != want_dir:
+                    continue
+                row["llm"] = _llm_review_fields(d)
+                matched.add(d["id"])
+                break
+    except Exception:
+        logger.exception("Failed to attach LLM reviews to recent trades for %s", name)
+    return matched
+
+
+def _unmatched_skip_decisions(name: str, matched_ids: set[int], limit: int = 25) -> list[dict]:
+    """Enforced LLM skips that produced NO journal row (issue #358).
+
+    These render as pseudo-rows in the merged trades table — a vetoed entry the
+    strategy never placed (the simplified engine does not journal vetoed
+    entries; futures_follow journals ``veto_skip`` rows, so its skips normally
+    arrive matched and are excluded here). Only enforced skips qualify: a
+    shadow-mode 'skip' still placed, and its trade row already carries the
+    decision.
+    """
+    if name not in _VETO_ENABLED_STRATEGIES:
+        return []
+    try:
+        from database.signal_decision_db import list_signal_decisions
+
+        filters = _LLM_DECISION_SOURCES.get(name) or {}
+        rows = list_signal_decisions(limit=100, **filters)
+        out = []
+        for d in rows:
+            if d["id"] in matched_ids or d.get("decision") != "skip":
+                continue
+            if d.get("enforcement_mode") != "active" and d.get("actually_taken") is not False:
+                continue
+            out.append(
+                {
+                    **_llm_review_fields(d),
+                    "symbol": d.get("symbol"),
+                    "direction": d.get("direction"),
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        logger.exception("Failed to fetch unmatched skip decisions for %s", name)
+        return []
+
+
 def _get_llm_mode(name: str) -> str:
     """Return the persistent llm_mode for a strategy, default 'off'.
 
@@ -856,6 +974,8 @@ def strategy_detail(name: str):
                     "mode": r.mode,
                     "status": r.status,
                     "entry_date": r.entry_date,
+                    "signal_id": r.signal_id,
+                    "decision_id": getattr(r, "decision_id", None),
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows
@@ -884,11 +1004,24 @@ def strategy_detail(name: str):
                     "signal_source": r.signal_source,
                     "placed_at": r.placed_at,
                     "exited_at": r.exited_at,
+                    "signal_decision_id": r.signal_decision_id,
+                    # Normalized aliases so the shared RecentTrades UI renders
+                    # P&L / Mode / Status / Time for journal rows too (#358).
+                    "net_pnl": r.pnl,
+                    "created_at": r.placed_at,
+                    "mode": r.signal_source,
+                    "status": "closed" if r.exited_at else "open",
                 }
                 for r in rows
             ]
         except Exception:
             logger.exception("Failed to fetch recent trades for %s", name)
+
+    # Issue #358: merged trades + LLM-decisions view. Embed the matched veto
+    # decision on each entry row, then surface enforced skips that never
+    # journaled as pseudo-rows.
+    matched_decision_ids = _attach_llm_reviews(name, recent_trades)
+    llm_unmatched_skips = _unmatched_skip_decisions(name, matched_decision_ids)
 
     return jsonify(
         {
@@ -907,6 +1040,7 @@ def strategy_detail(name: str):
                 "data_health": _data_health_summary(name),
                 "performance": performance,
                 "recent_trades": recent_trades,
+                "llm_unmatched_skips": llm_unmatched_skips,
                 "version_log": version_log,
                 "backtest_refs": backtest_refs,
             },

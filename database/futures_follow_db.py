@@ -67,6 +67,10 @@ class FuturesFollowTrade(Base):
     # the original entry session (so an exit reconciles to its T+1 entry).
     entry_date = Column(String(10), nullable=False)  # YYYY-MM-DD of the entry session
     signal_id = Column(String(64), nullable=True)  # opaque id of the sector_follow signal
+    # FK -> signal_decision.id (issue #358): the Stage-1 LLM veto row that reviewed
+    # this entry (BUY legs and veto_skip rows only; NULL when the veto was off,
+    # budget-exhausted, or the row predates the column).
+    decision_id = Column(Integer, nullable=True)
     vol_ratio = Column(Float, nullable=True)  # tiebreaker volume ratio of the source signal
     margin_inr = Column(Float, nullable=True)  # estimated overnight SPAN margin for the lot(s)
     gross_pnl = Column(Float, nullable=True)  # (exit-entry)*qty on the exit leg
@@ -83,10 +87,38 @@ class FuturesFollowTrade(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+def _ensure_columns():
+    """Idempotently add columns introduced after the table's first creation.
+
+    ``Base.metadata.create_all`` only creates *new* tables — it never alters an
+    existing one. ``decision_id`` (issue #358) was added after the table shipped,
+    so back-fill it on existing DBs via SQLite ``ALTER TABLE ADD COLUMN``. No-op
+    when the column already exists.
+    """
+    from sqlalchemy import text
+
+    wanted = {
+        "decision_id": "INTEGER",
+    }
+    try:
+        with engine.connect() as conn:
+            existing = {
+                row[1] for row in conn.execute(text("PRAGMA table_info(futures_follow_trades)"))
+            }
+            for col, ddl in wanted.items():
+                if col not in existing:
+                    conn.execute(text(f"ALTER TABLE futures_follow_trades ADD COLUMN {col} {ddl}"))
+                    logger.info("futures_follow_trades: added column %s", col)
+            conn.commit()
+    except Exception as e:
+        logger.exception(f"Failed to ensure futures_follow_trades columns: {e}")
+
+
 def init_db():
     """Create the futures_follow_trades table if it does not exist (idempotent)."""
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_columns()
         logger.info("futures_follow_trades table ready")
     except Exception as e:
         logger.exception(f"Failed to init futures_follow_trades table: {e}")
@@ -106,6 +138,7 @@ def record_trade(
     entry_price=None,
     exit_price=None,
     signal_id=None,
+    decision_id=None,
     vol_ratio=None,
     margin_inr=None,
     gross_pnl=None,
@@ -131,6 +164,7 @@ def record_trade(
             exit_price=exit_price,
             entry_date=entry_date,
             signal_id=signal_id,
+            decision_id=decision_id,
             vol_ratio=vol_ratio,
             margin_inr=margin_inr,
             gross_pnl=gross_pnl,
