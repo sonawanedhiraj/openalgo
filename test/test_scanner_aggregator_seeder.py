@@ -896,6 +896,28 @@ def test_session_aware_start_ts_never_raises_on_degenerate_lookback():
     assert start_ts < int(now.timestamp())
 
 
+def test_session_aware_start_ts_holiday_contributes_zero_minutes(caplog):
+    """Issue #253 — a market holiday inside the walk must contribute 0
+    trading minutes, exactly like a weekend day, not be silently counted as
+    a normal session.
+
+    Boot pre-market Tue 2026-01-27, 08:00 IST, lookback 100 (small — must
+    stay within a single prior session). The walk goes: today (Tue, 0 min
+    pre-open) -> Mon 2026-01-26 is Republic Day, a seeded NSE
+    TRADING_HOLIDAY (0 min, NOT a normal 375-min session) -> weekend (0 min)
+    -> Fri 2026-01-23, a genuine trading day, which supplies the requested
+    100 minutes. Pre-#253 (weekday-only ``_is_trading_day``), Monday would
+    have been (wrongly) treated as a trading day and the walk would have
+    landed inside Monday's session instead of reaching back to Friday.
+    """
+    now = datetime(2026, 1, 27, 8, 0)
+    start_ts = session_aware_start_ts(now, 100)
+    start_dt = datetime.fromtimestamp(start_ts, _IST)
+
+    assert start_dt.date() == date(2026, 1, 23)  # Friday — NOT Monday 01-26
+    assert start_dt.weekday() == 4
+
+
 # --------------------------------------------------------------------------- #
 # _calendar_days_for_lookback (issue #340 — broker-arm trim fix)
 # --------------------------------------------------------------------------- #

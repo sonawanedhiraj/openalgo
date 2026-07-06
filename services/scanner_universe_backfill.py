@@ -514,12 +514,11 @@ def _daily_resettle_days() -> int:
 
 
 def _nth_prev_business_day(d: date, n: int) -> date:
-    """The business day ``n`` trading days at/before ``d`` (``n``>=0).
+    """The trading day ``n`` trading days at/before ``d`` (``n``>=0).
 
-    ``n=0`` rolls a weekend back to the preceding Friday; each further step goes
-    back one more trading day. Holidays are not modelled (matches
-    ``data_freshness_service``) — a holiday just widens the fetch window by a day,
-    which is harmless for an overwrite re-fetch.
+    ``n=0`` rolls a weekend or NSE holiday back to the preceding trading day
+    (``_prev_or_same_business_day`` is holiday-aware as of issue #253); each
+    further step goes back one more trading day.
     """
     cur = _prev_or_same_business_day(d)
     for _ in range(max(0, n)):

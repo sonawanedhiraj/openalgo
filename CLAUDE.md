@@ -1060,8 +1060,15 @@ the entire time. The fix splits market data by its natural source:
 - **Pure service** `services/data_freshness_service.py` — read-only on
   `historify.duckdb`. `check_strategy_data_ready(strategy, date,
   max_staleness_business_days=1)` returns `(ok, per-symbol details)`;
-  business-day aware (weekend gap ≠ stale; holidays NOT modelled). For
-  sector_follow it checks the 8 mapped indices + 30 universe stocks. All
+  trading-day aware (weekend gap ≠ stale; NSE holidays are now modelled too,
+  issue #253 — the module's own `is_trading_day()` consults
+  `database.market_calendar_db.is_market_holiday()`, weekday AND not a market
+  holiday; fails open to weekday-only behavior with a once-per-year WARNING
+  if the calendar has no rows for a given year, e.g. a future year before its
+  yearly seed lands. `scanner_aggregator_seeder`, `scanner_backfill_scheduler`,
+  and `sector_follow_backfill_scheduler` all delegate their own
+  `_is_trading_day` to this same predicate). For sector_follow it checks the
+  8 mapped indices + 30 universe stocks. All
   read-only DuckDB reads go through **`connect_historify_readonly()`**, which
   tries `read_only=True` first but falls back to a config-matching connect when
   the live app already holds `historify.duckdb` open read-write **in the same

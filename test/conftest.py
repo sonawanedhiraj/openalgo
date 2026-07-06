@@ -154,6 +154,7 @@ _INIT_TARGETS = [
     ("database.strategy_runtime_override_db", "init_db"),
     ("database.daily_intent_db", "init_db"),
     ("database.data_health_db", "init_db"),
+    ("database.market_calendar_db", "init_db"),  # issue #253 — holiday calendar
     ("database.signal_decision_db", "init_db"),
     ("database.scan_cycle_db", "init_db"),
     ("database.scanner_db", "init_db"),

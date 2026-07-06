@@ -150,8 +150,15 @@ def _end_time() -> time:
 # Pure helpers (testable without threads/clocks)
 # --------------------------------------------------------------------------- #
 def _is_trading_day(d) -> bool:
-    """Weekday check (holidays not modelled — matches data_freshness_service)."""
-    return d.weekday() < 5
+    """Weekday AND not an NSE market holiday (issue #253).
+
+    Delegates to the shared ``services.data_freshness_service.is_trading_day``
+    predicate — fail-open (weekday-only) if the holiday calendar is
+    unavailable or has no rows for ``d.year``; never raises.
+    """
+    from services.data_freshness_service import is_trading_day as _shared_is_trading_day
+
+    return _shared_is_trading_day(d)
 
 
 def _within_window(now_t: time, end_t: time) -> bool:
