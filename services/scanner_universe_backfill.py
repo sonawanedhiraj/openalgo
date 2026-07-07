@@ -106,6 +106,19 @@ def max_catchup_days() -> int:
         return _DEFAULT_MAX_CATCHUP_DAYS
 
 
+def _session_coverage_enabled() -> bool:
+    """``SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED`` env flag (default true).
+
+    Issue #380 — gates the session-coverage-aware staleness predicate on the
+    1m convergence arm. When on, a symbol whose last 1m bar is dated today but
+    stops short of the session coverage expected right now (e.g. a lone 09:16
+    bar at a 15:34 post-close check) is treated as stale and caught up; when
+    off, the pre-#380 date-granular semantics apply (one same-day bar == fresh
+    all day). The daily-D arm never uses the coverage predicate either way.
+    """
+    return os.getenv("SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED", "true").lower() == "true"
+
+
 def scanner_universe_symbols() -> list[str]:
     """Unique scanner-universe symbols to keep fresh, sorted for stability.
 
@@ -299,12 +312,24 @@ def check_and_refresh_if_stale(
     than silently counted as done, and a >20% still-stale rate after a completed
     run escalates via ``services.notification_service``.
 
+    Issue #380 — on the ``1m`` arm the staleness predicate is additionally
+    **session-coverage-aware** (gated by
+    ``SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED``, default true): a symbol whose
+    last 1m bar is dated today but falls short of the session coverage expected
+    as of now (e.g. a lone 09:16 bar at the 15:34 post-close check) counts as
+    stale, so the catch-up backfills the rest of today's session instead of
+    letting every ``scanner_aggregator_seeder`` run fall back to ~225 per-symbol
+    broker calls. The historify 1m incremental download re-fetches from the last
+    bar's own date, so the partial day is actually refilled. The ``D`` arm keeps
+    the date-granular semantics unchanged.
+
     Returns ``{status, interval, stale_symbols, refreshed, still_stale, errors,
     skipped_fresh}``.
     """
     ref = today or date.today()
     path = duckdb_path or _DEFAULT_DUCKDB_PATH
     universe = scanner_universe_symbols()
+    require_coverage = interval == "1m" and _session_coverage_enabled()
 
     result: dict = {
         "status": "ok",
@@ -326,6 +351,7 @@ def check_and_refresh_if_stale(
             today=ref,
             max_staleness_business_days=max_staleness_business_days,
             interval=interval,
+            require_session_coverage=require_coverage,
         )
     except Exception as e:  # never let a freshness read crash the caller
         if is_transient_lock_error(e):
@@ -392,7 +418,15 @@ def check_and_refresh_if_stale(
         # a job that starts cleanly but fails/partially-completes mid-download
         # (dead token mid-batch, per-symbol broker error) was reported
         # `errors=0` with every stale symbol marked refreshed.
-        _verify_and_report_refresh(result, bf.get("job_id"), path, stale, ref, interval)
+        _verify_and_report_refresh(
+            result,
+            bf.get("job_id"),
+            path,
+            stale,
+            ref,
+            interval,
+            require_session_coverage=require_coverage,
+        )
     elif bf.get("status") == "ok":
         # Empty-universe / no-op success variant — nothing to refresh, not an error.
         pass
@@ -422,6 +456,7 @@ def _verify_and_report_refresh(
     stale: list[str],
     ref: date,
     interval: str,
+    require_session_coverage: bool = False,
 ) -> None:
     """Wait for the submitted job, then verify each stale symbol actually advanced.
 
@@ -431,6 +466,12 @@ def _verify_and_report_refresh(
     is fail-graceful — it falls back to submission-based reporting (the
     pre-#304 behavior) rather than raising, but is loudly logged so the
     degraded verification is diagnosable.
+
+    ``require_session_coverage`` carries the caller's #380 predicate into the
+    re-read, so a job that landed only a sliver of today's session can't be
+    counted as refreshed by the very date-granularity the predicate exists to
+    fix (the seeder-agreeing 15-minute broker-lag grace keeps a just-post-close
+    verification from false-flagging the normal current-day API lag).
     """
     if job_id:
         try:
@@ -457,6 +498,7 @@ def _verify_and_report_refresh(
             today=ref,
             max_staleness_business_days=0,
             interval=interval,
+            require_session_coverage=require_session_coverage,
         )
     except Exception as e:  # verification read failure — fail open to submission-based
         logger.exception(
