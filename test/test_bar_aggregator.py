@@ -379,6 +379,127 @@ def test_multi_interval_does_not_publish_when_disabled():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Issue #367 — pre-session tick gate at the bar-building layer.
+#
+# NSE pre-open (09:00-09:07 auction) ticks and the broker's subscribe-time
+# snapshot tick carry last_price == the PRIOR day's close. Letting them seed
+# today's first bucket made today_d.open == yest_close exactly, killing the
+# strict-inequality gap gates every pre-market-boot morning (KALYANKJIL /
+# COCHINSHIP, 2026-07-07).
+# ---------------------------------------------------------------------------
+
+
+def test_bar_builder_drops_pre_session_ticks():
+    """Ticks timestamped before 09:15:00 IST are dropped: no state, no emit."""
+    calls: list[dict] = []
+    builder = BarBuilder("KALYANKJIL", "5m", on_bar=lambda b: calls.append(b))
+
+    # Subscribe-snapshot tick at 08:48 + pre-open auction ticks at 09:00-09:07,
+    # all carrying the prior close.
+    for h, m in [(8, 48), (9, 0), (9, 5), (9, 7)]:
+        builder.on_tick({"price": 381.2, "cumulative_volume": 100, "ts": _ts(h, m)})
+
+    assert builder.current_bar() is None  # nothing seeded
+    assert calls == []  # nothing emitted
+    assert builder.presession_drop_count == 4  # silent-but-counted
+
+
+def test_bar_builder_keeps_tick_at_exactly_session_open():
+    """Boundary: a tick at exactly 09:15:00 is KEPT."""
+    builder = BarBuilder("KALYANKJIL", "5m")
+    builder.on_tick({"price": 352.0, "cumulative_volume": 100, "ts": _ts(9, 15, 0)})
+    snap = builder.current_bar()
+    assert snap is not None
+    assert snap["ts"] == _ts(9, 15)
+    assert snap["open"] == 352.0
+    assert builder.presession_drop_count == 0
+
+
+def test_pre_session_tick_does_not_seed_first_bar_open():
+    """The KALYANKJIL shape: pre-open tick @ prior_close (381.2), live ticks
+    from 09:15 @ the real gap-down open (~352). The first closed 5m bar must
+    open at the 09:15 price — NOT inherit yesterday's close."""
+    closes: list[dict] = []
+    builder = BarBuilder(
+        "KALYANKJIL", "5m", on_bar=lambda b: closes.append(b) if b["elapsed_pct"] == 1.0 else None
+    )
+
+    builder.on_tick({"price": 381.2, "cumulative_volume": 500, "ts": _ts(9, 5)})  # pre-open
+    builder.on_tick({"price": 352.0, "cumulative_volume": 1_000, "ts": _ts(9, 15, 1)})
+    builder.on_tick({"price": 351.5, "cumulative_volume": 1_500, "ts": _ts(9, 16)})
+    builder.on_tick({"price": 350.0, "cumulative_volume": 2_000, "ts": _ts(9, 20, 1)})  # closes
+
+    assert len(closes) == 1
+    assert closes[0]["ts"] == _ts(9, 15)  # first bucket is the 09:15 one
+    assert closes[0]["open"] == 352.0  # the real session open, not 381.2
+    assert closes[0]["is_replay"] is False
+
+
+def test_post_close_ticks_still_accepted():
+    """Symmetry check (documented behavior): ticks at/after 15:30 are NOT
+    dropped — the post-close straggler tick is what closes the session's final
+    bucket, and post-close EVALUATION is already gated in the scanner."""
+    closes: list[dict] = []
+    builder = BarBuilder(
+        "ITC", "5m", on_bar=lambda b: closes.append(b) if b["elapsed_pct"] == 1.0 else None
+    )
+    builder.on_tick({"price": 100.0, "cumulative_volume": 100, "ts": _ts(15, 29)})
+    builder.on_tick({"price": 100.5, "cumulative_volume": 150, "ts": _ts(15, 35)})  # straggler
+
+    assert len(closes) == 1
+    assert closes[0]["ts"] == _ts(15, 25)
+    assert closes[0]["is_replay"] is False  # same-session close stays live
+
+
+def test_cross_session_flush_emits_replay_flag():
+    """With pre-session ticks dropped, a bucket left open at yesterday's close
+    is now closed by TODAY's first in-session tick (at 09:15+, where the
+    scanner's market-hours gate would not skip it). Such a cross-session flush
+    must carry is_replay=True so it warms history without being evaluated —
+    the same contract as seeded / WS-recovery bars (#257)."""
+    emits: list[dict] = []
+    builder = BarBuilder(
+        "LT", "5m", on_bar=lambda b: emits.append(b) if b["elapsed_pct"] == 1.0 else None
+    )
+
+    d1 = dt.datetime(2026, 7, 6)
+    d2 = dt.datetime(2026, 7, 7)
+    # Yesterday's last ticks leave the 15:25 bucket open overnight.
+    builder.on_tick(
+        {"price": 100.0, "cumulative_volume": 100, "ts": d1.replace(hour=15, minute=27)}
+    )
+    # Today's first in-session tick closes it — as a replay flush.
+    builder.on_tick({"price": 104.0, "cumulative_volume": 50, "ts": d2.replace(hour=9, minute=15)})
+    # A normal same-day close afterwards stays live.
+    builder.on_tick({"price": 105.0, "cumulative_volume": 90, "ts": d2.replace(hour=9, minute=20)})
+
+    assert [e["ts"] for e in emits] == [
+        d1.replace(hour=15, minute=25),
+        d2.replace(hour=9, minute=15),
+    ]
+    assert emits[0]["is_replay"] is True  # yesterday's stale bucket — never evaluate
+    assert emits[1]["is_replay"] is False  # today's live bar — evaluates normally
+    assert emits[1]["open"] == 104.0
+
+
+def test_multi_interval_aggregator_drops_pre_session_ticks():
+    """The gate protects every consumer through MultiIntervalAggregator too."""
+    closes: list = []
+    agg = MultiIntervalAggregator(
+        symbols=["RELIANCE"],
+        intervals=["5m"],
+        on_bar_close=lambda s, i, b: closes.append(b),
+    )
+    agg.on_tick("RELIANCE", {"price": 1500.0, "cumulative_volume": 10, "ts": _ts(9, 4)})
+    assert agg.current_bar("RELIANCE", "5m") is None
+    agg.on_tick("RELIANCE", {"price": 1450.0, "cumulative_volume": 20, "ts": _ts(9, 15, 2)})
+    snap = agg.current_bar("RELIANCE", "5m")
+    assert snap is not None
+    assert snap["open"] == 1450.0
+    assert closes == []
+
+
 def test_multi_interval_on_bar_close_exception_does_not_kill_aggregator():
     def angry_cb(sym, ival, bar):
         raise RuntimeError("simulated downstream failure")
