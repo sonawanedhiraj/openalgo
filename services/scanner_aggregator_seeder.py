@@ -121,6 +121,7 @@ import time as _time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from services.bar_aggregator import SESSION_CLOSE_IST, SESSION_OPEN_IST
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -149,9 +150,15 @@ _DEFAULT_POLL_SEC = 5
 # seeder runs. ``_is_trading_day`` delegates to the shared, NSE-holiday-aware
 # ``services.data_freshness_service.is_trading_day`` (issue #253) so a holiday
 # inside the walk contributes 0 session minutes exactly like a weekend does.
-_SESSION_START = (9, 15)
-_SESSION_END = (15, 30)
-_SESSION_MINUTES = (15 * 60 + 30) - (9 * 60 + 15)  # 375
+# Shared NSE session bounds (issue #367): derived from bar_aggregator's
+# SESSION_OPEN_IST / SESSION_CLOSE_IST so the session definition lives in one
+# place across the seeder's session-aware lookback, the scanner's evaluation
+# gate, and the bar-building pre-session tick gate.
+_SESSION_START = (SESSION_OPEN_IST.hour, SESSION_OPEN_IST.minute)
+_SESSION_END = (SESSION_CLOSE_IST.hour, SESSION_CLOSE_IST.minute)
+_SESSION_MINUTES = (_SESSION_END[0] * 60 + _SESSION_END[1]) - (
+    _SESSION_START[0] * 60 + _SESSION_START[1]
+)  # 375
 
 
 def _is_trading_day(d: date) -> bool:

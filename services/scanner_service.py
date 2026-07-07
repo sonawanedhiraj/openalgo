@@ -30,7 +30,6 @@ import threading
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import time as _dtime
 from typing import Any
 
 import pandas as pd
@@ -45,7 +44,12 @@ from database.scanner_db import (
     _result_to_dict,
 )
 from services import indicators as _indicators
-from services.bar_aggregator import BarBuilder, MultiIntervalAggregator
+from services.bar_aggregator import (
+    SESSION_CLOSE_IST,
+    SESSION_OPEN_IST,
+    BarBuilder,
+    MultiIntervalAggregator,
+)
 from utils.event_bus import Event
 from utils.event_bus import bus as _default_bus
 from utils.logging import get_logger
@@ -65,8 +69,11 @@ logger = get_logger(__name__)
 # change to either one cannot silently re-open the post-close path on its own.
 # ---------------------------------------------------------------------------
 _IST = pytz.timezone("Asia/Kolkata")
-_MARKET_OPEN_IST = _dtime(9, 15)
-_MARKET_CLOSE_IST = _dtime(15, 30)
+# Shared NSE session bounds (issue #367): aliased from bar_aggregator so the
+# session definition lives in one place — the bar-building pre-session tick
+# gate and this evaluation gate can never drift apart.
+_MARKET_OPEN_IST = SESSION_OPEN_IST
+_MARKET_CLOSE_IST = SESSION_CLOSE_IST
 
 
 def _postclose_gate_enabled() -> bool:
