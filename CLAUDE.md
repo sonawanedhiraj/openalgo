@@ -1186,6 +1186,15 @@ intervals** (`1m` AND `D`):
   symbol for the interval from `historify.duckdb` (via
   `data_freshness_service.compute_stale_symbols`, which already accepts an
   `interval` argument) and fetches **only the symbols behind today's close**.
+  On the `1m` arm the predicate is additionally **session-coverage-aware**
+  (issue #380, flag `SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED` default `true`):
+  a symbol whose last 1m bar is dated today but stops short of the elapsed
+  session (minus a 15-min broker-lag grace, mirroring the seeder's
+  `_has_sufficient_today_coverage`) is stale too — pre-#380 a lone 09:16 bar
+  counted the symbol fresh all day, the post-close loop never backfilled the
+  session, and every `scanner_aggregator_seeder` run fell back to ~225
+  per-symbol broker calls. The `D` arm and the sector_follow backfills keep the
+  date-granular semantics.
   Idempotent (fresh → no-op), fail-graceful (a dead-token fetch is logged into
   `errors`, never raised), empty-universe-safe (no-op when `SCANNER_SYMBOLS` is
   unset).
@@ -1205,7 +1214,8 @@ intervals** (`1m` AND `D`):
   `SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN` (default `30`),
   `SCANNER_BACKFILL_PERIODIC_END_TIME` (default `17:00`),
   `SCANNER_BACKFILL_INTERVALS` (default `1m,D` — drop one arm to reduce broker
-  load). See `docs/PARAMETER_LOG.md`.
+  load), `SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED` (default `true` — the #380
+  rollback switch). See `docs/PARAMETER_LOG.md`.
 - **Manual catch-up** for a deep historical gap — notably the one-time initial
   deep 1m backfill for the ~200 never-fetched scanner symbols, which is beyond
   the small lookback window — uses the CLI (needs an active broker session):

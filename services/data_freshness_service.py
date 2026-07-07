@@ -43,7 +43,7 @@ a WARNING (deduped once per process per year) and fall back to
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 from utils.logging import get_logger
 
@@ -55,6 +55,14 @@ _DEFAULT_DUCKDB_PATH = "db/historify.duckdb"
 # Default acceptable staleness in business days. 1 == "yesterday's close is fine"
 # (the realistic state at 15:20 IST, before today's after-close backfill runs).
 _DEFAULT_MAX_STALENESS = 1
+
+# Session-coverage predicate (issue #380) — NSE cash session bounds plus the
+# same broker-lag grace scanner_aggregator_seeder._has_sufficient_today_coverage
+# uses (the broker's current-day historical API lags ~5-15 minutes), so the two
+# predicates agree on what "covered" means.
+_SESSION_OPEN = time(9, 15)
+_SESSION_CLOSE = time(15, 30)
+_SESSION_COVERAGE_GRACE_MIN = 15
 
 
 def default_max_staleness_business_days() -> int:
@@ -360,12 +368,49 @@ def get_data_freshness(
     return out
 
 
+def session_coverage_shortfall_min(
+    last_ts: float,
+    ref_business_day: date,
+    now: datetime | None = None,
+) -> float:
+    """Minutes of ``ref_business_day``'s 1m session that should already be
+    covered as of ``now`` but aren't, per the symbol's last bar ``last_ts``.
+
+    Issue #380 — the date-granular staleness math above can't see a partial
+    session: a single 09:16 bar dated today made a symbol "fresh" for the rest
+    of the day, so the post-close convergence never fetched the other ~373
+    session bars and every ``scanner_aggregator_seeder`` run fell back to
+    per-symbol broker calls. This helper mirrors the seeder's
+    ``_has_sufficient_today_coverage`` math: expected coverage is the session
+    minutes elapsed at ``now`` (clamped to the 15:30 close — a check on a LATER
+    day expects the full 375-minute session) minus the broker-lag grace; actual
+    coverage is ``(last bar - 09:15) + 1`` (each 1m bar covers its own minute).
+
+    Returns 0.0 when coverage is sufficient, pre-open, or within the first
+    grace minutes after open (nothing fetchable yet, per the broker lag).
+    ``now`` is for tests; naive datetimes are assumed IST.
+    """
+    now_ist = now if now is not None else datetime.now(_IST)
+    if now_ist.tzinfo is None:
+        now_ist = now_ist.replace(tzinfo=_IST)
+    session_open = datetime.combine(ref_business_day, _SESSION_OPEN, tzinfo=_IST)
+    session_close = datetime.combine(ref_business_day, _SESSION_CLOSE, tzinfo=_IST)
+    elapsed_min = (min(now_ist, session_close) - session_open).total_seconds() / 60.0
+    if elapsed_min <= _SESSION_COVERAGE_GRACE_MIN:
+        return 0.0
+    last_dt = datetime.fromtimestamp(last_ts, _IST)
+    covered_min = (last_dt - session_open).total_seconds() / 60.0 + 1.0
+    return max(0.0, elapsed_min - _SESSION_COVERAGE_GRACE_MIN - covered_min)
+
+
 def compute_stale_symbols(
     duckdb_path: str,
     symbols: list[str],
     today: date | None = None,
     max_staleness_business_days: int = 0,
     interval: str = "1m",
+    require_session_coverage: bool = False,
+    now: datetime | None = None,
 ) -> tuple[list[str], list[str], dict[str, dict]]:
     """Split ``symbols`` into stale vs fresh against the latest trading day.
 
@@ -376,8 +421,19 @@ def compute_stale_symbols(
     behind that reference (default 0 — the boot/periodic convergence target wants
     *today's* close present) or has no bars at all.
 
+    ``require_session_coverage`` (issue #380, opt-in — only the scanner 1m
+    convergence arm passes it) additionally marks a symbol stale when its last
+    bar IS dated on the reference business day but stops short of the session
+    coverage expected as of ``now`` (see ``session_coverage_shortfall_min``).
+    Without it, one 09:16 bar dated today counts as fresh all day and the
+    post-close catch-up never backfills the rest of the 375-bar session. The
+    default (off) preserves the date-granular semantics for every other caller
+    (sector_follow backfills, the daily-D arm). ``now`` is for tests.
+
     Returns ``(stale, fresh, details)`` where ``details`` maps each symbol to
-    ``{last_ts, last_date, staleness_days, stale}``. ``stale``/``fresh`` are sorted.
+    ``{last_ts, last_date, staleness_days, stale}`` (plus
+    ``session_coverage_shortfall_min`` when the coverage check evaluated).
+    ``stale``/``fresh`` are sorted.
     """
     ref_date = today or datetime.now(_IST).date()
     ref_business_day = _prev_or_same_business_day(ref_date)
@@ -407,6 +463,12 @@ def compute_stale_symbols(
             "staleness_days": staleness,
             "stale": is_stale,
         }
+        if require_session_coverage and not is_stale and last_date == ref_business_day:
+            shortfall = session_coverage_shortfall_min(last_ts, ref_business_day, now)
+            details[sym]["session_coverage_shortfall_min"] = round(shortfall, 1)
+            if shortfall > 0:
+                is_stale = True
+                details[sym]["stale"] = True
         (stale if is_stale else fresh).append(sym)
 
     return sorted(stale), sorted(fresh), details

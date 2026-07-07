@@ -178,6 +178,129 @@ def test_max_catchup_days_default_and_env_override(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# 1b. Issue #380 — same-day PARTIAL session must trigger the 1m catch-up
+# --------------------------------------------------------------------------- #
+def test_same_day_partial_session_triggers_1m_catchup():
+    """The #380 golden case through the convergence entry: a symbol whose only
+    same-day bar is 09:16 must be caught up by the post-close check, not
+    skipped as fresh. Pre-fix this fails: compute_stale_symbols measured
+    staleness in business days between bar DATES, so the lone 09:16 bar made
+    the symbol fresh, the 15:30-17:00 loop logged "1m feed fresh — no refresh",
+    and every scanner_aggregator_seeder run fell back to ~225 per-symbol broker
+    get_history calls (849 on 2026-07-07). THURS is a past trading day, so the
+    full-session coverage requirement applies deterministically (no wall-clock
+    dependence — cf. the smoke-hold wall-clock flake learning)."""
+    universe = ["RELIANCE", "SBIN"]
+    captured: dict = {}
+    freshness = {
+        "RELIANCE": _epoch(THURS, 9, 16),  # partial tape — 2 minutes of the session
+        "SBIN": _epoch(THURS),  # full session (15:29 close)
+    }
+
+    def fake_backfill(start, end, interval="1m", symbols=None):
+        captured["symbols"] = symbols
+        captured["start"] = start
+        captured["end"] = end
+        for s in symbols or []:
+            freshness[s] = _epoch(THURS)  # the re-download lands the full day
+        return {"status": "success", "job_id": "j380", "symbols": symbols, "interval": interval}
+
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            side_effect=lambda *a, **k: dict(freshness),
+        ),
+        patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j380": "completed"}),
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    assert res["status"] == "ok"
+    assert res["stale_symbols"] == ["RELIANCE"]
+    assert res["skipped_fresh"] == ["SBIN"]
+    assert res["refreshed"] == ["RELIANCE"]
+    assert res["still_stale"] == []
+    # The partial day itself is the gap — a same-day catch-up window (the 1m
+    # incremental download re-fetches from the last bar's own date, refilling
+    # the rest of the session).
+    assert captured["symbols"] == ["RELIANCE"]
+    assert captured["start"] == THURS.strftime("%Y-%m-%d")
+    assert captured["end"] == THURS.strftime("%Y-%m-%d")
+
+
+def test_same_day_partial_session_flag_off_restores_date_semantics(monkeypatch):
+    """Operator escape hatch: SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED=false
+    restores the pre-#380 date-granular predicate (same-day bar == fresh)."""
+    monkeypatch.setenv("SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED", "false")
+    universe = ["RELIANCE"]
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            return_value={"RELIANCE": _epoch(THURS, 9, 16)},
+        ),
+        patch.object(sub, "backfill_scanner_universe") as m_bf,
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    assert res["status"] == "ok"
+    assert res["stale_symbols"] == []
+    assert res["skipped_fresh"] == ["RELIANCE"]
+    m_bf.assert_not_called()
+
+
+def test_daily_D_arm_keeps_date_granular_semantics():
+    """The D arm must NOT inherit the session-coverage predicate — a daily bar's
+    intraday timestamp says nothing about coverage (one bar IS the whole day),
+    and provisional-close correction is the resettle's job (#299), not the
+    incremental convergence's."""
+    universe = ["RELIANCE"]
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            return_value={"RELIANCE": _epoch(THURS, 9, 16)},  # intraday-stamped D bar
+        ),
+        patch.object(sub, "backfill_scanner_universe") as m_bf,
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="D")
+
+    assert res["status"] == "ok"
+    assert res["stale_symbols"] == []
+    assert res["skipped_fresh"] == ["RELIANCE"]
+    m_bf.assert_not_called()
+
+
+def test_verification_holds_symbol_still_stale_when_session_only_partially_lands():
+    """#304 verification must apply the same #380 predicate: a job that only
+    advances the tape to mid-session (partial download failure) must land the
+    symbol in still_stale, not refreshed — otherwise the very date-granularity
+    the predicate fixes would sneak back in through the verification re-read."""
+    universe = ["RELIANCE"]
+    freshness = {"RELIANCE": _epoch(THURS, 9, 16)}
+
+    def fake_backfill(start, end, interval="1m", symbols=None):
+        freshness["RELIANCE"] = _epoch(THURS, 11, 0)  # landed only part of the day
+        return {"status": "success", "job_id": "j1", "symbols": symbols, "interval": interval}
+
+    with (
+        patch.object(sub, "scanner_universe_symbols", return_value=universe),
+        patch(
+            "services.data_freshness_service.get_data_freshness",
+            side_effect=lambda *a, **k: dict(freshness),
+        ),
+        patch.object(sub, "backfill_scanner_universe", side_effect=fake_backfill),
+        patch("services.historify_service.wait_for_jobs", return_value={"j1": "completed"}),
+    ):
+        res = sub.check_and_refresh_if_stale(THURS, interval="1m")
+
+    assert res["refreshed"] == []
+    assert res["still_stale"] == ["RELIANCE"]
+    assert res["status"] == "error"  # 100% still-stale > the 20% escalation threshold
+
+
+# --------------------------------------------------------------------------- #
 # 2. Fresh → no-op (no fetch)
 # --------------------------------------------------------------------------- #
 def test_fresh_is_a_noop():
