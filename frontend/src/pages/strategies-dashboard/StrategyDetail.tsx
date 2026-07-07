@@ -1028,6 +1028,16 @@ function BreakdownSymbolRow({ row }: { row: EntryBreakdownSymbol }) {
   )
 }
 
+// Outcomes a symbol can only reach AFTER clearing all three gates — everything
+// in run_entry's signal loop plus "passed but fell outside the K5 selection".
+const PASSING_OUTCOMES: EntryBreakdownOutcome[] = [
+  'in_cap_placed',
+  'cap_skipped',
+  'vetoed',
+  'placement_failed',
+  'not_selected',
+]
+
 export function EntryBreakdownCard() {
   const [expanded, setExpanded] = useState(false)
 
@@ -1041,6 +1051,10 @@ export function EntryBreakdownCard() {
   const gateFails = payload?.per_gate_fail_counts
   const sources = payload?.intraday_source_counts
   const total = payload?.symbols.length ?? 0
+  const passing = payload?.symbols.filter((s) => PASSING_OUTCOMES.includes(s.outcome)) ?? []
+  // Per-gate counts are independent (one symbol can fail several gates);
+  // missing-data symbols are never gate-evaluated.
+  const gated = total - (gateFails?.missing_data ?? 0)
   const liveCount = (sources?.quotes ?? 0) + (sources?.aggregator ?? 0)
   // The source most symbols were served by (mirrors the 'source=quotes
   // fetched=30/30' log line).
@@ -1079,16 +1093,53 @@ export function EntryBreakdownCard() {
           </p>
         ) : (
           <>
-            {/* Per-gate summary */}
+            {/* Symbols that cleared ALL three gates — the source of any signal.
+                Shown on the card face so a signal day is self-explanatory
+                without expanding the per-symbol table. */}
+            {passing.length > 0 ? (
+              <div className="px-4 pb-3 space-y-1">
+                <p className="text-xs font-medium text-muted-foreground">
+                  Passed all 3 gates ({passing.length})
+                </p>
+                {passing.map((row) => (
+                  <div key={row.symbol} className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="font-mono font-medium">{row.symbol}</span>
+                    <span className="text-muted-foreground tabular-nums">
+                      sector {fmtPct(row.sector_ret)} · stock {fmtPct(row.stock_ret)} · vol{' '}
+                      {row.vol_ratio != null ? `${row.vol_ratio.toFixed(2)}x` : '—'}
+                    </span>
+                    <OutcomeBadge outcome={row.outcome} />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="px-4 pb-3 text-xs text-muted-foreground">
+                No symbol passed all 3 gates today.
+              </p>
+            )}
+            {/* Per-gate summary — counts are independent per gate across all
+                evaluated symbols (one symbol can fail several gates). */}
             <div className="flex flex-wrap gap-2 px-4 pb-3">
-              <Badge variant="outline" className="text-xs text-muted-foreground">
-                sector &gt;1%: {gateFails?.sector ?? 0} failed
+              <Badge
+                variant="outline"
+                className="text-xs text-muted-foreground"
+                title="Symbols whose mapped sector index was up more than 1% intraday"
+              >
+                sector &gt;1%: {gated - (gateFails?.sector ?? 0)}/{gated} passed
               </Badge>
-              <Badge variant="outline" className="text-xs text-muted-foreground">
-                stock &gt;0.5%: {gateFails?.stock ?? 0} failed
+              <Badge
+                variant="outline"
+                className="text-xs text-muted-foreground"
+                title="Symbols up more than 0.5% intraday"
+              >
+                stock &gt;0.5%: {gated - (gateFails?.stock ?? 0)}/{gated} passed
               </Badge>
-              <Badge variant="outline" className="text-xs text-muted-foreground">
-                vol &gt;1x: {gateFails?.vol ?? 0} failed
+              <Badge
+                variant="outline"
+                className="text-xs text-muted-foreground"
+                title="Symbols with volume above 1x their 20-day average"
+              >
+                vol &gt;1x: {gated - (gateFails?.vol ?? 0)}/{gated} passed
               </Badge>
               {(gateFails?.missing_data ?? 0) > 0 && (
                 <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs">
