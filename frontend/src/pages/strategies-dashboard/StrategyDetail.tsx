@@ -12,6 +12,7 @@ import {
   FileBarChart2,
   GitCompare,
   History,
+  Info,
   ListChecks,
   Loader2,
   PauseCircle,
@@ -1040,6 +1041,7 @@ const PASSING_OUTCOMES: EntryBreakdownOutcome[] = [
 
 export function EntryBreakdownCard() {
   const [expanded, setExpanded] = useState(false)
+  const [howOpen, setHowOpen] = useState(false)
 
   const { data: snapshot, isLoading } = useQuery({
     queryKey: ['futures-follow-entry-breakdown'],
@@ -1147,6 +1149,54 @@ export function EntryBreakdownCard() {
                 </Badge>
               )}
             </div>
+            {/* How-this-works explainer — the strategy pipeline in one place,
+                so the card is readable without the PLAN/registry docs. Static
+                mechanism text; live numbers are in the Parameters card below. */}
+            <button
+              type="button"
+              className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
+              onClick={() => setHowOpen(!howOpen)}
+            >
+              <span className="flex items-center gap-1.5">
+                <Info className="h-3.5 w-3.5" /> How this evaluation works (signals → sizing)
+              </span>
+              {howOpen ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+            </button>
+            {howOpen && (
+              <div className="px-4 pb-3 pt-1 space-y-2 text-xs text-muted-foreground">
+                <p>
+                  <span className="font-medium text-foreground">1 · Signals (15:20 IST).</span> Each
+                  of the 30 locked universe stocks is a signal only if ALL three gates hold: its
+                  mapped sector index is up &gt;1% intraday, the stock itself is up &gt;0.5%, and
+                  today's volume is &gt;1× its 20-day average. Passing stocks are ranked by volume
+                  ratio; at most the top 5 become signals.
+                </p>
+                <p>
+                  <span className="font-medium text-foreground">2 · What it buys.</span> The stock
+                  is only the trigger — the position is always ONE NIFTY near-month futures lot per
+                  signal (NFO, NRML, MARKET). This sleeve is leveraged NIFTY beta on bullish-breadth
+                  days, not stock selection: the stocks vote, NIFTY is the vehicle.
+                </p>
+                <p>
+                  <span className="font-medium text-foreground">3 · Position sizing.</span> Signals
+                  are taken greedily in vol-ratio order, one lot each, until the estimated overnight
+                  SPAN margin would exceed the hard cap of 50% of capital — later signals are "cap
+                  skipped" (never partially sized). Each in-cap signal must also clear the LLM
+                  review before placement (enforcing in sandbox). Current capital / per-lot margin /
+                  cap values are in the Parameters card below.
+                </p>
+                <p>
+                  <span className="font-medium text-foreground">4 · Exit &amp; risk.</span> Every
+                  lot is sold at MARKET the next trading day at 15:25 IST (watchdog retry 15:28). No
+                  stop loss — backtests showed hard stops are net-negative on this signal class; the
+                  backstop is a 3%-of-capital daily-loss kill switch that halts new entries.
+                </p>
+              </div>
+            )}
             {/* Expandable per-symbol table (sorted by closeness to passing) */}
             <button
               type="button"
