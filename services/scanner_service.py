@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import threading
+import time as _time
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -150,6 +151,40 @@ def _completeness_crit_pct() -> float:
         return float(os.environ.get("SCANNER_COMPLETENESS_CRIT_PCT", "20"))
     except ValueError:
         return 20.0
+
+
+# ---------------------------------------------------------------------------
+# Tick-liveness heartbeat (issue #376 — the 2026-07-07 libzmq WSAENOBUFS
+# incident: the WS/ZMQ side died at 13:42 while Flask kept serving, and NO bar
+# closes for 42 minutes produced no alert because the completeness metric only
+# fires on window ROLLS driven by bar closes — a TOTAL outage never rolls the
+# window). The scanner stamps the wall-clock time of every genuine LIVE bar
+# close here; services/tick_liveness_watchdog.py polls this timestamp on its
+# own clock (independent of the tick stream) and alerts when it goes stale
+# mid-session. Replayed bars (boot seeder / ws_recovery) never stamp — a
+# historical replay must not make a dead feed look alive.
+# ---------------------------------------------------------------------------
+
+_last_live_bar_close_wall: float | None = None
+
+
+def _mark_live_bar_close() -> None:
+    """Stamp the wall-clock time of the most recent non-replay bar close."""
+    global _last_live_bar_close_wall  # noqa: PLW0603 — process-wide heartbeat by design
+    _last_live_bar_close_wall = _time.time()
+
+
+def get_last_live_bar_close_wall() -> float | None:
+    """Wall-clock (``time.time()``) of the last LIVE bar close, or None if no
+    live bar has closed since process start. Read by the tick-liveness
+    watchdog; never raises."""
+    return _last_live_bar_close_wall
+
+
+def _reset_live_bar_close_for_tests() -> None:
+    """Reset the heartbeat — tests only."""
+    global _last_live_bar_close_wall  # noqa: PLW0603
+    _last_live_bar_close_wall = None
 
 
 def _default_completeness_notifier(message: str) -> None:
@@ -1247,6 +1282,7 @@ class ScannerService:
             bars = self._append_bar(symbol, interval, bar)
             if bar.get("is_replay"):
                 return
+            _mark_live_bar_close()  # issue #376 tick-liveness heartbeat (live bars only)
             indicators_dict = self._build_indicators(symbol, bars)
             self._evaluate_definitions(symbol, interval, bars, indicators_dict, bar)
         except Exception:

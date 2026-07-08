@@ -1115,6 +1115,38 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize WS recovery service: {e}")
 
+            # WS-proxy subprocess supervision (issue #376). Polls the WS proxy
+            # handle every 30s from a daemon thread; on an unexpected exit it
+            # alerts (ws_proxy_died) and auto-restarts the child with the same
+            # args (capped at WS_PROXY_MAX_RESTARTS_PER_DAY/day, 60s backoff).
+            # Closes the 2026-07-07 gap where a libzmq assert killed the WS/ZMQ
+            # side while Flask kept serving. No-op in Docker/standalone (proxy
+            # runs externally). See services/ws_proxy_supervisor.py.
+            try:
+                from services.ws_proxy_supervisor import init_ws_proxy_supervisor
+
+                init_ws_proxy_supervisor(app=app)
+                logger.debug("WS proxy supervisor initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize WS proxy supervisor: {e}")
+
+            # Tick-liveness watchdog + auto-heal ladder + socket instrumentation
+            # (issue #376). Polls the wall-time of the last LIVE scanner bar
+            # close on its own clock; if NO bar closes across the whole universe
+            # for SCANNER_LIVENESS_MAX_SILENT_MIN minutes during market hours it
+            # alerts CRIT (tick_liveness) and runs the re-subscribe → adapter-
+            # reconnect → proxy-restart → terminal escalation ladder. Also emits
+            # the hourly handle/TCP resource-trend line (the 10055 lead). Closes
+            # the total-feed-outage blind spot the completeness metric documents.
+            # See services/tick_liveness_watchdog.py.
+            try:
+                from services.tick_liveness_watchdog import init_tick_liveness_watchdog
+
+                init_tick_liveness_watchdog(app=app)
+                logger.debug("Tick-liveness watchdog initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize tick-liveness watchdog: {e}")
+
             # Issue #157 (R4 of #156): boot-time orphan-exit reconciliation.
             # Marks pre-existing trade_journal rows where exit_reason was set
             # but exit_price never landed (broker rejection at 15:14 IST etc.)

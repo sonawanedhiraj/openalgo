@@ -43,6 +43,17 @@ Quick checks:
 2. `mcp__session_info__list_sessions` + `read_transcript` on today's "Fno scan cycle" sessions
 3. Then errors.jsonl (filter pytest noise per memory)
 
+**Silent tick-flow death (Flask alive, feed dead — the 2026-07-07 libzmq 10055
+incident):** two in-process daemons now watch for this (issue #376). The
+**tick-liveness watchdog** (`services/tick_liveness_watchdog.py`) alerts CRIT
+(`tick_liveness`) when NO live scanner bar closes for
+`SCANNER_LIVENESS_MAX_SILENT_MIN` (default 10) min in market hours, then runs an
+auto-heal ladder (re-subscribe → adapter reconnect → WS-proxy restart →
+terminal CRIT) and logs an hourly handle/TCP resource-trend line. The
+**WS-proxy supervisor** (`services/ws_proxy_supervisor.py`) auto-restarts the
+`websocket_proxy` subprocess on unexpected exit (`ws_proxy_died` alert, capped
+`WS_PROXY_MAX_RESTARTS_PER_DAY`/day). See `docs/SYSTEM_MAP.md` Processes §6.
+
 ## Task Tracking — Every Task Is a GitHub Issue
 
 Every unit of work — feature, bug fix, documentation, **or backtest round** —
