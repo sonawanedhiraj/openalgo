@@ -1588,6 +1588,30 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
   - **2026-07-06:** Introduced by issue #342 / PR #343 (operator request:
     stocks shown only while conditions are met; fired signals stay in history).
 
+## `TICK_LIVENESS_*` / `WS_PROXY_*` — feed-death watchdog + supervision (issue #376)
+
+Added by PR #391 after the 2026-07-07 libzmq WSAENOBUFS (10055) assertion killed
+the WS/ZMQ side while Flask stayed up — 42 min of silent tick outage.
+
+- **`TICK_LIVENESS_WATCHDOG_ENABLED`** (default `true`): master gate for the
+  tick-liveness watchdog (CRIT alert when no live bar closes universe-wide for
+  a threshold during market hours; the documented total-outage blind spot the
+  completeness metric cannot catch).
+- **`SCANNER_LIVENESS_MAX_SILENT_MIN`** (default `10`): minutes of universe-wide
+  bar-close silence (09:25-15:30 IST, holiday-aware) before the watchdog trips.
+- **`SCANNER_LIVENESS_REALERT_MIN`** (default `30`): re-alert cadence while an
+  outage persists.
+- **`TICK_LIVENESS_AUTOHEAL_ENABLED`** (default `true`): run the in-process
+  auto-heal ladder on trip (re-subscribe nudge -> broker adapter reconnect ->
+  WS-proxy subprocess restart -> terminal CRIT). `false` = alert-only.
+- **`SCANNER_LIVENESS_LADDER_COOLDOWN_MIN`** (default `30`): the whole ladder
+  runs at most once per this window (anti-thrash).
+- **`WS_PROXY_MAX_RESTARTS_PER_DAY`** (default `3`): supervisor auto-restart cap
+  for the WS-proxy subprocess per IST day; beyond it, CRIT and stop trying.
+- **History:**
+  - **2026-07-08:** Introduced by issue #376 / PR #391. Follow-ups tracked:
+    external main-process supervisor (#384), re-subscription seams (post-#376).
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
