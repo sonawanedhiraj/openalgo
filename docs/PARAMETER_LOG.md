@@ -1612,6 +1612,30 @@ the WS/ZMQ side while Flask stayed up — 42 min of silent tick outage.
   - **2026-07-08:** Introduced by issue #376 / PR #391. Follow-ups tracked:
     external main-process supervisor (#384), re-subscription seams (post-#376).
 
+## `SCANNER_SMOKE_TOTAL_HOLD_PCT` / `SCANNER_STRAGGLER_RECHECK_*` — per-symbol hold + intraday heal (issue #390)
+
+Added by PR #393 after 2026-07-08, when 3 of 216 stale 1m symbols armed the
+smoke post-hold all-or-nothing and suppressed the ENTIRE scanner all session
+(0 signals; hold released 15:36 after close because the release re-check only
+ran in the 15:30-17:00 periodic window).
+
+- **`SCANNER_SMOKE_TOTAL_HOLD_PCT`** (default `0.5`): on a smoke FAIL from stored
+  1m/D staleness, a stale fraction ABOVE this holds EVERYTHING (genuine dead-feed
+  / broker-down morning); at or below it, the hold is PER-SYMBOL — only the named
+  stale symbols are held, the fresh majority posts. A `None`/symbol-less hold
+  (aggregator-coverage gate fail, legacy caller) is always a total hold.
+- **`SCANNER_STRAGGLER_RECHECK_ENABLED`** (default `true`): master gate for the
+  mid-session straggler-heal loop.
+- **`SCANNER_STRAGGLER_RECHECK_MIN`** (default `15`): interval (minutes) of the
+  market-hours (09:20-15:30 IST, trading days) tick that re-fetches still-stale
+  symbols, persists verified health rows, and re-runs `re_check_and_release` — so
+  a handful of morning stragglers self-heal intraday instead of holding until the
+  15:30 periodic window.
+- **History:**
+  - **2026-07-10:** Introduced by issue #390 / PR #393. Fourth layer of the
+    smoke-hold saga: #305 (enforce) -> #319 (release wiring) -> #338 (verified
+    health rows) -> #390 (per-symbol + intraday heal).
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
