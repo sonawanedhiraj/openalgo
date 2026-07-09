@@ -1608,14 +1608,18 @@ class ScannerService:
             return {}
 
     def _hit_held_by_smoke(self, symbol: str, now_ist: _dt.datetime) -> bool:
-        """True iff the smoke-fail post-hold is active — the caller must skip
-        persisting/posting the hit. Emits a once-per-(symbol, IST-day)
-        WARNING so the held PASS is visible without flooding. Fail-open on a
-        probe error (never blocks on a broken import). Never raises."""
+        """True iff the smoke-fail post-hold is active FOR THIS SYMBOL — the
+        caller must skip persisting/posting the hit. The hold is per-symbol
+        (issue #390): only a symbol whose own data is untrustworthy is held; a
+        symbol with fresh data posts normally even while a partial hold is armed
+        (a total hold — dead feed / aggregator-starved / broker down — still
+        holds everything). Emits a once-per-(symbol, IST-day) WARNING so the
+        held PASS is visible without flooding. Fail-open on a probe error
+        (never blocks on a broken import). Never raises."""
         try:
             from services.scanner_smoke_check_service import is_post_hold_active  # noqa: PLC0415
 
-            if not is_post_hold_active(now=now_ist):
+            if not is_post_hold_active(now=now_ist, symbol=symbol):
                 return False
         except Exception:
             logger.exception("ScannerService: smoke post-hold probe failed — not holding")

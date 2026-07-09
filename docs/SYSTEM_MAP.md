@@ -303,7 +303,15 @@ periodic-in-the-post-close-window shape as sector_follow, gated by
 `'scanner_universe_D'`) — no schema change. CLI for deep manual catch-up
 (notably the one-time initial deep 1m backfill of never-fetched symbols): `python
 -m services.scanner_universe_backfill --from --to --interval {1m|D}`. Writes
-`1m`/`D` bars to `market_data`.
+`1m`/`D` bars to `market_data`. A **third daemon loop** — the **mid-session
+straggler re-check** (`ScannerStragglerRecheck`, issue #390) — runs every
+`SCANNER_STRAGGLER_RECHECK_MIN` (default 15) min inside **09:20-15:30 IST** on
+trading days: it reuses the same `run_backfill_checks(resettle=False)` machinery
+to catch up any symbols the 09:16 pre-entry refresh left stale, then invokes the
+scanner smoke-check `re_check_and_release()` so a handful of morning-stale
+symbols self-heal and the (now per-symbol) smoke post-hold narrows/clears
+intraday instead of at 15:30. Gated by `SCANNER_STRAGGLER_RECHECK_ENABLED`
+(default `true`).
 
 ### Telegram inbound intent bot (Phase 6)
 

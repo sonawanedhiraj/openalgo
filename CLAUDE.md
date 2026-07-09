@@ -1345,6 +1345,43 @@ broker-known prior close, with every existing guard alert-only). Three parts:
   `test/test_scanner_smoke_check.py`, and the golden-incident cases in
   `test/test_fno_intraday_{buy,sell}_chartink.py`.
 
+  **Per-symbol hold + mid-session straggler heal (issue #390, 2026-07-10).**
+  The post-hold used to be all-or-nothing: on 2026-07-08 just **3 of 216**
+  1m symbols stayed stale after the 09:16 pre-entry refresh (broker
+  current-day API lag tail), the 09:18 smoke check FAILED, and the hold
+  darked the **entire** scanner all session — 0 `scan_results`, 68 HELD
+  events, released only at 15:36 (after close) when the 15:30-17:00 periodic
+  loop finally re-checked. Two fixes:
+  - **A — the hold is now PER-SYMBOL.** On a FAIL the smoke check reads the
+    stale symbol SET from the stored-freshness rows'
+    (`scanner_universe_1m`/`_D`) own `stale_symbols` lists (the #338
+    post-refresh still-stale sets) and stores it on the hold.
+    `scanner_service._hit_held_by_smoke(symbol, …)` now holds a hit **only if
+    that symbol is in the stale set** — the fresh 213 post normally.
+    **Total-hold is preserved** for a genuine dead-feed morning: aggregator
+    coverage gate (gate 1) fail, broker session down (gate 4), a freshness
+    gate that names no symbols, or a stale fraction above
+    `SCANNER_SMOKE_TOTAL_HOLD_PCT` (default 0.5) all hold EVERYTHING (stale
+    set = `None` sentinel). A legacy symbol-less `set_post_hold` / a
+    symbol-less `is_post_hold_active` = total hold (backward-compatible).
+  - **B — mid-session straggler tick.** The convergence periodic loop only
+    runs 15:30-17:00, so morning stragglers couldn't self-heal intraday. A
+    new **daemon loop** (`_straggler_tick`/`_straggler_loop` in
+    `scanner_backfill_scheduler.py`) runs every `SCANNER_STRAGGLER_RECHECK_MIN`
+    (default 15) min inside **09:20-15:30 IST** on trading days (holiday-aware,
+    broker-session-gated), reuses the existing convergence machinery
+    (`run_backfill_checks(resettle=False)` → `check_and_refresh_if_stale`,
+    which no-ops cheaply when nothing is stale), persists the verified health
+    rows, then invokes `re_check_and_release()` — so a 3-straggler morning
+    heals within one tick (~15 min) and the hold narrows/clears intraday
+    instead of at 15:30. Gated by `SCANNER_STRAGGLER_RECHECK_ENABLED`
+    (default `true`). New flags: `SCANNER_SMOKE_TOTAL_HOLD_PCT`,
+    `SCANNER_STRAGGLER_RECHECK_ENABLED`, `SCANNER_STRAGGLER_RECHECK_MIN`
+    (see `docs/PARAMETER_LOG.md`). Tests:
+    `test/test_scanner_smoke_check.py` (partial vs total),
+    `test/test_scanner_service.py` (per-symbol enforcement),
+    `test/test_scanner_watchdog_and_backfill_gate.py` (straggler tick).
+
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
 A daily in-process APScheduler job (**15:45 IST mon-fri**) that scores how the
