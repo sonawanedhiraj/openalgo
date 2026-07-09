@@ -47,6 +47,8 @@ def _stub_providers(
     fresh_1m_ok: bool = True,
     fresh_d_ok: bool = True,
     session_ok: bool = True,
+    stale_1m: list[str] | None = None,
+    stale_d: list[str] | None = None,
 ):
     """Build a tuple of injected providers for the test.
 
@@ -54,6 +56,11 @@ def _stub_providers(
     intraday provider returns a non-None close (i.e. live aggregator bars
     exist). Everything else returns ``(None, None)`` — the "no bar today"
     signal.
+
+    ``stale_1m`` / ``stale_d`` populate the freshness row's ``stale_symbols``
+    list — the per-symbol stale set the #390 partial-hold logic reads. When
+    ``fresh_*_ok`` is False and no list is given, the row names no symbols
+    (the unscopable → total-hold case).
     """
     covered_set = set(aggregator_covered)
     notified: list[str] = []
@@ -69,9 +76,9 @@ def _stub_providers(
 
     def freshness_reader(strategy_name: str):
         if strategy_name == "scanner_universe_1m":
-            return {"overall_ok": fresh_1m_ok}
+            return {"overall_ok": fresh_1m_ok, "stale_symbols": list(stale_1m or [])}
         if strategy_name == "scanner_universe_D":
-            return {"overall_ok": fresh_d_ok}
+            return {"overall_ok": fresh_d_ok, "stale_symbols": list(stale_d or [])}
         return None
 
     def broker_session_checker() -> bool:
@@ -428,6 +435,177 @@ def test_re_check_and_release_keeps_hold_on_repeat_failure(monkeypatch):
     assert res is not None
     assert res[0] is False
     assert svc.is_post_hold_active(now=_mid_session()) is True
+
+
+# --------------------------------------------------------------------------- #
+# Issue #390 — per-symbol (partial) post-hold vs total hold
+# --------------------------------------------------------------------------- #
+
+
+def test_partial_stale_1m_arms_per_symbol_hold(monkeypatch):
+    """The 2026-07-08 acceptance case: 3/216 1m symbols stale (aggregator fine,
+    D fine, session fine) → the smoke check FAILS but arms a PER-SYMBOL hold.
+    ONLY the 3 stale symbols are held; the other 213 post normally."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SMOKE_TOTAL_HOLD_PCT", "0.5")
+    universe = [f"S{i:03d}" for i in range(216)]
+    stale3 = ["S010", "S050", "S200"]
+    providers, notified, health_rows = _stub_providers(
+        universe=universe,
+        aggregator_covered=universe,  # aggregator fully covered
+        fresh_1m_ok=False,  # stored 1m gate reports stale
+        stale_1m=stale3,
+    )
+    ok, details = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert ok is False
+    # Hold is per-symbol, not total.
+    hold = svc.get_post_hold()
+    assert hold is not None
+    assert hold["total_hold"] is False
+    assert hold["held_symbols"] == sorted(stale3)
+    assert details["hold_scope"] == "per-symbol:3"
+    # The 3 stale symbols are held; a fresh one is not.
+    now = _mid_session(9, 40)
+    for sym in stale3:
+        assert svc.is_post_hold_active(now=now, symbol=sym) is True
+    assert svc.is_post_hold_active(now=now, symbol="S001") is False
+    assert svc.is_post_hold_active(now=now, symbol="S100") is False
+
+
+def test_majority_stale_forces_total_hold(monkeypatch):
+    """A genuine dead-feed morning: >50% of the universe 1m-stale → TOTAL hold
+    (every symbol held), NOT a huge per-symbol set."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_SMOKE_TOTAL_HOLD_PCT", "0.5")
+    universe = [f"S{i:03d}" for i in range(100)]
+    stale60 = [f"S{i:03d}" for i in range(60)]  # 60/100 = 0.60 > 0.5
+    providers, _n, _r = _stub_providers(
+        universe=universe,
+        aggregator_covered=universe,
+        fresh_1m_ok=False,
+        stale_1m=stale60,
+    )
+    ok, details = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert ok is False
+    hold = svc.get_post_hold()
+    assert hold["total_hold"] is True
+    assert details["hold_scope"] == "total"
+    now = _mid_session(9, 40)
+    # A symbol NOT in the stale list is still held (total).
+    assert svc.is_post_hold_active(now=now, symbol="S099") is True
+    assert svc.is_post_hold_active(now=now, symbol="S000") is True
+
+
+def test_aggregator_gate_fail_forces_total_hold(monkeypatch):
+    """Aggregator coverage below threshold (gate 1) → broad live-feed starvation
+    → TOTAL hold, even though only a couple of 1m symbols are named stale."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    universe = [f"S{i:03d}" for i in range(100)]
+    providers, _n, _r = _stub_providers(
+        universe=universe,
+        aggregator_covered=[f"S{i:03d}" for i in range(40)],  # 40% < 50% → gate 1 fail
+        fresh_1m_ok=False,
+        stale_1m=["S000", "S001"],
+    )
+    ok, details = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert ok is False
+    assert svc.get_post_hold()["total_hold"] is True
+    assert details["hold_scope"] == "total"
+    assert svc.is_post_hold_active(now=_mid_session(9, 40), symbol="S099") is True
+
+
+def test_broker_session_down_forces_total_hold(monkeypatch):
+    """Broker session down (gate 4) → nothing is trustworthy → TOTAL hold."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    providers, _n, _r = _stub_providers(
+        universe=["A", "B", "C"],
+        aggregator_covered=["A", "B", "C"],
+        fresh_1m_ok=False,
+        stale_1m=["A"],
+        session_ok=False,
+    )
+    ok, details = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert ok is False
+    assert svc.get_post_hold()["total_hold"] is True
+    assert details["hold_scope"] == "total"
+
+
+def test_stale_gate_without_named_symbols_is_total_hold(monkeypatch):
+    """A freshness gate reports not-OK but names no stale symbols (unscopable)
+    → total hold (safe). Guards the backward-compat freshness-row shape that
+    carries only ``overall_ok``."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    providers, _n, _r = _stub_providers(
+        universe=["A", "B"],
+        aggregator_covered=["A", "B"],
+        fresh_1m_ok=False,  # not ok, but stale_1m defaults to [] (no names)
+    )
+    ok, details = svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert ok is False
+    assert svc.get_post_hold()["total_hold"] is True
+    assert details["hold_scope"] == "total"
+
+
+def test_partial_hold_narrows_on_recheck(monkeypatch):
+    """A straggler re-check with a smaller stale set narrows the per-symbol hold;
+    a fully-fresh re-check clears it (the intraday-heal contract)."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    universe = [f"S{i:03d}" for i in range(216)]
+    # First: 3 stale → per-symbol hold of 3.
+    p3, _n, _r = _stub_providers(
+        universe=universe,
+        aggregator_covered=universe,
+        fresh_1m_ok=False,
+        stale_1m=["S010", "S050", "S200"],
+    )
+    svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **p3)
+    assert svc.get_post_hold()["held_symbols"] == sorted(["S010", "S050", "S200"])
+    # Re-check: 1 still stale → hold narrows to that one; the other two post.
+    p1, _n1, _r1 = _stub_providers(
+        universe=universe,
+        aggregator_covered=universe,
+        fresh_1m_ok=False,
+        stale_1m=["S200"],
+    )
+    res = svc.re_check_and_release(as_of=_FAIL_DAY, **p1)
+    assert res is not None and res[0] is False
+    hold = svc.get_post_hold()
+    assert hold["held_symbols"] == ["S200"]
+    now = _mid_session(10, 0)
+    assert svc.is_post_hold_active(now=now, symbol="S200") is True
+    assert svc.is_post_hold_active(now=now, symbol="S010") is False
+    # Re-check: all fresh → hold clears entirely.
+    pfull, _n2, _r2 = _stub_providers(universe=universe, aggregator_covered=universe)
+    res2 = svc.re_check_and_release(as_of=_FAIL_DAY, **pfull)
+    assert res2 is not None and res2[0] is True
+    assert svc.get_post_hold() is None
+
+
+def test_symbol_less_call_true_under_partial_hold(monkeypatch):
+    """Backward-compat: a legacy symbol-less ``is_post_hold_active`` returns True
+    whenever ANY hold (total or partial) is temporally active."""
+    monkeypatch.setenv("SCANNER_SMOKE_BLOCK_ENABLED", "true")
+    providers, _n, _r = _stub_providers(
+        universe=["A", "B", "C"],
+        aggregator_covered=["A", "B", "C"],
+        fresh_1m_ok=False,
+        stale_1m=["A"],
+    )
+    svc.assert_scanner_pipeline_healthy(as_of=_FAIL_DAY, **providers)
+    assert svc.get_post_hold()["total_hold"] is False
+    assert svc.is_post_hold_active(now=_mid_session(9, 40)) is True
+
+
+def test_legacy_symbolless_set_post_hold_is_total():
+    """A hold armed via the legacy symbol-less ``set_post_hold`` is a TOTAL hold
+    — every symbol is held (no partial state can leak in without a symbol set)."""
+    svc.set_post_hold(reason="legacy", day=_FAIL_DAY.date())
+    hold = svc.get_post_hold()
+    assert hold["total_hold"] is True
+    assert hold["held_symbols"] is None
+    now = _mid_session(10, 0)
+    assert svc.is_post_hold_active(now=now, symbol="ANYTHING") is True
+    assert svc.is_post_hold_active(now=now) is True
 
 
 # --------------------------------------------------------------------------- #

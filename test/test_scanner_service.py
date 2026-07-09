@@ -1586,6 +1586,40 @@ def test_smoke_hold_flag_off_does_not_block(fresh_scanner_db, monkeypatch):
     assert len(capturing_bus.events) == 1
 
 
+def test_partial_smoke_hold_holds_stale_symbol_posts_fresh(fresh_scanner_db, caplog):
+    """Issue #390 acceptance: a PER-SYMBOL hold (armed with a stale symbol set)
+    holds ONLY the stale symbol's hit; a fresh symbol posts normally even while
+    the hold is armed. A 3/216-style straggler no longer darks the whole
+    scanner."""
+    import logging
+
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE", "TCS"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+    _seed_history(svc, "TCS", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    # RELIANCE is the stale straggler; TCS has fresh data.
+    smoke.set_post_hold(
+        reason="scanner_universe_1m stale", day=_PINNED_DAY, held_symbols=["RELIANCE"]
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=0))
+        svc._on_bar_close("TCS", "5m", _matching_bar(minute=0))
+
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    posted = {sym for row in rows for sym in row["symbols"]}
+    # Fresh TCS posted; stale RELIANCE was held.
+    assert posted == {"TCS"}
+    assert {e.symbol for e in capturing_bus.events} == {"TCS"}
+    held = [r for r in caplog.records if "scanner HELD RELIANCE" in r.getMessage()]
+    assert len(held) == 1
+    assert not any("scanner HELD TCS" in r.getMessage() for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Issue #367 — pre-session ticks must not pollute today's first bar.
 #

@@ -216,4 +216,136 @@ def test_periodic_tick_outside_window_short_circuits_before_gate(monkeypatch):
         ran, res = sched._periodic_tick(now, end_t)
 
     assert ran is False
+    assert res is None
     session_check.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# #390 — mid-session straggler re-check tick
+# --------------------------------------------------------------------------- #
+
+
+def test_straggler_tick_runs_in_window_and_releases_hold(monkeypatch):
+    """09:40 IST, trading day, broker session live → the straggler tick reuses
+    run_backfill_checks (resettle=False), persists health, and invokes the
+    smoke-hold release re-check. This is the intraday-heal path."""
+    monkeypatch.setenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_BACKFILL_GATE_ON_BROKER_SESSION", "true")
+    from services import scanner_backfill_scheduler as sched
+
+    now = datetime(2026, 6, 29, 9, 40, tzinfo=_IST)  # Mon, in 09:20-15:30 window
+
+    with (
+        patch("services.broker_session_health.is_live_broker_session", return_value=True),
+        patch.object(sched, "_is_trading_day", return_value=True),
+        patch.object(
+            sched, "run_backfill_checks", return_value={"all_fresh": True, "errors": []}
+        ) as run_fn,
+        patch.object(sched, "_persist_health"),
+        patch.object(sched, "_log_and_alert"),
+        patch.object(sched, "_maybe_release_smoke_hold") as release_fn,
+    ):
+        ran, res = sched._straggler_tick(now)
+
+    assert ran is True
+    assert res == {"all_fresh": True, "errors": []}
+    # Reuses the convergence machinery WITHOUT the intraday daily-D resettle.
+    run_fn.assert_called_once()
+    assert run_fn.call_args.kwargs.get("resettle") is False
+    release_fn.assert_called_once()
+
+
+def test_straggler_tick_skips_outside_window(monkeypatch):
+    """16:00 IST is past the 15:30 straggler window end → no-op (the post-close
+    periodic loop owns that window). Returns (False, None), no fetch."""
+    monkeypatch.setenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "true")
+    from services import scanner_backfill_scheduler as sched
+
+    now = datetime(2026, 6, 29, 16, 0, tzinfo=_IST)
+
+    with (
+        patch.object(sched, "_is_trading_day", return_value=True),
+        patch.object(sched, "run_backfill_checks") as run_fn,
+        patch("services.broker_session_health.is_live_broker_session") as session_check,
+    ):
+        ran, res = sched._straggler_tick(now)
+
+    assert ran is False
+    assert res is None
+    run_fn.assert_not_called()
+    session_check.assert_not_called()
+
+
+def test_straggler_tick_skips_before_window(monkeypatch):
+    """09:10 IST (before 09:20 / before the 09:18 smoke check) → no-op."""
+    monkeypatch.setenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "true")
+    from services import scanner_backfill_scheduler as sched
+
+    now = datetime(2026, 6, 29, 9, 10, tzinfo=_IST)
+
+    with (
+        patch.object(sched, "_is_trading_day", return_value=True),
+        patch.object(sched, "run_backfill_checks") as run_fn,
+    ):
+        ran, res = sched._straggler_tick(now)
+
+    assert ran is False
+    assert res is None
+    run_fn.assert_not_called()
+
+
+def test_straggler_tick_skips_on_holiday(monkeypatch):
+    """Non-trading day (weekend / NSE holiday) → no-op even inside the clock
+    window."""
+    monkeypatch.setenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "true")
+    from services import scanner_backfill_scheduler as sched
+
+    now = datetime(2026, 6, 27, 10, 0, tzinfo=_IST)  # Saturday
+
+    with (
+        patch.object(sched, "_is_trading_day", return_value=False),
+        patch.object(sched, "run_backfill_checks") as run_fn,
+    ):
+        ran, res = sched._straggler_tick(now)
+
+    assert ran is False
+    assert res is None
+    run_fn.assert_not_called()
+
+
+def test_straggler_tick_skips_when_no_broker_session(monkeypatch):
+    """In-window trading day but no broker session → skip (avoids 401-flood
+    during the morning re-login gap), same gate as the periodic tick."""
+    monkeypatch.setenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "true")
+    monkeypatch.setenv("SCANNER_BACKFILL_GATE_ON_BROKER_SESSION", "true")
+    from services import scanner_backfill_scheduler as sched
+
+    now = datetime(2026, 6, 29, 9, 40, tzinfo=_IST)
+
+    with (
+        patch("services.broker_session_health.is_live_broker_session", return_value=False),
+        patch.object(sched, "_is_trading_day", return_value=True),
+        patch.object(sched, "run_backfill_checks") as run_fn,
+    ):
+        ran, res = sched._straggler_tick(now)
+
+    assert ran is False
+    assert res is None
+    run_fn.assert_not_called()
+
+
+def test_straggler_tick_flag_off_is_noop(monkeypatch):
+    """SCANNER_STRAGGLER_RECHECK_ENABLED=false → tick is a no-op regardless of
+    window/session; start_straggler_recheck returns False."""
+    monkeypatch.setenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "false")
+    from services import scanner_backfill_scheduler as sched
+
+    now = datetime(2026, 6, 29, 9, 40, tzinfo=_IST)
+
+    with patch.object(sched, "run_backfill_checks") as run_fn:
+        ran, res = sched._straggler_tick(now)
+
+    assert ran is False
+    assert res is None
+    run_fn.assert_not_called()
+    assert sched.start_straggler_recheck() is False

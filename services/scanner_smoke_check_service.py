@@ -82,6 +82,14 @@ _hold_lock = threading.Lock()
 _hold_day: date | None = None
 _hold_reason: str = ""
 _hold_set_at: datetime | None = None
+# Issue #390: the hold is now PER-SYMBOL, not all-or-nothing. ``_hold_symbols``
+# is the set of symbols whose OWN data is untrustworthy — ONLY their hits are
+# held; symbols with fresh data post normally. ``None`` is the sentinel for a
+# TOTAL hold (whole universe held) — a broad failure (aggregator coverage gate,
+# broker session down, a majority-stale morning, or a legacy symbol-less caller).
+# A tiny straggler set (e.g. 3/216 stale on 2026-07-08) no longer darks the
+# entire scanner all session.
+_hold_symbols: set[str] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -100,6 +108,17 @@ def smoke_min_coverage() -> float:
     ``SCANNER_SYMBOLS`` that must have produced at least one live bar today."""
     try:
         return float(os.getenv("SCANNER_SMOKE_MIN_COVERAGE", "0.5"))
+    except ValueError:
+        return 0.5
+
+
+def smoke_total_hold_pct() -> float:
+    """``SCANNER_SMOKE_TOTAL_HOLD_PCT`` (default 0.5). When a smoke check FAILS on
+    stored 1m/D staleness, a stale fraction ABOVE this threshold is treated as a
+    genuine broad/dead-feed morning and holds EVERYTHING (total hold); a fraction
+    at or below it holds only the named stale symbols (per-symbol hold, #390)."""
+    try:
+        return float(os.getenv("SCANNER_SMOKE_TOTAL_HOLD_PCT", "0.5"))
     except ValueError:
         return 0.5
 
@@ -132,24 +151,44 @@ def smoke_block_enabled() -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def set_post_hold(reason: str, day: date | None = None) -> None:
+def set_post_hold(
+    reason: str,
+    day: date | None = None,
+    held_symbols: list[str] | set[str] | None = None,
+) -> None:
     """Arm the smoke-fail post-hold for ``day`` (default today IST).
 
     Called by the FAIL path of ``assert_scanner_pipeline_healthy``. Idempotent
-    — re-arming on a repeat failure just refreshes the reason/timestamp."""
-    global _hold_day, _hold_reason, _hold_set_at
+    — re-arming on a repeat failure just refreshes the reason/timestamp/scope.
+
+    ``held_symbols`` (issue #390):
+      * ``None`` (default) → **TOTAL hold** — every symbol's hits are held.
+        This is the backward-compatible path: a legacy/symbol-less caller and a
+        genuine broad/dead-feed failure both hold everything.
+      * a collection → **PER-SYMBOL hold** — ONLY the named symbols (whose own
+        data is untrustworthy) are held; every other symbol posts normally."""
+    global _hold_day, _hold_reason, _hold_set_at, _hold_symbols
     if day is None:
         day = datetime.now(_IST).date()
+    normalized = None if held_symbols is None else {s.upper() for s in held_symbols}
     with _hold_lock:
         _hold_day = day
         _hold_reason = reason
         _hold_set_at = datetime.now(_IST)
+        _hold_symbols = normalized
+    scope = (
+        "TOTAL (whole universe)"
+        if normalized is None
+        else f"PER-SYMBOL ({len(normalized)} symbol(s): {sorted(normalized)[:20]})"
+    )
     logger.warning(
-        "scanner smoke-check post-hold ARMED for %s (%s) — rule PASSes will be "
-        "logged but hits NOT persisted/posted until a re-check passes or the hold "
-        "expires at %s IST (enforcement gated by SCANNER_SMOKE_BLOCK_ENABLED=%s)",
+        "scanner smoke-check post-hold ARMED for %s (%s) scope=%s — matching hits "
+        "will be logged but NOT persisted/posted until a re-check passes/narrows "
+        "or the hold expires at %s IST (enforcement gated by "
+        "SCANNER_SMOKE_BLOCK_ENABLED=%s)",
         day.isoformat(),
         reason,
+        scope,
         _HOLD_EXPIRY_IST.strftime("%H:%M"),
         smoke_block_enabled(),
     )
@@ -157,26 +196,36 @@ def set_post_hold(reason: str, day: date | None = None) -> None:
 
 def clear_post_hold(reason: str = "check passed") -> None:
     """Release the post-hold (PASS path / operator action). No-op when idle."""
-    global _hold_day, _hold_reason, _hold_set_at
+    global _hold_day, _hold_reason, _hold_set_at, _hold_symbols
     with _hold_lock:
         was_armed = _hold_day is not None
         _hold_day = None
         _hold_reason = ""
         _hold_set_at = None
+        _hold_symbols = None
     if was_armed:
         logger.info("scanner smoke-check post-hold RELEASED (%s)", reason)
 
 
-def is_post_hold_active(now: datetime | None = None) -> bool:
+def is_post_hold_active(now: datetime | None = None, symbol: str | None = None) -> bool:
     """True iff hit-posting must be held right now.
 
     Consult-time semantics: enforcement flag on AND the hold was armed for
     ``now``'s IST date AND the session-end expiry (15:35 IST) has not passed.
-    A hold armed on a prior day never carries over (day-scoped)."""
+    A hold armed on a prior day never carries over (day-scoped).
+
+    Per-symbol semantics (issue #390):
+      * ``symbol`` given + a TOTAL hold (``_hold_symbols is None``) → True
+        (everything held — the genuine dead-feed case).
+      * ``symbol`` given + a PER-SYMBOL hold → True only when ``symbol`` is in
+        the stale set; a fresh symbol posts normally.
+      * ``symbol`` omitted (legacy/observability callers) → True whenever a
+        hold of any scope is temporally active ("is anything held right now")."""
     if not smoke_block_enabled():
         return False
     with _hold_lock:
         day = _hold_day
+        held = _hold_symbols
     if day is None:
         return False
     if now is None:
@@ -185,7 +234,12 @@ def is_post_hold_active(now: datetime | None = None) -> bool:
         return False
     if now.time() >= _HOLD_EXPIRY_IST:
         return False
-    return True
+    # Hold is temporally active. Scope it.
+    if held is None:
+        return True  # total hold — every symbol held
+    if symbol is None:
+        return True  # legacy "is any hold active" query
+    return symbol.upper() in held
 
 
 def get_post_hold() -> dict | None:
@@ -198,6 +252,8 @@ def get_post_hold() -> dict | None:
             "day": _hold_day.isoformat(),
             "reason": _hold_reason,
             "set_at": _hold_set_at.isoformat() if _hold_set_at else None,
+            "total_hold": _hold_symbols is None,
+            "held_symbols": (None if _hold_symbols is None else sorted(_hold_symbols)),
         }
 
 
@@ -222,11 +278,12 @@ def re_check_and_release(**kwargs) -> tuple[bool, dict] | None:
 
 def _reset_hold_for_tests() -> None:
     """Wipe the post-hold state (test helper, NOT for production use)."""
-    global _hold_day, _hold_reason, _hold_set_at
+    global _hold_day, _hold_reason, _hold_set_at, _hold_symbols
     with _hold_lock:
         _hold_day = None
         _hold_reason = ""
         _hold_set_at = None
+        _hold_symbols = None
 
 
 # --------------------------------------------------------------------------- #
@@ -420,11 +477,45 @@ def assert_scanner_pipeline_healthy(
     reason = "; ".join(reasons)
     logger.error(f"scanner smoke check 09:18 FAILED: {reason}")
 
-    # Issue #305: a failed check ARMS the post-hold — ScannerService keeps
-    # evaluating (observability) but stops persisting/posting hits until a
-    # re-check passes or the hold expires at 15:35 IST. Enforcement is
-    # consult-time gated by SCANNER_SMOKE_BLOCK_ENABLED.
-    set_post_hold(reason=reason, day=today)
+    # Issue #305/#390: a failed check ARMS the post-hold — ScannerService keeps
+    # evaluating (observability) but stops persisting/posting hits for the held
+    # symbols until a re-check passes/narrows or the hold expires at 15:35 IST.
+    # Enforcement is consult-time gated by SCANNER_SMOKE_BLOCK_ENABLED.
+    #
+    # Scope decision (#390): a handful of stale symbols must not dark the whole
+    # scanner. The per-symbol stale set is drawn from the stored-freshness rows'
+    # own ``stale_symbols`` lists (the #338 post-refresh still-stale sets). Two
+    # gates are BROAD by nature and force a TOTAL hold: aggregator coverage
+    # (gate 1 — the live feed is broadly starved) and broker session (gate 4 —
+    # nothing is trustworthy). A failed freshness gate that names no symbols is
+    # unscopable → total hold (safe). Finally, a stale fraction above
+    # SCANNER_SMOKE_TOTAL_HOLD_PCT is a genuine dead-feed morning → total hold.
+    total_hold = (not agg_ok) or (not session_ok)
+    stale_set: set[str] = set()
+    for row, gate_ok in ((fresh_1m, fresh_1m_ok), (fresh_d, fresh_d_ok)):
+        if gate_ok:
+            continue
+        named = row.get("stale_symbols") or []
+        if named:
+            stale_set.update(str(s).upper() for s in named)
+        else:
+            # freshness gate failed but named no symbols — cannot scope → total.
+            total_hold = True
+    if not total_hold and stale_set:
+        frac = len(stale_set) / total
+        if frac > smoke_total_hold_pct():
+            total_hold = True
+    # A partial hold with an empty set would hold nothing — fall back to total.
+    if total_hold or not stale_set:
+        set_post_hold(reason=reason, day=today)
+        hold_scope = "total"
+        held_for_row = stale_symbols  # aggregator-missing set, for the health row
+    else:
+        set_post_hold(reason=reason, day=today, held_symbols=stale_set)
+        hold_scope = f"per-symbol:{len(stale_set)}"
+        held_for_row = sorted(stale_set)
+    details["hold_scope"] = hold_scope
+    details["hold_stale_count"] = len(stale_set)
 
     alert_already_sent_today = _last_alert_date == today
     if not alert_already_sent_today:
@@ -439,7 +530,7 @@ def assert_scanner_pipeline_healthy(
         except Exception:
             logger.exception("scanner smoke-check Telegram send failed")
 
-    health_writer(False, stale_symbols[:50], details, not alert_already_sent_today)
+    health_writer(False, list(held_for_row)[:50], details, not alert_already_sent_today)
     return False, details
 
 
