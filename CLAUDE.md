@@ -1016,15 +1016,27 @@ gain — NIFTY-only is the vehicle). Keep `sector_follow_cap5_vol` (CNC T+1 equi
 the alpha primary; run this as a separate, leverage-bounded beta sleeve. Key files:
 `services/futures_follow_service.py` (evaluator reuse + sizing + scheduler glue),
 `blueprints/futures_follow.py` (control API at `/futures_follow_cap50/api/*` —
-status/positions/pause/resume/close_all/data_health/entry_breakdown),
+status/positions/pause/resume/close_all/data_health/entry_breakdown/entry_breakdown-history),
 `database/futures_follow_db.py` (`futures_follow_trades` journal),
 `database/futures_follow_eval_db.py` (`futures_follow_eval_snapshots` — the
 per-day 15:20 entry-evaluation breakdown, issue #352: `run_entry` persists the
 sector_follow evaluator's per-symbol gate inputs/outcomes after placement
 decisions, fail-graceful; read via `GET /futures_follow_cap50/api/entry_breakdown`
-— API-key OR logged-in-session auth, read-only — and rendered as the "Today's
-15:20 Evaluation" card on `/strategies/futures_follow_cap50`, so a zero-signal
-day is explainable without reading logs). Plan + locked
+— API-key OR logged-in-session auth, read-only — and rendered as the
+"15:20 Evaluation" card on `/strategies/futures_follow_cap50`, so a zero-signal
+day is explainable without reading logs. **History (issue #395):** `GET
+/futures_follow_cap50/api/entry_breakdown/history?limit=&before=` lists per-day
+digests (`services/futures_follow_eval_view.summarize_payload` — ~300 B/day, not
+the ~9 KB payload; `limit` clamped to `MAX_HISTORY_LIMIT`=90, `before` pages
+backwards) plus a `today` object (`is_trading_day` via
+`data_freshness_service.is_trading_day`, `snapshot_exists`) that tells the UI
+whether to show the pending row — the snapshot only lands at 15:20 IST, and on a
+weekend/NSE holiday none is coming at all. The card is one table: today is the
+newest row, the newest row WITH a snapshot is expanded by default, and each row
+drills into the same per-symbol table via the `?date=` endpoint. Snapshots start
+2026-07-07 (when #352 shipped the writer); earlier days are not reconstructable
+because the live path reads today's close/volume from broker `quotes` while a
+replay could only read historify). Plan + locked
 decisions: [`strategies/futures_follow_cap50/PLAN.md`](strategies/futures_follow_cap50/PLAN.md).
 Backtest reports:
 [`docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md`](docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md)

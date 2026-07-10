@@ -237,5 +237,116 @@ def test_entry_breakdown_session_auth_allows_read(client, _eval_db, monkeypatch)
     assert resp.get_json()["data"] is None
 
 
+# ---------------------------------------------------------------------------
+# Entry-evaluation history (issue #395)
+# ---------------------------------------------------------------------------
+
+_HISTORY_URL = "/futures_follow_cap50/api/entry_breakdown/history"
+
+
+def _payload(n_signals=0, fails=None, symbols=None):
+    return {
+        "eval_at": "2026-07-07T15:20:03+05:30",
+        "mode": "sandbox",
+        "n_signals": n_signals,
+        "intraday_source_counts": {"quotes": 30, "aggregator": 0, "historify": 0, "none": 0},
+        "cap_skipped": 0,
+        "vetoed": 0,
+        "per_gate_fail_counts": fails or {"sector": 28, "stock": 24, "vol": 19, "missing_data": 0},
+        "symbols": symbols if symbols is not None else [],
+    }
+
+
+def test_history_requires_auth(client, _eval_db):
+    assert client.get(_HISTORY_URL).status_code == 401
+
+
+def test_history_rejects_bad_key(client, _eval_db):
+    assert client.get(_HISTORY_URL, headers={"X-API-KEY": "BAD"}).status_code == 401
+
+
+def test_history_empty_is_success_not_error(client, _eval_db):
+    resp = client.get(_HISTORY_URL, headers={"X-API-KEY": "GOOD"})
+    assert resp.status_code == 200
+    data = resp.get_json()["data"]
+    assert data["rows"] == []
+    assert data["has_more"] is False
+
+
+def test_history_returns_summaries_newest_first(client, _eval_db):
+    for d in ("2026-07-07", "2026-07-08", "2026-07-09"):
+        assert _eval_db.upsert_snapshot("futures_follow_cap50", d, _payload())
+    rows = client.get(_HISTORY_URL, headers={"X-API-KEY": "GOOD"}).get_json()["data"]["rows"]
+    assert [r["eval_date"] for r in rows] == ["2026-07-09", "2026-07-08", "2026-07-07"]
+    # Summaries, not payloads: no per-symbol list is shipped.
+    assert "symbols" not in rows[0]
+    assert rows[0]["gates_passed"] == {"sector": 0, "stock": 0, "vol": 0}
+
+
+def test_history_has_more_flag_and_limit(client, _eval_db):
+    for d in ("2026-07-07", "2026-07-08", "2026-07-09"):
+        assert _eval_db.upsert_snapshot("futures_follow_cap50", d, _payload())
+    data = client.get(f"{_HISTORY_URL}?limit=2", headers={"X-API-KEY": "GOOD"}).get_json()["data"]
+    assert [r["eval_date"] for r in data["rows"]] == ["2026-07-09", "2026-07-08"]
+    assert data["has_more"] is True
+
+    data = client.get(f"{_HISTORY_URL}?limit=3", headers={"X-API-KEY": "GOOD"}).get_json()["data"]
+    assert data["has_more"] is False
+
+
+def test_history_before_pages_backwards(client, _eval_db):
+    for d in ("2026-07-07", "2026-07-08", "2026-07-09"):
+        assert _eval_db.upsert_snapshot("futures_follow_cap50", d, _payload())
+    data = client.get(
+        f"{_HISTORY_URL}?before=2026-07-09&limit=2", headers={"X-API-KEY": "GOOD"}
+    ).get_json()["data"]
+    assert [r["eval_date"] for r in data["rows"]] == ["2026-07-08", "2026-07-07"]
+
+
+@pytest.mark.parametrize("qs", ["limit=abc", "limit=0", "limit=-5", "before=not-a-date"])
+def test_history_invalid_params_400(client, _eval_db, qs):
+    assert client.get(f"{_HISTORY_URL}?{qs}", headers={"X-API-KEY": "GOOD"}).status_code == 400
+
+
+def test_history_today_reports_pending_on_a_trading_day(client, _eval_db, monkeypatch):
+    """No snapshot yet + a trading day -> the UI shows the pending row."""
+    import blueprints.futures_follow as bp  # noqa: F401
+
+    monkeypatch.setattr("services.data_freshness_service.is_trading_day", lambda d: True)
+    today = client.get(_HISTORY_URL, headers={"X-API-KEY": "GOOD"}).get_json()["data"]["today"]
+    assert today["is_trading_day"] is True
+    assert today["snapshot_exists"] is False
+
+
+def test_history_today_no_pending_row_on_a_holiday(client, _eval_db, monkeypatch):
+    """A weekend / NSE holiday must not promise an evaluation that never comes."""
+    monkeypatch.setattr("services.data_freshness_service.is_trading_day", lambda d: False)
+    today = client.get(_HISTORY_URL, headers={"X-API-KEY": "GOOD"}).get_json()["data"]["today"]
+    assert today["is_trading_day"] is False
+
+
+def test_history_today_snapshot_exists_survives_paging(client, _eval_db, monkeypatch):
+    """`snapshot_exists` is queried directly, never inferred from the page — a
+    ?before= page never contains today's row."""
+    from datetime import datetime, timedelta, timezone
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    today_str = datetime.now(ist).date().isoformat()
+    assert _eval_db.upsert_snapshot("futures_follow_cap50", today_str, _payload())
+    assert _eval_db.upsert_snapshot("futures_follow_cap50", "2026-01-02", _payload())
+
+    data = client.get(
+        f"{_HISTORY_URL}?before={today_str}", headers={"X-API-KEY": "GOOD"}
+    ).get_json()["data"]
+    assert today_str not in [r["eval_date"] for r in data["rows"]]
+    assert data["today"]["snapshot_exists"] is True
+
+
+def test_history_session_auth_allows_read(client, _eval_db, monkeypatch):
+    """The React page authenticates with a session cookie, not an API key."""
+    monkeypatch.setattr("utils.session.is_session_valid", lambda: True)
+    assert client.get(_HISTORY_URL).status_code == 200
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
