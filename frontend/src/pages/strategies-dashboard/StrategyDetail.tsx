@@ -1352,7 +1352,9 @@ export function EntryEvaluationCard() {
   const today = history?.today
   const showPending = Boolean(today?.is_trading_day && !today.snapshot_exists)
   // Default-open the newest day that actually has a snapshot, so the card never
-  // opens on a blank panel while today is still pending.
+  // opens on a blank panel while today is still pending. `openDate` is null
+  // until the operator touches a row, then '' means "explicitly closed" — the
+  // ?? is load-bearing (|| would treat '' as untouched and re-open the default).
   const defaultOpen = rows[0]?.eval_date ?? null
   const effectiveOpen = openDate ?? defaultOpen
   const signalDays = rows.filter((r) => r.n_signals > 0).length
