@@ -7,6 +7,7 @@ import {
   Bot,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Clock,
   FileBarChart2,
@@ -35,6 +36,8 @@ import {
 import {
   type DataHealth,
   type EntryBreakdownOutcome,
+  type EntryBreakdownPayload,
+  type EntryBreakdownSummary,
   type EntryBreakdownSymbol,
   type LLMFlipOutcome,
   type LLMMode,
@@ -1039,215 +1042,403 @@ const PASSING_OUTCOMES: EntryBreakdownOutcome[] = [
   'not_selected',
 ]
 
-export function EntryBreakdownCard() {
+/**
+ * Renders ONE day's evaluation payload. Shared by every row of the history
+ * table (issue #395) so today and any past day can never drift apart.
+ */
+function EntryBreakdownBody({ payload }: { payload: EntryBreakdownPayload }) {
   const [expanded, setExpanded] = useState(false)
   const [howOpen, setHowOpen] = useState(false)
 
-  const { data: snapshot, isLoading } = useQuery({
-    queryKey: ['futures-follow-entry-breakdown'],
-    queryFn: () => strategiesDashboardApi.getEntryBreakdown(),
-    refetchInterval: 60_000,
-  })
-
-  const payload = snapshot?.payload
-  const gateFails = payload?.per_gate_fail_counts
-  const sources = payload?.intraday_source_counts
-  const total = payload?.symbols.length ?? 0
-  const passing = payload?.symbols.filter((s) => PASSING_OUTCOMES.includes(s.outcome)) ?? []
+  const gateFails = payload.per_gate_fail_counts
+  const total = payload.symbols.length
+  const passing = payload.symbols.filter((s) => PASSING_OUTCOMES.includes(s.outcome))
   // Per-gate counts are independent (one symbol can fail several gates);
   // missing-data symbols are never gate-evaluated.
   const gated = total - (gateFails?.missing_data ?? 0)
-  const liveCount = (sources?.quotes ?? 0) + (sources?.aggregator ?? 0)
-  // The source most symbols were served by (mirrors the 'source=quotes
-  // fetched=30/30' log line).
-  const dominantSource = sources
-    ? (Object.entries(sources).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'none')
-    : 'none'
+
+  return (
+    <>
+      {/* Symbols that cleared ALL three gates — the source of any signal.
+                Shown on the row face so a signal day is self-explanatory
+                without expanding the per-symbol table. */}
+      {passing.length > 0 ? (
+        <div className="px-4 pb-3 space-y-1">
+          <p className="text-xs font-medium text-muted-foreground">
+            Passed all 3 gates ({passing.length})
+          </p>
+          {passing.map((row) => (
+            <div key={row.symbol} className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-mono font-medium">{row.symbol}</span>
+              <span className="text-muted-foreground tabular-nums">
+                sector {fmtPct(row.sector_ret)} · stock {fmtPct(row.stock_ret)} · vol{' '}
+                {row.vol_ratio != null ? `${row.vol_ratio.toFixed(2)}x` : '—'}
+              </span>
+              <OutcomeBadge outcome={row.outcome} />
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="px-4 pb-3 text-xs text-muted-foreground">
+          No symbol passed all 3 gates today.
+        </p>
+      )}
+      {/* Per-gate summary — counts are independent per gate across all
+                evaluated symbols (one symbol can fail several gates). */}
+      <div className="flex flex-wrap gap-2 px-4 pb-3">
+        <Badge
+          variant="outline"
+          className="text-xs text-muted-foreground"
+          title="Symbols whose mapped sector index was up more than 1% intraday"
+        >
+          sector &gt;1%: {gated - (gateFails?.sector ?? 0)}/{gated} passed
+        </Badge>
+        <Badge
+          variant="outline"
+          className="text-xs text-muted-foreground"
+          title="Symbols up more than 0.5% intraday"
+        >
+          stock &gt;0.5%: {gated - (gateFails?.stock ?? 0)}/{gated} passed
+        </Badge>
+        <Badge
+          variant="outline"
+          className="text-xs text-muted-foreground"
+          title="Symbols with volume above 1x their 20-day average"
+        >
+          vol &gt;1x: {gated - (gateFails?.vol ?? 0)}/{gated} passed
+        </Badge>
+        {(gateFails?.missing_data ?? 0) > 0 && (
+          <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs">
+            missing data: {gateFails?.missing_data}
+          </Badge>
+        )}
+      </div>
+      {/* How-this-works explainer — the strategy pipeline in one place,
+                so the card is readable without the PLAN/registry docs. Static
+                mechanism text; live numbers are in the Parameters card below. */}
+      <button
+        type="button"
+        className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
+        onClick={() => setHowOpen(!howOpen)}
+      >
+        <span className="flex items-center gap-1.5">
+          <Info className="h-3.5 w-3.5" /> How this evaluation works (signals → sizing)
+        </span>
+        {howOpen ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+      {howOpen && (
+        <div className="px-4 pb-3 pt-1 space-y-2 text-xs text-muted-foreground">
+          <p>
+            <span className="font-medium text-foreground">1 · Signals (15:20 IST).</span> Each of
+            the 30 locked universe stocks is a signal only if ALL three gates hold: its mapped
+            sector index is up &gt;1% intraday, the stock itself is up &gt;0.5%, and today's volume
+            is &gt;1× its 20-day average. Passing stocks are ranked by volume ratio; at most the top
+            5 become signals.
+          </p>
+          <p>
+            <span className="font-medium text-foreground">2 · What it buys.</span> The stock is only
+            the trigger — the position is always ONE NIFTY near-month futures lot per signal (NFO,
+            NRML, MARKET). This sleeve is leveraged NIFTY beta on bullish-breadth days, not stock
+            selection: the stocks vote, NIFTY is the vehicle.
+          </p>
+          <p>
+            <span className="font-medium text-foreground">3 · Position sizing.</span> Signals are
+            taken greedily in vol-ratio order, one lot each, until the estimated overnight SPAN
+            margin would exceed the hard cap of 50% of capital — later signals are "cap skipped"
+            (never partially sized). Each in-cap signal must also clear the LLM review before
+            placement (enforcing in sandbox). Current capital / per-lot margin / cap values are in
+            the Parameters card below.
+          </p>
+          <p>
+            <span className="font-medium text-foreground">4 · Exit &amp; risk.</span> Every lot is
+            sold at MARKET the next trading day at 15:25 IST (watchdog retry 15:28). No stop loss —
+            backtests showed hard stops are net-negative on this signal class; the backstop is a
+            3%-of-capital daily-loss kill switch that halts new entries.
+          </p>
+        </div>
+      )}
+      {/* Expandable per-symbol table (sorted by closeness to passing) */}
+      <button
+        type="button"
+        className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span>Per-symbol breakdown ({total} symbols, sorted by closeness to passing)</span>
+        {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+      </button>
+      {expanded && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b bg-muted/30">
+                <th className="text-left px-3 py-2 font-medium text-muted-foreground">Symbol</th>
+                <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                  Sector Index
+                </th>
+                <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                  Sector Ret
+                </th>
+                <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                  Stock Ret
+                </th>
+                <th className="text-right px-3 py-2 font-medium text-muted-foreground">
+                  Vol Ratio
+                </th>
+                <th className="text-left px-3 py-2 font-medium text-muted-foreground">Outcome</th>
+                <th className="text-left px-3 py-2 font-medium text-muted-foreground">
+                  Fail Reason
+                </th>
+                <th className="text-left px-3 py-2 font-medium text-muted-foreground">Source</th>
+              </tr>
+            </thead>
+            <tbody>
+              {payload.symbols.map((row) => (
+                <BreakdownSymbolRow key={row.symbol} row={row} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </>
+  )
+}
+
+/** dd MMM for the history table's date column. */
+function fmtDayLabel(isoDate: string) {
+  const d = new Date(`${isoDate}T00:00:00`)
+  if (Number.isNaN(d.getTime())) return isoDate
+  return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' })
+}
+
+/**
+ * Signals-per-day strip. Makes a run of zero-signal days visible at a glance —
+ * pair it with the Source column to tell a quiet market from a degraded feed.
+ */
+function SignalStrip({ rows, pending }: { rows: EntryBreakdownSummary[]; pending: boolean }) {
+  const maxSignals = Math.max(1, ...rows.map((r) => r.n_signals))
+  // Oldest -> newest, so the strip reads left-to-right like a calendar.
+  const chrono = [...rows].reverse()
+  return (
+    <div className="px-4 pb-3">
+      <div className="flex items-end gap-[3px] h-8">
+        {chrono.map((r) => (
+          <div
+            key={r.eval_date}
+            title={`${r.eval_date} · ${r.n_signals} signal${r.n_signals !== 1 ? 's' : ''}`}
+            className={
+              r.n_signals > 0
+                ? 'w-4 rounded-t-sm bg-green-500/70 dark:bg-green-500/60'
+                : 'w-4 rounded-t-sm bg-muted-foreground/30'
+            }
+            style={{ height: r.n_signals > 0 ? `${(r.n_signals / maxSignals) * 100}%` : '3px' }}
+          />
+        ))}
+        {pending && (
+          <div
+            title="Today · pending"
+            className="w-4 h-8 rounded-t-sm border border-dashed border-muted-foreground/40 border-b-0"
+          />
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground mt-1.5">Signals per day · hover for detail</p>
+    </div>
+  )
+}
+
+/**
+ * One day in the history table. The full payload is fetched only when the row
+ * is open — past days are immutable, so it is cached indefinitely.
+ */
+function EvalDayRow({
+  summary,
+  open,
+  onToggle,
+}: {
+  summary: EntryBreakdownSummary
+  open: boolean
+  onToggle: () => void
+}) {
+  const { data: snapshot, isLoading } = useQuery({
+    queryKey: ['futures-follow-entry-breakdown', summary.eval_date],
+    queryFn: () => strategiesDashboardApi.getEntryBreakdown(summary.eval_date),
+    enabled: open,
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+
+  const gp = summary.gates_passed
+  const gf = summary.gates_failed
+  const n = summary.evaluated_symbols
+
+  return (
+    <>
+      <tr
+        className={`border-b cursor-pointer hover:bg-muted/20 ${open ? 'bg-muted/20' : ''}`}
+        onClick={onToggle}
+      >
+        <td className="px-3 py-2 whitespace-nowrap">
+          {open ? (
+            <ChevronDown className="h-3.5 w-3.5 inline mr-1 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 inline mr-1 text-muted-foreground" />
+          )}
+          <span className="font-mono">{fmtDayLabel(summary.eval_date)}</span>
+        </td>
+        <td
+          className={`px-2 py-2 text-right tabular-nums ${
+            summary.n_signals > 0 ? '' : 'text-muted-foreground'
+          }`}
+        >
+          {summary.n_signals}
+        </td>
+        <td
+          className={`px-2 py-2 text-right tabular-nums ${
+            summary.placed > 0 ? '' : 'text-muted-foreground'
+          }`}
+        >
+          {summary.placed}
+        </td>
+        <td
+          className="px-2 py-2 text-muted-foreground tabular-nums"
+          title={`Failed — sector ${gf.sector} · stock ${gf.stock} · vol ${gf.vol}`}
+        >
+          sector {gp.sector} · stock {gp.stock} · vol {gp.vol}
+          {n > 0 && <span className="opacity-60"> of {n}</span>}
+        </td>
+        <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">
+          {summary.dominant_source} {summary.live_source_count}/{summary.total_symbols}
+          {summary.missing_data > 0 && (
+            <AlertTriangle className="h-3 w-3 inline ml-1 text-red-500" />
+          )}
+        </td>
+      </tr>
+      {open && (
+        <tr className="border-b bg-muted/10">
+          <td colSpan={5} className="p-0">
+            {isLoading || !snapshot ? (
+              <div className="p-4">
+                <Skeleton className="h-24 w-full" />
+              </div>
+            ) : (
+              <EntryBreakdownBody payload={snapshot.payload} />
+            )}
+          </td>
+        </tr>
+      )}
+    </>
+  )
+}
+
+/**
+ * The 15:20 evaluation card (issue #395). Today is simply the newest row — it
+ * shows a one-line pending state until the 15:20 IST run writes its snapshot,
+ * and no pending row at all on a weekend / NSE holiday.
+ */
+export function EntryEvaluationCard() {
+  const [limit, setLimit] = useState(30)
+  const [openDate, setOpenDate] = useState<string | null>(null)
+
+  const { data: history, isLoading } = useQuery({
+    queryKey: ['futures-follow-eval-history', limit],
+    queryFn: () => strategiesDashboardApi.getEntryBreakdownHistory(limit),
+    // Only poll while today's snapshot is still expected; otherwise nothing can
+    // change (past days are immutable) and the old 60s poll just fetched a null.
+    refetchInterval: (q) => {
+      const t = q.state.data?.today
+      return t?.is_trading_day && !t.snapshot_exists ? 60_000 : false
+    },
+  })
+
+  const rows = history?.rows ?? []
+  const today = history?.today
+  const showPending = Boolean(today?.is_trading_day && !today.snapshot_exists)
+  // Default-open the newest day that actually has a snapshot, so the card never
+  // opens on a blank panel while today is still pending. `openDate` is null
+  // until the operator touches a row, then '' means "explicitly closed" — the
+  // ?? is load-bearing (|| would treat '' as untouched and re-open the default).
+  const defaultOpen = rows[0]?.eval_date ?? null
+  const effectiveOpen = openDate ?? defaultOpen
+  const signalDays = rows.filter((r) => r.n_signals > 0).length
 
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <ListChecks className="h-4 w-4" /> Today's 15:20 Evaluation
-          {payload && (
-            <span className="text-xs text-muted-foreground font-normal">
-              {fmtDate(payload.eval_at)} · mode {payload.mode}
-            </span>
+        <div className="flex items-center justify-between gap-3">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <ListChecks className="h-4 w-4" /> 15:20 Evaluation
+            {rows.length > 0 && (
+              <span className="text-xs text-muted-foreground font-normal">
+                {rows[0].mode && `mode ${rows[0].mode} · `}
+                {rows.length} day{rows.length !== 1 ? 's' : ''} recorded · {signalDays} signal day
+                {signalDays !== 1 ? 's' : ''}
+              </span>
+            )}
+          </CardTitle>
+          {(rows.length > 0 || history?.has_more) && (
+            <select
+              className="text-xs h-7 rounded-md border bg-background px-2"
+              value={limit}
+              onChange={(e) => setLimit(Number(e.target.value))}
+            >
+              <option value={30}>Last 30 days</option>
+              <option value={90}>Last 90 days</option>
+            </select>
           )}
-        </CardTitle>
-        {payload && (
-          <p className="text-xs text-muted-foreground">
-            {payload.n_signals} signal{payload.n_signals !== 1 ? 's' : ''} · source {dominantSource}{' '}
-            {liveCount}/{total}
-            {payload.cap_skipped > 0 && ` · ${payload.cap_skipped} cap-skipped`}
-            {payload.vetoed > 0 && ` · ${payload.vetoed} LLM-vetoed`}
-          </p>
-        )}
+        </div>
       </CardHeader>
       <CardContent className="p-0">
         {isLoading ? (
           <div className="p-4">
             <Skeleton className="h-24 w-full" />
           </div>
-        ) : !payload ? (
+        ) : rows.length === 0 && !showPending ? (
           <p className="text-sm text-muted-foreground px-4 py-6 text-center italic">
             No evaluation recorded yet — the breakdown is captured at the next 15:20 IST entry run.
           </p>
         ) : (
           <>
-            {/* Symbols that cleared ALL three gates — the source of any signal.
-                Shown on the card face so a signal day is self-explanatory
-                without expanding the per-symbol table. */}
-            {passing.length > 0 ? (
-              <div className="px-4 pb-3 space-y-1">
-                <p className="text-xs font-medium text-muted-foreground">
-                  Passed all 3 gates ({passing.length})
-                </p>
-                {passing.map((row) => (
-                  <div key={row.symbol} className="flex flex-wrap items-center gap-2 text-xs">
-                    <span className="font-mono font-medium">{row.symbol}</span>
-                    <span className="text-muted-foreground tabular-nums">
-                      sector {fmtPct(row.sector_ret)} · stock {fmtPct(row.stock_ret)} · vol{' '}
-                      {row.vol_ratio != null ? `${row.vol_ratio.toFixed(2)}x` : '—'}
-                    </span>
-                    <OutcomeBadge outcome={row.outcome} />
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="px-4 pb-3 text-xs text-muted-foreground">
-                No symbol passed all 3 gates today.
-              </p>
-            )}
-            {/* Per-gate summary — counts are independent per gate across all
-                evaluated symbols (one symbol can fail several gates). */}
-            <div className="flex flex-wrap gap-2 px-4 pb-3">
-              <Badge
-                variant="outline"
-                className="text-xs text-muted-foreground"
-                title="Symbols whose mapped sector index was up more than 1% intraday"
-              >
-                sector &gt;1%: {gated - (gateFails?.sector ?? 0)}/{gated} passed
-              </Badge>
-              <Badge
-                variant="outline"
-                className="text-xs text-muted-foreground"
-                title="Symbols up more than 0.5% intraday"
-              >
-                stock &gt;0.5%: {gated - (gateFails?.stock ?? 0)}/{gated} passed
-              </Badge>
-              <Badge
-                variant="outline"
-                className="text-xs text-muted-foreground"
-                title="Symbols with volume above 1x their 20-day average"
-              >
-                vol &gt;1x: {gated - (gateFails?.vol ?? 0)}/{gated} passed
-              </Badge>
-              {(gateFails?.missing_data ?? 0) > 0 && (
-                <Badge className="bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 text-xs">
-                  missing data: {gateFails?.missing_data}
-                </Badge>
-              )}
-            </div>
-            {/* How-this-works explainer — the strategy pipeline in one place,
-                so the card is readable without the PLAN/registry docs. Static
-                mechanism text; live numbers are in the Parameters card below. */}
-            <button
-              type="button"
-              className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
-              onClick={() => setHowOpen(!howOpen)}
-            >
-              <span className="flex items-center gap-1.5">
-                <Info className="h-3.5 w-3.5" /> How this evaluation works (signals → sizing)
-              </span>
-              {howOpen ? (
-                <ChevronUp className="h-3.5 w-3.5" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5" />
-              )}
-            </button>
-            {howOpen && (
-              <div className="px-4 pb-3 pt-1 space-y-2 text-xs text-muted-foreground">
-                <p>
-                  <span className="font-medium text-foreground">1 · Signals (15:20 IST).</span> Each
-                  of the 30 locked universe stocks is a signal only if ALL three gates hold: its
-                  mapped sector index is up &gt;1% intraday, the stock itself is up &gt;0.5%, and
-                  today's volume is &gt;1× its 20-day average. Passing stocks are ranked by volume
-                  ratio; at most the top 5 become signals.
-                </p>
-                <p>
-                  <span className="font-medium text-foreground">2 · What it buys.</span> The stock
-                  is only the trigger — the position is always ONE NIFTY near-month futures lot per
-                  signal (NFO, NRML, MARKET). This sleeve is leveraged NIFTY beta on bullish-breadth
-                  days, not stock selection: the stocks vote, NIFTY is the vehicle.
-                </p>
-                <p>
-                  <span className="font-medium text-foreground">3 · Position sizing.</span> Signals
-                  are taken greedily in vol-ratio order, one lot each, until the estimated overnight
-                  SPAN margin would exceed the hard cap of 50% of capital — later signals are "cap
-                  skipped" (never partially sized). Each in-cap signal must also clear the LLM
-                  review before placement (enforcing in sandbox). Current capital / per-lot margin /
-                  cap values are in the Parameters card below.
-                </p>
-                <p>
-                  <span className="font-medium text-foreground">4 · Exit &amp; risk.</span> Every
-                  lot is sold at MARKET the next trading day at 15:25 IST (watchdog retry 15:28). No
-                  stop loss — backtests showed hard stops are net-negative on this signal class; the
-                  backstop is a 3%-of-capital daily-loss kill switch that halts new entries.
-                </p>
-              </div>
-            )}
-            {/* Expandable per-symbol table (sorted by closeness to passing) */}
-            <button
-              type="button"
-              className="w-full flex items-center justify-between px-4 py-2 border-t text-xs text-muted-foreground hover:bg-muted/20"
-              onClick={() => setExpanded(!expanded)}
-            >
-              <span>Per-symbol breakdown ({total} symbols, sorted by closeness to passing)</span>
-              {expanded ? (
-                <ChevronUp className="h-3.5 w-3.5" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5" />
-              )}
-            </button>
-            {expanded && (
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="border-b bg-muted/30">
-                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                        Symbol
-                      </th>
-                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                        Sector Index
-                      </th>
-                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
-                        Sector Ret
-                      </th>
-                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
-                        Stock Ret
-                      </th>
-                      <th className="text-right px-3 py-2 font-medium text-muted-foreground">
-                        Vol Ratio
-                      </th>
-                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                        Outcome
-                      </th>
-                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                        Fail Reason
-                      </th>
-                      <th className="text-left px-3 py-2 font-medium text-muted-foreground">
-                        Source
-                      </th>
+            {rows.length > 0 && <SignalStrip rows={rows} pending={showPending} />}
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-y bg-muted/30 text-muted-foreground">
+                    <th className="text-left px-3 py-2 font-medium">Date</th>
+                    <th className="text-right px-2 py-2 font-medium">Signals</th>
+                    <th className="text-right px-2 py-2 font-medium">Placed</th>
+                    <th className="text-left px-2 py-2 font-medium">Gates passed</th>
+                    <th className="text-left px-3 py-2 font-medium">Source</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {showPending && (
+                    <tr className="border-b">
+                      <td className="px-3 py-2 whitespace-nowrap text-muted-foreground">
+                        <Clock className="h-3.5 w-3.5 inline mr-1" />
+                        <span className="font-mono">Today</span>
+                      </td>
+                      <td colSpan={4} className="px-2 py-2 text-muted-foreground italic">
+                        Runs at 15:20 IST
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {payload.symbols.map((row) => (
-                      <BreakdownSymbolRow key={row.symbol} row={row} />
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                  )}
+                  {rows.map((r) => (
+                    <EvalDayRow
+                      key={r.eval_date}
+                      summary={r}
+                      open={effectiveOpen === r.eval_date}
+                      onToggle={() => setOpenDate(effectiveOpen === r.eval_date ? '' : r.eval_date)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {history?.has_more && limit < 90 && (
+              <button
+                type="button"
+                className="w-full border-t px-4 py-2 text-xs text-muted-foreground hover:bg-muted/20"
+                onClick={() => setLimit(90)}
+              >
+                Load more
+              </button>
             )}
           </>
         )}
@@ -1481,8 +1672,8 @@ export default function StrategyDetailPage() {
         <PnlCurve name={data.name} />
       </div>
 
-      {/* Today's 15:20 entry-evaluation breakdown (issue #352) */}
-      {data.name === 'futures_follow_cap50' && <EntryBreakdownCard />}
+      {/* 15:20 entry-evaluation breakdown + history (issues #352, #395) */}
+      {data.name === 'futures_follow_cap50' && <EntryEvaluationCard />}
 
       {/* Trades + LLM decisions (merged, issue #358) */}
       <TradesAndDecisionsCard data={data} />
