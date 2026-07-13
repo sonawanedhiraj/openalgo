@@ -207,6 +207,61 @@ wrapper except LONG delta-1 overnight has now failed on this signal family.
 Report: `docs/research/strategy/futures_follow_cap50/2026-07-05_inverse_short_futures_backtest.md`
 (R42, issue #336).
 
+### 2026-07-13 — R54: intraday STOP-LOSS on the leveraged sleeve REJECTS (tested with leverage, not extrapolated)
+
+Operator asked, after the 2026-07-07 war-news day lost −₹34k in the pilot,
+whether a **stop loss** would make the sleeve profitable. Phase-1 rejected stops
+but only on the *unleveraged* ₹2.5L equity book; this round tested them directly
+on the ~7×-leveraged futures wrapper. **REJECT — the Phase-1 finding holds with
+leverage.**
+
+Overlay on the canonical NIFTY-only CAP50 trade set (the stop changes only the
+exit; sizing is fixed at 15:20 entry), using NIFTY's intraday 1m low-path over
+each overnight hold window; window extended to 2026-07-10 so 07-07 is in-sample.
+Baseline reproduced the canonical result exactly (worst day −₹34,396; CAGR
+14.84% vs 14.44%; Sharpe 1.31 vs 1.27):
+
+| Variant | CAGR% | Sharpe | MaxDD% | Worst day ₹ |
+|---|---:|---:|---:|---:|
+| **BASELINE no-stop** | **14.84** | **1.31** | −8.01 | **−34,396** |
+| PCT 0.75% | 11.24 | 0.95 | −8.46 | −45,438 |
+| PCT 1.00% | 12.12 | 1.01 | −9.89 | −45,438 |
+| PCT 1.50% | 13.28 | 1.14 | −8.01 | −52,021 |
+| PCT 2.00% | 12.56 | 1.06 | −8.01 | −69,027 |
+| PCT 2.50% / ATR≥1.5× | 14.84 | 1.31 | −8.01 | −34,396 (never fires) |
+| ATR 1.0× | 12.31 | 1.03 | −8.29 | −67,846 |
+
+**Two counter-intuitive findings:**
+1. **Stops make the worst day BIGGER** (−₹45k to −₹69k vs −₹34k), not smaller —
+   they can't catch overnight gaps (fill at the gapped open) AND on this signal
+   family intraday dips frequently recover into the 15:25 close, so stopping out
+   locks in a price worse than holding; whipsaw-outs cluster into new bad days.
+2. **The war day in isolation IS the exception** — re-pricing the actual 07-07
+   position (−493.6 pts), a 0.75–1.0% stop would have saved ~250–310 pts (≈₹16–20k
+   on a 75-lot). 07-07 was 75% an intraday grind (23,805 low @14:51, bounced to
+   23,888 by exit), which is exactly why it *looks* like a stop fixes everything —
+   but intraday-dip-then-recover is the rule, grind-to-close the exception.
+
+There is **no stop distance that wins**: firing stops lose 1.6–3.6pp CAGR /
+0.17–0.36 Sharpe; non-firing stops are just the baseline. Keep `stop_loss: none`.
+Mitigations that DO have evidence: size down; fix the kill switch's T+1 blind
+spot; OTM-put overnight hedge (separate round — the only thing that caps the ~19%
+gap portion). Report:
+`docs/research/strategy/futures_follow_cap50/2026-07-13_intraday_stop_loss_backtest.md`
+(R54, issue #397). See memory `stop-loss-futures-sleeve-rejected-with-leverage`.
+
 ## Live Learnings
 
 _(populate as the sandbox pilot produces evidence)_
+
+### 2026-07-07 — war-news day: −₹34k on 1 NIFTY lot (the modeled worst day, not a flaw)
+
+Entered NIFTY28JUL26FUT @ 24,438.6 on 07-07 15:20 (INFY signal), exited T+1
+07-08 15:25 @ 23,922.1 = −516.5 pts / −₹34,037. This alone exceeded the pilot's
+two winners (+₹10,803, +₹10,749). Decomposition (spot): 6% the 07-07 tail, **19%
+overnight gap** (−95 pts, unstoppable), **75% the 07-08 intraday grind**
+(open 24,260 → 23,805 low @14:51 → 23,888 exit). It is essentially the backtest's
+modeled worst overnight day (−₹34,396) — the sleeve behaving as designed on a
+bad leveraged-beta day, not a broken strategy. The 3% kill switch (₹30k) never
+fired because it counts only same-day *entries*, not the T+1 overnight loss — a
+real blind spot to close. Stop-loss remedy tested and rejected — see R54 above.
