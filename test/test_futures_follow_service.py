@@ -106,6 +106,7 @@ def _make_service(signals=None, **overrides):
     signal_evaluator_details = overrides.pop("signal_evaluator_details", None)
     signal_reviewer = overrides.pop("signal_reviewer", None)
     market_context_provider = overrides.pop("market_context_provider", None)
+    news_context_provider = overrides.pop("news_context_provider", lambda: "")
     order_placer = overrides.pop("order_placer", fake_placer)
 
     intent_resolver = overrides.pop("intent_resolver", None)
@@ -132,6 +133,7 @@ def _make_service(signals=None, **overrides):
         data_health_checker=data_health_checker,
         signal_reviewer=signal_reviewer,
         market_context_provider=market_context_provider,
+        news_context_provider=news_context_provider,
     )
     svc._test_placed = placed_orders
     svc._test_journal = journal
@@ -1873,6 +1875,95 @@ def test_entry_breakdown_snapshot_none_when_not_yet_evaluated(_isolated_eval_db)
     """No evaluation recorded yet for a given date -> get_snapshot returns None
     (the endpoint's contract: data=null means 'no evaluation recorded yet')."""
     assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-01-01") is None
+
+
+# --------------------------------------------------------------------------- #
+# Big-loss news-context alert (issue #399) — informational, human-in-the-loop
+# --------------------------------------------------------------------------- #
+def test_big_loss_alert_fires_with_news_on_large_t1_loss():
+    alerts = []
+    svc = _make_service(
+        mode="sandbox",
+        price_fetcher=lambda s, e: 23_400.0,  # -600 pts vs 24000 entry -> ~-45k
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "📰 Recent headlines:\n⚠️ [et] War fears hit markets",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()
+    big = [a for a in alerts if "BIG LOSS" in a]
+    assert len(big) == 1
+    assert "War fears" in big[0]  # news context attached
+    assert "no auto-action" in big[0].lower()  # human-in-the-loop framing
+
+
+def test_big_loss_alert_not_fired_on_small_loss():
+    alerts = []
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_990.0,  # -10 pts -> tiny loss, below 2%
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "NEWS",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()
+    assert not any("BIG LOSS" in a for a in alerts)
+
+
+def test_big_loss_alert_dedups_per_day_and_resets():
+    alerts = []
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_400.0,
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "N",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()
+    _seed_position(svc, "P2", entry_date="2026-06-09")
+    svc.run_exit()  # same day -> deduped
+    assert len([a for a in alerts if "BIG LOSS" in a]) == 1
+    svc.reset_daily_state()
+    _seed_position(svc, "P3", entry_date="2026-06-09")
+    svc.run_exit()  # after reset -> fires again
+    assert len([a for a in alerts if "BIG LOSS" in a]) == 2
+
+
+def test_big_loss_alert_places_no_extra_order():
+    """The alert is informational — it must NOT place or cancel any order."""
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_400.0,
+        news_context_provider=lambda: "N",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    n_before = len(svc._test_placed)
+    svc.run_exit()
+    assert len(svc._test_placed) == n_before + 1  # only the T+1 SELL, none from the alert
+
+
+def test_kill_switch_alert_includes_news_context():
+    alerts = []
+    svc = _make_service(
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "📰 headline XYZ",
+    )
+    svc.update_daily_pnl(realized_today=-30_001.0, open_mtm=0.0)
+    ks = [a for a in alerts if "kill switch" in a]
+    assert len(ks) == 1
+    assert "headline XYZ" in ks[0]
+
+
+def test_big_loss_alert_survives_news_provider_failure():
+    alerts = []
+
+    def boom():
+        raise RuntimeError("feed down")
+
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_400.0,
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=boom,
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()  # must not raise
+    assert any("BIG LOSS" in a for a in alerts)  # alert still sent, without news
 
 
 if __name__ == "__main__":

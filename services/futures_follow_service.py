@@ -535,6 +535,30 @@ def data_freshness_enabled() -> bool:
     return os.getenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true").lower() == "true"
 
 
+def production_news_context() -> str:
+    """Injected default: recent market headlines for big-loss/kill-switch alerts.
+
+    Read-only, fail-open, informational — see ``news_context_service``. Never
+    triggers a trade; the headlines are DATA embedded in the operator alert only."""
+    try:
+        from services.news_context_service import get_recent_news_context
+
+        return get_recent_news_context()
+    except Exception:
+        logger.debug("news context provider unavailable", exc_info=True)
+        return ""
+
+
+def big_loss_alert_pct() -> float:
+    """``FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT`` — realized daily loss (percent of
+    capital) that triggers the news-enriched big-loss alert. Default 2.0."""
+    try:
+        return float(os.getenv("FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT", "2.0"))
+    except ValueError:
+        logger.warning("bad FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT — using 2.0")
+        return 2.0
+
+
 def production_data_health_checker(
     strategy_name: str, date: str | None = None, index_only: bool = False
 ):
@@ -709,6 +733,7 @@ class FuturesFollowService:
         quote_probe: Callable[[], bool] | None = None,
         signal_reviewer: Callable[..., dict] | None = None,
         market_context_provider: Callable[[], dict] | None = None,
+        news_context_provider: Callable[[], str] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -727,6 +752,12 @@ class FuturesFollowService:
         self._order_placer = order_placer or production_order_placer
         self._price_fetcher = price_fetcher or production_price_fetcher
         self._notify = notifier or telegram_notifier
+        # Read-only market-news context for big-loss / kill-switch alerts
+        # (informational, human-in-the-loop; issue #399). Left injectable for
+        # hermetic tests; the default reads market_intel(kind='news'), fail-open.
+        self._news_context = news_context_provider or production_news_context
+        # Per-day dedup so the news-enriched big-loss alert fires at most once/day.
+        self._big_loss_alerted_date: str | None = None
         self._record_trade = trade_recorder or self._default_trade_recorder
         self._intent_resolver = intent_resolver or production_intent_resolver
         # Data-freshness gate. Left None in unit tests (gate skipped, hermetic);
@@ -846,17 +877,61 @@ class FuturesFollowService:
                 threshold,
                 self.config.daily_loss_kill_pct,
             )
-            self._notify(
+            ks_msg = (
                 f"🛑 {STRATEGY_NAME} kill switch fired — daily P&L "
                 f"₹{self.daily_pnl:,.0f} breached {self.config.daily_loss_kill_pct}% of capital. "
                 "New entries blocked; open positions hold to scheduled exit."
             )
+            try:
+                news = self._news_context() or ""
+            except Exception:
+                logger.debug("futures_follow kill-switch news context failed", exc_info=True)
+                news = ""
+            self._notify(f"{ks_msg}\n\n{news}" if news else ks_msg)
             self._set_runtime_override(
                 "kill_switch",
                 self._end_of_today_ist(),
                 self.kill_switch_reason or "daily loss kill",
             )
         return self.kill_switch_active
+
+    def _maybe_alert_big_loss(self, realized_net: float, trigger: str) -> bool:
+        """Send a news-enriched operator alert when the day's realized loss crosses
+        ``FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT`` of capital. At most once per day.
+
+        STRICTLY informational + human-in-the-loop: it surfaces recent market
+        headlines (read-only, fail-open) so the operator can see the likely macro
+        driver of a big overnight loss and decide. It NEVER places or cancels an
+        order — R54/R55 proved that reacting (stop/hedge/news-sell) is net-negative
+        on this leveraged-beta sleeve. Returns True iff an alert was sent."""
+        thr = -(big_loss_alert_pct() / 100.0) * self.config.capital_inr
+        if realized_net > thr:
+            return False
+        today = self._now().date().isoformat()
+        if self._big_loss_alerted_date == today:
+            return False
+        self._big_loss_alerted_date = today
+        pct = (
+            abs(realized_net) / self.config.capital_inr * 100.0 if self.config.capital_inr else 0.0
+        )
+        header = (
+            f"⚠️ {STRATEGY_NAME} [{self.mode}] BIG LOSS ₹{realized_net:+,.0f} "
+            f"({pct:.1f}% of capital) via {trigger}. This sleeve is leveraged "
+            "long-NIFTY beta, so a large overnight loss usually means a broad "
+            "down day — review the context below and decide (no auto-action taken)."
+        )
+        news = ""
+        try:
+            news = self._news_context() or ""
+        except Exception:
+            logger.debug("futures_follow big-loss news context failed", exc_info=True)
+        body = f"{header}\n\n{news}" if news else header
+        try:
+            self._notify(body)
+        except Exception:
+            logger.exception("futures_follow big-loss alert failed")
+        logger.warning("futures_follow BIG LOSS alert: net=%.0f trigger=%s", realized_net, trigger)
+        return True
 
     def reset_daily_state(self) -> None:
         """09:00 IST reset: clear kill switch + daily P&L and the intraday journals.
@@ -868,6 +943,7 @@ class FuturesFollowService:
         self.daily_pnl = 0.0
         self.today_entries = []
         self.today_exits = []
+        self._big_loss_alerted_date = None
         logger.info("futures_follow daily state reset (kill switch cleared, pnl=0)")
 
     # ----- runtime-override durability (mode-only safety guards) ---------- #
@@ -1803,6 +1879,11 @@ class FuturesFollowService:
                 f"📉 {STRATEGY_NAME} [{self.mode}] T+1 exits: {len(exited)} position(s), "
                 f"net ₹{net:+,.0f}"
             )
+            # The kill switch is same-day and blind to T+1 overnight losses (the
+            # 2026-07-07 war-day gap). This realized-loss alert is the T+1-aware
+            # hook: on a big loss, surface recent market headlines so the operator
+            # can see the macro reason and decide. Informational only — never trades.
+            self._maybe_alert_big_loss(net, trigger="T+1 exit")
         return exited
 
     # ----- price helpers ------------------------------------------------- #

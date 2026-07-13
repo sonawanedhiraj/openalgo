@@ -980,6 +980,19 @@ proved hard stops net-negative on this signal class); the **15:28 IST EOD watchd
 NFO close; a rejected 15:25 SELL stays in the book for it to retry) is the only
 backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
 (0.03% notional) round-trip charges.
+**Big-loss news-context alert (issue #399):** the kill switch is same-day and
+blind to T+1 overnight losses (the 2026-07-07 war-day gap read ₹0), so on a big
+*realized* T+1 loss (`FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT`, default 2% of capital;
+`_maybe_alert_big_loss` in `run_exit`) — and on a kill-switch fire — the operator
+Telegram alert is enriched with recent market headlines (`news_context_service`
+reads `market_intel(kind='news')` already ingested by `news_ingest_service`), so
+a large loss is explainable (war/macro/broad sell-off) at a glance. **Strictly
+informational + human-in-the-loop — it NEVER places or cancels an order** (R54
+stops and R55 put hedges both proved reacting is net-negative on this
+leveraged-beta sleeve; headlines are treated as untrusted DATA, only embedded in
+the alert text). Read-only, fail-open, once/day; flags
+`NEWS_CONTEXT_ON_ALERTS_ENABLED` (default true), `NEWS_CONTEXT_LOOKBACK_MIN`,
+`NEWS_CONTEXT_MAX_ITEMS`, `NEWS_CONTEXT_HIGHLIGHT_TERMS`.
 **ACTIVELY TRADING IN SANDBOX** (`mode: sandbox`, `deployable: true`) — there is **no
 scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
 `FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
