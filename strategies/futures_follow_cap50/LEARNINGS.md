@@ -250,6 +250,37 @@ gap portion). Report:
 `docs/research/strategy/futures_follow_cap50/2026-07-13_intraday_stop_loss_backtest.md`
 (R54, issue #397). See memory `stop-loss-futures-sleeve-rejected-with-leverage`.
 
+### 2026-07-13 — R55: OTM put overnight HEDGE REJECTS — structurally short the sleeve's own edge
+
+Follow-up to R54 (a stop can't catch the ~19% overnight-gap portion of a war-day
+loss; a long PUT is the only structure that can). Tested with **real** NIFTY
+bhavcopy premiums (`index_options_eod`, NOT synthetic BS), EOD close-to-close
+(R42 proxy), full window 2024-01..2026-06-04 (option data ends 06-04, so the
+07-07 war day is not priceable), **100% hedge coverage**. Baseline reproduced the
+R42 long control (CAGR 15.5% vs 15.48%). **REJECT.**
+
+| Variant | CAGR% | Sharpe | MaxDD% | Worst day ₹ | Hedge P&L ₹ |
+|---|---:|---:|---:|---:|---:|
+| **UNHEDGED** | **15.50** | **1.35** | −8.05 | −33,143 | — |
+| PUT 2.0% OTM | 10.14 | 1.10 | −7.98 | −23,315 | −154,366 |
+| PUT 3.0% OTM | 11.44 | 1.18 | −8.17 | −26,100 | −117,790 |
+| PUT 2.0% OTM ½-notional | 12.74 | 1.23 | −8.09 | −28,300 | −80,652 |
+| PUT 1.0% OTM | 8.50 | 1.00 | −7.65 | −21,107 | −199,418 |
+| PUT 0.5% OTM | 7.04 | 0.88 | −7.38 | −19,333 | −238,590 |
+
+Every variant is a net cost and lowers **both** CAGR and Sharpe. The hedge bounds
+the worst day (−33k → −19–26k) but barely moves MaxDD. **Root cause is structural,
+not just theta:** on the 80 NIFTY-UP days (sleeve wins) the 2% OTM hedge loses
+−₹184,736; on the 67 DOWN days it gains only +₹30,370 — profitable on just 24% of
+days. The sleeve is leveraged long-NIFTY beta (+0.17%/day drift on bullish signals);
+a put is a bet **against** that drift. You pay premium every session to short your
+own edge; it only pays on rare gaps, and being OTM it covers only ~25–30% of a bad
+day. Third confirmation that option BUYING (return-vehicle OR hedge) fails on this
+family — the only wrapper that works is long delta-1 overnight. Preferred tail
+lever is **sizing down** (linear, no drag), not options. Report:
+`docs/research/strategy/futures_follow_cap50/2026-07-13_otm_put_overnight_hedge_backtest.md`
+(R55, issue #398). See memory `put-hedge-futures-sleeve-rejected-short-own-edge`.
+
 ## Live Learnings
 
 _(populate as the sandbox pilot produces evidence)_
