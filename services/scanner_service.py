@@ -1194,6 +1194,45 @@ class ScannerService:
             logger.exception("ScannerService.get_today_ohlcv failed for %s", symbol)
             return None, None
 
+    def get_today_bars(
+        self, symbol: str, as_of_date: _dt.date, interval: str | None = None
+    ) -> list:
+        """Return today's CLOSED OHLCV bars for ``symbol`` at the primary interval.
+
+        A list of ``(ts, open, high, low, close, volume)`` tuples (naive IST ``ts``),
+        filtered to ``as_of_date``. The in-progress (not-yet-closed) bar is
+        intentionally excluded — callers that trigger on a bar (e.g. a breakout
+        candle) must see only confirmed closed bars. Returns ``[]`` when the
+        scanner has no bars for ``symbol`` today. Thread-safe; never raises.
+
+        Companion to ``get_today_ohlcv`` (which returns cumulative close+volume);
+        this returns the per-candle series a candlestick-pattern strategy needs.
+        """
+        try:
+            interval = interval or (self.intervals[0] if self.intervals else "5m")
+            with self._history_lock:
+                frame = self._bar_history.get((symbol, interval))
+                rows = frame.to_dict("records") if frame is not None and not frame.empty else []
+            out = []
+            for r in rows:
+                ts = r.get("ts")
+                if ts is None or getattr(ts, "date", lambda: None)() != as_of_date:
+                    continue
+                out.append(
+                    (
+                        ts,
+                        float(r.get("open")),
+                        float(r.get("high")),
+                        float(r.get("low")),
+                        float(r.get("close")),
+                        float(r.get("volume") or 0),
+                    )
+                )
+            return out
+        except Exception:
+            logger.exception("ScannerService.get_today_bars failed for %s", symbol)
+            return []
+
     # -- ZMQ subscriber -----------------------------------------------------
 
     def _run_subscriber(self) -> None:
