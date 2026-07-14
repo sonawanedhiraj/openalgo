@@ -18,6 +18,27 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### futures_follow OPTION_C same-minute@15:25 entry (issue #406, added 2026-07-14)
+The 15:20 entry seeds its 50% margin cap from `lots_held()`, which counts the
+still-open prior-day lot (it exits at 15:25) — under-sizing carry days (issue #405).
+Backtest (`docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md`):
+running the T+1 exit FIRST at 15:25 and placing entries in the same minute recovers
+**+1.19pp CAGR / +0.07 Sharpe** vs current production while keeping peak margin at
+**49.8%** (no overlap). Selection stays at 15:20 (backtest-faithful); only execution
+moves to 15:25. New tunable proposed in PR #406; lands on dev with the merge.
+
+#### FUTURES_FOLLOW_ENTRY_MODE (NEW)
+- **Current value:** unset → **`legacy`** (default = current behavior: entry 15:20,
+  T+1 exit 15:25). Set to **`same_minute`** to enable OPTION_C.
+- **Set in:** env; read by `services.futures_follow_service.futures_entry_mode()`,
+  consulted at `register_jobs` (takes effect on the next restart).
+- **What it does:** `same_minute` replaces the 15:20 entry job with a 15:20 *signal
+  snapshot* and the 15:25 exit job with a *15:25 exit-then-entry* job (exit first →
+  fresh cap → margin never overlaps). Any value other than `same_minute` resolves to
+  `legacy` (fail-safe). **Live caveat:** in live the exit fill must confirm before the
+  entry places, else a tight-margin broker could reject; the sandbox ₹1Cr book is
+  unaffected. Ships default-`legacy`; operator flips to `same_minute` after review.
+
 ### futures_follow big-loss news-context alerts (issue #399, added 2026-07-13)
 The 3% kill switch is same-day and blind to T+1 overnight losses (the 2026-07-07
 war-day gap read ₹0). New: on a big **realized** T+1 loss (and on a kill-switch

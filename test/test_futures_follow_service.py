@@ -339,6 +339,54 @@ def test_run_exit_skips_same_day_positions():
     assert svc.lots_held() == 1
 
 
+# --------------------------------------------------------------------------- #
+# OPTION_C same-minute@15:25 (issue #406)
+# --------------------------------------------------------------------------- #
+def test_signal_snapshot_stashes_signals_without_placing():
+    svc = _make_service(signals=[_sig("AAA"), _sig("BBB")], mode="sandbox")
+    out = svc.run_signal_snapshot()
+    assert [s["symbol"] for s in out] == ["AAA", "BBB"]
+    assert svc._pending_snapshot is not None
+    assert [s["symbol"] for s in svc._pending_snapshot[1]] == ["AAA", "BBB"]
+    assert svc._test_placed == []  # snapshot places NO orders
+
+
+def test_exit_then_entry_exits_first_then_sizes_fresh_cap():
+    """OPTION_C core: the T+1 exit runs BEFORE the entry, so the carried lot's
+    margin is freed and the new entry sizes against a fresh (empty) book — the
+    #405 leak is closed by construction, not by a sizing rule."""
+    # 2 lots already held into the session (prior-day) — with legacy sizing they
+    # would occupy the whole 50% cap and block today's entries.
+    svc = _make_service(signals=[_sig("AAA")], mode="sandbox", price_fetcher=lambda s, e: 24000.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # exits today
+    svc.run_signal_snapshot()
+    result = svc.run_exit_then_entry()
+    assert len(result["exited"]) == 1  # the prior-day 2-lot cohort squared off
+    assert len(result["placed"]) == 1  # today's entry placed (cap was fresh)
+    # exactly one held position remains: today's new lot, none of the old
+    assert svc.lots_held() == 1
+    sides = [o[1]["action"] for o in svc._test_placed]
+    assert sides == ["SELL", "BUY"]  # exit first, then entry
+
+
+def test_exit_then_entry_falls_back_to_fresh_eval_without_snapshot():
+    svc = _make_service(signals=[_sig("AAA")], mode="sandbox", price_fetcher=lambda s, e: 24000.0)
+    # no run_signal_snapshot() called -> _pending_snapshot is None
+    assert svc._pending_snapshot is None
+    result = svc.run_exit_then_entry()
+    assert len(result["placed"]) == 1  # re-evaluated at 15:25 and placed
+
+
+def test_signal_snapshot_failure_clears_pending(monkeypatch):
+    svc = _make_service(mode="sandbox")
+    monkeypatch.setattr(
+        svc, "evaluate_signals", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    out = svc.run_signal_snapshot()
+    assert out == []
+    assert svc._pending_snapshot is None  # cleared on failure (15:25 re-evaluates)
+
+
 def _open_store_book(symbol="NIFTY30JUN26FUT", qty=75, avg="24000.0"):
     return (
         True,

@@ -616,6 +616,30 @@ def futures_smoke_check_enabled() -> bool:
     return os.getenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true").lower() == "true"
 
 
+def futures_entry_mode() -> str:
+    """``FUTURES_FOLLOW_ENTRY_MODE`` env flag — ``legacy`` (default) or ``same_minute``.
+
+    ``legacy`` — the shipped behavior: entry job at 15:20, T+1 exit at 15:25. The
+    still-open prior-day lot occupies the 50% cap at 15:20, under-sizing carry days
+    (issue #405).
+
+    ``same_minute`` — OPTION_C (issue #406): 15:20 job only *snapshots* the selected
+    signals; the 15:25 job squares off the T+1 exit FIRST (freeing its margin) and
+    THEN places the snapshotted entries in the same minute. Selection stays at 15:20
+    (backtest-faithful), execution moves to 15:25, sizing is naturally fresh-cap
+    (``lots_held``==0 after the exit) and margin never overlaps (≤50%). Backtest:
+    +1.19pp CAGR / +0.07 Sharpe over legacy, peak margin 49.8% (vs OPTION_A's 98.7%).
+    See ``docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md``.
+
+    Consult-time (re-read at ``register_jobs``). Any value other than ``same_minute``
+    resolves to ``legacy`` (fail-safe: a typo keeps the conservative behavior)."""
+    return (
+        "same_minute"
+        if os.getenv("FUTURES_FOLLOW_ENTRY_MODE", "legacy").strip().lower() == "same_minute"
+        else "legacy"
+    )
+
+
 def production_broker_session_checker() -> bool:
     """True iff a broker session (API key) is configured (operator logged in).
     Best-effort; ``False`` on any error. Used by the 15:18 smoke check."""
@@ -786,6 +810,11 @@ class FuturesFollowService:
         self.today_entries: list[dict] = []
         self.today_exits: list[dict] = []
         self.strategy_id: int | None = self.config.strategy_id
+        # OPTION_C same-minute@15:25 (issue #406): the 15:20 job snapshots the
+        # selected signals here; the 15:25 exit-then-entry job consumes them so
+        # selection stays at 15:20 (backtest-faithful) while execution moves to
+        # 15:25 (after the T+1 exit frees margin). None outside same_minute mode.
+        self._pending_snapshot: tuple[datetime, list[dict]] | None = None
 
     # ----- per-lot margin estimate -------------------------------------- #
     def lot_margin_estimate(self, price: float | None = None) -> float:
@@ -1569,10 +1598,15 @@ class FuturesFollowService:
             )
 
     # ----- scheduled job bodies ------------------------------------------ #
-    def run_entry(self) -> list[dict]:
+    def run_entry(self, signals: list[dict] | None = None) -> list[dict]:
         """15:20 IST: evaluate signals, resolve the contract, buy 1 lot/signal up to
         the 50%-margin cap (subject to the lateness guard, override gate, kill
-        switch + freshness)."""
+        switch + freshness).
+
+        ``signals`` — when provided (OPTION_C same-minute@15:25, issue #406), these
+        pre-selected 15:20 signals are used instead of re-evaluating; the caller
+        (``run_exit_then_entry``) has already run the T+1 exit, so ``lots_held``==0
+        and the cap is naturally fresh. ``None`` (legacy) re-evaluates now."""
         # Wall-clock entry-lateness guard (#332 follow-up) — FIRST, before any
         # gate/evaluation/order. A misfired cron (app down at 15:20 →
         # APScheduler fires on restart) must never place entries near/after the
@@ -1625,7 +1659,7 @@ class FuturesFollowService:
             )
             return []
 
-        signals = self.evaluate_signals()
+        signals = signals if signals is not None else self.evaluate_signals()
         veto_mode = self._resolve_veto_mode()
         if signals:
             # R2 (#318): make the resolved enforcement mode loud at every entry —
@@ -1886,6 +1920,54 @@ class FuturesFollowService:
             # can see the macro reason and decide. Informational only — never trades.
             self._maybe_alert_big_loss(net, trigger="T+1 exit")
         return exited
+
+    # ----- OPTION_C same-minute@15:25 (issue #406) ----------------------- #
+    def run_signal_snapshot(self) -> list[dict]:
+        """15:20 IST (same_minute mode): SELECT today's signals and stash them for
+        the 15:25 exit-then-entry job — no orders placed here.
+
+        Selection stays at 15:20 (what the 14.31% backtest measured); execution is
+        deferred to 15:25 so the T+1 exit can free its margin first. Fail-graceful:
+        on any evaluation error the snapshot is cleared (the 15:25 job then falls
+        back to a fresh 15:25 evaluation)."""
+        try:
+            now_ist = self._now().astimezone(_IST) if self._now().tzinfo else self._now()
+            signals = self.evaluate_signals()
+            self._pending_snapshot = (now_ist, list(signals))
+            logger.info(
+                "futures_follow 15:20 signal snapshot (same_minute): %d signal(s) stashed "
+                "for 15:25 exit-then-entry",
+                len(signals),
+            )
+            return signals
+        except Exception:
+            logger.exception("futures_follow signal snapshot failed — cleared (15:25 will re-eval)")
+            self._pending_snapshot = None
+            return []
+
+    def run_exit_then_entry(self) -> dict:
+        """15:25 IST (same_minute mode): square off the T+1 exit FIRST, then place
+        today's entries in the same minute (OPTION_C, issue #406).
+
+        Exit-before-entry is load-bearing: after ``run_exit`` the in-memory
+        ``paper_book`` is flat, so ``run_entry`` sizes against a fresh 50% cap
+        (``lots_held``==0) and the two cohorts never overlap on margin. Entries use
+        the 15:20 snapshot when present (backtest-faithful selection), else fall
+        back to a fresh 15:25 evaluation. Exit and entry are independently
+        fail-isolated so an entry error can never strand the exit."""
+        exited = self.run_exit()
+        snap = self._pending_snapshot
+        self._pending_snapshot = None
+        if snap is not None:
+            _snap_ist, signals = snap
+        else:
+            logger.warning(
+                "futures_follow 15:25: no 15:20 snapshot present — re-evaluating signals now "
+                "(same_minute fallback)"
+            )
+            signals = None  # run_entry re-evaluates at 15:25
+        placed = self.run_entry(signals=signals)
+        return {"exited": exited, "placed": placed}
 
     # ----- price helpers ------------------------------------------------- #
     def _resolve_entry_price(self, contract: dict) -> float | None:
@@ -2534,20 +2616,48 @@ class FuturesFollowService:
             replace_existing=True,
             name="Futures Follow CAP50 EOD watchdog (15:28 IST)",
         )
-        sched.add_job(
-            _entry_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"),
-            id="futures_follow_entry",
-            replace_existing=True,
-            name="Futures Follow CAP50 entry (15:20 IST)",
-        )
-        sched.add_job(
-            _exit_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"),
-            id="futures_follow_exit",
-            replace_existing=True,
-            name="Futures Follow CAP50 T+1 exit (15:25 IST)",
-        )
+        entry_mode = futures_entry_mode()
+        if entry_mode == "same_minute":
+            # OPTION_C (issue #406): 15:20 snapshots signals; 15:25 does the T+1 exit
+            # FIRST then places entries in the same minute (fresh cap, no margin
+            # overlap). A single 15:25 job guarantees exit-before-entry ordering.
+            sched.add_job(
+                _snapshot_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_entry",  # reuse id -> replaces the legacy entry job
+                replace_existing=True,
+                name="Futures Follow CAP50 15:20 signal snapshot (same_minute)",
+            )
+            sched.add_job(
+                _exit_then_entry_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_exit",  # reuse id -> replaces the legacy exit job
+                replace_existing=True,
+                name="Futures Follow CAP50 15:25 exit-then-entry (same_minute)",
+            )
+        else:
+            sched.add_job(
+                _entry_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_entry",
+                replace_existing=True,
+                name="Futures Follow CAP50 entry (15:20 IST)",
+            )
+            sched.add_job(
+                _exit_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_exit",
+                replace_existing=True,
+                name="Futures Follow CAP50 T+1 exit (15:25 IST)",
+            )
         sched.add_job(
             _eod_summary_job,
             trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone="Asia/Kolkata"),
@@ -2566,8 +2676,9 @@ class FuturesFollowService:
                 name="Futures Follow CAP50 pre-entry smoke check (15:18 IST)",
             )
         logger.info(
-            "futures_follow jobs registered (mode=%s, strategy_id=%s, smoke_check=%s)",
+            "futures_follow jobs registered (mode=%s, entry_mode=%s, strategy_id=%s, smoke_check=%s)",
             self.mode,
+            entry_mode,
             self.strategy_id,
             futures_smoke_check_enabled(),
         )
@@ -2591,6 +2702,16 @@ def _entry_job() -> None:
 def _exit_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.run_exit()
+
+
+def _snapshot_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_signal_snapshot()
+
+
+def _exit_then_entry_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_exit_then_entry()
 
 
 def _daily_reset_job() -> None:

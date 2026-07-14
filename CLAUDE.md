@@ -997,7 +997,17 @@ the alert text). Read-only, fail-open, once/day; flags
 scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
 `FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
 registers 6 APScheduler jobs (reset 09:00 / smoke-check 15:18 / entry 15:20 /
-exit 15:25 / watchdog 15:28 / EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
+exit 15:25 / watchdog 15:28 / EOD-summary 15:30 IST).
+**Entry timing is flag-gated (`FUTURES_FOLLOW_ENTRY_MODE`, default `legacy`, issue #406):**
+`legacy` is the job map above (entry 15:20, T+1 exit 15:25). `same_minute` (OPTION_C)
+instead makes 15:20 a *signal snapshot* and 15:25 an *exit-then-entry* job — the T+1
+exit runs first so the new entry sizes against a fresh 50% cap (closes the #405 carry
+under-sizing) and margin never overlaps. Backtest: +1.19pp CAGR / +0.07 Sharpe vs
+legacy, peak margin 49.8% (see
+`docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md`).
+Selection stays at 15:20 (backtest-faithful); execution moves to 15:25. Live needs the
+exit fill confirmed before the entry places (sandbox ₹1Cr book is unaffected).
+The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
 real orders into `sandbox.db` (the virtual ₹1Cr book) from boot** — the first sandbox
 cycle is **Monday 2026-06-15 15:20 IST** (the session's first sector_follow signal →
 a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a
