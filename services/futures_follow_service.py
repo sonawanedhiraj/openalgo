@@ -2097,9 +2097,15 @@ class FuturesFollowService:
         known_symbols = {p.nifty_symbol for p in self.paper_book.values()}
         rehydrated = 0
         today = self._now().date().isoformat()
-        # Rehydrated positions are stamped with YESTERDAY's date so the T+1 exit
-        # jobs (which square off positions whose entry_date != today) act on them.
-        prior_day = (self._now().date() - timedelta(days=1)).isoformat()
+        # Rehydrated positions are stamped with the PREVIOUS TRADING DAY so the
+        # T+1 exit jobs (which square off positions whose entry_date != today)
+        # act on them. Must be a real trading day, not calendar-yesterday: a
+        # Monday restart of a Friday position previously stamped Sunday (an
+        # impossible entry session that then rode into the journal exit row —
+        # issue #401). Weekend/holiday-aware via data_freshness_service.
+        from services.data_freshness_service import previous_trading_day
+
+        prior_day = previous_trading_day(self._now().date()).isoformat()
 
         for pos in positions:
             try:

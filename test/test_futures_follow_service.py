@@ -995,6 +995,42 @@ def test_rehydrate_rebuilds_paper_book_in_live():
     assert pos.entry_date != "2026-06-10"
 
 
+def test_rehydrate_stamps_previous_trading_day_not_calendar_yesterday():
+    """A Monday restart of a Friday position must stamp the FRIDAY (previous
+    trading day), never Sunday (calendar-yesterday) — issue #401. The buggy
+    Sunday entry_date rode straight into the T+1 journal exit row, showing an
+    impossible entry session on the dashboard."""
+    # Monday 2026-07-13; calendar-yesterday is Sunday 2026-07-12 (impossible).
+    monday = lambda: datetime(2026, 7, 13, 15, 20, tzinfo=_IST)  # noqa: E731
+    svc = _make_service(mode="sandbox", now=monday)
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY28JUL26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 75,
+                    "average_price": "24240.0",
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    assert n == 1
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.entry_date == "2026-07-10"  # Friday, not Sunday 2026-07-12
+    # And it's still a prior day, so the T+1 exit predicate (entry_date != today) fires.
+    assert pos.entry_date != "2026-07-13"
+
+
 def test_rehydrate_skips_already_known_symbols():
     svc = _make_service(mode="live")
     _seed_position(svc, "P1", entry_date="2026-06-09")  # NIFTY26JUN24FUT already held
