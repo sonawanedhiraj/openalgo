@@ -18,6 +18,33 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### VETO_CLAUDE_TIMEOUT_SECONDS 25 → 60 (added 2026-07-14)
+The Stage-1 LLM veto invokes `claude -p` in-process
+(`services/llm_review_client.invoke_claude_review`) with a wall-clock budget from
+`VETO_CLAUDE_TIMEOUT_SECONDS` (`signal_review_service._claude_timeout_seconds`,
+code default 25). Measured on 2026-07-14: a real veto prompt on the default model
+(Opus) takes **~19–22s warm** and more cold — the CLI cold-loads ~75K tokens of
+system/tool context per call, and live vetoes fire only a few times a day so they
+are always cold. Result: **100% of fresh reviews timed out** (`review_failed` /
+`claude_timeout`), failing safe to `take` — the guardrail was silently inert
+(2026-07-14 CONCOR / KALYANKJIL rows). Benchmarks also showed a model swap on the
+CLI path does NOT help (Haiku was slower, ~27–29s) and the `stdin=DEVNULL` fix saves
+at most ~3s — the CLI transport is the bottleneck, not the model. Bumping the budget
+is the correct hotfix and keeps the veto on the Claude subscription (OAuth) rather
+than a metered Messages-API bill.
+
+#### VETO_CLAUDE_TIMEOUT_SECONDS
+- **Current value:** `60` (in `.env`; code default remains `25` when unset).
+- **Set in:** env; read live per call by
+  `services.signal_review_service._claude_timeout_seconds` via `os.getenv` →
+  **takes effect on the next OpenAlgo restart** (the process env is loaded from
+  `.env` at boot).
+- **What it does:** wall-clock ceiling for the `claude -p` veto reasoning
+  subprocess. 60s gives comfortable headroom over the ~19–22s warm / higher-cold
+  latency so cold calls complete instead of timing out. Vetoes fire only a few
+  times/day, so the extra seconds are operationally immaterial. Lower it only if a
+  faster transport (direct Messages API) later replaces the CLI.
+
 ### futures_follow big-loss news-context alerts (issue #399, added 2026-07-13)
 The 3% kill switch is same-day and blind to T+1 overnight losses (the 2026-07-07
 war-day gap read ₹0). New: on a big **realized** T+1 loss (and on a kill-switch
