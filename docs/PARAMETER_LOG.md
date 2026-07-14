@@ -18,6 +18,37 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### futures_follow big-loss news-context alerts (issue #399, added 2026-07-13)
+The 3% kill switch is same-day and blind to T+1 overnight losses (the 2026-07-07
+war-day gap read ₹0). New: on a big **realized** T+1 loss (and on a kill-switch
+fire) the operator alert is enriched with recent market headlines — already
+ingested by `news_ingest_service` into `market_intel(kind='news')` — so a large
+loss is *explainable* (war / macro / broad sell-off). **Strictly informational +
+human-in-the-loop: no order is ever placed from this path** (R54/R55 proved
+reacting is net-negative on this leveraged-beta sleeve). Pure DB read, fail-open.
+Proposed in PR for #399; lands on dev with the merge.
+
+#### FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT (NEW)
+- **Current value:** unset → **2.0** (percent of capital; ₹20,000 on the ₹10L book).
+- **Set in:** env; read by `services.futures_follow_service.big_loss_alert_pct`,
+  consumed by `_maybe_alert_big_loss` (called from `run_exit`).
+- **What it does:** realized daily-loss magnitude that triggers the news-enriched
+  big-loss alert (at most once/day, reset at the 09:00 daily reset). Does NOT gate
+  trading — alert only.
+
+#### NEWS_CONTEXT_ON_ALERTS_ENABLED (NEW)
+- **Current value:** unset → **`true`**. Master switch for attaching news context
+  to big-loss / kill-switch alerts. When `false`, `get_recent_news_context`
+  returns "" and alerts fire unchanged (no news block).
+- **Set in:** env; read by `services.news_context_service`.
+
+#### NEWS_CONTEXT_LOOKBACK_MIN / NEWS_CONTEXT_MAX_ITEMS / NEWS_CONTEXT_HIGHLIGHT_TERMS (NEW)
+- **Defaults:** `720` (12h lookback), `6` (headlines shown), and a built-in
+  geopolitics/macro highlight list (war/attack/missile/sanction/RBI/Fed/crude/…)
+  overridable as a comma-separated list. Highlighted headlines get a ⚠️ marker —
+  a hint to the operator, **never** a trading trigger.
+- **Set in:** env; read by `services.news_context_service`.
+
 ### futures_follow quotes-snapshot data source (issue #332, added 2026-07-05)
 `futures_follow_cap50` makes exactly one decision per day (15:20 IST); PR #333
 moved its decision snapshot (today's per-symbol close + cumulative volume) off

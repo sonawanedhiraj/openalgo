@@ -161,6 +161,17 @@ def _prev_or_same_business_day(d: date) -> date:
     return d
 
 
+def previous_trading_day(d: date) -> date:
+    """The latest NSE trading day strictly before ``d``.
+
+    Weekend- and NSE-holiday-aware (issue #253) via ``is_trading_day``: from a
+    Monday it returns the preceding Friday, and it skips NSE holidays. Used to
+    stamp a rehydrated-position entry date on a value that is a real trading day
+    (never a weekend/holiday) so the T+1 journal reconciles sensibly.
+    """
+    return _prev_or_same_business_day(d - timedelta(days=1))
+
+
 def business_days_between(d_from: date, d_to: date) -> int:
     """Count trading days in the half-open interval ``(d_from, d_to]``.
 
