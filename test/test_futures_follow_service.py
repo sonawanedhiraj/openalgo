@@ -339,6 +339,77 @@ def test_run_exit_skips_same_day_positions():
     assert svc.lots_held() == 1
 
 
+def _open_store_book(symbol="NIFTY30JUN26FUT", qty=75, avg="24000.0"):
+    return (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": symbol,
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": qty,
+                    "average_price": avg,
+                }
+            ],
+        },
+        200,
+    )
+
+
+def test_run_exit_rehydrates_boot_race_position_before_squaring_off():
+    """Issue #403 — the 2026-07-14 missed-exit reproduction. The in-memory
+    paper_book is EMPTY (boot rehydration skipped because the broker session
+    wasn't up yet), but a prior-day leg is still open in the store. run_exit must
+    rehydrate-then-exit so the T+1 square-off still fires — pre-fix it squared off
+    0 because it only looked at the empty paper_book."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    assert svc.paper_book == {}  # boot-race: nothing in memory
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=_open_store_book(qty=75, avg="24000.0"),
+        ),
+    ):
+        exited = svc.run_exit()
+    assert len(exited) == 1  # pre-fix: 0
+    assert svc._test_placed[0][1]["action"] == "SELL"
+    assert svc.lots_held() == 0
+
+
+def test_run_eod_watchdog_rehydrates_boot_race_position():
+    """The 15:28 watchdog is the second exit path — it must also rehydrate a
+    boot-race position the empty paper_book never saw (issue #403)."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    assert svc.paper_book == {}
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=_open_store_book(),
+        ),
+    ):
+        flattened = svc.run_eod_watchdog()
+    assert len(flattened) == 1
+    assert svc.lots_held() == 0
+
+
+def test_run_exit_rehydrate_before_exit_is_noop_when_store_empty():
+    """No open store position -> rehydrate-before-exit is a clean no-op and the
+    exit run stays empty (never raises, never fabricates a position)."""
+    svc = _make_service(mode="sandbox")
+    empty = (True, {"status": "success", "data": []}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=empty),
+    ):
+        exited = svc.run_exit()
+    assert exited == []
+    assert svc.lots_held() == 0
+
+
 # --------------------------------------------------------------------------- #
 # Kill switch
 # --------------------------------------------------------------------------- #

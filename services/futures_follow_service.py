@@ -1864,6 +1864,7 @@ class FuturesFollowService:
         decision = self._resolve_decision()
         self._warn_if_stale_for_exit()
         self._apply_mode_override(decision)
+        self._rehydrate_before_exit("exit job")
         today = self._now().date().isoformat()
         to_exit = [(pid, p) for pid, p in list(self.paper_book.items()) if p.entry_date != today]
         exited: list[dict] = []
@@ -2176,6 +2177,30 @@ class FuturesFollowService:
                 logger.exception("futures_follow rehydrate notify failed")
         return rehydrated
 
+    def _rehydrate_before_exit(self, reason: str) -> None:
+        """Pull any open store position into ``paper_book`` before an exit run.
+
+        Load-bearing backstop for the boot-race that missed the 2026-07-14 T+1
+        exit (issue #403): boot rehydration checks the broker api_key ONCE and
+        skips if the session isn't up yet (the normal morning case — OpenAlgo
+        boots before the daily Zerodha login). Nothing re-ran it, so the open
+        overnight leg was never in ``paper_book`` at 15:25 and the exit job
+        squared off 0. Re-running rehydration at the top of every exit path makes
+        the exit self-healing regardless of boot timing: ``rehydrate_paper_book_
+        from_store`` is idempotent (dedups by symbol already held) and never
+        raises, so this is a safe no-op when the book is already correct."""
+        try:
+            n = self.rehydrate_paper_book_from_store()
+            if n:
+                logger.warning(
+                    "futures_follow %s: rehydrated %d open position(s) the boot path "
+                    "missed (broker session likely landed after boot) — squaring off now",
+                    reason,
+                    n,
+                )
+        except Exception:
+            logger.exception("futures_follow %s rehydrate-before-exit failed (ignored)", reason)
+
     # ----- observability + EOD summary ----------------------------------- #
     def _config_view(self) -> dict:
         c = self.config
@@ -2463,6 +2488,7 @@ class FuturesFollowService:
         15:30 close, so that constraint does not apply — and firing before the
         primary exit made the watchdog the de-facto exit.) Exits are never
         gated."""
+        self._rehydrate_before_exit("EOD watchdog")
         today = self._now().date().isoformat()
         to_flatten = [(pid, p) for pid, p in list(self.paper_book.items()) if p.entry_date != today]
         if not to_flatten:
@@ -2628,6 +2654,36 @@ def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowServic
         svc.rehydrate_paper_book_from_store()
     except Exception:
         logger.exception("futures_follow boot rehydrate failed (ignored)")
+    # Boot-race arming (#403): the boot rehydrate above checks the broker api_key
+    # ONCE and skips if the session isn't up yet — the normal morning case, since
+    # OpenAlgo boots before the daily Zerodha login. On 2026-07-14 that skipped
+    # the open leg and the 15:25 exit found an empty book. Re-arm on the
+    # in-process broker_session_refreshed event (published by
+    # utils.auth_utils.notify_broker_session_refreshed the instant login lands) so
+    # rehydration re-runs the moment the session appears — mirroring
+    # scanner_presubscribe / ws_recovery_service. The run_exit / watchdog
+    # rehydrate-before-exit backstop covers the exit itself; this keeps the live
+    # paper_book (and the "Open" status card) correct through the day too.
+    try:
+        from utils.event_bus import bus as _bus
+
+        def _rehydrate_on_session_refreshed(_event) -> None:
+            try:
+                n = svc.rehydrate_paper_book_from_store()
+                logger.info(
+                    "futures_follow: broker_session_refreshed -> rehydrated %d open position(s)",
+                    n,
+                )
+            except Exception:
+                logger.exception("futures_follow session-refreshed rehydrate failed (ignored)")
+
+        _bus.subscribe(
+            "broker_session_refreshed",
+            _rehydrate_on_session_refreshed,
+            name="futures_follow_rehydrate",
+        )
+    except Exception:
+        logger.exception("futures_follow broker-session rehydrate arming failed (ignored)")
     if app is not None:
         app.futures_follow_service = svc
     return svc
