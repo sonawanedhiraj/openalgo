@@ -243,6 +243,7 @@ class IntradayPullbackService:
         self.sizing_mode = str(cap.get("sizing_mode", "fixed")).lower()
 
         self.cfg = _build_pullback_config(raw)
+        self._apply_editable_config()  # layer operator UI overrides over the JSON defaults
         self.universe = sorted(self.sector_map.keys())
         self.index_syms = sorted(set(self.sector_map.values()) | {"NIFTY"})
 
@@ -313,9 +314,75 @@ class IntradayPullbackService:
         except Exception:  # noqa: BLE001
             logger.debug("intraday_pullback mode override resolve failed", exc_info=True)
 
+    def _apply_editable_config(self):
+        """Layer operator-editable settings (base capital, sizing mode, no-trade + afternoon
+        windows) from the intraday_pullback_config DB table over the config_snapshot.json
+        defaults. Windows map: morning=[09:30, no_trade_start]; afternoon=[afternoon_start,
+        afternoon_end] (no_trade_end == afternoon_start, contiguous). Never raises."""
+        try:
+            from dataclasses import replace
+
+            from database.intraday_pullback_config_db import get_config
+
+            # 1) reset editable fields to the config_snapshot.json defaults, so a deleted row
+            #    (Reset to defaults) reverts cleanly on the next apply.
+            cap = self.raw_config.get("capital", {})
+            self.base_capital = float(cap.get("base_capital", 60000))
+            self.sizing_mode = str(cap.get("sizing_mode", "fixed")).lower()
+            self.cfg = _build_pullback_config(self.raw_config)
+            # 2) layer any persisted operator overrides on top.
+            row = get_config(STRATEGY_NAME)
+            if not row:
+                return
+            if row.get("base_capital"):
+                self.base_capital = float(row["base_capital"])
+            if row.get("sizing_mode") in ("fixed", "compound", "capped"):
+                self.sizing_mode = row["sizing_mode"]
+            m_end = _parse_time(row.get("no_trade_start")) or self.cfg.morning[1]
+            a_start = _parse_time(row.get("afternoon_start")) or self.cfg.afternoon[0]
+            a_end = _parse_time(row.get("afternoon_end")) or self.cfg.afternoon[1]
+            self.cfg = replace(
+                self.cfg,
+                morning=(self.cfg.morning[0], m_end),
+                afternoon=(a_start, a_end),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("intraday_pullback editable-config load failed", exc_info=True)
+
+    def current_settings(self) -> dict:
+        """The effective editable settings + computed fields, for the settings UI GET."""
+        realized = _cumulative_realized(self.strategy_id, self.mode)
+        return {
+            "base_capital": self.base_capital,
+            "sizing_mode": self.sizing_mode,
+            "slots": self.slots,
+            "margin_per_slot": round(self.base_capital / self.slots, 0),
+            "morning": [
+                self.cfg.morning[0].strftime("%H:%M"),
+                self.cfg.morning[1].strftime("%H:%M"),
+            ],
+            "no_trade": [
+                self.cfg.morning[1].strftime("%H:%M"),
+                self.cfg.afternoon[0].strftime("%H:%M"),
+            ],
+            "afternoon": [
+                self.cfg.afternoon[0].strftime("%H:%M"),
+                self.cfg.afternoon[1].strftime("%H:%M"),
+            ],
+            "eod_flatten": self.cfg.eod_flatten.strftime("%H:%M"),
+            "realized_pnl_to_date": round(realized, 0),
+            "deployable_capital": round(self.deployable_capital(), 0),
+        }
+
     def run_daily_reset(self):
         self._apply_mode_override()
-        logger.info("intraday_pullback daily reset (mode=%s)", self.mode)
+        self._apply_editable_config()
+        logger.info(
+            "intraday_pullback daily reset (mode=%s cap=%.0f sizing=%s)",
+            self.mode,
+            self.base_capital,
+            self.sizing_mode,
+        )
         self._reset_state()
 
     # -- sizing ------------------------------------------------------------------------------
@@ -748,6 +815,17 @@ class IntradayPullbackService:
 # --------------------------------------------------------------------------------------------
 # helpers + module-level singleton / job dispatchers
 # --------------------------------------------------------------------------------------------
+
+
+def _parse_time(s) -> time | None:
+    """Parse 'HH:MM' -> datetime.time, or None if unparseable/empty."""
+    if not s:
+        return None
+    try:
+        hh, mm = str(s).split(":")
+        return time(int(hh), int(mm))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _build_pullback_config(raw: dict) -> PullbackConfig:
