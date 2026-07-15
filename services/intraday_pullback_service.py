@@ -246,10 +246,17 @@ class IntradayPullbackService:
         self.universe = sorted(self.sector_map.keys())
         self.index_syms = sorted(set(self.sector_map.values()) | {"NIFTY"})
 
+        # Mode resolution mirrors futures_follow / sector_follow: env var is the default,
+        # a persistent strategy_mode[STRATEGY_NAME] row (set via strategy_mode_service.flip_mode
+        # / the strategies dashboard toggle) overrides it. Actual sandbox-vs-live ORDER routing
+        # is still the platform-global gate (place_order -> resolve_effective_mode(__global__)),
+        # identical to every other strategy. An explicit constructor `mode` (tests) wins outright.
+        self._mode_forced = mode is not None
         self.mode = (mode or os.getenv("INTRADAY_PULLBACK_MODE", "sandbox")).lower()
         if self.mode not in VALID_MODES:
             logger.warning("Unknown INTRADAY_PULLBACK_MODE=%s — forcing sandbox", self.mode)
             self.mode = "sandbox"
+        self._apply_mode_override()
 
         self._price = price_provider or make_production_price_provider(
             self.universe + self.index_syms, self.sector_map
@@ -283,7 +290,31 @@ class IntradayPullbackService:
         self.today_realized = 0.0
         self.today_date = self._now().astimezone(_IST).date().isoformat()
 
+    def _apply_mode_override(self):
+        """Escalate/downgrade self.mode from a persistent strategy_mode row (aligned with
+        futures_follow / sector_follow). Only a row with source=='strategy_mode' overrides;
+        env/default sources leave the env-resolved mode untouched. Never raises. A constructor-
+        forced mode (tests) is never overridden. Re-run each daily reset so an operator flip via
+        the strategies dashboard takes effect next trading day without a restart."""
+        if self._mode_forced:
+            return
+        try:
+            from services.mode_service import resolve_mode
+
+            rm = resolve_mode(STRATEGY_NAME)
+            if rm.source == "strategy_mode" and rm.mode in ("live", "sandbox"):
+                if rm.mode != self.mode:
+                    logger.info(
+                        "intraday_pullback mode override: %s -> %s (strategy_mode row)",
+                        self.mode,
+                        rm.mode,
+                    )
+                self.mode = rm.mode
+        except Exception:  # noqa: BLE001
+            logger.debug("intraday_pullback mode override resolve failed", exc_info=True)
+
     def run_daily_reset(self):
+        self._apply_mode_override()
         logger.info("intraday_pullback daily reset (mode=%s)", self.mode)
         self._reset_state()
 

@@ -111,6 +111,37 @@ def test_observe_mode_journals_but_places_no_broker_orders():
     assert len(trades) == 1 and trades[0]["status"] == "open" and trades[0]["side"] == "L"
 
 
+def test_strategy_mode_row_overrides_env(monkeypatch):
+    """Aligned with futures_follow/sector_follow: a persistent strategy_mode row
+    (source='strategy_mode') overrides the env-resolved mode."""
+    import services.mode_service as ms
+
+    monkeypatch.setattr(
+        ms, "resolve_mode", lambda name: ms.ResolvedMode(mode="live", source="strategy_mode")
+    )
+    svc = IntradayPullbackService(  # no forced mode -> resolves via env + strategy_mode row
+        sector_map={"AAA": "IDX1"},
+        prev_close_provider=lambda s, a: {},
+        price_provider=lambda s, a: None,
+        bars_provider=lambda s, a: [],
+        order_placer=lambda m, o: {"status": "success"},
+        notifier=lambda m: None,
+        broker_session_checker=lambda: True,
+        now=lambda: dt.datetime.combine(D, dt.time(9, 40), IST),
+    )
+    assert svc.mode == "live"  # strategy_mode row wins over the sandbox env default
+
+
+def test_forced_mode_is_not_overridden(monkeypatch):
+    import services.mode_service as ms
+
+    monkeypatch.setattr(
+        ms, "resolve_mode", lambda name: ms.ResolvedMode(mode="live", source="strategy_mode")
+    )
+    svc = _mk_service(mode="sandbox")  # explicit constructor mode wins outright
+    assert svc.mode == "sandbox"
+
+
 def test_status_and_performance_shape():
     svc = _mk_service()
     st = svc.get_status()

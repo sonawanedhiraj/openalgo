@@ -45,7 +45,15 @@ Broker session down → 09:18 smoke check **holds entries + alerts** (fail-safe,
 1:2 partial · breakeven-at-1R · trailing/target · vol >2.5× · 10/15m candles · static stop/ext caps ·
 long band-widening · mid-strength short (−1..−2.5) · nf_mom/noreentry on short · **1pm re-selection (both sides)** · 65/35 tilt.
 
-## 9. Deployment gate
+## 9. Mode control (aligned with the other strategies)
+`INTRADAY_PULLBACK_MODE` env is the default; a persistent `strategy_mode['intraday_pullback_top2']`
+row overrides it (set via the strategies-dashboard toggle / `strategy_mode_service.flip_mode`) — same
+mechanism as `futures_follow` / `sector_follow`. Actual **sandbox-vs-live order routing is the
+platform-global gate** (`place_order` → `resolve_effective_mode(__global__)` + `analyze_mode`), shared
+by all strategies — a resolved `live` still routes to sandbox while the global gate is sandbox. `observe`
+is an env-only dry-run (journal signals, place no orders).
+
+## 10. Deployment gate
 Run in **sandbox** → paper-trade forward → **measure realized slippage per sleeve** (deep-loser shorts
 are the most fragile) → only then consider `live` with small capital. Long is the validated primary;
 the short is promising-but-unproven.
