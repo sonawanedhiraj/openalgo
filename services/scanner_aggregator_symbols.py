@@ -75,6 +75,35 @@ def _sector_follow_indices() -> list[str]:
         return []
 
 
+def _intraday_pullback_symbols() -> list[str]:
+    """The intraday_pullback_top2 universe (163 F&O stocks) + its 15 mapped sector
+    indices + NIFTY, from strategies/intraday_pullback_top2/sector_map.json (issue #394).
+
+    Same rationale as sector_follow: the aggregator only builds bars for symbols in its
+    builder dict, so the strategy's universe must be unioned in here or its 5m trigger
+    candles never form. Best-effort; a missing map contributes [] with a logged exception.
+    """
+    try:
+        import json
+        from pathlib import Path
+
+        p = (
+            Path(__file__).resolve().parent.parent
+            / "strategies"
+            / "intraday_pullback_top2"
+            / "sector_map.json"
+        )
+        data = json.loads(p.read_text())
+        mapping = data.get("mapping", data) if isinstance(data, dict) else {}
+        return [s for s in (list(mapping.keys()) + list(mapping.values()) + ["NIFTY"]) if s]
+    except Exception:
+        logger.exception(
+            "scanner_aggregator_symbols: intraday_pullback universe failed — "
+            "its stocks/indices will be missing from the aggregator"
+        )
+        return []
+
+
 def compute_aggregator_symbols() -> list[str]:
     """Return the de-duplicated, sorted union of every symbol source the
     scanner aggregator must track.
@@ -90,22 +119,24 @@ def compute_aggregator_symbols() -> list[str]:
     scanner = _scanner_symbols()
     regime = _regime_symbols()
     sf_idx = _sector_follow_indices()
+    ip_univ = _intraday_pullback_symbols()
 
-    combined = sorted({s.upper() for s in (scanner + regime + sf_idx) if s})
+    combined = sorted({s.upper() for s in (scanner + regime + sf_idx + ip_univ) if s})
     # Per-source counts let the operator confirm at a glance:
     #   "scanner aggregator universe: 232 symbols
     #     (SCANNER_SYMBOLS=216 + REGIME_SECTOR_SYMBOLS=10 + sector_follow=8;
     #      union=232, dedup-drop=2)"
-    total_input = len(scanner) + len(regime) + len(sf_idx)
+    total_input = len(scanner) + len(regime) + len(sf_idx) + len(ip_univ)
     dedup_drop = total_input - len(combined)
     logger.info(
         "scanner aggregator universe: %d symbols "
-        "(SCANNER_SYMBOLS=%d + REGIME_SECTOR_SYMBOLS=%d + sector_follow=%d; "
-        "union=%d, dedup-drop=%d)",
+        "(SCANNER_SYMBOLS=%d + REGIME_SECTOR_SYMBOLS=%d + sector_follow=%d + "
+        "intraday_pullback=%d; union=%d, dedup-drop=%d)",
         len(combined),
         len(scanner),
         len(regime),
         len(sf_idx),
+        len(ip_univ),
         len(combined),
         dedup_drop,
     )

@@ -14,9 +14,36 @@ import pytest
 
 from services.scanner_aggregator_symbols import compute_aggregator_symbols
 
+
+@pytest.fixture(autouse=True)
+def _no_intraday_pullback_universe(monkeypatch):
+    """Neutralise the file-based intraday_pullback universe source (#394) so the union-logic
+    tests below control their inputs exactly. A dedicated test exercises that source."""
+    monkeypatch.setattr(
+        "services.scanner_aggregator_symbols._intraday_pullback_symbols",
+        lambda: [],
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Union behaviour — the core of the fix
 # --------------------------------------------------------------------------- #
+
+
+def test_union_includes_intraday_pullback_universe(monkeypatch):
+    """The intraday_pullback_top2 universe (163 stocks + 15 indices) must land in the
+    aggregator set or its 5m trigger candles never form (issue #394)."""
+    monkeypatch.setenv("SCANNER_SYMBOLS", "RELIANCE")
+    monkeypatch.setenv("REGIME_SECTOR_SYMBOLS", "")
+    with (
+        patch("services.sector_follow_index_backfill.sector_index_symbols", return_value=[]),
+        patch(
+            "services.scanner_aggregator_symbols._intraday_pullback_symbols",
+            return_value=["AAA", "NIFTYIT", "NIFTY"],
+        ),
+    ):
+        result = compute_aggregator_symbols()
+    assert set(result) == {"RELIANCE", "AAA", "NIFTYIT", "NIFTY"}
 
 
 def test_union_includes_sector_follow_indices_not_in_scanner_symbols(monkeypatch):
