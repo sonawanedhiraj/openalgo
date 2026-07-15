@@ -68,6 +68,16 @@ every 5m-eval tick, once past 09:30 while `not selected`):
 - Flag `INTRADAY_PULLBACK_BOOT_RESUME_ENABLED` (default true). Caveat: a restart **after 15:15** with
   an open position relies on sandbox MIS auto-square-off (the eval tick is past its window).
 
+## 9b. Entry-breakdown observability (why no trades)
+`GET /intraday_pullback_top2/api/entry_breakdown` (also in `get_status().today_evaluation`) explains
+a zero-signal day per pick: its 09:30 gain / sector / sector-return, running diagnostics (references
+formed, breakouts seen, gate-blocks, slot-blocks, entries/exits) and a one-line **reason** — e.g.
+"no low-volume reference candle formed", "reference formed but no ≥2.5×-volume breakout", "breakout
+formed but the live NIFTY/sector gate blocked it". Live from in-memory state; a snapshot is persisted
+at the 15:30 EOD summary (`intraday_pullback_eval_snapshots`) so it survives restarts and is queryable
+historically (`?date=YYYY-MM-DD`). The strategy is selective (~0.7 trades/day in backtest) — many days
+are legitimately zero, and this makes that explicit rather than indistinguishable from a data outage.
+
 ## 10. Deployment gate
 Run in **sandbox** → paper-trade forward → **measure realized slippage per sleeve** (deep-loser shorts
 are the most fragile) → only then consider `live` with small capital. Long is the validated primary;
