@@ -92,6 +92,118 @@ def performance():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+def _parse_hhmm(s):
+    try:
+        hh, mm = str(s).split(":")
+        h, m = int(hh), int(mm)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return h * 60 + m
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+@intraday_pullback_bp.route("/api/settings", methods=["GET"])
+def get_settings():
+    """Current editable settings + computed deployable capital / realized P&L (for the UI form)."""
+    if not _authed_for_read():
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    try:
+        return jsonify({"status": "success", "data": svc.current_settings()})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("intraday_pullback get_settings failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@intraday_pullback_bp.route("/api/settings", methods=["POST"])
+def update_settings():
+    """Validate + persist the editable settings, then apply to the running service.
+
+    Accepts a logged-in web session OR an API key (the React settings page saves over the
+    session cookie, same as the strategies-dashboard mutations)."""
+    if not _authed_for_read():
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    errors = []
+    fields = {}
+
+    cap = body.get("base_capital")
+    try:
+        cap = float(cap)
+        if not (10000 <= cap <= 10_000_000):
+            errors.append("base_capital must be between 10,000 and 1,00,00,000")
+        else:
+            fields["base_capital"] = cap
+    except (TypeError, ValueError):
+        errors.append("base_capital must be a number")
+
+    sm = str(body.get("sizing_mode", "")).lower()
+    if sm in ("fixed", "compound", "capped"):
+        fields["sizing_mode"] = sm
+    else:
+        errors.append("sizing_mode must be fixed | compound | capped")
+
+    nts, nte = _parse_hhmm(body.get("no_trade_start")), _parse_hhmm(body.get("no_trade_end"))
+    afs, afe = _parse_hhmm(body.get("afternoon_start")), _parse_hhmm(body.get("afternoon_end"))
+    OPEN, FLAT = 9 * 60 + 30, 15 * 60 + 10
+    if None in (nts, nte, afs, afe):
+        errors.append("windows must be valid HH:MM times")
+    else:
+        if not (OPEN < nts < nte):
+            errors.append("no-trade start must be after 09:30 and before its end")
+        if nte != afs:
+            errors.append("no-trade end must equal afternoon start (contiguous windows)")
+        if not (afs < afe <= FLAT):
+            errors.append("afternoon window must end by 15:10 and after its start")
+        if not errors:
+            fields.update(
+                no_trade_start=body["no_trade_start"],
+                no_trade_end=body["no_trade_end"],
+                afternoon_start=body["afternoon_start"],
+                afternoon_end=body["afternoon_end"],
+            )
+
+    if errors:
+        return jsonify({"status": "error", "message": "; ".join(errors)}), 400
+
+    try:
+        from database.intraday_pullback_config_db import set_config
+        from services.intraday_pullback_service import STRATEGY_NAME
+
+        set_config(STRATEGY_NAME, updated_by="ui", **fields)
+        svc._apply_editable_config()  # reflect immediately (affects new entries only)
+        return jsonify({"status": "success", "data": svc.current_settings()})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("intraday_pullback update_settings failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@intraday_pullback_bp.route("/api/settings/reset", methods=["POST"])
+def reset_settings():
+    """Delete operator overrides -> revert to config_snapshot.json defaults."""
+    if not _authed_for_read():
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    try:
+        from database.intraday_pullback_config_db import delete_config
+        from services.intraday_pullback_service import STRATEGY_NAME
+
+        delete_config(STRATEGY_NAME)
+        svc._apply_editable_config()
+        return jsonify({"status": "success", "data": svc.current_settings()})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("intraday_pullback reset_settings failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @intraday_pullback_bp.route("/api/positions", methods=["GET"])
 def positions():
     if not _authed_for_read():

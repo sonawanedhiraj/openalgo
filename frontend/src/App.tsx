@@ -92,6 +92,9 @@ const StrategiesDashboardIndex = lazy(
   () => import('@/pages/strategies-dashboard/StrategiesDashboardIndex')
 )
 const StrategyDetailPage = lazy(() => import('@/pages/strategies-dashboard/StrategyDetail'))
+const IntradayPullbackSettings = lazy(
+  () => import('@/pages/strategies-dashboard/IntradayPullbackSettings')
+)
 
 // Chartink pages
 const ChartinkIndex = lazy(() => import('@/pages/chartink/ChartinkIndex'))
@@ -223,6 +226,10 @@ function App() {
                 <Route path="/scanner/:id" element={<ScannerDetail />} />
                 {/* Strategies Dashboard (Tier 2 read-only) */}
                 <Route path="/strategies" element={<StrategiesDashboardIndex />} />
+                <Route
+                  path="/strategies/intraday_pullback_top2/settings"
+                  element={<IntradayPullbackSettings />}
+                />
                 <Route path="/strategies/:name" element={<StrategyDetailPage />} />
                 {/* Legacy /tools/strategy paths — redirect to the new route. */}
                 <Route

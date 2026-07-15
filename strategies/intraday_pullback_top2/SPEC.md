@@ -53,6 +53,21 @@ platform-global gate** (`place_order` → `resolve_effective_mode(__global__)` +
 by all strategies — a resolved `live` still routes to sandbox while the global gate is sandbox. `observe`
 is an env-only dry-run (journal signals, place no orders).
 
+## 9a. Resume after late boot / mid-session restart
+The strategy self-heals if OpenAlgo starts after 09:30 or restarts intraday (boot daemon +
+every 5m-eval tick, once past 09:30 while `not selected`):
+- **Restart with prior trades today** → reconstruct side / picks / per-stock attempts / open
+  positions **from the journal** (authoritative, no re-selection). Reconciled open positions are
+  managed (stop + 15:15 flatten) so nothing is orphaned; prior attempts count toward max-2 so
+  nothing is double-placed.
+- **Late boot, never traded today** → re-select using the **historical 09:30 price** (`get_history`,
+  broker `source='api'`) so the "09:30 gain" is measured at 09:30, not at boot time — then trade the
+  remaining windows.
+- No-chase: past breakouts during downtime are **not** back-filled at the current price; the
+  aggregator only has post-restart bars, so entries resume cleanly from now forward.
+- Flag `INTRADAY_PULLBACK_BOOT_RESUME_ENABLED` (default true). Caveat: a restart **after 15:15** with
+  an open position relies on sandbox MIS auto-square-off (the eval tick is past its window).
+
 ## 10. Deployment gate
 Run in **sandbox** → paper-trade forward → **measure realized slippage per sleeve** (deep-loser shorts
 are the most fragile) → only then consider `live` with small capital. Long is the validated primary;
