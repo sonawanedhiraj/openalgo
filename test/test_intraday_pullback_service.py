@@ -142,6 +142,39 @@ def test_forced_mode_is_not_overridden(monkeypatch):
     assert svc.mode == "sandbox"
 
 
+def test_editable_config_overrides_and_reset():
+    from database.intraday_pullback_config_db import delete_config, init_db, set_config
+
+    init_db()
+    delete_config("intraday_pullback_top2")
+    try:
+        set_config(
+            "intraday_pullback_top2",
+            base_capital=100000,
+            sizing_mode="compound",
+            no_trade_start="10:30",
+            no_trade_end="12:30",
+            afternoon_start="12:30",
+            afternoon_end="14:45",
+        )
+        svc = _mk_service()  # __init__ layers the DB overrides over the JSON defaults
+        assert svc.base_capital == 100000
+        assert svc.sizing_mode == "compound"
+        assert svc.cfg.morning[1].strftime("%H:%M") == "10:30"
+        assert svc.cfg.afternoon[0].strftime("%H:%M") == "12:30"
+        assert svc.cfg.afternoon[1].strftime("%H:%M") == "14:45"
+        s = svc.current_settings()
+        assert s["base_capital"] == 100000 and s["no_trade"] == ["10:30", "12:30"]
+
+        # reset -> revert to config_snapshot.json defaults
+        delete_config("intraday_pullback_top2")
+        svc._apply_editable_config()
+        assert svc.base_capital == 60000 and svc.sizing_mode == "fixed"
+        assert svc.cfg.afternoon[1].strftime("%H:%M") == "15:00"
+    finally:
+        delete_config("intraday_pullback_top2")
+
+
 def test_status_and_performance_shape():
     svc = _mk_service()
     st = svc.get_status()
