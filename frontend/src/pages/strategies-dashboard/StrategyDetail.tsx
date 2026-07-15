@@ -53,6 +53,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { IntradayPullbackEvalCard } from './IntradayPullbackEvalCard'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1674,6 +1675,9 @@ export default function StrategyDetailPage() {
 
       {/* 15:20 entry-evaluation breakdown + history (issues #352, #395) */}
       {data.name === 'futures_follow_cap50' && <EntryEvaluationCard />}
+
+      {/* Today's per-pick evaluation — why entries did/didn't fire (issue #412) */}
+      {data.name === 'intraday_pullback_top2' && <IntradayPullbackEvalCard />}
 
       {/* Trades + LLM decisions (merged, issue #358) */}
       <TradesAndDecisionsCard data={data} />
