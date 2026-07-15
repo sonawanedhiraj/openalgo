@@ -341,6 +341,9 @@ class IntradayPullbackService:
         ] = {}  # symbol -> {trade_id, entry_price, qty, stop, side}
         self.open_count = 0
         self.last_fed: dict[str, int] = {}
+        self.pick_meta: dict[
+            str, dict
+        ] = {}  # sym -> {gain930, sector, sector930} for the breakdown
         self.selected = False
         self.manual_pause = False
         self.kill_switch = False
@@ -526,6 +529,18 @@ class IntradayPullbackService:
         )
         self.states = {s: StockState(self.side, self.cfg) for s in self.picks}
         self.last_fed = dict.fromkeys(self.picks, 0)
+        self.pick_meta = {
+            s: {
+                "gain930": round(rets.get(s), 3) if rets.get(s) is not None else None,
+                "sector": self.sector_map.get(s),
+                "sector930": (
+                    round(rets.get(self.sector_map.get(s)), 3)
+                    if rets.get(self.sector_map.get(s)) is not None
+                    else None
+                ),
+            }
+            for s in self.picks
+        }
         self.selected = True
         logger.info(
             "intraday_pullback selection: side=%s nifty930=%.2f%% picks=%s",
@@ -628,6 +643,11 @@ class IntradayPullbackService:
                 }
                 self.open_count += 1
             self.states[sym] = st
+            self.pick_meta[sym] = {
+                "sector": (srows[0].get("gate") or {}).get("sector") or self.sector_map.get(sym),
+                "gain930": None,  # not recoverable from the journal
+                "sector930": None,
+            }
             self.last_fed[sym] = 0
         logger.info(
             "intraday_pullback resume: reconstructed from journal side=%s picks=%s open=%d",
@@ -826,6 +846,15 @@ class IntradayPullbackService:
             self._notify(msg)
         except Exception:  # noqa: BLE001
             logger.exception("intraday_pullback EOD summary failed")
+        # persist the per-pick evaluation breakdown so a zero-signal day stays explainable
+        try:
+            from database import intraday_pullback_eval_db
+
+            intraday_pullback_eval_db.upsert_snapshot(
+                STRATEGY_NAME, self.today_date, self.entry_breakdown()
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("intraday_pullback EOD breakdown persist failed")
 
     # -- smoke check -------------------------------------------------------------------------
 
@@ -887,6 +916,45 @@ class IntradayPullbackService:
         self.run_eod_flatten(now)
         return closed
 
+    def entry_breakdown(self) -> dict:
+        """Per-pick evaluation for the day, so a zero-signal day explains itself.
+
+        For each 09:30-selected stock: its selection numbers, the running trigger diagnostics
+        (references formed, breakouts seen, gate/slot blocks, entries/exits), a one-line reason,
+        and its current position status. Live from in-memory state; a snapshot is persisted at EOD.
+        """
+        evaluation = []
+        for sym in self.picks:
+            st = self.states.get(sym)
+            meta = self.pick_meta.get(sym, {})
+            pos = self.open_positions.get(sym)
+            status = "none"
+            if pos:
+                status = "open"
+            elif st and st.attempts > 0:
+                status = "closed"
+            evaluation.append(
+                {
+                    "symbol": sym,
+                    "sector": meta.get("sector"),
+                    "gain_930_pct": meta.get("gain930"),
+                    "sector_930_pct": meta.get("sector930"),
+                    "diag": dict(st.diag) if st else None,
+                    "reason": st.reason() if st else "not evaluated",
+                    "position": status,
+                }
+            )
+        return {
+            "date": self.today_date,
+            "mode": self.mode,
+            "side_today": self.side,
+            "nifty_930_pct": self.nifty_930,
+            "selected": self.selected,
+            "picks": self.picks,
+            "n_trades_today": sum(1 for e in evaluation if e["position"] != "none"),
+            "evaluation": evaluation,
+        }
+
     def get_status(self) -> dict:
         perf = journal.performance_by_side(
             self.strategy_id, date_from=self.today_date, date_to=self.today_date, mode=self.mode
@@ -910,6 +978,7 @@ class IntradayPullbackService:
                 {"symbol": s, **{k: v for k, v in p.items() if k != "trade_id"}}
                 for s, p in self.open_positions.items()
             ],
+            "today_evaluation": self.entry_breakdown(),
             "performance": perf,
         }
 
@@ -1063,11 +1132,12 @@ def _build_pullback_config(raw: dict) -> PullbackConfig:
 def _seed_strategy_id() -> int | None:
     try:
         journal.init_db()
-        from database import intraday_pullback_config_db
+        from database import intraday_pullback_config_db, intraday_pullback_eval_db
 
         intraday_pullback_config_db.init_db()
+        intraday_pullback_eval_db.init_db()
     except Exception:  # noqa: BLE001
-        logger.debug("journal/config init_db failed", exc_info=True)
+        logger.debug("journal/config/eval init_db failed", exc_info=True)
     return None
 
 

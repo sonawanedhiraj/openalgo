@@ -102,6 +102,16 @@ class StockState:
         self.pos: tuple | None = None  # (entry_ts, entry_price, stop_price)
         self.prior_vols: list[float] = []  # volumes of already-processed candles
         self.done = False  # set by noreentry-after-SL
+        # per-day diagnostics — why an entry did/didn't fire (observability, not logic)
+        self.diag = {
+            "candles": 0,  # candles evaluated
+            "ref_formed": 0,  # low-volume reference (no-supply) candles seen
+            "breakouts": 0,  # candles meeting the 2.5x-vol + close-vs-ref trigger
+            "gate_blocked": 0,  # a breakout that the NIFTY/sector fresh gate rejected
+            "no_slot": 0,  # a breakout that couldn't enter (both slots busy)
+            "entries": 0,
+            "exits": 0,
+        }
 
     @property
     def _nf_mom(self) -> bool:
@@ -135,6 +145,7 @@ class StockState:
     def process_candle(self, candle: Candle, ctx: GateContext) -> list:
         ts, o, h, lo, c, v = candle
         actions: list = []
+        self.diag["candles"] += 1
 
         # 1) manage an open position first (stop / EOD) — frees the slot
         if self.pos is not None:
@@ -143,11 +154,13 @@ class StockState:
             if breached:
                 actions.append(ExitAction(ts=ts, price=stop, reason="SL"))
                 self.pos = None
+                self.diag["exits"] += 1
                 if self._noreentry:
                     self.done = True
             elif ts.time() >= self.cfg.eod_flatten:
                 actions.append(ExitAction(ts=ts, price=c, reason="EOD"))
                 self.pos = None
+                self.diag["exits"] += 1
             self.prior_vols.append(v)
             return actions
 
@@ -157,26 +170,33 @@ class StockState:
             return actions
 
         entered = False
-        if self.ref is not None and _in_window(ts.time(), self.cfg) and self._gate_ok(ctx):
+        if self.ref is not None and _in_window(ts.time(), self.cfg):
             ro, rh, rl, rv = self.ref
             rec = self.prior_vols[-self.cfg.vol_avg_window :]
             avg = (sum(rec) / len(rec)) if rec else v
             vol_ok = v >= self.cfg.vol_multiplier * avg
             close_ok = (c > ro) if self.side == "L" else (c < ro)
-            if vol_ok and close_ok and ctx.slot_available:
-                floor = self.cfg.stop_floor_pct / 100.0 * c
-                if self.side == "L":
-                    dd = max(c - rl, floor)
-                    stop = c - dd
+            if vol_ok and close_ok:  # a breakout candle (2.5x vol + close vs ref-open)
+                self.diag["breakouts"] += 1
+                if not self._gate_ok(ctx):
+                    self.diag["gate_blocked"] += 1
+                elif not ctx.slot_available:
+                    self.diag["no_slot"] += 1
                 else:
-                    dd = max(rh - c, floor)
-                    stop = c + dd
-                self.pos = (ts, c, stop)
-                self.attempts += 1
-                self.ref = None
-                actions.append(EntryAction(ts=ts, price=c, stop=stop, side=self.side))
-                entered = True
-            # trigger met but no free slot -> do not enter; ref is retained (a breakout candle
+                    floor = self.cfg.stop_floor_pct / 100.0 * c
+                    if self.side == "L":
+                        dd = max(c - rl, floor)
+                        stop = c - dd
+                    else:
+                        dd = max(rh - c, floor)
+                        stop = c + dd
+                    self.pos = (ts, c, stop)
+                    self.attempts += 1
+                    self.ref = None
+                    actions.append(EntryAction(ts=ts, price=c, stop=stop, side=self.side))
+                    entered = True
+                    self.diag["entries"] += 1
+            # a breakout that was gate-blocked or slot-blocked retains its ref (a breakout candle
             # can never satisfy the reference condition below), so it retries on the next breakout.
 
         # 2) update the reference candle (skipped only when we just entered)
@@ -186,9 +206,25 @@ class StockState:
             is_ref = (c < o) if self.side == "L" else (c > o)
             if is_ref and low_vol:
                 self.ref = (o, h, lo, v)
+                self.diag["ref_formed"] += 1
 
         self.prior_vols.append(v)
         return actions
+
+    def reason(self) -> str:
+        """One-line explanation of why this pick did / didn't produce an entry today."""
+        d = self.diag
+        if d["entries"] > 0:
+            return "entered"
+        if d["no_slot"] > 0:
+            return "breakout formed but no free slot (both positions held)"
+        if d["gate_blocked"] > 0:
+            return "breakout formed but the live NIFTY/sector gate blocked it"
+        if d["ref_formed"] == 0:
+            return "no low-volume reference (no-supply pullback) candle formed"
+        if d["breakouts"] == 0:
+            return "reference formed but no >=2.5x-volume breakout candle followed"
+        return "no valid entry setup"
 
     def force_eod(self, ts: dt.datetime, price: float) -> ExitAction | None:
         """Emit a flatten for any still-open position (watchdog backstop)."""

@@ -144,6 +144,41 @@ def test_no_slot_defers_entry_then_enters_when_free():
     assert len(acts) == 1 and acts[0][0] == 3 and isinstance(acts[0][1], EntryAction)
 
 
+def test_diag_reason_no_reference():
+    st = StockState("L", CFG)
+    for cd in [
+        _c(9, 30, 100.0, 101.0, 100.0, 100.8, 500),  # green — never a red low-vol ref (long)
+        _c(9, 35, 100.8, 101.5, 100.8, 101.2, 600),
+    ]:
+        st.process_candle(cd, _ctx())
+    assert st.diag["ref_formed"] == 0
+    assert st.reason() == "no low-volume reference (no-supply pullback) candle formed"
+
+
+def test_diag_reason_ref_but_no_breakout():
+    st = StockState("L", CFG)
+    for cd in [
+        _c(9, 30, 100.0, 100.5, 99.8, 100.2, 500),
+        _c(9, 35, 100.2, 100.3, 99.5, 99.6, 100),  # red low-vol reference
+        _c(9, 40, 99.6, 100.1, 99.6, 100.0, 120),  # up but vol 120 < 2.5*avg -> not a breakout
+    ]:
+        st.process_candle(cd, _ctx())
+    assert st.diag["ref_formed"] >= 1 and st.diag["breakouts"] == 0
+    assert st.reason() == "reference formed but no >=2.5x-volume breakout candle followed"
+
+
+def test_diag_reason_gate_blocked():
+    st = StockState("L", CFG)
+    for cd in [
+        _c(9, 30, 100.0, 100.5, 99.8, 100.2, 500),
+        _c(9, 35, 100.2, 100.3, 99.5, 99.6, 100),
+        _c(9, 40, 99.6, 101.0, 99.6, 100.5, 1000),  # breakout, but gate blocks (nifty < +0.3%)
+    ]:
+        st.process_candle(cd, _ctx(nf=0.1))
+    assert st.diag["breakouts"] == 1 and st.diag["gate_blocked"] == 1 and st.diag["entries"] == 0
+    assert st.reason() == "breakout formed but the live NIFTY/sector gate blocked it"
+
+
 def test_select_top2_long_and_short():
     sector_of = {"A": "S1", "B": "S1", "C": "S2", "D": "S2", "E": "S1"}
     # long: band [1.0,2.5), sector green

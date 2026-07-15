@@ -204,6 +204,41 @@ def reset_settings():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@intraday_pullback_bp.route("/api/entry_breakdown", methods=["GET"])
+def entry_breakdown():
+    """Per-pick evaluation for a day (why entries did/didn't fire). ?date=YYYY-MM-DD for history;
+    defaults to today's live breakdown, falling back to the persisted EOD snapshot."""
+    if not _authed_for_read():
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    try:
+        date = request.args.get("date")
+        if not date or date == svc.today_date:
+            live = svc.entry_breakdown()
+            if live.get("selected"):
+                return jsonify({"status": "success", "data": live, "source": "live"})
+            date = svc.today_date
+        from database import intraday_pullback_eval_db
+        from services.intraday_pullback_service import STRATEGY_NAME
+
+        snap = intraday_pullback_eval_db.get_snapshot(STRATEGY_NAME, date)
+        if snap is None:
+            return jsonify(
+                {
+                    "status": "success",
+                    "data": None,
+                    "source": "none",
+                    "message": f"no evaluation recorded for {date}",
+                }
+            )
+        return jsonify({"status": "success", "data": snap, "source": "persisted"})
+    except Exception as e:  # noqa: BLE001
+        logger.exception("intraday_pullback entry_breakdown failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @intraday_pullback_bp.route("/api/positions", methods=["GET"])
 def positions():
     if not _authed_for_read():
