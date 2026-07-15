@@ -1,0 +1,58 @@
+import { webClient } from '@/api/client'
+
+export interface IntradayPullbackSettings {
+  base_capital: number
+  sizing_mode: 'fixed' | 'compound' | 'capped'
+  slots: number
+  margin_per_slot: number
+  morning: [string, string]
+  no_trade: [string, string]
+  afternoon: [string, string]
+  eod_flatten: string
+  realized_pnl_to_date: number
+  deployable_capital: number
+}
+
+export interface IntradayPullbackSettingsUpdate {
+  base_capital: number
+  sizing_mode: string
+  no_trade_start: string
+  no_trade_end: string
+  afternoon_start: string
+  afternoon_end: string
+}
+
+const BASE = '/intraday_pullback_top2/api'
+
+interface Envelope<T> {
+  status: string
+  data?: T
+  message?: string
+}
+
+export const intradayPullbackApi = {
+  getSettings: async (): Promise<IntradayPullbackSettings> => {
+    const res = await webClient.get<Envelope<IntradayPullbackSettings>>(`${BASE}/settings`)
+    return res.data.data as IntradayPullbackSettings
+  },
+
+  updateSettings: async (
+    body: IntradayPullbackSettingsUpdate
+  ): Promise<IntradayPullbackSettings> => {
+    const res = await webClient.post<Envelope<IntradayPullbackSettings>>(`${BASE}/settings`, body, {
+      validateStatus: (s) => s === 200 || s === 400,
+    })
+    if (res.data.status === 'error') {
+      throw new Error(res.data.message || 'Failed to save settings')
+    }
+    return res.data.data as IntradayPullbackSettings
+  },
+
+  resetSettings: async (): Promise<IntradayPullbackSettings> => {
+    const res = await webClient.post<Envelope<IntradayPullbackSettings>>(
+      `${BASE}/settings/reset`,
+      {}
+    )
+    return res.data.data as IntradayPullbackSettings
+  },
+}

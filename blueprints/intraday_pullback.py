@@ -120,8 +120,11 @@ def get_settings():
 
 @intraday_pullback_bp.route("/api/settings", methods=["POST"])
 def update_settings():
-    """Validate + persist the editable settings, then apply to the running service."""
-    if not _authed():
+    """Validate + persist the editable settings, then apply to the running service.
+
+    Accepts a logged-in web session OR an API key (the React settings page saves over the
+    session cookie, same as the strategies-dashboard mutations)."""
+    if not _authed_for_read():
         return _unauthorized()
     svc, err = _service_or_503()
     if err:
@@ -184,7 +187,7 @@ def update_settings():
 @intraday_pullback_bp.route("/api/settings/reset", methods=["POST"])
 def reset_settings():
     """Delete operator overrides -> revert to config_snapshot.json defaults."""
-    if not _authed():
+    if not _authed_for_read():
         return _unauthorized()
     svc, err = _service_or_503()
     if err:

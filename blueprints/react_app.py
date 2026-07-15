@@ -307,6 +307,11 @@ def react_strategy_dashboard_detail(name):
     return serve_react_app()
 
 
+@react_bp.route("/strategies/<name>/settings", strict_slashes=False)
+def react_strategy_settings(name):  # deep-link/refresh for the strategy settings page (#394)
+    return serve_react_app()
+
+
 # ============================================================
 # Phase 6 Routes - Strategy & Automation
 # ============================================================
