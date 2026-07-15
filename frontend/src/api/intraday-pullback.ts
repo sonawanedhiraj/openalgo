@@ -22,6 +22,27 @@ export interface IntradayPullbackSettingsUpdate {
   afternoon_end: string
 }
 
+export interface PickEvaluation {
+  symbol: string
+  sector: string | null
+  gain_930_pct: number | null
+  sector_930_pct: number | null
+  diag: Record<string, number> | null
+  reason: string
+  position: 'open' | 'closed' | 'none'
+}
+
+export interface EntryBreakdown {
+  date: string
+  mode: string
+  side_today: 'L' | 'S' | null
+  nifty_930_pct: number | null
+  selected: boolean
+  picks: string[]
+  n_trades_today: number
+  evaluation: PickEvaluation[]
+}
+
 const BASE = '/intraday_pullback_top2/api'
 
 interface Envelope<T> {
@@ -46,6 +67,13 @@ export const intradayPullbackApi = {
       throw new Error(res.data.message || 'Failed to save settings')
     }
     return res.data.data as IntradayPullbackSettings
+  },
+
+  getEntryBreakdown: async (date?: string): Promise<EntryBreakdown | null> => {
+    const res = await webClient.get<Envelope<EntryBreakdown | null>>(`${BASE}/entry_breakdown`, {
+      params: date ? { date } : undefined,
+    })
+    return (res.data.data as EntryBreakdown | null) ?? null
   },
 
   resetSettings: async (): Promise<IntradayPullbackSettings> => {
