@@ -136,6 +136,60 @@ def make_production_price_provider(universe: list[str], sector_map: dict):
         return price
 
 
+def _ts_to_ist(ts) -> datetime | None:
+    """Normalize a get_history timestamp (epoch int/float or ISO str) to an IST datetime."""
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts, _IST)
+        d = datetime.fromisoformat(str(ts))
+        return d if d.tzinfo else d.replace(tzinfo=_IST)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def production_history_provider(symbol: str, exchange: str, interval: str, date_str: str) -> list:
+    """Today's historical bars for ``symbol`` via the broker/historify history API.
+
+    Returns ``[(ist_datetime, open, high, low, close, volume), ...]`` sorted by time, or [] on
+    failure. Used only for RESUME (late boot / restart) — a normal intraday run uses the live
+    aggregator/quotes. get_history enforces the broker 3 req/sec limit internally.
+    """
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.history_service import get_history
+
+        ok, payload, _ = get_history(
+            symbol=symbol,
+            exchange=exchange,
+            interval=interval,
+            start_date=date_str,
+            end_date=date_str,
+            api_key=get_first_available_api_key(),
+        )
+        if not ok:
+            return []
+        out = []
+        for r in (payload or {}).get("data") or []:
+            ts = _ts_to_ist(r.get("timestamp"))
+            if ts is None:
+                continue
+            out.append(
+                (
+                    ts,
+                    r.get("open"),
+                    r.get("high"),
+                    r.get("low"),
+                    float(r.get("close")),
+                    float(r.get("volume") or 0),
+                )
+            )
+        out.sort(key=lambda b: b[0])
+        return out
+    except Exception:  # noqa: BLE001
+        logger.debug("history provider failed for %s", symbol, exc_info=True)
+        return []
+
+
 def production_bars_provider(symbol: str, as_of: datetime) -> list:
     """Today's CLOSED 5m bars for ``symbol`` from the scanner aggregator."""
     try:
@@ -225,6 +279,7 @@ class IntradayPullbackService:
         price_provider=None,
         bars_provider=None,
         prev_close_provider=None,
+        history_provider=None,
         order_placer=None,
         notifier=None,
         broker_session_checker=None,
@@ -264,6 +319,7 @@ class IntradayPullbackService:
         )
         self._bars = bars_provider or production_bars_provider
         self._prev_closes = prev_close_provider or _prev_closes
+        self._history = history_provider or production_history_provider
         self._place = order_placer or production_order_placer
         self._notify = notifier or production_notifier
         self._session_ok = broker_session_checker or production_broker_session_checker
@@ -422,16 +478,32 @@ class IntradayPullbackService:
 
     # -- selection ---------------------------------------------------------------------------
 
-    def run_selection(self, now: datetime | None = None):
+    def _price_0930_hist(self, sym: str, date_str: str) -> float | None:
+        """The stock's price AT 09:30 today from the history API (last 1m close <= 09:30).
+
+        Used on a LATE boot so the 09:30 gain is measured at 09:30, not at the current time."""
+        exch = "NSE_INDEX" if sym in self.index_syms else "NSE"
+        p = None
+        for ts, _o, _h, _lo, c, _v in self._history(sym, exch, "1m", date_str):
+            if ts.astimezone(_IST).time() <= self.cfg.morning[0]:
+                p = c
+            else:
+                break
+        return p
+
+    def run_selection(self, now: datetime | None = None, historical: bool = False):
         now = now or self._now()
         all_syms = self.universe + self.index_syms
+        date_str = now.astimezone(_IST).date().isoformat()
         prev = self._prev_closes(all_syms, now)
         self.prev_close = {k: v for k, v in prev.items() if v}
         rets: dict[str, float] = {}
         for sym in all_syms:
             pc = self.prev_close.get(sym)
-            px = self._price(sym, now)
-            if pc and pc > 0 and px:
+            if not (pc and pc > 0):
+                continue
+            px = self._price_0930_hist(sym, date_str) if historical else self._price(sym, now)
+            if px:
                 rets[sym] = (px / pc - 1.0) * 100.0
         nifty = rets.get("NIFTY")
         if nifty is None:
@@ -479,11 +551,90 @@ class IntradayPullbackService:
                 logger.info("intraday_pullback: entries held by override — skipping selection")
                 self.selected = True
                 return
-            self.run_selection(now)
-        if not self.picks:
+            # Resume if OpenAlgo booted late / restarted mid-session (past the live 09:30 tick):
+            # reconstruct the day's state from the journal, or historically re-select, instead of
+            # measuring the "09:30 gain" at the wrong (current) time.
+            if ist.time() > _time_plus(self.cfg.morning[0], 3):
+                self._resume(now)
+            else:
+                self.run_selection(now)
+        managed = set(self.picks) | set(self.open_positions)
+        if not managed:
             return
-        for sym in self.picks:  # rank order preserved
+        for sym in self.picks + [s for s in self.open_positions if s not in self.picks]:
             self._feed_symbol(sym, now)
+
+    # -- resume (late boot / restart) --------------------------------------------------------
+
+    def _resume(self, now: datetime):
+        """Rebuild the day's state after a late boot / mid-session restart.
+
+        If today's journal has this strategy's rows -> reconstruct picks/side/attempts/open
+        positions from them (fast, authoritative — no re-selection). Otherwise (booted late,
+        never traded) -> historically re-select at 09:30 so it can still trade the remaining
+        windows. Idempotent: reconciled positions are managed (stop/EOD) and prior entries count
+        toward max-attempts so nothing is double-placed."""
+        today = now.astimezone(_IST).date().isoformat()
+        try:
+            rows = [
+                r
+                for r in journal.get_trades(self.strategy_id, trade_date=today)
+                if r["mode"] == self.mode
+            ]
+        except Exception:  # noqa: BLE001
+            logger.exception("intraday_pullback resume: journal read failed")
+            rows = []
+        if rows:
+            self._reconstruct_from_journal(now, rows)
+        else:
+            logger.info("intraday_pullback resume: no journal rows today — historical re-select")
+            self.run_selection(now, historical=True)
+        self.selected = True
+
+    def _reconstruct_from_journal(self, now: datetime, rows: list):
+        self.side = rows[0]["side"]
+        for r in rows:
+            g = r.get("gate") or {}
+            if g.get("nifty_930") is not None:
+                self.nifty_930 = g["nifty_930"]
+                break
+        picks: list[str] = []
+        for r in rows:
+            if r["symbol"] not in picks:
+                picks.append(r["symbol"])
+        self.picks = picks
+        needed = set(picks) | {self.sector_map.get(s, "NIFTY") for s in picks} | {"NIFTY"}
+        prev = self._prev_closes(sorted(needed), now)
+        self.prev_close = {k: v for k, v in prev.items() if v}
+        self.states = {}
+        for sym in picks:
+            st = StockState(self.side, self.cfg)
+            srows = [r for r in rows if r["symbol"] == sym]
+            st.attempts = len(srows)
+            if st._noreentry and any(
+                r["status"] == "closed" and r["exit_reason"] == "SL" for r in srows
+            ):
+                st.done = True
+            openr = next((r for r in srows if r["status"] == "open"), None)
+            if openr is not None:
+                ets = _parse_iso(openr.get("entry_time")) or now
+                st.pos = (ets, openr["entry_price"], openr.get("stop_price"))
+                self.open_positions[sym] = {
+                    "trade_id": openr["id"],
+                    "entry_price": openr["entry_price"],
+                    "qty": openr["quantity"],
+                    "stop": openr.get("stop_price"),
+                    "side": self.side,
+                }
+                self.open_count += 1
+            self.states[sym] = st
+            self.last_fed[sym] = 0
+        logger.info(
+            "intraday_pullback resume: reconstructed from journal side=%s picks=%s open=%d",
+            self.side,
+            picks,
+            self.open_count,
+        )
 
     def _feed_symbol(self, sym: str, now: datetime):
         st = self.states.get(sym)
@@ -810,6 +961,36 @@ class IntradayPullbackService:
             name="Intraday Pullback EOD summary (15:30 IST)",
         )
         logger.info("intraday_pullback jobs registered (mode=%s)", self.mode)
+        self._start_boot_resume()
+
+    def _start_boot_resume(self):
+        """On boot, if we're already inside the trading session (late start / restart), wait for a
+        broker session and run one eval tick immediately so the day resumes without waiting for the
+        next 5-min tick. Daemon thread; never blocks boot. Gated by INTRADAY_PULLBACK_BOOT_RESUME."""
+        if os.getenv("INTRADAY_PULLBACK_BOOT_RESUME_ENABLED", "true").lower() != "true":
+            return
+        try:
+            ist = self._now().astimezone(_IST)
+        except Exception:  # noqa: BLE001
+            return
+        if not (self.cfg.morning[0] < ist.time() < self.cfg.eod_flatten):
+            return  # only a boot DURING the session needs an immediate resume
+
+        import threading
+        import time as _time
+
+        def _worker():
+            for _ in range(40):  # ~10 min: wait for a broker session to appear
+                if self._session_ok():
+                    break
+                _time.sleep(15)
+            try:
+                logger.info("intraday_pullback boot-resume: running immediate eval tick")
+                self.run_eval_tick()
+            except Exception:  # noqa: BLE001
+                logger.exception("intraday_pullback boot-resume tick failed")
+
+        threading.Thread(target=_worker, name="IntradayPullbackBootResume", daemon=True).start()
 
 
 # --------------------------------------------------------------------------------------------
@@ -824,6 +1005,22 @@ def _parse_time(s) -> time | None:
     try:
         hh, mm = str(s).split(":")
         return time(int(hh), int(mm))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _time_plus(t: time, mins: int) -> time:
+    """Add minutes to a time-of-day (clamped within the day)."""
+    total = t.hour * 60 + t.minute + mins
+    return time((total // 60) % 24, total % 60)
+
+
+def _parse_iso(s) -> datetime | None:
+    """Parse an ISO datetime string (journal entry_time) -> datetime, or None."""
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(str(s))
     except Exception:  # noqa: BLE001
         return None
 
@@ -866,8 +1063,11 @@ def _build_pullback_config(raw: dict) -> PullbackConfig:
 def _seed_strategy_id() -> int | None:
     try:
         journal.init_db()
+        from database import intraday_pullback_config_db
+
+        intraday_pullback_config_db.init_db()
     except Exception:  # noqa: BLE001
-        logger.debug("journal init_db failed", exc_info=True)
+        logger.debug("journal/config init_db failed", exc_info=True)
     return None
 
 
