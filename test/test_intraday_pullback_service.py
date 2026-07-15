@@ -284,6 +284,19 @@ def test_resume_historical_selection_when_no_journal():
     assert svc.picks == ["AAA"]  # +1.5% in band; BBB +0.2% excluded
 
 
+def test_entry_breakdown_explains_no_trade_day():
+    # AAA is selected at 09:30 but gets no candles -> no trigger; the breakdown says why
+    svc = _mk_service(now=dt.datetime.combine(D, dt.time(9, 30), IST))
+    svc.run_eval_tick(dt.datetime.combine(D, dt.time(9, 30), IST))
+    b = svc.entry_breakdown()
+    assert b["selected"] and b["picks"] == ["AAA"] and b["n_trades_today"] == 0
+    ev = b["evaluation"][0]
+    assert ev["symbol"] == "AAA" and ev["position"] == "none"
+    assert ev["gain_930_pct"] is not None and ev["sector"] == "IDX1"
+    assert "reference" in ev["reason"]  # no candles -> no reference formed
+    assert svc.get_status()["today_evaluation"]["picks"] == ["AAA"]
+
+
 def test_status_and_performance_shape():
     svc = _mk_service()
     st = svc.get_status()
