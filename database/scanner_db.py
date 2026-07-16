@@ -27,6 +27,7 @@ from typing import Any
 import pytz
 from sqlalchemy import (
     Column,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -92,6 +93,10 @@ class ScanResult(Base):
     source = Column(String(16), nullable=False)  # 'chartink' | 'inhouse' | 'shadow' | 'manual'
     posted_to_engine = Column(Integer, nullable=False, default=0)
     notes = Column(Text, nullable=True)
+    # Bar close the rule matched on, captured at write time (in-house scanner
+    # only writes one symbol/row so a scalar suffices). NULL for pre-migration
+    # rows and for multi-symbol chartink rows where no single price applies.
+    price = Column(Float, nullable=True)
 
     __table_args__ = (
         Index("idx_scan_results_run_at", "run_at"),
@@ -129,12 +134,39 @@ def _migrate_scan_definitions() -> None:
         logger.debug("_migrate_scan_definitions: table may not exist yet (fresh DB)", exc_info=True)
 
 
+def _migrate_scan_results() -> None:
+    """Add later columns to scan_results on existing databases (idempotent).
+
+    Same rationale as ``_migrate_scan_definitions``: ``create_all`` never alters
+    an existing table, so new columns need an explicit ``ALTER TABLE … ADD
+    COLUMN`` guarded against the "duplicate column name" error on re-runs.
+    """
+    new_columns = [
+        ("price", "REAL"),
+    ]
+    try:
+        with engine.begin() as conn:
+            for col_name, col_type in new_columns:
+                try:
+                    conn.execute(
+                        text(f"ALTER TABLE scan_results ADD COLUMN {col_name} {col_type}")  # noqa: S608
+                    )
+                except OperationalError as exc:
+                    if "duplicate column name" in str(exc).lower():
+                        pass  # already present — idempotent
+                    else:
+                        raise
+    except Exception:
+        logger.debug("_migrate_scan_results: table may not exist yet (fresh DB)", exc_info=True)
+
+
 def init_db():
     """Create scan_definitions + scan_results tables if missing. Idempotent."""
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Scanner DB", logger)
     _migrate_scan_definitions()
+    _migrate_scan_results()
 
 
 def _now_iso() -> str:
@@ -165,6 +197,7 @@ def _result_to_dict(row: ScanResult) -> dict[str, Any]:
         "source": row.source,
         "posted_to_engine": bool(row.posted_to_engine),
         "notes": row.notes,
+        "price": row.price,
     }
 
 

@@ -581,10 +581,21 @@ def record_scan_result(
     source: str,
     posted_to_engine: bool = False,
     notes: str | None = None,
+    price: float | None = None,
 ) -> int:
-    """Append a scan result row and return its id."""
+    """Append a scan result row and return its id.
+
+    ``price`` is the bar close the rule matched on (in-house scanner). It is
+    optional and best-effort: a non-numeric value is coerced to ``None`` so a
+    malformed bar can never break the audit insert.
+    """
     if source not in {"chartink", "inhouse", "shadow", "manual"}:
         raise ValueError(f"source must be one of chartink|inhouse|shadow|manual, got {source!r}")
+    price_val: float | None
+    try:
+        price_val = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price_val = None
     sess = _session()
     try:
         row = ScanResult(
@@ -594,6 +605,7 @@ def record_scan_result(
             source=source,
             posted_to_engine=1 if posted_to_engine else 0,
             notes=notes,
+            price=price_val,
         )
         sess.add(row)
         sess.commit()
@@ -1586,6 +1598,7 @@ class ScannerService:
                     source="inhouse",
                     posted_to_engine=False,
                     notes=f"interval={interval}",
+                    price=bar.get("close"),
                 )
             except Exception:
                 logger.exception(

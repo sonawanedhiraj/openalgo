@@ -112,6 +112,27 @@ def test_record_scan_result_and_retrieve(fresh_scanner_db):
     assert r["source"] == "chartink"
     assert r["posted_to_engine"] is True
     assert r["notes"] == "seeded by webhook test"
+    # No price supplied → NULL round-trips as None.
+    assert r["price"] is None
+
+
+def test_record_scan_result_persists_price(fresh_scanner_db):
+    from services import scanner_service
+
+    scanner_service.init_scanner_db()
+    def_id = scanner_service.create_scan_definition(
+        name="inhouse_buy", screener_type="buy", expression_json={}
+    )
+
+    # A numeric price round-trips; a non-numeric one is coerced to None rather
+    # than raising, so a malformed bar can never break the audit insert.
+    scanner_service.record_scan_result(def_id, ["TCS"], source="inhouse", price=3421.75)
+    scanner_service.record_scan_result(def_id, ["INFY"], source="inhouse", price="not-a-number")
+
+    results = scanner_service.get_scan_results(hours=24)
+    by_symbol = {r["symbols"][0]: r for r in results}
+    assert by_symbol["TCS"]["price"] == 3421.75
+    assert by_symbol["INFY"]["price"] is None
 
 
 def test_get_scan_results_filters_by_source(fresh_scanner_db):

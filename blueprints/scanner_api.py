@@ -336,6 +336,7 @@ def get_signals(definition_id: int):
                 "source": r.source,
                 "posted_to_engine": bool(r.posted_to_engine),
                 "notes": r.notes,
+                "price": r.price,
             }
             for r in rows
         ]
