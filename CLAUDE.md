@@ -79,7 +79,14 @@ see the carve-out below). Capability reference:
    PR-list scan without having to click through. Docs-only PRs are exempt from
    the link-guard block but should still link a `type:docs` issue and carry the
    `[#N]` prefix.
-4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
+4. **Review before merge.** Every code-changing PR gets a review pass over the
+   NEW CODE **and** the NEW/CHANGED TESTS before merging — run `/code-review`
+   (or a manual pass) against [`docs/CODING_GUIDELINES.md`](docs/CODING_GUIDELINES.md)
+   and [`docs/TESTING_GUIDELINES.md`](docs/TESTING_GUIDELINES.md), fix or
+   explicitly waive each finding, and complete the "PR review" checklist in the
+   PR template. These two docs are the distilled record of past mistakes —
+   review against them so no session repeats one.
+5. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
    (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
    keyword close only fires on the default branch, so we do it ourselves).
    No-PR/manual work (a doc edit, a closed-as-wontfix) → close it yourself with
@@ -635,6 +642,14 @@ uv sync
 **Rule of thumb:** if you are releasing OpenAlgo, bump #1. If a new SDK is on PyPI with a fix you need, bump #2. They are unrelated.
 
 ## Code Style and Conventions
+
+**Read first when writing code or tests:**
+[`docs/CODING_GUIDELINES.md`](docs/CODING_GUIDELINES.md) and
+[`docs/TESTING_GUIDELINES.md`](docs/TESTING_GUIDELINES.md) — the distilled,
+incident-backed rules from every mistake this project has already made (silent
+success envelopes, wall-clock test flakes, live-DB pollution, eventlet
+constraints, worktree/pre-commit deadlocks, …). PRs are reviewed against them
+(lifecycle step 4 above + the PR template checklist).
 
 ### Python
 
