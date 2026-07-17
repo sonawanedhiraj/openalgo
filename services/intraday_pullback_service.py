@@ -561,6 +561,19 @@ class IntradayPullbackService:
             self.run_daily_reset()
         if ist.time() < self.cfg.morning[0] or ist.time() >= self.cfg.eod_flatten:
             return
+        try:
+            self._eval_tick(now, ist)
+        finally:
+            # Persist the day's diagnostics on every tick (issue #422). The card reads live
+            # in-memory state, so before this a restart any time before the 15:30 EOD write lost
+            # the whole day's record — the journal resume path restores picks and positions, but
+            # not the diag counters. Unique on (strategy_name, eval_date), so each write is an
+            # idempotent overwrite of the same row. In `finally` so the zero-pick and
+            # entries-held days — the ones this record exists to explain — persist too.
+            if self.selected:
+                self._persist_eval_snapshot()
+
+    def _eval_tick(self, now: datetime, ist: datetime):
         if not self.selected:
             if self._entry_blocked():
                 logger.info("intraday_pullback: entries held by override — skipping selection")
@@ -846,7 +859,15 @@ class IntradayPullbackService:
             self._notify(msg)
         except Exception:  # noqa: BLE001
             logger.exception("intraday_pullback EOD summary failed")
-        # persist the per-pick evaluation breakdown so a zero-signal day stays explainable
+        # final write of the per-pick evaluation breakdown (the eval tick has been upserting the
+        # same row all day — this one closes the record out with the settled positions)
+        self._persist_eval_snapshot()
+
+    def _persist_eval_snapshot(self):
+        """Upsert today's evaluation breakdown (issue #422).
+
+        Fail-graceful: observability must never break a trading tick, so a persist failure is
+        logged and swallowed."""
         try:
             from database import intraday_pullback_eval_db
 
@@ -854,7 +875,7 @@ class IntradayPullbackService:
                 STRATEGY_NAME, self.today_date, self.entry_breakdown()
             )
         except Exception:  # noqa: BLE001
-            logger.exception("intraday_pullback EOD breakdown persist failed")
+            logger.exception("intraday_pullback eval breakdown persist failed")
 
     # -- smoke check -------------------------------------------------------------------------
 
