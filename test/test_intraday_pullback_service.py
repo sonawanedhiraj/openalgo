@@ -304,3 +304,80 @@ def test_status_and_performance_shape():
     assert st["mode"] == "sandbox"
     assert st["slots"] == 2 and st["base_capital"] == 60000
     assert set(st["performance"].keys()) == {"long", "short", "combined"}
+
+
+# -- per-tick eval snapshot persistence (issue #422) ------------------------------------------
+
+
+@pytest.fixture
+def recorded_snapshots(monkeypatch):
+    """Record every upsert the service makes instead of writing a DB row."""
+    from database import intraday_pullback_eval_db
+
+    calls = []
+    monkeypatch.setattr(
+        intraday_pullback_eval_db,
+        "upsert_snapshot",
+        lambda strategy, date, payload: calls.append((strategy, date, payload)) or True,
+    )
+    return calls
+
+
+def test_eval_tick_persists_the_breakdown_every_tick(recorded_snapshots):
+    """Without this the record is in-memory until the 15:30 EOD write — a restart loses the day."""
+    svc = _mk_service(now=dt.datetime.combine(D, dt.time(9, 30), IST))
+    svc.run_eval_tick(dt.datetime.combine(D, dt.time(9, 30), IST))
+    svc.run_eval_tick(dt.datetime.combine(D, dt.time(9, 35), IST))
+
+    assert len(recorded_snapshots) == 2
+    strategy, date, payload = recorded_snapshots[-1]
+    assert strategy == "intraday_pullback_top2"
+    assert date == D.isoformat()
+    # the same row every tick (unique on (strategy, date)) -> idempotent overwrite
+    assert {d for _, d, _ in recorded_snapshots} == {D.isoformat()}
+    assert payload["picks"] == ["AAA"]
+    assert payload["evaluation"][0]["symbol"] == "AAA"
+
+
+def test_eval_tick_persists_a_no_book_day(recorded_snapshots):
+    """A flat-NIFTY day selects no book and returns early — it is exactly the day this record
+    exists to explain, so it must persist too."""
+    flat = {"AAA": 100.0, "BBB": 100.0, "IDX1": 100.0, "NIFTY": 100.0}
+    svc = IntradayPullbackService(
+        mode="sandbox",
+        sector_map={"AAA": "IDX1", "BBB": "IDX1"},
+        prev_close_provider=lambda syms, as_of: {s: flat.get(s) for s in syms},
+        price_provider=lambda sym, as_of: flat.get(sym),  # every symbol flat vs prev close
+        bars_provider=lambda sym, as_of: [],
+        order_placer=RecordingPlacer(),
+        notifier=lambda m: None,
+        broker_session_checker=lambda: True,
+        now=lambda: dt.datetime.combine(D, dt.time(9, 30), IST),
+    )
+    svc.run_eval_tick(dt.datetime.combine(D, dt.time(9, 30), IST))
+
+    assert svc.side is None and svc.picks == []
+    assert len(recorded_snapshots) == 1
+    payload = recorded_snapshots[0][2]
+    assert payload["selected"] is True
+    assert payload["side_today"] is None
+    assert payload["evaluation"] == []
+
+
+def test_eval_tick_does_not_persist_outside_the_session(recorded_snapshots):
+    svc = _mk_service(now=dt.datetime.combine(D, dt.time(8, 0), IST))
+    svc.run_eval_tick(dt.datetime.combine(D, dt.time(8, 0), IST))
+    assert recorded_snapshots == []
+
+
+def test_persist_failure_never_breaks_the_tick(monkeypatch):
+    """Observability is not allowed to take the trading tick down with it."""
+    from database import intraday_pullback_eval_db
+
+    def _boom(*a, **k):
+        raise RuntimeError("db is down")
+
+    monkeypatch.setattr(intraday_pullback_eval_db, "upsert_snapshot", _boom)
+    svc = _mk_service(now=dt.datetime.combine(D, dt.time(9, 30), IST))
+    svc.run_eval_tick(dt.datetime.combine(D, dt.time(9, 30), IST))  # must not raise
+    assert svc.picks == ["AAA"]

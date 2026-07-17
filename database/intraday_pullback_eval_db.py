@@ -1,8 +1,10 @@
 """Daily entry-evaluation snapshots for intraday_pullback_top2 (issue #394 observability).
 
 One JSON row per trade date: the per-pick breakdown of why entries did/didn't fire (the same
-payload the /api/entry_breakdown endpoint serves live). Persisted at the 15:30 EOD summary so a
-zero-signal day stays explainable across restarts and historically. Mirrors futures_follow_eval_db.
+payload the /api/entry_breakdown endpoint serves live). Written on every eval tick and again at
+the 15:30 EOD summary (issue #422) — the unique (strategy_name, eval_date) constraint makes each
+write an idempotent overwrite of the same row, so a restart mid-session no longer loses the day's
+diagnostics. Mirrors futures_follow_eval_db.
 """
 
 import json
@@ -32,6 +34,11 @@ Base = declarative_base()
 Base.query = db_session.query_property()
 
 TABLE_NAME = "intraday_pullback_eval_snapshots"
+
+# Upper bound on a single ``list_snapshots`` page (issue #422). Mirrors
+# futures_follow_eval_db: the payload is a few KB per day, so 90 days is the most
+# one request should ever load off disk.
+MAX_HISTORY_LIMIT = 90
 
 
 class IntradayPullbackEvalSnapshot(Base):
@@ -83,6 +90,31 @@ def upsert_snapshot(strategy_name: str, eval_date: str, payload: dict) -> bool:
         logger.exception("upsert_snapshot failed: %s", e)
         db_session.rollback()
         return False
+    finally:
+        db_session.remove()
+
+
+def list_snapshots(strategy_name: str, limit: int = 30, before: str | None = None) -> list[dict]:
+    """Snapshots for ``strategy_name``, newest ``eval_date`` first (issue #422).
+
+    ``before`` (exclusive ``YYYY-MM-DD``) pages backwards: pass the oldest date already rendered
+    to fetch the next page. ``limit`` is clamped to ``[1, MAX_HISTORY_LIMIT]``.
+
+    Returns the same dicts as ``get_snapshot`` — each carries the day's full payload. Callers
+    that only need a per-day digest should run each row through
+    ``services.intraday_pullback_eval_view.summarize_payload`` rather than shipping every
+    per-pick row to the browser.
+    """
+    limit = max(1, min(int(limit), MAX_HISTORY_LIMIT))
+    try:
+        query = IntradayPullbackEvalSnapshot.query.filter_by(strategy_name=strategy_name)
+        if before:
+            query = query.filter(IntradayPullbackEvalSnapshot.eval_date < str(before))
+        rows = query.order_by(IntradayPullbackEvalSnapshot.eval_date.desc()).limit(limit).all()
+        return [_row_to_dict(r) for r in rows]
+    except Exception as e:  # noqa: BLE001
+        logger.exception("list_snapshots failed: %s", e)
+        return []
     finally:
         db_session.remove()
 
