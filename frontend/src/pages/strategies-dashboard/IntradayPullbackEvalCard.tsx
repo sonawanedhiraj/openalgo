@@ -175,6 +175,7 @@ function EvalDayRow({
   return (
     <>
       <tr
+        data-testid={`eval-row-${summary.eval_date}`}
         className={`border-b cursor-pointer hover:bg-muted/20 ${open ? 'bg-muted/20' : ''}`}
         onClick={onToggle}
       >

@@ -92,8 +92,12 @@ describe('IntradayPullbackEvalCard', () => {
     vi.spyOn(ip.intradayPullbackApi, 'getEntryBreakdown').mockResolvedValue(breakdown())
     render(<IntradayPullbackEvalCard />, { wrapper: Wrapper })
 
-    await waitFor(() => expect(screen.getByText('16 Jul')).toBeInTheDocument())
-    expect(screen.getByText('15 Jul')).toBeInTheDocument()
+    const row = await screen.findByTestId('eval-row-2026-07-16')
+    expect(screen.getByTestId('eval-row-2026-07-15')).toBeInTheDocument()
+    // The label renders in the viewer's locale ('16 Jul' vs 'Jul 16'), so assert its parts
+    // rather than one locale's ordering.
+    expect(row).toHaveTextContent(/16/)
+    expect(row).toHaveTextContent(/Jul/i)
     expect(screen.getByText(/2 days recorded · 1 trade day/)).toBeInTheDocument()
   })
 
@@ -112,7 +116,7 @@ describe('IntradayPullbackEvalCard', () => {
     vi.spyOn(ip.intradayPullbackApi, 'getEntryBreakdown').mockResolvedValue(breakdown())
     render(<IntradayPullbackEvalCard />, { wrapper: Wrapper })
 
-    await waitFor(() => expect(screen.getByText('16 Jul')).toBeInTheDocument())
+    await screen.findByTestId('eval-row-2026-07-16')
     expect(screen.queryByText('Picks are chosen at 09:30 IST')).not.toBeInTheDocument()
   })
 
@@ -144,7 +148,7 @@ describe('IntradayPullbackEvalCard', () => {
     vi.spyOn(ip.intradayPullbackApi, 'getEntryBreakdown').mockResolvedValue(breakdown())
     render(<IntradayPullbackEvalCard />, { wrapper: Wrapper })
 
-    const row = await screen.findByText('16 Jul')
+    const row = await screen.findByTestId('eval-row-2026-07-16')
     expect(await screen.findByText('no breakout after reference')).toBeInTheDocument()
 
     await userEvent.click(row)
@@ -203,7 +207,7 @@ describe('IntradayPullbackEvalCard', () => {
     vi.spyOn(ip.intradayPullbackApi, 'getEntryBreakdown').mockResolvedValue(breakdown())
     render(<IntradayPullbackEvalCard />, { wrapper: Wrapper })
 
-    await screen.findByText('16 Jul') // the selector only renders once the table has rows
+    await screen.findByTestId('eval-row-2026-07-16') // the selector renders once the table has rows
     expect(spy).toHaveBeenCalledWith(30)
     await userEvent.selectOptions(screen.getByRole('combobox'), '90')
     await waitFor(() => expect(spy).toHaveBeenCalledWith(90))
