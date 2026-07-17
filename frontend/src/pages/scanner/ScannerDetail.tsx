@@ -20,13 +20,18 @@ import {
 
 const REFRESH_MS = 30_000
 
-type SortField = 'run_at' | 'symbol_count'
+type SortField = 'run_at' | 'symbol_count' | 'price'
 type SortDir = 'asc' | 'desc'
 
 function fmtDateTime(ts: string): string {
   const m = ts.match(/(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/)
   if (!m) return ts
   return `${m[1]} ${m[2]}`
+}
+
+function fmtPrice(price?: number | null): string {
+  if (price === null || price === undefined) return '—'
+  return `₹${price.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
 function todayStr(): string {
@@ -162,6 +167,13 @@ function SignalRow({ sig, isNew }: { sig: ScanSignal; isNew: boolean }) {
           </div>
         )}
       </TableCell>
+      <TableCell className="text-right tabular-nums text-xs whitespace-nowrap">
+        {sig.price === null || sig.price === undefined ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          fmtPrice(sig.price)
+        )}
+      </TableCell>
       <TableCell className="text-center tabular-nums">{sig.symbols.length}</TableCell>
       <TableCell className="text-center">
         <Badge variant="outline" className="text-xs">
@@ -251,6 +263,14 @@ export default function ScannerDetail() {
       let cmp = 0
       if (sortField === 'run_at') {
         cmp = a.run_at < b.run_at ? -1 : a.run_at > b.run_at ? 1 : 0
+      } else if (sortField === 'price') {
+        // Nulls sort last regardless of direction.
+        const pa = a.price ?? null
+        const pb = b.price ?? null
+        if (pa === null && pb === null) cmp = 0
+        else if (pa === null) return 1
+        else if (pb === null) return -1
+        else cmp = pa - pb
       } else {
         cmp = a.symbols.length - b.symbols.length
       }
@@ -480,6 +500,17 @@ export default function ScannerDetail() {
                 </Button>
               </TableHead>
               <TableHead>Symbols</TableHead>
+              <TableHead className="text-right">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1"
+                  onClick={() => handleSort('price')}
+                >
+                  Price
+                  <ArrowUpDown className="h-3.5 w-3.5 opacity-50" />
+                </Button>
+              </TableHead>
               <TableHead className="text-center">
                 <Button
                   variant="ghost"
@@ -506,6 +537,9 @@ export default function ScannerDetail() {
                     <Skeleton className="h-4 w-48" />
                   </TableCell>
                   <TableCell>
+                    <Skeleton className="h-4 w-16 ml-auto" />
+                  </TableCell>
+                  <TableCell>
                     <Skeleton className="h-4 w-8 mx-auto" />
                   </TableCell>
                   <TableCell>
@@ -518,7 +552,7 @@ export default function ScannerDetail() {
               ))}
             {!isLoading && displayed.length === 0 && (
               <TableRow>
-                <TableCell colSpan={5} className="text-center py-12 text-muted-foreground">
+                <TableCell colSpan={6} className="text-center py-12 text-muted-foreground">
                   {activeHour !== null
                     ? `No signals in hour ${String(activeHour).padStart(2, '0')}:xx for this range.`
                     : `No signals from ${sinceDate} to ${untilDate}.`}
