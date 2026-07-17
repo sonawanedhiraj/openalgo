@@ -535,6 +535,30 @@ def data_freshness_enabled() -> bool:
     return os.getenv("DATA_FRESHNESS_VALIDATION_ENABLED", "true").lower() == "true"
 
 
+def production_news_context() -> str:
+    """Injected default: recent market headlines for big-loss/kill-switch alerts.
+
+    Read-only, fail-open, informational — see ``news_context_service``. Never
+    triggers a trade; the headlines are DATA embedded in the operator alert only."""
+    try:
+        from services.news_context_service import get_recent_news_context
+
+        return get_recent_news_context()
+    except Exception:
+        logger.debug("news context provider unavailable", exc_info=True)
+        return ""
+
+
+def big_loss_alert_pct() -> float:
+    """``FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT`` — realized daily loss (percent of
+    capital) that triggers the news-enriched big-loss alert. Default 2.0."""
+    try:
+        return float(os.getenv("FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT", "2.0"))
+    except ValueError:
+        logger.warning("bad FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT — using 2.0")
+        return 2.0
+
+
 def production_data_health_checker(
     strategy_name: str, date: str | None = None, index_only: bool = False
 ):
@@ -590,6 +614,30 @@ def futures_smoke_check_enabled() -> bool:
     data at 15:20 will then be caught only by the per-entry
     ``_data_is_fresh_for_entry`` gate (which still blocks but does NOT alert)."""
     return os.getenv("FUTURES_FOLLOW_SMOKE_CHECK_ENABLED", "true").lower() == "true"
+
+
+def futures_entry_mode() -> str:
+    """``FUTURES_FOLLOW_ENTRY_MODE`` env flag — ``legacy`` (default) or ``same_minute``.
+
+    ``legacy`` — the shipped behavior: entry job at 15:20, T+1 exit at 15:25. The
+    still-open prior-day lot occupies the 50% cap at 15:20, under-sizing carry days
+    (issue #405).
+
+    ``same_minute`` — OPTION_C (issue #406): 15:20 job only *snapshots* the selected
+    signals; the 15:25 job squares off the T+1 exit FIRST (freeing its margin) and
+    THEN places the snapshotted entries in the same minute. Selection stays at 15:20
+    (backtest-faithful), execution moves to 15:25, sizing is naturally fresh-cap
+    (``lots_held``==0 after the exit) and margin never overlaps (≤50%). Backtest:
+    +1.19pp CAGR / +0.07 Sharpe over legacy, peak margin 49.8% (vs OPTION_A's 98.7%).
+    See ``docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md``.
+
+    Consult-time (re-read at ``register_jobs``). Any value other than ``same_minute``
+    resolves to ``legacy`` (fail-safe: a typo keeps the conservative behavior)."""
+    return (
+        "same_minute"
+        if os.getenv("FUTURES_FOLLOW_ENTRY_MODE", "legacy").strip().lower() == "same_minute"
+        else "legacy"
+    )
 
 
 def production_broker_session_checker() -> bool:
@@ -709,6 +757,7 @@ class FuturesFollowService:
         quote_probe: Callable[[], bool] | None = None,
         signal_reviewer: Callable[..., dict] | None = None,
         market_context_provider: Callable[[], dict] | None = None,
+        news_context_provider: Callable[[], str] | None = None,
     ):
         self.app = app
         self.scheduler = scheduler
@@ -727,6 +776,12 @@ class FuturesFollowService:
         self._order_placer = order_placer or production_order_placer
         self._price_fetcher = price_fetcher or production_price_fetcher
         self._notify = notifier or telegram_notifier
+        # Read-only market-news context for big-loss / kill-switch alerts
+        # (informational, human-in-the-loop; issue #399). Left injectable for
+        # hermetic tests; the default reads market_intel(kind='news'), fail-open.
+        self._news_context = news_context_provider or production_news_context
+        # Per-day dedup so the news-enriched big-loss alert fires at most once/day.
+        self._big_loss_alerted_date: str | None = None
         self._record_trade = trade_recorder or self._default_trade_recorder
         self._intent_resolver = intent_resolver or production_intent_resolver
         # Data-freshness gate. Left None in unit tests (gate skipped, hermetic);
@@ -755,6 +810,11 @@ class FuturesFollowService:
         self.today_entries: list[dict] = []
         self.today_exits: list[dict] = []
         self.strategy_id: int | None = self.config.strategy_id
+        # OPTION_C same-minute@15:25 (issue #406): the 15:20 job snapshots the
+        # selected signals here; the 15:25 exit-then-entry job consumes them so
+        # selection stays at 15:20 (backtest-faithful) while execution moves to
+        # 15:25 (after the T+1 exit frees margin). None outside same_minute mode.
+        self._pending_snapshot: tuple[datetime, list[dict]] | None = None
 
     # ----- per-lot margin estimate -------------------------------------- #
     def lot_margin_estimate(self, price: float | None = None) -> float:
@@ -846,17 +906,61 @@ class FuturesFollowService:
                 threshold,
                 self.config.daily_loss_kill_pct,
             )
-            self._notify(
+            ks_msg = (
                 f"🛑 {STRATEGY_NAME} kill switch fired — daily P&L "
                 f"₹{self.daily_pnl:,.0f} breached {self.config.daily_loss_kill_pct}% of capital. "
                 "New entries blocked; open positions hold to scheduled exit."
             )
+            try:
+                news = self._news_context() or ""
+            except Exception:
+                logger.debug("futures_follow kill-switch news context failed", exc_info=True)
+                news = ""
+            self._notify(f"{ks_msg}\n\n{news}" if news else ks_msg)
             self._set_runtime_override(
                 "kill_switch",
                 self._end_of_today_ist(),
                 self.kill_switch_reason or "daily loss kill",
             )
         return self.kill_switch_active
+
+    def _maybe_alert_big_loss(self, realized_net: float, trigger: str) -> bool:
+        """Send a news-enriched operator alert when the day's realized loss crosses
+        ``FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT`` of capital. At most once per day.
+
+        STRICTLY informational + human-in-the-loop: it surfaces recent market
+        headlines (read-only, fail-open) so the operator can see the likely macro
+        driver of a big overnight loss and decide. It NEVER places or cancels an
+        order — R54/R55 proved that reacting (stop/hedge/news-sell) is net-negative
+        on this leveraged-beta sleeve. Returns True iff an alert was sent."""
+        thr = -(big_loss_alert_pct() / 100.0) * self.config.capital_inr
+        if realized_net > thr:
+            return False
+        today = self._now().date().isoformat()
+        if self._big_loss_alerted_date == today:
+            return False
+        self._big_loss_alerted_date = today
+        pct = (
+            abs(realized_net) / self.config.capital_inr * 100.0 if self.config.capital_inr else 0.0
+        )
+        header = (
+            f"⚠️ {STRATEGY_NAME} [{self.mode}] BIG LOSS ₹{realized_net:+,.0f} "
+            f"({pct:.1f}% of capital) via {trigger}. This sleeve is leveraged "
+            "long-NIFTY beta, so a large overnight loss usually means a broad "
+            "down day — review the context below and decide (no auto-action taken)."
+        )
+        news = ""
+        try:
+            news = self._news_context() or ""
+        except Exception:
+            logger.debug("futures_follow big-loss news context failed", exc_info=True)
+        body = f"{header}\n\n{news}" if news else header
+        try:
+            self._notify(body)
+        except Exception:
+            logger.exception("futures_follow big-loss alert failed")
+        logger.warning("futures_follow BIG LOSS alert: net=%.0f trigger=%s", realized_net, trigger)
+        return True
 
     def reset_daily_state(self) -> None:
         """09:00 IST reset: clear kill switch + daily P&L and the intraday journals.
@@ -868,6 +972,7 @@ class FuturesFollowService:
         self.daily_pnl = 0.0
         self.today_entries = []
         self.today_exits = []
+        self._big_loss_alerted_date = None
         logger.info("futures_follow daily state reset (kill switch cleared, pnl=0)")
 
     # ----- runtime-override durability (mode-only safety guards) ---------- #
@@ -927,6 +1032,7 @@ class FuturesFollowService:
         lots: int,
         entry_price: float,
         entry_date: str | None = None,
+        decision_id: int | None = None,
     ) -> dict | None:
         """Buy ``lots`` NIFTY future lot(s) for one signal in the active mode.
 
@@ -1007,6 +1113,7 @@ class FuturesFollowService:
                 exchange=self.config.exchange,
                 product=self.config.product,
                 signal_id=signal_id,
+                decision_id=decision_id,
                 vol_ratio=vol_ratio,
                 margin_inr=margin,
                 order_id=None,
@@ -1037,6 +1144,7 @@ class FuturesFollowService:
             exchange=self.config.exchange,
             product=self.config.product,
             signal_id=signal_id,
+            decision_id=decision_id,
             vol_ratio=vol_ratio,
             margin_inr=margin,
             order_id=order_id,
@@ -1429,7 +1537,7 @@ class FuturesFollowService:
                 symbol,
                 reasoning,
             )
-            self._journal_veto_skip(signal, contract, lots, entry_price, reasoning)
+            self._journal_veto_skip(signal, contract, lots, entry_price, reasoning, decision_id)
             self._mark_review_outcome(decision_id, taken=False)
             return False, decision_id, elapsed_s
         return True, decision_id, elapsed_s
@@ -1441,6 +1549,7 @@ class FuturesFollowService:
         lots: int,
         entry_price: float,
         reasoning: str | None = None,
+        decision_id: int | None = None,
     ) -> None:
         """Audit-trail a veto-skipped entry in ``futures_follow_trades``.
 
@@ -1458,6 +1567,7 @@ class FuturesFollowService:
                 exchange=self.config.exchange,
                 product=self.config.product,
                 signal_id=signal.get("signal_id") or signal.get("symbol"),
+                decision_id=decision_id,
                 vol_ratio=signal.get("vol_ratio") or 0.0,
                 margin_inr=0.0,
                 order_id=None,
@@ -1488,10 +1598,15 @@ class FuturesFollowService:
             )
 
     # ----- scheduled job bodies ------------------------------------------ #
-    def run_entry(self) -> list[dict]:
+    def run_entry(self, signals: list[dict] | None = None) -> list[dict]:
         """15:20 IST: evaluate signals, resolve the contract, buy 1 lot/signal up to
         the 50%-margin cap (subject to the lateness guard, override gate, kill
-        switch + freshness)."""
+        switch + freshness).
+
+        ``signals`` — when provided (OPTION_C same-minute@15:25, issue #406), these
+        pre-selected 15:20 signals are used instead of re-evaluating; the caller
+        (``run_exit_then_entry``) has already run the T+1 exit, so ``lots_held``==0
+        and the cap is naturally fresh. ``None`` (legacy) re-evaluates now."""
         # Wall-clock entry-lateness guard (#332 follow-up) — FIRST, before any
         # gate/evaluation/order. A misfired cron (app down at 15:20 →
         # APScheduler fires on restart) must never place entries near/after the
@@ -1544,7 +1659,7 @@ class FuturesFollowService:
             )
             return []
 
-        signals = self.evaluate_signals()
+        signals = signals if signals is not None else self.evaluate_signals()
         veto_mode = self._resolve_veto_mode()
         if signals:
             # R2 (#318): make the resolved enforcement mode loud at every entry —
@@ -1602,7 +1717,7 @@ class FuturesFollowService:
                 if symbol:
                     signal_outcomes[symbol] = "vetoed"
                 continue
-            r = self.place_entry(sig, contract, lots, entry_price)
+            r = self.place_entry(sig, contract, lots, entry_price, decision_id=decision_id)
             self._mark_review_outcome(decision_id, taken=bool(r))
             if r:
                 placed.append(r)
@@ -1783,6 +1898,7 @@ class FuturesFollowService:
         decision = self._resolve_decision()
         self._warn_if_stale_for_exit()
         self._apply_mode_override(decision)
+        self._rehydrate_before_exit("exit job")
         today = self._now().date().isoformat()
         to_exit = [(pid, p) for pid, p in list(self.paper_book.items()) if p.entry_date != today]
         exited: list[dict] = []
@@ -1798,7 +1914,60 @@ class FuturesFollowService:
                 f"📉 {STRATEGY_NAME} [{self.mode}] T+1 exits: {len(exited)} position(s), "
                 f"net ₹{net:+,.0f}"
             )
+            # The kill switch is same-day and blind to T+1 overnight losses (the
+            # 2026-07-07 war-day gap). This realized-loss alert is the T+1-aware
+            # hook: on a big loss, surface recent market headlines so the operator
+            # can see the macro reason and decide. Informational only — never trades.
+            self._maybe_alert_big_loss(net, trigger="T+1 exit")
         return exited
+
+    # ----- OPTION_C same-minute@15:25 (issue #406) ----------------------- #
+    def run_signal_snapshot(self) -> list[dict]:
+        """15:20 IST (same_minute mode): SELECT today's signals and stash them for
+        the 15:25 exit-then-entry job — no orders placed here.
+
+        Selection stays at 15:20 (what the 14.31% backtest measured); execution is
+        deferred to 15:25 so the T+1 exit can free its margin first. Fail-graceful:
+        on any evaluation error the snapshot is cleared (the 15:25 job then falls
+        back to a fresh 15:25 evaluation)."""
+        try:
+            now_ist = self._now().astimezone(_IST) if self._now().tzinfo else self._now()
+            signals = self.evaluate_signals()
+            self._pending_snapshot = (now_ist, list(signals))
+            logger.info(
+                "futures_follow 15:20 signal snapshot (same_minute): %d signal(s) stashed "
+                "for 15:25 exit-then-entry",
+                len(signals),
+            )
+            return signals
+        except Exception:
+            logger.exception("futures_follow signal snapshot failed — cleared (15:25 will re-eval)")
+            self._pending_snapshot = None
+            return []
+
+    def run_exit_then_entry(self) -> dict:
+        """15:25 IST (same_minute mode): square off the T+1 exit FIRST, then place
+        today's entries in the same minute (OPTION_C, issue #406).
+
+        Exit-before-entry is load-bearing: after ``run_exit`` the in-memory
+        ``paper_book`` is flat, so ``run_entry`` sizes against a fresh 50% cap
+        (``lots_held``==0) and the two cohorts never overlap on margin. Entries use
+        the 15:20 snapshot when present (backtest-faithful selection), else fall
+        back to a fresh 15:25 evaluation. Exit and entry are independently
+        fail-isolated so an entry error can never strand the exit."""
+        exited = self.run_exit()
+        snap = self._pending_snapshot
+        self._pending_snapshot = None
+        if snap is not None:
+            _snap_ist, signals = snap
+        else:
+            logger.warning(
+                "futures_follow 15:25: no 15:20 snapshot present — re-evaluating signals now "
+                "(same_minute fallback)"
+            )
+            signals = None  # run_entry re-evaluates at 15:25
+        placed = self.run_entry(signals=signals)
+        return {"exited": exited, "placed": placed}
 
     # ----- price helpers ------------------------------------------------- #
     def _resolve_entry_price(self, contract: dict) -> float | None:
@@ -2011,9 +2180,15 @@ class FuturesFollowService:
         known_symbols = {p.nifty_symbol for p in self.paper_book.values()}
         rehydrated = 0
         today = self._now().date().isoformat()
-        # Rehydrated positions are stamped with YESTERDAY's date so the T+1 exit
-        # jobs (which square off positions whose entry_date != today) act on them.
-        prior_day = (self._now().date() - timedelta(days=1)).isoformat()
+        # Rehydrated positions are stamped with the PREVIOUS TRADING DAY so the
+        # T+1 exit jobs (which square off positions whose entry_date != today)
+        # act on them. Must be a real trading day, not calendar-yesterday: a
+        # Monday restart of a Friday position previously stamped Sunday (an
+        # impossible entry session that then rode into the journal exit row —
+        # issue #401). Weekend/holiday-aware via data_freshness_service.
+        from services.data_freshness_service import previous_trading_day
+
+        prior_day = previous_trading_day(self._now().date()).isoformat()
 
         for pos in positions:
             try:
@@ -2083,6 +2258,30 @@ class FuturesFollowService:
             except Exception:
                 logger.exception("futures_follow rehydrate notify failed")
         return rehydrated
+
+    def _rehydrate_before_exit(self, reason: str) -> None:
+        """Pull any open store position into ``paper_book`` before an exit run.
+
+        Load-bearing backstop for the boot-race that missed the 2026-07-14 T+1
+        exit (issue #403): boot rehydration checks the broker api_key ONCE and
+        skips if the session isn't up yet (the normal morning case — OpenAlgo
+        boots before the daily Zerodha login). Nothing re-ran it, so the open
+        overnight leg was never in ``paper_book`` at 15:25 and the exit job
+        squared off 0. Re-running rehydration at the top of every exit path makes
+        the exit self-healing regardless of boot timing: ``rehydrate_paper_book_
+        from_store`` is idempotent (dedups by symbol already held) and never
+        raises, so this is a safe no-op when the book is already correct."""
+        try:
+            n = self.rehydrate_paper_book_from_store()
+            if n:
+                logger.warning(
+                    "futures_follow %s: rehydrated %d open position(s) the boot path "
+                    "missed (broker session likely landed after boot) — squaring off now",
+                    reason,
+                    n,
+                )
+        except Exception:
+            logger.exception("futures_follow %s rehydrate-before-exit failed (ignored)", reason)
 
     # ----- observability + EOD summary ----------------------------------- #
     def _config_view(self) -> dict:
@@ -2371,6 +2570,7 @@ class FuturesFollowService:
         15:30 close, so that constraint does not apply — and firing before the
         primary exit made the watchdog the de-facto exit.) Exits are never
         gated."""
+        self._rehydrate_before_exit("EOD watchdog")
         today = self._now().date().isoformat()
         to_flatten = [(pid, p) for pid, p in list(self.paper_book.items()) if p.entry_date != today]
         if not to_flatten:
@@ -2416,20 +2616,48 @@ class FuturesFollowService:
             replace_existing=True,
             name="Futures Follow CAP50 EOD watchdog (15:28 IST)",
         )
-        sched.add_job(
-            _entry_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"),
-            id="futures_follow_entry",
-            replace_existing=True,
-            name="Futures Follow CAP50 entry (15:20 IST)",
-        )
-        sched.add_job(
-            _exit_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"),
-            id="futures_follow_exit",
-            replace_existing=True,
-            name="Futures Follow CAP50 T+1 exit (15:25 IST)",
-        )
+        entry_mode = futures_entry_mode()
+        if entry_mode == "same_minute":
+            # OPTION_C (issue #406): 15:20 snapshots signals; 15:25 does the T+1 exit
+            # FIRST then places entries in the same minute (fresh cap, no margin
+            # overlap). A single 15:25 job guarantees exit-before-entry ordering.
+            sched.add_job(
+                _snapshot_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_entry",  # reuse id -> replaces the legacy entry job
+                replace_existing=True,
+                name="Futures Follow CAP50 15:20 signal snapshot (same_minute)",
+            )
+            sched.add_job(
+                _exit_then_entry_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_exit",  # reuse id -> replaces the legacy exit job
+                replace_existing=True,
+                name="Futures Follow CAP50 15:25 exit-then-entry (same_minute)",
+            )
+        else:
+            sched.add_job(
+                _entry_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_entry",
+                replace_existing=True,
+                name="Futures Follow CAP50 entry (15:20 IST)",
+            )
+            sched.add_job(
+                _exit_job,
+                trigger=CronTrigger(
+                    day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"
+                ),
+                id="futures_follow_exit",
+                replace_existing=True,
+                name="Futures Follow CAP50 T+1 exit (15:25 IST)",
+            )
         sched.add_job(
             _eod_summary_job,
             trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone="Asia/Kolkata"),
@@ -2448,8 +2676,9 @@ class FuturesFollowService:
                 name="Futures Follow CAP50 pre-entry smoke check (15:18 IST)",
             )
         logger.info(
-            "futures_follow jobs registered (mode=%s, strategy_id=%s, smoke_check=%s)",
+            "futures_follow jobs registered (mode=%s, entry_mode=%s, strategy_id=%s, smoke_check=%s)",
             self.mode,
+            entry_mode,
             self.strategy_id,
             futures_smoke_check_enabled(),
         )
@@ -2473,6 +2702,16 @@ def _entry_job() -> None:
 def _exit_job() -> None:
     if _SINGLETON is not None:
         _SINGLETON.run_exit()
+
+
+def _snapshot_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_signal_snapshot()
+
+
+def _exit_then_entry_job() -> None:
+    if _SINGLETON is not None:
+        _SINGLETON.run_exit_then_entry()
 
 
 def _daily_reset_job() -> None:
@@ -2536,6 +2775,36 @@ def init_futures_follow_service(app=None, scheduler=None) -> FuturesFollowServic
         svc.rehydrate_paper_book_from_store()
     except Exception:
         logger.exception("futures_follow boot rehydrate failed (ignored)")
+    # Boot-race arming (#403): the boot rehydrate above checks the broker api_key
+    # ONCE and skips if the session isn't up yet — the normal morning case, since
+    # OpenAlgo boots before the daily Zerodha login. On 2026-07-14 that skipped
+    # the open leg and the 15:25 exit found an empty book. Re-arm on the
+    # in-process broker_session_refreshed event (published by
+    # utils.auth_utils.notify_broker_session_refreshed the instant login lands) so
+    # rehydration re-runs the moment the session appears — mirroring
+    # scanner_presubscribe / ws_recovery_service. The run_exit / watchdog
+    # rehydrate-before-exit backstop covers the exit itself; this keeps the live
+    # paper_book (and the "Open" status card) correct through the day too.
+    try:
+        from utils.event_bus import bus as _bus
+
+        def _rehydrate_on_session_refreshed(_event) -> None:
+            try:
+                n = svc.rehydrate_paper_book_from_store()
+                logger.info(
+                    "futures_follow: broker_session_refreshed -> rehydrated %d open position(s)",
+                    n,
+                )
+            except Exception:
+                logger.exception("futures_follow session-refreshed rehydrate failed (ignored)")
+
+        _bus.subscribe(
+            "broker_session_refreshed",
+            _rehydrate_on_session_refreshed,
+            name="futures_follow_rehydrate",
+        )
+    except Exception:
+        logger.exception("futures_follow broker-session rehydrate arming failed (ignored)")
     if app is not None:
         app.futures_follow_service = svc
     return svc

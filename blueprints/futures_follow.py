@@ -148,6 +148,83 @@ def entry_breakdown():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@futures_follow_bp.route("/api/entry_breakdown/history", methods=["GET"])
+def entry_breakdown_history():
+    """Per-day digests of the 15:20 entry evaluations, newest first (issue #395).
+
+    Read-only on ``futures_follow_eval_snapshots``. Returns compact summaries
+    (``services.futures_follow_eval_view.summarize_payload``) rather than the full
+    ~9 KB/day payloads — the UI drills into one day at a time through the
+    ``/api/entry_breakdown?date=`` endpoint above.
+
+    ``?limit=`` (default 30, clamped to ``MAX_HISTORY_LIMIT``) and ``?before=``
+    (exclusive ``YYYY-MM-DD``, pages backwards) control the window.
+
+    ``today`` answers whether the UI should show a pending row: a snapshot only
+    appears at 15:20 IST, so ``snapshot_exists`` is false all morning — but on a
+    weekend or an NSE holiday no snapshot is ever coming, and promising one would
+    be a lie. ``is_trading_day`` resolves through the same predicate the backfill
+    schedulers share.
+    """
+    if not _authed_for_read():
+        return _unauthorized()
+    try:
+        from datetime import date as _date
+        from datetime import datetime, timedelta, timezone
+
+        from database.futures_follow_eval_db import (
+            MAX_HISTORY_LIMIT,
+            get_snapshot,
+            list_snapshots,
+        )
+        from services.data_freshness_service import is_trading_day
+        from services.futures_follow_eval_view import summarize_payload
+
+        raw_limit = request.args.get("limit", "30")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return jsonify({"status": "error", "message": f"invalid limit: {raw_limit}"}), 400
+        if limit < 1:
+            return jsonify({"status": "error", "message": f"invalid limit: {raw_limit}"}), 400
+        limit = min(limit, MAX_HISTORY_LIMIT)
+
+        before = request.args.get("before")
+        if before:
+            try:
+                _date.fromisoformat(before)
+            except ValueError:
+                return jsonify({"status": "error", "message": f"invalid before: {before}"}), 400
+
+        rows = list_snapshots("futures_follow_cap50", limit=limit + 1, before=before)
+        has_more = len(rows) > limit
+        summaries = [summarize_payload(r) for r in rows[:limit]]
+
+        ist = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(ist).date()
+        today_str = today.isoformat()
+        return jsonify(
+            {
+                "status": "success",
+                "data": {
+                    "rows": summaries,
+                    "has_more": has_more,
+                    "today": {
+                        "date": today_str,
+                        "is_trading_day": is_trading_day(today),
+                        # Queried directly, not inferred from ``summaries`` — a
+                        # ``?before=`` page never contains today's row.
+                        "snapshot_exists": get_snapshot("futures_follow_cap50", today_str)
+                        is not None,
+                    },
+                },
+            }
+        )
+    except Exception as e:
+        logger.exception("futures_follow entry_breakdown_history failed: %s", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @futures_follow_bp.route("/api/positions", methods=["GET"])
 def positions():
     """Open positions + today's entries/exits in full detail."""

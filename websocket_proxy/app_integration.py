@@ -333,6 +333,78 @@ def start_websocket_server():
     return _websocket_thread
 
 
+def get_websocket_runtime_status() -> tuple[str, bool]:
+    """Report how the WS proxy is running in THIS process and whether it is alive.
+
+    Returns ``(mode, alive)`` where mode is:
+
+    * ``"subprocess"`` — gunicorn+eventlet path; alive iff ``poll() is None``.
+    * ``"thread"`` — dev-server path; alive iff the thread ``is_alive()``.
+    * ``"none"`` — this process never started a WS proxy (Docker/standalone
+      runs it externally, or startup failed) — nothing to supervise here.
+
+    Read by :mod:`services.ws_proxy_supervisor` (issue #376). Never raises.
+    """
+    try:
+        if _websocket_subprocess is not None:
+            return "subprocess", _websocket_subprocess.poll() is None
+        if _websocket_thread is not None:
+            return "thread", _websocket_thread.is_alive()
+    except Exception:
+        logger.exception("get_websocket_runtime_status failed")
+    return "none", False
+
+
+def get_websocket_subprocess_pid() -> int | None:
+    """PID of the live WS child process, or None (thread path / dead / never
+    spawned). Read by the resource instrumentation in
+    :mod:`services.tick_liveness_watchdog`. Never raises."""
+    try:
+        if _websocket_subprocess is not None and _websocket_subprocess.poll() is None:
+            return _websocket_subprocess.pid
+    except Exception:
+        logger.debug("get_websocket_subprocess_pid failed", exc_info=True)
+    return None
+
+
+def restart_websocket_server() -> bool:
+    """Best-effort respawn of a DEAD WS proxy (supervisor use — issue #376).
+
+    Subprocess path: drops the dead Popen handle and re-runs the same spawn
+    (`python -u -m websocket_proxy.server`, same cwd). Thread path: starts a
+    fresh proxy thread via :func:`start_websocket_server` (the dead thread's
+    ``run_websocket_server`` already cleared its event loop in its finally
+    block). Returns True when the replacement reports alive. Never raises.
+
+    NOTE: never call this while the proxy is still alive — the supervisor
+    only invokes it after :func:`get_websocket_runtime_status` reports dead.
+    """
+    global _websocket_subprocess
+    try:
+        if _websocket_subprocess is not None:
+            if _websocket_subprocess.poll() is None:
+                return True  # still alive — nothing to do
+            logger.warning(
+                "Respawning WebSocket subprocess (previous PID %s exited with code %s)",
+                _websocket_subprocess.pid,
+                _websocket_subprocess.returncode,
+            )
+            _websocket_subprocess = None
+            _spawn_websocket_subprocess()
+            return _websocket_subprocess is not None and _websocket_subprocess.poll() is None
+        if _websocket_thread is not None:
+            if _websocket_thread.is_alive():
+                return True
+            logger.warning("Restarting WebSocket proxy thread (previous thread died)")
+            start_websocket_server()
+            return _websocket_thread is not None and _websocket_thread.is_alive()
+        logger.warning("restart_websocket_server: no WS proxy was ever started here — skipping")
+        return False
+    except Exception:
+        logger.exception("restart_websocket_server failed")
+        return False
+
+
 def start_websocket_proxy(app):
     """
     Integrate the WebSocket proxy server with a Flask application.

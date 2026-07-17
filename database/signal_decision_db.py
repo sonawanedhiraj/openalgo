@@ -220,6 +220,23 @@ def get_signal_decision(decision_id: int) -> dict[str, Any] | None:
         db_session.remove()
 
 
+def get_signal_decisions_by_ids(decision_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Batch-fetch decision rows keyed by id (issue #358 — trade↔decision join).
+
+    Missing ids are simply absent from the result. Empty input → empty dict
+    without touching the DB.
+    """
+    ids = [int(i) for i in decision_ids if i is not None]
+    if not ids:
+        return {}
+    _ensure_tables()
+    try:
+        rows = db_session.query(SignalDecision).filter(SignalDecision.id.in_(ids)).all()
+        return {r.id: _row_to_dict(r) for r in rows}
+    finally:
+        db_session.remove()
+
+
 def _apply_source_filters(q, sources: list[str] | None, exclude_sources: list[str] | None):
     """Apply the inclusion / exclusion ``source`` filters to a query (R1, #318).
 

@@ -265,6 +265,148 @@ def test_get_data_freshness_returns_last_ts_and_none_for_missing(tmp_duckdb):
 
 
 # --------------------------------------------------------------------------- #
+# Issue #380 — opt-in session-coverage-aware staleness (compute_stale_symbols).
+#
+# The date-granular math can't see a partial session: one 09:16 bar dated today
+# made a symbol "fresh" for the rest of the day, so the 15:30-17:00 post-close
+# convergence never backfilled the other ~373 bars of the 375-bar session and
+# every scanner_aggregator_seeder run fell back to ~225 per-symbol broker calls
+# (849 on 2026-07-07 alone). Only the scanner 1m arm opts in; the default-off
+# path keeps the sector_follow / daily-D semantics byte-identical.
+# --------------------------------------------------------------------------- #
+TUE_0707 = date(2026, 7, 7)  # the incident day — an ordinary trading Tuesday
+
+
+def test_session_coverage_golden_lone_0916_bar_at_1534_is_stale(tmp_duckdb):
+    """The golden case from issue #380: last 1m bar 09:16 today, checked at the
+    15:34 post-close tick → STALE (pre-fix: fresh, catch-up skipped all day)."""
+    path = tmp_duckdb({"AAA": (2026, 7, 7, 9, 16)})
+    stale, fresh, details = dfs.compute_stale_symbols(
+        path,
+        ["AAA"],
+        today=TUE_0707,
+        max_staleness_business_days=0,
+        interval="1m",
+        require_session_coverage=True,
+        now=datetime(2026, 7, 7, 15, 34, tzinfo=_IST),
+    )
+    assert stale == ["AAA"]
+    assert fresh == []
+    assert details["AAA"]["stale"] is True
+    assert details["AAA"]["staleness_days"] == 0  # date-fresh — coverage is what flags it
+    # ~360 expected minutes (375 - 15 grace) vs ~2 covered.
+    assert details["AAA"]["session_coverage_shortfall_min"] > 300
+
+
+def test_session_coverage_full_session_bar_is_fresh(tmp_duckdb):
+    path = tmp_duckdb({"AAA": (2026, 7, 7, 15, 29)})
+    stale, fresh, details = dfs.compute_stale_symbols(
+        path,
+        ["AAA"],
+        today=TUE_0707,
+        max_staleness_business_days=0,
+        require_session_coverage=True,
+        now=datetime(2026, 7, 7, 15, 34, tzinfo=_IST),
+    )
+    assert stale == []
+    assert fresh == ["AAA"]
+    assert details["AAA"]["session_coverage_shortfall_min"] == 0.0
+
+
+def test_session_coverage_broker_lag_grace_is_fresh(tmp_duckdb):
+    """A last bar within the 15-minute broker-lag grace of the close (the
+    documented current-day historical-API lag) must NOT flag — otherwise the
+    first post-close tick would false-alarm on every normal day."""
+    path = tmp_duckdb({"AAA": (2026, 7, 7, 15, 19)})
+    stale, fresh, _details = dfs.compute_stale_symbols(
+        path,
+        ["AAA"],
+        today=TUE_0707,
+        max_staleness_business_days=0,
+        require_session_coverage=True,
+        now=datetime(2026, 7, 7, 15, 34, tzinfo=_IST),
+    )
+    assert stale == []
+    assert fresh == ["AAA"]
+
+
+def test_session_coverage_default_off_preserves_date_semantics(tmp_duckdb):
+    """Back-compat control — without the opt-in flag the lone 09:16 bar stays
+    fresh (the sector_follow callers and the daily-D arm keep the pre-#380
+    behavior byte-identical)."""
+    path = tmp_duckdb({"AAA": (2026, 7, 7, 9, 16)})
+    stale, fresh, details = dfs.compute_stale_symbols(
+        path,
+        ["AAA"],
+        today=TUE_0707,
+        max_staleness_business_days=0,
+        now=datetime(2026, 7, 7, 15, 34, tzinfo=_IST),
+    )
+    assert stale == []
+    assert fresh == ["AAA"]
+    assert "session_coverage_shortfall_min" not in details["AAA"]
+
+
+def test_session_coverage_intraday_restart_flags_gap(tmp_duckdb):
+    """A mid-session check (e.g. an 11:00 restart's boot convergence) expects
+    coverage up to now-minus-grace: a 09:16 bar is stale, a 10:58 bar is fine."""
+    path = tmp_duckdb({"OLD": (2026, 7, 7, 9, 16), "CUR": (2026, 7, 7, 10, 58)})
+    stale, fresh, _details = dfs.compute_stale_symbols(
+        path,
+        ["OLD", "CUR"],
+        today=TUE_0707,
+        max_staleness_business_days=0,
+        require_session_coverage=True,
+        now=datetime(2026, 7, 7, 11, 0, tzinfo=_IST),
+    )
+    assert stale == ["OLD"]
+    assert fresh == ["CUR"]
+
+
+def test_session_coverage_early_session_grace_never_flags(tmp_duckdb):
+    """Within the first grace minutes after open there is nothing fetchable yet
+    (broker lag) — a same-day bar must stay fresh regardless of its time."""
+    path = tmp_duckdb({"AAA": (2026, 7, 7, 9, 16)})
+    stale, fresh, _details = dfs.compute_stale_symbols(
+        path,
+        ["AAA"],
+        today=TUE_0707,
+        max_staleness_business_days=0,
+        require_session_coverage=True,
+        now=datetime(2026, 7, 7, 9, 25, tzinfo=_IST),
+    )
+    assert stale == []
+    assert fresh == ["AAA"]
+
+
+def test_session_coverage_weekend_check_requires_full_friday_session(tmp_duckdb):
+    """A Saturday boot rolls the reference back to Friday, whose session is
+    over — a partial Friday tape (09:16 bar) must flag so the weekend
+    convergence closes the gap instead of leaving it until Monday."""
+    sat = date(2026, 7, 11)
+    path = tmp_duckdb({"PART": (2026, 7, 10, 9, 16), "FULL": (2026, 7, 10, 15, 29)})
+    stale, fresh, _details = dfs.compute_stale_symbols(
+        path,
+        ["PART", "FULL"],
+        today=sat,
+        max_staleness_business_days=0,
+        require_session_coverage=True,
+        now=datetime(2026, 7, 11, 10, 0, tzinfo=_IST),
+    )
+    assert stale == ["PART"]
+    assert fresh == ["FULL"]
+
+
+def test_session_coverage_shortfall_zero_pre_open():
+    """Pre-open on the reference day: nothing to cover yet → 0.0."""
+    last_ts = _epoch(2026, 7, 7, 9, 16)
+    got = dfs.session_coverage_shortfall_min(
+        last_ts, TUE_0707, now=datetime(2026, 7, 7, 9, 0, tzinfo=_IST)
+    )
+    assert got == 0.0
+
+
+# --------------------------------------------------------------------------- #
 # check_strategy_data_ready
 # --------------------------------------------------------------------------- #
 @pytest.fixture

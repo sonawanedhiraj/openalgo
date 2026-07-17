@@ -43,6 +43,17 @@ Quick checks:
 2. `mcp__session_info__list_sessions` + `read_transcript` on today's "Fno scan cycle" sessions
 3. Then errors.jsonl (filter pytest noise per memory)
 
+**Silent tick-flow death (Flask alive, feed dead — the 2026-07-07 libzmq 10055
+incident):** two in-process daemons now watch for this (issue #376). The
+**tick-liveness watchdog** (`services/tick_liveness_watchdog.py`) alerts CRIT
+(`tick_liveness`) when NO live scanner bar closes for
+`SCANNER_LIVENESS_MAX_SILENT_MIN` (default 10) min in market hours, then runs an
+auto-heal ladder (re-subscribe → adapter reconnect → WS-proxy restart →
+terminal CRIT) and logs an hourly handle/TCP resource-trend line. The
+**WS-proxy supervisor** (`services/ws_proxy_supervisor.py`) auto-restarts the
+`websocket_proxy` subprocess on unexpected exit (`ws_proxy_died` alert, capped
+`WS_PROXY_MAX_RESTARTS_PER_DAY`/day). See `docs/SYSTEM_MAP.md` Processes §6.
+
 ## Task Tracking — Every Task Is a GitHub Issue
 
 Every unit of work — feature, bug fix, documentation, **or backtest round** —
@@ -969,11 +980,34 @@ proved hard stops net-negative on this signal class); the **15:28 IST EOD watchd
 NFO close; a rejected 15:25 SELL stays in the book for it to retry) is the only
 backstop. 3%-of-capital daily kill switch; modelled ~₹530/lot
 (0.03% notional) round-trip charges.
+**Big-loss news-context alert (issue #399):** the kill switch is same-day and
+blind to T+1 overnight losses (the 2026-07-07 war-day gap read ₹0), so on a big
+*realized* T+1 loss (`FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT`, default 2% of capital;
+`_maybe_alert_big_loss` in `run_exit`) — and on a kill-switch fire — the operator
+Telegram alert is enriched with recent market headlines (`news_context_service`
+reads `market_intel(kind='news')` already ingested by `news_ingest_service`), so
+a large loss is explainable (war/macro/broad sell-off) at a glance. **Strictly
+informational + human-in-the-loop — it NEVER places or cancels an order** (R54
+stops and R55 put hedges both proved reacting is net-negative on this
+leveraged-beta sleeve; headlines are treated as untrusted DATA, only embedded in
+the alert text). Read-only, fail-open, once/day; flags
+`NEWS_CONTEXT_ON_ALERTS_ENABLED` (default true), `NEWS_CONTEXT_LOOKBACK_MIN`,
+`NEWS_CONTEXT_MAX_ITEMS`, `NEWS_CONTEXT_HIGHLIGHT_TERMS`.
 **ACTIVELY TRADING IN SANDBOX** (`mode: sandbox`, `deployable: true`) — there is **no
 scaffold / observe-only state**; the mode flag is only `sandbox` or `live`.
 `FuturesFollowService` (`services/futures_follow_service.py`) is built at boot and
 registers 6 APScheduler jobs (reset 09:00 / smoke-check 15:18 / entry 15:20 /
-exit 15:25 / watchdog 15:28 / EOD-summary 15:30 IST). The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
+exit 15:25 / watchdog 15:28 / EOD-summary 15:30 IST).
+**Entry timing is flag-gated (`FUTURES_FOLLOW_ENTRY_MODE`, default `legacy`, issue #406):**
+`legacy` is the job map above (entry 15:20, T+1 exit 15:25). `same_minute` (OPTION_C)
+instead makes 15:20 a *signal snapshot* and 15:25 an *exit-then-entry* job — the T+1
+exit runs first so the new entry sizes against a fresh 50% cap (closes the #405 carry
+under-sizing) and margin never overlaps. Backtest: +1.19pp CAGR / +0.07 Sharpe vs
+legacy, peak margin 49.8% (see
+`docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md`).
+Selection stays at 15:20 (backtest-faithful); execution moves to 15:25. Live needs the
+exit fill confirmed before the entry places (sandbox ₹1Cr book is unaffected).
+The default `FUTURES_FOLLOW_MODE=sandbox` means it **places
 real orders into `sandbox.db` (the virtual ₹1Cr book) from boot** — the first sandbox
 cycle is **Monday 2026-06-15 15:20 IST** (the session's first sector_follow signal →
 a NIFTY-futures BUY in sandbox.db). Flip to `live` is operator-only (env or a
@@ -1005,15 +1039,27 @@ gain — NIFTY-only is the vehicle). Keep `sector_follow_cap5_vol` (CNC T+1 equi
 the alpha primary; run this as a separate, leverage-bounded beta sleeve. Key files:
 `services/futures_follow_service.py` (evaluator reuse + sizing + scheduler glue),
 `blueprints/futures_follow.py` (control API at `/futures_follow_cap50/api/*` —
-status/positions/pause/resume/close_all/data_health/entry_breakdown),
+status/positions/pause/resume/close_all/data_health/entry_breakdown/entry_breakdown-history),
 `database/futures_follow_db.py` (`futures_follow_trades` journal),
 `database/futures_follow_eval_db.py` (`futures_follow_eval_snapshots` — the
 per-day 15:20 entry-evaluation breakdown, issue #352: `run_entry` persists the
 sector_follow evaluator's per-symbol gate inputs/outcomes after placement
 decisions, fail-graceful; read via `GET /futures_follow_cap50/api/entry_breakdown`
-— API-key OR logged-in-session auth, read-only — and rendered as the "Today's
-15:20 Evaluation" card on `/strategies/futures_follow_cap50`, so a zero-signal
-day is explainable without reading logs). Plan + locked
+— API-key OR logged-in-session auth, read-only — and rendered as the
+"15:20 Evaluation" card on `/strategies/futures_follow_cap50`, so a zero-signal
+day is explainable without reading logs. **History (issue #395):** `GET
+/futures_follow_cap50/api/entry_breakdown/history?limit=&before=` lists per-day
+digests (`services/futures_follow_eval_view.summarize_payload` — ~300 B/day, not
+the ~9 KB payload; `limit` clamped to `MAX_HISTORY_LIMIT`=90, `before` pages
+backwards) plus a `today` object (`is_trading_day` via
+`data_freshness_service.is_trading_day`, `snapshot_exists`) that tells the UI
+whether to show the pending row — the snapshot only lands at 15:20 IST, and on a
+weekend/NSE holiday none is coming at all. The card is one table: today is the
+newest row, the newest row WITH a snapshot is expanded by default, and each row
+drills into the same per-symbol table via the `?date=` endpoint. Snapshots start
+2026-07-07 (when #352 shipped the writer); earlier days are not reconstructable
+because the live path reads today's close/volume from broker `quotes` while a
+replay could only read historify). Plan + locked
 decisions: [`strategies/futures_follow_cap50/PLAN.md`](strategies/futures_follow_cap50/PLAN.md).
 Backtest reports:
 [`docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md`](docs/research/strategy/sector_follow_cap5_vol/2026-06-14_sector_matched_futures_10L.md)
@@ -1186,6 +1232,15 @@ intervals** (`1m` AND `D`):
   symbol for the interval from `historify.duckdb` (via
   `data_freshness_service.compute_stale_symbols`, which already accepts an
   `interval` argument) and fetches **only the symbols behind today's close**.
+  On the `1m` arm the predicate is additionally **session-coverage-aware**
+  (issue #380, flag `SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED` default `true`):
+  a symbol whose last 1m bar is dated today but stops short of the elapsed
+  session (minus a 15-min broker-lag grace, mirroring the seeder's
+  `_has_sufficient_today_coverage`) is stale too — pre-#380 a lone 09:16 bar
+  counted the symbol fresh all day, the post-close loop never backfilled the
+  session, and every `scanner_aggregator_seeder` run fell back to ~225
+  per-symbol broker calls. The `D` arm and the sector_follow backfills keep the
+  date-granular semantics.
   Idempotent (fresh → no-op), fail-graceful (a dead-token fetch is logged into
   `errors`, never raised), empty-universe-safe (no-op when `SCANNER_SYMBOLS` is
   unset).
@@ -1205,7 +1260,8 @@ intervals** (`1m` AND `D`):
   `SCANNER_BACKFILL_PERIODIC_INTERVAL_MIN` (default `30`),
   `SCANNER_BACKFILL_PERIODIC_END_TIME` (default `17:00`),
   `SCANNER_BACKFILL_INTERVALS` (default `1m,D` — drop one arm to reduce broker
-  load). See `docs/PARAMETER_LOG.md`.
+  load), `SCANNER_BACKFILL_SESSION_COVERAGE_ENABLED` (default `true` — the #380
+  rollback switch). See `docs/PARAMETER_LOG.md`.
 - **Manual catch-up** for a deep historical gap — notably the one-time initial
   deep 1m backfill for the ~200 never-fetched scanner symbols, which is beyond
   the small lookback window — uses the CLI (needs an active broker session):
@@ -1323,6 +1379,43 @@ broker-known prior close, with every existing guard alert-only). Three parts:
   takes effect immediately). Tests: `test/test_scanner_reference_data.py`,
   `test/test_scanner_smoke_check.py`, and the golden-incident cases in
   `test/test_fno_intraday_{buy,sell}_chartink.py`.
+
+  **Per-symbol hold + mid-session straggler heal (issue #390, 2026-07-10).**
+  The post-hold used to be all-or-nothing: on 2026-07-08 just **3 of 216**
+  1m symbols stayed stale after the 09:16 pre-entry refresh (broker
+  current-day API lag tail), the 09:18 smoke check FAILED, and the hold
+  darked the **entire** scanner all session — 0 `scan_results`, 68 HELD
+  events, released only at 15:36 (after close) when the 15:30-17:00 periodic
+  loop finally re-checked. Two fixes:
+  - **A — the hold is now PER-SYMBOL.** On a FAIL the smoke check reads the
+    stale symbol SET from the stored-freshness rows'
+    (`scanner_universe_1m`/`_D`) own `stale_symbols` lists (the #338
+    post-refresh still-stale sets) and stores it on the hold.
+    `scanner_service._hit_held_by_smoke(symbol, …)` now holds a hit **only if
+    that symbol is in the stale set** — the fresh 213 post normally.
+    **Total-hold is preserved** for a genuine dead-feed morning: aggregator
+    coverage gate (gate 1) fail, broker session down (gate 4), a freshness
+    gate that names no symbols, or a stale fraction above
+    `SCANNER_SMOKE_TOTAL_HOLD_PCT` (default 0.5) all hold EVERYTHING (stale
+    set = `None` sentinel). A legacy symbol-less `set_post_hold` / a
+    symbol-less `is_post_hold_active` = total hold (backward-compatible).
+  - **B — mid-session straggler tick.** The convergence periodic loop only
+    runs 15:30-17:00, so morning stragglers couldn't self-heal intraday. A
+    new **daemon loop** (`_straggler_tick`/`_straggler_loop` in
+    `scanner_backfill_scheduler.py`) runs every `SCANNER_STRAGGLER_RECHECK_MIN`
+    (default 15) min inside **09:20-15:30 IST** on trading days (holiday-aware,
+    broker-session-gated), reuses the existing convergence machinery
+    (`run_backfill_checks(resettle=False)` → `check_and_refresh_if_stale`,
+    which no-ops cheaply when nothing is stale), persists the verified health
+    rows, then invokes `re_check_and_release()` — so a 3-straggler morning
+    heals within one tick (~15 min) and the hold narrows/clears intraday
+    instead of at 15:30. Gated by `SCANNER_STRAGGLER_RECHECK_ENABLED`
+    (default `true`). New flags: `SCANNER_SMOKE_TOTAL_HOLD_PCT`,
+    `SCANNER_STRAGGLER_RECHECK_ENABLED`, `SCANNER_STRAGGLER_RECHECK_MIN`
+    (see `docs/PARAMETER_LOG.md`). Tests:
+    `test/test_scanner_smoke_check.py` (partial vs total),
+    `test/test_scanner_service.py` (per-symbol enforcement),
+    `test/test_scanner_watchdog_and_backfill_gate.py` (straggler tick).
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 

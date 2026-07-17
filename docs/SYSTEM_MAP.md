@@ -192,6 +192,53 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   regime. Backtest (NIFTY-only CAP50): CAGR 14.44%, Sharpe 1.27, MaxDD −8.0% on ₹10L.
   See `strategies/futures_follow_cap50/PLAN.md`.
 
+### 6. Tick-liveness watchdog + WS-proxy supervisor (in-process daemon threads, issue #376)
+
+Two resilience daemons wired at boot in `app.py`'s background init thread,
+after `init_ws_recovery_service`. Both are the durable fix for the 2026-07-07
+libzmq WSAENOBUFS (10055) incident: the WS/ZMQ side hard-aborted at 13:42 IST
+while Flask kept serving port 5000, producing **42 minutes of silent tick
+outage** that every existing guard missed (the completeness metric only fires
+on a window roll, which needs a bar close, which needs ticks — a total outage
+never rolls it).
+
+- **WS-proxy supervisor** (`services/ws_proxy_supervisor.py`,
+  `WSProxySupervisor`): a daemon thread polls the WS-proxy handle every **30s**
+  via `websocket_proxy.app_integration.get_websocket_runtime_status()`
+  (subprocess under gunicorn+eventlet / real OS thread under the dev server /
+  `none` in Docker-standalone where the proxy runs externally). On an
+  **unexpected exit** it `logger.error`s, alerts Telegram (`ws_proxy_died`
+  event), waits `60s` backoff, then respawns the child via
+  `restart_websocket_server()` — capped at `WS_PROXY_MAX_RESTARTS_PER_DAY`
+  (default 3) per IST day. Beyond the cap it fires one CRITICAL alert and stops
+  (operator territory). Auto-restart runs at any hour; Telegram alerts are
+  suppressed outside 08:45-16:00 IST on trading days (no off-hours spam). Never
+  touches the main Flask process. No-op in Docker/standalone.
+- **Tick-liveness watchdog** (`services/tick_liveness_watchdog.py`,
+  `TickLivenessWatchdog`): a daemon thread polls — on its **own clock**,
+  independent of the tick stream — the wall-time of the last LIVE scanner bar
+  close (`scanner_service.get_last_live_bar_close_wall`, stamped in
+  `_on_bar_close` for non-replay bars only). On trading days between **09:25 and
+  15:30 IST** (holiday-aware via `data_freshness_service.is_trading_day`),
+  silence beyond `SCANNER_LIVENESS_MAX_SILENT_MIN` (default 10) minutes →
+  `logger.error` + Telegram CRIT (`tick_liveness` event), re-alerted at most
+  every `SCANNER_LIVENESS_REALERT_MIN` (default 30) min, with one INFO
+  "recovered after X min" line + notice when bars resume. An **auto-heal ladder**
+  (`TICK_LIVENESS_AUTOHEAL_ENABLED`, default true) then escalates one step per
+  ~2 min while dark: (1) re-subscribe nudge (`scanner_pre_subscriber.ensure(...,
+  reset=True)`), (2) broker-adapter reconnect (FEED cache-invalidate — the same
+  ZMQ event the ~3AM re-login rides), (3) WS-proxy restart via
+  `ws_proxy_supervisor.request_supervised_restart` (shares the supervisor's
+  daily cap), (4) terminal CRITICAL ("manual OpenAlgo restart required");
+  cooldown-throttled per `SCANNER_LIVENESS_LADDER_COOLDOWN_MIN` (default 30).
+  The same thread emits an **hourly resource-trend INFO line** (process
+  handle/TCP/thread counts via psutil, ctypes `GetProcessHandleCount` fallback;
+  the 10055 lead). No-op when `SCANNER_ENABLED` != true (no bars to watch).
+- **Master flags:** `TICK_LIVENESS_WATCHDOG_ENABLED` (default true),
+  `TICK_LIVENESS_AUTOHEAL_ENABLED` (default true). Tests:
+  `test/test_tick_liveness_watchdog.py`, `test/test_ws_proxy_supervisor.py`,
+  `test/test_scanner_live_bar_heartbeat.py`.
+
 ## In-process APScheduler jobs (OpenAlgo worker)
 
 These cron jobs run **inside** the single eventlet worker on the shared
@@ -256,7 +303,15 @@ periodic-in-the-post-close-window shape as sector_follow, gated by
 `'scanner_universe_D'`) — no schema change. CLI for deep manual catch-up
 (notably the one-time initial deep 1m backfill of never-fetched symbols): `python
 -m services.scanner_universe_backfill --from --to --interval {1m|D}`. Writes
-`1m`/`D` bars to `market_data`.
+`1m`/`D` bars to `market_data`. A **third daemon loop** — the **mid-session
+straggler re-check** (`ScannerStragglerRecheck`, issue #390) — runs every
+`SCANNER_STRAGGLER_RECHECK_MIN` (default 15) min inside **09:20-15:30 IST** on
+trading days: it reuses the same `run_backfill_checks(resettle=False)` machinery
+to catch up any symbols the 09:16 pre-entry refresh left stale, then invokes the
+scanner smoke-check `re_check_and_release()` so a handful of morning-stale
+symbols self-heal and the (now per-symbol) smoke post-hold narrows/clears
+intraday instead of at 15:30. Gated by `SCANNER_STRAGGLER_RECHECK_ENABLED`
+(default `true`).
 
 ### Telegram inbound intent bot (Phase 6)
 

@@ -51,6 +51,19 @@ _WINDOW_START = time(15, 30)
 _DEFAULT_END_TIME = "17:00"
 _DEFAULT_INTERVAL_MIN = 30
 
+# Mid-session straggler re-check window (issue #390). The post-close periodic
+# loop above only runs 15:30-17:00, so a handful of 1m/D symbols that miss the
+# 09:16 pre-entry catch-up (broker current-day API lag / rate-limit tail — the
+# 3/216 stale symbols on 2026-07-08) stay stale AND the smoke-fail post-hold
+# never re-evaluates until 15:30, holding a healthy day all session. This
+# in-market loop re-fetches only the still-stale symbols every N minutes and
+# invokes the smoke-hold release re-check, so morning stragglers self-heal
+# within one tick instead of darkening the scanner all day.
+_STRAGGLER_WINDOW_START = time(9, 20)
+_STRAGGLER_WINDOW_END = time(15, 30)
+_DEFAULT_STRAGGLER_INTERVAL_MIN = 15
+_straggler_thread: threading.Thread | None = None
+
 # How long the boot worker waits for a broker session (API key) to appear before
 # running the convergence check.
 _BOOT_WAIT_MAX_SEC = 7200
@@ -126,6 +139,29 @@ def _intervals() -> list[str]:
     return chosen or list(STORAGE_INTERVALS)
 
 
+def straggler_recheck_enabled() -> bool:
+    """``SCANNER_STRAGGLER_RECHECK_ENABLED`` env flag (default true). Master gate
+    for the mid-session straggler catch-up + smoke-hold release re-check (#390)."""
+    return os.getenv("SCANNER_STRAGGLER_RECHECK_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def _straggler_interval_seconds() -> int:
+    """``SCANNER_STRAGGLER_RECHECK_MIN`` (default 15) minutes → seconds (min 60s)."""
+    try:
+        return max(
+            60,
+            int(os.getenv("SCANNER_STRAGGLER_RECHECK_MIN", str(_DEFAULT_STRAGGLER_INTERVAL_MIN)))
+            * 60,
+        )
+    except (TypeError, ValueError):
+        return _DEFAULT_STRAGGLER_INTERVAL_MIN * 60
+
+
 def _interval_seconds() -> int:
     try:
         return max(
@@ -164,6 +200,13 @@ def _is_trading_day(d) -> bool:
 def _within_window(now_t: time, end_t: time) -> bool:
     """True iff ``now_t`` is in the post-close re-check window ``[15:30, end_t]``."""
     return _WINDOW_START <= now_t <= end_t
+
+
+def _within_straggler_window(now_t: time) -> bool:
+    """True iff ``now_t`` is in the mid-session straggler window ``[09:20, 15:30]``
+    (issue #390) — after the 09:16 pre-entry catch-up + 09:18 smoke check, up to
+    the market close where the post-close periodic loop takes over."""
+    return _STRAGGLER_WINDOW_START <= now_t <= _STRAGGLER_WINDOW_END
 
 
 def _seconds_until_next_window_start(now: datetime) -> float:
@@ -222,7 +265,7 @@ def _maybe_resettle_daily(today) -> None:
         logger.exception("scanner daily-D resettle raised")
 
 
-def run_backfill_checks(today=None) -> dict:
+def run_backfill_checks(today=None, *, resettle: bool = True) -> dict:
     """Run the per-interval stale-check (1m then D); return the combined verdict.
 
     ``all_fresh`` is **verified-fresh** semantics (issue #338): True iff no
@@ -240,11 +283,15 @@ def run_backfill_checks(today=None) -> dict:
 
     Before the stale-check, a once-per-day daily-D re-settle corrects any
     provisional (intraday-captured) daily close so the scanner's ``yest_d`` gate
-    reads the settled value (issue #299).
+    reads the settled value (issue #299). ``resettle=False`` skips it — used by
+    the mid-session straggler tick (#390), where an intraday non-incremental
+    full-universe D overwrite is undesirable (today's daily bar is still
+    provisional and re-settle is a post-close concern).
     """
     from services.scanner_universe_backfill import check_and_refresh_if_stale
 
-    _maybe_resettle_daily(today)
+    if resettle:
+        _maybe_resettle_daily(today)
 
     per_interval: dict[str, dict] = {}
     errors: list[str] = []
@@ -586,6 +633,79 @@ def stop_periodic_backfill_check() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Mid-session straggler re-check loop (issue #390)
+# --------------------------------------------------------------------------- #
+def _straggler_tick(now: datetime) -> tuple[bool, dict | None]:
+    """One mid-session straggler evaluation. Returns ``(ran, result)``.
+
+    ``ran`` is False (result None) when the tick is a no-op: feature off, outside
+    the trading-day ``[09:20, 15:30]`` window, or no broker session. Otherwise it
+    reuses the **existing convergence machinery** (``run_backfill_checks`` →
+    ``check_and_refresh_if_stale`` per interval, which no-ops cheaply when nothing
+    is stale) with ``resettle=False`` (the intraday daily bar is provisional —
+    re-settle is a post-close concern), persists the verified health rows (#338
+    semantics), and invokes the smoke-hold release re-check so a healed straggler
+    set narrows/clears the per-symbol post-hold **intraday** rather than at 15:30.
+
+    Idempotent, fail-graceful (every dependency is defensive; the loop wrapper
+    also catches). A no-stale tick is a cheap freshness read + no-op, not a
+    full re-fetch."""
+    if not straggler_recheck_enabled():
+        return False, None
+    if not (_is_trading_day(now.date()) and _within_straggler_window(now.time())):
+        return False, None
+    # Same broker-session gate as the post-close periodic tick — during the
+    # morning re-login gap there is no api_key, so a fetch would 401-flood.
+    if _gate_on_broker_session():
+        try:
+            from services.broker_session_health import is_live_broker_session
+
+            if not is_live_broker_session():
+                logger.info("scanner straggler tick: no broker session yet — skipping")
+                return False, None
+        except Exception:
+            logger.exception("scanner straggler: live-session probe raised — proceeding anyway")
+    res = run_backfill_checks(now.date(), resettle=False)
+    _persist_health(res)
+    _log_and_alert(res, phase="straggler")
+    _maybe_release_smoke_hold()
+    return True, res
+
+
+def _straggler_loop() -> None:
+    interval = _straggler_interval_seconds()
+    logger.info(
+        "scanner straggler re-check loop started (every %ds, window 09:20..15:30 IST)",
+        interval,
+    )
+    while not _stop_event.is_set():
+        now = datetime.now(_IST)
+        try:
+            _straggler_tick(now)
+        except Exception:  # a tick must never kill the loop
+            logger.exception("scanner straggler tick failed")
+        _stop_event.wait(interval)
+    logger.info("scanner straggler re-check loop stopped")
+
+
+def start_straggler_recheck() -> bool:
+    """Start the mid-session straggler daemon thread (idempotent). Returns True
+    if started. No-op (returns False) when the feature flag is off."""
+    global _straggler_thread
+    if not straggler_recheck_enabled():
+        logger.info("scanner straggler re-check disabled (SCANNER_STRAGGLER_RECHECK_ENABLED!=true)")
+        return False
+    if _straggler_thread is not None and _straggler_thread.is_alive():
+        return False
+    _stop_event.clear()
+    _straggler_thread = threading.Thread(
+        target=_straggler_loop, daemon=True, name="ScannerStragglerRecheck"
+    )
+    _straggler_thread.start()
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Boot entry
 # --------------------------------------------------------------------------- #
 def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
@@ -625,6 +745,9 @@ def _boot_worker() -> None:
             "periodic check will retry in the post-close window"
         )
     start_periodic_backfill_check()
+    # Issue #390: the mid-session straggler re-check loop (09:20-15:30 IST) so a
+    # handful of morning-stale symbols self-heal + release the smoke-hold intraday.
+    start_straggler_recheck()
 
 
 def init_scanner_backfill_scheduler(app=None) -> None:

@@ -210,6 +210,19 @@ class NotificationService:
             # operator needs visibility. Caller: services/scanner_service.py
             # (aggregator-seeding path).
             "scanner_aggregator_seed": _env_bool("NOTIFY_SCANNER_AGGREGATOR_SEED", default=True),
+            # Tick-liveness watchdog (issue #376). Fires CRIT when NO live bar
+            # closes across the whole scanner universe for
+            # SCANNER_LIVENESS_MAX_SILENT_MIN minutes during market hours —
+            # the total-feed-outage blind spot the completeness metric
+            # documents (a dead feed never rolls the completeness window).
+            # Default ON. Caller: services/tick_liveness_watchdog.py.
+            "tick_liveness": _env_bool("NOTIFY_TICK_LIVENESS", default=True),
+            # WS-proxy subprocess supervision (issue #376). Fires when the
+            # websocket_proxy child process (or dev-server WS thread) exits
+            # unexpectedly, on each auto-restart attempt, and CRIT when the
+            # daily restart cap is exhausted. Default ON. Caller:
+            # services/ws_proxy_supervisor.py.
+            "ws_proxy_died": _env_bool("NOTIFY_WS_PROXY_DIED", default=True),
         }
         # Whether to deliver messages for event_types NOT in per_event (i.e.
         # future callers that ship without a registry entry). When True (default)

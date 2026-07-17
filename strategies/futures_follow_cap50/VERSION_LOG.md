@@ -1,5 +1,29 @@
 # Futures Follow CAP50 — Version Log
 
+## v0.4.0 — 2026-07-14
+OPTION_C same-minute@15:25 entry, flag-gated (issues #405/#406).
+Mode: **sandbox (default)** · Deployable: **true** · Default behavior: **unchanged**
+
+- Finding (#405): the 15:20 entry seeds its 50% cap from `lots_held()`, which
+  counts the still-open prior-day lot (it exits at 15:25). This under-sizes carry
+  days — production was running the *more conservative* sizing than its own
+  validating backtest, which sizes each day against a fresh cap.
+- Backtest (four-way, `docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md`):
+  CONTROL 13.12% / Sharpe 1.19 · OPTION_A (fresh cap, entry 15:20) 14.44% / 1.27
+  but peak margin 98.7% · OPTION_B (same-min@15:20) 13.75% (loses the exit edge)
+  · **OPTION_C (same-min@15:25) 14.31% / 1.26, peak margin 49.8%** — the winner:
+  recovers +1.19pp/+0.07 Sharpe over CONTROL with no margin overlap.
+- Key asymmetry: exit-timing carries the edge (moving it earlier costs 0.69pp),
+  entry-timing does not (moving it later costs 0.13pp).
+- Change: `FUTURES_FOLLOW_ENTRY_MODE` (default `legacy`). `same_minute` swaps the
+  15:20 entry for a 15:20 *signal snapshot* and the 15:25 exit for a *15:25
+  exit-then-entry* job — exit first frees margin, so `run_entry` sizes against a
+  fresh (empty) book with no code change to the cap math. Selection stays at
+  15:20; execution moves to 15:25.
+- **Default is `legacy` — no behavior change on merge.** Operator flips to
+  `same_minute` after review. Live needs exit-fill confirmation before entry
+  (documented in PLAN.md); sandbox ₹1Cr book is unaffected.
+
 ## v0.3.1 — 2026-07-05
 EOD watchdog moved 15:14 → 15:28 so the 15:25 T+1 exit is primary (issue #334).
 Mode: **sandbox (default)** · Deployable: **true**

@@ -73,9 +73,26 @@ export interface VersionLogEntry {
   body: string
 }
 
+// Compact Stage-1 LLM veto decision embedded on a trade row (issue #358).
+export interface TradeLLMReview {
+  decision_id: number | null
+  decision: string
+  confidence: number | null
+  reasoning: string | null
+  enforcement_mode: string
+  candidate_at: string | null
+}
+
+// An enforced LLM skip that blocked an entry and therefore has no trade row —
+// rendered as a pseudo-row in the merged trades table (issue #358).
+export interface UnmatchedSkipDecision extends TradeLLMReview {
+  symbol: string
+  direction: string | null
+}
+
 export interface RecentTrade {
   id: number
-  side: 'BUY' | 'SELL'
+  side: 'BUY' | 'SELL' | 'LONG' | 'SHORT'
   symbol: string
   quantity: number
   lots?: number
@@ -90,6 +107,7 @@ export interface RecentTrade {
   status: string
   entry_date: string
   created_at: string | null
+  llm?: TradeLLMReview | null
 }
 
 // Latest data-freshness (data_health_check) state for the strategy's feed (#237).
@@ -118,6 +136,7 @@ export interface StrategyDetail {
   data_health: DataHealth
   performance: StrategyPerformance
   recent_trades: RecentTrade[]
+  llm_unmatched_skips?: UnmatchedSkipDecision[]
   version_log: VersionLogEntry[]
   backtest_refs: string[]
 }
@@ -209,6 +228,39 @@ export interface EntryBreakdownSnapshot {
   created_at: string | null
 }
 
+/** One day's digest in the evaluation-history table (issue #395). */
+export interface EntryBreakdownSummary {
+  eval_date: string
+  eval_at: string | null
+  mode: string | null
+  n_signals: number
+  placed: number
+  cap_skipped: number
+  vetoed: number
+  placement_failed: number
+  missing_data: number
+  total_symbols: number
+  evaluated_symbols: number
+  /** Symbols clearing each gate, of `evaluated_symbols`. */
+  gates_passed: { sector: number; stock: number; vol: number }
+  /** Raw stored fail counts — shown in the tooltip so log lines reconcile. */
+  gates_failed: { sector: number; stock: number; vol: number }
+  dominant_source: string
+  live_source_count: number
+  passed_symbols: Array<{ symbol: string; outcome: EntryBreakdownOutcome }>
+}
+
+export interface EntryBreakdownHistory {
+  rows: EntryBreakdownSummary[]
+  has_more: boolean
+  /**
+   * Whether a pending row belongs at the top. The snapshot is only written at
+   * 15:20 IST, so `snapshot_exists` is false all morning — but on a weekend or
+   * an NSE holiday none is ever coming, and `is_trading_day` says so.
+   */
+  today: { date: string; is_trading_day: boolean; snapshot_exists: boolean }
+}
+
 // ---------------------------------------------------------------------------
 // API client
 // ---------------------------------------------------------------------------
@@ -224,6 +276,20 @@ export const strategiesDashboardApi = {
     if (date) params.date = date
     const res = await webClient.get<{ status: string; data: EntryBreakdownSnapshot | null }>(
       '/futures_follow_cap50/api/entry_breakdown',
+      { params }
+    )
+    return res.data.data
+  },
+
+  /**
+   * Per-day digests of past 15:20 evaluations, newest first (issue #395).
+   * `before` (exclusive `YYYY-MM-DD`) pages backwards.
+   */
+  getEntryBreakdownHistory: async (limit = 30, before?: string): Promise<EntryBreakdownHistory> => {
+    const params: Record<string, string> = { limit: String(limit) }
+    if (before) params.before = before
+    const res = await webClient.get<{ status: string; data: EntryBreakdownHistory }>(
+      '/futures_follow_cap50/api/entry_breakdown/history',
       { params }
     )
     return res.data.data

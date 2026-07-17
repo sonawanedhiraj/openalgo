@@ -39,6 +39,10 @@ logger = get_logger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///db/openalgo.db")
 
+# Upper bound on a single ``list_snapshots`` page (issue #395). ~9 KB payload per
+# day, so 90 days is the most one request should ever load off disk.
+MAX_HISTORY_LIMIT = 90
+
 if DATABASE_URL and "sqlite" in DATABASE_URL:
     engine = create_engine(
         DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
@@ -132,6 +136,34 @@ def upsert_snapshot(
             eval_date_str,
         )
         return False
+    finally:
+        db_session.remove()
+
+
+def list_snapshots(
+    strategy_name: str,
+    limit: int = 30,
+    before: str | date | None = None,
+) -> list[dict]:
+    """Snapshots for ``strategy_name``, newest ``eval_date`` first (issue #395).
+
+    ``before`` (exclusive) pages backwards through the history: pass the oldest
+    ``eval_date`` already rendered to fetch the next page. ``limit`` is clamped to
+    ``[1, MAX_HISTORY_LIMIT]``.
+
+    Returns the same dicts as ``get_snapshot`` — each carries the full payload.
+    Callers that only need the per-day summary should run each payload through
+    ``services.futures_follow_eval_view.summarize_payload`` rather than shipping
+    ~9 KB/day to the browser.
+    """
+    limit = max(1, min(int(limit), MAX_HISTORY_LIMIT))
+    try:
+        query = db_session.query(FuturesFollowEvalSnapshot).filter_by(strategy_name=strategy_name)
+        if before is not None:
+            before_str = before.isoformat() if isinstance(before, date) else str(before)
+            query = query.filter(FuturesFollowEvalSnapshot.eval_date < before_str)
+        rows = query.order_by(FuturesFollowEvalSnapshot.eval_date.desc()).limit(limit).all()
+        return [_row_to_dict(r) for r in rows]
     finally:
         db_session.remove()
 

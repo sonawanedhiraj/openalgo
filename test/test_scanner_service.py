@@ -1584,3 +1584,164 @@ def test_smoke_hold_flag_off_does_not_block(fresh_scanner_db, monkeypatch):
     rows = scanner_service.get_scan_results(hours=24, source="inhouse")
     assert len(rows) == 1
     assert len(capturing_bus.events) == 1
+
+
+def test_partial_smoke_hold_holds_stale_symbol_posts_fresh(fresh_scanner_db, caplog):
+    """Issue #390 acceptance: a PER-SYMBOL hold (armed with a stale symbol set)
+    holds ONLY the stale symbol's hit; a fresh symbol posts normally even while
+    the hold is armed. A 3/216-style straggler no longer darks the whole
+    scanner."""
+    import logging
+
+    from services import scanner_smoke_check_service as smoke
+
+    capturing_bus = _CapturingBus()
+    svc = scanner_service.ScannerService(symbols=["RELIANCE", "TCS"], bus=capturing_bus)
+    _enable_buy_definition()
+    _seed_history(svc, "RELIANCE", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+    _seed_history(svc, "TCS", "5m", [100.0 + i * 0.5 for i in range(20)], [1000.0] * 20)
+
+    # RELIANCE is the stale straggler; TCS has fresh data.
+    smoke.set_post_hold(
+        reason="scanner_universe_1m stale", day=_PINNED_DAY, held_symbols=["RELIANCE"]
+    )
+
+    with caplog.at_level(logging.INFO, logger="services.scanner_service"):
+        svc._on_bar_close("RELIANCE", "5m", _matching_bar(minute=0))
+        svc._on_bar_close("TCS", "5m", _matching_bar(minute=0))
+
+    rows = scanner_service.get_scan_results(hours=24, source="inhouse")
+    posted = {sym for row in rows for sym in row["symbols"]}
+    # Fresh TCS posted; stale RELIANCE was held.
+    assert posted == {"TCS"}
+    assert {e.symbol for e in capturing_bus.events} == {"TCS"}
+    held = [r for r in caplog.records if "scanner HELD RELIANCE" in r.getMessage()]
+    assert len(held) == 1
+    assert not any("scanner HELD TCS" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Issue #367 — pre-session ticks must not pollute today's first bar.
+#
+# Evidence (2026-07-07): the app booted at 08:47, WS subscribed pre-market, and
+# pre-open ticks carrying last_price == the PRIOR close seeded today's first 5m
+# bucket. derive_today_and_yest Path B then reported today_d.open == yest_close
+# EXACTLY (KALYANKJIL 381.2/381.2, COCHINSHIP 1506/1506), so the strict
+# open_lt_yest_close SELL gate (and the mirror BUY gate) failed at equality on
+# genuine gap days. The fix drops ticks timestamped before 09:15:00 IST at the
+# bar-building layer (BarBuilder.on_tick), protecting every consumer.
+#
+# These tests drive the REAL path: _ingest_message → MultiIntervalAggregator →
+# _on_bar_close → _append_bar → derive_today_and_yest.
+# ---------------------------------------------------------------------------
+
+
+def _drive_ticks(svc, symbol: str, ticks: list[tuple[dt.datetime, float, int]]) -> None:
+    """Feed (ts, ltp, cumulative_volume) ticks through the real ZMQ-parse path."""
+    for ts_, px, vol in ticks:
+        payload = json.dumps({"ltp": px, "volume": vol, "timestamp": int(ts_.timestamp())})
+        svc._ingest_message(f"NSE_{symbol}_QUOTE", payload)
+
+
+def _daily_frame_ending_yesterday(today: dt.date, closes: list[float]) -> pd.DataFrame:
+    """Settled daily frame whose last row is dated YESTERDAY (with a real
+    ``timestamp`` column so ``derive_today_and_yest`` takes the production
+    Path B, not the synthetic-frame Path A)."""
+    n = len(closes)
+    dates = [today - dt.timedelta(days=n - i) for i in range(n)]
+    return pd.DataFrame(
+        {
+            "timestamp": [int(dt.datetime.combine(d, dt.time(15, 30)).timestamp()) for d in dates],
+            "open": closes,
+            "high": [c + 2.0 for c in closes],
+            "low": [c - 2.0 for c in closes],
+            "close": closes,
+            "volume": [1_000_000.0] * n,
+        }
+    )
+
+
+def test_preopen_tick_does_not_pollute_today_d_open_gap_down(fresh_scanner_db):
+    """Acceptance (issue #367), KALYANKJIL shape: pre-open tick @ prior close
+    381.2 at 09:05, live ticks from 09:15 @ ~352 (a genuine −8% gap-down).
+    today_d.open must be the 09:15 price, and the SELL rule's strict
+    ``open_lt_yest_close`` gate condition must now hold."""
+    from services.scan_rules._today_running import derive_today_and_yest
+
+    svc = scanner_service.ScannerService(symbols=["KALYANKJIL"], bus=_CapturingBus())
+    today = dt.date.today()
+
+    def t(h: int, m: int, s: int = 0) -> dt.datetime:
+        return dt.datetime(today.year, today.month, today.day, h, m, s)
+
+    _drive_ticks(
+        svc,
+        "KALYANKJIL",
+        [
+            (t(9, 5), 381.2, 500),  # pre-open auction tick @ prior close
+            (t(9, 15, 1), 352.0, 1_000),  # real gap-down open
+            (t(9, 16), 351.5, 1_500),
+            (t(9, 20, 1), 350.0, 2_000),  # closes the 09:15 bucket
+            (t(9, 25, 1), 349.4, 2_500),  # closes the 09:20 bucket
+        ],
+    )
+
+    frame = svc._bar_history[("KALYANKJIL", "5m")]
+    # No pre-session bucket may exist in the frame.
+    assert all(ts.time() >= dt.time(9, 15) for ts in frame["ts"])
+
+    bars_daily = _daily_frame_ending_yesterday(today, [378.0, 380.0, 381.2])
+    now_ist = dt.datetime.combine(today, dt.time(10, 0))
+    today_d, yest_d, _ = derive_today_and_yest(bars_daily, frame, now_ist)
+
+    assert today_d is not None and yest_d is not None
+    assert today_d["open"] == 352.0  # the 09:15 price — NOT yesterday's close
+    assert yest_d["close"] == 381.2
+    # The SELL rule's gate 9 condition (fails when open >= yest_close):
+    assert today_d["open"] < yest_d["close"]
+
+
+def test_preopen_tick_does_not_pollute_today_d_open_gap_up(fresh_scanner_db):
+    """Mirror BUY-side case: gap-UP. Pre-open tick @ prior close 100, live from
+    09:15 @ 104. today_d.open must be 104 so the BUY rule's strict
+    ``open_gt_yest_close`` gate condition holds."""
+    from services.scan_rules._today_running import derive_today_and_yest
+
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    today = dt.date.today()
+
+    def t(h: int, m: int, s: int = 0) -> dt.datetime:
+        return dt.datetime(today.year, today.month, today.day, h, m, s)
+
+    _drive_ticks(
+        svc,
+        "RELIANCE",
+        [
+            (t(9, 6), 100.0, 300),  # pre-open tick @ prior close
+            (t(9, 15, 2), 104.0, 900),  # real gap-up open
+            (t(9, 18), 104.5, 1_200),
+            (t(9, 20, 1), 105.0, 1_600),  # closes the 09:15 bucket
+        ],
+    )
+
+    frame = svc._bar_history[("RELIANCE", "5m")]
+    bars_daily = _daily_frame_ending_yesterday(today, [98.0, 99.0, 100.0])
+    now_ist = dt.datetime.combine(today, dt.time(10, 0))
+    today_d, yest_d, _ = derive_today_and_yest(bars_daily, frame, now_ist)
+
+    assert today_d is not None and yest_d is not None
+    assert today_d["open"] == 104.0
+    assert yest_d["close"] == 100.0
+    # The BUY rule's gate 9 condition (fails when open <= yest_close):
+    assert today_d["open"] > yest_d["close"]
+
+
+def test_tick_at_exactly_0915_is_kept(fresh_scanner_db):
+    """Boundary: a tick timestamped exactly 09:15:00 seeds the first bucket."""
+    svc = scanner_service.ScannerService(symbols=["RELIANCE"], bus=_CapturingBus())
+    today = dt.date.today()
+    ts = dt.datetime(today.year, today.month, today.day, 9, 15, 0)
+    _drive_ticks(svc, "RELIANCE", [(ts, 104.0, 100)])
+    snap = svc.aggregator.current_bar("RELIANCE", "5m")
+    assert snap is not None
+    assert snap["open"] == 104.0

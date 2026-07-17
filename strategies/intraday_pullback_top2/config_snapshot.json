@@ -1,0 +1,82 @@
+{
+  "strategy_name": "intraday_pullback_top2",
+  "description": "R53 combined long+short intraday pullback-breakout. Long mid-strength gainers on NIFTY-up days; deep-loser shorts on NIFTY-down days. Shared 60k/2-slot pool, EOD flatten.",
+  "mode": "sandbox",
+  "deployable": true,
+  "issue": 394,
+  "research": "docs/research/strategy/screener/2026-07-09_r53_loss_month_filters.md",
+
+  "capital": {
+    "base_capital": 60000,
+    "slots": 2,
+    "leverage": 5,
+    "sizing_mode": "fixed",
+    "weight": "equal",
+    "_notes": "margin/slot = base_capital/slots; notional/slot = margin*leverage. sizing_mode: fixed | compound | capped."
+  },
+
+  "windows_ist": {
+    "morning": ["09:30", "11:00"],
+    "no_trade": ["11:00", "13:00"],
+    "afternoon": ["13:00", "15:00"],
+    "eod_flatten": "15:15",
+    "daily_reset": "09:00",
+    "smoke_check": "09:18",
+    "eod_summary": "15:30",
+    "_notes": "no_trade[1] == afternoon[0] (same boundary). afternoon start tunable 12:00/13:00/14:00. eod_flatten strictly < 15:15 MIS square-off enforced upstream; 15:15 places exits before broker square-off."
+  },
+
+  "long": {
+    "active_on": "nifty_up",
+    "market_gate_pct": 0.0,
+    "sector_gate": "green",
+    "band_pct": [1.0, 2.5],
+    "rank": "desc",
+    "top_n": 2,
+    "vol_multiplier": 2.5,
+    "vol_avg_window": 6,
+    "fresh_gate_nifty_pct": 0.30,
+    "nf_mom": true,
+    "noreentry_after_sl": true,
+    "stop": "ref_candle_low",
+    "stop_floor_pct": 0.3,
+    "max_attempts": 2,
+    "reuse_morning_picks_afternoon": true
+  },
+
+  "short": {
+    "active_on": "nifty_down",
+    "market_gate_pct": 0.0,
+    "sector_gate": "red",
+    "band_pct": [-5.0, -3.0],
+    "rank": "asc",
+    "top_n": 2,
+    "vol_multiplier": 2.5,
+    "vol_avg_window": 6,
+    "fresh_gate_nifty_pct": -0.30,
+    "nf_mom": false,
+    "noreentry_after_sl": false,
+    "stop": "ref_candle_high",
+    "stop_floor_pct": 0.3,
+    "max_attempts": 2,
+    "reuse_morning_picks_afternoon": true,
+    "_notes": "Deep-loser band (-5,-3] is the edge; mid-strength (-1,-2.5] and nf_mom/noreentry/1pm-reselect all REJECTED. Most slippage-fragile leg."
+  },
+
+  "candle_minutes": 5,
+  "intraday_source_chain": ["aggregator", "broker_quotes", "historify"],
+
+  "backtest": {
+    "window": "2024-11-01..2026-07-06",
+    "universe": "163 stocks / 15 sectors, real NIFTY+15 sector indices, real Zerodha charges, slippage NOT modelled",
+    "combined_fixed": {"pf": 1.60, "wr": 48, "return_pct": 97.6, "sharpe": 2.96, "maxdd_pct": -8.9, "months_positive": "15/21"},
+    "combined_compound": {"pf": 1.60, "return_pct": 162.1, "sharpe": 2.93, "maxdd_pct": -11.6},
+    "long_contribution": {"trades": 155, "pf": 1.72, "net": 44202},
+    "short_contribution": {"trades": 80, "pf": 1.40, "net": 14362}
+  },
+
+  "llm_context": {
+    "strategy": "intraday_pullback_top2",
+    "framing": "Intraday T+0 pullback-breakout. Long book buys mid-strength (+1..+2.5%) sector-aligned gainers on a no-supply pullback then volume breakout; short book sells deep losers (-3..-5%) on a no-supply bounce then volume breakdown. All positions flat by 15:15. The veto reviews per-signal setup quality / regime fit, not overnight risk (no overnight hold)."
+  }
+}

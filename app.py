@@ -54,6 +54,7 @@ from blueprints.gc_json import gc_json_bp
 from blueprints.gex import gex_bp  # Import the GEX blueprint
 from blueprints.health import health_bp  # Import the health monitoring blueprint
 from blueprints.historify import historify_bp  # Import the historify blueprint
+from blueprints.intraday_pullback import intraday_pullback_bp  # intraday_pullback_top2 control
 from blueprints.ivchart import ivchart_bp  # Import the IV chart blueprint
 from blueprints.ivsmile import ivsmile_bp  # Import the IV Smile blueprint
 from blueprints.journal import journal_bp  # Stage 2 trade journal inspection endpoints
@@ -115,6 +116,13 @@ from database.flow_db import init_db as ensure_flow_tables_exists
 from database.futures_follow_db import init_db as ensure_futures_follow_tables_exists
 from database.futures_follow_eval_db import init_db as ensure_futures_follow_eval_tables_exists
 from database.historify_db import init_database as ensure_historify_tables_exists
+from database.intraday_pullback_config_db import (
+    init_db as ensure_intraday_pullback_config_tables_exists,
+)
+from database.intraday_pullback_db import init_db as ensure_intraday_pullback_tables_exists
+from database.intraday_pullback_eval_db import (
+    init_db as ensure_intraday_pullback_eval_tables_exists,
+)
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
@@ -287,6 +295,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(chartink_bp)
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
+    app.register_blueprint(intraday_pullback_bp)  # intraday_pullback_top2 control/observability
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
@@ -709,6 +718,9 @@ def setup_environment(app):
                 ("Historify DB", ensure_historify_tables_exists),
                 ("Flow DB", ensure_flow_tables_exists),
                 ("Futures Follow DB", ensure_futures_follow_tables_exists),
+                ("Intraday Pullback DB", ensure_intraday_pullback_tables_exists),
+                ("Intraday Pullback Config DB", ensure_intraday_pullback_config_tables_exists),
+                ("Intraday Pullback Eval DB", ensure_intraday_pullback_eval_tables_exists),
                 ("Futures Follow Eval DB", ensure_futures_follow_eval_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
@@ -916,6 +928,18 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Futures Follow service: {e}")
 
+            # Intraday Pullback Top-2 (combined long+short). Default mode=sandbox ->
+            # 09:00/09:18/5m-eval/15:15/15:30 IST jobs place real sandbox orders into
+            # sandbox.db (no live broker orders until the operator sets mode=live).
+            # See strategies/intraday_pullback_top2/ and INTRADAY_PULLBACK_MODE (#394).
+            try:
+                from services.intraday_pullback_service import init_intraday_pullback_service
+
+                init_intraday_pullback_service(app=app)
+                logger.debug("Intraday Pullback Top-2 service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Intraday Pullback service: {e}")
+
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
             # single 15:45 IST mon-fri job that compares the in-house scanner's
@@ -1114,6 +1138,38 @@ def setup_environment(app):
                 logger.info("WS recovery service registered")
             except Exception as e:
                 logger.error(f"Failed to initialize WS recovery service: {e}")
+
+            # WS-proxy subprocess supervision (issue #376). Polls the WS proxy
+            # handle every 30s from a daemon thread; on an unexpected exit it
+            # alerts (ws_proxy_died) and auto-restarts the child with the same
+            # args (capped at WS_PROXY_MAX_RESTARTS_PER_DAY/day, 60s backoff).
+            # Closes the 2026-07-07 gap where a libzmq assert killed the WS/ZMQ
+            # side while Flask kept serving. No-op in Docker/standalone (proxy
+            # runs externally). See services/ws_proxy_supervisor.py.
+            try:
+                from services.ws_proxy_supervisor import init_ws_proxy_supervisor
+
+                init_ws_proxy_supervisor(app=app)
+                logger.debug("WS proxy supervisor initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize WS proxy supervisor: {e}")
+
+            # Tick-liveness watchdog + auto-heal ladder + socket instrumentation
+            # (issue #376). Polls the wall-time of the last LIVE scanner bar
+            # close on its own clock; if NO bar closes across the whole universe
+            # for SCANNER_LIVENESS_MAX_SILENT_MIN minutes during market hours it
+            # alerts CRIT (tick_liveness) and runs the re-subscribe → adapter-
+            # reconnect → proxy-restart → terminal escalation ladder. Also emits
+            # the hourly handle/TCP resource-trend line (the 10055 lead). Closes
+            # the total-feed-outage blind spot the completeness metric documents.
+            # See services/tick_liveness_watchdog.py.
+            try:
+                from services.tick_liveness_watchdog import init_tick_liveness_watchdog
+
+                init_tick_liveness_watchdog(app=app)
+                logger.debug("Tick-liveness watchdog initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize tick-liveness watchdog: {e}")
 
             # Issue #157 (R4 of #156): boot-time orphan-exit reconciliation.
             # Marks pre-existing trade_journal rows where exit_reason was set

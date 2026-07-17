@@ -18,6 +18,85 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### futures_follow OPTION_C same-minute@15:25 entry (issue #406, added 2026-07-14)
+The 15:20 entry seeds its 50% margin cap from `lots_held()`, which counts the
+still-open prior-day lot (it exits at 15:25) — under-sizing carry days (issue #405).
+Backtest (`docs/research/strategy/futures_follow_cap50/2026-07-14_entry_cap_carry_sizing.md`):
+running the T+1 exit FIRST at 15:25 and placing entries in the same minute recovers
+**+1.19pp CAGR / +0.07 Sharpe** vs current production while keeping peak margin at
+**49.8%** (no overlap). Selection stays at 15:20 (backtest-faithful); only execution
+moves to 15:25. New tunable proposed in PR #406; lands on dev with the merge.
+
+#### FUTURES_FOLLOW_ENTRY_MODE (NEW)
+- **Current value:** unset → **`legacy`** (default = current behavior: entry 15:20,
+  T+1 exit 15:25). Set to **`same_minute`** to enable OPTION_C.
+- **Set in:** env; read by `services.futures_follow_service.futures_entry_mode()`,
+  consulted at `register_jobs` (takes effect on the next restart).
+- **What it does:** `same_minute` replaces the 15:20 entry job with a 15:20 *signal
+  snapshot* and the 15:25 exit job with a *15:25 exit-then-entry* job (exit first →
+  fresh cap → margin never overlaps). Any value other than `same_minute` resolves to
+  `legacy` (fail-safe). **Live caveat:** in live the exit fill must confirm before the
+  entry places, else a tight-margin broker could reject; the sandbox ₹1Cr book is
+  unaffected. Ships default-`legacy`; operator flips to `same_minute` after review.
+
+### VETO_CLAUDE_TIMEOUT_SECONDS 25 → 60 (added 2026-07-14)
+The Stage-1 LLM veto invokes `claude -p` in-process
+(`services/llm_review_client.invoke_claude_review`) with a wall-clock budget from
+`VETO_CLAUDE_TIMEOUT_SECONDS` (`signal_review_service._claude_timeout_seconds`,
+code default 25). Measured on 2026-07-14: a real veto prompt on the default model
+(Opus) takes **~19–22s warm** and more cold — the CLI cold-loads ~75K tokens of
+system/tool context per call, and live vetoes fire only a few times a day so they
+are always cold. Result: **100% of fresh reviews timed out** (`review_failed` /
+`claude_timeout`), failing safe to `take` — the guardrail was silently inert
+(2026-07-14 CONCOR / KALYANKJIL rows). Benchmarks also showed a model swap on the
+CLI path does NOT help (Haiku was slower, ~27–29s) and the `stdin=DEVNULL` fix saves
+at most ~3s — the CLI transport is the bottleneck, not the model. Bumping the budget
+is the correct hotfix and keeps the veto on the Claude subscription (OAuth) rather
+than a metered Messages-API bill.
+
+#### VETO_CLAUDE_TIMEOUT_SECONDS
+- **Current value:** `60` (in `.env`; code default remains `25` when unset).
+- **Set in:** env; read live per call by
+  `services.signal_review_service._claude_timeout_seconds` via `os.getenv` →
+  **takes effect on the next OpenAlgo restart** (the process env is loaded from
+  `.env` at boot).
+- **What it does:** wall-clock ceiling for the `claude -p` veto reasoning
+  subprocess. 60s gives comfortable headroom over the ~19–22s warm / higher-cold
+  latency so cold calls complete instead of timing out. Vetoes fire only a few
+  times/day, so the extra seconds are operationally immaterial. Lower it only if a
+  faster transport (direct Messages API) later replaces the CLI.
+
+### futures_follow big-loss news-context alerts (issue #399, added 2026-07-13)
+The 3% kill switch is same-day and blind to T+1 overnight losses (the 2026-07-07
+war-day gap read ₹0). New: on a big **realized** T+1 loss (and on a kill-switch
+fire) the operator alert is enriched with recent market headlines — already
+ingested by `news_ingest_service` into `market_intel(kind='news')` — so a large
+loss is *explainable* (war / macro / broad sell-off). **Strictly informational +
+human-in-the-loop: no order is ever placed from this path** (R54/R55 proved
+reacting is net-negative on this leveraged-beta sleeve). Pure DB read, fail-open.
+Proposed in PR for #399; lands on dev with the merge.
+
+#### FUTURES_FOLLOW_BIG_LOSS_ALERT_PCT (NEW)
+- **Current value:** unset → **2.0** (percent of capital; ₹20,000 on the ₹10L book).
+- **Set in:** env; read by `services.futures_follow_service.big_loss_alert_pct`,
+  consumed by `_maybe_alert_big_loss` (called from `run_exit`).
+- **What it does:** realized daily-loss magnitude that triggers the news-enriched
+  big-loss alert (at most once/day, reset at the 09:00 daily reset). Does NOT gate
+  trading — alert only.
+
+#### NEWS_CONTEXT_ON_ALERTS_ENABLED (NEW)
+- **Current value:** unset → **`true`**. Master switch for attaching news context
+  to big-loss / kill-switch alerts. When `false`, `get_recent_news_context`
+  returns "" and alerts fire unchanged (no news block).
+- **Set in:** env; read by `services.news_context_service`.
+
+#### NEWS_CONTEXT_LOOKBACK_MIN / NEWS_CONTEXT_MAX_ITEMS / NEWS_CONTEXT_HIGHLIGHT_TERMS (NEW)
+- **Defaults:** `720` (12h lookback), `6` (headlines shown), and a built-in
+  geopolitics/macro highlight list (war/attack/missile/sanction/RBI/Fed/crude/…)
+  overridable as a comma-separated list. Highlighted headlines get a ⚠️ marker —
+  a hint to the operator, **never** a trading trigger.
+- **Set in:** env; read by `services.news_context_service`.
+
 ### futures_follow quotes-snapshot data source (issue #332, added 2026-07-05)
 `futures_follow_cap50` makes exactly one decision per day (15:20 IST); PR #333
 moved its decision snapshot (today's per-symbol close + cumulative volume) off
@@ -1587,6 +1666,54 @@ wired in `app.py` via `init_scanner_backfill_scheduler`.
 - **History:**
   - **2026-07-06:** Introduced by issue #342 / PR #343 (operator request:
     stocks shown only while conditions are met; fired signals stay in history).
+
+## `TICK_LIVENESS_*` / `WS_PROXY_*` — feed-death watchdog + supervision (issue #376)
+
+Added by PR #391 after the 2026-07-07 libzmq WSAENOBUFS (10055) assertion killed
+the WS/ZMQ side while Flask stayed up — 42 min of silent tick outage.
+
+- **`TICK_LIVENESS_WATCHDOG_ENABLED`** (default `true`): master gate for the
+  tick-liveness watchdog (CRIT alert when no live bar closes universe-wide for
+  a threshold during market hours; the documented total-outage blind spot the
+  completeness metric cannot catch).
+- **`SCANNER_LIVENESS_MAX_SILENT_MIN`** (default `10`): minutes of universe-wide
+  bar-close silence (09:25-15:30 IST, holiday-aware) before the watchdog trips.
+- **`SCANNER_LIVENESS_REALERT_MIN`** (default `30`): re-alert cadence while an
+  outage persists.
+- **`TICK_LIVENESS_AUTOHEAL_ENABLED`** (default `true`): run the in-process
+  auto-heal ladder on trip (re-subscribe nudge -> broker adapter reconnect ->
+  WS-proxy subprocess restart -> terminal CRIT). `false` = alert-only.
+- **`SCANNER_LIVENESS_LADDER_COOLDOWN_MIN`** (default `30`): the whole ladder
+  runs at most once per this window (anti-thrash).
+- **`WS_PROXY_MAX_RESTARTS_PER_DAY`** (default `3`): supervisor auto-restart cap
+  for the WS-proxy subprocess per IST day; beyond it, CRIT and stop trying.
+- **History:**
+  - **2026-07-08:** Introduced by issue #376 / PR #391. Follow-ups tracked:
+    external main-process supervisor (#384), re-subscription seams (post-#376).
+
+## `SCANNER_SMOKE_TOTAL_HOLD_PCT` / `SCANNER_STRAGGLER_RECHECK_*` — per-symbol hold + intraday heal (issue #390)
+
+Added by PR #393 after 2026-07-08, when 3 of 216 stale 1m symbols armed the
+smoke post-hold all-or-nothing and suppressed the ENTIRE scanner all session
+(0 signals; hold released 15:36 after close because the release re-check only
+ran in the 15:30-17:00 periodic window).
+
+- **`SCANNER_SMOKE_TOTAL_HOLD_PCT`** (default `0.5`): on a smoke FAIL from stored
+  1m/D staleness, a stale fraction ABOVE this holds EVERYTHING (genuine dead-feed
+  / broker-down morning); at or below it, the hold is PER-SYMBOL — only the named
+  stale symbols are held, the fresh majority posts. A `None`/symbol-less hold
+  (aggregator-coverage gate fail, legacy caller) is always a total hold.
+- **`SCANNER_STRAGGLER_RECHECK_ENABLED`** (default `true`): master gate for the
+  mid-session straggler-heal loop.
+- **`SCANNER_STRAGGLER_RECHECK_MIN`** (default `15`): interval (minutes) of the
+  market-hours (09:20-15:30 IST, trading days) tick that re-fetches still-stale
+  symbols, persists verified health rows, and re-runs `re_check_and_release` — so
+  a handful of morning stragglers self-heal intraday instead of holding until the
+  15:30 periodic window.
+- **History:**
+  - **2026-07-10:** Introduced by issue #390 / PR #393. Fourth layer of the
+    smoke-hold saga: #305 (enforce) -> #319 (release wiring) -> #338 (verified
+    health rows) -> #390 (per-symbol + intraday heal).
 
 ## Other tunables (placeholder — populate as discovered)
 

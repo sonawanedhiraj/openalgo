@@ -41,6 +41,9 @@ export interface ScanSignal {
   source: string
   posted_to_engine: boolean
   notes?: string | null
+  // Bar close the rule matched on, captured at write time. null for
+  // pre-migration rows and multi-symbol chartink rows.
+  price?: number | null
 }
 
 export interface ScanDefinitionSummary {

@@ -27,10 +27,10 @@ import json
 import os
 import sys
 import threading
+import time as _time
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import time as _dtime
 from typing import Any
 
 import pandas as pd
@@ -45,7 +45,12 @@ from database.scanner_db import (
     _result_to_dict,
 )
 from services import indicators as _indicators
-from services.bar_aggregator import BarBuilder, MultiIntervalAggregator
+from services.bar_aggregator import (
+    SESSION_CLOSE_IST,
+    SESSION_OPEN_IST,
+    BarBuilder,
+    MultiIntervalAggregator,
+)
 from utils.event_bus import Event
 from utils.event_bus import bus as _default_bus
 from utils.logging import get_logger
@@ -65,8 +70,11 @@ logger = get_logger(__name__)
 # change to either one cannot silently re-open the post-close path on its own.
 # ---------------------------------------------------------------------------
 _IST = pytz.timezone("Asia/Kolkata")
-_MARKET_OPEN_IST = _dtime(9, 15)
-_MARKET_CLOSE_IST = _dtime(15, 30)
+# Shared NSE session bounds (issue #367): aliased from bar_aggregator so the
+# session definition lives in one place — the bar-building pre-session tick
+# gate and this evaluation gate can never drift apart.
+_MARKET_OPEN_IST = SESSION_OPEN_IST
+_MARKET_CLOSE_IST = SESSION_CLOSE_IST
 
 
 def _postclose_gate_enabled() -> bool:
@@ -143,6 +151,40 @@ def _completeness_crit_pct() -> float:
         return float(os.environ.get("SCANNER_COMPLETENESS_CRIT_PCT", "20"))
     except ValueError:
         return 20.0
+
+
+# ---------------------------------------------------------------------------
+# Tick-liveness heartbeat (issue #376 — the 2026-07-07 libzmq WSAENOBUFS
+# incident: the WS/ZMQ side died at 13:42 while Flask kept serving, and NO bar
+# closes for 42 minutes produced no alert because the completeness metric only
+# fires on window ROLLS driven by bar closes — a TOTAL outage never rolls the
+# window). The scanner stamps the wall-clock time of every genuine LIVE bar
+# close here; services/tick_liveness_watchdog.py polls this timestamp on its
+# own clock (independent of the tick stream) and alerts when it goes stale
+# mid-session. Replayed bars (boot seeder / ws_recovery) never stamp — a
+# historical replay must not make a dead feed look alive.
+# ---------------------------------------------------------------------------
+
+_last_live_bar_close_wall: float | None = None
+
+
+def _mark_live_bar_close() -> None:
+    """Stamp the wall-clock time of the most recent non-replay bar close."""
+    global _last_live_bar_close_wall  # noqa: PLW0603 — process-wide heartbeat by design
+    _last_live_bar_close_wall = _time.time()
+
+
+def get_last_live_bar_close_wall() -> float | None:
+    """Wall-clock (``time.time()``) of the last LIVE bar close, or None if no
+    live bar has closed since process start. Read by the tick-liveness
+    watchdog; never raises."""
+    return _last_live_bar_close_wall
+
+
+def _reset_live_bar_close_for_tests() -> None:
+    """Reset the heartbeat — tests only."""
+    global _last_live_bar_close_wall  # noqa: PLW0603
+    _last_live_bar_close_wall = None
 
 
 def _default_completeness_notifier(message: str) -> None:
@@ -539,10 +581,21 @@ def record_scan_result(
     source: str,
     posted_to_engine: bool = False,
     notes: str | None = None,
+    price: float | None = None,
 ) -> int:
-    """Append a scan result row and return its id."""
+    """Append a scan result row and return its id.
+
+    ``price`` is the bar close the rule matched on (in-house scanner). It is
+    optional and best-effort: a non-numeric value is coerced to ``None`` so a
+    malformed bar can never break the audit insert.
+    """
     if source not in {"chartink", "inhouse", "shadow", "manual"}:
         raise ValueError(f"source must be one of chartink|inhouse|shadow|manual, got {source!r}")
+    price_val: float | None
+    try:
+        price_val = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price_val = None
     sess = _session()
     try:
         row = ScanResult(
@@ -552,6 +605,7 @@ def record_scan_result(
             source=source,
             posted_to_engine=1 if posted_to_engine else 0,
             notes=notes,
+            price=price_val,
         )
         sess.add(row)
         sess.commit()
@@ -1152,6 +1206,45 @@ class ScannerService:
             logger.exception("ScannerService.get_today_ohlcv failed for %s", symbol)
             return None, None
 
+    def get_today_bars(
+        self, symbol: str, as_of_date: _dt.date, interval: str | None = None
+    ) -> list:
+        """Return today's CLOSED OHLCV bars for ``symbol`` at the primary interval.
+
+        A list of ``(ts, open, high, low, close, volume)`` tuples (naive IST ``ts``),
+        filtered to ``as_of_date``. The in-progress (not-yet-closed) bar is
+        intentionally excluded — callers that trigger on a bar (e.g. a breakout
+        candle) must see only confirmed closed bars. Returns ``[]`` when the
+        scanner has no bars for ``symbol`` today. Thread-safe; never raises.
+
+        Companion to ``get_today_ohlcv`` (which returns cumulative close+volume);
+        this returns the per-candle series a candlestick-pattern strategy needs.
+        """
+        try:
+            interval = interval or (self.intervals[0] if self.intervals else "5m")
+            with self._history_lock:
+                frame = self._bar_history.get((symbol, interval))
+                rows = frame.to_dict("records") if frame is not None and not frame.empty else []
+            out = []
+            for r in rows:
+                ts = r.get("ts")
+                if ts is None or getattr(ts, "date", lambda: None)() != as_of_date:
+                    continue
+                out.append(
+                    (
+                        ts,
+                        float(r.get("open")),
+                        float(r.get("high")),
+                        float(r.get("low")),
+                        float(r.get("close")),
+                        float(r.get("volume") or 0),
+                    )
+                )
+            return out
+        except Exception:
+            logger.exception("ScannerService.get_today_bars failed for %s", symbol)
+            return []
+
     # -- ZMQ subscriber -----------------------------------------------------
 
     def _run_subscriber(self) -> None:
@@ -1240,6 +1333,7 @@ class ScannerService:
             bars = self._append_bar(symbol, interval, bar)
             if bar.get("is_replay"):
                 return
+            _mark_live_bar_close()  # issue #376 tick-liveness heartbeat (live bars only)
             indicators_dict = self._build_indicators(symbol, bars)
             self._evaluate_definitions(symbol, interval, bars, indicators_dict, bar)
         except Exception:
@@ -1504,6 +1598,7 @@ class ScannerService:
                     source="inhouse",
                     posted_to_engine=False,
                     notes=f"interval={interval}",
+                    price=bar.get("close"),
                 )
             except Exception:
                 logger.exception(
@@ -1565,14 +1660,18 @@ class ScannerService:
             return {}
 
     def _hit_held_by_smoke(self, symbol: str, now_ist: _dt.datetime) -> bool:
-        """True iff the smoke-fail post-hold is active — the caller must skip
-        persisting/posting the hit. Emits a once-per-(symbol, IST-day)
-        WARNING so the held PASS is visible without flooding. Fail-open on a
-        probe error (never blocks on a broken import). Never raises."""
+        """True iff the smoke-fail post-hold is active FOR THIS SYMBOL — the
+        caller must skip persisting/posting the hit. The hold is per-symbol
+        (issue #390): only a symbol whose own data is untrustworthy is held; a
+        symbol with fresh data posts normally even while a partial hold is armed
+        (a total hold — dead feed / aggregator-starved / broker down — still
+        holds everything). Emits a once-per-(symbol, IST-day) WARNING so the
+        held PASS is visible without flooding. Fail-open on a probe error
+        (never blocks on a broken import). Never raises."""
         try:
             from services.scanner_smoke_check_service import is_post_hold_active  # noqa: PLC0415
 
-            if not is_post_hold_active(now=now_ist):
+            if not is_post_hold_active(now=now_ist, symbol=symbol):
                 return False
         except Exception:
             logger.exception("ScannerService: smoke post-hold probe failed — not holding")

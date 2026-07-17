@@ -106,6 +106,7 @@ def _make_service(signals=None, **overrides):
     signal_evaluator_details = overrides.pop("signal_evaluator_details", None)
     signal_reviewer = overrides.pop("signal_reviewer", None)
     market_context_provider = overrides.pop("market_context_provider", None)
+    news_context_provider = overrides.pop("news_context_provider", lambda: "")
     order_placer = overrides.pop("order_placer", fake_placer)
 
     intent_resolver = overrides.pop("intent_resolver", None)
@@ -132,6 +133,7 @@ def _make_service(signals=None, **overrides):
         data_health_checker=data_health_checker,
         signal_reviewer=signal_reviewer,
         market_context_provider=market_context_provider,
+        news_context_provider=news_context_provider,
     )
     svc._test_placed = placed_orders
     svc._test_journal = journal
@@ -335,6 +337,125 @@ def test_run_exit_skips_same_day_positions():
     exited = svc.run_exit()
     assert exited == []
     assert svc.lots_held() == 1
+
+
+# --------------------------------------------------------------------------- #
+# OPTION_C same-minute@15:25 (issue #406)
+# --------------------------------------------------------------------------- #
+def test_signal_snapshot_stashes_signals_without_placing():
+    svc = _make_service(signals=[_sig("AAA"), _sig("BBB")], mode="sandbox")
+    out = svc.run_signal_snapshot()
+    assert [s["symbol"] for s in out] == ["AAA", "BBB"]
+    assert svc._pending_snapshot is not None
+    assert [s["symbol"] for s in svc._pending_snapshot[1]] == ["AAA", "BBB"]
+    assert svc._test_placed == []  # snapshot places NO orders
+
+
+def test_exit_then_entry_exits_first_then_sizes_fresh_cap():
+    """OPTION_C core: the T+1 exit runs BEFORE the entry, so the carried lot's
+    margin is freed and the new entry sizes against a fresh (empty) book — the
+    #405 leak is closed by construction, not by a sizing rule."""
+    # 2 lots already held into the session (prior-day) — with legacy sizing they
+    # would occupy the whole 50% cap and block today's entries.
+    svc = _make_service(signals=[_sig("AAA")], mode="sandbox", price_fetcher=lambda s, e: 24000.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09", lots=2)  # exits today
+    svc.run_signal_snapshot()
+    result = svc.run_exit_then_entry()
+    assert len(result["exited"]) == 1  # the prior-day 2-lot cohort squared off
+    assert len(result["placed"]) == 1  # today's entry placed (cap was fresh)
+    # exactly one held position remains: today's new lot, none of the old
+    assert svc.lots_held() == 1
+    sides = [o[1]["action"] for o in svc._test_placed]
+    assert sides == ["SELL", "BUY"]  # exit first, then entry
+
+
+def test_exit_then_entry_falls_back_to_fresh_eval_without_snapshot():
+    svc = _make_service(signals=[_sig("AAA")], mode="sandbox", price_fetcher=lambda s, e: 24000.0)
+    # no run_signal_snapshot() called -> _pending_snapshot is None
+    assert svc._pending_snapshot is None
+    result = svc.run_exit_then_entry()
+    assert len(result["placed"]) == 1  # re-evaluated at 15:25 and placed
+
+
+def test_signal_snapshot_failure_clears_pending(monkeypatch):
+    svc = _make_service(mode="sandbox")
+    monkeypatch.setattr(
+        svc, "evaluate_signals", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    out = svc.run_signal_snapshot()
+    assert out == []
+    assert svc._pending_snapshot is None  # cleared on failure (15:25 re-evaluates)
+
+
+def _open_store_book(symbol="NIFTY30JUN26FUT", qty=75, avg="24000.0"):
+    return (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": symbol,
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": qty,
+                    "average_price": avg,
+                }
+            ],
+        },
+        200,
+    )
+
+
+def test_run_exit_rehydrates_boot_race_position_before_squaring_off():
+    """Issue #403 — the 2026-07-14 missed-exit reproduction. The in-memory
+    paper_book is EMPTY (boot rehydration skipped because the broker session
+    wasn't up yet), but a prior-day leg is still open in the store. run_exit must
+    rehydrate-then-exit so the T+1 square-off still fires — pre-fix it squared off
+    0 because it only looked at the empty paper_book."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    assert svc.paper_book == {}  # boot-race: nothing in memory
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=_open_store_book(qty=75, avg="24000.0"),
+        ),
+    ):
+        exited = svc.run_exit()
+    assert len(exited) == 1  # pre-fix: 0
+    assert svc._test_placed[0][1]["action"] == "SELL"
+    assert svc.lots_held() == 0
+
+
+def test_run_eod_watchdog_rehydrates_boot_race_position():
+    """The 15:28 watchdog is the second exit path — it must also rehydrate a
+    boot-race position the empty paper_book never saw (issue #403)."""
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    assert svc.paper_book == {}
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch(
+            "services.positionbook_service.get_positionbook",
+            return_value=_open_store_book(),
+        ),
+    ):
+        flattened = svc.run_eod_watchdog()
+    assert len(flattened) == 1
+    assert svc.lots_held() == 0
+
+
+def test_run_exit_rehydrate_before_exit_is_noop_when_store_empty():
+    """No open store position -> rehydrate-before-exit is a clean no-op and the
+    exit run stays empty (never raises, never fabricates a position)."""
+    svc = _make_service(mode="sandbox")
+    empty = (True, {"status": "success", "data": []}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=empty),
+    ):
+        exited = svc.run_exit()
+    assert exited == []
+    assert svc.lots_held() == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -993,6 +1114,42 @@ def test_rehydrate_rebuilds_paper_book_in_live():
     assert pos.entry_date != "2026-06-10"
 
 
+def test_rehydrate_stamps_previous_trading_day_not_calendar_yesterday():
+    """A Monday restart of a Friday position must stamp the FRIDAY (previous
+    trading day), never Sunday (calendar-yesterday) — issue #401. The buggy
+    Sunday entry_date rode straight into the T+1 journal exit row, showing an
+    impossible entry session on the dashboard."""
+    # Monday 2026-07-13; calendar-yesterday is Sunday 2026-07-12 (impossible).
+    monday = lambda: datetime(2026, 7, 13, 15, 20, tzinfo=_IST)  # noqa: E731
+    svc = _make_service(mode="sandbox", now=monday)
+    book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": "NIFTY28JUL26FUT",
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": 75,
+                    "average_price": "24240.0",
+                },
+            ],
+        },
+        200,
+    )
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=book),
+    ):
+        n = svc.rehydrate_paper_book_from_store()
+    assert n == 1
+    pos = next(iter(svc.paper_book.values()))
+    assert pos.entry_date == "2026-07-10"  # Friday, not Sunday 2026-07-12
+    # And it's still a prior day, so the T+1 exit predicate (entry_date != today) fires.
+    assert pos.entry_date != "2026-07-13"
+
+
 def test_rehydrate_skips_already_known_symbols():
     svc = _make_service(mode="live")
     _seed_position(svc, "P1", entry_date="2026-06-09")  # NIFTY26JUN24FUT already held
@@ -1518,6 +1675,12 @@ def test_run_entry_active_skip_blocks_lot_and_does_not_consume_cap(monkeypatch):
     assert veto_rows[0]["signal_id"] == "AAA"
     assert veto_rows[0]["margin_inr"] == 0.0
     assert veto_rows[0]["order_id"] is None
+    # The veto_skip row links back to its signal_decision audit row (#358).
+    assert veto_rows[0]["decision_id"] == 1
+    # Placed entries carry their reviewer's decision id too (reviewer stub
+    # returns id=call-ordinal: AAA=1, BBB=2, CCC=3).
+    placed_rows = [j for j in svc._test_journal if j.get("status") == "placed"]
+    assert sorted(r["decision_id"] for r in placed_rows) == [2, 3]
     # No phantom position for the vetoed signal.
     assert all(p.signal_symbol != "AAA" for p in svc.paper_book.values())
     # And only two orders reached the placer.
@@ -1867,6 +2030,95 @@ def test_entry_breakdown_snapshot_none_when_not_yet_evaluated(_isolated_eval_db)
     """No evaluation recorded yet for a given date -> get_snapshot returns None
     (the endpoint's contract: data=null means 'no evaluation recorded yet')."""
     assert _isolated_eval_db.get_snapshot("futures_follow_cap50", "2026-01-01") is None
+
+
+# --------------------------------------------------------------------------- #
+# Big-loss news-context alert (issue #399) — informational, human-in-the-loop
+# --------------------------------------------------------------------------- #
+def test_big_loss_alert_fires_with_news_on_large_t1_loss():
+    alerts = []
+    svc = _make_service(
+        mode="sandbox",
+        price_fetcher=lambda s, e: 23_400.0,  # -600 pts vs 24000 entry -> ~-45k
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "📰 Recent headlines:\n⚠️ [et] War fears hit markets",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()
+    big = [a for a in alerts if "BIG LOSS" in a]
+    assert len(big) == 1
+    assert "War fears" in big[0]  # news context attached
+    assert "no auto-action" in big[0].lower()  # human-in-the-loop framing
+
+
+def test_big_loss_alert_not_fired_on_small_loss():
+    alerts = []
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_990.0,  # -10 pts -> tiny loss, below 2%
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "NEWS",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()
+    assert not any("BIG LOSS" in a for a in alerts)
+
+
+def test_big_loss_alert_dedups_per_day_and_resets():
+    alerts = []
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_400.0,
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "N",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()
+    _seed_position(svc, "P2", entry_date="2026-06-09")
+    svc.run_exit()  # same day -> deduped
+    assert len([a for a in alerts if "BIG LOSS" in a]) == 1
+    svc.reset_daily_state()
+    _seed_position(svc, "P3", entry_date="2026-06-09")
+    svc.run_exit()  # after reset -> fires again
+    assert len([a for a in alerts if "BIG LOSS" in a]) == 2
+
+
+def test_big_loss_alert_places_no_extra_order():
+    """The alert is informational — it must NOT place or cancel any order."""
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_400.0,
+        news_context_provider=lambda: "N",
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    n_before = len(svc._test_placed)
+    svc.run_exit()
+    assert len(svc._test_placed) == n_before + 1  # only the T+1 SELL, none from the alert
+
+
+def test_kill_switch_alert_includes_news_context():
+    alerts = []
+    svc = _make_service(
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=lambda: "📰 headline XYZ",
+    )
+    svc.update_daily_pnl(realized_today=-30_001.0, open_mtm=0.0)
+    ks = [a for a in alerts if "kill switch" in a]
+    assert len(ks) == 1
+    assert "headline XYZ" in ks[0]
+
+
+def test_big_loss_alert_survives_news_provider_failure():
+    alerts = []
+
+    def boom():
+        raise RuntimeError("feed down")
+
+    svc = _make_service(
+        price_fetcher=lambda s, e: 23_400.0,
+        notifier=lambda m: alerts.append(m),
+        news_context_provider=boom,
+    )
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+    svc.run_exit()  # must not raise
+    assert any("BIG LOSS" in a for a in alerts)  # alert still sent, without news
 
 
 if __name__ == "__main__":

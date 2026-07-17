@@ -43,6 +43,26 @@ INTERVAL_SECONDS: dict[str, int] = {
     "1h": 3600,
 }
 
+# NSE cash session bounds (IST wall-clock). Shared session constants — the
+# scanner's evaluation gate (services.scanner_service) and the seeder's
+# session-aware lookback (services.scanner_aggregator_seeder) alias these so
+# the session definition lives in exactly one place.
+#
+# Issue #367: ticks timestamped BEFORE ``SESSION_OPEN_IST`` are dropped at the
+# bar-building layer (see ``BarBuilder.on_tick``). The NSE pre-open session
+# (09:00-09:07 call auction) and the broker's subscribe-time snapshot tick both
+# carry last_price == the PRIOR day's close until price discovery; letting them
+# seed today's first bucket made ``derive_today_and_yest``'s Path B report
+# ``today_d.open`` == yesterday's close — killing the gap gates
+# (open_lt_yest_close / open_gt_yest_close) at exact equality every morning the
+# app booted pre-market. Ticks at/after ``SESSION_CLOSE_IST`` are deliberately
+# NOT dropped: post-close evaluation is already gated by the scanner's
+# market-hours gate (SCANNER_POSTCLOSE_GATE), the closing-session prints are
+# genuine settlement data, and a post-close straggler tick is what closes the
+# session's final in-progress bucket.
+SESSION_OPEN_IST = dt.time(9, 15)
+SESSION_CLOSE_IST = dt.time(15, 30)
+
 
 def interval_to_seconds(interval: str) -> int:
     try:
@@ -213,12 +233,43 @@ class BarBuilder:
         # replay idempotent: a bar whose ts is already here is skipped, so calling
         # replay_bars with overlapping data never double-counts volume.
         self._replayed_ts: set[dt.datetime] = set()
+        # Issue #367 — pre-session tick drops: silent-but-counted. The counter
+        # is cumulative for the builder's lifetime; the DEBUG log is dedup'd to
+        # once per (builder, calendar day) so a flood of pre-open ticks (one
+        # per symbol per second during the 09:00-09:07 auction) cannot spam.
+        self.presession_drop_count = 0
+        self._presession_log_date: dt.date | None = None
 
     def _bucket(self, ts: dt.datetime) -> dt.datetime:
         return bucket_for_interval(ts, self.interval_seconds)
 
     def on_tick(self, tick: dict) -> None:
         ts = tick["ts"]
+
+        # --- Session-open gate (issue #367) -------------------------------
+        # Drop any tick timestamped before the 09:15:00 IST session open.
+        # Pre-open auction ticks and the broker's subscribe-time snapshot
+        # carry last_price == the prior close, and letting them seed today's
+        # first bucket corrupted today_d.open (== yest close exactly), which
+        # broke the gap gates every pre-market-boot morning. A tick at
+        # exactly 09:15:00 is KEPT. Post-close ticks are intentionally NOT
+        # dropped (see SESSION_OPEN_IST module comment).
+        if ts.time() < SESSION_OPEN_IST:
+            self.presession_drop_count += 1
+            if self._presession_log_date != ts.date():
+                self._presession_log_date = ts.date()
+                logger.debug(
+                    "BarBuilder %s/%s: dropping pre-session tick(s) before %s "
+                    "(first dropped ts=%s); further drops today counted silently "
+                    "(lifetime dropped=%d)",
+                    self.symbol,
+                    self.interval,
+                    SESSION_OPEN_IST,
+                    ts,
+                    self.presession_drop_count,
+                )
+            return
+
         price = float(tick["price"])
         cum_vol = int(tick.get("cumulative_volume") or 0)
         bucket = self._bucket(ts)
@@ -236,7 +287,17 @@ class BarBuilder:
             return
 
         if bucket != self._current["bucket"]:
-            self._emit(1.0)
+            # Cross-SESSION flush (issue #367): with pre-session ticks dropped,
+            # a bucket left open at yesterday's close (e.g. the 15:25 bar when
+            # no post-close straggler tick arrived) is now closed by today's
+            # FIRST in-session tick — at 09:15+, where the scanner's
+            # market-hours gate would NOT skip it. Emit such a stale flush
+            # with ``is_replay=True`` so consumers warm their history but
+            # never evaluate it as a live signal (same contract as seeded /
+            # WS-recovery bars, #257). Pre-#367 these flushes happened via
+            # pre-open ticks inside the gated pre-open window, so they were
+            # never evaluated either — this preserves that guarantee.
+            self._emit(1.0, is_replay=bucket.date() != self._current["bucket"].date())
             self._current = {
                 "bucket": bucket,
                 "open": price,
@@ -506,6 +567,8 @@ class MultiIntervalAggregator:
 
 __all__ = [
     "INTERVAL_SECONDS",
+    "SESSION_CLOSE_IST",
+    "SESSION_OPEN_IST",
     "interval_to_seconds",
     "bucket_for_interval",
     "FiveMinuteCandleBuilder",
