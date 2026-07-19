@@ -1722,7 +1722,9 @@ ran in the 15:30-17:00 periodic window).
   orders; `OPEN15_VOL_MULT` (default `1.5`) — cumvol-in-minute must reach this ×
   the running-avg completed-minute volume; `OPEN15_TOP_N` (default `3`) — top-N
   gainers long / losers short; `OPEN15_MARGIN_PER_SLOT` (default `30000`) and
-  `OPEN15_LEVERAGE` (default `5`) → ₹150k notional per trade.
+  `OPEN15_LEVERAGE` (default `5`) → ₹150k notional per trade;
+  `OPEN15_TICK_CAPTURE` (default `true`) — persist the selected symbols' ticks
+  (incl. the 09:15 first minute) to `tick_logs/open15/` for backtest replay.
 - **Why these defaults:** mirrors the Round 58 research configuration so the
   sandbox measurement is comparable to the backtest grid; sizing mirrors
   intraday_pullback_top2's ₹30k/slot convention.

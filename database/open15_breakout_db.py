@@ -20,6 +20,7 @@ from sqlalchemy import (
     Float,
     Integer,
     String,
+    Text,
     create_engine,
 )
 from sqlalchemy.ext.declarative import declarative_base
@@ -81,10 +82,60 @@ class Open15Trade(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class Open15DayLog(Base):
+    """One row per trading day: the full decision log as a JSON blob.
+
+    Written at 09:30 flatten and 09:35 summary (idempotent upsert by date) so
+    the UI can show past days' decision timelines after restarts.
+    """
+
+    __tablename__ = "open15_day_logs"
+
+    id = Column(Integer, primary_key=True)
+    trade_date = Column(String(10), unique=True, index=True)
+    log_json = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 def init_db():
-    """Create the table if missing. Idempotent; never touches other tables."""
+    """Create the tables if missing. Idempotent; never touches other tables."""
     Base.metadata.create_all(bind=engine)
-    logger.info("open15_trades table ready")
+    logger.info("open15_trades + open15_day_logs tables ready")
+
+
+def save_day_log(trade_date: str, events: list) -> bool:
+    """Upsert the day's decision log (JSON). Fail-graceful."""
+    import json
+
+    try:
+        row = db_session.query(Open15DayLog).filter(Open15DayLog.trade_date == trade_date).first()
+        if row is None:
+            row = Open15DayLog(trade_date=trade_date)
+            db_session.add(row)
+        row.log_json = json.dumps(events)
+        db_session.commit()
+        return True
+    except Exception:
+        db_session.rollback()
+        logger.exception("open15: day-log save failed for %s", trade_date)
+        return False
+    finally:
+        db_session.remove()
+
+
+def get_day_log(trade_date: str) -> list | None:
+    """Return the persisted decision log for a date, or None."""
+    import json
+
+    try:
+        row = db_session.query(Open15DayLog).filter(Open15DayLog.trade_date == trade_date).first()
+        return json.loads(row.log_json) if row and row.log_json else None
+    except Exception:
+        logger.exception("open15: day-log read failed for %s", trade_date)
+        return None
+    finally:
+        db_session.remove()
 
 
 def insert_trade(**kw) -> int | None:

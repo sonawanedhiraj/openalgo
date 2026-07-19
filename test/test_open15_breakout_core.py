@@ -75,6 +75,20 @@ def test_short_side_and_entry_minute_close():
     assert core.entry_minute_close("SSS") == l1 - 0.9
 
 
+def test_near_miss_stats_for_decision_log():
+    """A selected watch that never fully triggers still records how close it got."""
+    core = Open15Core({"AAA": 100.0}, vol_mult=1.5, top_n=1)
+    feed_first_candle(core, "AAA", 102.0, 1000)
+    h1 = core.sym["AAA"]["fc"]["high"]
+    core.on_tick("AAA", 101.0, 1400, t(9, 16, 30))  # 09:16 vol 400 -> baseline mean(1000,400)=700
+    # beyond level but volume only reaches 1.0x baseline -> no entry, stats recorded
+    assert core.on_tick("AAA", h1 + 0.3, 1400 + 700, t(9, 17, 20)) is None
+    ws = core.watch_stats["AAA"]
+    assert ws["level_broken"] is True
+    assert 0.9 < ws["max_vol_ratio_beyond"] <= 1.1
+    assert "AAA" not in core.entered
+
+
 def test_unselected_symbol_never_enters():
     core = Open15Core({"AAA": 100.0, "ZZZ": 100.0}, vol_mult=1.5, top_n=1)
     feed_first_candle(core, "AAA", 103.0, 1000)

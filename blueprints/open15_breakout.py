@@ -39,6 +39,72 @@ def status():
     return jsonify(svc.get_status())
 
 
+@open15_bp.route("/api/decision_log", methods=["GET"])
+@check_session_validity
+def decision_log():
+    """Decision timeline for the 15-min window. Today = live from the service;
+    past dates = persisted snapshot (written at 09:30 flatten / 09:35 summary)."""
+    import datetime as dt
+
+    import pytz
+
+    from services.open15_breakout_service import get_open15_service
+
+    date = request.args.get("date")
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    svc = get_open15_service()
+    if (not date or date == today) and svc is not None and svc.day_log:
+        return jsonify({"date": today, "source": "live", "events": svc.day_log})
+    from database.open15_breakout_db import get_day_log
+
+    events = get_day_log(date or today)
+    return jsonify({"date": date or today, "source": "snapshot", "events": events or []})
+
+
+_LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<title>open15_vol_breakout — decision log</title>
+<style>
+ body{font-family:ui-monospace,Consolas,monospace;background:#0f1419;color:#d7dde4;margin:24px}
+ h2{color:#7dc4e4} table{border-collapse:collapse;width:100%;margin-top:8px}
+ td,th{border-bottom:1px solid #2a3138;padding:4px 10px;text-align:left;font-size:13px;vertical-align:top}
+ th{color:#8aa0b4} .ev-entry{color:#a6e3a1}.ev-exit{color:#f9e2af}.ev-no_entry{color:#f38ba8}
+ .ev-selection{color:#89b4fa}.ev-armed{color:#94e2d5}.ev-summary{color:#cba6f7}
+ .ev-skipped_late_boot,.ev-skipped_no_prev_closes{color:#f38ba8;font-weight:bold}
+ input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
+ .muted{color:#6b7886;font-size:12px}
+</style></head><body>
+<h2>open15_vol_breakout — decision log</h2>
+<div class="muted">Live during 09:15–09:30 IST (auto-refresh 5s), snapshots after.
+ <input id="d" type="date"> <button onclick="load()">load</button>
+ <a href="/open15_vol_breakout/api/trades" style="color:#7dc4e4">trades json</a></div>
+<div id="status" class="muted"></div>
+<table id="t"><thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead><tbody></tbody></table>
+<script>
+async function load(){
+  const d=document.getElementById('d').value;
+  const r=await fetch('/open15_vol_breakout/api/decision_log'+(d?('?date='+d):''));
+  const j=await r.json();
+  document.getElementById('status').textContent=j.date+' ('+j.source+') — '+(j.events||[]).length+' events';
+  const tb=document.querySelector('#t tbody'); tb.innerHTML='';
+  for(const e of (j.events||[])){
+    const {ts,event,...rest}=e;
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>'+ts+'</td><td class="ev-'+event+'">'+event+'</td><td>'+
+      JSON.stringify(rest).slice(1,-1).replaceAll('"','')+'</td>';
+    tb.appendChild(tr);
+  }
+}
+load(); setInterval(()=>{if(!document.getElementById('d').value) load();},5000);
+</script></body></html>"""
+
+
+@open15_bp.route("/logs", methods=["GET"])
+@check_session_validity
+def logs_page():
+    """Self-contained decision-log viewer (no frontend build required)."""
+    return _LOGS_PAGE
+
+
 @open15_bp.route("/api/trades", methods=["GET"])
 @check_session_validity
 def trades():

@@ -77,6 +77,11 @@ def _top_n() -> int:
         return 3
 
 
+def _tick_capture_enabled() -> bool:
+    """Persist ticks for the day's SELECTED symbols (backtest replay data)."""
+    return os.getenv("OPEN15_TICK_CAPTURE", "true").lower() == "true"
+
+
 def _notional() -> float:
     """Per-trade notional = margin/slot x leverage (defaults 30k x 5 = 150k)."""
     try:
@@ -109,6 +114,9 @@ class Open15Core:
         self.finalized = False
         self.entered: dict[str, dict[str, Any]] = {}
         self.last_price: dict[str, float] = {}
+        # per-selected-symbol near-miss stats for the decision log: how close a
+        # non-entered watch got (max cumvol/baseline ratio, ever beyond level)
+        self.watch_stats: dict[str, dict[str, Any]] = {}
 
     def _st(self, symbol: str) -> dict[str, Any]:
         st = self.sym.get(symbol)
@@ -189,6 +197,14 @@ class Open15Core:
         cum_in_min = max(cumvol - st["cum_prev_end"], 0.0)
         level = st["fc"]["high"] if side == "L" else st["fc"]["low"]
         beyond = price > level if side == "L" else price < level
+        ws = self.watch_stats.setdefault(
+            symbol, {"max_vol_ratio": 0.0, "max_vol_ratio_beyond": 0.0, "level_broken": False}
+        )
+        ratio = cum_in_min / baseline
+        ws["max_vol_ratio"] = max(ws["max_vol_ratio"], ratio)
+        if beyond:
+            ws["level_broken"] = True
+            ws["max_vol_ratio_beyond"] = max(ws["max_vol_ratio_beyond"], ratio)
         if beyond and cum_in_min >= self.vol_mult * baseline:
             action = {
                 "symbol": symbol,
@@ -257,6 +273,25 @@ class Open15BreakoutService:
         self._lock = threading.Lock()
         self._zmq_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # decision log: ordered events for the UI (persisted per-day at 09:35)
+        self.day_log: list[dict[str, Any]] = []
+        self._log_date: str | None = None
+        # targeted tick capture: only the day's SELECTED symbols are persisted,
+        # plus their 09:15 first-minute ticks (buffered until selection).
+        self._tick_writer = None
+        self._first_min_buffer: dict[str, list[tuple]] = {}
+        self._capture_flushed = False
+
+    def _log_event(self, event: str, **detail: Any) -> None:
+        rec = {
+            "ts": dt.datetime.now(IST).strftime("%H:%M:%S.%f")[:-3],
+            "event": event,
+            **detail,
+        }
+        self.day_log.append(rec)
+        if len(self.day_log) > 500:
+            del self.day_log[: len(self.day_log) - 500]
+        logger.info("open15 [%s] %s", event, detail if detail else "")
 
     # ---- universe / data ------------------------------------------------- #
     @staticmethod
@@ -296,24 +331,53 @@ class Open15BreakoutService:
             self.day_status = "idle"
             return
         now = dt.datetime.now(IST)
+        self.day_log = []
+        self._log_date = now.strftime("%Y-%m-%d")
+        self._first_min_buffer = {}
+        self._capture_flushed = False
         if now.time() >= dt.time(9, 15, 30):
             self.day_status = "skipped_late_boot"
+            self._log_event(
+                "skipped_late_boot",
+                armed_at=now.strftime("%H:%M:%S"),
+                fix="boot OpenAlgo before 09:15 IST",
+            )
             logger.warning(
                 "open15: armed at %s — after 09:15 IST, first candle unobservable; "
                 "day SKIPPED. Boot OpenAlgo before 09:15 for this strategy.",
                 now.strftime("%H:%M:%S"),
             )
+            self._persist_day_log()
             return
         self.universe = self._load_universe()
         prev = self._load_prev_closes(self.universe, now.date())
         if len(prev) < 20:
             self.day_status = "skipped_late_boot"
-            logger.warning("open15: only %d prev-closes available — day skipped", len(prev))
+            self._log_event("skipped_no_prev_closes", available=len(prev))
+            self._persist_day_log()
             return
+        if _tick_capture_enabled() and self._tick_writer is None:
+            try:
+                from services.simplified_stock_engine_ticklog import TickLogWriter
+
+                self._tick_writer = TickLogWriter(
+                    enabled=True, directory="tick_logs/open15", retention_days=365
+                )
+            except Exception:
+                logger.exception("open15: tick writer init failed — capture disabled today")
         with self._lock:
             self.core = Open15Core(prev, vol_mult=_vol_mult(), top_n=_top_n())
             self.positions = {}
             self.day_status = "armed"
+        self._log_event(
+            "armed",
+            universe=len(self.universe),
+            prev_closes=len(prev),
+            vol_mult=_vol_mult(),
+            top_n=_top_n(),
+            mode=_mode(),
+            tick_capture=bool(self._tick_writer),
+        )
         self._ensure_zmq_thread()
         logger.info(
             "open15: ARMED for %s — universe %d, prev-closes %d, vol_mult %.2f, top_n %d, mode %s",
@@ -362,16 +426,35 @@ class Open15BreakoutService:
                 update_trade(pos["row_id"], **fields)
             with self._lock:
                 pos["status"] = "closed" if ok else "open"  # keep open on failure for retry
-            logger.info(
-                "open15: EXIT %s %s x%d -> %s (%s)",
-                action,
-                symbol,
-                pos["quantity"],
-                resp.get("status"),
-                reason,
+            self._log_event(
+                "exit",
+                symbol=symbol,
+                action=action,
+                qty=pos["quantity"],
+                exit_price=last_px,
+                pnl=round(pnl, 0) if pnl is not None else None,
+                order_status=resp.get("status"),
+                reason=reason,
             )
         if reason == "eod_0930":
             self.day_status = "done"
+            # log why each selected-but-not-entered watch never fired (near-miss)
+            core = self.core
+            if core:
+                for sym, side in core.selected.items():
+                    if sym in core.entered:
+                        continue
+                    ws = core.watch_stats.get(sym, {})
+                    self._log_event(
+                        "no_entry",
+                        symbol=sym,
+                        side=side,
+                        level_broken=ws.get("level_broken", False),
+                        max_vol_ratio=round(ws.get("max_vol_ratio", 0.0), 2),
+                        max_vol_ratio_while_beyond=round(ws.get("max_vol_ratio_beyond", 0.0), 2),
+                        needed=_vol_mult(),
+                    )
+            self._persist_day_log()
 
     def summary(self) -> None:
         """09:35 IST — one-line research summary of today's measurement."""
@@ -385,19 +468,38 @@ class Open15BreakoutService:
             if close and rec["level"]:
                 sgn = 1 if rec["side"] == "L" else -1
                 drifts.append(
-                    (
-                        s,
-                        sgn * (rec["trigger_price"] / rec["level"] - 1) * 100,
-                        sgn * (close / rec["level"] - 1) * 100,
-                    )
+                    {
+                        "symbol": s,
+                        "trigger_vs_level_pct": round(
+                            sgn * (rec["price"] / rec["level"] - 1) * 100, 3
+                        ),
+                        "minclose_vs_level_pct": round(sgn * (close / rec["level"] - 1) * 100, 3),
+                    }
                 )
-        logger.info(
-            "open15 SUMMARY: selected %d, entered %d, day=%s; per-entry (sym, trigger-vs-level%%, close-vs-level%%): %s",
-            n_sel,
-            n_ent,
-            self.day_status,
-            [(s, f"{a:+.2f}", f"{b:+.2f}") for s, a, b in drifts],
+        self._log_event(
+            "summary",
+            selected=n_sel,
+            entered=n_ent,
+            day=self.day_status,
+            captured_drift=drifts,
         )
+        if self._tick_writer is not None:
+            try:
+                flushed = self._tick_writer.flush_now()
+                self._log_event("tick_capture_flushed", records=flushed)
+            except Exception:
+                logger.exception("open15: tick flush failed")
+        self._persist_day_log()
+
+    def _persist_day_log(self) -> None:
+        """Snapshot today's decision log so the UI can query past days."""
+        try:
+            from database.open15_breakout_db import save_day_log
+
+            if self._log_date and self.day_log:
+                save_day_log(self._log_date, self.day_log)
+        except Exception:
+            logger.exception("open15: day-log persist failed")
 
     def register_jobs(self, scheduler=None) -> None:
         from apscheduler.triggers.cron import CronTrigger
@@ -484,13 +586,54 @@ class Open15BreakoutService:
                 # minute attribution uses the tick's exchange timestamp (naive IST);
                 # the wall-clock gate above only bounds the processing window.
                 tick_ts = tick.get("ts") or now.replace(tzinfo=None)
-                action = core.on_tick(
-                    symbol, float(tick["price"]), float(tick.get("cumulative_volume") or 0), tick_ts
-                )
+                price = float(tick["price"])
+                cumvol = float(tick.get("cumulative_volume") or 0)
+                was_finalized = core.finalized
+                action = core.on_tick(symbol, price, cumvol, tick_ts)
+                self._capture_tick(core, symbol, price, cumvol, tick_ts, was_finalized)
                 if action:
                     self._enter(action)
             except Exception:
                 logger.exception("open15: tick handling failed")
+
+    def _capture_tick(
+        self,
+        core: Open15Core,
+        symbol: str,
+        price: float,
+        cumvol: float,
+        ts: dt.datetime,
+        was_finalized: bool,
+    ) -> None:
+        """Persist ticks for SELECTED symbols only (backtest replay data).
+
+        Before selection (09:15 minute) every universe symbol's ticks are
+        buffered in memory; the moment selection finalizes, only the selected
+        symbols' buffers are flushed to the writer and the rest are dropped.
+        After that, selected-symbol ticks stream straight to the writer.
+        """
+        if self._tick_writer is None:
+            return
+        if not core.finalized:
+            buf = self._first_min_buffer.setdefault(symbol, [])
+            if len(buf) < 3000:
+                buf.append((price, int(cumvol), ts))
+            return
+        if not was_finalized and not self._capture_flushed:
+            # selection just finalized on this tick — flush buffers once
+            self._capture_flushed = True
+            for sym in core.selected:
+                for p, v, t in self._first_min_buffer.get(sym, []):
+                    self._tick_writer.enqueue(sym, p, v, t)
+            self._first_min_buffer = {}
+            self._log_event(
+                "selection",
+                selected=dict(core.selected),
+                gaps_pct={s: round(core.gaps.get(s, 0) * 100, 2) for s in core.selected},
+                candidates=len(core.gaps),
+            )
+        if symbol in core.selected:
+            self._tick_writer.enqueue(symbol, price, int(cumvol), ts)
 
     def _enter(self, action: dict) -> None:
         from database.open15_breakout_db import insert_trade
@@ -562,6 +705,8 @@ class Open15BreakoutService:
                 s: {k: p.get(k) for k in ("side", "quantity", "trigger_price", "status")}
                 for s, p in self.positions.items()
             },
+            "tick_capture": bool(self._tick_writer),
+            "day_log": self.day_log[-100:],
         }
 
 

@@ -60,6 +60,24 @@ Per entry: `level`, `trigger_minute`+`trigger_second`, `trigger_price`,
 `OPEN15_VOL_MULT` (1.5) · `OPEN15_TOP_N` (3) · `OPEN15_MARGIN_PER_SLOT` (30000) ·
 `OPEN15_LEVERAGE` (5).
 
-## 7. API
-`GET /open15_vol_breakout/api/status` — live state (selection, entries, day status).
+## 7. API / UI
+`GET /open15_vol_breakout/api/status` — live state (selection, entries, day
+status, last 100 decision-log events).
 `GET /open15_vol_breakout/api/trades?date=&limit=` — journal incl. research fields.
+`GET /open15_vol_breakout/api/decision_log?date=` — the 15-min decision timeline
+(armed → selection+gaps → entries with trigger detail → exits → per-watch
+no-entry near-miss stats → summary with captured-drift). Today is served live
+from memory; past days from the `open15_day_logs` snapshot (written at 09:30 and
+09:35).
+`GET /open15_vol_breakout/logs` — **self-contained log-viewer page** (session
+auth, auto-refreshing during the window, date picker for history).
+
+## 8. Tick capture (backtest replay data)
+`OPEN15_TICK_CAPTURE` (default true): ticks for **the day's selected symbols
+only** are persisted to `tick_logs/open15/ticks-YYYYMMDD-<pid>.jsonl`
+(`{ts, symbol, ltp, volume}`, cumulative day volume; retention 365d). The full
+09:15 first minute is included (all universe symbols are buffered in memory for
+that one minute; on selection, only the picked symbols' buffers are flushed and
+the rest discarded). This makes every armed day fully replayable: first candle +
+entry window + exit for exactly the strategy's watchlist, at tick resolution —
+the dataset the offline salvage analysis was missing.
