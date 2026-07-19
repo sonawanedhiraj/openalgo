@@ -1,0 +1,94 @@
+<svg width="880" height="615" viewBox="0 0 680 615" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>The look-ahead entry mistake on a 1-minute chart</title>
+<desc>Candlestick chart showing the 09:21 breakout candle. The backtest entered at the trigger level 100.00 early inside the candle, but the volume signal was only confirmable at the candle close 100.54. The 0.54 percent gap between the two was the phantom edge. Exit at 09:30 is 100.38: a fake +0.38% win from the level, a real -0.16% loss from the honest close entry.</desc>
+<style>
+  text { font-family: "Segoe UI", Arial, sans-serif; }
+  .t  { font-size: 14px; fill: #2C2C2A; font-weight: 600; }
+  .ts { font-size: 12px; fill: #5F5E5A; }
+</style>
+<rect x="0" y="0" width="680" height="615" fill="#FFFFFF"/>
+
+<text x="40" y="46" class="ts">Price (₹)</text>
+
+<!-- H1 trigger level -->
+<line x1="52" y1="182" x2="640" y2="182" stroke="#888780" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="76" y="172" class="ts">first-candle high (H1) ₹100.00 — the trigger level</text>
+
+<!-- candles: wicks then bodies -->
+<line x1="60" y1="182" x2="60" y2="314" stroke="#1D9E75" stroke-width="1.5"/>
+<rect x="49" y="223" width="22" height="66" fill="#1D9E75" rx="1.5"/>
+<line x1="122" y1="215" x2="122" y2="264" stroke="#D85A30" stroke-width="1.5"/>
+<rect x="111" y="223" width="22" height="25" fill="#D85A30" rx="1.5"/>
+<line x1="184" y1="223" x2="184" y2="264" stroke="#1D9E75" stroke-width="1.5"/>
+<rect x="173" y="231" width="22" height="17" fill="#1D9E75" rx="1.5"/>
+<line x1="246" y1="218" x2="246" y2="272" stroke="#D85A30" stroke-width="1.5"/>
+<rect x="235" y="231" width="22" height="25" fill="#D85A30" rx="1.5"/>
+<line x1="308" y1="207" x2="308" y2="264" stroke="#1D9E75" stroke-width="1.5"/>
+<rect x="297" y="215" width="22" height="41" fill="#1D9E75" rx="1.5"/>
+<line x1="370" y1="198" x2="370" y2="231" stroke="#1D9E75" stroke-width="1.5"/>
+<rect x="359" y="207" width="22" height="8" fill="#1D9E75" rx="1.5"/>
+<!-- 09:21 burst candle -->
+<line x1="432" y1="75" x2="432" y2="215" stroke="#1D9E75" stroke-width="1.5"/>
+<rect x="421" y="93" width="22" height="114" fill="#1D9E75" rx="1.5"/>
+<!-- after burst -->
+<line x1="494" y1="86" x2="494" y2="116" stroke="#D85A30" stroke-width="1.5"/>
+<rect x="483" y="93" width="22" height="13" fill="#D85A30" rx="1.5"/>
+<line x1="556" y1="99" x2="556" y2="126" stroke="#D85A30" stroke-width="1.5"/>
+<rect x="545" y="106" width="22" height="10" fill="#D85A30" rx="1.5"/>
+
+<!-- 09:30 exit -->
+<text x="575" y="123" class="ts">⋯</text>
+<line x1="592" y1="119" x2="640" y2="119" stroke="#378ADD" stroke-width="1.6" stroke-dasharray="5 4"/>
+<text x="640" y="110" class="ts" text-anchor="end">09:30 exit</text>
+<text x="640" y="136" class="ts" text-anchor="end">₹100.38</text>
+
+<!-- point A: illegal entry at level, early in the candle -->
+<circle cx="424" cy="182" r="5.5" fill="#993C1D"/>
+<line x1="302" y1="152" x2="420" y2="179" stroke="#993C1D" stroke-width="1"/>
+<text x="120" y="141" class="t">① backtest entered here — ₹100.00</text>
+<text x="120" y="158" class="ts">early inside the candle, volume still unknown</text>
+
+<!-- point B: honest entry at candle close -->
+<circle cx="445" cy="93" r="5.5" fill="#185FA5"/>
+<line x1="466" y1="64" x2="448" y2="89" stroke="#185FA5" stroke-width="1"/>
+<text x="470" y="54" class="t">② signal confirmed here</text>
+<text x="470" y="70" class="ts">candle closed → honest entry ₹100.54</text>
+
+<!-- phantom gap brace -->
+<line x1="412" y1="93" x2="412" y2="182" stroke="#7F77DD" stroke-width="1.4"/>
+<line x1="407" y1="93" x2="417" y2="93" stroke="#7F77DD" stroke-width="1.4"/>
+<line x1="407" y1="182" x2="417" y2="182" stroke="#7F77DD" stroke-width="1.4"/>
+<text x="404" y="134" class="t" text-anchor="end">+0.54%</text>
+<text x="404" y="150" class="ts" text-anchor="end">phantom</text>
+
+<!-- volume pane -->
+<text x="40" y="392" class="ts">Volume (per minute)</text>
+<line x1="40" y1="449" x2="640" y2="449" stroke="#D85A30" stroke-width="1.2" stroke-dasharray="5 4"/>
+<text x="76" y="443" class="ts">1.5× running avg — legal (from closed candles only)</text>
+<rect x="49" y="423" width="22" height="77" fill="#B4B2A9" rx="1.5"/>
+<rect x="111" y="474" width="22" height="26" fill="#B4B2A9" rx="1.5"/>
+<rect x="173" y="477" width="22" height="23" fill="#B4B2A9" rx="1.5"/>
+<rect x="235" y="481" width="22" height="19" fill="#B4B2A9" rx="1.5"/>
+<rect x="297" y="471" width="22" height="29" fill="#B4B2A9" rx="1.5"/>
+<rect x="359" y="468" width="22" height="32" fill="#B4B2A9" rx="1.5"/>
+<rect x="421" y="410" width="22" height="90" fill="#7F77DD" rx="1.5"/>
+<rect x="483" y="461" width="22" height="39" fill="#B4B2A9" rx="1.5"/>
+<rect x="545" y="471" width="22" height="29" fill="#B4B2A9" rx="1.5"/>
+<text x="432" y="404" class="ts" text-anchor="middle">final volume known only at 09:22:00</text>
+
+<!-- time axis -->
+<text x="60" y="518" class="ts" text-anchor="middle">09:15</text>
+<text x="122" y="518" class="ts" text-anchor="middle">09:16</text>
+<text x="184" y="518" class="ts" text-anchor="middle">09:17</text>
+<text x="246" y="518" class="ts" text-anchor="middle">09:18</text>
+<text x="308" y="518" class="ts" text-anchor="middle">09:19</text>
+<text x="370" y="518" class="ts" text-anchor="middle">09:20</text>
+<text x="432" y="518" class="ts" text-anchor="middle">09:21</text>
+<text x="494" y="518" class="ts" text-anchor="middle">09:22</text>
+<text x="556" y="518" class="ts" text-anchor="middle">09:23</text>
+
+<!-- outcome captions -->
+<text x="40" y="551" class="ts">① backtest: buy ₹100.00 → exit ₹100.38 = +0.38% — price printed before the signal existed</text>
+<text x="40" y="571" class="ts">② honest: buy ₹100.54 (close, signal confirmed) → exit ₹100.38 = −0.16%</text>
+<text x="40" y="593" class="t">The +0.54% gap between ① and ② was the entire “edge”.</text>
+</svg>

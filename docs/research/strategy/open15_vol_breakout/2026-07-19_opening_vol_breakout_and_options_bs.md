@@ -222,6 +222,12 @@ intact. The R58 diagnosis (per-name IV deviation) was wrong.
 
 ## 2. The real error: entry-spot convention = look-ahead
 
+![The look-ahead entry mistake on a 1-minute chart](lookahead_entry_mistake.svg)
+*Diagram: backtest entered at the trigger level (①) inside the breakout candle,
+but the volume gate is only confirmable at that candle's close (②). The +0.54%
+gap between them was the entire claimed edge; from the honest entry the same
+trade loses −0.16% at the 09:30 exit.*
+
 The harness priced the BS entry at the **breakout level** (H1/L1), but the real
 option entry premium is the entry-minute bar **close** — after the intra-bar
 momentum burst. Mean adverse intra-bar drift (level→close, signed) on the July
