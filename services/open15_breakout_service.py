@@ -144,10 +144,10 @@ class Open15Core:
             self.selected[s] = "L"
         for s in neg[: self.top_n]:
             self.selected[s] = "S"
-        logger.info(
-            "open15: selection finalized — %s",
-            {s: f"{d}/{self.gaps[s] * 100:+.2f}%" for s, d in self.selected.items()},
-        )
+        # NB: never pass a bare dict as the sole logging arg — logging's
+        # single-mapping special case turns it into `msg % dict` and raises.
+        sel = ", ".join(f"{s}:{d}{self.gaps[s] * 100:+.2f}%" for s, d in self.selected.items())
+        logger.info("open15: selection finalized — %s", sel)
 
     def on_tick(self, symbol: str, price: float, cumvol: float, ts: dt.datetime) -> dict | None:
         """Process one tick (ts must be IST-naive or IST-aware). Returns an
