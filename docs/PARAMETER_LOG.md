@@ -1715,6 +1715,23 @@ ran in the 15:30-17:00 periodic window).
     smoke-hold saga: #305 (enforce) -> #319 (release wiring) -> #338 (verified
     health rows) -> #390 (per-symbol + intraday heal).
 
+## `OPEN15_*` — open15_vol_breakout mid-bar breakout strategy (issue #425)
+
+- **What:** `OPEN15_ENABLED` (default `true`) master switch; `OPEN15_MODE`
+  (`sandbox` | `observe`, default `sandbox`) — observe journals signals without
+  orders; `OPEN15_VOL_MULT` (default `1.5`) — cumvol-in-minute must reach this ×
+  the running-avg completed-minute volume; `OPEN15_TOP_N` (default `3`) — top-N
+  gainers long / losers short; `OPEN15_MARGIN_PER_SLOT` (default `30000`) and
+  `OPEN15_LEVERAGE` (default `5`) → ₹150k notional per trade.
+- **Why these defaults:** mirrors the Round 58 research configuration so the
+  sandbox measurement is comparable to the backtest grid; sizing mirrors
+  intraday_pullback_top2's ₹30k/slot convention.
+- **History:**
+  - **2026-07-20:** Introduced by issue #425. Strategy is a measurement
+    deployment — see `strategies/open15_vol_breakout/SPEC.md` §2 before tuning
+    anything (the bar-level signal has NO honest edge; the mid-bar capture
+    fraction is what's being measured).
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

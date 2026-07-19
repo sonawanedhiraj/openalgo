@@ -1,0 +1,26 @@
+{
+  "strategy": "open15_vol_breakout",
+  "version": "0.1.0",
+  "mode": "sandbox",
+  "deployable": false,
+  "created": "2026-07-20",
+  "issue": 425,
+  "params": {
+    "window_ist": "09:15-09:30",
+    "universe": "SCANNER_SYMBOLS (F&O stocks, indices excluded)",
+    "selection": "top-3 gainers long / top-3 losers short by 09:15-open vs prev daily close",
+    "vol_mult": 1.5,
+    "vol_baseline": "running average of completed minute volumes since 09:15 (auction included in v0)",
+    "entry": "mid-bar tick trigger: cumvol-in-minute >= vol_mult x baseline AND ltp beyond first-candle level",
+    "exit": "hard flatten 09:30:00 IST, retry 09:32; no stop, no target",
+    "margin_per_slot": 30000,
+    "leverage": 5,
+    "notional_per_trade": 150000,
+    "max_concurrent": 6,
+    "product": "MIS",
+    "order_type": "MARKET"
+  },
+  "honest_context": "Round 58: bar-level versions of this signal have NO honest edge (close entry -0.16%/trade; the published +0.38% was entry-level look-ahead). This sandbox run measures whether the legal mid-bar entry captures enough of the ~0.54% intra-bar burst. Decision rule: trigger entry must beat close entry by >=0.4pp/trade over ~30+ signals, else final REJECT.",
+  "parity_target": null,
+  "ops": "App must boot before 09:15 IST; late boot = day skipped (loud WARNING)."
+}

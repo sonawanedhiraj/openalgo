@@ -982,6 +982,33 @@ def strategy_detail(name: str):
             ]
         except Exception:
             logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == "open15_vol_breakout":
+        try:
+            from database.open15_breakout_db import Open15Trade
+            from database.open15_breakout_db import db_session as o15_session
+
+            rows = o15_session.query(Open15Trade).order_by(Open15Trade.id.desc()).limit(50).all()
+            recent_trades = [
+                {
+                    "id": r.id,
+                    "side": r.side,
+                    "symbol": r.symbol,
+                    "quantity": r.quantity,
+                    "entry_price": r.trigger_price,
+                    "exit_price": r.exit_price,
+                    "net_pnl": r.pnl,
+                    "mode": r.mode,
+                    "status": r.status,
+                    "entry_date": r.trade_date,
+                    "trigger": f"{r.trigger_minute}:{r.trigger_second:02d}"
+                    if r.trigger_minute
+                    else None,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         try:
             rows = (
