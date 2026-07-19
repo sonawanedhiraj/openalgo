@@ -257,6 +257,19 @@ need no external scheduler.
 > The `futures_follow_cap50` strategy likewise registers its own
 > reset/entry/exit/watchdog/EOD jobs (09:00/15:20/15:25/15:28/15:30 IST) — see the
 > FuturesFollowService process entry (§5).
+> The `open15_vol_breakout` strategy (issue #425, sandbox) registers 4 jobs on
+> this same scheduler: `open15_arm` 09:10 / `open15_exit` 09:30 / `open15_exit_retry`
+> 09:32 / `open15_summary` 09:35 IST (mon-fri). Its tick feed is an **own additive
+> ZMQ SUB** on the proxy bus (5555), active only 09:14:50–09:30:05 IST
+> (`services/open15_breakout_service.py`). **Ops: the app must be booted before
+> 09:15 IST or the day is marked `skipped_late_boot`** — the 09:15 first candle is
+> built from live ticks and cannot be reconstructed. Journal: `open15_trades` +
+> `open15_day_logs` (per-day decision-log JSON) in `db/openalgo.db`
+> (`database/open15_breakout_db.py`); API `/open15_vol_breakout/api/status|trades|decision_log`
+> + self-contained viewer at `/open15_vol_breakout/logs`. **Tick capture:** the
+> day's selected symbols' ticks (incl. the buffered 09:15 minute) are persisted
+> to `tick_logs/open15/` (365d retention, `OPEN15_TICK_CAPTURE` default true) —
+> tick-resolution replay data for re-backtesting. Flags `OPEN15_*` (PARAMETER_LOG).
 
 **sector_follow 1m feed: boot-time + periodic state-convergence (not a cron).**
 The `sector_follow_index_backfill` (`5 16 * * 1-5`) and `sector_follow_stock_backfill`

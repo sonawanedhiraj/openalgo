@@ -1067,6 +1067,20 @@ Backtest reports:
 written to `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md` at 15:30 IST
 (git-ignored, observational).
 
+**Sandbox measurement strategy**: [`strategies/open15_vol_breakout/`](strategies/open15_vol_breakout/)
+— opening 15-min **mid-bar volume-surge breakout** (issue #425). Top-3 pre-open
+gainers long / losers short; tick-driven entry the moment cumvol-in-minute ≥1.5×
+the running-avg minute volume AND price breaks the 09:15 candle level; hard
+flatten 09:30. **Deployed as a measurement, not a validated edge**: Round 58
+proved every honest bar-level variant of this signal loses (the published edge
+was entry-level look-ahead); the journal's level/trigger-second/trigger-price/
+minute-close columns measure how much of the ~0.54% intra-bar burst a legal
+real-time entry captures (decision rule in SPEC §4). `Open15BreakoutService`
+(`services/open15_breakout_service.py`) has its own additive ZMQ tick SUB and 4
+APScheduler jobs (arm 09:10 / exit 09:30 / retry 09:32 / summary 09:35 IST).
+**Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
+day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only).
+
 ## Data freshness validation (sector_follow_cap5_vol)
 
 A durable guard against the class of failure that produced the 2026-05-29→06-10

@@ -68,6 +68,7 @@ from blueprints.master_contract_status import (
 from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
 from blueprints.oiprofile import oiprofile_bp  # Import the OI Profile blueprint
 from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
+from blueprints.open15_breakout import open15_bp  # open15_vol_breakout control/observability
 from blueprints.orders import orders_bp
 from blueprints.platforms import platforms_bp
 from blueprints.playground import playground_bp  # Import the API playground blueprint
@@ -126,6 +127,7 @@ from database.intraday_pullback_eval_db import (
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
+from database.open15_breakout_db import init_db as ensure_open15_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
 from database.scanner_comparison_db import (
@@ -296,6 +298,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
     app.register_blueprint(intraday_pullback_bp)  # intraday_pullback_top2 control/observability
+    app.register_blueprint(open15_bp)  # open15_vol_breakout control/observability
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
@@ -721,6 +724,7 @@ def setup_environment(app):
                 ("Intraday Pullback DB", ensure_intraday_pullback_tables_exists),
                 ("Intraday Pullback Config DB", ensure_intraday_pullback_config_tables_exists),
                 ("Intraday Pullback Eval DB", ensure_intraday_pullback_eval_tables_exists),
+                ("Open15 Breakout DB", ensure_open15_tables_exists),
                 ("Futures Follow Eval DB", ensure_futures_follow_eval_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
@@ -939,6 +943,16 @@ def setup_environment(app):
                 logger.debug("Intraday Pullback Top-2 service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Intraday Pullback service: {e}")
+
+            # open15_vol_breakout — mid-bar volume-surge breakout, sandbox (#425).
+            # See strategies/open15_vol_breakout/ and OPEN15_* env flags.
+            try:
+                from services.open15_breakout_service import init_open15_breakout_service
+
+                init_open15_breakout_service(app=app)
+                logger.debug("Open15 breakout service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Open15 breakout service: {e}")
 
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
