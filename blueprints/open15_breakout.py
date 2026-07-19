@@ -39,6 +39,65 @@ def status():
     return jsonify(svc.get_status())
 
 
+@open15_bp.route("/api/config", methods=["GET", "POST"])
+@check_session_validity
+def config():
+    """UI-editable strategy config (capital, sizing mode, volume filter).
+
+    GET  -> {env_defaults, override (DB row or null), effective_today}.
+    POST -> validate + upsert the single row. Applies at the NEXT 09:10 arm
+    (or today's arm if saved before 09:10 IST).
+    """
+    import os as _os
+
+    from database.open15_breakout_db import get_config, save_config
+    from services.open15_breakout_service import get_open15_service
+
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        errors = []
+        margin = body.get("margin_per_slot")
+        sizing = body.get("sizing_mode")
+        vol = body.get("vol_mult")
+        if margin is not None:
+            try:
+                margin = float(margin)
+                if not (5_000 <= margin <= 500_000):
+                    errors.append("margin_per_slot must be between 5000 and 500000")
+            except (TypeError, ValueError):
+                errors.append("margin_per_slot must be a number")
+        if sizing is not None and sizing not in ("fixed", "compound"):
+            errors.append("sizing_mode must be 'fixed' or 'compound'")
+        if vol is not None:
+            try:
+                vol = float(vol)
+                if not (1.0 <= vol <= 5.0):
+                    errors.append("vol_mult must be between 1.0 and 5.0")
+            except (TypeError, ValueError):
+                errors.append("vol_mult must be a number")
+        if errors:
+            return jsonify({"status": "error", "errors": errors}), 400
+        ok = save_config(margin, sizing, vol, updated_by="ui")
+        if not ok:
+            return jsonify({"status": "error", "errors": ["save failed"]}), 500
+        return jsonify({"status": "success", "saved": get_config()})
+
+    svc = get_open15_service()
+    return jsonify(
+        {
+            "env_defaults": {
+                "margin_per_slot": float(_os.getenv("OPEN15_MARGIN_PER_SLOT", "30000")),
+                "sizing_mode": _os.getenv("OPEN15_SIZING_MODE", "fixed"),
+                "vol_mult": float(_os.getenv("OPEN15_VOL_MULT", "1.5")),
+                "leverage": float(_os.getenv("OPEN15_LEVERAGE", "5")),
+            },
+            "override": get_config(),
+            "effective_today": (svc.day_config if svc else None),
+            "note": "changes apply at the next 09:10 IST arm",
+        }
+    )
+
+
 @open15_bp.route("/api/decision_log", methods=["GET"])
 @check_session_validity
 def decision_log():
@@ -77,8 +136,44 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div class="muted">Live during 09:15–09:30 IST (auto-refresh 5s), snapshots after.
  <input id="d" type="date"> <button onclick="load()">load</button>
  <a href="/open15_vol_breakout/api/trades" style="color:#7dc4e4">trades json</a></div>
+<fieldset style="border:1px solid #2a3138;border-radius:6px;margin:14px 0;padding:10px 14px">
+ <legend style="color:#8aa0b4;font-size:13px;padding:0 6px">strategy config (applies at next 09:10 arm)</legend>
+ <label class="muted">capital/slot (Rs) <input id="c_margin" type="number" min="5000" max="500000" step="1000" style="width:90px"></label>
+ <label class="muted" style="margin-left:14px">sizing
+  <select id="c_sizing" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
+   <option value="fixed">fixed</option><option value="compound">compounding</option></select></label>
+ <label class="muted" style="margin-left:14px">volume filter (x avg) <input id="c_vol" type="number" min="1.0" max="5.0" step="0.1" style="width:60px"></label>
+ <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
+ <span id="c_msg" class="muted" style="margin-left:10px"></span>
+ <div id="c_eff" class="muted" style="margin-top:6px"></div>
+</fieldset>
 <div id="status" class="muted"></div>
 <table id="t"><thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead><tbody></tbody></table>
+<script>
+async function loadCfg(){
+  const r=await fetch('/open15_vol_breakout/api/config'); const j=await r.json();
+  const o=j.override||{}, d=j.env_defaults||{};
+  document.getElementById('c_margin').value=o.margin_per_slot||d.margin_per_slot;
+  document.getElementById('c_sizing').value=o.sizing_mode||d.sizing_mode||'fixed';
+  document.getElementById('c_vol').value=o.vol_mult||d.vol_mult;
+  const e=j.effective_today;
+  if(e) document.getElementById('c_eff').textContent=
+    'effective today: '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
+    (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
+    ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult;
+}
+async function saveCfg(){
+  const body={margin_per_slot:+document.getElementById('c_margin').value,
+    sizing_mode:document.getElementById('c_sizing').value,
+    vol_mult:+document.getElementById('c_vol').value};
+  const r=await fetch('/open15_vol_breakout/api/config',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();
+  document.getElementById('c_msg').textContent=(j.status==='success')?'saved ✓':('error: '+(j.errors||[]).join('; '));
+  loadCfg();
+}
+loadCfg();
+</script>
 <script>
 async function load(){
   const d=document.getElementById('d').value;

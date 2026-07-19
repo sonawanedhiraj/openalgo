@@ -98,10 +98,89 @@ class Open15DayLog(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class Open15Config(Base):
+    """Single-row (id=1) UI-editable strategy config (issue #425 follow-up).
+
+    NULL field = fall through to the OPEN15_* env default. Changes apply at the
+    next 09:10 arm (the service snapshots an effective day-config then).
+    """
+
+    __tablename__ = "open15_config"
+
+    id = Column(Integer, primary_key=True)
+    margin_per_slot = Column(Float, nullable=True)  # Rs capital per trade slot
+    sizing_mode = Column(String(16), nullable=True)  # fixed | compound
+    vol_mult = Column(Float, nullable=True)  # volume-surge multiplier
+    updated_by = Column(String(64), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 def init_db():
     """Create the tables if missing. Idempotent; never touches other tables."""
     Base.metadata.create_all(bind=engine)
-    logger.info("open15_trades + open15_day_logs tables ready")
+    logger.info("open15_trades + open15_day_logs + open15_config tables ready")
+
+
+def get_config() -> dict | None:
+    """Return the UI config row as a dict (None if never saved)."""
+    try:
+        row = db_session.query(Open15Config).filter(Open15Config.id == 1).first()
+        if row is None:
+            return None
+        return {
+            "margin_per_slot": row.margin_per_slot,
+            "sizing_mode": row.sizing_mode,
+            "vol_mult": row.vol_mult,
+            "updated_by": row.updated_by,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+    except Exception:
+        logger.exception("open15: config read failed")
+        return None
+    finally:
+        db_session.remove()
+
+
+def save_config(
+    margin_per_slot: float | None,
+    sizing_mode: str | None,
+    vol_mult: float | None,
+    updated_by: str = "ui",
+) -> bool:
+    """Upsert the single config row. Fail-graceful."""
+    try:
+        row = db_session.query(Open15Config).filter(Open15Config.id == 1).first()
+        if row is None:
+            row = Open15Config(id=1)
+            db_session.add(row)
+        row.margin_per_slot = margin_per_slot
+        row.sizing_mode = sizing_mode
+        row.vol_mult = vol_mult
+        row.updated_by = updated_by
+        db_session.commit()
+        return True
+    except Exception:
+        db_session.rollback()
+        logger.exception("open15: config save failed")
+        return False
+    finally:
+        db_session.remove()
+
+
+def total_realized_pnl() -> float:
+    """Sum of research P&L across closed trades (drives compound sizing)."""
+    try:
+        from sqlalchemy import func
+
+        val = (
+            db_session.query(func.sum(Open15Trade.pnl)).filter(Open15Trade.pnl.isnot(None)).scalar()
+        )
+        return float(val or 0.0)
+    except Exception:
+        logger.exception("open15: realized-pnl sum failed")
+        return 0.0
+    finally:
+        db_session.remove()
 
 
 def save_day_log(trade_date: str, events: list) -> bool:

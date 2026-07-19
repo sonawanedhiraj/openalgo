@@ -89,6 +89,44 @@ def test_near_miss_stats_for_decision_log():
     assert "AAA" not in core.entered
 
 
+def test_resolve_day_config_fixed_and_compound():
+    from services.open15_breakout_service import resolve_day_config
+
+    # env defaults, no UI row
+    c = resolve_day_config(None, 0.0)
+    assert c["sizing_mode"] == "fixed"
+    assert c["notional"] == c["margin_per_slot"] * c["leverage"]
+    # UI row overrides; fixed ignores cum pnl
+    c = resolve_day_config(
+        {"margin_per_slot": 50000, "sizing_mode": "fixed", "vol_mult": 2.0}, 99999
+    )
+    assert c["margin_effective"] == 50000 and c["vol_mult"] == 2.0
+    # compound rolls realized P&L into capital
+    c = resolve_day_config(
+        {"margin_per_slot": 50000, "sizing_mode": "compound", "vol_mult": None}, 12500
+    )
+    assert c["margin_effective"] == 62500 and c["notional"] == 62500 * c["leverage"]
+    # drawdown floor: never below 25% of base
+    c = resolve_day_config(
+        {"margin_per_slot": 40000, "sizing_mode": "compound", "vol_mult": None}, -90000
+    )
+    assert c["margin_effective"] == 10000
+    # junk sizing mode falls back to fixed
+    c = resolve_day_config({"sizing_mode": "martingale"}, 0.0)
+    assert c["sizing_mode"] == "fixed"
+
+
+def test_config_db_roundtrip():
+    from database.open15_breakout_db import get_config, init_db, save_config
+
+    init_db()
+    assert save_config(60000, "compound", 1.8, updated_by="test")
+    cfg = get_config()
+    assert cfg["margin_per_slot"] == 60000
+    assert cfg["sizing_mode"] == "compound"
+    assert cfg["vol_mult"] == 1.8
+
+
 def test_unselected_symbol_never_enters():
     core = Open15Core({"AAA": 100.0, "ZZZ": 100.0}, vol_mult=1.5, top_n=1)
     feed_first_candle(core, "AAA", 103.0, 1000)

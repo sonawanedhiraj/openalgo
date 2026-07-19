@@ -92,6 +92,36 @@ def _notional() -> float:
         return 150_000.0
 
 
+def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
+    """Merge the UI config row over env defaults into today's effective config.
+
+    Pure (unit-testable). Sizing modes:
+      - ``fixed``    — margin/slot is the configured base every day.
+      - ``compound`` — margin/slot = base + cumulative realized P&L (research
+        P&L from ``open15_trades``), floored at 25% of base so a drawdown can
+        shrink but never zero the strategy.
+    """
+    cfg = cfg_row or {}
+    base_margin = float(cfg.get("margin_per_slot") or os.getenv("OPEN15_MARGIN_PER_SLOT", "30000"))
+    vol_mult = float(cfg.get("vol_mult") or os.getenv("OPEN15_VOL_MULT", "1.5"))
+    sizing_mode = (cfg.get("sizing_mode") or os.getenv("OPEN15_SIZING_MODE", "fixed")).lower()
+    if sizing_mode not in ("fixed", "compound"):
+        sizing_mode = "fixed"
+    lev = float(os.getenv("OPEN15_LEVERAGE", "5"))
+    margin_eff = base_margin
+    if sizing_mode == "compound":
+        margin_eff = max(base_margin + cum_realized_pnl, 0.25 * base_margin)
+    return {
+        "margin_per_slot": base_margin,
+        "margin_effective": round(margin_eff, 2),
+        "sizing_mode": sizing_mode,
+        "vol_mult": vol_mult,
+        "leverage": lev,
+        "notional": round(margin_eff * lev, 2),
+        "cum_realized_pnl": round(cum_realized_pnl, 2),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Pure tick-driven core (no I/O — unit-testable)
 # --------------------------------------------------------------------------- #
@@ -276,6 +306,7 @@ class Open15BreakoutService:
         # decision log: ordered events for the UI (persisted per-day at 09:35)
         self.day_log: list[dict[str, Any]] = []
         self._log_date: str | None = None
+        self.day_config: dict[str, Any] = resolve_day_config(None, 0.0)
         # targeted tick capture: only the day's SELECTED symbols are persisted,
         # plus their 09:15 first-minute ticks (buffered until selection).
         self._tick_writer = None
@@ -365,17 +396,37 @@ class Open15BreakoutService:
                 )
             except Exception:
                 logger.exception("open15: tick writer init failed — capture disabled today")
+        try:
+            from database.open15_breakout_db import get_config, total_realized_pnl
+
+            cfg_row = get_config()
+            cum_pnl = (
+                total_realized_pnl()
+                if (cfg_row or {}).get("sizing_mode") == "compound"
+                or (os.getenv("OPEN15_SIZING_MODE", "fixed") == "compound")
+                else 0.0
+            )
+        except Exception:
+            logger.exception("open15: config load failed — using env defaults")
+            cfg_row, cum_pnl = None, 0.0
+        self.day_config = resolve_day_config(cfg_row, cum_pnl)
         with self._lock:
-            self.core = Open15Core(prev, vol_mult=_vol_mult(), top_n=_top_n())
+            self.core = Open15Core(prev, vol_mult=self.day_config["vol_mult"], top_n=_top_n())
             self.positions = {}
             self.day_status = "armed"
         self._log_event(
             "armed",
             universe=len(self.universe),
             prev_closes=len(prev),
-            vol_mult=_vol_mult(),
+            vol_mult=self.day_config["vol_mult"],
             top_n=_top_n(),
             mode=_mode(),
+            sizing_mode=self.day_config["sizing_mode"],
+            margin_per_slot=self.day_config["margin_per_slot"],
+            margin_effective=self.day_config["margin_effective"],
+            notional=self.day_config["notional"],
+            cum_realized_pnl=self.day_config["cum_realized_pnl"],
+            config_source="ui" if cfg_row else "env_defaults",
             tick_capture=bool(self._tick_writer),
         )
         self._ensure_zmq_thread()
@@ -638,7 +689,8 @@ class Open15BreakoutService:
     def _enter(self, action: dict) -> None:
         from database.open15_breakout_db import insert_trade
 
-        qty = max(int(_notional() / action["price"]), 1)
+        notional = (self.day_config or {}).get("notional") or _notional()
+        qty = max(int(notional / action["price"]), 1)
         side_word = "BUY" if action["side"] == "L" else "SELL"
         resp = self.order_placer(
             _mode(), {"symbol": action["symbol"], "action": side_word, "quantity": qty}
@@ -706,6 +758,7 @@ class Open15BreakoutService:
                 for s, p in self.positions.items()
             },
             "tick_capture": bool(self._tick_writer),
+            "config": dict(self.day_config or {}),
             "day_log": self.day_log[-100:],
         }
 

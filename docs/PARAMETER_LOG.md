@@ -1725,6 +1725,11 @@ ran in the 15:30-17:00 periodic window).
   `OPEN15_LEVERAGE` (default `5`) → ₹150k notional per trade;
   `OPEN15_TICK_CAPTURE` (default `true`) — persist the selected symbols' ticks
   (incl. the 09:15 first minute) to `tick_logs/open15/` for backtest replay.
+  `OPEN15_SIZING_MODE` (default `fixed`) — `fixed` | `compound` capital sizing.
+  **UI overrides:** `margin_per_slot`, `sizing_mode`, and `vol_mult` are
+  editable from `/open15_vol_breakout/logs` (stored in the `open15_config`
+  row; NULL = env default; applied at the next 09:10 arm and recorded in the
+  day's `armed` decision-log event). The env vars are the DEFAULTS layer.
 - **Why these defaults:** mirrors the Round 58 research configuration so the
   sandbox measurement is comparable to the backtest grid; sizing mirrors
   intraday_pullback_top2's ₹30k/slot convention.

@@ -55,10 +55,22 @@ Per entry: `level`, `trigger_minute`+`trigger_second`, `trigger_price`,
 - Same-day flatten means no overnight risk; kill = set `OPEN15_ENABLED=false`
   and restart (or flip `OPEN15_MODE=observe` for signals-only).
 
-## 6. Flags (see docs/PARAMETER_LOG.md)
-`OPEN15_ENABLED` (true) · `OPEN15_MODE` (sandbox|observe, default sandbox) ·
-`OPEN15_VOL_MULT` (1.5) · `OPEN15_TOP_N` (3) · `OPEN15_MARGIN_PER_SLOT` (30000) ·
-`OPEN15_LEVERAGE` (5).
+## 6. Config (UI-editable) + flags (see docs/PARAMETER_LOG.md)
+**UI-editable** (settings panel on `/open15_vol_breakout/logs`, or
+`GET/POST /open15_vol_breakout/api/config` — stored in the `open15_config` row,
+NULL field = env default; **applies at the next 09:10 arm**):
+- `margin_per_slot` (₹, capital per trade slot; 5k–500k)
+- `sizing_mode` — `fixed` (same base every day) | `compound` (base +
+  cumulative realized research P&L from `open15_trades`, floored at 25% of
+  base so a drawdown can shrink but never zero the strategy)
+- `vol_mult` — the volume-surge filter (1.0–5.0×)
+
+**Env defaults:** `OPEN15_ENABLED` (true) · `OPEN15_MODE` (sandbox|observe) ·
+`OPEN15_VOL_MULT` (1.5) · `OPEN15_SIZING_MODE` (fixed) · `OPEN15_TOP_N` (3) ·
+`OPEN15_MARGIN_PER_SLOT` (30000) · `OPEN15_LEVERAGE` (5) ·
+`OPEN15_TICK_CAPTURE` (true). The `armed` decision-log event records the
+effective day-config (incl. `config_source: ui | env_defaults`), so every day's
+sizing/filter is auditable.
 
 ## 7. API / UI
 `GET /open15_vol_breakout/api/status` — live state (selection, entries, day
