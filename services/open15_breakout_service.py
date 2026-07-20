@@ -489,8 +489,22 @@ class Open15BreakoutService:
             )
         if reason == "eod_0930":
             self.day_status = "done"
-            # log why each selected-but-not-entered watch never fired (near-miss)
+            # loud dead-feed diagnostics: an armed day with no/partial ticks must
+            # be visually distinct from a genuine no-trigger day (issue #428).
             core = self.core
+            if core is not None and not core.sym:
+                self._log_event(
+                    "no_ticks_received",
+                    hint="ZMQ feed delivered ZERO ticks in the window — check WS proxy (8765), "
+                    "broker session, scanner presubscribe",
+                )
+            elif core is not None and not core.finalized:
+                self._log_event(
+                    "selection_never_finalized",
+                    symbols_with_ticks=len(core.sym),
+                    hint="ticks stopped before 09:16 — selection could not run",
+                )
+            # log why each selected-but-not-entered watch never fired (near-miss)
             if core:
                 for sym, side in core.selected.items():
                     if sym in core.entered:
@@ -605,11 +619,49 @@ class Open15BreakoutService:
         self._zmq_thread = threading.Thread(target=self._zmq_loop, name="open15-zmq", daemon=True)
         self._zmq_thread.start()
 
+    @staticmethod
+    def _now_ist() -> dt.datetime:
+        """Indirected for testability (scanner-service pattern)."""
+        return dt.datetime.now(IST)
+
+    def _handle_raw(self, topic_str: str, data_str: str, now: dt.datetime) -> None:
+        """Process one raw ZMQ frame — the ENTIRE per-tick pipeline.
+
+        Extracted from the socket loop so the end-to-end test drives the exact
+        same code path (parse → normalize → gate → core → capture → order).
+        """
+        import json
+
+        from services.scanner_service import _normalize_tick, _parse_topic
+
+        core = self.core
+        if core is None or self.day_status != "armed":
+            return
+        if not (dt.time(9, 14, 50) <= now.time() <= dt.time(9, 30, 5)):
+            return
+        parsed = _parse_topic(topic_str)
+        if parsed is None:
+            return
+        _exch, symbol, _md = parsed
+        if symbol not in self.universe:
+            return
+        tick = _normalize_tick(json.loads(data_str))
+        if tick is None:
+            return
+        # minute attribution uses the tick's exchange timestamp (naive IST);
+        # the wall-clock gate above only bounds the processing window.
+        tick_ts = tick.get("ts") or now.replace(tzinfo=None)
+        price = float(tick["price"])
+        cumvol = float(tick.get("cumulative_volume") or 0)
+        was_finalized = core.finalized
+        action = core.on_tick(symbol, price, cumvol, tick_ts)
+        self._capture_tick(core, symbol, price, cumvol, tick_ts, was_finalized)
+        if action:
+            self._enter(action)
+
     def _zmq_loop(self) -> None:
         """Own SUB socket on the proxy bus; active only around the open."""
         import zmq
-
-        from services.scanner_service import _normalize_tick, _parse_topic
 
         ctx = zmq.Context.instance()
         sock = ctx.socket(zmq.SUB)
@@ -617,8 +669,6 @@ class Open15BreakoutService:
         sock.setsockopt_string(zmq.SUBSCRIBE, "")
         sock.setsockopt(zmq.RCVTIMEO, 1000)
         logger.info("open15: ZMQ subscriber up")
-        import json
-
         while not self._stop.is_set():
             try:
                 topic_b, data_b = sock.recv_multipart()
@@ -627,32 +677,12 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: ZMQ recv failed")
                 continue
-            core = self.core
-            if core is None or self.day_status != "armed":
-                continue
-            now = dt.datetime.now(IST)
-            if not (dt.time(9, 14, 50) <= now.time() <= dt.time(9, 30, 5)):
-                continue
             try:
-                parsed = _parse_topic(topic_b.decode("utf-8", errors="replace"))
-                if parsed is None:
-                    continue
-                _exch, symbol, _md = parsed
-                if symbol not in self.universe:
-                    continue
-                tick = _normalize_tick(json.loads(data_b.decode("utf-8", errors="replace")))
-                if tick is None:
-                    continue
-                # minute attribution uses the tick's exchange timestamp (naive IST);
-                # the wall-clock gate above only bounds the processing window.
-                tick_ts = tick.get("ts") or now.replace(tzinfo=None)
-                price = float(tick["price"])
-                cumvol = float(tick.get("cumulative_volume") or 0)
-                was_finalized = core.finalized
-                action = core.on_tick(symbol, price, cumvol, tick_ts)
-                self._capture_tick(core, symbol, price, cumvol, tick_ts, was_finalized)
-                if action:
-                    self._enter(action)
+                self._handle_raw(
+                    topic_b.decode("utf-8", errors="replace"),
+                    data_b.decode("utf-8", errors="replace"),
+                    self._now_ist(),
+                )
             except Exception:
                 logger.exception("open15: tick handling failed")
 
@@ -730,19 +760,19 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open" if ok else "error",
             }
-        logger.info(
-            "open15: ENTRY %s %s x%d @ ~%.2f (level %.2f, +%ds into %s, cumvol %.0f >= %.2fx%.0f) -> %s",
-            side_word,
-            action["symbol"],
-            qty,
-            action["price"],
-            action["level"],
-            action["trigger_second"],
-            action["trigger_minute"],
-            action["cum_vol_at_trigger"],
-            _vol_mult(),
-            action["baseline_vol"],
-            resp.get("status"),
+        self._log_event(
+            "entry",
+            symbol=action["symbol"],
+            side=side_word,
+            qty=qty,
+            trigger_price=round(action["price"], 2),
+            level=round(action["level"], 2),
+            at=f"{action['trigger_minute']}:{action['trigger_second']:02d}",
+            cumvol=int(action["cum_vol_at_trigger"]),
+            baseline=int(action["baseline_vol"]),
+            vol_ratio=round(action["cum_vol_at_trigger"] / max(action["baseline_vol"], 1), 2),
+            order_status=resp.get("status"),
+            order_id=resp.get("orderid"),
         )
 
     # ---- status for the blueprint ---------------------------------------- #
