@@ -553,6 +553,15 @@ class Open15BreakoutService:
             logger.exception("open15: day-log persist failed")
 
     def register_jobs(self, scheduler=None) -> None:
+        """Register the 4 cron jobs.
+
+        The shared historify APScheduler uses a persistent SQLAlchemyJobStore,
+        which PICKLES job callables — so these MUST be module-level functions
+        (``_arm_job`` etc., dereferencing the singleton), never bound methods
+        or lambdas. Bound methods drag ``self`` (holding a ``threading.Lock``)
+        into the pickle and raise ``cannot pickle '_thread.lock' object`` —
+        the bug that silently killed the 2026-07-20 first session (issue #428).
+        """
         from apscheduler.triggers.cron import CronTrigger
 
         sched = scheduler
@@ -565,22 +574,22 @@ class Open15BreakoutService:
             (
                 "open15_arm",
                 CronTrigger(hour=9, minute=10, day_of_week="mon-fri", timezone=tz),
-                self.arm,
+                _arm_job,
             ),
             (
                 "open15_exit",
                 CronTrigger(hour=9, minute=30, second=0, day_of_week="mon-fri", timezone=tz),
-                lambda: self.flatten("eod_0930"),
+                _eod_exit_job,
             ),
             (
                 "open15_exit_retry",
                 CronTrigger(hour=9, minute=32, day_of_week="mon-fri", timezone=tz),
-                lambda: self.flatten("eod_retry_0932"),
+                _eod_retry_job,
             ),
             (
                 "open15_summary",
                 CronTrigger(hour=9, minute=35, day_of_week="mon-fri", timezone=tz),
-                self.summary,
+                _summary_job,
             ),
         ]
         for job_id, trigger, fn in jobs:
@@ -770,6 +779,32 @@ def get_open15_service() -> Open15BreakoutService | None:
     return _service
 
 
+# --- module-level job callables (MUST stay module-level: the persistent
+# SQLAlchemy jobstore pickles them by reference; see register_jobs docstring) ---
+def _arm_job() -> None:
+    svc = get_open15_service()
+    if svc is not None:
+        svc.arm()
+
+
+def _eod_exit_job() -> None:
+    svc = get_open15_service()
+    if svc is not None:
+        svc.flatten("eod_0930")
+
+
+def _eod_retry_job() -> None:
+    svc = get_open15_service()
+    if svc is not None:
+        svc.flatten("eod_retry_0932")
+
+
+def _summary_job() -> None:
+    svc = get_open15_service()
+    if svc is not None:
+        svc.summary()
+
+
 def init_open15_breakout_service(app=None) -> Open15BreakoutService | None:
     """Boot hook (app.py). Builds the service + registers scheduler jobs."""
     global _service
@@ -778,8 +813,11 @@ def init_open15_breakout_service(app=None) -> Open15BreakoutService | None:
         return None
     _service = Open15BreakoutService()
     _service.register_jobs()
-    # If booted mid-morning before the window, arm immediately so a 09:05 boot works.
+    # A boot inside 09:10..15:30 on a weekday arms immediately: before 09:15:30
+    # this makes an 09:05-09:14 boot work; after it, arm() marks the day
+    # skipped_late_boot LOUDLY (and persists it) instead of leaving the day
+    # silently 'idle' because the 09:10 cron already passed (issue #428).
     now = dt.datetime.now(IST)
-    if now.weekday() < 5 and dt.time(9, 10) <= now.time() < dt.time(9, 15, 30):
+    if now.weekday() < 5 and dt.time(9, 10) <= now.time() < dt.time(15, 30):
         _service.arm()
     return _service

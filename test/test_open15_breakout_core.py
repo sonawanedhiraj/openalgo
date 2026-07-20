@@ -127,6 +127,29 @@ def test_config_db_roundtrip():
     assert cfg["vol_mult"] == 1.8
 
 
+def test_register_jobs_with_persistent_jobstore():
+    """The shared scheduler uses SQLAlchemyJobStore, which PICKLES callables.
+
+    Pre-#428 this raised ``cannot pickle '_thread.lock' object`` (bound methods
+    + lambdas dragging the service instance into the pickle) — the bug that
+    silently killed the 2026-07-20 first session. Registers against a real
+    in-memory persistent jobstore to prove serializability.
+    """
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    from services.open15_breakout_service import Open15BreakoutService
+
+    sched = BackgroundScheduler(jobstores={"default": SQLAlchemyJobStore(url="sqlite://")})
+    sched.start(paused=True)
+    try:
+        Open15BreakoutService().register_jobs(sched)
+        ids = {j.id for j in sched.get_jobs()}
+        assert ids == {"open15_arm", "open15_exit", "open15_exit_retry", "open15_summary"}
+    finally:
+        sched.shutdown(wait=False)
+
+
 def test_unselected_symbol_never_enters():
     core = Open15Core({"AAA": 100.0, "ZZZ": 100.0}, vol_mult=1.5, top_n=1)
     feed_first_candle(core, "AAA", 103.0, 1000)
