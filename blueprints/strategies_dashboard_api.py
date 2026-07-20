@@ -871,8 +871,11 @@ def strategy_detail(name: str):
     version_log = _load_version_log(name)
     backtest_refs = _list_backtest_refs(name)
 
-    # 3-column performance data
-    parity = config.get("parity_target", {})
+    # 3-column performance data.
+    # NB: `or {}` (not a .get default) — a config_snapshot with an explicit
+    # `"parity_target": null` returns None from .get and crashed the endpoint
+    # with AttributeError (open15_vol_breakout, 2026-07-20).
+    parity = config.get("parity_target") or {}
     performance = {
         "backtest": {
             "cagr_pct": parity.get("cagr_pct") or parity.get("sharpe_daily"),
