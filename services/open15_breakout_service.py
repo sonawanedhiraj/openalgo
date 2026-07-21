@@ -59,8 +59,30 @@ def _enabled() -> bool:
 
 
 def _mode() -> str:
-    m = os.getenv("OPEN15_MODE", "sandbox").lower()
-    return m if m in ("sandbox", "observe") else "sandbox"
+    """Effective mode: env ``observe`` (dry-run kill switch) wins; otherwise the
+    persistent ``strategy_mode`` row (what the strategies-page toggle writes)
+    governs, defaulting to ``sandbox``. Note a ``live`` row still routes through
+    ``place_order``'s platform-global gate, so it cannot silently go live while
+    the global gate is sandbox (same contract as intraday_pullback SPEC §9)."""
+    env = os.getenv("OPEN15_MODE", "").lower()
+    if env == "observe":
+        return "observe"
+    try:
+        from database.strategy_mode_db import StrategyMode, db_session
+
+        row = db_session.query(StrategyMode).filter_by(strategy_name=STRATEGY_NAME).first()
+        if row and row.mode in ("sandbox", "live"):
+            return row.mode
+    except Exception:
+        logger.exception("open15: strategy_mode read failed — falling back to env/sandbox")
+    finally:
+        try:
+            from database.strategy_mode_db import db_session
+
+            db_session.remove()
+        except Exception:
+            pass
+    return env if env in ("sandbox",) else "sandbox"
 
 
 def _vol_mult() -> float:

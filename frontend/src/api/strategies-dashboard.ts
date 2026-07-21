@@ -139,6 +139,8 @@ export interface StrategyDetail {
   llm_unmatched_skips?: UnmatchedSkipDecision[]
   version_log: VersionLogEntry[]
   backtest_refs: string[]
+  /** Optional per-strategy console page (decision log / settings), e.g. open15's /logs */
+  console_url?: string | null
 }
 
 // ---------------------------------------------------------------------------
