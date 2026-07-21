@@ -79,11 +79,24 @@ see the carve-out below). Capability reference:
    PR-list scan without having to click through. Docs-only PRs are exempt from
    the link-guard block but should still link a `type:docs` issue and carry the
    `[#N]` prefix.
-4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
+4. **Validate before close (operator rule, 2026-07-21).** Every NEW issue MUST
+   carry a `## Validation` section: concrete acceptance checks that prove the
+   requirement is met, not just that code merged. For UI work the check is a
+   **walkthrough from the user's navigation entry point** (e.g. /strategies →
+   click through to the feature) with screenshot evidence — a feature reachable
+   only by a hand-typed URL is NOT done, and the missing link IS part of the
+   requirement (the open15 decision-log miss, issues #430/#425). **Evidence is
+   posted to the ISSUE before it closes — strictly in that order.** When a
+   check needs the running app, validate from the checked-out BRANCH (restart
+   loads branch code) so evidence lands pre-merge; only then merge (auto-close
+   fires with evidence already on the issue). If an issue ever auto-closes
+   without evidence, REOPEN it until the evidence is posted.
+5. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
    (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
    keyword close only fires on the default branch, so we do it ourselves).
-   No-PR/manual work (a doc edit, a closed-as-wontfix) → close it yourself with
-   a result comment.
+   **Auto-close certifies "merged", not "validated"** — step 4's evidence must
+   exist either way. No-PR/manual work (a doc edit, a closed-as-wontfix) →
+   close it yourself with a result comment.
 
 **Labels** (filterable; bootstrap via `bash scripts/gh/bootstrap_labels.sh`):
 `type:*` (kind), `status:*` (lifecycle), `session:*` (which session opened it),

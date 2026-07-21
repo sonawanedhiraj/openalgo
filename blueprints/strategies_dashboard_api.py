@@ -1073,6 +1073,11 @@ def strategy_detail(name: str):
                 "llm_unmatched_skips": llm_unmatched_skips,
                 "version_log": version_log,
                 "backtest_refs": backtest_refs,
+                # optional per-strategy console page (decision log / settings),
+                # declared in config_snapshot.json — rendered as a header button
+                # on the React detail page (issue #430: requirements must be
+                # REACHABLE from the strategies section, not URL-only).
+                "console_url": config.get("console_url"),
             },
         }
     )

@@ -116,6 +116,30 @@ def test_resolve_day_config_fixed_and_compound():
     assert c["sizing_mode"] == "fixed"
 
 
+def test_mode_resolution_env_observe_wins_and_strategy_mode_row_governs(monkeypatch):
+    """Env observe = dry-run kill switch; else the strategy_mode row (UI toggle)
+    governs; no row -> sandbox default (issue #430)."""
+    from database.strategy_mode_db import StrategyMode, db_session
+    from database.strategy_mode_db import init_db as mode_init
+    from services import open15_breakout_service as m
+
+    mode_init()
+    monkeypatch.setenv("OPEN15_MODE", "observe")
+    assert m._mode() == "observe"
+    monkeypatch.setenv("OPEN15_MODE", "sandbox")
+    assert m._mode() == "sandbox"  # no row -> default
+    db_session.add(StrategyMode(strategy_name=m.STRATEGY_NAME, mode="live", updated_by="test"))
+    db_session.commit()
+    try:
+        assert m._mode() == "live"  # row governs (global gate still rules routing)
+        monkeypatch.setenv("OPEN15_MODE", "observe")
+        assert m._mode() == "observe"  # env observe still wins over the row
+    finally:
+        db_session.query(StrategyMode).filter_by(strategy_name=m.STRATEGY_NAME).delete()
+        db_session.commit()
+        db_session.remove()
+
+
 def test_config_db_roundtrip():
     from database.open15_breakout_db import get_config, init_db, save_config
 

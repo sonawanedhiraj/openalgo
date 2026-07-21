@@ -1,8 +1,10 @@
 {
   "strategy": "open15_vol_breakout",
   "version": "0.1.0",
+  "console_url": "/open15_vol_breakout/logs",
   "mode": "sandbox",
-  "deployable": false,
+  "deployable": true,
+  "deployable_note": "deployable:true means ACTIVELY TRADING IN SANDBOX (futures_follow precedent) — there is no scaffold/observe-only default state; it does NOT mean cleared for live. Live would additionally need the strategy_mode flip + the platform-global gate.",
   "created": "2026-07-20",
   "issue": 425,
   "params": {
