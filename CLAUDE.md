@@ -85,10 +85,12 @@ see the carve-out below). Capability reference:
    **walkthrough from the user's navigation entry point** (e.g. /strategies →
    click through to the feature) with screenshot evidence — a feature reachable
    only by a hand-typed URL is NOT done, and the missing link IS part of the
-   requirement (the open15 decision-log miss, issues #430/#425). Execute the
-   checks and post the evidence as an issue/PR comment BEFORE close; if a check
-   can only run post-merge (needs a restart/market session), say so in the PR
-   and post the validation comment after it runs.
+   requirement (the open15 decision-log miss, issues #430/#425). **Evidence is
+   posted to the ISSUE before it closes — strictly in that order.** When a
+   check needs the running app, validate from the checked-out BRANCH (restart
+   loads branch code) so evidence lands pre-merge; only then merge (auto-close
+   fires with evidence already on the issue). If an issue ever auto-closes
+   without evidence, REOPEN it until the evidence is posted.
 5. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
    (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
    keyword close only fires on the default branch, so we do it ourselves).
