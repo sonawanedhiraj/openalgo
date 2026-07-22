@@ -108,6 +108,10 @@ export interface RecentTrade {
   entry_date: string
   created_at: string | null
   llm?: TradeLLMReview | null
+  /** open15: mid-bar entry moment "HH:MM:SS" IST (trigger_minute + trigger_second) */
+  trigger?: string | null
+  /** open15: exit timestamp (ISO, IST offset) stamped at the 09:30 flatten */
+  exit_ts?: string | null
 }
 
 // Latest data-freshness (data_health_check) state for the strategy's feed (#237).

@@ -94,6 +94,9 @@ def test_full_session_entry_exit_journal_and_daylog():
     row = db_session.query(Open15Trade).filter(Open15Trade.symbol == "AAA").first()
     assert row.status == "closed" and row.exit_price is not None and row.pnl is not None
     assert row.entry_minute_close == h1 + 0.9
+    # issue #433: exit timestamp + modelled MIS round-trip charges stamped at close
+    assert row.exit_ts is not None
+    assert row.charges_inr is not None and row.charges_inr > 0
     events = [e["event"] for e in svc.day_log]
     assert "entry" in events and "exit" in events and "no_entry" in events
     assert svc.day_status == "done"
