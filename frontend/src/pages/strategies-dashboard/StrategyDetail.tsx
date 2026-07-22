@@ -650,10 +650,12 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
 
   // Gross P&L / Charges / Capital are only populated for strategies that journal
   // them per leg (futures_follow_cap50). Show those columns only when present so
-  // the sector_follow / simplified views stay compact.
-  const hasFinancials = trades.some(
-    (t) => t.gross_pnl != null || t.charges_inr != null || t.margin_inr != null
-  )
+  // the sector_follow / simplified views stay compact. charges_inr alone does NOT
+  // qualify — open15 journals charges but renders them in its entry/exit block.
+  const hasFinancials = trades.some((t) => t.gross_pnl != null || t.margin_inr != null)
+  // open15: rows carry the mid-bar trigger time + flatten timestamp — render the
+  // Entry/Exit price+time (+ charges) block for those (issue #433).
+  const hasEntryExit = trades.some((t) => t.trigger != null || t.exit_ts != null)
   // LLM columns render for veto-wired strategies (or whenever a verdict/skip
   // actually exists) — sector_follow stays compact.
   const hasLLM = data.llm_veto_enabled || skips.length > 0 || trades.some((t) => t.llm)
@@ -712,6 +714,46 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Side</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Symbol</th>
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">Qty</th>
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="LTP at the legal mid-bar trigger moment"
+                    >
+                      Entry Price
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Mid-bar trigger time (IST)"
+                    >
+                      Entry Time
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Last tick at the 09:30 flatten"
+                    >
+                      Exit Price
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Flatten timestamp (IST)"
+                    >
+                      Exit Time
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Modelled MIS round-trip charges (brokerage + STT + txn + stamp + GST); Net P&L deducts these"
+                    >
+                      Charges
+                    </th>
+                  )}
                   {hasFinancials && (
                     <th
                       className="text-right px-3 py-2 font-medium text-muted-foreground"
@@ -800,6 +842,21 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                         </td>
                         <td className="px-3 py-1.5 font-mono">{s.symbol}</td>
                         <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
                         {hasFinancials && (
                           <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
                         )}
@@ -854,6 +911,41 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                       </td>
                       <td className="px-3 py-1.5 font-mono">{t.symbol}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums">{t.quantity}</td>
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.entry_price != null ? (
+                            fmtPrice(t.entry_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground whitespace-nowrap">
+                          {t.trigger ?? '—'}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.exit_price != null ? (
+                            fmtPrice(t.exit_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground whitespace-nowrap">
+                          {/* exit_ts is IST-offset ISO — chars 11-18 are HH:MM:SS in IST,
+                              locale/timezone-stable (no Date parsing) */}
+                          {t.exit_ts ? t.exit_ts.slice(11, 19) : '—'}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
+                          {t.charges_inr != null ? fmtInr(t.charges_inr) : '—'}
+                        </td>
+                      )}
                       {hasFinancials && (
                         <td className="px-3 py-1.5 text-right tabular-nums font-mono">
                           {t.entry_price != null ? (

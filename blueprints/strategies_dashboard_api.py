@@ -999,13 +999,19 @@ def strategy_detail(name: str):
                     "quantity": r.quantity,
                     "entry_price": r.trigger_price,
                     "exit_price": r.exit_price,
-                    "net_pnl": r.pnl,
+                    "charges_inr": r.charges_inr,
+                    # journal pnl is gross (trigger -> exit); net deducts the
+                    # modelled MIS round-trip charges when stamped (issue #433)
+                    "net_pnl": round(r.pnl - r.charges_inr, 2)
+                    if (r.pnl is not None and r.charges_inr is not None)
+                    else r.pnl,
                     "mode": r.mode,
                     "status": r.status,
                     "entry_date": r.trade_date,
                     "trigger": f"{r.trigger_minute}:{r.trigger_second:02d}"
                     if r.trigger_minute
                     else None,
+                    "exit_ts": r.exit_ts,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows

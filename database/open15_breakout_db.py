@@ -76,6 +76,7 @@ class Open15Trade(Base):
     exit_status = Column(String(16), nullable=True)
 
     pnl = Column(Float, nullable=True)  # research pnl: trigger_price -> exit_price
+    charges_inr = Column(Float, nullable=True)  # modelled MIS round-trip charges (issue #433)
     status = Column(String(16), default="open")  # open / closed / error / observe
     reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -115,9 +116,34 @@ class Open15Config(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+def _ensure_columns():
+    """Idempotently add columns introduced after the table's first creation.
+
+    ``Base.metadata.create_all`` only creates *new* tables — it never alters an
+    existing one, so post-ship columns need an explicit ``ALTER TABLE``. No-op
+    when the column already exists.
+    """
+    from sqlalchemy import text
+
+    wanted = {
+        "charges_inr": "FLOAT",
+    }
+    try:
+        with engine.connect() as conn:
+            existing = {row[1] for row in conn.execute(text("PRAGMA table_info(open15_trades)"))}
+            for col, ddl in wanted.items():
+                if col not in existing:
+                    conn.execute(text(f"ALTER TABLE open15_trades ADD COLUMN {col} {ddl}"))
+                    logger.info("open15_trades: added column %s", col)
+            conn.commit()
+    except Exception:
+        logger.exception("Failed to ensure open15_trades columns")
+
+
 def init_db():
     """Create the tables if missing. Idempotent; never touches other tables."""
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()
     logger.info("open15_trades + open15_day_logs + open15_config tables ready")
 
 

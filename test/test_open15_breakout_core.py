@@ -181,3 +181,21 @@ def test_unselected_symbol_never_enters():
     zh = core.sym["ZZZ"]["fc"]["high"]
     core.on_tick("ZZZ", 101.2, 1200, t(9, 16, 10))
     assert core.on_tick("ZZZ", zh + 1.0, 99000, t(9, 17, 5)) is None
+
+
+def test_mis_round_trip_charges_model():
+    """issue #433: modelled Zerodha MIS equity round-trip charges.
+
+    Rs 1.2L per leg: brokerage min(20, 0.03% of 1.2L=36) = 20/leg = 40, STT
+    0.025% of sell = 30, txn 0.00297% of 2.4L = 7.13, SEBI 0.24, stamp 3.60,
+    GST 18% of (40 + 7.13 + 0.24) = 8.53 -> ~89.5 total.
+    """
+    from services.open15_breakout_service import mis_round_trip_charges
+
+    c = mis_round_trip_charges(120_000.0, 120_000.0)
+    assert c is not None and 85.0 < c < 95.0
+    # tiny order: brokerage is percentage-bound, not the Rs20 cap
+    small = mis_round_trip_charges(1000.0, 1000.0)
+    assert small is not None and small < 2.0
+    # missing a leg -> None (open trade / no exit price)
+    assert mis_round_trip_charges(0.0, 120_000.0) is None

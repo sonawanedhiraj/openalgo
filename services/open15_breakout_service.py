@@ -114,6 +114,26 @@ def _notional() -> float:
         return 150_000.0
 
 
+def mis_round_trip_charges(buy_value: float, sell_value: float) -> float | None:
+    """Modelled Zerodha MIS equity round-trip charges in Rs (issue #433).
+
+    Brokerage min(Rs20, 0.03%) per executed leg, STT 0.025% of the sell leg,
+    NSE txn 0.00297% of total turnover, SEBI Rs10/crore, stamp 0.003% of the
+    buy leg, 18% GST on brokerage + exchange txn + SEBI. Pure; direction is
+    encoded by which leg value is the buy vs the sell.
+    """
+    if not buy_value or not sell_value:
+        return None
+    turnover = buy_value + sell_value
+    brokerage = min(20.0, 0.0003 * buy_value) + min(20.0, 0.0003 * sell_value)
+    stt = 0.00025 * sell_value
+    exch_txn = 0.0000297 * turnover
+    sebi = 0.000001 * turnover
+    stamp = 0.00003 * buy_value
+    gst = 0.18 * (brokerage + exch_txn + sebi)
+    return round(brokerage + stt + exch_txn + sebi + stamp + gst, 2)
+
+
 def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     """Merge the UI config row over env defaults into today's effective config.
 
@@ -478,6 +498,7 @@ class Open15BreakoutService:
                 "trigger_price"
             ]
             pnl = None
+            charges = None
             if last_px:
                 d = (
                     (last_px - pos["trigger_price"])
@@ -485,12 +506,18 @@ class Open15BreakoutService:
                     else (pos["trigger_price"] - last_px)
                 )
                 pnl = d * pos["quantity"]
+                buy_px = pos["trigger_price"] if pos["side"] == "L" else last_px
+                sell_px = last_px if pos["side"] == "L" else pos["trigger_price"]
+                charges = mis_round_trip_charges(
+                    buy_px * pos["quantity"], sell_px * pos["quantity"]
+                )
             fields = {
                 "exit_ts": dt.datetime.now(IST).isoformat(),
                 "exit_price": last_px,
                 "exit_order_id": str(resp.get("orderid") or ""),
                 "exit_status": "success" if ok else "error",
                 "pnl": pnl,
+                "charges_inr": charges,
                 "status": "closed" if ok else "error",
                 "reason": reason,
                 "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
