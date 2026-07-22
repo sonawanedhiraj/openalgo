@@ -77,6 +77,15 @@ class Open15Trade(Base):
 
     pnl = Column(Float, nullable=True)  # research pnl: trigger_price -> exit_price
     charges_inr = Column(Float, nullable=True)  # modelled MIS round-trip charges (issue #433)
+
+    # ATM option shadow trade (issue #435) — research-only: what 1 lot of the
+    # ATM CE (L) / PE (S) did over the same entry->exit window. No orders.
+    opt_symbol = Column(String(48), nullable=True)  # e.g. BAJAJ-AUTO28JUL2610700CE
+    opt_lot_size = Column(Integer, nullable=True)
+    opt_entry_premium = Column(Float, nullable=True)  # open of minute after trigger
+    opt_exit_premium = Column(Float, nullable=True)  # 09:30 bar open
+    opt_charges_inr = Column(Float, nullable=True)  # modelled option round-trip, 1 lot
+    opt_pnl = Column(Float, nullable=True)  # NET premium pnl for 1 lot
     status = Column(String(16), default="open")  # open / closed / error / observe
     reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -127,6 +136,12 @@ def _ensure_columns():
 
     wanted = {
         "charges_inr": "FLOAT",
+        "opt_symbol": "VARCHAR(48)",
+        "opt_lot_size": "INTEGER",
+        "opt_entry_premium": "FLOAT",
+        "opt_exit_premium": "FLOAT",
+        "opt_charges_inr": "FLOAT",
+        "opt_pnl": "FLOAT",
     }
     try:
         with engine.connect() as conn:

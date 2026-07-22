@@ -1012,6 +1012,13 @@ def strategy_detail(name: str):
                     if r.trigger_minute
                     else None,
                     "exit_ts": r.exit_ts,
+                    # ATM option shadow trade (issue #435) — research columns
+                    "opt_symbol": r.opt_symbol,
+                    "opt_lot_size": r.opt_lot_size,
+                    "opt_entry_premium": r.opt_entry_premium,
+                    "opt_exit_premium": r.opt_exit_premium,
+                    "opt_charges_inr": r.opt_charges_inr,
+                    "opt_pnl": r.opt_pnl,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows

@@ -104,6 +104,11 @@ def _tick_capture_enabled() -> bool:
     return os.getenv("OPEN15_TICK_CAPTURE", "true").lower() == "true"
 
 
+def _opt_shadow_enabled() -> bool:
+    """ATM option shadow pricing on journal rows (issue #435, research-only)."""
+    return os.getenv("OPEN15_OPT_SHADOW_ENABLED", "true").lower() == "true"
+
+
 def _notional() -> float:
     """Per-trade notional = margin/slot x leverage (defaults 30k x 5 = 150k)."""
     try:
@@ -472,6 +477,12 @@ class Open15BreakoutService:
             tick_capture=bool(self._tick_writer),
         )
         self._ensure_zmq_thread()
+        if _opt_shadow_enabled():
+            # catch-up pricing for rows the 09:35 broker-lag left unpriced
+            # (and the one-off #435 backfill) — daemon thread, never blocks arm
+            threading.Thread(
+                target=self._opt_shadow_catchup, name="open15-opt-shadow", daemon=True
+            ).start()
         logger.info(
             "open15: ARMED for %s — universe %d, prev-closes %d, vol_mult %.2f, top_n %d, mode %s",
             now.date(),
@@ -481,6 +492,17 @@ class Open15BreakoutService:
             _top_n(),
             _mode(),
         )
+
+    def _opt_shadow_catchup(self) -> None:
+        """Daemon-thread wrapper for the arm-time option-shadow catch-up."""
+        try:
+            from services.open15_option_shadow import enrich_missing
+
+            res = enrich_missing()
+            if res.get("priced"):
+                logger.info("open15 opt-shadow catch-up: %s", res)
+        except Exception:
+            logger.exception("open15: option-shadow catch-up failed")
 
     def flatten(self, reason: str = "eod_0930") -> None:
         """09:30 IST — market-out every open position (also 09:32 backstop)."""
@@ -597,6 +619,16 @@ class Open15BreakoutService:
             day=self.day_status,
             captured_drift=drifts,
         )
+        if _opt_shadow_enabled():
+            # ATM option shadow pricing (issue #435). Broker current-day 1m
+            # history lags ~5-15 min, so rows left unpriced here are retried
+            # by the next 09:10 arm's catch-up call.
+            try:
+                from services.open15_option_shadow import enrich_missing
+
+                self._log_event("opt_shadow", **enrich_missing())
+            except Exception:
+                logger.exception("open15: option-shadow enrichment failed")
         if self._tick_writer is not None:
             try:
                 flushed = self._tick_writer.flush_now()
