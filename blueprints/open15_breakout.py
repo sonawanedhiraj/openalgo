@@ -75,9 +75,22 @@ def config():
                     errors.append("vol_mult must be between 1.0 and 5.0")
             except (TypeError, ValueError):
                 errors.append("vol_mult must be a number")
+        instrument = body.get("instrument")
+        if instrument is not None and instrument not in ("stock", "atm_option"):
+            errors.append("instrument must be 'stock' or 'atm_option'")
+        max_trades = body.get("max_trades")
+        if max_trades is not None:
+            try:
+                max_trades = int(max_trades)
+                if not (1 <= max_trades <= 6):
+                    errors.append("max_trades must be between 1 and 6")
+            except (TypeError, ValueError):
+                errors.append("max_trades must be an integer")
         if errors:
             return jsonify({"status": "error", "errors": errors}), 400
-        ok = save_config(margin, sizing, vol, updated_by="ui")
+        ok = save_config(
+            margin, sizing, vol, updated_by="ui", instrument=instrument, max_trades=max_trades
+        )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
         return jsonify({"status": "success", "saved": get_config()})
@@ -90,6 +103,8 @@ def config():
                 "sizing_mode": _os.getenv("OPEN15_SIZING_MODE", "fixed"),
                 "vol_mult": float(_os.getenv("OPEN15_VOL_MULT", "1.5")),
                 "leverage": float(_os.getenv("OPEN15_LEVERAGE", "5")),
+                "instrument": _os.getenv("OPEN15_INSTRUMENT", "stock"),
+                "max_trades": int(_os.getenv("OPEN15_MAX_TRADES", "3")),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -143,6 +158,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <select id="c_sizing" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
    <option value="fixed">fixed</option><option value="compound">compounding</option></select></label>
  <label class="muted" style="margin-left:14px">volume filter (x avg) <input id="c_vol" type="number" min="1.0" max="5.0" step="0.1" style="width:60px"></label>
+ <label class="muted" style="margin-left:14px">instrument
+  <select id="c_instr" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
+   <option value="stock">stock</option><option value="atm_option">ATM option</option></select></label>
+ <label class="muted" style="margin-left:14px">max trades/day <input id="c_maxt" type="number" min="1" max="6" step="1" style="width:44px"></label>
  <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
  <div id="c_eff" class="muted" style="margin-top:6px"></div>
@@ -156,16 +175,21 @@ async function loadCfg(){
   document.getElementById('c_margin').value=o.margin_per_slot||d.margin_per_slot;
   document.getElementById('c_sizing').value=o.sizing_mode||d.sizing_mode||'fixed';
   document.getElementById('c_vol').value=o.vol_mult||d.vol_mult;
+  document.getElementById('c_instr').value=o.instrument||d.instrument||'stock';
+  document.getElementById('c_maxt').value=o.max_trades||d.max_trades||3;
   const e=j.effective_today;
   if(e) document.getElementById('c_eff').textContent=
-    'effective today: '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
+    'effective today: '+(e.instrument||'stock')+' | max trades '+(e.max_trades||3)+
+    ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
     (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
     ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult;
 }
 async function saveCfg(){
   const body={margin_per_slot:+document.getElementById('c_margin').value,
     sizing_mode:document.getElementById('c_sizing').value,
-    vol_mult:+document.getElementById('c_vol').value};
+    vol_mult:+document.getElementById('c_vol').value,
+    instrument:document.getElementById('c_instr').value,
+    max_trades:+document.getElementById('c_maxt').value};
   const r=await fetch('/open15_vol_breakout/api/config',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const j=await r.json();
@@ -220,6 +244,12 @@ def trades():
                     "symbol": r.symbol,
                     "side": r.side,
                     "mode": r.mode,
+                    "instrument": r.instrument or "stock",
+                    "opt_symbol": r.opt_symbol,
+                    "opt_lot_size": r.opt_lot_size,
+                    "opt_entry_premium": r.opt_entry_premium,
+                    "opt_exit_premium": r.opt_exit_premium,
+                    "opt_pnl": r.opt_pnl,
                     "gap_pct": r.gap_pct,
                     "level": r.level,
                     "baseline_vol": r.baseline_vol,

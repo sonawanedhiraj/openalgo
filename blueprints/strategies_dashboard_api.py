@@ -996,6 +996,7 @@ def strategy_detail(name: str):
                     "id": r.id,
                     "side": r.side,
                     "symbol": r.symbol,
+                    "instrument": r.instrument or "stock",
                     "quantity": r.quantity,
                     "entry_price": r.trigger_price,
                     "exit_price": r.exit_price,

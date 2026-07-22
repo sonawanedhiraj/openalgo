@@ -186,6 +186,8 @@ def enrich_missing(max_rows: int = 20) -> dict:
     09:35 summary (today's rows), the 09:10 arm (catch-up for rows the broker
     lag left unpriced), and manually for the one-off backfill.
     """
+    from sqlalchemy import or_
+
     from database.open15_breakout_db import Open15Trade, db_session, update_trade
 
     done, skipped = 0, 0
@@ -197,6 +199,8 @@ def enrich_missing(max_rows: int = 20) -> dict:
                 Open15Trade.opt_pnl.is_(None),
                 Open15Trade.trigger_price.isnot(None),
                 Open15Trade.trigger_minute.isnot(None),
+                # option-MODE rows carry real fills, not a shadow (issue #437)
+                or_(Open15Trade.instrument.is_(None), Open15Trade.instrument == "stock"),
             )
             .order_by(Open15Trade.id.desc())
             .limit(max_rows)

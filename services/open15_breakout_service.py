@@ -109,6 +109,21 @@ def _opt_shadow_enabled() -> bool:
     return os.getenv("OPEN15_OPT_SHADOW_ENABLED", "true").lower() == "true"
 
 
+def _instrument_default() -> str:
+    """What the entry BUYS: the stock itself, or its ATM option (issue #437)."""
+    v = os.getenv("OPEN15_INSTRUMENT", "stock").lower()
+    return v if v in ("stock", "atm_option") else "stock"
+
+
+def _max_trades_default() -> int:
+    """Daily entry cap across both sides (issue #437). Clamped 1..6."""
+    try:
+        v = int(os.getenv("OPEN15_MAX_TRADES", "3"))
+    except ValueError:
+        v = 3
+    return max(1, min(v, 6))
+
+
 def _notional() -> float:
     """Per-trade notional = margin/slot x leverage (defaults 30k x 5 = 150k)."""
     try:
@@ -158,6 +173,14 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     margin_eff = base_margin
     if sizing_mode == "compound":
         margin_eff = max(base_margin + cum_realized_pnl, 0.25 * base_margin)
+    instrument = (cfg.get("instrument") or _instrument_default()).lower()
+    if instrument not in ("stock", "atm_option"):
+        instrument = "stock"
+    try:
+        max_trades = int(cfg.get("max_trades") or _max_trades_default())
+    except (TypeError, ValueError):
+        max_trades = _max_trades_default()
+    max_trades = max(1, min(max_trades, 6))
     return {
         "margin_per_slot": base_margin,
         "margin_effective": round(margin_eff, 2),
@@ -166,6 +189,8 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "leverage": lev,
         "notional": round(margin_eff * lev, 2),
         "cum_realized_pnl": round(cum_realized_pnl, 2),
+        "instrument": instrument,
+        "max_trades": max_trades,
     }
 
 
@@ -325,7 +350,7 @@ def production_order_placer(mode: str, order: dict) -> dict:
             "apikey": api_key,
             "strategy": STRATEGY_NAME,
             "symbol": order["symbol"],
-            "exchange": "NSE",
+            "exchange": order.get("exchange", "NSE"),
             "action": order["action"],
             "product": "MIS",
             "pricetype": "MARKET",
@@ -340,9 +365,30 @@ def production_order_placer(mode: str, order: dict) -> dict:
         return {"status": "error", "message": str(e)}
 
 
+def production_quote_ltp(symbol: str, exchange: str) -> float | None:
+    """Last traded price via the shared quotes path (option-mode sizing/fills)."""
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_quotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            return None
+        ok, data, _code = get_quotes(symbol, exchange, api_key=api_key)
+        if not ok:
+            logger.warning("open15: quote failed for %s:%s — %s", exchange, symbol, data)
+            return None
+        ltp = (data.get("data") or {}).get("ltp")
+        return float(ltp) if ltp else None
+    except Exception:
+        logger.exception("open15: quote raised for %s:%s", exchange, symbol)
+        return None
+
+
 class Open15BreakoutService:
-    def __init__(self, order_placer=production_order_placer):
+    def __init__(self, order_placer=production_order_placer, quote_fn=production_quote_ltp):
         self.order_placer = order_placer
+        self.quote_fn = quote_fn
         self.core: Open15Core | None = None
         self.positions: dict[str, dict[str, Any]] = {}  # symbol -> journal/fill info
         self.day_status = "idle"  # idle / armed / skipped_late_boot / done
@@ -511,17 +557,64 @@ class Open15BreakoutService:
         with self._lock:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
         for symbol, pos in open_pos.items():
-            action = "SELL" if pos["side"] == "L" else "BUY"
-            resp = self.order_placer(
-                _mode(), {"symbol": symbol, "action": action, "quantity": pos["quantity"]}
-            )
+            is_option = pos.get("instrument") == "option"
+            if is_option:
+                # option exit is always a SELL of the bought CE/PE (issue #437)
+                action = "SELL"
+                resp = self.order_placer(
+                    _mode(),
+                    {
+                        "symbol": pos["opt_symbol"],
+                        "action": "SELL",
+                        "quantity": pos["quantity"],
+                        "exchange": "NFO",
+                    },
+                )
+            else:
+                action = "SELL" if pos["side"] == "L" else "BUY"
+                resp = self.order_placer(
+                    _mode(), {"symbol": symbol, "action": action, "quantity": pos["quantity"]}
+                )
             ok = resp.get("status") == "success"
             last_px = (self.core.last_price.get(symbol) if self.core else None) or pos[
                 "trigger_price"
             ]
             pnl = None
             charges = None
-            if last_px:
+            fields = {
+                "exit_ts": dt.datetime.now(IST).isoformat(),
+                "exit_price": last_px,
+                "exit_order_id": str(resp.get("orderid") or ""),
+                "exit_status": "success" if ok else "error",
+                "status": "closed" if ok else "error",
+                "reason": reason,
+                "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
+            }
+            if is_option:
+                # real trade P&L is on the option premium, not the stock path
+                from services.open15_option_shadow import option_round_trip_charges
+
+                entry_prem = pos.get("opt_entry_premium")
+                exit_prem = self.quote_fn(pos["opt_symbol"], "NFO")
+                lot = pos.get("opt_lot_size") or 1
+                lots = pos["quantity"] // lot if lot else 1
+                if entry_prem and exit_prem:
+                    pnl = (exit_prem - entry_prem) * pos["quantity"]
+                    charges = option_round_trip_charges(
+                        entry_prem * pos["quantity"], exit_prem * pos["quantity"]
+                    )
+                    per_lot_charges = round(charges / lots, 2) if charges and lots else None
+                    fields.update(
+                        opt_exit_premium=exit_prem,
+                        opt_charges_inr=per_lot_charges,
+                        opt_pnl=round((exit_prem - entry_prem) * lot - (per_lot_charges or 0.0), 2),
+                    )
+                else:
+                    logger.warning(
+                        "open15: option exit premium unavailable for %s — pnl unpriced",
+                        pos.get("opt_symbol"),
+                    )
+            elif last_px:
                 d = (
                     (last_px - pos["trigger_price"])
                     if pos["side"] == "L"
@@ -533,17 +626,8 @@ class Open15BreakoutService:
                 charges = mis_round_trip_charges(
                     buy_px * pos["quantity"], sell_px * pos["quantity"]
                 )
-            fields = {
-                "exit_ts": dt.datetime.now(IST).isoformat(),
-                "exit_price": last_px,
-                "exit_order_id": str(resp.get("orderid") or ""),
-                "exit_status": "success" if ok else "error",
-                "pnl": pnl,
-                "charges_inr": charges,
-                "status": "closed" if ok else "error",
-                "reason": reason,
-                "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
-            }
+            fields["pnl"] = pnl
+            fields["charges_inr"] = charges
             if pos.get("row_id"):
                 update_trade(pos["row_id"], **fields)
             with self._lock:
@@ -552,8 +636,9 @@ class Open15BreakoutService:
                 "exit",
                 symbol=symbol,
                 action=action,
+                instrument="option" if is_option else "stock",
                 qty=pos["quantity"],
-                exit_price=last_px,
+                exit_price=last_px if not is_option else fields.get("opt_exit_premium"),
                 pnl=round(pnl, 0) if pnl is not None else None,
                 order_status=resp.get("status"),
                 reason=reason,
@@ -806,10 +891,44 @@ class Open15BreakoutService:
         if symbol in core.selected:
             self._tick_writer.enqueue(symbol, price, int(cumvol), ts)
 
+    def _journal_skip(self, action: dict, reason: str, **extra) -> None:
+        """Journal a trigger that did NOT place an order (cap / sizing skips)."""
+        from database.open15_breakout_db import insert_trade
+
+        insert_trade(
+            trade_date=dt.datetime.now(IST).strftime("%Y-%m-%d"),
+            symbol=action["symbol"],
+            side=action["side"],
+            mode=_mode(),
+            gap_pct=action["gap_pct"],
+            level=action["level"],
+            baseline_vol=action["baseline_vol"],
+            cum_vol_at_trigger=action["cum_vol_at_trigger"],
+            trigger_minute=action["trigger_minute"],
+            trigger_second=action["trigger_second"],
+            trigger_price=action["price"],
+            quantity=0,
+            status="skipped",
+            reason=reason,
+            **extra,
+        )
+        self._log_event("entry_skipped", symbol=action["symbol"], reason=reason, **extra)
+
     def _enter(self, action: dict) -> None:
         from database.open15_breakout_db import insert_trade
 
-        notional = (self.day_config or {}).get("notional") or _notional()
+        cfg = self.day_config or {}
+        max_trades = int(cfg.get("max_trades") or _max_trades_default())
+        with self._lock:
+            n_placed = len(self.positions)
+        if n_placed >= max_trades:
+            self._journal_skip(action, "max_trades_cap", instrument=cfg.get("instrument", "stock"))
+            return
+        if cfg.get("instrument") == "atm_option":
+            self._enter_option(action, cfg)
+            return
+
+        notional = cfg.get("notional") or _notional()
         qty = max(int(notional / action["price"]), 1)
         side_word = "BUY" if action["side"] == "L" else "SELL"
         resp = self.order_placer(
@@ -821,6 +940,7 @@ class Open15BreakoutService:
             symbol=action["symbol"],
             side=action["side"],
             mode=_mode(),
+            instrument="stock",
             gap_pct=action["gap_pct"],
             level=action["level"],
             baseline_vol=action["baseline_vol"],
@@ -856,6 +976,95 @@ class Open15BreakoutService:
             order_id=resp.get("orderid"),
         )
 
+    def _enter_option(self, action: dict, cfg: dict) -> None:
+        """Option-mode entry (issue #437): BUY the ATM CE (L) / PE (S).
+
+        Fit-to-capital sizing: lots = floor(slot capital / (premium x lot));
+        0 lots -> journaled ``unaffordable`` skip. Both directions are premium
+        BUYS — the strategy never sells options.
+        """
+        from database.open15_breakout_db import insert_trade
+        from services.open15_option_shadow import resolve_atm_option
+
+        today = dt.datetime.now(IST).strftime("%Y-%m-%d")
+        contract = resolve_atm_option(action["symbol"], action["side"], action["price"], today)
+        if not contract:
+            self._journal_skip(action, "no_option_contract", instrument="option")
+            return
+        premium = self.quote_fn(contract["symbol"], "NFO")
+        if not premium:
+            self._journal_skip(
+                action, "no_option_quote", instrument="option", opt_symbol=contract["symbol"]
+            )
+            return
+        lot = int(contract["lotsize"])
+        slot_capital = float(cfg.get("margin_effective") or cfg.get("margin_per_slot") or 30_000)
+        lots = int(slot_capital // (premium * lot))
+        if lots < 1:
+            self._journal_skip(
+                action,
+                "unaffordable",
+                instrument="option",
+                opt_symbol=contract["symbol"],
+                opt_lot_size=lot,
+                opt_entry_premium=premium,
+            )
+            return
+        qty = lots * lot
+        resp = self.order_placer(
+            _mode(),
+            {"symbol": contract["symbol"], "action": "BUY", "quantity": qty, "exchange": "NFO"},
+        )
+        ok = resp.get("status") == "success"
+        row_id = insert_trade(
+            trade_date=today,
+            symbol=action["symbol"],
+            side=action["side"],
+            mode=_mode(),
+            instrument="option",
+            gap_pct=action["gap_pct"],
+            level=action["level"],
+            baseline_vol=action["baseline_vol"],
+            cum_vol_at_trigger=action["cum_vol_at_trigger"],
+            trigger_minute=action["trigger_minute"],
+            trigger_second=action["trigger_second"],
+            trigger_price=action["price"],
+            quantity=qty,
+            opt_symbol=contract["symbol"],
+            opt_lot_size=lot,
+            opt_entry_premium=premium,
+            entry_order_id=str(resp.get("orderid") or ""),
+            entry_status="success" if ok else "error",
+            status="open" if ok else "error",
+        )
+        with self._lock:
+            self.positions[action["symbol"]] = {
+                **action,
+                "trigger_price": action["price"],
+                "quantity": qty,
+                "row_id": row_id,
+                "status": "open" if ok else "error",
+                "instrument": "option",
+                "opt_symbol": contract["symbol"],
+                "opt_lot_size": lot,
+                "opt_entry_premium": premium,
+            }
+        self._log_event(
+            "entry",
+            symbol=action["symbol"],
+            side="BUY",
+            instrument="option",
+            contract=contract["symbol"],
+            lots=lots,
+            lot_size=lot,
+            premium=premium,
+            qty=qty,
+            trigger_price=round(action["price"], 2),
+            at=f"{action['trigger_minute']}:{action['trigger_second']:02d}",
+            order_status=resp.get("status"),
+            order_id=resp.get("orderid"),
+        )
+
     # ---- status for the blueprint ---------------------------------------- #
     def get_status(self) -> dict:
         core = self.core
@@ -867,6 +1076,8 @@ class Open15BreakoutService:
             "vol_mult": _vol_mult(),
             "top_n": _top_n(),
             "notional_per_trade": _notional(),
+            "instrument": (self.day_config or {}).get("instrument") or _instrument_default(),
+            "max_trades": (self.day_config or {}).get("max_trades") or _max_trades_default(),
             "universe_size": len(self.universe),
             "selected": dict(core.selected) if core else {},
             "gaps_pct": {s: round(g * 100, 2) for s, g in (core.gaps or {}).items()}
