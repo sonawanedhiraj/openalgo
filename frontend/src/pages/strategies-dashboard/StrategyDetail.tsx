@@ -626,6 +626,13 @@ type MergedRow =
   | { kind: 'trade'; ts: number; trade: RecentTrade }
   | { kind: 'skip'; ts: number; skip: UnmatchedSkipDecision }
 
+// "BAJAJ-AUTO28JUL2610700CE" -> "10700CE 28JUL" (compact contract label for the
+// Opt Entry cell). Falls back to the raw symbol if the format is unexpected.
+function optContractLabel(optSymbol: string): string {
+  const m = optSymbol.match(/^(.+?)(\d{2}[A-Z]{3})(\d{2})(\d+(?:\.\d+)?)(CE|PE)$/)
+  return m ? `${m[4]}${m[5]} ${m[2]}` : optSymbol
+}
+
 export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
   const [sortAsc, setSortAsc] = useState(false)
   const trades = data.recent_trades
@@ -656,6 +663,8 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
   // open15: rows carry the mid-bar trigger time + flatten timestamp — render the
   // Entry/Exit price+time (+ charges) block for those (issue #433).
   const hasEntryExit = trades.some((t) => t.trigger != null || t.exit_ts != null)
+  // open15: ATM option shadow trade columns (issue #435, research-only).
+  const hasOptShadow = trades.some((t) => t.opt_entry_premium != null)
   // LLM columns render for veto-wired strategies (or whenever a verdict/skip
   // actually exists) — sector_follow stays compact.
   const hasLLM = data.llm_veto_enabled || skips.length > 0 || trades.some((t) => t.llm)
@@ -786,6 +795,46 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">
                     Net P&L
                   </th>
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="ATM option shadow trade (research, no orders): premium at entry — open of the minute after the trigger"
+                    >
+                      Opt Entry
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Premium at the 09:30 flatten (bar open)"
+                    >
+                      Opt Exit
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Contract lot size from the master contract"
+                    >
+                      Lot Size
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Modelled option round-trip charges for 1 lot (brokerage + txn + STT + GST)"
+                    >
+                      Opt Charges
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Net premium P&L for 1 lot (after modelled charges)"
+                    >
+                      Opt P&L / lot
+                    </th>
+                  )}
                   {hasFinancials && (
                     <th
                       className="text-right px-3 py-2 font-medium text-muted-foreground"
@@ -870,6 +919,21 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                           <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
                         )}
                         <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
                         {hasFinancials && (
                           <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
                         )}
@@ -1001,6 +1065,62 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                           <span className="text-muted-foreground">—</span>
                         )}
                       </td>
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums">
+                          {t.opt_entry_premium != null ? (
+                            <>
+                              <span className="font-mono">{fmtPrice(t.opt_entry_premium)}</span>
+                              {t.opt_symbol && (
+                                <div className="text-[11px] text-muted-foreground whitespace-nowrap">
+                                  {optContractLabel(t.opt_symbol)}
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono align-top">
+                          {t.opt_exit_premium != null ? (
+                            fmtPrice(t.opt_exit_premium)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono align-top">
+                          {t.opt_lot_size != null ? (
+                            t.opt_lot_size
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground align-top">
+                          {t.opt_charges_inr != null ? fmtInr(t.opt_charges_inr) : '—'}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono align-top">
+                          {t.opt_pnl != null ? (
+                            <span
+                              className={
+                                t.opt_pnl >= 0
+                                  ? 'text-green-600 dark:text-green-400'
+                                  : 'text-red-600 dark:text-red-400'
+                              }
+                            >
+                              {fmtPnl(t.opt_pnl)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
                       {hasFinancials && (
                         // Capital (SPAN margin) is committed by the entry (BUY) and
                         // released by the T+1 exit (SELL) — so show it on the entry

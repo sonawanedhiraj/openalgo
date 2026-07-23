@@ -112,6 +112,13 @@ export interface RecentTrade {
   trigger?: string | null
   /** open15: exit timestamp (ISO, IST offset) stamped at the 09:30 flatten */
   exit_ts?: string | null
+  /** open15: ATM option shadow trade (issue #435) — research-only, 1 lot */
+  opt_symbol?: string | null
+  opt_lot_size?: number | null
+  opt_entry_premium?: number | null
+  opt_exit_premium?: number | null
+  opt_charges_inr?: number | null
+  opt_pnl?: number | null
 }
 
 // Latest data-freshness (data_health_check) state for the strategy's feed (#237).

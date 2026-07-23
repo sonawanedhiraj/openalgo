@@ -133,3 +133,147 @@ def test_ticks_outside_window_or_unknown_symbol_are_ignored():
     except Exception:
         pass  # the loop catches; direct call may raise — either way no state change
     assert svc.core.sym == {} and orders == []
+
+
+def test_max_trades_cap_skips_and_journals(monkeypatch):
+    """issue #437: the daily entry cap holds across both sides; later triggers
+    are journaled as skips, not silently dropped."""
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders)
+    svc.day_config = resolve_day_config(
+        {"margin_per_slot": 30000, "sizing_mode": "fixed", "vol_mult": 1.5, "max_trades": 1}, 0
+    )
+
+    for sym, px in (("AAA", 103.0), ("CCC", 97.0), ("ZZZ", 101.0)):
+        svc._handle_raw(*_frame(sym, px, 1000, 9, 15, 1), _now(9, 15, 1))
+        svc._handle_raw(*_frame(sym, px * 1.001, 5000, 9, 15, 50), _now(9, 15, 50))
+    svc._handle_raw(*_frame("AAA", 103.0, 6000, 9, 16, 10), _now(9, 16, 10))
+    svc._handle_raw(*_frame("CCC", 96.9, 6000, 9, 16, 15), _now(9, 16, 15))
+
+    # AAA triggers -> takes the single slot
+    h1 = svc.core.sym["AAA"]["fc"]["high"]
+    svc._handle_raw(*_frame("AAA", h1 + 0.5, 6000 + 9000, 9, 17, 12), _now(9, 17, 12))
+    assert len(orders) == 1
+    # CCC (short watch) triggers -> capped, journaled as skip, NO order
+    l1 = svc.core.sym["CCC"]["fc"]["low"]
+    svc._handle_raw(*_frame("CCC", l1 - 0.5, 6000 + 9000, 9, 18, 30), _now(9, 18, 30))
+    assert len(orders) == 1
+    row = db_session.query(Open15Trade).filter(Open15Trade.symbol == "CCC").first()
+    assert row is not None and row.status == "skipped" and row.reason == "max_trades_cap"
+    assert row.quantity == 0
+    db_session.remove()
+
+
+def test_option_mode_full_session(monkeypatch):
+    """issue #437: ATM-option mode — fit-to-capital lots, NFO BUY at trigger,
+    SELL at flatten, real premium P&L + per-lot opt columns journaled."""
+    import services.open15_option_shadow as shadow
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders)
+    svc.day_config = resolve_day_config(
+        {
+            "margin_per_slot": 30000,
+            "sizing_mode": "fixed",
+            "vol_mult": 1.5,
+            "instrument": "atm_option",
+        },
+        0,
+    )
+    monkeypatch.setattr(
+        shadow,
+        "resolve_atm_option",
+        lambda underlying, side, spot, trade_date: {
+            "symbol": "AAA28JUL26105CE",
+            "strike": 105.0,
+            "expiry": "28-JUL-26",
+            "lotsize": 75,
+        },
+    )
+    premium = {"now": 152.0}
+    svc.quote_fn = lambda sym, ex: premium["now"]
+
+    for sym, px in (("AAA", 103.0), ("CCC", 97.0), ("ZZZ", 101.0)):
+        svc._handle_raw(*_frame(sym, px, 1000, 9, 15, 1), _now(9, 15, 1))
+        svc._handle_raw(*_frame(sym, px * 1.001, 5000, 9, 15, 50), _now(9, 15, 50))
+    svc._handle_raw(*_frame("AAA", 103.0, 6000, 9, 16, 10), _now(9, 16, 10))
+
+    h1 = svc.core.sym["AAA"]["fc"]["high"]
+    svc._handle_raw(*_frame("AAA", h1 + 0.5, 6000 + 9000, 9, 17, 12), _now(9, 17, 12))
+    # 30000 // (152 * 75) = 2 lots -> qty 150, BUY on NFO
+    assert len(orders) == 1
+    assert orders[0]["symbol"] == "AAA28JUL26105CE"
+    assert orders[0]["action"] == "BUY" and orders[0]["quantity"] == 150
+    assert orders[0]["exchange"] == "NFO"
+
+    premium["now"] = 170.0
+    svc.flatten("eod_0930")
+    assert len(orders) == 2 and orders[1]["action"] == "SELL" and orders[1]["quantity"] == 150
+
+    db_session.expire_all()
+    row = (
+        db_session.query(Open15Trade)
+        .filter(Open15Trade.symbol == "AAA")
+        .order_by(Open15Trade.id.desc())
+        .first()
+    )
+    assert row.instrument == "option" and row.opt_symbol == "AAA28JUL26105CE"
+    assert row.opt_entry_premium == 152.0 and row.opt_exit_premium == 170.0
+    assert row.pnl == (170.0 - 152.0) * 150  # real premium P&L on full qty
+    assert row.charges_inr is not None and 200 < row.charges_inr < 350
+    # per-lot net for the shadow-consistent columns
+    assert row.opt_lot_size == 75 and 1150 < row.opt_pnl < 1330
+    db_session.remove()
+
+
+def test_option_mode_unaffordable_skip(monkeypatch):
+    """issue #437: 1 lot beyond slot capital -> journaled skip, no order."""
+    import services.open15_option_shadow as shadow
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders)
+    svc.day_config = resolve_day_config(
+        {
+            "margin_per_slot": 30000,
+            "sizing_mode": "fixed",
+            "vol_mult": 1.5,
+            "instrument": "atm_option",
+        },
+        0,
+    )
+    monkeypatch.setattr(
+        shadow,
+        "resolve_atm_option",
+        lambda underlying, side, spot, trade_date: {
+            "symbol": "AAA28JUL26105CE",
+            "strike": 105.0,
+            "expiry": "28-JUL-26",
+            "lotsize": 625,
+        },
+    )
+    svc.quote_fn = lambda sym, ex: 75.7  # 625 x 75.7 = 47,312 > 30,000
+
+    for sym, px in (("AAA", 103.0), ("CCC", 97.0), ("ZZZ", 101.0)):
+        svc._handle_raw(*_frame(sym, px, 1000, 9, 15, 1), _now(9, 15, 1))
+        svc._handle_raw(*_frame(sym, px * 1.001, 5000, 9, 15, 50), _now(9, 15, 50))
+    svc._handle_raw(*_frame("AAA", 103.0, 6000, 9, 16, 10), _now(9, 16, 10))
+    h1 = svc.core.sym["AAA"]["fc"]["high"]
+    svc._handle_raw(*_frame("AAA", h1 + 0.5, 6000 + 9000, 9, 17, 12), _now(9, 17, 12))
+
+    assert orders == []
+    row = (
+        db_session.query(Open15Trade)
+        .filter(Open15Trade.symbol == "AAA")
+        .order_by(Open15Trade.id.desc())
+        .first()
+    )
+    assert row is not None and row.status == "skipped" and row.reason == "unaffordable"
+    assert row.opt_entry_premium == 75.7 and row.opt_lot_size == 625
+    db_session.remove()

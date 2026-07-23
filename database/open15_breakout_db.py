@@ -55,6 +55,7 @@ class Open15Trade(Base):
     symbol = Column(String(32), index=True)
     side = Column(String(1))  # L / S
     mode = Column(String(16))  # sandbox / observe
+    instrument = Column(String(8), nullable=True)  # stock / option (issue #437; NULL = stock)
 
     # research fields (the measurement)
     gap_pct = Column(Float)  # 09:15 open vs prev daily close
@@ -77,6 +78,15 @@ class Open15Trade(Base):
 
     pnl = Column(Float, nullable=True)  # research pnl: trigger_price -> exit_price
     charges_inr = Column(Float, nullable=True)  # modelled MIS round-trip charges (issue #433)
+
+    # ATM option shadow trade (issue #435) — research-only: what 1 lot of the
+    # ATM CE (L) / PE (S) did over the same entry->exit window. No orders.
+    opt_symbol = Column(String(48), nullable=True)  # e.g. BAJAJ-AUTO28JUL2610700CE
+    opt_lot_size = Column(Integer, nullable=True)
+    opt_entry_premium = Column(Float, nullable=True)  # open of minute after trigger
+    opt_exit_premium = Column(Float, nullable=True)  # 09:30 bar open
+    opt_charges_inr = Column(Float, nullable=True)  # modelled option round-trip, 1 lot
+    opt_pnl = Column(Float, nullable=True)  # NET premium pnl for 1 lot
     status = Column(String(16), default="open")  # open / closed / error / observe
     reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -112,6 +122,8 @@ class Open15Config(Base):
     margin_per_slot = Column(Float, nullable=True)  # Rs capital per trade slot
     sizing_mode = Column(String(16), nullable=True)  # fixed | compound
     vol_mult = Column(Float, nullable=True)  # volume-surge multiplier
+    instrument = Column(String(16), nullable=True)  # stock | atm_option (issue #437)
+    max_trades = Column(Integer, nullable=True)  # daily entry cap, both sides (issue #437)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -125,19 +137,33 @@ def _ensure_columns():
     """
     from sqlalchemy import text
 
-    wanted = {
-        "charges_inr": "FLOAT",
+    wanted_by_table = {
+        "open15_trades": {
+            "charges_inr": "FLOAT",
+            "instrument": "VARCHAR(8)",
+            "opt_symbol": "VARCHAR(48)",
+            "opt_lot_size": "INTEGER",
+            "opt_entry_premium": "FLOAT",
+            "opt_exit_premium": "FLOAT",
+            "opt_charges_inr": "FLOAT",
+            "opt_pnl": "FLOAT",
+        },
+        "open15_config": {
+            "instrument": "VARCHAR(16)",
+            "max_trades": "INTEGER",
+        },
     }
     try:
         with engine.connect() as conn:
-            existing = {row[1] for row in conn.execute(text("PRAGMA table_info(open15_trades)"))}
-            for col, ddl in wanted.items():
-                if col not in existing:
-                    conn.execute(text(f"ALTER TABLE open15_trades ADD COLUMN {col} {ddl}"))
-                    logger.info("open15_trades: added column %s", col)
+            for table, wanted in wanted_by_table.items():
+                existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+                for col, ddl in wanted.items():
+                    if col not in existing:
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                        logger.info("%s: added column %s", table, col)
             conn.commit()
     except Exception:
-        logger.exception("Failed to ensure open15_trades columns")
+        logger.exception("Failed to ensure open15 columns")
 
 
 def init_db():
@@ -157,6 +183,8 @@ def get_config() -> dict | None:
             "margin_per_slot": row.margin_per_slot,
             "sizing_mode": row.sizing_mode,
             "vol_mult": row.vol_mult,
+            "instrument": row.instrument,
+            "max_trades": row.max_trades,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -172,6 +200,8 @@ def save_config(
     sizing_mode: str | None,
     vol_mult: float | None,
     updated_by: str = "ui",
+    instrument: str | None = None,
+    max_trades: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -182,6 +212,8 @@ def save_config(
         row.margin_per_slot = margin_per_slot
         row.sizing_mode = sizing_mode
         row.vol_mult = vol_mult
+        row.instrument = instrument
+        row.max_trades = max_trades
         row.updated_by = updated_by
         db_session.commit()
         return True
