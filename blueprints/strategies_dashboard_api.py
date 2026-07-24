@@ -670,6 +670,106 @@ def _simplified_engine_lifetime() -> dict:
         return _lifetime_from_pnls([])
 
 
+def _open15_net_pnl(row) -> float:
+    """Net P&L for a closed ``open15_trades`` row.
+
+    The journal ``pnl`` is gross (trigger price -> exit price); the modelled MIS
+    round-trip charges live separately in ``charges_inr`` (issue #433). Deduct
+    them when stamped — same convention as the Recent Trades table's ``net_pnl``.
+    """
+    gross = float(row.pnl or 0.0)
+    if row.charges_inr is not None:
+        return gross - float(row.charges_inr)
+    return gross
+
+
+def _open15_stats() -> dict:
+    """Today's open positions, realized net P&L, trade count, and last trade
+    time from ``open15_trades`` (issue #442).
+
+    The strategy is intraday (entry and its 09:30 flatten share ``trade_date``),
+    so "today" keys directly off ``trade_date``. ``observe``-mode rows are
+    journal-only dry runs (no orders placed) and are excluded so they can't
+    inflate the book. ``created_at`` is naive UTC (``datetime.utcnow`` default),
+    which is exactly the card's ``last_trade_at`` contract (issue #317).
+    """
+    try:
+        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import db_session as o15_session
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        rows = (
+            o15_session.query(Open15Trade).filter(Open15Trade.mode.in_(("sandbox", "live"))).all()
+        )
+        open_count = 0
+        today_trade_count = 0
+        today_pnl = 0.0
+        today_unpriced_exits = 0
+        last_at: datetime | None = None
+        for r in rows:
+            if (r.status or "") == "open":
+                open_count += 1
+            if r.created_at is not None and (last_at is None or r.created_at > last_at):
+                last_at = r.created_at
+            if r.trade_date != today_str:
+                continue
+            today_trade_count += 1
+            if (r.status or "") == "closed":
+                if r.pnl is not None:
+                    today_pnl += _open15_net_pnl(r)
+                else:
+                    # Closed but never priced (e.g. exit tick unavailable at
+                    # flatten) — surfaced so ₹X with N unpriced trades can't
+                    # masquerade as a complete ₹X (same contract as #350).
+                    today_unpriced_exits += 1
+        return {
+            "open_positions": open_count,
+            "today_net_pnl": round(today_pnl, 2),
+            "today_unpriced_exits": today_unpriced_exits,
+            "last_trade_at": last_at.isoformat() if last_at else None,
+            "today_trade_count": today_trade_count,
+        }
+    except Exception:
+        logger.exception("Failed to aggregate open15 stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
+
+
+def _open15_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized net P&L + win-rate from
+    closed ``open15_trades`` rows (issue #442).
+
+    Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
+    columns honest once the strategy is flipped live — sandbox history never
+    leaks into the live column and vice-versa (futures_follow precedent).
+    ``observe`` rows fall outside both buckets by construction.
+    """
+    out = {"sandbox": _lifetime_from_pnls([]), "live": _lifetime_from_pnls([])}
+    try:
+        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import db_session as o15_session
+
+        rows = (
+            o15_session.query(Open15Trade)
+            .filter(Open15Trade.status == "closed", Open15Trade.pnl.isnot(None))
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        for r in rows:
+            m = (r.mode or "").lower()
+            if m in buckets:
+                buckets[m].append(_open15_net_pnl(r))
+        out = {m: _lifetime_from_pnls(p) for m, p in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate open15 lifetime stats")
+    return out
+
+
 def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
     """Daily realized-P&L series from ``trade_journal`` rows for the simplified
     engine (closed rows carry ``pnl``; the date key is the ``exited_at`` IST
@@ -818,6 +918,8 @@ def _build_summary(name: str) -> dict:
         stats = _futures_follow_stats()
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
+    elif name == "open15_vol_breakout":
+        stats = _open15_stats()
 
     # Effective order routing RIGHT NOW (issue #440): the per-strategy
     # dispatch verdict an order would get — 'live' only when the navbar is on
@@ -939,6 +1041,18 @@ def strategy_detail(name: str):
         # trade_journal carries no mode column, so attribute the whole view to the
         # strategy's current resolved mode (sandbox by default).
         performance["live" if mode_val == "live" else "sandbox"] = perf
+    elif name == "open15_vol_breakout":
+        stats = _open15_stats()
+        lifetime = _open15_lifetime()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
+        }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []

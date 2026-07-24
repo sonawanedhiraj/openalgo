@@ -155,6 +155,23 @@ def strategies_dir(tmp_path):
     tei.mkdir()
     (tei / "LEARNINGS.md").write_text("# Trending Equity Intraday\n", encoding="utf-8")
 
+    # open15_vol_breakout — measurement deployment: parity_target is
+    # deliberately null (R58), so its Backtest column stays empty while the
+    # Sandbox/Live columns aggregate open15_trades (issue #442).
+    o15 = tmp_path / "open15_vol_breakout"
+    o15.mkdir()
+    (o15 / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "0.1.0",
+                "mode": "sandbox",
+                "deployable": True,
+                "parity_target": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
     return tmp_path
 
 
@@ -169,6 +186,9 @@ def wired_dbs(monkeypatch):
     import blueprints.strategies_dashboard_api as sda
     from database import (
         futures_follow_db as ffdb,
+    )
+    from database import (
+        open15_breakout_db as o15db,
     )
     from database import (
         sector_follow_db as sfdb,
@@ -188,6 +208,7 @@ def wired_dbs(monkeypatch):
     sm_eng, sm_sess = _mk_engine()
     sr_eng, sr_sess = _mk_engine()
     tj_eng, tj_sess = _mk_engine()
+    o15_eng, o15_sess = _mk_engine()
 
     # Create tables on the in-memory engines
     sfdb.Base.metadata.create_all(sf_eng)
@@ -195,6 +216,7 @@ def wired_dbs(monkeypatch):
     smdb.Base.metadata.create_all(sm_eng)
     srodb.Base.metadata.create_all(sr_eng)
     tjdb.Base.metadata.create_all(tj_eng)
+    o15db.Base.metadata.create_all(o15_eng)
 
     # Patch the database modules (for ORM lookups that go through the module)
     monkeypatch.setattr(sfdb, "engine", sf_eng)
@@ -207,6 +229,10 @@ def wired_dbs(monkeypatch):
     monkeypatch.setattr(srodb, "db_session", sr_sess)
     monkeypatch.setattr(tjdb, "engine", tj_eng)
     monkeypatch.setattr(tjdb, "db_session", tj_sess)
+    # open15 is imported lazily inside the routes/helpers, so patching the
+    # database module alone is sufficient (no blueprint-level alias exists).
+    monkeypatch.setattr(o15db, "engine", o15_eng)
+    monkeypatch.setattr(o15db, "db_session", o15_sess)
 
     # ALSO patch the blueprint's module-level session aliases — these are bound
     # at import time and would otherwise still point at the live-DB sessions.
@@ -222,11 +248,12 @@ def wired_dbs(monkeypatch):
         "sm": (sm_eng, sm_sess, smdb),
         "sr": (sr_eng, sr_sess, srodb),
         "tj": (tj_eng, tj_sess, tjdb),
+        "o15": (o15_eng, o15_sess, o15db),
     }
 
-    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess):
+    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess, o15_sess):
         sess.remove()
-    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng):
+    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng, o15_eng):
         eng.dispose()
 
 
@@ -860,6 +887,137 @@ def test_futures_pnl_curve_keys_exit_by_execution_date(app, wired_dbs):
     assert len(points) == 1
     assert points[0]["date"] == today  # exit date, NOT yesterday
     assert points[0]["pnl"] == 10802.84
+
+
+# ---------------------------------------------------------------------------
+# open15_vol_breakout — Sandbox/Live performance columns (issue #442)
+# ---------------------------------------------------------------------------
+
+
+def _o15_row(o15db, **kw):
+    """An Open15Trade row with sensible closed-sandbox defaults."""
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    defaults = {
+        "trade_date": today,
+        "symbol": "RELIANCE",
+        "side": "L",
+        "mode": "sandbox",
+        "quantity": 100,
+        "trigger_price": 1500.0,
+        "exit_price": 1510.0,
+        "status": "closed",
+        "pnl": 1000.0,
+        "charges_inr": 60.0,
+        "created_at": _utc_naive_for_ist_today(hour_ist=9, minute_ist=21),
+    }
+    defaults.update(kw)
+    return o15db.Open15Trade(**defaults)
+
+
+def test_open15_sandbox_column_populated(app, wired_dbs):
+    """The Sandbox column aggregates open15_trades: cumulative NET P&L
+    (gross pnl minus modelled charges, the #433 convention), running win-rate,
+    closed-trade count, today's net P&L, and open positions."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    # One win (+1000 gross - 60 charges), one loss (-500 gross - 40 charges).
+    sess.add(_o15_row(o15db))
+    sess.add(_o15_row(o15db, symbol="TCS", side="S", pnl=-500.0, charges_inr=40.0))
+    # An open row (entered, not yet flattened) counts as an open position.
+    sess.add(_o15_row(o15db, symbol="INFY", status="open", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    assert resp.status_code == 200
+    perf = resp.get_json()["data"]["performance"]
+    sb = perf["sandbox"]
+    assert sb["cum_net_pnl"] == 400.0  # (1000-60) + (-500-40)
+    assert sb["closed_trades"] == 2
+    assert sb["win_rate_pct"] == 50.0
+    assert sb["today_net_pnl"] == 400.0  # all rows are today's
+    assert sb["open_positions"] == 1
+    # Never flipped live, no live rows → Live column stays empty ('—' in UI).
+    assert perf["live"] is None
+    # Backtest column stays empty by design (parity_target: null, R58).
+    assert perf["backtest"]["win_rate_pct"] is None
+
+
+def test_open15_live_column_isolated_from_sandbox(app, wired_dbs):
+    """A live-mode closed row populates the Live column with its own history;
+    sandbox history never leaks across (futures_follow precedent)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))  # sandbox win, net +940
+    sess.add(_o15_row(o15db, symbol="SBIN", mode="live", pnl=300.0, charges_inr=50.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["cum_net_pnl"] == 940.0
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["live"]["cum_net_pnl"] == 250.0  # 300 - 50
+    assert perf["live"]["closed_trades"] == 1
+    assert perf["live"]["win_rate_pct"] == 100.0
+
+
+def test_open15_observe_rows_excluded(app, wired_dbs):
+    """observe-mode rows are journal-only dry runs (no orders placed) — they
+    must not inflate either column or the card stats."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db, mode="observe"))
+    sess.add(_o15_row(o15db, symbol="INFY", mode="observe", status="open", pnl=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    perf = resp.get_json()["data"]["performance"]
+    sb = perf["sandbox"]
+    assert sb["closed_trades"] == 0
+    assert sb["cum_net_pnl"] is None  # UI renders '—', not a misleading ₹0
+    assert sb["open_positions"] == 0
+    assert perf["live"] is None
+
+
+def test_open15_unpriced_exit_surfaced_not_summed(app, wired_dbs):
+    """A closed-today row with pnl=None (exit tick unavailable at flatten) is
+    counted as an unpriced exit, not silently folded into today's ₹ figure."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))
+    sess.add(_o15_row(o15db, symbol="TCS", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["today_net_pnl"] == 940.0
+    assert sb["today_unpriced_exits"] == 1
+
+
+def test_open15_list_card_carries_today_stats(app, wired_dbs):
+    """The /api/list summary card shows today's trade count / net P&L / open
+    positions for open15 (previously all defaults — issue #442)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))
+    sess.add(_o15_row(o15db, symbol="INFY", status="open", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    card = next(s for s in resp.get_json()["data"] if s["name"] == "open15_vol_breakout")
+    assert card["today_trade_count"] == 2
+    assert card["today_net_pnl"] == 940.0
+    assert card["open_positions"] == 1
+    assert card["last_trade_at"] is not None
 
 
 # ---------------------------------------------------------------------------
