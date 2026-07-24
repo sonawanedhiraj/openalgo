@@ -258,9 +258,15 @@ need no external scheduler.
 > reset/entry/exit/watchdog/EOD jobs (09:00/15:20/15:25/15:28/15:30 IST) — see the
 > FuturesFollowService process entry (§5).
 > The `open15_vol_breakout` strategy (issue #425, sandbox) registers 4 jobs on
-> this same scheduler: `open15_arm` 09:10 / `open15_exit` 09:30 / `open15_exit_retry`
-> 09:32 / `open15_summary` 09:35 IST (mon-fri). Its tick feed is an **own additive
-> ZMQ SUB** on the proxy bus (5555), active only 09:14:50–09:30:05 IST
+> this same scheduler: `open15_arm` 09:10 / `open15_exit` / `open15_exit_retry`
+> (+2 min) / `open15_summary` (+5 min), mon-fri. Exit defaults to 09:30 (so
+> retry 09:32 / summary 09:35) but is **UI-configurable** together with the
+> entry cutoff (issue #451: `open15_config.no_entry_after`/`exit_time`, env
+> defaults `OPEN15_NO_ENTRY_AFTER` 09:29 / `OPEN15_EXIT_TIME` 09:30, exit
+> capped 15:10 to precede the 15:15 MIS square-off) — jobs are (re)pointed at
+> the effective times at boot registration and every 09:10 arm. Its tick feed
+> is an **own additive
+> ZMQ SUB** on the proxy bus (5555), active only 09:14:50 .. exit+5s IST
 > (`services/open15_breakout_service.py`). **Ops: the app must be booted before
 > 09:15 IST or the day is marked `skipped_late_boot`** — the 09:15 first candle is
 > built from live ticks and cannot be reconstructed. Journal: `open15_trades` +

@@ -97,10 +97,34 @@ def config():
                     errors.append("max_trades must be between 1 and 6")
             except (TypeError, ValueError):
                 errors.append("max_trades must be an integer")
+        no_entry_after = body.get("no_entry_after") or None  # empty input = env default
+        exit_time = body.get("exit_time") or None
+        if no_entry_after is not None or exit_time is not None:
+            from services.open15_breakout_service import (
+                _exit_time_default,
+                _no_entry_after_default,
+                validate_window,
+            )
+
+            # cross-field check against the effective value when only one is sent
+            row = get_config() or {}
+            errors.extend(
+                validate_window(
+                    no_entry_after or row.get("no_entry_after") or _no_entry_after_default(),
+                    exit_time or row.get("exit_time") or _exit_time_default(),
+                )
+            )
         if errors:
             return jsonify({"status": "error", "errors": errors}), 400
         ok = save_config(
-            margin, sizing, vol, updated_by="ui", instrument=instrument, max_trades=max_trades
+            margin,
+            sizing,
+            vol,
+            updated_by="ui",
+            instrument=instrument,
+            max_trades=max_trades,
+            no_entry_after=no_entry_after,
+            exit_time=exit_time,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -116,6 +140,8 @@ def config():
                 "leverage": float(_os.getenv("OPEN15_LEVERAGE", "5")),
                 "instrument": _os.getenv("OPEN15_INSTRUMENT", "stock"),
                 "max_trades": int(_os.getenv("OPEN15_MAX_TRADES", "3")),
+                "no_entry_after": _os.getenv("OPEN15_NO_ENTRY_AFTER", "09:29"),
+                "exit_time": _os.getenv("OPEN15_EXIT_TIME", "09:30"),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -253,6 +279,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <select id="c_instr" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
    <option value="stock">stock</option><option value="atm_option">ATM option</option></select></label>
  <label class="muted" style="margin-left:14px">max trades/day <input id="c_maxt" type="number" min="1" max="6" step="1" style="width:44px"></label>
+ <label class="muted" style="margin-left:14px">no entry after <input id="c_nea" type="time" min="09:16" max="15:09" style="width:92px"></label>
+ <label class="muted" style="margin-left:14px">exit time <input id="c_exit" type="time" min="09:17" max="15:10" style="width:92px"></label>
  <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
  <div id="c_eff" class="muted" style="margin-top:6px"></div>
@@ -286,19 +314,28 @@ async function loadCfg(){
   document.getElementById('c_vol').value=o.vol_mult||d.vol_mult;
   document.getElementById('c_instr').value=o.instrument||d.instrument||'stock';
   document.getElementById('c_maxt').value=o.max_trades||d.max_trades||3;
+  document.getElementById('c_nea').value=o.no_entry_after||d.no_entry_after||'09:29';
+  document.getElementById('c_exit').value=o.exit_time||d.exit_time||'09:30';
   const e=j.effective_today;
-  if(e) document.getElementById('c_eff').textContent=
-    'effective today: '+(e.instrument||'stock')+' | max trades '+(e.max_trades||3)+
-    ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
-    (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
-    ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult;
+  if(e){
+    const nea=e.no_entry_after||'09:29', ext=e.exit_time||'09:30';
+    document.getElementById('c_eff').textContent=
+      'effective today: '+(e.instrument||'stock')+' | max trades '+(e.max_trades||3)+
+      ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
+      (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
+      ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult+
+      ' | entries 09:16–'+nea+' | exit '+ext+
+      ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'');
+  }
 }
 async function saveCfg(){
   const body={margin_per_slot:+document.getElementById('c_margin').value,
     sizing_mode:document.getElementById('c_sizing').value,
     vol_mult:+document.getElementById('c_vol').value,
     instrument:document.getElementById('c_instr').value,
-    max_trades:+document.getElementById('c_maxt').value};
+    max_trades:+document.getElementById('c_maxt').value,
+    no_entry_after:document.getElementById('c_nea').value,
+    exit_time:document.getElementById('c_exit').value};
   const msg=document.getElementById('c_msg');
   try{
     // CSRFProtect is global (issue #446): the POST is rejected 400 without this token

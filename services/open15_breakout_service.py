@@ -12,13 +12,18 @@ at that second, so the entry is legal. Whether it captures enough of the
 with real (sandbox) fills. Full spec: ``strategies/open15_vol_breakout/SPEC.md``.
 
 Rules (locked; see SPEC):
-  - Window 09:15–09:30 IST only. Universe = SCANNER_SYMBOLS F&O stocks
+  - Window opens 09:15 IST. Universe = SCANNER_SYMBOLS F&O stocks
     (indices excluded via ``resolve_exchange_for_symbol``).
   - First candle (09:15) built from live ticks -> H1/L1 + open.
   - Selection at 09:16: top-N gainers (LONG) / top-N losers (SHORT) by
     gap = 09:15 open / prev daily close − 1 (prev close from historify D).
-  - Entry: tick-driven mid-bar trigger, once per symbol, MARKET MIS.
-  - Exit: hard flatten at 09:30 (retry backstop 09:32). No stop/target.
+  - Entry: tick-driven mid-bar trigger, once per symbol, MARKET MIS. New
+    entries stop at the UI-configurable ``no_entry_after`` cutoff (default
+    09:29 = the measured SPEC window; issue #451).
+  - Exit: hard flatten at the UI-configurable ``exit_time`` (default 09:30;
+    retry backstop +2 min, capped 15:10). No stop/target. A non-default
+    window departs from the R58-measured 09:29/09:30 convention — the day's
+    ``armed`` decision-log event records the effective window.
   - Journal (``open15_trades``) records level / trigger second / trigger price /
     entry-minute close — the captured-drift measurement.
 
@@ -50,8 +55,45 @@ STRATEGY_NAME = "open15_vol_breakout"
 
 _FIRST_MIN = 9 * 60 + 15  # 555 = 09:15
 _ENTRY_FROM = _FIRST_MIN + 1  # 09:16
-_ENTRY_TO = 9 * 60 + 29  # 09:29 inclusive
-_EXIT_MIN = 9 * 60 + 30  # 09:30
+_ENTRY_TO = 9 * 60 + 29  # 09:29 inclusive (default; UI-overridable, issue #451)
+_EXIT_MIN = 9 * 60 + 30  # 09:30 (default; UI-overridable, issue #451)
+
+# UI-configurable window defaults (issue #451). Exit is capped at 15:10 so the
+# +2 min retry backstop always lands before the 15:15 MIS square-off cutoff.
+_NO_ENTRY_AFTER_DEFAULT = "09:29"
+_EXIT_TIME_DEFAULT = "09:30"
+_EXIT_LATEST_MIN = 15 * 60 + 10  # 15:10
+
+
+def parse_hhmm(value) -> int | None:
+    """``"HH:MM"`` -> minutes since midnight, or None on malformed input."""
+    try:
+        hh, mm = str(value).strip().split(":")
+        h, m = int(hh), int(mm)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def validate_window(no_entry_after: str, exit_time: str) -> list[str]:
+    """Validation errors for a proposed entry/exit window (empty list = valid)."""
+    errors: list[str] = []
+    nea_min, exit_min = parse_hhmm(no_entry_after), parse_hhmm(exit_time)
+    if nea_min is None:
+        errors.append("no_entry_after must be HH:MM (24h IST)")
+    if exit_min is None:
+        errors.append("exit_time must be HH:MM (24h IST)")
+    if nea_min is None or exit_min is None:
+        return errors
+    if nea_min < _ENTRY_FROM:
+        errors.append("no_entry_after must be 09:16 or later")
+    if exit_min > _EXIT_LATEST_MIN:
+        errors.append("exit_time must be 15:10 or earlier (15:15 is the MIS square-off cutoff)")
+    if nea_min >= exit_min:
+        errors.append("exit_time must be after no_entry_after")
+    return errors
 
 
 def _enabled() -> bool:
@@ -124,6 +166,18 @@ def _max_trades_default() -> int:
     return max(1, min(v, 6))
 
 
+def _no_entry_after_default() -> str:
+    """Env default for the entry cutoff (issue #451)."""
+    v = os.getenv("OPEN15_NO_ENTRY_AFTER", _NO_ENTRY_AFTER_DEFAULT)
+    return v if parse_hhmm(v) is not None else _NO_ENTRY_AFTER_DEFAULT
+
+
+def _exit_time_default() -> str:
+    """Env default for the hard-flatten time (issue #451)."""
+    v = os.getenv("OPEN15_EXIT_TIME", _EXIT_TIME_DEFAULT)
+    return v if parse_hhmm(v) is not None else _EXIT_TIME_DEFAULT
+
+
 def _notional() -> float:
     """Per-trade notional = margin/slot x leverage (defaults 30k x 5 = 150k)."""
     try:
@@ -181,6 +235,17 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     except (TypeError, ValueError):
         max_trades = _max_trades_default()
     max_trades = max(1, min(max_trades, 6))
+    no_entry_after = cfg.get("no_entry_after") or _no_entry_after_default()
+    exit_time = cfg.get("exit_time") or _exit_time_default()
+    if validate_window(no_entry_after, exit_time):
+        logger.warning(
+            "open15: invalid entry/exit window %r/%r — using defaults %s/%s",
+            no_entry_after,
+            exit_time,
+            _NO_ENTRY_AFTER_DEFAULT,
+            _EXIT_TIME_DEFAULT,
+        )
+        no_entry_after, exit_time = _NO_ENTRY_AFTER_DEFAULT, _EXIT_TIME_DEFAULT
     return {
         "margin_per_slot": base_margin,
         "margin_effective": round(margin_eff, 2),
@@ -191,6 +256,8 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "cum_realized_pnl": round(cum_realized_pnl, 2),
         "instrument": instrument,
         "max_trades": max_trades,
+        "no_entry_after": no_entry_after,
+        "exit_time": exit_time,
     }
 
 
@@ -206,10 +273,22 @@ class Open15Core:
     triggers the entry. Nothing from later in the minute is consulted.
     """
 
-    def __init__(self, prev_closes: dict[str, float], vol_mult: float = 1.5, top_n: int = 3):
+    def __init__(
+        self,
+        prev_closes: dict[str, float],
+        vol_mult: float = 1.5,
+        top_n: int = 3,
+        entry_to_min: int = _ENTRY_TO,
+        track_to_min: int = _EXIT_MIN,
+    ):
         self.prev_closes = prev_closes
         self.vol_mult = vol_mult
         self.top_n = top_n
+        # entries allowed through entry_to_min; price/minute tracking continues
+        # through track_to_min (the exit minute) so the flatten's research
+        # exit_price stays fresh on an extended window (issue #451)
+        self.entry_to_min = entry_to_min
+        self.track_to_min = max(track_to_min, entry_to_min)
         self.sym: dict[str, dict[str, Any]] = {}
         self.selected: dict[str, str] = {}  # symbol -> "L"/"S"
         self.gaps: dict[str, float] = {}
@@ -263,7 +342,7 @@ class Open15Core:
         """Process one tick (ts must be IST-naive or IST-aware). Returns an
         entry-action dict the first time a selected symbol triggers, else None."""
         minute = ts.hour * 60 + ts.minute
-        if minute < _FIRST_MIN or minute > _ENTRY_TO:
+        if minute < _FIRST_MIN or minute > self.track_to_min:
             return None
         self.last_price[symbol] = price
         st = self._st(symbol)
@@ -286,6 +365,9 @@ class Open15Core:
         self._roll_minutes(st, minute)
         st["last_cum"] = cumvol
         st["min_last_price"][minute] = price
+
+        if minute > self.entry_to_min:
+            return None  # tracking only past the cutoff — no new entries
 
         side = self.selected.get(symbol)
         if side is None or symbol in self.entered or st["fc"] is None:
@@ -325,7 +407,7 @@ class Open15Core:
         return None
 
     def entry_minute_close(self, symbol: str) -> float | None:
-        """Last price seen inside the symbol's entry minute (call after 09:30)."""
+        """Last price seen inside the symbol's entry minute (call after exit)."""
         rec = self.entered.get(symbol)
         if not rec:
             return None
@@ -390,6 +472,7 @@ class Open15BreakoutService:
         self.order_placer = order_placer
         self.quote_fn = quote_fn
         self.core: Open15Core | None = None
+        self._sched = None  # scheduler handle from register_jobs (arm reschedules on it)
         self.positions: dict[str, dict[str, Any]] = {}  # symbol -> journal/fill info
         self.day_status = "idle"  # idle / armed / skipped_late_boot / done
         self.universe: set[str] = set()
@@ -507,8 +590,16 @@ class Open15BreakoutService:
             logger.exception("open15: config load failed — using env defaults")
             cfg_row, cum_pnl = None, 0.0
         self.day_config = resolve_day_config(cfg_row, cum_pnl)
+        nea_min, exit_min = self._window_minutes()
+        self._apply_exit_schedule()
         with self._lock:
-            self.core = Open15Core(prev, vol_mult=self.day_config["vol_mult"], top_n=_top_n())
+            self.core = Open15Core(
+                prev,
+                vol_mult=self.day_config["vol_mult"],
+                top_n=_top_n(),
+                entry_to_min=nea_min,
+                track_to_min=exit_min,
+            )
             self.positions = {}
             self.day_status = "armed"
         self._log_event(
@@ -518,6 +609,8 @@ class Open15BreakoutService:
             vol_mult=self.day_config["vol_mult"],
             top_n=_top_n(),
             mode=_mode(),
+            no_entry_after=self.day_config["no_entry_after"],
+            exit_time=self.day_config["exit_time"],
             sizing_mode=self.day_config["sizing_mode"],
             margin_per_slot=self.day_config["margin_per_slot"],
             margin_effective=self.day_config["margin_effective"],
@@ -554,8 +647,42 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: option-shadow catch-up failed")
 
+    def _window_minutes(self) -> tuple[int, int]:
+        """Today's effective (entry-cutoff, exit) as minutes since midnight."""
+        cfg = self.day_config or {}
+        nea = parse_hhmm(cfg.get("no_entry_after"))
+        ex = parse_hhmm(cfg.get("exit_time"))
+        return (nea if nea is not None else _ENTRY_TO, ex if ex is not None else _EXIT_MIN)
+
+    def _apply_exit_schedule(self) -> None:
+        """(Re)point the exit/retry/summary jobs at the effective exit time.
+
+        Called from ``arm`` so a window saved after boot applies at the next
+        arm (same contract as every other config field). No-op when
+        ``register_jobs`` hasn't run (unit tests drive ``arm`` directly).
+        """
+        if self._sched is None:
+            return
+        from apscheduler.triggers.cron import CronTrigger
+
+        for job_id, (h, m) in zip(
+            ("open15_exit", "open15_exit_retry", "open15_summary"),
+            _exit_schedule_times(self.day_config),
+            strict=True,
+        ):
+            try:
+                self._sched.reschedule_job(
+                    job_id,
+                    trigger=CronTrigger(
+                        hour=h, minute=m, second=0, day_of_week="mon-fri", timezone="Asia/Kolkata"
+                    ),
+                )
+            except Exception:
+                logger.exception("open15: reschedule failed for %s", job_id)
+
     def flatten(self, reason: str = "eod_0930") -> None:
-        """09:30 IST — market-out every open position (also 09:32 backstop)."""
+        """Configured exit time (default 09:30 IST) — market-out every open
+        position (also the +2 min retry backstop)."""
         from database.open15_breakout_db import update_trade
 
         with self._lock:
@@ -682,7 +809,7 @@ class Open15BreakoutService:
             self._persist_day_log()
 
     def summary(self) -> None:
-        """09:35 IST — one-line research summary of today's measurement."""
+        """Exit+5 min — one-line research summary of today's measurement."""
         if not self.core:
             return
         n_sel = len(self.core.selected)
@@ -759,7 +886,12 @@ class Open15BreakoutService:
             from services.historify_scheduler_service import get_historify_scheduler
 
             sched = get_historify_scheduler().scheduler
+        self._sched = sched
         tz = "Asia/Kolkata"
+        # exit/retry/summary follow the configured exit time (issue #451) —
+        # resolved from the DB config row + env here (boot), re-applied at every
+        # 09:10 arm so a window saved mid-day takes effect at the next arm
+        (eh, em), (rh, rm), (sh, sm) = _exit_schedule_times()
         jobs = [
             (
                 "open15_arm",
@@ -768,24 +900,31 @@ class Open15BreakoutService:
             ),
             (
                 "open15_exit",
-                CronTrigger(hour=9, minute=30, second=0, day_of_week="mon-fri", timezone=tz),
+                CronTrigger(hour=eh, minute=em, second=0, day_of_week="mon-fri", timezone=tz),
                 _eod_exit_job,
             ),
             (
                 "open15_exit_retry",
-                CronTrigger(hour=9, minute=32, day_of_week="mon-fri", timezone=tz),
+                CronTrigger(hour=rh, minute=rm, day_of_week="mon-fri", timezone=tz),
                 _eod_retry_job,
             ),
             (
                 "open15_summary",
-                CronTrigger(hour=9, minute=35, day_of_week="mon-fri", timezone=tz),
+                CronTrigger(hour=sh, minute=sm, day_of_week="mon-fri", timezone=tz),
                 _summary_job,
             ),
         ]
         for job_id, trigger, fn in jobs:
             sched.add_job(fn, trigger, id=job_id, replace_existing=True, misfire_grace_time=60)
         logger.info(
-            "open15: 4 scheduler jobs registered (arm 09:10 / exit 09:30 / retry 09:32 / summary 09:35 IST)"
+            "open15: 4 scheduler jobs registered (arm 09:10 / exit %02d:%02d / retry %02d:%02d "
+            "/ summary %02d:%02d IST)",
+            eh,
+            em,
+            rh,
+            rm,
+            sh,
+            sm,
         )
 
     # ---- tick pipeline --------------------------------------------------- #
@@ -813,7 +952,8 @@ class Open15BreakoutService:
         core = self.core
         if core is None or self.day_status != "armed":
             return
-        if not (dt.time(9, 14, 50) <= now.time() <= dt.time(9, 30, 5)):
+        _nea_min, exit_min = self._window_minutes()
+        if not (dt.time(9, 14, 50) <= now.time() <= dt.time(exit_min // 60, exit_min % 60, 5)):
             return
         parsed = _parse_topic(topic_str)
         if parsed is None:
@@ -1109,6 +1249,29 @@ _service: Open15BreakoutService | None = None
 
 def get_open15_service() -> Open15BreakoutService | None:
     return _service
+
+
+def _exit_schedule_times(day_config: dict | None = None) -> tuple[tuple[int, int], ...]:
+    """Effective (exit, retry, summary) job times as (hour, minute) tuples.
+
+    Resolved from the passed day-config (arm path) or, when None, freshly from
+    the DB config row + env defaults (boot path). Retry is exit+2, summary
+    exit+5 — with exit capped at 15:10 the retry always precedes the 15:15
+    MIS square-off cutoff (issue #451).
+    """
+    cfg = day_config
+    if cfg is None:
+        try:
+            from database.open15_breakout_db import get_config
+
+            cfg = resolve_day_config(get_config(), 0.0)
+        except Exception:
+            logger.exception("open15: config read failed for exit schedule — using defaults")
+            cfg = None
+    exit_min = parse_hhmm((cfg or {}).get("exit_time"))
+    if exit_min is None:
+        exit_min = _EXIT_MIN
+    return tuple(divmod(m, 60) for m in (exit_min, exit_min + 2, exit_min + 5))
 
 
 # --- module-level job callables (MUST stay module-level: the persistent
