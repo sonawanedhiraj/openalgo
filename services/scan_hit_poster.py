@@ -258,6 +258,12 @@ class ScanHitPoster:
         Empty symbol list yields ``{"stocks": ""}`` — the engine accepts
         that shape (see ``parse_chartink_symbols``) and the always-POST
         contract from the SKILL.md fix earlier this session.
+
+        ``source='inhouse_scanner'`` (issue #447) lets the webhook audit
+        these echoes as ``cycle_kind='inhouse_echo'`` instead of
+        ``'chartink'`` — without it the EOD scanner-vs-Chartink comparison
+        counts the scanner's own hits as Chartink's, making the comparison
+        self-referential. The engine ignores the extra key.
         """
         stocks = ",".join(s for s in symbols if s)
         direction = "BUY" if screener_type == "buy" else "SELL"
@@ -265,6 +271,7 @@ class ScanHitPoster:
         return {
             "stocks": stocks,
             "scan_name": name,
+            "source": "inhouse_scanner",
         }
 
     def _do_post(self, url: str, payload: dict[str, str]) -> Any:
