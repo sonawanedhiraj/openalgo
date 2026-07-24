@@ -1473,6 +1473,18 @@ Telegrammed every trading day.
   sees ticks the engine subscribed (the "in-house scanner starved" learning) — a
   fully-disjoint result usually means tick starvation, not a threshold mismatch.
   The tuning verdict calls this out.
+- **Echo exclusion (issue #447):** the in-house `ScanHitPoster` posts scanner
+  hits into the *same* simplified-engine webhook Chartink uses. Those payloads
+  carry `source='inhouse_scanner'` and the webhook audits them as
+  `cycle_kind='inhouse_echo'`, so the comparison's Chartink side (and the #321
+  miss-debug set in `scanner_service._today_chartink_symbols`) sees only genuine
+  Chartink cycles. Before 2026-07-24 the echoes were recorded as `'chartink'`
+  with SELL hits misfiled into `screener_buy` (the webhook's old
+  whitespace-token side check vs the poster's single-token
+  `fno_intraday_sell_20` scan name) — every `scanner_comparison` row from
+  ~2026-07-01 to 2026-07-24 is self-referential and untrustworthy. The side
+  check now tokenizes on non-alphabetic chars (SELL/SHORT/COVER), mirroring the
+  engine's `_infer_direction`, so audit and armed direction cannot diverge.
 
 Registered at boot in `app.py` next to `init_sector_follow_service`. One-shot
 backfill / re-run for a past day: `run_comparison_for_date(date='YYYY-MM-DD')`.
