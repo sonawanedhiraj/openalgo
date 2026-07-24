@@ -299,10 +299,16 @@ async function saveCfg(){
     vol_mult:+document.getElementById('c_vol').value,
     instrument:document.getElementById('c_instr').value,
     max_trades:+document.getElementById('c_maxt').value};
-  const r=await fetch('/open15_vol_breakout/api/config',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json();
-  document.getElementById('c_msg').textContent=(j.status==='success')?'saved ✓':('error: '+(j.errors||[]).join('; '));
+  const msg=document.getElementById('c_msg');
+  try{
+    // CSRFProtect is global (issue #446): the POST is rejected 400 without this token
+    const tok=(await (await fetch('/auth/csrf-token')).json()).csrf_token||'';
+    const r=await fetch('/open15_vol_breakout/api/config',{method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRFToken':tok},body:JSON.stringify(body)});
+    const j=await r.json();
+    msg.textContent=(j.status==='success')?'saved ✓'
+      :('error: '+((j.errors&&j.errors.length)?j.errors.join('; '):(j.message||j.error||('HTTP '+r.status))));
+  }catch(e){msg.textContent='error: '+e;}
   loadCfg();
 }
 loadCfg();
