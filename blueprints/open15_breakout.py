@@ -8,6 +8,17 @@ GET /open15_vol_breakout/api/status
 GET /open15_vol_breakout/api/trades?limit=N&date=YYYY-MM-DD
     Journal rows (research fields included: level / trigger second / trigger
     price / entry-minute close) — the captured-drift measurement data.
+
+GET /open15_vol_breakout/api/decision_log?date=YYYY-MM-DD
+    One day's decision timeline (today live, past days from open15_day_logs).
+
+GET /open15_vol_breakout/api/decision_log/days
+    Digest of every stored day (status / selected / entered / P&L) for the
+    history sidebar on /logs (issue #444).
+
+GET /open15_vol_breakout/api/decision_log/export.csv
+    All stored days flattened to one row per selected symbol — the
+    backtest-facing export (issue #444).
 """
 
 from __future__ import annotations
@@ -117,7 +128,7 @@ def config():
 @check_session_validity
 def decision_log():
     """Decision timeline for the 15-min window. Today = live from the service;
-    past dates = persisted snapshot (written at 09:30 flatten / 09:35 summary)."""
+    past dates = persisted snapshot (upserted on every logged event)."""
     import datetime as dt
 
     import pytz
@@ -135,22 +146,102 @@ def decision_log():
     return jsonify({"date": date or today, "source": "snapshot", "events": events or []})
 
 
+def _all_day_logs() -> list[tuple[str, list, str]]:
+    """Persisted day logs newest-first, with today's live log overlaid.
+
+    Returns ``[(date, events, source)]`` where source is ``live`` for the
+    in-memory copy of today (fresher than — or identical to — the per-event
+    snapshot) and ``snapshot`` for DB rows.
+    """
+    import datetime as dt
+
+    import pytz
+
+    from database.open15_breakout_db import list_day_logs
+    from services.open15_breakout_service import get_open15_service
+
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    days = {d: (events, "snapshot") for d, events in list_day_logs()}
+    svc = get_open15_service()
+    if svc is not None and svc.day_log and getattr(svc, "_log_date", None) == today:
+        days[today] = (svc.day_log, "live")
+    return [(d, ev, src) for d, (ev, src) in sorted(days.items(), reverse=True)]
+
+
+@open15_bp.route("/api/decision_log/days", methods=["GET"])
+@check_session_validity
+def decision_log_days():
+    """Digest of every stored day for the history sidebar (issue #444)."""
+    from database.open15_breakout_db import trades_pnl_by_date
+    from services.open15_log_view import summarize_day
+
+    try:
+        pnl_by_date = trades_pnl_by_date()
+        out = []
+        for date, events, source in _all_day_logs():
+            digest = summarize_day(date, events, trades_pnl=pnl_by_date.get(date))
+            digest["source"] = source
+            out.append(digest)
+        return jsonify({"days": out})
+    except Exception:
+        logger.exception("open15: decision-log days digest failed")
+        return jsonify({"days": []}), 500
+
+
+@open15_bp.route("/api/decision_log/export.csv", methods=["GET"])
+@check_session_validity
+def decision_log_export_csv():
+    """All stored days flattened to one CSV row per selected symbol (issue #444)."""
+    from flask import Response
+
+    from services.open15_log_view import render_csv, selection_outcomes
+
+    try:
+        rows = []
+        for date, events, _source in reversed(_all_day_logs()):
+            rows.extend(selection_outcomes(date, events))
+        return Response(
+            render_csv(rows),
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=open15_decision_log.csv"},
+        )
+    except Exception:
+        logger.exception("open15: decision-log CSV export failed")
+        return jsonify({"status": "error", "message": "export failed"}), 500
+
+
 _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>open15_vol_breakout — decision log</title>
 <style>
  body{font-family:ui-monospace,Consolas,monospace;background:#0f1419;color:#d7dde4;margin:24px}
- h2{color:#7dc4e4} table{border-collapse:collapse;width:100%;margin-top:8px}
+ h2{color:#7dc4e4;margin-bottom:4px} table{border-collapse:collapse;width:100%;margin-top:8px}
  td,th{border-bottom:1px solid #2a3138;padding:4px 10px;text-align:left;font-size:13px;vertical-align:top}
  th{color:#8aa0b4} .ev-entry{color:#a6e3a1}.ev-exit{color:#f9e2af}.ev-no_entry{color:#f38ba8}
  .ev-selection{color:#89b4fa}.ev-armed{color:#94e2d5}.ev-summary{color:#cba6f7}
  .ev-skipped_late_boot,.ev-skipped_no_prev_closes{color:#f38ba8;font-weight:bold}
  input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
  .muted{color:#6b7886;font-size:12px}
+ button{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 10px;cursor:pointer}
+ .layout{display:flex;gap:18px;align-items:flex-start;margin-top:12px}
+ .side{width:200px;flex:none}
+ .day{border:1px solid #2a3138;border-radius:6px;padding:6px 10px;margin-bottom:6px;cursor:pointer}
+ .day:hover{background:#161d25}.day.sel{background:#1e2630;border-color:#7dc4e4}
+ .day .d1{display:flex;justify-content:space-between}
+ .pos{color:#a6e3a1}.neg{color:#f38ba8}
+ .badge{font-size:10px;border-radius:8px;padding:1px 7px}
+ .b-live{background:#12324a;color:#89b4fa}.b-skip{background:#463a20;color:#f9e2af}
+ .main{flex:1;min-width:0}
+ .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+ .chip{background:#161d25;border-radius:6px;padding:6px 12px}
+ .chip .k{display:block;font-size:10px;color:#6b7886}.chip .v{font-size:14px}
+ .fbtn{font-size:11px;padding:2px 10px;border-radius:10px}.fbtn.on{background:#2a3138;color:#7dc4e4}
+ .sec{color:#8aa0b4;font-size:12px;margin:14px 0 0}
 </style></head><body>
 <h2>open15_vol_breakout — decision log</h2>
-<div class="muted">Live during 09:15–09:30 IST (auto-refresh 5s), snapshots after.
- <input id="d" type="date"> <button onclick="load()">load</button>
- <a href="/open15_vol_breakout/api/trades" style="color:#7dc4e4">trades json</a></div>
+<div class="muted">Every day is persisted — pick one from the history list. Today auto-refreshes 5s during the window.
+ <a href="/open15_vol_breakout/api/trades" style="color:#7dc4e4">trades json</a>
+ · <a href="/open15_vol_breakout/api/decision_log/export.csv" style="color:#7dc4e4">all days CSV</a>
+ · <a id="dayjson" href="/open15_vol_breakout/api/decision_log" style="color:#7dc4e4">day JSON</a></div>
 <fieldset style="border:1px solid #2a3138;border-radius:6px;margin:14px 0;padding:10px 14px">
  <legend style="color:#8aa0b4;font-size:13px;padding:0 6px">strategy config (applies at next 09:10 arm)</legend>
  <label class="muted">capital/slot (Rs) <input id="c_margin" type="number" min="5000" max="500000" step="1000" style="width:90px"></label>
@@ -166,8 +257,26 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
  <div id="c_eff" class="muted" style="margin-top:6px"></div>
 </fieldset>
-<div id="status" class="muted"></div>
-<table id="t"><thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead><tbody></tbody></table>
+<div class="layout">
+ <div class="side">
+  <div class="muted" style="margin-bottom:6px">history</div>
+  <div id="days"></div>
+ </div>
+ <div class="main">
+  <div id="status" class="muted"></div>
+  <div class="chips" id="chips"></div>
+  <div class="sec">selection outcomes</div>
+  <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>gap %</th><th>max vol&times;</th><th>outcome</th></tr></thead><tbody></tbody></table>
+  <div class="sec" style="display:flex;align-items:center;gap:8px">event timeline
+   <span style="flex:1"></span>
+   <button class="fbtn on" data-f="all">all</button>
+   <button class="fbtn" data-f="trade">entries</button>
+   <button class="fbtn" data-f="no_entry">no-entry</button>
+   <button class="fbtn" data-f="sys">system</button>
+  </div>
+  <table id="t"><thead><tr><th style="width:90px">time</th><th style="width:120px">event</th><th>detail</th></tr></thead><tbody></tbody></table>
+ </div>
+</div>
 <script>
 async function loadCfg(){
   const r=await fetch('/open15_vol_breakout/api/config'); const j=await r.json();
@@ -199,21 +308,103 @@ async function saveCfg(){
 loadCfg();
 </script>
 <script>
-async function load(){
-  const d=document.getElementById('d').value;
-  const r=await fetch('/open15_vol_breakout/api/decision_log'+(d?('?date='+d):''));
-  const j=await r.json();
-  document.getElementById('status').textContent=j.date+' ('+j.source+') — '+(j.events||[]).length+' events';
-  const tb=document.querySelector('#t tbody'); tb.innerHTML='';
-  for(const e of (j.events||[])){
-    const {ts,event,...rest}=e;
+let curDate=null, curEvents=[], curFilter='all', digests=[];
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function kindOf(e){
+  if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped')return 'trade';
+  if(e.event==='no_entry')return 'no_entry';
+  return 'sys';
+}
+async function loadDays(){
+  const r=await fetch('/open15_vol_breakout/api/decision_log/days'); const j=await r.json();
+  digests=j.days||[];
+  const box=document.getElementById('days'); box.innerHTML='';
+  for(const d of digests){
+    const el=document.createElement('div');
+    el.className='day'+(d.date===curDate?' sel':'');
+    const skip=d.status&&d.status.startsWith('skipped');
+    const right=d.source==='live'?'<span class="badge b-live">live</span>'
+      :skip?'<span class="badge b-skip">skipped</span>'
+      :(d.pnl==null?'<span class="muted">—</span>'
+        :'<span class="'+(d.pnl>=0?'pos':'neg')+'">'+(d.pnl>=0?'+':'')+'&#8377;'+Math.round(d.pnl)+'</span>');
+    el.innerHTML='<div class="d1"><span>'+esc(d.date)+'</span>'+right+'</div>'+
+      '<div class="muted">'+(skip?esc(d.status):(d.selected+' sel &middot; '+d.entered+' entered'))+'</div>';
+    el.onclick=()=>selectDay(d.date);
+    box.appendChild(el);
+  }
+  if(!curDate&&digests.length)selectDay(digests[0].date);
+}
+async function selectDay(date){
+  curDate=date;
+  document.getElementById('dayjson').href='/open15_vol_breakout/api/decision_log?date='+date;
+  const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
+  curEvents=j.events||[];
+  document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
+  renderChips(); renderSel(); renderTimeline();
+  document.querySelectorAll('#days .day').forEach(el=>
+    el.classList.toggle('sel',el.querySelector('span').textContent===date));
+}
+function renderChips(){
+  const armed=curEvents.find(e=>e.event==='armed')||{};
+  const summ=curEvents.find(e=>e.event==='summary')||{};
+  const dig=digests.find(d=>d.date===curDate)||{};
+  const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
+    ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
+    ['entries',(dig.entered??summ.entered??0)+' / '+(dig.selected??summ.selected??0)],
+    ['day P&amp;L',dig.pnl==null?'—':((dig.pnl>=0?'+':'')+'&#8377;'+Math.round(dig.pnl))]];
+  document.getElementById('chips').innerHTML=chips.map(([k,v])=>
+    '<div class="chip"><span class="k">'+k+'</span><span class="v'+
+    (k==='day P&amp;L'&&dig.pnl!=null?(dig.pnl>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>').join('');
+}
+function renderSel(){
+  const rows={};
+  for(const e of curEvents){
+    if(e.event==='selection'){
+      for(const[s,side]of Object.entries(e.selected||{}))
+        rows[s]={side,gap:(e.gaps_pct||{})[s],out:'no trigger'};
+    }else if(!rows[e.symbol]){continue;
+    }else if(e.event==='entry'){
+      rows[e.symbol].out='<span class="pos">entered @ '+e.trigger_price+
+        (e.vol_ratio?(' &middot; vol '+e.vol_ratio+'&times;'):'')+'</span>';
+    }else if(e.event==='exit'&&e.pnl!=null){
+      rows[e.symbol].out+=' <span class="'+(e.pnl>=0?'pos':'neg')+'">&rarr; '+
+        (e.pnl>=0?'+':'')+'&#8377;'+e.pnl+'</span>';
+    }else if(e.event==='no_entry'){
+      rows[e.symbol].vol=e.max_vol_ratio;
+      rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+e.max_vol_ratio+
+        '&times; &lt; '+e.needed):'level never broken';
+    }else if(e.event==='entry_skipped'){rows[e.symbol].out='skipped: '+esc(e.reason||'');}
+  }
+  const tb=document.querySelector('#sel tbody'); tb.innerHTML='';
+  for(const[s,r]of Object.entries(rows)){
     const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+ts+'</td><td class="ev-'+event+'">'+event+'</td><td>'+
-      JSON.stringify(rest).slice(1,-1).replaceAll('"','')+'</td>';
+    tr.innerHTML='<td>'+esc(s)+'</td><td>'+esc(r.side)+'</td><td>'+(r.gap??'')+
+      '</td><td>'+(r.vol??'')+'</td><td>'+r.out+'</td>';
+    tb.appendChild(tr);
+  }
+  if(!Object.keys(rows).length)
+    tb.innerHTML='<tr><td colspan="5" class="muted">no selection this day</td></tr>';
+}
+function renderTimeline(){
+  const tb=document.querySelector('#t tbody'); tb.innerHTML='';
+  for(const e of curEvents){
+    if(curFilter!=='all'&&kindOf(e)!==curFilter)continue;
+    const{ts,event,...rest}=e;
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>'+esc(ts)+'</td><td class="ev-'+esc(event)+'">'+esc(event)+'</td><td>'+
+      esc(JSON.stringify(rest).slice(1,-1).replaceAll('"',''))+'</td>';
     tb.appendChild(tr);
   }
 }
-load(); setInterval(()=>{if(!document.getElementById('d').value) load();},5000);
+document.querySelectorAll('.fbtn').forEach(b=>{b.onclick=()=>{
+  curFilter=b.dataset.f;
+  document.querySelectorAll('.fbtn').forEach(x=>x.classList.toggle('on',x===b));
+  renderTimeline();};});
+loadDays();
+setInterval(()=>{
+  const today=digests.length&&digests[0].source==='live'?digests[0].date:null;
+  if(curDate&&curDate===today){loadDays();selectDay(curDate);}
+},5000);
 </script></body></html>"""
 
 

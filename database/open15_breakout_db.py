@@ -96,8 +96,9 @@ class Open15Trade(Base):
 class Open15DayLog(Base):
     """One row per trading day: the full decision log as a JSON blob.
 
-    Written at 09:30 flatten and 09:35 summary (idempotent upsert by date) so
-    the UI can show past days' decision timelines after restarts.
+    Upserted on every logged event (issue #444 — was 09:30/09:35 only), so
+    the UI can show past days' decision timelines after restarts and a
+    mid-window crash loses nothing.
     """
 
     __tablename__ = "open15_day_logs"
@@ -257,6 +258,51 @@ def save_day_log(trade_date: str, events: list) -> bool:
         db_session.rollback()
         logger.exception("open15: day-log save failed for %s", trade_date)
         return False
+    finally:
+        db_session.remove()
+
+
+def list_day_logs() -> list[tuple[str, list]]:
+    """All persisted day logs as ``[(trade_date, events), ...]``, newest first.
+
+    Fail-graceful (returns ``[]``); a row whose JSON fails to parse is skipped
+    with an exception log rather than sinking the whole listing.
+    """
+    import json
+
+    out: list[tuple[str, list]] = []
+    try:
+        rows = db_session.query(Open15DayLog).order_by(Open15DayLog.trade_date.desc()).all()
+        for row in rows:
+            try:
+                out.append((row.trade_date, json.loads(row.log_json) if row.log_json else []))
+            except (ValueError, TypeError):
+                logger.exception(
+                    "open15: day-log JSON unparseable for %s — skipped", row.trade_date
+                )
+        return out
+    except Exception:
+        logger.exception("open15: day-log listing failed")
+        return []
+    finally:
+        db_session.remove()
+
+
+def trades_pnl_by_date() -> dict[str, float]:
+    """Gross journal P&L per trade_date (``pnl`` column, charges not deducted)."""
+    try:
+        from sqlalchemy import func
+
+        rows = (
+            db_session.query(Open15Trade.trade_date, func.sum(Open15Trade.pnl))
+            .filter(Open15Trade.pnl.isnot(None))
+            .group_by(Open15Trade.trade_date)
+            .all()
+        )
+        return {d: round(float(v), 2) for d, v in rows if v is not None}
+    except Exception:
+        logger.exception("open15: per-date pnl aggregation failed")
+        return {}
     finally:
         db_session.remove()
 
