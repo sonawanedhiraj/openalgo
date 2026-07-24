@@ -170,19 +170,49 @@ function DataHealthBadge({ dataHealth }: { dataHealth: DataHealth }) {
   )
 }
 
-function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) {
+// mode = the strategy's toggle; effectiveRouting = the per-strategy dispatch
+// verdict right now (issue #440) — 'Live (held)' when Analyze mode gates a
+// live toggle down to sandbox routing.
+function ModeBadge({
+  mode,
+  deployable,
+  effectiveRouting,
+}: {
+  mode: string
+  deployable: boolean
+  effectiveRouting?: 'live' | 'sandbox'
+}) {
   if (!deployable || mode.includes('scaffold'))
     return (
       <Badge variant="outline" className="text-muted-foreground">
         Scaffold-only
       </Badge>
     )
-  if (mode === 'live')
-    return <Badge className="bg-green-600 text-white hover:bg-green-700">Live</Badge>
+  if (mode === 'live') {
+    if (effectiveRouting === 'sandbox')
+      return (
+        <Badge
+          variant="secondary"
+          className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+          title="Toggle is LIVE but orders route to sandbox — Analyze mode is ON (navbar)"
+        >
+          Live (held: Analyze on)
+        </Badge>
+      )
+    return (
+      <Badge
+        className="bg-green-600 text-white hover:bg-green-700"
+        title="Orders route to the REAL broker"
+      >
+        Live
+      </Badge>
+    )
+  }
   return (
     <Badge
       variant="secondary"
       className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+      title="Orders route to the sandbox book"
     >
       Sandbox
     </Badge>
@@ -1854,7 +1884,11 @@ export default function StrategyDetailPage() {
             <h1 className="text-2xl font-semibold">{data.display_name}</h1>
             <HealthBadge health={data.health} />
             <DataHealthBadge dataHealth={data.data_health} />
-            <ModeBadge mode={data.mode} deployable={data.deployable} />
+            <ModeBadge
+              mode={data.mode}
+              deployable={data.deployable}
+              effectiveRouting={data.effective_routing}
+            />
             <LLMModeBadge llmMode={data.llm_mode} />
           </div>
           <p className="text-sm text-muted-foreground font-mono pl-7">

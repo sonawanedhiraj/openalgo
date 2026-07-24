@@ -1,4 +1,10 @@
-"""Tests for Stage-0 resolver wired into ``place_gtt_order_with_auth``."""
+"""Tests for the per-strategy dispatch wired into ``place_gtt_order_with_auth``.
+
+Issue #440 — UI-driven routing: GTT placement creates exposure, so it goes
+through ``resolve_order_mode(order_data['strategy'])``. LIVE (live row +
+Analyze off) → broker; every SANDBOX resolution surfaces 501 (GTT is not
+implemented in the sandbox book).
+"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,23 +15,19 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 
 @pytest.fixture
-def fresh_intent_db(monkeypatch):
-    from database import daily_intent_db as dim
+def fresh_mode_db(monkeypatch):
+    """Point strategy_mode_db at a fresh in-memory SQLite for one test."""
+    from database import strategy_mode_db as sm
 
-    test_engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
-
-    monkeypatch.setattr(dim, "engine", test_engine)
-    monkeypatch.setattr(dim, "db_session", test_session)
-    dim.Base.metadata.create_all(test_engine)
-
-    yield dim
-
-    test_session.remove()
-    test_engine.dispose()
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(sm, "engine", eng)
+    monkeypatch.setattr(sm, "db_session", sess)
+    sm.Base.query = sess.query_property()
+    sm.Base.metadata.create_all(eng)
+    yield sm
+    sess.remove()
+    eng.dispose()
 
 
 def _payload():
@@ -44,17 +46,16 @@ def _payload():
     }
 
 
-def _patch_modes(monkeypatch, analyze=False):
+def _patch_analyze(monkeypatch, analyze=False):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: analyze)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
 
-def test_place_gtt_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
+def test_place_gtt_routes_to_broker_when_strategy_live(fresh_mode_db, monkeypatch):
+    """strategy_mode row='live' + analyze off → broker.place_gtt_order fires."""
     from services import place_gtt_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "TRG-1"))
     monkeypatch.setattr(
@@ -75,13 +76,13 @@ def test_place_gtt_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     broker_place.assert_called_once()
 
 
-def test_place_gtt_returns_501_when_sandbox_intent(fresh_intent_db, monkeypatch):
-    """Sandbox GTT not implemented — expect 501, not broker call."""
+def test_place_gtt_returns_501_when_strategy_row_sandbox(fresh_mode_db, monkeypatch):
+    """Sandbox GTT not implemented — a sandbox-flagged strategy gets 501,
+    never a broker call, even with analyze off."""
     from services import place_gtt_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "sandbox", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     broker_place = MagicMock()
     monkeypatch.setattr(
@@ -103,12 +104,12 @@ def test_place_gtt_returns_501_when_sandbox_intent(fresh_intent_db, monkeypatch)
     broker_place.assert_not_called()
 
 
-def test_place_gtt_returns_501_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
+def test_place_gtt_returns_501_when_live_but_analyze_on(fresh_mode_db, monkeypatch):
+    """Analyze mode is the platform kill switch: a live row cannot beat it."""
     from services import place_gtt_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch, analyze=True)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch, analyze=True)
 
     broker_place = MagicMock()
     monkeypatch.setattr(
@@ -129,14 +130,11 @@ def test_place_gtt_returns_501_when_live_but_analyze_on(fresh_intent_db, monkeyp
     broker_place.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_place_gtt_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX — GTT is not
-    implemented in sandbox, so it surfaces 501 (not a rejection)."""
+def test_place_gtt_returns_501_when_no_row_default_denies(fresh_mode_db, monkeypatch):
+    """Default deny: no strategy_mode row → SANDBOX; GTT surfaces 501."""
     from services import place_gtt_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    _patch_analyze(monkeypatch)
 
     broker_place = MagicMock()
     monkeypatch.setattr(
@@ -158,11 +156,12 @@ def test_place_gtt_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, mo
     broker_place.assert_not_called()
 
 
-def test_place_gtt_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): no daily_intent row → SANDBOX default; GTT surfaces 501."""
+def test_place_gtt_retired_global_row_has_no_effect(fresh_mode_db, monkeypatch):
+    """A manually re-created __global__ live row must not route anything live."""
     from services import place_gtt_order_service
 
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("__global__", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     broker_place = MagicMock()
     monkeypatch.setattr(
@@ -184,17 +183,17 @@ def test_place_gtt_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch
     broker_place.assert_not_called()
 
 
-def test_place_gtt_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+def test_place_gtt_reject_response_shape_matches_existing_convention(fresh_mode_db, monkeypatch):
     from services import place_gtt_order_service
-    from services.mode_service import set_daily_intent
 
-    _patch_modes(monkeypatch)
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
+    _patch_analyze(monkeypatch)
     monkeypatch.setattr(
         place_gtt_order_service,
         "import_broker_gtt_module",
         lambda _b: SimpleNamespace(place_gtt_order=MagicMock()),
     )
+
+    # ---- 501 shape (no strategy_mode row → default deny) ----
     reject_result = place_gtt_order_service.place_gtt_order_with_auth(
         _payload(),
         auth_token="dummy",
@@ -202,7 +201,8 @@ def test_place_gtt_reject_response_shape_matches_existing_convention(fresh_inten
         original_data=_payload(),
     )
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
+    # ---- live shape (live row + analyze off) ----
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
     broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "TRG-1"))
     monkeypatch.setattr(
         place_gtt_order_service,

@@ -1061,15 +1061,15 @@ def simplified_stock_engine_webhook(webhook_id):
             syms = []
         scan_cycle_service.heartbeat(cycle_id, scan_stage, "ok", f"{len(syms)} syms")
 
-        # Capture today's effective mode for the audit. Best-effort — if the
-        # resolver throws (e.g. DailyIntent table missing on an old install),
-        # we record None and continue. Order placement is unchanged by this.
+        # Capture the engine's effective order routing for the audit —
+        # per-strategy dispatch (issue #440). Best-effort: on resolver failure
+        # record None and continue. Order placement is unchanged by this.
         try:
-            from services.mode_service import resolve_effective_mode
+            from services.mode_service import resolve_order_mode
 
-            effective_mode = resolve_effective_mode().value
+            effective_mode = resolve_order_mode("simplified_engine").value
         except Exception as e:
-            logger.warning("resolve_effective_mode failed (non-fatal): %s", e)
+            logger.warning("resolve_order_mode failed (non-fatal): %s", e)
             effective_mode = None
 
         from services.simplified_stock_engine_service import (

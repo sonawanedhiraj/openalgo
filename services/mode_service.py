@@ -1,20 +1,31 @@
 """Resolve the effective trade mode for any strategy or the global order path.
 
-**Mode-only architecture.** The single persistent control is ``mode`` ∈
-{``live``, ``sandbox``} per strategy, stored in the ``strategy_mode`` table.
-There is no ``intent`` axis and no daily date key — automated, self-expiring
+**Mode-only, UI-driven architecture (issue #440).** The single persistent
+control is ``mode`` ∈ {``live``, ``sandbox``} per strategy, stored in the
+``strategy_mode`` table and written ONLY through the preflight-gated
+``strategy_mode_service.flip_mode`` — i.e. the strategies-page toggle. There
+is no ``intent`` axis, no daily date key, and **no hidden global DB flag** —
+the retired ``strategy_mode['__global__']`` row and the legacy ``daily_intent``
+fall-through no longer participate in order dispatch. Automated, self-expiring
 safety guards live in ``strategy_runtime_override`` (read at engine job-entry),
 not here.
 
-Resolution (``resolve_mode``): persistent ``strategy_mode`` row → env mode flag
-→ ``sandbox`` default. **Default is sandbox everywhere** — both per-strategy and
-on the global external-order gate. ``live`` is an explicit operator opt-in via a
-persistent row; nothing is ever *refused* for lack of configuration (it routes
-to the virtual sandbox book instead).
+Two visible operator controls, nothing else:
 
-``resolve_strategy_mode`` and ``resolve_effective_mode`` are retained as
-DEPRECATED back-compat shims over ``resolve_mode`` (see their docstrings). New
-code should call ``resolve_mode`` directly.
+1. The navbar **Analyze/Live toggle** (``settings.analyze_mode``) — the
+   platform-wide kill switch. Analyze ON forces SANDBOX for everything.
+2. The per-strategy **Live/Sandbox toggle** on /strategies (a ``strategy_mode``
+   row). With Analyze OFF, an order routes LIVE **only** when its strategy's
+   row says ``live``. No row / unknown label → SANDBOX (default deny).
+
+Order dispatch for exposure-creating paths (place/basket/split/smart) MUST use
+:func:`resolve_order_mode`. :func:`resolve_effective_mode` is retained as the
+platform-level analyze overlay for read decorations and order-management
+routing only — it must NEVER gate a new order onto the live broker.
+
+``resolve_strategy_mode`` is retained as a DEPRECATED back-compat shim over
+``resolve_mode`` (see its docstring). New code should call ``resolve_mode``
+directly.
 """
 
 import os
@@ -33,12 +44,12 @@ __all__ = [
     "EffectiveDecision",
     "ResolvedMode",
     "resolve_mode",
+    "resolve_order_mode",
     "get_daily_intent",
     "set_daily_intent",
     "set_daily_intent_safe",
     "resolve_effective_mode",
     "resolve_strategy_mode",
-    "GLOBAL_MODE_KEY",
     "_today_ist_str",
 ]
 
@@ -61,17 +72,10 @@ def set_daily_intent_safe(
 class EffectiveMode(str, Enum):
     LIVE = "live"
     SANDBOX = "sandbox"
-    # Retained for back-compat with the order services (close/cancel/basket),
-    # which still branch on them defensively. The mode-only resolver never
-    # returns SKIP or DISABLED — the global gate fails to SANDBOX, never refuses.
+    # Retained only so old imports don't break. NO resolver returns these —
+    # orders are never refused for lack of configuration (they route sandbox).
     SKIP = "skip"
     DISABLED = "disabled"
-
-
-# Reserved strategy key for the GLOBAL external-order path (the /api/v1
-# place/close/cancel family). An operator opts the external path into live by
-# setting a strategy_mode row for this key; with no row it defaults to sandbox.
-GLOBAL_MODE_KEY = "__global__"
 
 
 # --------------------------------------------------------------------------- #
@@ -92,14 +96,15 @@ class ResolvedMode:
 
 
 # Per-engine env vocabularies, collapsed onto the mode-only {live, sandbox}
-# axis. Any "no orders" sentinel (disabled / scaffold / skip) maps to the
-# conservative ``sandbox`` — never to ``live``.
+# axis. EVERY env value maps to ``sandbox`` — an env var is a hidden non-UI
+# flag and can never escalate to live (issue #440: only the strategies-page
+# toggle, i.e. a ``strategy_mode`` row written via ``flip_mode``, can).
 _ENV_VAR = {
     "simplified_engine": "SIMPLIFIED_ENGINE_MODE",
     "sector_follow_cap5_vol": "SECTOR_FOLLOW_CAP5_VOL_MODE",
 }
 _ENV_VALUE_MAP = {
-    "live": "live",
+    "live": "sandbox",  # capped — env cannot opt into live (#440)
     "sandbox": "sandbox",
     "disabled": "sandbox",
     "scaffold": "sandbox",
@@ -173,63 +178,59 @@ def resolve_strategy_mode(strategy_name: str, date: str | None = None) -> Effect
     return EffectiveDecision(mode=rm.mode, intent="run", daily_capital_cap=None, source=rm.source)
 
 
-def _legacy_global_mode(date_str: str | None = None) -> str | None:
-    """Back-compat fall-through for the global gate: the legacy date-keyed
-    ``daily_intent`` table, collapsed onto {live, sandbox}.
+def resolve_order_mode(mode_key: str | None) -> EffectiveMode:
+    """Per-strategy order dispatch: the ONLY gate for exposure-creating orders.
 
-    Returns 'live' / 'sandbox' for a present legacy row (``skip`` → ``sandbox``,
-    since 'skip' is retired), or None when no legacy row exists. This mirrors the
-    documented phased retirement of ``daily_intent`` — ``strategy_mode`` is the
-    primary control; legacy is consulted only while external-API workflows
-    migrate. Never raises.
+    ``mode_key`` is the strategy identity of the order — normally the payload's
+    ``strategy`` label; in-repo engines pass their canonical ``strategy_mode``
+    key explicitly when the two differ (simplified engine).
+
+    UI-driven resolution (issue #440), two visible controls and nothing else:
+
+    1. Analyze/Live navbar toggle: Analyze ON → ``SANDBOX`` for everything
+       (platform kill switch; also the fail-safe if the flag can't be read).
+    2. Strategies-page toggle: with Analyze OFF, ``LIVE`` **only** when a
+       ``strategy_mode`` row for ``mode_key`` says ``live``. No key, no row,
+       or an env-only resolution → ``SANDBOX`` (default deny — no hidden
+       ``__global__``/``daily_intent``/env escalation paths exist anymore).
+
+    Never raises and never returns SKIP/DISABLED — an order is never refused
+    for lack of configuration; it routes to the virtual sandbox book.
     """
     try:
-        row = get_daily_intent(date_str if date_str is not None else _today_ist_str())
+        if get_analyze_mode():
+            return EffectiveMode.SANDBOX
     except Exception:
-        return None
-    if not row:
-        return None
-    intent = row.get("intent")
-    if intent == "live":
-        return "live"
-    if intent in ("sandbox", "skip"):
-        return "sandbox"
-    return None
+        # If the analyzer flag can't be read, fail to the safer paper mode.
+        return EffectiveMode.SANDBOX
+
+    if not mode_key:
+        return EffectiveMode.SANDBOX
+
+    rm = resolve_mode(mode_key)
+    if rm.mode == "live" and rm.source == "strategy_mode":
+        return EffectiveMode.LIVE
+    return EffectiveMode.SANDBOX
 
 
 def resolve_effective_mode(date_str: str | None = None) -> EffectiveMode:
-    """DEPRECATED shim — the GLOBAL external-order gate, now mode-only.
+    """Platform-level analyze overlay — read decorations + order management.
 
-    Resolution order:
+    Returns ``SANDBOX`` when the Analyze/Live navbar toggle is on Analyze (or
+    unreadable), else ``LIVE``. That is the whole resolution: the retired
+    hidden ``strategy_mode['__global__']`` row and legacy ``daily_intent``
+    fall-through are gone (issue #440 — no non-UI DB flags).
 
-    1. ``strategy_mode['__global__']`` row — the operator's persistent global
-       knob (primary control). Set it to enable live external-API orders.
-    2. Legacy ``daily_intent`` table — documented back-compat fall-through while
-       the daily_intent retirement completes (``skip`` collapses to sandbox).
-    3. ``SANDBOX`` default (was ``DISABLED``). External callers are never
-       refused for lack of configuration — orders route to the virtual ₹1Cr
-       sandbox book. This is the authorized "default sandbox globally" policy;
-       the change only ever makes the path *more* sandboxy, never live.
-
-    A resolved ``live`` is downgraded to ``SANDBOX`` whenever the platform-wide
-    ``analyze_mode`` is ON (legacy conservative overlay). Never returns ``SKIP``
-    or ``DISABLED``.
+    Use ONLY for (a) read paths deciding which book to display and (b)
+    order-management routing (cancel/modify/close) where the sandbox-book
+    lookup handles per-order targeting. It must NEVER gate an
+    exposure-creating order onto the live broker — that is
+    :func:`resolve_order_mode`'s job (per-strategy, default deny).
+    ``date_str`` is accepted for back-compat and ignored.
     """
-    rm = resolve_mode(GLOBAL_MODE_KEY)
-    mode = rm.mode
-    if rm.source != "strategy_mode":
-        # No explicit global strategy_mode row — consult legacy daily_intent
-        # before falling to the sandbox default.
-        legacy = _legacy_global_mode(date_str)
-        if legacy is not None:
-            mode = legacy
-
-    if mode == "live":
-        try:
-            if get_analyze_mode():
-                return EffectiveMode.SANDBOX
-        except Exception:
-            # If the analyzer flag can't be read, fail to the safer paper mode.
+    try:
+        if get_analyze_mode():
             return EffectiveMode.SANDBOX
-        return EffectiveMode.LIVE
-    return EffectiveMode.SANDBOX
+    except Exception:
+        return EffectiveMode.SANDBOX
+    return EffectiveMode.LIVE

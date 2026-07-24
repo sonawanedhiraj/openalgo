@@ -281,9 +281,10 @@ def test_classification_falls_back_to_symbol_suffix_when_info_missing(monkeypatc
 def _live_mode(monkeypatch):
     from services.mode_service import EffectiveMode
 
+    # Issue #440: dispatch is per-strategy via resolve_order_mode(mode_key).
     monkeypatch.setattr(
-        "services.place_order_service.resolve_effective_mode",
-        lambda: EffectiveMode.LIVE,
+        "services.place_order_service.resolve_order_mode",
+        lambda _key: EffectiveMode.LIVE,
     )
 
 

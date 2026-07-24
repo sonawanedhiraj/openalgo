@@ -87,33 +87,18 @@ def modify_order_with_auth(
     if "apikey" in order_request_data:
         order_request_data.pop("apikey", None)
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    # Order-management routing (issue #440): Analyze ON → sandbox only. With
+    # Analyze OFF, route by where the order actually lives — a sandbox orderid
+    # goes to the sandbox book, anything else falls through to the broker.
+    from services.sandbox_service import sandbox_order_exists
+
     mode = resolve_effective_mode()
+    route_sandbox = mode is EffectiveMode.SANDBOX or (
+        original_data.get("apikey")
+        and sandbox_order_exists(order_data.get("orderid", ""), original_data["apikey"])
+    )
 
-    if mode is EffectiveMode.SKIP:
-        logger.info("Modify order rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Modify order rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.SANDBOX:
+    if route_sandbox:
         from services.sandbox_service import sandbox_modify_order
 
         # Get API key from original data
@@ -159,7 +144,7 @@ def modify_order_with_auth(
 
         return success, response, status_code
 
-    # mode is EffectiveMode.LIVE — proceed with actual broker modify.
+    # Not a sandbox-book order and Analyze is off — proceed with broker modify.
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}

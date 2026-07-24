@@ -66,12 +66,16 @@ def get_order_status_with_auth(
     if "apikey" in request_data:
         request_data.pop("apikey", None)
 
-    # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
-    # SKIP/DISABLED are not order rejections for reads — operator still wants
-    # to see state. is_analyze_mode is kept as a boolean for downstream label
+    # Read path (issue #440): sandbox source when Analyze is ON, or when the
+    # orderid is a sandbox-book order (mixed-mode operation) — otherwise the
+    # broker source. is_analyze_mode is kept as a boolean for downstream label
     # formatting (error responses route to analyzer_db vs apilog_db).
-    is_analyze_mode = resolve_effective_mode() is EffectiveMode.SANDBOX
     orderid = status_data.get("orderid")
+    is_analyze_mode = resolve_effective_mode() is EffectiveMode.SANDBOX
+    if not is_analyze_mode and orderid and original_data.get("apikey"):
+        from services.sandbox_service import sandbox_order_exists
+
+        is_analyze_mode = sandbox_order_exists(orderid, original_data["apikey"])
     logger.info(
         f"[OrderStatus] Processing order status request - Mode: {'ANALYZE' if is_analyze_mode else 'LIVE'}, OrderID: {orderid}, Broker: {broker}"
     )

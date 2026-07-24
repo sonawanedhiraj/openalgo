@@ -1132,9 +1132,12 @@ class SimplifiedStockEngineService:
         - sandbox: call sandbox_service.sandbox_place_order directly so the engine
           can run against virtual Rs1Cr capital regardless of the global
           analyze_mode setting.
-        - live: call services.place_order_service.place_order, which still honors
-          the global analyze_mode flag (so an operator can flip the whole
-          installation into analyzer mode and the engine follows).
+        - live: call services.place_order_service.place_order with
+          mode_key='simplified_engine' — the payload's ``strategy`` is the
+          webhook label, not the strategy_mode key, so without the explicit
+          key the per-strategy dispatch (issue #440) would default-deny the
+          order to sandbox. Live routing still requires the strategies-page
+          toggle (strategy_mode row) AND Analyze mode off.
 
         Returns (success, response_dict). Both modes produce a response with an
         "orderid" on success; the caller uses _wait_for_fill to confirm.
@@ -1159,7 +1162,9 @@ class SimplifiedStockEngineService:
         if self.mode == MODE_LIVE:
             from services.place_order_service import place_order
 
-            success, response, _ = place_order(payload, api_key=api_key)
+            success, response, _ = place_order(
+                payload, api_key=api_key, mode_key="simplified_engine"
+            )
             return success, response
 
         # Should be unreachable -- disabled is short-circuited by callers, and
@@ -1776,19 +1781,15 @@ class SimplifiedStockEngineService:
             return MODE_DISABLED
         if self.mode == MODE_SANDBOX:
             return MODE_SANDBOX
-        # mode == MODE_LIVE: still surface whether the global toggle would
-        # override us into sandbox.
-        #
-        # TODO(stage-0): this is a status-payload label only, not a routing
-        # decision — actual order routing in this engine goes through
-        # services.place_order which already uses resolve_effective_mode().
-        # Migrating the label to the resolver is intertwined with the engine's
-        # own mode flag (SIMPLIFIED_ENGINE_MODE) and the operator's
-        # daily_intent. Defer to the Stage 2/3 cleanup of the simplified
-        # engine's mode handling. See docs/SIMPLIFIED_ENGINE_HANDOFF.md.
-        from database.settings_db import get_analyze_mode
+        # mode == MODE_LIVE: this is a status-payload label only, not a
+        # routing decision — actual order routing goes through
+        # services.place_order which uses the per-strategy
+        # resolve_order_mode('simplified_engine') dispatch (issue #440).
+        # Surface what that dispatch would actually do.
+        from services.mode_service import EffectiveMode, resolve_order_mode
 
-        return "analyze" if get_analyze_mode() else MODE_LIVE
+        routed = resolve_order_mode("simplified_engine")
+        return MODE_LIVE if routed is EffectiveMode.LIVE else "analyze"
 
     # ------------------------------------------------------------------
     # P0 — EOD safety net (services/eod_watchdog_service.py is the caller).
@@ -2151,7 +2152,12 @@ def flatten_strategy_positions(
         try:
             from services.place_order_service import place_order
 
-            success, response, status_code = place_order(payload, api_key=api_key)
+            # mode_key: trade_journal rows are the simplified engine's — the
+            # journal 'strategy' label is a webhook name, not the engine's
+            # strategy_mode key, so route by the engine's key (issue #440).
+            success, response, status_code = place_order(
+                payload, api_key=api_key, mode_key="simplified_engine"
+            )
         except Exception as e:
             logger.exception("[EOD-FLATTEN] %s %s place_order raised", strategy_name, symbol)
             summary["failed"].append({"symbol": symbol, "error": f"exception:{e}"})

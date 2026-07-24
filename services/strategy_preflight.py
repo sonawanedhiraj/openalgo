@@ -385,6 +385,37 @@ def _load_strategy_preflight(strategy_name: str):
     return func
 
 
+def _open_broker_positions_count() -> int | None:
+    """Count open (netqty != 0) positions in the LIVE broker book.
+
+    Best-effort for the live→sandbox flip warning: returns None when no api
+    key / broker session / any error — the warning is simply skipped then.
+    """
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.positionbook_service import get_positionbook
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            return None
+        ok, resp, _status = get_positionbook(api_key=api_key)
+        if not ok or not isinstance(resp, dict):
+            return None
+        rows = resp.get("data") or []
+        count = 0
+        for r in rows:
+            try:
+                qty = float(r.get("netqty") or r.get("net_quantity") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if qty != 0:
+                count += 1
+        return count
+    except Exception:
+        logger.exception("preflight: open broker position count failed")
+        return None
+
+
 def run_preflight(strategy_name: str, target_mode: str) -> PreflightResult:
     """Run the preflight check for a flip attempt — the single public entry.
 
@@ -404,15 +435,41 @@ def run_preflight(strategy_name: str, target_mode: str) -> PreflightResult:
             snapshot={"preflight_path": "validation"},
         )
 
-    # Sandbox is always allowed — the gates exist to protect LIVE.
+    # Sandbox is always allowed — the gates exist to protect LIVE. But warn
+    # loudly when flipping a currently-LIVE-routing strategy back to sandbox
+    # while the broker account holds open positions (issue #440): after the
+    # flip its exit orders route to the sandbox book, so any real position it
+    # owns would be stranded at the broker. Warning, not blocker — the
+    # operator may be flipping precisely to stop the strategy and square off
+    # by hand.
     if target_mode == "sandbox":
-        return PreflightResult.allow(
+        warnings: list[str] = []
+        try:
+            from services.mode_service import EffectiveMode, resolve_order_mode
+
+            if resolve_order_mode(strategy_name) is EffectiveMode.LIVE:
+                n_open = _open_broker_positions_count()
+                if n_open:
+                    warnings.append(
+                        f"{strategy_name} is currently routing LIVE and the broker "
+                        f"account has {n_open} open position(s). After this flip its "
+                        "exits route to the sandbox book — verify none of these "
+                        "positions belong to this strategy, or square them off "
+                        "manually first."
+                    )
+        except Exception:
+            logger.exception("preflight: live→sandbox open-position warning check failed")
+
+        return PreflightResult(
+            can_flip=True,
+            blockers=[],
+            warnings=warnings,
             snapshot={
                 "preflight_path": "sandbox-always-allowed",
                 "strategy_name": strategy_name,
                 "target_mode": target_mode,
                 "evaluated_at_ist": datetime.now(_IST).isoformat(),
-            }
+            },
         )
 
     custom = _load_strategy_preflight(strategy_name)

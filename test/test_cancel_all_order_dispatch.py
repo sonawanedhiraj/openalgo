@@ -1,59 +1,55 @@
-"""Tests for Stage-0 resolver wired into ``cancel_all_orders_with_auth``."""
+"""Tests for order-management routing wired into ``cancel_all_orders_with_auth``.
+
+Issue #440 — cancel-all is protective, so under mixed-mode operation it sweeps
+BOTH books: the sandbox book always (when an apikey is available), and the
+broker book too when Analyze is off. With Analyze ON the sandbox sweep result
+is returned and the broker is never touched; with Analyze OFF the sandbox
+canceled/failed lists are merged into the broker response.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
-
-
-@pytest.fixture
-def fresh_intent_db(monkeypatch):
-    from database import daily_intent_db as dim
-
-    test_engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
-
-    monkeypatch.setattr(dim, "engine", test_engine)
-    monkeypatch.setattr(dim, "db_session", test_session)
-    dim.Base.metadata.create_all(test_engine)
-
-    yield dim
-
-    test_session.remove()
-    test_engine.dispose()
 
 
 def _payload():
     return {"apikey": "test-api-key"}
 
 
-def _patch_modes(monkeypatch, analyze=False):
+def _patch_analyze(monkeypatch, analyze=False):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: analyze)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
 
-def test_cancel_all_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
+def _sandbox_sweep_result():
+    return (
+        True,
+        {
+            "status": "success",
+            "canceled_count": 1,
+            "failed_count": 1,
+            "canceled_orders": ["SBX-OID-1"],
+            "failed_cancellations": ["SBX-OID-2"],
+        },
+        200,
+    )
+
+
+def test_cancel_all_sweeps_both_books_when_analyze_off(monkeypatch):
+    """Analyze off → sandbox sweep runs first, then the broker sweep; the
+    response folds the sandbox canceled/failed lists into the broker's."""
     from services import cancel_all_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    _patch_analyze(monkeypatch)
 
-    broker_api = MagicMock(return_value=(["OID1"], []))
+    broker_api = MagicMock(return_value=(["OID1"], ["OID2"]))
     monkeypatch.setattr(
         cancel_all_order_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
-    sandbox_mock = MagicMock()
+    sandbox_mock = MagicMock(return_value=_sandbox_sweep_result())
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
 
-    success, _, status = cancel_all_order_service.cancel_all_orders_with_auth(
+    success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
         {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
@@ -63,44 +59,19 @@ def test_cancel_all_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     assert success is True
     assert status == 200
     broker_api.assert_called_once()
-    sandbox_mock.assert_not_called()
-
-
-def test_cancel_all_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatch):
-    from services import cancel_all_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
-
-    sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
-    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
-    broker_api = MagicMock()
-    monkeypatch.setattr(
-        cancel_all_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
-    )
-
-    cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},  # pragma: allowlist secret
-        auth_token="dummy",
-        broker="zerodha",
-        original_data=_payload(),
-    )
-
     sandbox_mock.assert_called_once()
-    broker_api.assert_not_called()
+    # Broker results come first, sandbox-book results are merged in after.
+    assert response["canceled_orders"] == ["OID1", "SBX-OID-1"]
+    assert response["failed_cancellations"] == ["OID2", "SBX-OID-2"]
 
 
-def test_cancel_all_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
+def test_cancel_all_sandbox_only_when_analyze_on(monkeypatch):
+    """Analyze ON → the sandbox sweep result is returned; broker never touched."""
     from services import cancel_all_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch, analyze=True)
+    _patch_analyze(monkeypatch, analyze=True)
 
-    sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
+    sandbox_mock = MagicMock(return_value=_sandbox_sweep_result())
     monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
     broker_api = MagicMock()
     monkeypatch.setattr(
@@ -109,114 +80,54 @@ def test_cancel_all_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, 
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
 
-    cancel_all_order_service.cancel_all_orders_with_auth(
+    success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
         {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
     )
 
+    assert success is True
+    assert status == 200
     sandbox_mock.assert_called_once()
     broker_api.assert_not_called(), "Live broker fired despite analyze_mode=True!"
+    assert response["canceled_orders"] == ["SBX-OID-1"]
 
 
-def test_cancel_all_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
-    from services import cancel_all_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
-
-    sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
-    broker_api = MagicMock()
-    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
-    monkeypatch.setattr(
-        cancel_all_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
-    )
-
-    success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},  # pragma: allowlist secret
-        auth_token="dummy",
-        broker="zerodha",
-        original_data=_payload(),
-    )
-
-    assert success is True
-    assert status == 200
-    sandbox_mock.assert_called_once()
-    broker_api.assert_not_called()
-
-
-def test_cancel_all_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
+def test_cancel_all_reject_response_shape_matches_existing_convention(monkeypatch):
+    """Both sandbox-only and mixed-mode returns are (bool, dict, int)."""
     from services import cancel_all_order_service
 
-    _patch_modes(monkeypatch)
-
-    sandbox_mock = MagicMock(return_value=(True, {"canceled_count": 1}, 200))
-    broker_api = MagicMock()
-    monkeypatch.setattr("services.sandbox_service.sandbox_cancel_all_orders", sandbox_mock)
-    monkeypatch.setattr(
-        cancel_all_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
-    )
-
-    success, response, status = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},  # pragma: allowlist secret
-        auth_token="dummy",
-        broker="zerodha",
-        original_data=_payload(),
-    )
-
-    assert success is True
-    assert status == 200
-    sandbox_mock.assert_called_once()
-    broker_api.assert_not_called()
-
-
-def test_cancel_all_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
-    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
-    from services import cancel_all_order_service
-    from services.mode_service import set_daily_intent
-
-    _patch_modes(monkeypatch)
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
     monkeypatch.setattr(
         "services.sandbox_service.sandbox_cancel_all_orders",
-        MagicMock(return_value=(True, {"canceled_count": 1}, 200)),
+        MagicMock(return_value=_sandbox_sweep_result()),
     )
-    monkeypatch.setattr(
-        cancel_all_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(cancel_all_orders_api=MagicMock()),
-    )
-
-    reject_result = cancel_all_order_service.cancel_all_orders_with_auth(
-        {"apikey": "test"},  # pragma: allowlist secret
-        auth_token="dummy",
-        broker="zerodha",
-        original_data=_payload(),
-    )
-
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
     broker_api = MagicMock(return_value=(["OID"], []))
     monkeypatch.setattr(
         cancel_all_order_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(cancel_all_orders_api=broker_api),
     )
-    success_result = cancel_all_order_service.cancel_all_orders_with_auth(
+
+    # ---- sandbox-only shape (analyze ON) ----
+    _patch_analyze(monkeypatch, analyze=True)
+    sandbox_result = cancel_all_order_service.cancel_all_orders_with_auth(
         {"apikey": "test"},  # pragma: allowlist secret
         auth_token="dummy",
         broker="zerodha",
         original_data=_payload(),
     )
 
-    for r in (reject_result, success_result):
+    # ---- mixed-mode shape (analyze OFF → both books) ----
+    _patch_analyze(monkeypatch)
+    merged_result = cancel_all_order_service.cancel_all_orders_with_auth(
+        {"apikey": "test"},  # pragma: allowlist secret
+        auth_token="dummy",
+        broker="zerodha",
+        original_data=_payload(),
+    )
+
+    for r in (sandbox_result, merged_result):
         assert isinstance(r, tuple) and len(r) == 3
         assert isinstance(r[0], bool)
         assert isinstance(r[1], dict)
