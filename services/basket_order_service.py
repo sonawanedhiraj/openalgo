@@ -120,6 +120,7 @@ def place_single_order(
     auth_token: str,
     total_orders: int,
     order_index: int,
+    broker: str | None = None,
 ) -> dict[str, Any]:
     """
     Place a single order (no per-order event emission - summary event emitted at end)
@@ -130,11 +131,26 @@ def place_single_order(
         auth_token: Authentication token
         total_orders: Total number of orders in the basket
         order_index: Index of the current order
+        broker: Broker name (for the stock-option MARKET→LIMIT conversion)
 
     Returns:
         Order result dictionary
     """
     try:
+        # Stock/commodity-option MARKET/SL-M orders are RMS-blocked live —
+        # convert to a protective LIMIT or reject this order (issue #438).
+        from services.synthetic_market_order_service import ensure_live_safe_pricetype
+
+        order_data, _conversion, conversion_error = ensure_live_safe_pricetype(
+            order_data, auth_token, broker or broker_module.__name__.split(".")[1]
+        )
+        if conversion_error:
+            return {
+                "symbol": order_data.get("symbol", "Unknown"),
+                "status": "error",
+                "message": conversion_error,
+            }
+
         # Place the order
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
@@ -373,6 +389,7 @@ def process_basket_order_with_auth(
                     auth_token,
                     total_orders,
                     batch_start + idx,
+                    broker,
                 ): order_data
                 for idx, order_data in enumerate(batch)
             }
