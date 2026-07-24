@@ -125,6 +125,8 @@ class Open15Config(Base):
     vol_mult = Column(Float, nullable=True)  # volume-surge multiplier
     instrument = Column(String(16), nullable=True)  # stock | atm_option (issue #437)
     max_trades = Column(Integer, nullable=True)  # daily entry cap, both sides (issue #437)
+    no_entry_after = Column(String(5), nullable=True)  # "HH:MM" IST entry cutoff (issue #451)
+    exit_time = Column(String(5), nullable=True)  # "HH:MM" IST hard flatten (issue #451)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -152,6 +154,8 @@ def _ensure_columns():
         "open15_config": {
             "instrument": "VARCHAR(16)",
             "max_trades": "INTEGER",
+            "no_entry_after": "VARCHAR(5)",
+            "exit_time": "VARCHAR(5)",
         },
     }
     try:
@@ -186,6 +190,8 @@ def get_config() -> dict | None:
             "vol_mult": row.vol_mult,
             "instrument": row.instrument,
             "max_trades": row.max_trades,
+            "no_entry_after": row.no_entry_after,
+            "exit_time": row.exit_time,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -203,6 +209,8 @@ def save_config(
     updated_by: str = "ui",
     instrument: str | None = None,
     max_trades: int | None = None,
+    no_entry_after: str | None = None,
+    exit_time: str | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -215,6 +223,8 @@ def save_config(
         row.vol_mult = vol_mult
         row.instrument = instrument
         row.max_trades = max_trades
+        row.no_entry_after = no_entry_after
+        row.exit_time = exit_time
         row.updated_by = updated_by
         db_session.commit()
         return True
