@@ -396,7 +396,8 @@ class Open15BreakoutService:
         self._lock = threading.Lock()
         self._zmq_thread: threading.Thread | None = None
         self._stop = threading.Event()
-        # decision log: ordered events for the UI (persisted per-day at 09:35)
+        # decision log: ordered events for the UI (persisted on every event,
+        # so a mid-window crash never loses the day — issue #444)
         self.day_log: list[dict[str, Any]] = []
         self._log_date: str | None = None
         self.day_config: dict[str, Any] = resolve_day_config(None, 0.0)
@@ -416,6 +417,9 @@ class Open15BreakoutService:
         if len(self.day_log) > 500:
             del self.day_log[: len(self.day_log) - 500]
         logger.info("open15 [%s] %s", event, detail if detail else "")
+        # events are rare (<~20/day) so the per-event upsert is cheap; it means
+        # a crash mid-window loses nothing (issue #444)
+        self._persist_day_log()
 
     # ---- universe / data ------------------------------------------------- #
     @staticmethod
@@ -723,12 +727,18 @@ class Open15BreakoutService:
         self._persist_day_log()
 
     def _persist_day_log(self) -> None:
-        """Snapshot today's decision log so the UI can query past days."""
+        """Snapshot today's decision log so the UI can query past days.
+
+        Called from ``_log_event`` on every event (plus the explicit
+        end-of-window calls kept as belt-and-braces). The list is copied
+        before serializing so a concurrent append from another thread can't
+        mutate it mid-dump.
+        """
         try:
             from database.open15_breakout_db import save_day_log
 
             if self._log_date and self.day_log:
-                save_day_log(self._log_date, self.day_log)
+                save_day_log(self._log_date, list(self.day_log))
         except Exception:
             logger.exception("open15: day-log persist failed")
 
