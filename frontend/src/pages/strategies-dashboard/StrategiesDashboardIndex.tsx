@@ -66,20 +66,51 @@ function HealthLed({ health }: { health: StrategyHealth }) {
 // Mode badge
 // ---------------------------------------------------------------------------
 
-function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) {
+// mode = the strategy's toggle (strategy_mode row); effectiveRouting = what an
+// order placed RIGHT NOW would do (issue #440: per-strategy dispatch with the
+// Analyze/Live navbar toggle as the platform kill switch). When the toggle
+// says Live but Analyze mode holds routing at sandbox, show that truthfully.
+function ModeBadge({
+  mode,
+  deployable,
+  effectiveRouting,
+}: {
+  mode: string
+  deployable: boolean
+  effectiveRouting?: 'live' | 'sandbox'
+}) {
   if (!deployable || mode.includes('scaffold'))
     return (
       <Badge variant="outline" className="text-muted-foreground">
         Scaffold
       </Badge>
     )
-  if (mode === 'live')
-    return <Badge className="bg-green-600 text-white hover:bg-green-700">Live</Badge>
+  if (mode === 'live') {
+    if (effectiveRouting === 'sandbox')
+      return (
+        <Badge
+          variant="secondary"
+          className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+          title="Toggle is LIVE but orders route to sandbox — Analyze mode is ON (navbar)"
+        >
+          Live (held: Analyze on)
+        </Badge>
+      )
+    return (
+      <Badge
+        className="bg-green-600 text-white hover:bg-green-700"
+        title="Orders route to the REAL broker"
+      >
+        Live
+      </Badge>
+    )
+  }
   if (mode === 'sandbox')
     return (
       <Badge
         variant="secondary"
         className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+        title="Orders route to the sandbox book"
       >
         Sandbox
       </Badge>
@@ -343,7 +374,11 @@ function StrategyCard({ s }: { s: StrategySummary }) {
           </div>
           <div className="flex items-center gap-1.5">
             <LLMBadge llmMode={s.llm_mode} />
-            <ModeBadge mode={s.mode} deployable={s.deployable} />
+            <ModeBadge
+              mode={s.mode}
+              deployable={s.deployable}
+              effectiveRouting={s.effective_routing}
+            />
           </div>
         </div>
         <p className="text-xs text-muted-foreground font-mono">

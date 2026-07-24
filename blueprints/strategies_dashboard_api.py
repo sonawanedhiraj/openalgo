@@ -819,10 +819,23 @@ def _build_summary(name: str) -> dict:
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
 
+    # Effective order routing RIGHT NOW (issue #440): the per-strategy
+    # dispatch verdict an order would get — 'live' only when the navbar is on
+    # Live AND this strategy's row says live. Lets the UI show routing truth
+    # next to the toggle (e.g. "live" toggle but "sandbox (Analyze on)").
+    try:
+        from services.mode_service import resolve_order_mode
+
+        effective_routing = resolve_order_mode(name).value
+    except Exception:
+        logger.exception("resolve_order_mode failed for %s", name)
+        effective_routing = "sandbox"
+
     return {
         "name": name,
         "display_name": name.replace("_", " ").title(),
         "mode": mode_val,
+        "effective_routing": effective_routing,
         "llm_mode": _get_llm_mode(name),
         "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
         "deployable": config.get("deployable", False),
@@ -1067,6 +1080,15 @@ def strategy_detail(name: str):
     matched_decision_ids = _attach_llm_reviews(name, recent_trades)
     llm_unmatched_skips = _unmatched_skip_decisions(name, matched_decision_ids)
 
+    # Effective order routing RIGHT NOW (issue #440) — see _build_summary.
+    try:
+        from services.mode_service import resolve_order_mode
+
+        effective_routing = resolve_order_mode(name).value
+    except Exception:
+        logger.exception("resolve_order_mode failed for %s", name)
+        effective_routing = "sandbox"
+
     return jsonify(
         {
             "status": "success",
@@ -1074,6 +1096,7 @@ def strategy_detail(name: str):
                 "name": name,
                 "display_name": name.replace("_", " ").title(),
                 "mode": mode_val,
+                "effective_routing": effective_routing,
                 "llm_mode": _get_llm_mode(name),
                 "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
                 "deployable": config.get("deployable", False),

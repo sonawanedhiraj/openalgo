@@ -225,7 +225,7 @@ def production_order_placer(mode: str, order: dict) -> dict:
             "pricetype": "MARKET",
             "quantity": str(order["quantity"]),
         }
-        success, response, _ = place_order(payload, api_key=api_key)
+        success, response, _ = place_order(payload, api_key=api_key, mode_key=STRATEGY_NAME)
         response = dict(response or {})
         response.setdefault("status", "success" if success else "error")
         return response
@@ -305,8 +305,8 @@ class IntradayPullbackService:
         # Mode resolution mirrors futures_follow / sector_follow: env var is the default,
         # a persistent strategy_mode[STRATEGY_NAME] row (set via strategy_mode_service.flip_mode
         # / the strategies dashboard toggle) overrides it. Actual sandbox-vs-live ORDER routing
-        # is still the platform-global gate (place_order -> resolve_effective_mode(__global__)),
-        # identical to every other strategy. An explicit constructor `mode` (tests) wins outright.
+        # is the per-strategy gate (place_order -> resolve_order_mode(STRATEGY_NAME), issue
+        # #440), identical to every other strategy. An explicit constructor `mode` (tests) wins.
         self._mode_forced = mode is not None
         self.mode = (mode or os.getenv("INTRADAY_PULLBACK_MODE", "sandbox")).lower()
         if self.mode not in VALID_MODES:

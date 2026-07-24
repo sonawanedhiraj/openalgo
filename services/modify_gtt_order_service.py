@@ -52,31 +52,9 @@ def modify_gtt_order_with_auth(
     api_key = original_data.get("apikey", "")
     trigger_id = order_data.get("trigger_id", "")
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    # GTT triggers only exist broker-side (no sandbox GTT book). Analyze ON →
+    # 501; Analyze OFF → broker management proceeds (issue #440).
     mode = resolve_effective_mode()
-
-    if mode is EffectiveMode.SKIP:
-        logger.info("Modify GTT rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Modify GTT rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
 
     if mode is EffectiveMode.SANDBOX:
         # Sandbox GTT not implemented yet — clean 501 until Phase 3.
@@ -87,7 +65,7 @@ def modify_gtt_order_with_auth(
         }
         return False, error_response, 501
 
-    # mode is EffectiveMode.LIVE — proceed.
+    # Analyze is off — proceed with broker GTT modify.
     broker_module = import_broker_gtt_module(broker)
     if broker_module is None:
         message = f"GTT orders are not supported for broker '{broker}' yet"

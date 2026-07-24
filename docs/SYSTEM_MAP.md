@@ -494,11 +494,19 @@ optional `daily_capital_cap`. The engines consult
 exits. Fall-through when no row exists (flag on): legacy `daily_intent`
 (simplified only) → env mode flag → `sandbox/run` default — so deploy is a no-op
 until the operator inserts a row. Feature-flagged by
-`STRATEGY_DAILY_INTENT_ENABLED` (default `true`). `place_order_service` is
-deliberately NOT wired through this — its global `resolve_effective_mode` floor
-is unchanged; the gate lives in the engines (the simplified engine's sandbox
-dispatch bypasses `place_order_service` entirely). Full design:
-`docs/design/strategy_daily_intent.md`.
+`STRATEGY_DAILY_INTENT_ENABLED` (default `true`). Since issue #440 (2026-07-23)
+`place_order_service` (and basket/split/smart/GTT-place/close_position)
+dispatches live-vs-sandbox **per strategy** via
+`services/mode_service.resolve_order_mode(mode_key)`: LIVE only when the navbar
+Analyze/Live toggle is on Live AND that strategy's `strategy_mode` row says
+`live` (the strategies-page toggle); no row / unknown label → sandbox (default
+deny). The hidden `strategy_mode['__global__']` gate and legacy `daily_intent`
+fall-through are retired from dispatch (leftover `__global__` rows are purged
+at boot); env mode flags are capped at sandbox. `resolve_effective_mode()`
+survives as the analyze overlay only (read decorations + cancel/modify/close
+routing, with a sandbox-book orderid lookup for per-order targeting). The
+simplified engine's sandbox dispatch still bypasses `place_order_service`
+entirely. Full design: `docs/design/strategy_daily_intent.md` + issue #440.
 
 `sector_follow_trades` columns (`database/sector_follow_db.py`): `id`, `strategy_id`,
 `mode`, `side` (BUY/SELL), `symbol`, `exchange`, `product`, `quantity`, `price`

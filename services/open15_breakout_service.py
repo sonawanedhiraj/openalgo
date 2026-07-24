@@ -356,7 +356,7 @@ def production_order_placer(mode: str, order: dict) -> dict:
             "pricetype": "MARKET",
             "quantity": str(order["quantity"]),
         }
-        success, response, _ = place_order(payload, api_key=api_key)
+        success, response, _ = place_order(payload, api_key=api_key, mode_key=STRATEGY_NAME)
         response = dict(response or {})
         response.setdefault("status", "success" if success else "error")
         return response

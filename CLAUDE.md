@@ -1551,14 +1551,31 @@ OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 > mode forward (drops intent/cap; `skip` → `sandbox`). The sections below describe the
 > table being retired; they are rewritten progressively as the refactor lands.
 >
-> **Global order-gate default changed (B2, 2026-06-12):** `resolve_effective_mode()`
-> — the external `/api/v1` place/cancel/close gate used by `place_order_service` &
-> friends — **no longer returns `DISABLED` when nothing is configured; it returns
-> `SANDBOX`.** Unconfigured external callers route to the virtual ₹1Cr book instead
-> of being refused. Live external orders require an explicit persistent `strategy_mode`
-> row for the reserved `__global__` key (and `analyze_mode` off); the `analyze_mode`
-> conservative overlay is preserved. The change only ever makes the path *more*
-> sandboxy, never more live. See `docs/PARAMETER_LOG.md` (mode-only architecture).
+> **Per-strategy UI-driven order dispatch (issue #440, 2026-07-23 — supersedes
+> B2):** live-vs-sandbox routing is now decided **per order, per strategy**, by
+> exactly two visible controls and nothing else: the navbar **Analyze/Live
+> toggle** (`analyze_mode`, the platform kill switch — Analyze ON forces
+> sandbox for everything) and the per-strategy **Live/Sandbox toggle** on
+> `/strategies` (a `strategy_mode` row written via the preflight-gated
+> `strategy_mode_service.flip_mode`). `place_order` (and basket/split/smart/
+> GTT-place/close_position) dispatch on
+> `services.mode_service.resolve_order_mode(mode_key)`: LIVE **only** when
+> Analyze is off AND that strategy's row says `live`; no row / unknown label /
+> env-only resolution → SANDBOX (**default deny**). In-repo engines pass their
+> canonical `mode_key` explicitly (the simplified engine's payload `strategy`
+> is a webhook label, so it passes `mode_key='simplified_engine'`). The hidden
+> `strategy_mode['__global__']` gate and the legacy `daily_intent` fall-through
+> are **retired from dispatch** (a leftover `__global__` row is purged at
+> boot), and env mode flags (`SIMPLIFIED_ENGINE_MODE` etc.) are **capped at
+> sandbox** — an env var can never escalate to live. The residual
+> `resolve_effective_mode()` is now the analyze overlay only (SANDBOX iff
+> Analyze ON, else LIVE) and is used ONLY by read decorations (which book the
+> UI shows) and order management (cancel/modify route per-order via a
+> sandbox-book orderid lookup, `sandbox_order_exists`; cancel-all sweeps both
+> books when Analyze is off) — it must never gate a new order live.
+> Observability: `/mode/status` lists every strategy row with its
+> `effective_routing`, and the strategies page badges show routing truth
+> (e.g. "Live (held: Analyze on)").
 >
 > **Engines + preflight wired to runtime_override (B3, 2026-06-12):** both engines
 > now consult `strategy_runtime_override.is_entry_blocked(strategy)` at job-entry
@@ -1597,9 +1614,10 @@ in-memory pause flag as the canonical *pre-market* control. One row per
 The single read path is
 `services.mode_service.resolve_strategy_mode(strategy_name, date=None)`, which
 returns an `EffectiveDecision(mode, intent, daily_capital_cap, source)`. It is a
-**separate** function from the load-bearing legacy global
-`resolve_effective_mode()` (an enum used by `place_order_service` /
-`/mode/status`) — see `docs/design/strategy_daily_intent.md` for why.
+**separate** function from the order-dispatch gate — since issue #440 that gate
+is the per-strategy `resolve_order_mode(mode_key)` (see the #440 block above);
+`resolve_effective_mode()` survives only as the analyze overlay for read paths
+and order management — see `docs/design/strategy_daily_intent.md` for history.
 
 **Fall-through (flag on):** unified row → legacy `daily_intent` (simplified
 only) → env mode flag (`SIMPLIFIED_ENGINE_MODE` / `SECTOR_FOLLOW_CAP5_VOL_MODE`)

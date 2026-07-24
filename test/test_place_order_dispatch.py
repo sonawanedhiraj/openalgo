@@ -1,15 +1,15 @@
-"""Tests for Stage-0 resolver wired into ``place_order_with_auth``.
+"""Tests for the per-strategy dispatch wired into ``place_order_with_auth``.
 
-Each test rebinds ``database.daily_intent_db`` to a fresh in-memory SQLite so
+Issue #440 — UI-driven routing: an order fires on the live broker ONLY when
+the Analyze/Live navbar toggle is on Live AND the order's strategy has a
+``strategy_mode`` row set to live (the strategies-page toggle). Everything
+else — sandbox row, no row, unknown label, Analyze ON — routes to sandbox.
+
+Each test rebinds ``database.strategy_mode_db`` to a fresh in-memory SQLite so
 nothing touches ``db/openalgo.db``. The broker side-call
 (``broker.<name>.api.order_api.place_order_api``) and the sandbox side-call
 (``services.sandbox_service.sandbox_place_order``) are both monkeypatched so
 tests assert routing without any broker network calls or sandbox DB writes.
-
-The critical case is ``test_place_order_routes_to_sandbox_when_live_but_analyze_on``
-— that exercises the bug being fixed: declaring ``daily_intent=live`` but
-leaving the global ``analyze_mode`` flag on must still resolve to SANDBOX, not
-fire the live broker path.
 
 P0-T1 integration tests (Issue #94)
 ------------------------------------
@@ -17,7 +17,7 @@ The second block of tests exercises ``place_order_service`` in *live* mode
 against the FastAPI mock Zerodha broker (``test/fixtures/mock_broker/app.py``)
 started in a daemon thread. ``BROKER_API_URL`` is redirected to the mock and
 the global httpx client is cleared so each test connects to the mock, not the
-real Zerodha endpoint. No live DB access — ``resolve_effective_mode`` is
+real Zerodha endpoint. No live DB access — ``resolve_order_mode`` is
 monkeypatched to ``EffectiveMode.LIVE`` and events are suppressed.
 """
 
@@ -45,31 +45,26 @@ import restx_api  # noqa: E402, F401
 
 
 @pytest.fixture
-def fresh_intent_db(monkeypatch):
-    """Point daily_intent_db at a fresh in-memory SQLite for one test."""
-    from database import daily_intent_db as dim
+def fresh_mode_db(monkeypatch):
+    """Point strategy_mode_db at a fresh in-memory SQLite for one test."""
+    from database import strategy_mode_db as sm
 
-    test_engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
-
-    monkeypatch.setattr(dim, "engine", test_engine)
-    monkeypatch.setattr(dim, "db_session", test_session)
-    dim.Base.metadata.create_all(test_engine)
-
-    yield dim
-
-    test_session.remove()
-    test_engine.dispose()
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(sm, "engine", eng)
+    monkeypatch.setattr(sm, "db_session", sess)
+    sm.Base.query = sess.query_property()
+    sm.Base.metadata.create_all(eng)
+    yield sm
+    sess.remove()
+    eng.dispose()
 
 
-def _order_payload():
+def _order_payload(strategy: str = "unit_test"):
     """Minimal validated order_data passed to place_order_with_auth."""
     return {
         "apikey": "test-api-key",
-        "strategy": "unit_test",
+        "strategy": strategy,
         "symbol": "INFY",
         "exchange": "NSE",
         "action": "BUY",
@@ -79,207 +74,168 @@ def _order_payload():
     }
 
 
-# ---------------------------------------------------------------------------
-# LIVE path
-# ---------------------------------------------------------------------------
-
-
-def test_place_order_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
-    """daily_intent='live' + analyze_mode=False → broker.place_order_api fires."""
-    from services import place_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
-
-    broker_place_order = MagicMock(
+def _patch_books(monkeypatch, place_order_service):
+    """Mock both books; return (broker_mock, sandbox_mock)."""
+    broker_mock = MagicMock(
         return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-LIVE-1")
     )
-    fake_broker_module = SimpleNamespace(place_order_api=broker_place_order)
-    monkeypatch.setattr(place_order_service, "import_broker_module", lambda _b: fake_broker_module)
-
-    sandbox_called = MagicMock()
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_called)
-
-    payload = _order_payload()
-    success, response, status = place_order_service.place_order_with_auth(
-        payload,
-        auth_token="dummy-token",
-        broker="zerodha",
-        original_data=payload,
-        emit_event=False,
-    )
-
-    assert success is True
-    assert response == {"status": "success", "orderid": "OID-LIVE-1"}
-    assert status == 200
-    broker_place_order.assert_called_once()
-    sandbox_called.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# SANDBOX path (explicit intent)
-# ---------------------------------------------------------------------------
-
-
-def test_place_order_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatch):
-    """daily_intent='sandbox' → sandbox_place_order fires, broker NOT called."""
-    from services import place_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
-
-    sandbox_mock = MagicMock(
-        return_value=(True, {"status": "success", "orderid": "SBX-1", "mode": "analyze"}, 200)
-    )
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
-
-    broker_called = MagicMock()
-    monkeypatch.setattr(
-        place_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(place_order_api=broker_called),
-    )
-
-    payload = _order_payload()
-    success, response, status = place_order_service.place_order_with_auth(
-        payload,
-        auth_token="dummy-token",
-        broker="zerodha",
-        original_data=payload,
-        emit_event=False,
-    )
-
-    assert success is True
-    assert response["status"] == "success"
-    assert response["orderid"] == "SBX-1"
-    assert status == 200
-    sandbox_mock.assert_called_once()
-    broker_called.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# SANDBOX path (the bug being fixed: live + analyze_on → sandbox)
-# ---------------------------------------------------------------------------
-
-
-def test_place_order_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
-    """THE BUG: daily_intent='live' + analyze_mode=True must conservative-down
-    to sandbox, not silently fire on the live broker.
-    """
-    from services import place_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: True)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
-
-    sandbox_mock = MagicMock(
-        return_value=(True, {"status": "success", "orderid": "SBX-BUG", "mode": "analyze"}, 200)
-    )
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
-
-    broker_called = MagicMock()
-    monkeypatch.setattr(
-        place_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(place_order_api=broker_called),
-    )
-
-    payload = _order_payload()
-    success, response, status = place_order_service.place_order_with_auth(
-        payload,
-        auth_token="dummy-token",
-        broker="zerodha",
-        original_data=payload,
-        emit_event=False,
-    )
-
-    assert success is True
-    sandbox_mock.assert_called_once()
-    broker_called.assert_not_called(), "Live broker fired despite analyze_mode=True!"
-
-
-# ---------------------------------------------------------------------------
-# SKIP path (mode-only: 'skip' is retired — legacy intent collapses to SANDBOX)
-# ---------------------------------------------------------------------------
-
-
-def test_place_order_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2, 2026-06-12): a legacy daily_intent='skip' no longer rejects
-    — it collapses to SANDBOX. External callers are never refused for config."""
-    from services import place_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
-
-    sandbox_mock = MagicMock(
-        return_value=(True, {"status": "success", "orderid": "SBX-SKIP", "mode": "analyze"}, 200)
-    )
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
-    broker_mock = MagicMock()
     monkeypatch.setattr(
         place_order_service,
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_mock),
     )
+    sandbox_mock = MagicMock(
+        return_value=(True, {"status": "success", "orderid": "SBX-1", "mode": "analyze"}, 200)
+    )
+    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
+    return broker_mock, sandbox_mock
 
-    payload = _order_payload()
-    success, response, status = place_order_service.place_order_with_auth(
+
+def _place(place_order_service, payload, **kwargs):
+    return place_order_service.place_order_with_auth(
         payload,
         auth_token="dummy-token",
         broker="zerodha",
         original_data=payload,
         emit_event=False,
+        **kwargs,
     )
 
+
+# ---------------------------------------------------------------------------
+# LIVE path: strategies-page toggle (strategy_mode row) + Analyze off
+# ---------------------------------------------------------------------------
+
+
+def test_place_order_routes_to_broker_when_strategy_live(fresh_mode_db, monkeypatch):
+    """strategy_mode row='live' + analyze off → broker.place_order_api fires."""
+    from services import place_order_service
+
+    fresh_mode_db._set_mode_unchecked("unit_test", "live", updated_by="op")
+    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
+
+    success, response, status = _place(place_order_service, _order_payload())
+
     assert success is True
-    assert response["status"] == "success"
+    assert response == {"status": "success", "orderid": "OID-LIVE-1"}
+    assert status == 200
+    broker_mock.assert_called_once()
+    sandbox_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# SANDBOX paths (issue #440 default-deny matrix)
+# ---------------------------------------------------------------------------
+
+
+def test_place_order_routes_to_sandbox_when_strategy_row_sandbox(fresh_mode_db, monkeypatch):
+    """A sandbox-flagged strategy stays sandbox even with analyze off AND other
+    strategies live — the futures_follow protection at the heart of #440."""
+    from services import place_order_service
+
+    fresh_mode_db._set_mode_unchecked("other_strategy", "live", updated_by="op")
+    fresh_mode_db._set_mode_unchecked("unit_test", "sandbox", updated_by="op")
+    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
+
+    success, response, status = _place(place_order_service, _order_payload())
+
+    assert success is True
+    assert response["orderid"] == "SBX-1"
+    sandbox_mock.assert_called_once()
+    broker_mock.assert_not_called()
+
+
+def test_place_order_routes_to_sandbox_when_live_but_analyze_on(fresh_mode_db, monkeypatch):
+    """Analyze mode is the platform kill switch: a live row cannot beat it."""
+    from services import place_order_service
+
+    fresh_mode_db._set_mode_unchecked("unit_test", "live", updated_by="op")
+    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: True)
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
+
+    success, _response, _status = _place(place_order_service, _order_payload())
+
+    assert success is True
+    sandbox_mock.assert_called_once()
+    broker_mock.assert_not_called(), "Live broker fired despite analyze_mode=True!"
+
+
+def test_place_order_routes_to_sandbox_when_no_row(fresh_mode_db, monkeypatch):
+    """Default deny: an unregistered strategy label routes sandbox even with
+    analyze off — no hidden global gate can open it (issue #440)."""
+    from services import place_order_service
+
+    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
+
+    success, _response, status = _place(place_order_service, _order_payload("some_tv_label"))
+
+    assert success is True
     assert status == 200
     sandbox_mock.assert_called_once()
     broker_mock.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# No-config path (mode-only: no row → SANDBOX default, never a DISABLED reject)
-# ---------------------------------------------------------------------------
-
-
-def test_place_order_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
+def test_place_order_retired_global_row_has_no_effect(fresh_mode_db, monkeypatch):
+    """A manually re-created __global__ row must not route anything live."""
     from services import place_order_service
 
-    # NO set_daily_intent call — table is empty.
+    fresh_mode_db._set_mode_unchecked("__global__", "live", updated_by="op")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
 
-    sandbox_mock = MagicMock(
-        return_value=(True, {"status": "success", "orderid": "SBX-DFLT", "mode": "analyze"}, 200)
-    )
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
-    broker_mock = MagicMock()
-    monkeypatch.setattr(
+    success, _response, _status = _place(place_order_service, _order_payload("some_tv_label"))
+
+    assert success is True
+    sandbox_mock.assert_called_once()
+    broker_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# mode_key override — engines whose payload label differs from their
+# strategy_mode key (the simplified engine)
+# ---------------------------------------------------------------------------
+
+
+def test_place_order_mode_key_overrides_payload_label(fresh_mode_db, monkeypatch):
+    """mode_key routes by the engine's canonical key, not the webhook label."""
+    from services import place_order_service
+
+    fresh_mode_db._set_mode_unchecked("simplified_engine", "live", updated_by="op")
+    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
+
+    # Payload label is the webhook name (no row) — mode_key must win.
+    success, _response, _status = _place(
         place_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(place_order_api=broker_mock),
-    )
-
-    payload = _order_payload()
-    success, response, status = place_order_service.place_order_with_auth(
-        payload,
-        auth_token="dummy-token",
-        broker="zerodha",
-        original_data=payload,
-        emit_event=False,
+        _order_payload("chartink_FnO_intraday_buy"),
+        mode_key="simplified_engine",
     )
 
     assert success is True
-    assert status == 200
+    broker_mock.assert_called_once()
+    sandbox_mock.assert_not_called()
+
+
+def test_place_order_mode_key_sandbox_row_denies_live_label(fresh_mode_db, monkeypatch):
+    """Conversely: mode_key='simplified_engine' with a sandbox row routes
+    sandbox even if the payload label happens to have a live row."""
+    from services import place_order_service
+
+    fresh_mode_db._set_mode_unchecked("simplified_engine", "sandbox", updated_by="op")
+    fresh_mode_db._set_mode_unchecked("chartink_FnO_intraday_buy", "live", updated_by="op")
+    monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
+    broker_mock, sandbox_mock = _patch_books(monkeypatch, place_order_service)
+
+    success, _response, _status = _place(
+        place_order_service,
+        _order_payload("chartink_FnO_intraday_buy"),
+        mode_key="simplified_engine",
+    )
+
+    assert success is True
     sandbox_mock.assert_called_once()
     broker_mock.assert_not_called()
 
@@ -290,55 +246,20 @@ def test_place_order_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_place_order_reject_response_shape_matches_existing_convention(
-    fresh_intent_db, monkeypatch
-):
+def test_place_order_reject_response_shape_matches_existing_convention(fresh_mode_db, monkeypatch):
     """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import place_order_service
-    from services.mode_service import set_daily_intent
 
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: False)
 
-    # ---- shape for the SANDBOX path (skip collapses to sandbox in mode-only) ----
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    sandbox_mock = MagicMock(
-        return_value=(True, {"status": "success", "orderid": "SBX", "mode": "analyze"}, 200)
-    )
-    monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
-    monkeypatch.setattr(
-        place_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(place_order_api=MagicMock()),
-    )
-
+    # ---- shape for the SANDBOX path (no row → default deny) ----
+    _broker, _sandbox = _patch_books(monkeypatch, place_order_service)
     payload = _order_payload()
-    sandbox_result = place_order_service.place_order_with_auth(
-        payload,
-        auth_token="dummy-token",
-        broker="zerodha",
-        original_data=payload,
-        emit_event=False,
-    )
+    sandbox_result = _place(place_order_service, payload)
 
     # ---- shape for a successful LIVE order, same call shape ----
-    # Re-bind: flip intent to live, ensure broker fires
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    broker_place_order = MagicMock(
-        return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-OK")
-    )
-    monkeypatch.setattr(
-        place_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(place_order_api=broker_place_order),
-    )
-    success_result = place_order_service.place_order_with_auth(
-        payload,
-        auth_token="dummy-token",
-        broker="zerodha",
-        original_data=payload,
-        emit_event=False,
-    )
+    fresh_mode_db._set_mode_unchecked("unit_test", "live", updated_by="op")
+    success_result = _place(place_order_service, payload)
 
     # Same outer shape: tuple of length 3, (bool, dict, int).
     for result in (sandbox_result, success_result):
@@ -437,8 +358,8 @@ def _live_patches(mock_broker_server, monkeypatch):
     from services.mode_service import EffectiveMode
 
     monkeypatch.setattr(
-        "services.place_order_service.resolve_effective_mode",
-        lambda: EffectiveMode.LIVE,
+        "services.place_order_service.resolve_order_mode",
+        lambda _key: EffectiveMode.LIVE,
     )
 
     import broker.zerodha.mapping.transform_data as td

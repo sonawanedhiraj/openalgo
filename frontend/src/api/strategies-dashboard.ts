@@ -24,6 +24,9 @@ export interface StrategySummary {
   name: string
   display_name: string
   mode: string
+  /** Actual order routing right now (issue #440): 'live' only when the navbar
+   *  is on Live AND this strategy's row is live — else 'sandbox'. */
+  effective_routing?: 'live' | 'sandbox'
   llm_mode: LLMMode
   llm_veto_enabled: boolean
   deployable: boolean
@@ -137,6 +140,8 @@ export interface StrategyDetail {
   name: string
   display_name: string
   mode: string
+  /** Actual order routing right now (issue #440) — see StrategySummary. */
+  effective_routing?: 'live' | 'sandbox'
   llm_mode: LLMMode
   llm_veto_enabled: boolean
   deployable: boolean

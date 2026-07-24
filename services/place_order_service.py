@@ -6,7 +6,7 @@ from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, OrderFailedEvent, OrderPlacedEvent
 from restx_api.schemas import OrderSchema
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import EffectiveMode, resolve_order_mode
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -124,6 +124,7 @@ def place_order_with_auth(
     original_data: dict[str, Any],
     emit_event: bool = True,
     prefetched_quote: dict[str, Any] | None = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order using provided auth token.
@@ -135,6 +136,10 @@ def place_order_with_auth(
         original_data: Original request data for logging
         emit_event: Whether to emit socket event (default True, set False for batch orders)
         prefetched_quote: Pre-fetched quote from batch call (optional, sandbox only)
+        mode_key: Explicit ``strategy_mode`` key for live/sandbox routing.
+            Defaults to the order's ``strategy`` label. In-repo engines whose
+            payload label differs from their strategy_mode key (the simplified
+            engine) MUST pass this explicitly.
 
     Returns:
         Tuple containing:
@@ -148,34 +153,17 @@ def place_order_with_auth(
 
     api_key = original_data.get("apikey", "")
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
-    # This is the single source-of-truth dispatch — closes the silent-sandbox
-    # bug where analyze_mode could quietly redirect orders the operator
-    # believed were going live (or vice versa).
-    mode = resolve_effective_mode()
-
-    if mode is EffectiveMode.SKIP:
-        logger.info("Order rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Order rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
+    # Per-strategy UI-driven dispatch (issue #440): LIVE only when the navbar
+    # toggle is on Live AND this order's strategy has a strategy_mode row set
+    # to live via the strategies-page toggle. Everything else → sandbox.
+    resolved_key = mode_key or order_data.get("strategy") or original_data.get("strategy")
+    mode = resolve_order_mode(resolved_key)
+    logger.info(
+        "order dispatch: strategy=%r mode_key=%r -> %s",
+        order_data.get("strategy"),
+        resolved_key,
+        mode.value,
+    )
 
     if mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_place_order
@@ -305,6 +293,7 @@ def place_order(
     broker: str | None = None,
     emit_event: bool = True,
     prefetched_quote: dict[str, Any] | None = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Place an order with the broker.
@@ -318,6 +307,9 @@ def place_order(
         emit_event: Whether to emit socket event (default True, set False for batch orders)
         prefetched_quote: Pre-fetched quote from batch call (optional, sandbox only).
             Skips per-order REST API quote fetch when provided.
+        mode_key: Explicit ``strategy_mode`` key for live/sandbox routing
+            (defaults to the payload's ``strategy`` label — see
+            ``place_order_with_auth``).
 
     Returns:
         Tuple containing:
@@ -367,13 +359,25 @@ def place_order(
             return False, error_response, 403
 
         return place_order_with_auth(
-            order_data, AUTH_TOKEN, broker_name, original_data, emit_event, prefetched_quote
+            order_data,
+            AUTH_TOKEN,
+            broker_name,
+            original_data,
+            emit_event,
+            prefetched_quote,
+            mode_key=mode_key,
         )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
         return place_order_with_auth(
-            order_data, auth_token, broker, original_data, emit_event, prefetched_quote
+            order_data,
+            auth_token,
+            broker,
+            original_data,
+            emit_event,
+            prefetched_quote,
+            mode_key=mode_key,
         )
 
     # Case 3: Invalid parameters
