@@ -351,7 +351,7 @@ function renderChips(){
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
     ['entries',(dig.entered??summ.entered??0)+' / '+(dig.selected??summ.selected??0)],
-    ['day P&amp;L',dig.pnl==null?'—':((dig.pnl>=0?'+':'')+'&#8377;'+Math.round(dig.pnl))]];
+    ['day P&amp;L',dig.pnl==null?'—':((dig.pnl>=0?'+':'')+'\\u20B9'+Math.round(dig.pnl))]];
   document.getElementById('chips').innerHTML=chips.map(([k,v])=>
     '<div class="chip"><span class="k">'+k+'</span><span class="v'+
     (k==='day P&amp;L'&&dig.pnl!=null?(dig.pnl>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>').join('');
