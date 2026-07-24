@@ -1482,9 +1482,15 @@ Telegrammed every trading day.
   with SELL hits misfiled into `screener_buy` (the webhook's old
   whitespace-token side check vs the poster's single-token
   `fno_intraday_sell_20` scan name) — every `scanner_comparison` row from
-  ~2026-07-01 to 2026-07-24 is self-referential and untrustworthy. The side
+  ~2026-07-01 to 2026-07-24 was self-referential. The side
   check now tokenizes on non-alphabetic chars (SELL/SHORT/COVER), mirroring the
   engine's `_infer_direction`, so audit and armed direction cannot diverge.
+  **The polluted window was repaired on 2026-07-24** (issue #449): the one-time
+  operator CLI `services/scanner_comparison_echo_backfill.py` (dry-run default,
+  `--apply` to write) reclassified the 5,412 pre-fix echo rows heuristically
+  (single-symbol `chartink` row matching an in-house `scan_results` hit within
+  ±3 s) and recomputed the 18 affected `scanner_comparison` days without
+  Telegram. NOT wired into the runtime.
 
 Registered at boot in `app.py` next to `init_sector_follow_service`. One-shot
 backfill / re-run for a past day: `run_comparison_for_date(date='YYYY-MM-DD')`.
