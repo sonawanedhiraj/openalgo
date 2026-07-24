@@ -213,7 +213,32 @@ def place_order_with_auth(
 
         return success, response, status_code
 
-    # mode is EffectiveMode.LIVE — proceed with actual order placement
+    # mode is EffectiveMode.LIVE — proceed with actual order placement.
+    # Stock/commodity-option MARKET (and SL-M) orders are RMS-blocked at the
+    # broker; convert to a protective LIMIT (Zerodha's documented workaround)
+    # or reject loudly when the conversion cannot be priced (issue #438).
+    from services.synthetic_market_order_service import ensure_live_safe_pricetype
+
+    order_data, _conversion, conversion_error = ensure_live_safe_pricetype(
+        order_data, auth_token, broker
+    )
+    if conversion_error:
+        logger.warning("Order rejected: %s", conversion_error)
+        error_response = {"status": "error", "message": conversion_error}
+        bus.publish(
+            OrderFailedEvent(
+                mode="live",
+                api_type="placeorder",
+                request_data=order_request_data,
+                response_data=error_response,
+                api_key=api_key,
+                symbol=order_data.get("symbol", ""),
+                exchange=order_data.get("exchange", ""),
+                error_message=conversion_error,
+            )
+        )
+        return False, error_response, 400
+
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
