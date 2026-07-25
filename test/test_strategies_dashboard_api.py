@@ -1020,6 +1020,132 @@ def test_open15_list_card_carries_today_stats(app, wired_dbs):
     assert card["last_trade_at"] is not None
 
 
+def test_open15_sandbox_long_short_split(app, wired_dbs):
+    """Sandbox column carries long/short sub-aggregates keyed off the journal's
+    side column, for both the stock leg and the option shadow (issue #458)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    # Longs: one win (+940 net), one loss (-540 net). Short: one win (+260 net).
+    sess.add(_o15_row(o15db, opt_pnl=500.0))
+    sess.add(_o15_row(o15db, symbol="TCS", pnl=-500.0, charges_inr=40.0, opt_pnl=-200.0))
+    sess.add(_o15_row(o15db, symbol="SBIN", side="S", pnl=300.0, charges_inr=40.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": 400.0,  # 940 - 540
+    }
+    assert sb["short"] == {
+        "n_trades": 1,
+        "wins": 1,
+        "win_rate_pct": 100.0,
+        "net_pnl_inr": 260.0,
+    }
+    # Option shadow split: only the two long rows carry opt_pnl.
+    opt = sb["options"]
+    assert opt["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": 300.0,  # 500 - 200
+    }
+    assert opt["short"]["n_trades"] == 0
+    assert opt["short"]["win_rate_pct"] is None
+
+
+def test_open15_side_split_empty_side_renders_none(app, wired_dbs):
+    """A side with no closed trades reports n_trades=0 and None stats — the UI
+    must render '—', never 0% (issue #458)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))  # single long win
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"]["n_trades"] == 1
+    assert sb["short"] == {
+        "n_trades": 0,
+        "wins": 0,
+        "win_rate_pct": None,
+        "net_pnl_inr": None,
+    }
+
+
+def test_open15_backtest_side_split_passthrough(app, wired_dbs, strategies_dir):
+    """parity_target.long/.short (and options_variant.long/.short) pass through
+    to the Backtest column verbatim (issue #458)."""
+    import json as _json
+
+    (strategies_dir / "open15_vol_breakout" / "config_snapshot.json").write_text(
+        _json.dumps(
+            {
+                "version": "0.1.0",
+                "mode": "sandbox",
+                "deployable": True,
+                "parity_target": {
+                    "window": "Jul 2026 R59",
+                    "n_trades": 15,
+                    "win_rate_pct": 60.0,
+                    "net_pnl_inr": 2564,
+                    "long": {"n_trades": 8, "wins": 6, "win_rate_pct": 75.0, "net_pnl_inr": 2707},
+                    "short": {"n_trades": 7, "wins": 3, "win_rate_pct": 42.9, "net_pnl_inr": -143},
+                    "options_variant": {
+                        "n_trades": 13,
+                        "win_rate_pct": 62.0,
+                        "net_pnl_inr": 11195,
+                        "long": {
+                            "n_trades": 8,
+                            "wins": 7,
+                            "win_rate_pct": 87.5,
+                            "net_pnl_inr": 13680,
+                        },
+                        "short": {
+                            "n_trades": 5,
+                            "wins": 1,
+                            "win_rate_pct": 20.0,
+                            "net_pnl_inr": -2485,
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    bt = resp.get_json()["data"]["performance"]["backtest"]
+    assert bt["long"]["win_rate_pct"] == 75.0
+    assert bt["short"]["net_pnl_inr"] == -143
+    assert bt["options"]["long"]["win_rate_pct"] == 87.5
+    assert bt["options"]["short"]["n_trades"] == 5
+    # Long + short must reconcile with the aggregate.
+    assert bt["long"]["net_pnl_inr"] + bt["short"]["net_pnl_inr"] == bt["net_pnl_inr"]
+
+
+def test_other_strategies_have_no_side_split(app, wired_dbs):
+    """Strategies without a long/short split carry no long/short keys — the UI
+    renders no sub-rows for them (issue #458)."""
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert "long" not in (perf["sandbox"] or {})
+    assert perf["backtest"].get("long") is None
+
+
 # ---------------------------------------------------------------------------
 # GET /strategies/api/<name>/parameters/diff
 # ---------------------------------------------------------------------------
