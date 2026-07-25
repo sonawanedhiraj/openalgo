@@ -770,6 +770,45 @@ def _open15_lifetime() -> dict[str, dict]:
     return out
 
 
+def _open15_opt_shadow() -> dict[str, dict | None]:
+    """Per-mode (sandbox|live) aggregate of the 1-lot ATM option shadow (#435).
+
+    Closed stock-instrument rows carry ``opt_pnl`` (net of modelled option
+    charges, 1 lot). Option-MODE rows are excluded — their real fills already
+    ARE the mode's P&L, not a shadow. Returns ``None`` for a mode with no
+    priced shadow rows so the UI renders '—' instead of a misleading 0.
+    """
+    out: dict[str, dict | None] = {"sandbox": None, "live": None}
+    try:
+        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import db_session as o15_session
+
+        rows = (
+            o15_session.query(Open15Trade)
+            .filter(Open15Trade.status == "closed", Open15Trade.opt_pnl.isnot(None))
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        for r in rows:
+            if r.instrument not in (None, "stock"):
+                continue
+            m = (r.mode or "").lower()
+            if m in buckets:
+                buckets[m].append(float(r.opt_pnl))
+        for m, pnls in buckets.items():
+            if pnls:
+                wins = sum(1 for p in pnls if p > 0)
+                out[m] = {
+                    "n_trades": len(pnls),
+                    "win_rate_pct": round(100.0 * wins / len(pnls), 1),
+                    "net_pnl_inr": round(sum(pnls), 2),
+                    "basis": "1-lot ATM shadow",
+                }
+    except Exception:
+        logger.exception("Failed to aggregate open15 option shadow")
+    return out
+
+
 def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
     """Daily realized-P&L series from ``trade_journal`` rows for the simplified
     engine (closed rows carry ``pnl``; the date key is the ``exited_at`` IST
@@ -991,6 +1030,21 @@ def strategy_detail(name: str):
     # `"parity_target": null` returns None from .get and crashed the endpoint
     # with AttributeError (open15_vol_breakout, 2026-07-20).
     parity = config.get("parity_target") or {}
+    # Optional instrument-variant sub-object (issue #455): a backtest that also
+    # priced the ATM-option leg records it under parity_target.options_variant;
+    # normalized here so the UI's paired stock/options cells can render it.
+    opt_variant = parity.get("options_variant") or {}
+    bt_options = (
+        {
+            "n_trades": opt_variant.get("n_trades"),
+            "win_rate_pct": opt_variant.get("win_rate_pct"),
+            "net_pnl_inr": opt_variant.get("net_pnl_inr"),
+            "max_dd_pct": opt_variant.get("max_dd_pct"),
+            "basis": "fit-to-capital lots",
+        }
+        if opt_variant
+        else None
+    )
     performance = {
         "backtest": {
             "cagr_pct": parity.get("cagr_pct") or parity.get("sharpe_daily"),
@@ -998,7 +1052,9 @@ def strategy_detail(name: str):
             "max_dd_pct": parity.get("max_dd_pct"),
             "win_rate_pct": parity.get("win_rate_pct"),
             "n_trades": parity.get("n_trades_window") or parity.get("n_trades"),
+            "net_pnl_inr": parity.get("net_pnl_inr"),
             "window": parity.get("window"),
+            "options": bt_options,
         },
         "sandbox": None,
         "live": None,
@@ -1044,15 +1100,17 @@ def strategy_detail(name: str):
     elif name == "open15_vol_breakout":
         stats = _open15_stats()
         lifetime = _open15_lifetime()
+        opt_shadow = _open15_opt_shadow()
         performance["sandbox"] = {
             "open_positions": stats["open_positions"],
             "today_net_pnl": stats["today_net_pnl"],
             "today_unpriced_exits": stats["today_unpriced_exits"],
             "last_trade_at": stats["last_trade_at"],
             **lifetime["sandbox"],
+            "options": opt_shadow["sandbox"],
         }
         if lifetime["live"]["closed_trades"] > 0:
-            performance["live"] = {**lifetime["live"]}
+            performance["live"] = {**lifetime["live"], "options": opt_shadow["live"]}
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []

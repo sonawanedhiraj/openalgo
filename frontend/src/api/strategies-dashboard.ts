@@ -44,13 +44,26 @@ export interface StrategySummary {
 // Detail endpoint
 // ---------------------------------------------------------------------------
 
+// ATM-option variant of a mode's performance (issue #455). Backtest basis is
+// fit-to-capital lots; sandbox/live basis is the 1-lot shadow (issue #435) —
+// directionally comparable, not rupee-for-rupee.
+export interface OptionsPerf {
+  n_trades: number | null
+  win_rate_pct: number | null
+  net_pnl_inr: number | null
+  max_dd_pct?: number | null
+  basis?: string
+}
+
 export interface BacktestPerf {
   cagr_pct: number | null
   sharpe: number | null
   max_dd_pct: number | null
   win_rate_pct: number | null
   n_trades: number | null
+  net_pnl_inr?: number | null
   window: string | null
+  options?: OptionsPerf | null
 }
 
 export interface LivePerf {
@@ -62,6 +75,7 @@ export interface LivePerf {
   cum_net_pnl?: number | null
   win_rate_pct?: number | null
   closed_trades?: number
+  options?: OptionsPerf | null
 }
 
 export interface StrategyPerformance {
