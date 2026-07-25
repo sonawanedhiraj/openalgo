@@ -231,6 +231,80 @@ def _prevclose_divergence_max_pct() -> float:
         return 0.05
 
 
+def _prevclose_quotes_enabled() -> bool:
+    """``OPEN15_PREVCLOSE_QUOTES_ENABLED`` (default true, issue #456)."""
+    return os.getenv("OPEN15_PREVCLOSE_QUOTES_ENABLED", "true").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def fetch_broker_prev_closes(universe: set[str]) -> dict[str, float]:
+    """ONE batched broker quote call -> ``{symbol: prev_close}`` (issue #456).
+
+    The broker quote payload carries the previous day's SETTLED close
+    (``prev_close`` = Zerodha ``ohlc.close``), so at the 09:10 arm this is the
+    authoritative selection reference for every symbol — fetched at the moment
+    of use, independent of historify state and resettle timing. Every value is
+    also recorded into the #305 broker prev-close registry, so the scanner's
+    reference certificate benefits for the rest of the day.
+
+    NEVER raises. Any failure (no API key / broker session down, broker error,
+    malformed response) logs a WARNING and returns ``{}`` — the caller falls
+    back to the registry-verified historify chain (#457 commit 1).
+    """
+    if not _prevclose_quotes_enabled():
+        return {}
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_multiquotes
+        from services.scanner_reference_data import record_broker_prev_close
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            logger.warning(
+                "open15 prev-close quotes: no API key (broker session down?) — "
+                "falling back to registry-verified historify"
+            )
+            return {}
+        payload = [{"symbol": s, "exchange": "NSE"} for s in sorted(universe)]
+        success, resp, _status = get_multiquotes(payload, api_key=api_key)
+        if not success:
+            logger.warning(
+                "open15 prev-close quotes: get_multiquotes failed: %s — falling "
+                "back to registry-verified historify",
+                (resp or {}).get("message", "unknown error"),
+            )
+            return {}
+        out: dict[str, float] = {}
+        for item in (resp or {}).get("results") or []:
+            sym = item.get("symbol")
+            data = item.get("data")
+            if not sym or not isinstance(data, dict):
+                continue
+            try:
+                pc = float(data.get("prev_close") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pc > 0:
+                out[sym] = pc
+                record_broker_prev_close(sym, pc)
+        logger.info(
+            "open15 prev-close quotes: %d/%d symbols from the live quote snapshot",
+            len(out),
+            len(universe),
+        )
+        return out
+    except Exception:
+        logger.exception(
+            "open15 prev-close quotes: snapshot failed — falling back to "
+            "registry-verified historify"
+        )
+        return {}
+
+
 def verify_prev_closes(closes: dict[str, float], today: dt.date) -> tuple[dict[str, float], dict]:
     """Cross-check historify prev-closes against the broker prev-close registry
     (issue #456 — the 2026-07-23 arm-vs-daily-D-resettle race).
@@ -655,15 +729,20 @@ class Open15BreakoutService:
             return
         self.universe = self._load_universe()
         prev = self._load_prev_closes(self.universe, now.date())
+        # issue #456: PRIMARY = one batched broker quote call at the moment of
+        # use (prev_close = the settled T-1 close, immune to the historify/
+        # resettle race). Quote values win the merge and are recorded into the
+        # #305 registry; whatever the call missed stays on historify and is
+        # cross-checked against the registry below (broker wins on divergence).
+        quote_closes = fetch_broker_prev_closes(self.universe)
+        prev = {**prev, **quote_closes}
         if len(prev) < 20:
             self.day_status = "skipped_late_boot"
             self._log_event("skipped_no_prev_closes", available=len(prev))
             self._persist_day_log()
             return
-        # issue #456: historify-D can hold provisional closes at 09:10 (the
-        # daily-D resettle may still be running) — verify against the broker
-        # prev-close registry; on confirmed divergence the broker value wins.
         prev, prev_check = verify_prev_closes(prev, now.date())
+        prev_check["from_live_quotes"] = len(quote_closes)
         if _tick_capture_enabled() and self._tick_writer is None:
             try:
                 from services.simplified_stock_engine_ticklog import TickLogWriter

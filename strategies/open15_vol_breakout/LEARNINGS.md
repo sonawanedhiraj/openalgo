@@ -58,3 +58,16 @@ in the `selection` event, so this class is diagnosable from the day log alone.
 9 unit tests incl. the exact OFSS 07-23 shape. Learning: **a correct selection
 rule fed unverified reference data is still wrong** — same lesson as DELHIVERY
 2026-07-02 (#305), now enforced at open15's choke point too.
+
+### 2026-07-25 (Sat, cont.) — #456 commit 2: quote-first prev-closes
+Operator question exposed the residual gap in commit 1: the #305 registry is
+populated as a SIDE EFFECT (boot seeder's broker-fallback arm — which makes no
+broker calls pre-open when historify looks healthy — and the resettle, which is
+the very job the arm races). So at 09:10 the registry can be sparse or empty.
+Commit 2 removes the dependence: the arm now makes ONE batched quote call
+(`fetch_broker_prev_closes`, `prev_close` = settled T-1 close) as the PRIMARY
+source, records the values into the registry, and falls back to the commit-1
+registry-verified-historify chain per symbol/on failure. Cost: one broker API
+call per trading day. Learning: **a verification layer that depends on another
+job's side effects inherits that job's timing — fetch the truth at the moment
+of use.**

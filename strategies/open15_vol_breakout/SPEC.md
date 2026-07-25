@@ -28,15 +28,19 @@ This sandbox run measures it with real fills. The journal is the experiment.
   minute volumes derived from cumulative tick volume (auction included in v0).
 - **Selection @ 09:16:** gap = 09:15 open ÷ prev daily close (historify D) − 1;
   top-3 positive → LONG watch, top-3 negative → SHORT watch.
-  **Prev-close verification (issue #456):** at the 09:10 arm each historify
-  prev-close is cross-checked against the scanner's broker prev-close registry
-  (#305); divergence > `OPEN15_PREVCLOSE_DIVERGENCE_MAX_PCT` (default 0.05%)
-  → the broker settled value WINS (WARNING logged). Fail-open per symbol when
-  no registry entry exists today. Provenance (`prev_close_check`) rides the
-  `armed` event; the `selection` event records each pick's prev-close. Guards
-  the 2026-07-23 class: arm racing the daily-D resettle (#299) and reading
-  provisional closes. Flag `OPEN15_PREVCLOSE_REGISTRY_CHECK_ENABLED`
-  (default true).
+  **Prev-close verification (issue #456):** the 09:10 arm sources prev-closes
+  quote-first: ONE batched broker quote call (`get_multiquotes`; `prev_close`
+  = the settled T-1 close, fetched at the moment of use) is the PRIMARY —
+  its values win the merge and are recorded into the #305 broker prev-close
+  registry. Symbols the call missed stay on historify-D and are cross-checked
+  against the registry; divergence > `OPEN15_PREVCLOSE_DIVERGENCE_MAX_PCT`
+  (default 0.05%) → the broker settled value WINS (WARNING logged), fail-open
+  per symbol when no registry entry exists today. Provenance
+  (`prev_close_check` incl. `from_live_quotes`) rides the `armed` event; the
+  `selection` event records each pick's prev-close. Guards the 2026-07-23
+  class: arm racing the daily-D resettle (#299) and reading provisional
+  closes. Flags `OPEN15_PREVCLOSE_QUOTES_ENABLED` +
+  `OPEN15_PREVCLOSE_REGISTRY_CHECK_ENABLED` (both default true).
 - **Entry (once per symbol, 09:16–09:29):** at tick time t inside minute m:
   `cumvol_within_m(t) ≥ 1.5 × mean(completed minute volumes since 09:15)`
   AND ltp beyond the level (>H1 long / <L1 short) → MARKET MIS immediately.
