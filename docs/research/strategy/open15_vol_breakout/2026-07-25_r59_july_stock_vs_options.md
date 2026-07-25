@@ -192,3 +192,46 @@ Per-trade detail at Rs1L/slot:
 | 2026-07-20 | HDFCBANK | S | 09:28 | 642 | -480 | HDFCBANK28JUL26780PE | 11 | 13.2->13.2 | -1,604 |
 | 2026-07-22 | BAJAJ-AUTO | L | 09:20 | 46 | +653 | BAJAJ-AUTO28JUL2610700CE | 8 | 152.0->170.0 | +9,887 |
 | 2026-07-23 | NATIONALUM | L | 09:21 | 1443 | +4,032 | NATIONALUM28JUL26345CE | 8 | 6.2->8.3 | +30,473 |
+
+## Addendum 2 (same day): hold-winners trail variant — REJECT on this sample
+
+Operator request: at 09:30 do NOT square off winners; stop-loss at the 09:30
+price (set 09:31 in backtest; ~09:30:30 live), trailed every 5 minutes
+(ratchet to each 5-min mark's close, never loosened; stop checked per 1m bar,
+gap-through fills at open; EOD flatten 15:10). Harness
+`backtest/options_open15/july_trail_variant.py`, 1L/slot sizing, 10 winners held.
+
+| stop offset below 09:30 price | stock-leg July total |
+|---|---|
+| 0% (as specified) | +5,346 |
+| 0.25% | +3,238 |
+| 0.50% | -2,570 |
+| 1.00% | +6,042 |
+| **base (exit all at 09:30)** | **+10,127** |
+
+- At 0% offset the stop sits AT the current price -> every winner stops out
+  09:31-09:32, several with gap-through slippage (MANAPPURAM +558 -> -770);
+  the trail never engages.
+- Wider offsets let trades breathe but the opening burst mean-reverts after
+  09:30: 9 of 10 winners exit worse than the 09:30 price at 0.5% (TITAN the
+  lone improver, +2,482). Even 1% underperforms base.
+- Verdict: on this one-month sample, **the profit IS the 09:16-09:30 burst;
+  holding past 09:30 with any stop tested gives part of it back** — consistent
+  with R58 (edge confined to the opening window) and the R54 stop-loss
+  learnings. Not deployed; re-examine only with a multi-month sample.
+
+## Addendum 3 (same day): live-selection verification + the 07-23 prev-close race (issue #456)
+
+Tick-log replay (`tick_logs/open15/`) of all three live days: 07-22 gaps
+reproduce to 2 decimals from first-tick opens x settled prev closes —
+**selection code verified, universe verified identical (211)**. 07-23's six
+logged gaps are all off by 0.06-0.72pp because the 09:10 arm read historify-D
+prev closes **while the daily-D resettle (#299) was still overwriting them**
+(job ran 09:08:37-09:18:45 that morning; no post-close convergence rows exist
+for 07-22 evening at all). The arm's `_load_prev_closes` takes `arg_max(close,
+timestamp)` with no settled-ness check, so the provisional closes shifted the
+gap ranking (ETERNAL/NATIONALUM out, ONGC/OIL in). Filed as **issue #456**
+with fix directions (broker prev-close registry cross-check / job sequencing /
+armed-event provenance logging). The R59 backtest side is unaffected — it used
+settled closes; the 07-23 backtest-vs-live pick divergence is now fully
+explained (data race, not code bug, not tick-vs-bar opens).
