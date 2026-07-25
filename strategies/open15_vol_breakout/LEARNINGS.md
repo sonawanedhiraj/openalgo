@@ -30,3 +30,18 @@ Scaffolded + wired (issue #425): service (ZMQ tick sub + 4 APScheduler jobs:
 arm 09:10 / exit 09:30 / retry 09:32 / summary 09:35), `open15_trades` journal,
 `/open15_vol_breakout/api/*`, sandbox mode default. First armed session
 expected Mon 2026-07-21 — REQUIRES pre-09:15 boot.
+
+### 2026-07-25 (Sat) — Round 59: July stock-vs-options backtest fills the dashboard Backtest column
+Full-July (07-01..24, 18d) production-faithful replay (issue #453; harness
+`backtest/options_open15/july_full_run.py`, untracked-local): production
+`resolve_day_config` defaults, production charge models, honest next-minute-open
+entry. **Stock: 15 trades, 60% win, +Rs2,564 net (+2.85% on the 90k margin
+base, maxDD -0.77%). Options (production option-mode, real 28-JUL premiums):
+13 trades (2 unaffordable), 62% win, +Rs11,195 (+12.44%, maxDD -2.18%)** —
+but NATIONALUM 07-23 alone is +7,583 of it, AND that pick came from a
+bar-vs-tick selection divergence (the live day traded OIL instead: pick overlap
+4/6 on 07-22, 3/6 on 07-23). Executed-trade parity where both fired is tight
+(BAJAJ-AUTO 07-22: same qty 14, entry within 2Rs). One green month does NOT
+overturn R58's full-history -0.16%/trade honest verdict; `parity_target` now
+carries the numbers with that caveat inline. Full doc:
+`docs/research/strategy/open15_vol_breakout/2026-07-25_r59_july_stock_vs_options.md`.

@@ -23,6 +23,28 @@
     "order_type": "MARKET"
   },
   "honest_context": "Round 58: bar-level versions of this signal have NO honest edge (close entry -0.16%/trade; the published +0.38% was entry-level look-ahead). This sandbox run measures whether the legal mid-bar entry captures enough of the ~0.54% intra-bar burst. Decision rule: trigger entry must beat close entry by >=0.4pp/trade over ~30+ signals, else final REJECT.",
-  "parity_target": null,
+  "parity_target": {
+    "window": "Jul 2026 (07-01..07-24, 18d) R59",
+    "n_trades": 15,
+    "win_rate_pct": 60.0,
+    "cagr_pct": 48.2,
+    "sharpe": 5.02,
+    "max_dd_pct": -0.77,
+    "instrument": "stock",
+    "net_pnl_inr": 2564,
+    "month_return_pct": 2.85,
+    "capital_base_inr": 90000,
+    "entry_convention": "next-minute-open (production-legal; R58 look-ahead excluded)",
+    "options_variant": {
+      "n_trades": 13,
+      "win_rate_pct": 62.0,
+      "net_pnl_inr": 11195,
+      "month_return_pct": 12.44,
+      "max_dd_pct": -2.18,
+      "note": "ATM 28-JUL monthly buys, production option-mode sizing floor(30k/(premium*lot)), real broker 1m premiums, production charge model (no bid-ask haircut); 2 signals unaffordable (MANAPPURAM 07-01, GVT&D 07-02); NATIONALUM 07-23 alone is +7,583 of the total"
+    },
+    "source": "docs/research/strategy/open15_vol_breakout/2026-07-25_r59_july_stock_vs_options.md (issue #453)",
+    "caveat": "Single-month window; annualized CAGR/Sharpe indicative only. R58 full-history honest edge remains -0.16%/trade - July is one favourable month, not a validation."
+  },
   "ops": "App must boot before 09:15 IST; late boot = day skipped (loud WARNING)."
 }
