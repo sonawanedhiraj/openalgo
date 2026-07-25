@@ -144,3 +144,51 @@ unaffordable), win 62%, **net +₹11,195**, avg +₹861/trade.
   columns (issue #435) — July says option-buying amplified a green month ~4×
   on ~2× the drawdown; it would equally amplify a red one (R58 full-history
   options: −₹160k). No instrument flip recommended on one month of data.
+
+## Addendum (same day): Rs1L per-slot capital scenario (operator request)
+
+Same 15 signals, `margin_per_slot` raised 30k -> **Rs1,00,000** (x5 leverage ->
+Rs5L notional/trade; capital base 3 slots = Rs3L). Selection and triggers are
+capital-invariant; only sizing changes. Harness override: `BT_MARGIN_PER_SLOT=100000`.
+
+| | n | win% | net Rs | month ret (Rs3L base) | maxDD | Sharpe (ann.) |
+|---|---|---|---|---|---|---|
+| STOCK (next-open) | 15 | 60% | +10,127 | +3.38% | -0.74% | 5.82 |
+| STOCK (trig-close) | 15 | 60% | +8,644 | +2.88% | -0.96% | 5.04 |
+| OPTIONS (ATM buy) | **15** | 67% | **+57,268** | +19.09% | -3.37% | 6.11 |
+
+Notables vs the 30k run:
+- **No unaffordable skips left** — MANAPPURAM 07-01 PE (+1,432) and GVT&D
+  07-02 PE (+7,026) now trade; both won, lifting the option win-rate 62->67%.
+- **Options P&L scales super-linearly** (+11,195 -> +57,268, ~5.1x on 3.33x
+  capital): fit-to-capital lot granularity improves (e.g. HYUNDAI 1->6 lots,
+  BAJAJ-AUTO 2->8), and the two recovered trades add +8.5k.
+- Stock leg scales ~linearly (+2,564 -> +10,127 on 3.33x capital; slight
+  gain from qty-rounding granularity on high-priced names like SHREECEM).
+- Concentration caveat persists: NATIONALUM 07-23 is +30,473 of the option
+  total — and it remains a pick the live tick-based selection did NOT make.
+- parity_target on the dashboard deliberately stays on the **30k production
+  config** — sandbox trades at 30k slots, and the Backtest column exists for
+  parity against that book. If the operator raises the production
+  `margin_per_slot` to 1L (UI-configurable on /open15_vol_breakout/logs),
+  re-point parity_target at this scenario in the same change.
+
+Per-trade detail at Rs1L/slot:
+
+| date | sym | side | trig | qty | stock net | contract | lots | prem in->out | option net |
+|---|---|---|---|---|---|---|---|---|---|
+| 2026-07-01 | MANAPPURAM | S | 09:27 | 1563 | +558 | MANAPPURAM28JUL26320PE | 2 | 11.4->11.8 | +1,432 |
+| 2026-07-01 | SHREECEM | L | 09:27 | 19 | -790 | SHREECEM28JUL2625750CE | 5 | 782.5->755.0 | -4,348 |
+| 2026-07-02 | VMM | L | 09:16 | 4172 | -182 | VMM28JUL26120CE | 5 | 4.0->4.1 | +287 |
+| 2026-07-02 | GVT&D | S | 09:20 | 104 | +4,436 | GVT&D28JUL264800PE | 3 | 261.7->283.0 | +7,026 |
+| 2026-07-06 | POLICYBZR | S | 09:19 | 315 | +1,163 | POLICYBZR28JUL261580PE | 5 | 51.3->54.9 | +5,335 |
+| 2026-07-07 | TITAN | L | 09:25 | 108 | +350 | TITAN28JUL264600CE | 6 | 95.2->99.0 | +3,137 |
+| 2026-07-08 | BPCL | S | 09:24 | 1657 | -2,212 | BPCL28JUL26300PE | 6 | 7.8->7.2 | -8,538 |
+| 2026-07-09 | DRREDDY | S | 09:21 | 378 | -2,605 | DRREDDY28JUL261320PE | 4 | 39.5->37.5 | -5,779 |
+| 2026-07-09 | KALYANKJIL | L | 09:26 | 1237 | +3,672 | KALYANKJIL28JUL26405CE | 4 | 17.9->18.9 | +4,462 |
+| 2026-07-10 | AUROPHARMA | S | 09:18 | 321 | -544 | AUROPHARMA28JUL261560PE | 4 | 38.6->38.9 | -258 |
+| 2026-07-13 | ONGC | L | 09:24 | 2014 | +421 | ONGC28JUL26247.5CE | 8 | 5.3->5.6 | +5,199 |
+| 2026-07-15 | HYUNDAI | L | 09:19 | 247 | +1,653 | HYUNDAI28JUL262020CE | 6 | 60.5->67.5 | +10,556 |
+| 2026-07-20 | HDFCBANK | S | 09:28 | 642 | -480 | HDFCBANK28JUL26780PE | 11 | 13.2->13.2 | -1,604 |
+| 2026-07-22 | BAJAJ-AUTO | L | 09:20 | 46 | +653 | BAJAJ-AUTO28JUL2610700CE | 8 | 152.0->170.0 | +9,887 |
+| 2026-07-23 | NATIONALUM | L | 09:21 | 1443 | +4,032 | NATIONALUM28JUL26345CE | 8 | 6.2->8.3 | +30,473 |

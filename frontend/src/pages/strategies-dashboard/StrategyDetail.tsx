@@ -447,58 +447,117 @@ function TradeStatusBadge({ status }: { status: string }) {
 // Performance comparison table
 // ---------------------------------------------------------------------------
 
+// A cell value with an optional ATM-options sub-value rendered beneath it
+// (issue #455). `opt` stays undefined for strategies without option pricing.
+type PairedCell = { main: string; opt?: string }
+
+function PerfCell({ cell }: { cell: PairedCell }) {
+  return (
+    <td className="px-4 py-2 text-right tabular-nums font-mono align-top">
+      {cell.main}
+      {cell.opt != null && (
+        <div className="text-xs text-blue-600 dark:text-blue-400">{cell.opt}</div>
+      )}
+    </td>
+  )
+}
+
 function PerfTable({ data }: { data: StrategyDetail }) {
   const bt = data.performance.backtest
   const sb = data.performance.sandbox
   const lv = data.performance.live
+  const btOpt = bt.options
+  const sbOpt = sb?.options
+  const lvOpt = lv?.options
+  const hasOptions = Boolean(btOpt || sbOpt || lvOpt)
 
-  const rows = [
-    { label: 'CAGR', bt: fmt(bt.cagr_pct, '%'), sb: '—', lv: '—' },
-    { label: 'Sharpe', bt: fmt(bt.sharpe), sb: '—', lv: '—' },
-    { label: 'Max DD', bt: fmt(bt.max_dd_pct, '%'), sb: '—', lv: '—' },
-    // Backtest win-rate is the 2.5yr figure; Sandbox/Live show the *running*
+  // Option-mode-unaffordable signals are visible as the stock-vs-options trade
+  // count gap (fit-to-capital sizing can price out a high-premium contract).
+  const btOptTrades =
+    btOpt?.n_trades != null
+      ? bt.n_trades != null && bt.n_trades > btOpt.n_trades
+        ? `${btOpt.n_trades} (${bt.n_trades - btOpt.n_trades} skip)`
+        : String(btOpt.n_trades)
+      : undefined
+
+  const rows: { label: string; bt: PairedCell; sb: PairedCell; lv: PairedCell }[] = [
+    { label: 'CAGR', bt: { main: fmt(bt.cagr_pct, '%') }, sb: { main: '—' }, lv: { main: '—' } },
+    { label: 'Sharpe', bt: { main: fmt(bt.sharpe) }, sb: { main: '—' }, lv: { main: '—' } },
+    {
+      label: 'Max DD',
+      bt: { main: fmt(bt.max_dd_pct, '%'), opt: btOpt ? fmt(btOpt.max_dd_pct, '%') : undefined },
+      sb: { main: '—' },
+      lv: { main: '—' },
+    },
+    // Backtest win-rate is the window figure; Sandbox/Live show the *running*
     // win-rate over closed trades so far (issue #323).
     {
       label: 'Win Rate',
-      bt: fmt(bt.win_rate_pct, '%'),
-      sb: fmt(sb?.win_rate_pct, '%'),
-      lv: fmt(lv?.win_rate_pct, '%'),
+      bt: {
+        main: fmt(bt.win_rate_pct, '%'),
+        opt: btOpt ? fmt(btOpt.win_rate_pct, '%') : undefined,
+      },
+      sb: {
+        main: fmt(sb?.win_rate_pct, '%'),
+        opt: sbOpt ? fmt(sbOpt.win_rate_pct, '%') : undefined,
+      },
+      lv: {
+        main: fmt(lv?.win_rate_pct, '%'),
+        opt: lvOpt ? fmt(lvOpt.win_rate_pct, '%') : undefined,
+      },
     },
     // Backtest N is the window trade count; Sandbox/Live show closed trades so
     // far, the denominator behind the running win-rate + cumulative P&L.
     {
       label: 'N Trades',
-      bt: fmt(bt.n_trades),
-      sb: sb?.closed_trades != null ? String(sb.closed_trades) : '—',
-      lv: lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+      bt: { main: fmt(bt.n_trades), opt: btOptTrades },
+      sb: {
+        main: sb?.closed_trades != null ? String(sb.closed_trades) : '—',
+        opt: sbOpt?.n_trades != null ? String(sbOpt.n_trades) : undefined,
+      },
+      lv: {
+        main: lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+        opt: lvOpt?.n_trades != null ? String(lvOpt.n_trades) : undefined,
+      },
     },
     {
       label: 'Open Pos',
-      bt: '—',
-      sb: sb?.open_positions != null ? String(sb.open_positions) : '—',
-      lv: lv?.open_positions != null ? String(lv.open_positions) : '—',
+      bt: { main: '—' },
+      sb: { main: sb?.open_positions != null ? String(sb.open_positions) : '—' },
+      lv: { main: lv?.open_positions != null ? String(lv.open_positions) : '—' },
     },
-    // Cumulative realized P&L since the strategy started trading in that mode.
+    // Cumulative realized P&L: backtest window total vs since-inception per mode.
     {
-      label: 'Cum P&L',
-      bt: '—',
-      sb: fmtPnl(sb?.cum_net_pnl),
-      lv: fmtPnl(lv?.cum_net_pnl),
+      label: 'Net P&L',
+      bt: {
+        main: fmtPnl(bt.net_pnl_inr),
+        opt: btOpt ? fmtPnl(btOpt.net_pnl_inr) : undefined,
+      },
+      sb: { main: fmtPnl(sb?.cum_net_pnl), opt: sbOpt ? fmtPnl(sbOpt.net_pnl_inr) : undefined },
+      lv: { main: fmtPnl(lv?.cum_net_pnl), opt: lvOpt ? fmtPnl(lvOpt.net_pnl_inr) : undefined },
     },
     {
       label: 'Today P&L',
-      bt: '—',
-      sb: fmtPnl(sb?.today_net_pnl),
-      lv: fmtPnl(lv?.today_net_pnl),
+      bt: { main: '—' },
+      sb: { main: fmtPnl(sb?.today_net_pnl) },
+      lv: { main: fmtPnl(lv?.today_net_pnl) },
     },
   ]
 
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <FileBarChart2 className="h-4 w-4" /> Performance Comparison
-        </CardTitle>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <FileBarChart2 className="h-4 w-4" /> Performance Comparison
+          </CardTitle>
+          {hasOptions && (
+            <span className="text-xs text-muted-foreground">
+              per cell: stock ·{' '}
+              <span className="text-blue-600 dark:text-blue-400 font-medium">options</span>
+            </span>
+          )}
+        </div>
         {bt.window && <p className="text-xs text-muted-foreground">Backtest window: {bt.window}</p>}
       </CardHeader>
       <CardContent className="p-0">
@@ -518,14 +577,21 @@ function PerfTable({ data }: { data: StrategyDetail }) {
               {rows.map((r) => (
                 <tr key={r.label} className="border-b last:border-0 hover:bg-muted/20">
                   <td className="px-4 py-2 text-muted-foreground">{r.label}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono">{r.bt}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono">{r.sb}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono">{r.lv}</td>
+                  <PerfCell cell={r.bt} />
+                  <PerfCell cell={r.sb} />
+                  <PerfCell cell={r.lv} />
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        {hasOptions && (
+          <p className="px-4 py-2 text-xs text-muted-foreground border-t">
+            Options basis differs by column: backtest = fit-to-capital lots (₹30k slot);
+            sandbox/live = 1-lot ATM shadow per trade — directionally comparable, not
+            rupee-for-rupee.
+          </p>
+        )}
       </CardContent>
     </Card>
   )
