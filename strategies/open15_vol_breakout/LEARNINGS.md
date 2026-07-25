@@ -45,3 +45,29 @@ bar-vs-tick selection divergence (the live day traded OIL instead: pick overlap
 overturn R58's full-history -0.16%/trade honest verdict; `parity_target` now
 carries the numbers with that caveat inline. Full doc:
 `docs/research/strategy/open15_vol_breakout/2026-07-25_r59_july_stock_vs_options.md`.
+
+### 2026-07-25 (Sat, later) — #456 fix: arm-time prev-close verification vs broker registry
+R59's tick-log replay proved the selection code exact (07-22 to 2dp) but found
+07-23's gaps shifted by provisional prev-closes: the 09:10 arm raced the
+09:08-09:18 daily-D resettle. Fix: `verify_prev_closes` cross-checks every
+historify prev-close against the #305 broker prev-close registry at arm time —
+divergence > 0.05% -> broker settled value wins (fail-open per symbol when no
+registry entry). Provenance in the `armed` event (`prev_close_check`: checked /
+no_registry_entry / overridden + per-symbol detail) and each pick's prev-close
+in the `selection` event, so this class is diagnosable from the day log alone.
+9 unit tests incl. the exact OFSS 07-23 shape. Learning: **a correct selection
+rule fed unverified reference data is still wrong** — same lesson as DELHIVERY
+2026-07-02 (#305), now enforced at open15's choke point too.
+
+### 2026-07-25 (Sat, cont.) — #456 commit 2: quote-first prev-closes
+Operator question exposed the residual gap in commit 1: the #305 registry is
+populated as a SIDE EFFECT (boot seeder's broker-fallback arm — which makes no
+broker calls pre-open when historify looks healthy — and the resettle, which is
+the very job the arm races). So at 09:10 the registry can be sparse or empty.
+Commit 2 removes the dependence: the arm now makes ONE batched quote call
+(`fetch_broker_prev_closes`, `prev_close` = settled T-1 close) as the PRIMARY
+source, records the values into the registry, and falls back to the commit-1
+registry-verified-historify chain per symbol/on failure. Cost: one broker API
+call per trading day. Learning: **a verification layer that depends on another
+job's side effects inherits that job's timing — fetch the truth at the moment
+of use.**
