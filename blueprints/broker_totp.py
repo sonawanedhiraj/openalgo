@@ -7,24 +7,53 @@ stored Fernet-encrypted in ``broker_totp_secrets`` (``database/broker_totp_db``)
 and is write-only through this API: it can be saved, replaced, or deleted, but
 never read back — only the derived code is ever returned.
 
-All routes are session-gated (``check_session_validity``) and CSRF-protected;
-there is deliberately NO API-key auth path.
+All routes require a logged-in OpenAlgo session and are CSRF-protected; there is
+deliberately NO API-key auth path.
+
+**Auth level is ``"user" in session``, NOT ``check_session_validity`` — this is
+load-bearing (issue #462).** OpenAlgo's session is two-stage: the password login
+sets ``session["user"]``, and ``session["logged_in"]`` is only set later by
+``handle_auth_success`` once BROKER auth completes. This blueprint is consumed by
+the broker-connect page, i.e. precisely the window between those two stages, where
+``is_session_valid()`` is False by design. ``check_session_validity``'s failure path
+is destructive — it calls ``revoke_user_tokens()`` (revoking broker tokens in the DB
+and clearing active sessions) and ``session.clear()`` — so decorating these routes
+with it logged the operator out on arrival at the broker page. We gate on the same
+condition ``/auth/broker-config`` uses to serve that very page, and the failure path
+here only ever returns 401.
 """
 
 import time
+from functools import wraps
 
 import pyotp
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, session
 
 from database.broker_totp_db import delete_secret, get_secret, has_secret, set_secret
 from utils.logging import get_logger
-from utils.session import check_session_validity
 
 logger = get_logger(__name__)
 
 broker_totp_bp = Blueprint("broker_totp_bp", __name__, url_prefix="/api/broker-totp")
 
 DEFAULT_BROKER = "zerodha"
+
+
+def require_login(f):
+    """Require a password-authenticated session; never mutate it.
+
+    Deliberately non-destructive: an unauthenticated call gets a plain 401 and
+    the session is left exactly as it was. See the module docstring for why
+    ``check_session_validity`` must not be used here (issue #462).
+    """
+
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "user" not in session:
+            return jsonify({"status": "error", "message": "Login required."}), 401
+        return f(*args, **kwargs)
+
+    return decorated_function
 
 
 def _normalize_secret(raw: str) -> str:
@@ -37,7 +66,7 @@ def _broker_from_request() -> str:
 
 
 @broker_totp_bp.route("/status", methods=["GET"])
-@check_session_validity
+@require_login
 def totp_status():
     """Whether a TOTP secret is configured for the broker."""
     broker = _broker_from_request()
@@ -45,7 +74,7 @@ def totp_status():
 
 
 @broker_totp_bp.route("/current", methods=["GET"])
-@check_session_validity
+@require_login
 def current_code():
     """Current 6-digit TOTP code + seconds left in this 30s window."""
     broker = _broker_from_request()
@@ -75,7 +104,7 @@ def current_code():
 
 
 @broker_totp_bp.route("", methods=["POST"])
-@check_session_validity
+@require_login
 def save_secret():
     """Save or replace the broker's TOTP secret (base32). Never echoed back."""
     data = request.get_json(silent=True) or {}
@@ -104,7 +133,7 @@ def save_secret():
 
 
 @broker_totp_bp.route("", methods=["DELETE"])
-@check_session_validity
+@require_login
 def remove_secret():
     """Delete the broker's stored TOTP secret."""
     broker = _broker_from_request()

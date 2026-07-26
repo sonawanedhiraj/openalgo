@@ -26,19 +26,26 @@ TEST_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"  # pragma: allowlist secret
 
 @pytest.fixture
 def client(monkeypatch):
-    """Bare Flask app with broker_totp_bp mounted on the conftest-redirected DB."""
+    """Bare Flask app with broker_totp_bp mounted on the conftest-redirected DB.
+
+    The test client carries only ``session["user"]`` — deliberately WITHOUT
+    ``logged_in`` — which is the broker-connect page's session state (issue #462).
+    """
     import database.broker_totp_db as btdb
     from blueprints.broker_totp import broker_totp_bp
 
     btdb.init_db()
 
-    monkeypatch.setattr("utils.session.is_session_valid", lambda: True)
-
     app = Flask(__name__)
     app.config["TESTING"] = True
+    app.secret_key = "test"  # pragma: allowlist secret  (session support)
     app.register_blueprint(broker_totp_bp)
 
-    yield app.test_client(), btdb
+    test_client = app.test_client()
+    with test_client.session_transaction() as sess:
+        sess["user"] = "tester"
+
+    yield test_client, btdb
 
     # Clean the table so tests stay order-independent.
     try:
@@ -126,25 +133,72 @@ def test_secret_encrypted_at_rest_and_never_echoed(client):
         assert TEST_SECRET not in test_client.get(url).get_data(as_text=True)
 
 
-def test_routes_are_session_gated(monkeypatch):
+ALL_ROUTES = (
+    ("get", "/api/broker-totp/status"),
+    ("get", "/api/broker-totp/current"),
+    ("post", "/api/broker-totp"),
+    ("delete", "/api/broker-totp"),
+)
+
+
+def _bare_app():
     import database.broker_totp_db as btdb  # noqa: F401  (ensure table/module import)
     from blueprints.broker_totp import broker_totp_bp
 
-    monkeypatch.setattr("utils.session.is_session_valid", lambda: False)
-    monkeypatch.setattr("utils.session.revoke_user_tokens", lambda: None)
-
     app = Flask(__name__)
     app.config["TESTING"] = True
-    app.secret_key = "test"  # pragma: allowlist secret  (session.clear() needs one)
+    app.secret_key = "test"  # pragma: allowlist secret  (session support)
     app.register_blueprint(broker_totp_bp)
-    test_client = app.test_client()
+    return app
 
-    for method, url in (
-        ("get", "/api/broker-totp/status"),
-        ("get", "/api/broker-totp/current"),
-        ("post", "/api/broker-totp"),
-        ("delete", "/api/broker-totp"),
-    ):
-        # JSON Accept header → the decorator answers 401 instead of a login redirect.
+
+def test_routes_reject_anonymous_callers():
+    """No session at all → 401 on every route."""
+    test_client = _bare_app().test_client()
+
+    for method, url in ALL_ROUTES:
         resp = getattr(test_client, method)(url, headers={"Accept": "application/json"})
         assert resp.status_code == 401, (method, url, resp.status_code)
+
+
+def test_routes_work_before_broker_login(client):
+    """The broker-connect page state — ``user`` set, ``logged_in`` absent — is allowed.
+
+    Regression test for #462: gating on ``check_session_validity`` made these
+    routes 401 here, and its failure path destroyed the session.
+    """
+    test_client, _ = client
+
+    with test_client.session_transaction() as sess:
+        assert "logged_in" not in sess
+
+    assert test_client.get("/api/broker-totp/status").status_code == 200
+
+
+def test_rejection_never_destroys_the_session():
+    """A rejected call must leave the session untouched (the #462 logout bug).
+
+    ``check_session_validity`` responded to an invalid session by revoking the
+    user's broker tokens and calling ``session.clear()``, so merely landing on
+    the broker page logged the operator out. Assert we do neither: an unrelated
+    session key survives the 401, and no revoke path is reachable from here.
+    """
+    import utils.session as session_module
+
+    revoked = []
+    original_revoke = session_module.revoke_user_tokens
+    session_module.revoke_user_tokens = lambda *a, **k: revoked.append(True)
+    try:
+        test_client = _bare_app().test_client()
+        with test_client.session_transaction() as sess:
+            sess["unrelated_key"] = "survives"  # no "user" → calls are rejected
+
+        for method, url in ALL_ROUTES:
+            resp = getattr(test_client, method)(url, headers={"Accept": "application/json"})
+            assert resp.status_code == 401, (method, url)
+
+        with test_client.session_transaction() as sess:
+            assert sess.get("unrelated_key") == "survives", "session was cleared on rejection"
+        assert not revoked, "rejection must not revoke broker auth tokens"
+    finally:
+        session_module.revoke_user_tokens = original_revoke
