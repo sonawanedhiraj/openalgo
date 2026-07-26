@@ -288,6 +288,16 @@ def place_order_with_auth(
                 )
             )
 
+        # Multi-account mirror fan-out (issue #474): a LIVE accepted parent is
+        # mirrored to enabled child accounts. Fire-and-forget no-op unless
+        # MULTI_ACCOUNT_ENABLED and children are configured; never raises.
+        try:
+            from services.account_fanout_service import maybe_fan_out
+
+            maybe_fan_out(order_data, resolved_key, broker, str(order_id))
+        except Exception:
+            logger.exception("multi-account fan-out failed (parent order unaffected)")
+
         return True, order_response_data, 200
     else:
         message = (

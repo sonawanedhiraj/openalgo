@@ -107,6 +107,7 @@ from blueprints.websocket_example import websocket_bp  # Import the websocket ex
 from blueprints.whatsapp import whatsapp_bp  # Import the WhatsApp blueprint
 from cors import cors  # Import the CORS instance
 from csp import apply_csp_middleware  # Import the CSP middleware
+from database.account_orders_db import init_db as ensure_account_orders_tables_exists
 from database.action_center_db import init_db as ensure_action_center_tables_exists
 from database.analyzer_db import init_db as ensure_analyzer_tables_exists
 from database.apilog_db import init_db as ensure_api_log_tables_exists
@@ -718,6 +719,7 @@ def setup_environment(app):
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Broker TOTP DB", ensure_broker_totp_tables_exists),
                 ("Broker Accounts DB", ensure_broker_accounts_tables_exists),
+                ("Account Orders DB", ensure_account_orders_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
                 ("Strategy DB", ensure_strategy_tables_exists),
