@@ -1,0 +1,94 @@
+import { webClient } from './client'
+
+// Multi-account child broker accounts (issue #468).
+// Backend: blueprints/broker_accounts.py → /broker_accounts/api
+
+export interface ChildAccount {
+  id: number
+  display_name: string
+  broker: string
+  broker_client_id: string | null
+  capital_inr: number
+  is_enabled: boolean
+  has_totp_secret: boolean
+  last_login_at: string | null
+  created_at: string | null
+  updated_at: string | null
+  connected: boolean
+  strategies: string[]
+  redirect_url_hint: string
+}
+
+export interface AccountsOverview {
+  status: string
+  multi_account_enabled: boolean
+  known_strategies: string[]
+  accounts: ChildAccount[]
+}
+
+export interface TotpCode {
+  status: string
+  code: string
+  seconds_remaining: number
+  interval: number
+}
+
+export interface AddAccountPayload {
+  display_name: string
+  broker_client_id?: string
+  api_key: string
+  api_secret: string
+  capital_inr: number
+}
+
+export interface UpdateAccountPayload {
+  display_name?: string
+  broker_client_id?: string
+  capital_inr?: number
+  is_enabled?: boolean
+  api_key?: string
+  api_secret?: string
+  totp_secret?: string
+}
+
+const BASE = '/broker_accounts/api'
+
+export const brokerAccountsApi = {
+  overview: async (): Promise<AccountsOverview> => {
+    const { data } = await webClient.get(BASE)
+    return data
+  },
+
+  add: async (payload: AddAccountPayload): Promise<ChildAccount> => {
+    const { data } = await webClient.post(BASE, payload)
+    return data.account
+  },
+
+  update: async (id: number, payload: UpdateAccountPayload): Promise<ChildAccount> => {
+    const { data } = await webClient.put(`${BASE}/${id}`, payload)
+    return data.account
+  },
+
+  remove: async (id: number): Promise<void> => {
+    await webClient.delete(`${BASE}/${id}`)
+  },
+
+  loginUrl: async (id: number): Promise<string> => {
+    const { data } = await webClient.get(`${BASE}/${id}/login_url`)
+    return data.login_url
+  },
+
+  disconnect: async (id: number): Promise<void> => {
+    await webClient.post(`${BASE}/${id}/disconnect`)
+  },
+
+  setStrategies: async (id: number, strategies: string[]): Promise<string[]> => {
+    const { data } = await webClient.post(`${BASE}/${id}/strategies`, { strategies })
+    return data.strategies
+  },
+
+  totpCode: async (id: number): Promise<TotpCode> => {
+    const { data } = await webClient.get(`${BASE}/${id}/totp`)
+    return data
+  },
+}
