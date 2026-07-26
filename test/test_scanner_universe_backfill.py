@@ -12,11 +12,44 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import services.scanner_backfill_scheduler as sched
 import services.scanner_smoke_check_service as smoke_svc
 import services.scanner_universe_backfill as sub
 
 _IST = timezone(timedelta(hours=5, minutes=30))
+
+
+@pytest.fixture(autouse=True)
+def _stub_daily_resettle(monkeypatch):
+    """These tests exercise the stale-check convergence contract, NOT the
+    daily-D resettle (that has its own suite, test_scanner_daily_resettle.py).
+
+    ``run_backfill_checks(resettle=True)`` calls the REAL
+    ``resettle_recent_daily`` unless stubbed. In isolation that fails fast
+    (fresh temp DB → no API key), but any earlier test in a full-suite run
+    that leaves an active user + API key in the session temp DB removes that
+    accident: with SCANNER_SYMBOLS set from .env, the resettle then launches
+    a genuine full-universe download job whose ``wait_for_jobs`` poll hangs
+    until pytest-timeout kills the run (2026-07-26). Stub it — and clear the
+    once-per-process latch both ways so no latch state leaks across files.
+    """
+    sched._resettled_dates.clear()
+    monkeypatch.setattr(
+        sub,
+        "resettle_recent_daily",
+        lambda today=None, **kw: {
+            "status": "ok",
+            "interval": "D",
+            "window": None,
+            "resettled": False,
+            "errors": [],
+        },
+    )
+    yield
+    sched._resettled_dates.clear()
+
 
 # Reference trading days. THURS is a weekday; WED is the prior business day.
 THURS = date(2026, 6, 11)

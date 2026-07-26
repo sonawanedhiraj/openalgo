@@ -15,10 +15,49 @@ import hashlib
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Force in-memory DB for testing
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+# NOTE: this module must NOT mutate os.environ["DATABASE_URL"] at import time.
+# Under pytest, test/conftest.py already redirects every DB to a throwaway temp
+# dir, and a module-level ``DATABASE_URL=sqlite:///:memory:`` leaks into the
+# rest of the session: any database.* module first-imported AFTER this file
+# binds its engine to an empty per-connection :memory: DB and every query fails
+# with "no such table". Standalone execution sets it in ``__main__`` below.
+
+
+@pytest.fixture(autouse=True)
+def _restore_auth_db_binding():
+    """Undo ``setup_test_db``'s rebinding of database.auth_db after each test.
+
+    ``setup_test_db`` swaps ``auth_mod.db_session`` / ``Base.query`` to a
+    StaticPool :memory: engine seeded with an ACTIVE user + API key and never
+    restored it. Left in place, every later test in the pytest session sees
+    ``get_first_available_api_key()`` return a real key — which let the scanner
+    boot-convergence tests fire an UNMOCKED ``resettle_recent_daily`` broker
+    download whose ``wait_for_jobs`` poll hung the full suite (2026-07-26).
+    """
+    import database.auth_db as auth_mod
+
+    orig_session = auth_mod.db_session
+    # Raw descriptor lookup — ``Base.query`` would INVOKE the query_property
+    # descriptor on the unmapped Base class and raise ArgumentError.
+    orig_query = auth_mod.Base.__dict__["query"]
+    yield
+    leaked = auth_mod.db_session
+    if leaked is not orig_session:
+        try:
+            leaked.remove()
+        except Exception:
+            pass
+    auth_mod.db_session = orig_session
+    auth_mod.Base.query = orig_query
+    # The tests plant entries keyed by their fake API keys; don't let them
+    # shadow real lookups later in the session.
+    auth_mod.auth_cache.clear()
+    auth_mod.verified_api_key_cache.clear()
+    auth_mod.invalid_api_key_cache.clear()
 
 
 def setup_test_db():
@@ -241,6 +280,11 @@ def test_only_admin_revoked_reproduces_original_bug():
 
 
 if __name__ == "__main__":
+    # Standalone (non-pytest) safety belt: make sure a direct `python` run can
+    # never touch the live DB. Under pytest this is unnecessary (conftest
+    # redirects) and harmful at import time (see module note above).
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
     print("=" * 60)
     print("Testing orphaned API key handling")
     print("=" * 60)
