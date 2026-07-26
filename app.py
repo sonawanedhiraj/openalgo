@@ -41,6 +41,7 @@ from blueprints.apikey import api_key_bp
 from blueprints.auth import auth_bp
 from blueprints.backtest import backtest_bp  # MVP backtester endpoints
 from blueprints.brlogin import brlogin_bp
+from blueprints.broker_accounts import broker_accounts_bp  # Multi-account child accounts (#468)
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
@@ -111,6 +112,7 @@ from database.analyzer_db import init_db as ensure_analyzer_tables_exists
 from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.auth_db import init_db as ensure_auth_tables_exists
 from database.backtest_db import init_db as ensure_backtest_tables_exists
+from database.broker_accounts_db import init_db as ensure_broker_accounts_tables_exists
 from database.broker_totp_db import init_db as ensure_broker_totp_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
@@ -336,6 +338,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(flow_bp)  # Register Flow blueprint
     app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
     app.register_blueprint(broker_totp_bp)  # Broker external-TOTP helper (Zerodha 2FA code)
+    app.register_blueprint(broker_accounts_bp)  # Multi-account child accounts (#468)
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
     app.register_blueprint(strategy_portfolio_bp)  # Register Strategy Portfolio blueprint
 
@@ -714,6 +717,7 @@ def setup_environment(app):
                 ("Backtest DB", ensure_backtest_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Broker TOTP DB", ensure_broker_totp_tables_exists),
+                ("Broker Accounts DB", ensure_broker_accounts_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
                 ("Strategy DB", ensure_strategy_tables_exists),

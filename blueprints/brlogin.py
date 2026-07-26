@@ -55,6 +55,29 @@ def broker_callback(broker, para=None):
             logger.warning(f"User not in session for {broker} callback, redirecting to login")
             return redirect(url_for("auth.login"))
 
+    # Multi-account child login (issue #468). A child account's Kite Connect app
+    # carries its redirect URL as .../zerodha/callback?account_id=<N>, so this
+    # param can only ever appear for a child app — the primary's app uses the
+    # bare URL and takes the unchanged path below. Handled BEFORE the logged_in
+    # early-return (the operator is normally already primary-connected when
+    # logging children in) and deliberately free of every primary side effect:
+    # no session mutation, no master-contract download, no WS notify.
+    # See docs/design/multi_account_plan.md §5.3.
+    child_account_id = request.args.get("account_id", "")
+    if child_account_id and broker == "zerodha":
+        from urllib.parse import quote
+
+        from services.broker_accounts_service import complete_login as complete_child_login
+
+        if not child_account_id.isdigit():
+            return redirect(f"/accounts?error={quote('Invalid account_id in callback URL')}")
+        ok, child_error = complete_child_login(
+            int(child_account_id), request.args.get("request_token")
+        )
+        if ok:
+            return redirect(f"/accounts?connected={quote(child_account_id)}")
+        return redirect(f"/accounts?error={quote(child_error or 'Child account login failed')}")
+
     if session.get("logged_in"):
         # Store broker in session and g
         session["broker"] = broker

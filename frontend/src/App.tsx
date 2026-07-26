@@ -87,6 +87,9 @@ const PythonStrategyGuide = lazy(() => import('@/pages/python-strategy/PythonStr
 const ScannerIndex = lazy(() => import('@/pages/scanner/ScannerIndex'))
 const ScannerDetail = lazy(() => import('@/pages/scanner/ScannerDetail'))
 
+// Multi-account child accounts (issue #468)
+const AccountsPage = lazy(() => import('@/pages/accounts/AccountsPage'))
+
 // Strategies Dashboard (Tier 2 — read-only strategy browser)
 const StrategiesDashboardIndex = lazy(
   () => import('@/pages/strategies-dashboard/StrategiesDashboardIndex')
@@ -224,6 +227,8 @@ function App() {
                 {/* In-house Scanner Browser (Tier 1 read-only) */}
                 <Route path="/scanner" element={<ScannerIndex />} />
                 <Route path="/scanner/:id" element={<ScannerDetail />} />
+                {/* Multi-account child accounts (issue #468) */}
+                <Route path="/accounts" element={<AccountsPage />} />
                 {/* Strategies Dashboard (Tier 2 read-only) */}
                 <Route path="/strategies" element={<StrategiesDashboardIndex />} />
                 <Route
