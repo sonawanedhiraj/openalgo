@@ -1696,14 +1696,14 @@ class SectorFollowService:
         # so the gate measures exactly what run_entry will see.
         #
         # #241 straggler: gate ONLY the indices the active sector_map actually
-        # references (what run_entry consumes via sector_map.get(sym)), NOT
-        # sector_index_symbols() — that appends the two defensive _ALWAYS_INCLUDE
-        # entries (NIFTYCONSRDURBL, NIFTYOILANDGAS) which no stock maps to after
-        # the Phase-3 RELIANCE/DIXON->NIFTY re-map, have no 1m feed, and whose
-        # names don't even match the master contract (NIFTY CONSR DURBL /
-        # NIFTY OIL AND GAS). Including them pinned index_coverage at a permanent
-        # 8/10, so the gate wrote a pause override EVERY day and held live equity
-        # entries. The mapped set is exactly the coverage run_entry requires.
+        # references (what run_entry consumes via sector_map.get(sym)). Until
+        # #465, sector_index_symbols() also appended two defensive
+        # _ALWAYS_INCLUDE entries (NIFTYCONSRDURBL, NIFTYOILANDGAS) that no
+        # stock maps to and whose names don't match the master contract —
+        # including them pinned index_coverage at a permanent 8/10, so the gate
+        # wrote a pause override EVERY day and held live equity entries. #465
+        # removed the pair at the source, but this gate stays on the mapped set:
+        # it is exactly the coverage run_entry requires, by construction.
         indices = sorted(set(self.sector_map.values()))
 
         idx_total = len(indices)

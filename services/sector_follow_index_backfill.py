@@ -46,12 +46,6 @@ logger = get_logger(__name__)
 # Indices live on the NSE_INDEX exchange (OpenAlgo symbol format — see CLAUDE.md).
 _INDEX_EXCHANGE = "NSE_INDEX"
 
-# Two sector indices have no 1m history yet (NIFTYCONSRDURBL, NIFTYOILANDGAS).
-# After the Phase 3 re-map (DIXON, RELIANCE -> NIFTY) no stock references them,
-# but we keep attempting them defensively: if the broker ever returns their 1m,
-# the feed begins populating with no further code change.
-_ALWAYS_INCLUDE = ("NIFTYCONSRDURBL", "NIFTYOILANDGAS")
-
 # Small lookback for the daily incremental refresh — covers a missed run/weekend
 # without re-pulling the whole history (downloads are incremental).
 _DAILY_LOOKBACK_DAYS = 4
@@ -60,8 +54,15 @@ _DAILY_LOOKBACK_DAYS = 4
 def sector_index_symbols(sector_map_path: str | Path | None = None) -> list[str]:
     """Unique sector-index symbols to keep fresh, sorted for stability.
 
-    Derived from ``sector_map.json``'s mapped index values unioned with the two
-    known 1m-missing indices (defensive). Tracks the live map automatically.
+    Derived from ``sector_map.json``'s mapped index values. Tracks the live map
+    automatically. Exactly the mapped set — no defensive extras: the old
+    ``_ALWAYS_INCLUDE`` pair (NIFTYCONSRDURBL, NIFTYOILANDGAS) could never
+    resolve (the master contract stores them as ``NIFTY CONSR DURBL`` /
+    ``NIFTY OIL AND GAS``) and no stock maps to them post-Phase-3, so every
+    consumer — ws_recovery above all — burned two guaranteed failures per
+    broker login (issue #465; #282 had already excluded them from the smoke
+    gate). If a future re-map revives these sectors, the map entry must carry
+    the master-contract spelling.
     """
     from services.sector_follow_service import load_sector_map
 
@@ -69,7 +70,6 @@ def sector_index_symbols(sector_map_path: str | Path | None = None) -> list[str]
         symbols = set(load_sector_map().values())
     else:
         symbols = set(load_sector_map(sector_map_path).values())
-    symbols.update(_ALWAYS_INCLUDE)
     return sorted(symbols)
 
 

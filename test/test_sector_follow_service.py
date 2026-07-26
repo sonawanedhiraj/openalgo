@@ -565,11 +565,11 @@ def test_sector_index_subscription_includes_all_mapped():
     subs = set(sector_index_symbols())
     raw = _json.loads(Path(_DEFAULT_SECTOR_MAP_PATH).read_text(encoding="utf-8"))
     mapped = {entry["index"] for entry in raw["map"].values()}
-    # Every index referenced by the live map is kept fresh.
-    assert mapped <= subs
-    # The two known 1m-missing indices are always attempted defensively, even
-    # though the Phase 3 re-map (DIXON, RELIANCE -> NIFTY) no longer references them.
-    assert {"NIFTYCONSRDURBL", "NIFTYOILANDGAS"} <= subs
+    # Exactly the indices the live map references — nothing more (#465: the old
+    # defensive _ALWAYS_INCLUDE pair could never resolve against the master
+    # contract and produced two guaranteed ws_recovery failures per login).
+    assert subs == mapped
+    assert not {"NIFTYCONSRDURBL", "NIFTYOILANDGAS"} & subs
     # NIFTY broad-market fallback is in the set.
     assert "NIFTY" in subs
 
