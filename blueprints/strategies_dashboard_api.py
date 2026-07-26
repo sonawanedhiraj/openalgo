@@ -740,6 +740,30 @@ def _open15_stats() -> dict:
         }
 
 
+_OPEN15_SIDE_KEY = {"L": "long", "S": "short"}
+
+
+def _side_split(pnls_by_side: dict[str, list[float]]) -> dict[str, dict]:
+    """Long/short sub-aggregates for the performance table (issue #458).
+
+    Uniform shape across all three columns: ``{n_trades, wins, win_rate_pct,
+    net_pnl_inr}``. A side with no closed trades keeps ``n_trades=0`` and
+    ``None`` stats so the UI renders '—' rather than a misleading 0%.
+    """
+    out: dict[str, dict] = {}
+    for key in ("long", "short"):
+        pnls = pnls_by_side.get(key) or []
+        n = len(pnls)
+        wins = sum(1 for p in pnls if p > 0)
+        out[key] = {
+            "n_trades": n,
+            "wins": wins,
+            "win_rate_pct": round(100.0 * wins / n, 1) if n else None,
+            "net_pnl_inr": round(sum(pnls), 2) if n else None,
+        }
+    return out
+
+
 def _open15_lifetime() -> dict[str, dict]:
     """Per-mode (sandbox|live) since-inception realized net P&L + win-rate from
     closed ``open15_trades`` rows (issue #442).
@@ -747,9 +771,14 @@ def _open15_lifetime() -> dict[str, dict]:
     Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
     columns honest once the strategy is flipped live — sandbox history never
     leaks into the live column and vice-versa (futures_follow precedent).
-    ``observe`` rows fall outside both buckets by construction.
+    ``observe`` rows fall outside both buckets by construction. Each mode also
+    carries ``long``/``short`` sub-aggregates keyed off the journal's ``side``
+    column (issue #458).
     """
-    out = {"sandbox": _lifetime_from_pnls([]), "live": _lifetime_from_pnls([])}
+    out = {
+        "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
+        "live": {**_lifetime_from_pnls([]), **_side_split({})},
+    }
     try:
         from database.open15_breakout_db import Open15Trade
         from database.open15_breakout_db import db_session as o15_session
@@ -760,11 +789,20 @@ def _open15_lifetime() -> dict[str, dict]:
             .all()
         )
         buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        sides: dict[str, dict[str, list[float]]] = {
+            "sandbox": {"long": [], "short": []},
+            "live": {"long": [], "short": []},
+        }
         for r in rows:
             m = (r.mode or "").lower()
-            if m in buckets:
-                buckets[m].append(_open15_net_pnl(r))
-        out = {m: _lifetime_from_pnls(p) for m, p in buckets.items()}
+            if m not in buckets:
+                continue
+            pnl = _open15_net_pnl(r)
+            buckets[m].append(pnl)
+            side_key = _OPEN15_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[m][side_key].append(pnl)
+        out = {m: {**_lifetime_from_pnls(p), **_side_split(sides[m])} for m, p in buckets.items()}
     except Exception:
         logger.exception("Failed to aggregate open15 lifetime stats")
     return out
@@ -789,12 +827,21 @@ def _open15_opt_shadow() -> dict[str, dict | None]:
             .all()
         )
         buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        sides: dict[str, dict[str, list[float]]] = {
+            "sandbox": {"long": [], "short": []},
+            "live": {"long": [], "short": []},
+        }
         for r in rows:
             if r.instrument not in (None, "stock"):
                 continue
             m = (r.mode or "").lower()
-            if m in buckets:
-                buckets[m].append(float(r.opt_pnl))
+            if m not in buckets:
+                continue
+            pnl = float(r.opt_pnl)
+            buckets[m].append(pnl)
+            side_key = _OPEN15_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[m][side_key].append(pnl)
         for m, pnls in buckets.items():
             if pnls:
                 wins = sum(1 for p in pnls if p > 0)
@@ -803,6 +850,7 @@ def _open15_opt_shadow() -> dict[str, dict | None]:
                     "win_rate_pct": round(100.0 * wins / len(pnls), 1),
                     "net_pnl_inr": round(sum(pnls), 2),
                     "basis": "1-lot ATM shadow",
+                    **_side_split(sides[m]),
                 }
     except Exception:
         logger.exception("Failed to aggregate open15 option shadow")
@@ -1041,6 +1089,10 @@ def strategy_detail(name: str):
             "net_pnl_inr": opt_variant.get("net_pnl_inr"),
             "max_dd_pct": opt_variant.get("max_dd_pct"),
             "basis": "fit-to-capital lots",
+            # Optional long/short sub-aggregates (issue #458) — pass-through
+            # from the config snapshot; absent for strategies without a split.
+            "long": opt_variant.get("long"),
+            "short": opt_variant.get("short"),
         }
         if opt_variant
         else None
@@ -1055,6 +1107,8 @@ def strategy_detail(name: str):
             "net_pnl_inr": parity.get("net_pnl_inr"),
             "window": parity.get("window"),
             "options": bt_options,
+            "long": parity.get("long"),
+            "short": parity.get("short"),
         },
         "sandbox": None,
         "live": None,

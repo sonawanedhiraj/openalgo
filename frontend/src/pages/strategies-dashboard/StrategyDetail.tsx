@@ -43,6 +43,7 @@ import {
   type LLMMode,
   type PnlWindow,
   type RecentTrade,
+  type SideSplit,
   type StrategyDetail,
   strategiesDashboardApi,
   type TradeLLMReview,
@@ -449,17 +450,54 @@ function TradeStatusBadge({ status }: { status: string }) {
 
 // A cell value with an optional ATM-options sub-value rendered beneath it
 // (issue #455). `opt` stays undefined for strategies without option pricing.
-type PairedCell = { main: string; opt?: string }
+// `tone` colors the main value (long/short P&L sub-rows, issue #458).
+type PairedCell = { main: string; opt?: string; tone?: 'pos' | 'neg' }
 
-function PerfCell({ cell }: { cell: PairedCell }) {
+function PerfCell({ cell, sub }: { cell: PairedCell; sub?: boolean }) {
+  const toneCls =
+    cell.tone === 'pos'
+      ? 'text-green-600 dark:text-green-400'
+      : cell.tone === 'neg'
+        ? 'text-red-600 dark:text-red-400'
+        : ''
   return (
-    <td className="px-4 py-2 text-right tabular-nums font-mono align-top">
-      {cell.main}
+    <td
+      className={`px-4 text-right tabular-nums font-mono align-top ${sub ? 'py-1 text-xs' : 'py-2'}`}
+    >
+      <span className={toneCls}>{cell.main}</span>
       {cell.opt != null && (
-        <div className="text-xs text-blue-600 dark:text-blue-400">{cell.opt}</div>
+        <div className={`text-blue-600 dark:text-blue-400 ${sub ? 'text-[11px]' : 'text-xs'}`}>
+          {cell.opt}
+        </div>
       )}
     </td>
   )
+}
+
+// '75% (6/8)' for a side with trades; '—' for an empty side (never 0%).
+function fmtSideRate(s: SideSplit | null | undefined): string {
+  if (!s || !s.n_trades) return '—'
+  return `${fmt(s.win_rate_pct, '%')} (${s.wins}/${s.n_trades})`
+}
+
+function fmtSidePnl(s: SideSplit | null | undefined): string {
+  if (!s || !s.n_trades) return '—'
+  return fmtPnl(s.net_pnl_inr)
+}
+
+function sideTone(s: SideSplit | null | undefined): 'pos' | 'neg' | undefined {
+  if (!s || !s.n_trades || s.net_pnl_inr == null) return undefined
+  return s.net_pnl_inr >= 0 ? 'pos' : 'neg'
+}
+
+// '15 (8L / 7S)' when the split exists, else the plain count.
+function withSideCounts(
+  main: string,
+  long: SideSplit | null | undefined,
+  short: SideSplit | null | undefined
+): string {
+  if (main === '—' || !long || !short) return main
+  return `${main} (${long.n_trades}L / ${short.n_trades}S)`
 }
 
 function PerfTable({ data }: { data: StrategyDetail }) {
@@ -480,7 +518,50 @@ function PerfTable({ data }: { data: StrategyDetail }) {
         : String(btOpt.n_trades)
       : undefined
 
-  const rows: { label: string; bt: PairedCell; sb: PairedCell; lv: PairedCell }[] = [
+  // Long/short sub-rows render only when some column carries the split
+  // (open15_vol_breakout today; other strategies are unaffected). issue #458.
+  const hasSideSplit = Boolean(
+    bt.long || bt.short || sb?.long || sb?.short || lv?.long || lv?.short
+  )
+
+  const sideRateRow = (label: string, key: 'long' | 'short') => ({
+    label,
+    sub: true,
+    bt: {
+      main: fmtSideRate(bt[key]),
+      opt: btOpt?.[key]?.n_trades ? fmtSideRate(btOpt[key]) : undefined,
+    },
+    sb: {
+      main: fmtSideRate(sb?.[key]),
+      opt: sbOpt?.[key]?.n_trades ? fmtSideRate(sbOpt[key]) : undefined,
+    },
+    lv: {
+      main: fmtSideRate(lv?.[key]),
+      opt: lvOpt?.[key]?.n_trades ? fmtSideRate(lvOpt[key]) : undefined,
+    },
+  })
+
+  const sidePnlRow = (label: string, key: 'long' | 'short') => ({
+    label,
+    sub: true,
+    bt: {
+      main: fmtSidePnl(bt[key]),
+      tone: sideTone(bt[key]),
+      opt: btOpt?.[key]?.n_trades ? fmtSidePnl(btOpt[key]) : undefined,
+    },
+    sb: {
+      main: fmtSidePnl(sb?.[key]),
+      tone: sideTone(sb?.[key]),
+      opt: sbOpt?.[key]?.n_trades ? fmtSidePnl(sbOpt[key]) : undefined,
+    },
+    lv: {
+      main: fmtSidePnl(lv?.[key]),
+      tone: sideTone(lv?.[key]),
+      opt: lvOpt?.[key]?.n_trades ? fmtSidePnl(lvOpt[key]) : undefined,
+    },
+  })
+
+  const rows: { label: string; sub?: boolean; bt: PairedCell; sb: PairedCell; lv: PairedCell }[] = [
     { label: 'CAGR', bt: { main: fmt(bt.cagr_pct, '%') }, sb: { main: '—' }, lv: { main: '—' } },
     { label: 'Sharpe', bt: { main: fmt(bt.sharpe) }, sb: { main: '—' }, lv: { main: '—' } },
     {
@@ -506,17 +587,26 @@ function PerfTable({ data }: { data: StrategyDetail }) {
         opt: lvOpt ? fmt(lvOpt.win_rate_pct, '%') : undefined,
       },
     },
+    ...(hasSideSplit ? [sideRateRow('Long', 'long'), sideRateRow('Short', 'short')] : []),
     // Backtest N is the window trade count; Sandbox/Live show closed trades so
     // far, the denominator behind the running win-rate + cumulative P&L.
     {
       label: 'N Trades',
-      bt: { main: fmt(bt.n_trades), opt: btOptTrades },
+      bt: { main: withSideCounts(fmt(bt.n_trades), bt.long, bt.short), opt: btOptTrades },
       sb: {
-        main: sb?.closed_trades != null ? String(sb.closed_trades) : '—',
+        main: withSideCounts(
+          sb?.closed_trades != null ? String(sb.closed_trades) : '—',
+          sb?.long,
+          sb?.short
+        ),
         opt: sbOpt?.n_trades != null ? String(sbOpt.n_trades) : undefined,
       },
       lv: {
-        main: lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+        main: withSideCounts(
+          lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+          lv?.long,
+          lv?.short
+        ),
         opt: lvOpt?.n_trades != null ? String(lvOpt.n_trades) : undefined,
       },
     },
@@ -536,6 +626,7 @@ function PerfTable({ data }: { data: StrategyDetail }) {
       sb: { main: fmtPnl(sb?.cum_net_pnl), opt: sbOpt ? fmtPnl(sbOpt.net_pnl_inr) : undefined },
       lv: { main: fmtPnl(lv?.cum_net_pnl), opt: lvOpt ? fmtPnl(lvOpt.net_pnl_inr) : undefined },
     },
+    ...(hasSideSplit ? [sidePnlRow('Long', 'long'), sidePnlRow('Short', 'short')] : []),
     {
       label: 'Today P&L',
       bt: { main: '—' },
@@ -574,12 +665,23 @@ function PerfTable({ data }: { data: StrategyDetail }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => (
-                <tr key={r.label} className="border-b last:border-0 hover:bg-muted/20">
-                  <td className="px-4 py-2 text-muted-foreground">{r.label}</td>
-                  <PerfCell cell={r.bt} />
-                  <PerfCell cell={r.sb} />
-                  <PerfCell cell={r.lv} />
+              {rows.map((r, i) => (
+                <tr
+                  key={`${r.label}-${i}`}
+                  className={`border-b last:border-0 hover:bg-muted/20 ${r.sub ? 'bg-muted/20' : ''}`}
+                >
+                  <td
+                    className={
+                      r.sub
+                        ? 'pl-8 pr-4 py-1 text-xs text-muted-foreground'
+                        : 'px-4 py-2 text-muted-foreground'
+                    }
+                  >
+                    {r.sub ? `↳ ${r.label}` : r.label}
+                  </td>
+                  <PerfCell cell={r.bt} sub={r.sub} />
+                  <PerfCell cell={r.sb} sub={r.sub} />
+                  <PerfCell cell={r.lv} sub={r.sub} />
                 </tr>
               ))}
             </tbody>

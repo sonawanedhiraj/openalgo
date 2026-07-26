@@ -44,6 +44,15 @@ export interface StrategySummary {
 // Detail endpoint
 // ---------------------------------------------------------------------------
 
+// Per-direction (long/short) sub-aggregate (issue #458). A side with no closed
+// trades has n_trades=0 and null stats — rendered as '—', never 0%.
+export interface SideSplit {
+  n_trades: number
+  wins: number
+  win_rate_pct: number | null
+  net_pnl_inr: number | null
+}
+
 // ATM-option variant of a mode's performance (issue #455). Backtest basis is
 // fit-to-capital lots; sandbox/live basis is the 1-lot shadow (issue #435) —
 // directionally comparable, not rupee-for-rupee.
@@ -53,6 +62,8 @@ export interface OptionsPerf {
   net_pnl_inr: number | null
   max_dd_pct?: number | null
   basis?: string
+  long?: SideSplit | null
+  short?: SideSplit | null
 }
 
 export interface BacktestPerf {
@@ -64,6 +75,8 @@ export interface BacktestPerf {
   net_pnl_inr?: number | null
   window: string | null
   options?: OptionsPerf | null
+  long?: SideSplit | null
+  short?: SideSplit | null
 }
 
 export interface LivePerf {
@@ -76,6 +89,8 @@ export interface LivePerf {
   win_rate_pct?: number | null
   closed_trades?: number
   options?: OptionsPerf | null
+  long?: SideSplit | null
+  short?: SideSplit | null
 }
 
 export interface StrategyPerformance {
