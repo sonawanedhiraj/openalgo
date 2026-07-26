@@ -12,9 +12,29 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import services.scanner_backfill_scheduler as sched
 import services.scanner_smoke_check_service as smoke_svc
 import services.scanner_universe_backfill as sub
+
+
+@pytest.fixture(autouse=True)
+def _disable_daily_resettle(monkeypatch):
+    """Keep the REAL daily-D resettle out of these tests (issue #472).
+
+    ``run_boot_backfill_checks``/``run_backfill_checks`` call
+    ``_maybe_resettle_daily`` → the real ``resettle_recent_daily`` unless the
+    once-per-process ``_resettled_dates`` latch already holds the date — and
+    ``test_scanner_daily_resettle.py`` (collected earlier) CLEARS that latch.
+    With ``.env``'s ``SCANNER_SYMBOLS`` loaded into every pytest run, a real
+    resettle submits a historify job that never executes and blocks in
+    ``wait_for_jobs`` (600s) until pytest-timeout kills the whole run (the
+    full-suite hang class from issue #470). No test here asserts resettle
+    behavior, so disable it via its own consult-time flag.
+    """
+    monkeypatch.setenv("SCANNER_DAILY_RESETTLE_ENABLED", "false")
+
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
