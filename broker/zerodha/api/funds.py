@@ -10,6 +10,36 @@ logger = get_logger(__name__)
 BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
 
 
+def test_auth_token(auth_token):
+    """Lightweight auth probe: is the stored daily token alive right now?
+
+    Preferred over ``get_margin_data`` by ``broker_session_health.
+    is_live_broker_session()`` and ``blueprints/auth.py:_try_resume_broker_session``
+    (both check ``hasattr(broker_module, "test_auth_token")``). The boot waiters
+    poll the health probe every 15s while waiting for the daily re-login, and a
+    dead token is the EXPECTED state on a weekend/holiday/pre-login morning — so
+    failures here log at DEBUG, never ERROR (issue #464: 241 ERROR lines flooded
+    errors.jsonl in one 20-minute pre-login window). ``get_margin_data`` keeps
+    its ERROR logging for real user-facing calls.
+
+    Returns (is_valid, error_message) — error_message is None when valid.
+    """
+    client = get_httpx_client()
+    headers = {"X-Kite-Version": "3", "Authorization": f"token {auth_token}"}
+
+    try:
+        response = client.get(f"{BROKER_API_URL}/user/profile", headers=headers)
+        payload = response.json()
+        if response.status_code == 200 and payload.get("status") == "success":
+            return True, None
+        message = payload.get("message") or f"HTTP {response.status_code}"
+        logger.debug(f"Zerodha auth probe failed: {message}")
+        return False, str(message)
+    except Exception as e:
+        logger.debug(f"Zerodha auth probe error: {e}")
+        return False, str(e)
+
+
 def get_margin_data(auth_token):
     """Fetch margin data from Zerodha's API using the provided auth token."""
     os.getenv("BROKER_API_KEY")
