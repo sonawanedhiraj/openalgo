@@ -109,6 +109,12 @@ def react_broker_totp(broker):
     return serve_react_app()
 
 
+# Multi-account child accounts page (#468)
+@react_bp.route("/accounts")
+def react_accounts():
+    return serve_react_app()
+
+
 # Dashboard
 @react_bp.route("/dashboard")
 def react_dashboard():
