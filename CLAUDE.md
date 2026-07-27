@@ -1563,6 +1563,42 @@ auto-square-off. This is load-bearing: sandbox *rejects* MIS orders placed at/af
 15:15, so a watchdog at the old declared 15:20 was always too late (the 2026-06-10
 OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 
+## Multi-account mirror trading (issues #468/#474/#476/#478)
+
+One install can drive multiple **family** Zerodha accounts: the PRIMARY account
+keeps everything it always did (feed, historical data, scanner, signals,
+sandbox); CHILD accounts exist only to **mirror LIVE strategy orders**, scaled
+to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design/multi_account_plan.md).
+
+- **Setup/login** (`/accounts` page, `blueprints/broker_accounts.py`,
+  `services/broker_accounts_service.py`): child rows in `broker_accounts`
+  (Kite app credentials encrypted, per-account TOTP, capital, `is_enabled`
+  default false) + `account_strategies` allow-list. Each child's daily token
+  lives in the `auth` table under `name='acct:<id>'`; the Zerodha callback
+  routes to the child path ONLY when `?account_id=<N>` (each child Kite app's
+  redirect URL carries it — all apps under ONE developer profile because the
+  static-IP whitelist is profile-level; SEBI family-only IP sharing).
+  Child login performs NONE of the primary-login side effects.
+- **Fan-out** (`services/account_fanout_service.py`): fires from ONE seam at
+  the tail of `place_order_with_auth`'s LIVE-accepted branch (covers entries,
+  exits, watchdog flattens, kill-switch closes uniformly). Gating: env
+  `MULTI_ACCOUNT_ENABLED` (default **false**) + LIVE parent + broker-accepted
+  + known strategy + enabled child selecting it. Sizing: `factor =
+  child.capital_inr / PRIMARY_BOOK_CAPITAL` (env, default 10L), floored to
+  shares/lots; EXITS flatten the child's own broker position, never blind
+  scaling; a flat child whose entry attempt recently FAILED gets
+  `skipped_no_position` (never a naked scaled position — issue #478 guard).
+  Fire-and-forget per-child isolation; every attempt journaled to
+  `account_orders`; every non-placed outcome Telegrams
+  (`multi_account_mirror`).
+- **Observability** (`services/account_mirror_summary_service.py`): orderbook
+  "Mirror Orders" card + `/accounts` today chips; login reminders 09:00/15:00
+  IST and a 15:35 IST EOD mirror summary — all fire-time gated on the master
+  flag + trading day (silent for single-account installs).
+- **Ops**: every child account needs its own daily Kite login (Connect button
+  + per-account TOTP code on `/accounts`); child fills/P&L live in the child's
+  own broker book — OpenAlgo does not track child positions.
+
 ## Unified strategy daily intent (`strategy_daily_intent`)
 
 > **Mode-only migration in progress (2026-06-12).** A new `strategy_mode` table

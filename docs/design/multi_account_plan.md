@@ -1,8 +1,11 @@
 # Multi-Account Trading — Design Plan
 
-**Status:** Phase 1 (accounts core) implemented under issue #468 (2026-07-26).
-Phases 2–4 (fan-out, observability, hardening) not started; `MULTI_ACCOUNT_ENABLED`
-defaults `false`, so no orders are mirrored yet.
+**Status (2026-07-27):** ALL FOUR PHASES IMPLEMENTED — Phase 1 accounts core
+(#468), Phase 2 order fan-out (#474), Phase 3 observability (#476), Phase 4
+hardening incl. the rejected-entry exit guard (#478). Mirroring stays dormant
+until the operator sets `MULTI_ACCOUNT_ENABLED=true` AND takes a strategy live
+with an enabled child. See the CLAUDE.md "Multi-account mirror trading"
+section for the operational summary.
 **Goal:** One OpenAlgo install drives multiple broker accounts. One **primary** account
 keeps everything it does today (WebSocket feed, historical downloads, scanner,
 dashboards). Additional **child** accounts exist for exactly one purpose:

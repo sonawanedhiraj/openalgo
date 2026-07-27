@@ -39,7 +39,14 @@ db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind
 Base = declarative_base()
 Base.query = db_session.query_property()
 
-VALID_STATUSES = ("placed", "rejected", "skipped_no_session", "skipped_zero_qty", "error")
+VALID_STATUSES = (
+    "placed",
+    "rejected",
+    "skipped_no_session",
+    "skipped_zero_qty",
+    "skipped_no_position",
+    "error",
+)
 
 
 class AccountOrder(Base):
@@ -141,6 +148,49 @@ def record_mirror_attempt(
         logger.exception(
             f"Failed to journal mirror attempt (account={account_id}, {symbol} {action})"
         )
+        return None
+    finally:
+        db_session.remove()
+
+
+def last_opposite_attempt_status(
+    account_id: int,
+    symbol: str,
+    exchange: str,
+    strategy_name: str,
+    action: str,
+    lookback_days: int = 7,
+) -> str | None:
+    """Status of the child's most recent OPPOSITE-action mirror attempt.
+
+    The rejected-entry exit guard (issue #478): before scaling an order for a
+    FLAT child, the fan-out asks whether the opposite side (the would-be entry)
+    was recently attempted and failed — if so, this "exit" has nothing to exit
+    and must be skipped, not scaled into a fresh naked position. Returns None
+    when no opposite attempt exists in the lookback window (a genuine opening
+    order). Fail-open (None) on any read error.
+    """
+    opposite = "SELL" if (action or "").upper() == "BUY" else "BUY"
+    try:
+        from datetime import timedelta
+
+        cutoff = datetime.utcnow() - timedelta(days=lookback_days)
+        row = (
+            db_session.query(AccountOrder)
+            .filter(
+                AccountOrder.account_id == account_id,
+                AccountOrder.symbol == symbol,
+                AccountOrder.exchange == exchange,
+                AccountOrder.strategy_name == strategy_name,
+                AccountOrder.action == opposite,
+                AccountOrder.created_at >= cutoff,
+            )
+            .order_by(AccountOrder.id.desc())
+            .first()
+        )
+        return row.status if row else None
+    except Exception:
+        logger.exception("last_opposite_attempt_status read failed — failing open")
         return None
     finally:
         db_session.remove()
