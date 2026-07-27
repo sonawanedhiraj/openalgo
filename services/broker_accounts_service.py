@@ -71,13 +71,40 @@ def _is_connected(account: dict) -> bool:
     return datetime.utcfromtimestamp(ist_now).date() == datetime.utcfromtimestamp(ist_last).date()
 
 
+def _today_mirror_stats() -> dict[int, dict[str, int]]:
+    """Per-account counts of today's mirror attempts: placed/skipped/failed.
+
+    Fail-graceful: an unreadable journal yields empty stats, never an error —
+    the /accounts page must render even if the Phase-2 table is unhappy.
+    """
+    try:
+        from database.account_orders_db import list_orders
+
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        stats: dict[int, dict[str, int]] = {}
+        for row in list_orders(date_utc=today):
+            s = stats.setdefault(row["account_id"], {"placed": 0, "skipped": 0, "failed": 0})
+            if row["status"] == "placed":
+                s["placed"] += 1
+            elif row["status"] in ("skipped_no_session", "skipped_zero_qty"):
+                s["skipped"] += 1
+            else:
+                s["failed"] += 1
+        return stats
+    except Exception:
+        logger.exception("today's mirror stats unavailable")
+        return {}
+
+
 def overview() -> dict:
     """Everything the /accounts page needs in one call."""
+    mirror_stats = _today_mirror_stats()
     accounts = []
     for acc in accounts_db.list_accounts():
         acc["connected"] = _is_connected(acc)
         acc["strategies"] = accounts_db.get_strategies(acc["id"])
         acc["redirect_url_hint"] = f"/zerodha/callback?account_id={acc['id']}"
+        acc["today_mirrors"] = mirror_stats.get(acc["id"], {"placed": 0, "skipped": 0, "failed": 0})
         accounts.append(acc)
     return {
         "multi_account_enabled": is_multi_account_enabled(),

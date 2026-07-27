@@ -17,6 +17,26 @@ export interface ChildAccount {
   connected: boolean
   strategies: string[]
   redirect_url_hint: string
+  today_mirrors: { placed: number; skipped: number; failed: number }
+}
+
+export interface MirrorOrder {
+  id: number
+  account_id: number
+  account_name: string
+  strategy_name: string
+  symbol: string
+  exchange: string
+  action: string
+  product: string | null
+  parent_qty: number
+  child_qty: number
+  factor: number | null
+  parent_orderid: string | null
+  status: 'placed' | 'rejected' | 'skipped_no_session' | 'skipped_zero_qty' | 'error'
+  broker_orderid: string | null
+  error_text: string | null
+  created_at: string | null
 }
 
 export interface AccountsOverview {
@@ -90,5 +110,12 @@ export const brokerAccountsApi = {
   totpCode: async (id: number): Promise<TotpCode> => {
     const { data } = await webClient.get(`${BASE}/${id}/totp`)
     return data
+  },
+
+  mirrorOrders: async (date?: string): Promise<MirrorOrder[]> => {
+    const { data } = await webClient.get(`${BASE}/mirror_orders`, {
+      params: date ? { date } : undefined,
+    })
+    return data.orders
   },
 }

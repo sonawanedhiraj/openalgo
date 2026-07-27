@@ -980,6 +980,20 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
 
+            # Multi-account observability jobs (issue #476): child-login
+            # reminders (09:00 + 15:00 IST) and the 15:35 IST EOD mirror
+            # summary. Fire-time gated on MULTI_ACCOUNT_ENABLED + trading-day —
+            # silent for single-account installs.
+            try:
+                from services.account_mirror_summary_service import (
+                    init_account_mirror_summary_service,
+                )
+
+                init_account_mirror_summary_service()
+                logger.debug("Multi-account observability jobs registered")
+            except Exception as e:
+                logger.error(f"Failed to register multi-account observability jobs: {e}")
+
             # Trading-day funnel (issue #159). Registers a single 15:35 IST
             # mon-fri job that walks the signal → engine → order → journal
             # pipeline, computes per-layer counts, and Telegrams the verdict

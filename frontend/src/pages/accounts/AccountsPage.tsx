@@ -254,6 +254,20 @@ export default function AccountsPage() {
                   ) : (
                     <Badge variant="destructive">Login needed</Badge>
                   )}
+                  {account.today_mirrors &&
+                    (account.today_mirrors.placed > 0 ||
+                      account.today_mirrors.skipped > 0 ||
+                      account.today_mirrors.failed > 0) && (
+                      <span className="flex gap-1 text-xs" data-testid={`mirrors-${account.id}`}>
+                        <Badge variant="outline">today: {account.today_mirrors.placed} ✓</Badge>
+                        {account.today_mirrors.skipped > 0 && (
+                          <Badge variant="secondary">{account.today_mirrors.skipped} skipped</Badge>
+                        )}
+                        {account.today_mirrors.failed > 0 && (
+                          <Badge variant="destructive">{account.today_mirrors.failed} failed</Badge>
+                        )}
+                      </span>
+                    )}
                   <TotpCell account={account} />
                   {!account.connected && (
                     <Button size="sm" onClick={() => handleConnect(account)}>

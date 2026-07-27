@@ -154,6 +154,32 @@ def set_strategies(account_id: int):
     return jsonify({"status": "success", "strategies": saved})
 
 
+@broker_accounts_bp.route("/mirror_orders", methods=["GET"])
+@require_login
+def mirror_orders():
+    """Today's (or ``?date=YYYY-MM-DD``) mirror attempts with account names.
+
+    Read-only view over ``account_orders`` (Phase 2's journal) for the
+    orderbook Mirror Orders card. Dates are UTC-day prefixes (repo journal
+    contract).
+    """
+    from datetime import datetime
+
+    from database.account_orders_db import list_orders
+
+    date_utc = (request.args.get("date") or datetime.utcnow().strftime("%Y-%m-%d")).strip()
+    try:
+        datetime.fromisoformat(date_utc)
+    except ValueError:
+        return jsonify({"status": "error", "message": "date must be YYYY-MM-DD"}), 400
+
+    names = {a["id"]: a["display_name"] for a in accounts_db.list_accounts()}
+    rows = list_orders(date_utc=date_utc)
+    for row in rows:
+        row["account_name"] = names.get(row["account_id"], f"account {row['account_id']}")
+    return jsonify({"status": "success", "date": date_utc, "orders": rows})
+
+
 @broker_accounts_bp.route("/<int:account_id>/totp", methods=["GET"])
 @require_login
 def totp_code(account_id: int):

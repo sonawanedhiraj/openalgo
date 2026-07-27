@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { type QuotesData, tradingApi } from '@/api/trading'
+import MirrorOrdersCard from '@/components/accounts/MirrorOrdersCard'
 import GttTab from '@/components/trading/GttTab'
 import {
   AlertDialog,
@@ -932,6 +933,9 @@ export default function OrderBook() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Multi-account mirror attempts (issue #476) — hidden when empty */}
+      <MirrorOrdersCard />
     </div>
   )
 }
