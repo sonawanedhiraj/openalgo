@@ -178,6 +178,27 @@ def _mirror_to_account(
 
         lotsize = _lookup_lotsize(symbol, exchange) if exchange in DERIVATIVE_EXCHANGES else None
         child_net = _child_open_qty(broker_module, symbol, exchange, product, token)
+
+        # Rejected-entry exit guard (issue #478): the child is FLAT but the
+        # journal shows its opposite-side entry was recently attempted and did
+        # NOT place — this parent order is an exit of a position the child
+        # never got. Scaling it would open a fresh naked position; skip it.
+        # A flat child with NO opposite-attempt history is a genuine opening
+        # order (e.g. a short entry) and scales normally below.
+        if child_net == 0:
+            prior = account_orders_db.last_opposite_attempt_status(
+                account_id, symbol, exchange, mode_key, action
+            )
+            if prior is not None and prior != "placed":
+                account_orders_db.record_mirror_attempt(
+                    **journal, child_qty=0, status="skipped_no_position"
+                )
+                _notify_operator(
+                    f"⚠ Mirror skipped — {name}: {action} {symbol} has nothing to exit "
+                    f"(entry attempt was '{prior}'). No position opened."
+                )
+                return
+
         child_qty = compute_child_qty(parent_qty, factor, exchange, lotsize, action, child_net)
 
         if child_qty <= 0:
