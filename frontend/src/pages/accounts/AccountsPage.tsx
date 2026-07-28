@@ -69,9 +69,12 @@ function StrategyChecklist({
       account.strategy_settings.map((s) => [s.strategy_name, s.capital_override_inr])
     )
   )
+  const [minOneLot, setMinOneLot] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(account.strategy_settings.map((s) => [s.strategy_name, s.min_one_lot]))
+  )
 
   const saveMutation = useMutation({
-    mutationFn: () => brokerAccountsApi.setStrategies(account.id, selected, overrides),
+    mutationFn: () => brokerAccountsApi.setStrategies(account.id, selected, overrides, minOneLot),
     onSuccess: () => {
       toast.success(`Strategies saved for ${account.display_name}`)
       queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
@@ -135,7 +138,21 @@ function StrategyChecklist({
                   }
                   data-testid={`override-${account.id}-${name}`}
                 />
-                <span className="text-muted-foreground text-xs">{preview(name)}</span>
+                <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <Checkbox
+                    checked={minOneLot[name] ?? false}
+                    onCheckedChange={(checked) =>
+                      setMinOneLot((prev) => ({ ...prev, [name]: checked === true }))
+                    }
+                    data-testid={`minlot-${account.id}-${name}`}
+                  />
+                  min 1 lot
+                </label>
+                <span className="text-muted-foreground text-xs">
+                  {preview(name)}
+                  {(minOneLot[name] ?? false) &&
+                    ' · 0-lot results round UP to 1 lot (options/futures)'}
+                </span>
               </>
             )}
           </div>

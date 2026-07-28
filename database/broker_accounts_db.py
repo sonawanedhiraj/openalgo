@@ -192,6 +192,9 @@ class AccountStrategy(Base):
     account_id = Column(Integer, primary_key=True, nullable=False)
     strategy_name = Column(String(64), primary_key=True, nullable=False)
     capital_override_inr = Column(Float, nullable=True)
+    # issue #490: derivative mirrors that scale to 0 lots round UP to 1 lot
+    # instead of skipping (child mirrors 1-lot parent trades at 1 lot).
+    min_one_lot = Column(Boolean, nullable=False, default=False)
 
 
 def _migrate_add_capital_override() -> None:
@@ -211,6 +214,15 @@ def _migrate_add_capital_override() -> None:
                 )
                 conn.commit()
                 logger.info("account_strategies.capital_override_inr column added (issue #486)")
+            if cols and "min_one_lot" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE account_strategies "
+                        "ADD COLUMN min_one_lot BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+                conn.commit()
+                logger.info("account_strategies.min_one_lot column added (issue #490)")
     except Exception:
         logger.exception("capital_override_inr migration failed")
 
@@ -409,6 +421,7 @@ def get_strategy_settings(account_id: int) -> list[dict]:
                         if r.capital_override_inr is not None
                         else None
                     ),
+                    "min_one_lot": bool(r.min_one_lot),
                 }
                 for r in rows
             ),
@@ -422,6 +435,7 @@ def set_strategies(
     account_id: int,
     strategy_names: list[str],
     capital_overrides: dict[str, float] | None = None,
+    min_one_lot: dict[str, bool] | None = None,
 ) -> list[str]:
     """Replace the account's strategy allow-list with ``strategy_names``.
 
@@ -433,6 +447,7 @@ def set_strategies(
     """
     cleaned = sorted({str(n).strip() for n in strategy_names if str(n).strip()})
     overrides = capital_overrides or {}
+    lot_flags = min_one_lot or {}
     for name, value in overrides.items():
         if value is not None and float(value) <= 0:
             raise ValueError(f"capital override for {name} must be positive")
@@ -445,6 +460,7 @@ def set_strategies(
                     account_id=account_id,
                     strategy_name=name,
                     capital_override_inr=float(override) if override is not None else None,
+                    min_one_lot=bool(lot_flags.get(name, False)),
                 )
             )
         db_session.commit()
@@ -464,7 +480,9 @@ def accounts_for_strategy(strategy_name: str) -> list[dict]:
     """
     try:
         rows = (
-            db_session.query(BrokerAccount, AccountStrategy.capital_override_inr)
+            db_session.query(
+                BrokerAccount, AccountStrategy.capital_override_inr, AccountStrategy.min_one_lot
+            )
             .join(AccountStrategy, AccountStrategy.account_id == BrokerAccount.id)
             .filter(
                 AccountStrategy.strategy_name == strategy_name,
@@ -474,9 +492,10 @@ def accounts_for_strategy(strategy_name: str) -> list[dict]:
             .all()
         )
         result = []
-        for account_row, override in rows:
+        for account_row, override, lot_flag in rows:
             d = _row_to_dict(account_row)
             d["capital_override_inr"] = float(override) if override is not None else None
+            d["min_one_lot"] = bool(lot_flag)
             result.append(d)
         return result
     finally:

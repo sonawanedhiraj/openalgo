@@ -110,6 +110,7 @@ def compute_child_qty(
     lotsize: int | None,
     action: str,
     child_net_qty: int,
+    min_one_lot: bool = False,
 ) -> int:
     """Mirror quantity for one child. Pure — unit-tested directly.
 
@@ -128,7 +129,15 @@ def compute_child_qty(
     if exchange in DERIVATIVE_EXCHANGES:
         if not lotsize or lotsize <= 0:
             return 0  # cannot round safely — caller journals the skip
-        return int(math.floor(scaled / lotsize)) * lotsize
+        lots = int(math.floor(scaled / lotsize)) * lotsize
+        # issue #490 (operator opt-in per strategy): a 1-lot parent trade
+        # scales to 0 for any factor < 1 — lots don't divide. With the flag,
+        # an OPENING order that floors to 0 rounds UP to 1 lot instead of
+        # skipping, provided the parent itself traded at least 1 lot. Exits
+        # never reach this branch (they flatten the child's own position).
+        if lots == 0 and min_one_lot and parent_qty >= lotsize:
+            return lotsize
+        return lots
     return int(math.floor(scaled))
 
 
@@ -201,7 +210,15 @@ def _mirror_to_account(
                 )
                 return
 
-        child_qty = compute_child_qty(parent_qty, factor, exchange, lotsize, action, child_net)
+        child_qty = compute_child_qty(
+            parent_qty,
+            factor,
+            exchange,
+            lotsize,
+            action,
+            child_net,
+            min_one_lot=bool(account.get("min_one_lot")),
+        )
 
         if child_qty <= 0:
             account_orders_db.record_mirror_attempt(

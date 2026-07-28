@@ -199,8 +199,14 @@ def set_strategies(account_id: int):
             return jsonify(
                 {"status": "error", "message": f"capital override for {key} must be a number"}
             ), 400
+    raw_lot_flags = data.get("min_one_lot") or {}
+    if not isinstance(raw_lot_flags, dict):
+        return jsonify({"status": "error", "message": "'min_one_lot' must be an object."}), 400
+    lot_flags = {k: bool(v) for k, v in raw_lot_flags.items() if k in names}
     try:
-        saved = accounts_db.set_strategies(account_id, names, capital_overrides=overrides)
+        saved = accounts_db.set_strategies(
+            account_id, names, capital_overrides=overrides, min_one_lot=lot_flags
+        )
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
     return jsonify(
