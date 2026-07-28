@@ -26,10 +26,13 @@ the latest decisions automatically.
   (`services/account_fanout_service.py`) and the Phase-3 observability jobs
   (login reminders 09:00/15:00 IST, EOD mirror summary 15:35 IST). Account
   setup/login on `/accounts` is never gated.
-- **Why enabling is currently inert:** mirrors fire ONLY for LIVE broker-accepted
-  parent orders of a strategy the child selected. Every strategy runs sandbox
-  today, so no orders mirror until one is flipped live on `/strategies`.
-  First child: Swapna-zerodha (₹15,000, open15_vol_breakout selected).
+- **CORRECTION (same day):** the first version of this entry said enabling was
+  inert because "every strategy runs sandbox" — WRONG. Verified against
+  `strategy_mode`: `open15_vol_breakout` is **live** (operator flip 2026-07-24)
+  and `sector_follow_cap5_vol` is **live** (2026-06-24). With the flag on,
+  **mirroring is ARMED from the next trading day**: open15's live orders mirror
+  into Swapna-zerodha (₹15,000, factor 0.015, open15 selected — ~₹2,250/slot).
+  sector_follow is live but NOT selected by any child → no mirrors for it.
 - **Rollback:** set `false` + restart (or delete the line — code default is false).
 
 #### PRIMARY_BOOK_CAPITAL
