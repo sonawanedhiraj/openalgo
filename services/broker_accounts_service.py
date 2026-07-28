@@ -36,11 +36,16 @@ BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
 
 # Canonical mode_keys a child may mirror. Deliberately a curated list (the
 # strategies dashboard hardcodes per-engine builders the same way); extend when
-# a new in-repo engine ships. open15 is excluded: it is a measurement strategy.
+# a new in-repo engine ships. open15 was initially excluded as a measurement
+# strategy; the operator opted it in on 2026-07-27 (issue #482) — MIS equity
+# scales fine at small child capital, and mirrors only fire if it ever runs
+# LIVE anyway (R58 note: its honest backtest is negative; the mirror simply
+# follows whatever the operator promotes).
 KNOWN_STRATEGIES = (
     "simplified_engine",
     "sector_follow_cap5_vol",
     "futures_follow_cap50",
+    "open15_vol_breakout",
 )
 
 
