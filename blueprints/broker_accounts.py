@@ -46,6 +46,37 @@ def list_accounts():
     return jsonify({"status": "success", **accounts_service.overview()})
 
 
+@broker_accounts_bp.route("/settings", methods=["PUT"])
+@require_login
+def update_settings():
+    """UI-configurable multi-account settings (issue #484): mirror-trading
+    master switch + primary book capital. DB-backed; applies immediately
+    (fan-out and jobs consult at fire time — no restart)."""
+    data = request.get_json(silent=True) or {}
+    kwargs = {}
+    if "enabled" in data:
+        kwargs["enabled"] = bool(data["enabled"])
+    if "primary_book_capital" in data:
+        try:
+            kwargs["primary_book_capital"] = float(data["primary_book_capital"])
+        except (TypeError, ValueError):
+            return jsonify(
+                {"status": "error", "message": "primary_book_capital must be a number"}
+            ), 400
+    if not kwargs:
+        return jsonify({"status": "error", "message": "Nothing to update."}), 400
+    try:
+        settings = accounts_db.set_multi_account_settings(
+            **kwargs, updated_by=f"ui:{session.get('user', '?')}"
+        )
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    except Exception as e:
+        logger.exception(f"Failed to update multi-account settings: {e}")
+        return jsonify({"status": "error", "message": "Failed to update settings."}), 500
+    return jsonify({"status": "success", "settings": settings})
+
+
 @broker_accounts_bp.route("", methods=["POST"])
 @require_login
 def add_account():

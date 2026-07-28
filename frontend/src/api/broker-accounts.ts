@@ -42,8 +42,16 @@ export interface MirrorOrder {
 export interface AccountsOverview {
   status: string
   multi_account_enabled: boolean
+  primary_book_capital: number
   known_strategies: string[]
   accounts: ChildAccount[]
+}
+
+export interface MultiAccountSettings {
+  enabled: boolean
+  primary_book_capital: number
+  updated_at: string | null
+  updated_by: string | null
 }
 
 export interface TotpCode {
@@ -77,6 +85,14 @@ export const brokerAccountsApi = {
   overview: async (): Promise<AccountsOverview> => {
     const { data } = await webClient.get(BASE)
     return data
+  },
+
+  updateSettings: async (payload: {
+    enabled?: boolean
+    primary_book_capital?: number
+  }): Promise<MultiAccountSettings> => {
+    const { data } = await webClient.put(`${BASE}/settings`, payload)
+    return data.settings
   },
 
   add: async (payload: AddAccountPayload): Promise<ChildAccount> => {

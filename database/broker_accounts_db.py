@@ -56,6 +56,109 @@ Base.query = db_session.query_property()
 AUTH_NAME_PREFIX = "acct:"
 
 
+class MultiAccountSettings(Base):
+    """Single-row UI-configurable multi-account settings (issue #484).
+
+    DB row wins; the env vars ``MULTI_ACCOUNT_ENABLED`` / ``PRIMARY_BOOK_CAPITAL``
+    are only the FIRST-READ seed (and fallback while no row exists) so a fresh
+    install still defaults off and an env-armed install carries over exactly.
+    Consulted at fire time — UI changes apply immediately, no restart.
+    """
+
+    __tablename__ = "multi_account_settings"
+
+    id = Column(Integer, primary_key=True, default=1)
+    enabled = Column(Boolean, nullable=False, default=False)
+    primary_book_capital = Column(Float, nullable=False, default=1_000_000.0)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(64), nullable=True)
+
+
+def _env_enabled_default() -> bool:
+    return os.getenv("MULTI_ACCOUNT_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+
+
+def _env_capital_default() -> float:
+    try:
+        value = float(os.getenv("PRIMARY_BOOK_CAPITAL", "1000000"))
+        return value if value > 0 else 1_000_000.0
+    except (TypeError, ValueError):
+        return 1_000_000.0
+
+
+def get_multi_account_settings() -> dict:
+    """The settings row, seeded from env on first read. Fail-safe: on any
+    error returns the env-derived values (never blocks a page or a fan-out
+    consult)."""
+    try:
+        row = db_session.query(MultiAccountSettings).filter_by(id=1).first()
+        if row is None:
+            row = MultiAccountSettings(
+                id=1,
+                enabled=_env_enabled_default(),
+                primary_book_capital=_env_capital_default(),
+                updated_by="env-seed",
+            )
+            db_session.add(row)
+            db_session.commit()
+            logger.info(
+                f"multi_account_settings seeded from env (enabled={row.enabled}, "
+                f"primary_book_capital={row.primary_book_capital})"
+            )
+        return {
+            "enabled": bool(row.enabled),
+            "primary_book_capital": float(row.primary_book_capital),
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "updated_by": row.updated_by,
+        }
+    except Exception:
+        db_session.rollback()
+        logger.exception("multi_account_settings read failed — env fallback")
+        return {
+            "enabled": _env_enabled_default(),
+            "primary_book_capital": _env_capital_default(),
+            "updated_at": None,
+            "updated_by": None,
+        }
+    finally:
+        db_session.remove()
+
+
+def set_multi_account_settings(
+    enabled: bool | None = None,
+    primary_book_capital: float | None = None,
+    updated_by: str = "ui",
+) -> dict:
+    """Update the settings row (partial). Raises ValueError on bad capital."""
+    if primary_book_capital is not None and float(primary_book_capital) <= 0:
+        raise ValueError("primary_book_capital must be positive")
+    get_multi_account_settings()  # ensure the row exists (env seed)
+    try:
+        row = db_session.query(MultiAccountSettings).filter_by(id=1).first()
+        if enabled is not None:
+            row.enabled = bool(enabled)
+        if primary_book_capital is not None:
+            row.primary_book_capital = float(primary_book_capital)
+        row.updated_at = datetime.utcnow()
+        row.updated_by = updated_by
+        db_session.commit()
+        logger.info(
+            f"multi_account_settings updated by {updated_by}: enabled={row.enabled}, "
+            f"primary_book_capital={row.primary_book_capital}"
+        )
+        return {
+            "enabled": bool(row.enabled),
+            "primary_book_capital": float(row.primary_book_capital),
+            "updated_at": row.updated_at.isoformat(),
+            "updated_by": row.updated_by,
+        }
+    except Exception:
+        db_session.rollback()
+        raise
+    finally:
+        db_session.remove()
+
+
 class BrokerAccount(Base):
     """One row per child broker account (the primary is NOT a row here)."""
 

@@ -36,6 +36,7 @@ def accounts_db():
     adb.init_db()
     yield adb
     try:
+        adb.db_session.query(adb.MultiAccountSettings).delete()
         adb.db_session.query(adb.AccountStrategy).delete()
         adb.db_session.query(adb.BrokerAccount).delete()
         adb.db_session.commit()
@@ -218,7 +219,10 @@ def test_api_requires_session():
     assert resp.get_json()["status"] == "error"
 
 
-def test_api_crud_roundtrip_never_echoes_secrets(client):
+def test_api_crud_roundtrip_never_echoes_secrets(client, monkeypatch):
+    # Pin the seed OFF — the dev box's .env may carry MULTI_ACCOUNT_ENABLED=true
+    # (issue #484: the DB row wins; env is only the first-read seed).
+    monkeypatch.setenv("MULTI_ACCOUNT_ENABLED", "false")
     resp = client.post(
         "/broker_accounts/api",
         json={

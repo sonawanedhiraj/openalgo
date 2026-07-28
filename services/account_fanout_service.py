@@ -50,11 +50,10 @@ _executor: ThreadPoolExecutor | None = None
 
 
 def _primary_book_capital() -> float:
-    try:
-        value = float(os.getenv("PRIMARY_BOOK_CAPITAL", "1000000"))
-        return value if value > 0 else 1_000_000.0
-    except (TypeError, ValueError):
-        return 1_000_000.0
+    """UI-configurable, DB-backed (issue #484); env is only the first-read seed."""
+    from services.broker_accounts_service import primary_book_capital
+
+    return primary_book_capital()
 
 
 def _get_executor() -> ThreadPoolExecutor:

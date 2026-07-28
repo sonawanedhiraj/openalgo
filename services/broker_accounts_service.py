@@ -50,8 +50,19 @@ KNOWN_STRATEGIES = (
 
 
 def is_multi_account_enabled() -> bool:
-    """Phase-2 fan-out master flag (default OFF). Setup/login are never gated."""
-    return os.getenv("MULTI_ACCOUNT_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    """Fan-out master switch — UI-configurable, DB-backed (issue #484).
+
+    Reads the ``multi_account_settings`` row (seeded from the
+    ``MULTI_ACCOUNT_ENABLED`` env var on first read). Consulted at fire time,
+    so a UI flip applies immediately without a restart. Setup/login are never
+    gated.
+    """
+    return accounts_db.get_multi_account_settings()["enabled"]
+
+
+def primary_book_capital() -> float:
+    """Mirror-sizing denominator — UI-configurable, DB-backed (issue #484)."""
+    return accounts_db.get_multi_account_settings()["primary_book_capital"]
 
 
 def _is_connected(account: dict) -> bool:
@@ -111,8 +122,10 @@ def overview() -> dict:
         acc["redirect_url_hint"] = f"/zerodha/callback?account_id={acc['id']}"
         acc["today_mirrors"] = mirror_stats.get(acc["id"], {"placed": 0, "skipped": 0, "failed": 0})
         accounts.append(acc)
+    settings = accounts_db.get_multi_account_settings()
     return {
-        "multi_account_enabled": is_multi_account_enabled(),
+        "multi_account_enabled": settings["enabled"],
+        "primary_book_capital": settings["primary_book_capital"],
         "known_strategies": list(KNOWN_STRATEGIES),
         "accounts": accounts,
     }
