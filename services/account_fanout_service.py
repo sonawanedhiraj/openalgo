@@ -147,7 +147,10 @@ def _mirror_to_account(
     parent_qty = int(order_data.get("quantity", 0))
     account_id = account["id"]
     name = account["display_name"]
-    factor = float(account["capital_inr"]) / _primary_book_capital()
+    # Per-strategy capital override (issue #486): stored on the selection row,
+    # so it exists only while the strategy is selected; None → base capital.
+    sizing_capital = account.get("capital_override_inr") or float(account["capital_inr"])
+    factor = float(sizing_capital) / _primary_book_capital()
 
     journal = {
         "account_id": account_id,

@@ -181,8 +181,35 @@ def set_strategies(account_id: int):
     unknown = [n for n in names if n not in accounts_service.KNOWN_STRATEGIES]
     if unknown:
         return jsonify({"status": "error", "message": f"Unknown strategies: {unknown}"}), 400
-    saved = accounts_db.set_strategies(account_id, names)
-    return jsonify({"status": "success", "strategies": saved})
+    # Optional per-SELECTED-strategy capital overrides (issue #486):
+    # {"capital_overrides": {"open15_vol_breakout": 50000}}. Entries for
+    # non-selected strategies are ignored; null/absent → account base capital.
+    raw_overrides = data.get("capital_overrides") or {}
+    if not isinstance(raw_overrides, dict):
+        return jsonify(
+            {"status": "error", "message": "'capital_overrides' must be an object."}
+        ), 400
+    overrides: dict[str, float] = {}
+    for key, value in raw_overrides.items():
+        if key not in names or value in (None, ""):
+            continue
+        try:
+            overrides[key] = float(value)
+        except (TypeError, ValueError):
+            return jsonify(
+                {"status": "error", "message": f"capital override for {key} must be a number"}
+            ), 400
+    try:
+        saved = accounts_db.set_strategies(account_id, names, capital_overrides=overrides)
+    except ValueError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    return jsonify(
+        {
+            "status": "success",
+            "strategies": saved,
+            "strategy_settings": accounts_db.get_strategy_settings(account_id),
+        }
+    )
 
 
 @broker_accounts_bp.route("/mirror_orders", methods=["GET"])

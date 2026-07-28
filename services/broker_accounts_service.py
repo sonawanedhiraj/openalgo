@@ -119,6 +119,7 @@ def overview() -> dict:
     for acc in accounts_db.list_accounts():
         acc["connected"] = _is_connected(acc)
         acc["strategies"] = accounts_db.get_strategies(acc["id"])
+        acc["strategy_settings"] = accounts_db.get_strategy_settings(acc["id"])
         acc["redirect_url_hint"] = f"/zerodha/callback?account_id={acc['id']}"
         acc["today_mirrors"] = mirror_stats.get(acc["id"], {"placed": 0, "skipped": 0, "failed": 0})
         accounts.append(acc)
