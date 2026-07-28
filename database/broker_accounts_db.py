@@ -179,18 +179,47 @@ class BrokerAccount(Base):
 
 
 class AccountStrategy(Base):
-    """Allow-list row: this account mirrors this strategy."""
+    """Allow-list row: this account mirrors this strategy.
+
+    ``capital_override_inr`` (issue #486): optional per-strategy sizing capital
+    for THIS account — NULL means "use the account's base ``capital_inr``".
+    Living on the selection row means the override exists only while the
+    strategy is selected and disappears with a deselect.
+    """
 
     __tablename__ = "account_strategies"
 
     account_id = Column(Integer, primary_key=True, nullable=False)
     strategy_name = Column(String(64), primary_key=True, nullable=False)
+    capital_override_inr = Column(Float, nullable=True)
+
+
+def _migrate_add_capital_override() -> None:
+    """Idempotent boot-time ALTER for installs created before issue #486
+    (same pattern as trade_journal.ltp_at_signal)."""
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            cols = [
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(account_strategies)")).fetchall()
+            ]
+            if cols and "capital_override_inr" not in cols:
+                conn.execute(
+                    text("ALTER TABLE account_strategies ADD COLUMN capital_override_inr FLOAT")
+                )
+                conn.commit()
+                logger.info("account_strategies.capital_override_inr column added (issue #486)")
+    except Exception:
+        logger.exception("capital_override_inr migration failed")
 
 
 def init_db():
     """Create the broker_accounts/account_strategies tables if missing. Idempotent."""
     try:
         Base.metadata.create_all(bind=engine)
+        _migrate_add_capital_override()
         logger.info("broker_accounts tables ready")
     except Exception as e:
         logger.exception(f"Failed to init broker_accounts tables: {e}")
@@ -364,13 +393,60 @@ def get_strategies(account_id: int) -> list[str]:
         db_session.remove()
 
 
-def set_strategies(account_id: int, strategy_names: list[str]) -> list[str]:
-    """Replace the account's strategy allow-list with ``strategy_names``."""
+def get_strategy_settings(account_id: int) -> list[dict]:
+    """Selected strategies with their per-strategy capital overrides, sorted.
+
+    ``capital_override_inr`` is None when the account's base capital applies.
+    """
+    try:
+        rows = db_session.query(AccountStrategy).filter_by(account_id=account_id).all()
+        return sorted(
+            (
+                {
+                    "strategy_name": r.strategy_name,
+                    "capital_override_inr": (
+                        float(r.capital_override_inr)
+                        if r.capital_override_inr is not None
+                        else None
+                    ),
+                }
+                for r in rows
+            ),
+            key=lambda x: x["strategy_name"],
+        )
+    finally:
+        db_session.remove()
+
+
+def set_strategies(
+    account_id: int,
+    strategy_names: list[str],
+    capital_overrides: dict[str, float] | None = None,
+) -> list[str]:
+    """Replace the account's strategy allow-list with ``strategy_names``.
+
+    ``capital_overrides`` maps strategy_name → per-strategy capital (₹) for
+    THIS account; a strategy absent from the map (or mapped to None) uses the
+    account's base capital. Overrides are only stored for SELECTED strategies —
+    deselecting deletes the row and its override with it (issue #486).
+    Raises ValueError on a non-positive override.
+    """
     cleaned = sorted({str(n).strip() for n in strategy_names if str(n).strip()})
+    overrides = capital_overrides or {}
+    for name, value in overrides.items():
+        if value is not None and float(value) <= 0:
+            raise ValueError(f"capital override for {name} must be positive")
     try:
         db_session.query(AccountStrategy).filter_by(account_id=account_id).delete()
         for name in cleaned:
-            db_session.add(AccountStrategy(account_id=account_id, strategy_name=name))
+            override = overrides.get(name)
+            db_session.add(
+                AccountStrategy(
+                    account_id=account_id,
+                    strategy_name=name,
+                    capital_override_inr=float(override) if override is not None else None,
+                )
+            )
         db_session.commit()
         return cleaned
     except Exception:
@@ -381,10 +457,14 @@ def set_strategies(account_id: int, strategy_names: list[str]) -> list[str]:
 
 
 def accounts_for_strategy(strategy_name: str) -> list[dict]:
-    """Enabled accounts that mirror ``strategy_name`` — the Phase-2 fan-out read."""
+    """Enabled accounts that mirror ``strategy_name`` — the Phase-2 fan-out read.
+
+    Each dict carries ``capital_override_inr`` (this strategy's override for
+    that account, or None) so the fan-out can size per (account, strategy).
+    """
     try:
         rows = (
-            db_session.query(BrokerAccount)
+            db_session.query(BrokerAccount, AccountStrategy.capital_override_inr)
             .join(AccountStrategy, AccountStrategy.account_id == BrokerAccount.id)
             .filter(
                 AccountStrategy.strategy_name == strategy_name,
@@ -393,6 +473,11 @@ def accounts_for_strategy(strategy_name: str) -> list[dict]:
             .order_by(BrokerAccount.id)
             .all()
         )
-        return [_row_to_dict(r) for r in rows]
+        result = []
+        for account_row, override in rows:
+            d = _row_to_dict(account_row)
+            d["capital_override_inr"] = float(override) if override is not None else None
+            result.append(d)
+        return result
     finally:
         db_session.remove()

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Copy, Plus, RefreshCw, Trash2, Users } from 'lucide-react'
+import { Copy, Pencil, Plus, RefreshCw, Trash2, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -43,48 +43,111 @@ function TotpCell({ account }: { account: ChildAccount }) {
   )
 }
 
+// Primary-side per-trade sizing used ONLY for the preview line (display, not
+// stored): open15 ₹1.5L/slot, sector_follow ₹50k/position, futures 1 NIFTY
+// lot ≈ ₹2.8L margin, simplified ₹20k capital base.
+const STRATEGY_SLOT_INFO: Record<string, { slot: number; label: string }> = {
+  open15_vol_breakout: { slot: 150000, label: 'per slot' },
+  sector_follow_cap5_vol: { slot: 50000, label: 'per position' },
+  futures_follow_cap50: { slot: 280000, label: 'per lot (margin)' },
+  simplified_engine: { slot: 20000, label: 'per trade base' },
+}
+
 function StrategyChecklist({
   account,
   knownStrategies,
+  primaryBookCapital,
 }: {
   account: ChildAccount
   knownStrategies: string[]
+  primaryBookCapital: number
 }) {
   const queryClient = useQueryClient()
   const [selected, setSelected] = useState<string[]>(account.strategies)
+  const [overrides, setOverrides] = useState<Record<string, number | null>>(() =>
+    Object.fromEntries(
+      account.strategy_settings.map((s) => [s.strategy_name, s.capital_override_inr])
+    )
+  )
 
   const saveMutation = useMutation({
-    mutationFn: () => brokerAccountsApi.setStrategies(account.id, selected),
+    mutationFn: () => brokerAccountsApi.setStrategies(account.id, selected, overrides),
     onSuccess: () => {
       toast.success(`Strategies saved for ${account.display_name}`)
       queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
     },
-    onError: () => toast.error('Failed to save strategies'),
+    onError: (e: unknown) => {
+      const message =
+        (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Failed to save strategies'
+      toast.error(message)
+    },
   })
+
+  const preview = (name: string) => {
+    const capital = overrides[name] ?? account.capital_inr
+    const factor = capital / primaryBookCapital
+    const info = STRATEGY_SLOT_INFO[name]
+    if (!info) return `factor ${factor.toFixed(3)}×`
+    const perSlot = Math.round(info.slot * factor)
+    if (name === 'futures_follow_cap50' && capital < info.slot) {
+      return `factor ${factor.toFixed(3)}× — ⚠ below 1 lot (needs ≥ ₹${info.slot.toLocaleString('en-IN')}): every mirror skips`
+    }
+    return `factor ${factor.toFixed(3)}× → ≈ ₹${perSlot.toLocaleString('en-IN')} ${info.label}`
+  }
 
   return (
     <div className="mt-2 rounded-md border border-dashed p-3">
       <p className="text-muted-foreground text-xs mb-2">
-        Select which strategies this account mirrors. No selection = no mirror orders.
+        Tick a strategy to mirror it. The Capital field appears only for selected strategies — blank
+        uses the account's base capital (₹{account.capital_inr.toLocaleString('en-IN')}).
       </p>
-      {knownStrategies.map((name) => (
-        <label key={name} className="flex items-center gap-2 py-1 text-sm">
-          <Checkbox
-            checked={selected.includes(name)}
-            onCheckedChange={(checked) =>
-              setSelected((prev) => (checked ? [...prev, name] : prev.filter((n) => n !== name)))
-            }
-          />
-          {name}
-        </label>
-      ))}
+      {knownStrategies.map((name) => {
+        const isSelected = selected.includes(name)
+        return (
+          <div
+            key={name}
+            className="flex flex-wrap items-center gap-2 py-1.5 text-sm border-b last:border-b-0"
+          >
+            <label className="flex items-center gap-2 min-w-52">
+              <Checkbox
+                checked={isSelected}
+                onCheckedChange={(checked) =>
+                  setSelected((prev) =>
+                    checked ? [...prev, name] : prev.filter((n) => n !== name)
+                  )
+                }
+              />
+              {name}
+            </label>
+            {isSelected && (
+              <>
+                <Input
+                  className="w-28 h-8"
+                  type="number"
+                  placeholder="base"
+                  value={overrides[name] ?? ''}
+                  onChange={(e) =>
+                    setOverrides((prev) => ({
+                      ...prev,
+                      [name]: e.target.value === '' ? null : Number(e.target.value),
+                    }))
+                  }
+                  data-testid={`override-${account.id}-${name}`}
+                />
+                <span className="text-muted-foreground text-xs">{preview(name)}</span>
+              </>
+            )}
+          </div>
+        )
+      })}
       <Button
         size="sm"
         className="mt-2"
         onClick={() => saveMutation.mutate()}
         disabled={saveMutation.isPending}
       >
-        Save selection
+        Save
       </Button>
     </div>
   )
@@ -107,6 +170,47 @@ export default function AccountsPage() {
   const [totpSecret, setTotpSecret] = useState('')
   const [expanded, setExpanded] = useState<number | null>(null)
   const [capitalDraft, setCapitalDraft] = useState<number | null>(null)
+  const [editAccount, setEditAccount] = useState<ChildAccount | null>(null)
+  const [editForm, setEditForm] = useState({
+    display_name: '',
+    broker_client_id: '',
+    capital_inr: 0,
+    api_key: '',
+    api_secret: '',
+  })
+
+  const openEdit = (account: ChildAccount) => {
+    setEditAccount(account)
+    setEditForm({
+      display_name: account.display_name,
+      broker_client_id: account.broker_client_id ?? '',
+      capital_inr: account.capital_inr,
+      api_key: '',
+      api_secret: '',
+    })
+  }
+
+  const editMutation = useMutation({
+    mutationFn: () =>
+      brokerAccountsApi.update(editAccount?.id ?? 0, {
+        display_name: editForm.display_name,
+        broker_client_id: editForm.broker_client_id,
+        capital_inr: editForm.capital_inr,
+        ...(editForm.api_key ? { api_key: editForm.api_key } : {}),
+        ...(editForm.api_secret ? { api_secret: editForm.api_secret } : {}),
+      }),
+    onSuccess: () => {
+      toast.success('Account updated')
+      setEditAccount(null)
+      queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
+    },
+    onError: (e: unknown) => {
+      const message =
+        (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Failed to update account'
+      toast.error(message)
+    },
+  })
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['broker-accounts'],
@@ -298,7 +402,14 @@ export default function AccountsPage() {
                     <div className="font-medium">{account.display_name}</div>
                     <div className="text-xs text-muted-foreground">
                       {account.broker_client_id || '—'} · ₹
-                      {account.capital_inr.toLocaleString('en-IN')}
+                      {account.capital_inr.toLocaleString('en-IN')} base
+                      {account.strategy_settings
+                        .filter((s) => s.capital_override_inr !== null)
+                        .map(
+                          (s) =>
+                            ` · ${s.strategy_name.split('_')[0]}: ₹${(s.capital_override_inr as number).toLocaleString('en-IN')}`
+                        )
+                        .join('')}
                     </div>
                   </div>
                   {account.connected ? (
@@ -338,6 +449,14 @@ export default function AccountsPage() {
                   <Button
                     variant="ghost"
                     size="sm"
+                    onClick={() => openEdit(account)}
+                    data-testid={`edit-${account.id}`}
+                  >
+                    <Pencil className="h-3 w-3 mr-1" /> Edit
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     onClick={() => setExpanded(expanded === account.id ? null : account.id)}
                   >
                     Strategies ({account.strategies.length})
@@ -369,7 +488,11 @@ export default function AccountsPage() {
                   </Button>
                 </div>
                 {expanded === account.id && data && (
-                  <StrategyChecklist account={account} knownStrategies={data.known_strategies} />
+                  <StrategyChecklist
+                    account={account}
+                    knownStrategies={data.known_strategies}
+                    primaryBookCapital={data.primary_book_capital}
+                  />
                 )}
               </div>
             ))}
@@ -438,6 +561,68 @@ export default function AccountsPage() {
               data-testid="save-account-btn"
             >
               Save (starts disabled)
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editAccount !== null} onOpenChange={(open) => !open && setEditAccount(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit — {editAccount?.display_name}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <Label>Display name</Label>
+              <Input
+                value={editForm.display_name}
+                onChange={(e) => setEditForm({ ...editForm, display_name: e.target.value })}
+              />
+            </div>
+            <div>
+              <Label>Broker Client ID</Label>
+              <Input
+                value={editForm.broker_client_id}
+                onChange={(e) => setEditForm({ ...editForm, broker_client_id: e.target.value })}
+              />
+            </div>
+            <div>
+              <Label>Base capital (₹)</Label>
+              <Input
+                type="number"
+                value={editForm.capital_inr || ''}
+                onChange={(e) => setEditForm({ ...editForm, capital_inr: Number(e.target.value) })}
+                data-testid="edit-capital"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Default sizing for every mirrored strategy: factor = base capital ÷ primary book.
+                Per-strategy overrides live in the Strategies panel.
+              </p>
+            </div>
+            <div>
+              <Label>Replace API Key (optional)</Label>
+              <Input
+                value={editForm.api_key}
+                onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
+                placeholder="leave blank to keep current"
+              />
+            </div>
+            <div>
+              <Label>Replace API Secret (optional)</Label>
+              <Input
+                type="password"
+                value={editForm.api_secret}
+                onChange={(e) => setEditForm({ ...editForm, api_secret: e.target.value })}
+                placeholder="leave blank to keep current"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditAccount(null)}>
+              Cancel
+            </Button>
+            <Button onClick={() => editMutation.mutate()} disabled={editMutation.isPending}>
+              Save
             </Button>
           </DialogFooter>
         </DialogContent>

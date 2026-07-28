@@ -16,8 +16,14 @@ export interface ChildAccount {
   updated_at: string | null
   connected: boolean
   strategies: string[]
+  strategy_settings: StrategySetting[]
   redirect_url_hint: string
   today_mirrors: { placed: number; skipped: number; failed: number }
+}
+
+export interface StrategySetting {
+  strategy_name: string
+  capital_override_inr: number | null
 }
 
 export interface MirrorOrder {
@@ -118,8 +124,15 @@ export const brokerAccountsApi = {
     await webClient.post(`${BASE}/${id}/disconnect`)
   },
 
-  setStrategies: async (id: number, strategies: string[]): Promise<string[]> => {
-    const { data } = await webClient.post(`${BASE}/${id}/strategies`, { strategies })
+  setStrategies: async (
+    id: number,
+    strategies: string[],
+    capitalOverrides?: Record<string, number | null>
+  ): Promise<string[]> => {
+    const { data } = await webClient.post(`${BASE}/${id}/strategies`, {
+      strategies,
+      capital_overrides: capitalOverrides ?? {},
+    })
     return data.strategies
   },
 
