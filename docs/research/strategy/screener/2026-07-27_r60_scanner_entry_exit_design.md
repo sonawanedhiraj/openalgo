@@ -150,10 +150,78 @@ mean/trade is within noise of the backtest (≳+0.2%/trade net combined). Add an
 earnings-day filter before go-live. Do NOT trade the deep-gap fade (H2 artifact
 risk) or the naive intraday short (net-negative).
 
+---
+
+# R60b addendum (same day, operator review) — REAL recorded screener history
+
+The operator reviewed R60a and directed the analysis at the **actual recorded
+screener output** (no replayed signals, no next-day re-entries, shorts strictly
+same-day). Sets: **Chartink webhook first-hits** (`scan_cycle`,
+`cycle_kind='chartink'` post-#449 repair: 360 first-hits per symbol-day-side,
+2026-05-29→07-27, 35 days) and **in-house scanner first-hits** (`scan_results`:
+306, 2026-06-30→07-27); pooled-deduped 527 priced events (BUY 287 / SELL 240).
+Prices: broker 1m (`prices.duckdb`) through 07-06, Yahoo 5m after; Yahoo daily
+for prev-close/T+1.
+
+## Chasing the hit does NOT work on the real tape
+
+Entering at the hit price (market order when the screener shows the stock):
+
+| Config (₹50k, real charges) | gross | net |
+|---|---|---|
+| LONG at hit → 15:25 | +0.145% | **+0.04%** (thin) |
+| LONG at hit → T+1 close (CNC) | +0.329% | +0.07% (STT eats it) |
+| SHORT at hit → 15:25 | +0.015% | **−0.09%** (loses) |
+| SHORT at hit → 30/60min | −0.02/+0.01% | −0.13/−0.10% |
+
+Every same-day SHORT chase configuration is net-negative — consistent with the
+year-long replay. The R60a mild-band/afternoon cuts do NOT reproduce on this
+2-month window (LONG mild+afternoon T+1c net −0.02%); the window even shows the
+opposite time-of-day tilt (morning fires better), i.e. those cuts are
+regime-sensitive and should not carry live weight.
+
+## The entry IS the edge: retrace-limit, not chase
+
+Limit order at hit_price ∓ X%, valid 60 min, filled only if touched; exit 15:25:
+
+| Side | retrace | fills | net/trade | win | weekly green |
+|---|---|---|---|---|---|
+| LONG | 0.25% | 65% | +0.17% | 52% | — |
+| **LONG** | **0.50%** | **35%** | **+0.263%** | **57%** | 6/10 (W28 = 86% of P&L) |
+| LONG | 0.75% | 13% | +0.45–0.77% | 60–74% | n too small |
+| SHORT | 0.25% | 67% | +0.02% | 47% | — |
+| **SHORT** | **0.50%** | **37%** | **+0.137%** | **51%** | 3/7 (choppy) |
+| SHORT | 0.75% | 17% | +0.19–0.34% | 51% | n too small |
+
+Per-source (0.5% config): LONG chartink +0.18% / inhouse +0.63%; SHORT chartink
++0.15% / inhouse +0.04%. Adverse excursion from fill: p25 ≈ −1.1% both sides →
+disaster stop ~2%, never tight (tight stops destroyed every prior round).
+With a retrace entry the T+1-close CNC exit is WORSE than 15:25 (+0.10–0.13%) —
+so on the real tape everything stays intraday; **no overnight positions on
+either side**.
+
+## Corrected verdict
+
+- **LONG:** retrace-limit −0.5% / 60min / exit 15:25 is the best real-data spec:
+  net +0.26%/trade, win 57%, positive in both sources — but 2 months, 96 fills,
+  P&L concentrated in one week. PROMISING, sandbox-first stands.
+- **SHORT:** never chase (−0.09% net). The only net-positive same-day short is
+  the +0.5% bounce-limit (+0.14%/trade, 51% win, 3/7 weeks green) — MARGINAL;
+  paper-only, or treat the SELL list as an avoid/hedge signal rather than a
+  trading edge. R60a's T+1-open short re-entry is retired per operator
+  direction (trade only what the screener shows, same-day).
+- R60a's year-long replay remains the statistical base for the LONG
+  continuation edge; R60b is the execution truth on the live tape: **the
+  screener's value is the WATCHLIST; the profit mechanic is buying/shorting the
+  retrace, not the breakout chase** — R57's pullback conclusion, reconfirmed on
+  real data.
+
 ## Artifacts
 
 - Analysis scripts + per-signal metrics: `backtest/inhouse_scanner/r60/`
   (stage_a_forward_returns.py, stage_b_aggregate.py, stage_c_execution.py,
-  stage_d_robustness.py, stage_e_portfolio_oos.py, metrics.parquet)
+  stage_d_robustness.py, stage_e_portfolio_oos.py, metrics.parquet;
+  R60b: real_screener_analysis.py, real_entry_refinement.py,
+  chartink_first_hits.parquet, inhouse_first_hits.parquet, real_metrics.parquet)
 - Signal set: `signals_full.parquet` (from commit `ee6651283`)
 - Prices: `outputs/tod_volume_gate/prices.duckdb` (read-only)
