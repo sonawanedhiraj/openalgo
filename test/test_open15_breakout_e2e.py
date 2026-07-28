@@ -277,3 +277,139 @@ def test_option_mode_unaffordable_skip(monkeypatch):
     assert row is not None and row.status == "skipped" and row.reason == "unaffordable"
     assert row.opt_entry_premium == 75.7 and row.opt_lot_size == 625
     db_session.remove()
+
+
+def _mk_option_service(orders, monkeypatch, lotsize=75):
+    """Option-mode service with the ATM resolver pinned to one contract."""
+    import services.open15_option_shadow as shadow
+
+    svc = _mk_service(orders)
+    svc.day_config = resolve_day_config(
+        {
+            "margin_per_slot": 30000,
+            "sizing_mode": "fixed",
+            "vol_mult": 1.5,
+            "instrument": "atm_option",
+        },
+        0,
+    )
+    monkeypatch.setattr(
+        shadow,
+        "resolve_atm_option",
+        lambda underlying, side, spot, trade_date: {
+            "symbol": "AAA28JUL26105CE",
+            "strike": 105.0,
+            "expiry": "28-JUL-26",
+            "lotsize": lotsize,
+        },
+    )
+    return svc
+
+
+def _drive_to_entry(svc):
+    """09:15 candles -> 09:16 selection -> 09:17 surge trigger on AAA."""
+    for sym, px in (("AAA", 103.0), ("CCC", 97.0), ("ZZZ", 101.0)):
+        svc._handle_raw(*_frame(sym, px, 1000, 9, 15, 1), _now(9, 15, 1))
+        svc._handle_raw(*_frame(sym, px * 1.001, 5000, 9, 15, 50), _now(9, 15, 50))
+    svc._handle_raw(*_frame("AAA", 103.0, 6000, 9, 16, 10), _now(9, 16, 10))
+    h1 = svc.core.sym["AAA"]["fc"]["high"]
+    svc._handle_raw(*_frame("AAA", h1 + 0.5, 6000 + 9000, 9, 17, 12), _now(9, 17, 12))
+
+
+def _latest(symbol="AAA"):
+    from database.open15_breakout_db import Open15Trade, db_session
+
+    db_session.expire_all()
+    return (
+        db_session.query(Open15Trade)
+        .filter(Open15Trade.symbol == symbol)
+        .order_by(Open15Trade.id.desc())
+        .first()
+    )
+
+
+def test_option_liquidity_recorded_at_entry_and_exit(monkeypatch):
+    """issue #488: the contract's own volume + OI are journaled at BOTH decision
+    moments, and the snapshot's ltp prices the trade (one quote call, not two)."""
+    from database.open15_breakout_db import db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_option_service(orders, monkeypatch)
+    snap = {"ltp": 152.0, "volume": 12345, "oi": 6789}
+    svc.quote_snapshot_fn = lambda sym, ex: dict(snap)
+    # would price the trade differently — proves the snapshot is the source
+    svc.quote_fn = lambda sym, ex: 999.0
+
+    _drive_to_entry(svc)
+    assert len(orders) == 1 and orders[0]["quantity"] == 150  # 30000 // (152*75) = 2 lots
+
+    snap.update(ltp=170.0, volume=55555, oi=4321)
+    svc.flatten("eod_0930")
+    assert len(orders) == 2 and orders[1]["action"] == "SELL"
+
+    row = _latest()
+    assert row.opt_entry_premium == 152.0 and row.opt_exit_premium == 170.0
+    assert row.opt_entry_volume == 12345 and row.opt_entry_oi == 6789
+    assert row.opt_exit_volume == 55555 and row.opt_exit_oi == 4321
+    db_session.remove()
+
+
+def test_option_liquidity_snapshot_unavailable_falls_back(monkeypatch):
+    """A snapshot miss must never cost an entry: quote_fn still prices the trade
+    and the liquidity columns stay NULL (unknown), not 0 (no liquidity)."""
+    from database.open15_breakout_db import db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_option_service(orders, monkeypatch)
+    svc.quote_snapshot_fn = lambda sym, ex: None
+    svc.quote_fn = lambda sym, ex: 152.0
+
+    _drive_to_entry(svc)
+    assert len(orders) == 1 and orders[0]["quantity"] == 150
+    svc.flatten("eod_0930")
+
+    row = _latest()
+    assert row.opt_entry_premium == 152.0 and row.opt_exit_premium == 152.0
+    assert row.opt_entry_volume is None and row.opt_entry_oi is None
+    assert row.opt_exit_volume is None and row.opt_exit_oi is None
+    db_session.remove()
+
+
+def test_option_liquidity_snapshot_raising_is_contained(monkeypatch):
+    """A broken snapshot provider is instrumentation failure, not trade failure."""
+    from database.open15_breakout_db import db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_option_service(orders, monkeypatch)
+
+    def boom(sym, ex):
+        raise RuntimeError("quote provider down")
+
+    svc.quote_snapshot_fn = boom
+    svc.quote_fn = lambda sym, ex: 152.0
+
+    _drive_to_entry(svc)
+    assert len(orders) == 1 and orders[0]["quantity"] == 150
+    svc.flatten("eod_0930")
+    assert len(orders) == 2  # exit still placed
+
+    row = _latest()
+    assert row.opt_entry_premium == 152.0
+    assert row.opt_entry_volume is None and row.opt_exit_oi is None
+    db_session.remove()
+
+
+def test_missing_quote_fields_read_as_unknown_not_zero():
+    """A broker that omits oi/volume must leave NULL — writing 0 would read as
+    'no liquidity' and poison the very analysis these columns exist for."""
+    from services.open15_breakout_service import _as_int
+
+    assert _as_int(None) is None
+    assert _as_int("") is None
+    assert _as_int("n/a") is None
+    assert _as_int(0) == 0  # a genuine reported zero is preserved
+    assert _as_int("12345") == 12345
+    assert _as_int(6789.0) == 6789

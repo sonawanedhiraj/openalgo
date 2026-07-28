@@ -87,6 +87,16 @@ class Open15Trade(Base):
     opt_exit_premium = Column(Float, nullable=True)  # 09:30 bar open
     opt_charges_inr = Column(Float, nullable=True)  # modelled option round-trip, 1 lot
     opt_pnl = Column(Float, nullable=True)  # NET premium pnl for 1 lot
+
+    # contract liquidity at the two decision moments (issue #488) — measurement
+    # only, nothing gates on them. Recorded so exit slippage can eventually be
+    # regressed against the contract's own flow instead of a guessed threshold:
+    # on 2026-07-28 every ex-ante metric ranked the two live trades backwards,
+    # so the raw inputs are captured until the data justifies a rule.
+    opt_entry_volume = Column(Integer, nullable=True)  # cumulative day volume at trigger
+    opt_entry_oi = Column(Integer, nullable=True)  # open interest at trigger
+    opt_exit_volume = Column(Integer, nullable=True)  # cumulative day volume at exit
+    opt_exit_oi = Column(Integer, nullable=True)  # open interest at exit
     status = Column(String(16), default="open")  # open / closed / error / observe
     reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -150,6 +160,10 @@ def _ensure_columns():
             "opt_exit_premium": "FLOAT",
             "opt_charges_inr": "FLOAT",
             "opt_pnl": "FLOAT",
+            "opt_entry_volume": "INTEGER",
+            "opt_entry_oi": "INTEGER",
+            "opt_exit_volume": "INTEGER",
+            "opt_exit_oi": "INTEGER",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
