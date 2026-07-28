@@ -85,6 +85,7 @@ def fanout_env(monkeypatch):
             if db is orders_db:
                 db.db_session.query(db.AccountOrder).delete()
             else:
+                db.db_session.query(db.MultiAccountSettings).delete()
                 db.db_session.query(db.AccountStrategy).delete()
                 db.db_session.query(db.BrokerAccount).delete()
             db.db_session.commit()

@@ -115,6 +115,7 @@ def seam_env(monkeypatch):
     finally:
         orders_db.db_session.remove()
     try:
+        accounts_db.db_session.query(accounts_db.MultiAccountSettings).delete()
         accounts_db.db_session.query(accounts_db.AccountStrategy).delete()
         accounts_db.db_session.query(accounts_db.BrokerAccount).delete()
         accounts_db.db_session.commit()

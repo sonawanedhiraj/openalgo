@@ -106,10 +106,31 @@ export default function AccountsPage() {
   const [totpAccount, setTotpAccount] = useState<ChildAccount | null>(null)
   const [totpSecret, setTotpSecret] = useState('')
   const [expanded, setExpanded] = useState<number | null>(null)
+  const [capitalDraft, setCapitalDraft] = useState<number | null>(null)
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['broker-accounts'],
     queryFn: brokerAccountsApi.overview,
+  })
+
+  const settingsMutation = useMutation({
+    mutationFn: (payload: { enabled?: boolean; primary_book_capital?: number }) =>
+      brokerAccountsApi.updateSettings(payload),
+    onSuccess: (settings) => {
+      toast.success(
+        settings.enabled
+          ? 'Mirror trading ENABLED — applies immediately'
+          : 'Mirror trading disabled'
+      )
+      setCapitalDraft(null)
+      queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
+    },
+    onError: (e: unknown) => {
+      const message =
+        (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Failed to update settings'
+      toast.error(message)
+    },
   })
 
   // Surface callback results (?connected=N / ?error=...) once, then clean the URL.
@@ -199,12 +220,43 @@ export default function AccountsPage() {
         </div>
       </div>
 
-      {data && !data.multi_account_enabled && (
-        <div className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-600 dark:text-amber-400">
-          Mirror trading is disabled (<code>MULTI_ACCOUNT_ENABLED=false</code>). Accounts can be set
-          up and logged in, but no orders will be mirrored until the operator enables the flag
-          (order fan-out ships in Phase 2).
-        </div>
+      {data && (
+        <Card data-testid="mirror-settings-card">
+          <CardContent className="pt-4 flex flex-wrap items-center gap-4">
+            <div className="flex items-center gap-2">
+              <Switch
+                checked={data.multi_account_enabled}
+                onCheckedChange={(checked) => settingsMutation.mutate({ enabled: checked })}
+                data-testid="mirror-master-switch"
+              />
+              <span className="font-medium">
+                Mirror trading {data.multi_account_enabled ? 'ENABLED' : 'disabled'}
+              </span>
+            </div>
+            <div className="flex items-center gap-2 text-sm">
+              <Label className="text-muted-foreground">Primary book capital (₹)</Label>
+              <Input
+                className="w-32"
+                type="number"
+                value={capitalDraft ?? data.primary_book_capital}
+                onChange={(e) => setCapitalDraft(Number(e.target.value))}
+              />
+              {capitalDraft !== null && capitalDraft !== data.primary_book_capital && (
+                <Button
+                  size="sm"
+                  onClick={() => settingsMutation.mutate({ primary_book_capital: capitalDraft })}
+                >
+                  Save
+                </Button>
+              )}
+            </div>
+            <span className="text-muted-foreground text-xs">
+              {data.multi_account_enabled
+                ? 'LIVE strategy orders mirror to enabled child accounts, scaled by child capital ÷ primary book. Changes apply immediately.'
+                : 'No orders are mirrored while disabled. Accounts can still be set up and logged in.'}
+            </span>
+          </CardContent>
+        </Card>
       )}
 
       <Card>
