@@ -18,6 +18,29 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Multi-account mirror trading (issues #468/#474/#476/#478/#482, added 2026-07-28)
+
+#### MULTI_ACCOUNT_ENABLED
+- **Value:** `true` (in `.env`; code default `false`) — enabled 2026-07-28 by the operator.
+- **What it gates:** the Phase-2 order fan-out to child broker accounts
+  (`services/account_fanout_service.py`) and the Phase-3 observability jobs
+  (login reminders 09:00/15:00 IST, EOD mirror summary 15:35 IST). Account
+  setup/login on `/accounts` is never gated.
+- **Why enabling is currently inert:** mirrors fire ONLY for LIVE broker-accepted
+  parent orders of a strategy the child selected. Every strategy runs sandbox
+  today, so no orders mirror until one is flipped live on `/strategies`.
+  First child: Swapna-zerodha (₹15,000, open15_vol_breakout selected).
+- **Rollback:** set `false` + restart (or delete the line — code default is false).
+
+#### PRIMARY_BOOK_CAPITAL
+- **Value:** `1000000` (₹10L, in `.env`; matches the code default — pinned
+  explicitly so sizing intent is visible).
+- **What it does:** denominator for child mirror sizing —
+  `factor = child.capital_inr / PRIMARY_BOOK_CAPITAL`, floored to shares/lots.
+  Only read when `MULTI_ACCOUNT_ENABLED=true`.
+- **Why ₹10L:** the consolidated primary book target (see the 2026-06 consolidated
+  ₹10L research). A ₹15k child ⇒ factor 0.015.
+
 ### futures_follow OPTION_C same-minute@15:25 entry (issue #406, added 2026-07-14)
 The 15:20 entry seeds its 50% margin cap from `lots_held()`, which counts the
 still-open prior-day lot (it exits at 15:25) — under-sizing carry days (issue #405).
