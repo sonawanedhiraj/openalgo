@@ -614,8 +614,28 @@ def production_order_placer(mode: str, order: dict) -> dict:
         return {"status": "error", "message": str(e)}
 
 
-def production_quote_ltp(symbol: str, exchange: str) -> float | None:
-    """Last traded price via the shared quotes path (option-mode sizing/fills)."""
+def _as_int(value: Any) -> int | None:
+    """Coerce a broker quote field to int; None when absent or unparseable.
+
+    Deliberately does NOT default to 0 — a field the broker omitted must read as
+    "unknown", not as "zero liquidity", or the research rows become misleading.
+    """
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def production_quote_snapshot(symbol: str, exchange: str) -> dict | None:
+    """Full quote for the option paths: last price plus the contract's own
+    traded volume and open interest (issue #488).
+
+    ``volume``/``oi`` are recorded for research only — nothing gates on them.
+    Returns None when the quote is unavailable; callers treat that as "unknown"
+    and fall back to the price-only path.
+    """
     try:
         from database.auth_db import get_first_available_api_key
         from services.quotes_service import get_quotes
@@ -627,17 +647,36 @@ def production_quote_ltp(symbol: str, exchange: str) -> float | None:
         if not ok:
             logger.warning("open15: quote failed for %s:%s — %s", exchange, symbol, data)
             return None
-        ltp = (data.get("data") or {}).get("ltp")
-        return float(ltp) if ltp else None
+        d = data.get("data") or {}
+        ltp = d.get("ltp")
+        if not ltp:
+            return None
+        return {
+            "ltp": float(ltp),
+            "volume": _as_int(d.get("volume")),
+            "oi": _as_int(d.get("oi")),
+        }
     except Exception:
         logger.exception("open15: quote raised for %s:%s", exchange, symbol)
         return None
 
 
+def production_quote_ltp(symbol: str, exchange: str) -> float | None:
+    """Last traded price via the shared quotes path (option-mode sizing/fills)."""
+    snap = production_quote_snapshot(symbol, exchange)
+    return snap["ltp"] if snap else None
+
+
 class Open15BreakoutService:
-    def __init__(self, order_placer=production_order_placer, quote_fn=production_quote_ltp):
+    def __init__(
+        self,
+        order_placer=production_order_placer,
+        quote_fn=production_quote_ltp,
+        quote_snapshot_fn=production_quote_snapshot,
+    ):
         self.order_placer = order_placer
         self.quote_fn = quote_fn
+        self.quote_snapshot_fn = quote_snapshot_fn
         self.core: Open15Core | None = None
         self._sched = None  # scheduler handle from register_jobs (arm reschedules on it)
         self.positions: dict[str, dict[str, Any]] = {}  # symbol -> journal/fill info
@@ -903,9 +942,12 @@ class Open15BreakoutService:
                 from services.open15_option_shadow import option_round_trip_charges
 
                 entry_prem = pos.get("opt_entry_premium")
-                exit_prem = self.quote_fn(pos["opt_symbol"], "NFO")
+                exit_prem, exit_volume, exit_oi = self._option_liquidity(pos["opt_symbol"])
                 lot = pos.get("opt_lot_size") or 1
                 lots = pos["quantity"] // lot if lot else 1
+                # recorded even when the premium is missing — an unpriced exit is
+                # exactly the case the liquidity data is meant to explain
+                fields.update(opt_exit_volume=exit_volume, opt_exit_oi=exit_oi)
                 if entry_prem and exit_prem:
                     pnl = (exit_prem - entry_prem) * pos["quantity"]
                     charges = option_round_trip_charges(
@@ -1306,6 +1348,24 @@ class Open15BreakoutService:
             order_id=resp.get("orderid"),
         )
 
+    def _option_liquidity(self, opt_symbol: str) -> tuple[float | None, int | None, int | None]:
+        """``(ltp, volume, oi)`` for an option contract (issue #488).
+
+        The volume/OI half is pure instrumentation — nothing gates on it. When the
+        snapshot is unavailable this falls back to ``quote_fn`` so sizing and exit
+        pricing behave exactly as before and the liquidity columns simply stay
+        NULL. Never raises: a broken snapshot must not cost an entry or an exit.
+        """
+        snap = None
+        try:
+            if self.quote_snapshot_fn is not None:
+                snap = self.quote_snapshot_fn(opt_symbol, "NFO")
+        except Exception:
+            logger.exception("open15: liquidity snapshot raised for %s", opt_symbol)
+        if snap:
+            return snap.get("ltp"), snap.get("volume"), snap.get("oi")
+        return self.quote_fn(opt_symbol, "NFO"), None, None
+
     def _enter_option(self, action: dict, cfg: dict) -> None:
         """Option-mode entry (issue #437): BUY the ATM CE (L) / PE (S).
 
@@ -1321,7 +1381,7 @@ class Open15BreakoutService:
         if not contract:
             self._journal_skip(action, "no_option_contract", instrument="option")
             return
-        premium = self.quote_fn(contract["symbol"], "NFO")
+        premium, opt_volume, opt_oi = self._option_liquidity(contract["symbol"])
         if not premium:
             self._journal_skip(
                 action, "no_option_quote", instrument="option", opt_symbol=contract["symbol"]
@@ -1338,6 +1398,8 @@ class Open15BreakoutService:
                 opt_symbol=contract["symbol"],
                 opt_lot_size=lot,
                 opt_entry_premium=premium,
+                opt_entry_volume=opt_volume,
+                opt_entry_oi=opt_oi,
             )
             return
         qty = lots * lot
@@ -1363,6 +1425,8 @@ class Open15BreakoutService:
             opt_symbol=contract["symbol"],
             opt_lot_size=lot,
             opt_entry_premium=premium,
+            opt_entry_volume=opt_volume,
+            opt_entry_oi=opt_oi,
             entry_order_id=str(resp.get("orderid") or ""),
             entry_status="success" if ok else "error",
             status="open" if ok else "error",

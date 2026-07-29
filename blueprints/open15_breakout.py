@@ -484,6 +484,12 @@ def trades():
                     "opt_entry_premium": r.opt_entry_premium,
                     "opt_exit_premium": r.opt_exit_premium,
                     "opt_pnl": r.opt_pnl,
+                    # contract liquidity at each decision moment (issue #488) —
+                    # research fields; NULL means "not captured", not "zero"
+                    "opt_entry_volume": r.opt_entry_volume,
+                    "opt_entry_oi": r.opt_entry_oi,
+                    "opt_exit_volume": r.opt_exit_volume,
+                    "opt_exit_oi": r.opt_exit_oi,
                     "gap_pct": r.gap_pct,
                     "level": r.level,
                     "baseline_vol": r.baseline_vol,
