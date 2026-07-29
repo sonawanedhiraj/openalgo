@@ -24,6 +24,7 @@ export interface ChildAccount {
 export interface StrategySetting {
   strategy_name: string
   capital_override_inr: number | null
+  min_one_lot: boolean
 }
 
 export interface MirrorOrder {
@@ -127,11 +128,13 @@ export const brokerAccountsApi = {
   setStrategies: async (
     id: number,
     strategies: string[],
-    capitalOverrides?: Record<string, number | null>
+    capitalOverrides?: Record<string, number | null>,
+    minOneLot?: Record<string, boolean>
   ): Promise<string[]> => {
     const { data } = await webClient.post(`${BASE}/${id}/strategies`, {
       strategies,
       capital_overrides: capitalOverrides ?? {},
+      min_one_lot: minOneLot ?? {},
     })
     return data.strategies
   },
