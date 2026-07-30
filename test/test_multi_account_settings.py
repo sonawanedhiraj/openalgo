@@ -128,8 +128,8 @@ def test_strategy_capital_override_crud(settings_env):
     adb = settings_env
     account = adb.add_account(
         display_name="OverrideChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=15000,
     )
     adb.set_strategies(
@@ -173,8 +173,8 @@ def test_accounts_for_strategy_carries_override(settings_env):
     adb = settings_env
     account = adb.add_account(
         display_name="FanoutOverrideChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=15000,
     )
     adb.update_account(account["id"], is_enabled=True)
@@ -199,8 +199,8 @@ def test_fanout_factor_uses_override(settings_env, monkeypatch):
     adb.set_multi_account_settings(enabled=True, primary_book_capital=1_000_000, updated_by="test")
     account = adb.add_account(
         display_name="FactorChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=15000,
     )
     adb.update_account(account["id"], is_enabled=True)
@@ -282,8 +282,8 @@ def test_min_one_lot_persistence_and_fanout_read(settings_env):
     adb = settings_env
     account = adb.add_account(
         display_name="LotChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=15000,
     )
     adb.update_account(account["id"], is_enabled=True)
@@ -319,8 +319,8 @@ def test_min_one_lot_end_to_end_option_mirror(settings_env, monkeypatch):
     adb.set_multi_account_settings(enabled=True, primary_book_capital=1_000_000, updated_by="t")
     account = adb.add_account(
         display_name="OptChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=15000,
     )
     adb.update_account(account["id"], is_enabled=True)

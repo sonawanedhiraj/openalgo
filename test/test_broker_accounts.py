@@ -115,6 +115,79 @@ def test_add_account_validates_input(accounts_db):
         _add(accounts_db, capital=None)
 
 
+# ---------------------------------------------------------------------------
+# Credential visibility + autofill guard (issue #492)
+# ---------------------------------------------------------------------------
+
+
+def test_row_dict_exposes_masked_api_key_never_the_secret(accounts_db):
+    account = _add(accounts_db)
+    # api_key echoed masked (it already travels in the Kite login URL); the
+    # secret is presence-only.
+    assert account["api_key_masked"] == "chil" + "•" * 8 + "_key"  # pragma: allowlist secret
+    assert account["has_api_secret"] is True
+    assert "child_api_key" not in str(account)
+    assert "child_api_secret" not in str(account)
+
+
+def test_credential_shape_guard_rejects_autofilled_login(accounts_db):
+    """A saved browser login (email + password with punctuation/spaces) is not a
+    plausible Kite credential and must never overwrite a working one."""
+    account = _add(accounts_db)
+    before = accounts_db.get_credentials(account["id"])
+
+    # NB: "" is not here — an empty field means "keep current" (asserted in
+    # test_non_credential_update_preserves_stored_credentials), not "clear".
+    for bad in ("someone@example.com", "my login password", "short", "a" * 65):
+        with pytest.raises(ValueError):
+            accounts_db.update_account(account["id"], api_key=bad)
+        with pytest.raises(ValueError):
+            accounts_db.update_account(account["id"], api_secret=bad)
+
+    # Nothing was written by any rejected attempt.
+    assert accounts_db.get_credentials(account["id"]) == before
+
+    with pytest.raises(ValueError):
+        accounts_db.add_account(
+            display_name="Autofilled",
+            api_key="someone@example.com",  # pragma: allowlist secret
+            api_secret="hunter2 with spaces",  # pragma: allowlist secret
+            capital_inr=100000,
+        )
+
+
+def test_non_credential_update_preserves_stored_credentials(accounts_db):
+    """The regression that produced #492: a routine capital/name edit must leave
+    the credential ciphertext byte-identical."""
+    account = _add(accounts_db)
+    row = accounts_db.db_session.query(accounts_db.BrokerAccount).first()
+    key_before, secret_before = row.api_key_encrypted, row.api_secret_encrypted
+    accounts_db.db_session.remove()
+
+    accounts_db.update_account(account["id"], capital_inr=300000, display_name="Renamed")
+    # An empty-string credential is treated as "keep", not "clear".
+    accounts_db.update_account(account["id"], api_key="", api_secret="")
+
+    row = accounts_db.db_session.query(accounts_db.BrokerAccount).first()
+    assert row.api_key_encrypted == key_before
+    assert row.api_secret_encrypted == secret_before
+    accounts_db.db_session.remove()
+    assert accounts_db.get_credentials(account["id"])[:2] == ("child_api_key", "child_api_secret")
+
+
+def test_api_rejects_implausible_credential_with_400(client, accounts_db):
+    account = _add(accounts_db)
+    resp = client.put(
+        f"/broker_accounts/api/{account['id']}",
+        json={"capital_inr": 400000, "api_key": "someone@example.com"},  # pragma: allowlist secret
+    )
+    assert resp.status_code == 400
+    assert "autofilled" in resp.get_json()["message"]
+    # The rejected request wrote NOTHING — not even the valid capital field.
+    assert accounts_db.get_account(account["id"])["capital_inr"] == 250000.0
+    assert accounts_db.get_credentials(account["id"])[0] == "child_api_key"
+
+
 def test_strategy_allowlist_and_fanout_read(accounts_db):
     acc1 = _add(accounts_db, name="A1")
     acc2 = _add(accounts_db, name="A2")
