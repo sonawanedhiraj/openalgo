@@ -1420,6 +1420,84 @@ def test_pnl_curve_resolves_simplified_engine(app, wired_dbs):
     assert points[0]["pnl"] == 350.0  # 500 + (-150)
 
 
+def test_simplified_engine_long_short_split(app, wired_dbs):
+    """The simplified engine's column carries long/short sub-aggregates keyed off
+    trade_journal.direction (issue #494). The blended headline hides that the two
+    sides diverge, so both must reconcile against the aggregate."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    # Longs: one win (+500), one loss (-800) => net -300, 50% win rate.
+    # Shorts: one win (+900) => net +900, 100% win rate.
+    for symbol, direction, pnl in (
+        ("RVNL", "LONG", 500.0),
+        ("INDIANB", "LONG", -800.0),
+        ("TATAELXSI", "SHORT", 900.0),
+    ):
+        _seed_simplified_journal_row(
+            tj_sess,
+            tjdb,
+            symbol=symbol,
+            direction=direction,
+            placed_at="2026-06-29T09:30:00+05:30",
+            exited_at="2026-06-29T15:14:00+05:30",
+            exit_price=110.0,
+            pnl=pnl,
+            exit_reason="eod_squareoff",
+        )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["cum_net_pnl"] == 600.0  # 500 - 800 + 900
+    assert sb["closed_trades"] == 3
+    assert sb["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": -300.0,
+    }
+    assert sb["short"] == {
+        "n_trades": 1,
+        "wins": 1,
+        "win_rate_pct": 100.0,
+        "net_pnl_inr": 900.0,
+    }
+    # The two sides must account for the whole book — no trade falls through.
+    assert sb["long"]["n_trades"] + sb["short"]["n_trades"] == sb["closed_trades"]
+    assert sb["long"]["net_pnl_inr"] + sb["short"]["net_pnl_inr"] == sb["cum_net_pnl"]
+
+
+def test_simplified_engine_empty_side_renders_none(app, wired_dbs):
+    """A side with no closed trades reports n_trades=0 and None stats so the UI
+    renders '—', never a misleading 0% / ₹0 (issue #494)."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="RVNL",
+        direction="LONG",
+        placed_at="2026-06-29T09:30:00+05:30",
+        exited_at="2026-06-29T15:14:00+05:30",
+        exit_price=110.0,
+        pnl=500.0,
+        exit_reason="eod_squareoff",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"]["n_trades"] == 1
+    assert sb["short"] == {
+        "n_trades": 0,
+        "wins": 0,
+        "win_rate_pct": None,
+        "net_pnl_inr": None,
+    }
+
+
 def test_other_strategies_unaffected_by_simplified_bridge(app, wired_dbs):
     """A trending_equity_intraday journal row must NOT leak into sector_follow
     or futures_follow stats (no regression on the existing branches)."""
