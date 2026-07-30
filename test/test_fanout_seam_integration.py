@@ -99,8 +99,8 @@ def seam_env(monkeypatch):
     # One connected, enabled child on the strategy at 0.25x.
     account = accounts_db.add_account(
         display_name="SeamChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=250000,
     )
     accounts_db.update_account(account["id"], is_enabled=True)
