@@ -1646,6 +1646,23 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
 > `effective_routing`, and the strategies page badges show routing truth
 > (e.g. "Live (held: Analyze on)").
 >
+> **A strategy reading back its OWN positions is NOT a read decoration
+> (issue #497).** `get_positionbook(mode_key=...)` /
+> `get_positionbook_with_auth(mode_key=...)` resolve the book with
+> `resolve_order_mode(mode_key)` — the *same* resolver that routed the order —
+> so the write and the read can never land on different books. Omitting
+> `mode_key` keeps the analyze-overlay behavior for UI reads. This is
+> load-bearing: with Analyze OFF the overlay returns LIVE, so a `sandbox`
+> strategy wrote into `sandbox.db` and read the empty LIVE broker book —
+> `futures_follow_cap50` rehydrated 0 positions and fired **no T+1 exits for
+> four trading days** (2026-07-27..30, 7 NIFTY lots stranded at 110% of book
+> against a 50% cap). It surfaced there first because it trades **NRML**, which
+> has no MIS auto-square-off underneath it. In-repo callers pass their canonical
+> key (`futures_follow_cap50`, `simplified_engine`). **When adding a position
+> read to a strategy, pass `mode_key` — and test the routing, not a mocked
+> `get_positionbook`** (mocking that call is what hid #497 from 5 existing
+> rehydrate tests). See `test/test_positionbook_mode_routing.py`.
+>
 > **Engines + preflight wired to runtime_override (B3, 2026-06-12):** both engines
 > now consult `strategy_runtime_override.is_entry_blocked(strategy)` at job-entry
 > instead of the retired `intent` axis. An active `pause`/`kill_switch` override
