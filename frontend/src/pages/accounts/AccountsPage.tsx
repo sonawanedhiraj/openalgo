@@ -74,11 +74,9 @@ const STRATEGY_MAX_CONCURRENT: Record<string, number> = {
 function StrategyChecklist({
   account,
   knownStrategies,
-  primaryBookCapital,
 }: {
   account: ChildAccount
   knownStrategies: string[]
-  primaryBookCapital: number
 }) {
   const queryClient = useQueryClient()
   const [selected, setSelected] = useState<string[]>(account.strategies)
@@ -497,11 +495,7 @@ export default function AccountsPage() {
                   </Button>
                 </div>
                 {expanded === account.id && data && (
-                  <StrategyChecklist
-                    account={account}
-                    knownStrategies={data.known_strategies}
-                    primaryBookCapital={data.primary_book_capital}
-                  />
+                  <StrategyChecklist account={account} knownStrategies={data.known_strategies} />
                 )}
               </div>
             ))}
