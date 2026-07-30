@@ -61,14 +61,14 @@ function TotpCell({ account }: { account: ChildAccount }) {
   )
 }
 
-// Primary-side per-trade sizing used ONLY for the preview line (display, not
-// stored): open15 ₹1.5L/slot, sector_follow ₹50k/position, futures 1 NIFTY
-// lot ≈ ₹2.8L margin, simplified ₹20k capital base.
-const STRATEGY_SLOT_INFO: Record<string, { slot: number; label: string }> = {
-  open15_vol_breakout: { slot: 150000, label: 'per slot' },
-  sector_follow_cap5_vol: { slot: 50000, label: 'per position' },
-  futures_follow_cap50: { slot: 280000, label: 'per lot (margin)' },
-  simplified_engine: { slot: 20000, label: 'per trade base' },
+// Max concurrent positions per strategy (display-only, for the worst-case
+// exposure line): open15 6 slots, sector_follow 5 positions, futures ~2 lots
+// under the 50% cap, simplified engine ~3 trades/day.
+const STRATEGY_MAX_CONCURRENT: Record<string, number> = {
+  open15_vol_breakout: 6,
+  sector_follow_cap5_vol: 5,
+  futures_follow_cap50: 2,
+  simplified_engine: 3,
 }
 
 function StrategyChecklist({
@@ -82,17 +82,14 @@ function StrategyChecklist({
 }) {
   const queryClient = useQueryClient()
   const [selected, setSelected] = useState<string[]>(account.strategies)
-  const [overrides, setOverrides] = useState<Record<string, number | null>>(() =>
+  const [perTrade, setPerTrade] = useState<Record<string, number | null>>(() =>
     Object.fromEntries(
-      account.strategy_settings.map((s) => [s.strategy_name, s.capital_override_inr])
+      account.strategy_settings.map((s) => [s.strategy_name, s.capital_per_trade_inr])
     )
-  )
-  const [minOneLot, setMinOneLot] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(account.strategy_settings.map((s) => [s.strategy_name, s.min_one_lot]))
   )
 
   const saveMutation = useMutation({
-    mutationFn: () => brokerAccountsApi.setStrategies(account.id, selected, overrides, minOneLot),
+    mutationFn: () => brokerAccountsApi.setStrategies(account.id, selected, perTrade),
     onSuccess: () => {
       toast.success(`Strategies saved for ${account.display_name}`)
       queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
@@ -106,22 +103,22 @@ function StrategyChecklist({
   })
 
   const preview = (name: string) => {
-    const capital = overrides[name] ?? account.capital_inr
-    const factor = capital / primaryBookCapital
-    const info = STRATEGY_SLOT_INFO[name]
-    if (!info) return `factor ${factor.toFixed(3)}×`
-    const perSlot = Math.round(info.slot * factor)
-    if (name === 'futures_follow_cap50' && capital < info.slot) {
-      return `factor ${factor.toFixed(3)}× — ⚠ below 1 lot (needs ≥ ₹${info.slot.toLocaleString('en-IN')}): every mirror skips`
+    const value = perTrade[name]
+    if (!value || value <= 0) {
+      return '\u26a0 not set \u2014 mirrors for this strategy will be SKIPPED until a \u20b9/trade is set'
     }
-    return `factor ${factor.toFixed(3)}× → ≈ ₹${perSlot.toLocaleString('en-IN')} ${info.label}`
+    const maxConcurrent = STRATEGY_MAX_CONCURRENT[name]
+    if (!maxConcurrent) return `\u20b9${value.toLocaleString('en-IN')} per trade`
+    const worstCase = value * maxConcurrent
+    return `\u20b9${value.toLocaleString('en-IN')} per trade \u00d7 up to ${maxConcurrent} concurrent = \u20b9${worstCase.toLocaleString('en-IN')} worst case`
   }
 
   return (
     <div className="mt-2 rounded-md border border-dashed p-3">
       <p className="text-muted-foreground text-xs mb-2">
-        Tick a strategy to mirror it. The Capital field appears only for selected strategies — blank
-        uses the account's base capital (₹{account.capital_inr.toLocaleString('en-IN')}).
+        Tick a strategy to mirror it, then set the ₹ this account deploys PER TRADE of that strategy
+        — quantity is computed from this capital and the live price at mirror time. Unset = mirrors
+        skipped (loudly).
       </p>
       {knownStrategies.map((name) => {
         const isSelected = selected.includes(name)
@@ -146,31 +143,17 @@ function StrategyChecklist({
                 <Input
                   className="w-28 h-8"
                   type="number"
-                  placeholder="base"
-                  value={overrides[name] ?? ''}
+                  placeholder="\u20b9 per trade"
+                  value={perTrade[name] ?? ''}
                   onChange={(e) =>
-                    setOverrides((prev) => ({
+                    setPerTrade((prev) => ({
                       ...prev,
                       [name]: e.target.value === '' ? null : Number(e.target.value),
                     }))
                   }
-                  data-testid={`override-${account.id}-${name}`}
+                  data-testid={`pertrade-${account.id}-${name}`}
                 />
-                <label className="flex items-center gap-1 text-xs text-muted-foreground">
-                  <Checkbox
-                    checked={minOneLot[name] ?? false}
-                    onCheckedChange={(checked) =>
-                      setMinOneLot((prev) => ({ ...prev, [name]: checked === true }))
-                    }
-                    data-testid={`minlot-${account.id}-${name}`}
-                  />
-                  min 1 lot
-                </label>
-                <span className="text-muted-foreground text-xs">
-                  {preview(name)}
-                  {(minOneLot[name] ?? false) &&
-                    ' · 0-lot results round UP to 1 lot (options/futures)'}
-                </span>
+                <span className="text-muted-foreground text-xs">{preview(name)}</span>
               </>
             )}
           </div>
@@ -204,7 +187,6 @@ export default function AccountsPage() {
   const [totpAccount, setTotpAccount] = useState<ChildAccount | null>(null)
   const [totpSecret, setTotpSecret] = useState('')
   const [expanded, setExpanded] = useState<number | null>(null)
-  const [capitalDraft, setCapitalDraft] = useState<number | null>(null)
   const [editAccount, setEditAccount] = useState<ChildAccount | null>(null)
   // Credential replacement is opt-in (issue #492): the fields do not exist in
   // the DOM until this is ticked, so the browser cannot autofill a saved login
@@ -266,7 +248,6 @@ export default function AccountsPage() {
           ? 'Mirror trading ENABLED — applies immediately'
           : 'Mirror trading disabled'
       )
-      setCapitalDraft(null)
       queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
     },
     onError: (e: unknown) => {
@@ -377,26 +358,9 @@ export default function AccountsPage() {
                 Mirror trading {data.multi_account_enabled ? 'ENABLED' : 'disabled'}
               </span>
             </div>
-            <div className="flex items-center gap-2 text-sm">
-              <Label className="text-muted-foreground">Primary book capital (₹)</Label>
-              <Input
-                className="w-32"
-                type="number"
-                value={capitalDraft ?? data.primary_book_capital}
-                onChange={(e) => setCapitalDraft(Number(e.target.value))}
-              />
-              {capitalDraft !== null && capitalDraft !== data.primary_book_capital && (
-                <Button
-                  size="sm"
-                  onClick={() => settingsMutation.mutate({ primary_book_capital: capitalDraft })}
-                >
-                  Save
-                </Button>
-              )}
-            </div>
             <span className="text-muted-foreground text-xs">
               {data.multi_account_enabled
-                ? 'LIVE strategy orders mirror to enabled child accounts, scaled by child capital ÷ primary book. Changes apply immediately.'
+                ? 'LIVE strategy orders mirror to enabled child accounts, sized by each child\u2019s \u20b9-per-trade setting at live prices. Changes apply immediately.'
                 : 'No orders are mirrored while disabled. Accounts can still be set up and logged in.'}
             </span>
           </CardContent>
@@ -442,12 +406,12 @@ export default function AccountsPage() {
                     <div className="font-medium">{account.display_name}</div>
                     <div className="text-xs text-muted-foreground">
                       {account.broker_client_id || '—'} · ₹
-                      {account.capital_inr.toLocaleString('en-IN')} base
+                      {account.capital_inr.toLocaleString('en-IN')} funds
                       {account.strategy_settings
-                        .filter((s) => s.capital_override_inr !== null)
+                        .filter((s) => s.capital_per_trade_inr !== null)
                         .map(
                           (s) =>
-                            ` · ${s.strategy_name.split('_')[0]}: ₹${(s.capital_override_inr as number).toLocaleString('en-IN')}`
+                            ` · ${s.strategy_name.split('_')[0]}: ₹${(s.capital_per_trade_inr as number).toLocaleString('en-IN')}/trade`
                         )
                         .join('')}
                     </div>

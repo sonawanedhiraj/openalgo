@@ -96,7 +96,9 @@ def seam_env(monkeypatch):
     notifications: list[str] = []
     monkeypatch.setattr(fanout, "_notify_operator", lambda m: notifications.append(m))
 
-    # One connected, enabled child on the strategy at 0.25x.
+    # One connected, enabled child sized at ₹15,000 per trade (issue #496);
+    # sizing price stubbed at 500 → 30 shares per mirror.
+    monkeypatch.setattr(fanout, "resolve_sizing_price", lambda od: 500.0)
     account = accounts_db.add_account(
         display_name="SeamChild",
         api_key="childapikey000001",  # pragma: allowlist secret
@@ -104,7 +106,11 @@ def seam_env(monkeypatch):
         capital_inr=250000,
     )
     accounts_db.update_account(account["id"], is_enabled=True)
-    accounts_db.set_strategies(account["id"], ["sector_follow_cap5_vol"])
+    accounts_db.set_strategies(
+        account["id"],
+        ["sector_follow_cap5_vol"],
+        capital_per_trade={"sector_follow_cap5_vol": 15000},
+    )
     upsert_auth(accounts_db.auth_name(account["id"]), "k:tok", "zerodha")
 
     yield pos, fanout, orders_db, accounts_db, parent_stub, child_stub, account, notifications
@@ -157,7 +163,7 @@ def test_live_accepted_parent_triggers_fanout(seam_env):
     # Parent went to the parent broker stub, child mirror to the child stub.
     assert len(parent_stub.placed_orders) == 1
     assert len(child_stub.placed_orders) == 1
-    assert child_stub.placed_orders[0][0]["quantity"] == 13  # 52 x 0.25
+    assert child_stub.placed_orders[0][0]["quantity"] == 30  # 15000 / 500
     rows = orders_db.list_orders()
     assert len(rows) == 1 and rows[0]["status"] == "placed"
     assert rows[0]["parent_orderid"] == "OID1"
@@ -231,12 +237,12 @@ def test_exit_after_rejected_entry_is_skipped_not_shorted(seam_env):
 def test_exit_after_placed_entry_flattens_held_qty(seam_env):
     pos, _fanout, orders_db, _adb, _parent, child_stub, _acc, _n = seam_env
 
-    _place(pos, dict(EQ_ORDER, action="BUY"))  # entry places (13 mirrored)
-    child_stub.open_qty = 13
+    _place(pos, dict(EQ_ORDER, action="BUY"))  # entry places (30 mirrored)
+    child_stub.open_qty = 30
     child_stub.placed_orders.clear()
 
     _place(pos, dict(EQ_ORDER, action="SELL"))
-    assert child_stub.placed_orders[0][0]["quantity"] == 13
+    assert child_stub.placed_orders[0][0]["quantity"] == 30
     assert orders_db.list_orders()[0]["status"] == "placed"
 
 
@@ -245,5 +251,5 @@ def test_genuine_short_entry_still_scales(seam_env):
 
     # No journal history, child flat → a parent SELL is a real short entry.
     _place(pos, dict(EQ_ORDER, action="SELL"))
-    assert child_stub.placed_orders[0][0]["quantity"] == 13
+    assert child_stub.placed_orders[0][0]["quantity"] == 30
     assert orders_db.list_orders()[0]["status"] == "placed"

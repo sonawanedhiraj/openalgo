@@ -27,8 +27,7 @@ export interface ChildAccount {
 
 export interface StrategySetting {
   strategy_name: string
-  capital_override_inr: number | null
-  min_one_lot: boolean
+  capital_per_trade_inr: number | null
 }
 
 export interface MirrorOrder {
@@ -44,7 +43,16 @@ export interface MirrorOrder {
   child_qty: number
   factor: number | null
   parent_orderid: string | null
-  status: 'placed' | 'rejected' | 'skipped_no_session' | 'skipped_zero_qty' | 'error'
+  status:
+    | 'placed'
+    | 'rejected'
+    | 'skipped_no_session'
+    | 'skipped_zero_qty'
+    | 'skipped_no_position'
+    | 'skipped_no_capital'
+    | 'skipped_no_quote'
+    | 'error'
+  sizing_price: number | null
   broker_orderid: string | null
   error_text: string | null
   created_at: string | null
@@ -132,13 +140,11 @@ export const brokerAccountsApi = {
   setStrategies: async (
     id: number,
     strategies: string[],
-    capitalOverrides?: Record<string, number | null>,
-    minOneLot?: Record<string, boolean>
+    capitalPerTrade?: Record<string, number | null>
   ): Promise<string[]> => {
     const { data } = await webClient.post(`${BASE}/${id}/strategies`, {
       strategies,
-      capital_overrides: capitalOverrides ?? {},
-      min_one_lot: minOneLot ?? {},
+      capital_per_trade: capitalPerTrade ?? {},
     })
     return data.strategies
   },

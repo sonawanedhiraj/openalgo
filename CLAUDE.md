@@ -1582,12 +1582,20 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
 - **Fan-out** (`services/account_fanout_service.py`): fires from ONE seam at
   the tail of `place_order_with_auth`'s LIVE-accepted branch (covers entries,
   exits, watchdog flattens, kill-switch closes uniformly). Gating: env
-  `MULTI_ACCOUNT_ENABLED` (default **false**) + LIVE parent + broker-accepted
-  + known strategy + enabled child selecting it. Sizing: `factor =
-  child.capital_inr / PRIMARY_BOOK_CAPITAL` (env, default 10L), floored to
-  shares/lots; EXITS flatten the child's own broker position, never blind
-  scaling; a flat child whose entry attempt recently FAILED gets
-  `skipped_no_position` (never a naked scaled position — issue #478 guard).
+  the UI master switch (`multi_account_settings.enabled`, default **false**;
+  issue #484 — env vars are only the first-boot seed) + LIVE parent +
+  broker-accepted + known strategy + enabled child selecting it.
+  **Sizing is capital-per-trade (issue #496, supersedes the ratio model):**
+  each (child, strategy) row carries `capital_per_trade_inr` — OPENING
+  quantity = `floor(capital ÷ price)` (equity) or `floor(capital ÷
+  (premium × lotsize)) × lotsize` (derivatives), priced from the parent's
+  LIMIT price or a live quote at mirror time (`resolve_sizing_price`;
+  journaled as `account_orders.sizing_price`). Unset capital →
+  `skipped_no_capital`, quote failure → `skipped_no_quote`, unaffordable →
+  `skipped_zero_qty` — all loud, never guessed. EXITS flatten the child's
+  own broker position (never blocked by capital/quote availability); a flat
+  child whose entry attempt recently FAILED gets `skipped_no_position`
+  (never a naked position — issue #478 guard).
   Fire-and-forget per-child isolation; every attempt journaled to
   `account_orders`; every non-placed outcome Telegrams
   (`multi_account_mirror`).

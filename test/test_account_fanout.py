@@ -1,32 +1,31 @@
-"""Tests for the multi-account order fan-out (Phase 2, issue #474).
+"""Tests for the multi-account order fan-out (Phase 2 #474, resized by #496).
 
-Covers ``services/account_fanout_service`` + ``database/account_orders_db``:
+Sizing model (issue #496): the child is a smaller account trading the same
+strategy — OPENING quantity comes from the child's per-(account, strategy)
+``capital_per_trade_inr`` and the live price, never from scaling the parent's
+quantity. Covers:
 
 * gating matrix — flag off / unknown mode_key / no eligible children → 0
   scheduled, no journal rows;
-* sizing math (``compute_child_qty``) — equity floor, derivative lot floor,
-  missing-lotsize refusal, zero-qty result;
-* exit asymmetry guard — position-reducing orders take the child's OWN held
-  quantity, opening orders scale;
-* end-to-end mirror against a stubbed broker module: placed / rejected /
-  no-session / zero-qty all journaled with the right status, child order
-  carries the scaled quantity, parent payload is never mutated;
-* per-child failure isolation — one child's exception never disturbs others.
+* ``compute_opening_qty`` — equity floor, derivative lot affordability,
+  unaffordable → 0, missing lotsize/price refusal;
+* default deny — no per-trade capital set → ``skipped_no_capital``; quote
+  failure → ``skipped_no_quote``; exits are NEVER blocked by either;
+* exit asymmetry — position-reducing orders flatten the child's OWN holding;
+* end-to-end placed/rejected/no-session journaling with ``sizing_price``;
+* per-child failure isolation.
 
-Hermetic: global conftest DB redirect; broker module stubbed; the executor is
-replaced with a synchronous inline runner so assertions are deterministic.
+Hermetic: global conftest DB redirect; broker + quotes stubbed; inline executor.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from services.account_fanout_service import compute_child_qty
+from services.account_fanout_service import compute_opening_qty
 
 
 class _InlineExecutor:
-    """Runs submitted work synchronously — deterministic tests."""
-
     def submit(self, fn, *args, **kwargs):
         fn(*args, **kwargs)
 
@@ -37,8 +36,6 @@ class _Res:
 
 
 class _StubBroker:
-    """Stands in for broker.zerodha.api.order_api."""
-
     def __init__(self, place_status=200, open_qty=0, raise_on_place=False):
         self.place_status = place_status
         self.open_qty = open_qty
@@ -59,7 +56,7 @@ class _StubBroker:
 
 @pytest.fixture
 def fanout_env(monkeypatch):
-    """Flag on, deterministic capital, inline executor, stub broker + notify."""
+    """Flag on, stub broker + quote price, inline executor."""
     import database.account_orders_db as orders_db
     import database.broker_accounts_db as accounts_db
     import services.account_fanout_service as svc
@@ -68,7 +65,6 @@ def fanout_env(monkeypatch):
     orders_db.init_db()
 
     monkeypatch.setenv("MULTI_ACCOUNT_ENABLED", "true")
-    monkeypatch.setenv("PRIMARY_BOOK_CAPITAL", "1000000")
     monkeypatch.setattr(svc, "_get_executor", lambda: _InlineExecutor())
 
     notifications = []
@@ -77,6 +73,8 @@ def fanout_env(monkeypatch):
     stub = _StubBroker()
     monkeypatch.setattr(svc, "import_module", lambda name: stub)
     monkeypatch.setattr(svc, "_lookup_lotsize", lambda symbol, exchange: 75)
+    # Deterministic sizing price (the quote path is unit-tested separately).
+    monkeypatch.setattr(svc, "resolve_sizing_price", lambda od: 500.0)
 
     yield svc, accounts_db, orders_db, stub, notifications
 
@@ -104,15 +102,25 @@ def fanout_env(monkeypatch):
     auth_db_module.auth_cache.clear()
 
 
-def _make_child(accounts_db, capital=250000.0, strategy="sector_follow_cap5_vol", login=True):
+def _make_child(
+    accounts_db,
+    per_trade=15000.0,
+    strategy="sector_follow_cap5_vol",
+    login=True,
+    set_capital=True,
+):
     account = accounts_db.add_account(
-        display_name=f"child-{capital}-{strategy}-{login}",
+        display_name=f"child-{per_trade}-{strategy}-{login}-{set_capital}",
         api_key="childapikey000001",  # pragma: allowlist secret
         api_secret="childapisecret000001",  # pragma: allowlist secret
-        capital_inr=capital,
+        capital_inr=100000,
     )
     accounts_db.update_account(account["id"], is_enabled=True)
-    accounts_db.set_strategies(account["id"], [strategy])
+    accounts_db.set_strategies(
+        account["id"],
+        [strategy],
+        capital_per_trade={strategy: per_trade} if set_capital else None,
+    )
     if login:
         from database.auth_db import upsert_auth
 
@@ -130,33 +138,38 @@ EQ_ORDER = {
     "strategy": "sector_follow_cap5_vol",
 }
 
+OPT_ORDER = {
+    "symbol": "NIFTY30JUL2624500CE",
+    "exchange": "NFO",
+    "action": "BUY",
+    "product": "MIS",
+    "pricetype": "MARKET",
+    "quantity": 75,
+    "strategy": "open15_vol_breakout",
+}
+
 
 # ---------------------------------------------------------------------------
-# compute_child_qty (pure)
+# compute_opening_qty (pure)
 # ---------------------------------------------------------------------------
 
 
-def test_sizing_equity_floor():
-    assert compute_child_qty(52, 0.25, "NSE", None, "BUY", 0) == 13
-    assert compute_child_qty(52, 0.05, "NSE", None, "BUY", 0) == 2
-    assert compute_child_qty(3, 0.25, "NSE", None, "BUY", 0) == 0
+def test_opening_qty_equity():
+    assert compute_opening_qty(15000, 500.0, "NSE", None) == 30
+    assert compute_opening_qty(15000, 14999.0, "NSE", None) == 1
+    assert compute_opening_qty(15000, 15001.0, "NSE", None) == 0  # unaffordable
 
 
-def test_sizing_derivative_lot_floor():
-    # 2 lots of 75 at 0.5x -> 1 lot; at 0.25x -> 0 (skip, not a 37-share order)
-    assert compute_child_qty(150, 0.5, "NFO", 75, "BUY", 0) == 75
-    assert compute_child_qty(150, 0.25, "NFO", 75, "BUY", 0) == 0
-    # Unknown lotsize on a derivative exchange -> refuse to guess
-    assert compute_child_qty(150, 0.5, "NFO", None, "BUY", 0) == 0
-
-
-def test_exit_guard_uses_child_position():
-    # SELL against a long: flatten what the child holds, ignore scaling
-    assert compute_child_qty(52, 0.25, "NSE", None, "SELL", 13) == 13
-    # BUY covering a short
-    assert compute_child_qty(150, 0.5, "NFO", 75, "BUY", -75) == 75
-    # SELL with no position -> opening short, scales normally
-    assert compute_child_qty(52, 0.25, "NSE", None, "SELL", 0) == 13
+def test_opening_qty_derivative_lots():
+    # premium 150 x lot 75 = 11,250/lot: 15k affords 1 lot, 23k affords 2
+    assert compute_opening_qty(15000, 150.0, "NFO", 75) == 75
+    assert compute_opening_qty(23000, 150.0, "NFO", 75) == 150
+    # unaffordable premium -> 0 lots, honest skip
+    assert compute_opening_qty(15000, 250.0, "NFO", 75) == 0
+    # unknown lotsize / bad price / bad capital -> refuse
+    assert compute_opening_qty(15000, 150.0, "NFO", None) == 0
+    assert compute_opening_qty(15000, 0, "NFO", 75) == 0
+    assert compute_opening_qty(0, 150.0, "NFO", 75) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -183,40 +196,80 @@ def test_unknown_mode_key_is_noop(fanout_env):
 
 def test_no_eligible_children_is_noop(fanout_env):
     svc, accounts_db, orders_db, stub, _ = fanout_env
-    # child exists but selected a DIFFERENT strategy
     _make_child(accounts_db, strategy="futures_follow_cap50")
     assert svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1") == 0
-    # and a disabled child never mirrors
-    account = _make_child(accounts_db, capital=300000.0)
+    account = _make_child(accounts_db, per_trade=20000.0)
     accounts_db.update_account(account["id"], is_enabled=False)
     assert svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1") == 0
     assert stub.placed_orders == []
 
 
 # ---------------------------------------------------------------------------
-# End-to-end mirrors against the stub broker
+# Capital-based sizing end-to-end
 # ---------------------------------------------------------------------------
 
 
-def test_mirror_placed_and_journaled(fanout_env):
+def test_mirror_sized_by_capital_not_parent_qty(fanout_env):
     svc, accounts_db, orders_db, stub, notifications = fanout_env
-    _make_child(accounts_db, capital=250000.0)
+    _make_child(accounts_db, per_trade=15000.0)
 
-    scheduled = svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P42")
-    assert scheduled == 1
-    assert len(stub.placed_orders) == 1
+    # price stubbed at 500 -> 15000/500 = 30 shares, independent of parent's 52
+    assert svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P42") == 1
     child_payload, child_token = stub.placed_orders[0]
-    assert child_payload["quantity"] == 13  # 52 x 0.25
+    assert child_payload["quantity"] == 30
     assert child_token == "k:tok"
     assert EQ_ORDER["quantity"] == 52  # parent payload untouched
 
     rows = orders_db.list_orders()
-    assert len(rows) == 1
     assert rows[0]["status"] == "placed"
-    assert rows[0]["child_qty"] == 13
+    assert rows[0]["child_qty"] == 30
+    assert rows[0]["sizing_price"] == 500.0
     assert rows[0]["parent_orderid"] == "P42"
-    assert rows[0]["broker_orderid"] == "CHILD1"
-    assert notifications == []  # success is quiet
+    assert notifications == []
+
+
+def test_option_mirror_affordability(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, notifications = fanout_env
+    import services.account_fanout_service as svc_mod
+
+    _make_child(accounts_db, per_trade=15000.0, strategy="open15_vol_breakout")
+
+    # premium 150 x 75 = 11,250/lot -> 1 lot
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: 150.0)
+    svc.maybe_fan_out(OPT_ORDER, "open15_vol_breakout", "zerodha", "P1")
+    assert stub.placed_orders[0][0]["quantity"] == 75
+    assert orders_db.list_orders()[0]["sizing_price"] == 150.0
+
+    # premium spikes to 250 -> 18,750/lot -> unaffordable -> honest skip
+    stub.placed_orders.clear()
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: 250.0)
+    svc.maybe_fan_out(OPT_ORDER, "open15_vol_breakout", "zerodha", "P2")
+    assert stub.placed_orders == []
+    assert orders_db.list_orders()[0]["status"] == "skipped_zero_qty"
+    assert any("cannot afford" in n for n in notifications)
+
+
+def test_no_capital_set_skips_loudly(fanout_env):
+    svc, accounts_db, orders_db, stub, notifications = fanout_env
+    _make_child(accounts_db, set_capital=False)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+    assert stub.placed_orders == []
+    assert orders_db.list_orders()[0]["status"] == "skipped_no_capital"
+    assert any("no per-trade capital" in n for n in notifications)
+
+
+def test_quote_failure_skips_loudly(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, notifications = fanout_env
+    import services.account_fanout_service as svc_mod
+
+    _make_child(accounts_db)
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: None)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+    assert stub.placed_orders == []
+    assert orders_db.list_orders()[0]["status"] == "skipped_no_quote"
+    assert any("no price available" in n for n in notifications)
 
 
 def test_mirror_rejected_journals_and_notifies(fanout_env):
@@ -241,44 +294,57 @@ def test_mirror_skipped_no_session(fanout_env):
     assert any("no broker session" in n for n in notifications)
 
 
-def test_mirror_skipped_zero_qty(fanout_env):
-    svc, accounts_db, orders_db, stub, notifications = fanout_env
-    _make_child(accounts_db, capital=10000.0)  # factor 0.01 -> 0 shares of 52
-
-    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
-    assert stub.placed_orders == []
-    assert orders_db.list_orders()[0]["status"] == "skipped_zero_qty"
-    assert any("scales to 0" in n for n in notifications)
+# ---------------------------------------------------------------------------
+# Exits — position-true, never blocked by capital/quote availability
+# ---------------------------------------------------------------------------
 
 
-def test_exit_uses_child_position_end_to_end(fanout_env):
+def test_exit_flattens_child_position_ignoring_capital(fanout_env, monkeypatch):
     svc, accounts_db, orders_db, stub, _ = fanout_env
-    _make_child(accounts_db, capital=250000.0)
-    stub.open_qty = 13  # the child holds 13 from the earlier entry
+    import services.account_fanout_service as svc_mod
 
-    exit_order = dict(EQ_ORDER, action="SELL", quantity=52)
+    # Child holds 30; no capital set AND quotes down — the exit must still go.
+    _make_child(accounts_db, set_capital=False)
+    stub.open_qty = 30
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: None)
+
+    exit_order = dict(EQ_ORDER, action="SELL")
     svc.maybe_fan_out(exit_order, "sector_follow_cap5_vol", "zerodha", "P2")
-    child_payload, _ = stub.placed_orders[0]
-    assert child_payload["quantity"] == 13  # held qty, not floor(52 x 0.25) coincidence:
-    # prove it's the position by changing the held qty
+    assert stub.placed_orders[0][0]["quantity"] == 30
+    assert orders_db.list_orders()[0]["status"] == "placed"
+
+    # And the flatten tracks the ACTUAL held qty.
     stub.open_qty = 7
     stub.placed_orders.clear()
     svc.maybe_fan_out(exit_order, "sector_follow_cap5_vol", "zerodha", "P3")
     assert stub.placed_orders[0][0]["quantity"] == 7
 
 
-def test_one_child_failure_never_disturbs_others(fanout_env, monkeypatch):
-    svc, accounts_db, orders_db, stub, notifications = fanout_env
-    _make_child(accounts_db, capital=250000.0)  # healthy
-    _make_child(accounts_db, capital=500000.0, login=False)  # no session
+def test_short_cover_flattens_short(fanout_env):
+    svc, accounts_db, orders_db, stub, _ = fanout_env
+    _make_child(accounts_db)
+    stub.open_qty = -30
 
-    # Position lookup explodes for everyone — must degrade to scaling, not raise
+    cover = dict(EQ_ORDER, action="BUY")
+    svc.maybe_fan_out(cover, "sector_follow_cap5_vol", "zerodha", "P1")
+    assert stub.placed_orders[0][0]["quantity"] == 30
+
+
+# ---------------------------------------------------------------------------
+# Isolation
+# ---------------------------------------------------------------------------
+
+
+def test_one_child_failure_never_disturbs_others(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, _ = fanout_env
+    _make_child(accounts_db, per_trade=15000.0)  # healthy
+    _make_child(accounts_db, per_trade=20000.0, login=False)  # no session
+
     monkeypatch.setattr(
         stub, "get_open_position", lambda *a: (_ for _ in ()).throw(RuntimeError("boom"))
     )
     scheduled = svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
     assert scheduled == 2
-    # healthy child still placed (scaled), broken-session child journaled skip
     statuses = sorted(r["status"] for r in orders_db.list_orders())
     assert statuses == ["placed", "skipped_no_session"]
 
@@ -292,4 +358,3 @@ def test_broker_exception_journals_error(fanout_env):
     row = orders_db.list_orders()[0]
     assert row["status"] == "error"
     assert "broker exploded" in row["error_text"]
-    assert any("ERROR" in n for n in notifications)

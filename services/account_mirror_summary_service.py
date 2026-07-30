@@ -82,7 +82,7 @@ def build_eod_summary(rows: list[dict], accounts: list[dict]) -> str | None:
     for account_id, counts in sorted(per_account.items()):
         name = names.get(account_id, f"account {account_id}")
         placed = counts.get("placed", 0)
-        skipped = counts.get("skipped_no_session", 0) + counts.get("skipped_zero_qty", 0)
+        skipped = sum(v for k, v in counts.items() if k.startswith("skipped"))
         bad = counts.get("rejected", 0) + counts.get("error", 0)
         parts = [f"{placed} placed"]
         if skipped:
