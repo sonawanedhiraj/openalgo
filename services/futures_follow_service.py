@@ -2154,6 +2154,13 @@ class FuturesFollowService:
         NIFTY*FUT leg on NFO/NRML that the ``paper_book`` doesn't already know
         about, so the 15:25/15:28 exit jobs will square it off.
 
+        ``mode_key=STRATEGY_NAME`` is load-bearing (issue #497): it resolves the
+        book with the SAME ``resolve_order_mode`` that routed the entry, so this
+        read can never land on a different book than the write. Without it the
+        read fell through to the platform analyze overlay, and a ``sandbox``
+        strategy with Analyze OFF read the LIVE broker book — an empty position
+        list, an empty ``paper_book``, and four trading days of missed T+1 exits.
+
         Returns the number of positions rehydrated. Never raises.
         """
         try:
@@ -2163,7 +2170,7 @@ class FuturesFollowService:
             if not api_key:
                 logger.warning("futures_follow rehydrate: no api_key; skipping")
                 return 0
-            success, resp, _ = get_positionbook(api_key=api_key)
+            success, resp, _ = get_positionbook(api_key=api_key, mode_key=STRATEGY_NAME)
             if not success or not isinstance(resp, dict):
                 logger.warning("futures_follow rehydrate: positionbook fetch failed: %r", resp)
                 return 0

@@ -1297,10 +1297,16 @@ class SimplifiedStockEngineService:
         that the engine has no record of. The engine's own check_eod_exits already
         emits exits for positions it knows about, so this pass only catches the
         orphans and any engine↔store qty mismatch (reconciled via #265).
+
+        ``mode_key='simplified_engine'`` matches the order-dispatch key used by
+        ``_place_exit_order`` so this read resolves the same book the orders were
+        written to (issue #497 — the analyze overlay is not the strategy's mode).
         """
         from services.positionbook_service import get_positionbook
 
-        success, response, status_code = get_positionbook(api_key=api_key)
+        success, response, status_code = get_positionbook(
+            api_key=api_key, mode_key="simplified_engine"
+        )
         if not success:
             logger.warning(
                 "[SIMPLIFIED-EOD] positionbook fetch failed status=%s response=%s",

@@ -77,7 +77,10 @@ def import_broker_module(broker_name: str) -> dict[str, Any] | None:
 
 
 def get_positionbook_with_auth(
-    auth_token: str, broker: str, original_data: dict[str, Any] = None
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any] = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get position book details using provided auth token.
@@ -86,6 +89,11 @@ def get_positionbook_with_auth(
         auth_token: Authentication token for the broker API
         broker: Name of the broker
         original_data: Original request data (for sandbox mode, optional for internal calls)
+        mode_key: Strategy identity (issue #497). When supplied, the book is
+            resolved by ``resolve_order_mode(mode_key)`` — the SAME resolver
+            that decided where the order was written — instead of the platform
+            analyze overlay. ``None`` keeps the overlay behavior for UI read
+            decorations.
 
     Returns:
         Tuple containing:
@@ -96,9 +104,19 @@ def get_positionbook_with_auth(
     # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
     # SKIP/DISABLED are not order rejections for reads — operator still wants
     # to see state. Internal calls (no original_data) use the live broker.
-    from services.mode_service import EffectiveMode, resolve_effective_mode
+    #
+    # Issue #497 — a strategy reading back its OWN positions must resolve the
+    # book with `resolve_order_mode(mode_key)`, not the analyze overlay. #440
+    # made `resolve_effective_mode()` the overlay only, so a `sandbox` strategy
+    # running with Analyze OFF wrote its orders to sandbox.db but read the LIVE
+    # broker book — futures_follow_cap50 saw an empty position book and stopped
+    # exiting entirely for four trading days. Same resolver both directions is
+    # the invariant that makes write and read incapable of diverging.
+    from services.mode_service import EffectiveMode, resolve_effective_mode, resolve_order_mode
 
-    if resolve_effective_mode() is EffectiveMode.SANDBOX and original_data:
+    book_mode = resolve_order_mode(mode_key) if mode_key else resolve_effective_mode()
+
+    if book_mode is EffectiveMode.SANDBOX and original_data:
         from services.sandbox_service import sandbox_get_positions
 
         api_key = original_data.get("apikey")
@@ -147,7 +165,10 @@ def get_positionbook_with_auth(
 
 
 def get_positionbook(
-    api_key: str | None = None, auth_token: str | None = None, broker: str | None = None
+    api_key: str | None = None,
+    auth_token: str | None = None,
+    broker: str | None = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get position book details.
@@ -157,6 +178,10 @@ def get_positionbook(
         api_key: OpenAlgo API key (for API-based calls)
         auth_token: Direct broker authentication token (for internal calls)
         broker: Direct broker name (for internal calls)
+        mode_key: Strategy identity (issue #497). An in-repo strategy reading
+            back its OWN positions MUST pass its canonical ``strategy_mode``
+            key so the book is resolved by the same ``resolve_order_mode``
+            that routed the order. Omit for UI read decorations.
 
     Returns:
         Tuple containing:
@@ -170,11 +195,11 @@ def get_positionbook(
         if AUTH_TOKEN is None:
             return False, {"status": "error", "message": "Invalid openalgo apikey"}, 403
         original_data = {"apikey": api_key}
-        return get_positionbook_with_auth(AUTH_TOKEN, broker_name, original_data)
+        return get_positionbook_with_auth(AUTH_TOKEN, broker_name, original_data, mode_key=mode_key)
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_positionbook_with_auth(auth_token, broker, None)
+        return get_positionbook_with_auth(auth_token, broker, None, mode_key=mode_key)
 
     # Case 3: Invalid parameters
     else:
