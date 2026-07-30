@@ -35,10 +35,28 @@ function TotpCell({ account }: { account: ChildAccount }) {
     return <span className="text-muted-foreground text-xs">not enrolled</span>
   }
   if (!data) return <span className="text-muted-foreground text-xs">…</span>
+  // The code is copied UNSPACED — Kite's 2FA field rejects the display spacing.
+  const copyCode = () => {
+    navigator.clipboard.writeText(data.code)
+    toast.success('TOTP code copied')
+  }
   return (
-    <span className="font-mono text-amber-500" data-testid={`totp-${account.id}`}>
-      {data.code.slice(0, 3)} {data.code.slice(3)}
-      <span className="text-muted-foreground text-xs ml-1">({data.seconds_remaining}s)</span>
+    <span className="flex items-center gap-1" data-testid={`totp-${account.id}`}>
+      <span className="font-mono text-amber-500">
+        {data.code.slice(0, 3)} {data.code.slice(3)}
+        <span className="text-muted-foreground text-xs ml-1">({data.seconds_remaining}s)</span>
+      </span>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-6 px-1"
+        title="Copy TOTP code"
+        aria-label={`Copy TOTP code for ${account.display_name}`}
+        onClick={copyCode}
+        data-testid={`copy-totp-${account.id}`}
+      >
+        <Copy className="h-3 w-3" />
+      </Button>
     </span>
   )
 }
@@ -188,6 +206,10 @@ export default function AccountsPage() {
   const [expanded, setExpanded] = useState<number | null>(null)
   const [capitalDraft, setCapitalDraft] = useState<number | null>(null)
   const [editAccount, setEditAccount] = useState<ChildAccount | null>(null)
+  // Credential replacement is opt-in (issue #492): the fields do not exist in
+  // the DOM until this is ticked, so the browser cannot autofill a saved login
+  // into them and a routine capital edit can never overwrite working keys.
+  const [replaceCreds, setReplaceCreds] = useState(false)
   const [editForm, setEditForm] = useState({
     display_name: '',
     broker_client_id: '',
@@ -198,6 +220,7 @@ export default function AccountsPage() {
 
   const openEdit = (account: ChildAccount) => {
     setEditAccount(account)
+    setReplaceCreds(false)
     setEditForm({
       display_name: account.display_name,
       broker_client_id: account.broker_client_id ?? '',
@@ -213,8 +236,8 @@ export default function AccountsPage() {
         display_name: editForm.display_name,
         broker_client_id: editForm.broker_client_id,
         capital_inr: editForm.capital_inr,
-        ...(editForm.api_key ? { api_key: editForm.api_key } : {}),
-        ...(editForm.api_secret ? { api_secret: editForm.api_secret } : {}),
+        ...(replaceCreds && editForm.api_key ? { api_key: editForm.api_key } : {}),
+        ...(replaceCreds && editForm.api_secret ? { api_secret: editForm.api_secret } : {}),
       }),
     onSuccess: () => {
       toast.success('Account updated')
@@ -434,6 +457,11 @@ export default function AccountsPage() {
                   ) : (
                     <Badge variant="destructive">Login needed</Badge>
                   )}
+                  {(!account.api_key_masked || !account.has_api_secret) && (
+                    <Badge variant="destructive" data-testid={`no-creds-${account.id}`}>
+                      credentials missing
+                    </Badge>
+                  )}
                   {account.today_mirrors &&
                     (account.today_mirrors.placed > 0 ||
                       account.today_mirrors.skipped > 0 ||
@@ -542,6 +570,8 @@ export default function AccountsPage() {
             <div>
               <Label>Kite Connect API Key</Label>
               <Input
+                name="child-kite-api-key"
+                autoComplete="off"
                 value={form.api_key}
                 onChange={(e) => setForm({ ...form, api_key: e.target.value })}
               />
@@ -554,6 +584,8 @@ export default function AccountsPage() {
               <Label>Kite Connect API Secret</Label>
               <Input
                 type="password"
+                name="child-kite-api-secret"
+                autoComplete="new-password"
                 value={form.api_secret}
                 onChange={(e) => setForm({ ...form, api_secret: e.target.value })}
               />
@@ -616,22 +648,73 @@ export default function AccountsPage() {
                 Per-strategy overrides live in the Strategies panel.
               </p>
             </div>
-            <div>
-              <Label>Replace API Key (optional)</Label>
-              <Input
-                value={editForm.api_key}
-                onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
-                placeholder="leave blank to keep current"
-              />
-            </div>
-            <div>
-              <Label>Replace API Secret (optional)</Label>
-              <Input
-                type="password"
-                value={editForm.api_secret}
-                onChange={(e) => setEditForm({ ...editForm, api_secret: e.target.value })}
-                placeholder="leave blank to keep current"
-              />
+            <div className="rounded-md border p-3 space-y-2">
+              <div className="text-sm" data-testid="stored-credentials">
+                <div>
+                  <span className="text-muted-foreground">Stored API key: </span>
+                  {editAccount?.api_key_masked ? (
+                    <code className="font-mono">{editAccount.api_key_masked}</code>
+                  ) : (
+                    <span className="text-destructive">none on file</span>
+                  )}
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Stored API secret: </span>
+                  {editAccount?.has_api_secret ? (
+                    <span>stored</span>
+                  ) : (
+                    <span className="text-destructive">none on file</span>
+                  )}
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={replaceCreds}
+                  onCheckedChange={(checked) => {
+                    const on = checked === true
+                    setReplaceCreds(on)
+                    if (!on) setEditForm((prev) => ({ ...prev, api_key: '', api_secret: '' }))
+                  }}
+                  data-testid="replace-creds"
+                />
+                Replace API key / secret
+              </label>
+              {replaceCreds ? (
+                <>
+                  <div>
+                    <Label>New API Key</Label>
+                    <Input
+                      name="child-kite-api-key"
+                      autoComplete="off"
+                      value={editForm.api_key}
+                      onChange={(e) => setEditForm({ ...editForm, api_key: e.target.value })}
+                      placeholder="from developers.kite.trade"
+                      data-testid="edit-api-key"
+                    />
+                  </div>
+                  <div>
+                    <Label>New API Secret</Label>
+                    <Input
+                      type="password"
+                      name="child-kite-api-secret"
+                      autoComplete="new-password"
+                      value={editForm.api_secret}
+                      onChange={(e) => setEditForm({ ...editForm, api_secret: e.target.value })}
+                      placeholder="from developers.kite.trade"
+                      data-testid="edit-api-secret"
+                    />
+                  </div>
+                  <p className="text-muted-foreground text-xs">
+                    Both fields are optional — a blank field keeps the stored value. Type these
+                    yourself; never accept a browser autofill here.
+                  </p>
+                </>
+              ) : (
+                <p className="text-muted-foreground text-xs">
+                  Credentials are left untouched. Tick the box only when you actually want to
+                  replace them.
+                </p>
+              )}
             </div>
           </div>
           <DialogFooter>

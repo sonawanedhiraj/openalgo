@@ -142,8 +142,8 @@ def test_reminder_job_fires_for_disconnected_child(accounts_env, monkeypatch):
     accounts_db, _ = accounts_env
     account = accounts_db.add_account(
         display_name="ReminderChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=100000,
     )
     accounts_db.update_account(account["id"], is_enabled=True)
@@ -169,8 +169,8 @@ def test_overview_carries_today_mirror_counts(accounts_env):
 
     account = accounts_db.add_account(
         display_name="StatsChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=100000,
     )
     for status in ("placed", "placed", "skipped_no_session", "error"):
@@ -195,8 +195,8 @@ def test_mirror_orders_endpoint(accounts_env):
 
     account = accounts_db.add_account(
         display_name="EndpointChild",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=100000,
     )
     orders_db.record_mirror_attempt(

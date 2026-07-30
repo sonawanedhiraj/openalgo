@@ -10,6 +10,10 @@ export interface ChildAccount {
   broker_client_id: string | null
   capital_inr: number
   is_enabled: boolean
+  // Masked echo of the stored Kite api_key (issue #492) — null when the row has
+  // no readable key. The secret is never echoed, only its presence.
+  api_key_masked: string | null
+  has_api_secret: boolean
   has_totp_secret: boolean
   last_login_at: string | null
   created_at: string | null

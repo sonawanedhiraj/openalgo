@@ -107,8 +107,8 @@ def fanout_env(monkeypatch):
 def _make_child(accounts_db, capital=250000.0, strategy="sector_follow_cap5_vol", login=True):
     account = accounts_db.add_account(
         display_name=f"child-{capital}-{strategy}-{login}",
-        api_key="k",  # pragma: allowlist secret
-        api_secret="s",  # pragma: allowlist secret
+        api_key="childapikey000001",  # pragma: allowlist secret
+        api_secret="childapisecret000001",  # pragma: allowlist secret
         capital_inr=capital,
     )
     accounts_db.update_account(account["id"], is_enabled=True)

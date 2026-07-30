@@ -20,6 +20,7 @@ exchange only. NullPool per the project's SQLite connection-pooling rule.
 """
 
 import os
+import re
 from datetime import datetime
 
 from sqlalchemy import (
@@ -54,6 +55,31 @@ Base = declarative_base()
 Base.query = db_session.query_property()
 
 AUTH_NAME_PREFIX = "acct:"
+
+# Kite Connect credentials are alphanumeric tokens (api_key 16, api_secret 32).
+# Anything with whitespace, an "@", or outside this shape is not a Kite
+# credential — in practice it is the browser having autofilled the OpenAlgo
+# login into the Edit dialog's replace fields (issue #492).
+_CREDENTIAL_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_AUTOFILL_HINT = (
+    "does not look like a Kite Connect credential (expected 8-64 characters, "
+    "letters/digits/-/_ only). If you did not type it, your browser most likely "
+    "autofilled a saved login — clear the field and re-enter the value from "
+    "developers.kite.trade."
+)
+
+
+def validate_credential(field: str, value: str) -> str:
+    """Return the stripped credential, or raise ValueError if implausible.
+
+    A shape guard, not an authenticity check: it cannot tell a wrong Kite key
+    from a right one, only reject values that Kite could never have issued.
+    That is enough to stop the autofill class of silent overwrite (issue #492).
+    """
+    cleaned = str(value or "").strip()
+    if not _CREDENTIAL_RE.match(cleaned):
+        raise ValueError(f"{field} {_AUTOFILL_HINT}")
+    return cleaned
 
 
 class MultiAccountSettings(Base):
@@ -245,6 +271,30 @@ def auth_name(account_id: int) -> str:
     return f"{AUTH_NAME_PREFIX}{int(account_id)}"
 
 
+def _mask_api_key(encrypted: str | None) -> str | None:
+    """``ab12••••••••yz90`` for the stored api_key, or None if unreadable.
+
+    Issue #492: the /accounts UI had NO way to tell "credentials on file" from
+    "credentials blank", so a silently clobbered api_key (browser autofill on
+    the Edit dialog) looked identical to a healthy account until the next Kite
+    login failed. The api_key is not a secret — ``get_login_url`` already puts
+    it in a URL the operator opens — so a masked echo is strictly safer than
+    the previous blindness. The SECRET is never echoed, masked or otherwise.
+    """
+    if not encrypted:
+        return None
+    try:
+        plain = decrypt_token(encrypted)
+    except Exception:
+        logger.exception("api_key mask failed — undecryptable ciphertext")
+        return None
+    if not plain:
+        return None
+    if len(plain) <= 8:
+        return "•" * len(plain)
+    return f"{plain[:4]}{'•' * 8}{plain[-4:]}"
+
+
 def _row_to_dict(row: BrokerAccount) -> dict:
     """Public dict — NEVER includes decrypted credentials or the TOTP secret."""
     return {
@@ -254,6 +304,8 @@ def _row_to_dict(row: BrokerAccount) -> dict:
         "broker_client_id": row.broker_client_id,
         "capital_inr": row.capital_inr,
         "is_enabled": bool(row.is_enabled),
+        "api_key_masked": _mask_api_key(row.api_key_encrypted),
+        "has_api_secret": bool(row.api_secret_encrypted),
         "has_totp_secret": row.totp_secret_encrypted is not None,
         "last_login_at": row.last_login_at.isoformat() if row.last_login_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
@@ -290,6 +342,8 @@ def add_account(
         raise ValueError("display_name is required")
     if not api_key or not api_secret:
         raise ValueError("api_key and api_secret are required")
+    api_key = validate_credential("api_key", api_key)
+    api_secret = validate_credential("api_secret", api_secret)
     if capital_inr is None or float(capital_inr) <= 0:
         raise ValueError("capital_inr must be positive")
     try:
@@ -297,8 +351,8 @@ def add_account(
             display_name=display_name.strip(),
             broker=(broker or "zerodha").strip().lower(),
             broker_client_id=(broker_client_id or "").strip() or None,
-            api_key_encrypted=encrypt_token(api_key.strip()),
-            api_secret_encrypted=encrypt_token(api_secret.strip()),
+            api_key_encrypted=encrypt_token(api_key),
+            api_secret_encrypted=encrypt_token(api_secret),
             capital_inr=float(capital_inr),
             is_enabled=False,
         )
@@ -335,17 +389,30 @@ def update_account(account_id: int, **fields) -> dict | None:
             row.capital_inr = cap
         if "is_enabled" in fields and fields["is_enabled"] is not None:
             row.is_enabled = bool(fields["is_enabled"])
+        # Credential replacements are logged (never valued) so a silent
+        # overwrite is traceable after the fact — issue #492.
+        replaced: list[str] = []
         if fields.get("api_key"):
-            row.api_key_encrypted = encrypt_token(str(fields["api_key"]).strip())
+            row.api_key_encrypted = encrypt_token(validate_credential("api_key", fields["api_key"]))
+            replaced.append("api_key")
         if fields.get("api_secret"):
-            row.api_secret_encrypted = encrypt_token(str(fields["api_secret"]).strip())
+            row.api_secret_encrypted = encrypt_token(
+                validate_credential("api_secret", fields["api_secret"])
+            )
+            replaced.append("api_secret")
         if "totp_secret" in fields:
             secret = str(fields["totp_secret"] or "").strip()
             row.totp_secret_encrypted = encrypt_token(secret) if secret else None
+            replaced.append("totp_secret" if secret else "totp_secret(cleared)")
         if "last_login_at" in fields:
             row.last_login_at = fields["last_login_at"]
         row.updated_at = datetime.utcnow()
         db_session.commit()
+        if replaced:
+            logger.info(
+                f"Child account {account_id} ('{row.display_name}') credentials "
+                f"replaced: {', '.join(replaced)}"
+            )
         return _row_to_dict(row)
     except Exception:
         db_session.rollback()
