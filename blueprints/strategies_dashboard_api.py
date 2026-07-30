@@ -79,6 +79,10 @@ _STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"
 _SIMPLIFIED_ENGINE_FOLDER = "simplified_engine"
 _SIMPLIFIED_ENGINE_JOURNAL_NAME = "trending_equity_intraday"
 
+# trade_journal.direction is 'LONG' | 'SHORT' (database/trade_journal_db.py) —
+# unlike open15, which stores 'L' | 'S'. Anything else buckets into neither side.
+_SIMPLIFIED_ENGINE_SIDE_KEY = {"LONG": "long", "SHORT": "short"}
+
 # Strategies to surface (read from filesystem, filtered below).
 # trending_equity_intraday is the journal-name twin of the simplified_engine folder
 # (see the bridge above) — it has no config_snapshot of its own and would otherwise
@@ -652,7 +656,10 @@ def _simplified_engine_lifetime() -> dict:
     ``trade_journal`` rows (``exited_at`` + ``pnl`` present).
 
     ``trade_journal`` has no mode column, so the caller attributes this to the
-    strategy's current resolved mode (the engine is sandbox by default).
+    strategy's current resolved mode (the engine is sandbox by default). Also
+    carries ``long``/``short`` sub-aggregates keyed off the journal's
+    ``direction`` column (issue #494) — the two sides of this strategy diverge
+    sharply, which the blended headline hides.
     """
     try:
         rows = (
@@ -664,10 +671,16 @@ def _simplified_engine_lifetime() -> dict:
             )
             .all()
         )
-        return _lifetime_from_pnls([float(r.pnl) for r in rows])
+        pnls = [float(r.pnl) for r in rows]
+        sides: dict[str, list[float]] = {"long": [], "short": []}
+        for r in rows:
+            side_key = _SIMPLIFIED_ENGINE_SIDE_KEY.get((r.direction or "").upper())
+            if side_key:
+                sides[side_key].append(float(r.pnl))
+        return {**_lifetime_from_pnls(pnls), **_side_split(sides)}
     except Exception:
         logger.exception("Failed to aggregate simplified_engine lifetime stats")
-        return _lifetime_from_pnls([])
+        return {**_lifetime_from_pnls([]), **_side_split({})}
 
 
 def _open15_net_pnl(row) -> float:
