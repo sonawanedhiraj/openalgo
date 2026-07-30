@@ -181,32 +181,27 @@ def set_strategies(account_id: int):
     unknown = [n for n in names if n not in accounts_service.KNOWN_STRATEGIES]
     if unknown:
         return jsonify({"status": "error", "message": f"Unknown strategies: {unknown}"}), 400
-    # Optional per-SELECTED-strategy capital overrides (issue #486):
-    # {"capital_overrides": {"open15_vol_breakout": 50000}}. Entries for
-    # non-selected strategies are ignored; null/absent → account base capital.
-    raw_overrides = data.get("capital_overrides") or {}
-    if not isinstance(raw_overrides, dict):
+    # Per-SELECTED-strategy capital-per-trade (issue #496) — the ONE sizing
+    # knob: {"capital_per_trade": {"open15_vol_breakout": 15000}}. Entries for
+    # non-selected strategies are ignored; null/absent leaves it unset (that
+    # strategy's mirrors are then skipped loudly — default deny).
+    raw_per_trade = data.get("capital_per_trade") or {}
+    if not isinstance(raw_per_trade, dict):
         return jsonify(
-            {"status": "error", "message": "'capital_overrides' must be an object."}
+            {"status": "error", "message": "'capital_per_trade' must be an object."}
         ), 400
-    overrides: dict[str, float] = {}
-    for key, value in raw_overrides.items():
+    per_trade: dict[str, float] = {}
+    for key, value in raw_per_trade.items():
         if key not in names or value in (None, ""):
             continue
         try:
-            overrides[key] = float(value)
+            per_trade[key] = float(value)
         except (TypeError, ValueError):
             return jsonify(
-                {"status": "error", "message": f"capital override for {key} must be a number"}
+                {"status": "error", "message": f"capital per trade for {key} must be a number"}
             ), 400
-    raw_lot_flags = data.get("min_one_lot") or {}
-    if not isinstance(raw_lot_flags, dict):
-        return jsonify({"status": "error", "message": "'min_one_lot' must be an object."}), 400
-    lot_flags = {k: bool(v) for k, v in raw_lot_flags.items() if k in names}
     try:
-        saved = accounts_db.set_strategies(
-            account_id, names, capital_overrides=overrides, min_one_lot=lot_flags
-        )
+        saved = accounts_db.set_strategies(account_id, names, capital_per_trade=per_trade)
     except ValueError as e:
         return jsonify({"status": "error", "message": str(e)}), 400
     return jsonify(

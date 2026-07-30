@@ -102,7 +102,7 @@ def _today_mirror_stats() -> dict[int, dict[str, int]]:
             s = stats.setdefault(row["account_id"], {"placed": 0, "skipped": 0, "failed": 0})
             if row["status"] == "placed":
                 s["placed"] += 1
-            elif row["status"] in ("skipped_no_session", "skipped_zero_qty"):
+            elif row["status"].startswith("skipped"):
                 s["skipped"] += 1
             else:
                 s["failed"] += 1

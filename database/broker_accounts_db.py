@@ -217,6 +217,11 @@ class AccountStrategy(Base):
 
     account_id = Column(Integer, primary_key=True, nullable=False)
     strategy_name = Column(String(64), primary_key=True, nullable=False)
+    # issue #496: THE sizing knob — ₹ the child deploys per mirrored trade of
+    # this strategy. None = mirroring skipped loudly (default deny).
+    capital_per_trade_inr = Column(Float, nullable=True)
+    # RETIRED sizing knobs (kept as dormant columns — SQLite drops need table
+    # rebuilds): the #486 ratio override and the #490 min-1-lot patch over it.
     capital_override_inr = Column(Float, nullable=True)
     # issue #490: derivative mirrors that scale to 0 lots round UP to 1 lot
     # instead of skipping (child mirrors 1-lot parent trades at 1 lot).
@@ -240,6 +245,12 @@ def _migrate_add_capital_override() -> None:
                 )
                 conn.commit()
                 logger.info("account_strategies.capital_override_inr column added (issue #486)")
+            if cols and "capital_per_trade_inr" not in cols:
+                conn.execute(
+                    text("ALTER TABLE account_strategies ADD COLUMN capital_per_trade_inr FLOAT")
+                )
+                conn.commit()
+                logger.info("account_strategies.capital_per_trade_inr column added (issue #496)")
             if cols and "min_one_lot" not in cols:
                 conn.execute(
                     text(
@@ -483,12 +494,11 @@ def get_strategy_settings(account_id: int) -> list[dict]:
             (
                 {
                     "strategy_name": r.strategy_name,
-                    "capital_override_inr": (
-                        float(r.capital_override_inr)
-                        if r.capital_override_inr is not None
+                    "capital_per_trade_inr": (
+                        float(r.capital_per_trade_inr)
+                        if r.capital_per_trade_inr is not None
                         else None
                     ),
-                    "min_one_lot": bool(r.min_one_lot),
                 }
                 for r in rows
             ),
@@ -501,8 +511,7 @@ def get_strategy_settings(account_id: int) -> list[dict]:
 def set_strategies(
     account_id: int,
     strategy_names: list[str],
-    capital_overrides: dict[str, float] | None = None,
-    min_one_lot: dict[str, bool] | None = None,
+    capital_per_trade: dict[str, float] | None = None,
 ) -> list[str]:
     """Replace the account's strategy allow-list with ``strategy_names``.
 
@@ -513,21 +522,19 @@ def set_strategies(
     Raises ValueError on a non-positive override.
     """
     cleaned = sorted({str(n).strip() for n in strategy_names if str(n).strip()})
-    overrides = capital_overrides or {}
-    lot_flags = min_one_lot or {}
-    for name, value in overrides.items():
+    per_trade = capital_per_trade or {}
+    for name, value in per_trade.items():
         if value is not None and float(value) <= 0:
-            raise ValueError(f"capital override for {name} must be positive")
+            raise ValueError(f"capital per trade for {name} must be positive")
     try:
         db_session.query(AccountStrategy).filter_by(account_id=account_id).delete()
         for name in cleaned:
-            override = overrides.get(name)
+            value = per_trade.get(name)
             db_session.add(
                 AccountStrategy(
                     account_id=account_id,
                     strategy_name=name,
-                    capital_override_inr=float(override) if override is not None else None,
-                    min_one_lot=bool(lot_flags.get(name, False)),
+                    capital_per_trade_inr=float(value) if value is not None else None,
                 )
             )
         db_session.commit()
@@ -547,9 +554,7 @@ def accounts_for_strategy(strategy_name: str) -> list[dict]:
     """
     try:
         rows = (
-            db_session.query(
-                BrokerAccount, AccountStrategy.capital_override_inr, AccountStrategy.min_one_lot
-            )
+            db_session.query(BrokerAccount, AccountStrategy.capital_per_trade_inr)
             .join(AccountStrategy, AccountStrategy.account_id == BrokerAccount.id)
             .filter(
                 AccountStrategy.strategy_name == strategy_name,
@@ -559,10 +564,9 @@ def accounts_for_strategy(strategy_name: str) -> list[dict]:
             .all()
         )
         result = []
-        for account_row, override, lot_flag in rows:
+        for account_row, per_trade in rows:
             d = _row_to_dict(account_row)
-            d["capital_override_inr"] = float(override) if override is not None else None
-            d["min_one_lot"] = bool(lot_flag)
+            d["capital_per_trade_inr"] = float(per_trade) if per_trade is not None else None
             result.append(d)
         return result
     finally:

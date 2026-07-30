@@ -49,13 +49,6 @@ DERIVATIVE_EXCHANGES = {"NFO", "BFO", "CDS", "BCD", "MCX", "NCDEX", "NCO"}
 _executor: ThreadPoolExecutor | None = None
 
 
-def _primary_book_capital() -> float:
-    """UI-configurable, DB-backed (issue #484); env is only the first-read seed."""
-    from services.broker_accounts_service import primary_book_capital
-
-    return primary_book_capital()
-
-
 def _get_executor() -> ThreadPoolExecutor:
     global _executor
     if _executor is None:
@@ -103,42 +96,63 @@ def _child_open_qty(broker_module, symbol: str, exchange: str, product: str, tok
         return 0
 
 
-def compute_child_qty(
-    parent_qty: int,
-    factor: float,
+def resolve_sizing_price(order_data: dict) -> float | None:
+    """Price used to size an OPENING child order (issue #496).
+
+    Parent LIMIT/SL price wins (it is already live-safe converted); otherwise
+    fetch LTP via the quotes service with the primary's api_key. None on any
+    failure — the caller journals ``skipped_no_quote`` (fail-safe: never guess).
+    """
+    try:
+        price = float(order_data.get("price") or 0)
+        if order_data.get("pricetype") in ("LIMIT", "SL") and price > 0:
+            return price
+    except (TypeError, ValueError):
+        pass
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_quotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            return None
+        ok, data, _status = get_quotes(
+            order_data.get("symbol", ""), order_data.get("exchange", ""), api_key=api_key
+        )
+        if ok:
+            ltp = float((data.get("data") or {}).get("ltp") or 0)
+            return ltp if ltp > 0 else None
+    except Exception:
+        logger.exception(
+            f"sizing quote failed for {order_data.get('symbol')}:{order_data.get('exchange')}"
+        )
+    return None
+
+
+def compute_opening_qty(
+    capital_per_trade: float,
+    price: float,
     exchange: str,
     lotsize: int | None,
-    action: str,
-    child_net_qty: int,
-    min_one_lot: bool = False,
 ) -> int:
-    """Mirror quantity for one child. Pure — unit-tested directly.
+    """Capital-based OPENING quantity (issue #496). Pure — unit-tested directly.
 
-    Exit guard: when the order REDUCES the child's existing position (SELL vs a
-    long, BUY vs a short), return the child's actual held size. Otherwise scale
-    the parent quantity by the capital factor, floored (to lot multiples on
-    derivative exchanges).
+    The child is a smaller account trading the same strategy: quantity comes
+    from ITS capital and the live price, not from scaling the parent's qty.
+
+    - equity: ``floor(capital / price)``
+    - derivatives: ``floor(capital / (price * lotsize)) * lotsize`` —
+      affordable means at least 1 lot naturally; unaffordable means 0 (honest
+      skip); unknown lotsize means 0 (refuse to guess).
     """
-    action = (action or "").upper()
-    if action == "SELL" and child_net_qty > 0:
-        return child_net_qty
-    if action == "BUY" and child_net_qty < 0:
-        return abs(child_net_qty)
-
-    scaled = parent_qty * factor
+    if capital_per_trade <= 0 or price <= 0:
+        return 0
     if exchange in DERIVATIVE_EXCHANGES:
         if not lotsize or lotsize <= 0:
-            return 0  # cannot round safely — caller journals the skip
-        lots = int(math.floor(scaled / lotsize)) * lotsize
-        # issue #490 (operator opt-in per strategy): a 1-lot parent trade
-        # scales to 0 for any factor < 1 — lots don't divide. With the flag,
-        # an OPENING order that floors to 0 rounds UP to 1 lot instead of
-        # skipping, provided the parent itself traded at least 1 lot. Exits
-        # never reach this branch (they flatten the child's own position).
-        if lots == 0 and min_one_lot and parent_qty >= lotsize:
-            return lotsize
-        return lots
-    return int(math.floor(scaled))
+            return 0
+        lots = int(math.floor(capital_per_trade / (price * lotsize)))
+        return lots * lotsize
+    return int(math.floor(capital_per_trade / price))
 
 
 def _mirror_to_account(
@@ -156,10 +170,10 @@ def _mirror_to_account(
     parent_qty = int(order_data.get("quantity", 0))
     account_id = account["id"]
     name = account["display_name"]
-    # Per-strategy capital override (issue #486): stored on the selection row,
-    # so it exists only while the strategy is selected; None → base capital.
-    sizing_capital = account.get("capital_override_inr") or float(account["capital_inr"])
-    factor = float(sizing_capital) / _primary_book_capital()
+    # Capital-per-trade sizing (issue #496): the ONE per-(child, strategy)
+    # knob, stored on the selection row. None means the mirror is skipped
+    # loudly (default deny) — never guessed from ratios.
+    capital_per_trade = account.get("capital_per_trade_inr")
 
     journal = {
         "account_id": account_id,
@@ -169,7 +183,6 @@ def _mirror_to_account(
         "action": action,
         "product": product,
         "parent_qty": parent_qty,
-        "factor": round(factor, 4),
         "parent_orderid": parent_orderid,
     }
 
@@ -210,25 +223,48 @@ def _mirror_to_account(
                 )
                 return
 
-        child_qty = compute_child_qty(
-            parent_qty,
-            factor,
-            exchange,
-            lotsize,
-            action,
-            child_net,
-            min_one_lot=bool(account.get("min_one_lot")),
+        action_upper = (action or "").upper()
+        reducing = (action_upper == "SELL" and child_net > 0) or (
+            action_upper == "BUY" and child_net < 0
         )
-
-        if child_qty <= 0:
-            account_orders_db.record_mirror_attempt(
-                **journal, child_qty=0, status="skipped_zero_qty"
+        sizing_price = None
+        if reducing:
+            # Exits flatten the child's ACTUAL position — no capital or price
+            # needed, and a missing capital setting must never block an exit.
+            child_qty = abs(child_net)
+        else:
+            if capital_per_trade is None or float(capital_per_trade) <= 0:
+                account_orders_db.record_mirror_attempt(
+                    **journal, child_qty=0, status="skipped_no_capital"
+                )
+                _notify_operator(
+                    f"⚠ Mirror skipped — {name}: no per-trade capital set for "
+                    f"{mode_key}. Set '₹ per trade' on /accounts → Strategies."
+                )
+                return
+            sizing_price = resolve_sizing_price(order_data)
+            if sizing_price is None:
+                account_orders_db.record_mirror_attempt(
+                    **journal, child_qty=0, status="skipped_no_quote"
+                )
+                _notify_operator(
+                    f"⚠ Mirror skipped — {name}: no price available to size "
+                    f"{action} {symbol} (quote failed). Not mirrored."
+                )
+                return
+            child_qty = compute_opening_qty(
+                float(capital_per_trade), sizing_price, exchange, lotsize
             )
-            _notify_operator(
-                f"⚠ Mirror skipped — {name}: {mode_key} {action} {symbol} "
-                f"scales to 0 (factor {factor:.2f}). Increase capital or deselect."
-            )
-            return
+            if child_qty <= 0:
+                account_orders_db.record_mirror_attempt(
+                    **journal, child_qty=0, status="skipped_zero_qty", sizing_price=sizing_price
+                )
+                unit = "lot" if exchange in DERIVATIVE_EXCHANGES else "share"
+                _notify_operator(
+                    f"⚠ Mirror skipped — {name}: ₹{float(capital_per_trade):,.0f} per trade "
+                    f"cannot afford 1 {unit} of {symbol} at ₹{sizing_price:,.2f}."
+                )
+                return
 
         child_order = copy.deepcopy(order_data)
         child_order["quantity"] = child_qty
@@ -236,11 +272,15 @@ def _mirror_to_account(
         res, response_data, order_id = broker_module.place_order_api(child_order, token)
         if getattr(res, "status", None) == 200:
             account_orders_db.record_mirror_attempt(
-                **journal, child_qty=child_qty, status="placed", broker_orderid=str(order_id)
+                **journal,
+                child_qty=child_qty,
+                status="placed",
+                broker_orderid=str(order_id),
+                sizing_price=sizing_price,
             )
             logger.info(
                 f"mirror placed — {name}: {action} {child_qty} {symbol} "
-                f"(parent {parent_qty}, factor {factor:.2f}, orderid {order_id})"
+                f"(parent {parent_qty}, price {sizing_price}, orderid {order_id})"
             )
         else:
             message = (
@@ -249,7 +289,11 @@ def _mirror_to_account(
                 else "broker rejected"
             )
             account_orders_db.record_mirror_attempt(
-                **journal, child_qty=child_qty, status="rejected", error_text=message
+                **journal,
+                child_qty=child_qty,
+                status="rejected",
+                error_text=message,
+                sizing_price=sizing_price,
             )
             _notify_operator(
                 f"⚠ Mirror REJECTED — {name}: {action} {child_qty} {symbol}: {message}"

@@ -45,6 +45,8 @@ VALID_STATUSES = (
     "skipped_no_session",
     "skipped_zero_qty",
     "skipped_no_position",
+    "skipped_no_capital",
+    "skipped_no_quote",
     "error",
 )
 
@@ -63,7 +65,8 @@ class AccountOrder(Base):
     product = Column(String(8), nullable=True)
     parent_qty = Column(Integer, nullable=False)
     child_qty = Column(Integer, nullable=False, default=0)
-    factor = Column(Float, nullable=True)
+    factor = Column(Float, nullable=True)  # retired ratio audit (pre-#496 rows)
+    sizing_price = Column(Float, nullable=True)  # issue #496: price used to size
     parent_orderid = Column(String(64), nullable=True)
     status = Column(String(24), nullable=False, index=True)
     broker_orderid = Column(String(64), nullable=True)
@@ -71,10 +74,28 @@ class AccountOrder(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
+def _migrate_add_sizing_price() -> None:
+    """Idempotent boot ALTER for installs created before issue #496."""
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            cols = [
+                row[1] for row in conn.execute(text("PRAGMA table_info(account_orders)")).fetchall()
+            ]
+            if cols and "sizing_price" not in cols:
+                conn.execute(text("ALTER TABLE account_orders ADD COLUMN sizing_price FLOAT"))
+                conn.commit()
+                logger.info("account_orders.sizing_price column added (issue #496)")
+    except Exception:
+        logger.exception("sizing_price migration failed")
+
+
 def init_db():
     """Create the account_orders table if missing. Idempotent."""
     try:
         Base.metadata.create_all(bind=engine)
+        _migrate_add_sizing_price()
         logger.info("account_orders table ready")
     except Exception as e:
         logger.exception(f"Failed to init account_orders table: {e}")
@@ -95,6 +116,7 @@ def _row_to_dict(row: AccountOrder) -> dict:
         "parent_qty": row.parent_qty,
         "child_qty": row.child_qty,
         "factor": row.factor,
+        "sizing_price": row.sizing_price,
         "parent_orderid": row.parent_orderid,
         "status": row.status,
         "broker_orderid": row.broker_orderid,
@@ -114,6 +136,7 @@ def record_mirror_attempt(
     status: str,
     product: str | None = None,
     factor: float | None = None,
+    sizing_price: float | None = None,
     parent_orderid: str | None = None,
     broker_orderid: str | None = None,
     error_text: str | None = None,
@@ -133,6 +156,7 @@ def record_mirror_attempt(
             parent_qty=int(parent_qty),
             child_qty=int(child_qty),
             factor=factor,
+            sizing_price=sizing_price,
             parent_orderid=parent_orderid,
             status=status,
             broker_orderid=broker_orderid,
