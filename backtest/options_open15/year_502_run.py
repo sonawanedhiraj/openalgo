@@ -42,7 +42,7 @@ import statistics as st
 
 import duckdb
 
-from backtest.options_open15 import bs
+from backtest.options_open15.bs import bs_price
 from backtest.options_open15.run_bs_backtest import (
     _D,
     T_years,
@@ -198,8 +198,8 @@ def run():
             )
             if not iv:
                 continue
-            pen = bs.bs_price(en, K, T_years(dstr, t["trig"], exp), R, iv, side == "L")
-            pex = bs.bs_price(ex, K, T_years(dstr, EXIT_MIN, exp), R, iv, side == "L")
+            pen = bs_price(en, K, T_years(dstr, t["trig"], exp), R, iv, side == "L")
+            pex = bs_price(ex, K, T_years(dstr, EXIT_MIN, exp), R, iv, side == "L")
             if pen <= 0.05:
                 continue
             lots = int(SLOT // (pen * lot))  # production fit-to-capital sizing

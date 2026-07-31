@@ -22,6 +22,22 @@ from unittest.mock import MagicMock, patch
 from broker.zerodha.api import funds as zerodha_funds
 
 
+def _probe_errors(caplog):
+    """ERROR+ records emitted BY THE PROBE.
+
+    Scoped to the module under test on purpose: `caplog.records` collects every
+    record propagating to root, including ones emitted from background threads
+    other tests left running (an unrelated `database.auth_db` failure on the
+    same xdist worker was enough to fail these). The guarantee #464 pins is
+    "``test_auth_token`` does not log at ERROR", not "nothing anywhere does".
+    """
+    return [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and r.name.startswith("broker.zerodha")
+    ]
+
+
 def _client_returning(status_code, payload):
     client = MagicMock()
     response = MagicMock()
@@ -53,7 +69,7 @@ class TestZerodhaTestAuthToken:
             is_valid, message = zerodha_funds.test_auth_token("key:dead")
         assert is_valid is False
         assert "Incorrect" in message
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not _probe_errors(caplog)
 
     def test_malformed_token_no_error_log(self, caplog):
         # The 2026-07-26 spam variant: header without api_key:access_token shape.
@@ -71,7 +87,7 @@ class TestZerodhaTestAuthToken:
             is_valid, message = zerodha_funds.test_auth_token("None")
         assert is_valid is False
         assert "api_key" in message
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not _probe_errors(caplog)
 
     def test_network_exception_no_error_log(self, caplog):
         client = MagicMock()
@@ -83,7 +99,7 @@ class TestZerodhaTestAuthToken:
             is_valid, message = zerodha_funds.test_auth_token("key:tok")
         assert is_valid is False
         assert "connection refused" in message
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not _probe_errors(caplog)
 
     def test_non_json_response_no_error_log(self, caplog):
         client = MagicMock()
@@ -98,7 +114,7 @@ class TestZerodhaTestAuthToken:
             is_valid, message = zerodha_funds.test_auth_token("key:tok")
         assert is_valid is False
         assert message
-        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not _probe_errors(caplog)
 
 
 class TestHealthProbePrefersTestAuthToken:
