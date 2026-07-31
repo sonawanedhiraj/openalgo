@@ -282,7 +282,10 @@ def test_complete_login_survives_transient_db_lock(accounts_db, monkeypatch):
 
     account = _add(accounts_db)
     monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
-    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0)
+    # raising=False so this test still EXERCISES the login path on a
+    # pre-fix tree (where the constant does not exist) — otherwise it
+    # would fail with AttributeError, proving only that the test is new.
+    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0, raising=False)
 
     real_upsert = svc.upsert_auth
     calls = {"n": 0}
@@ -315,7 +318,10 @@ def test_complete_login_returns_error_when_auth_write_stays_locked(accounts_db, 
 
     account = _add(accounts_db)
     monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
-    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0)
+    # raising=False so this test still EXERCISES the login path on a
+    # pre-fix tree (where the constant does not exist) — otherwise it
+    # would fail with AttributeError, proving only that the test is new.
+    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0, raising=False)
 
     def always_locked(name, token, broker):
         raise _locked_error()
@@ -533,7 +539,10 @@ def test_child_callback_returns_302_not_500_when_db_is_locked(
 
     account = _add(accounts_db)
     monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
-    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0)
+    # raising=False so this test still EXERCISES the login path on a
+    # pre-fix tree (where the constant does not exist) — otherwise it
+    # would fail with AttributeError, proving only that the test is new.
+    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0, raising=False)
 
     def always_locked(name, token, broker):
         raise _locked_error()
