@@ -265,7 +265,11 @@ need no external scheduler.
 > entry cutoff (issue #451: `open15_config.no_entry_after`/`exit_time`, env
 > defaults `OPEN15_NO_ENTRY_AFTER` 09:29 / `OPEN15_EXIT_TIME` 09:30, exit
 > capped 15:10 to precede the 15:15 MIS square-off) — jobs are (re)pointed at
-> the effective times at boot registration and every 09:10 arm. Its tick feed
+> the effective times at boot registration and every 09:10 arm. The **trade
+> side** is UI-configurable too (issue #503: `open15_config.trade_side`, env
+> default `OPEN15_TRADE_SIDE` `both`) — `long_only` / `short_only` gate the
+> 09:15 selection itself, so the excluded side is never watched, never
+> triggers and never journals a row. Its tick feed
 > is an **own additive
 > ZMQ SUB** on the proxy bus (5555), active only 09:14:50 .. exit+5s IST
 > (`services/open15_breakout_service.py`). **Ops: the app must be booted before

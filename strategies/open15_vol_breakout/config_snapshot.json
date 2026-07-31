@@ -11,6 +11,8 @@
     "window_ist": "09:15-09:30",
     "universe": "SCANNER_SYMBOLS (F&O stocks, indices excluded)",
     "selection": "top-3 gainers long / top-3 losers short by 09:15-open vs prev daily close",
+    "trade_side": "both",
+    "trade_side_note": "UI-configurable (issue #503): both | long_only | short_only. Gates selection, so an excluded side is never watched. The parity_target below is a BOTH-sides measurement — a one-sided day is not comparable to it.",
     "vol_mult": 1.5,
     "vol_baseline": "running average of completed minute volumes since 09:15 (auction included in v0)",
     "entry": "mid-bar tick trigger: cumvol-in-minute >= vol_mult x baseline AND ltp beyond first-candle level",
