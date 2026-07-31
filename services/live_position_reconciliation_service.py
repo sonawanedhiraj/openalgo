@@ -118,19 +118,29 @@ def is_enabled() -> bool:
     )
 
 
-def _fetch_broker_qty(api_key: str, symbol: str, exchange: str, product: str) -> tuple[bool, int]:
+def _fetch_broker_qty(
+    api_key: str,
+    symbol: str,
+    exchange: str,
+    product: str,
+    mode_key: str | None = None,
+) -> tuple[bool, int]:
     """Return ``(ok, signed_net_qty)`` from the mode-appropriate position store.
 
     ``ok`` is ``False`` on any fetch/parse failure — the caller then fails closed.
-    Never raises. Reads via ``openposition_service.get_open_position``, which is
-    itself mode-aware: it returns the ``sandbox.db`` net qty in sandbox mode and
-    the broker positionbook net qty in live mode.
+    Never raises. Reads via ``openposition_service.get_open_position``.
+
+    ``mode_key`` is load-bearing (issue #497): it resolves the store with the same
+    ``resolve_order_mode`` that routed the order. Without it the read fell through
+    to the platform analyze overlay, so a ``sandbox`` strategy was reconciled
+    against the LIVE broker book — which is flat — and every exit was SUPPRESSED
+    as a phantom.
     """
     try:
         from services.openposition_service import get_open_position
 
         position_data = {"symbol": symbol, "exchange": exchange, "product": product}
-        success, resp, _ = get_open_position(position_data, api_key=api_key)
+        success, resp, _ = get_open_position(position_data, api_key=api_key, mode_key=mode_key)
         if not success or not isinstance(resp, dict):
             logger.warning(
                 "live_position_reconcile: broker fetch failed for %s (%s/%s): %r",
@@ -182,12 +192,21 @@ def reconcile_exit(
     product: str,
     expected_close_side: str,
     journaled_qty: int,
+    mode_key: str | None = None,
 ) -> ReconcileDecision:
     """Reconcile an exit's close qty against the mode-appropriate store's net position.
 
-    Safe to call in BOTH modes: the underlying position read
-    (``openposition_service.get_open_position``) is mode-aware, returning the
-    ``sandbox.db`` net qty in sandbox and the broker positionbook net qty in live.
+    Safe to call in BOTH modes, PROVIDED ``mode_key`` names the strategy whose
+    order routing decided the book (issue #497). The underlying position read
+    (``openposition_service.get_open_position``) then resolves via
+    ``resolve_order_mode(mode_key)`` — the sandbox.db net qty for a sandbox
+    strategy, the broker positionbook net qty for a live one.
+
+    Passing ``mode_key=None`` falls back to the platform analyze overlay, which
+    is WRONG for a strategy reconciling its own position: with Analyze off the
+    overlay says LIVE, the broker book reads flat for a sandbox strategy, and
+    this guard suppresses every exit as a phantom. Always pass it from a strategy.
+
     Returns a :class:`ReconcileDecision` describing whether to proceed, clamp, or
     suppress. Never raises.
 
@@ -235,7 +254,7 @@ def reconcile_exit(
             reason=REASON_BROKER_FETCH_FAILED,
         )
 
-    ok, broker_qty = _fetch_broker_qty(api_key, symbol, exchange, product)
+    ok, broker_qty = _fetch_broker_qty(api_key, symbol, exchange, product, mode_key=mode_key)
 
     if not ok:
         # FAIL CLOSED for reverse-risk: do NOT exit more than journaled. Proceed

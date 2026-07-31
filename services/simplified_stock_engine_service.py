@@ -1970,6 +1970,10 @@ def _reconcile_store_close(
             product=product,
             expected_close_side=expected_close_side,
             journaled_qty=journaled_qty,
+            # #497: `strategy` here is the webhook label, not the canonical
+            # strategy_mode key — pass the mode key explicitly so the store
+            # resolves to the book these orders actually route to.
+            mode_key="simplified_engine",
         )
     except Exception:
         logger.exception("[SIMPLIFIED-EOD] store reconcile raised for %s", symbol)
