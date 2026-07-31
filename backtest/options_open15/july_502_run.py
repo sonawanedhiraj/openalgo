@@ -55,7 +55,7 @@ CFG = resolve_day_config(
     {
         "margin_per_slot": float(os.environ.get("BT_MARGIN_PER_SLOT", 22500.0)),
         "vol_mult": 1.5,
-        "max_trades": 3,
+        "max_trades": int(os.environ.get("BT_MAX_TRADES", 3)),
         "instrument": "atm_option",
     },
     0.0,
@@ -267,6 +267,8 @@ def run(include_first_minute):
                 }
             )
         fired.sort(key=lambda s: (s["trig_min"], -abs(s["gap"])))
+        sides = os.environ.get("BT_SIDES", "LS").upper()
+        fired = [f for f in fired if f["side"] in sides]
         signals.extend(fired[:MAX_TRADES])
 
     for s in signals:
