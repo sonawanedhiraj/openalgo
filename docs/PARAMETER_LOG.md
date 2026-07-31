@@ -1756,6 +1756,12 @@ ran in the 15:30-17:00 periodic window).
   editable from `/open15_vol_breakout/logs` (stored in the `open15_config`
   row; NULL = env default; applied at the next 09:10 arm and recorded in the
   day's `armed` decision-log event). The env vars are the DEFAULTS layer.
+  **Data-sourcing (issue #502):** `OPEN15_FIRST_CANDLE_SOURCE`
+  (`quotes` | `ticks`, default `quotes`) — where the 09:15 candle's
+  open/high/low come from. `quotes` = ONE batched broker quote call at 09:16
+  (the `open15_first_candles` job); `ticks` restores the pre-#502 tick-built
+  candle. `OPEN15_BASELINE_INCLUDE_FIRST_MINUTE` (default `false`) — whether
+  the 09:15 minute stays in the volume baseline.
 - **Why these defaults:** mirrors the Round 58 research configuration so the
   sandbox measurement is comparable to the backtest grid; sizing mirrors
   intraday_pullback_top2's ₹30k/slot convention.
@@ -1764,6 +1770,16 @@ ran in the 15:30-17:00 periodic window).
     deployment — see `strategies/open15_vol_breakout/SPEC.md` §2 before tuning
     anything (the bar-level signal has NO honest edge; the mid-bar capture
     fraction is what's being measured).
+  - **2026-07-31:** Added `OPEN15_FIRST_CANDLE_SOURCE` (default `quotes`) and
+    `OPEN15_BASELINE_INCLUDE_FIRST_MINUTE` (default `false`) — issue #502. The
+    tick feed is a ~1/sec sample that starts whenever the first tick arrives,
+    so it must not define the 09:15 open (wrong selection: MPHASIS 2026-07-31
+    ranked #1 short on a phantom −4.15% vs a real −0.94%/#11) or the breakout
+    level (high understated 24/24, low overstated 24/24). Keeping the 09:15
+    minute in the baseline inflated it 1.06×–1.67×, so the configured
+    `OPEN15_VOL_MULT=1.5` behaved like ~2.5× and produced zero entries on 3 of
+    4 sessions. **`OPEN15_VOL_MULT` itself is unchanged at 1.5** — the gate
+    now simply means what it says. Both new flags are rollback switches.
 
 ## Other tunables (placeholder — populate as discovered)
 

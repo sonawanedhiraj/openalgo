@@ -38,15 +38,18 @@ def test_midbar_trigger_fires_at_the_tick_not_bar_close():
     h1 = core.sym["AAA"]["fc"]["high"]
     # 09:16: quiet minute, no break (vol 400)
     assert core.on_tick("AAA", 101.5, 1400, t(9, 16, 30)) is None
-    # 09:17 rolls 09:16 closed -> baseline = mean(1000, 400) = 700
-    # surge: cumvol-in-minute reaches 1.5*700=1050 at second 12 with price beyond H1
-    assert core.on_tick("AAA", h1 + 0.5, 1400 + 1049, t(9, 17, 10)) is None  # 1049 < 1050
-    action = core.on_tick("AAA", h1 + 0.6, 1400 + 1200, t(9, 17, 12))
+    # 09:17 rolls 09:16 closed -> baseline = mean(400) = 400. The 09:15 minute
+    # is NOT in the baseline (issue #502): it is the day's busiest minute and
+    # its tick cumvol carries the pre-open auction.
+    # surge: cumvol-in-minute reaches 1.5*400=600 at second 12 with price beyond H1
+    assert core.on_tick("AAA", h1 + 0.5, 1400 + 599, t(9, 17, 10)) is None  # 599 < 600
+    action = core.on_tick("AAA", h1 + 0.6, 1400 + 620, t(9, 17, 12))
     assert action is not None
     assert action["side"] == "L"
     assert action["trigger_second"] == 12
     assert action["level"] == h1
-    assert action["cum_vol_at_trigger"] == 1200
+    assert action["baseline_vol"] == 400
+    assert action["cum_vol_at_trigger"] == 620
     # once per symbol
     assert core.on_tick("AAA", h1 + 1.0, 5000, t(9, 17, 30)) is None
 
@@ -80,9 +83,9 @@ def test_near_miss_stats_for_decision_log():
     core = Open15Core({"AAA": 100.0}, vol_mult=1.5, top_n=1)
     feed_first_candle(core, "AAA", 102.0, 1000)
     h1 = core.sym["AAA"]["fc"]["high"]
-    core.on_tick("AAA", 101.0, 1400, t(9, 16, 30))  # 09:16 vol 400 -> baseline mean(1000,400)=700
+    core.on_tick("AAA", 101.0, 1400, t(9, 16, 30))  # 09:16 vol 400 -> baseline 400 (#502)
     # beyond level but volume only reaches 1.0x baseline -> no entry, stats recorded
-    assert core.on_tick("AAA", h1 + 0.3, 1400 + 700, t(9, 17, 20)) is None
+    assert core.on_tick("AAA", h1 + 0.3, 1400 + 400, t(9, 17, 20)) is None
     ws = core.watch_stats["AAA"]
     assert ws["level_broken"] is True
     assert 0.9 < ws["max_vol_ratio_beyond"] <= 1.1
@@ -169,7 +172,13 @@ def test_register_jobs_with_persistent_jobstore():
     try:
         Open15BreakoutService().register_jobs(sched)
         ids = {j.id for j in sched.get_jobs()}
-        assert ids == {"open15_arm", "open15_exit", "open15_exit_retry", "open15_summary"}
+        assert ids == {
+            "open15_arm",
+            "open15_first_candles",
+            "open15_exit",
+            "open15_exit_retry",
+            "open15_summary",
+        }
     finally:
         sched.shutdown(wait=False)
 
