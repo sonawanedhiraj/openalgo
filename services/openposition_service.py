@@ -44,7 +44,11 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
 
 
 def get_open_position_with_auth(
-    position_data: dict[str, Any], auth_token: str, broker: str, original_data: dict[str, Any]
+    position_data: dict[str, Any],
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any],
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get quantity of an open position using provided auth token.
@@ -54,6 +58,9 @@ def get_open_position_with_auth(
         auth_token: Authentication token for the broker API
         broker: Name of the broker
         original_data: Original request data for logging
+        mode_key: Strategy identity (issue #497). When supplied the book is
+            resolved by ``resolve_order_mode(mode_key)`` — the same resolver
+            that routed the order. ``None`` keeps the analyze overlay for UI reads.
 
     Returns:
         Tuple containing:
@@ -68,7 +75,19 @@ def get_open_position_with_auth(
     # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
     # SKIP/DISABLED are not order rejections for reads — operator still wants
     # to see state.
-    if resolve_effective_mode() is EffectiveMode.SANDBOX:
+    #
+    # Issue #497 — this read sits on the EXIT path: it feeds
+    # `live_position_reconciliation_service`, whose job is to suppress an exit
+    # when the store says flat (so a phantom close can't open a naked short).
+    # Resolved through the analyze overlay it read the LIVE broker book for a
+    # `sandbox` strategy, reported flat, and SUPPRESSED every futures_follow
+    # T+1 exit — the guard behaving correctly on a wrong input. Resolve with
+    # the same mode the order was routed under.
+    from services.mode_service import resolve_order_mode
+
+    book_mode = resolve_order_mode(mode_key) if mode_key else resolve_effective_mode()
+
+    if book_mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_get_positions
 
         api_key = original_data.get("apikey")
@@ -171,6 +190,7 @@ def get_open_position(
     api_key: str | None = None,
     auth_token: str | None = None,
     broker: str | None = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get quantity of an open position.
@@ -181,6 +201,8 @@ def get_open_position(
         api_key: OpenAlgo API key (for API-based calls)
         auth_token: Direct broker authentication token (for internal calls)
         broker: Direct broker name (for internal calls)
+        mode_key: Strategy identity (issue #497). A strategy reconciling its OWN
+            position before an exit MUST pass its canonical ``strategy_mode`` key.
 
     Returns:
         Tuple containing:
@@ -203,11 +225,15 @@ def get_open_position(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return get_open_position_with_auth(position_data, AUTH_TOKEN, broker_name, original_data)
+        return get_open_position_with_auth(
+            position_data, AUTH_TOKEN, broker_name, original_data, mode_key=mode_key
+        )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_open_position_with_auth(position_data, auth_token, broker, original_data)
+        return get_open_position_with_auth(
+            position_data, auth_token, broker, original_data, mode_key=mode_key
+        )
 
     # Case 3: Invalid parameters
     else:

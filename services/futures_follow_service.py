@@ -1194,6 +1194,10 @@ class FuturesFollowService:
                 product=self.config.product,
                 expected_close_side="SELL",
                 journaled_qty=position.quantity,
+                # #497: reconcile against the book this strategy's orders route
+                # to, not the analyze overlay — otherwise a sandbox position is
+                # checked against the flat live broker book and SUPPRESSED.
+                mode_key=STRATEGY_NAME,
             )
         except Exception:
             # Guard must never break the exit path; on an unexpected failure fall

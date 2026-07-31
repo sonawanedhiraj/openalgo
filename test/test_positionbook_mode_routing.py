@@ -164,3 +164,72 @@ def test_no_mode_key_analyze_on_reads_sandbox_book(routing):
 
     sandbox.assert_called_once()
     broker.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# The EXIT-PATH half of #497 — openposition_service feeds the reconcile guard
+# --------------------------------------------------------------------------- #
+_SANDBOX_OPENPOS = (True, {"status": "success", "quantity": 455}, 200)
+
+
+def test_reconcile_guard_reads_sandbox_qty_for_a_sandbox_strategy(routing):
+    """#497 part 2: the pre-exit reconcile guard must see the SANDBOX qty.
+
+    ``live_position_reconciliation_service`` suppresses an exit when the store
+    reports flat, so a phantom close can't open a naked short. Resolved through
+    the analyze overlay it read the LIVE broker book (flat) for a sandbox
+    strategy and suppressed every futures_follow T+1 exit:
+
+        EXIT SUPPRESSED for NIFTY25AUG26FUT (reason=broker_flat, store_qty=0, journaled=455)
+
+    The guard was correct; its input was not. With mode_key it sees 455.
+    """
+    from services import live_position_reconciliation_service as recon
+
+    routing["analyze"] = False
+    routing["modes"]["futures_follow_cap50"] = "sandbox"
+
+    # Full chain, real routing: _fetch_broker_qty -> get_open_position ->
+    # get_open_position_with_auth -> resolve_order_mode -> sandbox store.
+    with (
+        patch(
+            "services.openposition_service.get_auth_token_broker",
+            return_value=("auth-token", "zerodha"),
+        ),
+        patch("services.openposition_service.socketio"),
+        patch(
+            "services.sandbox_service.sandbox_get_positions", return_value=_SANDBOX_BOOK
+        ) as sandbox,
+    ):
+        ok, qty = recon._fetch_broker_qty(
+            "k", "NIFTY25AUG26FUT", "NFO", "NRML", mode_key="futures_follow_cap50"
+        )
+
+    sandbox.assert_called_once()
+    assert ok is True
+    assert qty == 455, "the guard must see the sandbox position, not the flat live book"
+
+
+def test_reconcile_guard_without_mode_key_sees_the_flat_live_book(routing):
+    """Documents the pre-fix failure mode, so a regression is unmistakable.
+
+    With no mode_key the overlay resolves LIVE and the sandbox store is never
+    consulted — which is exactly how a real 455-qty position read as flat.
+    """
+    from services import live_position_reconciliation_service as recon
+
+    routing["analyze"] = False
+    routing["modes"]["futures_follow_cap50"] = "sandbox"
+
+    with (
+        patch(
+            "services.openposition_service.get_auth_token_broker",
+            return_value=("auth-token", "zerodha"),
+        ),
+        patch(
+            "services.sandbox_service.sandbox_get_positions", return_value=_SANDBOX_BOOK
+        ) as sandbox,
+    ):
+        recon._fetch_broker_qty("k", "NIFTY25AUG26FUT", "NFO", "NRML", mode_key=None)
+
+    sandbox.assert_not_called()
