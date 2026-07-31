@@ -35,6 +35,11 @@ ph = PasswordHasher()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Seconds SQLite waits for a competing writer before raising "database is
+# locked" on this engine. See the engine construction below for why the 5s
+# stdlib default is too short here (issue #500).
+SQLITE_BUSY_TIMEOUT_SEC = int(os.getenv("SQLITE_BUSY_TIMEOUT_SEC", "30"))
+
 # Security: Require API_KEY_PEPPER environment variable (fail fast if missing)
 # Pepper must be at least 32 bytes (64 hex characters) for cryptographic security
 _pepper_value = os.getenv("API_KEY_PEPPER")
@@ -161,8 +166,19 @@ if DATABASE_URL and "sqlite" in DATABASE_URL:
     # Session cleanup is handled by app.py teardown_appcontext.
     # StaticPool must NOT be used: concurrent requests on a single shared
     # SQLite connection cause "bad parameter or other API misuse" errors.
+    # SQLITE_BUSY_TIMEOUT_SEC: sqlite3's default is 5s, which is SHORTER than a
+    # master-contract bulk insert (107k rows, ~9s observed on 2026-07-31) — so
+    # a 1-row auth write landing in that window failed with "database is
+    # locked" and 500'd the broker login callback (issue #500). This DB is in
+    # journal_mode=delete, so any writer blocks every other writer. Matches the
+    # existing precedent in database/master_contract_status_db.py.
     engine = create_engine(
-        DATABASE_URL, poolclass=NullPool, connect_args={"check_same_thread": False}
+        DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={
+            "check_same_thread": False,
+            "timeout": SQLITE_BUSY_TIMEOUT_SEC,
+        },
     )
 else:
     # For other databases like PostgreSQL, use connection pooling
