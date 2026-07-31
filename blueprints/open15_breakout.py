@@ -62,7 +62,7 @@ def config():
     import os as _os
 
     from database.open15_breakout_db import get_config, save_config
-    from services.open15_breakout_service import get_open15_service
+    from services.open15_breakout_service import TRADE_SIDES, get_open15_service
 
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
@@ -89,6 +89,9 @@ def config():
         instrument = body.get("instrument")
         if instrument is not None and instrument not in ("stock", "atm_option"):
             errors.append("instrument must be 'stock' or 'atm_option'")
+        trade_side = body.get("trade_side")
+        if trade_side is not None and trade_side not in TRADE_SIDES:
+            errors.append("trade_side must be 'both', 'long_only' or 'short_only'")
         max_trades = body.get("max_trades")
         if max_trades is not None:
             try:
@@ -125,6 +128,7 @@ def config():
             max_trades=max_trades,
             no_entry_after=no_entry_after,
             exit_time=exit_time,
+            trade_side=trade_side,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -142,6 +146,7 @@ def config():
                 "max_trades": int(_os.getenv("OPEN15_MAX_TRADES", "3")),
                 "no_entry_after": _os.getenv("OPEN15_NO_ENTRY_AFTER", "09:29"),
                 "exit_time": _os.getenv("OPEN15_EXIT_TIME", "09:30"),
+                "trade_side": _os.getenv("OPEN15_TRADE_SIDE", "both"),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -278,6 +283,9 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <label class="muted" style="margin-left:14px">instrument
   <select id="c_instr" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
    <option value="stock">stock</option><option value="atm_option">ATM option</option></select></label>
+ <label class="muted" style="margin-left:14px">trade side
+  <select id="c_side" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
+   <option value="both">both</option><option value="long_only">longs only</option><option value="short_only">shorts only</option></select></label>
  <label class="muted" style="margin-left:14px">max trades/day <input id="c_maxt" type="number" min="1" max="6" step="1" style="width:44px"></label>
  <label class="muted" style="margin-left:14px">no entry after <input id="c_nea" type="time" min="09:16" max="15:09" style="width:92px"></label>
  <label class="muted" style="margin-left:14px">exit time <input id="c_exit" type="time" min="09:17" max="15:10" style="width:92px"></label>
@@ -313,14 +321,19 @@ async function loadCfg(){
   document.getElementById('c_sizing').value=o.sizing_mode||d.sizing_mode||'fixed';
   document.getElementById('c_vol').value=o.vol_mult||d.vol_mult;
   document.getElementById('c_instr').value=o.instrument||d.instrument||'stock';
+  document.getElementById('c_side').value=o.trade_side||d.trade_side||'both';
   document.getElementById('c_maxt').value=o.max_trades||d.max_trades||3;
   document.getElementById('c_nea').value=o.no_entry_after||d.no_entry_after||'09:29';
   document.getElementById('c_exit').value=o.exit_time||d.exit_time||'09:30';
   const e=j.effective_today;
   if(e){
     const nea=e.no_entry_after||'09:29', ext=e.exit_time||'09:30';
+    const sd=e.trade_side||'both';
+    const sdLbl={both:'both',long_only:'longs only',short_only:'shorts only'}[sd]||sd;
     document.getElementById('c_eff').textContent=
-      'effective today: '+(e.instrument||'stock')+' | max trades '+(e.max_trades||3)+
+      'effective today: '+(e.instrument||'stock')+' | trade side '+sdLbl+
+      (sd!=='both'?' ⚠ one-sided (parity targets measured both sides)':'')+
+      ' | max trades '+(e.max_trades||3)+
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
       ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult+
@@ -333,6 +346,7 @@ async function saveCfg(){
     sizing_mode:document.getElementById('c_sizing').value,
     vol_mult:+document.getElementById('c_vol').value,
     instrument:document.getElementById('c_instr').value,
+    trade_side:document.getElementById('c_side').value,
     max_trades:+document.getElementById('c_maxt').value,
     no_entry_after:document.getElementById('c_nea').value,
     exit_time:document.getElementById('c_exit').value};

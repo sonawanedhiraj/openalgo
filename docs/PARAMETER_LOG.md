@@ -1752,8 +1752,11 @@ ran in the 15:30-17:00 periodic window).
   `OPEN15_TICK_CAPTURE` (default `true`) — persist the selected symbols' ticks
   (incl. the 09:15 first minute) to `tick_logs/open15/` for backtest replay.
   `OPEN15_SIZING_MODE` (default `fixed`) — `fixed` | `compound` capital sizing.
-  **UI overrides:** `margin_per_slot`, `sizing_mode`, and `vol_mult` are
-  editable from `/open15_vol_breakout/logs` (stored in the `open15_config`
+  `OPEN15_TRADE_SIDE` (default `both`) — `both` | `long_only` | `short_only`;
+  which sides the 09:15 selection may pick at all.
+  **UI overrides:** `margin_per_slot`, `sizing_mode`, `vol_mult`, `instrument`,
+  `max_trades`, `no_entry_after`, `exit_time`, and `trade_side` are editable
+  from `/open15_vol_breakout/logs` (stored in the `open15_config`
   row; NULL = env default; applied at the next 09:10 arm and recorded in the
   day's `armed` decision-log event). The env vars are the DEFAULTS layer.
   **Data-sourcing (issue #502):** `OPEN15_FIRST_CANDLE_SOURCE`
@@ -1770,6 +1773,11 @@ ran in the 15:30-17:00 periodic window).
     deployment — see `strategies/open15_vol_breakout/SPEC.md` §2 before tuning
     anything (the bar-level signal has NO honest edge; the mid-bar capture
     fraction is what's being measured).
+  - **2026-07-31:** `OPEN15_TRADE_SIDE` added by issue #503 (default `both` =
+    no behavior change). Gates `Open15Core._finalize_selection`, so an excluded
+    side is never selected, watched, entered or journalled. Note the published
+    parity targets are BOTH-sides numbers — a one-sided day is not comparable
+    to them, and the logs page flags it.
   - **2026-07-31:** Added `OPEN15_FIRST_CANDLE_SOURCE` (default `quotes`) and
     `OPEN15_BASELINE_INCLUDE_FIRST_MINUTE` (default `false`) — issue #502. The
     tick feed is a ~1/sec sample that starts whenever the first tick arrives,

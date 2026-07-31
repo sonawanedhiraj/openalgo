@@ -96,10 +96,17 @@ NULL field = env default; **applies at the next 09:10 arm**):
   cumulative realized research P&L from `open15_trades`, floored at 25% of
   base so a drawdown can shrink but never zero the strategy)
 - `vol_mult` — the volume-surge filter (1.0–5.0×)
+- `trade_side` (issue #503) — `both` (default) | `long_only` | `short_only`.
+  Gates the 09:15 **selection**: an excluded side is never picked, so it is
+  never watched, never triggers and never journals a row (same shape as
+  `top_n`). The parity targets in `config_snapshot.json` are both-sides
+  numbers, so a one-sided day is not comparable to them — the logs page flags
+  it.
 
 **Env defaults:** `OPEN15_ENABLED` (true) · `OPEN15_MODE` (sandbox|observe) ·
 `OPEN15_VOL_MULT` (1.5) · `OPEN15_SIZING_MODE` (fixed) · `OPEN15_TOP_N` (3) ·
 `OPEN15_MARGIN_PER_SLOT` (30000) · `OPEN15_LEVERAGE` (5) ·
+`OPEN15_TRADE_SIDE` (both) ·
 `OPEN15_TICK_CAPTURE` (true). The `armed` decision-log event records the
 effective day-config (incl. `config_source: ui | env_defaults`), so every day's
 sizing/filter is auditable.
