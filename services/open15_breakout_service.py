@@ -14,7 +14,12 @@ with real (sandbox) fills. Full spec: ``strategies/open15_vol_breakout/SPEC.md``
 Rules (locked; see SPEC):
   - Window opens 09:15 IST. Universe = SCANNER_SYMBOLS F&O stocks
     (indices excluded via ``resolve_exchange_for_symbol``).
-  - First candle (09:15) built from live ticks -> H1/L1 + open.
+  - First candle (09:15) open/H1/L1 comes from ONE batched broker quote
+    snapshot at 09:16 (issue #502). Ticks remain the source of the WITHIN-minute
+    volume accumulation — the one thing bars cannot provide and the whole
+    reason this strategy is tick-driven — but they are a ~1/sec sample that
+    starts whenever the first tick arrives, so they must not define the open
+    or the breakout level. Per-symbol fail-open to the tick-built candle.
   - Selection at 09:16: top-N gainers (LONG) / top-N losers (SHORT) by
     gap = 09:15 open / prev daily close − 1 (prev close from historify D).
   - Entry: tick-driven mid-bar trigger, once per symbol, MARKET MIS. New
@@ -215,6 +220,88 @@ def mis_round_trip_charges(buy_value: float, sell_value: float) -> float | None:
     stamp = 0.00003 * buy_value
     gst = 0.18 * (brokerage + exch_txn + sebi)
     return round(brokerage + stt + exch_txn + sebi + stamp + gst, 2)
+
+
+def _first_candle_source() -> str:
+    """``OPEN15_FIRST_CANDLE_SOURCE`` — ``quotes`` (default, issue #502) sources
+    the 09:15 open/high/low from ONE batched broker quote snapshot at 09:16;
+    ``ticks`` restores the pre-#502 tick-built candle."""
+    v = os.getenv("OPEN15_FIRST_CANDLE_SOURCE", "quotes").strip().lower()
+    return v if v in ("quotes", "ticks") else "quotes"
+
+
+def _baseline_includes_first_minute() -> bool:
+    """``OPEN15_BASELINE_INCLUDE_FIRST_MINUTE`` (default false, issue #502) —
+    the rollback switch for keeping the 09:15 minute in the volume baseline."""
+    return os.getenv("OPEN15_BASELINE_INCLUDE_FIRST_MINUTE", "false").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
+def fetch_first_candles(universe: set[str]) -> dict[str, dict[str, float]]:
+    """ONE batched broker quote call at 09:16 -> ``{symbol: {open, high, low}}``.
+
+    The quote payload's ``open`` is the exchange's official day open (the
+    pre-open auction print), and at 09:16:00 the running day ``high``/``low``
+    ARE the 09:15 candle's extremes. Both are exact where the tick-sampled
+    candle is a ~1/sec approximation that starts whenever the first tick
+    happens to arrive (issue #502 bugs 1 and 2).
+
+    NEVER raises. Any failure logs a WARNING and returns ``{}``; the caller
+    falls back to the tick-built candle per symbol.
+    """
+    if _first_candle_source() != "quotes":
+        return {}
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_multiquotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            logger.warning(
+                "open15 first-candle snapshot: no API key (broker session down?) — "
+                "falling back to the tick-built candle"
+            )
+            return {}
+        payload = [{"symbol": s, "exchange": "NSE"} for s in sorted(universe)]
+        success, resp, _status = get_multiquotes(payload, api_key=api_key)
+        if not success:
+            logger.warning(
+                "open15 first-candle snapshot: get_multiquotes failed: %s — "
+                "falling back to the tick-built candle",
+                (resp or {}).get("message", "unknown error"),
+            )
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        for item in (resp or {}).get("results") or []:
+            sym = item.get("symbol")
+            data = item.get("data")
+            if not sym or not isinstance(data, dict):
+                continue
+            try:
+                o, h, low = (
+                    float(data.get("open") or 0),
+                    float(data.get("high") or 0),
+                    float(data.get("low") or 0),
+                )
+            except (TypeError, ValueError):
+                continue
+            if o > 0 and h >= low > 0:
+                out[sym] = {"open": o, "high": h, "low": low}
+        logger.info(
+            "open15 first-candle snapshot: %d/%d symbols from the 09:16 quote call",
+            len(out),
+            len(universe),
+        )
+        return out
+    except Exception:
+        logger.exception(
+            "open15 first-candle snapshot failed — falling back to the tick-built candle"
+        )
+        return {}
 
 
 def _prevclose_check_enabled() -> bool:
@@ -450,7 +537,9 @@ class Open15Core:
     Legality invariant (the whole point): every quantity an entry decision
     reads — prev close, first-candle OHLC, completed-minute volumes, and the
     CURRENT minute's volume accumulated SO FAR — is known at the tick that
-    triggers the entry. Nothing from later in the minute is consulted.
+    triggers the entry. Nothing from later in the minute is consulted. The
+    09:16 broker first-candle snapshot (issue #502) keeps this invariant: the
+    09:15 candle is fully settled history by the time it is read.
     """
 
     def __init__(
@@ -460,6 +549,8 @@ class Open15Core:
         top_n: int = 3,
         entry_to_min: int = _ENTRY_TO,
         track_to_min: int = _EXIT_MIN,
+        baseline_includes_first_minute: bool = False,
+        await_snapshot: bool = False,
         trade_side: str = "both",
     ):
         self.prev_closes = prev_closes
@@ -473,6 +564,19 @@ class Open15Core:
         # exit_price stays fresh on an extended window (issue #451)
         self.entry_to_min = entry_to_min
         self.track_to_min = max(track_to_min, entry_to_min)
+        # issue #502 bug 3: the 09:15 minute is the day's busiest AND its
+        # tick cumulative volume carries the pre-open auction, so leaving it in
+        # the running mean inflates the baseline 1.06x-1.67x and turns the
+        # configured 1.5x gate into ~2.5x. Excluding it also drops the auction,
+        # because every later minute is a cumulative DIFFERENCE.
+        self.baseline_includes_first_minute = baseline_includes_first_minute
+        # issue #502 bugs 1+2: broker-authoritative first candles, applied at
+        # 09:16 via ``apply_first_candles``. Until they land (or the deadline
+        # passes) selection is deferred — finalizing on the tick-built candle
+        # is exactly the bug.
+        self.first_candles: dict[str, dict[str, float]] = {}
+        self.first_candle_source = "ticks"
+        self._snapshot_applied = not await_snapshot
         self.sym: dict[str, dict[str, Any]] = {}
         self.selected: dict[str, str] = {}  # symbol -> "L"/"S"
         self.gaps: dict[str, float] = {}
@@ -482,6 +586,34 @@ class Open15Core:
         # per-selected-symbol near-miss stats for the decision log: how close a
         # non-entered watch got (max cumvol/baseline ratio, ever beyond level)
         self.watch_stats: dict[str, dict[str, Any]] = {}
+
+    def apply_first_candles(self, candles: dict[str, dict[str, float]]) -> None:
+        """Install the broker's 09:15 open/high/low and release the selection.
+
+        Always releases the deferral, even on an empty/partial dict — a failed
+        snapshot must fall back to the tick-built candle, never stall the day.
+        """
+        clean: dict[str, dict[str, float]] = {}
+        for sym, c in (candles or {}).items():
+            try:
+                o, h, low = float(c["open"]), float(c["high"]), float(c["low"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if o > 0 and h >= low > 0:
+                clean[sym] = {"open": o, "high": h, "low": low}
+        self.first_candles = clean
+        if clean:
+            self.first_candle_source = "quotes"
+        self._snapshot_applied = True
+
+    def first_candle(self, symbol: str) -> dict[str, float] | None:
+        """Broker candle when the snapshot carried this symbol, else the
+        tick-built fallback (fail-open per symbol)."""
+        fc = self.first_candles.get(symbol)
+        if fc is not None:
+            return fc
+        st = self.sym.get(symbol)
+        return st["fc"] if st else None
 
     def _st(self, symbol: str) -> dict[str, Any]:
         st = self.sym.get(symbol)
@@ -498,16 +630,24 @@ class Open15Core:
         return st
 
     def _roll_minutes(self, st: dict, minute: int) -> None:
-        """Close out completed minutes up to (excluding) ``minute``."""
+        """Close out completed minutes up to (excluding) ``minute``.
+
+        The 09:15 minute is skipped for the baseline unless
+        ``baseline_includes_first_minute`` (issue #502) — ``cum_prev_end``
+        still advances, so the within-minute accumulation is unaffected.
+        """
         while st["cur_min"] < minute:
-            st["minute_vols"].append(max(st["last_cum"] - st["cum_prev_end"], 0.0))
+            if st["cur_min"] != _FIRST_MIN or self.baseline_includes_first_minute:
+                st["minute_vols"].append(max(st["last_cum"] - st["cum_prev_end"], 0.0))
             st["cum_prev_end"] = st["last_cum"]
             st["cur_min"] += 1
 
     def _finalize_selection(self) -> None:
         self.finalized = True
-        for s, st in self.sym.items():
-            fc = st["fc"]
+        # union: a symbol the broker snapshot covers is rankable even if its
+        # own ticks were slow to arrive (the MPHASIS class, issue #502)
+        for s in {*self.sym, *self.first_candles}:
+            fc = self.first_candle(s)
             pc = self.prev_closes.get(s)
             if fc and pc:
                 self.gaps[s] = fc["open"] / pc - 1.0
@@ -533,8 +673,12 @@ class Open15Core:
         self.last_price[symbol] = price
         st = self._st(symbol)
 
+        # Defer selection until the broker first-candle snapshot lands (issue
+        # #502). The deadline is a hard fail-open: past 09:16 we finalize on
+        # whatever we have rather than lose the day to a slow quote call.
         if not self.finalized and minute >= _ENTRY_FROM:
-            self._finalize_selection()
+            if self._snapshot_applied or minute > _ENTRY_FROM:
+                self._finalize_selection()
 
         if minute == _FIRST_MIN:
             fc = st["fc"]
@@ -556,7 +700,8 @@ class Open15Core:
             return None  # tracking only past the cutoff — no new entries
 
         side = self.selected.get(symbol)
-        if side is None or symbol in self.entered or st["fc"] is None:
+        fc = self.first_candle(symbol)
+        if side is None or symbol in self.entered or fc is None:
             return None
         vols = st["minute_vols"]
         if not vols:
@@ -565,7 +710,7 @@ class Open15Core:
         if baseline <= 0:
             return None
         cum_in_min = max(cumvol - st["cum_prev_end"], 0.0)
-        level = st["fc"]["high"] if side == "L" else st["fc"]["low"]
+        level = fc["high"] if side == "L" else fc["low"]
         beyond = price > level if side == "L" else price < level
         ws = self.watch_stats.setdefault(
             symbol, {"max_vol_ratio": 0.0, "max_vol_ratio_beyond": 0.0, "level_broken": False}
@@ -833,6 +978,8 @@ class Open15BreakoutService:
                 top_n=_top_n(),
                 entry_to_min=nea_min,
                 track_to_min=exit_min,
+                baseline_includes_first_minute=_baseline_includes_first_minute(),
+                await_snapshot=_first_candle_source() == "quotes",
                 trade_side=self.day_config["trade_side"],
             )
             self.positions = {}
@@ -855,6 +1002,8 @@ class Open15BreakoutService:
             config_source="ui" if cfg_row else "env_defaults",
             tick_capture=bool(self._tick_writer),
             prev_close_check=prev_check,
+            first_candle_source=_first_candle_source(),
+            baseline_includes_first_minute=_baseline_includes_first_minute(),
         )
         self._ensure_zmq_thread()
         if _opt_shadow_enabled():
@@ -871,6 +1020,30 @@ class Open15BreakoutService:
             _vol_mult(),
             _top_n(),
             _mode(),
+        )
+
+    def capture_first_candles(self) -> None:
+        """09:16:00 IST — install the broker's 09:15 candle into today's core.
+
+        This is the fix for issue #502 bugs 1 and 2: selection and the breakout
+        level stop depending on when the first tick happened to arrive. The
+        core defers finalizing until this lands (hard deadline 09:17), and a
+        failed/partial snapshot falls back to the tick-built candle per symbol,
+        so the day never stalls on it.
+        """
+        core = self.core
+        if core is None or self.day_status != "armed":
+            return
+        if _first_candle_source() != "quotes":
+            core.apply_first_candles({})
+            return
+        candles = fetch_first_candles(self.universe)
+        core.apply_first_candles(candles)
+        self._log_event(
+            "first_candles",
+            source=core.first_candle_source,
+            covered=len(candles),
+            universe=len(self.universe),
         )
 
     def _opt_shadow_catchup(self) -> None:
@@ -1110,7 +1283,7 @@ class Open15BreakoutService:
             logger.exception("open15: day-log persist failed")
 
     def register_jobs(self, scheduler=None) -> None:
-        """Register the 4 cron jobs.
+        """Register the 5 cron jobs.
 
         The shared historify APScheduler uses a persistent SQLAlchemyJobStore,
         which PICKLES job callables — so these MUST be module-level functions
@@ -1139,6 +1312,11 @@ class Open15BreakoutService:
                 _arm_job,
             ),
             (
+                "open15_first_candles",
+                CronTrigger(hour=9, minute=16, second=0, day_of_week="mon-fri", timezone=tz),
+                _first_candles_job,
+            ),
+            (
                 "open15_exit",
                 CronTrigger(hour=eh, minute=em, second=0, day_of_week="mon-fri", timezone=tz),
                 _eod_exit_job,
@@ -1157,7 +1335,8 @@ class Open15BreakoutService:
         for job_id, trigger, fn in jobs:
             sched.add_job(fn, trigger, id=job_id, replace_existing=True, misfire_grace_time=60)
         logger.info(
-            "open15: 4 scheduler jobs registered (arm 09:10 / exit %02d:%02d / retry %02d:%02d "
+            "open15: 5 scheduler jobs registered (arm 09:10 / first-candles 09:16 / "
+            "exit %02d:%02d / retry %02d:%02d "
             "/ summary %02d:%02d IST)",
             eh,
             em,
@@ -1546,6 +1725,12 @@ def _arm_job() -> None:
     svc = get_open15_service()
     if svc is not None:
         svc.arm()
+
+
+def _first_candles_job() -> None:
+    svc = get_open15_service()
+    if svc is not None:
+        svc.capture_first_candles()
 
 
 def _eod_exit_job() -> None:

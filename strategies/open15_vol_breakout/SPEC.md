@@ -24,8 +24,27 @@ This sandbox run measures it with real fills. The journal is the experiment.
 
 ## 3. Rules (all real-time legal)
 - **Universe:** `SCANNER_SYMBOLS` F&O stocks (indices excluded).
-- **First candle:** built from live ticks 09:15:00–09:15:59 → open/H1/L1;
-  minute volumes derived from cumulative tick volume (auction included in v0).
+- **First candle (issue #502):** open/H1/L1 come from ONE batched broker quote
+  snapshot taken by the `open15_first_candles` job at 09:16:00 — the quote's
+  `open` is the exchange's official day open, and at 09:16:00 the running day
+  `high`/`low` ARE the 09:15 candle's extremes. Selection is deferred until the
+  snapshot lands (hard fail-open deadline 09:17; per-symbol fail-open to the
+  tick-built candle). **Ticks are NOT a valid source for the candle** — they are
+  a ~1/sec sample that begins whenever the first tick arrives, which produced
+  the wrong open (MPHASIS 2026-07-31: first tick 8 s late and 3.24% below the
+  real open → phantom −4.15% gap, watched as the #1 short when it was really
+  #11 at −0.94%) and a systematically NARROW candle (high understated 24/24,
+  low overstated 24/24 — a level easier to break than the real one). Ticks
+  remain the source of the WITHIN-minute volume accumulation, which no bar can
+  provide and which is the entire reason this strategy is tick-driven.
+  Rollback: `OPEN15_FIRST_CANDLE_SOURCE=ticks`.
+- **Minute volumes** derived from cumulative tick volume. The **09:15 minute is
+  excluded from the baseline** (issue #502): it is the day's busiest minute AND
+  its tick cumulative carries the pre-open auction, which inflated the baseline
+  1.06×–1.67× and made the configured 1.5× gate behave like ~2.5× (zero entries
+  on 3 of 4 sessions). Excluding it also removes the auction, since every later
+  minute is a cumulative difference. Rollback:
+  `OPEN15_BASELINE_INCLUDE_FIRST_MINUTE=true`.
 - **Selection @ 09:16:** gap = 09:15 open ÷ prev daily close (historify D) − 1;
   top-3 positive → LONG watch, top-3 negative → SHORT watch.
   **Prev-close verification (issue #456):** the 09:10 arm sources prev-closes
