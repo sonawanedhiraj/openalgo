@@ -157,6 +157,15 @@ def _instrument_default() -> str:
     return v if v in ("stock", "atm_option") else "stock"
 
 
+TRADE_SIDES = ("both", "long_only", "short_only")
+
+
+def _trade_side_default() -> str:
+    """Which sides the day may select: both / long_only / short_only (issue #503)."""
+    v = os.getenv("OPEN15_TRADE_SIDE", "both").lower()
+    return v if v in TRADE_SIDES else "both"
+
+
 def _max_trades_default() -> int:
     """Daily entry cap across both sides (issue #437). Clamped 1..6."""
     try:
@@ -397,6 +406,9 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     instrument = (cfg.get("instrument") or _instrument_default()).lower()
     if instrument not in ("stock", "atm_option"):
         instrument = "stock"
+    trade_side = (cfg.get("trade_side") or _trade_side_default()).lower()
+    if trade_side not in TRADE_SIDES:
+        trade_side = "both"
     try:
         max_trades = int(cfg.get("max_trades") or _max_trades_default())
     except (TypeError, ValueError):
@@ -425,6 +437,7 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "max_trades": max_trades,
         "no_entry_after": no_entry_after,
         "exit_time": exit_time,
+        "trade_side": trade_side,
     }
 
 
@@ -447,10 +460,14 @@ class Open15Core:
         top_n: int = 3,
         entry_to_min: int = _ENTRY_TO,
         track_to_min: int = _EXIT_MIN,
+        trade_side: str = "both",
     ):
         self.prev_closes = prev_closes
         self.vol_mult = vol_mult
         self.top_n = top_n
+        # which sides may be selected at all (issue #503) — an excluded side is
+        # never watched, so it produces no ticks, no entries and no journal rows
+        self.trade_side = trade_side if trade_side in TRADE_SIDES else "both"
         # entries allowed through entry_to_min; price/minute tracking continues
         # through track_to_min (the exit minute) so the flatten's research
         # exit_price stays fresh on an extended window (issue #451)
@@ -496,10 +513,12 @@ class Open15Core:
                 self.gaps[s] = fc["open"] / pc - 1.0
         pos = sorted((s for s in self.gaps if self.gaps[s] > 0), key=lambda s: -self.gaps[s])
         neg = sorted((s for s in self.gaps if self.gaps[s] < 0), key=lambda s: self.gaps[s])
-        for s in pos[: self.top_n]:
-            self.selected[s] = "L"
-        for s in neg[: self.top_n]:
-            self.selected[s] = "S"
+        if self.trade_side != "short_only":
+            for s in pos[: self.top_n]:
+                self.selected[s] = "L"
+        if self.trade_side != "long_only":
+            for s in neg[: self.top_n]:
+                self.selected[s] = "S"
         # NB: never pass a bare dict as the sole logging arg — logging's
         # single-mapping special case turns it into `msg % dict` and raises.
         sel = ", ".join(f"{s}:{d}{self.gaps[s] * 100:+.2f}%" for s, d in self.selected.items())
@@ -814,6 +833,7 @@ class Open15BreakoutService:
                 top_n=_top_n(),
                 entry_to_min=nea_min,
                 track_to_min=exit_min,
+                trade_side=self.day_config["trade_side"],
             )
             self.positions = {}
             self.day_status = "armed"
@@ -826,6 +846,7 @@ class Open15BreakoutService:
             mode=_mode(),
             no_entry_after=self.day_config["no_entry_after"],
             exit_time=self.day_config["exit_time"],
+            trade_side=self.day_config["trade_side"],
             sizing_mode=self.day_config["sizing_mode"],
             margin_per_slot=self.day_config["margin_per_slot"],
             margin_effective=self.day_config["margin_effective"],
@@ -1472,6 +1493,7 @@ class Open15BreakoutService:
             "notional_per_trade": _notional(),
             "instrument": (self.day_config or {}).get("instrument") or _instrument_default(),
             "max_trades": (self.day_config or {}).get("max_trades") or _max_trades_default(),
+            "trade_side": (self.day_config or {}).get("trade_side") or _trade_side_default(),
             "universe_size": len(self.universe),
             "selected": dict(core.selected) if core else {},
             "gaps_pct": {s: round(g * 100, 2) for s, g in (core.gaps or {}).items()}
