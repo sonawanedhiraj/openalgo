@@ -228,6 +228,7 @@ def _get_strategy_mode(name: str) -> str:
 # sector_follow still has no veto call, so its decisions view is empty by
 # construction. The UI notes this rather than faking rows.
 _FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
+_INTRADAY_PULLBACK_FOLDER = "intraday_pullback_top2"
 _VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
 # Map a dashboard strategy name → the signal_decision source filters its veto
@@ -870,6 +871,133 @@ def _open15_opt_shadow() -> dict[str, dict | None]:
     return out
 
 
+_INTRADAY_PULLBACK_SIDE_KEY = {"L": "long", "S": "short"}
+
+
+def _intraday_pullback_net_pnl(row) -> float | None:
+    """Net P&L for a closed ``intraday_pullback_trades`` row.
+
+    Unlike ``open15_trades`` (gross ``pnl`` + separate ``charges_inr``), this
+    journal stamps ``net_pnl`` directly. Fall back to ``gross_pnl - charges_inr``
+    only when the net column was never stamped, and return ``None`` when neither
+    is available so the caller can count it as an unpriced exit rather than
+    silently booking a ₹0 trade (issue #350 contract).
+    """
+    if row.net_pnl is not None:
+        return float(row.net_pnl)
+    if row.gross_pnl is not None:
+        return float(row.gross_pnl) - float(row.charges_inr or 0.0)
+    return None
+
+
+def _intraday_pullback_stats() -> dict:
+    """Today's open positions, realized net P&L, trade count, and last trade time
+    from ``intraday_pullback_trades`` (issue #508).
+
+    The strategy is intraday (entry and its 15:15 flatten share ``trade_date``),
+    so "today" keys directly off ``trade_date``. ``observe``-mode rows are
+    journal-only dry runs (no orders placed) and are excluded so they can't
+    inflate the book — same contract as open15. ``created_at`` is naive UTC
+    (``datetime.utcnow`` default), which is exactly the card's ``last_trade_at``
+    contract (issue #317).
+    """
+    try:
+        from database.intraday_pullback_db import IntradayPullbackTrade
+        from database.intraday_pullback_db import db_session as ip_session
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        rows = (
+            ip_session.query(IntradayPullbackTrade)
+            .filter(IntradayPullbackTrade.mode.in_(("sandbox", "live")))
+            .all()
+        )
+        open_count = 0
+        today_trade_count = 0
+        today_pnl = 0.0
+        today_unpriced_exits = 0
+        last_at: datetime | None = None
+        for r in rows:
+            if (r.status or "") == "open":
+                open_count += 1
+            if r.created_at is not None and (last_at is None or r.created_at > last_at):
+                last_at = r.created_at
+            if r.trade_date != today_str:
+                continue
+            today_trade_count += 1
+            if (r.status or "") == "closed":
+                pnl = _intraday_pullback_net_pnl(r)
+                if pnl is not None:
+                    today_pnl += pnl
+                else:
+                    today_unpriced_exits += 1
+        return {
+            "open_positions": open_count,
+            "today_net_pnl": round(today_pnl, 2),
+            "today_unpriced_exits": today_unpriced_exits,
+            "last_trade_at": last_at.isoformat() if last_at else None,
+            "today_trade_count": today_trade_count,
+        }
+    except Exception:
+        logger.exception("Failed to aggregate intraday_pullback stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
+
+
+def _intraday_pullback_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized net P&L + win-rate from
+    closed ``intraday_pullback_trades`` rows (issue #508).
+
+    Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
+    columns honest once the strategy is flipped live — sandbox history never
+    leaks into the live column and vice-versa (futures_follow / open15
+    precedent). ``observe`` rows fall outside both buckets by construction.
+
+    Each mode also carries ``long``/``short`` sub-aggregates keyed off the
+    journal's ``side`` column (``L``/``S``). The split matters here more than
+    elsewhere: the two books are mutually exclusive by day gate (NIFTY up →
+    long, NIFTY down → short) and the deep-loser short is the unvalidated,
+    slippage-fragile leg — a blended headline hides which book is working.
+    """
+    out = {
+        "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
+        "live": {**_lifetime_from_pnls([]), **_side_split({})},
+    }
+    try:
+        from database.intraday_pullback_db import IntradayPullbackTrade
+        from database.intraday_pullback_db import db_session as ip_session
+
+        rows = (
+            ip_session.query(IntradayPullbackTrade)
+            .filter(IntradayPullbackTrade.status == "closed")
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        sides: dict[str, dict[str, list[float]]] = {
+            "sandbox": {"long": [], "short": []},
+            "live": {"long": [], "short": []},
+        }
+        for r in rows:
+            m = (r.mode or "").lower()
+            if m not in buckets:
+                continue
+            pnl = _intraday_pullback_net_pnl(r)
+            if pnl is None:
+                continue
+            buckets[m].append(pnl)
+            side_key = _INTRADAY_PULLBACK_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[m][side_key].append(pnl)
+        out = {m: {**_lifetime_from_pnls(p), **_side_split(sides[m])} for m, p in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate intraday_pullback lifetime stats")
+    return out
+
+
 def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
     """Daily realized-P&L series from ``trade_journal`` rows for the simplified
     engine (closed rows carry ``pnl``; the date key is the ``exited_at`` IST
@@ -938,6 +1066,38 @@ def _pnl_curve_futures_follow(window_days: int | None) -> list[dict]:
         return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
     except Exception:
         logger.exception("Failed to build pnl_curve for futures_follow")
+        return []
+
+
+def _pnl_curve_intraday_pullback(window_days: int | None) -> list[dict]:
+    """Daily realized-net-P&L series from ``intraday_pullback_trades`` (#508).
+
+    The strategy is intraday — entry and its 15:15 flatten share ``trade_date``
+    — so the realization date IS ``trade_date``, and no created_at/entry_date
+    reconciliation (the futures_follow T+1 problem) applies. ``observe`` rows
+    are excluded to match the card's stats.
+    """
+    try:
+        from database.intraday_pullback_db import IntradayPullbackTrade
+        from database.intraday_pullback_db import db_session as ip_session
+
+        q = ip_session.query(IntradayPullbackTrade).filter(
+            IntradayPullbackTrade.status == "closed",
+            IntradayPullbackTrade.mode.in_(("sandbox", "live")),
+        )
+        if window_days:
+            cutoff = datetime.utcnow() - timedelta(days=window_days)
+            q = q.filter(IntradayPullbackTrade.created_at >= cutoff)
+        rows = q.order_by(IntradayPullbackTrade.created_at).all()
+        by_date: dict[str, float] = {}
+        for r in rows:
+            pnl = _intraday_pullback_net_pnl(r)
+            if pnl is None:
+                continue
+            by_date[r.trade_date] = by_date.get(r.trade_date, 0.0) + pnl
+        return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
+    except Exception:
+        logger.exception("Failed to build pnl_curve for intraday_pullback")
         return []
 
 
@@ -1020,6 +1180,8 @@ def _build_summary(name: str) -> dict:
         stats = _simplified_engine_stats()
     elif name == "open15_vol_breakout":
         stats = _open15_stats()
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        stats = _intraday_pullback_stats()
 
     # Effective order routing RIGHT NOW (issue #440): the per-strategy
     # dispatch verdict an order would get — 'live' only when the navbar is on
@@ -1178,6 +1340,18 @@ def strategy_detail(name: str):
         }
         if lifetime["live"]["closed_trades"] > 0:
             performance["live"] = {**lifetime["live"], "options": opt_shadow["live"]}
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        stats = _intraday_pullback_stats()
+        lifetime = _intraday_pullback_lifetime()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
+        }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []
@@ -1272,6 +1446,52 @@ def strategy_detail(name: str):
                     "opt_exit_premium": r.opt_exit_premium,
                     "opt_charges_inr": r.opt_charges_inr,
                     "opt_pnl": r.opt_pnl,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        try:
+            from database.intraday_pullback_db import IntradayPullbackTrade
+            from database.intraday_pullback_db import db_session as ip_session
+
+            rows = (
+                ip_session.query(IntradayPullbackTrade)
+                .order_by(IntradayPullbackTrade.id.desc())
+                .limit(50)
+                .all()
+            )
+            recent_trades = [
+                {
+                    "id": r.id,
+                    "side": r.side,
+                    "symbol": r.symbol,
+                    "sector": r.sector,
+                    "session": r.session,
+                    "quantity": r.quantity,
+                    "entry_price": r.entry_price,
+                    "exit_price": r.exit_price,
+                    "stop_price": r.stop_price,
+                    "exit_reason": r.exit_reason,
+                    # `trigger` is the shared table's "Entry Time" cell (named
+                    # for open15's mid-bar trigger); here it is the 5m breakout
+                    # candle's entry timestamp.
+                    "trigger": r.entry_time.strftime("%H:%M:%S") if r.entry_time else None,
+                    # gross_pnl is deliberately NOT sent: it flips the shared
+                    # table's `hasFinancials` group on, which is labelled for
+                    # the NIFTY-futures sleeve ("Buy Price"/"Sell Price" of the
+                    # future) and duplicates the Charges column. Gross is
+                    # net + charges, both of which ARE shown.
+                    "charges_inr": r.charges_inr,
+                    # The journal stamps net_pnl directly (charges already
+                    # deducted) — unlike open15, no derivation needed here.
+                    "net_pnl": _intraday_pullback_net_pnl(r),
+                    "mode": r.mode,
+                    "status": r.status,
+                    "entry_date": r.trade_date,
+                    "exit_ts": r.exit_time.isoformat() if r.exit_time else None,
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows
@@ -1383,6 +1603,8 @@ def pnl_curve(name: str):
         points = _pnl_curve_futures_follow(window_days)
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         points = _pnl_curve_simplified_engine(window_days)
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        points = _pnl_curve_intraday_pullback(window_days)
     # Other strategies: empty series (no journal yet)
 
     return jsonify({"status": "success", "data": {"window": window, "points": points}})

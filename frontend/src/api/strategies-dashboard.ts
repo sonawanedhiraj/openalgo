@@ -48,8 +48,11 @@ export interface StrategySummary {
 // trades has n_trades=0 and null stats — rendered as '—', never 0%.
 export interface SideSplit {
   n_trades: number
-  wins: number
-  win_rate_pct: number | null
+  // Journal-derived splits always carry `wins`; a backtest split declared in a
+  // config_snapshot may publish only per-side trade count + net P&L when the
+  // source report never broke out per-side win rate (issue #508).
+  wins?: number | null
+  win_rate_pct?: number | null
   net_pnl_inr: number | null
 }
 
