@@ -1451,6 +1451,78 @@ broker-known prior close, with every existing guard alert-only). Three parts:
     `test/test_scanner_service.py` (per-symbol enforcement),
     `test/test_scanner_watchdog_and_backfill_gate.py` (straggler tick).
 
+## Daily post-market review (`postmarket_review`) + job-run audit
+
+An in-process APScheduler job (**17:15 IST mon-fri, trading days only**) that
+records what the day actually did, and the `job_run` audit table it stands on.
+Issue #511, Phase 1 of a phased build.
+
+**Why it exists.** Two failures motivated it. (1) `futures_follow_cap50` T+1
+exits were silently dead for **four trading days** (2026-07-27..30, issue #497)
+while open NRML lots climbed to 110% of book — every individual layer looked
+healthy. (2) `journal_reflection`, the 16:00 IST nightly LLM job, has run **three
+times in two months** against a daily mon-fri schedule: it posts to the Cowork
+bridge on :5001, which is normally down, and fails silently. Nobody noticed
+because **nothing recorded whether a scheduled job fired**.
+
+**The load-bearing rule for every later phase: Python detects, the LLM triages.**
+Invariants are asserted in code and are either true or false; the model only
+ranks severity, correlates, and drafts prose. It never decides whether something
+is broken. That split is what stops the report from inventing problems on a quiet
+day — and it is why Phase 1 ships with **no verdicts and no LLM call at all**.
+
+- **`job_run` audit** (`database/job_run_db.py` + `services/job_run_audit.py`) —
+  one row per APScheduler fire (`ok` / `error` / `missed`, with `duration_ms`,
+  `scheduled_at`, exception text). The listener attaches to the shared Historify
+  scheduler in `app.py` **immediately after `init_historify_scheduler` and before
+  any service registers jobs**, so a boot-time fire is still captured. Two
+  non-obvious details, both regression-tested: the SUBMITTED event spells it
+  `scheduled_run_times` (a *list*) while EXECUTED uses `scheduled_run_time`
+  (singular) — keying only the singular form silently produced `duration_ms=None`
+  for every job; and job names are cached on `EVENT_JOB_ADDED` because a one-shot
+  (`date`-trigger) job is removed from the jobstore *before* it is submitted, so
+  a later `get_job` lookup returns None. Pruned to `JOB_RUN_RETENTION_DAYS`
+  (default 90) by the review job. Flag `JOB_RUN_AUDIT_ENABLED` (default `true`).
+- **Day digest** (`services/postmarket_day_digest.build_day_digest`) — read-only
+  aggregation over `job_run`, `trade_journal` (per strategy/direction, incl.
+  open-at-EOD and #350-style unpriced exits), `signal_decision`, `scan_results` +
+  `scan_cycle`, the four per-strategy journals, `data_health_check`,
+  `scanner_comparison`, `account_orders`, `sandbox_orders`, and the compacted
+  logs. **Every section is independently wrapped**: a dead source degrades to
+  `None` and is named in `sources_failed` rather than killing the run.
+  The **futures carry walk** is the #497 detector: exits are *separate SELL rows*
+  (`exit_price` is never back-filled onto the BUY leg), so carry is a FIFO lot
+  balance — replaying 2026-07-24..30 yields open lots `1→2→4→6→8` with
+  `exits_today=0` every day and `carry_age_days` reaching 13 on a T+1 strategy.
+- **Log compaction** (`services/postmarket_log_digest`) — the daily text log is
+  **~5 MB** and `errors.jsonl` is **capped at 1000 lines and truncated on every
+  app startup**, so raw logs can never go into a digest (or, later, a prompt) and
+  error history is otherwise lost on restart. Errors bucket by
+  `(logger, normalized_message)`; the text log is streamed for level counts and
+  known structured markers only — **raw log text never enters the digest**. A
+  durable `log/error_digest_<date>.json` snapshot is merged **max-wise** on each
+  run, which both survives the truncation and keeps re-runs idempotent (summing
+  would double-count everything already captured).
+- **Persistence + report** — one `postmarket_review` row per date (idempotent
+  delete-then-insert) plus a Telegram summary via `notify("postmarket_review")`.
+  A **non-trading day returns early and persists nothing** — an empty row for a
+  Saturday is noise, not a record.
+- **Replay CLI** — `uv run python -m services.postmarket_review_service --date
+  YYYY-MM-DD --dry-run`. Use it to develop against known-bad days before
+  anything runs live.
+- **Flags:** `POSTMARKET_REVIEW_ENABLED` (default `true`, per-fire),
+  `POSTMARKET_REVIEW_TIME` (default `17:15`), `NOTIFY_POSTMARKET_REVIEW`,
+  `JOB_RUN_AUDIT_ENABLED`, `JOB_RUN_RETENTION_DAYS`. See `docs/PARAMETER_LOG.md`.
+  **17:15 is not arbitrary** — the scanner backfill convergence loop runs until
+  17:00 (`SCANNER_BACKFILL_PERIODIC_END_TIME`); reviewing earlier reads
+  half-written data. Move one and you must move the other.
+
+**Not yet built** (later phases, each its own issue): expectation contracts
+(deterministic per-strategy pass/fail), the `claude -p` triage layer over the
+failures, GitHub issue filing with dedupe + a rate cap, and the closed-issue
+validation sweep. Tests: `test/test_job_run_audit.py`,
+`test/test_postmarket_review.py`.
+
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
 A daily in-process APScheduler job (**15:45 IST mon-fri**) that scores how the

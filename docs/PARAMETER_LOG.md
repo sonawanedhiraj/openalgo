@@ -18,6 +18,48 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Daily post-market review + job-run audit (issue #511, added 2026-08-02)
+
+New tunables introduced with Phase 1 of the post-market review scheduler. All are
+code defaults — none is set in `.env`, so the shipped behaviour is the default.
+
+#### POSTMARKET_REVIEW_ENABLED
+- **Value:** code default `true`. Per-fire gate, read **inside** the job body, so
+  flipping it needs no re-registration.
+- **What it gates:** whether the 17:15 IST `postmarket_review` job does anything.
+  `false` makes it a logged no-op; the job stays registered.
+
+#### POSTMARKET_REVIEW_TIME
+- **Value:** code default `17:15` (IST, `HH:MM`, mon-fri). Malformed values fall
+  back to `17:15`.
+- **Why 17:15 and not "right after the close":** the deterministic EOD chain runs
+  15:35 (trading-day funnel) → 15:45 (scanner comparison) → 16:00 (historify) →
+  16:30 (sector_follow data health), and the scanner backfill **convergence loop
+  runs until 17:00** (`SCANNER_BACKFILL_PERIODIC_END_TIME`). Reviewing before
+  that window closes reads half-written data and reports phantom staleness.
+  **If `SCANNER_BACKFILL_PERIODIC_END_TIME` is moved later, move this too.**
+
+#### NOTIFY_POSTMARKET_REVIEW
+- **Value:** code default `true` (still subject to the master
+  `NOTIFY_TELEGRAM_ENABLED`).
+- **What it gates:** the daily Telegram summary. Default ON because a silent
+  review is indistinguishable from a review that never ran — precisely the
+  failure mode that hid `journal_reflection`'s dead schedule for two months.
+
+#### JOB_RUN_AUDIT_ENABLED
+- **Value:** code default `true`. Per-fire gate read inside each listener handler.
+- **What it gates:** whether APScheduler fires are recorded to `job_run`. Off
+  means the review's job section reports zero recorded jobs — which looks
+  identical to "no jobs fired", so leave it on unless write volume is actually a
+  problem.
+
+#### JOB_RUN_RETENTION_DAYS
+- **Value:** code default `90` (IST days).
+- **What it does:** `job_run` rows older than this are pruned by the
+  `postmarket_review` job. Without pruning the table grows on every scheduler
+  tick forever. Lower it only if the table is measurably large — Phase 2's
+  expectation contracts want enough history to spot a job that *stopped* firing.
+
 ### Multi-account mirror trading (issues #468/#474/#476/#478/#482, added 2026-07-28)
 
 #### MULTI_ACCOUNT_ENABLED
