@@ -90,13 +90,13 @@ def _end_time() -> time:
         return time(17, 0)
 
 
-# Pre-entry refresh (#237): a single convergence fetch just before the 15:20
-# entry, since the boot check runs hours earlier and the periodic loop only runs
+# Pre-entry refresh (#237): a single convergence fetch just before the entry,
+# since the boot check runs hours earlier and the periodic loop only runs
 # 15:30-17:00 — a mid-day intraday gap otherwise stays open through entry.
-_DEFAULT_PREENTRY_TIME = "15:17"
+_DEFAULT_PREENTRY_TIME = "15:02"  # issue #512: before the 15:03 smoke / 15:05 entry
 # Bounded wait for the pre-entry download jobs. Must be short enough that a slow
-# fetch cannot overrun the 15:20 entry — if it does, the 15:18 smoke check still
-# catches the stale data and pauses.
+# fetch cannot overrun the entry — if it does, the smoke check still catches the
+# stale data and pauses.
 _PREENTRY_WAIT_SEC = 90
 
 
@@ -105,13 +105,13 @@ def preentry_refresh_enabled() -> bool:
 
 
 def preentry_refresh_time() -> time:
-    """Pre-entry refresh fire time (default 15:17 IST — before the 15:18 smoke)."""
+    """Pre-entry refresh fire time (default 15:02 IST — before the 15:03 smoke)."""
     raw = os.getenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", _DEFAULT_PREENTRY_TIME)
     try:
         hh, mm = (int(x) for x in raw.split(":", 1))
         return time(hh, mm)
     except (TypeError, ValueError):
-        return time(15, 17)
+        return time(15, 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,7 +249,7 @@ def run_preentry_backfill_checks(today=None) -> dict:
     enough not to overrun 15:20) for the download jobs so today's bars land in
     historify (the evaluator's fallback source) before the 15:18 smoke + 15:20
     entry. Additive, idempotent (fresh → no-op), and fail-graceful. Mirrors
-    ``run_boot_backfill_checks`` minus the boot serialisation lock — 15:17 is a
+    ``run_boot_backfill_checks`` minus the boot serialisation lock — 15:02 is a
     quiet window with no sibling convergence running.
 
     Returns the ``run_backfill_checks`` verdict, or ``{"skipped": True}`` when the

@@ -944,14 +944,33 @@ the operator hands-on sooner — no safety rails removed.
 
 **Scaffold strategy**: [`strategies/sector_follow_cap5_vol/`](strategies/sector_follow_cap5_vol/)
 — an intraday sector-follow strategy (spawned from R40 winner `V_SF_CAP5_VOL`):
-at 15:20 IST it buys ≤5 names whose mapped sector index is up >1% intraday AND the
+at **15:05 IST** it buys ≤5 names whose mapped sector index is up >1% intraday AND the
 stock is up >0.5% AND volume >1× its 20d average (vol-ratio tiebreaker), holds to a
-T+1 15:25 MARKET exit, with a 3%-of-capital daily kill switch. Universe is the
+T+1 **15:10** MARKET exit, with a 3%-of-capital daily kill switch. Universe is the
 Phase-0.5 `LOCK_STATIC_30` set; ₹2.5L capital, ₹50k/position.
-**SCAFFOLD ONLY — not live** (`mode: scaffold-only`, `deployable: false`). Unlike
+**Timing changed 2026-08-03 (issue #512 — NSE Closing Auction Session).** It was
+entry 15:20 / exit 15:25 until then. From 2026-08-03 NSE ends continuous trading in
+CAS-eligible cash scrips — **every F&O name, i.e. the entire `LOCK_STATIC_30`
+universe** — at **15:15 IST**, then runs the auction 15:15–15:35 whose 15:25–15:30
+phase accepts **LIMIT orders only**. This strategy places **CNC MARKET** orders and,
+being CNC, has **no MIS auto-square-off backstop**, so a rejected T+1 exit would
+silently carry to T+2 (the #497 failure shape). The whole chain therefore moved
+inside continuous trading — refresh 15:02 → smoke 15:03 → entry 15:05 → exit 15:10 —
+and the times are env-tunable (`SECTOR_FOLLOW_{ENTRY,EXIT,SMOKE_CHECK}_TIME`,
+`SECTOR_FOLLOW_PREENTRY_REFRESH_TIME`) but **hard-clamped to 15:10** by
+`resolve_schedule()`: an operator override can never push a MARKET order into the
+auction. ⚠️ **A 15:05 entry is a DIFFERENT signal from the backtested 15:20 one** (a
+different snapshot of the intraday move and of volume accumulation) — every R40/R41
+result predates the change, so post-2026-08-03 sessions are **unvalidated** until a
+re-backtest on the new window lands.
+**LIVE** — the `strategy_mode` row has said `live` since 2026-06-24 (operator flip
+via the harness). This paragraph previously read "SCAFFOLD ONLY — not live", which
+was stale and dangerous for a real-money sleeve; the env default
+`SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` is only the first-boot seed and is
+superseded by the DB row (per the #440 per-strategy dispatch rules). Unlike
 sector_rotation_etf, this strategy IS wired into the runtime: `SectorFollowService`
 (`services/sector_follow_service.py`) is built at boot and registers 4 APScheduler
-jobs (entry 15:20 / exit 15:25 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
+jobs (entry 15:05 / exit 15:10 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
 default `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` places **no orders** — it computes
 signals, logs, and writes the `sector_follow_trades` journal only. Flip to
 `sandbox` / `live` is operator-only. Key files:
