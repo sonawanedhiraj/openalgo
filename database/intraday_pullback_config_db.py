@@ -42,6 +42,7 @@ _EDITABLE = (
     "no_trade_end",
     "afternoon_start",
     "afternoon_end",
+    "trade_side",
 )
 
 
@@ -56,6 +57,8 @@ class IntradayPullbackConfig(Base):
     no_trade_end = Column(String(5), nullable=True)
     afternoon_start = Column(String(5), nullable=True)
     afternoon_end = Column(String(5), nullable=True)
+    # both | long_only | short_only (issue #509). NULL = both (backtested default).
+    trade_side = Column(String(12), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = Column(String(64), nullable=True)
 
@@ -69,15 +72,38 @@ def _row_to_dict(row: IntradayPullbackConfig) -> dict:
         "no_trade_end": row.no_trade_end,
         "afternoon_start": row.afternoon_start,
         "afternoon_end": row.afternoon_end,
+        "trade_side": row.trade_side,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "updated_by": row.updated_by,
     }
+
+
+def _ensure_columns():
+    """Idempotent additive migration (create_all never ALTERs an existing table).
+
+    Mirrors ``intraday_pullback_db._ensure_columns``. Without this, a column
+    added to the model after the table was first created is silently missing
+    on a live install and every read of it raises OperationalError.
+    """
+    wanted = {
+        "trade_side": "VARCHAR(12)",  # issue #509
+    }
+    try:
+        with engine.connect() as conn:
+            existing = {r[1] for r in conn.exec_driver_sql(f"PRAGMA table_info({TABLE_NAME})")}
+            for col, ddl in wanted.items():
+                if col not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {TABLE_NAME} ADD COLUMN {col} {ddl}")
+                    logger.info("added column %s.%s", TABLE_NAME, col)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("intraday_pullback_config _ensure_columns failed: %s", e)
 
 
 def init_db():
     """Create the intraday_pullback_config table if it does not exist (idempotent)."""
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_columns()
         logger.info("%s table ready", TABLE_NAME)
     except Exception as e:  # noqa: BLE001
         logger.exception("Failed to init %s table: %s", TABLE_NAME, e)

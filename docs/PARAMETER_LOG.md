@@ -1789,6 +1789,41 @@ ran in the 15:30-17:00 periodic window).
     4 sessions. **`OPEN15_VOL_MULT` itself is unchanged at 1.5** — the gate
     now simply means what it says. Both new flags are rollback switches.
 
+## `INTRADAY_PULLBACK_TRADE_SIDE` — intraday_pullback_top2 trade side (issue #509)
+
+- **Value:** `both` (default) | `long_only` | `short_only`. Env var is the
+  DEFAULTS layer; a `trade_side` value in the `intraday_pullback_config` row
+  (set from the strategy settings page or `POST
+  /intraday_pullback_top2/api/settings`) overrides it. NULL/unset = env → the
+  `trade_side` key in `config_snapshot.json` → `both`.
+- **What it does:** gates which book may run, enforced in
+  `IntradayPullbackService.run_selection` immediately after the 09:30 NIFTY day
+  gate. An excluded side is never selected, never watched, never triggers and
+  never journals a row — the same shape as open15's `OPEN15_TRADE_SIDE` (#503).
+  Applied at the 09:00 daily reset, like the other editable settings.
+- **Load-bearing semantics — this is NOT a rebalance.** The long and short
+  books are **mutually exclusive by the day gate** (NIFTY up at 09:30 → long
+  book only; NIFTY down → short book only). Excluding a side therefore means the
+  strategy **does not trade at all** on the days that side would have run:
+  `long_only` gives up every NIFTY-down day (~half the calendar), it does not
+  run longs on down-days. A skip records
+  `skip_reason='trade_side=…'` on `get_status()` / `entry_breakdown()` so it
+  stays distinguishable from a data outage.
+- **Why default `both`:** it is the backtested configuration. The R53 figures
+  (PF 1.60, +97.6% fixed, Sharpe 2.96, MaxDD −8.9%) are **both-sides numbers** —
+  a one-sided run is not comparable to them, and the settings page flags this.
+  Per-side backtest contribution: long 155 trades / PF 1.72 / +₹44,202; short
+  80 trades / PF 1.40 / +₹14,362.
+- **Failure mode:** an unrecognised env or stored value falls back to `both`
+  with a WARNING rather than darkening a book on a typo.
+- **History:**
+  - **2026-08-02:** Introduced by issue #509 (default `both` = no behaviour
+    change). Motivated by the strategy's own LEARNINGS: *"Long is the validated
+    primary; the short is promising-but-unproven"*, with the deep-loser short
+    called out as the most slippage-fragile leg — so disabling the short during
+    the sandbox measurement phase needed to be an operator control rather than a
+    code edit. First tunable cataloged for this strategy.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

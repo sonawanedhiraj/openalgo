@@ -1,8 +1,12 @@
 import { webClient } from '@/api/client'
 
+export type TradeSide = 'both' | 'long_only' | 'short_only'
+
 export interface IntradayPullbackSettings {
   base_capital: number
   sizing_mode: 'fixed' | 'compound' | 'capped'
+  /** issue #509 — which book(s) may run. See the day-gate note in the UI. */
+  trade_side: TradeSide
   slots: number
   margin_per_slot: number
   morning: [string, string]
@@ -16,6 +20,7 @@ export interface IntradayPullbackSettings {
 export interface IntradayPullbackSettingsUpdate {
   base_capital: number
   sizing_mode: string
+  trade_side: string
   no_trade_start: string
   no_trade_end: string
   afternoon_start: string
