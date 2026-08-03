@@ -1587,11 +1587,54 @@ that starts crying wolf can be muted same-day without a code change. A muted
 contract should get an issue to fix or delete it: a permanently disabled contract
 is worse than no contract, because the report still *looks* complete.
 
-**Not yet built** (later phases, each its own issue): the `claude -p` triage
-layer over the violations, GitHub issue filing with fingerprint dedupe + a rate
-cap, and the closed-issue validation sweep. Tests:
+**Phase 3 — LLM triage (issue #534, `services/postmarket_triage.py`).** Adds
+judgment on top of the verdict: a `claude -p` pass over the Phase 2 violations
+returning a day assessment, per-violation likely-cause / recurrence / recommended
+action, and draft issue title+body. It uses the **same in-process seam as the
+Stage-1 veto** (`llm_review_client.invoke_claude_review` — a blocking subprocess
+on a real, unpatched OS thread, because the app runs under eventlet). Persisted
+to `triage_json` / `llm_status` / `llm_latency_ms`.
+
+- **The model cannot create findings — enforced structurally, not by prompt.**
+  Every triage entry must carry a `fingerprint` that was in the input; entries
+  with an unrecognised fingerprint are dropped and logged. A model that invents
+  a problem produces nothing, whether it hallucinated or was steered there by
+  text injected into the logs it was shown. The model's `severity_assessment` is
+  **advisory** — the contract's own severity stays authoritative.
+- **Untrusted input.** Violation summaries and error templates originate in logs
+  containing arbitrary third-party text. Mitigations in order of real weight:
+  (1) the output is used only as text and ranking — never a command, path, shell
+  argument or filing decision (Phase 4 builds its `gh` argv in Python from a
+  fixed template regardless of what comes back); (2) log content rides inside a
+  delimited `<untrusted_log_data>` block; (3) the fingerprint allow-list above.
+  Prompt wording is not treated as a security boundary.
+- **Failure is LOUD.** Unlike the veto — which fails *open* to "take" on purpose
+  so a dead LLM never blocks a trade — a failed triage must be visible.
+  `llm_status ∈ ok | skipped_clean_day | skipped_disabled | not_logged_in |
+  cli_missing | unreachable | timeout | parse_failed | error`, and a non-skip
+  failure is stated in the Telegram summary. A silent no-op is exactly how
+  `journal_reflection` hid a dead schedule for two months.
+- **Clean days do not call the LLM** by default
+  (`POSTMARKET_TRIAGE_ON_CLEAN_DAYS=false`): with nothing proven broken the
+  output is speculative and Phase 4 would not file it.
+- **Operator prerequisite:** the `claude` CLI must be **logged in on the host**
+  (subscription auth via the CLI — there is no API key in this codebase).
+
+**Two logged-out-CLI bugs fixed in `llm_review_client` while building this
+(#534)** — both affected the live Stage-1 veto too. The CLI reports "not logged
+in" in two shapes and neither reached the caller as an error: (1) **exit 0 with
+`is_error: true`** in the envelope, whose `result` ("Not logged in · Please run
+/login") was returned as if it were the model's answer; and (2) **exit 1 with an
+EMPTY stderr**, the diagnostic being in *stdout*, which produced the useless
+message `"claude review exited 1: "` and cost `_AUTH_MARKERS` its only evidence
+— so the operator was told "error" instead of the one-command fix. `_parse_envelope`
+now raises on `is_error`, and a non-zero exit falls back to the stdout envelope's
+`result`. Regression tests in `test/test_llm_review_client.py`.
+
+**Not yet built** (later phases, each its own issue): GitHub issue filing with
+fingerprint dedupe + a rate cap, and the closed-issue validation sweep. Tests:
 `test/test_job_run_audit.py`, `test/test_postmarket_review.py`,
-`test/test_strategy_expectations.py`.
+`test/test_strategy_expectations.py`, `test/test_postmarket_triage.py`.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
