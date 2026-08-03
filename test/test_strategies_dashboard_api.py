@@ -172,6 +172,34 @@ def strategies_dir(tmp_path):
         encoding="utf-8",
     )
 
+    # intraday_pullback_top2 — combined long+short book whose two sides are
+    # mutually exclusive by day gate, so the Backtest column publishes a
+    # per-side split WITHOUT per-side win rates (the R53 report never broke
+    # those out). issue #508.
+    ip = tmp_path / "intraday_pullback_top2"
+    ip.mkdir()
+    (ip / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "0.1.0",
+                "mode": "sandbox",
+                "deployable": True,
+                "parity_target": {
+                    "window": "2024-11-01..2026-07-06",
+                    "n_trades": 235,
+                    "win_rate_pct": 48,
+                    "sharpe": 2.96,
+                    "max_dd_pct": -8.9,
+                    "net_pnl_inr": 58564,
+                    "cagr_pct": None,
+                    "long": {"n_trades": 155, "net_pnl_inr": 44202},
+                    "short": {"n_trades": 80, "net_pnl_inr": 14362},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
     return tmp_path
 
 
@@ -186,6 +214,9 @@ def wired_dbs(monkeypatch):
     import blueprints.strategies_dashboard_api as sda
     from database import (
         futures_follow_db as ffdb,
+    )
+    from database import (
+        intraday_pullback_db as ipdb,
     )
     from database import (
         open15_breakout_db as o15db,
@@ -209,6 +240,7 @@ def wired_dbs(monkeypatch):
     sr_eng, sr_sess = _mk_engine()
     tj_eng, tj_sess = _mk_engine()
     o15_eng, o15_sess = _mk_engine()
+    ip_eng, ip_sess = _mk_engine()
 
     # Create tables on the in-memory engines
     sfdb.Base.metadata.create_all(sf_eng)
@@ -217,6 +249,7 @@ def wired_dbs(monkeypatch):
     srodb.Base.metadata.create_all(sr_eng)
     tjdb.Base.metadata.create_all(tj_eng)
     o15db.Base.metadata.create_all(o15_eng)
+    ipdb.Base.metadata.create_all(ip_eng)
 
     # Patch the database modules (for ORM lookups that go through the module)
     monkeypatch.setattr(sfdb, "engine", sf_eng)
@@ -233,6 +266,9 @@ def wired_dbs(monkeypatch):
     # database module alone is sufficient (no blueprint-level alias exists).
     monkeypatch.setattr(o15db, "engine", o15_eng)
     monkeypatch.setattr(o15db, "db_session", o15_sess)
+    # intraday_pullback is likewise imported lazily inside the helpers.
+    monkeypatch.setattr(ipdb, "engine", ip_eng)
+    monkeypatch.setattr(ipdb, "db_session", ip_sess)
 
     # ALSO patch the blueprint's module-level session aliases — these are bound
     # at import time and would otherwise still point at the live-DB sessions.
@@ -249,11 +285,12 @@ def wired_dbs(monkeypatch):
         "sr": (sr_eng, sr_sess, srodb),
         "tj": (tj_eng, tj_sess, tjdb),
         "o15": (o15_eng, o15_sess, o15db),
+        "ip": (ip_eng, ip_sess, ipdb),
     }
 
-    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess, o15_sess):
+    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess, o15_sess, ip_sess):
         sess.remove()
-    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng, o15_eng):
+    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng, o15_eng, ip_eng):
         eng.dispose()
 
 
@@ -1132,6 +1169,259 @@ def test_open15_backtest_side_split_passthrough(app, wired_dbs, strategies_dir):
     assert bt["options"]["short"]["n_trades"] == 5
     # Long + short must reconcile with the aggregate.
     assert bt["long"]["net_pnl_inr"] + bt["short"]["net_pnl_inr"] == bt["net_pnl_inr"]
+
+
+# ---------------------------------------------------------------------------
+# intraday_pullback_top2 (issue #508)
+# ---------------------------------------------------------------------------
+
+
+def _ip_row(ipdb, **kw):
+    """An IntradayPullbackTrade row with sensible closed-sandbox defaults.
+
+    Unlike open15, this journal stamps ``net_pnl`` directly (charges already
+    deducted), so the fixtures set net_pnl rather than gross+charges.
+    """
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    defaults = {
+        "trade_date": today,
+        "symbol": "SHRIRAMFIN",
+        "side": "L",
+        "mode": "sandbox",
+        "sector": "FINNIFTY",
+        "session": "AFT",
+        "quantity": 100,
+        "entry_price": 1000.0,
+        "entry_time": dt.datetime(2026, 7, 31, 13, 25, 0),
+        "exit_price": 1010.0,
+        "status": "closed",
+        "gross_pnl": 1000.0,
+        "charges_inr": 100.0,
+        "net_pnl": 900.0,
+        "created_at": _utc_naive_for_ist_today(hour_ist=13, minute_ist=25),
+    }
+    defaults.update(kw)
+    return ipdb.IntradayPullbackTrade(**defaults)
+
+
+def test_intraday_pullback_sandbox_column_populated(app, wired_dbs):
+    """The Sandbox column aggregates intraday_pullback_trades: cumulative net
+    P&L, running win-rate, closed-trade count, today's net P&L, open positions."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))  # +900
+    sess.add(_ip_row(ipdb, symbol="LTF", net_pnl=-400.0, gross_pnl=-300.0))
+    sess.add(_ip_row(ipdb, symbol="VBL", status="open", gross_pnl=None, net_pnl=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["closed_trades"] == 2
+    assert sb["cum_net_pnl"] == 500.0
+    assert sb["win_rate_pct"] == 50.0
+    assert sb["today_net_pnl"] == 500.0
+    assert sb["open_positions"] == 1
+
+
+def test_intraday_pullback_long_short_split(app, wired_dbs):
+    """Sandbox column carries long/short sub-aggregates keyed off the journal's
+    L/S side column — the two books are mutually exclusive by day gate, so the
+    blended headline hides which one is working (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))  # long win +900
+    sess.add(_ip_row(ipdb, symbol="LTF", net_pnl=-400.0))  # long loss
+    sess.add(_ip_row(ipdb, symbol="YESBANK", side="S", net_pnl=-429.44))  # short loss
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": 500.0,
+    }
+    assert sb["short"] == {
+        "n_trades": 1,
+        "wins": 0,
+        "win_rate_pct": 0.0,
+        "net_pnl_inr": -429.44,
+    }
+    # The split must reconcile with the blended aggregate.
+    assert sb["long"]["net_pnl_inr"] + sb["short"]["net_pnl_inr"] == sb["cum_net_pnl"]
+
+
+def test_intraday_pullback_empty_side_renders_none(app, wired_dbs):
+    """A side with no closed trades reports n_trades=0 and None stats so the UI
+    renders '—', never a misleading 0% (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"]["n_trades"] == 1
+    assert sb["short"] == {
+        "n_trades": 0,
+        "wins": 0,
+        "win_rate_pct": None,
+        "net_pnl_inr": None,
+    }
+
+
+def test_intraday_pullback_live_column_isolated_from_sandbox(app, wired_dbs):
+    """Sandbox history must never leak into the Live column, and the Live column
+    stays absent until that mode has realized history (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+    assert resp.get_json()["data"]["performance"]["live"] is None
+
+    sess.add(_ip_row(ipdb, symbol="MPHASIS", mode="live", net_pnl=250.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["cum_net_pnl"] == 900.0
+    assert perf["live"]["cum_net_pnl"] == 250.0
+    assert perf["live"]["closed_trades"] == 1
+
+
+def test_intraday_pullback_observe_rows_excluded(app, wired_dbs):
+    """observe-mode rows are journal-only dry runs (no orders placed) and must
+    not inflate either column (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.add(_ip_row(ipdb, symbol="SBICARD", mode="observe", net_pnl=99999.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["sandbox"]["cum_net_pnl"] == 900.0
+    assert perf["live"] is None
+
+
+def test_intraday_pullback_unpriced_exit_surfaced_not_summed(app, wired_dbs):
+    """A closed-but-unpriced exit is counted separately, never booked as ₹0 —
+    same contract as #350 / open15."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.add(_ip_row(ipdb, symbol="POLICYBZR", gross_pnl=None, net_pnl=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["today_net_pnl"] == 900.0
+    assert sb["today_unpriced_exits"] == 1
+    assert sb["closed_trades"] == 1  # the unpriced row is not a realized trade
+
+
+def test_intraday_pullback_net_pnl_falls_back_to_gross_minus_charges(app, wired_dbs):
+    """A row stamped with gross+charges but no net still prices correctly."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, net_pnl=None, gross_pnl=1000.0, charges_inr=101.32))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["cum_net_pnl"] == 898.68
+    assert sb["today_unpriced_exits"] == 0
+
+
+def test_intraday_pullback_recent_trades(app, wired_dbs):
+    """Recent Trades is populated from intraday_pullback_trades (issue #508) —
+    the regression this issue was opened for ('No trades yet' with 7 rows in
+    the journal)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, exit_reason="EOD"))
+    sess.add(_ip_row(ipdb, symbol="SBICARD", side="S", net_pnl=-551.57, exit_reason="SL"))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    trades = resp.get_json()["data"]["recent_trades"]
+    assert len(trades) == 2
+    newest = trades[0]
+    assert newest["symbol"] == "SBICARD"
+    assert newest["side"] == "S"
+    assert newest["net_pnl"] == -551.57
+    assert newest["exit_reason"] == "SL"
+    assert newest["mode"] == "sandbox"
+    assert newest["status"] == "closed"
+    # `trigger` drives the shared table's "Entry Time" cell.
+    assert newest["trigger"] == "13:25:00"
+    # gross_pnl must NOT be sent: it would switch on the shared table's
+    # futures-labelled column group ("Buy Price"/"Sell Price") and duplicate
+    # the Charges column for an equity intraday strategy.
+    assert "gross_pnl" not in newest
+    assert newest["charges_inr"] == 100.0
+
+
+def test_intraday_pullback_pnl_curve(app, wired_dbs):
+    """The curve keys off trade_date — the strategy is intraday, so entry and
+    its 15:15 flatten share that date (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, trade_date="2026-07-29", net_pnl=1762.30))
+    sess.add(_ip_row(ipdb, symbol="TATAELXSI", trade_date="2026-07-29", net_pnl=3.38))
+    sess.add(_ip_row(ipdb, symbol="SHRIRAMFIN", trade_date="2026-07-31", net_pnl=-399.52))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2/pnl-curve")
+
+    points = resp.get_json()["data"]["points"]
+    assert points == [
+        {"date": "2026-07-29", "pnl": 1765.68},
+        {"date": "2026-07-31", "pnl": -399.52},
+    ]
+
+
+def test_intraday_pullback_backtest_side_split_without_win_rates(app, wired_dbs):
+    """The Backtest column publishes per-side trade count + net P&L but NO
+    per-side win rate (the R53 report never broke one out). The keys must pass
+    through as-is rather than being invented (issue #508)."""
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    bt = resp.get_json()["data"]["performance"]["backtest"]
+    assert bt["n_trades"] == 235
+    assert bt["net_pnl_inr"] == 58564
+    assert bt["long"] == {"n_trades": 155, "net_pnl_inr": 44202}
+    assert bt["short"] == {"n_trades": 80, "net_pnl_inr": 14362}
+    assert "win_rate_pct" not in bt["long"]
+    # Sides reconcile with the aggregate, and with the n_trades headline.
+    assert bt["long"]["net_pnl_inr"] + bt["short"]["net_pnl_inr"] == bt["net_pnl_inr"]
+    assert bt["long"]["n_trades"] + bt["short"]["n_trades"] == bt["n_trades"]
+    # CAGR is deliberately null: the headline is fixed (non-reinvested) sizing.
+    assert bt["cagr_pct"] is None
 
 
 def test_other_strategies_have_no_side_split(app, wired_dbs):

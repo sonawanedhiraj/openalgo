@@ -477,6 +477,10 @@ function PerfCell({ cell, sub }: { cell: PairedCell; sub?: boolean }) {
 // '75% (6/8)' for a side with trades; '—' for an empty side (never 0%).
 function fmtSideRate(s: SideSplit | null | undefined): string {
   if (!s || !s.n_trades) return '—'
+  // A split that carries trade count + P&L but no per-side win rate (a backtest
+  // whose source report never published one) renders '—' rather than a
+  // half-formed 'undefined/155'. issue #508.
+  if (s.win_rate_pct == null || s.wins == null) return '—'
   return `${fmt(s.win_rate_pct, '%')} (${s.wins}/${s.n_trades})`
 }
 
