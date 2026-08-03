@@ -433,10 +433,16 @@ function volNeeded(){
   if(a&&a.vol_mult!=null)return a.vol_mult;
   return liveNeeded;
 }
-function fmtVol(v,needed,live){
+function fmtVol(v,beyond,needed,live){
   if(v==null)return '<span class="muted">&mdash;</span>';
-  const hit=(needed!=null&&v>=needed);
-  return '<span class="'+(hit?'pos':'muted')+'">'+v+'&times;</span>'+
+  // The displayed number is the peak ANYWHERE in the minute, but the gate is
+  // `beyond and cum_in_min >= vol_mult*baseline` (issue #525) — so colour by
+  // the while-beyond peak. Colouring the peak-anywhere number would paint
+  // INDIGO green at 1.95x on a day it correctly never entered (1.27x beyond).
+  const hit=(needed!=null&&beyond!=null&&beyond>=needed);
+  const tip=beyond==null?'peak anywhere in the minute'
+    :('peak anywhere '+v+'x; '+beyond+'x while beyond the level (what the gate compares)');
+  return '<span class="'+(hit?'pos':'muted')+'" title="'+tip+'">'+v+'&times;</span>'+
     (live?' <span class="muted" style="font-size:10px">live</span>':'');
 }
 function renderSel(){
@@ -448,7 +454,9 @@ function renderSel(){
     }else if(e.event==='watch_stats'){
       // every selected symbol, entered ones included (issue #524)
       for(const[s,st]of Object.entries(e.stats||{}))
-        if(rows[s]&&rows[s].vol==null)rows[s].vol=st.max_vol_ratio;
+        if(rows[s]&&rows[s].vol==null){
+          rows[s].vol=st.max_vol_ratio; rows[s].volBeyond=st.max_vol_ratio_beyond;
+        }
     }else if(!rows[e.symbol]){continue;
     }else if(e.event==='entry'){
       rows[e.symbol].out='<span class="pos">entered @ '+e.trigger_price+
@@ -458,25 +466,34 @@ function renderSel(){
         (e.pnl>=0?'+':'')+'&#8377;'+e.pnl+'</span>';
     }else if(e.event==='no_entry'){
       rows[e.symbol].vol=e.max_vol_ratio;
-      rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+e.max_vol_ratio+
-        '&times; &lt; '+e.needed):'level never broken';
+      rows[e.symbol].volBeyond=e.max_vol_ratio_while_beyond;
+      // the gate compares the ratio measured WHILE price is beyond the level
+      // (on_tick: `beyond and cum_in_min >= vol_mult*baseline`), so the outcome
+      // must quote max_vol_ratio_while_beyond — the `max vol×` column's
+      // peak-anywhere number can be >= needed on a symbol that never entered.
+      const vb=e.max_vol_ratio_while_beyond??e.max_vol_ratio;
+      rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+vb+
+        '&times; &lt; '+e.needed+' while beyond'):'level never broken';
     }else if(e.event==='entry_skipped'){rows[e.symbol].out='skipped: '+esc(e.reason||'');}
   }
   // mid-window the log has published nothing yet — overlay the running max
   const liveSyms=new Set();
   for(const[s,st]of Object.entries(liveWatch)){
     if(rows[s]&&rows[s].vol==null&&st.max_vol_ratio!=null){
-      rows[s].vol=st.max_vol_ratio; liveSyms.add(s);
+      rows[s].vol=st.max_vol_ratio; rows[s].volBeyond=st.max_vol_ratio_beyond;
+      liveSyms.add(s);
     }
   }
   const needed=volNeeded();
+  // "beyond" is load-bearing in the label (issue #525): the number shown is the
+  // peak anywhere, while green means the gate's while-beyond peak cleared it
   document.getElementById('selVolHdr').innerHTML='max vol&times;'+
-    (needed!=null?' <span class="muted">(need '+needed+'&times;)</span>':'');
+    (needed!=null?' <span class="muted">(need '+needed+'&times; beyond)</span>':'');
   const tb=document.querySelector('#sel tbody'); tb.innerHTML='';
   for(const[s,r]of Object.entries(rows)){
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+esc(s)+'</td><td>'+esc(r.side)+'</td><td>'+(r.gap??'')+
-      '</td><td>'+fmtVol(r.vol,needed,liveSyms.has(s))+'</td><td>'+r.out+'</td>';
+      '</td><td>'+fmtVol(r.vol,r.volBeyond,needed,liveSyms.has(s))+'</td><td>'+r.out+'</td>';
     tb.appendChild(tr);
   }
   if(!Object.keys(rows).length)

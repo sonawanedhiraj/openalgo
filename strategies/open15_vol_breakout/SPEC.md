@@ -135,7 +135,10 @@ symbol, entered ones included — `no_entry` covers non-entered symbols only, so
 before #524 an entered symbol's max was never published at all. `no_entry`
 keeps precedence when both are present, so pre-#524 stored days parse
 unchanged. `needed` is the day config's `vol_mult` (the multiplier that
-actually gated entries), not the raw env default.
+actually gated entries), not the raw env default. The `max vol×` column shows
+the peak-**anywhere** ratio but colours on `max_vol_ratio_beyond` — the gate is
+`beyond and cum_in_min >= vol_mult*baseline`, so a peak-anywhere number can sit
+above the threshold on a symbol that correctly never entered (issue #525).
 `GET /open15_vol_breakout/logs` — **self-contained log-viewer page** (session
 auth, auto-refreshing during the window, date picker for history).
 
