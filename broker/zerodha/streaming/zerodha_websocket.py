@@ -271,7 +271,9 @@ class ZerodhaWebSocket:
         # Process subscriptions in a separate thread
         if not self._subscription_thread or not self._subscription_thread.is_alive():
             self._subscription_thread = threading.Thread(
-                target=self._process_pending_subscriptions, daemon=True
+                target=self._process_pending_subscriptions,
+                daemon=True,
+                name="ZerodhaWSSubscriptions",
             )
             self._subscription_thread.start()
 
@@ -523,7 +525,9 @@ class ZerodhaWebSocket:
     def _start_health_check(self):
         if self._health_check_thread and self._health_check_thread.is_alive():
             return
-        self._health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self._health_check_thread = threading.Thread(
+            target=self._health_check_loop, daemon=True, name="ZerodhaWSHealthCheck"
+        )
         self._health_check_thread.start()
 
     def _health_check_loop(self):

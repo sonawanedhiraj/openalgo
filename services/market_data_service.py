@@ -204,7 +204,9 @@ class ConnectionHealthMonitor:
 
         # Start health check thread
         self._running = True
-        self._health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self._health_thread = threading.Thread(
+            target=self._health_check_loop, daemon=True, name="MarketDataHealthCheck"
+        )
         self._health_thread.start()
 
     def record_data_received(self):
@@ -277,7 +279,10 @@ class ConnectionHealthMonitor:
 
     def _health_check_loop(self):
         """Background thread to check health"""
+        from services.thread_registry import beat as _beat
+
         while self._running:
+            _beat("MarketDataHealthCheck")
             try:
                 time.sleep(self.HEALTH_CHECK_INTERVAL)
 
@@ -374,7 +379,9 @@ class MarketDataService:
         self._pause_reason = ""
 
         # Start cleanup thread
-        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self.cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name="MarketDataCleanup"
+        )
         self.cleanup_thread.start()
 
         logger.debug("Enhanced MarketDataService initialized")
@@ -984,7 +991,10 @@ class MarketDataService:
 
     def _cleanup_loop(self) -> None:
         """Background thread to clean up stale data"""
+        from services.thread_registry import beat as _beat
+
         while True:
+            _beat("MarketDataCleanup")
             try:
                 time.sleep(300)  # Run every 5 minutes
 

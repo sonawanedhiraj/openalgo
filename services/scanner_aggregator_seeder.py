@@ -863,6 +863,9 @@ def _boot_worker(
     bar_15m_history: dict | None = None,
 ) -> None:
     """Boot daemon entry: wait for broker session, then seed."""
+    from services.thread_registry import beat as _beat
+
+    _beat("ScannerAggregatorSeed")
     if not _flag_enabled():
         logger.info("aggregator_seeder: disabled via SCANNER_AGGREGATOR_SEED_ENABLED=false")
         return

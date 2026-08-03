@@ -310,7 +310,10 @@ def _periodic_loop() -> None:
         end_t.hour,
         end_t.minute,
     )
+    from services.thread_registry import beat as _beat
+
     while not _stop_event.is_set():
+        _beat("SectorFollowBackfillPeriodic")
         now = datetime.now(_IST)
         try:
             ran, res = _periodic_tick(now, end_t)
@@ -375,6 +378,9 @@ def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
 
 
 def _boot_worker() -> None:
+    from services.thread_registry import beat as _beat
+
+    _beat("SectorFollowBackfillBoot")
     if _wait_for_broker_session():
         # Serialise the convergence work against sibling schedulers so the four
         # boot backfill jobs don't burst onto historify.duckdb simultaneously

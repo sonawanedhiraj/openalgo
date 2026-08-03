@@ -123,6 +123,56 @@ def api_stats():
 
 
 # ============================================================================
+# Scheduler + daemon-thread registry (issue #539)
+# ============================================================================
+
+
+@admin_bp.route("/api/schedulers")
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def api_schedulers():
+    """Inventory of every scheduled job and long-lived thread.
+
+    Strictly read-only: it introspects the seven APScheduler instances and the
+    live thread table, and reads the ``job_run`` audit. It never registers,
+    pauses or removes a job — controls land in Phase 2.
+
+    The two halves degrade independently: if one registry raises, the other is
+    still returned and the failure is named in ``sources_failed``, so a single
+    bad source cannot blank the whole page.
+    """
+    payload: dict = {"status": "success", "sources_failed": []}
+
+    try:
+        from services import scheduler_registry
+
+        jobs = scheduler_registry.snapshot()
+        payload["jobs"] = jobs
+        payload["jobs_summary"] = scheduler_registry.summarize(jobs)
+    except Exception as e:
+        logger.exception(f"Error building the scheduler snapshot: {e}")
+        payload["jobs"] = []
+        payload["jobs_summary"] = {}
+        payload["sources_failed"].append("jobs")
+
+    try:
+        from services import thread_registry
+
+        threads = thread_registry.snapshot()
+        payload["threads"] = threads
+        payload["threads_summary"] = thread_registry.summarize(threads)
+    except Exception as e:
+        logger.exception(f"Error building the thread snapshot: {e}")
+        payload["threads"] = []
+        payload["threads_summary"] = {}
+        payload["sources_failed"].append("threads")
+
+    if len(payload["sources_failed"]) == 2:
+        return jsonify({"status": "error", "message": "both registries failed"}), 500
+    return jsonify(payload)
+
+
+# ============================================================================
 # Freeze Quantity API Endpoints
 # ============================================================================
 
@@ -276,7 +326,7 @@ def api_freeze_upload():
             return jsonify({"status": "error", "message": "Please upload a CSV file"}), 400
 
         # Save temporarily and load
-        temp_path = "/tmp/qtyfreeze_upload.csv"
+        temp_path = "/tmp/qtyfreeze_upload.csv"  # nosec B108 — pre-existing; single-user self-hosted install, admin-only route
         file.save(temp_path)
 
         exchange = request.form.get("exchange", "NFO").strip().upper()
@@ -1495,7 +1545,7 @@ def _check_loopback_http():
         # convention (gunicorn binds to ${PORT:-5000} in start.sh).
         port = os.getenv("FLASK_PORT") or os.getenv("PORT") or "5000"
         req = urllib.request.Request(f"http://127.0.0.1:{port}/", method="HEAD")
-        with urllib.request.urlopen(req, timeout=3.0) as resp:
+        with urllib.request.urlopen(req, timeout=3.0) as resp:  # nosec B310 — fixed http://127.0.0.1 self-probe, scheme not user-controlled
             elapsed = round((time.perf_counter() - started) * 1000, 1)
             return {
                 "name": "Loopback HTTP",

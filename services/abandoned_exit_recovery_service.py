@@ -422,6 +422,9 @@ def _notify(message: str) -> None:
 
 
 def _boot_worker() -> None:
+    from services.thread_registry import beat as _beat
+
+    _beat("AbandonedExitRecovery")
     if not _flag_enabled():
         logger.info(
             "[ABANDONED-RECOVERY] disabled via ABANDONED_EXIT_RECOVERY_ENABLED=false — not running"
