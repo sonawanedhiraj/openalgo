@@ -17,6 +17,31 @@ from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
 
+# Valid operator trade-side selections (issue #509). Shared by the service's
+# day-config merge and the blueprint's request validation so the two can never
+# disagree about what is accepted.
+TRADE_SIDES = ("both", "long_only", "short_only")
+
+# Which book each selection permits, keyed by the core's side codes.
+_TRADE_SIDE_ALLOWS = {
+    "both": ("L", "S"),
+    "long_only": ("L",),
+    "short_only": ("S",),
+}
+
+
+def trade_side_allows(trade_side: str | None, side: str) -> bool:
+    """Is ``side`` ('L'|'S') enabled under this operator ``trade_side``?
+
+    Unknown/None falls back to ``both`` — an unrecognised stored value must
+    never silently dark a book (fail-open to the backtested default).
+    """
+    allowed = _TRADE_SIDE_ALLOWS.get(str(trade_side or "both").lower())
+    if allowed is None:
+        return True
+    return side in allowed
+
+
 # 5-minute candle tuple: (ts: datetime, open, high, low, close, volume)
 Candle = tuple
 
@@ -47,6 +72,14 @@ class PullbackConfig:
     stop_floor_pct: float = 0.3
     max_attempts: int = 2
     candle_minutes: int = 5
+
+    # Operator trade-side gate (issue #509): 'both' | 'long_only' | 'short_only'.
+    # NOTE the day-gate interaction: the two books are mutually exclusive by
+    # NIFTY direction at 09:30 (up -> long, down -> short), so this does NOT
+    # rebalance a mixed book — excluding a side means the strategy simply does
+    # not trade on the days that side would have run. 'long_only' gives up
+    # every NIFTY-down day. Default 'both' = the backtested behaviour.
+    trade_side: str = "both"
 
 
 @dataclass
