@@ -96,6 +96,19 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
                 vol_ratio_at_trigger=ev.get("vol_ratio"),
                 qty=ev.get("qty"),
             )
+        elif kind == "watch_stats":
+            # every selected symbol, entered ones included (issue #524). Only
+            # fills what is still unset, so the per-symbol `no_entry` event
+            # below keeps precedence and pre-#524 days parse identically.
+            for sym, st in (ev.get("stats") or {}).items():
+                if sym not in rows:
+                    continue
+                if rows[sym].get("max_vol_ratio") is None:
+                    rows[sym]["max_vol_ratio"] = st.get("max_vol_ratio")
+                if rows[sym].get("level_broken") is None:
+                    rows[sym]["level_broken"] = st.get("level_broken")
+                if rows[sym].get("vol_needed") is None:
+                    rows[sym]["vol_needed"] = ev.get("needed")
         elif kind == "no_entry":
             sym = ev.get("symbol")
             if sym not in rows:
