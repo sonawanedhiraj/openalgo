@@ -1749,8 +1749,12 @@ ran in the 15:30-17:00 periodic window).
   the running-avg completed-minute volume; `OPEN15_TOP_N` (default `3`) — top-N
   gainers long / losers short; `OPEN15_MARGIN_PER_SLOT` (default `30000`) and
   `OPEN15_LEVERAGE` (default `5`) → ₹150k notional per trade;
-  `OPEN15_TICK_CAPTURE` (default `true`) — persist the selected symbols' ticks
-  (incl. the 09:15 first minute) to `tick_logs/open15/` for backtest replay.
+  `OPEN15_TICK_CAPTURE` (default `true`) — master switch for persisting ticks
+  to `tick_logs/open15/` for backtest replay;
+  `OPEN15_TICK_CAPTURE_UNIVERSE` (default `true`, issue #528) — capture EVERY
+  universe symbol's ticks across the whole 09:14:50 → `exit_time`+5s window
+  instead of only the day's 3 selected symbols. `false` restores the pre-#528
+  targeted behaviour (unselected symbols' 09:15 ticks buffered then dropped).
   `OPEN15_SIZING_MODE` (default `fixed`) — `fixed` | `compound` capital sizing.
   `OPEN15_TRADE_SIDE` (default `both`) — `both` | `long_only` | `short_only`;
   which sides the 09:15 selection may pick at all.
@@ -1788,6 +1792,18 @@ ran in the 15:30-17:00 periodic window).
     `OPEN15_VOL_MULT=1.5` behaved like ~2.5× and produced zero entries on 3 of
     4 sessions. **`OPEN15_VOL_MULT` itself is unchanged at 1.5** — the gate
     now simply means what it says. Both new flags are rollback switches.
+  - **2026-08-03:** `OPEN15_TICK_CAPTURE_UNIVERSE` added by issue #528 (default
+    `true`). Selected-only capture made the strategy's own entry window
+    un-backtestable for any symbol outside the 09:16 gap ranking — the only
+    full-universe tick source (`tick_logs/`, written by the simplified engine)
+    starts ~09:20-09:23, covering <45% of the 09:16-09:29 window on 4 of 19
+    days. **No new broker load** (the ticks already arrive on the service's own
+    ZMQ SUB and are parsed before the filter); this changes only what is
+    written to disk: ~211 symbols × ~0.6 ticks/s × 900 s ≈ **120k ticks/day
+    ≈ 10 MB/day** (retention stays 365 days ⇒ ~2.5 GB/year steady state — revisit
+    if disk pressure appears). The writer's queue/batch are widened to
+    50000/500 in universe mode so the first-minute burst cannot overflow.
+    Set `false` to roll back without touching the master switch.
 
 ## `INTRADAY_PULLBACK_TRADE_SIDE` — intraday_pullback_top2 trade side (issue #509)
 
