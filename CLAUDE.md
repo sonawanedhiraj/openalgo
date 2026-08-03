@@ -1548,11 +1548,50 @@ day — and it is why Phase 1 ships with **no verdicts and no LLM call at all**.
   17:00 (`SCANNER_BACKFILL_PERIODIC_END_TIME`); reviewing earlier reads
   half-written data. Move one and you must move the other.
 
-**Not yet built** (later phases, each its own issue): expectation contracts
-(deterministic per-strategy pass/fail), the `claude -p` triage layer over the
-failures, GitHub issue filing with dedupe + a rate cap, and the closed-issue
-validation sweep. Tests: `test/test_job_run_audit.py`,
-`test/test_postmarket_review.py`.
+**Phase 2 — expectation contracts (issue #532, `services/strategy_expectations.py`).**
+This is what turns the digest from a report into a **verdict**. `EXPECTATIONS` is
+a registry of declarative `Expect(contract_id, strategy, predicate, severity,
+requires, shape, ...)` entries; `evaluate_expectations(digest)` returns
+violations, which lead the Telegram summary and persist to
+`postmarket_review.violations_json` / `n_violations` / `contracts_json`.
+
+Four rules, each load-bearing — break one and the report stops being trusted:
+
+- **Contracts read the digest ONLY, never the DB.** That is what makes every
+  contract replayable against any past day through the CLI, and testable without
+  fixtures for ten tables.
+- **Missing input is `unknown`, NEVER `fail`.** A degraded digest section means
+  *our collection* broke, not that a strategy misbehaved. Contracts declare
+  `requires` paths and short-circuit to `unknown`. Related: a contract that
+  depends on `job_run` checks `audit_earliest_date` first, so replaying a day
+  from before the audit shipped reports `unknown` instead of a phantom "nothing
+  fired". Accusing a strategy of a collection gap is how a report earns being
+  ignored.
+- **Fingerprints exclude observed values.** `strategy|contract_id|shape` only.
+  The #497 outage failed the same contract on four consecutive days with
+  different lot counts (2/4/6/8); Phase 4 must see one recurring problem, not
+  four. Renaming a `contract_id` re-files its issue — treat ids as an API.
+- **A raising predicate is contained as `unknown`.** One broken rule must not
+  take down the report it is part of.
+
+Evidence it works, from replaying real history: **2026-07-17** (a healthy day
+with a real exit) produces **zero** violations, while **2026-07-27** — day *one*
+of the #497 window — fires `futures_follow_cap50/t1_exit_for_carry` as **P0**,
+and all four broken days share the identical fingerprint. The bug that took four
+trading days to notice is caught on the first.
+
+Flags: `POSTMARKET_CONTRACTS_ENABLED` (default `true`) and
+`POSTMARKET_CONTRACTS_DISABLED` (comma-separated `contract_id` or
+`strategy:contract_id`) — the latter silences one contract surgically so a rule
+that starts crying wolf can be muted same-day without a code change. A muted
+contract should get an issue to fix or delete it: a permanently disabled contract
+is worse than no contract, because the report still *looks* complete.
+
+**Not yet built** (later phases, each its own issue): the `claude -p` triage
+layer over the violations, GitHub issue filing with fingerprint dedupe + a rate
+cap, and the closed-issue validation sweep. Tests:
+`test/test_job_run_audit.py`, `test/test_postmarket_review.py`,
+`test/test_strategy_expectations.py`.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 

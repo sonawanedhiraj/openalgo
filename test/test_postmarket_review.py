@@ -440,3 +440,93 @@ def test_parse_hh_mm_falls_back_on_garbage():
     assert _parse_hh_mm("09:45") == (9, 45)
     assert _parse_hh_mm("not-a-time") == (17, 15)
     assert _parse_hh_mm("99:99") == (17, 15)
+
+
+# --------------------------------------------------------------------------
+# Phase 2 (#532) — verdict rendering and violation persistence
+# --------------------------------------------------------------------------
+
+
+def _contracts(violations, evaluated=True, unknown=()):
+    return {
+        "violations": list(violations),
+        "counts": {"pass": 0, "fail": len(violations), "unknown": len(unknown), "skipped": 0},
+        "unknown_contracts": list(unknown),
+        "evaluated": evaluated,
+    }
+
+
+def test_summary_leads_with_violations_and_severity():
+    from services.postmarket_review_service import render_summary
+
+    text = render_summary(
+        {"date": DATE, "is_trading_day": True, "sources_failed": []},
+        _contracts(
+            [
+                {
+                    "severity": "P0",
+                    "strategy": "futures_follow_cap50",
+                    "contract_id": "t1_exit_for_carry",
+                    "summary": "8 lots open, 0 exits today",
+                }
+            ]
+        ),
+    )
+
+    lines = text.splitlines()
+    # The verdict must precede the counts — the operator reads the first lines.
+    assert "1 expectation(s) violated" in lines[1]
+    assert "[P0]" in lines[2]
+    assert "futures_follow_cap50/t1_exit_for_carry" in lines[2]
+
+
+def test_summary_states_a_clean_day_explicitly():
+    """Silence must never be how a healthy day is communicated."""
+    from services.postmarket_review_service import render_summary
+
+    text = render_summary(
+        {"date": DATE, "is_trading_day": True, "sources_failed": []}, _contracts([])
+    )
+
+    assert "All expectations passed" in text
+
+
+def test_summary_omits_verdict_when_contracts_did_not_run():
+    from services.postmarket_review_service import render_summary
+
+    text = render_summary(
+        {"date": DATE, "is_trading_day": True, "sources_failed": []},
+        _contracts([], evaluated=False),
+    )
+
+    assert "expectation" not in text.lower()
+
+
+def test_violations_are_persisted_and_read_back(review_table):
+    from services import postmarket_review_service as prs
+
+    with patch("services.notification_service.get_notification_service", return_value=MagicMock()):
+        result = prs.run_review_for_date(DATE, dispatch_telegram=False, persist=True)
+
+    stored = review_table.get_review(DATE)
+    assert stored is not None
+    assert stored["n_violations"] == len(result["contracts"]["violations"])
+    assert stored["contracts"]["evaluated"] is True
+    for violation in stored["violations"]:
+        assert violation["fingerprint"]
+        assert violation["severity"] in ("P0", "P1", "P2")
+
+
+def test_contract_failure_does_not_abort_the_review(review_table):
+    """A broken contract layer must still leave a persisted digest behind."""
+    from services import postmarket_review_service as prs
+
+    with patch(
+        "services.strategy_expectations.evaluate_expectations",
+        side_effect=RuntimeError("contracts exploded"),
+    ):
+        result = prs.run_review_for_date(DATE, dispatch_telegram=False, persist=True)
+
+    assert result["persisted"] is True
+    assert result["contracts"]["evaluated"] is False
+    assert review_table.get_review(DATE) is not None
