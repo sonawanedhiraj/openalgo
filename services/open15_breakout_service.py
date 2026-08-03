@@ -22,6 +22,15 @@ Rules (locked; see SPEC):
     or the breakout level. Per-symbol fail-open to the tick-built candle.
   - Selection at 09:16: top-N gainers (LONG) / top-N losers (SHORT) by
     gap = 09:15 open / prev daily close − 1 (prev close from historify D).
+  - Optional ROLLING additive watch list (issue #529, default OFF): every
+    ``rolling_cadence_s`` (UI-editable, default 30s) inside the entry window,
+    re-rank the universe on live LTP vs prev close and APPEND the current
+    top-N movers. Purely additive — the 09:16 seed picks are never dropped —
+    and the entry gate is unchanged, so added symbols compete for the same
+    ``max_trades`` slots first-come-first-served. Shipped as a MEASUREMENT
+    (journal column ``watch_source ∈ {seed, rolling}``), not a validated edge:
+    the 2026-08-03 replay showed the 09:16 ranking misses the day's biggest
+    movers but could NOT show the added names are profitable.
   - Entry: tick-driven mid-bar trigger, once per symbol, MARKET MIS. New
     entries stop at the UI-configurable ``no_entry_after`` cutoff (default
     09:29 = the measured SPEC window; issue #451).
@@ -189,6 +198,50 @@ def _max_trades_default() -> int:
     except ValueError:
         v = 3
     return max(1, min(v, 6))
+
+
+# Rolling additive watch list (issue #529). OFF by default — deploying this is a
+# no-op until the operator enables it from /open15_vol_breakout/logs.
+_ROLLING_CADENCE_MIN_S = 10
+_ROLLING_CADENCE_MAX_S = 300
+_ROLLING_TOP_N_MIN = 1
+_ROLLING_TOP_N_MAX = 10
+
+
+def clamp_rolling_cadence(value) -> int:
+    """Clamp a proposed re-rank cadence (seconds) into 10..300. Bad input -> 30.
+
+    Server-side clamping is deliberate: the UI number input is a hint, never a
+    trust boundary — a hand-crafted POST must not be able to set a 1-second
+    re-rank (a hot loop over ~210 symbols on the tick thread) or a cadence
+    longer than the entry window itself.
+    """
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return 30
+    return max(_ROLLING_CADENCE_MIN_S, min(v, _ROLLING_CADENCE_MAX_S))
+
+
+def clamp_rolling_top_n(value) -> int:
+    """Clamp a proposed per-side additions-per-cycle into 1..10. Bad input -> 3."""
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return 3
+    return max(_ROLLING_TOP_N_MIN, min(v, _ROLLING_TOP_N_MAX))
+
+
+def _rolling_enabled_default() -> bool:
+    return os.getenv("OPEN15_ROLLING_WATCHLIST_ENABLED", "false").lower() == "true"
+
+
+def _rolling_cadence_default() -> int:
+    return clamp_rolling_cadence(os.getenv("OPEN15_ROLLING_CADENCE_S", "30"))
+
+
+def _rolling_top_n_default() -> int:
+    return clamp_rolling_top_n(os.getenv("OPEN15_ROLLING_TOP_N", "3"))
 
 
 def _no_entry_after_default() -> str:
@@ -512,6 +565,24 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     except (TypeError, ValueError):
         max_trades = _max_trades_default()
     max_trades = max(1, min(max_trades, 6))
+    # rolling additive watch list (issue #529). ``is None`` — not truthiness —
+    # so an explicit stored ``false`` beats an env default of ``true``.
+    rolling_enabled_cfg = cfg.get("rolling_watchlist_enabled")
+    rolling_enabled = (
+        _rolling_enabled_default() if rolling_enabled_cfg is None else bool(rolling_enabled_cfg)
+    )
+    rolling_cadence_cfg = cfg.get("rolling_cadence_s")
+    rolling_cadence_s = (
+        _rolling_cadence_default()
+        if rolling_cadence_cfg is None
+        else clamp_rolling_cadence(rolling_cadence_cfg)
+    )
+    rolling_top_n_cfg = cfg.get("rolling_top_n")
+    rolling_top_n = (
+        _rolling_top_n_default()
+        if rolling_top_n_cfg is None
+        else clamp_rolling_top_n(rolling_top_n_cfg)
+    )
     no_entry_after = cfg.get("no_entry_after") or _no_entry_after_default()
     exit_time = cfg.get("exit_time") or _exit_time_default()
     if validate_window(no_entry_after, exit_time):
@@ -536,6 +607,9 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "no_entry_after": no_entry_after,
         "exit_time": exit_time,
         "trade_side": trade_side,
+        "rolling_watchlist_enabled": rolling_enabled,
+        "rolling_cadence_s": rolling_cadence_s,
+        "rolling_top_n": rolling_top_n,
     }
 
 
@@ -563,10 +637,25 @@ class Open15Core:
         baseline_includes_first_minute: bool = False,
         await_snapshot: bool = False,
         trade_side: str = "both",
+        rolling_enabled: bool = False,
+        rolling_cadence_s: int = 30,
+        rolling_top_n: int = 3,
     ):
         self.prev_closes = prev_closes
         self.vol_mult = vol_mult
         self.top_n = top_n
+        # rolling additive watch list (issue #529): every ``rolling_cadence_s``
+        # inside the entry window, re-rank the universe on live LTP and APPEND
+        # the current top-N movers. Nothing is ever removed, and the entry gate
+        # is untouched — added symbols compete for the same ``max_trades`` slots.
+        self.rolling_enabled = bool(rolling_enabled)
+        self.rolling_cadence_s = clamp_rolling_cadence(rolling_cadence_s)
+        self.rolling_top_n = clamp_rolling_top_n(rolling_top_n)
+        self._last_rerank: dt.datetime | None = None
+        # symbol -> "seed" (09:16 gap ranking) / "rolling" (intraday re-rank)
+        self.watch_source: dict[str, str] = {}
+        # ordered record of every addition, for the status API and the UI panel
+        self.rolling_adds: list[dict[str, Any]] = []
         # which sides may be selected at all (issue #503) — an excluded side is
         # never watched, so it produces no ticks, no entries and no journal rows
         self.trade_side = trade_side if trade_side in TRADE_SIDES else "both"
@@ -680,9 +769,84 @@ class Open15Core:
         # the ZMQ thread; (2) ``None`` keeps "no ticks arrived" distinguishable
         # from a genuine 0.0 ratio in the UI.
         for s in self.selected:
+            self.watch_source.setdefault(s, "seed")
             self.watch_stats.setdefault(
                 s, {"max_vol_ratio": None, "max_vol_ratio_beyond": None, "level_broken": False}
             )
+
+    def maybe_rerank(self, ts: dt.datetime) -> list[dict[str, Any]]:
+        """Additive intraday re-rank (issue #529) — returns the symbols ADDED.
+
+        Called once per tick from the service; it self-throttles to one pass
+        every ``rolling_cadence_s``. Ranking is pure in-process arithmetic over
+        state already held: the last LTP seen on the service's own ZMQ SUB
+        divided by the arm-time prev close. No broker calls, no new feed.
+
+        Invariants (all covered by tests):
+          - **additive only** — an entry is only ever inserted into
+            ``selected`` / ``watch_source``, never removed or re-sided, so the
+            09:16 seed picks stay watched for the whole session;
+          - ``trade_side`` is honoured, so an excluded side is never added;
+          - a symbol with no usable breakout level (no broker first candle and
+            no tick-built fallback) is skipped — watching it could never
+            produce a legal entry.
+        """
+        if not self.rolling_enabled or not self.finalized:
+            return []
+        minute = ts.hour * 60 + ts.minute
+        if minute < _ENTRY_FROM or minute > self.entry_to_min:
+            return []
+        if self._last_rerank is not None:
+            elapsed = (ts - self._last_rerank).total_seconds()
+            # a tick timestamp that jumps backwards (feed replay / clock skew)
+            # must not wedge the cadence — treat a negative delta as "due"
+            if 0 <= elapsed < self.rolling_cadence_s:
+                return []
+        self._last_rerank = ts
+
+        pct: dict[str, float] = {}
+        for sym, price in list(self.last_price.items()):
+            pc = self.prev_closes.get(sym)
+            if pc and pc > 0 and price > 0:
+                pct[sym] = price / pc - 1.0
+
+        adds: list[dict[str, Any]] = []
+        sides: list[tuple[str, list[str]]] = []
+        if self.trade_side != "short_only":
+            sides.append(("L", sorted((s for s in pct if pct[s] > 0), key=lambda s: -pct[s])))
+        if self.trade_side != "long_only":
+            sides.append(("S", sorted((s for s in pct if pct[s] < 0), key=lambda s: pct[s])))
+        for side, ranked in sides:
+            for rank, sym in enumerate(ranked[: self.rolling_top_n], start=1):
+                if sym in self.selected or self.first_candle(sym) is None:
+                    continue
+                # seed the stats key BEFORE publishing the symbol into
+                # ``selected``, so a concurrent ``watch_snapshot`` read can
+                # never see a watched symbol with no stats entry
+                self.watch_stats.setdefault(
+                    sym,
+                    {"max_vol_ratio": None, "max_vol_ratio_beyond": None, "level_broken": False},
+                )
+                self.watch_source[sym] = "rolling"
+                self.selected[sym] = side
+                rec = {
+                    "symbol": sym,
+                    "side": side,
+                    "pct_change": round(pct[sym] * 100, 2),
+                    "rank": rank,
+                    "watch_size": len(self.selected),
+                    "at": f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}",
+                }
+                self.rolling_adds.append(rec)
+                adds.append(rec)
+        if adds:
+            logger.info(
+                "open15: rolling watch-list +%d (size %d) — %s",
+                len(adds),
+                len(self.selected),
+                ", ".join(f"{a['symbol']}:{a['side']}{a['pct_change']:+.2f}%" for a in adds),
+            )
+        return adds
 
     def on_tick(self, symbol: str, price: float, cumvol: float, ts: dt.datetime) -> dict | None:
         """Process one tick (ts must be IST-naive or IST-aware). Returns an
@@ -752,18 +916,23 @@ class Open15Core:
                 "trigger_minute": f"{ts.hour:02d}:{ts.minute:02d}",
                 "trigger_second": ts.second,
                 "trigger_min_idx": minute,
+                # seed vs rolling cohort (issue #529) — journaled on the row so
+                # the two can be scored separately later
+                "watch_source": self.watch_source.get(symbol, "seed"),
             }
             self.entered[symbol] = action
             return action
         return None
 
     def watch_snapshot(self) -> dict[str, dict[str, Any]]:
-        """Per-selected-symbol near-miss stats, safe to read off-thread (#524).
+        """Per-watched-symbol near-miss stats, safe to read off-thread (#524).
 
-        Keys are seeded at ``_finalize_selection`` and never change afterwards,
-        so the ``list(...)`` copy cannot race the tick thread's value updates.
-        ``max_vol_ratio`` is ``None`` until the symbol's first in-window tick —
-        blank means "no data", NOT a 0.0 ratio.
+        Keys are seeded at ``_finalize_selection`` — and, when the rolling watch
+        list is on, at ``maybe_rerank`` (issue #529). Both writers run on the
+        ZMQ tick thread and only ever ADD keys; the ``list(...)`` copy is a
+        single C-level pass that cannot interleave with them, so a Flask reader
+        sees a consistent snapshot. ``max_vol_ratio`` is ``None`` until the
+        symbol's first in-window tick — blank means "no data", NOT a 0.0 ratio.
 
         Note the value FREEZES at entry for a symbol that triggered (``on_tick``
         returns early once ``symbol in self.entered``), so an entered symbol's
@@ -780,6 +949,7 @@ class Open15Core:
                 else round(ws["max_vol_ratio_beyond"], 2),
                 "level_broken": bool(ws.get("level_broken", False)),
                 "entered": sym in self.entered,
+                "watch_source": self.watch_source.get(sym, "seed"),
             }
             for sym, ws in list(self.watch_stats.items())
         }
@@ -1040,6 +1210,9 @@ class Open15BreakoutService:
                 baseline_includes_first_minute=_baseline_includes_first_minute(),
                 await_snapshot=_first_candle_source() == "quotes",
                 trade_side=self.day_config["trade_side"],
+                rolling_enabled=self.day_config["rolling_watchlist_enabled"],
+                rolling_cadence_s=self.day_config["rolling_cadence_s"],
+                rolling_top_n=self.day_config["rolling_top_n"],
             )
             self.positions = {}
             self.day_status = "armed"
@@ -1053,6 +1226,11 @@ class Open15BreakoutService:
             no_entry_after=self.day_config["no_entry_after"],
             exit_time=self.day_config["exit_time"],
             trade_side=self.day_config["trade_side"],
+            # rolling additive watch list (issue #529) — the effective values,
+            # so a day is replayable from its own log
+            rolling_watchlist_enabled=self.day_config["rolling_watchlist_enabled"],
+            rolling_cadence_s=self.day_config["rolling_cadence_s"],
+            rolling_top_n=self.day_config["rolling_top_n"],
             sizing_mode=self.day_config["sizing_mode"],
             margin_per_slot=self.day_config["margin_per_slot"],
             margin_effective=self.day_config["margin_effective"],
@@ -1283,6 +1461,7 @@ class Open15BreakoutService:
                         "no_entry",
                         symbol=sym,
                         side=side,
+                        watch_source=core.watch_source.get(sym, "seed"),
                         level_broken=ws.get("level_broken", False),
                         max_vol_ratio=round(ws.get("max_vol_ratio") or 0.0, 2),
                         max_vol_ratio_while_beyond=round(ws.get("max_vol_ratio_beyond") or 0.0, 2),
@@ -1314,6 +1493,9 @@ class Open15BreakoutService:
             "summary",
             selected=n_sel,
             entered=n_ent,
+            # seed vs rolling split (issue #529): `selected` counts the whole
+            # watch list, so without this the seed cohort is unreadable
+            rolling_added=len(self.core.rolling_adds),
             day=self.day_status,
             captured_drift=drifts,
         )
@@ -1459,6 +1641,16 @@ class Open15BreakoutService:
         cumvol = float(tick.get("cumulative_volume") or 0)
         was_finalized = core.finalized
         action = core.on_tick(symbol, price, cumvol, tick_ts)
+        # additive re-rank (issue #529) — self-throttled to the configured
+        # cadence, and a no-op entirely when the feature is off
+        if core.rolling_enabled:
+            try:
+                for add in core.maybe_rerank(tick_ts):
+                    self._log_event("watchlist_add", **add)
+            except Exception:
+                # the rolling watch list is additive instrumentation on top of
+                # the measured strategy — it must never cost a seed entry
+                logger.exception("open15: rolling watch-list re-rank failed")
         try:
             self._capture_tick(core, symbol, price, cumvol, tick_ts, was_finalized)
         except Exception:
@@ -1565,11 +1757,18 @@ class Open15BreakoutService:
             trigger_second=action["trigger_second"],
             trigger_price=action["price"],
             quantity=0,
+            watch_source=action.get("watch_source") or "seed",
             status="skipped",
             reason=reason,
             **extra,
         )
-        self._log_event("entry_skipped", symbol=action["symbol"], reason=reason, **extra)
+        self._log_event(
+            "entry_skipped",
+            symbol=action["symbol"],
+            reason=reason,
+            watch_source=action.get("watch_source") or "seed",
+            **extra,
+        )
 
     def _enter(self, action: dict) -> None:
         from database.open15_breakout_db import insert_trade
@@ -1606,6 +1805,7 @@ class Open15BreakoutService:
             trigger_second=action["trigger_second"],
             trigger_price=action["price"],
             quantity=qty,
+            watch_source=action.get("watch_source") or "seed",
             entry_order_id=str(resp.get("orderid") or ""),
             entry_status="success" if ok else "error",
             status="open" if ok else "error",
@@ -1622,6 +1822,7 @@ class Open15BreakoutService:
             "entry",
             symbol=action["symbol"],
             side=side_word,
+            watch_source=action.get("watch_source") or "seed",
             qty=qty,
             trigger_price=round(action["price"], 2),
             level=round(action["level"], 2),
@@ -1707,6 +1908,7 @@ class Open15BreakoutService:
             trigger_second=action["trigger_second"],
             trigger_price=action["price"],
             quantity=qty,
+            watch_source=action.get("watch_source") or "seed",
             opt_symbol=contract["symbol"],
             opt_lot_size=lot,
             opt_entry_premium=premium,
@@ -1732,6 +1934,7 @@ class Open15BreakoutService:
             "entry",
             symbol=action["symbol"],
             side="BUY",
+            watch_source=action.get("watch_source") or "seed",
             instrument="option",
             contract=contract["symbol"],
             lots=lots,
@@ -1784,6 +1987,15 @@ class Open15BreakoutService:
             # during the window instead of waiting for the exit job (issue #524)
             "watch_stats": core.watch_snapshot() if core else {},
             "vol_needed": self._vol_needed(),
+            # rolling additive watch list (issue #529) — the effective config and
+            # today's additions so far, readable mid-window
+            "rolling": {
+                "enabled": bool((self.day_config or {}).get("rolling_watchlist_enabled")),
+                "cadence_s": (self.day_config or {}).get("rolling_cadence_s"),
+                "top_n": (self.day_config or {}).get("rolling_top_n"),
+                "adds": list(core.rolling_adds) if core else [],
+            },
+            "watch_source": dict(core.watch_source) if core else {},
             "positions": {
                 s: {k: p.get(k) for k in ("side", "quantity", "trigger_price", "status")}
                 for s, p in self.positions.items()

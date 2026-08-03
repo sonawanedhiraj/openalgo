@@ -75,6 +75,8 @@ def test_summarize_day_traded():
         "date": "2026-07-23",
         "status": "done",
         "selected": 3,
+        # a pre-#529 day has no watchlist_add events, so the rolling cohort is 0
+        "rolling_added": 0,
         "entered": 1,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
@@ -140,6 +142,44 @@ def test_selection_outcomes_fills_max_vol_for_entered_symbol():
     # the per-symbol no_entry event still wins for non-entered symbols
     assert rows["OFSS"]["max_vol_ratio"] == 1.31
     assert rows["DRREDDY"]["level_broken"] is False
+
+
+def test_selection_outcomes_tags_seed_rows():
+    """A pre-#529 day is all seed — the column is never blank (issue #529)."""
+    from services.open15_log_view import selection_outcomes
+
+    rows = selection_outcomes("2026-07-23", TRADED_DAY)
+    assert {r["watch_source"] for r in rows} == {"seed"}
+
+
+def test_selection_outcomes_adds_rolling_rows():
+    """A rolling add is a watched symbol and gets its own outcome row (#529)."""
+    from services.open15_log_view import selection_outcomes, summarize_day
+
+    day = list(TRADED_DAY)
+    day.insert(
+        2,
+        {
+            "ts": "09:18:30.000",
+            "event": "watchlist_add",
+            "symbol": "JUBLFOOD",
+            "side": "L",
+            "pct_change": 6.5,
+            "rank": 1,
+            "watch_size": 4,
+            "at": "09:18:30",
+        },
+    )
+    rows = {r["symbol"]: r for r in selection_outcomes("2026-07-23", day)}
+    assert set(rows) == {"OIL", "OFSS", "DRREDDY", "JUBLFOOD"}
+    jub = rows["JUBLFOOD"]
+    assert jub["watch_source"] == "rolling"
+    assert jub["side"] == "L" and jub["entered"] is False
+    # a rolling add has no 09:15 gap — gap_pct carries its % change AT ADD
+    assert jub["gap_pct"] == 6.5
+    # the 09:16 seed picks keep their own tag
+    assert rows["OIL"]["watch_source"] == "seed"
+    assert summarize_day("2026-07-23", day)["rolling_added"] == 1
 
 
 def test_selection_outcomes_unchanged_without_watch_stats_event():

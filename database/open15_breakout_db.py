@@ -97,6 +97,11 @@ class Open15Trade(Base):
     opt_entry_oi = Column(Integer, nullable=True)  # open interest at trigger
     opt_exit_volume = Column(Integer, nullable=True)  # cumulative day volume at exit
     opt_exit_oi = Column(Integer, nullable=True)  # open interest at exit
+    # how this symbol got onto the watch list (issue #529): ``seed`` = the 09:16
+    # gap ranking, ``rolling`` = appended by an intraday re-rank. Load-bearing
+    # for the measurement — without it the two cohorts cannot be scored apart.
+    # NULL on rows written before #529 shipped; read as ``seed``.
+    watch_source = Column(String(8), nullable=True)
     status = Column(String(16), default="open")  # open / closed / error / observe
     reason = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -138,6 +143,11 @@ class Open15Config(Base):
     no_entry_after = Column(String(5), nullable=True)  # "HH:MM" IST entry cutoff (issue #451)
     exit_time = Column(String(5), nullable=True)  # "HH:MM" IST hard flatten (issue #451)
     trade_side = Column(String(16), nullable=True)  # both | long_only | short_only (issue #503)
+    # rolling additive watch list (issue #529). NULL = env default; the cadence
+    # and top-N are the operator-facing knobs edited from /open15_vol_breakout/logs.
+    rolling_watchlist_enabled = Column(Integer, nullable=True)  # 0/1 (NULL = env default)
+    rolling_cadence_s = Column(Integer, nullable=True)  # re-rank period, clamped 10..300
+    rolling_top_n = Column(Integer, nullable=True)  # adds per side per cycle, clamped 1..10
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -165,6 +175,7 @@ def _ensure_columns():
             "opt_entry_oi": "INTEGER",
             "opt_exit_volume": "INTEGER",
             "opt_exit_oi": "INTEGER",
+            "watch_source": "VARCHAR(8)",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -172,6 +183,9 @@ def _ensure_columns():
             "no_entry_after": "VARCHAR(5)",
             "exit_time": "VARCHAR(5)",
             "trade_side": "VARCHAR(16)",
+            "rolling_watchlist_enabled": "INTEGER",
+            "rolling_cadence_s": "INTEGER",
+            "rolling_top_n": "INTEGER",
         },
     }
     try:
@@ -209,6 +223,14 @@ def get_config() -> dict | None:
             "no_entry_after": row.no_entry_after,
             "exit_time": row.exit_time,
             "trade_side": row.trade_side,
+            # None stays None so ``resolve_day_config`` can fall through to env
+            "rolling_watchlist_enabled": (
+                None
+                if row.rolling_watchlist_enabled is None
+                else bool(row.rolling_watchlist_enabled)
+            ),
+            "rolling_cadence_s": row.rolling_cadence_s,
+            "rolling_top_n": row.rolling_top_n,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -229,6 +251,9 @@ def save_config(
     no_entry_after: str | None = None,
     exit_time: str | None = None,
     trade_side: str | None = None,
+    rolling_watchlist_enabled: bool | None = None,
+    rolling_cadence_s: int | None = None,
+    rolling_top_n: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -244,6 +269,11 @@ def save_config(
         row.no_entry_after = no_entry_after
         row.exit_time = exit_time
         row.trade_side = trade_side
+        row.rolling_watchlist_enabled = (
+            None if rolling_watchlist_enabled is None else int(bool(rolling_watchlist_enabled))
+        )
+        row.rolling_cadence_s = rolling_cadence_s
+        row.rolling_top_n = rolling_top_n
         row.updated_by = updated_by
         db_session.commit()
         return True

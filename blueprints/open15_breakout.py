@@ -62,7 +62,16 @@ def config():
     import os as _os
 
     from database.open15_breakout_db import get_config, save_config
-    from services.open15_breakout_service import TRADE_SIDES, get_open15_service
+    from services.open15_breakout_service import (
+        TRADE_SIDES,
+        get_open15_service,
+    )
+    from services.open15_breakout_service import (
+        clamp_rolling_cadence as _clamp_rolling_cadence,
+    )
+    from services.open15_breakout_service import (
+        clamp_rolling_top_n as _clamp_rolling_top_n,
+    )
 
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
@@ -100,6 +109,26 @@ def config():
                     errors.append("max_trades must be between 1 and 6")
             except (TypeError, ValueError):
                 errors.append("max_trades must be an integer")
+        # rolling additive watch list (issue #529). Empty string / absent = NULL
+        # = env default, matching every other field. The two numeric knobs are
+        # CLAMPED server-side rather than rejected: the UI number inputs already
+        # carry min/max, so an out-of-range value here means a hand-crafted POST
+        # (or a stale page) and silently landing on the nearest legal value beats
+        # both trusting it and failing the whole save.
+        rolling_enabled = body.get("rolling_watchlist_enabled")
+        if rolling_enabled is not None and rolling_enabled != "":
+            if isinstance(rolling_enabled, str):
+                rolling_enabled = rolling_enabled.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                rolling_enabled = bool(rolling_enabled)
+        else:
+            rolling_enabled = None
+        rolling_cadence_s = body.get("rolling_cadence_s")
+        rolling_cadence_s = (
+            None if rolling_cadence_s in (None, "") else _clamp_rolling_cadence(rolling_cadence_s)
+        )
+        rolling_top_n = body.get("rolling_top_n")
+        rolling_top_n = None if rolling_top_n in (None, "") else _clamp_rolling_top_n(rolling_top_n)
         no_entry_after = body.get("no_entry_after") or None  # empty input = env default
         exit_time = body.get("exit_time") or None
         if no_entry_after is not None or exit_time is not None:
@@ -129,6 +158,9 @@ def config():
             no_entry_after=no_entry_after,
             exit_time=exit_time,
             trade_side=trade_side,
+            rolling_watchlist_enabled=rolling_enabled,
+            rolling_cadence_s=rolling_cadence_s,
+            rolling_top_n=rolling_top_n,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -147,6 +179,14 @@ def config():
                 "no_entry_after": _os.getenv("OPEN15_NO_ENTRY_AFTER", "09:29"),
                 "exit_time": _os.getenv("OPEN15_EXIT_TIME", "09:30"),
                 "trade_side": _os.getenv("OPEN15_TRADE_SIDE", "both"),
+                "rolling_watchlist_enabled": _os.getenv(
+                    "OPEN15_ROLLING_WATCHLIST_ENABLED", "false"
+                ).lower()
+                == "true",
+                "rolling_cadence_s": _clamp_rolling_cadence(
+                    _os.getenv("OPEN15_ROLLING_CADENCE_S", "30")
+                ),
+                "rolling_top_n": _clamp_rolling_top_n(_os.getenv("OPEN15_ROLLING_TOP_N", "3")),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -249,7 +289,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  td,th{border-bottom:1px solid #2a3138;padding:4px 10px;text-align:left;font-size:13px;vertical-align:top}
  th{color:#8aa0b4} .ev-entry{color:#a6e3a1}.ev-exit{color:#f9e2af}.ev-no_entry{color:#f38ba8}
  .ev-selection{color:#89b4fa}.ev-armed{color:#94e2d5}.ev-summary{color:#cba6f7}
- .ev-watch_stats{color:#8aa0b4}
+ .ev-watch_stats{color:#8aa0b4}.ev-watchlist_add{color:#f5c2e7}
+ .b-seed{background:#1b2b3a;color:#89b4fa}.b-roll{background:#3a2436;color:#f5c2e7}
  .ev-skipped_late_boot,.ev-skipped_no_prev_closes{color:#f38ba8;font-weight:bold}
  input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
  .muted{color:#6b7886;font-size:12px}
@@ -290,8 +331,18 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <label class="muted" style="margin-left:14px">max trades/day <input id="c_maxt" type="number" min="1" max="6" step="1" style="width:44px"></label>
  <label class="muted" style="margin-left:14px">no entry after <input id="c_nea" type="time" min="09:16" max="15:09" style="width:92px"></label>
  <label class="muted" style="margin-left:14px">exit time <input id="c_exit" type="time" min="09:17" max="15:10" style="width:92px"></label>
+ <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
+  <span class="muted">rolling watch-list (issue #529 — measurement, off by default)</span>
+  <label class="muted" style="margin-left:14px"><input id="c_roll" type="checkbox"> enabled</label>
+  <label class="muted" style="margin-left:14px">re-rank every
+   <input id="c_rollcad" type="number" min="10" max="300" step="5" style="width:60px"> s</label>
+  <label class="muted" style="margin-left:14px">top-N per side
+   <input id="c_rolltn" type="number" min="1" max="10" step="1" style="width:44px"></label>
+  <span class="muted" style="margin-left:10px">clamped 10&ndash;300 s / 1&ndash;10 server-side</span>
+ </div>
  <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
+ <div id="c_rollsrc" class="muted" style="margin-top:6px"></div>
  <div id="c_eff" class="muted" style="margin-top:6px"></div>
 </fieldset>
 <div class="layout">
@@ -302,8 +353,11 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <div class="main">
   <div id="status" class="muted"></div>
   <div class="chips" id="chips"></div>
+  <div class="sec">rolling watch-list <span id="rollCfg" class="muted"></span></div>
+  <table id="roll"><thead><tr><th style="width:90px">time</th><th>symbol</th><th>side</th>
+   <th>% change at add</th><th>rank</th><th>watch size</th></tr></thead><tbody></tbody></table>
   <div class="sec">selection outcomes</div>
-  <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>gap %</th><th id="selVolHdr">max vol&times;</th><th>outcome</th></tr></thead><tbody></tbody></table>
+  <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>source</th><th>gap %</th><th id="selVolHdr">max vol&times;</th><th>outcome</th></tr></thead><tbody></tbody></table>
   <div class="sec" style="display:flex;align-items:center;gap:8px">event timeline
    <span style="flex:1"></span>
    <button class="fbtn on" data-f="all">all</button>
@@ -326,6 +380,17 @@ async function loadCfg(){
   document.getElementById('c_maxt').value=o.max_trades||d.max_trades||3;
   document.getElementById('c_nea').value=o.no_entry_after||d.no_entry_after||'09:29';
   document.getElementById('c_exit').value=o.exit_time||d.exit_time||'09:30';
+  // rolling watch list (issue #529): `??` not `||` — a stored `false` / `0`
+  // must beat the env default, and 0 is never a legal cadence anyway
+  document.getElementById('c_roll').checked=
+    !!(o.rolling_watchlist_enabled??d.rolling_watchlist_enabled);
+  document.getElementById('c_rollcad').value=o.rolling_cadence_s??d.rolling_cadence_s??30;
+  document.getElementById('c_rolltn').value=o.rolling_top_n??d.rolling_top_n??3;
+  // which source each rolling field resolved from, so "saved" is visible
+  const src=k=>(o[k]==null?'env default':'db');
+  document.getElementById('c_rollsrc').textContent=
+    'rolling config source: enabled='+src('rolling_watchlist_enabled')+
+    ', cadence='+src('rolling_cadence_s')+', top-N='+src('rolling_top_n');
   const e=j.effective_today;
   if(e){
     const nea=e.no_entry_after||'09:29', ext=e.exit_time||'09:30';
@@ -339,7 +404,9 @@ async function loadCfg(){
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
       ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult+
       ' | entries 09:16–'+nea+' | exit '+ext+
-      ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'');
+      ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'')+
+      ' | rolling watch-list '+(e.rolling_watchlist_enabled
+        ?('every '+e.rolling_cadence_s+'s, top '+e.rolling_top_n+'/side'):'disabled');
   }
 }
 async function saveCfg(){
@@ -350,7 +417,10 @@ async function saveCfg(){
     trade_side:document.getElementById('c_side').value,
     max_trades:+document.getElementById('c_maxt').value,
     no_entry_after:document.getElementById('c_nea').value,
-    exit_time:document.getElementById('c_exit').value};
+    exit_time:document.getElementById('c_exit').value,
+    rolling_watchlist_enabled:document.getElementById('c_roll').checked,
+    rolling_cadence_s:+document.getElementById('c_rollcad').value,
+    rolling_top_n:+document.getElementById('c_rolltn').value};
   const msg=document.getElementById('c_msg');
   try{
     // CSRFProtect is global (issue #446): the POST is rejected 400 without this token
@@ -410,7 +480,7 @@ async function selectDay(date){
   curEvents=j.events||[];
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
-  renderChips(); renderSel(); renderTimeline();
+  renderChips(); renderRolling(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
 }
@@ -425,6 +495,35 @@ function renderChips(){
   document.getElementById('chips').innerHTML=chips.map(([k,v])=>
     '<div class="chip"><span class="k">'+k+'</span><span class="v'+
     (k==='day P&amp;L'&&dig.pnl!=null?(dig.pnl>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>').join('');
+}
+function srcBadge(src){
+  return '<span class="badge '+(src==='rolling'?'b-roll':'b-seed')+'">'+esc(src||'seed')+'</span>';
+}
+function renderRolling(){
+  // issue #529: the day's additive watch-list additions, straight from the
+  // decision log — so a past day replays identically to the live view.
+  const armed=curEvents.find(e=>e.event==='armed')||{};
+  const adds=curEvents.filter(e=>e.event==='watchlist_add');
+  const cfg=document.getElementById('rollCfg');
+  if(armed.rolling_watchlist_enabled===undefined&&!adds.length){
+    // pre-#529 day: the armed event predates the feature entirely
+    cfg.textContent='— not recorded for this day';
+  }else if(armed.rolling_watchlist_enabled){
+    cfg.textContent='— enabled: re-rank every '+armed.rolling_cadence_s+
+      's, top '+armed.rolling_top_n+'/side · '+adds.length+' added';
+  }else{
+    cfg.textContent='— disabled this day';
+  }
+  const tb=document.querySelector('#roll tbody'); tb.innerHTML='';
+  for(const a of adds){
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td>'+esc(a.at||a.ts)+'</td><td>'+esc(a.symbol)+'</td><td>'+esc(a.side)+
+      '</td><td class="'+(a.pct_change>=0?'pos':'neg')+'">'+(a.pct_change>=0?'+':'')+
+      esc(a.pct_change)+'%</td><td>#'+esc(a.rank)+'</td><td>'+esc(a.watch_size)+'</td>';
+    tb.appendChild(tr);
+  }
+  if(!adds.length)
+    tb.innerHTML='<tr><td colspan="6" class="muted">no rolling additions this day</td></tr>';
 }
 function volNeeded(){
   const w=curEvents.find(e=>e.event==='watch_stats');
@@ -450,13 +549,21 @@ function renderSel(){
   for(const e of curEvents){
     if(e.event==='selection'){
       for(const[s,side]of Object.entries(e.selected||{}))
-        rows[s]={side,gap:(e.gaps_pct||{})[s],out:'no trigger'};
+        rows[s]={side,src:'seed',gap:(e.gaps_pct||{})[s],out:'no trigger'};
+    }else if(e.event==='watchlist_add'){
+      // rolling adds are watched symbols too (issue #529) — they belong in the
+      // outcome table, marked apart from the 09:16 seed picks
+      if(!rows[e.symbol])
+        rows[e.symbol]={side:e.side,src:'rolling',gap:e.pct_change,out:'no trigger'};
     }else if(e.event==='watch_stats'){
       // every selected symbol, entered ones included (issue #524)
-      for(const[s,st]of Object.entries(e.stats||{}))
-        if(rows[s]&&rows[s].vol==null){
+      for(const[s,st]of Object.entries(e.stats||{})){
+        if(!rows[s])continue;
+        if(rows[s].vol==null){
           rows[s].vol=st.max_vol_ratio; rows[s].volBeyond=st.max_vol_ratio_beyond;
         }
+        if(!rows[s].src&&st.watch_source)rows[s].src=st.watch_source;
+      }
     }else if(!rows[e.symbol]){continue;
     }else if(e.event==='entry'){
       rows[e.symbol].out='<span class="pos">entered @ '+e.trigger_price+
@@ -479,7 +586,9 @@ function renderSel(){
   // mid-window the log has published nothing yet — overlay the running max
   const liveSyms=new Set();
   for(const[s,st]of Object.entries(liveWatch)){
-    if(rows[s]&&rows[s].vol==null&&st.max_vol_ratio!=null){
+    if(!rows[s])continue;
+    if(!rows[s].src&&st.watch_source)rows[s].src=st.watch_source;
+    if(rows[s].vol==null&&st.max_vol_ratio!=null){
       rows[s].vol=st.max_vol_ratio; rows[s].volBeyond=st.max_vol_ratio_beyond;
       liveSyms.add(s);
     }
@@ -492,12 +601,13 @@ function renderSel(){
   const tb=document.querySelector('#sel tbody'); tb.innerHTML='';
   for(const[s,r]of Object.entries(rows)){
     const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+esc(s)+'</td><td>'+esc(r.side)+'</td><td>'+(r.gap??'')+
+    tr.innerHTML='<td>'+esc(s)+'</td><td>'+esc(r.side)+'</td><td>'+srcBadge(r.src)+
+      '</td><td>'+(r.gap??'')+
       '</td><td>'+fmtVol(r.vol,r.volBeyond,needed,liveSyms.has(s))+'</td><td>'+r.out+'</td>';
     tb.appendChild(tr);
   }
   if(!Object.keys(rows).length)
-    tb.innerHTML='<tr><td colspan="5" class="muted">no selection this day</td></tr>';
+    tb.innerHTML='<tr><td colspan="6" class="muted">no selection this day</td></tr>';
 }
 function renderTimeline(){
   const tb=document.querySelector('#t tbody'); tb.innerHTML='';
@@ -561,6 +671,9 @@ def trades():
                     "opt_entry_oi": r.opt_entry_oi,
                     "opt_exit_volume": r.opt_exit_volume,
                     "opt_exit_oi": r.opt_exit_oi,
+                    # seed (09:16 gap ranking) vs rolling (intraday re-rank),
+                    # issue #529. Pre-#529 rows are NULL — they are all seeds.
+                    "watch_source": r.watch_source or "seed",
                     "gap_pct": r.gap_pct,
                     "level": r.level,
                     "baseline_vol": r.baseline_vol,

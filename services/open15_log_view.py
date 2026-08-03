@@ -17,6 +17,8 @@ CSV_COLUMNS = [
     "date",
     "symbol",
     "side",
+    # seed (09:16 gap ranking) vs rolling (intraday re-rank) — issue #529
+    "watch_source",
     "gap_pct",
     "entered",
     "level",
@@ -38,6 +40,7 @@ def summarize_day(date: str, events: list[dict[str, Any]], trades_pnl: float | N
     selected = 0
     entered = 0
     entry_syms: set[str] = set()
+    rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
     pnl_from_events = 0.0
     saw_exit_pnl = False
     for ev in events:
@@ -48,6 +51,8 @@ def summarize_day(date: str, events: list[dict[str, Any]], trades_pnl: float | N
             status = "armed"
         elif kind == "selection":
             selected = len(ev.get("selected") or {})
+        elif kind == "watchlist_add":
+            rolling_added += 1
         elif kind == "entry" and ev.get("order_status") == "success":
             entry_syms.add(ev.get("symbol", ""))
         elif kind == "exit" and ev.get("pnl") is not None:
@@ -62,6 +67,7 @@ def summarize_day(date: str, events: list[dict[str, Any]], trades_pnl: float | N
         "date": date,
         "status": status,
         "selected": selected,
+        "rolling_added": rolling_added,
         "entered": entered,
         "pnl": round(pnl, 2) if pnl is not None else None,
         "events": len(events),
@@ -83,7 +89,28 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
             for sym, side in (ev.get("selected") or {}).items():
                 rows[sym] = dict.fromkeys(CSV_COLUMNS)
                 rows[sym].update(
-                    date=date, symbol=sym, side=side, gap_pct=gaps.get(sym), entered=False
+                    date=date,
+                    symbol=sym,
+                    side=side,
+                    watch_source="seed",
+                    gap_pct=gaps.get(sym),
+                    entered=False,
+                )
+        elif kind == "watchlist_add":
+            # a rolling add is a watched symbol too (issue #529) — it gets its
+            # own outcome row, tagged so the two cohorts can be scored apart.
+            # `gap_pct` carries its % change AT ADD (there is no 09:15 gap for
+            # a symbol the 09:16 ranking never picked).
+            sym = ev.get("symbol")
+            if sym and sym not in rows:
+                rows[sym] = dict.fromkeys(CSV_COLUMNS)
+                rows[sym].update(
+                    date=date,
+                    symbol=sym,
+                    side=ev.get("side"),
+                    watch_source="rolling",
+                    gap_pct=ev.get("pct_change"),
+                    entered=False,
                 )
         elif kind == "entry":
             sym = ev.get("symbol")
@@ -109,6 +136,8 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
                     rows[sym]["level_broken"] = st.get("level_broken")
                 if rows[sym].get("vol_needed") is None:
                     rows[sym]["vol_needed"] = ev.get("needed")
+                if rows[sym].get("watch_source") is None and st.get("watch_source"):
+                    rows[sym]["watch_source"] = st["watch_source"]
         elif kind == "no_entry":
             sym = ev.get("symbol")
             if sym not in rows:

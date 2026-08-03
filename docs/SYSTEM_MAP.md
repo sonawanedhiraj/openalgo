@@ -269,7 +269,16 @@ need no external scheduler.
 > side** is UI-configurable too (issue #503: `open15_config.trade_side`, env
 > default `OPEN15_TRADE_SIDE` `both`) — `long_only` / `short_only` gate the
 > 09:15 selection itself, so the excluded side is never watched, never
-> triggers and never journals a row. Its tick feed
+> triggers and never journals a row. A **rolling additive watch list** is
+> UI-configurable as well (issue #529: `open15_config.rolling_watchlist_enabled`
+> / `rolling_cadence_s` / `rolling_top_n`, env defaults
+> `OPEN15_ROLLING_WATCHLIST_ENABLED` **false** / `OPEN15_ROLLING_CADENCE_S` 30
+> (clamped 10-300) / `OPEN15_ROLLING_TOP_N` 3 (clamped 1-10)) — when ON, the
+> universe is re-ranked on live LTP every cadence inside the entry window and
+> the current top-N movers per side are **appended** to the watch list (never
+> removed; the entry gate and the `max_trades` cap are unchanged). Each
+> addition emits a `watchlist_add` decision-log event and the resulting trade
+> row carries `open15_trades.watch_source ∈ {seed, rolling}`. Its tick feed
 > is an **own additive
 > ZMQ SUB** on the proxy bus (5555), active only 09:14:50 .. exit+5s IST
 > (`services/open15_breakout_service.py`). **Ops: the app must be booted before
