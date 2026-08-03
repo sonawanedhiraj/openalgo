@@ -107,7 +107,8 @@ NULL field = env default; **applies at the next 09:10 arm**):
 `OPEN15_VOL_MULT` (1.5) · `OPEN15_SIZING_MODE` (fixed) · `OPEN15_TOP_N` (3) ·
 `OPEN15_MARGIN_PER_SLOT` (30000) · `OPEN15_LEVERAGE` (5) ·
 `OPEN15_TRADE_SIDE` (both) ·
-`OPEN15_TICK_CAPTURE` (true). The `armed` decision-log event records the
+`OPEN15_TICK_CAPTURE` (true) · `OPEN15_TICK_CAPTURE_UNIVERSE` (true).
+The `armed` decision-log event records the
 effective day-config (incl. `config_source: ui | env_defaults`), so every day's
 sizing/filter is auditable.
 
@@ -143,11 +144,25 @@ above the threshold on a symbol that correctly never entered (issue #525).
 auth, auto-refreshing during the window, date picker for history).
 
 ## 8. Tick capture (backtest replay data)
-`OPEN15_TICK_CAPTURE` (default true): ticks for **the day's selected symbols
-only** are persisted to `tick_logs/open15/ticks-YYYYMMDD-<pid>.jsonl`
-(`{ts, symbol, ltp, volume}`, cumulative day volume; retention 365d). The full
-09:15 first minute is included (all universe symbols are buffered in memory for
-that one minute; on selection, only the picked symbols' buffers are flushed and
-the rest discarded). This makes every armed day fully replayable: first candle +
-entry window + exit for exactly the strategy's watchlist, at tick resolution —
-the dataset the offline salvage analysis was missing.
+`OPEN15_TICK_CAPTURE` (default true) is the master switch; ticks are persisted
+to `tick_logs/open15/ticks-YYYYMMDD-<pid>.jsonl` (`{ts, symbol, ltp, volume}`,
+cumulative day volume; retention 365d).
+
+`OPEN15_TICK_CAPTURE_UNIVERSE` (default true, issue #528): **every universe
+symbol's** ticks are written across the whole processing window (09:14:50 →
+`exit_time`+5s), not just the day's picks. This makes the strategy's own entry
+window replayable for symbols outside the 09:16 gap ranking — the prerequisite
+for testing watch-list changes such as adding intraday top gainers (on
+2026-08-03 the day's four biggest movers ranked #22/#106/#130/#134 on the 09:16
+gap list). No extra broker load: the ticks already arrive on the service's own
+ZMQ SUB and are parsed before the filter, so only the disk write changes
+(~211 symbols ⇒ ~120k ticks/day ≈ 10 MB/day).
+
+Set it `false` for the pre-#528 behaviour: **selected symbols only**, with the
+09:15 first minute buffered in memory for all universe symbols and, on
+selection, only the picked symbols' buffers flushed and the rest discarded.
+
+Capture is instrumentation, never trade logic — a writer failure is logged and
+swallowed inside `_handle_raw` so it can never cost an entry. The `armed`
+decision-log event and `/api/status` both report `tick_capture` and
+`tick_capture_universe` so the day's capture mode is auditable.

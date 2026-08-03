@@ -147,8 +147,19 @@ def _top_n() -> int:
 
 
 def _tick_capture_enabled() -> bool:
-    """Persist ticks for the day's SELECTED symbols (backtest replay data)."""
+    """Master switch for tick persistence (backtest replay data)."""
     return os.getenv("OPEN15_TICK_CAPTURE", "true").lower() == "true"
+
+
+def _tick_capture_universe_enabled() -> bool:
+    """Capture EVERY universe symbol's ticks, not just the day's picks (#528).
+
+    The strategy's own 09:15-09:30 window was previously only replayable for
+    the 3 selected symbols, so any question about symbols outside the 09:16 gap
+    ranking (e.g. adding intraday top gainers to the watch list) had no data.
+    Off => the pre-#528 selected-symbols-only behaviour.
+    """
+    return os.getenv("OPEN15_TICK_CAPTURE_UNIVERSE", "true").lower() == "true"
 
 
 def _opt_shadow_enabled() -> bool:
@@ -890,9 +901,12 @@ class Open15BreakoutService:
         self.day_log: list[dict[str, Any]] = []
         self._log_date: str | None = None
         self.day_config: dict[str, Any] = resolve_day_config(None, 0.0)
-        # targeted tick capture: only the day's SELECTED symbols are persisted,
-        # plus their 09:15 first-minute ticks (buffered until selection).
+        # tick capture. Universe mode (#528, default): every universe symbol's
+        # ticks stream to disk for the whole window. Targeted mode (legacy):
+        # only the day's SELECTED symbols are persisted, plus their 09:15
+        # first-minute ticks (buffered in memory until selection finalizes).
         self._tick_writer = None
+        self._capture_universe = False
         self._first_min_buffer: dict[str, list[tuple]] = {}
         self._capture_flushed = False
 
@@ -986,9 +1000,18 @@ class Open15BreakoutService:
             try:
                 from services.simplified_stock_engine_ticklog import TickLogWriter
 
+                # universe capture is ~130 ticks/s across ~210 symbols, and the
+                # first-minute burst arrives as one flush — the default 10k
+                # queue would drop under it, so widen queue + batch (#528).
+                universe_capture = _tick_capture_universe_enabled()
                 self._tick_writer = TickLogWriter(
-                    enabled=True, directory="tick_logs/open15", retention_days=365
+                    enabled=True,
+                    directory="tick_logs/open15",
+                    retention_days=365,
+                    max_queue=50000 if universe_capture else 10000,
+                    batch_size=500 if universe_capture else 200,
                 )
+                self._capture_universe = universe_capture
             except Exception:
                 logger.exception("open15: tick writer init failed — capture disabled today")
         try:
@@ -1037,6 +1060,7 @@ class Open15BreakoutService:
             cum_realized_pnl=self.day_config["cum_realized_pnl"],
             config_source="ui" if cfg_row else "env_defaults",
             tick_capture=bool(self._tick_writer),
+            tick_capture_universe=bool(self._tick_writer) and self._capture_universe,
             prev_close_check=prev_check,
             first_candle_source=_first_candle_source(),
             baseline_includes_first_minute=_baseline_includes_first_minute(),
@@ -1435,7 +1459,11 @@ class Open15BreakoutService:
         cumvol = float(tick.get("cumulative_volume") or 0)
         was_finalized = core.finalized
         action = core.on_tick(symbol, price, cumvol, tick_ts)
-        self._capture_tick(core, symbol, price, cumvol, tick_ts, was_finalized)
+        try:
+            self._capture_tick(core, symbol, price, cumvol, tick_ts, was_finalized)
+        except Exception:
+            # capture is instrumentation — it must never cost an entry (#528)
+            logger.exception("open15: tick capture failed")
         if action:
             self._enter(action)
 
@@ -1475,26 +1503,38 @@ class Open15BreakoutService:
         ts: dt.datetime,
         was_finalized: bool,
     ) -> None:
-        """Persist ticks for SELECTED symbols only (backtest replay data).
+        """Persist ticks for backtest replay.
 
-        Before selection (09:15 minute) every universe symbol's ticks are
-        buffered in memory; the moment selection finalizes, only the selected
-        symbols' buffers are flushed to the writer and the rest are dropped.
-        After that, selected-symbol ticks stream straight to the writer.
+        UNIVERSE mode (#528, default): every universe symbol's tick is written
+        straight through for the whole processing window, so the strategy's own
+        09:15-09:30 window is replayable for symbols outside the day's picks
+        (e.g. testing intraday top gainers as watch candidates). No in-memory
+        buffering is needed because nothing is ever discarded.
+
+        TARGETED mode (legacy, ``OPEN15_TICK_CAPTURE_UNIVERSE=false``): before
+        selection (09:15 minute) every universe symbol's ticks are buffered in
+        memory; the moment selection finalizes, only the selected symbols'
+        buffers are flushed to the writer and the rest are dropped. After that,
+        selected-symbol ticks stream straight to the writer.
         """
         if self._tick_writer is None:
             return
+        universe_mode = self._capture_universe
         if not core.finalized:
-            buf = self._first_min_buffer.setdefault(symbol, [])
-            if len(buf) < 3000:
-                buf.append((price, int(cumvol), ts))
+            if universe_mode:
+                self._tick_writer.enqueue(symbol, price, int(cumvol), ts)
+            else:
+                buf = self._first_min_buffer.setdefault(symbol, [])
+                if len(buf) < 3000:
+                    buf.append((price, int(cumvol), ts))
             return
         if not was_finalized and not self._capture_flushed:
             # selection just finalized on this tick — flush buffers once
             self._capture_flushed = True
-            for sym in core.selected:
-                for p, v, t in self._first_min_buffer.get(sym, []):
-                    self._tick_writer.enqueue(sym, p, v, t)
+            if not universe_mode:
+                for sym in core.selected:
+                    for p, v, t in self._first_min_buffer.get(sym, []):
+                        self._tick_writer.enqueue(sym, p, v, t)
             self._first_min_buffer = {}
             self._log_event(
                 "selection",
@@ -1505,7 +1545,7 @@ class Open15BreakoutService:
                 prev_closes={s: core.prev_closes.get(s) for s in core.selected},
                 candidates=len(core.gaps),
             )
-        if symbol in core.selected:
+        if universe_mode or symbol in core.selected:
             self._tick_writer.enqueue(symbol, price, int(cumvol), ts)
 
     def _journal_skip(self, action: dict, reason: str, **extra) -> None:
@@ -1749,6 +1789,7 @@ class Open15BreakoutService:
                 for s, p in self.positions.items()
             },
             "tick_capture": bool(self._tick_writer),
+            "tick_capture_universe": bool(self._tick_writer) and self._capture_universe,
             "config": dict(self.day_config or {}),
             "day_log": self.day_log[-100:],
         }
