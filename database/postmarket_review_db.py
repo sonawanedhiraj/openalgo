@@ -58,15 +58,54 @@ class PostmarketReview(Base):
     summary_text = Column(Text, nullable=True)  # rendered operator summary
     elapsed_ms = Column(Integer, nullable=True)
     telegram_sent = Column(Integer, default=0)
+    # Phase 2 (#532) — expectation-contract verdicts. Added after the table
+    # shipped in #511, so init_db migrates existing installs in place.
+    violations_json = Column(Text, nullable=True)  # JSON array of Violation dicts
+    n_violations = Column(Integer, nullable=True)
+    contracts_json = Column(Text, nullable=True)  # counts + unknown-contract list
 
 
 Index("idx_postmarket_review_date", PostmarketReview.review_date)
+
+
+# Columns added after the table first shipped, migrated in on boot.
+_ADDED_COLUMNS = (
+    ("violations_json", "TEXT"),
+    ("n_violations", "INTEGER"),
+    ("contracts_json", "TEXT"),
+)
+
+
+def _ensure_columns():
+    """Add post-#511 columns to an existing ``postmarket_review`` table.
+
+    ``create_all`` only creates missing *tables*, never missing columns, so an
+    install that already ran #511 would otherwise keep the old schema and every
+    write of the new fields would fail.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            existing = {
+                row[1] for row in conn.execute(text("PRAGMA table_info(postmarket_review)"))
+            }
+            for name, sql_type in _ADDED_COLUMNS:
+                if name not in existing:
+                    conn.execute(
+                        text(f"ALTER TABLE postmarket_review ADD COLUMN {name} {sql_type}")
+                    )
+                    logger.info("postmarket_review: added column %s", name)
+            conn.commit()
+    except Exception:
+        logger.exception("failed to migrate postmarket_review columns")
 
 
 def init_db():
     """Create the ``postmarket_review`` table if missing. Idempotent."""
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_columns()
         logger.info("postmarket_review table ready")
     except Exception as e:
         logger.exception(f"Failed to init postmarket_review table: {e}")
@@ -86,6 +125,9 @@ def _row_to_dict(row: PostmarketReview) -> dict:
         "summary_text": row.summary_text,
         "elapsed_ms": row.elapsed_ms,
         "telegram_sent": bool(row.telegram_sent),
+        "violations": json.loads(row.violations_json) if row.violations_json else [],
+        "n_violations": row.n_violations,
+        "contracts": json.loads(row.contracts_json) if row.contracts_json else {},
     }
 
 
@@ -96,6 +138,7 @@ def upsert_review(
     is_trading_day: bool | None = None,
     elapsed_ms: int | None = None,
     telegram_sent: bool | int = 0,
+    contracts: dict | None = None,
 ) -> int:
     """Replace the row for ``review_date``. Returns the row id (0 on failure).
 
@@ -116,6 +159,16 @@ def upsert_review(
             summary_text=summary_text,
             elapsed_ms=elapsed_ms,
             telegram_sent=1 if telegram_sent else 0,
+            violations_json=json.dumps((contracts or {}).get("violations") or [], default=str),
+            n_violations=len((contracts or {}).get("violations") or []),
+            contracts_json=json.dumps(
+                {
+                    "counts": (contracts or {}).get("counts") or {},
+                    "unknown_contracts": (contracts or {}).get("unknown_contracts") or [],
+                    "evaluated": (contracts or {}).get("evaluated", False),
+                },
+                default=str,
+            ),
         )
         db_session.add(row)
         db_session.commit()

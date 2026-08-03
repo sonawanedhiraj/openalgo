@@ -92,7 +92,7 @@ def _fmt_count(value: Any) -> str:
     return "?" if value is None else str(value)
 
 
-def render_summary(digest: dict[str, Any]) -> str:
+def render_summary(digest: dict[str, Any], contracts: dict[str, Any] | None = None) -> str:
     """Render the operator-facing summary for one day's digest.
 
     Deliberately terse: this is a Telegram message read on a phone, not a
@@ -104,6 +104,26 @@ def render_summary(digest: dict[str, Any]) -> str:
     if digest.get("is_trading_day") is False:
         lines.append("Non-trading day — nothing to review.")
         return "\n".join(lines)
+
+    # Verdict first: the operator should see whether anything is WRONG before
+    # reading counts. A clean day says so explicitly rather than staying silent —
+    # "no findings" must never be indistinguishable from "the review didn't run",
+    # which is precisely how journal_reflection's dead schedule hid for months.
+    if contracts is not None and contracts.get("evaluated"):
+        violations = contracts.get("violations") or []
+        if violations:
+            lines.append(f"🚨 {len(violations)} expectation(s) violated:")
+            for v in violations[:8]:
+                lines.append(
+                    f"  [{v['severity']}] {v['strategy']}/{v['contract_id']}: {v['summary']}"
+                )
+            if len(violations) > 8:
+                lines.append(f"  …and {len(violations) - 8} more")
+        else:
+            lines.append("✅ All expectations passed.")
+        unknown = contracts.get("unknown_contracts") or []
+        if unknown:
+            lines.append(f"  ({len(unknown)} contract(s) indeterminate — missing inputs)")
 
     jobs = digest.get("jobs")
     if jobs is None:
@@ -215,13 +235,27 @@ def run_review_for_date(
         return {
             "date": target,
             "digest": digest,
+            "contracts": {
+                "violations": [],
+                "counts": {},
+                "unknown_contracts": [],
+                "evaluated": False,
+            },
             "summary": None,
             "persisted": False,
             "telegram_sent": False,
             "skipped": "non_trading_day",
         }
 
-    summary = render_summary(digest)
+    try:
+        from services.strategy_expectations import evaluate_expectations
+
+        contracts = evaluate_expectations(digest)
+    except Exception:
+        logger.exception("postmarket_review: contract evaluation failed")
+        contracts = {"violations": [], "counts": {}, "unknown_contracts": [], "evaluated": False}
+
+    summary = render_summary(digest, contracts)
     elapsed_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
 
     telegram_sent = False
@@ -245,13 +279,15 @@ def run_review_for_date(
             is_trading_day=digest.get("is_trading_day"),
             elapsed_ms=elapsed_ms,
             telegram_sent=telegram_sent,
+            contracts=contracts,
         )
         persisted = bool(row_id)
 
     logger.info(
-        "postmarket_review: %s done in %dms (persisted=%s, telegram=%s, degraded=%s)",
+        "postmarket_review: %s done in %dms (violations=%d, persisted=%s, telegram=%s, degraded=%s)",
         target,
         elapsed_ms,
+        len(contracts.get("violations") or []),
         persisted,
         telegram_sent,
         digest.get("sources_failed") or "none",
@@ -259,6 +295,7 @@ def run_review_for_date(
     return {
         "date": target,
         "digest": digest,
+        "contracts": contracts,
         "summary": summary,
         "persisted": persisted,
         "telegram_sent": telegram_sent,

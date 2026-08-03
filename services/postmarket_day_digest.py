@@ -123,6 +123,11 @@ def _collect_jobs(date: str) -> dict[str, Any]:
         "jobs": summary,
         "jobs_with_errors": errored,
         "jobs_missed": missed,
+        # Earliest date the audit ever recorded. Lets a contract tell "the audit
+        # was running and saw nothing" (a real problem) apart from "this date
+        # predates the audit" (a replay of history, not a fault) — otherwise
+        # every backfill of an old day reports a phantom violation.
+        "audit_earliest_date": job_run_db.earliest_run_date(),
     }
 
 

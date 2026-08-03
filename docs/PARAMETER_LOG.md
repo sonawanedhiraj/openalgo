@@ -60,6 +60,24 @@ code defaults — none is set in `.env`, so the shipped behaviour is the default
   tick forever. Lower it only if the table is measurably large — Phase 2's
   expectation contracts want enough history to spot a job that *stopped* firing.
 
+### Post-market expectation contracts (issue #532, added 2026-08-03)
+
+#### POSTMARKET_CONTRACTS_ENABLED
+- **Value:** code default `true`. Read at evaluation time.
+- **What it gates:** whether the post-market review evaluates expectation
+  contracts at all. `false` keeps the digest and the Telegram summary, but drops
+  the verdict section — the report degrades to Phase 1 behaviour.
+
+#### POSTMARKET_CONTRACTS_DISABLED
+- **Value:** code default empty. Comma-separated `contract_id` or
+  `strategy:contract_id` (e.g. `futures_follow_cap50:t1_exit_for_carry`).
+- **What it does:** silences individual contracts **surgically** — every other
+  contract keeps evaluating. Exists so a rule that starts crying wolf can be
+  muted the same day without a code change and without disabling the layer.
+  A contract silenced here should get an issue to fix or delete it; a permanently
+  disabled contract is worse than no contract, because the report still looks
+  complete.
+
 ### Multi-account mirror trading (issues #468/#474/#476/#478/#482, added 2026-07-28)
 
 #### MULTI_ACCOUNT_ENABLED
