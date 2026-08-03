@@ -428,8 +428,13 @@ function renderSel(){
         (e.pnl>=0?'+':'')+'&#8377;'+e.pnl+'</span>';
     }else if(e.event==='no_entry'){
       rows[e.symbol].vol=e.max_vol_ratio;
-      rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+e.max_vol_ratio+
-        '&times; &lt; '+e.needed):'level never broken';
+      // the gate compares the ratio measured WHILE price is beyond the level
+      // (on_tick: `beyond and cum_in_min >= vol_mult*baseline`), so the outcome
+      // must quote max_vol_ratio_while_beyond — the `max vol×` column's
+      // peak-anywhere number can be >= needed on a symbol that never entered.
+      const vb=e.max_vol_ratio_while_beyond??e.max_vol_ratio;
+      rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+vb+
+        '&times; &lt; '+e.needed+' while beyond'):'level never broken';
     }else if(e.event==='entry_skipped'){rows[e.symbol].out='skipped: '+esc(e.reason||'');}
   }
   const tb=document.querySelector('#sel tbody'); tb.innerHTML='';
