@@ -129,10 +129,12 @@ from database.intraday_pullback_db import init_db as ensure_intraday_pullback_ta
 from database.intraday_pullback_eval_db import (
     init_db as ensure_intraday_pullback_eval_tables_exists,
 )
+from database.job_run_db import init_db as ensure_job_run_tables_exists
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
 from database.open15_breakout_db import init_db as ensure_open15_tables_exists
+from database.postmarket_review_db import init_db as ensure_postmarket_review_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
 from database.scanner_comparison_db import (
@@ -715,6 +717,8 @@ def setup_environment(app):
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),
                 ("Trade Journal DB", ensure_trade_journal_tables_exists),
                 ("Journal Reflection DB", ensure_journal_reflection_tables_exists),
+                ("Job Run DB", ensure_job_run_tables_exists),
+                ("Post-market Review DB", ensure_postmarket_review_tables_exists),
                 ("Backtest DB", ensure_backtest_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Broker TOTP DB", ensure_broker_totp_tables_exists),
@@ -808,6 +812,18 @@ def setup_environment(app):
                 logger.debug("Historify scheduler initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
+
+            # Job-run audit — attach BEFORE any service registers its jobs so a
+            # job that fires immediately at boot is still recorded. Records one
+            # `job_run` row per fire so "did the 15:20 entry job run?" is a
+            # one-row lookup rather than a 5 MB log grep.
+            try:
+                from services.job_run_audit import init_job_run_audit
+
+                init_job_run_audit()
+                logger.debug("Job run audit initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize job run audit: {e}")
 
             # Probe historify.duckdb for orphan-process contention BEFORE wiring
             # any backfill scheduler. If a foreign python.exe is holding the
@@ -979,6 +995,20 @@ def setup_environment(app):
                 logger.debug("Scanner comparison EOD job registered")
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
+
+            # Daily post-market review (issue #511) — 17:15 IST, after the
+            # 15:30-17:00 backfill-convergence window closes so every input it
+            # reads has settled. Read-only on every DB except its own table;
+            # gated per-fire by POSTMARKET_REVIEW_ENABLED.
+            try:
+                from services.postmarket_review_service import (
+                    init_postmarket_review_service,
+                )
+
+                init_postmarket_review_service()
+                logger.debug("Post-market review job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Post-market review job: {e}")
 
             # Multi-account observability jobs (issue #476): child-login
             # reminders (09:00 + 15:00 IST) and the 15:35 IST EOD mirror
