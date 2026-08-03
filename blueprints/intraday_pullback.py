@@ -7,6 +7,7 @@ mutating routes require an API key; read-only routes accept an API key OR a logg
 from flask import Blueprint, jsonify, request
 
 from database.auth_db import verify_api_key
+from services.intraday_pullback_core import TRADE_SIDES
 from services.intraday_pullback_service import get_service
 from utils.logging import get_logger
 
@@ -148,6 +149,16 @@ def update_settings():
         fields["sizing_mode"] = sm
     else:
         errors.append("sizing_mode must be fixed | compound | capped")
+
+    # Trade side (issue #509). Omitted -> keep whatever is stored (the settings
+    # form always sends it, but an API-key caller updating only capital should
+    # not silently reset the operator's side selection).
+    if "trade_side" in body:
+        ts = str(body.get("trade_side", "")).lower()
+        if ts in TRADE_SIDES:
+            fields["trade_side"] = ts
+        else:
+            errors.append(f"trade_side must be one of {' | '.join(TRADE_SIDES)}")
 
     nts, nte = _parse_hhmm(body.get("no_trade_start")), _parse_hhmm(body.get("no_trade_end"))
     afs, afe = _parse_hhmm(body.get("afternoon_start")), _parse_hhmm(body.get("afternoon_end"))

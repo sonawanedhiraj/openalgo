@@ -27,12 +27,14 @@ from apscheduler.triggers.cron import CronTrigger
 
 from database import intraday_pullback_db as journal
 from services.intraday_pullback_core import (
+    TRADE_SIDES,
     EntryAction,
     ExitAction,
     GateContext,
     PullbackConfig,
     StockState,
     select_top2,
+    trade_side_allows,
 )
 from utils.logging import get_logger
 
@@ -345,6 +347,10 @@ class IntradayPullbackService:
             str, dict
         ] = {}  # sym -> {gain930, sector, sector930} for the breakdown
         self.selected = False
+        # Why the day produced no picks, when that was a deliberate gate rather
+        # than a data gap (issue #509) — surfaced on get_status/entry_breakdown
+        # so a trade_side skip is never mistaken for a broken feed.
+        self.skip_reason: str | None = None
         self.manual_pause = False
         self.kill_switch = False
         self.today_realized = 0.0
@@ -400,10 +406,15 @@ class IntradayPullbackService:
             m_end = _parse_time(row.get("no_trade_start")) or self.cfg.morning[1]
             a_start = _parse_time(row.get("afternoon_start")) or self.cfg.afternoon[0]
             a_end = _parse_time(row.get("afternoon_end")) or self.cfg.afternoon[1]
+            # issue #509: a stored value outside the enum is ignored (keep the
+            # env/JSON default) rather than darkening a book on bad data.
+            side_sel = str(row.get("trade_side") or "").lower()
+            trade_side = side_sel if side_sel in TRADE_SIDES else self.cfg.trade_side
             self.cfg = replace(
                 self.cfg,
                 morning=(self.cfg.morning[0], m_end),
                 afternoon=(a_start, a_end),
+                trade_side=trade_side,
             )
         except Exception:  # noqa: BLE001
             logger.debug("intraday_pullback editable-config load failed", exc_info=True)
@@ -414,6 +425,7 @@ class IntradayPullbackService:
         return {
             "base_capital": self.base_capital,
             "sizing_mode": self.sizing_mode,
+            "trade_side": self.cfg.trade_side,
             "slots": self.slots,
             "margin_per_slot": round(self.base_capital / self.slots, 0),
             "morning": [
@@ -437,10 +449,11 @@ class IntradayPullbackService:
         self._apply_mode_override()
         self._apply_editable_config()
         logger.info(
-            "intraday_pullback daily reset (mode=%s cap=%.0f sizing=%s)",
+            "intraday_pullback daily reset (mode=%s cap=%.0f sizing=%s trade_side=%s)",
             self.mode,
             self.base_capital,
             self.sizing_mode,
+            self.cfg.trade_side,
         )
         self._reset_state()
 
@@ -520,6 +533,21 @@ class IntradayPullbackService:
             self.side = "S"
         else:
             logger.info("intraday_pullback: NIFTY flat at 09:30 — no book today")
+            self.selected = True
+            return
+        # Operator trade-side gate (issue #509). The books are mutually exclusive
+        # by the day gate above, so an excluded side means NO TRADING today —
+        # not a switch to the other book. Enforced here, before selection, so the
+        # excluded side is never picked, never watched, never journals a row.
+        if not trade_side_allows(self.cfg.trade_side, self.side):
+            logger.info(
+                "intraday_pullback: NIFTY %s at 09:30 -> %s book, but trade_side=%s "
+                "— no trading today",
+                "up" if self.side == "L" else "down",
+                "long" if self.side == "L" else "short",
+                self.cfg.trade_side,
+            )
+            self.skip_reason = f"trade_side={self.cfg.trade_side}"
             self.selected = True
             return
         sector_returns = {idx: rets.get(idx) for idx in self.index_syms}
@@ -950,6 +978,10 @@ class IntradayPullbackService:
             "side_today": self.side,
             "nifty_930_pct": self.nifty_930,
             "selected": self.selected,
+            # issue #509: an operator trade-side gate is a DELIBERATE no-trade
+            # day. Naming it here keeps it distinguishable from a data gap.
+            "trade_side": self.cfg.trade_side,
+            "skip_reason": self.skip_reason,
             "picks": self.picks,
             "n_trades_today": sum(1 for e in evaluation if e["position"] != "none"),
             "evaluation": evaluation,
@@ -973,6 +1005,8 @@ class IntradayPullbackService:
             "base_capital": self.base_capital,
             "deployable_capital": round(self.deployable_capital(), 0),
             "sizing_mode": self.sizing_mode,
+            "trade_side": self.cfg.trade_side,
+            "skip_reason": self.skip_reason,
             "today_realized_net": round(self.today_realized, 0),
             "open_positions": [
                 {"symbol": s, **{k: v for k, v in p.items() if k != "trade_id"}}
@@ -1126,7 +1160,22 @@ def _build_pullback_config(raw: dict) -> PullbackConfig:
         market_gate_pct=float(lng.get("fresh_gate_nifty_pct", 0.30)),
         stop_floor_pct=float(lng.get("stop_floor_pct", 0.3)),
         max_attempts=int(lng.get("max_attempts", 2)),
+        trade_side=_env_trade_side(raw),
     )
+
+
+def _env_trade_side(raw: dict) -> str:
+    """Resolve the trade-side default: env var, else config_snapshot, else 'both'.
+
+    An unrecognised value falls back to 'both' with a WARNING rather than
+    darkening a book on a typo (issue #509).
+    """
+    raw_val = os.getenv("INTRADAY_PULLBACK_TRADE_SIDE") or raw.get("trade_side") or "both"
+    val = str(raw_val).strip().lower()
+    if val not in TRADE_SIDES:
+        logger.warning("intraday_pullback: invalid trade_side %r — falling back to 'both'", raw_val)
+        return "both"
+    return val
 
 
 def _seed_strategy_id() -> int | None:

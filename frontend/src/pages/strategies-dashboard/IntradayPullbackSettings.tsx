@@ -30,6 +30,27 @@ const SIZING = [
   },
 ] as const
 
+// issue #509. The long and short books are mutually exclusive by the 09:30
+// NIFTY day gate, so excluding a side does NOT move its days to the other book
+// — it means no trading at all on those days. The hints say so explicitly.
+const TRADE_SIDES = [
+  {
+    key: 'both',
+    label: 'Both',
+    hint: 'Long book on NIFTY-up days, short book on NIFTY-down days. This is the backtested configuration.',
+  },
+  {
+    key: 'long_only',
+    label: 'Longs only',
+    hint: 'Runs the long book on NIFTY-up days and does NOT TRADE AT ALL on NIFTY-down days — those days are given up, not switched to longs. Backtest contribution: 155 trades, PF 1.72, +₹44,202.',
+  },
+  {
+    key: 'short_only',
+    label: 'Shorts only',
+    hint: 'Runs the deep-loser short book on NIFTY-down days and does NOT TRADE AT ALL on NIFTY-up days. This is the unvalidated, most slippage-fragile leg. Backtest contribution: 80 trades, PF 1.40, +₹14,362.',
+  },
+] as const
+
 const inr = (n: number) => `₹${Math.round(n).toLocaleString('en-IN')}`
 
 export default function IntradayPullbackSettings() {
@@ -44,11 +65,13 @@ export default function IntradayPullbackSettings() {
   const [ntStart, setNtStart] = useState('11:00')
   const [ntEnd, setNtEnd] = useState('13:00')
   const [afEnd, setAfEnd] = useState('15:00')
+  const [tradeSide, setTradeSide] = useState<string>('both')
 
   useEffect(() => {
     if (data) {
       setCapital(String(data.base_capital))
       setSizing(data.sizing_mode)
+      setTradeSide(data.trade_side ?? 'both')
       setNtStart(data.no_trade[0])
       setNtEnd(data.no_trade[1])
       setAfEnd(data.afternoon[1])
@@ -65,6 +88,7 @@ export default function IntradayPullbackSettings() {
       intradayPullbackApi.updateSettings({
         base_capital: Number(capital),
         sizing_mode: sizing,
+        trade_side: tradeSide,
         no_trade_start: ntStart,
         no_trade_end: ntEnd,
         afternoon_start: ntEnd, // afternoon starts where the no-trade window ends (contiguous)
@@ -88,6 +112,7 @@ export default function IntradayPullbackSettings() {
   })
 
   const activeSizing = SIZING.find((s) => s.key === sizing) ?? SIZING[0]
+  const activeTradeSide = TRADE_SIDES.find((s) => s.key === tradeSide) ?? TRADE_SIDES[0]
   const deployable =
     sizing === 'fixed'
       ? Number(capital)
@@ -178,6 +203,34 @@ export default function IntradayPullbackSettings() {
                 ))}
               </div>
               <p className="text-xs text-muted-foreground">{activeSizing.hint}</p>
+            </div>
+
+            <div className="space-y-2">
+              <Label>Trade side</Label>
+              <div className="inline-flex rounded-md border overflow-hidden">
+                {TRADE_SIDES.map((s) => (
+                  <button
+                    key={s.key}
+                    type="button"
+                    onClick={() => setTradeSide(s.key)}
+                    className={`px-4 py-2 text-sm border-l first:border-l-0 transition-colors ${
+                      tradeSide === s.key
+                        ? 'bg-primary text-primary-foreground'
+                        : 'bg-transparent hover:bg-muted'
+                    }`}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-muted-foreground">{activeTradeSide.hint}</p>
+              {tradeSide !== 'both' && (
+                <p className="text-xs text-amber-600 dark:text-amber-500">
+                  ⚠ One-sided. The two books are mutually exclusive by the 09:30 NIFTY day gate, so
+                  this gives up every day the excluded book would have run — roughly half the
+                  calendar. The published backtest figures are both-sides numbers.
+                </p>
+              )}
             </div>
 
             <div className="rounded-lg bg-muted/40 px-4 py-3 flex items-baseline justify-between gap-4 flex-wrap">

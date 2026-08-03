@@ -32,8 +32,18 @@ Max **2 concurrent positions** (₹60k margin cap — never exceeded, days disjo
 (default) / `compound` (net capital carried forward daily) / `capped` (min(equity, base)).
 
 ## 6. Editable via UI (per-strategy config, applied at 09:00 reset)
-`base_capital`, `no_trade` window, `afternoon` window, `sizing_mode`. Strategy-logic params (bands, 2.5×,
-stop, filters, morning window, EOD) are read-only — changing them invalidates the backtest.
+`base_capital`, `no_trade` window, `afternoon` window, `sizing_mode`, `trade_side`. Strategy-logic
+params (bands, 2.5×, stop, filters, morning window, EOD) are read-only — changing them invalidates
+the backtest.
+
+**`trade_side`** (issue #509) ∈ `both` (default, backtested) / `long_only` / `short_only`, env default
+`INTRADAY_PULLBACK_TRADE_SIDE`. Enforced in `run_selection` immediately after the §2 day gate: an
+excluded side is never selected, never watched, never triggers, never journals. **Because the two
+books are mutually exclusive by that day gate, this is NOT a rebalance — excluding a side means the
+strategy does not trade at all on the days that side would have run** (`long_only` gives up every
+NIFTY-down day). A skip is recorded as `skip_reason='trade_side=…'` on `get_status()` /
+`entry_breakdown()` so it stays distinguishable from a data gap. Invalid stored/env values fall back
+to `both` with a WARNING — a typo must never silently dark a book.
 
 ## 7. Data pipeline (09:30 selection)
 Full-universe exact 09:30 returns (not a top-N list). Source chain (deterministic, no LLM/scrape):
