@@ -394,7 +394,8 @@ def test_summary_states_a_failed_triage_rather_than_omitting_it():
         {"status": "unreachable", "triage": [], "day_assessment": None},
     )
 
-    assert "Triage did not run (unreachable)" in text
+    # Wording covers both the triage and investigation paths since #536.
+    assert "Analysis did not run (unreachable)" in text
 
 
 def test_summary_stays_quiet_when_triage_was_deliberately_skipped():
@@ -406,7 +407,7 @@ def test_summary_stays_quiet_when_triage_was_deliberately_skipped():
         {"status": tri.STATUS_SKIPPED_CLEAN, "triage": [], "day_assessment": None},
     )
 
-    assert "Triage did not run" not in text
+    assert "Analysis did not run" not in text
 
 
 def test_logged_out_cli_is_its_own_status():

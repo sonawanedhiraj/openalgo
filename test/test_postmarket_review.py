@@ -28,6 +28,7 @@ Coverage:
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -306,6 +307,10 @@ def test_futures_carry_fifo_consumes_oldest_buy_first(tmp_path, monkeypatch):
                 nifty_symbol="N",
                 lots=2,
                 quantity=150,
+                # created_at is what dates an exit — entry_date carries the entry
+                # session even on a SELL row. See
+                # test_exits_are_counted_by_write_date_not_entry_date.
+                created_at=datetime(2026, 7, 30, 15, 25),
                 entry_date=DATE,
                 status="placed",
             ),
@@ -530,3 +535,58 @@ def test_contract_failure_does_not_abort_the_review(review_table):
     assert result["persisted"] is True
     assert result["contracts"]["evaluated"] is False
     assert review_table.get_review(DATE) is not None
+
+
+def test_exits_are_counted_by_write_date_not_entry_date(tmp_path, monkeypatch):
+    """A SELL row's `entry_date` is the ENTRY session, not the day it was written.
+
+    Found by the investigating agent (#536) reading the code: `place_exit` records
+    the SELL leg with `entry_date=position.entry_date`, and the column's own
+    docstring says so — a real row shows `entry_date=2026-07-17` created on
+    2026-07-20. Counting exits by `entry_date` made `exits_today` structurally
+    always 0 for a T+1 strategy, so `t1_exit_for_carry` could never observe a
+    successful exit and fired on healthy days that still carried older lots.
+    """
+    from datetime import datetime
+
+    from database import futures_follow_db as ffdb
+    from services import postmarket_day_digest as pdd
+
+    eng, sess = _mk(ffdb, tmp_path / "ff_exitdate.db")
+    monkeypatch.setattr(ffdb, "engine", eng)
+    monkeypatch.setattr(ffdb, "db_session", sess)
+
+    sess.add_all(
+        [
+            ffdb.FuturesFollowTrade(
+                strategy_id="s",
+                mode="sandbox",
+                side="BUY",
+                nifty_symbol="N",
+                lots=1,
+                quantity=75,
+                entry_date="2026-07-29",
+                status="placed",
+                created_at=datetime(2026, 7, 29, 9, 50),
+            ),
+            # The exit happened on the 30th but carries the 29th as entry_date.
+            ffdb.FuturesFollowTrade(
+                strategy_id="s",
+                mode="sandbox",
+                side="SELL",
+                nifty_symbol="N",
+                lots=1,
+                quantity=75,
+                entry_date="2026-07-29",
+                status="placed",
+                created_at=datetime(2026, 7, 30, 9, 55),
+            ),
+        ]
+    )
+    sess.commit()
+
+    result = pdd._collect_futures_carry("2026-07-30")
+
+    assert result["exits_today"] == 1, "the exit was written on the 30th"
+    assert result["lots_sold_today"] == 1
+    assert result["open_lots_carried"] == 0

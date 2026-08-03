@@ -1631,10 +1631,53 @@ message `"claude review exited 1: "` and cost `_AUTH_MARKERS` its only evidence
 now raises on `is_error`, and a non-zero exit falls back to the stdout envelope's
 `result`. Regression tests in `test/test_llm_review_client.py`.
 
-**Not yet built** (later phases, each its own issue): GitHub issue filing with
-fingerprint dedupe + a rate cap, and the closed-issue validation sweep. Tests:
+**Phase 3b/4 — investigating agent + issue filing (issue #536).** The agent now
+gets **read-only access to the source tree and the logs** and does two jobs:
+**verify** each deterministic violation against the actual code (`confirmed` /
+`refuted` / `unverified`, citing `file:line`), and **propose** problems the
+contracts do not cover. Confirmed findings are filed as GitHub issues.
+
+- **Seam:** `services/llm_agent_client.py` — same unpatched-OS-thread subprocess
+  pattern as the bare client, but with `--allowedTools Read Grep Glob`,
+  `--disallowedTools Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch
+  Task`, and CLI-level `--settings` deny rules on `.env*`, `db/`, `.git/`,
+  `*.key`, `*.pem`. **The deny-list is load-bearing, not tidy:** `.env` holds
+  `API_KEY_PEPPER`/`FERNET_SALT`, every encrypted secret in `openalgo.db` is
+  sealed against them, and the pipeline's whole purpose is to *publish* what the
+  agent writes. Read access plus a publish path is an exfiltration channel.
+- **Evidence replaces the fingerprint allow-list.** Phase 3 kept the model honest
+  by only letting it speak about violations Python had proven; that has to relax
+  once it can find new things. Instead: every finding must cite a repo path (or a
+  log template present in today's digest), and **cited paths are checked against
+  the filesystem in Python** — a confident citation of a file that isn't there is
+  the cheapest hallucination tell there is. Uncited findings are dropped.
+- **`services/publish_guard.py`** — `detect-secrets` plus an explicit pattern set
+  for this install's crown jewels, run over any model-authored text before it
+  leaves the machine. **Fails closed**: if the scanner cannot run, publishing is
+  refused. A scanner that degrades to "looks fine" is worse than none, because it
+  is trusted.
+- **`services/github_cli_client.py`** — the only path to GitHub. An **allow-list
+  of verbs** (`list/view/create/comment/edit/reopen/close`), argv built from fixed
+  templates, every body guarded. `pr merge`, `push`, `workflow run`, `release` are
+  structurally unreachable, so **model output is only ever a value inside a fixed
+  template, never part of the command shape**.
+- **Filing:** only `confirmed` + `worth_filing` findings become issues — an issue
+  asserts something *is* wrong, so refuted/unverified findings are reported to the
+  operator and never filed. Recurrences comment on the existing issue (matched via
+  a `<!-- postmarket-fingerprint: … -->` body marker) rather than opening a
+  second. Rate-capped by `POSTMARKET_MAX_ISSUES_PER_DAY` with overflow appended to
+  `audit/proposed_fixes.jsonl` — the cap bounds noise, never the record.
+  **`POSTMARKET_FILING_MODE` defaults to `dry_run`.**
+- **Read-only on code, always.** The agent never edits, branches, or commits —
+  the same carve-out the Cowork scheduled tasks run under. A human owns every fix,
+  and each filed issue says so.
+
+**Not yet built:** the closed-issue validation sweep (#537 — the agent runs the
+acceptance checks it can, posts evidence, and reopens on failure; it must never
+tick a box it did not actually verify). Tests:
 `test/test_job_run_audit.py`, `test/test_postmarket_review.py`,
-`test/test_strategy_expectations.py`, `test/test_postmarket_triage.py`.
+`test/test_strategy_expectations.py`, `test/test_postmarket_triage.py`,
+`test/test_postmarket_investigation.py`.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
