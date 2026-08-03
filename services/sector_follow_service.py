@@ -1,8 +1,13 @@
 """Sector Follow CAP5_VOL strategy service.
 
-Entry rule (15:20 IST eval): sector index >+1% intraday AND stock >+0.5% intraday
-AND volume >1x 20d avg. Buy at MARKET ~15:20-15:25. Exit T+1 at 15:25 close MARKET.
+Entry rule (15:05 IST eval): sector index >+1% intraday AND stock >+0.5% intraday
+AND volume >1x 20d avg. Buy at MARKET. Exit T+1 at 15:10 MARKET.
 Max 5 concurrent positions; tiebreaker = volume ratio descending.
+
+Fire times are env-tunable (``SECTOR_FOLLOW_ENTRY_TIME`` / ``_EXIT_TIME`` /
+``_SMOKE_CHECK_TIME``) and clamped to continuous trading — see ``resolve_schedule``
+and issue #512 (NSE Closing Auction Session, from 2026-08-03). They were 15:20 /
+15:25 / 15:18 up to that date; every backtest before it reflects the 15:20 snapshot.
 
 Mode flag (env): SECTOR_FOLLOW_CAP5_VOL_MODE = scaffold | sandbox | live
   scaffold: compute signals, log, NO orders (default)
@@ -27,7 +32,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from utils.logging import get_logger
@@ -44,6 +49,101 @@ _DEFAULT_SECTOR_MAP_PATH = _STRATEGY_DIR / "sector_map.json"
 _EOD_REPORTS_DIR = _STRATEGY_DIR / "eod_reports"
 
 VALID_MODES = ("scaffold", "sandbox", "live")
+
+
+# --------------------------------------------------------------------------- #
+# Session schedule (issue #512 — NSE Closing Auction Session, from 2026-08-03)
+# --------------------------------------------------------------------------- #
+# From 2026-08-03 the cash close is split by segment. Continuous trading in
+# CAS-eligible scrips — every F&O name, i.e. the WHOLE LOCK_STATIC_30 universe
+# — ends at 15:15 IST, followed by the Closing Auction Session 15:15..15:35
+# whose 15:25..15:30 phase accepts LIMIT orders ONLY. This strategy places CNC
+# MARKET orders and, being CNC, has NO MIS auto-square-off backstop: a rejected
+# T+1 exit would silently carry the position to T+2 (the #497 failure shape, on
+# live money). So every job in the chain must fire inside continuous trading.
+#
+# Ordering invariant, enforced by ``_resolve_schedule``:
+#     preentry_refresh < smoke_check < entry < exit <= _SCHEDULE_CEILING_IST
+_CONTINUOUS_CLOSE_IST = time(15, 15)  # CAS-eligible cash continuous cutoff
+_SCHEDULE_CEILING_IST = time(15, 10)  # last minute we will place a MARKET order
+
+_DEFAULT_SMOKE_TIME = "15:03"
+_DEFAULT_ENTRY_TIME = "15:05"
+_DEFAULT_EXIT_TIME = "15:10"
+
+
+def _parse_hhmm(raw: str | None) -> time | None:
+    """Parse ``HH:MM`` (24h IST). ``None`` on anything malformed."""
+    try:
+        hh, mm = (int(x) for x in str(raw).split(":", 1))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return time(hh, mm)
+
+
+def _schedule_time(env_var: str, default: str) -> time:
+    """Resolve one schedule time from ``env_var``, falling back to ``default``.
+
+    Fail-safe: a malformed value logs a WARNING and uses the default rather than
+    raising — a typo in ``.env`` must never leave the strategy unscheduled.
+    """
+    raw = os.getenv(env_var)
+    if raw is None:
+        return _parse_hhmm(default)  # type: ignore[return-value]
+    parsed = _parse_hhmm(raw)
+    if parsed is None:
+        logger.warning(
+            "sector_follow: %s=%r is not HH:MM — falling back to %s", env_var, raw, default
+        )
+        return _parse_hhmm(default)  # type: ignore[return-value]
+    return parsed
+
+
+def resolve_schedule() -> dict[str, time]:
+    """Resolve the smoke/entry/exit fire times, clamped to continuous trading.
+
+    Returns a dict keyed ``smoke`` / ``entry`` / ``exit``. Any time at or after
+    ``_SCHEDULE_CEILING_IST`` is clamped back to the ceiling with a WARNING: an
+    operator override must not be able to push a CNC MARKET order into the
+    Closing Auction Session, where it cannot fill as modelled (entry) or would
+    be rejected outright in the limit-only phase (exit).
+    """
+    resolved = {
+        "smoke": _schedule_time("SECTOR_FOLLOW_SMOKE_CHECK_TIME", _DEFAULT_SMOKE_TIME),
+        "entry": _schedule_time("SECTOR_FOLLOW_ENTRY_TIME", _DEFAULT_ENTRY_TIME),
+        "exit": _schedule_time("SECTOR_FOLLOW_EXIT_TIME", _DEFAULT_EXIT_TIME),
+    }
+    for key, t in resolved.items():
+        if t > _SCHEDULE_CEILING_IST:
+            logger.warning(
+                "sector_follow: %s time %s is past the %s continuous-trading ceiling "
+                "(CAS opens %s) — clamping to %s",
+                key,
+                t.strftime("%H:%M"),
+                _SCHEDULE_CEILING_IST.strftime("%H:%M"),
+                _CONTINUOUS_CLOSE_IST.strftime("%H:%M"),
+                _SCHEDULE_CEILING_IST.strftime("%H:%M"),
+            )
+            resolved[key] = _SCHEDULE_CEILING_IST
+    if not (resolved["smoke"] < resolved["entry"] <= resolved["exit"]):
+        logger.warning(
+            "sector_follow: schedule ordering violated (smoke=%s entry=%s exit=%s) — "
+            "reverting to defaults %s/%s/%s",
+            resolved["smoke"].strftime("%H:%M"),
+            resolved["entry"].strftime("%H:%M"),
+            resolved["exit"].strftime("%H:%M"),
+            _DEFAULT_SMOKE_TIME,
+            _DEFAULT_ENTRY_TIME,
+            _DEFAULT_EXIT_TIME,
+        )
+        return {
+            "smoke": _parse_hhmm(_DEFAULT_SMOKE_TIME),  # type: ignore[dict-item]
+            "entry": _parse_hhmm(_DEFAULT_ENTRY_TIME),  # type: ignore[dict-item]
+            "exit": _parse_hhmm(_DEFAULT_EXIT_TIME),  # type: ignore[dict-item]
+        }
+    return resolved
 
 
 # --------------------------------------------------------------------------- #
@@ -833,13 +933,46 @@ class SectorFollowService:
         """
         try:
             from database.sector_follow_db import init_db as _init_journal
-            from database.strategy_db import create_strategy, get_all_strategies
+            from database.strategy_db import (
+                create_strategy,
+                get_all_strategies,
+                update_strategy_times,
+            )
 
             _init_journal()  # ensure the trade-journal table exists
+
+            sched = resolve_schedule()
+            entry_s = sched["entry"].strftime("%H:%M")
+            exit_s = sched["exit"].strftime("%H:%M")
 
             for s in get_all_strategies():
                 if s.name == "sector_follow_cap5_vol":
                     self.strategy_id = s.id
+                    # Issue #512: an install seeded before the CAS shift still
+                    # carries the old 15:20/15:25 literals, which the strategies
+                    # dashboard renders. Converge the row to the resolved
+                    # schedule so the UI reports the times we actually fire at.
+                    if (s.start_time, s.end_time, s.squareoff_time) != (
+                        entry_s,
+                        exit_s,
+                        exit_s,
+                    ):
+                        logger.info(
+                            "sector_follow: converging strategy row times "
+                            "%s/%s/%s -> %s/%s/%s (issue #512)",
+                            s.start_time,
+                            s.end_time,
+                            s.squareoff_time,
+                            entry_s,
+                            exit_s,
+                            exit_s,
+                        )
+                        update_strategy_times(
+                            s.id,
+                            start_time=entry_s,
+                            end_time=exit_s,
+                            squareoff_time=exit_s,
+                        )
                     return s.id
 
             strat = create_strategy(
@@ -848,9 +981,9 @@ class SectorFollowService:
                 user_id=user_id,
                 is_intraday=False,  # T+1 hold, not same-day square-off
                 trading_mode="LONG",
-                start_time="15:20",
-                end_time="15:25",
-                squareoff_time="15:25",
+                start_time=entry_s,
+                end_time=exit_s,
+                squareoff_time=exit_s,
                 platform="internal",
             )
             if strat is not None:
@@ -2114,19 +2247,39 @@ class SectorFollowService:
         if self.strategy_id is None:
             self.seed_strategy()
 
+        # Issue #512: fire times are env-tunable and clamped to continuous
+        # trading — from 2026-08-03 a 15:20/15:25 CNC MARKET order lands inside
+        # the Closing Auction Session and cannot execute as modelled.
+        _sched_times = resolve_schedule()
+        _entry_t, _exit_t, _smoke_t = (
+            _sched_times["entry"],
+            _sched_times["exit"],
+            _sched_times["smoke"],
+        )
+
         sched.add_job(
             _entry_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=20, timezone="Asia/Kolkata"),
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=_entry_t.hour,
+                minute=_entry_t.minute,
+                timezone="Asia/Kolkata",
+            ),
             id="sector_follow_entry",
             replace_existing=True,
-            name="Sector Follow CAP5_VOL entry (15:20 IST)",
+            name=f"Sector Follow CAP5_VOL entry ({_entry_t.strftime('%H:%M')} IST)",
         )
         sched.add_job(
             _exit_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=25, timezone="Asia/Kolkata"),
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=_exit_t.hour,
+                minute=_exit_t.minute,
+                timezone="Asia/Kolkata",
+            ),
             id="sector_follow_exit",
             replace_existing=True,
-            name="Sector Follow CAP5_VOL T+1 exit (15:25 IST)",
+            name=f"Sector Follow CAP5_VOL T+1 exit ({_exit_t.strftime('%H:%M')} IST)",
         )
         sched.add_job(
             _daily_reset_job,
@@ -2151,15 +2304,20 @@ class SectorFollowService:
         )
         sched.add_job(
             _smoke_check_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=18, timezone="Asia/Kolkata"),
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=_smoke_t.hour,
+                minute=_smoke_t.minute,
+                timezone="Asia/Kolkata",
+            ),
             id="sector_follow_smoke_check",
             replace_existing=True,
-            name="Sector Follow CAP5_VOL pre-entry smoke check (15:18 IST)",
+            name=f"Sector Follow CAP5_VOL pre-entry smoke check ({_smoke_t.strftime('%H:%M')} IST)",
         )
         # Pre-entry data refresh (#237): fetch any stale intraday just BEFORE the
-        # 15:18 smoke check so the evaluator has today's data at 15:20 — closes
-        # the mid-day gap that produced the 06-29/06-30 zero-order days. Fires
-        # only when enabled; time is configurable (default 15:17, before smoke).
+        # smoke check so the evaluator has today's data at entry — closes the
+        # mid-day gap that produced the 06-29/06-30 zero-order days. Fires only
+        # when enabled; time is configurable (default 15:02, before smoke).
         from services.sector_follow_backfill_scheduler import (
             preentry_refresh_enabled,
             preentry_refresh_time,
