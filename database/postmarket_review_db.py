@@ -63,6 +63,10 @@ class PostmarketReview(Base):
     violations_json = Column(Text, nullable=True)  # JSON array of Violation dicts
     n_violations = Column(Integer, nullable=True)
     contracts_json = Column(Text, nullable=True)  # counts + unknown-contract list
+    # Phase 3 (#534) — LLM triage over the violations.
+    triage_json = Column(Text, nullable=True)  # day assessment + per-violation triage
+    llm_status = Column(String(32), nullable=True)  # ok | skipped_* | timeout | ...
+    llm_latency_ms = Column(Integer, nullable=True)
 
 
 Index("idx_postmarket_review_date", PostmarketReview.review_date)
@@ -73,6 +77,9 @@ _ADDED_COLUMNS = (
     ("violations_json", "TEXT"),
     ("n_violations", "INTEGER"),
     ("contracts_json", "TEXT"),
+    ("triage_json", "TEXT"),
+    ("llm_status", "TEXT"),
+    ("llm_latency_ms", "INTEGER"),
 )
 
 
@@ -128,6 +135,9 @@ def _row_to_dict(row: PostmarketReview) -> dict:
         "violations": json.loads(row.violations_json) if row.violations_json else [],
         "n_violations": row.n_violations,
         "contracts": json.loads(row.contracts_json) if row.contracts_json else {},
+        "triage": json.loads(row.triage_json) if row.triage_json else {},
+        "llm_status": row.llm_status,
+        "llm_latency_ms": row.llm_latency_ms,
     }
 
 
@@ -139,6 +149,7 @@ def upsert_review(
     elapsed_ms: int | None = None,
     telegram_sent: bool | int = 0,
     contracts: dict | None = None,
+    triage: dict | None = None,
 ) -> int:
     """Replace the row for ``review_date``. Returns the row id (0 on failure).
 
@@ -169,6 +180,9 @@ def upsert_review(
                 },
                 default=str,
             ),
+            triage_json=json.dumps(triage or {}, default=str),
+            llm_status=(triage or {}).get("status"),
+            llm_latency_ms=(triage or {}).get("latency_ms"),
         )
         db_session.add(row)
         db_session.commit()
@@ -209,5 +223,26 @@ def get_latest_review() -> dict | None:
     except Exception:
         logger.exception("failed to read latest postmarket_review row")
         return None
+    finally:
+        db_session.remove()
+
+
+def get_recent_reviews(limit: int = 30) -> list[dict]:
+    """Up to ``limit`` most-recent review rows, newest first.
+
+    Backs the triage layer's fingerprint history, so "new vs recurring" is read
+    off stored data rather than guessed by the model.
+    """
+    try:
+        rows = (
+            db_session.query(PostmarketReview)
+            .order_by(PostmarketReview.review_date.desc(), PostmarketReview.id.desc())
+            .limit(max(1, int(limit)))
+            .all()
+        )
+        return [_row_to_dict(r) for r in rows]
+    except Exception:
+        logger.exception("failed to read recent postmarket_review rows")
+        return []
     finally:
         db_session.remove()
