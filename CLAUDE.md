@@ -1117,6 +1117,18 @@ and exit time are **UI-configurable** on `/open15_vol_breakout/logs` (issue
 window; exit capped 15:10 so the retry precedes the 15:15 MIS square-off) —
 applied at the next 09:10 arm, with the effective window recorded in the day's
 `armed` decision-log event.
+**Rolling additive watch list (issue #529, default OFF):** when enabled from the
+same UI form, the universe is re-ranked on live LTP every `rolling_cadence_s`
+(default 30 s, clamped 10–300, **UI-editable** — the operator-facing knob) inside
+the entry window and the top-N movers per side are **appended** to the watch
+list. Strictly additive (the 09:16 seed picks are never dropped), the entry gate
+and `max_trades` cap are untouched, and every addition emits a `watchlist_add`
+decision-log event rendered in the "Rolling watch-list" panel on
+`/open15_vol_breakout/logs`. Trades carry `open15_trades.watch_source ∈ {seed,
+rolling}` so the two cohorts can be scored apart. ⚠ **Measurement, not a
+validated edge** — the 2026-08-03 replay showed the 09:16 ranking misses the
+day's biggest movers but could NOT show the added names pay (3 incremental
+trades on 4 usable days); a promotion decision waits on the #528 sample.
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only).
 

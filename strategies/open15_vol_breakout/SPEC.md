@@ -60,6 +60,22 @@ This sandbox run measures it with real fills. The journal is the experiment.
   class: arm racing the daily-D resettle (#299) and reading provisional
   closes. Flags `OPEN15_PREVCLOSE_QUOTES_ENABLED` +
   `OPEN15_PREVCLOSE_REGISTRY_CHECK_ENABLED` (both default true).
+- **Rolling additive watch list (issue #529, DEFAULT OFF):** when
+  `rolling_watchlist_enabled` is on, every `rolling_cadence_s` (default 30 s,
+  clamped 10–300) inside `[09:16, no_entry_after]` the universe is re-ranked by
+  `ltp / prev_close − 1` over symbols with a live tick, and the current top-N
+  gainers (LONG) / losers (SHORT) are **appended** to the watch list. **Purely
+  additive** — a symbol, once watched, stays watched, so the 09:16 seed picks
+  are never dropped and never re-sided. `trade_side` is honoured (an excluded
+  side is never added), and a symbol with no usable breakout level is skipped.
+  The re-rank is pure in-process arithmetic over state already held (the 09:16
+  quote snapshot covers the whole universe, prev-closes are already fetched, and
+  the LTP arrives on the service's own ZMQ SUB) — **no new broker load**.
+  Rationale: the 2026-08-03 replay put the day's four biggest movers at ranks
+  #22/#106/#130/#134 in the 09:16 gap ranking. ⚠ **The same study could not
+  show the added names pay** (3 incremental trades, +₹162, 1 win of 3, on 4
+  usable days) — this is a MEASUREMENT, which is why every row carries
+  `watch_source ∈ {seed, rolling}`. Promotion waits on the #528 sample.
 - **Entry (once per symbol, 09:16–09:29):** at tick time t inside minute m:
   `cumvol_within_m(t) ≥ 1.5 × mean(completed minute volumes since 09:15)`
   AND ltp beyond the level (>H1 long / <L1 short) → MARKET MIS immediately.
@@ -102,11 +118,22 @@ NULL field = env default; **applies at the next 09:10 arm**):
   `top_n`). The parity targets in `config_snapshot.json` are both-sides
   numbers, so a one-sided day is not comparable to them — the logs page flags
   it.
+- `rolling_watchlist_enabled` (issue #529) — `false` (default) | `true`. The
+  rolling additive watch list described in §3.
+- `rolling_cadence_s` — how often the re-rank runs, in seconds. Default `30`,
+  **clamped 10–300 server-side** on both the env read and the saved row, so
+  neither a bad `.env` value nor a hand-crafted POST can set a 1-second re-rank
+  (a hot loop over ~211 symbols on the tick thread) or a cadence longer than
+  the entry window itself.
+- `rolling_top_n` — movers appended per side per cycle. Default `3`, clamped
+  1–10. Note this is INDEPENDENT of `top_n` (the 09:16 seed count).
 
 **Env defaults:** `OPEN15_ENABLED` (true) · `OPEN15_MODE` (sandbox|observe) ·
 `OPEN15_VOL_MULT` (1.5) · `OPEN15_SIZING_MODE` (fixed) · `OPEN15_TOP_N` (3) ·
 `OPEN15_MARGIN_PER_SLOT` (30000) · `OPEN15_LEVERAGE` (5) ·
 `OPEN15_TRADE_SIDE` (both) ·
+`OPEN15_ROLLING_WATCHLIST_ENABLED` (**false**) · `OPEN15_ROLLING_CADENCE_S`
+(30) · `OPEN15_ROLLING_TOP_N` (3) ·
 `OPEN15_TICK_CAPTURE` (true) · `OPEN15_TICK_CAPTURE_UNIVERSE` (true).
 The `armed` decision-log event records the
 effective day-config (incl. `config_source: ui | env_defaults`), so every day's
@@ -140,8 +167,18 @@ actually gated entries), not the raw env default. The `max vol×` column shows
 the peak-**anywhere** ratio but colours on `max_vol_ratio_beyond` — the gate is
 `beyond and cum_in_min >= vol_mult*baseline`, so a peak-anywhere number can sit
 above the threshold on a symbol that correctly never entered (issue #525).
+The `watchlist_add` event (issue #529) carries `{symbol, side, pct_change,
+rank, watch_size, at}` — one per rolling addition, so a day is fully replayable
+from its own log and `watch_size` is auditable as monotonically non-decreasing.
+The effective rolling config rides the `armed` event
+(`rolling_watchlist_enabled` / `rolling_cadence_s` / `rolling_top_n`). A day
+with NO such events is either a pre-#529 day or a day the feature was off.
 `GET /open15_vol_breakout/logs` — **self-contained log-viewer page** (session
-auth, auto-refreshing during the window, date picker for history).
+auth, auto-refreshing during the window, date picker for history). Reachable by
+clicking from `/strategies` → the open15 card (its `console_url`). Carries the
+config form (including the rolling cadence/top-N/on-off inputs), a **Rolling
+watch-list** panel listing each addition, and a seed-vs-rolling `source` column
+on the selection-outcome table.
 
 ## 8. Tick capture (backtest replay data)
 `OPEN15_TICK_CAPTURE` (default true) is the master switch; ticks are persisted
