@@ -380,7 +380,7 @@ def _result(status: str, **extra: Any) -> dict[str, Any]:
 def investigate(digest: dict[str, Any], contracts: dict[str, Any]) -> dict[str, Any]:
     """Run the read-only investigating agent. Never raises."""
     from services.llm_agent_client import invoke_claude_agent
-    from services.llm_review_client import probe_claude_health
+    from services.llm_review_client import classify_invocation_error
 
     if not _enabled():
         return _result(STATUS_SKIPPED_DISABLED, detail="POSTMARKET_INVESTIGATION_ENABLED=false")
@@ -391,39 +391,32 @@ def investigate(digest: dict[str, Any], contracts: dict[str, Any]) -> dict[str, 
     if not violations and not error_total:
         return _result(STATUS_SKIPPED_NOTHING, detail="no violations and no errors")
 
-    health = probe_claude_health(12.0)
-    if not health.get("reachable"):
-        reason = health.get("reason")
-        status = {
-            "cli_missing": STATUS_CLI_MISSING,
-            "not_logged_in": STATUS_NOT_LOGGED_IN,
-        }.get(reason, STATUS_UNREACHABLE)
-        logger.warning(
-            "postmarket_investigation: claude unreachable (%s): %s", reason, health.get("detail")
-        )
-        return _result(status, detail=f"{reason}: {health.get('detail')}")
-
     known = {v.get("fingerprint") for v in violations if v.get("fingerprint")}
     prompt = build_prompt(digest, violations)
     root = repo_root()
 
+    # No pre-flight health probe: it costs a second full model round-trip, and a
+    # cold `claude -p` exceeds the probe's short budget, so probing first reports
+    # a spurious "unreachable" on a healthy CLI. The real call's own failure is
+    # classified instead — one call, no false negatives.
     started = time.time()
     try:
         model_text, _session = invoke_claude_agent(prompt, _timeout_seconds(), cwd=str(root))
-    except TimeoutError:
-        return _result(
-            STATUS_TIMEOUT,
-            latency_ms=int((time.time() - started) * 1000),
-            detail=f"no reply within {_timeout_seconds():.0f}s",
-        )
-    except FileNotFoundError:
-        return _result(STATUS_CLI_MISSING, detail="claude CLI not on PATH (set CLAUDE_CMD)")
     except Exception as exc:
-        logger.exception("postmarket_investigation: agent invocation failed")
+        reason = classify_invocation_error(exc)
+        status = {
+            "timeout": STATUS_TIMEOUT,
+            "cli_missing": STATUS_CLI_MISSING,
+            "not_logged_in": STATUS_NOT_LOGGED_IN,
+        }.get(reason, STATUS_ERROR)
+        if status == STATUS_ERROR:
+            logger.exception("postmarket_investigation: agent invocation failed")
+        else:
+            logger.warning("postmarket_investigation: agent unavailable (%s): %s", reason, exc)
         return _result(
-            STATUS_ERROR,
+            status,
             latency_ms=int((time.time() - started) * 1000),
-            detail=f"{type(exc).__name__}: {str(exc)[:300]}",
+            detail=f"{reason}: {str(exc)[:300]}",
         )
 
     latency_ms = int((time.time() - started) * 1000)

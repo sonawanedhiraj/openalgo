@@ -278,9 +278,15 @@ def test_invalid_verdict_and_severity_are_normalised():
 
 
 def test_logged_out_cli_reports_its_own_status():
+    """Classified from the REAL call, not a pre-flight probe.
+
+    Probing first cost a second model round-trip and, on its short budget,
+    reported a spurious timeout whenever the CLI was merely cold — a false
+    negative that only ever showed up against a live model.
+    """
     with patch(
-        "services.llm_review_client.probe_claude_health",
-        return_value={"reachable": False, "reason": "not_logged_in", "detail": "run claude login"},
+        "services.llm_agent_client.invoke_claude_agent",
+        side_effect=RuntimeError("claude agent exited 1: Not logged in - Please run /login"),
     ):
         result = inv.investigate(_digest(), _contracts())
 
@@ -288,27 +294,43 @@ def test_logged_out_cli_reports_its_own_status():
     assert result["findings"] == []
 
 
-def test_timeout_is_reported():
+def test_no_pre_flight_probe_is_issued():
+    """Exactly one model call per run.
+
+    Also guards the test suite itself: if `invoke_claude_agent` is ever left
+    unpatched here, a real agent call runs and the test hangs for minutes.
+    """
     with (
+        patch("services.llm_review_client.probe_claude_health") as probe,
         patch(
-            "services.llm_review_client.probe_claude_health",
-            return_value={"reachable": True, "reason": "ok"},
-        ),
-        patch("services.llm_agent_client.invoke_claude_agent", side_effect=TimeoutError("slow")),
+            "services.llm_agent_client.invoke_claude_agent",
+            return_value=(_reply([_finding()]), ""),
+        ) as agent,
     ):
+        inv.investigate(_digest(), _contracts())
+
+    probe.assert_not_called()
+    agent.assert_called_once()
+
+
+def test_timeout_is_reported():
+    with patch("services.llm_agent_client.invoke_claude_agent", side_effect=TimeoutError("slow")):
         result = inv.investigate(_digest(), _contracts())
 
     assert result["status"] == inv.STATUS_TIMEOUT
 
 
-def test_unparseable_reply_degrades():
-    with (
-        patch(
-            "services.llm_review_client.probe_claude_health",
-            return_value={"reachable": True, "reason": "ok"},
-        ),
-        patch("services.llm_agent_client.invoke_claude_agent", return_value=("no json here", "")),
+def test_missing_cli_is_reported():
+    with patch(
+        "services.llm_agent_client.invoke_claude_agent", side_effect=FileNotFoundError("claude")
     ):
+        result = inv.investigate(_digest(), _contracts())
+
+    assert result["status"] == inv.STATUS_CLI_MISSING
+
+
+def test_unparseable_reply_degrades():
+    with patch("services.llm_agent_client.invoke_claude_agent", return_value=("no json here", "")):
         result = inv.investigate(_digest(), _contracts())
 
     assert result["status"] == inv.STATUS_PARSE_FAILED

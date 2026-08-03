@@ -173,6 +173,27 @@ def _envelope_error_text(stdout: str) -> str:
     return stdout.strip()[:500]
 
 
+def classify_invocation_error(exc: BaseException) -> str:
+    """Map an :func:`invoke_claude_review` failure to a reason code.
+
+    Lets a caller classify the **real** call's failure instead of paying for a
+    separate pre-flight probe. That matters: a cold ``claude -p`` takes longer
+    than the probe's default 12 s budget, so probing first reports ``timeout``
+    on a perfectly healthy CLI and skips the work — a false negative that only
+    shows up against a live model, never against a stub.
+
+    Returns one of ``timeout`` | ``cli_missing`` | ``not_logged_in`` | ``error``.
+    """
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, FileNotFoundError):
+        return "cli_missing"
+    message = str(exc).lower()
+    if any(marker in message for marker in _AUTH_MARKERS):
+        return "not_logged_in"
+    return "error"
+
+
 # Substrings that mark a non-zero ``claude`` exit as an auth/login problem rather
 # than a generic error — surfaced to the operator as "run claude login".
 _AUTH_MARKERS = (
