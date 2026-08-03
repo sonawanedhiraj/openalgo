@@ -111,6 +111,22 @@ def test_selection_outcomes_rows():
     assert rows["DRREDDY"]["level_broken"] is False
 
 
+def test_logs_page_outcome_quotes_the_beyond_ratio():
+    """The `vol X < needed` sentence must quote the gate's own number (#525).
+
+    `on_tick` enters on `beyond and cum_in_min >= vol_mult*baseline`, so the
+    ratio being compared is the peak measured WHILE beyond the level. Quoting
+    the peak-anywhere `max_vol_ratio` there produced self-contradicting rows
+    like "level broken - vol 1.95x < 1.5" (INDIGO, 2026-08-03: peak 1.95x
+    inside the candle, only 1.27x while actually beyond).
+    """
+    from blueprints.open15_breakout import _LOGS_PAGE
+
+    branch = _LOGS_PAGE.split("e.event==='no_entry'")[-1].split("entry_skipped")[0]
+    assert "max_vol_ratio_while_beyond" in branch
+    assert "while beyond" in branch
+
+
 def test_selection_outcomes_empty_for_skipped_day():
     from services.open15_log_view import selection_outcomes
 
