@@ -92,7 +92,11 @@ def _fmt_count(value: Any) -> str:
     return "?" if value is None else str(value)
 
 
-def render_summary(digest: dict[str, Any]) -> str:
+def render_summary(
+    digest: dict[str, Any],
+    contracts: dict[str, Any] | None = None,
+    triage: dict[str, Any] | None = None,
+) -> str:
     """Render the operator-facing summary for one day's digest.
 
     Deliberately terse: this is a Telegram message read on a phone, not a
@@ -104,6 +108,66 @@ def render_summary(digest: dict[str, Any]) -> str:
     if digest.get("is_trading_day") is False:
         lines.append("Non-trading day — nothing to review.")
         return "\n".join(lines)
+
+    # Verdict first: the operator should see whether anything is WRONG before
+    # reading counts. A clean day says so explicitly rather than staying silent —
+    # "no findings" must never be indistinguishable from "the review didn't run",
+    # which is precisely how journal_reflection's dead schedule hid for months.
+    if contracts is not None and contracts.get("evaluated"):
+        violations = contracts.get("violations") or []
+        if violations:
+            lines.append(f"🚨 {len(violations)} expectation(s) violated:")
+            for v in violations[:8]:
+                lines.append(
+                    f"  [{v['severity']}] {v['strategy']}/{v['contract_id']}: {v['summary']}"
+                )
+            if len(violations) > 8:
+                lines.append(f"  …and {len(violations) - 8} more")
+        else:
+            lines.append("✅ All expectations passed.")
+        unknown = contracts.get("unknown_contracts") or []
+        if unknown:
+            lines.append(f"  ({len(unknown)} contract(s) indeterminate — missing inputs)")
+
+    # Triage adds judgment on top of the verdict. A failed triage is stated
+    # explicitly rather than omitted — a silently absent section is how a dead
+    # LLM path stays dead (the journal_reflection failure mode).
+    if triage:
+        status = triage.get("status")
+        if status == "ok":
+            if triage.get("day_assessment"):
+                lines.append(f"🧠 {triage['day_assessment']}")
+            causes = {
+                t["fingerprint"]: t for t in (triage.get("triage") or []) if t.get("fingerprint")
+            }
+            for v in (contracts or {}).get("violations", [])[:5]:
+                entry = causes.get(v.get("fingerprint"))
+                if entry and entry.get("likely_cause"):
+                    tag = "recurring" if entry.get("recurrence") == "recurring" else "new"
+                    lines.append(f"  ↳ {v['contract_id']} ({tag}): {entry['likely_cause']}")
+            for observation in (triage.get("soft_observations") or [])[:3]:
+                lines.append(f"  · {observation}")
+            for finding in (triage.get("findings") or [])[:5]:
+                cite = ""
+                for item in finding.get("evidence") or []:
+                    if item.get("path"):
+                        cite = f" [{item['path']}" + (
+                            f":{item['line']}]" if item.get("line") else "]"
+                        )
+                        break
+                mark = {"confirmed": "✓", "refuted": "✗"}.get(finding.get("verdict"), "?")
+                lines.append(f"  {mark} [{finding.get('severity')}] {finding.get('title')}{cite}")
+            filing = triage.get("filing") or {}
+            if filing:
+                verb = "would file" if filing.get("dry_run") else "filed"
+                lines.append(
+                    f"  → {verb} {len(filing.get('filed') or [])} issue(s), "
+                    f"{len(filing.get('recurrences') or [])} recurrence(s)"
+                )
+                if filing.get("blocked"):
+                    lines.append(f"  ⚠️ {len(filing['blocked'])} blocked by the publish guard")
+        elif status and not str(status).startswith("skipped"):
+            lines.append(f"🧠 Analysis did not run ({status}).")
 
     jobs = digest.get("jobs")
     if jobs is None:
@@ -215,13 +279,65 @@ def run_review_for_date(
         return {
             "date": target,
             "digest": digest,
+            "contracts": {
+                "violations": [],
+                "counts": {},
+                "unknown_contracts": [],
+                "evaluated": False,
+            },
             "summary": None,
             "persisted": False,
             "telegram_sent": False,
             "skipped": "non_trading_day",
         }
 
-    summary = render_summary(digest)
+    try:
+        from services.strategy_expectations import evaluate_expectations
+
+        contracts = evaluate_expectations(digest)
+    except Exception:
+        logger.exception("postmarket_review: contract evaluation failed")
+        contracts = {"violations": [], "counts": {}, "unknown_contracts": [], "evaluated": False}
+
+    # The investigating agent (#536) reads the code and cites file:line, so it
+    # supersedes the no-tools triage. Triage remains the degraded path when the
+    # agent is switched off — a fallback that still produces a day assessment
+    # beats no LLM output at all.
+    triage: dict[str, Any]
+    investigation: dict[str, Any] | None = None
+    try:
+        from services.postmarket_investigation import (
+            STATUS_SKIPPED_DISABLED,
+            file_findings,
+            investigate,
+        )
+
+        investigation = investigate(digest, contracts)
+        if investigation.get("status") == STATUS_SKIPPED_DISABLED:
+            investigation = None
+        else:
+            investigation["filing"] = file_findings(investigation.get("findings") or [], digest)
+    except Exception:
+        logger.exception("postmarket_review: investigation failed")
+        investigation = {
+            "status": "error",
+            "findings": [],
+            "day_assessment": None,
+            "latency_ms": None,
+        }
+
+    if investigation is not None:
+        triage = investigation
+    else:
+        try:
+            from services.postmarket_triage import run_triage
+
+            triage = run_triage(digest, contracts)
+        except Exception:
+            logger.exception("postmarket_review: triage failed")
+            triage = {"status": "error", "triage": [], "day_assessment": None, "latency_ms": None}
+
+    summary = render_summary(digest, contracts, triage)
     elapsed_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
 
     telegram_sent = False
@@ -245,13 +361,18 @@ def run_review_for_date(
             is_trading_day=digest.get("is_trading_day"),
             elapsed_ms=elapsed_ms,
             telegram_sent=telegram_sent,
+            contracts=contracts,
+            triage=triage,
         )
         persisted = bool(row_id)
 
     logger.info(
-        "postmarket_review: %s done in %dms (persisted=%s, telegram=%s, degraded=%s)",
+        "postmarket_review: %s done in %dms (violations=%d, triage=%s, persisted=%s, "
+        "telegram=%s, degraded=%s)",
         target,
         elapsed_ms,
+        len(contracts.get("violations") or []),
+        triage.get("status"),
         persisted,
         telegram_sent,
         digest.get("sources_failed") or "none",
@@ -259,6 +380,8 @@ def run_review_for_date(
     return {
         "date": target,
         "digest": digest,
+        "contracts": contracts,
+        "triage": triage,
         "summary": summary,
         "persisted": persisted,
         "telegram_sent": telegram_sent,

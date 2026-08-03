@@ -1612,11 +1612,136 @@ day — and it is why Phase 1 ships with **no verdicts and no LLM call at all**.
   17:00 (`SCANNER_BACKFILL_PERIODIC_END_TIME`); reviewing earlier reads
   half-written data. Move one and you must move the other.
 
-**Not yet built** (later phases, each its own issue): expectation contracts
-(deterministic per-strategy pass/fail), the `claude -p` triage layer over the
-failures, GitHub issue filing with dedupe + a rate cap, and the closed-issue
-validation sweep. Tests: `test/test_job_run_audit.py`,
-`test/test_postmarket_review.py`.
+**Phase 2 — expectation contracts (issue #532, `services/strategy_expectations.py`).**
+This is what turns the digest from a report into a **verdict**. `EXPECTATIONS` is
+a registry of declarative `Expect(contract_id, strategy, predicate, severity,
+requires, shape, ...)` entries; `evaluate_expectations(digest)` returns
+violations, which lead the Telegram summary and persist to
+`postmarket_review.violations_json` / `n_violations` / `contracts_json`.
+
+Four rules, each load-bearing — break one and the report stops being trusted:
+
+- **Contracts read the digest ONLY, never the DB.** That is what makes every
+  contract replayable against any past day through the CLI, and testable without
+  fixtures for ten tables.
+- **Missing input is `unknown`, NEVER `fail`.** A degraded digest section means
+  *our collection* broke, not that a strategy misbehaved. Contracts declare
+  `requires` paths and short-circuit to `unknown`. Related: a contract that
+  depends on `job_run` checks `audit_earliest_date` first, so replaying a day
+  from before the audit shipped reports `unknown` instead of a phantom "nothing
+  fired". Accusing a strategy of a collection gap is how a report earns being
+  ignored.
+- **Fingerprints exclude observed values.** `strategy|contract_id|shape` only.
+  The #497 outage failed the same contract on four consecutive days with
+  different lot counts (2/4/6/8); Phase 4 must see one recurring problem, not
+  four. Renaming a `contract_id` re-files its issue — treat ids as an API.
+- **A raising predicate is contained as `unknown`.** One broken rule must not
+  take down the report it is part of.
+
+Evidence it works, from replaying real history: **2026-07-17** (a healthy day
+with a real exit) produces **zero** violations, while **2026-07-27** — day *one*
+of the #497 window — fires `futures_follow_cap50/t1_exit_for_carry` as **P0**,
+and all four broken days share the identical fingerprint. The bug that took four
+trading days to notice is caught on the first.
+
+Flags: `POSTMARKET_CONTRACTS_ENABLED` (default `true`) and
+`POSTMARKET_CONTRACTS_DISABLED` (comma-separated `contract_id` or
+`strategy:contract_id`) — the latter silences one contract surgically so a rule
+that starts crying wolf can be muted same-day without a code change. A muted
+contract should get an issue to fix or delete it: a permanently disabled contract
+is worse than no contract, because the report still *looks* complete.
+
+**Phase 3 — LLM triage (issue #534, `services/postmarket_triage.py`).** Adds
+judgment on top of the verdict: a `claude -p` pass over the Phase 2 violations
+returning a day assessment, per-violation likely-cause / recurrence / recommended
+action, and draft issue title+body. It uses the **same in-process seam as the
+Stage-1 veto** (`llm_review_client.invoke_claude_review` — a blocking subprocess
+on a real, unpatched OS thread, because the app runs under eventlet). Persisted
+to `triage_json` / `llm_status` / `llm_latency_ms`.
+
+- **The model cannot create findings — enforced structurally, not by prompt.**
+  Every triage entry must carry a `fingerprint` that was in the input; entries
+  with an unrecognised fingerprint are dropped and logged. A model that invents
+  a problem produces nothing, whether it hallucinated or was steered there by
+  text injected into the logs it was shown. The model's `severity_assessment` is
+  **advisory** — the contract's own severity stays authoritative.
+- **Untrusted input.** Violation summaries and error templates originate in logs
+  containing arbitrary third-party text. Mitigations in order of real weight:
+  (1) the output is used only as text and ranking — never a command, path, shell
+  argument or filing decision (Phase 4 builds its `gh` argv in Python from a
+  fixed template regardless of what comes back); (2) log content rides inside a
+  delimited `<untrusted_log_data>` block; (3) the fingerprint allow-list above.
+  Prompt wording is not treated as a security boundary.
+- **Failure is LOUD.** Unlike the veto — which fails *open* to "take" on purpose
+  so a dead LLM never blocks a trade — a failed triage must be visible.
+  `llm_status ∈ ok | skipped_clean_day | skipped_disabled | not_logged_in |
+  cli_missing | unreachable | timeout | parse_failed | error`, and a non-skip
+  failure is stated in the Telegram summary. A silent no-op is exactly how
+  `journal_reflection` hid a dead schedule for two months.
+- **Clean days do not call the LLM** by default
+  (`POSTMARKET_TRIAGE_ON_CLEAN_DAYS=false`): with nothing proven broken the
+  output is speculative and Phase 4 would not file it.
+- **Operator prerequisite:** the `claude` CLI must be **logged in on the host**
+  (subscription auth via the CLI — there is no API key in this codebase).
+
+**Two logged-out-CLI bugs fixed in `llm_review_client` while building this
+(#534)** — both affected the live Stage-1 veto too. The CLI reports "not logged
+in" in two shapes and neither reached the caller as an error: (1) **exit 0 with
+`is_error: true`** in the envelope, whose `result` ("Not logged in · Please run
+/login") was returned as if it were the model's answer; and (2) **exit 1 with an
+EMPTY stderr**, the diagnostic being in *stdout*, which produced the useless
+message `"claude review exited 1: "` and cost `_AUTH_MARKERS` its only evidence
+— so the operator was told "error" instead of the one-command fix. `_parse_envelope`
+now raises on `is_error`, and a non-zero exit falls back to the stdout envelope's
+`result`. Regression tests in `test/test_llm_review_client.py`.
+
+**Phase 3b/4 — investigating agent + issue filing (issue #536).** The agent now
+gets **read-only access to the source tree and the logs** and does two jobs:
+**verify** each deterministic violation against the actual code (`confirmed` /
+`refuted` / `unverified`, citing `file:line`), and **propose** problems the
+contracts do not cover. Confirmed findings are filed as GitHub issues.
+
+- **Seam:** `services/llm_agent_client.py` — same unpatched-OS-thread subprocess
+  pattern as the bare client, but with `--allowedTools Read Grep Glob`,
+  `--disallowedTools Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch
+  Task`, and CLI-level `--settings` deny rules on `.env*`, `db/`, `.git/`,
+  `*.key`, `*.pem`. **The deny-list is load-bearing, not tidy:** `.env` holds
+  `API_KEY_PEPPER`/`FERNET_SALT`, every encrypted secret in `openalgo.db` is
+  sealed against them, and the pipeline's whole purpose is to *publish* what the
+  agent writes. Read access plus a publish path is an exfiltration channel.
+- **Evidence replaces the fingerprint allow-list.** Phase 3 kept the model honest
+  by only letting it speak about violations Python had proven; that has to relax
+  once it can find new things. Instead: every finding must cite a repo path (or a
+  log template present in today's digest), and **cited paths are checked against
+  the filesystem in Python** — a confident citation of a file that isn't there is
+  the cheapest hallucination tell there is. Uncited findings are dropped.
+- **`services/publish_guard.py`** — `detect-secrets` plus an explicit pattern set
+  for this install's crown jewels, run over any model-authored text before it
+  leaves the machine. **Fails closed**: if the scanner cannot run, publishing is
+  refused. A scanner that degrades to "looks fine" is worse than none, because it
+  is trusted.
+- **`services/github_cli_client.py`** — the only path to GitHub. An **allow-list
+  of verbs** (`list/view/create/comment/edit/reopen/close`), argv built from fixed
+  templates, every body guarded. `pr merge`, `push`, `workflow run`, `release` are
+  structurally unreachable, so **model output is only ever a value inside a fixed
+  template, never part of the command shape**.
+- **Filing:** only `confirmed` + `worth_filing` findings become issues — an issue
+  asserts something *is* wrong, so refuted/unverified findings are reported to the
+  operator and never filed. Recurrences comment on the existing issue (matched via
+  a `<!-- postmarket-fingerprint: … -->` body marker) rather than opening a
+  second. Rate-capped by `POSTMARKET_MAX_ISSUES_PER_DAY` with overflow appended to
+  `audit/proposed_fixes.jsonl` — the cap bounds noise, never the record.
+  **`POSTMARKET_FILING_MODE` defaults to `dry_run`.**
+- **Read-only on code, always.** The agent never edits, branches, or commits —
+  the same carve-out the Cowork scheduled tasks run under. A human owns every fix,
+  and each filed issue says so.
+
+**Not yet built:** the closed-issue validation sweep (#537 — the agent runs the
+acceptance checks it can, posts evidence, and reopens on failure; it must never
+tick a box it did not actually verify). Tests:
+`test/test_job_run_audit.py`, `test/test_postmarket_review.py`,
+`test/test_strategy_expectations.py`, `test/test_postmarket_triage.py`,
+`test/test_postmarket_investigation.py`.
 
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 

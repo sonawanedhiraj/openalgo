@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -325,16 +326,25 @@ def api_freeze_upload():
         if not file.filename.endswith(".csv"):
             return jsonify({"status": "error", "message": "Please upload a CSV file"}), 400
 
-        # Save temporarily and load
-        temp_path = "/tmp/qtyfreeze_upload.csv"  # nosec B108 — pre-existing; single-user self-hosted install, admin-only route
-        file.save(temp_path)
+        # Save to an OS-appropriate temp file and load. Do NOT hardcode "/tmp" —
+        # it does not exist on the Windows installs this runs on. delete=False so
+        # the handle is closed before load_freeze_qty_from_csv() re-opens the path
+        # (Windows refuses a second open while the first handle is live).
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+                temp_path = tmp.name
+                file.save(tmp)
 
-        exchange = request.form.get("exchange", "NFO").strip().upper()
-        result = load_freeze_qty_from_csv(temp_path, exchange)
-
-        # Clean up
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+            exchange = request.form.get("exchange", "NFO").strip().upper()
+            result = load_freeze_qty_from_csv(temp_path, exchange)
+        finally:
+            # Cleanup must survive a raising load, so it lives in finally.
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    logger.warning(f"Could not remove temp upload file {temp_path}")
 
         if result:
             count = QtyFreeze.query.filter_by(exchange=exchange).count()
@@ -1545,7 +1555,10 @@ def _check_loopback_http():
         # convention (gunicorn binds to ${PORT:-5000} in start.sh).
         port = os.getenv("FLASK_PORT") or os.getenv("PORT") or "5000"
         req = urllib.request.Request(f"http://127.0.0.1:{port}/", method="HEAD")
-        with urllib.request.urlopen(req, timeout=3.0) as resp:  # nosec B310 — fixed http://127.0.0.1 self-probe, scheme not user-controlled
+        # B310 (audit non-http schemes) is a false positive here: the scheme and
+        # host are hardcoded http://127.0.0.1 literals — only the port comes from
+        # env — so file:/ and custom schemes are unreachable.
+        with urllib.request.urlopen(req, timeout=3.0) as resp:  # nosec B310
             elapsed = round((time.perf_counter() - started) * 1000, 1)
             return {
                 "name": "Loopback HTTP",

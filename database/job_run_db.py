@@ -182,6 +182,23 @@ def get_runs_for_date(run_date: str, job_id: str | None = None) -> list[dict]:
         db_session.remove()
 
 
+def earliest_run_date() -> str | None:
+    """Earliest IST date the audit ever recorded, or None if the table is empty.
+
+    Used to tell "the audit was live and recorded nothing" apart from "this date
+    predates the audit entirely" — without it, replaying any pre-audit day
+    reports a phantom "no jobs fired" violation.
+    """
+    try:
+        row = db_session.query(JobRun.run_date).order_by(JobRun.run_date.asc()).first()
+        return row[0] if row else None
+    except Exception:
+        logger.exception("failed to read earliest job_run date")
+        return None
+    finally:
+        db_session.remove()
+
+
 def get_last_run(job_id: str) -> dict | None:
     """Most recent fire of ``job_id``, or None if it has never been recorded."""
     try:

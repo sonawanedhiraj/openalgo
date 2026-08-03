@@ -104,6 +104,96 @@ code defaults — none is set in `.env`, so the shipped behaviour is the default
   tick forever. Lower it only if the table is measurably large — Phase 2's
   expectation contracts want enough history to spot a job that *stopped* firing.
 
+### Post-market expectation contracts (issue #532, added 2026-08-03)
+
+#### POSTMARKET_CONTRACTS_ENABLED
+- **Value:** code default `true`. Read at evaluation time.
+- **What it gates:** whether the post-market review evaluates expectation
+  contracts at all. `false` keeps the digest and the Telegram summary, but drops
+  the verdict section — the report degrades to Phase 1 behaviour.
+
+#### POSTMARKET_CONTRACTS_DISABLED
+- **Value:** code default empty. Comma-separated `contract_id` or
+  `strategy:contract_id` (e.g. `futures_follow_cap50:t1_exit_for_carry`).
+- **What it does:** silences individual contracts **surgically** — every other
+  contract keeps evaluating. Exists so a rule that starts crying wolf can be
+  muted the same day without a code change and without disabling the layer.
+  A contract silenced here should get an issue to fix or delete it; a permanently
+  disabled contract is worse than no contract, because the report still looks
+  complete.
+
+### Post-market investigating agent + issue filing (issue #536, added 2026-08-03)
+
+#### POSTMARKET_FILING_MODE
+- **Value:** code default **`dry_run`**. Only the literal `live` enables writes.
+- **What it does:** whether confirmed findings actually become GitHub issues.
+  Default-deny on purpose: the first week should show what it *would* have filed
+  while the findings are still being tuned. An automated reporter that files
+  wrong issues gets muted, and a muted reporter is worse than none.
+
+#### POSTMARKET_MAX_ISSUES_PER_DAY
+- **Value:** code default `3`.
+- **What it does:** caps issues created per run. Overflow is appended to
+  `audit/proposed_fixes.jsonl` and named in the result — the cap bounds issue
+  noise, never the record.
+
+#### POSTMARKET_INVESTIGATION_ENABLED
+- **Value:** code default `true`.
+- **What it gates:** the tool-enabled investigating agent. When `false` the review
+  falls back to the #534 no-tools triage, which still produces a day assessment.
+
+#### POSTMARKET_INVESTIGATION_TIMEOUT_SECONDS
+- **Value:** code default `600`.
+- **Why so much larger than triage's 240:** tool use means several model turns
+  (Grep, then Read, then reason). Runs on a real OS thread and is killed at this
+  budget, so a hang cannot wedge the scheduler.
+
+#### POSTMARKET_REPO_ROOT
+- **Value:** code default = the repo containing `services/`.
+- **What it does:** the directory the agent's read-only tools are rooted at.
+
+#### GH_CMD
+- **Value:** code default `gh` (resolved on PATH).
+- **Note:** auth is the operator's ambient `gh auth` (keyring on this host);
+  `GH_TOKEN` is honoured if set. **If this install ever moves to a service
+  account or Docker, the keyring is unavailable and filing goes dark** — set
+  `GH_TOKEN` there.
+
+**Security note (not tunable, deliberately):** the agent may use only `Read`,
+`Grep`, `Glob`; `Bash`/`Write`/`Edit`/`WebFetch` are denied; and `.env*`, `db/`,
+`.git/`, `*.key`, `*.pem` are unreadable via the CLI's own deny rules. `.env`
+holds `API_KEY_PEPPER` and `FERNET_SALT`, and every encrypted secret in
+`openalgo.db` is sealed against them. Everything the agent writes also passes a
+`detect-secrets` gate before it can reach GitHub, and that gate **fails closed**
+if the scanner cannot run.
+
+### Post-market LLM triage (issue #534, added 2026-08-03)
+
+#### POSTMARKET_TRIAGE_ENABLED
+- **Value:** code default `true`.
+- **What it gates:** the `claude -p` triage pass over the Phase 2 violations.
+  `false` keeps the deterministic report intact and skips the LLM entirely.
+
+#### POSTMARKET_TRIAGE_ON_CLEAN_DAYS
+- **Value:** code default **`false`**.
+- **What it does:** whether to spend an LLM call on a day with zero violations.
+  Off by default because with nothing proven broken the output is speculative by
+  construction, and Phase 4 would not file it anyway. Turn on if the day
+  assessment is wanted every day regardless of cost.
+
+#### POSTMARKET_TRIAGE_TIMEOUT_SECONDS
+- **Value:** code default `240`.
+- **Why so much higher than the veto's 25-60s:** the triage prompt carries the
+  violations, prior-occurrence history, day context and error templates, and
+  asks for several paragraphs plus draft issue bodies. The call runs on a real
+  OS thread and is killed at this budget, so a hang cannot wedge the scheduler.
+
+**Operator prerequisite:** triage needs the `claude` CLI **logged in** on the
+box running OpenAlgo (it uses the CLI's own subscription auth — there is no API
+key anywhere in this codebase). As of 2026-08-03 it is **not** logged in: the
+review will report `llm_status='not_logged_in'` until someone runs `claude
+login`. Everything deterministic still runs and reports.
+
 ### Multi-account mirror trading (issues #468/#474/#476/#478/#482, added 2026-07-28)
 
 #### MULTI_ACCOUNT_ENABLED

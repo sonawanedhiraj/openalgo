@@ -123,6 +123,11 @@ def _collect_jobs(date: str) -> dict[str, Any]:
         "jobs": summary,
         "jobs_with_errors": errored,
         "jobs_missed": missed,
+        # Earliest date the audit ever recorded. Lets a contract tell "the audit
+        # was running and saw nothing" (a real problem) apart from "this date
+        # predates the audit" (a replay of history, not a fault) — otherwise
+        # every backfill of an old day reports a phantom violation.
+        "audit_earliest_date": job_run_db.earliest_run_date(),
     }
 
 
@@ -366,6 +371,7 @@ def _collect_futures_carry(date: str) -> dict[str, Any]:
                 ffdb.FuturesFollowTrade.side,
                 ffdb.FuturesFollowTrade.lots,
                 ffdb.FuturesFollowTrade.nifty_symbol,
+                ffdb.FuturesFollowTrade.created_at,
             )
             .filter(ffdb.FuturesFollowTrade.status == "placed")
             .filter(ffdb.FuturesFollowTrade.entry_date <= date)
@@ -379,20 +385,29 @@ def _collect_futures_carry(date: str) -> dict[str, Any]:
     # SELL leg, never back-filled onto the BUY it closes. So carry is the running
     # lot balance, and the oldest still-uncovered BUY is found by consuming BUY
     # legs FIFO against the SELL lots seen so far.
+    #
+    # `entry_date` on a SELL row carries the ENTRY session, not the day the exit
+    # happened — the column's own docstring says so, and a real row shows
+    # entry_date=2026-07-17 written on 2026-07-20. Counting exits by entry_date
+    # therefore made `exits_today` structurally always 0 for a T+1 strategy, which
+    # in turn made the `t1_exit_for_carry` contract unable to see a successful
+    # exit. Exits are counted by `created_at` (the row-write time) instead.
     buy_queue: list[tuple[str, int, str]] = []  # (entry_date, lots_remaining, symbol)
     entries_today = exits_today = 0
     lots_bought_today = lots_sold_today = 0
 
-    for entry_date, side, lots, symbol in rows:
+    for entry_date, side, lots, symbol, created_at in rows:
         qty = int(lots or 0)
         day = entry_date or ""
+        written_on = created_at.strftime("%Y-%m-%d") if created_at else None
         if (side or "").upper() == "BUY":
             buy_queue.append((day, qty, symbol or "?"))
             if day == date:
                 entries_today += 1
                 lots_bought_today += qty
         elif (side or "").upper() == "SELL":
-            if day == date:
+            # Row-write date, NOT entry_date — see the note above.
+            if written_on == date:
                 exits_today += 1
                 lots_sold_today += qty
             remaining = qty
