@@ -111,6 +111,50 @@ def test_selection_outcomes_rows():
     assert rows["DRREDDY"]["level_broken"] is False
 
 
+def test_selection_outcomes_fills_max_vol_for_entered_symbol():
+    """The `watch_stats` event covers EVERY selected symbol (issue #524).
+
+    Pre-#524 the entered row's `max_vol_ratio` was blank — `no_entry` skips
+    symbols that traded — which left the UI's `max vol×` column empty for them.
+    """
+    from services.open15_log_view import selection_outcomes
+
+    # emitted just before the per-symbol no_entry events, as the eod block does
+    day = list(TRADED_DAY)
+    day.insert(
+        -1,
+        {
+            "ts": "09:30:04.070",
+            "event": "watch_stats",
+            "needed": 1.5,
+            "stats": {
+                "OIL": {"max_vol_ratio": 1.95, "level_broken": True, "entered": True},
+                "OFSS": {"max_vol_ratio": 1.31, "level_broken": True, "entered": False},
+                "DRREDDY": {"max_vol_ratio": 0.99, "level_broken": False, "entered": False},
+            },
+        },
+    )
+    rows = {r["symbol"]: r for r in selection_outcomes("2026-07-23", day)}
+    assert rows["OIL"]["max_vol_ratio"] == 1.95  # was None before #524
+    assert rows["OIL"]["vol_needed"] == 1.5 and rows["OIL"]["entered"] is True
+    # the per-symbol no_entry event still wins for non-entered symbols
+    assert rows["OFSS"]["max_vol_ratio"] == 1.31
+    assert rows["DRREDDY"]["level_broken"] is False
+
+
+def test_selection_outcomes_unchanged_without_watch_stats_event():
+    """Pre-#524 stored days must parse byte-identically (no such event)."""
+    from services.open15_log_view import render_csv, selection_outcomes
+
+    rows = selection_outcomes("2026-07-23", TRADED_DAY)
+    assert {r["symbol"]: r["max_vol_ratio"] for r in rows} == {
+        "OIL": None,
+        "OFSS": 1.31,
+        "DRREDDY": 0.99,
+    }
+    assert render_csv(rows) == render_csv(selection_outcomes("2026-07-23", TRADED_DAY))
+
+
 def test_selection_outcomes_empty_for_skipped_day():
     from services.open15_log_view import selection_outcomes
 

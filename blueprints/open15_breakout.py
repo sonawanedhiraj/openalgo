@@ -249,6 +249,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  td,th{border-bottom:1px solid #2a3138;padding:4px 10px;text-align:left;font-size:13px;vertical-align:top}
  th{color:#8aa0b4} .ev-entry{color:#a6e3a1}.ev-exit{color:#f9e2af}.ev-no_entry{color:#f38ba8}
  .ev-selection{color:#89b4fa}.ev-armed{color:#94e2d5}.ev-summary{color:#cba6f7}
+ .ev-watch_stats{color:#8aa0b4}
  .ev-skipped_late_boot,.ev-skipped_no_prev_closes{color:#f38ba8;font-weight:bold}
  input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
  .muted{color:#6b7886;font-size:12px}
@@ -302,7 +303,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="status" class="muted"></div>
   <div class="chips" id="chips"></div>
   <div class="sec">selection outcomes</div>
-  <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>gap %</th><th>max vol&times;</th><th>outcome</th></tr></thead><tbody></tbody></table>
+  <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>gap %</th><th id="selVolHdr">max vol&times;</th><th>outcome</th></tr></thead><tbody></tbody></table>
   <div class="sec" style="display:flex;align-items:center;gap:8px">event timeline
    <span style="flex:1"></span>
    <button class="fbtn on" data-f="all">all</button>
@@ -366,6 +367,10 @@ loadCfg();
 </script>
 <script>
 let curDate=null, curEvents=[], curFilter='all', digests=[];
+// live max-vol overlay for today (issue #524): the tick-by-tick running max is
+// only published to the decision log at the exit job, so mid-window it comes
+// from /api/status instead. Cleared whenever a past day is selected.
+let liveWatch={}, liveNeeded=null;
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function kindOf(e){
   if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped')return 'trade';
@@ -391,11 +396,19 @@ async function loadDays(){
   }
   if(!curDate&&digests.length)selectDay(digests[0].date);
 }
+async function loadLiveWatch(){
+  // running max vol ratio for today's still-open window (issue #524)
+  try{
+    const r=await fetch('/open15_vol_breakout/api/status'); const s=await r.json();
+    liveWatch=s.watch_stats||{}; liveNeeded=s.vol_needed??null;
+  }catch(e){liveWatch={}; liveNeeded=null;}
+}
 async function selectDay(date){
   curDate=date;
   document.getElementById('dayjson').href='/open15_vol_breakout/api/decision_log?date='+date;
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
   curEvents=j.events||[];
+  if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderChips(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
@@ -413,12 +426,29 @@ function renderChips(){
     '<div class="chip"><span class="k">'+k+'</span><span class="v'+
     (k==='day P&amp;L'&&dig.pnl!=null?(dig.pnl>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>').join('');
 }
+function volNeeded(){
+  const w=curEvents.find(e=>e.event==='watch_stats');
+  if(w&&w.needed!=null)return w.needed;
+  const a=curEvents.find(e=>e.event==='armed');
+  if(a&&a.vol_mult!=null)return a.vol_mult;
+  return liveNeeded;
+}
+function fmtVol(v,needed,live){
+  if(v==null)return '<span class="muted">&mdash;</span>';
+  const hit=(needed!=null&&v>=needed);
+  return '<span class="'+(hit?'pos':'muted')+'">'+v+'&times;</span>'+
+    (live?' <span class="muted" style="font-size:10px">live</span>':'');
+}
 function renderSel(){
   const rows={};
   for(const e of curEvents){
     if(e.event==='selection'){
       for(const[s,side]of Object.entries(e.selected||{}))
         rows[s]={side,gap:(e.gaps_pct||{})[s],out:'no trigger'};
+    }else if(e.event==='watch_stats'){
+      // every selected symbol, entered ones included (issue #524)
+      for(const[s,st]of Object.entries(e.stats||{}))
+        if(rows[s]&&rows[s].vol==null)rows[s].vol=st.max_vol_ratio;
     }else if(!rows[e.symbol]){continue;
     }else if(e.event==='entry'){
       rows[e.symbol].out='<span class="pos">entered @ '+e.trigger_price+
@@ -432,11 +462,21 @@ function renderSel(){
         '&times; &lt; '+e.needed):'level never broken';
     }else if(e.event==='entry_skipped'){rows[e.symbol].out='skipped: '+esc(e.reason||'');}
   }
+  // mid-window the log has published nothing yet — overlay the running max
+  const liveSyms=new Set();
+  for(const[s,st]of Object.entries(liveWatch)){
+    if(rows[s]&&rows[s].vol==null&&st.max_vol_ratio!=null){
+      rows[s].vol=st.max_vol_ratio; liveSyms.add(s);
+    }
+  }
+  const needed=volNeeded();
+  document.getElementById('selVolHdr').innerHTML='max vol&times;'+
+    (needed!=null?' <span class="muted">(need '+needed+'&times;)</span>':'');
   const tb=document.querySelector('#sel tbody'); tb.innerHTML='';
   for(const[s,r]of Object.entries(rows)){
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+esc(s)+'</td><td>'+esc(r.side)+'</td><td>'+(r.gap??'')+
-      '</td><td>'+(r.vol??'')+'</td><td>'+r.out+'</td>';
+      '</td><td>'+fmtVol(r.vol,needed,liveSyms.has(s))+'</td><td>'+r.out+'</td>';
     tb.appendChild(tr);
   }
   if(!Object.keys(rows).length)

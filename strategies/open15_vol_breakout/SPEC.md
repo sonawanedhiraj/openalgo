@@ -113,13 +113,29 @@ sizing/filter is auditable.
 
 ## 7. API / UI
 `GET /open15_vol_breakout/api/status` — live state (selection, entries, day
-status, last 100 decision-log events).
+status, last 100 decision-log events), plus `watch_stats` + `vol_needed`: the
+**running** max cumvol/baseline ratio per selected symbol, readable DURING the
+window (issue #524). `max_vol_ratio` is `None` until the symbol's first
+in-window tick — blank means "no data", not a 0.0 ratio — and freezes at entry
+for a symbol that triggered (its max IS its ratio at trigger). It is final at
+the entry cutoff either way, since tracking stops there. `vol_mult` on this
+endpoint now also reports the **effective** multiplier (day config, falling back
+to env) rather than the raw env read, so it can no longer disagree with the
+threshold the run actually gated on.
 `GET /open15_vol_breakout/api/trades?date=&limit=` — journal incl. research fields.
 `GET /open15_vol_breakout/api/decision_log?date=` — the 15-min decision timeline
-(armed → selection+gaps → entries with trigger detail → exits → per-watch
-no-entry near-miss stats → summary with captured-drift). Today is served live
-from memory; past days from the `open15_day_logs` snapshot (written at 09:30 and
-09:35).
+(armed → selection+gaps → entries with trigger detail → exits → `watch_stats`
+for every selected symbol → per-watch no-entry near-miss stats → summary with
+captured-drift). Today is served live from memory; past days from the
+`open15_day_logs` snapshot (written at 09:30 and 09:35).
+
+The `watch_stats` event (issue #524) carries `{stats: {symbol: {max_vol_ratio,
+max_vol_ratio_beyond, level_broken, entered}}, needed}` for **every** selected
+symbol, entered ones included — `no_entry` covers non-entered symbols only, so
+before #524 an entered symbol's max was never published at all. `no_entry`
+keeps precedence when both are present, so pre-#524 stored days parse
+unchanged. `needed` is the day config's `vol_mult` (the multiplier that
+actually gated entries), not the raw env default.
 `GET /open15_vol_breakout/logs` — **self-contained log-viewer page** (session
 auth, auto-refreshing during the window, date picker for history).
 

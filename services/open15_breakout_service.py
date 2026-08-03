@@ -663,6 +663,15 @@ class Open15Core:
         # single-mapping special case turns it into `msg % dict` and raises.
         sel = ", ".join(f"{s}:{d}{self.gaps[s] * 100:+.2f}%" for s, d in self.selected.items())
         logger.info("open15: selection finalized — %s", sel)
+        # Seed the near-miss stats for every selected symbol (issue #524). Two
+        # jobs: (1) the key set is fixed here, at 09:16, so ``watch_snapshot``
+        # can copy it from a Flask request thread while ticks mutate values on
+        # the ZMQ thread; (2) ``None`` keeps "no ticks arrived" distinguishable
+        # from a genuine 0.0 ratio in the UI.
+        for s in self.selected:
+            self.watch_stats.setdefault(
+                s, {"max_vol_ratio": None, "max_vol_ratio_beyond": None, "level_broken": False}
+            )
 
     def on_tick(self, symbol: str, price: float, cumvol: float, ts: dt.datetime) -> dict | None:
         """Process one tick (ts must be IST-naive or IST-aware). Returns an
@@ -713,13 +722,13 @@ class Open15Core:
         level = fc["high"] if side == "L" else fc["low"]
         beyond = price > level if side == "L" else price < level
         ws = self.watch_stats.setdefault(
-            symbol, {"max_vol_ratio": 0.0, "max_vol_ratio_beyond": 0.0, "level_broken": False}
+            symbol, {"max_vol_ratio": None, "max_vol_ratio_beyond": None, "level_broken": False}
         )
         ratio = cum_in_min / baseline
-        ws["max_vol_ratio"] = max(ws["max_vol_ratio"], ratio)
+        ws["max_vol_ratio"] = max(ws["max_vol_ratio"] or 0.0, ratio)
         if beyond:
             ws["level_broken"] = True
-            ws["max_vol_ratio_beyond"] = max(ws["max_vol_ratio_beyond"], ratio)
+            ws["max_vol_ratio_beyond"] = max(ws["max_vol_ratio_beyond"] or 0.0, ratio)
         if beyond and cum_in_min >= self.vol_mult * baseline:
             action = {
                 "symbol": symbol,
@@ -736,6 +745,33 @@ class Open15Core:
             self.entered[symbol] = action
             return action
         return None
+
+    def watch_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Per-selected-symbol near-miss stats, safe to read off-thread (#524).
+
+        Keys are seeded at ``_finalize_selection`` and never change afterwards,
+        so the ``list(...)`` copy cannot race the tick thread's value updates.
+        ``max_vol_ratio`` is ``None`` until the symbol's first in-window tick —
+        blank means "no data", NOT a 0.0 ratio.
+
+        Note the value FREEZES at entry for a symbol that triggered (``on_tick``
+        returns early once ``symbol in self.entered``), so an entered symbol's
+        max is its ratio at trigger. It is also final at the entry cutoff, since
+        the ``minute > entry_to_min`` return sits above the update.
+        """
+        return {
+            sym: {
+                "max_vol_ratio": None
+                if ws.get("max_vol_ratio") is None
+                else round(ws["max_vol_ratio"], 2),
+                "max_vol_ratio_beyond": None
+                if ws.get("max_vol_ratio_beyond") is None
+                else round(ws["max_vol_ratio_beyond"], 2),
+                "level_broken": bool(ws.get("level_broken", False)),
+                "entered": sym in self.entered,
+            }
+            for sym, ws in list(self.watch_stats.items())
+        }
 
     def entry_minute_close(self, symbol: str) -> float | None:
         """Last price seen inside the symbol's entry minute (call after exit)."""
@@ -1204,6 +1240,15 @@ class Open15BreakoutService:
                     symbols_with_ticks=len(core.sym),
                     hint="ticks stopped before 09:16 — selection could not run",
                 )
+            # the full near-miss picture for EVERY selected symbol, entered ones
+            # included (issue #524) — `no_entry` below covers non-entered symbols
+            # only, which left the UI's `max vol×` column blank on entered rows.
+            if core and core.selected:
+                self._log_event(
+                    "watch_stats",
+                    stats=core.watch_snapshot(),
+                    needed=self._vol_needed(),
+                )
             # log why each selected-but-not-entered watch never fired (near-miss)
             if core:
                 for sym, side in core.selected.items():
@@ -1215,9 +1260,9 @@ class Open15BreakoutService:
                         symbol=sym,
                         side=side,
                         level_broken=ws.get("level_broken", False),
-                        max_vol_ratio=round(ws.get("max_vol_ratio", 0.0), 2),
-                        max_vol_ratio_while_beyond=round(ws.get("max_vol_ratio_beyond", 0.0), 2),
-                        needed=_vol_mult(),
+                        max_vol_ratio=round(ws.get("max_vol_ratio") or 0.0, 2),
+                        max_vol_ratio_while_beyond=round(ws.get("max_vol_ratio_beyond") or 0.0, 2),
+                        needed=self._vol_needed(),
                     )
             self._persist_day_log()
 
@@ -1660,6 +1705,19 @@ class Open15BreakoutService:
         )
 
     # ---- status for the blueprint ---------------------------------------- #
+    def _vol_needed(self) -> float:
+        """The multiplier that actually gated today's entries (issue #524).
+
+        The day config wins: a UI override on `open15_config.vol_mult` is what
+        `arm()` handed the core, so reporting the raw env `_vol_mult()` here
+        would show a threshold the run never used.
+        """
+        cfg_val = (self.day_config or {}).get("vol_mult")
+        try:
+            return float(cfg_val) if cfg_val is not None else _vol_mult()
+        except (TypeError, ValueError):
+            return _vol_mult()
+
     def get_status(self) -> dict:
         core = self.core
         return {
@@ -1667,7 +1725,10 @@ class Open15BreakoutService:
             "enabled": _enabled(),
             "mode": _mode(),
             "day_status": self.day_status,
-            "vol_mult": _vol_mult(),
+            # effective, not the raw env read (issue #524): every other field
+            # here already prefers the day config, and reporting a threshold
+            # the run never used sits badly next to `vol_needed` below
+            "vol_mult": self._vol_needed(),
             "top_n": _top_n(),
             "notional_per_trade": _notional(),
             "instrument": (self.day_config or {}).get("instrument") or _instrument_default(),
@@ -1679,6 +1740,10 @@ class Open15BreakoutService:
             if core
             else {},
             "entered": list(core.entered) if core else [],
+            # live near-miss stats so the decision-log UI can fill `max vol×`
+            # during the window instead of waiting for the exit job (issue #524)
+            "watch_stats": core.watch_snapshot() if core else {},
+            "vol_needed": self._vol_needed(),
             "positions": {
                 s: {k: p.get(k) for k in ("side", "quantity", "trigger_price", "status")}
                 for s, p in self.positions.items()

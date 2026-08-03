@@ -110,6 +110,64 @@ def test_full_session_entry_exit_journal_and_daylog():
     db_session.remove()
 
 
+def test_status_exposes_running_max_vol_mid_window():
+    """issue #524: the running max vol ratio must be readable from /api/status
+    DURING the window — the decision log only publishes it at the exit job, so
+    pre-#524 the UI's `max vol×` column was blank for the whole session."""
+    from database.open15_breakout_db import db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders)
+    for sym, px in (("AAA", 103.0), ("CCC", 97.0), ("ZZZ", 101.0)):
+        svc._handle_raw(*_frame(sym, px, 1000, 9, 15, 1), _now(9, 15, 1))
+        svc._handle_raw(*_frame(sym, px * 1.001, 5000, 9, 15, 50), _now(9, 15, 50))
+    svc._handle_raw(*_frame("AAA", 103.0, 6000, 9, 16, 10), _now(9, 16, 10))
+
+    st = svc.get_status()
+    # both selected symbols present the moment selection finalizes; the unselected
+    # ZZZ never appears, and CCC has no in-window tick yet -> None, not 0.0
+    assert set(st["watch_stats"]) == {"AAA", "CCC"}
+    assert st["watch_stats"]["CCC"]["max_vol_ratio"] is None
+    assert st["vol_needed"] == 1.5  # the day config's multiplier, not the env
+
+    # 09:17 partial surge, below the 1.5x threshold -> visible before any exit job
+    h1 = svc.core.sym["AAA"]["fc"]["high"]
+    svc._handle_raw(*_frame("AAA", h1 + 0.2, 6000 + 1000, 9, 17, 20), _now(9, 17, 20))
+    live = svc.get_status()["watch_stats"]["AAA"]
+    assert live["max_vol_ratio"] == 1.0 and live["entered"] is False
+    assert live["level_broken"] is True
+    assert not orders  # observing the near-miss must not place anything
+
+    # and the eod block publishes the same picture for EVERY selected symbol
+    svc.flatten("eod_0930")
+    ws = next(e for e in svc.day_log if e["event"] == "watch_stats")
+    assert ws["needed"] == 1.5
+    assert ws["stats"]["AAA"]["max_vol_ratio"] == 1.0
+    assert ws["stats"]["CCC"]["max_vol_ratio"] is None
+    db_session.remove()
+
+
+def test_watch_stats_event_covers_entered_symbols():
+    """The `no_entry` events skip symbols that traded (issue #524) — the
+    `watch_stats` event is what fills their `max vol×` cell."""
+    from database.open15_breakout_db import db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders)
+    _drive_to_entry(svc)
+    assert len(orders) == 1  # AAA entered
+    svc.flatten("eod_0930")
+
+    no_entry_syms = {e["symbol"] for e in svc.day_log if e["event"] == "no_entry"}
+    assert "AAA" not in no_entry_syms  # exactly the pre-#524 blank
+    ws = next(e for e in svc.day_log if e["event"] == "watch_stats")
+    assert ws["stats"]["AAA"]["entered"] is True
+    assert ws["stats"]["AAA"]["max_vol_ratio"] >= 1.5  # it cleared the gate
+    db_session.remove()
+
+
 def test_dead_feed_day_logs_loudly():
     """Armed but ZERO ticks -> the 09:30 flatten must say so explicitly."""
     orders = []

@@ -92,6 +92,42 @@ def test_near_miss_stats_for_decision_log():
     assert "AAA" not in core.entered
 
 
+def test_watch_snapshot_seeds_every_selected_symbol():
+    """Selection seeds the stats so the UI can read them off-thread (issue #524).
+
+    A seeded-but-tickless symbol must stay ``None`` — blank in the UI means "no
+    data", which is a different diagnosis from a genuine 0.0 ratio.
+    """
+    core = Open15Core({"AAA": 100.0, "BBB": 100.0}, vol_mult=1.5, top_n=1)
+    feed_first_candle(core, "AAA", 103.0, 1000)  # +3% -> long watch
+    feed_first_candle(core, "BBB", 97.0, 1000)  # -3% -> short watch
+    core.on_tick("AAA", 103.0, 1100, t(9, 16, 1))  # finalizes selection
+    snap = core.watch_snapshot()
+    assert set(snap) == {"AAA", "BBB"}  # keys fixed at 09:16, incl. tickless BBB
+    assert snap["BBB"]["max_vol_ratio"] is None  # no in-window tick yet
+    assert snap["BBB"]["level_broken"] is False
+    assert snap["AAA"]["entered"] is False
+    # 09:17 rolls the 09:16 minute closed -> baseline 100; half-baseline volume
+    core.on_tick("AAA", 103.0, 1150, t(9, 17, 10))
+    assert core.watch_snapshot()["AAA"]["max_vol_ratio"] == 0.5
+
+
+def test_watch_snapshot_max_freezes_at_entry():
+    """An entered symbol's max is its ratio at trigger — on_tick returns early
+    once the symbol is in ``entered``, so later surges never raise it."""
+    core = Open15Core({"AAA": 100.0}, vol_mult=1.5, top_n=1)
+    feed_first_candle(core, "AAA", 102.0, 1000)
+    h1 = core.sym["AAA"]["fc"]["high"]
+    core.on_tick("AAA", 101.5, 1400, t(9, 16, 30))  # baseline 400
+    assert core.on_tick("AAA", h1 + 0.6, 1400 + 800, t(9, 17, 12)) is not None
+    at_entry = core.watch_snapshot()["AAA"]["max_vol_ratio"]
+    assert at_entry == 2.0
+    core.on_tick("AAA", h1 + 2.0, 1400 + 9999, t(9, 18, 5))  # much bigger surge
+    snap = core.watch_snapshot()["AAA"]
+    assert snap["max_vol_ratio"] == at_entry
+    assert snap["entered"] is True
+
+
 def test_resolve_day_config_fixed_and_compound():
     from services.open15_breakout_service import resolve_day_config
 
