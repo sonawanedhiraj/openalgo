@@ -108,6 +108,7 @@ _SE = "strategy:simplified_engine"
 _FEED = "data_feed"
 _REPORTS = "reports"
 _SANDBOX = "sandbox"
+_PY = "python_strategy_host"
 
 
 CATALOG: tuple[JobSpec, ...] = (
@@ -481,6 +482,39 @@ CATALOG: tuple[JobSpec, ...] = (
         tier=TIER_FREE,
         env_flag="MULTI_ACCOUNT_ENABLED",
     ),
+    # ---- Python strategy host --------------------------------------------
+    JobSpec(
+        job_id="daily_trading_day_check",
+        label="Trading-day check",
+        group=_PY,
+        scheduler=SCHED_PYTHON,
+        schedule="00:01 daily",
+        description="Stops scheduled Python strategies on weekends and holidays.",
+        tier=TIER_PROTECTED,
+        safety_note="Without it, scheduled strategies fire on non-trading days.",
+    ),
+    JobSpec(
+        job_id="market_hours_enforcer",
+        label="Market-hours enforcer",
+        group=_PY,
+        scheduler=SCHED_PYTHON,
+        schedule="every 1 min",
+        description="Stops scheduled Python strategies once the market closes.",
+        tier=TIER_PROTECTED,
+        safety_note="The only thing stopping a strategy from running after close.",
+    ),
+    JobSpec(
+        job_id="reap_dead_strategies",
+        label="Reap dead strategies",
+        group=_PY,
+        scheduler=SCHED_PYTHON,
+        schedule="periodic",
+        description=(
+            "Clears crashed strategies out of RUNNING_STRATEGIES so a headless "
+            "deploy does not pin their resources until someone opens /python."
+        ),
+        tier=TIER_GUARDED,
+    ),
     # ---- sandbox ---------------------------------------------------------
     JobSpec(
         id_prefix="squareoff_",
@@ -652,8 +686,11 @@ def _row(spec: JobSpec | None, job_id: str, live: dict | None) -> dict:
         "safety_note": spec.safety_note if spec else None,
         "env_flag": spec.env_flag if spec else None,
         "env_flag_value": (os.environ.get(spec.env_flag) if spec and spec.env_flag else None),
+        # Precedence is (spec, live), not live-first: a live job with no catalog
+        # entry is *unregistered* — that is how user-defined schedules are
+        # distinguished from the ones this repo declares.
         "state": (
-            STATE_REGISTERED if live else (STATE_NOT_REGISTERED if spec else STATE_UNREGISTERED)
+            (STATE_REGISTERED if live else STATE_NOT_REGISTERED) if spec else STATE_UNREGISTERED
         ),
         "next_run_time": (live or {}).get("next_run_time"),
         "trigger": (live or {}).get("trigger"),
