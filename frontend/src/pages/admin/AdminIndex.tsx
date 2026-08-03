@@ -2,6 +2,7 @@ import {
   Activity,
   ArrowRight,
   Calendar,
+  CalendarClock,
   Clock,
   Gauge,
   Globe,
@@ -86,6 +87,14 @@ export default function AdminIndex() {
       href: '/logs/latency',
       countLabel: 'monitoring',
       color: 'bg-orange-500',
+    },
+    {
+      title: 'Schedulers',
+      description: 'Every scheduled job and long-lived daemon thread, with heartbeats',
+      icon: CalendarClock,
+      href: '/admin/schedulers',
+      countLabel: 'monitoring',
+      color: 'bg-amber-500',
     },
     {
       title: 'Diagnostics',

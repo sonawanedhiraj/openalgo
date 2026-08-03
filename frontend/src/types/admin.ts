@@ -321,3 +321,84 @@ export interface MCPSettingsUpdateResponse {
   restart_command?: string
   settings_pending?: MCPSettings
 }
+
+// ============================================================================
+// Scheduler + daemon-thread registry (issue #539)
+// ============================================================================
+
+export type SchedulerTier = 'protected' | 'guarded' | 'free'
+
+export type JobState = 'registered' | 'not_registered' | 'unregistered'
+
+export interface JobLastRun {
+  status?: string
+  job_name?: string | null
+  scheduled_at?: string | null
+  fired_at?: string | null
+  duration_ms?: number | null
+  error?: string | null
+}
+
+export interface ScheduledJobRow {
+  job_id: string
+  label: string
+  group: string
+  scheduler: string | null
+  schedule: string | null
+  description: string | null
+  tier: SchedulerTier
+  safety_note: string | null
+  env_flag: string | null
+  env_flag_value: string | null
+  state: JobState
+  next_run_time: string | null
+  trigger: string | null
+  live_name: string | null
+  last_run: JobLastRun | null
+}
+
+export type ThreadGroup = 'loop' | 'transport' | 'poller' | 'boot' | 'unregistered'
+
+export type ThreadState = 'running' | 'stale' | 'dead' | 'not_started' | 'completed'
+
+export interface DaemonThreadRow {
+  thread_name: string
+  label: string
+  group: ThreadGroup
+  owner: string | null
+  description: string | null
+  cadence_sec: number | null
+  window: string | null
+  env_flag: string | null
+  env_flag_value: string | null
+  tier: SchedulerTier
+  alive: boolean
+  state: ThreadState
+  heartbeat_age_sec: number | null
+  last_beat_at: number | null
+  beat_count: number
+}
+
+export interface SchedulersResponse {
+  status: string
+  sources_failed: string[]
+  jobs: ScheduledJobRow[]
+  jobs_summary: {
+    total?: number
+    registered?: number
+    not_registered?: number
+    unregistered?: number
+    schedulers?: number
+    last_run_error?: number
+    last_run_missed?: number
+  }
+  threads: DaemonThreadRow[]
+  threads_summary: {
+    expected?: number
+    alive?: number
+    stale?: number
+    dead?: number
+    not_started?: number
+    unregistered?: number
+  }
+}
