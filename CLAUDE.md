@@ -1482,6 +1482,70 @@ broker-known prior close, with every existing guard alert-only). Three parts:
     `test/test_scanner_service.py` (per-symbol enforcement),
     `test/test_scanner_watchdog_and_backfill_gate.py` (straggler tick).
 
+## Scheduler + daemon-thread registry (`/admin/schedulers`, issue #539)
+
+The single live answer to "what is scheduled, and is it actually running?"
+Phase 1 is **read-only observability**; controls are Phase 2.
+
+**Why a catalog and not just introspection.** Scheduling is spread across
+**seven** APScheduler instances (shared historify, EOD watchdog, sandbox
+square-off, Flow, python_strategy, chartink, strategy) plus ~32 long-lived
+daemon threads, several of which are cron jobs in all but name. Enumerating
+live jobs misses the row that matters most: a job whose registration was
+skipped by an env flag is simply **absent**, which is exactly the case an
+operator is trying to explain ("why did nothing happen at 16:00?").
+
+- **`services/scheduler_registry.py`** — declarative `CATALOG` of `JobSpec`s
+  merged at read time with live `get_jobs()` across all seven instances and the
+  last fire from `job_run`. States: `registered` / `not_registered` (catalogued
+  but absent) / `unregistered` (live but uncatalogued — user-defined historify,
+  python, flow and chartink schedules land here without needing entries).
+  Resolution reads `sys.modules` and **never imports** — importing
+  `blueprints.python_strategy` runs a strategy cleanup, so an observability call
+  that imported it would have real side effects.
+- **`services/thread_registry.py`** — same shape for daemon threads, by class
+  (`loop` / `transport` / `poller` / `boot`), plus an **in-memory heartbeat**
+  (`beat()`) stamped at the top of each recurring loop's tick. The heartbeat is
+  the point: `Thread.is_alive()` stays `True` forever for a thread wedged on a
+  socket read, so liveness alone proves nothing. States: `running` / `stale` /
+  `dead` / `not_started` / `completed`.
+- **Alerting is deliberately narrow** and rides the existing `ThreadWatchdog`
+  30 s loop (no new thread to watch threads): only a thread that **beat at least
+  once and then went silent or vanished** alerts. `not_started` never alerts,
+  because it is the normal state for most catalog entries on a normal install
+  (no broker session, outside the window, flag off, bot not configured) — daily
+  noise is how an alert channel gets ignored. Flags `THREAD_REGISTRY_ENABLED`,
+  `THREAD_HEARTBEAT_STALE_MULTIPLIER` (3.0), `THREAD_REGISTRY_ALERT_DEDUP_MIN`
+  (30), `NOTIFY_THREAD_REGISTRY`. See `docs/PARAMETER_LOG.md`.
+- **This closes a real gap.** `thread_watchdog_service` alerts on a thread
+  *leak* (count climbing); with no expected-set it structurally cannot detect
+  the opposite — a thread that died or wedged, the 2026-07-07 silent tick-flow
+  death shape.
+- **Tiers** are recorded now, enforced in Phase 2: `protected` (exits, EOD
+  flattens, square-offs, daily resets, market-hours enforcer — never disableable
+  from the UI; each carries a `safety_note` saying why, because the reason is
+  what stops a future maintainer from downgrading it), `guarded` (typed
+  confirmation + mandatory expiry), `free`.
+- **API + UI:** `GET /admin/api/schedulers` (`@check_session_validity`,
+  read-only, each half degrades independently into `sources_failed`) rendered by
+  `frontend/src/pages/admin/Schedulers.tsx`, reachable from the Admin dashboard
+  card at `/admin`.
+
+**⚠ When you add a scheduled job or a long-lived thread, add it to the matching
+catalog in the same commit.** This is enforced, not advisory:
+`test/test_scheduler_registry.py` parses every `add_job(..., id="X")` literal in
+`services/`, `blueprints/` and `sandbox/` and fails on anything uncatalogued;
+`test/test_thread_registry.py` does the same for `Thread(name="X")` literals.
+A catalog that falls behind the code answers "what runs?" *wrongly*, which is
+worse than not answering — so the tests treat drift as a build failure. Long-
+lived threads must also be **named** (`Thread(..., name="X")`); the name is the
+only join key against a live process.
+
+**Not yet built** (Phase 2+, separate issues): durable `scheduler_job_control`
+table, fire-time guard wrapper, per-tick loop gate, tiered toggles, run-now,
+per-job fire history, and post-market expectation contracts that read the
+control table so an operator-disabled job is not reported as a failure.
+
 ## Daily post-market review (`postmarket_review`) + job-run audit
 
 An in-process APScheduler job (**17:15 IST mon-fri, trading days only**) that
