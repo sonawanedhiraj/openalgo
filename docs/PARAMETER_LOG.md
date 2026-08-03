@@ -1758,8 +1758,17 @@ ran in the 15:30-17:00 periodic window).
   `OPEN15_SIZING_MODE` (default `fixed`) — `fixed` | `compound` capital sizing.
   `OPEN15_TRADE_SIDE` (default `both`) — `both` | `long_only` | `short_only`;
   which sides the 09:15 selection may pick at all.
+  **Rolling additive watch list (issue #529):**
+  `OPEN15_ROLLING_WATCHLIST_ENABLED` (default **`false`**) — master switch;
+  `OPEN15_ROLLING_CADENCE_S` (default `30`, clamped **10–300**) — how often the
+  universe is re-ranked on live LTP inside the entry window;
+  `OPEN15_ROLLING_TOP_N` (default `3`, clamped **1–10**) — how many movers per
+  side each cycle may append. All three are UI-editable (below); the clamps are
+  applied server-side on BOTH the env read and the saved row, so neither a bad
+  `.env` value nor a hand-crafted POST can set a 1-second re-rank.
   **UI overrides:** `margin_per_slot`, `sizing_mode`, `vol_mult`, `instrument`,
-  `max_trades`, `no_entry_after`, `exit_time`, and `trade_side` are editable
+  `max_trades`, `no_entry_after`, `exit_time`, `trade_side`,
+  `rolling_watchlist_enabled`, `rolling_cadence_s`, and `rolling_top_n` are editable
   from `/open15_vol_breakout/logs` (stored in the `open15_config`
   row; NULL = env default; applied at the next 09:10 arm and recorded in the
   day's `armed` decision-log event). The env vars are the DEFAULTS layer.
@@ -1804,6 +1813,21 @@ ran in the 15:30-17:00 periodic window).
     if disk pressure appears). The writer's queue/batch are widened to
     50000/500 in universe mode so the first-minute burst cannot overflow.
     Set `false` to roll back without touching the master switch.
+  - **2026-08-03:** `OPEN15_ROLLING_WATCHLIST_ENABLED` / `_CADENCE_S` /
+    `_TOP_N` added by issue #529. **Default OFF — the deploy is a no-op** until
+    the operator ticks the box on `/open15_vol_breakout/logs`. Rationale: the
+    2026-08-03 replay showed the 09:16 gap ranking put the day's four biggest
+    movers at ranks #22/#106/#130/#134, so a one-shot snapshot watches the
+    wrong names — but the SAME study could NOT show the added names are
+    profitable (3 incremental trades, +₹162, 1 win of 3, on 4 usable days).
+    This ships as a MEASUREMENT (journal column `open15_trades.watch_source ∈
+    {seed, rolling}` scores the two cohorts apart), NOT as a validated edge; a
+    promotion decision waits on the #528 sample. The entry gate is untouched —
+    added symbols compete for the same `max_trades` slots — and the list is
+    strictly additive, so the 09:16 seed picks are never dropped. Cadence
+    default 30 s: fast enough to catch a leaderboard that churns within the
+    13-minute window, slow enough that the re-rank (a sort over ~211 floats on
+    the tick thread) is negligible.
 
 ## `INTRADAY_PULLBACK_TRADE_SIDE` — intraday_pullback_top2 trade side (issue #509)
 
