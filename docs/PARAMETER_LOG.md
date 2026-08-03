@@ -18,6 +18,50 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Scheduler + daemon-thread registry (issue #539, added 2026-08-03)
+
+Tunables introduced with Phase 1 of the scheduler/thread inventory. All are code
+defaults — none is set in `.env`, so the shipped behaviour is the default. The
+registries themselves are **read-only**: these flags govern *alerting*, never
+whether a job or thread runs.
+
+#### THREAD_REGISTRY_ENABLED
+- **Value:** code default `true`. Consulted **per check**, inside
+  `thread_registry.check_and_alert()`, so a flip takes effect on the next tick
+  of the thread watchdog's 30 s loop without a restart.
+- **What it gates:** only the Telegram/alert publish for a stale or dead thread.
+  `snapshot()` and `GET /admin/api/schedulers` keep working when it is `false` —
+  the page must never go blank because alerting was silenced.
+
+#### THREAD_HEARTBEAT_STALE_MULTIPLIER
+- **Value:** code default `3.0`. Values `<= 1` fall back to `3.0` (a multiplier
+  of 1 would flag a loop stale the instant it is one tick late, which is normal
+  jitter, not a fault).
+- **What it does:** a loop thread is `stale` once its last heartbeat is older
+  than `cadence_sec * multiplier`. At the default that is 90 s for a 30 s
+  watchdog and 90 min for the 30 min backfill convergence loop.
+- **Why a multiplier and not a fixed deadline:** cadences in the catalog span
+  5 s to 30 min. One absolute deadline would either spam on the slow loops or
+  never fire on the fast ones.
+
+#### THREAD_REGISTRY_ALERT_DEDUP_MIN
+- **Value:** code default `30` (minutes), per thread.
+- **What it does:** a thread that stays wedged re-alerts at most once per window
+  — a reminder rather than a storm. Same policy shape as
+  `THREAD_WATCHDOG_DEDUP_WINDOW_MIN`.
+
+#### NOTIFY_THREAD_REGISTRY
+- **Value:** per-event Telegram toggle consumed by
+  `notification_service.notify("thread_registry", ...)`. Unregistered event
+  types fall through the `NOTIFY_UNKNOWN_EVENTS` fail-open path, so the alert is
+  delivered either way; register it to control it explicitly.
+
+**Not a parameter, but load-bearing:** alerts fire *only* for threads that beat
+at least once and then went silent or vanished. A thread that never started is
+reported as `not_started` and never alerts, because that is the normal state for
+most catalog entries on a normal install (no broker session, outside the window,
+flag off, bot not configured). Widening this is how the channel becomes noise.
+
 ### Daily post-market review + job-run audit (issue #511, added 2026-08-02)
 
 New tunables introduced with Phase 1 of the post-market review scheduler. All are

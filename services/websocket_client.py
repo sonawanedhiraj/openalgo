@@ -96,7 +96,9 @@ class WebSocketClient:
             self.running = True
 
             # Start the asyncio event loop in a separate thread
-            self.thread = _original_threading.Thread(target=self._run_event_loop)
+            self.thread = _original_threading.Thread(
+                target=self._run_event_loop, name="WebSocketClientLoop"
+            )
             self.thread.daemon = True
             self.thread.start()
 

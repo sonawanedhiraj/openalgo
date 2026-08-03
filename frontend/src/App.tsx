@@ -140,6 +140,8 @@ const FreezeQty = lazy(() => import('@/pages/admin/FreezeQty'))
 const Holidays = lazy(() => import('@/pages/admin/Holidays'))
 const MarketTimings = lazy(() => import('@/pages/admin/MarketTimings'))
 const Diagnostics = lazy(() => import('@/pages/admin/Diagnostics'))
+// Scheduler + daemon-thread registry (issue #539, read-only)
+const Schedulers = lazy(() => import('@/pages/admin/Schedulers'))
 const RemoteMcp = lazy(() => import('@/pages/admin/RemoteMcp'))
 
 // Telegram pages
@@ -282,6 +284,7 @@ function App() {
                 <Route path="/admin/holidays" element={<Holidays />} />
                 <Route path="/admin/timings" element={<MarketTimings />} />
                 <Route path="/admin/diagnostics" element={<Diagnostics />} />
+                <Route path="/admin/schedulers" element={<Schedulers />} />
                 <Route path="/admin/remote-mcp" element={<RemoteMcp />} />
                 {/* Phase 7: Telegram */}
                 <Route path="/telegram" element={<TelegramIndex />} />

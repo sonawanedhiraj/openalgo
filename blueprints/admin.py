@@ -124,6 +124,56 @@ def api_stats():
 
 
 # ============================================================================
+# Scheduler + daemon-thread registry (issue #539)
+# ============================================================================
+
+
+@admin_bp.route("/api/schedulers")
+@check_session_validity
+@limiter.limit(API_RATE_LIMIT)
+def api_schedulers():
+    """Inventory of every scheduled job and long-lived thread.
+
+    Strictly read-only: it introspects the seven APScheduler instances and the
+    live thread table, and reads the ``job_run`` audit. It never registers,
+    pauses or removes a job — controls land in Phase 2.
+
+    The two halves degrade independently: if one registry raises, the other is
+    still returned and the failure is named in ``sources_failed``, so a single
+    bad source cannot blank the whole page.
+    """
+    payload: dict = {"status": "success", "sources_failed": []}
+
+    try:
+        from services import scheduler_registry
+
+        jobs = scheduler_registry.snapshot()
+        payload["jobs"] = jobs
+        payload["jobs_summary"] = scheduler_registry.summarize(jobs)
+    except Exception as e:
+        logger.exception(f"Error building the scheduler snapshot: {e}")
+        payload["jobs"] = []
+        payload["jobs_summary"] = {}
+        payload["sources_failed"].append("jobs")
+
+    try:
+        from services import thread_registry
+
+        threads = thread_registry.snapshot()
+        payload["threads"] = threads
+        payload["threads_summary"] = thread_registry.summarize(threads)
+    except Exception as e:
+        logger.exception(f"Error building the thread snapshot: {e}")
+        payload["threads"] = []
+        payload["threads_summary"] = {}
+        payload["sources_failed"].append("threads")
+
+    if len(payload["sources_failed"]) == 2:
+        return jsonify({"status": "error", "message": "both registries failed"}), 500
+    return jsonify(payload)
+
+
+# ============================================================================
 # Freeze Quantity API Endpoints
 # ============================================================================
 

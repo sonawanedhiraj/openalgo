@@ -204,7 +204,10 @@ def _watchdog_loop() -> None:
     from database.health_db import HealthMetric, health_session
 
     logger.debug("Thread watchdog loop started (interval: %ds)", CHECK_INTERVAL_SEC)
+    from services import thread_registry
+
     while _watchdog_running:
+        thread_registry.beat("ThreadWatchdog")
         try:
             metric = HealthMetric.get_current_metrics()
             if (
@@ -220,6 +223,15 @@ def _watchdog_loop() -> None:
                 health_session.remove()
             except Exception:
                 pass
+
+        # This watchdog detects a thread *leak*; the registry detects the
+        # opposite — an expected thread that died or wedged. Same cadence and
+        # same owner, so it rides along here rather than adding yet another
+        # thread whose only job is to watch other threads.
+        try:
+            thread_registry.check_and_alert()
+        except Exception:
+            logger.exception("thread_watchdog: thread_registry check failed")
 
         time.sleep(CHECK_INTERVAL_SEC)
 

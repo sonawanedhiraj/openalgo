@@ -308,6 +308,7 @@ def start_websocket_server():
     _websocket_thread = _original_threading.Thread(
         target=run_websocket_server,
         daemon=False,  # Changed to False so we can properly clean up
+        name="WebSocketProxyServer",
     )
     _websocket_thread.start()
 

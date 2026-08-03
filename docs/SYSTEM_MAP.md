@@ -244,12 +244,77 @@ never rolls it).
   `test/test_tick_liveness_watchdog.py`, `test/test_ws_proxy_supervisor.py`,
   `test/test_scanner_live_bar_heartbeat.py`.
 
+## Live inventory — `/admin/schedulers` (issue #539)
+
+**Start here, not with this document.** The tables below are hand-written prose
+and drift; the page is generated from the running process. It merges a
+declarative catalog with live introspection, so it shows what this file cannot:
+which jobs are actually registered *right now*, when each next fires, how the
+last fire went (from `job_run`), and whether each long-lived thread is alive
+**and beating**.
+
+- **Jobs:** `services/scheduler_registry.py`. Catalogs every job across the
+  **seven** APScheduler instances (see the table below), then merges with live
+  `get_jobs()` + `job_run`. Three states: `registered`, `not_registered` (in the
+  catalog but absent from its scheduler — usually an env flag skipped
+  registration; **introspection alone can never surface this row**), and
+  `unregistered` (live but uncatalogued — where user-defined historify / python
+  / flow / chartink schedules land).
+- **Threads:** `services/thread_registry.py`. Catalogs ~32 long-lived threads by
+  class (`loop` / `transport` / `poller` / `boot`) and adds an in-memory
+  heartbeat, because `is_alive()` stays `True` for a thread wedged on a socket
+  read. States: `running`, `stale`, `dead`, `not_started`, `completed`.
+- **Read-only.** Neither module calls `add_job` / `pause_job` / `remove_job`, and
+  scheduler resolution reads `sys.modules` rather than importing (importing
+  `blueprints.python_strategy` runs a strategy cleanup). Controls — a durable
+  `scheduler_job_control` table, fire-time guards, tiered toggles — are Phase 2.
+- **Tiers** are recorded but not yet enforced: `protected` (exits, EOD flattens,
+  square-offs, daily resets — never disableable, each carries a `safety_note`
+  explaining why), `guarded`, `free`.
+- **API:** `GET /admin/api/schedulers` (session auth). Each half degrades
+  independently into `sources_failed`.
+- **Alerting:** a thread that beat at least once and then went silent past
+  `THREAD_HEARTBEAT_STALE_MULTIPLIER` x its cadence — or vanished — raises a
+  dedup'd alert from the thread-watchdog loop. A thread that never beat is
+  `not_started` and never alerts. This closes the gap that
+  `thread_watchdog_service` structurally cannot cover: it counts threads and
+  detects a *leak*, but has no expected-set and so cannot detect a **dead** one.
+- **Adding a job or a long-lived thread? Add it to the matching catalog.**
+  `test/test_scheduler_registry.py` parses every `add_job(..., id="X")` in
+  `services/`, `blueprints/` and `sandbox/` and fails when one is uncatalogued;
+  `test/test_thread_registry.py` does the same for `Thread(name="X")`.
+
+## Daemon threads (OpenAlgo worker)
+
+Not everything scheduled is an APScheduler job. Live state is on the page above;
+this is the map. Full per-thread detail lives in `thread_registry.CATALOG`.
+
+| Class | Members | Notes |
+|---|---|---|
+| **Recurring loops** | `ScannerBackfillPeriodic` (30 min, 15:30-17:00), `ScannerStragglerRecheck` (15 min, 09:20-15:30), `SectorFollowBackfillPeriodic` (30 min, 15:30-17:00), `TickLivenessWatchdog` (30 s), `WSProxySupervisor` (30 s), `ScannerWsWatchdog` (60 s), `ThreadWatchdog` (30 s), `HealthCollector` (10 s), `MarketDataHealthCheck` (5 s), `MarketDataCleanup` (300 s), `FlowPriceMonitor` (5 s) | Cron jobs in all but name. Each stamps `thread_registry.beat()` at the top of its tick — that heartbeat, not `is_alive()`, is what proves the loop is working. |
+| **Feed / transport** | `ZerodhaWS`, `ZerodhaWSSubscriptions`, `ZerodhaWSHealthCheck`, `WebSocketProxyServer`, `WebSocketClientLoop`, `ScannerZMQSubscriber`, `open15-zmq` (windowed 09:14:50 → exit+5 s), `SimplifiedTickLogWriter` | All `protected`. Everything downstream depends on them. |
+| **Bot pollers** | `TelegramBotThread`, `TelegramInboundThread`, `WhatsAppBotThread` | One poller per token — the inbound poller refuses to start while the UI bot owns it (issue #238). `telegram_bot_service_v2.py` / `_fixed.py` are **not imported anywhere**; their pollers never start. |
+| **Boot one-shots** | `ScannerBackfillBoot`, `SectorFollowBackfillBoot`, `ScannerAggregatorSeed`, `ScannerPreSubscribe`, `RegimeSectorPreSubscribe`, `ScannerHistoryWarmup`, `AbandonedExitRecovery`, `futures_follow_rehydrate`, `IntradayPullbackBootResume`, `WhatsAppAutoStart` | Run once and exit; `completed` is the healthy state, not `dead`. |
+| **Excluded** | Per-item ephemeral workers (chartink/strategy order processors, flow workflow runs, `execute_schedule`, `connect-cb-*`, open15 opt-shadow catch-up) | Thousands per session; they belong in logs, not an inventory. |
+
 ## In-process APScheduler jobs (OpenAlgo worker)
 
-These cron jobs run **inside** the single eventlet worker on the shared
-APScheduler instance (`services/historify_scheduler_service.py`). They are NOT
-Cowork host tasks (§3 above) — they live and die with the OpenAlgo process and
-need no external scheduler.
+Most of these run **inside** the single eventlet worker on the shared
+APScheduler instance (`services/historify_scheduler_service.py`), but that is
+**not the only scheduler** — there are seven:
+
+| Scheduler | Owner | Holds |
+|---|---|---|
+| shared "historify" | `services/historify_scheduler_service.py` | every strategy + report job |
+| EOD watchdog | `services/eod_watchdog_service.py` | `eod_watchdog_<strategy>` (15:14) |
+| sandbox square-off | `sandbox/squareoff_thread.py` | `squareoff_*`, `t1_settlement`, `auto_reset`, `daily_pnl_*` |
+| Flow | `services/flow_scheduler_service.py` | user Flow triggers |
+| Python strategies | `blueprints/python_strategy.py` | user strategies + `daily_trading_day_check`, `market_hours_enforcer`, `reap_dead_strategies` |
+| Chartink | `blueprints/chartink.py` | webhook strategy schedules |
+| Strategy | `blueprints/strategy.py` | webhook strategy schedules |
+
+They are NOT Cowork host tasks (§3 above) — they live and die with the OpenAlgo
+process and need no external scheduler.
 
 | Job id | Cron (IST) | What it does | Gating / writes |
 |---|---|---|---|

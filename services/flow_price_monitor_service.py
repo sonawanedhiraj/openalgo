@@ -126,7 +126,9 @@ class FlowPriceMonitor:
 
         self._stop_event.clear()
         self._running = True
-        self._monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self._monitor_thread = threading.Thread(
+            target=self._monitoring_loop, daemon=True, name="FlowPriceMonitor"
+        )
         self._monitor_thread.start()
         logger.info(f"Price monitoring started with {len(self._alerts)} alerts")
 
@@ -146,7 +148,10 @@ class FlowPriceMonitor:
 
     def _monitoring_loop(self):
         """Main monitoring loop that polls prices"""
+        from services.thread_registry import beat as _beat
+
         while not self._stop_event.is_set():
+            _beat("FlowPriceMonitor")
             try:
                 self._check_all_alerts()
             except Exception as e:
