@@ -400,5 +400,6 @@ export interface SchedulersResponse {
     dead?: number
     not_started?: number
     unregistered?: number
+    runtime_suppressed?: number
   }
 }

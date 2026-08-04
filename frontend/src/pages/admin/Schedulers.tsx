@@ -37,6 +37,11 @@ const THREAD_GROUP_HINTS: Record<string, string> = {
   unregistered: 'Alive but missing from the catalog — worth adding.',
 }
 
+function suppressedNote(count: number | undefined): string | null {
+  if (!count) return null
+  return `${count} runtime/library threads hidden (thread pools, event loops, request workers) — never ours to catalog.`
+}
+
 function tierBadge(tier: SchedulerTier) {
   if (tier === 'protected') {
     return (
@@ -363,6 +368,12 @@ export default function Schedulers() {
             <StatTile label="Dead" value={threads.dead ?? 0} tone="danger" />
             <StatTile label="Not started" value={threads.not_started ?? 0} />
           </div>
+
+          {suppressedNote(threads.runtime_suppressed) && (
+            <p className="text-xs text-muted-foreground">
+              {suppressedNote(threads.runtime_suppressed)}
+            </p>
+          )}
 
           {threadGroups.map(([group, rows]) => (
             <GroupCard key={group} group={group} hint={THREAD_GROUP_HINTS[group]}>

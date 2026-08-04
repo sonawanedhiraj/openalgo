@@ -209,6 +209,9 @@ def run_boot_warmup() -> dict | None:
     boot is unaffected. Returns the refresh result dict, or ``None`` when
     disabled or on failure.
     """
+    from services.thread_registry import beat as _beat
+
+    _beat("ScannerHistoryWarmup")
     if os.getenv("SCANNER_HISTORY_WARMUP_ENABLED", "true").lower() != "true":
         logger.info("Scanner history warm-up disabled (SCANNER_HISTORY_WARMUP_ENABLED!=true)")
         return None

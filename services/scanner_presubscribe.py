@@ -523,6 +523,9 @@ def wire_pre_subscribe(
     # somehow misses the bus emit, or a deployment where the bus is briefly
     # offline. Belt-and-braces, not single-point-of-failure.
     def _establish() -> None:
+        from services.thread_registry import beat as _beat
+
+        _beat(thread_name)
         deadline = time_fn() + max_wait_sec
         logged_no_key = False
         while time_fn() < deadline:

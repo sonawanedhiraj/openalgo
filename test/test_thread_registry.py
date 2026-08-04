@@ -102,6 +102,35 @@ def test_unregistered_live_thread_is_surfaced(monkeypatch):
     assert rows["SomeBrandNewThread"]["group"] == "unregistered"
 
 
+def test_runtime_threads_are_filtered_out_of_the_uncatalogued_bucket(monkeypatch):
+    """The "not in the catalog" bucket is a to-do list, so it must not contain
+    threads nobody would ever catalog.
+
+    The live process contributes ~24 of these (ThreadPoolExecutor-*,
+    Thread-9322 (process_request_thread), eventbus_*, MainThread, ...), which
+    buried the one genuinely uncatalogued application thread.
+    """
+    noise = {
+        "MainThread",
+        "APScheduler",
+        "Tornado selector",
+        "ThreadPoolExecutor-8_1",
+        "Thread-9322 (process_request_thread)",
+        "asyncio_0",
+        "eventbus_3",
+        "openalgo-claude-review",
+        "connect-cb-scanner",
+    }
+    monkeypatch.setattr(tr, "_live_thread_names", lambda: noise | {"RealAppThread"})
+
+    rows = tr.snapshot()
+    unregistered = [r["thread_name"] for r in rows if r["group"] == "unregistered"]
+    assert unregistered == ["RealAppThread"]
+
+    # Filtered, never silently dropped.
+    assert tr.summarize(rows)["runtime_suppressed"] == len(noise)
+
+
 # ---------------------------------------------------------------------------
 # Alert policy
 # ---------------------------------------------------------------------------
@@ -171,7 +200,18 @@ def test_alert_failure_does_not_propagate(monkeypatch):
 
 
 def _thread_name_literals(path: Path) -> set[str]:
-    """Every string literal passed as ``name=`` to a Thread(...) call."""
+    """Thread names a module actually constructs.
+
+    Collects ``name=`` string literals on ``Thread(...)`` calls, plus
+    ``thread_name=`` literals anywhere (a few threads are built by a helper
+    that receives the name from the boot site — ``scanner_presubscribe``).
+
+    Deliberately does **not** fall back to a plain substring search of the
+    file. That looseness let ``futures_follow_rehydrate`` — an event-bus
+    subscription named with the same keyword, not a thread at all — sit in the
+    catalog, where it could only ever render as a permanently "not started"
+    thread that does not exist.
+    """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
     except SyntaxError:  # pragma: no cover - defensive
@@ -181,14 +221,14 @@ def _thread_name_literals(path: Path) -> set[str]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        func = node.func
-        label = getattr(func, "attr", None) or getattr(func, "id", None)
-        if label != "Thread":
-            continue
+        label = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
         for kw in node.keywords:
-            if kw.arg == "name" and isinstance(kw.value, ast.Constant):
-                if isinstance(kw.value.value, str):
-                    names.add(kw.value.value)
+            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
+                continue
+            if kw.arg == "name" and label == "Thread":
+                names.add(kw.value.value)
+            elif kw.arg == "thread_name":
+                names.add(kw.value.value)
     return names
 
 
@@ -201,7 +241,7 @@ def test_every_catalog_thread_name_exists_in_its_owner_module():
     supplies the name via ``thread_name=``. Those are allowed to match in
     ``app.py`` instead, which still catches a rename.
     """
-    boot_source = (REPO_ROOT / "app.py").read_text(encoding="utf-8", errors="ignore")
+    boot_names = _thread_name_literals(REPO_ROOT / "app.py")
     missing: list[str] = []
 
     for spec in tr.CATALOG:
@@ -209,12 +249,9 @@ def test_every_catalog_thread_name_exists_in_its_owner_module():
         if not owner.exists():
             missing.append(f"{spec.thread_name}: owner {spec.owner} does not exist")
             continue
-        if spec.thread_name in _thread_name_literals(owner):
+        if spec.thread_name in _thread_name_literals(owner) or spec.thread_name in boot_names:
             continue
-        owner_source = owner.read_text(encoding="utf-8", errors="ignore")
-        if spec.thread_name in owner_source or spec.thread_name in boot_source:
-            continue
-        missing.append(f"{spec.thread_name}: not found in {spec.owner} or app.py")
+        missing.append(f"{spec.thread_name}: no Thread(name=...) literal in {spec.owner} or app.py")
 
     assert not missing, "Catalog entries no longer match the source:\n" + "\n".join(missing)
 
