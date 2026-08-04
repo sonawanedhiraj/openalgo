@@ -1083,6 +1083,9 @@ class IntradayPullbackService:
         import time as _time
 
         def _worker():
+            from services.thread_registry import beat as _beat
+
+            _beat("IntradayPullbackBootResume")
             for _ in range(40):  # ~10 min: wait for a broker session to appear
                 if self._session_ok():
                     break

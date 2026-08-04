@@ -49,6 +49,7 @@ Design rules
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,37 @@ STATE_COMPLETED = "completed"  # boot one-shot that ran and exited
 
 _DEFAULT_STALE_MULTIPLIER = 3.0
 _DEFAULT_DEDUP_MIN = 30
+
+# Threads owned by the runtime and its libraries, never by this repo. They are
+# excluded from the "not in the catalog" bucket because that bucket is a
+# to-do list — it means "worth cataloguing" — and nobody should ever add
+# ``ThreadPoolExecutor-8_1`` to the catalog. Without this filter the live
+# process contributes ~24 such rows and buries the handful of genuinely
+# uncatalogued application threads.
+#
+# They are counted, not silently dropped: the count rides in the summary as
+# ``runtime_suppressed`` and is shown in the UI.
+_RUNTIME_THREAD_PATTERNS = (
+    re.compile(r"^MainThread$"),
+    re.compile(r"^Thread-\d+"),  # anonymous stdlib threads, incl. "Thread-9 (foo)"
+    re.compile(r"^ThreadPoolExecutor-"),
+    re.compile(r"^asyncio_\d+$"),
+    re.compile(r"^eventbus_\d+$"),
+    re.compile(r"^APScheduler$"),
+    re.compile(r"^Tornado selector$"),
+    re.compile(r"^waitress"),
+    re.compile(r"^pydevd"),
+    # Per-call ephemeral workers this repo spawns and reaps within one request;
+    # they are deliberately outside the catalog (see the module docstring).
+    re.compile(r"^connect-cb-"),
+    re.compile(r"^openalgo-claude-"),
+    re.compile(r"^openalgo-kaleido-"),
+)
+
+
+def _is_runtime_thread(name: str) -> bool:
+    """True for library/runtime threads that must never be catalogued."""
+    return any(pattern.match(name) for pattern in _RUNTIME_THREAD_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -394,17 +426,6 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_PROTECTED,
     ),
     ThreadSpec(
-        thread_name="futures_follow_rehydrate",
-        label="futures_follow rehydrate",
-        group=GROUP_BOOT,
-        owner="services/futures_follow_service.py",
-        description=(
-            "Rebuilds open-lot state from the position book so T+1 exits know "
-            "what to close (the issue #497 read path)."
-        ),
-        tier=TIER_PROTECTED,
-    ),
-    ThreadSpec(
         thread_name="IntradayPullbackBootResume",
         label="intraday_pullback resume",
         group=GROUP_BOOT,
@@ -562,9 +583,11 @@ def snapshot() -> list[dict]:
         )
 
     # Anything alive that the catalog does not know about. Surfaced rather than
-    # hidden so a newly-added thread shows up as a gap to be catalogued.
+    # hidden so a newly-added thread shows up as a gap to be catalogued —
+    # minus the runtime/library threads, which are never ours to catalog.
     known = set(_BY_NAME)
-    for name in sorted(live - known):
+    unknown = sorted(live - known)
+    for name in (n for n in unknown if not _is_runtime_thread(n)):
         rows.append(
             {
                 "thread_name": name,
@@ -601,6 +624,11 @@ def summarize(rows: list[dict] | None = None) -> dict:
         "dead": sum(1 for r in catalogued if r["state"] == STATE_DEAD),
         "not_started": sum(1 for r in catalogued if r["state"] == STATE_NOT_STARTED),
         "unregistered": sum(1 for r in rows if r["group"] == "unregistered"),
+        # Reported, not silently dropped — a hidden count is how a filter turns
+        # into a lie about what is running.
+        "runtime_suppressed": sum(
+            1 for name in _live_thread_names() - set(_BY_NAME) if _is_runtime_thread(name)
+        ),
     }
 
 

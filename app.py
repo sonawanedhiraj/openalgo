@@ -1423,6 +1423,9 @@ def setup_environment(app):
             # We do this on a background thread so a slow WhatsApp handshake
             # never delays the Flask boot.
             def _autostart_whatsapp_bot():
+                from services.thread_registry import beat as _beat
+
+                _beat("WhatsAppAutoStart")
                 try:
                     from database.whatsapp_db import get_bot_config
                     from services.whatsapp_bot_service import whatsapp_bot_service
