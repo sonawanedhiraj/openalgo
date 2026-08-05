@@ -1079,6 +1079,10 @@ class Open15BreakoutService:
         self._capture_universe = False
         self._first_min_buffer: dict[str, list[tuple]] = {}
         self._capture_flushed = False
+        # per-day dedup for the broker-rejection alert (issue #548): a static-IP
+        # or RMS block rejects EVERY entry the same way, and three identical
+        # Telegram messages is how an alert channel gets muted.
+        self._rejection_alert_date: str | None = None
 
     def _log_event(self, event: str, **detail: Any) -> None:
         rec = {
@@ -1328,10 +1332,191 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: reschedule failed for %s", job_id)
 
+    def _broker_qty(self, symbol: str, exchange: str) -> int | None:
+        """Net quantity this strategy holds in ``symbol``, or None if unknown.
+
+        Used to decide whether a broker-rejected entry (issue #548) really left
+        us flat. ``mode_key`` is mandatory: it routes the READ to the same book
+        the order was routed to, which is the #497 rule — without it a sandbox
+        strategy reads the empty LIVE book and concludes it is flat.
+
+        Returns ``None`` on any failure — the caller papers an unverifiable
+        symbol rather than squaring it off. That is the safer direction: an
+        unnecessary square-off SELL against a position that was never opened is
+        a naked short, whereas a genuinely-filled lot left as paper is still
+        caught by the broker's own 15:15 MIS auto-square-off. Only an
+        AFFIRMATIVE non-zero book quantity justifies sending an order.
+        """
+        try:
+            from database.auth_db import get_first_available_api_key
+            from services.positionbook_service import get_positionbook
+
+            api_key = get_first_available_api_key()
+            if not api_key:
+                logger.warning("open15: no api key — cannot verify book for %s", symbol)
+                return None
+            ok, resp, _ = get_positionbook(api_key=api_key, mode_key=STRATEGY_NAME)
+            if not ok:
+                logger.warning("open15: positionbook read failed for %s: %s", symbol, resp)
+                return None
+            for row in (resp or {}).get("data") or []:
+                if (
+                    str(row.get("symbol") or "").upper() == symbol.upper()
+                    and str(row.get("exchange") or "").upper() == exchange.upper()
+                ):
+                    return int(float(row.get("quantity") or 0))
+            return 0
+        except Exception:
+            logger.exception("open15: positionbook verify raised for %s", symbol)
+            return None
+
+    def _resolve_paper_position(self, symbol: str, pos: dict) -> bool:
+        """True if ``pos`` is confirmed flat and may be priced as paper (#548).
+
+        A 403/RMS rejection is unambiguous, but a timeout or a dropped response
+        is not: the order may have reached the exchange. Rather than guess, ask
+        the book. Only an AFFIRMATIVE non-zero quantity promotes the row back to
+        a real ``open`` position so the normal square-off runs. An unreadable
+        book (``None``) is papered with a loud warning — sending a square-off we
+        cannot justify would open a naked position, while a genuinely-filled lot
+        left as paper is still caught by the 15:15 MIS auto-square-off.
+        """
+        is_option = pos.get("instrument") == "option"
+        sym = pos["opt_symbol"] if is_option else symbol
+        qty = self._broker_qty(sym, "NFO" if is_option else "NSE")
+        if qty:
+            logger.warning(
+                "open15: rejected entry %s actually HOLDS %s in the book — "
+                "squaring off for real instead of recording a paper fill",
+                sym,
+                qty,
+            )
+            with self._lock:
+                self.positions[symbol]["status"] = "open"
+                self.positions[symbol]["fill"] = "real"
+            self._log_event(
+                "rejection_unverified",
+                symbol=symbol,
+                contract=pos.get("opt_symbol"),
+                book_qty=qty,
+                action="squaring off as a real position",
+            )
+            return False
+        if qty is None:
+            logger.warning(
+                "open15: could not read the position book for %s — recording the "
+                "rejected entry as PAPER unverified (no square-off sent; a real "
+                "fill would still be squared off by the 15:15 MIS auto-square-off)",
+                sym,
+            )
+            self._log_event(
+                "rejection_unverified",
+                symbol=symbol,
+                contract=pos.get("opt_symbol"),
+                book_qty=None,
+                action="papered without book confirmation",
+            )
+        return True
+
+    def _flatten_paper(self, symbol: str, pos: dict, reason: str) -> None:
+        """Close a broker-rejected entry as a PAPER fill (issue #548).
+
+        Places NO order — there is no position to close. Prices the exit exactly
+        where a real flatten would have, so the row carries the full
+        sandbox-equivalent measurement (exit price, gross P&L, modelled charges)
+        and the day stays comparable to one that traded.
+        """
+        from database.open15_breakout_db import update_trade
+
+        is_option = pos.get("instrument") == "option"
+        fields = {
+            "exit_ts": dt.datetime.now(IST).isoformat(),
+            "exit_order_id": "",
+            "exit_status": "not_placed",
+            "status": "rejected",
+            "fill": "paper",
+            "reason": reason if reason != "eod_0930" else "entry_rejected",
+            "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
+        }
+        pnl = charges = None
+        exit_px = None
+        if is_option:
+            from services.open15_option_shadow import option_round_trip_charges
+
+            entry_prem = pos.get("opt_entry_premium")
+            exit_px, exit_volume, exit_oi = self._option_liquidity(pos["opt_symbol"])
+            fields.update(opt_exit_volume=exit_volume, opt_exit_oi=exit_oi)
+            lot = pos.get("opt_lot_size") or 1
+            lots = pos["quantity"] // lot if lot else 1
+            if entry_prem and exit_px:
+                pnl = (exit_px - entry_prem) * pos["quantity"]
+                charges = option_round_trip_charges(
+                    entry_prem * pos["quantity"], exit_px * pos["quantity"]
+                )
+                per_lot_charges = round(charges / lots, 2) if charges and lots else None
+                fields.update(
+                    opt_exit_premium=exit_px,
+                    opt_charges_inr=per_lot_charges,
+                    opt_pnl=round((exit_px - entry_prem) * lot - (per_lot_charges or 0.0), 2),
+                )
+            else:
+                # left unpriced rather than guessed — the summary's `opt_shadow`
+                # catch-up re-prices it from 1m bars once the broker publishes them
+                logger.warning(
+                    "open15: paper exit premium unavailable for %s — pnl unpriced",
+                    pos.get("opt_symbol"),
+                )
+        else:
+            exit_px = (self.core.last_price.get(symbol) if self.core else None) or pos[
+                "trigger_price"
+            ]
+            fields["exit_price"] = exit_px
+            d = (
+                (exit_px - pos["trigger_price"])
+                if pos["side"] == "L"
+                else (pos["trigger_price"] - exit_px)
+            )
+            pnl = d * pos["quantity"]
+            buy_px = pos["trigger_price"] if pos["side"] == "L" else exit_px
+            sell_px = exit_px if pos["side"] == "L" else pos["trigger_price"]
+            charges = mis_round_trip_charges(buy_px * pos["quantity"], sell_px * pos["quantity"])
+        fields["pnl"] = pnl
+        fields["charges_inr"] = charges
+        if pos.get("row_id"):
+            update_trade(pos["row_id"], **fields)
+        with self._lock:
+            pos["status"] = "closed"
+        self._log_event(
+            "exit_paper",
+            symbol=symbol,
+            instrument="option" if is_option else "stock",
+            contract=pos.get("opt_symbol"),
+            qty=pos["quantity"],
+            exit_price=exit_px,
+            gross=round(pnl, 2) if pnl is not None else None,
+            charges=charges,
+            pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
+            fill="paper",
+            reason=reason,
+            note="order was rejected — sandbox-equivalent, no money moved",
+        )
+
     def flatten(self, reason: str = "eod_0930") -> None:
         """Configured exit time (default 09:30 IST) — market-out every open
-        position (also the +2 min retry backstop)."""
+        position (also the +2 min retry backstop).
+
+        Broker-rejected entries (``status='paper'``, issue #548) are resolved
+        here too: verified flat against the book, then priced as paper fills
+        with NO order placed. They are handled first so a position promoted back
+        to ``open`` by the verification is squared off in this same pass.
+        """
         from database.open15_breakout_db import update_trade
+
+        with self._lock:
+            paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
+        for symbol, pos in paper_pos.items():
+            if self._resolve_paper_position(symbol, pos):
+                self._flatten_paper(symbol, pos, reason)
 
         with self._lock:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
@@ -1366,6 +1551,7 @@ class Open15BreakoutService:
                 "exit_order_id": str(resp.get("orderid") or ""),
                 "exit_status": "success" if ok else "error",
                 "status": "closed" if ok else "error",
+                "fill": "real",
                 "reason": reason,
                 "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
             }
@@ -1475,6 +1661,10 @@ class Open15BreakoutService:
             return
         n_sel = len(self.core.selected)
         n_ent = len(self.core.entered)
+        # `core.entered` counts TRIGGERS, not placements — on 2026-08-05 it read
+        # 5 on a day with zero fills (2 unaffordable skips + 3 broker rejections).
+        # Report what actually happened alongside it (issue #548).
+        n_real, n_paper = self._count_fills()
         drifts = []
         for s, rec in self.core.entered.items():
             close = self.core.entry_minute_close(s)
@@ -1493,6 +1683,8 @@ class Open15BreakoutService:
             "summary",
             selected=n_sel,
             entered=n_ent,
+            filled=n_real,
+            paper=n_paper,
             # seed vs rolling split (issue #529): `selected` counts the whole
             # watch list, so without this the seed cohort is unreadable
             rolling_added=len(self.core.rolling_adds),
@@ -1761,6 +1953,114 @@ class Open15BreakoutService:
         if universe_mode or symbol in core.selected:
             self._tick_writer.enqueue(symbol, price, int(cumvol), ts)
 
+    # ---- broker-rejection handling (issue #548) --------------------------- #
+    @staticmethod
+    def _order_error(resp: dict) -> str:
+        """The broker's rejection text, trimmed for storage/display.
+
+        Falls back to a marker rather than an empty string: a rejection whose
+        cause we failed to extract must still be visibly a rejection, not a
+        blank cell that reads like "no reason given, probably fine".
+        """
+        msg = (resp or {}).get("message") or (resp or {}).get("error") or ""
+        msg = str(msg).strip()
+        return msg[:500] if msg else "broker rejected the order (no message returned)"
+
+    def _count_fills(self) -> tuple[int, int]:
+        """``(real, paper)`` position counts (issue #548).
+
+        A rejected entry frees its ``max_trades`` slot — it is not a trade, and
+        on 2026-08-05 three rejections consumed the whole daily cap. Paper fills
+        carry their own cap so a persistently-rejecting broker (static IP, RMS
+        block) cannot simulate an unbounded number of trades and leave the day
+        incomparable to a normal one.
+        """
+        with self._lock:
+            vals = list(self.positions.values())
+        paper = sum(1 for p in vals if p.get("fill") == "paper")
+        return len(vals) - paper, paper
+
+    def _alert_rejection(self, symbol: str, qty: int, msg: str) -> None:
+        """Log loudly + Telegram once per day. Never raises into the entry path."""
+        logger.error(
+            "[%s] open15 ENTRY REJECTED %s qty=%s — %s",
+            _mode(),
+            symbol,
+            qty,
+            msg,
+        )
+        today = dt.datetime.now(IST).strftime("%Y-%m-%d")
+        if self._rejection_alert_date == today:
+            return
+        self._rejection_alert_date = today
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().notify(
+                "open15_breakout",
+                f"⚠ open15_vol_breakout [{_mode()}]: broker REJECTED entry {symbol} "
+                f"qty={qty}\n{msg}\n\n"
+                f"No position was taken. Today's rejected entries are recorded as "
+                f"PAPER fills (simulated as if run in sandbox) so the day stays "
+                f"measurable — they are excluded from realized P&L.",
+            )
+        except Exception:
+            logger.exception("open15: rejection alert failed for %s", symbol)
+
+    def _journal_rejection(self, action: dict, row_kw: dict, qty: int, msg: str) -> None:
+        """Record a broker-rejected entry as a terminal PAPER row (issue #548).
+
+        The row keeps ``mode`` as the run's real mode — a paper row is never
+        disguised as a sandbox run — and is marked ``status='rejected'`` with
+        ``fill='paper'``. It is registered in ``self.positions`` so ``flatten``
+        prices the sandbox-equivalent exit at the normal exit time; beyond the
+        paper cap it is journaled terminal immediately with no pricing.
+        """
+        from database.open15_breakout_db import insert_trade
+
+        _real, n_paper = self._count_fills()
+        max_trades = int((self.day_config or {}).get("max_trades") or _max_trades_default())
+        priced = n_paper < max_trades
+        row_id = insert_trade(
+            **row_kw,
+            quantity=qty,
+            entry_order_id="",
+            entry_status="error",
+            status="rejected",
+            fill="paper" if priced else "none",
+            reason="entry_rejected" if priced else "entry_rejected_paper_cap",
+            error_message=msg,
+        )
+        if priced:
+            with self._lock:
+                self.positions[action["symbol"]] = {
+                    **action,
+                    "trigger_price": action["price"],
+                    "quantity": qty,
+                    "row_id": row_id,
+                    "status": "paper",
+                    "fill": "paper",
+                    **{
+                        k: row_kw[k]
+                        for k in ("instrument", "opt_symbol", "opt_lot_size", "opt_entry_premium")
+                        if k in row_kw
+                    },
+                }
+        self._log_event(
+            "entry_rejected",
+            symbol=action["symbol"],
+            instrument=row_kw.get("instrument", "stock"),
+            contract=row_kw.get("opt_symbol"),
+            qty=qty,
+            entry_price=row_kw.get("opt_entry_premium") or round(action["price"], 2),
+            watch_source=action.get("watch_source") or "seed",
+            error=msg,
+            fill="paper" if priced else "none",
+            paper_capped=not priced,
+            slot_released=True,
+        )
+        self._alert_rejection(action["symbol"], qty, msg)
+
     def _journal_skip(self, action: dict, reason: str, **extra) -> None:
         """Journal a trigger that did NOT place an order (cap / sizing skips)."""
         from database.open15_breakout_db import insert_trade
@@ -1796,9 +2096,11 @@ class Open15BreakoutService:
 
         cfg = self.day_config or {}
         max_trades = int(cfg.get("max_trades") or _max_trades_default())
-        with self._lock:
-            n_placed = len(self.positions)
-        if n_placed >= max_trades:
+        # only REAL fills consume the daily cap (issue #548) — a broker-rejected
+        # entry is not a trade, and letting rejections eat the cap is how three
+        # static-IP 403s used up the whole 2026-08-05 budget
+        n_real, _n_paper = self._count_fills()
+        if n_real >= max_trades:
             self._journal_skip(action, "max_trades_cap", instrument=cfg.get("instrument", "stock"))
             return
         if cfg.get("instrument") == "atm_option":
@@ -1812,24 +2114,31 @@ class Open15BreakoutService:
             _mode(), {"symbol": action["symbol"], "action": side_word, "quantity": qty}
         )
         ok = resp.get("status") == "success"
+        row_kw = {
+            "trade_date": dt.datetime.now(IST).strftime("%Y-%m-%d"),
+            "symbol": action["symbol"],
+            "side": action["side"],
+            "mode": _mode(),
+            "instrument": "stock",
+            "gap_pct": action["gap_pct"],
+            "level": action["level"],
+            "baseline_vol": action["baseline_vol"],
+            "cum_vol_at_trigger": action["cum_vol_at_trigger"],
+            "trigger_minute": action["trigger_minute"],
+            "trigger_second": action["trigger_second"],
+            "trigger_price": action["price"],
+            "watch_source": action.get("watch_source") or "seed",
+        }
+        if not ok:
+            self._journal_rejection(action, row_kw, qty, self._order_error(resp))
+            return
         row_id = insert_trade(
-            trade_date=dt.datetime.now(IST).strftime("%Y-%m-%d"),
-            symbol=action["symbol"],
-            side=action["side"],
-            mode=_mode(),
-            instrument="stock",
-            gap_pct=action["gap_pct"],
-            level=action["level"],
-            baseline_vol=action["baseline_vol"],
-            cum_vol_at_trigger=action["cum_vol_at_trigger"],
-            trigger_minute=action["trigger_minute"],
-            trigger_second=action["trigger_second"],
-            trigger_price=action["price"],
+            **row_kw,
             quantity=qty,
-            watch_source=action.get("watch_source") or "seed",
             entry_order_id=str(resp.get("orderid") or ""),
-            entry_status="success" if ok else "error",
-            status="open" if ok else "error",
+            entry_status="success",
+            status="open",
+            fill="real",
         )
         with self._lock:
             self.positions[action["symbol"]] = {
@@ -1837,7 +2146,8 @@ class Open15BreakoutService:
                 "trigger_price": action["price"],
                 "quantity": qty,
                 "row_id": row_id,
-                "status": "open" if ok else "error",
+                "status": "open",
+                "fill": "real",
             }
         self._log_event(
             "entry",
@@ -1915,29 +2225,36 @@ class Open15BreakoutService:
             {"symbol": contract["symbol"], "action": "BUY", "quantity": qty, "exchange": "NFO"},
         )
         ok = resp.get("status") == "success"
+        row_kw = {
+            "trade_date": today,
+            "symbol": action["symbol"],
+            "side": action["side"],
+            "mode": _mode(),
+            "instrument": "option",
+            "gap_pct": action["gap_pct"],
+            "level": action["level"],
+            "baseline_vol": action["baseline_vol"],
+            "cum_vol_at_trigger": action["cum_vol_at_trigger"],
+            "trigger_minute": action["trigger_minute"],
+            "trigger_second": action["trigger_second"],
+            "trigger_price": action["price"],
+            "watch_source": action.get("watch_source") or "seed",
+            "opt_symbol": contract["symbol"],
+            "opt_lot_size": lot,
+            "opt_entry_premium": premium,
+            "opt_entry_volume": opt_volume,
+            "opt_entry_oi": opt_oi,
+        }
+        if not ok:
+            self._journal_rejection(action, row_kw, qty, self._order_error(resp))
+            return
         row_id = insert_trade(
-            trade_date=today,
-            symbol=action["symbol"],
-            side=action["side"],
-            mode=_mode(),
-            instrument="option",
-            gap_pct=action["gap_pct"],
-            level=action["level"],
-            baseline_vol=action["baseline_vol"],
-            cum_vol_at_trigger=action["cum_vol_at_trigger"],
-            trigger_minute=action["trigger_minute"],
-            trigger_second=action["trigger_second"],
-            trigger_price=action["price"],
+            **row_kw,
             quantity=qty,
-            watch_source=action.get("watch_source") or "seed",
-            opt_symbol=contract["symbol"],
-            opt_lot_size=lot,
-            opt_entry_premium=premium,
-            opt_entry_volume=opt_volume,
-            opt_entry_oi=opt_oi,
             entry_order_id=str(resp.get("orderid") or ""),
-            entry_status="success" if ok else "error",
-            status="open" if ok else "error",
+            entry_status="success",
+            status="open",
+            fill="real",
         )
         with self._lock:
             self.positions[action["symbol"]] = {
@@ -1945,7 +2262,8 @@ class Open15BreakoutService:
                 "trigger_price": action["price"],
                 "quantity": qty,
                 "row_id": row_id,
-                "status": "open" if ok else "error",
+                "status": "open",
+                "fill": "real",
                 "instrument": "option",
                 "opt_symbol": contract["symbol"],
                 "opt_lot_size": lot,

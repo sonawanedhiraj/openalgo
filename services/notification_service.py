@@ -232,6 +232,12 @@ class NotificationService:
             # daily restart cap is exhausted. Default ON. Caller:
             # services/ws_proxy_supervisor.py.
             "ws_proxy_died": _env_bool("NOTIFY_WS_PROXY_DIED", default=True),
+            # open15_vol_breakout broker-rejected entry (issue #548). Fires once
+            # per day when the broker refuses an entry order (static-IP block,
+            # RMS reject) — the strategy took no position and the trade is
+            # recorded as a PAPER fill instead. Default ON. Caller:
+            # services/open15_breakout_service.py.
+            "open15_breakout": _env_bool("NOTIFY_OPEN15_BREAKOUT", default=True),
         }
         # Whether to deliver messages for event_types NOT in per_event (i.e.
         # future callers that ship without a registry entry). When True (default)
