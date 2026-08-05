@@ -1641,6 +1641,18 @@ class Open15BreakoutService:
         cumvol = float(tick.get("cumulative_volume") or 0)
         was_finalized = core.finalized
         action = core.on_tick(symbol, price, cumvol, tick_ts)
+        # Log the SEED selection the instant it finalizes — BEFORE the re-rank
+        # below can append to ``core.selected`` (issue #545). This used to live
+        # in ``_capture_tick``, which runs after the re-rank, so the first
+        # pass's rolling adds were recorded as seed picks (and carried their
+        # 09:15 open gap where their %-at-add belonged). Emitting it here also
+        # means the decision log keeps its selection record when tick capture
+        # is switched off — ``_capture_tick`` returns early with no writer.
+        if not was_finalized and core.finalized:
+            try:
+                self._log_selection_event(core)
+            except Exception:
+                logger.exception("open15: selection event log failed")
         # additive re-rank (issue #529) — self-throttled to the configured
         # cadence, and a no-op entirely when the feature is off
         if core.rolling_enabled:
@@ -1686,6 +1698,24 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: tick handling failed")
 
+    def _log_selection_event(self, core: Open15Core) -> None:
+        """Record the 09:16 SEED picks in the decision log (issue #545).
+
+        ``watch_source`` is the authoritative seed-vs-rolling split, so the
+        filter here holds even if a future change reorders the caller — the
+        ordering fragility it guards against is exactly what caused #545.
+        """
+        seed = [s for s in core.selected if core.watch_source.get(s, "seed") == "seed"]
+        self._log_event(
+            "selection",
+            selected={s: core.selected[s] for s in seed},
+            gaps_pct={s: round(core.gaps.get(s, 0) * 100, 2) for s in seed},
+            # issue #456 provenance: the exact prev-close each gap divided by,
+            # so a selection oddity is auditable straight from the day log
+            prev_closes={s: core.prev_closes.get(s) for s in seed},
+            candidates=len(core.gaps),
+        )
+
     def _capture_tick(
         self,
         core: Open15Core,
@@ -1728,15 +1758,6 @@ class Open15BreakoutService:
                     for p, v, t in self._first_min_buffer.get(sym, []):
                         self._tick_writer.enqueue(sym, p, v, t)
             self._first_min_buffer = {}
-            self._log_event(
-                "selection",
-                selected=dict(core.selected),
-                gaps_pct={s: round(core.gaps.get(s, 0) * 100, 2) for s in core.selected},
-                # issue #456 provenance: the exact prev-close each gap divided by,
-                # so a selection oddity is auditable straight from the day log
-                prev_closes={s: core.prev_closes.get(s) for s in core.selected},
-                candidates=len(core.gaps),
-            )
         if universe_mode or symbol in core.selected:
             self._tick_writer.enqueue(symbol, price, int(cumvol), ts)
 
