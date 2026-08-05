@@ -243,14 +243,20 @@ def _all_day_logs() -> list[tuple[str, list, str]]:
 @check_session_validity
 def decision_log_days():
     """Digest of every stored day for the history sidebar (issue #444)."""
-    from database.open15_breakout_db import trades_pnl_by_date
+    from database.open15_breakout_db import paper_pnl_by_date, trades_pnl_by_date
     from services.open15_log_view import summarize_day
 
     try:
         pnl_by_date = trades_pnl_by_date()
+        paper_by_date = paper_pnl_by_date()
         out = []
         for date, events, source in _all_day_logs():
-            digest = summarize_day(date, events, trades_pnl=pnl_by_date.get(date))
+            digest = summarize_day(
+                date,
+                events,
+                trades_pnl=pnl_by_date.get(date),
+                paper_pnl=paper_by_date.get(date),
+            )
             digest["source"] = source
             out.append(digest)
         return jsonify({"days": out})
@@ -290,6 +296,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  th{color:#8aa0b4} .ev-entry{color:#a6e3a1}.ev-exit{color:#f9e2af}.ev-no_entry{color:#f38ba8}
  .ev-selection{color:#89b4fa}.ev-armed{color:#94e2d5}.ev-summary{color:#cba6f7}
  .ev-watch_stats{color:#8aa0b4}.ev-watchlist_add{color:#f5c2e7}
+ .ev-entry_rejected,.ev-rejection_unverified{color:#f38ba8;font-weight:bold}
+ .ev-exit_paper{color:#f9e2af}
  .b-seed{background:#1b2b3a;color:#89b4fa}.b-roll{background:#3a2436;color:#f5c2e7}
  .ev-skipped_late_boot,.ev-skipped_no_prev_closes{color:#f38ba8;font-weight:bold}
  input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
@@ -303,6 +311,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .pos{color:#a6e3a1}.neg{color:#f38ba8}
  .badge{font-size:10px;border-radius:8px;padding:1px 7px}
  .b-live{background:#12324a;color:#89b4fa}.b-skip{background:#463a20;color:#f9e2af}
+ .b-paper{background:#463a20;color:#f9e2af}
+ .rejbanner{background:#2a1416;border-left:3px solid #f38ba8;padding:9px 12px;margin-bottom:12px}
+ .rejbanner .rt{color:#f38ba8}.rejbanner .rm{color:#8aa0b4;margin-top:4px}
+ .rejbanner .rn{color:#6b7886;margin-top:4px}
  .main{flex:1;min-width:0}
  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
  .chip{background:#161d25;border-radius:6px;padding:6px 12px}
@@ -352,6 +364,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  </div>
  <div class="main">
   <div id="status" class="muted"></div>
+  <div id="rejbox"></div>
   <div class="chips" id="chips"></div>
   <div class="sec">rolling watch-list <span id="rollCfg" class="muted"></span></div>
   <table id="roll"><thead><tr><th style="width:90px">time</th><th>symbol</th><th>side</th>
@@ -443,7 +456,9 @@ let curDate=null, curEvents=[], curFilter='all', digests=[];
 let liveWatch={}, liveNeeded=null;
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function kindOf(e){
-  if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped')return 'trade';
+  if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped'||
+     e.event==='entry_rejected'||e.event==='exit_paper'||
+     e.event==='rejection_unverified')return 'trade';
   if(e.event==='no_entry')return 'no_entry';
   return 'sys';
 }
@@ -455,12 +470,23 @@ async function loadDays(){
     const el=document.createElement('div');
     el.className='day'+(d.date===curDate?' sel':'');
     const skip=d.status&&d.status.startsWith('skipped');
+    const amt=(v)=>'<span class="'+(v>=0?'pos':'neg')+'">'+(v>=0?'+':'')+
+      '&#8377;'+Math.round(v)+'</span>';
+    // a paper day shows its simulated P&L ONLY behind the badge (issue #548) —
+    // an unbadged number in this column reads as money that was actually made.
+    // Keyed off paper_pnl too, not just the event count: a day repaired by the
+    // one-off backfill has paper P&L in the DB, and showing that number bare
+    // would be exactly the failure this badge exists to prevent.
+    const isPaper=(d.paper>0)||(d.paper_pnl!=null);
+    const paperTag=isPaper?'<span class="badge b-paper">paper</span> ':'';
     const right=d.source==='live'?'<span class="badge b-live">live</span>'
       :skip?'<span class="badge b-skip">skipped</span>'
-      :(d.pnl==null?'<span class="muted">—</span>'
-        :'<span class="'+(d.pnl>=0?'pos':'neg')+'">'+(d.pnl>=0?'+':'')+'&#8377;'+Math.round(d.pnl)+'</span>');
+      :(d.pnl!=null?amt(d.pnl)
+        :(d.paper_pnl!=null?(paperTag+amt(d.paper_pnl))
+          :(isPaper?paperTag:'<span class="muted">&mdash;</span>')));
     el.innerHTML='<div class="d1"><span>'+esc(d.date)+'</span>'+right+'</div>'+
-      '<div class="muted">'+(skip?esc(d.status):(d.selected+' sel &middot; '+d.entered+' entered'))+'</div>';
+      '<div class="muted">'+(skip?esc(d.status):(d.selected+' sel &middot; '+d.entered+
+        ' filled'+(d.paper?(' &middot; '+d.paper+' paper'):'')))+'</div>';
     el.onclick=()=>selectDay(d.date);
     box.appendChild(el);
   }
@@ -480,21 +506,49 @@ async function selectDay(date){
   curEvents=j.events||[];
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
-  renderChips(); renderRolling(); renderSel(); renderTimeline();
+  renderRejected(); renderChips(); renderRolling(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
+}
+function renderRejected(){
+  // broker-rejected entries (issue #548): no position was taken, and every
+  // number on those rows is a sandbox-equivalent simulation. Say so once,
+  // loudly, above the numbers — not in a tooltip.
+  const rej=curEvents.filter(e=>e.event==='entry_rejected');
+  const box=document.getElementById('rejbox');
+  if(!rej.length){box.innerHTML='';return;}
+  const msgs=[...new Set(rej.map(e=>e.error).filter(Boolean))];
+  const capped=rej.filter(e=>e.paper_capped).length;
+  box.innerHTML='<div class="rejbanner"><div class="rt">'+rej.length+
+    ' '+(rej.length===1?'entry':'entries')+' rejected by broker — no live position was taken</div>'+
+    msgs.map(m=>'<div class="rm">'+esc(m)+'</div>').join('')+
+    '<div class="rn">Values below are simulated as if the day had run in sandbox. No money moved.'+
+    (capped?(' '+capped+' beyond the paper cap '+(capped===1?'was':'were')+' left unpriced.'):'')+
+    '</div></div>';
 }
 function renderChips(){
   const armed=curEvents.find(e=>e.event==='armed')||{};
   const summ=curEvents.find(e=>e.event==='summary')||{};
   const dig=digests.find(d=>d.date===curDate)||{};
+  const filled=dig.entered??summ.filled??0;
+  const paper=dig.paper??summ.paper??0;
+  const rupee=v=>(v>=0?'+':'')+'\\u20B9'+Math.round(v);
+  // real and paper P&L are NEVER summed into one figure — paper money was
+  // never made, and blending them is how a rejected day reads as a traded one
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
-    ['entries',(dig.entered??summ.entered??0)+' / '+(dig.selected??summ.selected??0)],
-    ['day P&amp;L',dig.pnl==null?'—':((dig.pnl>=0?'+':'')+'\\u20B9'+Math.round(dig.pnl))]];
-  document.getElementById('chips').innerHTML=chips.map(([k,v])=>
-    '<div class="chip"><span class="k">'+k+'</span><span class="v'+
-    (k==='day P&amp;L'&&dig.pnl!=null?(dig.pnl>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>').join('');
+    ['entries',filled+' filled'+(paper?(' &middot; '+paper+' paper'):'')+
+      ' / '+(dig.selected??summ.selected??0)+' sel'],
+    ['real P&amp;L',dig.pnl==null?'—':rupee(dig.pnl)]];
+  if(paper||dig.paper_pnl!=null)
+    chips.push(['paper P&amp;L',dig.paper_pnl==null?'—':rupee(dig.paper_pnl)]);
+  document.getElementById('chips').innerHTML=chips.map(([k,v])=>{
+    const isPaper=(k==='paper P&amp;L'), isReal=(k==='real P&amp;L');
+    const val=isPaper?dig.paper_pnl:(isReal?dig.pnl:null);
+    return '<div class="chip"'+(isPaper?' style="border:1px solid #463a20"':'')+
+      '><span class="k">'+k+'</span><span class="v'+
+      (val!=null?(val>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>';
+  }).join('');
 }
 function srcBadge(src){
   return '<span class="badge '+(src==='rolling'?'b-roll':'b-seed')+'">'+esc(src||'seed')+'</span>';
@@ -568,7 +622,13 @@ function renderSel(){
     }else if(e.event==='entry'){
       rows[e.symbol].out='<span class="pos">entered @ '+e.trigger_price+
         (e.vol_ratio?(' &middot; vol '+e.vol_ratio+'&times;'):'')+'</span>';
-    }else if(e.event==='exit'&&e.pnl!=null){
+    }else if(e.event==='entry_rejected'){
+      // issue #548 — the order never reached the market; what follows is a
+      // sandbox-equivalent simulation and is badged as such
+      rows[e.symbol].out='<span class="badge b-paper">paper</span> '+
+        '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
+        esc(e.entry_price)+'</span>';
+    }else if((e.event==='exit'||e.event==='exit_paper')&&e.pnl!=null){
       rows[e.symbol].out+=' <span class="'+(e.pnl>=0?'pos':'neg')+'">&rarr; '+
         (e.pnl>=0?'+':'')+'&#8377;'+e.pnl+'</span>';
     }else if(e.event==='no_entry'){
@@ -690,6 +750,10 @@ def trades():
                     "pnl": r.pnl,
                     "status": r.status,
                     "reason": r.reason,
+                    # real fill vs broker-rejected paper simulation (issue #548).
+                    # NULL on pre-#548 rows — those are all real.
+                    "fill": r.fill or "real",
+                    "error_message": r.error_message,
                 }
                 for r in rows
             ]

@@ -102,8 +102,19 @@ class Open15Trade(Base):
     # for the measurement — without it the two cohorts cannot be scored apart.
     # NULL on rows written before #529 shipped; read as ``seed``.
     watch_source = Column(String(8), nullable=True)
-    status = Column(String(16), default="open")  # open / closed / error / observe
+    status = Column(String(16), default="open")  # open / closed / error / observe / rejected
+    # Did an order actually fill (issue #548)? ``real`` = the broker accepted it;
+    # ``paper`` = the broker REJECTED the entry and every price/P&L field on this
+    # row is a sandbox-equivalent simulation of what the trade would have done.
+    # NULL on rows written before #548 shipped; read as ``real``.
+    #
+    # Load-bearing: ``mode`` still records what the run genuinely was (``live``)
+    # — a paper row must never be disguised as a sandbox run, and paper P&L must
+    # never be summed into realized P&L (see ``total_realized_pnl``).
+    fill = Column(String(8), nullable=True)
     reason = Column(String(64), nullable=True)
+    # full broker rejection text — ``reason`` stays a short machine-readable code
+    error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -176,6 +187,8 @@ def _ensure_columns():
             "opt_exit_volume": "INTEGER",
             "opt_exit_oi": "INTEGER",
             "watch_source": "VARCHAR(8)",
+            "fill": "VARCHAR(8)",
+            "error_message": "TEXT",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -285,13 +298,29 @@ def save_config(
         db_session.remove()
 
 
+# A row is a REAL fill unless it is explicitly marked paper (issue #548). Written
+# as a NULL-tolerant predicate so every row created before the column existed —
+# and every row a future writer forgets to stamp — counts as real, which is the
+# safe direction: a mislabelled paper row would inflate realized P&L, whereas a
+# mislabelled real row only understates it.
+_REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill != "paper")
+
+
 def total_realized_pnl() -> float:
-    """Sum of research P&L across closed trades (drives compound sizing)."""
+    """Sum of research P&L across closed trades (drives compound sizing).
+
+    **Paper rows are excluded** (issue #548). A broker-rejected entry is priced
+    as a sandbox-equivalent simulation so the day stays measurable, but that
+    money was never made — compounding tomorrow's position size off it would
+    size real orders against fictional capital.
+    """
     try:
         from sqlalchemy import func
 
         val = (
-            db_session.query(func.sum(Open15Trade.pnl)).filter(Open15Trade.pnl.isnot(None)).scalar()
+            db_session.query(func.sum(Open15Trade.pnl))
+            .filter(Open15Trade.pnl.isnot(None), _REAL_FILL)
+            .scalar()
         )
         return float(val or 0.0)
     except Exception:
@@ -347,23 +376,38 @@ def list_day_logs() -> list[tuple[str, list]]:
         db_session.remove()
 
 
-def trades_pnl_by_date() -> dict[str, float]:
-    """Gross journal P&L per trade_date (``pnl`` column, charges not deducted)."""
+def _pnl_by_date(paper: bool) -> dict[str, float]:
+    """Gross journal P&L per trade_date for one fill class (issue #548)."""
     try:
         from sqlalchemy import func
 
+        pred = (Open15Trade.fill == "paper") if paper else _REAL_FILL
         rows = (
             db_session.query(Open15Trade.trade_date, func.sum(Open15Trade.pnl))
-            .filter(Open15Trade.pnl.isnot(None))
+            .filter(Open15Trade.pnl.isnot(None), pred)
             .group_by(Open15Trade.trade_date)
             .all()
         )
         return {d: round(float(v), 2) for d, v in rows if v is not None}
     except Exception:
-        logger.exception("open15: per-date pnl aggregation failed")
+        logger.exception("open15: per-date pnl aggregation failed (paper=%s)", paper)
         return {}
     finally:
         db_session.remove()
+
+
+def trades_pnl_by_date() -> dict[str, float]:
+    """Gross REAL journal P&L per trade_date (charges not deducted).
+
+    Paper rows are excluded and reported separately by ``paper_pnl_by_date`` —
+    the history sidebar must never blend simulated money into a day's P&L.
+    """
+    return _pnl_by_date(paper=False)
+
+
+def paper_pnl_by_date() -> dict[str, float]:
+    """Gross PAPER journal P&L per trade_date (broker-rejected entries, #548)."""
+    return _pnl_by_date(paper=True)
 
 
 def get_day_log(trade_date: str) -> list | None:

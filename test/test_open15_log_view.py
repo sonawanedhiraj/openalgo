@@ -78,6 +78,10 @@ def test_summarize_day_traded():
         # a pre-#529 day has no watchlist_add events, so the rolling cohort is 0
         "rolling_added": 0,
         "entered": 1,
+        # a pre-#548 day has no entry_rejected/exit_paper events, so the paper
+        # cohort is empty and paper P&L is absent (not 0 — nothing was simulated)
+        "paper": 0,
+        "paper_pnl": None,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
     }

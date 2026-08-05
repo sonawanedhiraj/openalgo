@@ -2040,6 +2040,30 @@ ran in the 15:30-17:00 periodic window).
     the sandbox measurement phase needed to be an operator control rather than a
     code edit. First tunable cataloged for this strategy.
 
+## `NOTIFY_OPEN15_BREAKOUT`
+
+- **Default:** `true` (gated, as every `NOTIFY_*` is, by the master switch
+  `NOTIFY_TELEGRAM_ENABLED`).
+- **Where:** `services/notification_service.py` `per_event` registry; caller is
+  `services/open15_breakout_service.py` `_alert_rejection`.
+- **What it controls:** the operator Telegram alert when the broker REJECTS an
+  open15_vol_breakout entry order — no position was taken and the trade is
+  recorded as a PAPER fill instead.
+- **Deduped once per day, deliberately.** A static-IP or RMS block rejects every
+  entry with the identical message; on 2026-08-05 that would have been three
+  identical alerts. Repeated identical alerts are how a channel gets muted, and
+  a muted channel is worse than no alert.
+- **Failure mode:** the alert is fail-open — a dead Telegram bot never blocks or
+  delays an entry. The `logger.error` line (which reaches `log/errors.jsonl`)
+  fires unconditionally and is the durable record; Telegram is the nudge.
+- **History:**
+  - **2026-08-05:** Introduced by issue #548. Before it, open15 had **no alert
+    path at all** — three live entries were rejected with a static-IP 403 and
+    the only trace was an INFO decision-log line reading `order_status: error`,
+    with the broker's message discarded entirely. `sector_follow` had logged
+    `[live] … ENTRY REJECTED … <message>` at ERROR since its own build-out; this
+    brings open15 to parity and adds the Telegram leg.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

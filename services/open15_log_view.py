@@ -31,18 +31,36 @@ CSV_COLUMNS = [
     "exit_price",
     "pnl",
     "skip_reason",
+    # real fill vs broker-rejected paper simulation (issue #548) — load-bearing
+    # for any downstream scoring: a paper row's P&L never actually happened
+    "fill",
+    "error_message",
 ]
 
 
-def summarize_day(date: str, events: list[dict[str, Any]], trades_pnl: float | None = None) -> dict:
-    """One-line digest of a day's decision log for the history sidebar."""
+def summarize_day(
+    date: str,
+    events: list[dict[str, Any]],
+    trades_pnl: float | None = None,
+    paper_pnl: float | None = None,
+) -> dict:
+    """One-line digest of a day's decision log for the history sidebar.
+
+    ``entered`` counts REAL fills only. Broker-rejected entries (issue #548) are
+    counted and priced separately as ``paper`` / ``paper_pnl`` — a simulated day
+    must never be summed into a day's P&L, or the sidebar shows money that was
+    never made.
+    """
     status = "unknown"
     selected = 0
     entered = 0
     entry_syms: set[str] = set()
+    paper_syms: set[str] = set()
     rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
     pnl_from_events = 0.0
+    paper_from_events = 0.0
     saw_exit_pnl = False
+    saw_paper_pnl = False
     for ev in events:
         kind = ev.get("event")
         if kind in ("skipped_late_boot", "skipped_no_prev_closes"):
@@ -55,21 +73,29 @@ def summarize_day(date: str, events: list[dict[str, Any]], trades_pnl: float | N
             rolling_added += 1
         elif kind == "entry" and ev.get("order_status") == "success":
             entry_syms.add(ev.get("symbol", ""))
+        elif kind == "entry_rejected":
+            paper_syms.add(ev.get("symbol", ""))
         elif kind == "exit" and ev.get("pnl") is not None:
             pnl_from_events += float(ev["pnl"])
             saw_exit_pnl = True
+        elif kind == "exit_paper" and ev.get("gross") is not None:
+            paper_from_events += float(ev["gross"])
+            saw_paper_pnl = True
         elif kind == "summary":
             status = ev.get("day") or status
             selected = ev.get("selected", selected)
     entered = len(entry_syms)
     pnl = trades_pnl if trades_pnl is not None else (pnl_from_events if saw_exit_pnl else None)
+    ppnl = paper_pnl if paper_pnl is not None else (paper_from_events if saw_paper_pnl else None)
     return {
         "date": date,
         "status": status,
         "selected": selected,
         "rolling_added": rolling_added,
         "entered": entered,
+        "paper": len(paper_syms),
         "pnl": round(pnl, 2) if pnl is not None else None,
+        "paper_pnl": round(ppnl, 2) if ppnl is not None else None,
         "events": len(events),
     }
 
@@ -162,11 +188,27 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
                 max_vol_ratio=ev.get("max_vol_ratio"),
                 vol_needed=ev.get("needed"),
             )
-        elif kind == "exit":
+        elif kind == "entry_rejected":
+            # a rejected entry is a real measurement, just not a real fill — it
+            # keeps its outcome row so the CSV stays complete (issue #548)
+            sym = ev.get("symbol")
+            if sym not in rows:
+                continue
+            rows[sym].update(
+                entered=False,
+                fill="paper",
+                qty=ev.get("qty"),
+                trigger_price=ev.get("entry_price"),
+                skip_reason="entry_rejected",
+                error_message=ev.get("error"),
+            )
+        elif kind in ("exit", "exit_paper"):
             sym = ev.get("symbol")
             if sym not in rows:
                 continue
             rows[sym].update(exit_price=ev.get("exit_price"), pnl=ev.get("pnl"))
+            if kind == "exit_paper":
+                rows[sym]["fill"] = "paper"
         elif kind == "entry_skipped":
             sym = ev.get("symbol")
             if sym in rows:

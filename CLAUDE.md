@@ -1129,8 +1129,43 @@ rolling}` so the two cohorts can be scored apart. ⚠ **Measurement, not a
 validated edge** — the 2026-08-03 replay showed the 09:16 ranking misses the
 day's biggest movers but could NOT show the added names pay (3 incremental
 trades on 4 usable days); a promotion decision waits on the #528 sample.
+**Broker-rejected entries become PAPER fills (issue #548).** On 2026-08-05
+Zerodha rejected three live entries with a static-IP 403; the message was
+discarded, `flatten` only ever looked at `status='open'` so the rows sat at
+`status='error'` forever with no exit, the rejections ate the whole `max_trades`
+cap, and nothing alerted. Now a rejected entry is journaled
+`status='rejected'` + **`fill='paper'`** with the broker text in
+`error_message`, and at the exit time it is priced exactly as a sandbox run
+would have been (exit price, gross P&L, modelled charges) — **no order is ever
+placed for it**. Four rules, each load-bearing:
+- **`mode` still records what the run genuinely was** (`live`). A paper row is
+  never disguised as a sandbox run; `fill` is the axis that says "this did not
+  happen".
+- **Paper P&L never merges into real P&L.** `total_realized_pnl()` (which drives
+  compound sizing) and `trades_pnl_by_date()` exclude `fill='paper'`;
+  `paper_pnl_by_date()` reports it separately and the UI badges every paper
+  number. Blending them would compound tomorrow's real position size off money
+  that was never made.
+- **Only an AFFIRMATIVE non-zero position book justifies a square-off.** A 403 is
+  unambiguous but a timeout is not, so `flatten` verifies via
+  `get_positionbook(mode_key='open15_vol_breakout')` (the #497 rule). A non-zero
+  quantity promotes the row back to a real `open` and squares it off; an
+  **unreadable** book papers it with a loud warning — sending an unjustified
+  square-off would open a naked position, whereas a genuinely-filled lot is
+  still caught by the 15:15 MIS auto-square-off.
+- **A rejection frees its `max_trades` slot** (it is not a trade), while paper
+  fills carry their own cap of `max_trades` so a persistently-rejecting broker
+  cannot simulate an unbounded day.
+Alert: `logger.error` + Telegram `open15_breakout`, deduped once per day. The
+digest/summary report `filled` and `paper` separately — `core.entered` counts
+TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows
+(journal AND the day log, which is what the `/logs` page renders):
+`uv run python -m services.open15_rejection_backfill --date YYYY-MM-DD [--apply]`
+(dry-run default, NOT wired into the runtime).
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
-day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only).
+day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
+`NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.
 
 ## Data freshness validation (sector_follow_cap5_vol)
 
