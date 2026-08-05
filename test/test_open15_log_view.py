@@ -274,6 +274,103 @@ def test_logs_page_colours_max_vol_by_the_beyond_ratio():
     assert "v>=needed" not in packed  # never gate the colour on the peak-anywhere value
 
 
+def _run_render_sel(events):
+    """Execute the logs page's OWN row-building JS in node (issue #545).
+
+    The page builds its selection-outcomes table client-side, duplicating
+    ``selection_outcomes``. That duplication is what let #545 be fixed in Python
+    while the page kept showing the wrong thing — so this test runs the real
+    extracted source rather than grepping it for a substring.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    import pytest
+
+    from blueprints.open15_breakout import _LOGS_PAGE
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+    body = _LOGS_PAGE.split("function renderSel(){")[1].split("// mid-window")[0]
+    script = (
+        "const esc=s=>String(s);\n"
+        f"const curEvents={json.dumps(events)};\n"
+        f"{body}\n"
+        "console.log(JSON.stringify(rows));"
+    )
+    out = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=60, check=True
+    )
+    return json.loads(out.stdout)
+
+
+# The real 2026-08-05 shape: the first re-rank pass fired on the same tick that
+# finalized selection, so its adds leaked into the `selection` event AND are
+# logged earlier than it. PNBHOUSING is the tell — a LONG with a negative gap.
+POLLUTED_DAY = [
+    {"ts": "09:10:00.190", "event": "armed", "universe": 211, "vol_mult": 1.5},
+    {
+        "ts": "09:16:00.100",
+        "event": "watchlist_add",
+        "symbol": "PNBHOUSING",
+        "side": "L",
+        "pct_change": 2.67,
+        "rank": 3,
+        "watch_size": 5,
+        "at": "09:16:00",
+    },
+    {
+        "ts": "09:16:00.167",
+        "event": "selection",
+        "selected": {"ICICIGI": "L", "INDIGO": "L", "PNBHOUSING": "L"},
+        "gaps_pct": {"ICICIGI": 5.14, "INDIGO": 1.9, "PNBHOUSING": -0.91},
+        "candidates": 211,
+    },
+]
+
+
+def test_logs_page_js_does_not_relabel_a_rolling_add_as_seed():
+    """The page JS must reach the same verdict as `selection_outcomes` (#545)."""
+    rows = _run_render_sel(POLLUTED_DAY)
+    assert rows["PNBHOUSING"]["src"] == "rolling"
+    assert rows["PNBHOUSING"]["gap"] == 2.67  # % at add, NOT the -0.91 open gap
+    assert rows["PNBHOUSING"]["side"] == "L"
+    assert rows["ICICIGI"]["src"] == "seed" and rows["ICICIGI"]["gap"] == 5.14
+
+
+def test_logs_page_js_and_python_parsers_agree():
+    """The duplicated parsers must not drift — the #545 failure mode."""
+    from services.open15_log_view import selection_outcomes
+
+    js = _run_render_sel(POLLUTED_DAY)
+    py = {r["symbol"]: r for r in selection_outcomes("2026-08-05", POLLUTED_DAY)}
+    assert set(js) == set(py)
+    for sym in py:
+        assert js[sym]["src"] == py[sym]["watch_source"], sym
+        assert js[sym]["gap"] == py[sym]["gap_pct"], sym
+        assert js[sym]["side"] == py[sym]["side"], sym
+
+
+def test_logs_page_js_keeps_a_rolling_row_outcome():
+    """The override must not wipe an outcome already recorded for the row."""
+    day = [
+        *POLLUTED_DAY,
+        {
+            "ts": "09:20:00.000",
+            "event": "entry",
+            "symbol": "PNBHOUSING",
+            "trigger_price": 478.45,
+            "vol_ratio": 1.84,
+            "order_status": "success",
+        },
+    ]
+    rows = _run_render_sel(day)
+    assert rows["PNBHOUSING"]["src"] == "rolling"
+    assert "entered @ 478.45" in rows["PNBHOUSING"]["out"]
+
+
 def test_selection_outcomes_empty_for_skipped_day():
     from services.open15_log_view import selection_outcomes
 

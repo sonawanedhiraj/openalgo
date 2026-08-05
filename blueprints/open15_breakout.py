@@ -548,13 +548,22 @@ function renderSel(){
   const rows={};
   for(const e of curEvents){
     if(e.event==='selection'){
-      for(const[s,side]of Object.entries(e.selected||{}))
+      for(const[s,side]of Object.entries(e.selected||{})){
+        // never downgrade a row a `watchlist_add` already proved rolling (#545)
+        if(rows[s]&&rows[s].src==='rolling')continue;
         rows[s]={side,src:'seed',gap:(e.gaps_pct||{})[s],out:'no trigger'};
+      }
     }else if(e.event==='watchlist_add'){
       // rolling adds are watched symbols too (issue #529) — they belong in the
-      // outcome table, marked apart from the 09:16 seed picks
-      if(!rows[e.symbol])
-        rows[e.symbol]={side:e.side,src:'rolling',gap:e.pct_change,out:'no trigger'};
+      // outcome table, marked apart from the 09:16 seed picks.
+      // A `watchlist_add` PROVES a rolling add and so OVERRIDES the `selection`
+      // event (issue #545): maybe_rerank skips any symbol already selected, so
+      // a seed pick can never emit one. Pre-#545 logs recorded the first
+      // re-rank pass inside `selection` too — and that event is written LATER
+      // in the same tick, so merely filling the gap here would lose the repair.
+      if(!rows[e.symbol])rows[e.symbol]={out:'no trigger'};
+      const wr=rows[e.symbol];
+      wr.side=e.side; wr.src='rolling'; wr.gap=e.pct_change;
     }else if(e.event==='watch_stats'){
       // every selected symbol, entered ones included (issue #524)
       for(const[s,st]of Object.entries(e.stats||{})){
