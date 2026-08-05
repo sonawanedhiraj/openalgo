@@ -182,6 +182,53 @@ def test_selection_outcomes_adds_rolling_rows():
     assert summarize_day("2026-07-23", day)["rolling_added"] == 1
 
 
+def test_selection_outcomes_repairs_pre545_polluted_selection_event():
+    """A pre-#545 log double-recorded the FIRST re-rank pass (issue #545).
+
+    Before the fix, ``maybe_rerank`` appended to ``core.selected`` on the very
+    tick that finalized selection — with its own ``watchlist_add`` logged first
+    — so the ``selection`` event that followed carried the rolling adds too.
+    The parse must trust the ``watchlist_add`` (a seed pick can never emit one)
+    and report the symbol as rolling, carrying its %-at-add rather than the
+    09:15 open gap.
+    """
+    from services.open15_log_view import selection_outcomes
+
+    day = list(TRADED_DAY)
+    # ordering is load-bearing: the add precedes the polluted selection event
+    day.insert(
+        1,
+        {
+            "ts": "09:16:00.100",
+            "event": "watchlist_add",
+            "symbol": "PNBHOUSING",
+            "side": "L",
+            "pct_change": 2.67,
+            "rank": 3,
+            "watch_size": 5,
+            "at": "09:16:00",
+        },
+    )
+    day[2] = {
+        "ts": "09:16:00.167",
+        "event": "selection",
+        # PNBHOUSING leaked in, with its OPEN gap (negative — it gapped down
+        # and then rallied inside the 09:15 candle) and a LONG side, which no
+        # seed pick can ever have
+        "selected": {"OIL": "L", "OFSS": "L", "DRREDDY": "S", "PNBHOUSING": "L"},
+        "gaps_pct": {"OIL": 0.52, "OFSS": 4.3, "DRREDDY": -6.67, "PNBHOUSING": -0.91},
+        "candidates": 211,
+    }
+    rows = {r["symbol"]: r for r in selection_outcomes("2026-08-05", day)}
+    pnb = rows["PNBHOUSING"]
+    assert pnb["watch_source"] == "rolling"
+    assert pnb["gap_pct"] == 2.67  # % at add, NOT the -0.91 open gap
+    assert pnb["side"] == "L"
+    # exactly one row for the symbol, and the genuine seed picks are untouched
+    assert len(rows) == 4
+    assert rows["OIL"]["watch_source"] == "seed" and rows["OIL"]["gap_pct"] == 0.52
+
+
 def test_selection_outcomes_unchanged_without_watch_stats_event():
     """Pre-#524 stored days must parse byte-identically (no such event)."""
     from services.open15_log_view import render_csv, selection_outcomes
@@ -257,7 +304,11 @@ def test_db_list_day_logs_and_pnl_by_date():
     assert save_day_log("2026-07-22", [{"event": "armed"}])
     assert save_day_log("2026-07-23", TRADED_DAY)
     days = dict(list_day_logs())
-    assert list(days)[:2] == ["2026-07-23", "2026-07-22"]  # newest first
+    # newest first. Assert the ORDER of this test's own dates rather than their
+    # absolute positions: the DB is shared across the session, so another test
+    # file's persisted day log would otherwise fail this unrelated assertion.
+    mine = [d for d in days if d in ("2026-07-22", "2026-07-23")]
+    assert mine == ["2026-07-23", "2026-07-22"]
     assert days["2026-07-23"][0]["event"] == "armed"
     insert_trade(trade_date="2026-07-23", symbol="OIL", side="L", mode="sandbox", pnl=82.0)
     insert_trade(trade_date="2026-07-23", symbol="OFSS", side="L", mode="sandbox", pnl=-22.5)

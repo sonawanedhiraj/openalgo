@@ -499,6 +499,73 @@ def test_session_watch_size_never_shrinks_and_status_reports_config():
     assert status["watch_stats"]["AAA"]["watch_source"] == "seed"
 
 
+def _run_intra_candle_rally(svc):
+    """The PNBHOUSING shape (issue #545): BBB opens DOWN 1%, then rallies to
+    +5% inside the 09:15 candle. It is invisible to the 09:16 gap ranking (a
+    negative gap can only ever be a SHORT seed, and CCC's -3% outranks it), but
+    it is the #1 LONG on live price the moment selection finalizes — so the
+    FIRST re-rank pass adds it on that very tick, before the old code logged
+    the selection event.
+    """
+    for sym, o, last in (
+        ("AAA", 103.0, 103.0),  # +3% gap -> seed L
+        ("CCC", 97.0, 97.0),  # -3% gap -> seed S
+        ("ZZZ", 101.0, 101.0),
+        ("BBB", 99.0, 105.0),  # gaps DOWN, rallies inside the candle
+    ):
+        svc._handle_raw(*_frame(sym, o, 1000, 9, 15, 1), _now(9, 15, 1))
+        svc._handle_raw(*_frame(sym, last, 5000, 9, 15, 50), _now(9, 15, 50))
+    # the finalizing tick — seeds AND the first re-rank pass both land here
+    svc._handle_raw(*_frame("AAA", 103.0, 6000, 9, 16, 10), _now(9, 16, 10))
+
+
+def test_first_rerank_pass_is_not_recorded_as_a_seed_pick():
+    """The #545 regression: the selection event must carry SEED picks only.
+
+    ``maybe_rerank``'s first pass has no cadence to wait for, so it fires on
+    the same tick that finalizes selection and appends to ``core.selected``.
+    Logging that dict verbatim tagged the added symbol ``seed`` in the decision
+    log and the CSV export, and gave it the 09:15 OPEN gap where its %-at-add
+    belonged — a long with a negative gap, which no seed pick can be.
+    """
+    from services.open15_log_view import selection_outcomes
+
+    orders = []
+    svc = _mk_service(
+        {"rolling_watchlist_enabled": True, "rolling_cadence_s": 30, "rolling_top_n": 1}, orders
+    )
+    _run_intra_candle_rally(svc)
+
+    # BBB really was added by the first pass, on the finalizing tick
+    adds = [e for e in svc.day_log if e["event"] == "watchlist_add"]
+    assert [a["symbol"] for a in adds] == ["BBB"]
+    assert adds[0]["side"] == "L" and adds[0]["pct_change"] == 5.0
+    assert svc.core.watch_source["BBB"] == "rolling"
+
+    sel = [e for e in svc.day_log if e["event"] == "selection"]
+    assert len(sel) == 1
+    assert sel[0]["selected"] == {"AAA": "L", "CCC": "S"}  # BBB must NOT be here
+    assert "BBB" not in sel[0]["gaps_pct"]
+
+    # ... and the view layer agrees end-to-end
+    rows = {r["symbol"]: r for r in selection_outcomes("2026-08-03", svc.day_log)}
+    assert rows["BBB"]["watch_source"] == "rolling"
+    assert rows["BBB"]["gap_pct"] == 5.0  # % at add, not the -1.0 open gap
+    assert rows["AAA"]["watch_source"] == "seed" and rows["AAA"]["gap_pct"] == 3.0
+
+
+def test_selection_event_is_logged_without_a_tick_writer():
+    """It used to be emitted from ``_capture_tick``, which returns early when
+    tick capture is off — so the decision log silently lost its selection
+    record (issue #545)."""
+    orders = []
+    svc = _mk_service({"rolling_watchlist_enabled": False}, orders)
+    assert svc._tick_writer is None
+    _run_session(svc)
+    sel = [e for e in svc.day_log if e["event"] == "selection"]
+    assert len(sel) == 1 and sel[0]["selected"] == {"AAA": "L", "CCC": "S"}
+
+
 def test_armed_event_records_the_effective_rolling_config():
     """A day must be replayable from its own log (the config_source pattern)."""
     orders = []

@@ -87,6 +87,11 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
         if kind == "selection":
             gaps = ev.get("gaps_pct") or {}
             for sym, side in (ev.get("selected") or {}).items():
+                # a row already tagged `rolling` was proven so by its own
+                # `watchlist_add`, which pre-#545 was logged EARLIER in the same
+                # tick than this event — never downgrade it back to `seed`
+                if rows.get(sym, {}).get("watch_source") == "rolling":
+                    continue
                 rows[sym] = dict.fromkeys(CSV_COLUMNS)
                 rows[sym].update(
                     date=date,
@@ -101,17 +106,27 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
             # own outcome row, tagged so the two cohorts can be scored apart.
             # `gap_pct` carries its % change AT ADD (there is no 09:15 gap for
             # a symbol the 09:16 ranking never picked).
+            #
+            # A `watchlist_add` is PROOF of a rolling add and therefore wins
+            # over the `selection` event (issue #545): `maybe_rerank` skips any
+            # symbol already in `selected`, so a genuine seed pick can never
+            # emit one. Day logs written before #545 recorded the first
+            # re-rank pass's adds inside `selection` too — overriding here
+            # repairs those historical rows instead of leaving them as `seed`
+            # carrying an open gap in the %-at-add column.
             sym = ev.get("symbol")
-            if sym and sym not in rows:
+            if not sym:
+                continue
+            if sym not in rows:
                 rows[sym] = dict.fromkeys(CSV_COLUMNS)
-                rows[sym].update(
-                    date=date,
-                    symbol=sym,
-                    side=ev.get("side"),
-                    watch_source="rolling",
-                    gap_pct=ev.get("pct_change"),
-                    entered=False,
-                )
+                rows[sym]["entered"] = False
+            rows[sym].update(
+                date=date,
+                symbol=sym,
+                side=ev.get("side"),
+                watch_source="rolling",
+                gap_pct=ev.get("pct_change"),
+            )
         elif kind == "entry":
             sym = ev.get("symbol")
             if sym not in rows:
