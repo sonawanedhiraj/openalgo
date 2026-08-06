@@ -210,11 +210,28 @@ def decision_log():
     today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
     svc = get_open15_service()
     if (not date or date == today) and svc is not None and svc.day_log:
-        return jsonify({"date": today, "source": "live", "events": svc.day_log})
+        return jsonify(
+            {
+                "date": today,
+                "source": "live",
+                "events": svc.day_log,
+                # the journal rides along so the page never has to reconstruct
+                # prices or P&L from the timeline (issue #557)
+                "journal": journal_for_date(today),
+            }
+        )
     from database.open15_breakout_db import get_day_log
 
-    events = get_day_log(date or today)
-    return jsonify({"date": date or today, "source": "snapshot", "events": events or []})
+    day = date or today
+    events = get_day_log(day)
+    return jsonify(
+        {
+            "date": day,
+            "source": "snapshot",
+            "events": events or [],
+            "journal": journal_for_date(day),
+        }
+    )
 
 
 def _all_day_logs() -> list[tuple[str, list, str]]:
@@ -282,7 +299,9 @@ def decision_log_export_csv():
     try:
         rows = []
         for date, events, _source in reversed(_all_day_logs()):
-            rows.extend(selection_outcomes(date, events))
+            # journal per day (issue #557) — the export must carry the CORRECTED
+            # prices and P&L, not whatever was believed when the log was sealed
+            rows.extend(selection_outcomes(date, events, journal=journal_for_date(date)))
         return Response(
             render_csv(rows),
             mimetype="text/csv",
@@ -475,7 +494,7 @@ async function saveCfg(){
 loadCfg();
 </script>
 <script>
-let curDate=null, curEvents=[], curFilter='all', digests=[];
+let curDate=null, curEvents=[], curJournal=[], curFilter='all', digests=[];
 // live max-vol overlay for today (issue #524): the tick-by-tick running max is
 // only published to the decision log at the exit job, so mid-window it comes
 // from /api/status instead. Cleared whenever a past day is selected.
@@ -538,6 +557,7 @@ async function selectDay(date){
   document.getElementById('dayjson').href='/open15_vol_breakout/api/decision_log?date='+date;
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
   curEvents=j.events||[];
+  curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderRejected(); renderChips(); renderRolling(); renderSel(); renderTimeline();
@@ -715,19 +735,6 @@ function renderSel(){
       if(e.sim_quantity)r.qty=e.sim_quantity;
       r.out='skipped: '+esc(e.reason||'')+
         (e.fill==='sim'?' <span class="badge b-sim">sim &middot; priced 1 lot</span>':'');
-    }else if(e.event==='liquidity_row'){
-      // the contract's OI path over the hold (issue #555) — direction matters:
-      // building vs unwinding is invisible to two endpoint snapshots
-      rows[e.symbol].oiPath={minutes:e.minutes,oi_change:e.oi_change,
-        oi_change_lots:e.oi_change_lots,volume_traded:e.volume_traded};
-    }else if(e.event==='fill_reconcile_row'){
-      // what the broker ACTUALLY filled (issue #555) — overlaid on the quote
-      // prices already in the row so slippage renders as the gap between them
-      const r=rows[e.symbol];
-      r.entryFill=e.entry_fill_price; r.exitFill=e.exit_fill_price;
-      r.pnlSource=e.pnl_source; r.brokerPnl=e.broker_pnl; r.reconcile=e.status;
-      if(e.pnl!=null){r.gross=e.pnl; r.charges=e.charges;
-        r.net=Math.round((e.pnl-(e.charges||0))*100)/100;}
     }else if((e.event==='exit'||e.event==='exit_paper'||e.event==='exit_sim')&&e.pnl!=null){
       const r=rows[e.symbol];
       r.gross=e.gross; r.charges=e.charges; r.net=e.pnl; r.qty=e.qty??r.qty;
@@ -754,6 +761,10 @@ function renderSel(){
         '&times; &lt; '+e.needed+' while beyond'):'level never broken';
     }
   }
+  // the journal wins over anything the timeline said (issue #557) — applied
+  // here, immediately after the event loop, so it is part of the row-building
+  // logic the parser-parity test extracts and checks against Python
+  applyJournal(rows);
   // mid-window the log has published nothing yet — overlay the running max
   const liveSyms=new Set();
   for(const[s,st]of Object.entries(liveWatch)){
@@ -847,6 +858,47 @@ function renderLiquidity(rows){
       'is optimistic by roughly this amount; real rows use broker fills, where the spread '+
       'is already inside the fill price.'
     : 'Bid/ask not captured for this day &mdash; it starts with the next armed session.';
+}
+function applyJournal(rows){
+  // issue #557: the JOURNAL is authoritative for everything it stores, because
+  // the reconcile passes correct it IN PLACE. The decision log records what was
+  // believed at the time. Reading P&L out of events left the rows stale next to
+  // a chip that reads the journal — and the arm-time catch-up, whose whole job
+  // is to run on a LATER day, can never append events to the day it corrects.
+  // Mirrors `apply_journal` in services/open15_log_view.py.
+  for(const j of (curJournal||[])){
+    const r=rows[j.symbol];
+    if(!r)continue;                       // never triggered: nothing to correct
+    r.stockEntry=j.trigger_price??r.stockEntry;
+    r.stockExit=j.exit_price??r.stockExit;
+    r.instr=j.instrument||r.instr;
+    r.contract=j.opt_symbol??r.contract;
+    r.optEntry=j.opt_entry_premium??r.optEntry;
+    r.optExit=j.opt_exit_premium??r.optExit;
+    r.entryFill=j.entry_fill_price??r.entryFill;
+    r.exitFill=j.exit_fill_price??r.exitFill;
+    r.pnlSource=j.pnl_source||r.pnlSource;
+    r.reconcile=j.fill_reconcile_status??r.reconcile;
+    r.brokerPnl=j.broker_pnl??r.brokerPnl;
+    r.fill=j.fill||r.fill;
+    // `quantity` is what was ORDERED; `sim_quantity` is what a non-traded row
+    // is priced on. Exactly one is meaningful per row.
+    r.qty=j.quantity||j.sim_quantity||r.qty;
+    r.lotSize=j.opt_lot_size??r.lotSize;
+    r.tick=j.opt_tick_size??r.tick;
+    r.entryBid=j.opt_entry_bid??r.entryBid; r.entryAsk=j.opt_entry_ask??r.entryAsk;
+    r.exitBid=j.opt_exit_bid??r.exitBid;    r.exitAsk=j.opt_exit_ask??r.exitAsk;
+    r.entryVol=j.opt_entry_volume??r.entryVol; r.entryOi=j.opt_entry_oi??r.entryOi;
+    r.exitVol=j.opt_exit_volume??r.exitVol;    r.exitOi=j.opt_exit_oi??r.exitOi;
+    if(j.liquidity_path&&j.liquidity_path.minutes)r.oiPath=j.liquidity_path;
+    if(j.pnl!=null){
+      // the journal stores GROSS in `pnl` with charges separate; every number
+      // this page shows is NET (issue #552). Copying `pnl` straight across
+      // would reintroduce the gross/net split inside the fix for #557.
+      r.gross=j.pnl; r.charges=j.charges_inr;
+      r.net=Math.round((j.pnl-(j.charges_inr||0))*100)/100;
+    }
+  }
 }
 const dash='<span class="muted">&mdash;</span>';
 function px(v){return v==null?null:(Math.round(v*100)/100).toFixed(2);}
@@ -964,11 +1016,119 @@ def logs_page():
     return _LOGS_PAGE
 
 
+def serialize_trade(r) -> dict:
+    """One journal row as JSON — the SINGLE serializer (issue #557).
+
+    Shared by ``/api/trades`` and ``/api/decision_log`` so the two can never
+    drift into describing the same row differently, which is the defect class
+    #557 is about one level up.
+    """
+    from services import open15_liquidity as _liquidity
+
+    return {
+        "id": r.id,
+        "trade_date": r.trade_date,
+        "symbol": r.symbol,
+        "side": r.side,
+        "mode": r.mode,
+        "instrument": r.instrument or "stock",
+        "opt_symbol": r.opt_symbol,
+        "opt_lot_size": r.opt_lot_size,
+        "opt_entry_premium": r.opt_entry_premium,
+        "opt_exit_premium": r.opt_exit_premium,
+        "opt_pnl": r.opt_pnl,
+        # contract liquidity at each decision moment (issue #488) —
+        # research fields; NULL means "not captured", not "zero"
+        "opt_entry_volume": r.opt_entry_volume,
+        "opt_entry_oi": r.opt_entry_oi,
+        "opt_exit_volume": r.opt_exit_volume,
+        "opt_exit_oi": r.opt_exit_oi,
+        # top-of-book at both decision moments (issue #555). The
+        # strategy sends MARKET orders, so the spread is a real cost
+        # and these are what make it measurable.
+        "opt_entry_bid": r.opt_entry_bid,
+        "opt_entry_ask": r.opt_entry_ask,
+        "opt_exit_bid": r.opt_exit_bid,
+        "opt_exit_ask": r.opt_exit_ask,
+        "opt_tick_size": r.opt_tick_size,
+        # derived, lot- and rupee-normalized — raw contract counts
+        # are not comparable across a universe whose lot sizes differ
+        # ~30x, which is what made the #488 columns unreadable
+        "liquidity": _liquidity.derive(r),
+        "spread_cost_inr": _liquidity.spread_cost_inr(r),
+        "liquidity_path": _liquidity.summarize_path(r.opt_liquidity_path, r.opt_lot_size),
+        # seed (09:16 gap ranking) vs rolling (intraday re-rank),
+        # issue #529. Pre-#529 rows are NULL — they are all seeds.
+        "watch_source": r.watch_source or "seed",
+        "gap_pct": r.gap_pct,
+        "level": r.level,
+        "baseline_vol": r.baseline_vol,
+        "cum_vol_at_trigger": r.cum_vol_at_trigger,
+        "trigger_minute": r.trigger_minute,
+        "trigger_second": r.trigger_second,
+        "trigger_price": r.trigger_price,
+        "entry_minute_close": r.entry_minute_close,
+        "quantity": r.quantity,
+        "entry_status": r.entry_status,
+        "exit_ts": r.exit_ts,
+        "exit_price": r.exit_price,
+        "exit_status": r.exit_status,
+        "pnl": r.pnl,
+        "charges_inr": r.charges_inr,
+        # what the BROKER actually filled, vs the quote/tick prices
+        # above that the decision was made on (issue #555). The gap
+        # between them is this strategy's slippage.
+        "entry_fill_price": r.entry_fill_price,
+        "exit_fill_price": r.exit_fill_price,
+        "entry_fill_qty": r.entry_fill_qty,
+        "exit_fill_qty": r.exit_fill_qty,
+        "fill_reconcile_status": r.fill_reconcile_status,
+        # `fill` once reconciled, else `quote`; NULL on pre-#555 rows
+        # (all quote-derived)
+        "pnl_source": r.pnl_source or "quote",
+        "broker_pnl": r.broker_pnl,
+        # pricing size for a row no order was placed for — never an
+        # order quantity (`quantity` stays 0 on those)
+        "sim_quantity": r.sim_quantity,
+        "status": r.status,
+        "reason": r.reason,
+        # real fill vs broker-rejected paper simulation (issue #548).
+        # NULL on pre-#548 rows — those are all real.
+        "fill": r.fill or "real",
+        "error_message": r.error_message,
+    }
+
+
+def journal_for_date(date: str) -> list[dict]:
+    """Serialized journal rows for one trade date (issue #557).
+
+    The journal is AUTHORITATIVE for everything it stores — prices, quantities,
+    P&L, fills, liquidity — because it is corrected in place by the reconcile
+    passes. The decision log is authoritative for the decision TIMELINE. Rows
+    that read P&L out of the event log go stale the moment a reconcile lands,
+    which is the whole of #557.
+    """
+    from database.open15_breakout_db import Open15Trade, db_session
+
+    try:
+        rows = (
+            db_session.query(Open15Trade)
+            .filter(Open15Trade.trade_date == date)
+            .order_by(Open15Trade.id.asc())
+            .all()
+        )
+        return [serialize_trade(r) for r in rows]
+    except Exception:
+        logger.exception("open15: journal read failed for %s", date)
+        return []
+    finally:
+        db_session.remove()
+
+
 @open15_bp.route("/api/trades", methods=["GET"])
 @check_session_validity
 def trades():
     from database.open15_breakout_db import Open15Trade, db_session
-    from services import open15_liquidity as _liquidity
 
     limit = min(int(request.args.get("limit", 100)), 500)
     date = request.args.get("date")
@@ -977,85 +1137,7 @@ def trades():
         if date:
             q = q.filter(Open15Trade.trade_date == date)
         rows = q.order_by(Open15Trade.id.desc()).limit(limit).all()
-        return jsonify(
-            [
-                {
-                    "id": r.id,
-                    "trade_date": r.trade_date,
-                    "symbol": r.symbol,
-                    "side": r.side,
-                    "mode": r.mode,
-                    "instrument": r.instrument or "stock",
-                    "opt_symbol": r.opt_symbol,
-                    "opt_lot_size": r.opt_lot_size,
-                    "opt_entry_premium": r.opt_entry_premium,
-                    "opt_exit_premium": r.opt_exit_premium,
-                    "opt_pnl": r.opt_pnl,
-                    # contract liquidity at each decision moment (issue #488) —
-                    # research fields; NULL means "not captured", not "zero"
-                    "opt_entry_volume": r.opt_entry_volume,
-                    "opt_entry_oi": r.opt_entry_oi,
-                    "opt_exit_volume": r.opt_exit_volume,
-                    "opt_exit_oi": r.opt_exit_oi,
-                    # top-of-book at both decision moments (issue #555). The
-                    # strategy sends MARKET orders, so the spread is a real cost
-                    # and these are what make it measurable.
-                    "opt_entry_bid": r.opt_entry_bid,
-                    "opt_entry_ask": r.opt_entry_ask,
-                    "opt_exit_bid": r.opt_exit_bid,
-                    "opt_exit_ask": r.opt_exit_ask,
-                    "opt_tick_size": r.opt_tick_size,
-                    # derived, lot- and rupee-normalized — raw contract counts
-                    # are not comparable across a universe whose lot sizes differ
-                    # ~30x, which is what made the #488 columns unreadable
-                    "liquidity": _liquidity.derive(r),
-                    "spread_cost_inr": _liquidity.spread_cost_inr(r),
-                    "liquidity_path": _liquidity.summarize_path(
-                        r.opt_liquidity_path, r.opt_lot_size
-                    ),
-                    # seed (09:16 gap ranking) vs rolling (intraday re-rank),
-                    # issue #529. Pre-#529 rows are NULL — they are all seeds.
-                    "watch_source": r.watch_source or "seed",
-                    "gap_pct": r.gap_pct,
-                    "level": r.level,
-                    "baseline_vol": r.baseline_vol,
-                    "cum_vol_at_trigger": r.cum_vol_at_trigger,
-                    "trigger_minute": r.trigger_minute,
-                    "trigger_second": r.trigger_second,
-                    "trigger_price": r.trigger_price,
-                    "entry_minute_close": r.entry_minute_close,
-                    "quantity": r.quantity,
-                    "entry_status": r.entry_status,
-                    "exit_ts": r.exit_ts,
-                    "exit_price": r.exit_price,
-                    "exit_status": r.exit_status,
-                    "pnl": r.pnl,
-                    "charges_inr": r.charges_inr,
-                    # what the BROKER actually filled, vs the quote/tick prices
-                    # above that the decision was made on (issue #555). The gap
-                    # between them is this strategy's slippage.
-                    "entry_fill_price": r.entry_fill_price,
-                    "exit_fill_price": r.exit_fill_price,
-                    "entry_fill_qty": r.entry_fill_qty,
-                    "exit_fill_qty": r.exit_fill_qty,
-                    "fill_reconcile_status": r.fill_reconcile_status,
-                    # `fill` once reconciled, else `quote`; NULL on pre-#555 rows
-                    # (all quote-derived)
-                    "pnl_source": r.pnl_source or "quote",
-                    "broker_pnl": r.broker_pnl,
-                    # pricing size for a row no order was placed for — never an
-                    # order quantity (`quantity` stays 0 on those)
-                    "sim_quantity": r.sim_quantity,
-                    "status": r.status,
-                    "reason": r.reason,
-                    # real fill vs broker-rejected paper simulation (issue #548).
-                    # NULL on pre-#548 rows — those are all real.
-                    "fill": r.fill or "real",
-                    "error_message": r.error_message,
-                }
-                for r in rows
-            ]
-        )
+        return jsonify([serialize_trade(r) for r in rows])
     except Exception:
         logger.exception("open15: trades query failed")
         return jsonify([]), 500

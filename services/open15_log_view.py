@@ -137,7 +137,64 @@ def summarize_day(
     }
 
 
-def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
+# Fields the JOURNAL owns (issue #557). The journal is corrected in place by the
+# reconcile passes; the decision log is a record of what was believed AT THE
+# TIME. So anything the journal stores must be read from the journal, and the
+# events keep only what they alone know — the decision timeline.
+#
+# The JS in ``blueprints/open15_breakout.py`` applies the same overlay; the two
+# are kept honest by ``test_logs_page_js_and_python_agree_*``.
+_JOURNAL_OWNED = {
+    "trigger_price": "trigger_price",
+    "exit_price": "exit_price",
+    "instrument": "instrument",
+    "opt_symbol": "opt_symbol",
+    "opt_entry_premium": "opt_entry_premium",
+    "opt_exit_premium": "opt_exit_premium",
+    "entry_fill_price": "entry_fill_price",
+    "exit_fill_price": "exit_fill_price",
+    "pnl_source": "pnl_source",
+    "fill": "fill",
+    "error_message": "error_message",
+    "skip_reason": "reason",
+    "level": "level",
+}
+
+
+def apply_journal(rows: dict[str, dict], journal: list[dict] | None) -> None:
+    """Overlay authoritative journal values onto event-derived outcome rows.
+
+    Mutates ``rows`` in place. A symbol with no journal row is left untouched —
+    it never triggered, so there is nothing to be authoritative about.
+
+    **``pnl`` is NET here** (issue #552): the journal stores gross in ``pnl``
+    with charges separate in ``charges_inr``, while these outcome rows — and the
+    day digest they must agree with — are net throughout. Copying the journal's
+    ``pnl`` straight across would silently reintroduce the gross/net split that
+    #552 removed, in the exact place #557 was opened to fix.
+    """
+    if not journal:
+        return
+    from database.open15_breakout_db import net_pnl_of_row
+
+    for jr in journal:
+        row = rows.get(jr.get("symbol"))
+        if row is None:
+            continue
+        for col, key in _JOURNAL_OWNED.items():
+            value = jr.get(key)
+            if value is not None:
+                row[col] = value
+        # size: `quantity` is what was ORDERED, `sim_quantity` what a non-traded
+        # row is priced on — exactly one of them is meaningful per row
+        row["qty"] = jr.get("quantity") or jr.get("sim_quantity")
+        if jr.get("pnl") is not None:
+            row["pnl"] = round(net_pnl_of_row(jr), 2)
+
+
+def selection_outcomes(
+    date: str, events: list[dict[str, Any]], journal: list[dict] | None = None
+) -> list[dict]:
     """Per-selected-symbol outcome rows — the backtest-facing flattening.
 
     One row per symbol in the day's ``selection`` event, enriched from the
@@ -273,17 +330,13 @@ def selection_outcomes(date: str, events: list[dict[str, Any]]) -> list[dict]:
                         opt_symbol=ev.get("opt_symbol"),
                         opt_entry_premium=ev.get("opt_entry_premium"),
                     )
-        elif kind == "fill_reconcile_row":
-            # emitted per row once the broker reports its fills (issue #555), so
-            # a day's CSV carries what was TRANSACTED next to what was quoted
-            sym = ev.get("symbol")
-            if sym in rows:
-                rows[sym].update(
-                    entry_fill_price=ev.get("entry_fill_price"),
-                    exit_fill_price=ev.get("exit_fill_price"),
-                    pnl_source=ev.get("pnl_source"),
-                    pnl=ev.get("pnl", rows[sym].get("pnl")),
-                )
+    # The journal wins, last (issue #557). `fill_reconcile_row` / `liquidity_row`
+    # events used to populate these fields, which left them stale whenever a
+    # reconcile landed after the day log was sealed — including the ARM-TIME
+    # CATCH-UP, whose whole purpose is to run on a later day. Those events stay
+    # in the timeline as an audit of when reconciliation happened; they no
+    # longer feed a row.
+    apply_journal(rows, journal)
     return list(rows.values())
 
 
