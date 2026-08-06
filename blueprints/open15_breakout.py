@@ -537,7 +537,9 @@ function renderChips(){
   // never made, and blending them is how a rejected day reads as a traded one
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
-    ['entries',filled+' filled'+(paper?(' &middot; '+paper+' paper'):'')+
+    // a literal '\\u00B7', NOT '&middot;': chip VALUES go through esc() (keys are
+    // inserted raw), so an HTML entity here renders as the text "&middot;"
+    ['entries',filled+' filled'+(paper?(' \\u00B7 '+paper+' paper'):'')+
       ' / '+(dig.selected??summ.selected??0)+' sel'],
     ['real P&amp;L',dig.pnl==null?'—':rupee(dig.pnl)]];
   if(paper||dig.paper_pnl!=null)
