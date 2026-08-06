@@ -794,6 +794,48 @@ def test_a_reconcile_after_the_log_was_sealed_still_reaches_the_rows():
     assert digest["pnl"] == pytest.approx(rendered), "chip != rows is the #557 bug"
 
 
+def test_the_outcome_text_never_repeats_a_stale_pnl():
+    """Found in live validation of #557/#559, on the merged page.
+
+    MUTHOOTFIN's P&L column correctly read the reconciled **-Rs288.15** while the
+    outcome cell in the SAME ROW still read "entered 09:20:33 -> +Rs316" — the
+    event's figure, appended as prose. The #557 overlay fixes data fields; a
+    number baked into a rendered string is invisible to it. The `net P&L` column
+    owns the number now, so the outcome text must carry none.
+    """
+    from test.test_open15_log_view import _run_render_sel
+
+    day = [
+        {"ts": "09:16", "event": "selection", "selected": {"HAL": "L"}, "gaps_pct": {"HAL": 2.3}},
+        {
+            "ts": "09:21",
+            "event": "entry",
+            "symbol": "HAL",
+            "trigger_price": 4770.9,
+            "at": "09:21:59",
+            "order_status": "success",
+        },
+        # the STALE event value the reconcile later superseded
+        {"ts": "09:30", "event": "exit", "symbol": "HAL", "exit_price": 197.9, "pnl": 5850.0},
+    ]
+    journal = [
+        {
+            "symbol": "HAL",
+            "fill": "real",
+            "quantity": 150,
+            "pnl": 5910.0,
+            "charges_inr": 287.51,
+            "pnl_source": "fill",
+        }
+    ]
+    row = _run_render_sel(day, journal=journal)["HAL"]
+
+    assert "5850" not in row["out"], "the outcome text must not carry the stale event P&L"
+    assert "316" not in row["out"]
+    assert row["net"] == pytest.approx(5622.49), "the P&L column owns the number"
+    assert "entered" in row["out"], "the outcome still says what happened"
+
+
 def test_the_journal_never_invents_a_row_for_a_symbol_that_never_triggered():
     """The overlay corrects rows; it must not create them.
 

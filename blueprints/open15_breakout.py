@@ -343,6 +343,16 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .b-pend{background:#232c36;color:#8aa0b4}
  .leg{color:#8aa0b4;font-size:11px;display:block;margin-top:2px}
  .opt{color:#94e2d5}.slip{color:#f9e2af}
+ /* merged symbol table (issue #559): one row per watched symbol, detail on click */
+ tr.main{cursor:pointer}tr.main:hover{background:#161d25}tr.main.open{background:#161d25}
+ tr.main:focus-visible{outline:1px solid #7dc4e4;outline-offset:-1px}
+ .caret{color:#6b7886;-webkit-user-select:none;user-select:none}
+ tr.detail>td{background:#12181f;border-bottom:2px solid #2a3138;padding:10px 14px}
+ .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+ .dbox .h{color:#7dc4e4;font-size:10px;margin-bottom:5px;letter-spacing:.5px}
+ .dbox table{margin:0;width:auto}
+ .dbox td{border:0;padding:2px 0;font-size:11.5px}
+ .dbox td:first-child{color:#6b7886;padding-right:14px;white-space:nowrap}
  .rejbanner{background:#2a1416;border-left:3px solid #f38ba8;padding:9px 12px;margin-bottom:12px}
  .rejbanner .rt{color:#f38ba8}.rejbanner .rm{color:#8aa0b4;margin-top:4px}
  .rejbanner .rn{color:#6b7886;margin-top:4px}
@@ -398,24 +408,14 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="status" class="muted"></div>
   <div id="rejbox"></div>
   <div class="chips" id="chips"></div>
-  <div class="sec">rolling watch-list <span id="rollCfg" class="muted"></span></div>
-  <table id="roll"><thead><tr><th style="width:90px">time</th><th>symbol</th><th>side</th>
-   <th>% change at add</th><th>rank</th><th>watch size</th></tr></thead><tbody></tbody></table>
-  <div class="sec">selection outcomes</div>
-  <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>source</th><th>gap %</th>
+  <div class="sec">selection outcomes
+   <span class="muted">&mdash; click a row for fills, liquidity and the decision detail</span></div>
+  <div id="rollCfg" class="muted"></div>
+  <table id="sel"><thead><tr><th style="width:16px"></th><th>symbol</th><th>side</th>
+   <th>source</th><th>gap %</th>
    <th id="selVolHdr">max vol&times;</th><th>entry</th><th>exit</th><th>qty</th>
    <th>net P&amp;L</th><th>outcome</th></tr></thead><tbody></tbody></table>
-  <div class="sec">contract liquidity <span class="muted">(measurement only &mdash; nothing gates on it)</span></div>
-  <table id="liq"><thead><tr><th>symbol</th><th>contract</th><th>lot</th>
-   <th>entry bid/ask</th><th>spread</th><th>exit bid/ask</th><th>spread</th>
-   <th>round-trip</th><th>spread cost</th><th>volume</th><th>OI</th>
-   <th>vol/OI</th><th>OI path</th></tr></thead><tbody></tbody></table>
   <div id="liqNote" class="muted" style="margin-top:6px"></div>
-  <div class="sec">fills &amp; charges <span id="fillNote" class="muted"></span></div>
-  <table id="fills"><thead><tr><th>symbol</th><th>quote entry</th><th>fill entry</th>
-   <th>quote exit</th><th>fill exit</th><th>slippage</th><th>gross</th>
-   <th>charges <span class="net">modelled</span></th><th>net</th><th>broker</th></tr></thead>
-   <tbody></tbody></table>
   <div class="sec" style="display:flex;align-items:center;gap:8px">event timeline
    <span style="flex:1"></span>
    <button class="fbtn on" data-f="all">all</button>
@@ -495,6 +495,9 @@ loadCfg();
 </script>
 <script>
 let curDate=null, curEvents=[], curJournal=[], curFilter='all', digests=[];
+// symbols whose detail row is open, so the 5s live refresh does not collapse
+// them under the operator (issue #559). Cleared when a different day is picked.
+let expanded=new Set();
 // live max-vol overlay for today (issue #524): the tick-by-tick running max is
 // only published to the decision log at the exit job, so mid-window it comes
 // from /api/status instead. Cleared whenever a past day is selected.
@@ -553,6 +556,7 @@ async function loadLiveWatch(){
   }catch(e){liveWatch={}; liveNeeded=null;}
 }
 async function selectDay(date){
+  if(date!==curDate)expanded.clear();   // a different day's rows are different rows
   curDate=date;
   document.getElementById('dayjson').href='/open15_vol_breakout/api/decision_log?date='+date;
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
@@ -626,30 +630,23 @@ function srcBadge(src){
   return '<span class="badge '+(src==='rolling'?'b-roll':'b-seed')+'">'+esc(src||'seed')+'</span>';
 }
 function renderRolling(){
-  // issue #529: the day's additive watch-list additions, straight from the
-  // decision log — so a past day replays identically to the live view.
+  // issue #529 config summary. The per-add TABLE is gone (issue #559): every
+  // add is a watched symbol and already has a row, so its unique fields
+  // (time / rank / watch size) moved into that row's source cell and detail.
+  // `% change at add` was never unique — it is the `gap %` column for a
+  // rolling row.
   const armed=curEvents.find(e=>e.event==='armed')||{};
   const adds=curEvents.filter(e=>e.event==='watchlist_add');
   const cfg=document.getElementById('rollCfg');
   if(armed.rolling_watchlist_enabled===undefined&&!adds.length){
     // pre-#529 day: the armed event predates the feature entirely
-    cfg.textContent='— not recorded for this day';
+    cfg.textContent='rolling watch-list — not recorded for this day';
   }else if(armed.rolling_watchlist_enabled){
-    cfg.textContent='— enabled: re-rank every '+armed.rolling_cadence_s+
+    cfg.textContent='rolling watch-list — enabled: re-rank every '+armed.rolling_cadence_s+
       's, top '+armed.rolling_top_n+'/side · '+adds.length+' added';
   }else{
-    cfg.textContent='— disabled this day';
+    cfg.textContent='rolling watch-list — disabled this day';
   }
-  const tb=document.querySelector('#roll tbody'); tb.innerHTML='';
-  for(const a of adds){
-    const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+esc(a.at||a.ts)+'</td><td>'+esc(a.symbol)+'</td><td>'+esc(a.side)+
-      '</td><td class="'+(a.pct_change>=0?'pos':'neg')+'">'+(a.pct_change>=0?'+':'')+
-      esc(a.pct_change)+'%</td><td>#'+esc(a.rank)+'</td><td>'+esc(a.watch_size)+'</td>';
-    tb.appendChild(tr);
-  }
-  if(!adds.length)
-    tb.innerHTML='<tr><td colspan="6" class="muted">no rolling additions this day</td></tr>';
 }
 function volNeeded(){
   const w=curEvents.find(e=>e.event==='watch_stats');
@@ -690,6 +687,9 @@ function renderSel(){
       if(!rows[e.symbol])rows[e.symbol]={out:'no trigger'};
       const wr=rows[e.symbol];
       wr.side=e.side; wr.src='rolling'; wr.gap=e.pct_change;
+      // the add's own fields (issue #559) — these are what the separate rolling
+      // table used to carry, and they belong on the row they describe
+      wr.addAt=e.at||e.ts; wr.addRank=e.rank; wr.addSize=e.watch_size;
     }else if(e.event==='watch_stats'){
       // every selected symbol, entered ones included (issue #524)
       for(const[s,st]of Object.entries(e.stats||{})){
@@ -698,11 +698,21 @@ function renderSel(){
           rows[s].vol=st.max_vol_ratio; rows[s].volBeyond=st.max_vol_ratio_beyond;
         }
         if(!rows[s].src&&st.watch_source)rows[s].src=st.watch_source;
+        if(rows[s].levelBroken==null)rows[s].levelBroken=st.level_broken;
+        if(rows[s].needed==null)rows[s].needed=e.needed;
+      }
+    }else if(e.event==='summary'){
+      // the captured-drift measurement this deployment exists for (SPEC 4)
+      for(const d of (e.captured_drift||[])){
+        if(rows[d.symbol])Object.assign(rows[d.symbol],
+          {drift:d.trigger_vs_level_pct,driftClose:d.minclose_vs_level_pct});
       }
     }else if(!rows[e.symbol]){continue;
     }else if(e.event==='entry'){
       const r=rows[e.symbol];
       r.fill='real'; r.qty=e.qty; r.stockEntry=e.trigger_price;
+      r.level=e.level??r.level; r.at=e.at; r.volRatio=e.vol_ratio;
+      r.orderId=e.order_id;
       // in option mode the money is on the premium while `trigger_price` is the
       // stock — record BOTH legs (issue #555), never one standing in for the other
       if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.premium;
@@ -734,7 +744,7 @@ function renderSel(){
         r.entryVol??=e.opt_entry_volume; r.entryOi??=e.opt_entry_oi;}
       if(e.sim_quantity)r.qty=e.sim_quantity;
       r.out='skipped: '+esc(e.reason||'')+
-        (e.fill==='sim'?' <span class="badge b-sim">sim &middot; priced 1 lot</span>':'');
+        (e.fill==='sim'?' <span class="badge b-sim">priced 1 lot</span>':'');
     }else if((e.event==='exit'||e.event==='exit_paper'||e.event==='exit_sim')&&e.pnl!=null){
       const r=rows[e.symbol];
       r.gross=e.gross; r.charges=e.charges; r.net=e.pnl; r.qty=e.qty??r.qty;
@@ -747,11 +757,16 @@ function renderSel(){
       if(e.stock_entry_price!=null)r.stockEntry=r.stockEntry??e.stock_entry_price;
       if(e.event==='exit_paper')r.fill='paper';
       if(e.event==='exit_sim')r.fill='sim';
-      r.out+=' <span class="'+(e.pnl>=0?'pos':'neg')+'">&rarr; '+
-        (e.pnl>=0?'+':'')+'&#8377;'+e.pnl+'</span>';
+      // The outcome text no longer repeats the P&L (issues #557, #559): the
+      // `net P&L` column owns that number and reads it from the JOURNAL, which
+      // the reconcile passes correct. Appending the EVENT's figure here printed
+      // a stale "-> +Rs316" beside a correctly reconciled "-Rs288.15" in the
+      // same row — the exact divergence #557 was opened for, surviving in the
+      // one cell that was prose rather than data.
     }else if(e.event==='no_entry'){
       rows[e.symbol].vol=e.max_vol_ratio;
       rows[e.symbol].volBeyond=e.max_vol_ratio_while_beyond;
+      rows[e.symbol].levelBroken=e.level_broken; rows[e.symbol].needed=e.needed;
       // the gate compares the ratio measured WHILE price is beyond the level
       // (on_tick: `beyond and cum_in_min >= vol_mult*baseline`), so the outcome
       // must quote max_vol_ratio_while_beyond — the `max vol×` column's
@@ -782,17 +797,169 @@ function renderSel(){
     (needed!=null?' <span class="muted">(need '+needed+'&times; beyond)</span>':'');
   const tb=document.querySelector('#sel tbody'); tb.innerHTML='';
   for(const[s,r]of Object.entries(rows)){
+    // one row per watched symbol, its detail directly beneath (issue #559).
+    // The three symbol-keyed tables this replaces forced the reader to match
+    // rows by eye across the page to connect a fill to its contract's spread.
     const tr=document.createElement('tr');
-    tr.innerHTML='<td>'+esc(s)+'</td><td>'+esc(r.side)+'</td><td>'+srcBadge(r.src)+
+    tr.className='main'; tr.tabIndex=0;
+    tr.innerHTML='<td class="caret">&#9656;</td><td>'+esc(s)+'</td><td>'+esc(r.side)+
+      '</td><td>'+srcBadge(r.src)+
+      (r.addAt?('<span class="leg">#'+esc(r.addRank)+' @ '+esc(r.addAt)+'</span>'):'')+
       '</td><td>'+(r.gap??'')+
       '</td><td>'+fmtVol(r.vol,r.volBeyond,needed,liveSyms.has(s))+
       '</td><td>'+legCell(r,'entry')+'</td><td>'+legCell(r,'exit')+
       '</td><td>'+qtyCell(r)+'</td><td>'+pnlCell(r)+'</td><td>'+r.out+'</td>';
-    tb.appendChild(tr);
+    const det=document.createElement('tr');
+    det.className='detail';
+    det.innerHTML='<td></td><td colspan="10">'+detailFor(s,r,needed)+'</td>';
+    // Expansion survives the 5s auto-refresh (issue #559). The live day
+    // re-renders this whole table every tick, so without this an operator
+    // reading a row's fills during the window has it snap shut under them.
+    const open=expanded.has(s);
+    det.style.display=open?'':'none';
+    tr.classList.toggle('open',open);
+    tr.firstChild.innerHTML=open?'&#9662;':'&#9656;';
+    tr.dataset.sym=s;
+    tr.onclick=()=>toggleDetail(tr);
+    tr.onkeydown=ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();toggleDetail(tr);}};
+    tb.appendChild(tr); tb.appendChild(det);
   }
   if(!Object.keys(rows).length)
-    tb.innerHTML='<tr><td colspan="10" class="muted">no selection this day</td></tr>';
-  renderFills(rows); renderLiquidity(rows);
+    tb.innerHTML='<tr><td colspan="11" class="muted">no selection this day</td></tr>';
+  renderLiqNote(rows);
+}
+function toggleDetail(tr){
+  const d=tr.nextElementSibling, open=d.style.display!=='none';
+  d.style.display=open?'none':'';
+  tr.classList.toggle('open',!open);
+  tr.querySelector('.caret').innerHTML=open?'&#9656;':'&#9662;';
+  if(open)expanded.delete(tr.dataset.sym); else expanded.add(tr.dataset.sym);
+}
+function dbox(title,pairs){
+  // a box with nothing in it is noise — drop it rather than render empty labels
+  const body=pairs.filter(p=>p&&p[1]!=null&&p[1]!=='').map(
+    p=>'<tr><td>'+p[0]+'</td><td>'+p[1]+'</td></tr>').join('');
+  return body?('<div class="dbox"><div class="h">'+title+'</div><table>'+body+'</table></div>'):'';
+}
+function detailFor(sym,r,needed){
+  // The detail ADAPTS to what the row is: a filled row needs fills and
+  // slippage, a skipped row needs the arithmetic that skipped it, a
+  // never-entered row needs the gate that held it. Rendering all three
+  // shapes for every row is how a detail panel becomes wallpaper.
+  const isOpt=r.instr==='option';
+  const es=spreadOf(r.entryBid,r.entryAsk,r.tick), xs=spreadOf(r.exitBid,r.exitAsk,r.tick);
+  const rt=(es.pct!=null&&xs.pct!=null)?(es.pct+xs.pct):null;
+  const cost=(es.abs!=null&&xs.abs!=null&&r.qty)?((es.abs+xs.abs)/2*+r.qty):null;
+  const slip=(q,f)=>(q&&f)?('<span class="'+(f>q?'neg':'pos')+'">'+
+    ((f/q-1)*100>=0?'+':'')+((f/q-1)*100).toFixed(2)+'%</span>'):null;
+  const boxes=[];
+
+  if(r.net!=null||r.entryFill!=null){
+    let chk=null;
+    if(r.brokerPnl!=null&&r.gross!=null){
+      const d=Math.abs(r.brokerPnl-r.gross);
+      chk=d<=1?'<span class="badge b-ok">&#10003; matches book</span>'
+        :'<span class="badge b-warn">&#9888; &#8377;'+(Math.round(d*100)/100)+' diff</span>';
+    }else if(r.reconcile==='unavailable')chk='<span class="badge b-warn">unavailable</span>';
+    else if(r.reconcile==='pending')chk='<span class="badge b-pend">pending</span>';
+    else if(r.pnlSource!=='fill')chk='<span class="badge b-pend">not reconciled</span>';
+    boxes.push(dbox('FILLS &amp; CHARGES',[
+      ['quote in / out',(px(isOpt?r.optEntry:r.stockEntry)||'—')+' / '+
+        (px(isOpt?r.optExit:r.stockExit)||'—')],
+      ['fill in / out',(r.entryFill!=null||r.exitFill!=null)
+        ?('<b>'+(px(r.entryFill)||'—')+' / '+(px(r.exitFill)||'—')+'</b>'):null],
+      ['slippage in',slip(isOpt?r.optEntry:r.stockEntry,r.entryFill)],
+      ['slippage out',slip(isOpt?r.optExit:r.stockExit,r.exitFill)],
+      ['gross',r.gross!=null?rupee2(r.gross):null],
+      ['charges <span class="muted">modelled</span>',r.charges!=null?rupee2(r.charges):null],
+      ['net',r.net!=null?('<span class="'+(r.net>=0?'pos':'neg')+'">'+rupee2(r.net)+'</span>'):null],
+      ['priced from',r.pnlSource==='fill'?'broker fills':'quotes (not reconciled)'],
+      ['broker check',chk],
+      ['entry order',r.orderId?('<span class="muted">'+esc(r.orderId)+'</span>'):null],
+    ]));
+  }
+
+  if(isOpt){
+    boxes.push(dbox('CONTRACT LIQUIDITY',[
+      ['contract','<span class="opt">'+esc(r.contract||'')+'</span>'],
+      ['lot / tick',(r.lotSize??'—')+' / '+(r.tick??'—')],
+      ['entry bid/ask',r.entryBid?(px(r.entryBid)+' / '+px(r.entryAsk)):null],
+      ['entry spread',es.pct!=null?fmtSpread(es):null],
+      ['exit bid/ask',r.exitBid?(px(r.exitBid)+' / '+px(r.exitAsk)):null],
+      ['exit spread',xs.pct!=null?fmtSpread(xs):null],
+      ['round trip',rt!=null?('<b>'+rt.toFixed(2)+'%</b> <span class="muted">of premium</span>'):null],
+      ['spread cost',cost!=null?('&#8377;'+Math.round(cost)+
+        ' <span class="muted">not deducted</span>'):null],
+      ['volume',r.entryVol!=null&&r.lotSize?(Math.round(r.entryVol/r.lotSize)+
+        ' <span class="muted">lots</span>'):null],
+      ['OI',r.entryOi!=null&&r.lotSize?(Math.round(r.entryOi/r.lotSize)+
+        ' <span class="muted">lots</span>'):null],
+      ['vol / OI',(r.entryVol!=null&&r.entryOi)?(r.entryVol/r.entryOi).toFixed(1):null],
+      ['OI path',(r.oiPath&&r.oiPath.oi_change!=null)
+        ?('<span class="'+(r.oiPath.oi_change>=0?'pos':'neg')+'">'+
+          (r.oiPath.oi_change>=0?'+':'')+
+          (r.oiPath.oi_change_lots!=null?(r.oiPath.oi_change_lots+' lots'):r.oiPath.oi_change)+
+          '</span> <span class="muted">'+r.oiPath.minutes+' min, '+
+          (r.oiPath.oi_change>=0?'building':'unwinding')+'</span>'):null],
+    ]));
+  }
+
+  if(r.fill==='sim'||/unaffordable|max_trades_cap/.test(r.skipReason||'')){
+    // the arithmetic that skipped it — currently only derivable by hand
+    const armed=curEvents.find(e=>e.event==='armed')||{};
+    const need=(r.lotSize&&r.optEntry)?(r.lotSize*r.optEntry):null;
+    const slot=armed.margin_effective??armed.margin_per_slot;
+    boxes.push(dbox('WHY IT WAS SKIPPED',[
+      ['reason',esc(r.skipReason||'')],
+      ['needed',need!=null?(r.lotSize+' &times; '+rupee2(r.optEntry)+' = <b>'+
+        rupee2(need)+'</b>'):null],
+      ['slot capital',slot!=null?rupee2(slot):null],
+      ['short by',(need!=null&&slot!=null&&need>slot)
+        ?('<span class="neg">'+rupee2(need-slot)+'</span>'):null],
+      ['priced at',r.qty?(r.qty+' <span class="muted">(1 lot, measurement only)</span>'):null],
+    ]));
+  }else if(r.net==null&&r.vol!=null){
+    boxes.push(dbox('WHY IT NEVER ENTERED',[
+      ['level',r.level!=null?px(r.level):null],
+      ['level broken',r.levelBroken==null?null
+        :(r.levelBroken?'<span class="pos">yes</span>':'<span class="neg">never</span>')],
+      ['peak vol anywhere',r.vol!=null?(r.vol+'&times;'):null],
+      ['peak vol while beyond',r.volBeyond!=null?(r.volBeyond+'&times;')
+        :'<span class="muted">n/a — never beyond</span>'],
+      ['needed',(r.needed??needed)!=null?((r.needed??needed)+'&times; while beyond'):null],
+    ]));
+  }
+
+  boxes.push(dbox('DECISION',[
+    ['level',r.level!=null?px(r.level):null],
+    ['trigger',r.at?(esc(r.at)+(r.stockEntry?(' @ '+px(r.stockEntry)):'')):null],
+    ['vol at trigger',r.volRatio!=null?(r.volRatio+'&times;'):null],
+    ['captured drift',r.drift!=null?(r.drift+'% <span class="muted">vs level</span>'):null],
+    ['min-close drift',r.driftClose!=null?(r.driftClose+'%'):null],
+    ['watch-list add',r.addAt?(esc(r.addAt)+', rank #'+esc(r.addRank)+
+      ', size '+esc(r.addSize)):null],
+    ['% change at add',(r.addAt&&r.gap!=null)?(r.gap+'%'):null],
+  ]));
+
+  const html=boxes.filter(Boolean).join('');
+  return html?('<div class="dgrid">'+html+'</div>')
+    :'<span class="muted">nothing further recorded for this symbol</span>';
+}
+function rupee2(v){
+  return (v<0?'-':'')+'&#8377;'+Math.abs(Math.round(v*100)/100).toLocaleString('en-IN');
+}
+function renderLiqNote(rows){
+  const anySpread=Object.values(rows).some(r=>r.entryBid||r.exitBid);
+  const anyOpt=Object.values(rows).some(r=>r.instr==='option');
+  const note=document.getElementById('liqNote');
+  if(!anyOpt){note.textContent='';return;}
+  note.innerHTML=anySpread
+    ? 'Liquidity is reported in <b>LOTS</b> — raw contract counts are not comparable '+
+      'across a universe whose lot sizes differ ~30&times;. <b>Spread cost is NOT deducted '+
+      'from P&amp;L</b>: sim and paper rows price both legs at the quote LTP, so their net '+
+      'is optimistic by roughly that amount; real rows use broker fills, where the spread '+
+      'is already inside the fill price.'
+    : 'Bid/ask not captured for this day &mdash; it starts with the next armed session.';
 }
 // --- liquidity derivations (issue #555) ------------------------------------
 // Mirrors services/open15_liquidity.py. Two rules it must not break:
@@ -814,51 +981,6 @@ function fmtSpread(s){
   return s.abs.toFixed(2)+' <span class="muted">'+s.pct.toFixed(2)+'%'+
     (s.ticks!=null?(' &middot; '+s.ticks.toFixed(0)+'t'):'')+'</span>';
 }
-function renderLiquidity(rows){
-  const rs=Object.entries(rows).filter(([,r])=>r.instr==='option'&&r.contract);
-  const tb=document.querySelector('#liq tbody'); tb.innerHTML='';
-  const note=document.getElementById('liqNote');
-  if(!rs.length){
-    tb.innerHTML='<tr><td colspan="13" class="muted">no option contracts this day</td></tr>';
-    note.textContent=''; return;
-  }
-  let anySpread=false;
-  for(const[s,r]of rs){
-    const es=spreadOf(r.entryBid,r.entryAsk,r.tick), xs=spreadOf(r.exitBid,r.exitAsk,r.tick);
-    if(es.pct!=null||xs.pct!=null)anySpread=true;
-    const rt=(es.pct!=null&&xs.pct!=null)?(es.pct+xs.pct):null;
-    // half the width per leg: a mid fill is the fair reference and a market
-    // order gives up half of it on each side
-    const cost=(es.abs!=null&&xs.abs!=null&&r.qty)?((es.abs+xs.abs)/2*+r.qty):null;
-    const vLots=inLots(r.entryVol,r.lotSize), oLots=inLots(r.entryOi,r.lotSize);
-    const vOi=(r.entryVol!=null&&r.entryOi)?(+r.entryVol/+r.entryOi):null;
-    const p=r.oiPath;
-    const pathCell=p&&p.oi_change!=null
-      ? '<span class="'+(p.oi_change>=0?'pos':'neg')+'">'+(p.oi_change>=0?'+':'')+
-        (p.oi_change_lots!=null?p.oi_change_lots+' lots':p.oi_change)+'</span>'+
-        '<span class="leg">'+p.minutes+' min '+(p.oi_change>=0?'building':'unwinding')+'</span>'
-      : dash;
-    tb.innerHTML+='<tr><td>'+esc(s)+'</td><td class="opt">'+esc(shortC(r.contract))+
-      '</td><td>'+(r.lotSize??dash)+
-      '</td><td>'+(r.entryBid?(px(r.entryBid)+' / '+px(r.entryAsk)):dash)+
-      '</td><td>'+fmtSpread(es)+
-      '</td><td>'+(r.exitBid?(px(r.exitBid)+' / '+px(r.exitAsk)):dash)+
-      '</td><td>'+fmtSpread(xs)+
-      '</td><td>'+(rt!=null?('<b>'+rt.toFixed(2)+'%</b>'):dash)+
-      '</td><td>'+(cost!=null?('&#8377;'+Math.round(cost)):dash)+
-      '</td><td>'+(vLots!=null?(Math.round(vLots)+' <span class="muted">lots</span>'):dash)+
-      '</td><td>'+(oLots!=null?(Math.round(oLots)+' <span class="muted">lots</span>'):dash)+
-      '</td><td>'+(vOi!=null?vOi.toFixed(1):dash)+
-      '</td><td>'+pathCell+'</td></tr>';
-  }
-  note.innerHTML=anySpread
-    ? 'Volume and OI are shown in <b>LOTS</b> — raw contract counts are not comparable '+
-      'across a universe whose lot sizes differ ~30&times;. <b>Spread cost is NOT deducted '+
-      'from P&amp;L</b>: sim and paper rows price both legs at the quote LTP, so their net '+
-      'is optimistic by roughly this amount; real rows use broker fills, where the spread '+
-      'is already inside the fill price.'
-    : 'Bid/ask not captured for this day &mdash; it starts with the next armed session.';
-}
 function applyJournal(rows){
   // issue #557: the JOURNAL is authoritative for everything it stores, because
   // the reconcile passes correct it IN PLACE. The decision log records what was
@@ -871,6 +993,11 @@ function applyJournal(rows){
     if(!r)continue;                       // never triggered: nothing to correct
     r.stockEntry=j.trigger_price??r.stockEntry;
     r.stockExit=j.exit_price??r.stockExit;
+    // the option-mode `entry` event never carried `level` (only the stock path
+    // logs it), so without this the breakout level is blank on exactly the rows
+    // that traded. Python's `_JOURNAL_OWNED` already had it.
+    r.level=j.level??r.level;
+    r.skipReason=j.reason??r.skipReason;
     r.instr=j.instrument||r.instr;
     r.contract=j.opt_symbol??r.contract;
     r.optEntry=j.opt_entry_premium??r.optEntry;
@@ -951,40 +1078,6 @@ function pnlCell(r){
   return '<span class="'+cls+'">'+(r.net>=0?'+':'')+'&#8377;'+r.net+'</span>'+
     '<span class="leg">gross '+(r.gross??'?')+' &middot; charges '+(r.charges??'?')+
     ' '+badge+' '+src+'</span>';
-}
-function renderFills(rows){
-  // real fills only — paper and sim rows have no orders to reconcile
-  const rs=Object.entries(rows).filter(([,r])=>r.fill==='real'&&r.net!=null);
-  const tb=document.querySelector('#fills tbody'); tb.innerHTML='';
-  const note=document.getElementById('fillNote');
-  const done=rs.filter(([,r])=>r.pnlSource==='fill').length;
-  note.innerHTML=rs.length
-    ?('&mdash; '+done+'/'+rs.length+' reconciled against broker fills. '+
-      'Gross uses fill prices once reported; charges are always MODELLED '+
-      '(no broker exposes per-order charges via API).')
-    :'&mdash; no real fills this day';
-  for(const[s,r]of rs){
-    const isOpt=r.instr==='option';
-    const qe=px(isOpt?r.optEntry:r.stockEntry), qx=px(isOpt?r.optExit:r.stockExit);
-    const fe=px(r.entryFill), fx=px(r.exitFill);
-    const slip=(fe!=null&&qe!=null)?(((parseFloat(fe)/parseFloat(qe))-1)*100).toFixed(2)+'%':'';
-    // the broker's own realized P&L, compared against ours. A gap over Rs1 is
-    // shown as the gap, not hidden behind a tick.
-    let chk='<span class="badge b-pend">pending</span>';
-    if(r.reconcile==='unavailable')chk='<span class="badge b-warn">unavailable</span>';
-    else if(r.brokerPnl!=null&&r.gross!=null){
-      const d=Math.abs(r.brokerPnl-r.gross);
-      chk=d<=1?'<span class="badge b-ok">&#10003; matches book</span>'
-        :'<span class="badge b-warn">&#9888; &#8377;'+(Math.round(d*100)/100)+' diff</span>';
-    }else if(r.pnlSource==='fill')chk='<span class="badge b-ok">&#10003; fills</span>';
-    tb.innerHTML+='<tr><td>'+esc(s)+(isOpt?('<span class="leg opt">'+esc(shortC(r.contract))+
-      '</span>'):'')+'</td><td>'+(qe??dash)+'</td><td>'+(fe!=null?('<b>'+fe+'</b>'):dash)+
-      '</td><td>'+(qx??dash)+'</td><td>'+(fx!=null?('<b>'+fx+'</b>'):dash)+
-      '</td><td class="muted">'+slip+'</td><td>'+(r.gross??dash)+'</td><td>'+(r.charges??dash)+
-      '</td><td class="'+(r.net>=0?'pos':'neg')+'">'+(r.net>=0?'+':'')+'&#8377;'+r.net+
-      '</td><td>'+chk+'</td></tr>';
-  }
-  if(!rs.length)tb.innerHTML='<tr><td colspan="10" class="muted">nothing to reconcile</td></tr>';
 }
 function renderTimeline(){
   const tb=document.querySelector('#t tbody'); tb.innerHTML='';
