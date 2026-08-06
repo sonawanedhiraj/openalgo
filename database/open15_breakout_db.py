@@ -306,8 +306,38 @@ def save_config(
 _REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill != "paper")
 
 
+def net_pnl_expr():
+    """SQL expression for a row's NET P&L — the ONE P&L convention (issue #552).
+
+    ``pnl`` is gross (entry -> exit) and the modelled round-trip charges live
+    separately in ``charges_inr`` (issue #433), so every consumer that reports
+    "the P&L" has to deduct them. Before #552 four sites re-derived this
+    independently and three disagreed: the day digest and ``total_realized_pnl``
+    reported gross, the strategies dashboard reported net, the ``exit`` event
+    reported gross and the ``exit_paper`` event reported net. On 2026-08-05 that
+    put **+₹2109 gross** in the logs-page chip above rows totalling **+₹1383.81
+    net** (charges were 34% of gross); on 2026-07-23 it flipped the sign.
+
+    Charges are real money, so net is the honest number and the only one that
+    should ever be shown or compounded. Route every new consumer through here
+    (or ``net_pnl_of_row``) rather than writing ``sum(pnl)`` again.
+    """
+    from sqlalchemy import func
+
+    return Open15Trade.pnl - func.coalesce(Open15Trade.charges_inr, 0.0)
+
+
+def net_pnl_of_row(row) -> float:
+    """Python-side twin of :func:`net_pnl_expr` for an ORM row / mapping."""
+    get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
+    return float(get("pnl") or 0.0) - float(get("charges_inr") or 0.0)
+
+
 def total_realized_pnl() -> float:
-    """Sum of research P&L across closed trades (drives compound sizing).
+    """Sum of NET research P&L across closed trades (drives compound sizing).
+
+    Net of modelled charges (issue #552) — compounding off gross would size
+    tomorrow's real orders against money the charges already took.
 
     **Paper rows are excluded** (issue #548). A broker-rejected entry is priced
     as a sandbox-equivalent simulation so the day stays measurable, but that
@@ -318,7 +348,7 @@ def total_realized_pnl() -> float:
         from sqlalchemy import func
 
         val = (
-            db_session.query(func.sum(Open15Trade.pnl))
+            db_session.query(func.sum(net_pnl_expr()))
             .filter(Open15Trade.pnl.isnot(None), _REAL_FILL)
             .scalar()
         )
@@ -377,13 +407,13 @@ def list_day_logs() -> list[tuple[str, list]]:
 
 
 def _pnl_by_date(paper: bool) -> dict[str, float]:
-    """Gross journal P&L per trade_date for one fill class (issue #548)."""
+    """NET journal P&L per trade_date for one fill class (issues #548, #552)."""
     try:
         from sqlalchemy import func
 
         pred = (Open15Trade.fill == "paper") if paper else _REAL_FILL
         rows = (
-            db_session.query(Open15Trade.trade_date, func.sum(Open15Trade.pnl))
+            db_session.query(Open15Trade.trade_date, func.sum(net_pnl_expr()))
             .filter(Open15Trade.pnl.isnot(None), pred)
             .group_by(Open15Trade.trade_date)
             .all()
@@ -397,7 +427,7 @@ def _pnl_by_date(paper: bool) -> dict[str, float]:
 
 
 def trades_pnl_by_date() -> dict[str, float]:
-    """Gross REAL journal P&L per trade_date (charges not deducted).
+    """NET REAL journal P&L per trade_date (charges deducted — issue #552).
 
     Paper rows are excluded and reported separately by ``paper_pnl_by_date`` —
     the history sidebar must never blend simulated money into a day's P&L.
@@ -406,7 +436,7 @@ def trades_pnl_by_date() -> dict[str, float]:
 
 
 def paper_pnl_by_date() -> dict[str, float]:
-    """Gross PAPER journal P&L per trade_date (broker-rejected entries, #548)."""
+    """NET PAPER journal P&L per trade_date (broker-rejected entries, #548)."""
     return _pnl_by_date(paper=True)
 
 

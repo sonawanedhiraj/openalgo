@@ -50,6 +50,10 @@ def summarize_day(
     counted and priced separately as ``paper`` / ``paper_pnl`` — a simulated day
     must never be summed into a day's P&L, or the sidebar shows money that was
     never made.
+
+    Both P&L figures are **NET** of modelled charges (issue #552), matching the
+    per-symbol rows and ``trades_pnl_by_date`` / ``paper_pnl_by_date``. There is
+    one P&L convention here; do not reintroduce a gross one.
     """
     status = "unknown"
     selected = 0
@@ -78,8 +82,11 @@ def summarize_day(
         elif kind == "exit" and ev.get("pnl") is not None:
             pnl_from_events += float(ev["pnl"])
             saw_exit_pnl = True
-        elif kind == "exit_paper" and ev.get("gross") is not None:
-            paper_from_events += float(ev["gross"])
+        elif kind == "exit_paper" and ev.get("pnl") is not None:
+            # `pnl`, NOT `gross` (issue #552) — the digest must agree with the
+            # per-symbol rows the page renders from the same events, and those
+            # read `pnl`. Both events carry gross/charges/pnl(net) alike.
+            paper_from_events += float(ev["pnl"])
             saw_paper_pnl = True
         elif kind == "summary":
             status = ev.get("day") or status

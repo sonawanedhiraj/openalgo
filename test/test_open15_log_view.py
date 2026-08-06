@@ -429,3 +429,108 @@ def test_log_event_persists_immediately(monkeypatch):
     assert persisted is not None and persisted[-1]["event"] == "selection"
     svc._log_event("entry", symbol="OIL", order_status="success")
     assert get_day_log("2026-01-05")[-1]["event"] == "entry"
+
+
+# --- issue #552: ONE P&L convention (net) across chip, digest and rows --------
+#
+# The 2026-08-05 shape, verbatim: three broker-rejected option entries whose
+# gross sums to +2108.75 while the per-symbol rows (net of modelled charges)
+# sum to +1383.81. Pre-fix the chip read +2109 above rows totalling +1384.
+_PAPER_DAY_ROWS = [
+    # (symbol, gross pnl, charges, net)
+    ("JUBLFOOD", -312.50, 229.22, -541.72),
+    ("GODREJPROP", 1803.75, 246.34, 1557.41),
+    ("DLF", 617.50, 249.38, 368.12),
+]
+_PAPER_DAY_NET = round(sum(net for *_, net in _PAPER_DAY_ROWS), 2)  # 1383.81
+
+
+def _paper_day_events(date: str) -> list[dict]:
+    ev: list[dict] = [
+        {"event": "armed", "universe": 211, "vol_mult": 1.5, "mode": "live"},
+        {
+            "event": "selection",
+            "selected": {s: "L" for s, *_ in _PAPER_DAY_ROWS},
+            "gaps_pct": {s: 2.5 for s, *_ in _PAPER_DAY_ROWS},
+        },
+    ]
+    for sym, gross, charges, net in _PAPER_DAY_ROWS:
+        ev.append({"event": "entry_rejected", "symbol": sym, "entry_price": 20.0, "error": "403"})
+        ev.append(
+            {
+                "event": "exit_paper",
+                "symbol": sym,
+                "instrument": "option",
+                "exit_price": 21.0,
+                "gross": gross,
+                "charges": charges,
+                "pnl": net,
+                "fill": "paper",
+            }
+        )
+    return ev
+
+
+def test_paper_day_digest_equals_the_sum_of_its_rows():
+    """The chip and the rows below it must be the same number (issue #552).
+
+    Pre-fix the digest summed the events' ``gross`` while the page rendered
+    each row's ``pnl`` (net), so the header overstated the day by the whole
+    charge bill — 34% of gross on the day this was found.
+    """
+    from services.open15_log_view import selection_outcomes, summarize_day
+
+    events = _paper_day_events("2026-08-05")
+    digest = summarize_day("2026-08-05", events)
+    rows_total = round(
+        sum(r["pnl"] for r in selection_outcomes("2026-08-05", events) if r.get("pnl") is not None),
+        2,
+    )
+    assert rows_total == _PAPER_DAY_NET
+    assert digest["paper_pnl"] == _PAPER_DAY_NET, (
+        f"chip {digest['paper_pnl']} != rows {rows_total} — the header and the "
+        "table are reporting different P&L conventions again"
+    )
+    assert digest["pnl"] is None and digest["paper"] == 3
+
+
+def test_pnl_by_date_and_realized_pnl_are_net_of_charges():
+    """``charges_inr`` is real money — never report or compound gross (#552)."""
+    from database.open15_breakout_db import (
+        db_session,
+        init_db,
+        insert_trade,
+        paper_pnl_by_date,
+        total_realized_pnl,
+        trades_pnl_by_date,
+    )
+
+    init_db()
+    before = total_realized_pnl()
+    for sym, gross, charges, _net in _PAPER_DAY_ROWS:
+        insert_trade(
+            trade_date="2026-08-05",
+            symbol=sym,
+            side="L",
+            mode="live",
+            pnl=gross,
+            charges_inr=charges,
+            fill="paper",
+        )
+    # A real row on a date no other test touches (the DB is shared across the
+    # session). Gross 82.25 - 100.07 charges is a NET LOSS, which the pre-fix
+    # gross aggregation reported as a +82 gain — the real 2026-07-23 OIL trade.
+    insert_trade(
+        trade_date="2026-07-23-net552",
+        symbol="OIL",
+        side="L",
+        mode="sandbox",
+        pnl=82.25,
+        charges_inr=100.07,
+    )
+
+    assert paper_pnl_by_date()["2026-08-05"] == _PAPER_DAY_NET
+    assert trades_pnl_by_date()["2026-07-23-net552"] == -17.82
+    # paper still never reaches compound sizing, and the real row lands net
+    assert round(total_realized_pnl() - before, 2) == -17.82
+    db_session.remove()
