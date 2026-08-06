@@ -82,6 +82,11 @@ def test_summarize_day_traded():
         # cohort is empty and paper P&L is absent (not 0 — nothing was simulated)
         "paper": 0,
         "paper_pnl": None,
+        # likewise a pre-#555 day has no entry_skipped/exit_sim events, so the
+        # sim cohort is empty and its P&L is absent rather than 0 — "nothing was
+        # simulated" and "the simulation broke even" must stay distinguishable
+        "sim": 0,
+        "sim_pnl": None,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
     }
@@ -372,7 +377,10 @@ def test_logs_page_js_keeps_a_rolling_row_outcome():
     ]
     rows = _run_render_sel(day)
     assert rows["PNBHOUSING"]["src"] == "rolling"
-    assert "entered @ 478.45" in rows["PNBHOUSING"]["out"]
+    assert "entered" in rows["PNBHOUSING"]["out"]
+    # the entry price moved out of the outcome text into its own column
+    # (issue #555) — it must still be on the row, not merely still rendered
+    assert rows["PNBHOUSING"]["stockEntry"] == 478.45
 
 
 def test_selection_outcomes_empty_for_skipped_day():

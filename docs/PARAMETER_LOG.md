@@ -2064,6 +2064,57 @@ ran in the 15:30-17:00 periodic window).
     `[live] … ENTRY REJECTED … <message>` at ERROR since its own build-out; this
     brings open15 to parity and adds the Telegram leg.
 
+## `OPEN15_FILL_RECONCILE_ENABLED` (default `true`)
+
+- **Where:** `services/open15_fill_reconcile.py` `_enabled()`; also gated in
+  `services/open15_breakout_service.py` (`_fill_reconcile_enabled`).
+- **What it controls:** whether open15_vol_breakout asks the broker what it
+  ACTUALLY filled (`average_price` per leg) and re-derives the row's gross P&L
+  and modelled charges from those prices instead of the quote/tick prices the
+  decision was made on.
+- **Why it is off the hot path.** It runs at the summary job (exit+5 min) and is
+  retried by the next 09:10 arm — never inside `_enter`/`flatten`. Entries are
+  placed from the ZMQ tick callback, where a synchronous broker round-trip would
+  stall every other symbol's tick processing.
+- **One P&L convention is preserved (issue #552).** Reconciliation OVERWRITES
+  `pnl` / `charges_inr` in place and stamps `pnl_source='fill'`; it does not add
+  a second number. `net_pnl_expr()` and every consumer are untouched.
+- **Charges remain MODELLED even when enabled.** No broker exposes per-order
+  charges through its API (Zerodha publishes them on the next-day contract note
+  only), so the Zerodha formula is kept — but applied to the actual fill
+  turnover. Gross matches the broker; charges are a labelled estimate.
+- **Failure mode:** fail-graceful. A leg the broker has not reported leaves the
+  row `pending` with its quote-derived P&L intact and is retried; a terminally
+  rejected/cancelled leg is marked `unavailable` so the retry loop stops.
+- **History:**
+  - **2026-08-06:** Introduced by issue #555. Before it, every P&L the strategy
+    published was a quote-derived estimate that had never been checked against
+    the broker, and slippage was structurally unmeasurable.
+
+## `OPEN15_SIM_SKIPPED_ENABLED` (default `true`) / `OPEN15_PAPER_SIM_MAX` (default `10`)
+
+- **Where:** `services/open15_breakout_service.py` `_sim_skipped_enabled()` /
+  `_paper_sim_max()`, consumed by `_sim_context` and `_journal_skip`.
+- **What they control:** whether a trigger the strategy did NOT send an order for
+  (`unaffordable`, `max_trades_cap`) is priced at **1 lot** so the journal can
+  answer "would it have paid?", and how many such rows a day may carry.
+- **Never an order.** A sim row places nothing and — unlike a broker *rejection*
+  — never reads the position book: no order was sent, so the book could only
+  surface an unrelated same-symbol position and promote a trade we never placed
+  into a live square-off.
+- **Sim money is never real money.** `fill='sim'` is excluded from
+  `total_realized_pnl()` (which sizes tomorrow's real orders under compound
+  sizing) and reported as its own third bucket by `sim_pnl_by_date()`, never
+  folded into `paper`.
+- **Why a cap:** each sim row spends a broker quote at entry and another at exit.
+  Setting `OPEN15_PAPER_SIM_MAX=0` disables pricing while leaving the bare skip
+  rows exactly as they were pre-#555.
+- **History:**
+  - **2026-08-06:** Introduced by issue #555. Before it, an unaffordable trigger
+    journaled a contract and an entry premium and then stopped — no exit, no
+    P&L, no label — so it was impossible to tell whether the slot capital or the
+    signal was what capped the strategy.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

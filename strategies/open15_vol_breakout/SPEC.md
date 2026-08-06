@@ -94,6 +94,38 @@ Per entry: `level`, `trigger_minute`+`trigger_second`, `trigger_price`,
   Round 58: trigger entry must beat the close entry by ≥0.4pp/trade to be a
   real strategy; otherwise final REJECT.
 
+### 4a. Which prices the decision rule may use (issue #555)
+
+The columns above are **decision-moment observations**, not transactions:
+`trigger_price` is the tick that fired the volume gate and `opt_entry_premium`
+is the option quote at that instant. Scoring the strategy on them measures the
+signal, not the trade.
+
+`entry_fill_price` / `exit_fill_price` carry what the broker actually filled
+(reconciled at exit+5, retried at the next arm; `pnl_source='fill'` once both
+legs report, else `quote`). **`pnl` is always the one gross number** and is
+re-derived from the fills in place when they land — there is no second P&L
+convention (the #552 rule). Read the pair as:
+
+- **signal quality** — quote/tick columns, the `captured drift` metric above;
+- **realisable P&L** — `net_pnl_of_row` on a `pnl_source='fill'` row;
+- **slippage** — `fill − quote`, which is why the quote columns are never
+  overwritten. The ≥0.4pp decision rule is a claim about *tradeable* return, so
+  it must be evaluated on fill-sourced rows once enough exist.
+
+**Charges are modelled, always.** No broker exposes per-order charges through
+its API (Zerodha publishes them on the next-day contract note), so even a fully
+reconciled row's net is gross-from-fills minus a modelled deduction. `broker_pnl`
+records the position book's own realized figure as an independent cross-check;
+a gap over ₹1 is surfaced on the logs page rather than smoothed over.
+
+**Three P&L buckets, never summed** — `fill='real'` (money; the only bucket that
+compounds), `fill='paper'` (the broker rejected the entry, #548), `fill='sim'`
+(no order was ever attempted — `unaffordable` / `max_trades_cap` — priced at
+1 lot). The sim bucket exists to answer a question the journal previously could
+not: whether the *slot capital* or the *signal* is what caps the strategy. Only
+real rows may enter any published performance number.
+
 ## 5. Ops constraints (load-bearing)
 - **OpenAlgo must be running before 09:15 IST.** The arm job runs 09:10; a boot
   after 09:15:30 marks the day `skipped_late_boot` with a loud WARNING —

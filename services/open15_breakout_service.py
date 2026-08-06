@@ -176,6 +176,29 @@ def _opt_shadow_enabled() -> bool:
     return os.getenv("OPEN15_OPT_SHADOW_ENABLED", "true").lower() == "true"
 
 
+def _sim_skipped_enabled() -> bool:
+    """Price triggers no order was sent for (unaffordable / cap), issue #555."""
+    return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
+
+
+def _paper_sim_max() -> int:
+    """Daily cap on simulated rows.
+
+    They cost no money and place no orders, but each one spends a broker quote
+    at entry and another at exit — so a 9-selection all-unaffordable day is
+    bounded rather than left to fan out.
+    """
+    try:
+        return max(int(os.getenv("OPEN15_PAPER_SIM_MAX", "10")), 0)
+    except (TypeError, ValueError):
+        return 10
+
+
+def _fill_reconcile_enabled() -> bool:
+    """Reconcile real rows against the broker's own fills (issue #555)."""
+    return os.getenv("OPEN15_FILL_RECONCILE_ENABLED", "true").lower() == "true"
+
+
 def _instrument_default() -> str:
     """What the entry BUYS: the stock itself, or its ATM option (issue #437)."""
     v = os.getenv("OPEN15_INSTRUMENT", "stock").lower()
@@ -1230,6 +1253,10 @@ class Open15BreakoutService:
             no_entry_after=self.day_config["no_entry_after"],
             exit_time=self.day_config["exit_time"],
             trade_side=self.day_config["trade_side"],
+            # what the day actually traded (issue #555). Absent before now, so a
+            # past day's log could not say whether its P&L was on stock or on
+            # option premium — the single most load-bearing fact for reading it.
+            instrument=self.day_config.get("instrument"),
             # rolling additive watch list (issue #529) — the effective values,
             # so a day is replayable from its own log
             rolling_watchlist_enabled=self.day_config["rolling_watchlist_enabled"],
@@ -1248,9 +1275,10 @@ class Open15BreakoutService:
             baseline_includes_first_minute=_baseline_includes_first_minute(),
         )
         self._ensure_zmq_thread()
-        if _opt_shadow_enabled():
-            # catch-up pricing for rows the 09:35 broker-lag left unpriced
-            # (and the one-off #435 backfill) — daemon thread, never blocks arm
+        if _opt_shadow_enabled() or _fill_reconcile_enabled():
+            # catch-up pricing for rows the 09:35 broker-lag left unpriced (the
+            # #435 shadow premiums and the #555 fill prices, each gated inside)
+            # — daemon thread, never blocks arm
             threading.Thread(
                 target=self._opt_shadow_catchup, name="open15-opt-shadow", daemon=True
             ).start()
@@ -1289,15 +1317,35 @@ class Open15BreakoutService:
         )
 
     def _opt_shadow_catchup(self) -> None:
-        """Daemon-thread wrapper for the arm-time option-shadow catch-up."""
-        try:
-            from services.open15_option_shadow import enrich_missing
+        """Daemon-thread wrapper for the arm-time catch-up passes.
 
-            res = enrich_missing()
-            if res.get("priced"):
-                logger.info("open15 opt-shadow catch-up: %s", res)
+        Two independent retries share this thread because they retry for the
+        same reason — the broker had not published the data yet at 09:35:
+        option-shadow premiums (1m history lags 5-15 min) and fill prices for a
+        leg still reporting as open. Both are idempotent and fail-graceful, and
+        neither may take the other down, so they are wrapped separately.
+        """
+        if _opt_shadow_enabled():
+            try:
+                from services.open15_option_shadow import enrich_missing
+
+                res = enrich_missing()
+                if res.get("priced"):
+                    logger.info("open15 opt-shadow catch-up: %s", res)
+            except Exception:
+                logger.exception("open15: option-shadow catch-up failed")
+        if not _fill_reconcile_enabled():
+            return
+        try:
+            from services.open15_fill_reconcile import reconcile_fills
+
+            # no date filter: this is the catch-up for ANY day whose legs were
+            # still pending, including one the app was restarted through
+            res = reconcile_fills()
+            if res.get("reconciled"):
+                logger.info("open15 fill-reconcile catch-up: %s", res)
         except Exception:
-            logger.exception("open15: option-shadow catch-up failed")
+            logger.exception("open15: fill-reconcile catch-up failed")
 
     def _window_minutes(self) -> tuple[int, int]:
         """Today's effective (entry-cutoff, exit) as minutes since midnight."""
@@ -1419,25 +1467,40 @@ class Open15BreakoutService:
         return True
 
     def _flatten_paper(self, symbol: str, pos: dict, reason: str) -> None:
-        """Close a broker-rejected entry as a PAPER fill (issue #548).
+        """Close a non-traded row as a PAPER or SIM fill (issues #548, #555).
 
         Places NO order — there is no position to close. Prices the exit exactly
         where a real flatten would have, so the row carries the full
         sandbox-equivalent measurement (exit price, gross P&L, modelled charges)
         and the day stays comparable to one that traded.
+
+        Serves both non-traded classes because the *pricing* is identical; only
+        the labels differ. A ``sim`` row keeps its ``skipped`` status and its
+        original skip reason — it was never rejected, and relabelling it would
+        blame the broker for a budget decision.
         """
         from database.open15_breakout_db import update_trade
 
         is_option = pos.get("instrument") == "option"
+        is_sim = pos.get("fill") == "sim"
         fields = {
             "exit_ts": dt.datetime.now(IST).isoformat(),
             "exit_order_id": "",
             "exit_status": "not_placed",
-            "status": "rejected",
-            "fill": "paper",
-            "reason": reason if reason != "eod_0930" else "entry_rejected",
+            "status": "skipped" if is_sim else "rejected",
+            "fill": "sim" if is_sim else "paper",
+            "pnl_source": "quote",
+            "fill_reconcile_status": "not_applicable",
+            "reason": (
+                pos.get("sim_reason", reason)
+                if is_sim
+                else (reason if reason != "eod_0930" else "entry_rejected")
+            ),
             "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
         }
+        if is_sim:
+            # the size the P&L is priced on; `quantity` stays 0 (nothing ordered)
+            fields["sim_quantity"] = pos["quantity"]
         pnl = charges = None
         exit_px = None
         if is_option:
@@ -1487,18 +1550,31 @@ class Open15BreakoutService:
         with self._lock:
             pos["status"] = "closed"
         self._log_event(
-            "exit_paper",
+            # a THIRD event name, not a flag on `exit_paper` (issue #555): the
+            # digest sums events by name, so folding sim into the paper event
+            # would silently merge the two buckets the operator asked to keep apart
+            "exit_sim" if is_sim else "exit_paper",
             symbol=symbol,
             instrument="option" if is_option else "stock",
             contract=pos.get("opt_symbol"),
             qty=pos["quantity"],
+            entry_price=pos.get("opt_entry_premium") if is_option else pos.get("trigger_price"),
             exit_price=exit_px,
+            # both legs, same reason as the real `exit` event above
+            stock_entry_price=round(pos["trigger_price"], 2),
+            stock_exit_price=(self.core.last_price.get(symbol) if self.core else None),
+            opt_entry_premium=pos.get("opt_entry_premium"),
             gross=round(pnl, 2) if pnl is not None else None,
             charges=charges,
             pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
-            fill="paper",
-            reason=reason,
-            note="order was rejected — sandbox-equivalent, no money moved",
+            fill="sim" if is_sim else "paper",
+            reason=pos.get("sim_reason") if is_sim else reason,
+            note=(
+                f"no order was placed ({pos.get('sim_reason')}) — priced at "
+                f"{pos['quantity']} for measurement only, no money moved"
+                if is_sim
+                else "order was rejected — sandbox-equivalent, no money moved"
+            ),
         )
 
     def flatten(self, reason: str = "eod_0930") -> None:
@@ -1514,9 +1590,17 @@ class Open15BreakoutService:
 
         with self._lock:
             paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
+            sim_pos = {s: p for s, p in self.positions.items() if p.get("status") == "sim"}
         for symbol, pos in paper_pos.items():
             if self._resolve_paper_position(symbol, pos):
                 self._flatten_paper(symbol, pos, reason)
+        # SIM rows (issue #555) skip the book verification entirely: no order was
+        # ever sent for them, so there is nothing that could have half-reached
+        # the exchange. Reading the book here could only surface an unrelated
+        # same-symbol position and promote a trade we never placed into a live
+        # square-off — the one failure mode this whole path must not have.
+        for symbol, pos in sim_pos.items():
+            self._flatten_paper(symbol, pos, reason)
 
         with self._lock:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
@@ -1607,6 +1691,12 @@ class Open15BreakoutService:
                 instrument="option" if is_option else "stock",
                 qty=pos["quantity"],
                 exit_price=last_px if not is_option else fields.get("opt_exit_premium"),
+                # BOTH legs (issue #555). In option mode `exit_price` above is
+                # the premium the P&L is computed on, so without these the page
+                # can show either the signal or the money, never both.
+                stock_entry_price=round(pos["trigger_price"], 2),
+                stock_exit_price=last_px,
+                opt_entry_premium=pos.get("opt_entry_premium"),
                 # gross/charges/pnl(NET) — the SAME shape `exit_paper` emits, so
                 # the page never has to know which kind of exit it is reading
                 # (issue #552: this used to be gross-rounded-to-0dp while its
@@ -1670,7 +1760,7 @@ class Open15BreakoutService:
         # `core.entered` counts TRIGGERS, not placements — on 2026-08-05 it read
         # 5 on a day with zero fills (2 unaffordable skips + 3 broker rejections).
         # Report what actually happened alongside it (issue #548).
-        n_real, n_paper = self._count_fills()
+        n_real, n_paper, n_sim = self._count_fills()
         drifts = []
         for s, rec in self.core.entered.items():
             close = self.core.entry_minute_close(s)
@@ -1691,12 +1781,31 @@ class Open15BreakoutService:
             entered=n_ent,
             filled=n_real,
             paper=n_paper,
+            # triggers no order was sent for, priced at 1 lot (issue #555)
+            sim=n_sim,
             # seed vs rolling split (issue #529): `selected` counts the whole
             # watch list, so without this the seed cohort is unreadable
             rolling_added=len(self.core.rolling_adds),
             day=self.day_status,
             captured_drift=drifts,
         )
+        if _fill_reconcile_enabled():
+            # Broker fill reconciliation (issue #555). Runs HERE and not in the
+            # entry/exit paths: entries are placed from the ZMQ tick callback,
+            # where a synchronous broker round-trip would stall every other
+            # symbol's ticks. Legs the broker has not reported yet stay
+            # `pending` and are retried by the next 09:10 arm.
+            try:
+                from services.open15_fill_reconcile import reconcile_fills
+
+                res = reconcile_fills(self._trade_date())
+                # one event per row FIRST, so the per-symbol table and the CSV
+                # carry the transacted prices, then the roll-up
+                for detail in res.pop("rows", []):
+                    self._log_event("fill_reconcile_row", **detail)
+                self._log_event("fill_reconcile", **res)
+            except Exception:
+                logger.exception("open15: fill reconciliation failed")
         if _opt_shadow_enabled():
             # ATM option shadow pricing (issue #435). Broker current-day 1m
             # history lags ~5-15 min, so rows left unpriced here are retried
@@ -1972,19 +2081,24 @@ class Open15BreakoutService:
         msg = str(msg).strip()
         return msg[:500] if msg else "broker rejected the order (no message returned)"
 
-    def _count_fills(self) -> tuple[int, int]:
-        """``(real, paper)`` position counts (issue #548).
+    def _count_fills(self) -> tuple[int, int, int]:
+        """``(real, paper, sim)`` position counts (issues #548, #555).
 
         A rejected entry frees its ``max_trades`` slot — it is not a trade, and
         on 2026-08-05 three rejections consumed the whole daily cap. Paper fills
         carry their own cap so a persistently-rejecting broker (static IP, RMS
         block) cannot simulate an unbounded number of trades and leave the day
         incomparable to a normal one.
+
+        ``sim`` rows (triggers no order was ever sent for) are counted apart from
+        ``paper`` and carry their own cap: they are not evidence of a broker
+        problem, so letting them consume the paper budget would mask one.
         """
         with self._lock:
             vals = list(self.positions.values())
         paper = sum(1 for p in vals if p.get("fill") == "paper")
-        return len(vals) - paper, paper
+        sim = sum(1 for p in vals if p.get("fill") == "sim")
+        return len(vals) - paper - sim, paper, sim
 
     def _alert_rejection(self, symbol: str, qty: int, msg: str) -> None:
         """Log loudly + Telegram once per day. Never raises into the entry path."""
@@ -2024,7 +2138,7 @@ class Open15BreakoutService:
         """
         from database.open15_breakout_db import insert_trade
 
-        _real, n_paper = self._count_fills()
+        _real, n_paper, _n_sim = self._count_fills()
         max_trades = int((self.day_config or {}).get("max_trades") or _max_trades_default())
         priced = n_paper < max_trades
         row_id = insert_trade(
@@ -2079,11 +2193,63 @@ class Open15BreakoutService:
         """
         return self._log_date or dt.datetime.now(IST).strftime("%Y-%m-%d")
 
+    def _sim_context(self, action: dict, cfg: dict) -> dict:
+        """Fields that let a NON-TRADED trigger be priced at 1 lot (issue #555).
+
+        Returns ``{}`` when simulation is off or the day's sim budget is spent —
+        the caller then journals exactly the bare skip row it always did.
+
+        In option mode this resolves the contract and quotes its premium: the
+        same single broker call ``_enter_option`` would have made for a real
+        entry, so the tick thread does no work it was not already doing on a
+        triggering symbol, and the sim cap bounds how often it happens.
+        """
+        if not _sim_skipped_enabled():
+            return {}
+        _real, _paper, n_sim = self._count_fills()
+        if n_sim >= _paper_sim_max():
+            return {}
+        if cfg.get("instrument") != "atm_option":
+            notional = cfg.get("notional") or _notional()
+            return {"sim_quantity": max(int(notional / action["price"]), 1)}
+
+        from services.open15_option_shadow import resolve_atm_option
+
+        contract = resolve_atm_option(
+            action["symbol"], action["side"], action["price"], self._trade_date()
+        )
+        if not contract:
+            return {}
+        premium, opt_volume, opt_oi = self._option_liquidity(contract["symbol"])
+        if not premium:
+            return {}
+        return {
+            "opt_symbol": contract["symbol"],
+            "opt_lot_size": int(contract["lotsize"]),
+            "opt_entry_premium": premium,
+            "opt_entry_volume": opt_volume,
+            "opt_entry_oi": opt_oi,
+            # ONE lot: the minimum tradeable unit, which is what "would this have
+            # paid?" means for a trade we could not afford. It also keeps rows
+            # comparable across contracts whose lot sizes differ 30-fold
+            # (SAIL 4700 vs HAL 150).
+            "sim_quantity": int(contract["lotsize"]),
+        }
+
     def _journal_skip(self, action: dict, reason: str, **extra) -> None:
-        """Journal a trigger that did NOT place an order (cap / sizing skips)."""
+        """Journal a trigger that did NOT place an order (cap / sizing skips).
+
+        When ``extra`` carries a ``sim_quantity`` the row is also registered as a
+        SIM position (issue #555) so ``flatten`` prices its exit at the normal
+        exit time — that is what turns "skipped: unaffordable" from a dead end
+        into the measurement of what the trade would have done.
+
+        ``quantity`` stays 0: it records what was ORDERED, and nothing was.
+        """
         from database.open15_breakout_db import insert_trade
 
-        insert_trade(
+        sim_qty = extra.get("sim_quantity")
+        row_id = insert_trade(
             trade_date=self._trade_date(),
             symbol=action["symbol"],
             side=action["side"],
@@ -2099,13 +2265,39 @@ class Open15BreakoutService:
             watch_source=action.get("watch_source") or "seed",
             status="skipped",
             reason=reason,
+            fill="sim" if sim_qty else None,
             **extra,
         )
+        if sim_qty:
+            with self._lock:
+                self.positions[action["symbol"]] = {
+                    **action,
+                    "trigger_price": action["price"],
+                    # the size the row's P&L is priced on — NOT an order quantity
+                    "quantity": int(sim_qty),
+                    "row_id": row_id,
+                    "status": "sim",
+                    "fill": "sim",
+                    "sim_reason": reason,
+                    # No order was ever sent, so there is nothing that could have
+                    # half-reached the exchange: `flatten` must NOT run the book
+                    # verification that exists for rejections. Reading the book
+                    # here could only find someone else's same-symbol position
+                    # and promote this row into a live square-off.
+                    "no_order_attempted": True,
+                    "instrument": "option" if extra.get("opt_symbol") else "stock",
+                    **{
+                        k: extra[k]
+                        for k in ("opt_symbol", "opt_lot_size", "opt_entry_premium")
+                        if k in extra
+                    },
+                }
         self._log_event(
             "entry_skipped",
             symbol=action["symbol"],
             reason=reason,
             watch_source=action.get("watch_source") or "seed",
+            fill="sim" if sim_qty else None,
             **extra,
         )
 
@@ -2117,9 +2309,20 @@ class Open15BreakoutService:
         # only REAL fills consume the daily cap (issue #548) — a broker-rejected
         # entry is not a trade, and letting rejections eat the cap is how three
         # static-IP 403s used up the whole 2026-08-05 budget
-        n_real, _n_paper = self._count_fills()
+        n_real, _n_paper, _n_sim = self._count_fills()
         if n_real >= max_trades:
-            self._journal_skip(action, "max_trades_cap", instrument=cfg.get("instrument", "stock"))
+            # priced at 1 lot (issue #555) so a capped day still answers "what
+            # did the trades I had no room for do?" — the cap is a budget
+            # decision, and its cost is only knowable if the misses are measured
+            self._journal_skip(
+                action,
+                "max_trades_cap",
+                # the journal's own vocabulary is stock/option — `atm_option` is
+                # the CONFIG value and writing it here left cap-skipped rows
+                # disagreeing with every other row's instrument label
+                instrument="option" if cfg.get("instrument") == "atm_option" else "stock",
+                **self._sim_context(action, cfg),
+            )
             return
         if cfg.get("instrument") == "atm_option":
             self._enter_option(action, cfg)
@@ -2226,6 +2429,12 @@ class Open15BreakoutService:
         slot_capital = float(cfg.get("margin_effective") or cfg.get("margin_per_slot") or 30_000)
         lots = int(slot_capital // (premium * lot))
         if lots < 1:
+            # the contract and its premium are already in hand, so pricing this
+            # at 1 lot (issue #555) costs one extra quote at exit and nothing
+            # more — and it is the only way to learn whether the slot capital,
+            # not the signal, is what is capping the strategy
+            _real, _paper, n_sim = self._count_fills()
+            simulate = _sim_skipped_enabled() and n_sim < _paper_sim_max()
             self._journal_skip(
                 action,
                 "unaffordable",
@@ -2235,6 +2444,7 @@ class Open15BreakoutService:
                 opt_entry_premium=premium,
                 opt_entry_volume=opt_volume,
                 opt_entry_oi=opt_oi,
+                **({"sim_quantity": lot} if simulate else {}),
             )
             return
         qty = lots * lot
