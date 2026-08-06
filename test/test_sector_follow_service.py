@@ -1320,3 +1320,191 @@ def test_preentry_refresh_job_swallows_errors(monkeypatch):
     )
     # Must not raise.
     sfs._preentry_refresh_job()
+
+
+# --------------------------------------------------------------------------- #
+# Issue #563 — T+1 exit must survive a restart (the #497 pattern)
+# --------------------------------------------------------------------------- #
+#
+# `paper_book` is in-memory only. Before this fix a restart between the 15:05
+# entry and the 15:10 T+1 exit erased the position: run_exit iterated an empty
+# dict, logged "squared off 0 position(s)" and left a real CNC position open
+# indefinitely. The live journal holds 0 SELL rows against 19 entries, and the
+# exit job logged "0 position(s)" on every trading day from 2026-08-03 to 08-06.
+#
+# The rules under test, each load-bearing:
+#   * the journal supplies the ENTRY SESSION (the T+1 predicate keys on it)
+#   * the position book supplies the AUTHORITATIVE QUANTITY
+#   * only an AFFIRMATIVE non-zero book position justifies a square-off
+#   * an UNREADABLE book rehydrates nothing and alerts — it is not "flat"
+#   * the read is routed by resolve_order_mode(mode_key), not the analyze
+#     overlay (mocking get_positionbook is what hid #497 from 5 tests)
+
+
+def _restarted_service(book_positions, book_ok=True, **kw):
+    """A service with an EMPTY paper_book — i.e. freshly restarted.
+
+    The journal is patched separately via ``_patch_journal`` so each test states
+    the two inputs (journal belief, book truth) independently — they disagree in
+    several of the cases below, which is the whole point.
+    """
+    alerts = []
+    svc = _make_service(mode="live", notifier=alerts.append, **kw)
+    svc.paper_book.clear()
+    svc._test_alerts = alerts
+    svc._read_position_book = lambda: (book_ok, book_positions)
+    return svc
+
+
+def _patch_journal(monkeypatch, entries):
+    monkeypatch.setattr(
+        "database.sector_follow_db.get_unexited_entries",
+        lambda strategy_id=None, mode=None: list(entries),
+    )
+
+
+def _pos(symbol, qty, exchange="NSE", product="CNC"):
+    return {"symbol": symbol, "quantity": qty, "exchange": exchange, "product": product}
+
+
+def _entry(symbol, qty=46, entry_date="2026-08-05", price=100.0):
+    return {
+        "symbol": symbol,
+        "quantity": qty,
+        "entry_price": price,
+        "entry_date": entry_date,
+        "order_id": f"OID-{symbol}",
+        "mode": "live",
+        "vol_ratio": 1.5,
+    }
+
+
+def test_rehydrate_restores_position_after_restart(monkeypatch):
+    """Journal says open + book confirms non-zero -> position is restored."""
+    _patch_journal(monkeypatch, [_entry("AAA", qty=46)])
+    svc = _restarted_service([_pos("AAA", 46)])
+
+    assert svc.rehydrate_from_positionbook() == 1
+    assert "AAA" in svc.paper_book
+    assert svc.paper_book["AAA"].quantity == 46
+    # entry_date comes from the JOURNAL — the T+1 predicate depends on it.
+    assert svc.paper_book["AAA"].entry_date == "2026-08-05"
+
+
+def test_run_exit_squares_off_a_rehydrated_position(monkeypatch):
+    """The end-to-end bug: an exit after a restart must actually place a SELL."""
+    _patch_journal(monkeypatch, [_entry("AAA", qty=46, entry_date="2026-08-05")])
+    svc = _restarted_service([_pos("AAA", 46)])
+    # `now` is 2026-06-10 in the factory; entry_date differs -> T+1 eligible.
+    exited = svc.run_exit()
+
+    assert [e["symbol"] for e in exited] == ["AAA"]
+    sells = [o for _m, o in svc._test_placed if o["action"] == "SELL"]
+    assert len(sells) == 1
+    assert sells[0]["symbol"] == "AAA"
+    assert sells[0]["quantity"] == 46
+
+
+def test_unreadable_book_rehydrates_nothing_and_alerts(monkeypatch):
+    """'Cannot read' must NEVER collapse into 'flat' — no naked short."""
+    _patch_journal(monkeypatch, [_entry("AAA")])
+    svc = _restarted_service([], book_ok=False)
+
+    assert svc.rehydrate_from_positionbook() == 0
+    assert svc.paper_book == {}
+    assert any("unreadable" in a.lower() for a in svc._test_alerts)
+
+
+def test_unreadable_book_places_no_exit_order(monkeypatch):
+    """The consequence of the rule above, at the run_exit level."""
+    _patch_journal(monkeypatch, [_entry("AAA")])
+    svc = _restarted_service([], book_ok=False)
+
+    assert svc.run_exit() == []
+    assert [o for _m, o in svc._test_placed if o["action"] == "SELL"] == []
+
+
+def test_flat_book_does_not_invent_a_position(monkeypatch):
+    """Journal thinks open, book says flat -> the BOOK wins (rejected entries)."""
+    _patch_journal(monkeypatch, [_entry("AAA")])
+    svc = _restarted_service([_pos("AAA", 0)])
+
+    assert svc.rehydrate_from_positionbook() == 0
+    assert svc.paper_book == {}
+
+
+def test_rehydrate_ignores_foreign_exchange_and_product(monkeypatch):
+    """Only our NSE/CNC legs are ours — an NFO/MIS leg is someone else's."""
+    _patch_journal(monkeypatch, [_entry("AAA")])
+    svc = _restarted_service([_pos("AAA", 46, exchange="NFO", product="NRML")])
+
+    assert svc.rehydrate_from_positionbook() == 0
+
+
+def test_rehydrate_is_idempotent(monkeypatch):
+    """Boot + every run_exit call it; repeats must never double-count."""
+    _patch_journal(monkeypatch, [_entry("AAA")])
+    svc = _restarted_service([_pos("AAA", 46)])
+
+    assert svc.rehydrate_from_positionbook() == 1
+    assert svc.rehydrate_from_positionbook() == 0
+    assert len(svc.paper_book) == 1
+
+
+def test_rehydrate_prefers_the_smaller_of_book_and_journal(monkeypatch):
+    """Never square off more than the book actually holds."""
+    _patch_journal(monkeypatch, [_entry("AAA", qty=100)])
+    svc = _restarted_service([_pos("AAA", 40)])
+
+    svc.rehydrate_from_positionbook()
+    assert svc.paper_book["AAA"].quantity == 40
+
+
+def test_same_day_entry_is_not_exited_after_rehydrate(monkeypatch):
+    """T+1 means T+1: a position opened TODAY is never squared off today."""
+    today = datetime(2026, 6, 10, 15, 20, tzinfo=_IST).date().isoformat()
+    _patch_journal(monkeypatch, [_entry("AAA", entry_date=today)])
+    svc = _restarted_service([_pos("AAA", 46)])
+
+    assert svc.run_exit() == []
+
+
+def test_position_book_read_is_routed_by_mode_key_not_analyze_overlay(monkeypatch):
+    """Issue #497's actual lesson: assert the ROUTING, not a mocked call.
+
+    Mocking get_positionbook is what let #497 hide from five existing tests, so
+    this test lets the real _read_position_book run and captures the kwargs it
+    passes down. `mode_key` must be the canonical strategy key — that is what
+    makes the read resolve to the SAME book that resolve_order_mode routed the
+    write to.
+    """
+    import services.sector_follow_service as sfs
+
+    captured = {}
+
+    def fake_get_positionbook(api_key=None, mode_key=None, **kw):
+        captured["api_key"] = api_key
+        captured["mode_key"] = mode_key
+        return True, {"data": []}, 200
+
+    monkeypatch.setattr(sfs, "_resolve_exit_api_key", lambda: "KEY")
+    monkeypatch.setattr("services.positionbook_service.get_positionbook", fake_get_positionbook)
+    svc = _make_service(mode="live")
+
+    ok, positions = svc._read_position_book()
+
+    assert ok is True
+    assert positions == []
+    assert captured["mode_key"] == sfs.STRATEGY_NAME == "sector_follow_cap5_vol"
+
+
+def test_missing_api_key_reports_unreadable_not_flat(monkeypatch):
+    """No broker session at boot (#403) must not look like an empty book."""
+    import services.sector_follow_service as sfs
+
+    monkeypatch.setattr(sfs, "_resolve_exit_api_key", lambda: None)
+    svc = _make_service(mode="live")
+
+    ok, positions = svc._read_position_book()
+    assert ok is False
+    assert positions == []
