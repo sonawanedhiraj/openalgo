@@ -199,7 +199,10 @@ def test_paper_fills_are_themselves_capped_at_max_trades():
     # beyond the paper cap: still recorded with its error, but not priced
     assert rows["CCC"].fill == "none" and rows["CCC"].reason == "entry_rejected_paper_cap"
     assert rows["CCC"].error_message == REJECT_MSG
-    assert svc._count_fills() == (0, 1)
+    # (real, paper, sim) — the sim bucket (issue #555) is counted apart from
+    # paper, so simulated rows can never spend the paper budget and mask a
+    # broker that is rejecting everything
+    assert svc._count_fills() == (0, 1, 0)
     db_session.remove()
 
 

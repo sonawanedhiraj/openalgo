@@ -94,6 +94,92 @@ Per entry: `level`, `trigger_minute`+`trigger_second`, `trigger_price`,
   Round 58: trigger entry must beat the close entry by ≥0.4pp/trade to be a
   real strategy; otherwise final REJECT.
 
+### 4a. Which prices the decision rule may use (issue #555)
+
+The columns above are **decision-moment observations**, not transactions:
+`trigger_price` is the tick that fired the volume gate and `opt_entry_premium`
+is the option quote at that instant. Scoring the strategy on them measures the
+signal, not the trade.
+
+`entry_fill_price` / `exit_fill_price` carry what the broker actually filled
+(reconciled at exit+5, retried at the next arm; `pnl_source='fill'` once both
+legs report, else `quote`). **`pnl` is always the one gross number** and is
+re-derived from the fills in place when they land — there is no second P&L
+convention (the #552 rule). Read the pair as:
+
+- **signal quality** — quote/tick columns, the `captured drift` metric above;
+- **realisable P&L** — `net_pnl_of_row` on a `pnl_source='fill'` row;
+- **slippage** — `fill − quote`, which is why the quote columns are never
+  overwritten. The ≥0.4pp decision rule is a claim about *tradeable* return, so
+  it must be evaluated on fill-sourced rows once enough exist.
+
+**Charges are modelled, always.** No broker exposes per-order charges through
+its API (Zerodha publishes them on the next-day contract note), so even a fully
+reconciled row's net is gross-from-fills minus a modelled deduction. `broker_pnl`
+records the position book's own realized figure as an independent cross-check;
+a gap over ₹1 is surfaced on the logs page rather than smoothed over.
+
+**Three P&L buckets, never summed** — `fill='real'` (money; the only bucket that
+compounds), `fill='paper'` (the broker rejected the entry, #548), `fill='sim'`
+(no order was ever attempted — `unaffordable` / `max_trades_cap` — priced at
+1 lot). The sim bucket exists to answer a question the journal previously could
+not: whether the *slot capital* or the *signal* is what caps the strategy. Only
+real rows may enter any published performance number.
+
+### 4b. Contract liquidity (issue #555)
+
+**Read every count in LOTS, never in contracts.** Lot sizes across this universe
+differ by ~30x (measured 2026-08-06: HAL 150, SAIL 4700), so the raw
+`opt_*_volume` / `opt_*_oi` columns from #488 were never comparable between
+contracts. On raw counts SAIL looked 26x more liquid than HAL; in lots it is the
+*smaller* book, and in rupee turnover smaller by 2.2x. That inversion is the
+simplest explanation for #488's own note that "every ex-ante metric ranked the
+two live trades backwards" — no exotic cause required. `services/open15_liquidity.py`
+holds the derivations; nothing reports a bare contract count.
+
+**The spread is the cost nobody was measuring.** The strategy sends MARKET
+orders, so it crosses the book at entry and again at exit. Same instant,
+2026-08-06: HAL 0.67% of mid, SAIL **2.11%** — a ~1.3% vs ~4.2% round-trip drag.
+`opt_*_bid` / `opt_*_ask` are captured at both decision moments; they arrive in
+the quote response the strategy **already fetches** and were simply discarded,
+so capture costs no broker call. Spread % is always of the **mid**, never the
+LTP (the LTP is whichever side last traded, so quoting against it makes the same
+book look wider or narrower depending only on who traded last). `opt_tick_size`
+travels with the contract because it is not constant (0.05 and 0.01 both
+observed), and a spread is only comparable across contracts in ticks.
+
+⚠ **Spread cost is reported, never deducted** (operator decision, 2026-08-06).
+Sim and paper rows price both legs at the quote LTP, so **their net P&L is
+optimistic by roughly `spread_cost_inr`**; real rows use broker fills, where the
+spread is already inside the fill price and the figure is a counterfactual.
+Keeping it out of `pnl` preserves the #552 single convention and keeps every
+previously-written row comparable.
+
+`opt_liquidity_path` stores per-minute `{m, v, oi}` over the hold, built from the
+1m bars the option-shadow already fetches (`volume` and `oi` are on every bar —
+the historical endpoint is called with `oi=1` — and were being discarded). Its
+value is *direction*: whether open interest was **building or unwinding** while
+the position was held, which two endpoint snapshots structurally cannot show.
+Per-bar `v` is incremental and may be summed; the quote's `volume` is cumulative
+for the day and must not be.
+
+**Nothing gates on any of it** — the #488 rule, restated. R58 and #488 both
+showed that inventing a threshold before the data supports one makes this
+strategy worse.
+
+**Available but NOT captured**, should a later round want it: Kite's `/quote`
+also returns `average_price` (day VWAP), `last_trade_time` (quote staleness),
+`buy_quantity`/`sell_quantity` (whole-book totals — note OpenAlgo's
+`totalbuyqty` is only the sum of the 5 visible levels: 750 vs 105,150 for HAL at
+the same instant), `oi_day_high`/`oi_day_low`, circuit limits, the
+**`low/high_limit_price_protection` band** (NSE rejects MARKET orders outside
+it — execution safety, not research), and per-level `orders` counts. All are
+dropped by OpenAlgo's shared broker mappers, so capturing them means changing a
+mapper every broker and every quote consumer uses. The 5-level book is reachable
+today via `depth_service.get_depth` at one extra REST call per contract per
+moment. The WS feed is **not** a source: open15 subscribes `NSE_<sym>_LTP`
+topics only, and LTP mode carries neither depth nor OI.
+
 ## 5. Ops constraints (load-bearing)
 - **OpenAlgo must be running before 09:15 IST.** The arm job runs 09:10; a boot
   after 09:15:30 marks the day `skipped_late_boot` with a loud WARNING —

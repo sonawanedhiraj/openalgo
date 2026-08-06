@@ -79,6 +79,34 @@ class Open15Trade(Base):
     pnl = Column(Float, nullable=True)  # research pnl: trigger_price -> exit_price
     charges_inr = Column(Float, nullable=True)  # modelled MIS round-trip charges (issue #433)
 
+    # ---- broker fill reconciliation (issue #555) ------------------------- #
+    # What the broker ACTUALLY filled, as opposed to the quote/tick prices the
+    # decision was made on. Every other price column on this row is a
+    # measurement of a decision moment (``trigger_price`` = the tick that fired
+    # the gate, ``opt_entry_premium`` = the quote at that instant); these two are
+    # the only ones that say what was transacted. Kept SEPARATE rather than
+    # overwriting the quote columns, because ``fill - quote`` is the slippage the
+    # strategy exists to measure, and collapsing them destroys it.
+    entry_fill_price = Column(Float, nullable=True)  # broker average_price, entry leg
+    exit_fill_price = Column(Float, nullable=True)  # broker average_price, exit leg
+    entry_fill_qty = Column(Integer, nullable=True)  # filled qty (catches partial fills)
+    exit_fill_qty = Column(Integer, nullable=True)
+    # pending / reconciled / unavailable / not_applicable — ``unavailable`` means
+    # we asked the broker and it could not tell us, which is a different fact
+    # from "we have not asked yet" and must stay distinguishable.
+    fill_reconcile_status = Column(String(16), nullable=True)
+    # Which prices produced ``pnl``: ``fill`` once reconciled, else ``quote``.
+    # NULL on pre-#555 rows — those are all quote-derived.
+    pnl_source = Column(String(8), nullable=True)
+    # The broker's own realized P&L for this symbol, for the cross-check. NULL
+    # when the position book did not report one; never inferred.
+    broker_pnl = Column(Float, nullable=True)
+    # Notional size a NON-TRADED row is priced on (issue #555): unaffordable and
+    # cap-skipped triggers are simulated at 1 lot so "would it have paid?" is
+    # answerable. ``quantity`` stays 0 on those rows — it means "what was
+    # ordered", and nothing was.
+    sim_quantity = Column(Integer, nullable=True)
+
     # ATM option shadow trade (issue #435) — research-only: what 1 lot of the
     # ATM CE (L) / PE (S) did over the same entry->exit window. No orders.
     opt_symbol = Column(String(48), nullable=True)  # e.g. BAJAJ-AUTO28JUL2610700CE
@@ -97,20 +125,54 @@ class Open15Trade(Base):
     opt_entry_oi = Column(Integer, nullable=True)  # open interest at trigger
     opt_exit_volume = Column(Integer, nullable=True)  # cumulative day volume at exit
     opt_exit_oi = Column(Integer, nullable=True)  # open interest at exit
+
+    # ---- contract liquidity, part 2 (issue #555) ------------------------- #
+    # The #488 columns above are RAW CONTRACT COUNTS, and lot sizes across this
+    # universe differ by ~30x (HAL 150 vs SAIL 4700) — so they were never
+    # comparable between contracts, which is the simplest explanation for #488's
+    # note that "every ex-ante metric ranked the two live trades backwards".
+    # Everything derived from them is normalized to LOTS or RUPEES; see
+    # ``services/open15_liquidity.py``.
+    #
+    # The bid/ask pair arrives in the SAME quote response the strategy already
+    # fetches at both decision moments — it was simply being discarded. It is the
+    # one liquidity fact that directly costs money: the strategy sends MARKET
+    # orders, so it pays the spread on entry and again on exit.
+    opt_entry_bid = Column(Float, nullable=True)
+    opt_entry_ask = Column(Float, nullable=True)
+    opt_exit_bid = Column(Float, nullable=True)
+    opt_exit_ask = Column(Float, nullable=True)
+    # from the master contract; varies per contract (0.05 vs 0.01 observed), so a
+    # spread is only comparable across contracts once expressed in ticks
+    opt_tick_size = Column(Float, nullable=True)
+    # per-minute [{"m": "09:21", "v": 3300, "oi": 72150}, ...] over the hold,
+    # from the 1m bars the option-shadow already fetches (volume and oi were
+    # being discarded). Two endpoint snapshots cannot show whether OI was
+    # BUILDING or UNWINDING while the position was held; this can.
+    opt_liquidity_path = Column(Text, nullable=True)
     # how this symbol got onto the watch list (issue #529): ``seed`` = the 09:16
     # gap ranking, ``rolling`` = appended by an intraday re-rank. Load-bearing
     # for the measurement — without it the two cohorts cannot be scored apart.
     # NULL on rows written before #529 shipped; read as ``seed``.
     watch_source = Column(String(8), nullable=True)
     status = Column(String(16), default="open")  # open / closed / error / observe / rejected
-    # Did an order actually fill (issue #548)? ``real`` = the broker accepted it;
-    # ``paper`` = the broker REJECTED the entry and every price/P&L field on this
-    # row is a sandbox-equivalent simulation of what the trade would have done.
+    # Did an order actually fill (issue #548)? Four classes, and the difference
+    # between them is the difference between money that moved and money that did
+    # not — never collapse them into one number:
+    #   ``real``  — the broker accepted the order.
+    #   ``paper`` — the broker REJECTED the entry; every price/P&L field is a
+    #               sandbox-equivalent simulation of what the trade would have
+    #               done. An order WAS attempted.
+    #   ``sim``   — no order was ever attempted (unaffordable / cap-skipped,
+    #               issue #555). Priced at 1 lot purely to answer "would it have
+    #               paid?". Provenance differs from ``paper``: nothing was sent,
+    #               so nothing can have half-reached the exchange.
+    #   ``none``  — beyond the paper cap; deliberately left unpriced.
     # NULL on rows written before #548 shipped; read as ``real``.
     #
     # Load-bearing: ``mode`` still records what the run genuinely was (``live``)
-    # — a paper row must never be disguised as a sandbox run, and paper P&L must
-    # never be summed into realized P&L (see ``total_realized_pnl``).
+    # — a paper row must never be disguised as a sandbox run, and neither paper
+    # nor sim P&L may be summed into realized P&L (see ``total_realized_pnl``).
     fill = Column(String(8), nullable=True)
     reason = Column(String(64), nullable=True)
     # full broker rejection text — ``reason`` stays a short machine-readable code
@@ -189,6 +251,22 @@ def _ensure_columns():
             "watch_source": "VARCHAR(8)",
             "fill": "VARCHAR(8)",
             "error_message": "TEXT",
+            # broker fill reconciliation (issue #555)
+            "entry_fill_price": "FLOAT",
+            "exit_fill_price": "FLOAT",
+            "entry_fill_qty": "INTEGER",
+            "exit_fill_qty": "INTEGER",
+            "fill_reconcile_status": "VARCHAR(16)",
+            "pnl_source": "VARCHAR(8)",
+            "broker_pnl": "FLOAT",
+            "sim_quantity": "INTEGER",
+            # contract liquidity, part 2 (issue #555)
+            "opt_entry_bid": "FLOAT",
+            "opt_entry_ask": "FLOAT",
+            "opt_exit_bid": "FLOAT",
+            "opt_exit_ask": "FLOAT",
+            "opt_tick_size": "FLOAT",
+            "opt_liquidity_path": "TEXT",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -298,12 +376,17 @@ def save_config(
         db_session.remove()
 
 
-# A row is a REAL fill unless it is explicitly marked paper (issue #548). Written
-# as a NULL-tolerant predicate so every row created before the column existed —
-# and every row a future writer forgets to stamp — counts as real, which is the
-# safe direction: a mislabelled paper row would inflate realized P&L, whereas a
-# mislabelled real row only understates it.
-_REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill != "paper")
+# Every non-real fill class (issue #555 widened this from just ``paper``). A row
+# is REAL unless it is explicitly marked as one of these — a NULL-tolerant
+# predicate, so every row created before the column existed counts as real.
+#
+# The exclusion is an explicit LIST rather than ``!= 'paper'`` on purpose: that
+# form silently reclassified every future class as REAL, so adding ``sim``
+# (issue #555) would have folded simulated money straight into realized P&L and
+# into tomorrow's compound position size. A new fill class must be added here.
+NON_REAL_FILLS = ("paper", "sim", "none")
+
+_REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill.notin_(NON_REAL_FILLS))
 
 
 def net_pnl_expr():
@@ -406,12 +489,16 @@ def list_day_logs() -> list[tuple[str, list]]:
         db_session.remove()
 
 
-def _pnl_by_date(paper: bool) -> dict[str, float]:
-    """NET journal P&L per trade_date for one fill class (issues #548, #552)."""
+def _pnl_by_date(fill_class: str) -> dict[str, float]:
+    """NET journal P&L per trade_date for one fill class (issues #548, #552, #555).
+
+    ``fill_class`` is ``real`` (the NULL-tolerant real predicate) or an exact
+    value from :data:`NON_REAL_FILLS`.
+    """
     try:
         from sqlalchemy import func
 
-        pred = (Open15Trade.fill == "paper") if paper else _REAL_FILL
+        pred = _REAL_FILL if fill_class == "real" else (Open15Trade.fill == fill_class)
         rows = (
             db_session.query(Open15Trade.trade_date, func.sum(net_pnl_expr()))
             .filter(Open15Trade.pnl.isnot(None), pred)
@@ -420,7 +507,7 @@ def _pnl_by_date(paper: bool) -> dict[str, float]:
         )
         return {d: round(float(v), 2) for d, v in rows if v is not None}
     except Exception:
-        logger.exception("open15: per-date pnl aggregation failed (paper=%s)", paper)
+        logger.exception("open15: per-date pnl aggregation failed (fill=%s)", fill_class)
         return {}
     finally:
         db_session.remove()
@@ -429,15 +516,27 @@ def _pnl_by_date(paper: bool) -> dict[str, float]:
 def trades_pnl_by_date() -> dict[str, float]:
     """NET REAL journal P&L per trade_date (charges deducted — issue #552).
 
-    Paper rows are excluded and reported separately by ``paper_pnl_by_date`` —
-    the history sidebar must never blend simulated money into a day's P&L.
+    Paper and sim rows are excluded and reported separately by
+    ``paper_pnl_by_date`` / ``sim_pnl_by_date`` — the history sidebar must never
+    blend simulated money into a day's P&L.
     """
-    return _pnl_by_date(paper=False)
+    return _pnl_by_date("real")
 
 
 def paper_pnl_by_date() -> dict[str, float]:
     """NET PAPER journal P&L per trade_date (broker-rejected entries, #548)."""
-    return _pnl_by_date(paper=True)
+    return _pnl_by_date("paper")
+
+
+def sim_pnl_by_date() -> dict[str, float]:
+    """NET SIM journal P&L per trade_date (issue #555).
+
+    Triggers we never sent an order for — unaffordable or past the daily cap —
+    priced at 1 lot. A THIRD bucket, not folded into ``paper``: "the broker
+    blocked us" and "we could not afford it" are different claims about a day,
+    and a single blended figure answers neither.
+    """
+    return _pnl_by_date("sim")
 
 
 def get_day_log(trade_date: str) -> list | None:

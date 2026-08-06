@@ -1176,6 +1176,68 @@ placed for it**. Four rules, each load-bearing:
 - **A rejection frees its `max_trades` slot** (it is not a trade), while paper
   fills carry their own cap of `max_trades` so a persistently-rejecting broker
   cannot simulate an unbounded day.
+**Reported P&L is reconciled against the broker's own fills, and there are
+THREE buckets (issue #555).** Every price the strategy journals is a *decision*
+observation — `trigger_price` is the tick that fired the volume gate,
+`opt_entry_premium` the option quote at that instant — so before #555 every
+published P&L was a quote-derived estimate that had never been checked, and
+slippage was unmeasurable. `services/open15_fill_reconcile.py` reads the broker's
+`average_price` per leg (via `get_order_status`, which routes to the sandbox or
+live book automatically through `sandbox_order_exists`) into
+`entry_fill_price`/`exit_fill_price` and **re-derives `pnl`/`charges_inr` in
+place**, stamping `pnl_source='fill'` — it does NOT add a second number, so the
+#552 one-convention rule survives untouched. It runs at the summary job (exit+5)
+and is retried by the next 09:10 arm; **never** in `_enter`/`flatten`, because
+entries are placed from the ZMQ tick callback where a synchronous broker call
+would stall every other symbol's ticks. Charges stay **modelled** — no broker
+exposes per-order charges via API — but on the actual fill turnover, and the UI
+labels them as modelled. The quote columns are deliberately NOT overwritten:
+`fill − quote` is the slippage this deployment exists to measure. The three
+P&L buckets are never summed into one another:
+- **real** (`fill='real'`) — money. The only bucket that compounds.
+- **paper** (`fill='paper'`) — the broker REJECTED the entry (#548). An order was
+  attempted and refused.
+- **sim** (`fill='sim'`) — no order was ever attempted (`unaffordable` /
+  `max_trades_cap`), priced at **1 lot** so a capped or under-funded day can say
+  whether the slot capital or the signal is what limited it.
+A sim row places nothing and — unlike a rejection — **never reads the position
+book**: nothing was sent, so the book could only surface an unrelated same-symbol
+position and promote a trade we never placed into a live square-off. `_REAL_FILL`
+is an explicit exclusion **list** (`NON_REAL_FILLS`), not `!= 'paper'`: the old
+form silently classified every future class as REAL, which would have compounded
+tomorrow's real position size off simulated money. Flags
+`OPEN15_FILL_RECONCILE_ENABLED`, `OPEN15_SIM_SKIPPED_ENABLED`,
+`OPEN15_PAPER_SIM_MAX`.
+**Option liquidity: read every count in LOTS, and the spread is the cost
+(issue #555).** Lot sizes across this universe differ ~30× (HAL 150 vs SAIL
+4700), so #488's raw `opt_*_volume`/`opt_*_oi` contract counts were never
+comparable between contracts — measured 2026-08-06, raw counts made SAIL look
+**26× more liquid** than HAL when in lots it is the *smaller* book. That
+inversion is the simplest explanation for #488's own note that "every ex-ante
+metric ranked the two live trades backwards". `services/open15_liquidity.py`
+owns every derivation and never reports a bare contract count. The strategy
+sends **MARKET** orders, so it crosses the book twice: `opt_*_bid`/`opt_*_ask` +
+`opt_tick_size` are now captured at both decision moments at **zero broker
+cost** (the pair always rode in the quote response `_option_liquidity` already
+fetched and was discarded). Spread % is of the **MID**, never the LTP — the LTP
+is whichever side last traded, so quoting against it moves the metric without
+the market moving. ⚠ **Spread cost is reported, never deducted from `pnl`**:
+sim/paper rows price both legs at the quote LTP so their net is optimistic by
+roughly `spread_cost_inr`, while real rows use fills where the spread is already
+inside the price — deducting it would break the #552 single convention and make
+every older row incomparable. `opt_liquidity_path` stores per-minute `{m,v,oi}`
+over the hold from the 1m bars the option-shadow already fetches (per-bar `v` is
+incremental and may be summed; the quote's `volume` is cumulative and must not
+be), answering *building vs unwinding* — which endpoint snapshots cannot.
+**Nothing gates on any of it.** Flag `OPEN15_LIQUIDITY_PATH_ENABLED`. Kite also
+returns `average_price`, `last_trade_time`, whole-book `buy_quantity`/
+`sell_quantity` (OpenAlgo's `totalbuyqty` is only the 5 visible levels — 750 vs
+105,150 for HAL at one instant), `oi_day_high/low`, circuit limits, the
+`low/high_limit_price_protection` band (NSE rejects MARKET orders outside it)
+and per-level `orders`; all are dropped by the shared broker mappers, so
+capturing them means changing a mapper every broker uses. The WS feed is not a
+source — open15 subscribes `NSE_<sym>_LTP` only, which carries neither depth
+nor OI.
 Alert: `logger.error` + Telegram `open15_breakout`, deduped once per day. The
 digest/summary report `filled` and `paper` separately — `core.entered` counts
 TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows

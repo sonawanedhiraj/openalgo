@@ -26,6 +26,7 @@ never raised into the scheduler.
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 from utils.logging import get_logger
 
@@ -94,7 +95,16 @@ def resolve_atm_option(underlying: str, side: str, spot: float, trade_date: str)
             .all()
         )
         candidates = [
-            {"symbol": r.symbol, "strike": r.strike, "expiry": r.expiry, "lotsize": r.lotsize}
+            {
+                "symbol": r.symbol,
+                "strike": r.strike,
+                "expiry": r.expiry,
+                "lotsize": r.lotsize,
+                # per-contract and NOT constant (0.05 and 0.01 both observed on
+                # 2026-08-06) — a spread is only comparable across contracts once
+                # expressed in ticks, so it has to travel with the contract
+                "ticksize": r.tick_size,
+            }
             for r in rows
             if r.strike
         ]
@@ -177,6 +187,125 @@ def premiums_from_bars(
         float(entry) if entry is not None else None,
         float(exit_p) if exit_p is not None else None,
     )
+
+
+def liquidity_path_from_bars(
+    bars: list[dict], from_minute: str, to_minute: str = "09:30", tz_name: str = "Asia/Kolkata"
+) -> list[dict]:
+    """``[{"m": "09:21", "v": 3300, "oi": 72150}, ...]`` over the hold (issue #555).
+
+    Built from bars this module ALREADY fetches — ``volume`` and ``oi`` are on
+    every 1m bar the broker returns (the historical endpoint is called with
+    ``oi=1``) and were simply being discarded here.
+
+    ``v`` is each bar's OWN traded quantity, not the quote's cumulative day
+    figure — the two must never be mixed, so the summariser sums this and would
+    be wrong to sum that. The point of the series is direction: whether open
+    interest was BUILDING or UNWINDING while the position was held, which two
+    endpoint snapshots structurally cannot show.
+    """
+    import pytz
+
+    tz = pytz.timezone(tz_name)
+    try:
+        fh, fm = (int(x) for x in from_minute.split(":"))
+        th, tm = (int(x) for x in to_minute.split(":"))
+    except (ValueError, AttributeError):
+        return []
+    lo, hi = dt.time(fh, fm), dt.time(th, tm)
+
+    out: list[dict] = []
+    for b in bars:
+        try:
+            ts = dt.datetime.fromtimestamp(int(b["timestamp"]), tz=pytz.UTC).astimezone(tz)
+        except (KeyError, ValueError, TypeError, OSError):
+            continue
+        t = ts.time().replace(second=0, microsecond=0)
+        if not (lo <= t <= hi):
+            continue
+        entry = {"m": t.strftime("%H:%M")}
+        if b.get("volume") is not None:
+            entry["v"] = int(b["volume"])
+        if b.get("oi") is not None:
+            entry["oi"] = int(b["oi"])
+        out.append(entry)
+    return out
+
+
+def enrich_liquidity_paths(max_rows: int = 20) -> dict:
+    """Fill ``opt_liquidity_path`` for rows that traded (or simulated) an option.
+
+    Runs alongside :func:`enrich_missing` and for the same reason — the broker's
+    current-day 1m history lags 5-15 min, so a row unpriced at 09:35 is retried
+    by the next 09:10 arm. Unlike ``enrich_missing`` this covers option-MODE
+    rows too (they carry real fills, not a shadow, but their contract's OI path
+    is just as measurable). Idempotent and fail-graceful.
+    """
+    import json
+
+    if os.getenv("OPEN15_LIQUIDITY_PATH_ENABLED", "true").lower() != "true":
+        return {"status": "disabled", "priced": 0, "skipped": 0}
+
+    from database.open15_breakout_db import Open15Trade, db_session, update_trade
+
+    done = skipped = 0
+    try:
+        rows = (
+            db_session.query(Open15Trade)
+            .filter(
+                Open15Trade.opt_symbol.isnot(None),
+                Open15Trade.opt_liquidity_path.is_(None),
+                Open15Trade.trigger_minute.isnot(None),
+                # only rows whose window has closed — a path fetched mid-hold
+                # would be truncated and then never retried, because the column
+                # would no longer be NULL
+                Open15Trade.exit_ts.isnot(None),
+            )
+            .order_by(Open15Trade.id.desc())
+            .limit(max_rows)
+            .all()
+        )
+        work = [
+            {
+                "id": r.id,
+                "symbol": r.symbol,
+                "opt_symbol": r.opt_symbol,
+                "opt_lot_size": r.opt_lot_size,
+                "trade_date": r.trade_date,
+                "trigger_minute": r.trigger_minute,
+                "exit_ts": r.exit_ts,
+            }
+            for r in rows
+        ]
+    except Exception:
+        logger.exception("open15 liquidity: journal scan failed")
+        return {"status": "error", "priced": 0, "skipped": 0}
+    finally:
+        db_session.remove()
+
+    details: list[dict] = []
+    for w in work:
+        bars = _fetch_1m_bars(w["opt_symbol"], w["trade_date"])
+        if not bars:
+            skipped += 1
+            continue
+        exit_min = "09:30"
+        try:
+            exit_min = dt.datetime.fromisoformat(w["exit_ts"]).strftime("%H:%M")
+        except (ValueError, TypeError):
+            pass
+        path = liquidity_path_from_bars(bars, w["trigger_minute"], exit_min)
+        if not path:
+            skipped += 1
+            continue
+        if update_trade(w["id"], opt_liquidity_path=json.dumps(path)):
+            done += 1
+            from services.open15_liquidity import summarize_path
+
+            details.append({"symbol": w["symbol"], **summarize_path(path, w["opt_lot_size"])})
+        else:
+            skipped += 1
+    return {"status": "ok", "priced": done, "skipped": skipped, "rows": details}
 
 
 def enrich_missing(max_rows: int = 20) -> dict:
