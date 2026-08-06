@@ -229,6 +229,7 @@ def _get_strategy_mode(name: str) -> str:
 # construction. The UI notes this rather than faking rows.
 _FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
 _INTRADAY_PULLBACK_FOLDER = "intraday_pullback_top2"
+_SECTOR_FOLLOW_FOLDER = "sector_follow_cap5_vol"
 _VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
 # Map a dashboard strategy name → the signal_decision source filters its veto
@@ -448,22 +449,42 @@ def _sector_follow_stats(since: datetime | None = None) -> dict:
             t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
         ]
         placed = [t for t in trades if (t.status or "") == "placed"]
-        net_qty_by_symbol: dict[str, int] = {}
+        # Issue #562: net WITHIN each mode. Sandbox and live positions are not
+        # the same kind of thing and must never be summed into one number — the
+        # #552 convention. Before this, the card blended 12 sandbox positions
+        # with 7 live ones into a single "Open 10", which is what made a live
+        # book impossible to read off the dashboard.
+        net_by_mode: dict[str, dict[str, int]] = {}
         for t in placed:
             sign = 1 if t.side == "BUY" else -1
-            net_qty_by_symbol[t.symbol] = net_qty_by_symbol.get(t.symbol, 0) + sign * int(
-                t.quantity or 0
-            )
-        open_count = sum(1 for qty in net_qty_by_symbol.values() if qty > 0)
+            bucket = net_by_mode.setdefault((t.mode or "sandbox").lower(), {})
+            bucket[t.symbol] = bucket.get(t.symbol, 0) + sign * int(t.quantity or 0)
+        open_by_mode = {
+            mode: sum(1 for qty in symbols.values() if qty > 0)
+            for mode, symbols in net_by_mode.items()
+        }
+        # The headline number is the book the strategy would trade RIGHT NOW,
+        # so it answers "what am I exposed to?" rather than "what has this
+        # journal ever contained". The per-mode split rides alongside it.
+        current_mode = _get_strategy_mode(_SECTOR_FOLLOW_FOLDER)
+        open_count = open_by_mode.get(current_mode, 0)
         last = max((t.created_at for t in trades), default=None)
         return {
             "open_positions": open_count,
+            "open_positions_by_mode": open_by_mode,
+            "open_positions_mode": current_mode,
             "last_trade_at": last.isoformat() if last else None,
             "today_trade_count": len(today_entries) + len(today_exits),
         }
     except Exception:
         logger.exception("Failed to aggregate sector_follow_stats")
-        return {"open_positions": 0, "last_trade_at": None, "today_trade_count": 0}
+        return {
+            "open_positions": 0,
+            "open_positions_by_mode": {},
+            "open_positions_mode": None,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
 
 
 def _lot_size_from_rows(rows: list) -> int:
@@ -1234,6 +1255,11 @@ def _build_summary(name: str) -> dict:
         "config_conflict": config_conflict,
         "version": config.get("version", "—"),
         "open_positions": stats.get("open_positions", 0),
+        # Issue #562: sandbox and live position counts are reported separately —
+        # never summed (the #552 convention). Absent for strategies that do not
+        # yet split, so the UI falls back to the single headline number.
+        "open_positions_by_mode": stats.get("open_positions_by_mode"),
+        "open_positions_mode": stats.get("open_positions_mode"),
         "today_net_pnl": stats.get("today_net_pnl", None),
         "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
         "today_trade_count": stats.get("today_trade_count", 0),

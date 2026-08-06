@@ -2139,6 +2139,37 @@ ran in the 15:30-17:00 periodic window).
     sizes differ ~30x — which is the likely explanation for #488's own note
     that "every ex-ante metric ranked the two live trades backwards".
 
+## `SECTOR_FOLLOW_FILL_RECONCILE_ENABLED` (issue #562)
+
+- **Default:** `true`
+- **Where:** `services/sector_follow_fill_reconcile.py`, consulted per run.
+- **What it gates:** asking the broker what it actually FILLED for every
+  `sector_follow_trades` row still sitting at `status='placed'` with an
+  `order_id`. Runs at the 15:30 EOD summary job and on the next boot for legs
+  the broker had not yet reported — never on the 15:05 order path, where a
+  synchronous status round-trip per order would delay later signals in the
+  same batch.
+- **Why it exists:** `status='placed'` was written from the broker's
+  *acknowledgement*. A Kite `place_order` returns an `order_id` the moment the
+  request is accepted; the order can still be rejected downstream by RMS. Seven
+  live orders were acknowledged 2026-07-29..08-06 and **only one filled** — the
+  other six were rejected silently, with nothing alerting and every row frozen
+  at `placed` forever, so the journal, the dashboard and the P&L all reported
+  acknowledgements as trades.
+- **Failure mode:** fail-graceful and idempotent. An unreadable order status
+  leaves the row untouched and marks it `pending` for retry — it NEVER
+  downgrades a row to `rejected` on a failed lookup, which would invent a
+  rejection the broker never reported. A terminal rejection corrects `status`
+  and raises an operator alert (silence is the bug this fixes).
+- **Note:** the decision price in `price` is never overwritten; the broker's
+  `average_price` lands in the new `fill_price` column, so `fill_price - price`
+  stays measurable as slippage.
+- **Related:** mirrors `OPEN15_FILL_RECONCILE_ENABLED` (issue #555), which
+  solved the identical problem for `open15_vol_breakout` — the only strategy
+  that had fill reconciliation before this.
+- **History:**
+  - **2026-08-07:** Introduced by issue #562.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

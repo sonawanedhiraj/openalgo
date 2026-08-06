@@ -2391,6 +2391,19 @@ class SectorFollowService:
         """15:30 IST: write the Day-N markdown report to disk AND broadcast the
         Telegram summary. The two sinks are independent — one failing is logged
         but never blocks the other (best-effort)."""
+        # Issue #562: ask the broker what it actually filled BEFORE summarising,
+        # so the report describes trades rather than acknowledgements. Deferred
+        # to here deliberately — never on the 15:05 order path, where a
+        # synchronous status round-trip per order would delay later signals in
+        # the same batch. Best-effort; a reconciliation failure never blocks the
+        # summary.
+        if self.mode != "scaffold":
+            try:
+                from services.sector_follow_fill_reconcile import reconcile_unreconciled
+
+                reconcile_unreconciled()
+            except Exception:
+                logger.exception("sector_follow EOD fill reconciliation failed (ignored)")
         msg = self.build_eod_summary()
         # File sink (markdown Day-N report mirror of the Telegram summary).
         try:

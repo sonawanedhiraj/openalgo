@@ -450,6 +450,42 @@ def test_deployable_sandbox_strategy_has_no_conflict(app, wired_dbs):
     assert ff["health"] == "healthy"
 
 
+def test_open_positions_never_sum_sandbox_and_live(app, wired_dbs):
+    """Issue #562 — the #552 convention: real and sandbox are not one number.
+
+    The live card showed "Open 10" by netting 12 sandbox positions together
+    with 7 live ones, which made the real book unreadable off the dashboard.
+    """
+    _eng, sess, sfdb = wired_dbs["sf"]
+    for symbol, mode in (("AAA", "sandbox"), ("BBB", "sandbox"), ("CCC", "live")):
+        sess.add(
+            sfdb.SectorFollowTrade(
+                strategy_id=1,
+                mode=mode,
+                side="BUY",
+                symbol=symbol,
+                exchange="NSE",
+                product="CNC",
+                quantity=10,
+                price=100.0,
+                entry_date="2026-08-06",
+                status="placed",
+            )
+        )
+    sess.commit()
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    # Headline = the book the strategy would trade RIGHT NOW, not the blend.
+    assert sf["open_positions"] == 1
+    assert sf["open_positions_mode"] == "live"
+    assert sf["open_positions_by_mode"] == {"sandbox": 2, "live": 1}
+
+
 def test_detail_endpoint_agrees_with_card_on_routing_truth(app, wired_dbs):
     """/api/<name> must not contradict /api/list — same contract, same fields."""
     _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")

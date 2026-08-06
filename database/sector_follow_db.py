@@ -71,6 +71,14 @@ class SectorFollowTrade(Base):
     error_message = Column(String(255), nullable=True)  # broker/exception message on failure
     note = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Fill reconciliation (issue #562). `status='placed'` records only that the
+    # broker ACKNOWLEDGED the order and handed back an id — a Kite order can
+    # still be rejected downstream by RMS. 6 of 7 live orders in 2026-07/08 were
+    # acknowledged and never filled, and every row stayed 'placed' forever.
+    fill_price = Column(Float, nullable=True)  # broker average_price
+    fill_qty = Column(Integer, nullable=True)  # broker filled quantity
+    # reconciled | unavailable | pending  (None = never attempted)
+    fill_reconcile_status = Column(String(16), nullable=True)
 
 
 def _ensure_columns():
@@ -86,6 +94,14 @@ def _ensure_columns():
     wanted = {
         "status": "VARCHAR(12) NOT NULL DEFAULT 'placed'",
         "error_message": "VARCHAR(255)",
+        # Issue #562 — fill reconciliation. `price` is the DECISION price (a
+        # quote at signal time) and `status='placed'` is only the broker's
+        # ACKNOWLEDGEMENT; neither says the order actually transacted. These
+        # record what the broker really did, so `fill_price - price` stays
+        # measurable as slippage rather than overwriting the decision record.
+        "fill_price": "FLOAT",
+        "fill_qty": "INTEGER",
+        "fill_reconcile_status": "VARCHAR(16)",
     }
     try:
         with engine.connect() as conn:
