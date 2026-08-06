@@ -125,6 +125,31 @@ class Open15Trade(Base):
     opt_entry_oi = Column(Integer, nullable=True)  # open interest at trigger
     opt_exit_volume = Column(Integer, nullable=True)  # cumulative day volume at exit
     opt_exit_oi = Column(Integer, nullable=True)  # open interest at exit
+
+    # ---- contract liquidity, part 2 (issue #555) ------------------------- #
+    # The #488 columns above are RAW CONTRACT COUNTS, and lot sizes across this
+    # universe differ by ~30x (HAL 150 vs SAIL 4700) — so they were never
+    # comparable between contracts, which is the simplest explanation for #488's
+    # note that "every ex-ante metric ranked the two live trades backwards".
+    # Everything derived from them is normalized to LOTS or RUPEES; see
+    # ``services/open15_liquidity.py``.
+    #
+    # The bid/ask pair arrives in the SAME quote response the strategy already
+    # fetches at both decision moments — it was simply being discarded. It is the
+    # one liquidity fact that directly costs money: the strategy sends MARKET
+    # orders, so it pays the spread on entry and again on exit.
+    opt_entry_bid = Column(Float, nullable=True)
+    opt_entry_ask = Column(Float, nullable=True)
+    opt_exit_bid = Column(Float, nullable=True)
+    opt_exit_ask = Column(Float, nullable=True)
+    # from the master contract; varies per contract (0.05 vs 0.01 observed), so a
+    # spread is only comparable across contracts once expressed in ticks
+    opt_tick_size = Column(Float, nullable=True)
+    # per-minute [{"m": "09:21", "v": 3300, "oi": 72150}, ...] over the hold,
+    # from the 1m bars the option-shadow already fetches (volume and oi were
+    # being discarded). Two endpoint snapshots cannot show whether OI was
+    # BUILDING or UNWINDING while the position was held; this can.
+    opt_liquidity_path = Column(Text, nullable=True)
     # how this symbol got onto the watch list (issue #529): ``seed`` = the 09:16
     # gap ranking, ``rolling`` = appended by an intraday re-rank. Load-bearing
     # for the measurement — without it the two cohorts cannot be scored apart.
@@ -235,6 +260,13 @@ def _ensure_columns():
             "pnl_source": "VARCHAR(8)",
             "broker_pnl": "FLOAT",
             "sim_quantity": "INTEGER",
+            # contract liquidity, part 2 (issue #555)
+            "opt_entry_bid": "FLOAT",
+            "opt_entry_ask": "FLOAT",
+            "opt_exit_bid": "FLOAT",
+            "opt_exit_ask": "FLOAT",
+            "opt_tick_size": "FLOAT",
+            "opt_liquidity_path": "TEXT",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",

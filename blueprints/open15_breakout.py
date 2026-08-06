@@ -386,6 +386,12 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <table id="sel"><thead><tr><th>symbol</th><th>side</th><th>source</th><th>gap %</th>
    <th id="selVolHdr">max vol&times;</th><th>entry</th><th>exit</th><th>qty</th>
    <th>net P&amp;L</th><th>outcome</th></tr></thead><tbody></tbody></table>
+  <div class="sec">contract liquidity <span class="muted">(measurement only &mdash; nothing gates on it)</span></div>
+  <table id="liq"><thead><tr><th>symbol</th><th>contract</th><th>lot</th>
+   <th>entry bid/ask</th><th>spread</th><th>exit bid/ask</th><th>spread</th>
+   <th>round-trip</th><th>spread cost</th><th>volume</th><th>OI</th>
+   <th>vol/OI</th><th>OI path</th></tr></thead><tbody></tbody></table>
+  <div id="liqNote" class="muted" style="margin-top:6px"></div>
   <div class="sec">fills &amp; charges <span id="fillNote" class="muted"></span></div>
   <table id="fills"><thead><tr><th>symbol</th><th>quote entry</th><th>fill entry</th>
    <th>quote exit</th><th>fill exit</th><th>slippage</th><th>gross</th>
@@ -478,7 +484,8 @@ const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'
 function kindOf(e){
   if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped'||
      e.event==='entry_rejected'||e.event==='exit_paper'||e.event==='exit_sim'||
-     e.event==='fill_reconcile_row'||e.event==='rejection_unverified')return 'trade';
+     e.event==='fill_reconcile_row'||e.event==='liquidity_row'||
+     e.event==='rejection_unverified')return 'trade';
   if(e.event==='no_entry')return 'no_entry';
   return 'sys';
 }
@@ -678,7 +685,9 @@ function renderSel(){
       r.fill='real'; r.qty=e.qty; r.stockEntry=e.trigger_price;
       // in option mode the money is on the premium while `trigger_price` is the
       // stock — record BOTH legs (issue #555), never one standing in for the other
-      if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.premium;}
+      if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.premium;
+        r.entryBid=e.bid; r.entryAsk=e.ask; r.tick=e.tick_size; r.lotSize=e.lot_size;
+        r.entryVol=e.volume; r.entryOi=e.oi;}
       r.out='<span class="pos">entered '+esc(e.at||'')+
         (e.vol_ratio?(' &middot; vol '+e.vol_ratio+'&times;'):'')+'</span>';
     }else if(e.event==='entry_rejected'){
@@ -686,7 +695,8 @@ function renderSel(){
       // sandbox-equivalent simulation and is badged as such
       const r=rows[e.symbol];
       r.fill='paper'; r.qty=e.qty;
-      if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.entry_price;}
+      if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.entry_price;
+        r.entryBid=e.bid; r.entryAsk=e.ask; r.tick=e.tick_size;}
       else{r.stockEntry=e.entry_price;}
       r.out='<span class="badge b-paper">paper</span> '+
         '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
@@ -695,10 +705,21 @@ function renderSel(){
       const r=rows[e.symbol];
       r.skipReason=e.reason;
       if(e.fill==='sim')r.fill='sim';
-      if(e.opt_symbol){r.instr='option'; r.contract=e.opt_symbol; r.optEntry=e.opt_entry_premium;}
+      if(e.opt_symbol){r.instr='option'; r.contract=e.opt_symbol; r.optEntry=e.opt_entry_premium;
+        // `??=`, not `=`: a later event for the same symbol that omits a field
+        // must not erase what an earlier one recorded. Assigning undefined here
+        // would blank the book on any day whose log carries two skip events.
+        r.entryBid??=e.opt_entry_bid; r.entryAsk??=e.opt_entry_ask;
+        r.tick??=e.opt_tick_size; r.lotSize??=e.opt_lot_size;
+        r.entryVol??=e.opt_entry_volume; r.entryOi??=e.opt_entry_oi;}
       if(e.sim_quantity)r.qty=e.sim_quantity;
       r.out='skipped: '+esc(e.reason||'')+
         (e.fill==='sim'?' <span class="badge b-sim">sim &middot; priced 1 lot</span>':'');
+    }else if(e.event==='liquidity_row'){
+      // the contract's OI path over the hold (issue #555) — direction matters:
+      // building vs unwinding is invisible to two endpoint snapshots
+      rows[e.symbol].oiPath={minutes:e.minutes,oi_change:e.oi_change,
+        oi_change_lots:e.oi_change_lots,volume_traded:e.volume_traded};
     }else if(e.event==='fill_reconcile_row'){
       // what the broker ACTUALLY filled (issue #555) — overlaid on the quote
       // prices already in the row so slippage renders as the gap between them
@@ -714,6 +735,7 @@ function renderSel(){
       if(e.instrument==='option'){
         r.instr='option'; r.contract=e.contract??r.contract;
         r.optExit=e.exit_price; r.optEntry=r.optEntry??e.opt_entry_premium??e.entry_price;
+        r.exitBid=e.bid; r.exitAsk=e.ask; r.exitVol=e.volume; r.exitOi=e.oi;
       }
       if(e.stock_entry_price!=null)r.stockEntry=r.stockEntry??e.stock_entry_price;
       if(e.event==='exit_paper')r.fill='paper';
@@ -759,7 +781,72 @@ function renderSel(){
   }
   if(!Object.keys(rows).length)
     tb.innerHTML='<tr><td colspan="10" class="muted">no selection this day</td></tr>';
-  renderFills(rows);
+  renderFills(rows); renderLiquidity(rows);
+}
+// --- liquidity derivations (issue #555) ------------------------------------
+// Mirrors services/open15_liquidity.py. Two rules it must not break:
+//  * spread % is of the MID, not the LTP — the LTP is whichever side last
+//    traded, so quoting against it makes the same book look wider or narrower
+//    depending on who traded last;
+//  * a contract COUNT is not a quantity until divided by lot size. Lot sizes
+//    here differ ~30x (HAL 150 vs SAIL 4700), which is why the raw #488
+//    columns ranked contracts backwards.
+function spreadOf(bid,ask,tick){
+  const b=+bid, a=+ask;
+  if(!bid||!ask||!(a>=b))return {abs:null,pct:null,ticks:null};
+  const w=a-b, mid=(a+b)/2;
+  return {abs:w, pct:mid?(w/mid*100):null, ticks:tick?(w/+tick):null};
+}
+function inLots(n,lot){return (n!=null&&lot)?(+n/+lot):null;}
+function fmtSpread(s){
+  if(s.pct==null)return dash;
+  return s.abs.toFixed(2)+' <span class="muted">'+s.pct.toFixed(2)+'%'+
+    (s.ticks!=null?(' &middot; '+s.ticks.toFixed(0)+'t'):'')+'</span>';
+}
+function renderLiquidity(rows){
+  const rs=Object.entries(rows).filter(([,r])=>r.instr==='option'&&r.contract);
+  const tb=document.querySelector('#liq tbody'); tb.innerHTML='';
+  const note=document.getElementById('liqNote');
+  if(!rs.length){
+    tb.innerHTML='<tr><td colspan="13" class="muted">no option contracts this day</td></tr>';
+    note.textContent=''; return;
+  }
+  let anySpread=false;
+  for(const[s,r]of rs){
+    const es=spreadOf(r.entryBid,r.entryAsk,r.tick), xs=spreadOf(r.exitBid,r.exitAsk,r.tick);
+    if(es.pct!=null||xs.pct!=null)anySpread=true;
+    const rt=(es.pct!=null&&xs.pct!=null)?(es.pct+xs.pct):null;
+    // half the width per leg: a mid fill is the fair reference and a market
+    // order gives up half of it on each side
+    const cost=(es.abs!=null&&xs.abs!=null&&r.qty)?((es.abs+xs.abs)/2*+r.qty):null;
+    const vLots=inLots(r.entryVol,r.lotSize), oLots=inLots(r.entryOi,r.lotSize);
+    const vOi=(r.entryVol!=null&&r.entryOi)?(+r.entryVol/+r.entryOi):null;
+    const p=r.oiPath;
+    const pathCell=p&&p.oi_change!=null
+      ? '<span class="'+(p.oi_change>=0?'pos':'neg')+'">'+(p.oi_change>=0?'+':'')+
+        (p.oi_change_lots!=null?p.oi_change_lots+' lots':p.oi_change)+'</span>'+
+        '<span class="leg">'+p.minutes+' min '+(p.oi_change>=0?'building':'unwinding')+'</span>'
+      : dash;
+    tb.innerHTML+='<tr><td>'+esc(s)+'</td><td class="opt">'+esc(shortC(r.contract))+
+      '</td><td>'+(r.lotSize??dash)+
+      '</td><td>'+(r.entryBid?(px(r.entryBid)+' / '+px(r.entryAsk)):dash)+
+      '</td><td>'+fmtSpread(es)+
+      '</td><td>'+(r.exitBid?(px(r.exitBid)+' / '+px(r.exitAsk)):dash)+
+      '</td><td>'+fmtSpread(xs)+
+      '</td><td>'+(rt!=null?('<b>'+rt.toFixed(2)+'%</b>'):dash)+
+      '</td><td>'+(cost!=null?('&#8377;'+Math.round(cost)):dash)+
+      '</td><td>'+(vLots!=null?(Math.round(vLots)+' <span class="muted">lots</span>'):dash)+
+      '</td><td>'+(oLots!=null?(Math.round(oLots)+' <span class="muted">lots</span>'):dash)+
+      '</td><td>'+(vOi!=null?vOi.toFixed(1):dash)+
+      '</td><td>'+pathCell+'</td></tr>';
+  }
+  note.innerHTML=anySpread
+    ? 'Volume and OI are shown in <b>LOTS</b> — raw contract counts are not comparable '+
+      'across a universe whose lot sizes differ ~30&times;. <b>Spread cost is NOT deducted '+
+      'from P&amp;L</b>: sim and paper rows price both legs at the quote LTP, so their net '+
+      'is optimistic by roughly this amount; real rows use broker fills, where the spread '+
+      'is already inside the fill price.'
+    : 'Bid/ask not captured for this day &mdash; it starts with the next armed session.';
 }
 const dash='<span class="muted">&mdash;</span>';
 function px(v){return v==null?null:(Math.round(v*100)/100).toFixed(2);}
@@ -881,6 +968,7 @@ def logs_page():
 @check_session_validity
 def trades():
     from database.open15_breakout_db import Open15Trade, db_session
+    from services import open15_liquidity as _liquidity
 
     limit = min(int(request.args.get("limit", 100)), 500)
     date = request.args.get("date")
@@ -909,6 +997,22 @@ def trades():
                     "opt_entry_oi": r.opt_entry_oi,
                     "opt_exit_volume": r.opt_exit_volume,
                     "opt_exit_oi": r.opt_exit_oi,
+                    # top-of-book at both decision moments (issue #555). The
+                    # strategy sends MARKET orders, so the spread is a real cost
+                    # and these are what make it measurable.
+                    "opt_entry_bid": r.opt_entry_bid,
+                    "opt_entry_ask": r.opt_entry_ask,
+                    "opt_exit_bid": r.opt_exit_bid,
+                    "opt_exit_ask": r.opt_exit_ask,
+                    "opt_tick_size": r.opt_tick_size,
+                    # derived, lot- and rupee-normalized — raw contract counts
+                    # are not comparable across a universe whose lot sizes differ
+                    # ~30x, which is what made the #488 columns unreadable
+                    "liquidity": _liquidity.derive(r),
+                    "spread_cost_inr": _liquidity.spread_cost_inr(r),
+                    "liquidity_path": _liquidity.summarize_path(
+                        r.opt_liquidity_path, r.opt_lot_size
+                    ),
                     # seed (09:16 gap ranking) vs rolling (intraday re-rank),
                     # issue #529. Pre-#529 rows are NULL — they are all seeds.
                     "watch_source": r.watch_source or "seed",

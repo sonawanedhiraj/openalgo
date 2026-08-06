@@ -2115,6 +2115,30 @@ ran in the 15:30-17:00 periodic window).
     P&L, no label — so it was impossible to tell whether the slot capital or the
     signal was what capped the strategy.
 
+## `OPEN15_LIQUIDITY_PATH_ENABLED` (default `true`)
+
+- **Where:** `services/open15_option_shadow.py` `enrich_liquidity_paths()`.
+- **What it controls:** whether the per-minute `{minute, volume, oi}` path over
+  each option position's hold is stored in `open15_trades.opt_liquidity_path`.
+- **Costs no broker call.** It is built from the 1m bars the option-shadow
+  already fetches — `volume` and `oi` are on every bar (the historical endpoint
+  is called with `oi=1`) and were simply being discarded.
+- **Why a path and not two snapshots:** endpoints give a delta but cannot say
+  whether open interest was *building* or *unwinding* during the hold, which is
+  the question the series exists to answer.
+- **Failure mode:** fail-graceful and idempotent — a row whose bars the broker
+  has not published yet (current-day history lags 5-15 min) stays NULL and is
+  retried by the next 09:10 arm, exactly like the option-shadow premiums.
+- **Note:** the bid/ask liquidity capture that shipped alongside it (issue #555)
+  has **no flag** — it reads two fields out of a quote response the strategy
+  already fetches, so there is nothing to switch off and no cost to avoid.
+- **History:**
+  - **2026-08-06:** Introduced by issue #555, alongside `opt_*_bid`/`opt_*_ask`
+    and `opt_tick_size`. Before it, #488's raw contract counts were the only
+    liquidity data, and they are not comparable across a universe whose lot
+    sizes differ ~30x — which is the likely explanation for #488's own note
+    that "every ex-ante metric ranked the two live trades backwards".
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

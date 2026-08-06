@@ -1033,12 +1033,17 @@ def _as_int(value: Any) -> int | None:
 
 
 def production_quote_snapshot(symbol: str, exchange: str) -> dict | None:
-    """Full quote for the option paths: last price plus the contract's own
-    traded volume and open interest (issue #488).
+    """Full quote for the option paths: last price, the contract's own traded
+    volume and open interest (issue #488), and the top-of-book bid/ask (#555).
 
-    ``volume``/``oi`` are recorded for research only — nothing gates on them.
-    Returns None when the quote is unavailable; callers treat that as "unknown"
-    and fall back to the price-only path.
+    The bid/ask pair costs NOTHING extra — ``get_quotes`` has always returned it
+    in this same response and open15 simply dropped it on the floor. It is the
+    one liquidity fact that directly costs money: the strategy sends MARKET
+    orders, so it crosses the spread on entry and again on exit.
+
+    All of it is recorded for research only — nothing gates on any of it (the
+    #488 rule). Returns None when the quote is unavailable; callers treat that
+    as "unknown" and fall back to the price-only path.
     """
     try:
         from database.auth_db import get_first_available_api_key
@@ -1059,6 +1064,9 @@ def production_quote_snapshot(symbol: str, exchange: str) -> dict | None:
             "ltp": float(ltp),
             "volume": _as_int(d.get("volume")),
             "oi": _as_int(d.get("oi")),
+            # 0 is the mapper's "absent", not a price — keep it as unknown
+            "bid": float(d["bid"]) if d.get("bid") else None,
+            "ask": float(d["ask"]) if d.get("ask") else None,
         }
     except Exception:
         logger.exception("open15: quote raised for %s:%s", exchange, symbol)
@@ -1334,6 +1342,14 @@ class Open15BreakoutService:
                     logger.info("open15 opt-shadow catch-up: %s", res)
             except Exception:
                 logger.exception("open15: option-shadow catch-up failed")
+        try:
+            from services.open15_option_shadow import enrich_liquidity_paths
+
+            res = enrich_liquidity_paths()
+            if res.get("priced"):
+                logger.info("open15 liquidity-path catch-up: %s", res)
+        except Exception:
+            logger.exception("open15: liquidity-path catch-up failed")
         if not _fill_reconcile_enabled():
             return
         try:
@@ -1507,8 +1523,14 @@ class Open15BreakoutService:
             from services.open15_option_shadow import option_round_trip_charges
 
             entry_prem = pos.get("opt_entry_premium")
-            exit_px, exit_volume, exit_oi = self._option_liquidity(pos["opt_symbol"])
-            fields.update(opt_exit_volume=exit_volume, opt_exit_oi=exit_oi)
+            liq = self._option_liquidity(pos["opt_symbol"])
+            exit_px = liq["ltp"]
+            fields.update(
+                opt_exit_volume=liq["volume"],
+                opt_exit_oi=liq["oi"],
+                opt_exit_bid=liq["bid"],
+                opt_exit_ask=liq["ask"],
+            )
             lot = pos.get("opt_lot_size") or 1
             lots = pos["quantity"] // lot if lot else 1
             if entry_prem and exit_px:
@@ -1564,6 +1586,10 @@ class Open15BreakoutService:
             stock_entry_price=round(pos["trigger_price"], 2),
             stock_exit_price=(self.core.last_price.get(symbol) if self.core else None),
             opt_entry_premium=pos.get("opt_entry_premium"),
+            bid=fields.get("opt_exit_bid"),
+            ask=fields.get("opt_exit_ask"),
+            volume=fields.get("opt_exit_volume"),
+            oi=fields.get("opt_exit_oi"),
             gross=round(pnl, 2) if pnl is not None else None,
             charges=charges,
             pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
@@ -1644,12 +1670,18 @@ class Open15BreakoutService:
                 from services.open15_option_shadow import option_round_trip_charges
 
                 entry_prem = pos.get("opt_entry_premium")
-                exit_prem, exit_volume, exit_oi = self._option_liquidity(pos["opt_symbol"])
+                liq = self._option_liquidity(pos["opt_symbol"])
+                exit_prem = liq["ltp"]
                 lot = pos.get("opt_lot_size") or 1
                 lots = pos["quantity"] // lot if lot else 1
                 # recorded even when the premium is missing — an unpriced exit is
                 # exactly the case the liquidity data is meant to explain
-                fields.update(opt_exit_volume=exit_volume, opt_exit_oi=exit_oi)
+                fields.update(
+                    opt_exit_volume=liq["volume"],
+                    opt_exit_oi=liq["oi"],
+                    opt_exit_bid=liq["bid"],
+                    opt_exit_ask=liq["ask"],
+                )
                 if entry_prem and exit_prem:
                     pnl = (exit_prem - entry_prem) * pos["quantity"]
                     charges = option_round_trip_charges(
@@ -1697,6 +1729,10 @@ class Open15BreakoutService:
                 stock_entry_price=round(pos["trigger_price"], 2),
                 stock_exit_price=last_px,
                 opt_entry_premium=pos.get("opt_entry_premium"),
+                bid=fields.get("opt_exit_bid"),
+                ask=fields.get("opt_exit_ask"),
+                volume=fields.get("opt_exit_volume"),
+                oi=fields.get("opt_exit_oi"),
                 # gross/charges/pnl(NET) — the SAME shape `exit_paper` emits, so
                 # the page never has to know which kind of exit it is reading
                 # (issue #552: this used to be gross-rounded-to-0dp while its
@@ -1816,6 +1852,19 @@ class Open15BreakoutService:
                 self._log_event("opt_shadow", **enrich_missing())
             except Exception:
                 logger.exception("open15: option-shadow enrichment failed")
+        # the contract's per-minute OI/volume path over the hold (issue #555) —
+        # same 1m bars, same broker lag, so the same retry treatment. Gated
+        # separately from the shadow: option-MODE rows have no shadow to price
+        # but their contract's OI path is just as measurable.
+        try:
+            from services.open15_option_shadow import enrich_liquidity_paths
+
+            res = enrich_liquidity_paths()
+            for detail in res.pop("rows", []):
+                self._log_event("liquidity_row", **detail)
+            self._log_event("opt_liquidity_path", **res)
+        except Exception:
+            logger.exception("open15: liquidity-path enrichment failed")
         if self._tick_writer is not None:
             try:
                 flushed = self._tick_writer.flush_now()
@@ -2172,6 +2221,9 @@ class Open15BreakoutService:
             instrument=row_kw.get("instrument", "stock"),
             contract=row_kw.get("opt_symbol"),
             qty=qty,
+            bid=row_kw.get("opt_entry_bid"),
+            ask=row_kw.get("opt_entry_ask"),
+            tick_size=row_kw.get("opt_tick_size"),
             entry_price=row_kw.get("opt_entry_premium") or round(action["price"], 2),
             watch_source=action.get("watch_source") or "seed",
             error=msg,
@@ -2386,13 +2438,18 @@ class Open15BreakoutService:
             order_id=resp.get("orderid"),
         )
 
-    def _option_liquidity(self, opt_symbol: str) -> tuple[float | None, int | None, int | None]:
-        """``(ltp, volume, oi)`` for an option contract (issue #488).
+    def _option_liquidity(self, opt_symbol: str) -> dict:
+        """``{ltp, volume, oi, bid, ask}`` for an option contract (#488, #555).
 
-        The volume/OI half is pure instrumentation — nothing gates on it. When the
-        snapshot is unavailable this falls back to ``quote_fn`` so sizing and exit
-        pricing behave exactly as before and the liquidity columns simply stay
-        NULL. Never raises: a broken snapshot must not cost an entry or an exit.
+        Everything but ``ltp`` is pure instrumentation — nothing gates on it.
+        When the snapshot is unavailable this falls back to ``quote_fn`` so
+        sizing and exit pricing behave exactly as before and the liquidity
+        columns simply stay NULL. Never raises: a broken snapshot must not cost
+        an entry or an exit.
+
+        Returns a dict rather than a tuple (it was ``(ltp, volume, oi)``) so
+        adding a field cannot silently mis-bind a positional unpack at a call
+        site someone forgot to update.
         """
         snap = None
         try:
@@ -2401,8 +2458,20 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: liquidity snapshot raised for %s", opt_symbol)
         if snap:
-            return snap.get("ltp"), snap.get("volume"), snap.get("oi")
-        return self.quote_fn(opt_symbol, "NFO"), None, None
+            return {
+                "ltp": snap.get("ltp"),
+                "volume": snap.get("volume"),
+                "oi": snap.get("oi"),
+                "bid": snap.get("bid"),
+                "ask": snap.get("ask"),
+            }
+        return {
+            "ltp": self.quote_fn(opt_symbol, "NFO"),
+            "volume": None,
+            "oi": None,
+            "bid": None,
+            "ask": None,
+        }
 
     def _enter_option(self, action: dict, cfg: dict) -> None:
         """Option-mode entry (issue #437): BUY the ATM CE (L) / PE (S).
@@ -2419,13 +2488,21 @@ class Open15BreakoutService:
         if not contract:
             self._journal_skip(action, "no_option_contract", instrument="option")
             return
-        premium, opt_volume, opt_oi = self._option_liquidity(contract["symbol"])
+        liq = self._option_liquidity(contract["symbol"])
+        premium, opt_volume, opt_oi = liq["ltp"], liq["volume"], liq["oi"]
         if not premium:
             self._journal_skip(
                 action, "no_option_quote", instrument="option", opt_symbol=contract["symbol"]
             )
             return
         lot = int(contract["lotsize"])
+        # captured at BOTH decision moments (issue #555) — free, they ride in the
+        # quote response already fetched above
+        liq_kw = {
+            "opt_entry_bid": liq["bid"],
+            "opt_entry_ask": liq["ask"],
+            "opt_tick_size": contract.get("ticksize"),
+        }
         slot_capital = float(cfg.get("margin_effective") or cfg.get("margin_per_slot") or 30_000)
         lots = int(slot_capital // (premium * lot))
         if lots < 1:
@@ -2444,6 +2521,7 @@ class Open15BreakoutService:
                 opt_entry_premium=premium,
                 opt_entry_volume=opt_volume,
                 opt_entry_oi=opt_oi,
+                **liq_kw,
                 **({"sim_quantity": lot} if simulate else {}),
             )
             return
@@ -2472,6 +2550,7 @@ class Open15BreakoutService:
             "opt_entry_premium": premium,
             "opt_entry_volume": opt_volume,
             "opt_entry_oi": opt_oi,
+            **liq_kw,
         }
         if not ok:
             self._journal_rejection(action, row_kw, qty, self._order_error(resp))
@@ -2507,6 +2586,13 @@ class Open15BreakoutService:
             lots=lots,
             lot_size=lot,
             premium=premium,
+            # top of book at the entry instant (issue #555) — the MARKET order
+            # crosses this, so the page can show what the fill really cost
+            bid=liq["bid"],
+            ask=liq["ask"],
+            tick_size=contract.get("ticksize"),
+            volume=opt_volume,
+            oi=opt_oi,
             qty=qty,
             trigger_price=round(action["price"], 2),
             at=f"{action['trigger_minute']}:{action['trigger_second']:02d}",

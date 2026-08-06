@@ -1208,6 +1208,36 @@ form silently classified every future class as REAL, which would have compounded
 tomorrow's real position size off simulated money. Flags
 `OPEN15_FILL_RECONCILE_ENABLED`, `OPEN15_SIM_SKIPPED_ENABLED`,
 `OPEN15_PAPER_SIM_MAX`.
+**Option liquidity: read every count in LOTS, and the spread is the cost
+(issue #555).** Lot sizes across this universe differ ~30× (HAL 150 vs SAIL
+4700), so #488's raw `opt_*_volume`/`opt_*_oi` contract counts were never
+comparable between contracts — measured 2026-08-06, raw counts made SAIL look
+**26× more liquid** than HAL when in lots it is the *smaller* book. That
+inversion is the simplest explanation for #488's own note that "every ex-ante
+metric ranked the two live trades backwards". `services/open15_liquidity.py`
+owns every derivation and never reports a bare contract count. The strategy
+sends **MARKET** orders, so it crosses the book twice: `opt_*_bid`/`opt_*_ask` +
+`opt_tick_size` are now captured at both decision moments at **zero broker
+cost** (the pair always rode in the quote response `_option_liquidity` already
+fetched and was discarded). Spread % is of the **MID**, never the LTP — the LTP
+is whichever side last traded, so quoting against it moves the metric without
+the market moving. ⚠ **Spread cost is reported, never deducted from `pnl`**:
+sim/paper rows price both legs at the quote LTP so their net is optimistic by
+roughly `spread_cost_inr`, while real rows use fills where the spread is already
+inside the price — deducting it would break the #552 single convention and make
+every older row incomparable. `opt_liquidity_path` stores per-minute `{m,v,oi}`
+over the hold from the 1m bars the option-shadow already fetches (per-bar `v` is
+incremental and may be summed; the quote's `volume` is cumulative and must not
+be), answering *building vs unwinding* — which endpoint snapshots cannot.
+**Nothing gates on any of it.** Flag `OPEN15_LIQUIDITY_PATH_ENABLED`. Kite also
+returns `average_price`, `last_trade_time`, whole-book `buy_quantity`/
+`sell_quantity` (OpenAlgo's `totalbuyqty` is only the 5 visible levels — 750 vs
+105,150 for HAL at one instant), `oi_day_high/low`, circuit limits, the
+`low/high_limit_price_protection` band (NSE rejects MARKET orders outside it)
+and per-level `orders`; all are dropped by the shared broker mappers, so
+capturing them means changing a mapper every broker uses. The WS feed is not a
+source — open15 subscribes `NSE_<sym>_LTP` only, which carries neither depth
+nor OI.
 Alert: `logger.error` + Telegram `open15_breakout`, deduped once per day. The
 digest/summary report `filled` and `paper` separately — `core.entered` counts
 TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows
