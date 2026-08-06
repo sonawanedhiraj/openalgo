@@ -1146,6 +1146,26 @@ placed for it**. Four rules, each load-bearing:
   `paper_pnl_by_date()` reports it separately and the UI badges every paper
   number. Blending them would compound tomorrow's real position size off money
   that was never made.
+- **Every reported P&L is NET, and is derived in exactly ONE place** (issue
+  #552). `open15_trades.pnl` is gross with modelled charges in `charges_inr`
+  (#433), so "the P&L" is a *derived* value — and before #552 four consumers
+  derived it independently with three different answers, putting a **gross**
+  +₹2109 in the logs-page chip above rows totalling **net** +₹1383.81 (charges
+  were 34% of gross), and flipping 2026-07-23's sign (+₹82 gross vs −₹17.82
+  net). `net_pnl_expr()` (SQL) and `net_pnl_of_row()` (Python) in
+  `database/open15_breakout_db.py` are now the only definition; the `exit` and
+  `exit_paper` decision-log events emit the identical `gross`/`charges`/`pnl`
+  (net) triple so the page never has to know which kind of exit it is reading.
+  **Never write `sum(pnl)` against this journal again** — route through the
+  helpers. The regression that catches this class asserts the day digest equals
+  the sum of the rows the page renders, which is the invariant nothing
+  expressed before (a pre-#552 test pinned the digest at 150.0 three lines
+  above the row it renders at 120.0).
+- **One date key per day.** The journal's `trade_date` comes from
+  `Open15BreakoutService._trade_date()` — the arm-time `_log_date` that
+  `save_day_log` also uses — not from a fresh clock read (issue #553). Deriving
+  it twice filed a row and its own day log under different dates, which left
+  two #548 tests green only on the day they were written.
 - **Only an AFFIRMATIVE non-zero position book justifies a square-off.** A 403 is
   unambiguous but a timeout is not, so `flatten` verifies via
   `get_positionbook(mode_key='open15_vol_breakout')` (the #497 rule). A non-zero
