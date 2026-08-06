@@ -1607,7 +1607,13 @@ class Open15BreakoutService:
                 instrument="option" if is_option else "stock",
                 qty=pos["quantity"],
                 exit_price=last_px if not is_option else fields.get("opt_exit_premium"),
-                pnl=round(pnl, 0) if pnl is not None else None,
+                # gross/charges/pnl(NET) — the SAME shape `exit_paper` emits, so
+                # the page never has to know which kind of exit it is reading
+                # (issue #552: this used to be gross-rounded-to-0dp while its
+                # sibling was net, which is how the chip and the rows diverged).
+                gross=round(pnl, 2) if pnl is not None else None,
+                charges=charges,
+                pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
                 order_status=resp.get("status"),
                 reason=reason,
             )
@@ -2061,12 +2067,24 @@ class Open15BreakoutService:
         )
         self._alert_rejection(action["symbol"], qty, msg)
 
+    def _trade_date(self) -> str:
+        """The day's ONE date key — journal row and day log must never differ.
+
+        ``_log_date`` is stamped at arm (09:10 IST) and is what ``save_day_log``
+        files the decision log under, so the journal reads it rather than
+        re-deriving "today" from the clock (issue #553). Equivalent in
+        production — arming precedes every entry — but it removes a second
+        derivation of one fact, the same defect shape as #552. Falls back to the
+        clock if the service journals before it ever armed.
+        """
+        return self._log_date or dt.datetime.now(IST).strftime("%Y-%m-%d")
+
     def _journal_skip(self, action: dict, reason: str, **extra) -> None:
         """Journal a trigger that did NOT place an order (cap / sizing skips)."""
         from database.open15_breakout_db import insert_trade
 
         insert_trade(
-            trade_date=dt.datetime.now(IST).strftime("%Y-%m-%d"),
+            trade_date=self._trade_date(),
             symbol=action["symbol"],
             side=action["side"],
             mode=_mode(),
@@ -2115,7 +2133,7 @@ class Open15BreakoutService:
         )
         ok = resp.get("status") == "success"
         row_kw = {
-            "trade_date": dt.datetime.now(IST).strftime("%Y-%m-%d"),
+            "trade_date": self._trade_date(),
             "symbol": action["symbol"],
             "side": action["side"],
             "mode": _mode(),
@@ -2193,7 +2211,7 @@ class Open15BreakoutService:
         from database.open15_breakout_db import insert_trade
         from services.open15_option_shadow import resolve_atm_option
 
-        today = dt.datetime.now(IST).strftime("%Y-%m-%d")
+        today = self._trade_date()
         contract = resolve_atm_option(action["symbol"], action["side"], action["price"], today)
         if not contract:
             self._journal_skip(action, "no_option_contract", instrument="option")

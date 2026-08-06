@@ -319,6 +319,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
  .chip{background:#161d25;border-radius:6px;padding:6px 12px}
  .chip .k{display:block;font-size:10px;color:#6b7886}.chip .v{font-size:14px}
+ .chip .net{background:#232c36;border-radius:3px;padding:0 3px;color:#8aa0b4}
  .fbtn{font-size:11px;padding:2px 10px;border-radius:10px}.fbtn.on{background:#2a3138;color:#7dc4e4}
  .sec{color:#8aa0b4;font-size:12px;margin:14px 0 0}
 </style></head><body>
@@ -534,18 +535,22 @@ function renderChips(){
   const paper=dig.paper??summ.paper??0;
   const rupee=v=>(v>=0?'+':'')+'\\u20B9'+Math.round(v);
   // real and paper P&L are NEVER summed into one figure — paper money was
-  // never made, and blending them is how a rejected day reads as a traded one
+  // never made, and blending them is how a rejected day reads as a traded one.
+  // Both are NET of modelled charges (issue #552) and say so: these chips used
+  // to show gross while the rows below showed net, which on 2026-08-05 read
+  // +2109 above rows totalling +1384, and on 2026-07-23 flipped the sign.
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
     // a literal '\\u00B7', NOT '&middot;': chip VALUES go through esc() (keys are
     // inserted raw), so an HTML entity here renders as the text "&middot;"
     ['entries',filled+' filled'+(paper?(' \\u00B7 '+paper+' paper'):'')+
       ' / '+(dig.selected??summ.selected??0)+' sel'],
-    ['real P&amp;L',dig.pnl==null?'—':rupee(dig.pnl)]];
+    ['real P&amp;L <span class="net">net</span>',dig.pnl==null?'—':rupee(dig.pnl)]];
   if(paper||dig.paper_pnl!=null)
-    chips.push(['paper P&amp;L',dig.paper_pnl==null?'—':rupee(dig.paper_pnl)]);
+    chips.push(['paper P&amp;L <span class="net">net</span>',
+      dig.paper_pnl==null?'—':rupee(dig.paper_pnl)]);
   document.getElementById('chips').innerHTML=chips.map(([k,v])=>{
-    const isPaper=(k==='paper P&amp;L'), isReal=(k==='real P&amp;L');
+    const isPaper=k.startsWith('paper P&amp;L'), isReal=k.startsWith('real P&amp;L');
     const val=isPaper?dig.paper_pnl:(isReal?dig.pnl:null);
     return '<div class="chip"'+(isPaper?' style="border:1px solid #463a20"':'')+
       '><span class="k">'+k+'</span><span class="v'+

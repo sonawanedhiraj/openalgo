@@ -690,11 +690,14 @@ def _open15_net_pnl(row) -> float:
     The journal ``pnl`` is gross (trigger price -> exit price); the modelled MIS
     round-trip charges live separately in ``charges_inr`` (issue #433). Deduct
     them when stamped — same convention as the Recent Trades table's ``net_pnl``.
+
+    Delegates to the journal's own helper so this file cannot drift from it
+    again (issue #552): a local copy here is exactly how the logs page ended up
+    reporting gross while this dashboard reported net.
     """
-    gross = float(row.pnl or 0.0)
-    if row.charges_inr is not None:
-        return gross - float(row.charges_inr)
-    return gross
+    from database.open15_breakout_db import net_pnl_of_row
+
+    return net_pnl_of_row(row)
 
 
 def _open15_stats() -> dict:

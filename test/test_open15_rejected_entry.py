@@ -23,9 +23,10 @@ from services.open15_breakout_service import Open15BreakoutService, Open15Core, 
 def _clean_journal():
     """Empty the journal between tests.
 
-    Every test here writes rows for the same ``trade_date`` (the service stamps
-    it from the real clock), so without this a query for "the AAA row" picks up
-    a previous test's row and the file passes test-by-test but fails as a suite.
+    Every test here writes rows for the same ``trade_date`` (``_log_date``,
+    2026-08-05 — see ``_trade_date`` and issue #553), so without this a query
+    for "the AAA row" picks up a previous test's row and the file passes
+    test-by-test but fails as a suite.
     """
     from database.open15_breakout_db import Open15Trade, db_session, init_db
 
@@ -308,6 +309,16 @@ def test_summary_reports_filled_and_paper_separately():
     db_session.remove()
 
 
+def _row_pnl(events) -> float:
+    """Sum of the per-symbol row values the page actually renders."""
+    from services.open15_log_view import selection_outcomes
+
+    return round(
+        sum(r["pnl"] for r in selection_outcomes("2026-08-05", events) if r.get("pnl") is not None),
+        2,
+    )
+
+
 def test_digest_and_outcome_rows_keep_paper_apart():
     """The history sidebar must not show simulated money as a day's P&L."""
     from services.open15_log_view import selection_outcomes, summarize_day
@@ -329,8 +340,31 @@ def test_digest_and_outcome_rows_keep_paper_apart():
     dig = summarize_day("2026-08-05", events)
     assert dig["entered"] == 0 and dig["paper"] == 1
     assert dig["pnl"] is None, "a rejected day has no real P&L"
-    assert dig["paper_pnl"] == 150.0
+    # NET (120), not the event's gross (150) — issue #552. This assertion used
+    # to read 150.0 three lines above a row assertion of 120.0, i.e. the header
+    # and the table disagreeing was pinned here as correct.
+    assert dig["paper_pnl"] == 120.0 == _row_pnl(events)
 
     row = selection_outcomes("2026-08-05", events)[0]
     assert row["fill"] == "paper" and row["entered"] is False
     assert row["error_message"] == REJECT_MSG and row["pnl"] == 120.0
+
+
+def test_journal_row_and_day_log_share_one_date_key():
+    """A row must never be filed under a different date than its day log (#553).
+
+    Pre-fix the journal read the wall clock while the day log used the arm-time
+    `_log_date`, so these two tests passed only on 2026-08-05 itself.
+    """
+    from database.open15_breakout_db import Open15Trade, db_session, get_day_log, init_db
+
+    init_db()
+    svc = _mk_service([])
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    rows = db_session.query(Open15Trade).filter(Open15Trade.symbol == "AAA").all()
+    assert rows, "the trigger journaled nothing"
+    assert {r.trade_date for r in rows} == {svc._log_date}
+    assert get_day_log(svc._log_date), "the day log is filed under the same key"
+    db_session.remove()
