@@ -283,13 +283,17 @@ def test_logs_page_colours_max_vol_by_the_beyond_ratio():
     assert "v>=needed" not in packed  # never gate the colour on the peak-anywhere value
 
 
-def _run_render_sel(events):
+def _run_render_sel(events, journal=None):
     """Execute the logs page's OWN row-building JS in node (issue #545).
 
     The page builds its selection-outcomes table client-side, duplicating
     ``selection_outcomes``. That duplication is what let #545 be fixed in Python
     while the page kept showing the wrong thing — so this test runs the real
     extracted source rather than grepping it for a substring.
+
+    ``applyJournal`` (issue #557) is extracted too, because the journal overlay
+    IS part of row building — a row whose P&L came only from the timeline is
+    stale the moment a reconcile lands.
     """
     import json
     import shutil
@@ -303,9 +307,15 @@ def _run_render_sel(events):
     if node is None:
         pytest.skip("node not available")
     body = _LOGS_PAGE.split("function renderSel(){")[1].split("// mid-window")[0]
+    overlay = (
+        "function applyJournal(rows){"
+        + _LOGS_PAGE.split("function applyJournal(rows){")[1].split("\nconst dash=")[0]
+    )
     script = (
         "const esc=s=>String(s);\n"
         f"const curEvents={json.dumps(events)};\n"
+        f"const curJournal={json.dumps(journal or [])};\n"
+        f"{overlay}\n"
         f"{body}\n"
         "console.log(JSON.stringify(rows));"
     )

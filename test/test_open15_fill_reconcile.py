@@ -629,13 +629,39 @@ OPTION_DAY = [
         "stock_exit_price": 4835.0,
         "pnl": 5562.24,
     },
+]
+
+# The journal — authoritative for prices and P&L (issue #557). Deliberately
+# carries NO matching `fill_reconcile_row` event: this is the sealed-log case,
+# where reconciliation landed after the day was written, which is precisely
+# what the event-sourced version could not represent.
+OPTION_JOURNAL = [
     {
-        "ts": "09:35",
-        "event": "fill_reconcile_row",
         "symbol": "HAL",
+        "instrument": "option",
+        "opt_symbol": "HAL25AUG264750CE",
+        "opt_entry_premium": 158.9,
+        "opt_exit_premium": 197.9,
         "entry_fill_price": 159.35,
         "exit_fill_price": 197.2,
         "pnl_source": "fill",
+        "fill": "real",
+        "quantity": 150,
+        "trigger_price": 4770.9,
+        "exit_price": 4835.0,
+        "pnl": 5677.5,
+        "charges_inr": 115.26,
+    },
+    {
+        "symbol": "SAIL",
+        "instrument": "option",
+        "opt_symbol": "SAIL25AUG26180CE",
+        "opt_entry_premium": 5.76,
+        "fill": "sim",
+        "quantity": 0,
+        "sim_quantity": 4700,
+        "trigger_price": 178.9,
+        "reason": "unaffordable",
     },
 ]
 
@@ -650,8 +676,10 @@ def test_logs_page_js_and_python_agree_on_the_new_fields():
     from services.open15_log_view import selection_outcomes
     from test.test_open15_log_view import _run_render_sel
 
-    js = _run_render_sel(OPTION_DAY)
-    py = {r["symbol"]: r for r in selection_outcomes("2026-08-06", OPTION_DAY)}
+    js = _run_render_sel(OPTION_DAY, journal=OPTION_JOURNAL)
+    py = {
+        r["symbol"]: r for r in selection_outcomes("2026-08-06", OPTION_DAY, journal=OPTION_JOURNAL)
+    }
     assert set(js) == set(py)
     assert js["HAL"]["instr"] == py["HAL"]["instrument"] == "option"
     assert js["HAL"]["contract"] == py["HAL"]["opt_symbol"] == "HAL25AUG264750CE"
@@ -699,6 +727,103 @@ def test_the_whole_logs_page_script_parses():
         assert res.returncode == 0, f"script block {i} does not parse:\n{res.stderr}"
 
 
+def test_a_reconcile_after_the_log_was_sealed_still_reaches_the_rows():
+    """Issue #557 — the case the event-sourced version structurally could not do.
+
+    On 2026-08-06 the chip read +Rs5334 (journal) while the rows beneath it read
+    +Rs316 and +Rs5850 (timeline). The rows were not merely out of date: the
+    arm-time catch-up — the designed retry for legs the broker reports late —
+    runs on a LATER day, so it can never append events to the day it corrects.
+    Any fix that keeps sourcing row P&L from events fails this test forever.
+    """
+    from services.open15_log_view import selection_outcomes, summarize_day
+
+    # a day log sealed BEFORE reconciliation: quote-derived, no reconcile events
+    day = [
+        {"ts": "09:16", "event": "selection", "selected": {"HAL": "L"}, "gaps_pct": {"HAL": 2.3}},
+        {
+            "ts": "09:21",
+            "event": "entry",
+            "symbol": "HAL",
+            "instrument": "option",
+            "contract": "HAL25AUG264750CE",
+            "premium": 158.9,
+            "trigger_price": 4770.9,
+            "qty": 150,
+            "order_status": "success",
+        },
+        {
+            "ts": "09:30",
+            "event": "exit",
+            "symbol": "HAL",
+            "instrument": "option",
+            "exit_price": 197.9,
+            "gross": 5850.0,
+            "charges": 287.51,
+            "pnl": 5562.49,
+        },
+    ]
+    # ...and the journal as the reconcile later left it: fill-derived gross
+    journal = [
+        {
+            "symbol": "HAL",
+            "instrument": "option",
+            "opt_symbol": "HAL25AUG264750CE",
+            "opt_entry_premium": 158.9,
+            "opt_exit_premium": 197.9,
+            "entry_fill_price": 158.5,
+            "exit_fill_price": 197.9,
+            "pnl_source": "fill",
+            "fill": "real",
+            "quantity": 150,
+            "pnl": 5910.0,
+            "charges_inr": 287.51,
+        }
+    ]
+    net = 5910.0 - 287.51  # 5622.49
+
+    rows = selection_outcomes("2026-08-06", day, journal=journal)
+    assert len(rows) == 1
+    assert rows[0]["pnl"] == pytest.approx(net), "the row must show the RECONCILED net"
+    assert rows[0]["entry_fill_price"] == 158.5
+    assert rows[0]["pnl_source"] == "fill"
+
+    # and the chip — which reads the journal via trades_pnl — must agree with it
+    digest = summarize_day("2026-08-06", day, trades_pnl=net)
+    rendered = sum(r["pnl"] for r in rows if r["pnl"] is not None)
+    assert digest["pnl"] == pytest.approx(rendered), "chip != rows is the #557 bug"
+
+
+def test_the_journal_never_invents_a_row_for_a_symbol_that_never_triggered():
+    """The overlay corrects rows; it must not create them.
+
+    A journal row whose symbol is absent from the day's watch list would
+    otherwise appear as an outcome with no gap, no volume and no reason —
+    indistinguishable from a selection the log failed to record.
+    """
+    from services.open15_log_view import selection_outcomes
+
+    day = [{"ts": "09:16", "event": "selection", "selected": {"HAL": "L"}, "gaps_pct": {}}]
+    journal = [{"symbol": "NOTWATCHED", "pnl": 999.0, "charges_inr": 0.0, "fill": "real"}]
+    rows = selection_outcomes("2026-08-06", day, journal=journal)
+    assert [r["symbol"] for r in rows] == ["HAL"]
+
+
+def test_the_overlay_reports_net_not_the_journals_gross():
+    """The #552 trap, inside the #557 fix.
+
+    The journal stores GROSS in `pnl` with charges separate; every number the
+    page and the digest show is NET. Copying `pnl` across would put gross in the
+    rows and net in the chip — reintroducing the exact divergence being fixed.
+    """
+    from services.open15_log_view import selection_outcomes
+
+    day = [{"ts": "09:16", "event": "selection", "selected": {"X": "L"}, "gaps_pct": {}}]
+    journal = [{"symbol": "X", "pnl": 1000.0, "charges_inr": 250.0, "fill": "real"}]
+    row = selection_outcomes("2026-08-06", day, journal=journal)[0]
+    assert row["pnl"] == pytest.approx(750.0), "gross 1000 - charges 250"
+
+
 def test_both_legs_reach_the_csv_for_an_option_day():
     """Ask #1: in option mode the stock price and the premium are different
     facts, and a row carrying one of them cannot be reconciled to its own P&L."""
@@ -726,16 +851,23 @@ def test_both_legs_reach_the_csv_for_an_option_day():
             "stock_exit_price": 4835.0,
             "pnl": 5562.24,
         },
+    ]
+    journal = [
         {
-            "ts": "09:35",
-            "event": "fill_reconcile_row",
             "symbol": "HAL",
+            "instrument": "option",
+            "opt_symbol": "HAL25AUG264750CE",
+            "opt_entry_premium": 158.9,
+            "opt_exit_premium": 197.9,
             "entry_fill_price": 159.35,
             "exit_fill_price": 197.2,
             "pnl_source": "fill",
-        },
+            "fill": "real",
+            "quantity": 150,
+            "trigger_price": 4770.9,
+        }
     ]
-    row = selection_outcomes("2026-08-06", day)[0]
+    row = selection_outcomes("2026-08-06", day, journal=journal)[0]
     assert row["trigger_price"] == 4770.9  # the stock leg
     assert row["opt_symbol"] == "HAL25AUG264750CE"
     assert row["opt_entry_premium"] == 158.9 and row["opt_exit_premium"] == 197.9
