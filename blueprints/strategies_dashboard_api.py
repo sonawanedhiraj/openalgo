@@ -1109,10 +1109,18 @@ def _pnl_curve_intraday_pullback(window_days: int | None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _health_led(name: str, overrides: list[dict], config: dict) -> str:
-    """Return 'healthy' | 'paused' | 'scaffold' | 'unknown'."""
+def _health_led(name: str, overrides: list[dict], config: dict, is_live: bool = False) -> str:
+    """Return 'healthy' | 'paused' | 'scaffold' | 'unknown'.
+
+    ``is_live`` is the resolved routing from the ``strategy_mode`` row. It wins
+    over the static ``config_snapshot.json`` (issue #561): a strategy that is
+    actually routing orders to the real broker is never a "scaffold", whatever
+    a stale JSON file claims. Defaults False so existing callers are unchanged.
+    """
     if any(o["type"] in ("pause", "kill_switch") for o in overrides):
         return "paused"
+    if is_live:
+        return "healthy"
     mode_val = config.get("mode", "")
     if "scaffold" in str(mode_val).lower():
         return "scaffold"
@@ -1198,6 +1206,22 @@ def _build_summary(name: str) -> dict:
         logger.exception("resolve_order_mode failed for %s", name)
         effective_routing = "sandbox"
 
+    # Issue #561: `deployable` comes from the STATIC config_snapshot.json and is
+    # advisory metadata only — it gates the sandbox→live direction, never the
+    # live→sandbox one, and it must never decide what routing the card DISPLAYS.
+    # sector_follow_cap5_vol shipped `deployable: false, mode: "scaffold-only"`
+    # in June and kept it while the strategy routed live to Zerodha from
+    # 2026-07-29; the card rendered "Scaffold" with no off-switch because the UI
+    # trusted this file over the strategy_mode row that actually drives dispatch.
+    # `config_conflict` names that disagreement so the UI can show it instead of
+    # silently preferring the JSON.
+    deployable = bool(config.get("deployable", False))
+    config_declared_mode = config.get("mode")
+    config_conflict = bool(
+        (mode_val == "live" or effective_routing == "live")
+        and (not deployable or "scaffold" in str(config_declared_mode or "").lower())
+    )
+
     return {
         "name": name,
         "display_name": name.replace("_", " ").title(),
@@ -1205,7 +1229,9 @@ def _build_summary(name: str) -> dict:
         "effective_routing": effective_routing,
         "llm_mode": _get_llm_mode(name),
         "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
-        "deployable": config.get("deployable", False),
+        "deployable": deployable,
+        "config_declared_mode": config_declared_mode,
+        "config_conflict": config_conflict,
         "version": config.get("version", "—"),
         "open_positions": stats.get("open_positions", 0),
         "today_net_pnl": stats.get("today_net_pnl", None),
@@ -1213,7 +1239,7 @@ def _build_summary(name: str) -> dict:
         "today_trade_count": stats.get("today_trade_count", 0),
         "last_trade_at": stats.get("last_trade_at"),
         "active_overrides": overrides,
-        "health": _health_led(name, overrides, config),
+        "health": _health_led(name, overrides, config, is_live=(mode_val == "live")),
     }
 
 
@@ -1561,11 +1587,20 @@ def strategy_detail(name: str):
                 "effective_routing": effective_routing,
                 "llm_mode": _get_llm_mode(name),
                 "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
-                "deployable": config.get("deployable", False),
+                "deployable": bool(config.get("deployable", False)),
+                # Issue #561 — same routing-truth contract as /api/list.
+                "config_declared_mode": config.get("mode"),
+                "config_conflict": bool(
+                    (mode_val == "live" or effective_routing == "live")
+                    and (
+                        not config.get("deployable", False)
+                        or "scaffold" in str(config.get("mode") or "").lower()
+                    )
+                ),
                 "version": config.get("version", "—"),
                 "config_snapshot": config,
                 "active_overrides": overrides,
-                "health": _health_led(name, overrides, config),
+                "health": _health_led(name, overrides, config, is_live=(mode_val == "live")),
                 "data_health": _data_health_summary(name),
                 "performance": performance,
                 "recent_trades": recent_trades,

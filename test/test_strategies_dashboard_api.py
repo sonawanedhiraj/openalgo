@@ -380,6 +380,92 @@ def test_list_futures_is_healthy(app):
 
 
 # ---------------------------------------------------------------------------
+# Issue #561 — routing truth beats the static config_snapshot.json
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-06 incident: sector_follow_cap5_vol routed LIVE to Zerodha from
+# 2026-07-29 while its config_snapshot.json still said
+# {"mode": "scaffold-only", "deployable": false} from June. The dashboard
+# trusted the FILE, so the card rendered a "Scaffold" badge, a "scaffold"
+# health LED and a DISABLED toggle — on the one strategy placing real orders,
+# leaving the operator no way to switch it off from the UI.
+#
+# The strategies_dir fixture reproduces that exact shape (sector_follow is
+# scaffold-only/deployable:false), so writing a live strategy_mode row is all
+# it takes. On the pre-fix tree these assertions fail: health was "scaffold"
+# and config_conflict did not exist.
+
+
+def _set_mode(wired_dbs, name: str, mode: str) -> None:
+    """Insert a strategy_mode row on the in-memory test engine."""
+    _eng, sess, smdb = wired_dbs["sm"]
+    sess.add(smdb.StrategyMode(strategy_name=name, mode=mode, updated_by="test"))
+    sess.commit()
+
+
+def test_live_strategy_is_not_reported_as_scaffold(app, wired_dbs):
+    """A live strategy_mode row wins over a stale scaffold-only config file."""
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    assert sf["mode"] == "live"
+    # The LED must not call a live strategy a scaffold.
+    assert sf["health"] == "healthy"
+    # `deployable` stays as the file declares it — it is advisory metadata that
+    # gates sandbox→live only, NOT a statement about current routing.
+    assert sf["deployable"] is False
+    # ...and the disagreement is surfaced, not silently resolved.
+    assert sf["config_conflict"] is True
+    assert sf["config_declared_mode"] == "scaffold-only"
+
+
+def test_non_live_scaffold_still_reads_as_scaffold(app, wired_dbs):
+    """No regression: a genuinely non-deployable, non-live strategy is a scaffold."""
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "sandbox")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    assert sf["mode"] == "sandbox"
+    assert sf["health"] == "scaffold"
+    assert sf["config_conflict"] is False
+
+
+def test_deployable_sandbox_strategy_has_no_conflict(app, wired_dbs):
+    """A deployable strategy in sandbox is the ordinary case — no warning."""
+    _set_mode(wired_dbs, "futures_follow_cap50", "sandbox")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    ff = next(s for s in resp.get_json()["data"] if s["name"] == "futures_follow_cap50")
+    assert ff["config_conflict"] is False
+    assert ff["health"] == "healthy"
+
+
+def test_detail_endpoint_agrees_with_card_on_routing_truth(app, wired_dbs):
+    """/api/<name> must not contradict /api/list — same contract, same fields."""
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/sector_follow_cap5_vol")
+
+    data = resp.get_json()["data"]
+    assert data["mode"] == "live"
+    assert data["health"] == "healthy"
+    assert data["config_conflict"] is True
+    assert data["config_declared_mode"] == "scaffold-only"
+
+
+# ---------------------------------------------------------------------------
 # GET /strategies/api/<name>
 # ---------------------------------------------------------------------------
 
