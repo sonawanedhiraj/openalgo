@@ -237,7 +237,16 @@ def reconcile_unreconciled(limit: int = 200, api_key: str | None = None) -> dict
             "filled:\n  " + "\n  ".join(newly_rejected)
         )
     if counts["checked"]:
-        logger.info("sector_follow fill-reconcile: %s", counts)
+        # Explicit fields, not the dict — `logger.info("%s", counts)` is the
+        # shape that trips LogRecord's single-Mapping unwrapping (see
+        # utils.logging._redact_arg), and it reads better in the log anyway.
+        logger.info(
+            "sector_follow fill-reconcile: checked=%d reconciled=%d rejected=%d pending=%d",
+            counts["checked"],
+            counts["reconciled"],
+            counts["rejected"],
+            counts["pending"],
+        )
     return counts
 
 

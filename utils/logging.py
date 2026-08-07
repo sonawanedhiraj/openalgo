@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import traceback
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
@@ -146,6 +147,38 @@ class WebSocketHandshakeFilter(logging.Filter):
         return True
 
 
+def _redact_arg(arg):
+    """Redact one logging arg, preserving its original type when unchanged.
+
+    Returning the original object (not its ``str``) whenever redaction was a
+    no-op is what keeps ``%d``/``%.2f`` format specifiers working.
+    """
+    str_arg = str(arg)
+    filtered = str_arg
+    for pattern, replacement in SENSITIVE_PATTERNS:
+        filtered = re.sub(pattern, replacement, filtered, flags=re.IGNORECASE)
+    return filtered if filtered != str_arg else arg
+
+
+def _redact_mapping_value(key, value):
+    """Redact one ``key: value`` pair from a mapping-style logging arg.
+
+    SENSITIVE_PATTERNS are key-aware (they match ``token=…`` / ``'apikey': …``),
+    so a bare value carries no signal on its own — ``"hunter2"`` looks like any
+    other string. Probing with a synthesised ``key=value`` lets the same
+    patterns decide, which keeps mapping args as well protected as the
+    positional ones.
+    """
+    probe = f"{key}={value}"
+    redacted = probe
+    for pattern, replacement in SENSITIVE_PATTERNS:
+        redacted = re.sub(pattern, replacement, redacted, flags=re.IGNORECASE)
+    if redacted != probe:
+        return "[REDACTED]"
+    # Key is innocuous — the value may still embed a secret of its own.
+    return _redact_arg(value)
+
+
 class SensitiveDataFilter(logging.Filter):
     """Filter to redact sensitive information from log messages."""
 
@@ -168,15 +201,18 @@ class SensitiveDataFilter(logging.Filter):
             # contain sensitive data; preserve original types for others so
             # %-style format specifiers like %d still work.
             if hasattr(record, "args") and record.args:
-                filtered_args = []
-                for arg in record.args:
-                    str_arg = str(arg)
-                    filtered = str_arg
-                    for pattern, replacement in SENSITIVE_PATTERNS:
-                        filtered = re.sub(pattern, replacement, filtered, flags=re.IGNORECASE)
-                    # Only replace with the string version if redaction changed it
-                    filtered_args.append(filtered if filtered != str_arg else arg)
-                record.args = tuple(filtered_args)
+                # `record.args` is a MAPPING whenever the caller passed a single
+                # dict — `LogRecord.__init__` unwraps `logger.info("%s", d)` to
+                # `record.args = d` to support %(key)s formatting. Iterating a
+                # mapping yields its KEYS, so rebuilding it as a tuple here
+                # silently replaced the caller's data with its key names and
+                # made `msg % args` raise "not all arguments converted during
+                # string formatting" — turning a valid log call into a crash.
+                # Redact the VALUES and keep it a mapping.
+                if isinstance(record.args, Mapping):
+                    record.args = {k: _redact_mapping_value(k, v) for k, v in record.args.items()}
+                else:
+                    record.args = tuple(_redact_arg(arg) for arg in record.args)
         except Exception:
             # If filtering fails, don't block the log message
             pass
@@ -225,9 +261,13 @@ class ColoredFormatter(logging.Formatter):
         if os.name == "nt":
             try:
                 # Try to enable ANSI escape sequences on Windows
-                import subprocess
+                import subprocess  # nosec B404
 
-                result = subprocess.run(
+                # argv is a hardcoded literal (no shell, no interpolation,
+                # nothing caller-supplied) and `reg` resolves from the system
+                # PATH on Windows only. Pre-existing call; annotated so the
+                # bandit hook stops blocking unrelated edits to this file.
+                result = subprocess.run(  # nosec B603 B607
                     ["reg", "query", "HKCU\\Console", "/v", "VirtualTerminalLevel"],
                     capture_output=True,
                     text=True,
