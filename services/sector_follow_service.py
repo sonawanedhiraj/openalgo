@@ -50,6 +50,13 @@ _EOD_REPORTS_DIR = _STRATEGY_DIR / "eod_reports"
 
 VALID_MODES = ("scaffold", "sandbox", "live")
 
+# Canonical strategy_mode / order-dispatch key (issue #440). It MUST match the
+# strategies/<name>/ folder so the /strategies toggle writes the row that
+# `resolve_order_mode` reads, and it is passed as `mode_key` to BOTH order
+# placement and the position-book read so a write and its read can never land
+# on different books (issue #497).
+STRATEGY_NAME = "sector_follow_cap5_vol"
+
 
 # --------------------------------------------------------------------------- #
 # Session schedule (issue #512 — NSE Closing Auction Session, from 2026-08-03)
@@ -719,7 +726,7 @@ def production_order_placer(mode: str, order: dict) -> dict:
         return {"status": "error", "message": "no api key available"}
     payload = {
         "apikey": api_key,
-        "strategy": "sector_follow_cap5_vol",
+        "strategy": STRATEGY_NAME,
         "symbol": order["symbol"],
         "exchange": order["exchange"],
         "action": order["action"],
@@ -727,10 +734,25 @@ def production_order_placer(mode: str, order: dict) -> dict:
         "pricetype": "MARKET",
         "quantity": str(order["quantity"]),
     }
-    success, response, _ = place_order(payload, api_key=api_key, mode_key="sector_follow_cap5_vol")
+    success, response, _ = place_order(payload, api_key=api_key, mode_key=STRATEGY_NAME)
     response = dict(response or {})
     response.setdefault("status", "success" if success else "error")
     return response
+
+
+def _resolve_exit_api_key() -> str | None:
+    """First available OpenAlgo api key for the position-book read (issue #563).
+
+    Lazily imported so importing this module never pulls the auth stack. ``None``
+    when no key is available — the rehydrate guard then fails closed (it reports
+    the book as unreadable rather than assuming flat)."""
+    try:
+        from database.auth_db import get_first_available_api_key
+
+        return get_first_available_api_key()
+    except Exception:
+        logger.exception("sector_follow: resolve exit api_key failed")
+        return None
 
 
 def production_price_fetcher(symbol: str, exchange: str) -> float | None:
@@ -1004,6 +1026,151 @@ class SectorFollowService:
         if self._open_positions_loader is not None:
             return set(self._open_positions_loader())
         return set(self.paper_book.keys())
+
+    # ----- position-book rehydrate (issue #563, the #497 pattern) --------- #
+    def _read_position_book(self) -> tuple[bool, list[dict]]:
+        """Read the mode-appropriate position book. Returns ``(ok, positions)``.
+
+        ``mode_key=STRATEGY_NAME`` is load-bearing (issue #497): it resolves the
+        book with the SAME ``resolve_order_mode`` that routed the entry, so this
+        read can never land on a different book than the write. Omitting it
+        falls through to the platform analyze overlay, which is how
+        futures_follow read the empty LIVE broker book for a sandbox strategy
+        and missed four trading days of T+1 exits.
+
+        ``ok=False`` means "could not read" — which is NOT the same as "flat",
+        and callers must never treat it as such.
+        """
+        try:
+            from services.positionbook_service import get_positionbook
+
+            api_key = _resolve_exit_api_key()
+            if not api_key:
+                logger.warning("sector_follow rehydrate: no api_key available; cannot read book")
+                return False, []
+            success, resp, _ = get_positionbook(api_key=api_key, mode_key=STRATEGY_NAME)
+            if not success or not isinstance(resp, dict):
+                logger.warning("sector_follow rehydrate: positionbook fetch failed: %r", resp)
+                return False, []
+            return True, list(resp.get("data") or [])
+        except Exception:
+            logger.exception("sector_follow rehydrate: positionbook read raised")
+            return False, []
+
+    def _book_quantities(self, positions: list[dict]) -> dict[str, int]:
+        """Net long quantity per symbol from the position book, filtered to ours."""
+        exchange = str(self.config.exchange).upper()
+        product = str(self.config.product).upper()
+        out: dict[str, int] = {}
+        for pos in positions:
+            try:
+                raw = pos.get("quantity") or pos.get("netqty") or pos.get("net_qty") or 0
+                qty = int(float(raw))
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:  # only long equity legs are ours
+                continue
+            pos_exchange = str(pos.get("exchange", "")).strip().upper()
+            pos_product = str(pos.get("product", "")).strip().upper()
+            if pos_exchange and pos_exchange != exchange:
+                continue
+            if pos_product and pos_product != product:
+                continue
+            symbol = str(pos.get("symbol", "")).strip()
+            if not symbol:
+                continue
+            out[symbol] = out.get(symbol, 0) + qty
+        return out
+
+    def rehydrate_from_positionbook(self) -> int:
+        """Rebuild ``paper_book`` from the journal + the real position book (#563).
+
+        ``paper_book`` is in-memory only, and before this existed a restart
+        between the 15:05 entry and the T+1 15:10 exit erased the position
+        entirely: ``run_exit`` iterated an empty dict, logged "squared off 0
+        position(s)" and left a real CNC position open forever. OpenAlgo
+        restarted 5 times on 2026-08-06 alone, and the journal holds 0 SELL rows
+        against 19 entries. CNC has no MIS auto-square-off underneath it, so
+        nothing else would have caught it.
+
+        Two sources, both required — the journal supplies the *entry session*
+        (which the T+1 predicate keys on) and the position book supplies the
+        *authoritative quantity*. A symbol is only rehydrated when BOTH agree it
+        is open. An unreadable book rehydrates NOTHING and says so loudly: an
+        unjustified square-off would open a naked short, so "cannot read" must
+        never collapse into "flat" (the #497/#548 rule).
+
+        Idempotent: symbols already in ``paper_book`` are left untouched, so
+        repeated calls (boot + every ``run_exit``) never double-count.
+        Returns the number of positions rehydrated. Never raises.
+        """
+        try:
+            from database.sector_follow_db import get_unexited_entries
+
+            journal = get_unexited_entries(strategy_id=self.strategy_id, mode=self.mode)
+        except Exception:
+            logger.exception("sector_follow rehydrate: journal read raised")
+            return 0
+        if not journal:
+            return 0
+
+        ok, positions = self._read_position_book()
+        if not ok:
+            logger.error(
+                "sector_follow rehydrate: position book UNREADABLE — %d journalled "
+                "position(s) NOT rehydrated (%s). No square-off will be attempted; "
+                "an unverified exit could open a naked short.",
+                len(journal),
+                ", ".join(sorted(j["symbol"] for j in journal)),
+            )
+            try:
+                self._notify(
+                    "⚠️ sector_follow_cap5_vol: position book unreadable — "
+                    f"{len(journal)} journalled position(s) could not be verified "
+                    "for T+1 exit. Check the broker session."
+                )
+            except Exception:
+                logger.exception("sector_follow rehydrate: alert failed")
+            return 0
+
+        book = self._book_quantities(positions)
+        rehydrated = 0
+        for entry in journal:
+            symbol = entry["symbol"]
+            if symbol in self.paper_book:
+                continue  # already tracked in memory — never double-count
+            book_qty = book.get(symbol, 0)
+            if book_qty <= 0:
+                # The journal thinks it is open but the book says flat. The BOOK
+                # wins: the entry was probably acknowledged and then rejected
+                # downstream, or squared off elsewhere. Never invent a position.
+                logger.info(
+                    "sector_follow rehydrate: %s in journal but flat in the %s book — skipping",
+                    symbol,
+                    self.mode,
+                )
+                continue
+            qty = min(book_qty, int(entry["quantity"]))
+            self.paper_book[symbol] = PaperPosition(
+                symbol=symbol,
+                quantity=qty,
+                entry_price=entry["entry_price"],
+                entry_date=entry["entry_date"],
+                vol_ratio=entry.get("vol_ratio", 0.0),
+                order_id=entry.get("order_id"),
+            )
+            rehydrated += 1
+            logger.info(
+                "sector_follow rehydrated %s qty=%d entry_date=%s (book=%d, journal=%d)",
+                symbol,
+                qty,
+                entry["entry_date"],
+                book_qty,
+                entry["quantity"],
+            )
+        if rehydrated:
+            logger.info("sector_follow rehydrate: %d position(s) restored", rehydrated)
+        return rehydrated
 
     # ----- evaluation ---------------------------------------------------- #
     def evaluate_candidates(self, as_of: datetime | None = None) -> list[dict]:
@@ -1625,6 +1792,17 @@ class SectorFollowService:
         # block — leaving a T+1 position open is riskier than a stale-feed exit.
         self._warn_if_stale_for_exit()
         self._apply_mode_override(decision)
+        # Issue #563: paper_book is in-memory, so a restart between the 15:05
+        # entry and this 15:10 T+1 exit used to erase the position — the job
+        # then logged "squared off 0 position(s)" and left a real CNC position
+        # open indefinitely. Rehydrate from the journal + the actual position
+        # book FIRST, so an exit acts on the true book rather than on whatever
+        # survived in memory. Idempotent; never raises.
+        if self.mode != "scaffold":
+            try:
+                self.rehydrate_from_positionbook()
+            except Exception:
+                logger.exception("sector_follow run_exit: rehydrate raised — continuing")
         today = self._now().date().isoformat()
         to_exit = [p for p in list(self.paper_book.values()) if p.entry_date != today]
         exited = [r for r in (self.place_exit(p) for p in to_exit) if r]
@@ -2213,6 +2391,19 @@ class SectorFollowService:
         """15:30 IST: write the Day-N markdown report to disk AND broadcast the
         Telegram summary. The two sinks are independent — one failing is logged
         but never blocks the other (best-effort)."""
+        # Issue #562: ask the broker what it actually filled BEFORE summarising,
+        # so the report describes trades rather than acknowledgements. Deferred
+        # to here deliberately — never on the 15:05 order path, where a
+        # synchronous status round-trip per order would delay later signals in
+        # the same batch. Best-effort; a reconciliation failure never blocks the
+        # summary.
+        if self.mode != "scaffold":
+            try:
+                from services.sector_follow_fill_reconcile import reconcile_unreconciled
+
+                reconcile_unreconciled()
+            except Exception:
+                logger.exception("sector_follow EOD fill reconciliation failed (ignored)")
         msg = self.build_eod_summary()
         # File sink (markdown Day-N report mirror of the Telegram summary).
         try:
@@ -2406,6 +2597,36 @@ def init_sector_follow_service(app=None, scheduler=None) -> SectorFollowService:
         app=app, scheduler=scheduler, data_health_checker=production_data_health_checker
     )
     svc.register_jobs(scheduler)
+    # Boot durability (issue #563): rebuild paper_book from the journal + the
+    # mode-appropriate position book so a restart cannot strand an open T+1 CNC
+    # position. Best-effort — a rehydrate failure never blocks boot.
+    try:
+        svc.rehydrate_from_positionbook()
+    except Exception:
+        logger.exception("sector_follow boot rehydrate failed (ignored)")
+    # Boot-race re-arm (the #403 pattern): OpenAlgo boots BEFORE the daily
+    # Zerodha login, so the boot rehydrate above normally finds no api_key and
+    # skips — which would leave the 15:10 exit reading an empty book again, the
+    # very bug this fixes. Re-run the instant the session appears.
+    try:
+        from utils.event_bus import bus as _bus
+
+        def _rehydrate_on_session_refreshed(_event) -> None:
+            try:
+                n = svc.rehydrate_from_positionbook()
+                logger.info(
+                    "sector_follow: broker_session_refreshed -> rehydrated %d open position(s)", n
+                )
+            except Exception:
+                logger.exception("sector_follow session-refreshed rehydrate failed (ignored)")
+
+        _bus.subscribe(
+            "broker_session_refreshed",
+            _rehydrate_on_session_refreshed,
+            name="sector_follow_rehydrate",
+        )
+    except Exception:
+        logger.exception("sector_follow broker-session rehydrate arming failed (ignored)")
     if app is not None:
         app.sector_follow_service = svc
     return svc

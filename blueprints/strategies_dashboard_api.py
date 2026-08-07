@@ -229,6 +229,7 @@ def _get_strategy_mode(name: str) -> str:
 # construction. The UI notes this rather than faking rows.
 _FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
 _INTRADAY_PULLBACK_FOLDER = "intraday_pullback_top2"
+_SECTOR_FOLLOW_FOLDER = "sector_follow_cap5_vol"
 _VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
 # Map a dashboard strategy name → the signal_decision source filters its veto
@@ -448,22 +449,42 @@ def _sector_follow_stats(since: datetime | None = None) -> dict:
             t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
         ]
         placed = [t for t in trades if (t.status or "") == "placed"]
-        net_qty_by_symbol: dict[str, int] = {}
+        # Issue #562: net WITHIN each mode. Sandbox and live positions are not
+        # the same kind of thing and must never be summed into one number — the
+        # #552 convention. Before this, the card blended 12 sandbox positions
+        # with 7 live ones into a single "Open 10", which is what made a live
+        # book impossible to read off the dashboard.
+        net_by_mode: dict[str, dict[str, int]] = {}
         for t in placed:
             sign = 1 if t.side == "BUY" else -1
-            net_qty_by_symbol[t.symbol] = net_qty_by_symbol.get(t.symbol, 0) + sign * int(
-                t.quantity or 0
-            )
-        open_count = sum(1 for qty in net_qty_by_symbol.values() if qty > 0)
+            bucket = net_by_mode.setdefault((t.mode or "sandbox").lower(), {})
+            bucket[t.symbol] = bucket.get(t.symbol, 0) + sign * int(t.quantity or 0)
+        open_by_mode = {
+            mode: sum(1 for qty in symbols.values() if qty > 0)
+            for mode, symbols in net_by_mode.items()
+        }
+        # The headline number is the book the strategy would trade RIGHT NOW,
+        # so it answers "what am I exposed to?" rather than "what has this
+        # journal ever contained". The per-mode split rides alongside it.
+        current_mode = _get_strategy_mode(_SECTOR_FOLLOW_FOLDER)
+        open_count = open_by_mode.get(current_mode, 0)
         last = max((t.created_at for t in trades), default=None)
         return {
             "open_positions": open_count,
+            "open_positions_by_mode": open_by_mode,
+            "open_positions_mode": current_mode,
             "last_trade_at": last.isoformat() if last else None,
             "today_trade_count": len(today_entries) + len(today_exits),
         }
     except Exception:
         logger.exception("Failed to aggregate sector_follow_stats")
-        return {"open_positions": 0, "last_trade_at": None, "today_trade_count": 0}
+        return {
+            "open_positions": 0,
+            "open_positions_by_mode": {},
+            "open_positions_mode": None,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
 
 
 def _lot_size_from_rows(rows: list) -> int:
@@ -1109,10 +1130,18 @@ def _pnl_curve_intraday_pullback(window_days: int | None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _health_led(name: str, overrides: list[dict], config: dict) -> str:
-    """Return 'healthy' | 'paused' | 'scaffold' | 'unknown'."""
+def _health_led(name: str, overrides: list[dict], config: dict, is_live: bool = False) -> str:
+    """Return 'healthy' | 'paused' | 'scaffold' | 'unknown'.
+
+    ``is_live`` is the resolved routing from the ``strategy_mode`` row. It wins
+    over the static ``config_snapshot.json`` (issue #561): a strategy that is
+    actually routing orders to the real broker is never a "scaffold", whatever
+    a stale JSON file claims. Defaults False so existing callers are unchanged.
+    """
     if any(o["type"] in ("pause", "kill_switch") for o in overrides):
         return "paused"
+    if is_live:
+        return "healthy"
     mode_val = config.get("mode", "")
     if "scaffold" in str(mode_val).lower():
         return "scaffold"
@@ -1198,6 +1227,22 @@ def _build_summary(name: str) -> dict:
         logger.exception("resolve_order_mode failed for %s", name)
         effective_routing = "sandbox"
 
+    # Issue #561: `deployable` comes from the STATIC config_snapshot.json and is
+    # advisory metadata only — it gates the sandbox→live direction, never the
+    # live→sandbox one, and it must never decide what routing the card DISPLAYS.
+    # sector_follow_cap5_vol shipped `deployable: false, mode: "scaffold-only"`
+    # in June and kept it while the strategy routed live to Zerodha from
+    # 2026-07-29; the card rendered "Scaffold" with no off-switch because the UI
+    # trusted this file over the strategy_mode row that actually drives dispatch.
+    # `config_conflict` names that disagreement so the UI can show it instead of
+    # silently preferring the JSON.
+    deployable = bool(config.get("deployable", False))
+    config_declared_mode = config.get("mode")
+    config_conflict = bool(
+        (mode_val == "live" or effective_routing == "live")
+        and (not deployable or "scaffold" in str(config_declared_mode or "").lower())
+    )
+
     return {
         "name": name,
         "display_name": name.replace("_", " ").title(),
@@ -1205,15 +1250,22 @@ def _build_summary(name: str) -> dict:
         "effective_routing": effective_routing,
         "llm_mode": _get_llm_mode(name),
         "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
-        "deployable": config.get("deployable", False),
+        "deployable": deployable,
+        "config_declared_mode": config_declared_mode,
+        "config_conflict": config_conflict,
         "version": config.get("version", "—"),
         "open_positions": stats.get("open_positions", 0),
+        # Issue #562: sandbox and live position counts are reported separately —
+        # never summed (the #552 convention). Absent for strategies that do not
+        # yet split, so the UI falls back to the single headline number.
+        "open_positions_by_mode": stats.get("open_positions_by_mode"),
+        "open_positions_mode": stats.get("open_positions_mode"),
         "today_net_pnl": stats.get("today_net_pnl", None),
         "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
         "today_trade_count": stats.get("today_trade_count", 0),
         "last_trade_at": stats.get("last_trade_at"),
         "active_overrides": overrides,
-        "health": _health_led(name, overrides, config),
+        "health": _health_led(name, overrides, config, is_live=(mode_val == "live")),
     }
 
 
@@ -1561,11 +1613,20 @@ def strategy_detail(name: str):
                 "effective_routing": effective_routing,
                 "llm_mode": _get_llm_mode(name),
                 "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
-                "deployable": config.get("deployable", False),
+                "deployable": bool(config.get("deployable", False)),
+                # Issue #561 — same routing-truth contract as /api/list.
+                "config_declared_mode": config.get("mode"),
+                "config_conflict": bool(
+                    (mode_val == "live" or effective_routing == "live")
+                    and (
+                        not config.get("deployable", False)
+                        or "scaffold" in str(config.get("mode") or "").lower()
+                    )
+                ),
                 "version": config.get("version", "—"),
                 "config_snapshot": config,
                 "active_overrides": overrides,
-                "health": _health_led(name, overrides, config),
+                "health": _health_led(name, overrides, config, is_live=(mode_val == "live")),
                 "data_health": _data_health_summary(name),
                 "performance": performance,
                 "recent_trades": recent_trades,

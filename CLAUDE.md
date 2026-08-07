@@ -963,11 +963,42 @@ auction. ⚠️ **A 15:05 entry is a DIFFERENT signal from the backtested 15:20 
 different snapshot of the intraday move and of volume accumulation) — every R40/R41
 result predates the change, so post-2026-08-03 sessions are **unvalidated** until a
 re-backtest on the new window lands.
-**LIVE** — the `strategy_mode` row has said `live` since 2026-06-24 (operator flip
-via the harness). This paragraph previously read "SCAFFOLD ONLY — not live", which
-was stale and dangerous for a real-money sleeve; the env default
-`SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` is only the first-boot seed and is
-superseded by the DB row (per the #440 per-strategy dispatch rules). Unlike
+**The `strategy_mode` row said `live` from 2026-06-24 to 2026-08-07 — and that
+was NOT an intentional operator flip** (this paragraph used to call it "operator
+flip via the harness"; the 2026-08-06 investigation disproved it). It was a
+direct `_set_mode_unchecked` write by an automated harness that bypassed the
+preflight-gated `flip_mode`, exactly the write the helper's own docstring now
+warns about. The write path was hardened afterwards; **the row it created was
+never reverted**, and the strategy began routing real CNC orders to Zerodha on
+2026-07-29 (masked until then, most likely by the Analyze navbar toggle). Three
+defects kept it invisible and unstoppable, all fixed in
+[#561](https://github.com/sonawanedhiraj/openalgo/issues/561)/[#562](https://github.com/sonawanedhiraj/openalgo/issues/562)/[#563](https://github.com/sonawanedhiraj/openalgo/issues/563):
+
+1. **The dashboard read a STATIC file.** `config_snapshot.json` still said
+   `{"mode": "scaffold-only", "deployable": false}`, so the card showed a
+   "Scaffold" badge and a **disabled** toggle — the one strategy placing real
+   orders was the one with no off-switch. Badge/toggle now derive from the
+   `strategy_mode` row; **a live strategy ALWAYS renders "Switch to SANDBOX"**
+   (`deployable` gates sandbox→live only), and a `config_conflict` flag surfaces
+   any file-vs-row disagreement instead of silently preferring the file.
+2. **Acknowledgement was recorded as a fill.** `status='placed'` came from the
+   broker ACK; 6 of 7 live orders were rejected downstream by RMS with nothing
+   alerting. `services/sector_follow_fill_reconcile.py` now asks
+   `get_order_status` what really happened (EOD job, never the order path),
+   corrects the row, alerts loudly, and records the fill in `fill_price` so
+   `fill_price - price` stays measurable as slippage. Flag
+   `SECTOR_FOLLOW_FILL_RECONCILE_ENABLED`.
+3. **The T+1 exit read an in-memory dict.** `paper_book` had no rehydrate, so a
+   restart erased the position and `run_exit` squared off **0** every day (19
+   entries, 0 SELL rows ever). `rehydrate_from_positionbook()` now combines the
+   journal (entry session) with `get_positionbook(mode_key=STRATEGY_NAME)`
+   (authoritative quantity) — the #497 rule. An **unreadable** book rehydrates
+   nothing and alerts; it is never treated as flat. Runs at boot, at the head of
+   `run_exit`, and on `broker_session_refreshed` (the #403 boot race).
+
+The env default `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` is only the first-boot
+seed and is superseded by the DB row (per the #440 per-strategy dispatch rules).
+Unlike
 sector_rotation_etf, this strategy IS wired into the runtime: `SectorFollowService`
 (`services/sector_follow_service.py`) is built at boot and registers 4 APScheduler
 jobs (entry 15:05 / exit 15:10 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
@@ -978,6 +1009,7 @@ signals, logs, and writes the `sector_follow_trades` journal only. Flip to
 `blueprints/sector_follow.py` (control API at `/sector_follow_cap5_vol/api/*` —
 status/positions/pause/resume/close_all),
 `database/sector_follow_db.py` (`sector_follow_trades` journal),
+`services/sector_follow_fill_reconcile.py` (ACK-vs-fill reconciliation, #562),
 `services/sector_follow_index_backfill.py` + `services/sector_follow_stock_backfill.py`
 (sector-index + universe-stock 1m feed; refreshed by the boot+periodic
 state-convergence check below, not a cron). Plan + locked operator

@@ -29,9 +29,23 @@ export interface StrategySummary {
   effective_routing?: 'live' | 'sandbox'
   llm_mode: LLMMode
   llm_veto_enabled: boolean
+  /** Advisory metadata from the STATIC config_snapshot.json (issue #561).
+   *  Gates the sandbox→live direction ONLY. It must never gate live→sandbox,
+   *  and never decide what routing the card displays — `mode` /
+   *  `effective_routing` (the strategy_mode row) are the truth for that. */
   deployable: boolean
+  /** `mode` as declared in config_snapshot.json — advisory, often stale. */
+  config_declared_mode?: string | null
+  /** True when the static config claims scaffold/non-deployable while the
+   *  strategy actually routes live. Surfaced, never silently resolved. */
+  config_conflict?: boolean
   version: string
   open_positions: number
+  /** Per-mode open-position split (issue #562). Sandbox and live counts are
+   *  reported separately and NEVER summed — the #552 convention. */
+  open_positions_by_mode?: Record<string, number> | null
+  /** Which mode `open_positions` refers to (the strategy's current routing). */
+  open_positions_mode?: string | null
   today_net_pnl: number | null
   today_trade_count: number
   last_trade_at: string | null
