@@ -261,6 +261,22 @@ def record_exit(
         if hold_duration_seconds is not None:
             row.hold_duration_seconds = int(hold_duration_seconds)
 
+        # Modelled MIS round-trip cost (issue #579). `pnl` above is GROSS; this
+        # is the other half of the pair every consumer needs to report an honest
+        # net. Stamped here so a live trade never depends on the backfill.
+        # Best-effort: a costing failure must not lose the exit itself, which is
+        # the row that stops a position being counted as still open.
+        try:
+            from database.trade_journal_db import compute_charges_for_row
+
+            charges = compute_charges_for_row(row)
+            if charges is not None:
+                row.charges_inr = charges
+        except Exception:
+            logger.exception(
+                "trade_journal.record_exit: charge computation failed (id=%s)", journal_id
+            )
+
         row.updated_at = now_iso
         sess.commit()
     except Exception as e:

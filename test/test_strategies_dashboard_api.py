@@ -2632,3 +2632,125 @@ def test_backtest_cagr_does_not_fall_back_to_sharpe_daily(app, tmp_path, monkeyp
     assert bt["cagr_pct"] is None, "CAGR must stay blank, not borrow the Sharpe"
     # sharpe_daily IS a Sharpe, so that row legitimately keeps its fallback.
     assert bt["sharpe"] == 2.19
+
+
+# ---------------------------------------------------------------------------
+# Gross vs NET reporting (issue #579)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_reports_net_not_gross(app, wired_dbs):
+    """THE regression. `trade_journal.pnl` is GROSS; before #579 the dashboard
+    summed it under a "Net P&L" label. On the real sandbox book that showed
+    +Rs8,740 for trades whose true net was negative — the sign was wrong, not
+    just the magnitude."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    # Two trades, +200 and +150 gross, with 120 of charges each => net +110.
+    for sym, pnl in (("RVNL", 200.0), ("INDIANB", 150.0)):
+        row = _seed_closed(tj_sess, tjdb, symbol=sym, pnl=pnl, day="2026-06-29", mode="sandbox")
+        row.charges_inr = 120.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["gross_pnl_inr"] == 350.0
+    assert sb["charges_inr"] == 240.0
+    assert sb["cum_net_pnl"] == 110.0, "headline must be NET, not the 350 gross"
+
+
+def test_net_can_flip_the_sign_of_a_gross_profit(app, wired_dbs):
+    """Charges were 199% of gross on the real book. A dashboard that cannot show
+    a loss where gross is positive is the bug this issue is about."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    row = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=50.0, day="2026-06-29", mode="sandbox")
+    row.charges_inr = 130.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["gross_pnl_inr"] == 50.0
+    assert sb["cum_net_pnl"] == -80.0
+    # A gross win that is a net loss must NOT count toward the win rate.
+    assert sb["win_rate_pct"] == 0.0
+
+
+def test_headline_equals_sum_of_rendered_trade_rows(app, wired_dbs):
+    """The #552 invariant, ported to this journal: the number in the summary must
+    equal the sum of the per-trade `net_pnl` values the table renders. A
+    pre-#579 test could pin the headline and the rows at different values and
+    still pass, which is exactly how the divergence survived."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    for sym, pnl, ch in (
+        ("RVNL", 500.0, 90.0),
+        ("INDIANB", -300.0, 85.0),
+        ("TATAELXSI", 40.0, 75.0),
+    ):
+        row = _seed_closed(tj_sess, tjdb, symbol=sym, pnl=pnl, day="2026-06-29", mode="sandbox")
+        row.charges_inr = ch
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/simplified_engine").get_json()["data"]
+
+    headline = data["performance"]["sandbox"]["cum_net_pnl"]
+    rows_total = sum(t["net_pnl"] for t in data["recent_trades"] if t.get("net_pnl") is not None)
+    # (500-90) + (-300-85) + (40-75) = 410 - 385 - 35 = -10
+    assert headline == round(rows_total, 2) == -10.0
+
+
+def test_recent_trades_net_pnl_is_not_an_alias_for_gross(app, wired_dbs):
+    """`net_pnl` used to be `r.pnl` verbatim — a gross number under a net key."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    row = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    row.charges_inr = 90.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        t = client.get("/strategies/api/simplified_engine").get_json()["data"]["recent_trades"][0]
+
+    assert t["gross_pnl"] == 500.0
+    assert t["charges_inr"] == 90.0
+    assert t["net_pnl"] == 410.0
+
+
+def test_uncosted_rows_are_counted_and_fall_back_to_gross(app, wired_dbs):
+    """A closed row with no modelled charge must not blank the aggregate, but the
+    optimism it introduces has to be visible."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    a = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=300.0, day="2026-06-29", mode="sandbox")
+    a.charges_inr = 100.0
+    _seed_closed(tj_sess, tjdb, symbol="INDIANB", pnl=200.0, day="2026-06-30", mode="sandbox")
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["cum_net_pnl"] == 400.0  # 200 net + 200 gross-only
+    assert sb["uncosted_trades"] == 1
+
+
+def test_pnl_curve_is_net(app, wired_dbs):
+    """The curve must agree with the headline, or the page contradicts itself."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    row = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    row.charges_inr = 90.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        pts = client.get("/strategies/api/simplified_engine/pnl-curve").get_json()["data"]["points"]
+
+    assert [p["pnl"] for p in pts] == [410.0]

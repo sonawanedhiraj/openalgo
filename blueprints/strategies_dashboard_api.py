@@ -54,7 +54,7 @@ from database.sector_follow_db import db_session as sf_session
 from database.strategy_mode_db import StrategyMode
 from database.strategy_mode_db import db_session as mode_session
 from database.strategy_runtime_override_db import db_session as override_session
-from database.trade_journal_db import TradeJournal, mode_of_row
+from database.trade_journal_db import TradeJournal, mode_of_row, net_pnl_of_row
 from database.trade_journal_db import db_session as tj_session
 from services.strategy_performance_metrics import compute_realized_metrics
 from utils.logging import get_logger
@@ -599,7 +599,8 @@ def _simplified_engine_stats() -> dict:
             exited = r.exited_at or ""
             if exited.startswith(today_str):
                 if r.pnl is not None:
-                    today_pnl += float(r.pnl)
+                    # NET, never gross (issue #579) — `pnl` excludes charges.
+                    today_pnl += net_pnl_of_row(r) or 0.0
                 else:
                     # Closed today but never priced (e.g. a watchdog exit whose
                     # fill wasn't reconciled yet — issue #350). Surfaced so ₹X
@@ -694,6 +695,9 @@ def _simplified_engine_lifetime() -> dict[str, dict]:
         **_lifetime_from_pnls([]),
         **_side_split({}),
         **_simplified_engine_metrics([]),
+        "gross_pnl_inr": None,
+        "charges_inr": None,
+        "uncosted_trades": 0,
     }
     out: dict[str, dict] = {"sandbox": dict(empty), "live": dict(empty)}
     try:
@@ -715,16 +719,28 @@ def _simplified_engine_lifetime() -> dict[str, dict]:
                 bucket.append(r)
 
         for mode_key, mode_rows in buckets.items():
-            pnls = [float(r.pnl) for r in mode_rows]
+            # Every aggregate below is NET of modelled charges (issue #579).
+            # Summing `pnl` here reported +Rs8,740 on trades whose true net was
+            # -Rs8,645 — a profitable-looking strategy that was losing money.
+            pnls = [net_pnl_of_row(r) or 0.0 for r in mode_rows]
             sides: dict[str, list[float]] = {"long": [], "short": []}
             for r in mode_rows:
                 side_key = _SIMPLIFIED_ENGINE_SIDE_KEY.get((r.direction or "").upper())
                 if side_key:
-                    sides[side_key].append(float(r.pnl))
+                    sides[side_key].append(net_pnl_of_row(r) or 0.0)
             out[mode_key] = {
                 **_lifetime_from_pnls(pnls),
                 **_side_split(sides),
                 **_simplified_engine_metrics(mode_rows),
+                # The decomposition behind `cum_net_pnl`, surfaced so the page
+                # can never again imply a gross number is net (issue #579).
+                "gross_pnl_inr": round(sum(float(r.pnl) for r in mode_rows), 2)
+                if mode_rows
+                else None,
+                "charges_inr": round(sum(float(r.charges_inr or 0.0) for r in mode_rows), 2)
+                if mode_rows
+                else None,
+                "uncosted_trades": sum(1 for r in mode_rows if r.charges_inr is None),
             }
         return out
     except Exception:
@@ -757,7 +773,9 @@ def _simplified_engine_metrics(rows: list) -> dict:
     for r in rows:
         day = _ist_date_of(r.exited_at or r.placed_at)
         if day is not None:
-            daily.append((day, float(r.pnl or 0.0)))
+            # NET series — Sharpe / Max DD / window return must be costed
+            # (issue #579), otherwise every risk metric is optimistic.
+            daily.append((day, net_pnl_of_row(r) or 0.0))
 
     capital = None
     try:
@@ -1127,7 +1145,8 @@ def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
             d = (r.exited_at or "")[:10]
             if not d:
                 continue
-            by_date[d] = by_date.get(d, 0.0) + float(r.pnl or 0.0)
+            # NET (issue #579) — the curve must agree with the headline P&L.
+            by_date[d] = by_date.get(d, 0.0) + (net_pnl_of_row(r) or 0.0)
         return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
     except Exception:
         logger.exception("Failed to build pnl_curve for simplified_engine")
@@ -1675,7 +1694,12 @@ def strategy_detail(name: str):
                     "signal_decision_id": r.signal_decision_id,
                     # Normalized aliases so the shared RecentTrades UI renders
                     # P&L / Mode / Status / Time for journal rows too (#358).
-                    "net_pnl": r.pnl,
+                    # `net_pnl` used to alias the GROSS `pnl` verbatim, which is
+                    # how a table of gross rows summed to a "Net P&L" headline
+                    # (issue #579). All three are now reported separately.
+                    "gross_pnl": r.pnl,
+                    "charges_inr": r.charges_inr,
+                    "net_pnl": net_pnl_of_row(r),
                     "created_at": r.placed_at,
                     "mode": r.signal_source,
                     "status": "closed" if r.exited_at else "open",

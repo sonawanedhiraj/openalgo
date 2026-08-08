@@ -518,6 +518,26 @@ function cagrOrReturnCell(p: LivePerf | null | undefined): PairedCell {
   }
 }
 
+// Charges are a modelled figure, not a broker-reported one — no Indian broker
+// exposes per-order charges via API, so the label says so rather than implying
+// these were billed (issue #579, same convention as open15).
+const CHARGES_NOTE =
+  'Modelled Zerodha MIS intraday charges (brokerage, STT, exchange, SEBI, stamp, GST). ' +
+  'Deducted from Gross to give Net. No broker exposes per-order charges via API.'
+
+function pnlTone(v: number | null | undefined): 'pos' | 'neg' | undefined {
+  if (v == null) return undefined
+  return v >= 0 ? 'pos' : 'neg'
+}
+
+function chargesCell(p: LivePerf | null | undefined): string {
+  if (!p || p.charges_inr == null) return '—'
+  const base = fmtPnl(-Math.abs(p.charges_inr))
+  // A closed trade with no modelled charge contributes at gross, so the net
+  // above is optimistic by that much. Say so rather than quietly rounding it in.
+  return p.uncosted_trades ? `${base} (${p.uncosted_trades} uncosted)` : base
+}
+
 function maxDdCell(p: LivePerf | null | undefined): PairedCell {
   if (!p) return { main: '—' }
   const notional = p.capital_basis_is_notional
@@ -691,15 +711,46 @@ function PerfTable({ data }: { data: StrategyDetail }) {
       sb: { main: sb?.open_positions != null ? String(sb.open_positions) : '—' },
       lv: { main: lv?.open_positions != null ? String(lv.open_positions) : '—' },
     },
-    // Cumulative realized P&L: backtest window total vs since-inception per mode.
+    // Cumulative realized P&L: backtest window total vs since-inception per
+    // mode. Gross and charges are shown as sub-rows above the net headline
+    // (issue #579) — this row previously displayed the GROSS journal sum under
+    // a "Net P&L" label, which reported +Rs8,740 on trades whose true net was
+    // -Rs8,868. Showing the decomposition makes that class of error visible
+    // instead of silent.
+    ...(sb?.gross_pnl_inr != null || lv?.gross_pnl_inr != null
+      ? [
+          {
+            label: 'Gross P&L',
+            sub: true,
+            bt: { main: '—' },
+            sb: { main: fmtPnl(sb?.gross_pnl_inr), tone: pnlTone(sb?.gross_pnl_inr) },
+            lv: { main: fmtPnl(lv?.gross_pnl_inr), tone: pnlTone(lv?.gross_pnl_inr) },
+          },
+          {
+            label: 'Charges (modelled)',
+            sub: true,
+            bt: { main: '—' },
+            sb: { main: chargesCell(sb), title: CHARGES_NOTE },
+            lv: { main: chargesCell(lv), title: CHARGES_NOTE },
+          },
+        ]
+      : []),
     {
       label: 'Net P&L',
       bt: {
         main: fmtPnl(bt.net_pnl_inr),
         opt: btOpt ? fmtPnl(btOpt.net_pnl_inr) : undefined,
       },
-      sb: { main: fmtPnl(sb?.cum_net_pnl), opt: sbOpt ? fmtPnl(sbOpt.net_pnl_inr) : undefined },
-      lv: { main: fmtPnl(lv?.cum_net_pnl), opt: lvOpt ? fmtPnl(lvOpt.net_pnl_inr) : undefined },
+      sb: {
+        main: fmtPnl(sb?.cum_net_pnl),
+        tone: pnlTone(sb?.cum_net_pnl),
+        opt: sbOpt ? fmtPnl(sbOpt.net_pnl_inr) : undefined,
+      },
+      lv: {
+        main: fmtPnl(lv?.cum_net_pnl),
+        tone: pnlTone(lv?.cum_net_pnl),
+        opt: lvOpt ? fmtPnl(lvOpt.net_pnl_inr) : undefined,
+      },
     },
     ...(hasSideSplit ? [sidePnlRow('Long', 'long'), sidePnlRow('Short', 'short')] : []),
     {
