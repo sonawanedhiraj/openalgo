@@ -6,7 +6,7 @@ from database.apilog_db import async_log_order
 from database.apilog_db import executor as log_executor
 from database.auth_db import get_auth_token_broker
 from extensions import socketio
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import EffectiveMode, resolve_effective_mode, resolve_order_mode
 from utils.logging import get_logger
 
 # Initialize logger
@@ -44,7 +44,11 @@ def emit_analyzer_error(request_data: dict[str, Any], error_message: str) -> dic
 
 
 def get_open_position_with_auth(
-    position_data: dict[str, Any], auth_token: str, broker: str, original_data: dict[str, Any]
+    position_data: dict[str, Any],
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any],
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get quantity of an open position using provided auth token.
@@ -54,6 +58,11 @@ def get_open_position_with_auth(
         auth_token: Authentication token for the broker API
         broker: Name of the broker
         original_data: Original request data for logging
+        mode_key: Strategy identity (issues #497 / #507). When supplied, the
+            store is resolved by ``resolve_order_mode(mode_key)`` — the SAME
+            resolver that decided where the order was written — instead of the
+            platform analyze overlay. ``None`` keeps the overlay behavior for
+            UI read decorations.
 
     Returns:
         Tuple containing:
@@ -68,7 +77,19 @@ def get_open_position_with_auth(
     # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
     # SKIP/DISABLED are not order rejections for reads — operator still wants
     # to see state.
-    if resolve_effective_mode() is EffectiveMode.SANDBOX:
+    #
+    # Issue #507 — this function sits on the EXIT path (it feeds
+    # ``live_position_reconciliation_service``, whose job is to suppress an exit
+    # when the store reads flat). #499 fixed the same overlay bug in
+    # ``positionbook_service`` but classified this call site as a UI read, so a
+    # `sandbox` strategy running with Analyze OFF wrote its orders to sandbox.db
+    # and then read the empty LIVE broker book: futures_follow_cap50's guard saw
+    # ``store_qty=0``, called the real 455-qty position phantom, and SUPPRESSED
+    # every T+1 exit from 2026-07-17 onward. Same resolver both directions is the
+    # invariant that makes write and read incapable of diverging.
+    store_mode = resolve_order_mode(mode_key) if mode_key else resolve_effective_mode()
+
+    if store_mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_get_positions
 
         api_key = original_data.get("apikey")
@@ -126,7 +147,12 @@ def get_open_position_with_auth(
         from services.positionbook_service import get_positionbook
 
         api_key = position_data.get("apikey")
-        success, positionbook_data, status_code = get_positionbook(api_key=api_key)
+        # Forward mode_key so the positionbook resolves through the same
+        # resolver as this function (issue #507) — otherwise the two layers
+        # could still disagree about which book to read.
+        success, positionbook_data, status_code = get_positionbook(
+            api_key=api_key, mode_key=mode_key
+        )
 
         if not success:
             error_response = {
@@ -171,6 +197,7 @@ def get_open_position(
     api_key: str | None = None,
     auth_token: str | None = None,
     broker: str | None = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get quantity of an open position.
@@ -181,6 +208,9 @@ def get_open_position(
         api_key: OpenAlgo API key (for API-based calls)
         auth_token: Direct broker authentication token (for internal calls)
         broker: Direct broker name (for internal calls)
+        mode_key: Strategy identity (issues #497 / #507). A strategy reading
+            back its OWN position MUST pass its canonical key so the read
+            resolves to the same store the write did. Omit only for UI reads.
 
     Returns:
         Tuple containing:
@@ -203,11 +233,15 @@ def get_open_position(
             # Skip logging for invalid API keys to prevent database flooding
             return False, error_response, 403
 
-        return get_open_position_with_auth(position_data, AUTH_TOKEN, broker_name, original_data)
+        return get_open_position_with_auth(
+            position_data, AUTH_TOKEN, broker_name, original_data, mode_key=mode_key
+        )
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_open_position_with_auth(position_data, auth_token, broker, original_data)
+        return get_open_position_with_auth(
+            position_data, auth_token, broker, original_data, mode_key=mode_key
+        )
 
     # Case 3: Invalid parameters
     else:

@@ -46,10 +46,15 @@ existing data-drift path).
 
 Design constraints
 ------------------
-* **Both modes, mode-aware store.** The guard runs in ``live`` AND ``sandbox`` —
-  the caller no longer gates on mode. The store it consults is chosen by
-  ``get_open_position``'s own mode-awareness (sandbox.db vs broker), so the guard
-  never over-exits against whichever store is authoritative for the running mode.
+* **Both modes, mode-aware store — via ``mode_key``.** The guard runs in ``live``
+  AND ``sandbox``; the caller no longer gates on mode. The store it consults is
+  chosen by ``resolve_order_mode(mode_key)``, the same resolver that decided
+  where the ENTRY was written, so the guard never over-exits against whichever
+  store is authoritative for the running mode. **The caller must pass its
+  canonical ``mode_key``.** Issue #507: without it the read resolves through the
+  platform analyze overlay, which with Analyze OFF returns the LIVE book for
+  every strategy — futures_follow_cap50's sandbox position then read flat and
+  this guard suppressed its T+1 exit for three weeks.
   :func:`reconcile_exit` short-circuits only when the ``POSITION_RECONCILE_ENABLED``
   flag is off, returning a PROCEED decision with the journalled qty unchanged.
 * **Import-light.** All heavy imports are lazy inside the function body so
@@ -118,19 +123,31 @@ def is_enabled() -> bool:
     )
 
 
-def _fetch_broker_qty(api_key: str, symbol: str, exchange: str, product: str) -> tuple[bool, int]:
+def _fetch_broker_qty(
+    api_key: str,
+    symbol: str,
+    exchange: str,
+    product: str,
+    mode_key: str | None = None,
+) -> tuple[bool, int]:
     """Return ``(ok, signed_net_qty)`` from the mode-appropriate position store.
 
     ``ok`` is ``False`` on any fetch/parse failure — the caller then fails closed.
-    Never raises. Reads via ``openposition_service.get_open_position``, which is
-    itself mode-aware: it returns the ``sandbox.db`` net qty in sandbox mode and
-    the broker positionbook net qty in live mode.
+    Never raises. Reads via ``openposition_service.get_open_position``.
+
+    ``mode_key`` is what MAKES that read mode-aware (issue #507): it routes the
+    lookup through ``resolve_order_mode(mode_key)``, so a sandbox strategy reads
+    ``sandbox.db`` and a live one reads the broker positionbook. Without it the
+    read falls back to the platform analyze overlay, which with Analyze OFF
+    reports the LIVE book for EVERY strategy — a sandbox position then reads
+    flat and this guard suppresses a legitimate exit. Callers on a strategy's
+    own exit path must always pass their canonical key.
     """
     try:
         from services.openposition_service import get_open_position
 
         position_data = {"symbol": symbol, "exchange": exchange, "product": product}
-        success, resp, _ = get_open_position(position_data, api_key=api_key)
+        success, resp, _ = get_open_position(position_data, api_key=api_key, mode_key=mode_key)
         if not success or not isinstance(resp, dict):
             logger.warning(
                 "live_position_reconcile: broker fetch failed for %s (%s/%s): %r",
@@ -182,17 +199,22 @@ def reconcile_exit(
     product: str,
     expected_close_side: str,
     journaled_qty: int,
+    mode_key: str | None = None,
 ) -> ReconcileDecision:
     """Reconcile an exit's close qty against the mode-appropriate store's net position.
 
-    Safe to call in BOTH modes: the underlying position read
-    (``openposition_service.get_open_position``) is mode-aware, returning the
-    ``sandbox.db`` net qty in sandbox and the broker positionbook net qty in live.
+    Safe to call in BOTH modes — but ONLY when ``mode_key`` is supplied. The
+    underlying read (``openposition_service.get_open_position``) is mode-aware
+    *because of* ``mode_key``; without it the read falls back to the platform
+    analyze overlay and reports the LIVE book for every strategy (issue #507).
     Returns a :class:`ReconcileDecision` describing whether to proceed, clamp, or
     suppress. Never raises.
 
     Args:
-        strategy: strategy name (dedup key + alert label + log tag).
+        strategy: strategy name (dedup key + alert label + log tag). This is a
+            LABEL and may be a webhook name — it is deliberately NOT reused as
+            ``mode_key``, because an unrecognised label resolves to sandbox
+            (default deny) and would silently read the wrong book.
         api_key: OpenAlgo api key used to read the mode-appropriate position store.
             When ``None``/empty the guard fails closed (proceeds with journalled qty).
         symbol: OpenAlgo-format symbol of the position being closed.
@@ -201,12 +223,28 @@ def reconcile_exit(
         expected_close_side: the exit action — ``SELL`` closes a long, ``BUY``
             closes a short. Determines which store-position sign is "closeable".
         journaled_qty: the strategy's own (positive) close quantity.
+        mode_key: the strategy's CANONICAL order-dispatch key (e.g.
+            ``futures_follow_cap50``, ``simplified_engine``). Required in
+            practice: it is what routes the read to the same store the entry
+            was written to.
 
     Returns:
         A guarded :class:`ReconcileDecision`.
     """
     journaled = abs(int(journaled_qty))
     side = (expected_close_side or "").strip().upper()
+
+    # A missing mode_key on an exit path IS the #507 defect — the read silently
+    # resolves through the analyze overlay. Never guess a key here (a wrong one
+    # reads the wrong book just as silently); make the omission loud instead.
+    if not mode_key:
+        logger.warning(
+            "live_position_reconcile[%s]: no mode_key for %s — position read will fall "
+            "back to the analyze overlay and may consult the WRONG book (issue #507). "
+            "Callers on a strategy exit path must pass their canonical mode_key.",
+            strategy,
+            symbol,
+        )
 
     # Flag off → legacy behaviour: proceed with journalled qty, no broker call.
     if not is_enabled():
@@ -235,7 +273,7 @@ def reconcile_exit(
             reason=REASON_BROKER_FETCH_FAILED,
         )
 
-    ok, broker_qty = _fetch_broker_qty(api_key, symbol, exchange, product)
+    ok, broker_qty = _fetch_broker_qty(api_key, symbol, exchange, product, mode_key=mode_key)
 
     if not ok:
         # FAIL CLOSED for reverse-risk: do NOT exit more than journaled. Proceed

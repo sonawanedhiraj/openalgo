@@ -1319,6 +1319,36 @@ def test_rehydrate_derives_lots_by_ceiling_not_floor(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# #507 — the exit reconciliation must route by this strategy's dispatch key
+# --------------------------------------------------------------------------- #
+def test_exit_reconciliation_passes_canonical_mode_key():
+    """Without ``mode_key`` the store read resolves through the analyze overlay
+    and a sandbox position reads flat, so the guard suppresses a real exit —
+    this strategy lost every T+1 exit from 2026-07-17 to 2026-08-07 that way.
+    The full routing behaviour is pinned in
+    ``test/test_openposition_mode_routing.py``; this asserts the caller's half."""
+    from services import futures_follow_service as ffs
+    from services import live_position_reconciliation_service as recon
+
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch.object(recon, "reconcile_exit") as rec,
+    ):
+        rec.return_value = recon.ReconcileDecision(
+            broker_qty=75,
+            action=recon.ACTION_PROCEED,
+            guarded_qty=75,
+            reason="ok",
+        )
+        svc.run_exit()
+
+    assert rec.call_args.kwargs["mode_key"] == ffs.STRATEGY_NAME == "futures_follow_cap50"
+
+
+# --------------------------------------------------------------------------- #
 # #292 — 15:18 pre-entry smoke check for futures_follow_cap50
 # --------------------------------------------------------------------------- #
 
