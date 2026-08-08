@@ -772,9 +772,17 @@ def setup_environment(app):
             # safety-guard table exist on every boot. Without this, the engines'
             # runtime-override reads and the safety guards' override writes would
             # hit a missing table (and silently fail-open / fail-safe).
+            # strategy_mode_audit belongs here too (issue #575): it is the ONLY
+            # history of who flipped a strategy and when — `strategy_mode` keeps
+            # one row per strategy and overwrites it in place. Missing at boot,
+            # every flip (accepted AND preflight-blocked) was dropped, including
+            # the live->sandbox flip that remediated #561.
             try:
                 from database.strategy_llm_config_db import (
                     init_db as _init_strategy_llm_config,
+                )
+                from database.strategy_mode_audit_db import (
+                    init_db as _init_strategy_mode_audit,
                 )
                 from database.strategy_mode_db import init_db as _init_strategy_mode
                 from database.strategy_runtime_override_db import (
@@ -782,6 +790,7 @@ def setup_environment(app):
                 )
 
                 _init_strategy_mode()
+                _init_strategy_mode_audit()
                 _init_strategy_runtime_override()
                 _init_strategy_llm_config()
             except Exception as e:
