@@ -1922,13 +1922,27 @@ def strategy_mode_audit(name: str):
         limit = 10
     limit = max(1, min(limit, 100))
 
+    # A failed query must NOT render as an empty history (issue #575). Before
+    # this, a missing strategy_mode_audit table returned `success` with rows=[],
+    # so "this strategy has never been flipped" and "we cannot answer" looked
+    # identical — which is how the table being absent from boot went unnoticed
+    # while every flip was dropped.
     try:
         from database.strategy_mode_audit_db import list_attempts
 
         rows = list_attempts(strategy_name=name, limit=limit)
-    except Exception:
+    except Exception as exc:
         logger.exception("strategy_mode_audit: list_attempts failed for %s", name)
-        rows = []
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": f"Could not read the mode-flip audit trail: {exc}",
+                    "data": {"name": name, "rows": [], "limit": limit, "degraded": True},
+                }
+            ),
+            500,
+        )
 
     return jsonify({"status": "success", "data": {"name": name, "rows": rows, "limit": limit}})
 
