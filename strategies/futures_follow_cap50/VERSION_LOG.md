@@ -1,5 +1,48 @@
 # Futures Follow CAP50 — Version Log
 
+## Data repair — 2026-08-08: the 7 lots #507 stranded were closed by backfill
+
+**The `futures_follow_trades` exit rows dated 2026-07-28 .. 2026-07-31 were
+written by an operator backfill, not by the running strategy.** They are
+deliberately indistinguishable from real exits in the journal (`note='t+1_exit'`,
+strategy tag `futures_follow_cap50`, sandbox order-id shape) — an explicit
+operator decision on 2026-08-08 — so **this entry is the only record that they
+are reconstructed.** Any performance study of this sleeve that treats
+2026-07-28..31 as measured fills is overstating its evidence.
+
+Why they were needed: issue #507 (the analyze-overlay position read) suppressed
+every T+1 exit from 2026-07-17, stranding 7 NIFTY lots (455 qty) and consuming
+the whole 50% margin cap, which then blocked all entries after 2026-07-30. The
+code fix is PR #569.
+
+How the prices were derived — real, not modelled:
+- Exit marks are the **OPEN of the 15:25 IST 1m bar** for `NIFTY25AUG26FUT`,
+  pulled from the broker's own history API (`history_service.get_history`).
+  15:28.1 → `2026-07-28=24115.1`, `2026-07-29=24305.0`, `2026-07-30=24362.0`,
+  `2026-07-31=24455.1`.
+- Calibrated against the four real 15:20 entry fills: the bar open tracks an
+  actual fill to **±4 index points (~₹260/lot)**. That is the residual error in
+  these four rows.
+- Entry prices are the **actual sandbox fills** (`sandbox_orders.average_price`),
+  not the journal's pre-fill quote.
+- Charges use the strategy's own `compute_futures_charges` — not a
+  reimplementation.
+- Exits are **merged per (exit_date, symbol)**, as the overnight rehydrate would
+  have merged the positions (cf. the real qty=130 rows). This is not cosmetic:
+  brokerage is a flat ₹40/round-trip, so 7 separate exits would have overstated
+  charges by ~₹142 against the 4 the strategy would really have placed.
+
+Result — 4 exits, 455 qty, **+₹43,706.44 net**. Sleeve total after repair:
+**11 round-trips, +₹11,431.17 net, 7/11 wins**, versus −₹32,275.28 over 7
+round-trips before it.
+
+⚠ **This is NOT the sleeve's true P&L for the period.** Had the exits fired,
+the freed margin would have admitted further entries from 2026-07-31 onward
+(the log shows `CAP HIT — skipping signal` daily). Those trades never happened
+and are not reconstructable, so the repaired series still understates activity.
+
+Backups: `db/openalgo.db.bak.20260808_211821`, `db/sandbox.db.bak.20260808_211821`.
+
 ## v0.4.0 — 2026-07-14
 OPTION_C same-minute@15:25 entry, flag-gated (issues #405/#406).
 Mode: **sandbox (default)** · Deployable: **true** · Default behavior: **unchanged**
