@@ -123,6 +123,13 @@ export interface LivePerf {
   capital_basis_inr?: number | null
   capital_basis_is_notional?: boolean
   notes?: string | null
+  // Decomposition behind cum_net_pnl (issue #579). `cum_net_pnl` is NET of
+  // `charges_inr`; the journal's own P&L column is gross. `uncosted_trades`
+  // counts closed rows with no modelled charge yet — those contribute at gross,
+  // so a non-zero count means the net figure is optimistic by that much.
+  gross_pnl_inr?: number | null
+  charges_inr?: number | null
+  uncosted_trades?: number
 }
 
 export interface StrategyPerformance {
