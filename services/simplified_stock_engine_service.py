@@ -1950,12 +1950,17 @@ def _reconcile_store_close(
     """Return a store-reconciled close decision, or ``None`` in disabled/error mode.
 
     Runs in BOTH ``sandbox`` AND ``live`` mode: the underlying position read
-    (``reconcile_exit`` → ``get_open_position``) is mode-aware, so it consults
-    ``sandbox.db`` in sandbox and the broker positionbook in live. Returns a
+    (``reconcile_exit`` → ``get_open_position``) consults ``sandbox.db`` in
+    sandbox and the broker positionbook in live. Returns a
     ``ReconcileDecision`` (proceed / clamp / suppress) in those modes. ``None``
     means "no reconciliation ran" — either ``disabled`` mode (never sends orders)
     or an import failure — and the caller then falls back to its legacy
     (non-reconciled) path. Never raises.
+
+    ``mode_key='simplified_engine'`` is passed explicitly (issue #507) and is
+    NOT the ``strategy`` argument: ``strategy`` here is the webhook payload's
+    label, which ``resolve_order_mode`` would not recognise — it would default
+    to sandbox and read the wrong book on a live engine.
     """
     if mode == MODE_DISABLED:
         return None
@@ -1964,6 +1969,7 @@ def _reconcile_store_close(
 
         return recon.reconcile_exit(
             strategy=strategy,
+            mode_key="simplified_engine",
             api_key=api_key,
             symbol=symbol,
             exchange=exchange,

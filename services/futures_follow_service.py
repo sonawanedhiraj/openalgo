@@ -1179,15 +1179,17 @@ class FuturesFollowService:
 
         Reconciles the journalled close qty against the mode-appropriate position
         store: the ``sandbox.db`` virtual book in sandbox mode and the broker
-        positionbook in live mode (routing is handled by ``get_open_position``'s
-        own mode-awareness). Returns the guarded SELL quantity to place, or
-        ``None`` to SUPPRESS the exit (store flat / opposite side).
+        positionbook in live mode. Routing comes from ``mode_key=STRATEGY_NAME``
+        (issue #507) — the same key that dispatched the entry order. Returns the
+        guarded SELL quantity to place, or ``None`` to SUPPRESS the exit (store
+        flat / opposite side).
         """
         try:
             from services import live_position_reconciliation_service as recon
 
             decision = recon.reconcile_exit(
                 strategy=STRATEGY_NAME,
+                mode_key=STRATEGY_NAME,
                 api_key=_resolve_exit_api_key(),
                 symbol=position.nifty_symbol,
                 exchange=self.config.exchange,
@@ -1220,7 +1222,7 @@ class FuturesFollowService:
         The mode-appropriate position store's net qty is reconciled first (#265,
         BOTH modes): a phantom (store flat) is SUPPRESSED and a partial
         (store < journaled) is CLAMPED. Sandbox reads ``sandbox.db``; live reads
-        the broker positionbook (routing handled by ``get_open_position``)."""
+        the broker positionbook (routed by ``mode_key=STRATEGY_NAME``, #507)."""
         symbol = position.nifty_symbol
         exit_price = price if price is not None else position.entry_price
 
