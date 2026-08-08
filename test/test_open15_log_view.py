@@ -87,6 +87,11 @@ def test_summarize_day_traded():
         # simulated" and "the simulation broke even" must stay distinguishable
         "sim": 0,
         "sim_pnl": None,
+        # and a pre-#581 day has no entry_shadow/exit_shadow events — same rule,
+        # absent rather than 0, so "the excluded side was never watched" stays
+        # distinguishable from "it was watched and broke even"
+        "shadow": 0,
+        "shadow_pnl": None,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
     }

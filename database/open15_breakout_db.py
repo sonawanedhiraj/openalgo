@@ -167,6 +167,13 @@ class Open15Trade(Base):
     #               issue #555). Priced at 1 lot purely to answer "would it have
     #               paid?". Provenance differs from ``paper``: nothing was sent,
     #               so nothing can have half-reached the exchange.
+    #   ``shadow``— the side is switched OFF by ``trade_side``, so no order was
+    #               ever attempted (issue #581). Priced at the FULL slot size a
+    #               real entry would have used, because the whole point is to
+    #               compare the excluded cohort against the traded one. Kept
+    #               apart from ``sim`` deliberately: ``sim`` asks "was the budget
+    #               the constraint?", ``shadow`` asks "does the signal work on
+    #               the other side?" — one blended number answers neither.
     #   ``none``  — beyond the paper cap; deliberately left unpriced.
     # NULL on rows written before #548 shipped; read as ``real``.
     #
@@ -216,6 +223,11 @@ class Open15Config(Base):
     no_entry_after = Column(String(5), nullable=True)  # "HH:MM" IST entry cutoff (issue #451)
     exit_time = Column(String(5), nullable=True)  # "HH:MM" IST hard flatten (issue #451)
     trade_side = Column(String(16), nullable=True)  # both | long_only | short_only (issue #503)
+    # shadow-log the side ``trade_side`` excludes (issue #581). NULL = env
+    # default (OFF). Places no orders — it only decides whether the excluded
+    # side is still watched and journaled as ``fill='shadow'`` rows.
+    shadow_excluded_side = Column(Integer, nullable=True)  # 0/1 (NULL = env default)
+    shadow_max_trades = Column(Integer, nullable=True)  # own daily cap, clamped 0..10
     # rolling additive watch list (issue #529). NULL = env default; the cadence
     # and top-N are the operator-facing knobs edited from /open15_vol_breakout/logs.
     rolling_watchlist_enabled = Column(Integer, nullable=True)  # 0/1 (NULL = env default)
@@ -277,6 +289,10 @@ def _ensure_columns():
             "rolling_watchlist_enabled": "INTEGER",
             "rolling_cadence_s": "INTEGER",
             "rolling_top_n": "INTEGER",
+            # issue #581 — both NULL on an existing install, which resolves to
+            # the env default (OFF), so the next arm behaves exactly as before
+            "shadow_excluded_side": "INTEGER",
+            "shadow_max_trades": "INTEGER",
         },
     }
     try:
@@ -322,6 +338,11 @@ def get_config() -> dict | None:
             ),
             "rolling_cadence_s": row.rolling_cadence_s,
             "rolling_top_n": row.rolling_top_n,
+            # issue #581 — None stays None so env can supply the default (OFF)
+            "shadow_excluded_side": (
+                None if row.shadow_excluded_side is None else bool(row.shadow_excluded_side)
+            ),
+            "shadow_max_trades": row.shadow_max_trades,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -345,6 +366,8 @@ def save_config(
     rolling_watchlist_enabled: bool | None = None,
     rolling_cadence_s: int | None = None,
     rolling_top_n: int | None = None,
+    shadow_excluded_side: bool | None = None,
+    shadow_max_trades: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -365,6 +388,10 @@ def save_config(
         )
         row.rolling_cadence_s = rolling_cadence_s
         row.rolling_top_n = rolling_top_n
+        row.shadow_excluded_side = (
+            None if shadow_excluded_side is None else int(bool(shadow_excluded_side))
+        )
+        row.shadow_max_trades = shadow_max_trades
         row.updated_by = updated_by
         db_session.commit()
         return True
@@ -384,7 +411,7 @@ def save_config(
 # form silently reclassified every future class as REAL, so adding ``sim``
 # (issue #555) would have folded simulated money straight into realized P&L and
 # into tomorrow's compound position size. A new fill class must be added here.
-NON_REAL_FILLS = ("paper", "sim", "none")
+NON_REAL_FILLS = ("paper", "sim", "none", "shadow")
 
 _REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill.notin_(NON_REAL_FILLS))
 
@@ -537,6 +564,22 @@ def sim_pnl_by_date() -> dict[str, float]:
     and a single blended figure answers neither.
     """
     return _pnl_by_date("sim")
+
+
+def shadow_pnl_by_date() -> dict[str, float]:
+    """NET SHADOW journal P&L per trade_date (issue #581).
+
+    Triggers on the side ``trade_side`` switched off, priced at the FULL slot
+    size a real entry would have used. A FOURTH bucket for the same reason
+    ``sim`` is a third one: "we could not afford it" and "we deliberately do not
+    trade that side" are different claims, and the second is the one this
+    strategy is collecting data to answer.
+
+    These rows are counterfactual — no order was ever placed — so the figure is
+    quote-priced and optimistic by roughly the round-trip spread. It must never
+    be added to the real number.
+    """
+    return _pnl_by_date("shadow")
 
 
 def get_day_log(trade_date: str) -> list | None:

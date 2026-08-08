@@ -18,6 +18,40 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 shadow-logged excluded side (issue #581, added 2026-08-08)
+
+Two new tunables for measuring the side `trade_side` switches off. Both are code
+defaults — neither is set in `.env` — and the shipped behaviour is **OFF**, so
+merging changed nothing about what the next 09:10 arm does. The live install's
+`open15_config` row has both columns NULL, which resolves to the env default.
+
+⚠ Context that makes the default load-bearing: `open15_vol_breakout` has been
+**live (real money)** since 2026-07-24, trading `long_only`. Shadowing exists so
+the short side can be measured **without** placing a short order.
+
+#### OPEN15_SHADOW_EXCLUDED_SIDE
+- **Value:** code default `false`. Read at the 09:10 arm via
+  `resolve_day_config`; the UI row (`open15_config.shadow_excluded_side`) wins
+  when set, and a stored `false` beats a `true` env default (`is None`, not
+  truthiness).
+- **What it gates:** whether the excluded side is watched at all. When off, the
+  pre-#581 behaviour is exact — the side is never selected, so it never
+  triggers and never journals. When on, it triggers normally and journals
+  `fill='shadow'` rows, and **no order is ever placed for it**
+  (`_journal_shadow` runs before anything can reach `order_placer`).
+- **No effect when `trade_side='both'`** — nothing is excluded, so
+  `shadow_side_for` returns `None` however the flag is set.
+
+#### OPEN15_SHADOW_MAX_TRADES
+- **Value:** code default `3`. **Clamped 0–10** server-side on both the env read
+  and the saved row (`clamp_shadow_max_trades`); bad input falls back to 3.
+  `0` is legal and means "shadow nothing".
+- **What it bounds:** shadow rows per day. **Independent of `max_trades`** —
+  that cap is a real-money budget and a shadow row places no order, so spending
+  it on measurement would silently reduce how much the strategy actually trades.
+  This cap is also what bounds the per-trigger broker quote calls the tick
+  thread makes for a shadow row (one at entry, one at exit).
+
 ### Scheduler + daemon-thread registry (issue #539, added 2026-08-03)
 
 Tunables introduced with Phase 1 of the scheduler/thread inventory. All are code
