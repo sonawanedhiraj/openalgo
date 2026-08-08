@@ -32,6 +32,8 @@ from flask import Blueprint, Flask
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from services.strategy_performance_metrics import MIN_TRADING_DAYS_SHARPE
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1671,9 +1673,14 @@ def _seed_simplified_journal_row(
     pnl: float | None = None,
     exit_reason: str | None = None,
     signal_decision_id: int | None = None,
+    mode: str | None = None,
 ):
     """Insert one trade_journal row under the simplified engine's REGISTERED
-    journal name (trending_equity_intraday) — the real persisted name."""
+    journal name (trending_equity_intraday) — the real persisted name.
+
+    ``mode`` defaults to None on purpose: that is what every pre-#568 row looks
+    like, and readers must resolve it to 'sandbox'.
+    """
     row = tjdb.TradeJournal(
         placed_at=placed_at,
         symbol=symbol,
@@ -1687,6 +1694,7 @@ def _seed_simplified_journal_row(
         exit_reason=exit_reason,
         pnl=pnl,
         signal_decision_id=signal_decision_id,
+        mode=mode,
         created_at=placed_at,
         updated_at=placed_at,
     )
@@ -2481,3 +2489,146 @@ def test_non_veto_strategy_has_no_llm_enrichment(app, wired_dbs, wired_llm_dbs):
 
     assert data["llm_unmatched_skips"] == []
     assert "llm" not in data["recent_trades"][0] or data["recent_trades"][0]["llm"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-mode split + realized performance metrics (issue #568)
+# ---------------------------------------------------------------------------
+
+
+def _seed_closed(
+    tj_sess, tjdb, *, symbol, pnl, day, mode=None, direction="LONG", reason="stop_loss"
+):
+    return _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol=symbol,
+        direction=direction,
+        placed_at=f"{day}T09:30:00+05:30",
+        exited_at=f"{day}T15:14:00+05:30",
+        exit_price=110.0,
+        pnl=pnl,
+        exit_reason=reason,
+        mode=mode,
+    )
+
+
+def test_sandbox_history_never_leaks_into_the_live_column(app, wired_dbs):
+    """THE regression this issue exists for.
+
+    Before #568 trade_journal had no `mode`, so the endpoint attributed the whole
+    journal to whatever mode the strategy sat in *today*. Flipping the engine
+    live would have re-labelled every sandbox trade as live P&L. The Live column
+    must contain live rows and nothing else.
+    """
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    _seed_closed(tj_sess, tjdb, symbol="INDIANB", pnl=-200.0, day="2026-06-30", mode="sandbox")
+    _seed_closed(tj_sess, tjdb, symbol="TATAELXSI", pnl=1000.0, day="2026-07-01", mode="live")
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["closed_trades"] == 2
+    assert perf["sandbox"]["cum_net_pnl"] == 300.0
+    assert perf["live"]["closed_trades"] == 1
+    assert perf["live"]["cum_net_pnl"] == 1000.0
+    # The two buckets partition the book — no row counted twice, none dropped.
+    assert perf["sandbox"]["closed_trades"] + perf["live"]["closed_trades"] == 3
+
+
+def test_legacy_null_mode_rows_resolve_to_sandbox(app, wired_dbs):
+    """Every pre-#568 row carries mode=NULL. The engine ran sandbox for all of
+    that history, so NULL means sandbox — never 'unknown', and never live."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=250.0, day="2026-06-29", mode=None)
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["sandbox"]["cum_net_pnl"] == 250.0
+    # No live rows => the Live column stays absent so the UI renders '—'.
+    assert perf["live"] is None
+
+
+def test_phantom_cleanup_rows_are_not_counted_as_trades(app, wired_dbs):
+    """The 2026-06-11 pytest-pollution tombstones carry pnl=0.0. Counting them
+    scored 28 phantom rows as losses and dragged the reported win rate down."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    for i in range(3):
+        _seed_closed(
+            tj_sess,
+            tjdb,
+            symbol="RELIANCE",
+            pnl=0.0,
+            day=f"2026-06-1{i}",
+            mode="sandbox",
+            reason="phantom_cleanup_pytest_pollution_2026-06-11",
+        )
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["sandbox"]["win_rate_pct"] == 100.0  # not 25.0
+
+
+def test_sandbox_column_carries_realized_metrics(app, wired_dbs):
+    """CAGR/Sharpe/MaxDD were hardcoded '—' in the UI with nothing behind them."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    for i in range(MIN_TRADING_DAYS_SHARPE + 5):
+        day = (dt.date(2026, 6, 1) + dt.timedelta(days=i)).isoformat()
+        _seed_closed(
+            tj_sess,
+            tjdb,
+            symbol=f"SYM{i}",
+            pnl=(300.0 if i % 3 else -150.0),
+            day=day,
+            mode="sandbox",
+        )
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    sb = perf["sandbox"]
+    assert sb["sharpe"] is not None
+    assert sb["max_dd_inr"] is not None
+    assert sb["trading_days"] == MIN_TRADING_DAYS_SHARPE + 5
+    # Short window => CAGR withheld with a stated reason, not extrapolated.
+    assert sb["cagr_pct"] is None
+    assert "CAGR needs" in sb["notes"]
+
+
+def test_backtest_cagr_does_not_fall_back_to_sharpe_daily(app, tmp_path, monkeypatch):
+    """A parity_target with sharpe_daily but no cagr_pct used to render the
+    Sharpe (2.19) as a CAGR of '2.19%' — a wrong number that looks real."""
+    import blueprints.strategies_dashboard_api as sda
+
+    d = tmp_path / "sector_follow_cap5_vol"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "deployable": True,
+                "parity_target": {"sharpe_daily": 2.19, "win_rate_pct": 56.3},
+            }
+        )
+    )
+    monkeypatch.setattr(sda, "_STRATEGIES_DIR", tmp_path)
+
+    with app.test_client() as client:
+        _login(client)
+        bt = client.get("/strategies/api/sector_follow_cap5_vol").get_json()["data"]["performance"][
+            "backtest"
+        ]
+
+    assert bt["cagr_pct"] is None, "CAGR must stay blank, not borrow the Sharpe"
+    # sharpe_daily IS a Sharpe, so that row legitimately keeps its fallback.
+    assert bt["sharpe"] == 2.19

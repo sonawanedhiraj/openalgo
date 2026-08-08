@@ -68,6 +68,15 @@ class TradeJournal(Base):
     # rows predate the column, and signal-less exits (EOD flatten) have no LTP.
     ltp_at_signal = Column(Float, nullable=True)
 
+    # Which book the order actually routed to — 'sandbox' | 'live' (issue #568).
+    # Load-bearing for the strategies dashboard: without it the whole journal is
+    # attributed to whatever mode the strategy is in *today*, so flipping a
+    # strategy live silently re-labels its entire sandbox history as live
+    # performance. Nullable because rows predating the column exist; readers
+    # MUST treat NULL as 'sandbox' via ``mode_of_row`` rather than as 'unknown'
+    # — every pre-#568 row was written while the engine defaulted to sandbox.
+    mode = Column(String(16), nullable=True)
+
     # Context at entry — Stage 1.7 will fill these richer. nifty_pct + vix
     # are kept as top-level columns so the reflection loop can group/filter
     # cheaply without parsing JSON; the regime_snapshot blob carries the
@@ -99,7 +108,30 @@ class TradeJournal(Base):
         Index("idx_trade_journal_strategy", "strategy_name"),
         Index("idx_trade_journal_exit_reason", "exit_reason"),
         Index("idx_trade_journal_signal_decision", "signal_decision_id"),
+        Index("idx_trade_journal_mode", "mode"),
     )
+
+
+#: Books an order can route to. Mirrors ``services.mode_service`` vocabulary.
+MODE_SANDBOX = "sandbox"
+MODE_LIVE = "live"
+
+#: Rows written before the ``mode`` column existed (issue #568) carry NULL. The
+#: simplified engine ran ``SIMPLIFIED_ENGINE_MODE=sandbox`` for the whole of that
+#: history, so NULL means sandbox — never "unknown". Resolving it anywhere else
+#: would re-introduce the leak the column exists to prevent.
+DEFAULT_MODE = MODE_SANDBOX
+
+
+def mode_of_row(row) -> str:
+    """Resolve a journal row's book, treating NULL/blank as ``sandbox``.
+
+    The single definition of that fallback — callers must not re-derive it, for
+    the same reason ``net_pnl_expr``/``net_pnl_of_row`` are centralized in
+    ``open15_breakout_db`` (issue #552): three call sites deriving one convention
+    independently is how the dashboard and the logs page ended up disagreeing.
+    """
+    return (getattr(row, "mode", None) or DEFAULT_MODE).strip().lower() or DEFAULT_MODE
 
 
 def init_db():
@@ -123,7 +155,7 @@ def _ensure_columns():
 
     # ALTER TABLE ADD COLUMN clause keyed by column name. SQLite has no
     # native bool/decimal types; REAL maps to the SQLAlchemy Float column.
-    pending = {"ltp_at_signal": "REAL"}
+    pending = {"ltp_at_signal": "REAL", "mode": "VARCHAR(16)"}
     try:
         inspector = inspect(engine)
         existing = {col["name"] for col in inspector.get_columns("trade_journal")}
@@ -142,6 +174,34 @@ def _ensure_columns():
             logger.info("trade_journal: added column %s %s", name, sql_type)
         except Exception as e:
             logger.warning("trade_journal: failed adding column %s: %s", name, e)
+            continue
+        if name == "mode":
+            _backfill_mode()
+
+
+def _backfill_mode() -> None:
+    """One-shot: stamp pre-#568 rows as ``sandbox``.
+
+    Runs only in the branch that just *added* the column, so it can never
+    re-stamp a row a later live session wrote. Verified before shipping: the
+    ``strategy_mode`` row for ``simplified_engine`` has read ``sandbox`` since
+    2026-06-12 and was never flipped, and it is the only strategy with journal
+    rows — so every existing row genuinely is a sandbox trade.
+
+    ``mode_of_row`` already resolves NULL to sandbox, so this is belt-and-braces;
+    its real value is making raw SQL (``GROUP BY mode``) agree with the ORM
+    readers instead of silently bucketing history under NULL.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(
+                text(f"UPDATE trade_journal SET mode = '{MODE_SANDBOX}' WHERE mode IS NULL")
+            )
+        logger.info("trade_journal: backfilled mode=sandbox on %s legacy row(s)", res.rowcount)
+    except Exception as e:
+        logger.warning("trade_journal: mode backfill failed (readers fall back): %s", e)
 
 
 def _now_iso() -> str:
@@ -163,6 +223,7 @@ def _row_to_dict(row: TradeJournal) -> dict:
         "entry_order_id": row.entry_order_id,
         "entry_fill_at": row.entry_fill_at,
         "ltp_at_signal": row.ltp_at_signal,
+        "mode": mode_of_row(row),
         "regime_snapshot": row.regime_snapshot,
         "nifty_pct_at_entry": row.nifty_pct_at_entry,
         "india_vix_at_entry": row.india_vix_at_entry,

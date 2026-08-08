@@ -1,6 +1,6 @@
 {
   "strategy": "simplified_engine",
-  "snapshot_date": "2026-05-21",
+  "snapshot_date": "2026-08-08",
   "version": "v1.1",
   "deployable": true,
   "source": "SIMPLIFIED_ENGINE_* env vars",
@@ -12,7 +12,7 @@
     "atr_period": 14,
     "atr_sl_mult": 1.5,
     "volume_multiplier": 2.5,
-    "max_trades_per_day": 4,
+    "max_trades_per_day": 6,
     "cooldown_candles": 3,
     "no_new_entries_after": "15:10",
     "eod_exit_time": "15:20",
@@ -20,7 +20,52 @@
     "rr_trail_start_r": 1.5,
     "sl_confirm_seconds": 0,
     "enable_global_profit_lock": false,
-    "atr_entry_min_mult": 0.0
+    "atr_entry_min_mult": 0.5
+  },
+  "parity_target": {
+    "round": 56,
+    "verdict": "REJECT",
+    "window": "2025-06-20 -> 2026-07-06 (258 trading days, 211 F&O symbols)",
+    "n_trades": 1177,
+    "win_rate_pct": 42.8,
+    "net_pnl_inr": -251526,
+    "gross_pnl_inr": -162042,
+    "charges_inr": -89484,
+    "payoff_ratio": 0.34,
+    "green_months": "0 / 14",
+    "cagr_pct": null,
+    "sharpe": null,
+    "max_dd_pct": null,
+    "long": {
+      "n_trades": 649,
+      "win_rate_pct": 39.9,
+      "net_pnl_inr": -152000,
+      "net_pnl_is_rounded": true
+    },
+    "short": {
+      "n_trades": 528,
+      "win_rate_pct": 46.4,
+      "net_pnl_inr": -100000,
+      "net_pnl_is_rounded": true
+    },
+    "notes": [
+      "R56 replayed the REAL in-house scanner signals through the REAL engine.",
+      "Per-side net P&L is quoted to the nearest Rs1k in the report, so the two",
+      "sides sum to -Rs252k vs the exact blended -Rs251,526. Trust n_trades and",
+      "win_rate_pct exactly; treat the per-side rupee figures as approximate.",
+      "cagr_pct / sharpe / max_dd_pct are null because R56 did not compute them:",
+      "the report states the Rs20,000 capital is a per-trade risk-sizing base,",
+      "not a book that compounds, and that its '-1258% ROI on capital' line is",
+      "misleading. Read the verdict as net -Rs251k over 0-of-14 green months.",
+      "Do NOT synthesise these three from the P&L - a wrong number that looks",
+      "real is worse than an honest blank (issue #568).",
+      "Scanner SELECTION is sound (reproduces Chartink 10/10); the signals just",
+      "carry ~zero intraday directional edge - they fire late (median ~13:45).",
+      "87% of exits are stops; win rate < 50% AND payoff < 1."
+    ],
+    "report": "docs/research/strategy/screener/2026-07-16_r56_inhouse_scanner_engine_backtest.md",
+    "report_status": "pending merge of PR #417 (registry row 56 is on dev)",
+    "issue": 416
   },
   "screeners": {
     "buy": "https://chartink.com/screener/fno-intraday-buy-20",
