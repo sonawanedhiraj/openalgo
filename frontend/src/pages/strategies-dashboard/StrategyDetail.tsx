@@ -493,6 +493,31 @@ function metricCell(
   return { main: fmt(p[key], suffix), title: p.notes || undefined }
 }
 
+// CAGR cell for the Sandbox/Live columns (issue #573).
+//
+// CAGR is withheld until there are enough trading days to annualise honestly
+// (60 — below that, simplified_engine's 41 days of +Rs8,220 on Rs20,000 prints
+// a >700% "CAGR"). Rather than leave the cell blank, fall back to the window
+// return the backend already computes, tagged with the trading-day count so it
+// can never be read as an annualised figure. Once `cagr_pct` exists it takes
+// over and the day-count marker disappears — that is the signal that the number
+// changed meaning.
+function cagrOrReturnCell(p: LivePerf | null | undefined): PairedCell {
+  if (!p) return { main: '—' }
+  if (p.cagr_pct != null) {
+    return { main: fmt(p.cagr_pct, '%'), title: p.notes || undefined }
+  }
+  if (p.roc_pct == null) return { main: '—', title: p.notes || undefined }
+  const days = p.trading_days
+  return {
+    main: fmt(p.roc_pct, '%'),
+    opt: days ? `${days}d` : undefined,
+    title:
+      `Window return over ${days ?? '?'} trading days — NOT annualised. ` +
+      `${p.notes || ''}`.trim(),
+  }
+}
+
 function maxDdCell(p: LivePerf | null | undefined): PairedCell {
   if (!p) return { main: '—' }
   const notional = p.capital_basis_is_notional
@@ -597,10 +622,13 @@ function PerfTable({ data }: { data: StrategyDetail }) {
 
   const rows: { label: string; sub?: boolean; bt: PairedCell; sb: PairedCell; lv: PairedCell }[] = [
     {
-      label: 'CAGR',
+      // Sandbox/Live fall back to the window return until CAGR is annualisable
+      // (issue #573), so the row covers both — the '(Nd)' marker distinguishes
+      // them. Backtest is always a true CAGR or '—'.
+      label: 'CAGR / Return',
       bt: { main: fmt(bt.cagr_pct, '%') },
-      sb: metricCell(sb, 'cagr_pct', '%'),
-      lv: metricCell(lv, 'cagr_pct', '%'),
+      sb: cagrOrReturnCell(sb),
+      lv: cagrOrReturnCell(lv),
     },
     {
       label: 'Sharpe',
