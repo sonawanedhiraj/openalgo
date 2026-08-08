@@ -54,8 +54,9 @@ from database.sector_follow_db import db_session as sf_session
 from database.strategy_mode_db import StrategyMode
 from database.strategy_mode_db import db_session as mode_session
 from database.strategy_runtime_override_db import db_session as override_session
-from database.trade_journal_db import TradeJournal
+from database.trade_journal_db import TradeJournal, mode_of_row
 from database.trade_journal_db import db_session as tj_session
+from services.strategy_performance_metrics import compute_realized_metrics
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -673,16 +674,28 @@ def _futures_follow_lifetime() -> dict[str, dict]:
     return out
 
 
-def _simplified_engine_lifetime() -> dict:
-    """Since-inception realized P&L + win-rate from the simplified engine's closed
-    ``trade_journal`` rows (``exited_at`` + ``pnl`` present).
+def _simplified_engine_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized stats for the simplified
+    engine's closed ``trade_journal`` rows (``exited_at`` + ``pnl`` present).
 
-    ``trade_journal`` has no mode column, so the caller attributes this to the
-    strategy's current resolved mode (the engine is sandbox by default). Also
-    carries ``long``/``short`` sub-aggregates keyed off the journal's
+    Splitting on the row's own ``mode`` column (issue #568) is what keeps the
+    Live column honest. Previously ``trade_journal`` had no mode and the caller
+    attributed the WHOLE journal to whatever mode the strategy sat in today — so
+    flipping the engine live would have silently re-labelled 235 sandbox trades
+    as live performance. Rows written before the column exists resolve to
+    ``sandbox`` via ``mode_of_row``.
+
+    Carries ``long``/``short`` sub-aggregates keyed off the journal's
     ``direction`` column (issue #494) — the two sides of this strategy diverge
-    sharply, which the blended headline hides.
+    sharply, which the blended headline hides — plus realized CAGR / Sharpe /
+    Max DD per mode (issue #568).
     """
+    empty = {
+        **_lifetime_from_pnls([]),
+        **_side_split({}),
+        **_simplified_engine_metrics([]),
+    }
+    out: dict[str, dict] = {"sandbox": dict(empty), "live": dict(empty)}
     try:
         rows = (
             tj_session.query(TradeJournal)
@@ -693,16 +706,88 @@ def _simplified_engine_lifetime() -> dict:
             )
             .all()
         )
-        pnls = [float(r.pnl) for r in rows]
-        sides: dict[str, list[float]] = {"long": [], "short": []}
+        buckets: dict[str, list] = {"sandbox": [], "live": []}
         for r in rows:
-            side_key = _SIMPLIFIED_ENGINE_SIDE_KEY.get((r.direction or "").upper())
-            if side_key:
-                sides[side_key].append(float(r.pnl))
-        return {**_lifetime_from_pnls(pnls), **_side_split(sides)}
+            if _is_non_trade_row(r):
+                continue
+            bucket = buckets.get(mode_of_row(r))
+            if bucket is not None:
+                bucket.append(r)
+
+        for mode_key, mode_rows in buckets.items():
+            pnls = [float(r.pnl) for r in mode_rows]
+            sides: dict[str, list[float]] = {"long": [], "short": []}
+            for r in mode_rows:
+                side_key = _SIMPLIFIED_ENGINE_SIDE_KEY.get((r.direction or "").upper())
+                if side_key:
+                    sides[side_key].append(float(r.pnl))
+            out[mode_key] = {
+                **_lifetime_from_pnls(pnls),
+                **_side_split(sides),
+                **_simplified_engine_metrics(mode_rows),
+            }
+        return out
     except Exception:
         logger.exception("Failed to aggregate simplified_engine lifetime stats")
-        return {**_lifetime_from_pnls([]), **_side_split({})}
+        return out
+
+
+#: Exit reasons marking rows that are NOT trades — data-repair tombstones left by
+#: the 2026-06-11 pytest-pollution cleanup. They carry ``pnl=0.0``, so counting
+#: them scores 28 phantom rows as losses and drags the reported win rate down
+#: (issue #568). Matched by prefix so a future cleanup tag is excluded too.
+_NON_TRADE_EXIT_PREFIXES = ("phantom_cleanup",)
+
+
+def _is_non_trade_row(row) -> bool:
+    return str(row.exit_reason or "").startswith(_NON_TRADE_EXIT_PREFIXES)
+
+
+def _simplified_engine_metrics(rows: list) -> dict:
+    """Realized CAGR / Sharpe / Max DD for a set of closed journal rows.
+
+    The capital basis is read from the strategy's own ``config_snapshot.json``
+    so it tracks the declared config instead of being duplicated here. It is
+    flagged ``notional`` because R56 is explicit that the engine's ₹20,000 is a
+    per-trade risk-sizing base rather than a compounding book — the maths is
+    still run (operator's call), but the caveat rides along to the UI instead of
+    being silently dropped.
+    """
+    daily: list[tuple[date, float]] = []
+    for r in rows:
+        day = _ist_date_of(r.exited_at or r.placed_at)
+        if day is not None:
+            daily.append((day, float(r.pnl or 0.0)))
+
+    capital = None
+    try:
+        capital = float(
+            (_load_config_snapshot(_SIMPLIFIED_ENGINE_FOLDER).get("config") or {}).get("capital")
+            or 0
+        )
+    except Exception:
+        logger.exception("simplified_engine: could not read capital basis from config_snapshot")
+
+    return compute_realized_metrics(
+        daily,
+        capital_inr=capital,
+        capital_is_notional=True,
+    )
+
+
+def _ist_date_of(ts: str | None) -> date | None:
+    """Calendar (IST) date of an ISO journal timestamp, or None if unparseable.
+
+    Journal timestamps are written with an explicit +05:30 offset, so the date
+    component is already IST and is taken directly — no tz conversion that could
+    shift a 15:2x exit onto the previous day.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts)).date()
+    except Exception:
+        return None
 
 
 def _open15_net_pnl(row) -> float:
@@ -1329,7 +1414,13 @@ def strategy_detail(name: str):
     )
     performance = {
         "backtest": {
-            "cagr_pct": parity.get("cagr_pct") or parity.get("sharpe_daily"),
+            # NB: `cagr_pct` must NOT fall back to `sharpe_daily` (issue #568).
+            # It used to, which rendered sector_follow_cap5_vol's Sharpe of 2.19
+            # as a CAGR of "2.19%" — a wrong number that looks real, which is
+            # worse than the '—' an honestly-absent metric produces. `sharpe`
+            # keeps its fallback: sharpe_daily IS a Sharpe, just a daily-series
+            # one, so it belongs in that row.
+            "cagr_pct": parity.get("cagr_pct"),
             "sharpe": parity.get("sharpe") or parity.get("sharpe_daily"),
             "max_dd_pct": parity.get("max_dd_pct"),
             "win_rate_pct": parity.get("win_rate_pct"),
@@ -1371,16 +1462,22 @@ def strategy_detail(name: str):
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
         lifetime = _simplified_engine_lifetime()
-        perf = {
+        # Per-mode split off the journal's own `mode` column (issue #568) — the
+        # Live column is populated only by genuinely-live rows, so flipping the
+        # strategy live no longer re-labels its sandbox history as live P&L.
+        # Today's open/P&L counters remain whole-journal and are attached to the
+        # currently-routing mode, which is the only one that can still change.
+        current = "live" if mode_val == "live" else "sandbox"
+        performance["sandbox"] = {**lifetime["sandbox"]}
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
+        performance[current] = {
+            **(performance[current] or lifetime[current]),
             "open_positions": stats["open_positions"],
             "today_net_pnl": stats["today_net_pnl"],
             "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
             "last_trade_at": stats["last_trade_at"],
-            **lifetime,
         }
-        # trade_journal carries no mode column, so attribute the whole view to the
-        # strategy's current resolved mode (sandbox by default).
-        performance["live" if mode_val == "live" else "sandbox"] = perf
     elif name == "open15_vol_breakout":
         stats = _open15_stats()
         lifetime = _open15_lifetime()

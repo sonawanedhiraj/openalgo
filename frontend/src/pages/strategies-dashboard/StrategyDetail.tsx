@@ -39,6 +39,7 @@ import {
   type EntryBreakdownPayload,
   type EntryBreakdownSummary,
   type EntryBreakdownSymbol,
+  type LivePerf,
   type LLMFlipOutcome,
   type LLMMode,
   type PnlWindow,
@@ -451,7 +452,10 @@ function TradeStatusBadge({ status }: { status: string }) {
 // A cell value with an optional ATM-options sub-value rendered beneath it
 // (issue #455). `opt` stays undefined for strategies without option pricing.
 // `tone` colors the main value (long/short P&L sub-rows, issue #458).
-type PairedCell = { main: string; opt?: string; tone?: 'pos' | 'neg' }
+// `title` surfaces the backend's `notes` as a hover tooltip so a '—' can say why
+// it is blank ("Sharpe needs >=20 trading days (7 so far)") instead of reading as
+// broken (issue #568).
+type PairedCell = { main: string; opt?: string; tone?: 'pos' | 'neg'; title?: string }
 
 function PerfCell({ cell, sub }: { cell: PairedCell; sub?: boolean }) {
   const toneCls =
@@ -462,6 +466,7 @@ function PerfCell({ cell, sub }: { cell: PairedCell; sub?: boolean }) {
         : ''
   return (
     <td
+      title={cell.title}
       className={`px-4 text-right tabular-nums font-mono align-top ${sub ? 'py-1 text-xs' : 'py-2'}`}
     >
       <span className={toneCls}>{cell.main}</span>
@@ -475,6 +480,31 @@ function PerfCell({ cell, sub }: { cell: PairedCell; sub?: boolean }) {
 }
 
 // '75% (6/8)' for a side with trades; '—' for an empty side (never 0%).
+// Realized-metric cells for the Sandbox/Live columns (issue #568). These used to
+// be a hardcoded '—' with no backend behind them. A null metric keeps the dash
+// but carries `notes` as a tooltip, so "not enough history yet" is visibly
+// different from "broken".
+function metricCell(
+  p: LivePerf | null | undefined,
+  key: 'cagr_pct' | 'sharpe',
+  suffix = ''
+): PairedCell {
+  if (!p) return { main: '—' }
+  return { main: fmt(p[key], suffix), title: p.notes || undefined }
+}
+
+function maxDdCell(p: LivePerf | null | undefined): PairedCell {
+  if (!p) return { main: '—' }
+  const notional = p.capital_basis_is_notional
+    ? ' % is of the declared capital, which is a per-trade risk-sizing base, not a compounding book.'
+    : ''
+  return {
+    main: p.max_dd_inr != null ? fmtPnl(p.max_dd_inr) : '—',
+    opt: p.max_dd_pct != null ? fmt(p.max_dd_pct, '%') : undefined,
+    title: `${p.notes || ''}${notional}`.trim() || undefined,
+  }
+}
+
 function fmtSideRate(s: SideSplit | null | undefined): string {
   if (!s || !s.n_trades) return '—'
   // A split that carries trade count + P&L but no per-side win rate (a backtest
@@ -566,13 +596,26 @@ function PerfTable({ data }: { data: StrategyDetail }) {
   })
 
   const rows: { label: string; sub?: boolean; bt: PairedCell; sb: PairedCell; lv: PairedCell }[] = [
-    { label: 'CAGR', bt: { main: fmt(bt.cagr_pct, '%') }, sb: { main: '—' }, lv: { main: '—' } },
-    { label: 'Sharpe', bt: { main: fmt(bt.sharpe) }, sb: { main: '—' }, lv: { main: '—' } },
     {
+      label: 'CAGR',
+      bt: { main: fmt(bt.cagr_pct, '%') },
+      sb: metricCell(sb, 'cagr_pct', '%'),
+      lv: metricCell(lv, 'cagr_pct', '%'),
+    },
+    {
+      label: 'Sharpe',
+      bt: { main: fmt(bt.sharpe) },
+      sb: metricCell(sb, 'sharpe'),
+      lv: metricCell(lv, 'sharpe'),
+    },
+    {
+      // Sandbox/Live show drawdown in rupees as the primary figure — it is the
+      // honest one. The %-of-capital reading is the paired `opt` sub-value and
+      // is caveated in the tooltip whenever the basis is notional (issue #568).
       label: 'Max DD',
       bt: { main: fmt(bt.max_dd_pct, '%'), opt: btOpt ? fmt(btOpt.max_dd_pct, '%') : undefined },
-      sb: { main: '—' },
-      lv: { main: '—' },
+      sb: maxDdCell(sb),
+      lv: maxDdCell(lv),
     },
     // Backtest win-rate is the window figure; Sandbox/Live show the *running*
     // win-rate over closed trades so far (issue #323).

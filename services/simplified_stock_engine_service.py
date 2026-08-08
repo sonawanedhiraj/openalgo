@@ -865,6 +865,43 @@ class SimplifiedStockEngineService:
             return "eod_squareoff"
         return reason
 
+    def _journal_routed_mode(self) -> str:
+        """The book this entry actually routed to — 'sandbox' | 'live' (#568).
+
+        Resolved through ``resolve_order_mode('simplified_engine')``, the SAME
+        dispatch the order itself went through (issue #440), NOT ``self.mode``.
+        Using the configured mode would let the journal claim 'live' while the
+        Analyze kill-switch was silently routing the order to sandbox — exactly
+        the write-here/read-there divergence that stranded futures_follow's T+1
+        exits in #497.
+        """
+        try:
+            from services.mode_service import EffectiveMode, resolve_order_mode
+
+            routed = resolve_order_mode("simplified_engine")
+            return MODE_LIVE if routed is EffectiveMode.LIVE else MODE_SANDBOX
+        except Exception:
+            # Never block an order on a bookkeeping lookup. Sandbox is the
+            # safe attribution: it keeps unproven P&L out of the live column.
+            logger.exception("[SIMPLIFIED-ENTRY] routed-mode resolution failed; recording sandbox")
+            return MODE_SANDBOX
+
+    def _journal_market_context(self) -> dict:
+        """Best-effort ``{nifty_pct, india_vix, regime_snapshot}`` at entry (#568).
+
+        These journal columns sat 0/235 populated, which made every
+        market-condition question ("were entries worse in quiet hours?")
+        untestable except by clock-time proxy. Fail-safe: any fetch problem
+        yields empty slots rather than blocking the entry.
+        """
+        try:
+            from services import signal_review_service
+
+            return signal_review_service.build_market_context()
+        except Exception:
+            logger.exception("[SIMPLIFIED-ENTRY] market-context capture failed; journaling without")
+            return {}
+
     def _journal_record_entry(
         self, signal: EntrySignal, decision_id: int | None, order_id: str | None
     ) -> int:
@@ -872,6 +909,7 @@ class SimplifiedStockEngineService:
         try:
             from services import trade_journal_service
 
+            ctx = self._journal_market_context()
             return trade_journal_service.record_entry(
                 symbol=signal.symbol,
                 direction="LONG" if signal.action == DIRECTION_BUY else "SHORT",
@@ -886,6 +924,10 @@ class SimplifiedStockEngineService:
                 ltp_at_signal=float(signal.reference_price),
                 entry_order_id=str(order_id) if order_id else None,
                 signal_decision_id=decision_id,
+                mode=self._journal_routed_mode(),
+                nifty_pct=ctx.get("nifty_pct"),
+                india_vix=ctx.get("india_vix"),
+                regime_snapshot=ctx.get("regime_snapshot"),
             )
         except Exception:
             logger.exception(

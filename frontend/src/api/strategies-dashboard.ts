@@ -108,6 +108,21 @@ export interface LivePerf {
   options?: OptionsPerf | null
   long?: SideSplit | null
   short?: SideSplit | null
+  // Realized performance metrics computed from the closed-trade daily P&L
+  // series (issue #568). Null while there is not yet enough history — `notes`
+  // carries the human-readable reason, surfaced as a cell tooltip.
+  // `max_dd_inr` is the honest absolute figure; `max_dd_pct` is relative to
+  // `capital_basis_inr`, which for the simplified engine is a per-trade
+  // risk-sizing base rather than a compounding book (`capital_basis_is_notional`).
+  cagr_pct?: number | null
+  sharpe?: number | null
+  max_dd_pct?: number | null
+  max_dd_inr?: number | null
+  roc_pct?: number | null
+  trading_days?: number
+  capital_basis_inr?: number | null
+  capital_basis_is_notional?: boolean
+  notes?: string | null
 }
 
 export interface StrategyPerformance {
