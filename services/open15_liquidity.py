@@ -77,6 +77,96 @@ def spread(bid, ask, tick_size=None) -> dict:
     }
 
 
+def execution_range(premium) -> dict:
+    """NSE's trade-execution range for an option (NSE/FAOP/40075, 2019-01-29).
+
+    ``{"low", "high", "band_abs", "band_pct"}`` around a reference price, or all
+    ``None`` when the premium is unusable.
+
+    Why this matters to a strategy that sends MARKET orders: an order that *would*
+    trade outside this range is **cancelled by the Exchange** (full or partial), so on
+    a thin book the failure mode is not a bad fill, it is no fill at all. The bands are
+    also enormous at low premiums — +/-Rs 20 absolute below Rs 50 — which is why a
+    quoted spread can be terrible and still be perfectly legal.
+    """
+    p = _f(premium)
+    if p is None:
+        return {"low": None, "high": None, "band_abs": None, "band_pct": None}
+    band = 20.0 if p <= 50 else 0.40 * p
+    return {
+        "low": round(max(0.05, p - band), 2),
+        "high": round(p + band, 2),
+        "band_abs": round(band, 2),
+        "band_pct": round(band / p * 100, 2) if p else None,
+    }
+
+
+def impact_cost(levels, target_qty, reference=None) -> dict:
+    """What a MARKET order for ``target_qty`` actually pays, walking the book.
+
+    ``levels`` is the depth side being crossed — ``asks`` to buy, ``bids`` to sell —
+    as ``[{"price", "quantity"}, ...]``. Returns
+    ``{avg_px, impact_pct, filled_qty, exhausted, levels_used}``.
+
+    ``impact_pct`` is measured from ``reference`` (pass the MID; it defaults to the
+    best price on the side being crossed). Of the mid, never the LTP — the #555 rule:
+    the LTP is whichever side last traded, so quoting against it makes the same book
+    look better or worse depending on who traded last.
+
+    This is SEBI's own definition of illiquidity, re-pointed at our order: the
+    Liquidity Enhancement Scheme calls a security illiquid at a mean impact cost >= 2%
+    for a Rs 1 lakh order. We ask the same question for the size we actually send.
+
+    ``exhausted=True`` means five visible levels could not fill the order. That is a
+    stronger signal than any percentage — the book demonstrably cannot absorb us — and
+    ``impact_pct`` is then computed on the partial fill, so it UNDERSTATES the true
+    cost. Callers must treat exhaustion as disqualifying in its own right.
+    """
+    out = {
+        "avg_px": None,
+        "impact_pct": None,
+        "filled_qty": 0.0,
+        "exhausted": True,
+        "levels_used": 0,
+    }
+    qty = _f(target_qty)
+    if not levels or qty is None:
+        return out
+
+    filled = 0.0
+    cost = 0.0
+    used = 0
+    for lvl in levels:
+        px = _f(lvl.get("price") if isinstance(lvl, dict) else None)
+        avail = _f(lvl.get("quantity") if isinstance(lvl, dict) else None)
+        if px is None or avail is None:
+            continue
+        used += 1
+        take = min(avail, qty - filled)
+        filled += take
+        cost += take * px
+        if filled >= qty:
+            break
+
+    if filled <= 0:
+        return out
+    avg = cost / filled
+    ref = _f(reference)
+    if ref is None:
+        first = next((_f(x.get("price")) for x in levels if isinstance(x, dict)), None)
+        ref = first
+    out.update(
+        {
+            "avg_px": round(avg, 4),
+            "impact_pct": round(abs(avg - ref) / ref * 100, 4) if ref else None,
+            "filled_qty": round(filled, 2),
+            "exhausted": filled < qty,
+            "levels_used": used,
+        }
+    )
+    return out
+
+
 def lots(contracts, lot_size) -> float | None:
     """Contract count expressed in LOTS — the only cross-contract comparable."""
     c, ls = _f(contracts), _f(lot_size)

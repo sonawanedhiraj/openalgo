@@ -134,6 +134,7 @@ from database.journal_reflection_db import init_db as ensure_journal_reflection_
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
 from database.open15_breakout_db import init_db as ensure_open15_tables_exists
+from database.option_liquidity_db import init_db as ensure_option_liquidity_tables_exists
 from database.postmarket_review_db import init_db as ensure_postmarket_review_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
@@ -711,6 +712,7 @@ def setup_environment(app):
                 ("Daily Intent DB", ensure_daily_intent_tables_exists),
                 ("Strategy Daily Intent DB", ensure_strategy_daily_intent_tables_exists),
                 ("Data Health DB", ensure_data_health_tables_exists),
+                ("Option Liquidity DB", ensure_option_liquidity_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Scanner Comparison DB", ensure_scanner_comparison_tables_exists),
@@ -1004,6 +1006,20 @@ def setup_environment(app):
                 logger.debug("Scanner comparison EOD job registered")
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
+
+            # open15 option-liquidity sweep (issue #583) — 15:45 IST, while the
+            # broker session is still alive (the sweep needs a live token, and
+            # Zerodha's expires overnight). Batched get_multiquotes over the
+            # near-the-money band of every F&O underlying, scored PER SIDE into
+            # option_liquidity_daily. Phase 1 only MEASURES — nothing reads the
+            # table yet; gated per-fire by OPTION_LIQUIDITY_ENABLED.
+            try:
+                from services.option_liquidity_service import init_option_liquidity_service
+
+                init_option_liquidity_service()
+                logger.debug("Option liquidity EOD job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Option liquidity EOD job: {e}")
 
             # Daily post-market review (issue #511) — 17:15 IST, after the
             # 15:30-17:00 backfill-convergence window closes so every input it

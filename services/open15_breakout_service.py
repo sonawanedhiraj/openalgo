@@ -302,6 +302,80 @@ def shadow_side_for(trade_side: str, enabled: bool) -> str | None:
     return {"long_only": "S", "short_only": "L"}.get(trade_side)
 
 
+# ---- option-liquidity gate (issue #583) ---------------------------------- #
+# Defaults come from the measured distribution, not from a guess: on 20-day medians
+# for 2026-08-07, p20 excludes 33 of 208 CE names. The re-entry band exists because a
+# name sitting on the threshold would otherwise flap in and out on alternate days.
+
+
+def clamp_pctile(raw, default: float) -> float:
+    """0..100. The UI number input is a hint, never a trust boundary."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(100.0, max(0.0, v))
+
+
+def clamp_days(raw, default: int, lo: int = 0, hi: int = 120) -> int:
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, v))
+
+
+def _liq_gate_enabled_default() -> bool:
+    """OFF by default — the placebo failed it (2026-08-09).
+
+    Replayed against the R60 July backtest, restricted to option-leg trades so the
+    comparison is fair, excluding the real bottom quintile was **indistinguishable
+    from excluding the same number of symbols at random** in both arms (placebo >=
+    real 48.4% and 51.8%). Worse, in the larger arm the excluded trades averaged
+    +Rs 834 against +Rs 743 for the kept ones — the gate removes ABOVE-average
+    trades, which is #488's inversion showing up again on a bigger sample.
+
+    The scoring stays on and stays logged (``universe_excluded`` with
+    ``enforced=false``), because the measurement is cheap, harmless, and the only
+    thing that can eventually overturn this. Enforcement waits for evidence.
+    """
+    return os.getenv("OPEN15_LIQUIDITY_GATE_ENABLED", "false").lower() == "true"
+
+
+def _liq_min_pctile_default() -> float:
+    return clamp_pctile(os.getenv("OPEN15_LIQUIDITY_MIN_PCTILE", "20"), 20.0)
+
+
+def _liq_reentry_pctile_default() -> float:
+    return clamp_pctile(os.getenv("OPEN15_LIQUIDITY_REENTRY_PCTILE", "25"), 25.0)
+
+
+def _liq_reentry_days_default() -> int:
+    return clamp_days(os.getenv("OPEN15_LIQUIDITY_REENTRY_DAYS", "3"), 3, 1, 30)
+
+
+def _liq_min_days_default() -> int:
+    return clamp_days(os.getenv("OPEN15_LIQUIDITY_MIN_DAYS", "10"), 10, 1, 120)
+
+
+def _liq_max_staleness_default() -> int:
+    return clamp_days(os.getenv("OPEN15_LIQUIDITY_MAX_STALENESS_DAYS", "3"), 3, 0, 60)
+
+
+def _liq_backfill_rank_default() -> bool:
+    return os.getenv("OPEN15_LIQUIDITY_BACKFILL_RANK", "true").lower() == "true"
+
+
+def _impact_gate_enabled_default() -> bool:
+    return os.getenv("OPEN15_IMPACT_GATE_ENABLED", "true").lower() == "true"
+
+
+def _impact_max_pct_default() -> float:
+    """SEBI's Liquidity Enhancement Scheme calls a security illiquid at a mean impact
+    cost >= 2% for a Rs 1 lakh order. Same shape, our slot size."""
+    return clamp_pctile(os.getenv("OPEN15_IMPACT_MAX_PCT", "2.0"), 2.0)
+
+
 def _rolling_cadence_default() -> int:
     return clamp_rolling_cadence(os.getenv("OPEN15_ROLLING_CADENCE_S", "30"))
 
@@ -691,6 +765,56 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         # derived, so exactly ONE place decides which side is shadow-only and
         # every consumer (core, entry branch, day log, UI) reads that one answer
         "shadow_side": shadow_side_for(trade_side, shadow_enabled),
+        # ---- option-liquidity gates (issue #583) --------------------------
+        # ``is None`` rather than ``or``, so a stored false/0 beats a true env
+        # default instead of being silently overridden by it.
+        "option_liquidity_gate_enabled": (
+            _liq_gate_enabled_default()
+            if cfg.get("option_liquidity_gate_enabled") is None
+            else bool(cfg.get("option_liquidity_gate_enabled"))
+        ),
+        "option_liquidity_min_pctile": (
+            _liq_min_pctile_default()
+            if cfg.get("option_liquidity_min_pctile") is None
+            else clamp_pctile(cfg.get("option_liquidity_min_pctile"), _liq_min_pctile_default())
+        ),
+        "option_liquidity_reentry_pctile": (
+            _liq_reentry_pctile_default()
+            if cfg.get("option_liquidity_reentry_pctile") is None
+            else clamp_pctile(
+                cfg.get("option_liquidity_reentry_pctile"), _liq_reentry_pctile_default()
+            )
+        ),
+        "option_liquidity_reentry_days": (
+            _liq_reentry_days_default()
+            if cfg.get("option_liquidity_reentry_days") is None
+            else clamp_days(cfg.get("option_liquidity_reentry_days"), 3, 1, 30)
+        ),
+        "option_liquidity_min_days": (
+            _liq_min_days_default()
+            if cfg.get("option_liquidity_min_days") is None
+            else clamp_days(cfg.get("option_liquidity_min_days"), 10, 1, 120)
+        ),
+        "option_liquidity_max_staleness_days": (
+            _liq_max_staleness_default()
+            if cfg.get("option_liquidity_max_staleness_days") is None
+            else clamp_days(cfg.get("option_liquidity_max_staleness_days"), 3, 0, 60)
+        ),
+        "option_liquidity_backfill_rank": (
+            _liq_backfill_rank_default()
+            if cfg.get("option_liquidity_backfill_rank") is None
+            else bool(cfg.get("option_liquidity_backfill_rank"))
+        ),
+        "option_impact_gate_enabled": (
+            _impact_gate_enabled_default()
+            if cfg.get("option_impact_gate_enabled") is None
+            else bool(cfg.get("option_impact_gate_enabled"))
+        ),
+        "option_impact_max_pct": (
+            _impact_max_pct_default()
+            if cfg.get("option_impact_max_pct") is None
+            else clamp_pctile(cfg.get("option_impact_max_pct"), _impact_max_pct_default())
+        ),
     }
 
 
@@ -722,8 +846,19 @@ class Open15Core:
         rolling_cadence_s: int = 30,
         rolling_top_n: int = 3,
         shadow_side: str | None = None,
+        liquidity_gate=None,
+        liquidity_backfill_rank: bool = True,
     ):
         self.prev_closes = prev_closes
+        # Gate 1 stage 2 (issue #583): the per-SIDE option-liquidity check, applied
+        # the moment a side is assigned. There are TWO such moments — the 09:16 gap
+        # ranking and every rolling addition — and both are patched, because
+        # ``maybe_rerank`` assigns sides independently of ``_finalize_selection``.
+        # The core still decides nothing about orders; it drops a symbol from the
+        # WATCH list and records why.
+        self.liquidity_gate = liquidity_gate
+        self.liquidity_backfill_rank = bool(liquidity_backfill_rank)
+        self.liquidity_exclusions: list[dict[str, Any]] = []
         self.vol_mult = vol_mult
         self.top_n = top_n
         # rolling additive watch list (issue #529): every ``rolling_cadence_s``
@@ -849,6 +984,49 @@ class Open15Core:
         """True when ``side`` is watched for measurement only (issue #581)."""
         return self.shadow_side is not None and side == self.shadow_side
 
+    def _side_excluded(self, symbol: str, side: str, watch_source: str) -> bool:
+        """Gate-1 stage 2. Records the exclusion and returns True when it fires."""
+        if self.liquidity_gate is None:
+            return False
+        try:
+            # ``would_exclude`` ignores the enabled flag so a DISABLED gate still
+            # RECORDS its verdict; only the return value below respects it. The
+            # placebo failed (2026-08-09), so the gate measures rather than acts.
+            ex = self.liquidity_gate.would_exclude(symbol, side)
+            enforced = bool(getattr(self.liquidity_gate, "enabled", False))
+        except Exception:
+            # a broken gate must never cost a selection — fail OPEN
+            logger.exception("open15: liquidity gate raised for %s/%s", symbol, side)
+            return False
+        if ex is None:
+            return False
+        rec = ex.as_event()
+        rec["watch_source"] = watch_source
+        rec["stage"] = 2
+        rec["enforced"] = enforced
+        self.liquidity_exclusions.append(rec)
+        return enforced
+
+    def _take_top_n(self, ranked: list[str], side: str) -> list[str]:
+        """The first ``top_n`` names on ``ranked`` that clear the per-side gate.
+
+        With ``liquidity_backfill_rank`` on (the default) an excluded name is replaced
+        by the next candidate, so a funded slot is not silently left empty; with it off
+        the slot is simply forgone. Promoting #4 IS a different signal from #3, which
+        is why it is a flag rather than a decision baked in here.
+        """
+        out: list[str] = []
+        for s in ranked:
+            if len(out) >= self.top_n:
+                break
+            if self._side_excluded(s, side, "seed"):
+                if not self.liquidity_backfill_rank:
+                    # consume the slot without filling it
+                    out.append(None)  # type: ignore[arg-type]
+                continue
+            out.append(s)
+        return [s for s in out if s is not None]
+
     def _finalize_selection(self) -> None:
         self.finalized = True
         # union: a symbol the broker snapshot covers is rankable even if its
@@ -861,10 +1039,10 @@ class Open15Core:
         pos = sorted((s for s in self.gaps if self.gaps[s] > 0), key=lambda s: -self.gaps[s])
         neg = sorted((s for s in self.gaps if self.gaps[s] < 0), key=lambda s: self.gaps[s])
         if self._watches("L"):
-            for s in pos[: self.top_n]:
+            for s in self._take_top_n(pos, "L"):
                 self.selected[s] = "L"
         if self._watches("S"):
-            for s in neg[: self.top_n]:
+            for s in self._take_top_n(neg, "S"):
                 self.selected[s] = "S"
         # NB: never pass a bare dict as the sole logging arg — logging's
         # single-mapping special case turns it into `msg % dict` and raises.
@@ -929,6 +1107,14 @@ class Open15Core:
         for side, ranked in sides:
             for rank, sym in enumerate(ranked[: self.rolling_top_n], start=1):
                 if sym in self.selected or self.first_candle(sym) is None:
+                    continue
+                # Gate-1 stage 2 on the ROLLING path (issue #583). This assigns a
+                # side at ``:941`` independently of ``_finalize_selection``, so a
+                # check placed only there would leave half the watch list ungated.
+                # No backfill here, matching the slice above and the existing
+                # first_candle skip: the rolling list is additive instrumentation
+                # with its own cap, not a funded max_trades slot.
+                if self._side_excluded(sym, side, "rolling"):
                     continue
                 # seed the stats key BEFORE publishing the symbol into
                 # ``selected``, so a concurrent ``watch_snapshot`` read can
@@ -1233,6 +1419,77 @@ class Open15BreakoutService:
         syms = {s.strip() for s in raw.split(",") if s.strip()}
         return {s for s in syms if resolve_exchange_for_symbol(s) == "NSE"}
 
+    def _drain_liquidity_exclusions(self, core) -> None:
+        """Emit and clear whatever stage 2 recorded. Never raises."""
+        try:
+            pending, core.liquidity_exclusions = core.liquidity_exclusions, []
+            for rec in pending:
+                self._log_event("universe_excluded", **rec)
+        except Exception:
+            logger.exception("open15: liquidity exclusion logging failed")
+
+    def _apply_liquidity_stage1(self, today: dt.date):
+        """Gate 1 stage 1 — drop symbols that fail on BOTH option sides.
+
+        Returns ``(gate, excluded_records)``. Mutates ``self.universe`` in place, which
+        is what makes the exclusion total: a dropped symbol is discarded by the tick
+        gate in ``_handle_raw``, so it never reaches ``core.last_price`` and the rolling
+        re-rank can never see it either. One check here covers seed AND rolling.
+
+        Never raises. Every failure path leaves the universe untouched — a broken gate
+        must not cost a trading day.
+        """
+        excluded: list[dict] = []
+        if self.day_config.get("instrument") != "atm_option":
+            return None, excluded
+        try:
+            from services.open15_liquidity_gate import build_gate
+
+            gate = build_gate(self.day_config, today)
+        except Exception:
+            logger.exception("open15: liquidity gate build failed — gate OFF for the day")
+            return None, excluded
+        keep: set[str] = set()
+        for sym in sorted(self.universe):
+            try:
+                # ``would_exclude`` ignores the enabled flag, so a DISABLED gate still
+                # records its verdict. The placebo failed on 2026-08-09, so the gate
+                # ships measuring rather than acting — and switching a rule off must
+                # not switch off the data that could overturn it.
+                ex = gate.would_exclude(sym)
+            except Exception:
+                logger.exception("open15: stage-1 gate raised for %s — keeping it", sym)
+                ex = None
+            if ex is None or not gate.enabled:
+                keep.add(sym)
+            if ex is not None:
+                rec = ex.as_event()
+                rec["stage"] = 1
+                rec["enforced"] = bool(gate.enabled)
+                excluded.append(rec)
+        if excluded:
+            self.universe = keep
+            self._log_event(
+                "universe_excluded",
+                stage=1,
+                n_excluded=len(excluded),
+                n_watched=len(keep),
+                min_pctile=self.day_config["option_liquidity_min_pctile"],
+                enforced=bool(gate.enabled),
+                symbols=excluded,
+            )
+            no_contracts = [e["symbol"] for e in excluded if e["reason"] == "no_option_contracts"]
+            if no_contracts:
+                # NOT an illiquidity verdict: SCANNER_SYMBOLS has drifted from the
+                # master contract and should be corrected by an operator.
+                logger.error(
+                    "open15: %d watched symbols have NO NFO option contracts — "
+                    "SCANNER_SYMBOLS is stale: %s",
+                    len(no_contracts),
+                    ", ".join(no_contracts),
+                )
+        return gate, excluded
+
     @staticmethod
     def _load_prev_closes(universe: set[str], today: dt.date) -> dict[str, float]:
         """Last settled daily close per symbol from historify (read-only)."""
@@ -1328,6 +1585,12 @@ class Open15BreakoutService:
             logger.exception("open15: config load failed — using env defaults")
             cfg_row, cum_pnl = None, 0.0
         self.day_config = resolve_day_config(cfg_row, cum_pnl)
+        # Gate 1 stage 1 (issue #583) — side-INDEPENDENT, so it can run before the
+        # 09:16 ranking assigns one. Only drops symbols that fail on BOTH sides (or
+        # have no NFO contracts at all); the per-side half is stage 2, inside the
+        # core. Option-mode only: in stock mode option liquidity is irrelevant and
+        # must not shrink the universe.
+        gate, stage1_excluded = self._apply_liquidity_stage1(now.date())
         nea_min, exit_min = self._window_minutes()
         self._apply_exit_schedule()
         with self._lock:
@@ -1344,6 +1607,8 @@ class Open15BreakoutService:
                 rolling_cadence_s=self.day_config["rolling_cadence_s"],
                 rolling_top_n=self.day_config["rolling_top_n"],
                 shadow_side=self.day_config["shadow_side"],
+                liquidity_gate=gate,
+                liquidity_backfill_rank=self.day_config["option_liquidity_backfill_rank"],
             )
             self.positions = {}
             self.day_status = "armed"
@@ -1382,6 +1647,15 @@ class Open15BreakoutService:
             prev_close_check=prev_check,
             first_candle_source=_first_candle_source(),
             baseline_includes_first_minute=_baseline_includes_first_minute(),
+            # option-liquidity gate (issue #583) — the effective thresholds AND the
+            # symbols stage 1 dropped, so a past round can always reconstruct the
+            # universe that produced it. The arm-time filter CHANGES selection, so
+            # without this stamp a day is not comparable to any earlier baseline.
+            option_liquidity_gate_enabled=self.day_config["option_liquidity_gate_enabled"],
+            option_liquidity_min_pctile=self.day_config["option_liquidity_min_pctile"],
+            option_liquidity_backfill_rank=self.day_config["option_liquidity_backfill_rank"],
+            option_liquidity_excluded=sorted(e["symbol"] for e in stage1_excluded),
+            option_liquidity_universe_after=len(self.universe),
         )
         self._ensure_zmq_thread()
         if _opt_shadow_enabled() or _fill_reconcile_enabled():
@@ -2120,12 +2394,17 @@ class Open15BreakoutService:
                 self._log_selection_event(core)
             except Exception:
                 logger.exception("open15: selection event log failed")
+        # Gate-1 stage-2 exclusions (issue #583) — drained rather than re-read, so
+        # each is logged exactly once whether it came from the seed ranking above or
+        # from a rolling addition below.
+        self._drain_liquidity_exclusions(core)
         # additive re-rank (issue #529) — self-throttled to the configured
         # cadence, and a no-op entirely when the feature is off
         if core.rolling_enabled:
             try:
                 for add in core.maybe_rerank(tick_ts):
                     self._log_event("watchlist_add", **add)
+                self._drain_liquidity_exclusions(core)
             except Exception:
                 # the rolling watch list is additive instrumentation on top of
                 # the measured strategy — it must never cost a seed entry
@@ -2781,6 +3060,63 @@ class Open15BreakoutService:
             "ask": None,
         }
 
+    def _option_impact(self, opt_symbol: str, qty: int, liq: dict) -> dict:
+        """Cost of crossing the ask for ``qty``, and whether that disqualifies it.
+
+        ``{"blocked": bool, "columns": {...}}``. **Fails OPEN** — a depth call that
+        errors, times out or comes back empty proceeds to place the order, mirroring
+        ``_option_liquidity``'s own rule that a broken snapshot must never cost an
+        entry. Entry only: nothing here may ever slow a square-off.
+        """
+        cols: dict = {}
+        cfg = self.day_config or {}
+        if not cfg.get("option_impact_gate_enabled", True):
+            return {"blocked": False, "columns": cols}
+        try:
+            from services.depth_service import get_depth
+            from services.open15_liquidity import impact_cost
+
+            success, resp, _status = get_depth(opt_symbol, "NFO")
+            data = (resp or {}).get("data") if success else None
+            asks = (data or {}).get("asks") or []
+            bid, ask = liq.get("bid"), liq.get("ask")
+            mid = (float(bid) + float(ask)) / 2 if bid and ask else None
+            ic = impact_cost(asks, qty, reference=mid)
+        except Exception:
+            logger.exception(
+                "open15: depth probe failed for %s — impact gate FAILS OPEN", opt_symbol
+            )
+            return {"blocked": False, "columns": cols}
+
+        cols = {
+            "opt_impact_pct": ic["impact_pct"],
+            "opt_depth_levels_used": ic["levels_used"],
+            "opt_depth_exhausted": 1 if ic["exhausted"] else 0,
+        }
+        if ic["filled_qty"] <= 0:
+            # no readable depth at all: a data gap, not a verdict
+            logger.warning("open15: no depth for %s — impact gate FAILS OPEN", opt_symbol)
+            return {"blocked": False, "columns": cols}
+
+        limit = float(cfg.get("option_impact_max_pct", 2.0))
+        # Exhaustion is disqualifying on its own: five visible levels could not fill
+        # us, so impact_pct is computed on a PARTIAL fill and understates the cost.
+        blocked = bool(ic["exhausted"]) or (
+            ic["impact_pct"] is not None and ic["impact_pct"] > limit
+        )
+        if blocked:
+            logger.warning(
+                "open15: %s impact %.2f%% on %d qty (limit %.2f%%, levels=%d, exhausted=%s)"
+                " — entry skipped",
+                opt_symbol,
+                ic["impact_pct"] or -1,
+                qty,
+                limit,
+                ic["levels_used"],
+                ic["exhausted"],
+            )
+        return {"blocked": blocked, "columns": cols}
+
     def _enter_option(self, action: dict, cfg: dict) -> None:
         """Option-mode entry (issue #437): BUY the ATM CE (L) / PE (S).
 
@@ -2834,6 +3170,34 @@ class Open15BreakoutService:
             )
             return
         qty = lots * lot
+        # Gate 2 (issue #583) — what will this MARKET order actually pay? The
+        # structural score in Gate 1 is a per-NAME aggregate and cannot see a strike
+        # that is thin RIGHT NOW: POWERINDIA, the #488 bad exit, sits at p80 on it.
+        # Only the live book at the trigger catches that, so this runs on the sized
+        # order, immediately before it is sent.
+        impact = self._option_impact(contract["symbol"], qty, liq)
+        if impact.get("blocked"):
+            self._journal_skip(
+                action,
+                "illiquid_option_book",
+                instrument="option",
+                opt_symbol=contract["symbol"],
+                opt_lot_size=lot,
+                opt_entry_premium=premium,
+                opt_entry_volume=opt_volume,
+                opt_entry_oi=opt_oi,
+                **liq_kw,
+                **impact["columns"],
+            )
+            self._log_event(
+                "entry_skipped",
+                symbol=action["symbol"],
+                reason="illiquid_option_book",
+                opt_symbol=contract["symbol"],
+                qty=qty,
+                **impact["columns"],
+            )
+            return
         resp = self.order_placer(
             _mode(),
             {"symbol": contract["symbol"], "action": "BUY", "quantity": qty, "exchange": "NFO"},

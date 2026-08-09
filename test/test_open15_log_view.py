@@ -77,6 +77,9 @@ def test_summarize_day_traded():
         "selected": 3,
         # a pre-#529 day has no watchlist_add events, so the rolling cohort is 0
         "rolling_added": 0,
+        "liq_excluded": 0,
+        "liq_excluded_stage1": 0,
+        "liq_excluded_stage2": 0,
         "entered": 1,
         # a pre-#548 day has no entry_rejected/exit_paper events, so the paper
         # cohort is empty and paper P&L is absent (not 0 — nothing was simulated)
@@ -557,3 +560,24 @@ def test_pnl_by_date_and_realized_pnl_are_net_of_charges():
     # paper still never reaches compound sizing, and the real row lands net
     assert round(total_realized_pnl() - before, 2) == -17.82
     db_session.remove()
+
+
+def test_summarize_day_counts_liquidity_exclusions():
+    """Stage 1 arrives as ONE event carrying a list of symbols; stage 2 as one event
+    per symbol. The digest counts SYMBOLS, so the two stages stay comparable."""
+    from services.open15_log_view import summarize_day
+
+    day = [
+        {"event": "armed"},
+        {
+            "event": "universe_excluded",
+            "stage": 1,
+            "symbols": [{"symbol": "AAA"}, {"symbol": "BBB"}, {"symbol": "CCC"}],
+        },
+        {"event": "universe_excluded", "stage": 2, "symbol": "DDD", "side": "long"},
+        {"event": "summary", "day": "done"},
+    ]
+    d = summarize_day("2026-08-10", day)
+    assert d["liq_excluded"] == 4
+    assert d["liq_excluded_stage1"] == 3
+    assert d["liq_excluded_stage2"] == 1
