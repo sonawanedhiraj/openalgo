@@ -81,6 +81,10 @@ DEFAULT_MIN_DAYS = 10
 #: strikes we might pick traded nothing all day, the book is not there.
 _ZERO_VOL_FLOOR_FRAC = 0.5
 
+#: If MORE than this fraction of the universe scores zero turnover, the sweep is
+#: broken, not the market. See ``sweep_is_credible``.
+DEFAULT_MAX_DEAD_FRAC = 0.5
+
 #: Zerodha's own per-request instrument cap is 500 and the mapper batches internally;
 #: this only bounds how much we hand it at once.
 _SWEEP_CHUNK = 500
@@ -112,6 +116,45 @@ def _min_days() -> int:
     except ValueError:
         return DEFAULT_MIN_DAYS
     return max(1, min(120, n))
+
+
+def _max_dead_frac() -> float:
+    try:
+        v = float(os.getenv("OPTION_LIQUIDITY_MAX_DEAD_FRAC", str(DEFAULT_MAX_DEAD_FRAC)))
+    except ValueError:
+        return DEFAULT_MAX_DEAD_FRAC
+    return min(1.0, max(0.0, v))
+
+
+def sweep_is_credible(rows: list[dict], max_dead_frac: float | None = None) -> tuple[bool, dict]:
+    """Is this sweep a market reading, or a broken feed? ``(ok, stats)``.
+
+    **The failure this exists to prevent.** Run against a closed market the broker
+    returns LTP and OHLC quite happily but ``volume``, ``oi``, ``bid`` and ``ask`` all
+    come back **0** (verified on a Sunday: every one of 416 rows scored zero turnover
+    with 6/6 dead strikes). Scored naively that reads as *"the entire F&O universe is
+    illiquid"* — and a consumer acting on it would exclude everything.
+
+    The calendar gate in ``run_for_date`` catches the weekend case, but a calendar is
+    not the general defence: a mid-session feed outage, an expired token accepted by a
+    stale cache, or a broker-side incident all produce the same all-zero shape on a
+    genuine trading day. So credibility is judged from the DATA, not from the date.
+
+    A real market never has a majority of underlyings at zero ATM turnover — measured
+    2026-08-07, zero of 208 did.
+    """
+    total = len(rows)
+    if not total:
+        return False, {"total": 0, "dead": 0, "dead_frac": 1.0}
+    dead = sum(1 for r in rows if not r.get("atm_premium_turnover"))
+    frac = dead / total
+    limit = _max_dead_frac() if max_dead_frac is None else max_dead_frac
+    return frac <= limit, {
+        "total": total,
+        "dead": dead,
+        "dead_frac": round(frac, 3),
+        "limit": limit,
+    }
 
 
 def _parse_hh_mm(raw: str, default: str = _DEFAULT_TIME) -> tuple[int, int]:
@@ -507,6 +550,13 @@ def run_for_date(trade_date: dt.date | None = None, dry_run: bool = False) -> di
     """Sweep, score and persist one day. Returns a summary dict; never raises."""
     from services.data_freshness_service import is_trading_day
 
+    try:
+        from database.option_liquidity_db import init_db
+
+        init_db()  # idempotent; the CLI may run before the app has ever booted
+    except Exception:
+        logger.exception("option_liquidity: table init failed")
+
     today = trade_date or dt.datetime.now().date()
     if not is_trading_day(today):
         logger.info("option_liquidity: %s is not a trading day — skipping", today)
@@ -541,6 +591,38 @@ def run_for_date(trade_date: dt.date | None = None, dry_run: bool = False) -> di
             ", ".join(recon["unwatched_with_options"][:20]),
         )
 
+    credible, stats = sweep_is_credible(rows)
+    if not credible:
+        # Writing this would record "the whole universe is illiquid", which is never
+        # a market fact. Refuse the whole day rather than persist a plausible-looking
+        # lie — a bad row would then sit in the 20-day median for four weeks.
+        logger.error(
+            "option_liquidity: sweep NOT credible (%d/%d underlying-sides with zero "
+            "turnover, %.0f%% > %.0f%% limit) — writing NOTHING. Feed outage, dead "
+            "token, or a closed market?",
+            stats["dead"],
+            stats["total"],
+            stats["dead_frac"] * 100,
+            stats["limit"] * 100,
+        )
+        try:
+            from services.notification_service import notify
+
+            notify(
+                "option_liquidity",
+                f"option_liquidity sweep on {today} discarded: {stats['dead']}/"
+                f"{stats['total']} underlying-sides had zero turnover. No score written.",
+            )
+        except Exception:
+            logger.exception("option_liquidity: alert dispatch failed")
+        return {
+            "status": "discarded_not_credible",
+            "date": str(today),
+            "rows": len(rows),
+            "written": 0,
+            **stats,
+        }
+
     written = 0
     if rows and not dry_run:
         from database.option_liquidity_db import upsert_scores
@@ -550,6 +632,7 @@ def run_for_date(trade_date: dt.date | None = None, dry_run: bool = False) -> di
     ranked = [r for r in rows if r.get("option_liquidity_pctile") is not None]
     summary = {
         "status": "ok",
+        "dead_frac": stats["dead_frac"],
         "date": str(today),
         "rows": len(rows),
         "written": written,
@@ -650,12 +733,32 @@ def _main() -> None:
         # named symbols (BAJAJHLDNG at the bottom, MANAPPURAM mid-pack, FORTIS's
         # two sides far apart), and a summary line cannot show any of them
         from database.auth_db import get_first_available_api_key
+        from database.option_liquidity_db import init_db
+        from services.data_freshness_service import is_trading_day
 
+        init_db()
         api_key = get_first_available_api_key()
         if not api_key:
             print("no API key — broker session down; cannot sweep")
             return
-        rows = compute_scores(day or dt.datetime.now().date(), api_key)
+        when = day or dt.datetime.now().date()
+        if not is_trading_day(when):
+            # A live session is not the same as a live market. With the market shut
+            # the broker still returns LTP and OHLC but zeroes volume/OI/bid/ask, so
+            # every symbol scores dead and the table below is meaningless.
+            print(
+                f"\n*** {when} ({when:%A}) is NOT a trading day. The broker will "
+                "return LTP but ZERO volume/OI/bid/ask, so every symbol will score "
+                "dead. These numbers mean nothing — re-run on a trading day. ***"
+            )
+        rows = compute_scores(when, api_key)
+        credible, stats = sweep_is_credible(rows)
+        if not credible:
+            print(
+                f"\n*** SWEEP NOT CREDIBLE: {stats['dead']}/{stats['total']} "
+                f"underlying-sides scored zero turnover ({stats['dead_frac']:.0%} > "
+                f"{stats['limit']:.0%}). A real run would write NOTHING. ***"
+            )
         ce = sorted(
             (r for r in rows if r["side"] == "CE" and r.get("daily_pctile") is not None),
             key=lambda r: r["daily_pctile"],

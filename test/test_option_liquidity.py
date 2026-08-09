@@ -327,6 +327,67 @@ def test_no_broker_session_writes_nothing(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# sweep credibility — the all-zero feed guard
+# ---------------------------------------------------------------------------
+
+
+def test_all_zero_sweep_is_rejected():
+    """A closed market (or a dead feed) returns LTP but zeroes volume/OI/bid/ask.
+
+    Observed live on a Sunday: all 416 underlying-sides scored zero turnover with 6/6
+    dead strikes. Scored naively that reads as "the entire F&O universe is illiquid".
+    It must be discarded, not persisted — a bad row would sit in the 20-day median for
+    four weeks.
+    """
+    rows = [{"symbol": f"S{i}", "side": "CE", "atm_premium_turnover": 0.0} for i in range(50)]
+    ok, stats = ols.sweep_is_credible(rows)
+    assert not ok
+    assert stats["dead_frac"] == 1.0
+
+
+def test_a_few_dead_names_are_normal():
+    """Genuinely thin names exist — BAJAJHLDNG scored zero on real days. Only a
+    MAJORITY of the universe being dead indicts the sweep rather than the market."""
+    rows = [{"symbol": f"S{i}", "side": "CE", "atm_premium_turnover": 1000.0} for i in range(48)]
+    rows += [{"symbol": "DEAD1", "side": "CE", "atm_premium_turnover": 0.0}]
+    rows += [{"symbol": "DEAD2", "side": "CE", "atm_premium_turnover": None}]
+    ok, stats = ols.sweep_is_credible(rows)
+    assert ok
+    assert stats["dead"] == 2
+
+
+def test_empty_sweep_is_not_credible():
+    ok, _ = ols.sweep_is_credible([])
+    assert not ok
+
+
+def test_incredible_sweep_writes_nothing(monkeypatch):
+    """End-to-end: the guard must stop the WRITE, not merely log."""
+    monkeypatch.setattr(
+        "services.data_freshness_service.is_trading_day", lambda d, exchange=None: True
+    )
+    monkeypatch.setattr("database.auth_db.get_first_available_api_key", lambda: "k")
+    monkeypatch.setattr(
+        ols,
+        "compute_scores",
+        lambda *a, **k: [
+            {"symbol": f"S{i}", "side": "CE", "atm_premium_turnover": 0.0} for i in range(30)
+        ],
+    )
+    monkeypatch.setattr(
+        ols, "reconcile_universe", lambda: {"missing_contracts": [], "unwatched_with_options": []}
+    )
+
+    def _boom(*a, **k):  # pragma: no cover - must never be reached
+        raise AssertionError("upsert_scores must not be called for an incredible sweep")
+
+    monkeypatch.setattr("database.option_liquidity_db.upsert_scores", _boom)
+    out = ols.run_for_date(dt.date(2026, 8, 7))
+    assert out["status"] == "discarded_not_credible"
+    assert out["written"] == 0
+
+
+# ---------------------------------------------------------------------------
 # persistence
 # ---------------------------------------------------------------------------
 
