@@ -278,6 +278,50 @@ sector_follow and the aggregator all read it.
 
 ---
 
+## 5b. Phase 3 validation — run, and INCONCLUSIVE. Here is exactly why.
+
+Run against the seeded scores and the live journal (SQLite only, no DuckDB).
+
+**The gate would have excluded ZERO of the 8 option trades open15 has ever priced.**
+Every one scored p23 or better on its own trade date:
+
+| Date | Symbol | pctile | net P&L |
+|---|---|--:|--:|
+| 2026-07-23 | OIL | 23 | −₹18 |
+| 2026-08-05 | JUBLFOOD | 23 | −₹542 |
+| 2026-08-05 | GODREJPROP | 54 | +₹1,557 |
+| 2026-08-05 | DLF | 55 | +₹368 |
+| 2026-08-06 | MUTHOOTFIN | 68 | −₹288 |
+| 2026-08-06 | HAL | 79 | +₹5,622 |
+| 2026-07-22 | BAJAJ-AUTO | 86 | +₹259 |
+| 2026-08-07 | KALYANKJIL | 96 | +₹6,726 |
+
+Consequences, stated plainly:
+
+- **The placebo could not run.** It compares "exclude the real bottom quintile" against
+  "exclude the same number at random", and the real exclusion set is empty. There is
+  nothing to test.
+- **Winner/loser separation could not be computed** — one cohort is empty.
+- **Split-half is meaningless** at n=8 with an empty arm.
+
+**What the data does say, weakly.** Spearman correlation between percentile and net
+P&L is **+0.595** (n=8); the two sub-p50 trades average **−₹280** while the six at or
+above average **+₹2,374**. The direction is the important part: #488 found every
+ex-ante metric ranked its trades **backwards**, and this one does not invert. But n=8,
+two names (HAL, KALYANKJIL) carry almost all of the P&L, and a rank correlation on
+eight points is not evidence a threshold is right.
+
+**Two readings, both true.** Shipping the gate is **low-risk** — it would not have
+blocked a single trade we have made, so it cannot destroy a known winner. It is also
+**unproven** — it has not yet been shown to block a loser either.
+
+**What would settle it**, in order of strength: (1) the July option-parity backtest
+re-run restricted to `pctile >= 20`, which needs the `backtest/options_open15/` harness
+and therefore DuckDB — impossible while the app holds the file open; (2) ~20 live
+option trades, per #488's own bar; (3) the slippage regression once excluded and traded
+cohorts both exist. Until one of those lands, the gate is a **defensible prior**, not a
+validated edge, and `option_liquidity_gate_enabled=false` retires it in one flag.
+
 ## 6. Relationship to #488, and what is still unproven
 
 #488 measured two option-liquidity filters and rejected both as **inverted, not
