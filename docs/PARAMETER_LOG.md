@@ -18,6 +18,25 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 option-liquidity score (issue #583, added 2026-08-09)
+
+Five tunables for the daily option-liquidity sweep. All are code defaults — none is
+set in `.env`. **Phase 1 MEASURES ONLY**: the job writes `option_liquidity_daily` and
+nothing reads it, so merging changed nothing about what any strategy does. The gates
+that consume the score ship separately, because the score needs ~10 sessions of
+history before it can be trusted.
+
+| Parameter | Default | Why this value |
+|---|---|---|
+| `OPTION_LIQUIDITY_ENABLED` | `true` | Per-fire gate. Registration always happens; flipping this needs only a restart. |
+| `OPTION_LIQUIDITY_EOD_TIME` | `15:45` | **Load-bearing**: the sweep needs a LIVE broker session, and the Zerodha token expires overnight. Do not move it after the close. |
+| `OPTION_LIQUIDITY_BAND_PER_SIDE` | `6` | Strikes each side of the money. Measured: the p20 exclusion set is on a stable plateau from ~3/side outward (6/side and 10/side agree exactly), while a 1-strike band differs by 20 of 42 names — the picked strike is ATM to the *post-gap* trigger, so gaps of 0.14–2.55% move it 1–2 steps. |
+| `OPTION_LIQUIDITY_MEDIAN_DAYS` | `20` | **Required, not smoothing.** Single-day scoring churns ~30 names a day (consecutive-day Jaccard 0.48); the 20-day median cuts that to 3.4 (Jaccard 0.91), replayed over 2026-02..05. Shortening this re-introduces the churn. |
+| `OPTION_LIQUIDITY_MIN_DAYS` | `10` | Below this the score is **NULL, not low** — "cannot rank yet" for a newly listed F&O name, which is a different fact from "illiquid". NSE does the same for newly listed securities. |
+
+Rationale and every measurement behind these:
+[`docs/research/strategy/open15_vol_breakout/2026-08-09_option_liquidity_screen_design.md`](research/strategy/open15_vol_breakout/2026-08-09_option_liquidity_screen_design.md).
+
 ### open15 shadow-logged excluded side (issue #581, added 2026-08-08)
 
 Two new tunables for measuring the side `trade_side` switches off. Both are code

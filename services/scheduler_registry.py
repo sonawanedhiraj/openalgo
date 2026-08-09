@@ -419,6 +419,20 @@ CATALOG: tuple[JobSpec, ...] = (
         env_flag="SCANNER_COMPARISON_EOD_ENABLED",
     ),
     JobSpec(
+        job_id="option_liquidity_eod",
+        label="open15 option-liquidity sweep",
+        group=_REPORTS,
+        scheduler=SCHED_SHARED,
+        schedule="15:45 mon-fri",
+        description=(
+            "Batched broker sweep of the near-the-money option band per F&O "
+            "underlying, scored per side into option_liquidity_daily. 15:45 "
+            "because the sweep needs a live broker session."
+        ),
+        tier=TIER_FREE,
+        env_flag="OPTION_LIQUIDITY_ENABLED",
+    ),
+    JobSpec(
         job_id="postmarket_review",
         label="Post-market review",
         group=_REPORTS,

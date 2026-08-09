@@ -1005,6 +1005,20 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
 
+            # open15 option-liquidity sweep (issue #583) — 15:45 IST, while the
+            # broker session is still alive (the sweep needs a live token, and
+            # Zerodha's expires overnight). Batched get_multiquotes over the
+            # near-the-money band of every F&O underlying, scored PER SIDE into
+            # option_liquidity_daily. Phase 1 only MEASURES — nothing reads the
+            # table yet; gated per-fire by OPTION_LIQUIDITY_ENABLED.
+            try:
+                from services.option_liquidity_service import init_option_liquidity_service
+
+                init_option_liquidity_service()
+                logger.debug("Option liquidity EOD job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Option liquidity EOD job: {e}")
+
             # Daily post-market review (issue #511) — 17:15 IST, after the
             # 15:30-17:00 backfill-convergence window closes so every input it
             # reads has settled. Read-only on every DB except its own table;
