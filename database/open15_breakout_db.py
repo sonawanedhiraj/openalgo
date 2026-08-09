@@ -243,6 +243,18 @@ class Open15Config(Base):
     rolling_watchlist_enabled = Column(Integer, nullable=True)  # 0/1 (NULL = env default)
     rolling_cadence_s = Column(Integer, nullable=True)  # re-rank period, clamped 10..300
     rolling_top_n = Column(Integer, nullable=True)  # adds per side per cycle, clamped 1..10
+    # option-liquidity gates (issue #583). NULL = env default. Thresholds are
+    # PERCENTILES within that day's universe, not absolute rupee floors, so the gate
+    # does not silently widen or vanish when market-wide activity shifts.
+    option_liquidity_gate_enabled = Column(Integer, nullable=True)  # 0/1 - Gate 1
+    option_liquidity_min_pctile = Column(Float, nullable=True)  # exclude below this
+    option_liquidity_reentry_pctile = Column(Float, nullable=True)  # hysteresis band top
+    option_liquidity_reentry_days = Column(Integer, nullable=True)  # clean sessions to return
+    option_liquidity_min_days = Column(Integer, nullable=True)  # history before a score counts
+    option_liquidity_max_staleness_days = Column(Integer, nullable=True)  # then fail OPEN
+    option_liquidity_backfill_rank = Column(Integer, nullable=True)  # 0/1 - seed path only
+    option_impact_gate_enabled = Column(Integer, nullable=True)  # 0/1 - Gate 2
+    option_impact_max_pct = Column(Float, nullable=True)  # SEBI LES shape, our slot size
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -302,6 +314,15 @@ def _ensure_columns():
             "rolling_watchlist_enabled": "INTEGER",
             "rolling_cadence_s": "INTEGER",
             "rolling_top_n": "INTEGER",
+            "option_liquidity_gate_enabled": "INTEGER",
+            "option_liquidity_min_pctile": "FLOAT",
+            "option_liquidity_reentry_pctile": "FLOAT",
+            "option_liquidity_reentry_days": "INTEGER",
+            "option_liquidity_min_days": "INTEGER",
+            "option_liquidity_max_staleness_days": "INTEGER",
+            "option_liquidity_backfill_rank": "INTEGER",
+            "option_impact_gate_enabled": "INTEGER",
+            "option_impact_max_pct": "FLOAT",
             # issue #581 — both NULL on an existing install, which resolves to
             # the env default (OFF), so the next arm behaves exactly as before
             "shadow_excluded_side": "INTEGER",
@@ -356,6 +377,28 @@ def get_config() -> dict | None:
                 None if row.shadow_excluded_side is None else bool(row.shadow_excluded_side)
             ),
             "shadow_max_trades": row.shadow_max_trades,
+            # issue #583 — None stays None so env supplies the default
+            "option_liquidity_gate_enabled": (
+                None
+                if row.option_liquidity_gate_enabled is None
+                else bool(row.option_liquidity_gate_enabled)
+            ),
+            "option_liquidity_min_pctile": row.option_liquidity_min_pctile,
+            "option_liquidity_reentry_pctile": row.option_liquidity_reentry_pctile,
+            "option_liquidity_reentry_days": row.option_liquidity_reentry_days,
+            "option_liquidity_min_days": row.option_liquidity_min_days,
+            "option_liquidity_max_staleness_days": row.option_liquidity_max_staleness_days,
+            "option_liquidity_backfill_rank": (
+                None
+                if row.option_liquidity_backfill_rank is None
+                else bool(row.option_liquidity_backfill_rank)
+            ),
+            "option_impact_gate_enabled": (
+                None
+                if row.option_impact_gate_enabled is None
+                else bool(row.option_impact_gate_enabled)
+            ),
+            "option_impact_max_pct": row.option_impact_max_pct,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -381,6 +424,15 @@ def save_config(
     rolling_top_n: int | None = None,
     shadow_excluded_side: bool | None = None,
     shadow_max_trades: int | None = None,
+    option_liquidity_gate_enabled: bool | None = None,
+    option_liquidity_min_pctile: float | None = None,
+    option_liquidity_reentry_pctile: float | None = None,
+    option_liquidity_reentry_days: int | None = None,
+    option_liquidity_min_days: int | None = None,
+    option_liquidity_max_staleness_days: int | None = None,
+    option_liquidity_backfill_rank: bool | None = None,
+    option_impact_gate_enabled: bool | None = None,
+    option_impact_max_pct: float | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -405,6 +457,25 @@ def save_config(
             None if shadow_excluded_side is None else int(bool(shadow_excluded_side))
         )
         row.shadow_max_trades = shadow_max_trades
+        row.option_liquidity_gate_enabled = (
+            None
+            if option_liquidity_gate_enabled is None
+            else int(bool(option_liquidity_gate_enabled))
+        )
+        row.option_liquidity_min_pctile = option_liquidity_min_pctile
+        row.option_liquidity_reentry_pctile = option_liquidity_reentry_pctile
+        row.option_liquidity_reentry_days = option_liquidity_reentry_days
+        row.option_liquidity_min_days = option_liquidity_min_days
+        row.option_liquidity_max_staleness_days = option_liquidity_max_staleness_days
+        row.option_liquidity_backfill_rank = (
+            None
+            if option_liquidity_backfill_rank is None
+            else int(bool(option_liquidity_backfill_rank))
+        )
+        row.option_impact_gate_enabled = (
+            None if option_impact_gate_enabled is None else int(bool(option_impact_gate_enabled))
+        )
+        row.option_impact_max_pct = option_impact_max_pct
         row.updated_by = updated_by
         db_session.commit()
         return True

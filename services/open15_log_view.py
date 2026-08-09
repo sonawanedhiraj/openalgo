@@ -85,6 +85,9 @@ def summarize_day(
     sim_syms: set[str] = set()
     shadow_syms: set[str] = set()
     rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
+    # option-liquidity exclusions (#583): stage 1 = both sides dead, at arm;
+    # stage 2 = the assigned side is dead, at seed selection or a rolling add
+    liq_excluded = liq_excluded_stage1 = liq_excluded_stage2 = 0
     pnl_from_events = 0.0
     paper_from_events = 0.0
     sim_from_events = 0.0
@@ -103,6 +106,15 @@ def summarize_day(
             selected = len(ev.get("selected") or {})
         elif kind == "watchlist_add":
             rolling_added += 1
+        elif kind == "universe_excluded":
+            # stage 1 arrives as ONE event carrying a list of symbols; stage 2 as one
+            # event per symbol. Counting SYMBOLS keeps the two stages comparable.
+            n = len(ev.get("symbols") or []) or 1
+            liq_excluded += n
+            if ev.get("stage") == 1:
+                liq_excluded_stage1 += n
+            else:
+                liq_excluded_stage2 += n
         elif kind == "entry" and ev.get("order_status") == "success":
             entry_syms.add(ev.get("symbol", ""))
         elif kind == "entry_rejected":
@@ -141,6 +153,9 @@ def summarize_day(
         "status": status,
         "selected": selected,
         "rolling_added": rolling_added,
+        "liq_excluded": liq_excluded,
+        "liq_excluded_stage1": liq_excluded_stage1,
+        "liq_excluded_stage2": liq_excluded_stage2,
         "entered": entered,
         "paper": len(paper_syms),
         "sim": len(sim_syms),

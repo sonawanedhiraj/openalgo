@@ -151,6 +151,37 @@ def config():
         shadow_max_trades = (
             None if shadow_max_trades in (None, "") else _clamp_shadow_max_trades(shadow_max_trades)
         )
+        # ---- option-liquidity gates (issue #583) ---------------------------
+        # Every numeric is clamped SERVER-side: the UI number input is a hint, never
+        # a trust boundary. Empty string means "clear the override", not zero.
+        from services.open15_breakout_service import clamp_days as _clamp_days
+        from services.open15_breakout_service import clamp_pctile as _clamp_pctile
+
+        def _opt_bool(key):
+            v = body.get(key)
+            return None if v in (None, "") else bool(v)
+
+        def _opt_pct(key, default):
+            v = body.get(key)
+            return None if v in (None, "") else _clamp_pctile(v, default)
+
+        def _opt_days(key, default, lo, hi):
+            v = body.get(key)
+            return None if v in (None, "") else _clamp_days(v, default, lo, hi)
+
+        liq_gate = _opt_bool("option_liquidity_gate_enabled")
+        liq_min = _opt_pct("option_liquidity_min_pctile", 20.0)
+        liq_reentry = _opt_pct("option_liquidity_reentry_pctile", 25.0)
+        liq_reentry_days = _opt_days("option_liquidity_reentry_days", 3, 1, 30)
+        liq_min_days = _opt_days("option_liquidity_min_days", 10, 1, 120)
+        liq_stale = _opt_days("option_liquidity_max_staleness_days", 3, 0, 60)
+        liq_backfill = _opt_bool("option_liquidity_backfill_rank")
+        impact_gate = _opt_bool("option_impact_gate_enabled")
+        impact_max = _opt_pct("option_impact_max_pct", 2.0)
+        if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
+            # an inverted band would readmit a name the same day it was excluded,
+            # which is the flapping the hysteresis exists to prevent
+            errors.append("re-entry percentile must be >= the exclusion percentile")
         no_entry_after = body.get("no_entry_after") or None  # empty input = env default
         exit_time = body.get("exit_time") or None
         if no_entry_after is not None or exit_time is not None:
@@ -185,6 +216,15 @@ def config():
             rolling_top_n=rolling_top_n,
             shadow_excluded_side=shadow_excluded_side,
             shadow_max_trades=shadow_max_trades,
+            option_liquidity_gate_enabled=liq_gate,
+            option_liquidity_min_pctile=liq_min,
+            option_liquidity_reentry_pctile=liq_reentry,
+            option_liquidity_reentry_days=liq_reentry_days,
+            option_liquidity_min_days=liq_min_days,
+            option_liquidity_max_staleness_days=liq_stale,
+            option_liquidity_backfill_rank=liq_backfill,
+            option_impact_gate_enabled=impact_gate,
+            option_impact_max_pct=impact_max,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -216,6 +256,32 @@ def config():
                 "shadow_max_trades": _clamp_shadow_max_trades(
                     _os.getenv("OPEN15_SHADOW_MAX_TRADES", "3")
                 ),
+                "option_liquidity_gate_enabled": _os.getenv(
+                    "OPEN15_LIQUIDITY_GATE_ENABLED", "true"
+                ).lower()
+                == "true",
+                "option_liquidity_min_pctile": float(
+                    _os.getenv("OPEN15_LIQUIDITY_MIN_PCTILE", "20")
+                ),
+                "option_liquidity_reentry_pctile": float(
+                    _os.getenv("OPEN15_LIQUIDITY_REENTRY_PCTILE", "25")
+                ),
+                "option_liquidity_reentry_days": int(
+                    _os.getenv("OPEN15_LIQUIDITY_REENTRY_DAYS", "3")
+                ),
+                "option_liquidity_min_days": int(_os.getenv("OPEN15_LIQUIDITY_MIN_DAYS", "10")),
+                "option_liquidity_max_staleness_days": int(
+                    _os.getenv("OPEN15_LIQUIDITY_MAX_STALENESS_DAYS", "3")
+                ),
+                "option_liquidity_backfill_rank": _os.getenv(
+                    "OPEN15_LIQUIDITY_BACKFILL_RANK", "true"
+                ).lower()
+                == "true",
+                "option_impact_gate_enabled": _os.getenv(
+                    "OPEN15_IMPACT_GATE_ENABLED", "true"
+                ).lower()
+                == "true",
+                "option_impact_max_pct": float(_os.getenv("OPEN15_IMPACT_MAX_PCT", "2.0")),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -375,6 +441,12 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
     must never let the two read as one bucket */
  .b-shadow{background:#153037;color:#94e2d5}
  .ev-entry_shadow,.ev-exit_shadow{color:#94e2d5}
+ /* issue #583 — amber like the other "held, not traded" events, and distinct
+    from the red rejection colours: an exclusion is a decision, not a failure */
+ .ev-universe_excluded{color:#f9e2af}
+ .b-liq{background:#463a20;color:#f9e2af}
+ .b-nocontract{background:#3a2028;color:#f38ba8}
+ .b-newlisting{background:#232c36;color:#8aa0b4}
  .b-ok{background:#16331f;color:#a6e3a1}.b-warn{background:#463a20;color:#f9e2af}
  .b-pend{background:#232c36;color:#8aa0b4}
  .leg{color:#8aa0b4;font-size:11px;display:block;margin-top:2px}
@@ -436,6 +508,31 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label class="muted" style="margin-left:14px">top-N per side
    <input id="c_rolltn" type="number" min="1" max="10" step="1" style="width:44px"></label>
   <span class="muted" style="margin-left:10px">clamped 10&ndash;300 s / 1&ndash;10 server-side</span>
+ </div>
+ <div style="margin-top:6px">
+  <label><input id="c_liqgate" type="checkbox"> exclude illiquid option books</label>
+  <label class="muted" style="margin-left:14px">out below p
+   <input id="c_liqmin" type="number" min="0" max="100" step="1" style="width:48px"></label>
+  <label class="muted" style="margin-left:10px">back above p
+   <input id="c_liqre" type="number" min="0" max="100" step="1" style="width:48px"></label>
+  <label class="muted" style="margin-left:10px">for
+   <input id="c_liqredays" type="number" min="1" max="30" step="1" style="width:40px"> sessions</label>
+  <label class="muted" style="margin-left:14px"><input id="c_liqbackfill" type="checkbox"> backfill the freed slot</label>
+  <span class="leg">percentile of ATM premium turnover within the day's universe, per SIDE,
+   as a 20-day median. Below <code>min days</code> of history a symbol is NOT ranked and is
+   watched anyway. Applies in option mode only.</span>
+ </div>
+ <div style="margin-top:6px">
+  <label class="muted">min days
+   <input id="c_liqmindays" type="number" min="1" max="120" step="1" style="width:44px"></label>
+  <label class="muted" style="margin-left:10px">max staleness
+   <input id="c_liqstale" type="number" min="0" max="60" step="1" style="width:44px"> d</label>
+  <label style="margin-left:14px"><input id="c_impactgate" type="checkbox"> skip on impact cost</label>
+  <label class="muted" style="margin-left:10px">above
+   <input id="c_impactmax" type="number" min="0" max="100" step="0.5" style="width:52px"> %</label>
+  <span class="leg">impact cost walks the 5 visible ask levels for the SIZED order,
+   measured from the MID. A book that cannot fill the order at all is skipped whatever the
+   percentage says. Stale scores FAIL OPEN &mdash; nothing is excluded.</span>
  </div>
  <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
@@ -507,6 +604,25 @@ async function loadCfg(){
   document.getElementById('c_shadow').checked=
     !!(o.shadow_excluded_side??d.shadow_excluded_side);
   document.getElementById('c_shadowmax').value=o.shadow_max_trades??d.shadow_max_trades??3;
+  // option-liquidity gates (issue #583) — `??` again, so a stored false/0 wins
+  document.getElementById('c_liqgate').checked=
+    !!(o.option_liquidity_gate_enabled??d.option_liquidity_gate_enabled);
+  document.getElementById('c_liqmin').value=
+    o.option_liquidity_min_pctile??d.option_liquidity_min_pctile??20;
+  document.getElementById('c_liqre').value=
+    o.option_liquidity_reentry_pctile??d.option_liquidity_reentry_pctile??25;
+  document.getElementById('c_liqredays').value=
+    o.option_liquidity_reentry_days??d.option_liquidity_reentry_days??3;
+  document.getElementById('c_liqmindays').value=
+    o.option_liquidity_min_days??d.option_liquidity_min_days??10;
+  document.getElementById('c_liqstale').value=
+    o.option_liquidity_max_staleness_days??d.option_liquidity_max_staleness_days??3;
+  document.getElementById('c_liqbackfill').checked=
+    !!(o.option_liquidity_backfill_rank??d.option_liquidity_backfill_rank);
+  document.getElementById('c_impactgate').checked=
+    !!(o.option_impact_gate_enabled??d.option_impact_gate_enabled);
+  document.getElementById('c_impactmax').value=
+    o.option_impact_max_pct??d.option_impact_max_pct??2.0;
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
   const src=k=>(o[k]==null?'env default':'db');
@@ -550,7 +666,16 @@ async function saveCfg(){
     rolling_cadence_s:+document.getElementById('c_rollcad').value,
     rolling_top_n:+document.getElementById('c_rolltn').value,
     shadow_excluded_side:document.getElementById('c_shadow').checked,
-    shadow_max_trades:+document.getElementById('c_shadowmax').value};
+    shadow_max_trades:+document.getElementById('c_shadowmax').value,
+    option_liquidity_gate_enabled:document.getElementById('c_liqgate').checked,
+    option_liquidity_min_pctile:+document.getElementById('c_liqmin').value,
+    option_liquidity_reentry_pctile:+document.getElementById('c_liqre').value,
+    option_liquidity_reentry_days:+document.getElementById('c_liqredays').value,
+    option_liquidity_min_days:+document.getElementById('c_liqmindays').value,
+    option_liquidity_max_staleness_days:+document.getElementById('c_liqstale').value,
+    option_liquidity_backfill_rank:document.getElementById('c_liqbackfill').checked,
+    option_impact_gate_enabled:document.getElementById('c_impactgate').checked,
+    option_impact_max_pct:+document.getElementById('c_impactmax').value};
   const msg=document.getElementById('c_msg');
   try{
     // CSRFProtect is global (issue #446): the POST is rejected 400 without this token
@@ -584,6 +709,9 @@ function kindOf(e){
      e.event==='fill_reconcile_row'||e.event==='liquidity_row'||
      e.event==='rejection_unverified')return 'trade';
   if(e.event==='no_entry')return 'no_entry';
+  // issue #583 — an exclusion is a decision ABOUT a symbol, so it belongs with
+  // the other "watched but not traded" rows rather than buried in sys noise
+  if(e.event==='universe_excluded')return 'no_entry';
   return 'sys';
 }
 async function loadDays(){
