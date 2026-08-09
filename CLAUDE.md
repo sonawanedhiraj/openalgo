@@ -1224,7 +1224,7 @@ entries are placed from the ZMQ tick callback where a synchronous broker call
 would stall every other symbol's ticks. Charges stay **modelled** — no broker
 exposes per-order charges via API — but on the actual fill turnover, and the UI
 labels them as modelled. The quote columns are deliberately NOT overwritten:
-`fill − quote` is the slippage this deployment exists to measure. The three
+`fill − quote` is the slippage this deployment exists to measure. The four
 P&L buckets are never summed into one another:
 - **real** (`fill='real'`) — money. The only bucket that compounds.
 - **paper** (`fill='paper'`) — the broker REJECTED the entry (#548). An order was
@@ -1232,6 +1232,12 @@ P&L buckets are never summed into one another:
 - **sim** (`fill='sim'`) — no order was ever attempted (`unaffordable` /
   `max_trades_cap`), priced at **1 lot** so a capped or under-funded day can say
   whether the slot capital or the signal is what limited it.
+- **shadow** (`fill='shadow'`) — the side is switched off by `trade_side`
+  (issue #581), priced at the **full slot size** a real entry would have used.
+  Kept apart from `sim` deliberately: *sim* asks "was the budget the
+  constraint?", *shadow* asks "does the signal work on the side we don't
+  trade?" — one blended number answers neither, and the sizing conventions
+  differ because shadow rows exist to be compared against the traded cohort.
 A sim row places nothing and — unlike a rejection — **never reads the position
 book**: nothing was sent, so the book could only surface an unrelated same-symbol
 position and promote a trade we never placed into a live square-off. `_REAL_FILL`
@@ -1276,6 +1282,39 @@ TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows
 (journal AND the day log, which is what the `/logs` page renders):
 `uv run python -m services.open15_rejection_backfill --date YYYY-MM-DD [--apply]`
 (dry-run default, NOT wired into the runtime).
+
+**The excluded side can be measured without being traded (issue #581, default
+OFF).** `trade_side` was set to `long_only` because July parity had the short
+side at **−₹2,485 / 20% win rate** (options) against longs at +₹13,680 — but
+switching a side off also stops collecting the data that would say whether that
+verdict still holds, and this strategy has been **live (real money) since
+2026-07-24**, so simply turning shorts back on is not the cheap experiment it
+looks like. With `shadow_excluded_side` on, the excluded side is selected,
+watched and triggered **exactly as the traded side is** — and no order is ever
+placed for it. Five rules, each load-bearing:
+- **The gate is in the service, never the core.** `Open15Core` still emits a
+  normal action carrying `shadow=True`; `_enter` diverts to `_journal_shadow`
+  before anything can reach `order_placer`. Gating inside the core would make
+  the shadow cohort a *different decision* from the traded one, which is
+  precisely what destroys comparability.
+- **Full slot sizing, not the 1-lot `sim` convention.** The point is comparing
+  against the traded cohort and `parity_target`. The one case the conventions
+  meet — an unaffordable contract — falls back to 1 lot and SAYS SO
+  (`reason='side_excluded_unaffordable'`) rather than hiding a sizing split
+  inside one bucket.
+- **`shadow` is in `NON_REAL_FILLS`, and `_count_fills` subtracts it.** Both are
+  required: the list keeps it out of `total_realized_pnl` (and so out of
+  compound sizing), while `_count_fills` computes `real` by subtracting every
+  non-real class — miss that and shadow rows consume the real `max_trades`
+  budget and report as `filled`.
+- **Its own cap** (`shadow_max_trades`, default 3, clamped 0–10). `max_trades`
+  is a real-money budget; measurement must not spend it.
+- **The position book is never read for a shadow row** at exit. Nothing was
+  sent, so a non-zero quantity could only be an unrelated position, and acting
+  on it would open a real square-off for a trade that never existed.
+Both **seed and rolling** additions are shadowed. Distinct `entry_shadow` /
+`exit_shadow` events (the digest sums by event name). Flags
+`OPEN15_SHADOW_EXCLUDED_SIDE`, `OPEN15_SHADOW_MAX_TRADES`.
 
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);

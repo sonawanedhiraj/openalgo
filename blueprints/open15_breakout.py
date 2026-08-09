@@ -72,6 +72,9 @@ def config():
     from services.open15_breakout_service import (
         clamp_rolling_top_n as _clamp_rolling_top_n,
     )
+    from services.open15_breakout_service import (
+        clamp_shadow_max_trades as _clamp_shadow_max_trades,
+    )
 
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
@@ -129,6 +132,25 @@ def config():
         )
         rolling_top_n = body.get("rolling_top_n")
         rolling_top_n = None if rolling_top_n in (None, "") else _clamp_rolling_top_n(rolling_top_n)
+        # shadow-log the excluded side (issue #581) — same NULL-is-env-default and
+        # clamp-don't-reject treatment as the rolling knobs above
+        shadow_excluded_side = body.get("shadow_excluded_side")
+        if shadow_excluded_side is not None and shadow_excluded_side != "":
+            if isinstance(shadow_excluded_side, str):
+                shadow_excluded_side = shadow_excluded_side.strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+            else:
+                shadow_excluded_side = bool(shadow_excluded_side)
+        else:
+            shadow_excluded_side = None
+        shadow_max_trades = body.get("shadow_max_trades")
+        shadow_max_trades = (
+            None if shadow_max_trades in (None, "") else _clamp_shadow_max_trades(shadow_max_trades)
+        )
         no_entry_after = body.get("no_entry_after") or None  # empty input = env default
         exit_time = body.get("exit_time") or None
         if no_entry_after is not None or exit_time is not None:
@@ -161,6 +183,8 @@ def config():
             rolling_watchlist_enabled=rolling_enabled,
             rolling_cadence_s=rolling_cadence_s,
             rolling_top_n=rolling_top_n,
+            shadow_excluded_side=shadow_excluded_side,
+            shadow_max_trades=shadow_max_trades,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -187,6 +211,11 @@ def config():
                     _os.getenv("OPEN15_ROLLING_CADENCE_S", "30")
                 ),
                 "rolling_top_n": _clamp_rolling_top_n(_os.getenv("OPEN15_ROLLING_TOP_N", "3")),
+                "shadow_excluded_side": _os.getenv("OPEN15_SHADOW_EXCLUDED_SIDE", "false").lower()
+                == "true",
+                "shadow_max_trades": _clamp_shadow_max_trades(
+                    _os.getenv("OPEN15_SHADOW_MAX_TRADES", "3")
+                ),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -262,6 +291,7 @@ def decision_log_days():
     """Digest of every stored day for the history sidebar (issue #444)."""
     from database.open15_breakout_db import (
         paper_pnl_by_date,
+        shadow_pnl_by_date,
         sim_pnl_by_date,
         trades_pnl_by_date,
     )
@@ -271,6 +301,7 @@ def decision_log_days():
         pnl_by_date = trades_pnl_by_date()
         paper_by_date = paper_pnl_by_date()
         sim_by_date = sim_pnl_by_date()
+        shadow_by_date = shadow_pnl_by_date()
         out = []
         for date, events, source in _all_day_logs():
             digest = summarize_day(
@@ -279,6 +310,7 @@ def decision_log_days():
                 trades_pnl=pnl_by_date.get(date),
                 paper_pnl=paper_by_date.get(date),
                 sim_pnl=sim_by_date.get(date),
+                shadow_pnl=shadow_by_date.get(date),
             )
             digest["source"] = source
             out.append(digest)
@@ -339,6 +371,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .b-live{background:#12324a;color:#89b4fa}.b-skip{background:#463a20;color:#f9e2af}
  .b-paper{background:#463a20;color:#f9e2af}
  .b-sim{background:#2b2438;color:#cba6f7}.b-real{background:#16331f;color:#a6e3a1}
+ /* issue #581 — its OWN colour: a shadow row is not a sim row, and the page
+    must never let the two read as one bucket */
+ .b-shadow{background:#153037;color:#94e2d5}
+ .ev-entry_shadow,.ev-exit_shadow{color:#94e2d5}
  .b-ok{background:#16331f;color:#a6e3a1}.b-warn{background:#463a20;color:#f9e2af}
  .b-pend{background:#232c36;color:#8aa0b4}
  .leg{color:#8aa0b4;font-size:11px;display:block;margin-top:2px}
@@ -386,6 +422,13 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <label class="muted" style="margin-left:14px">no entry after <input id="c_nea" type="time" min="09:16" max="15:09" style="width:92px"></label>
  <label class="muted" style="margin-left:14px">exit time <input id="c_exit" type="time" min="09:17" max="15:10" style="width:92px"></label>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
+  <span class="muted">shadow the excluded side (issue #581 — journal only, no orders, never compounds)</span>
+  <label class="muted" style="margin-left:14px"><input id="c_shadow" type="checkbox"> log the excluded side's triggers</label>
+  <label class="muted" style="margin-left:14px">shadow rows/day
+   <input id="c_shadowmax" type="number" min="0" max="10" step="1" style="width:44px"></label>
+  <span id="c_shadowhint" class="muted" style="margin-left:10px"></span>
+ </div>
+ <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
   <span class="muted">rolling watch-list (issue #529 — measurement, off by default)</span>
   <label class="muted" style="margin-left:14px"><input id="c_roll" type="checkbox"> enabled</label>
   <label class="muted" style="margin-left:14px">re-rank every
@@ -427,6 +470,21 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  </div>
 </div>
 <script>
+// Shadowing only means something when a side is EXCLUDED, so with trade side
+// `both` the controls are disabled and say why. The server derives the same
+// answer independently (shadow_side_for) — this is the explanation, not the
+// enforcement.
+function syncShadowUi(){
+  const both=document.getElementById('c_side').value==='both';
+  const cb=document.getElementById('c_shadow'), mx=document.getElementById('c_shadowmax');
+  cb.disabled=both; mx.disabled=both||!cb.checked;
+  document.getElementById('c_shadowhint').textContent=both
+    ?'trade side is “both” — no excluded side to shadow'
+    :(cb.checked
+      ?('watches the '+(document.getElementById('c_side').value==='long_only'?'SHORT':'LONG')+
+        ' side and journals it — no orders, excluded from real P&L and from compound sizing')
+      :'off — the excluded side is not watched at all');
+}
 async function loadCfg(){
   const r=await fetch('/open15_vol_breakout/api/config'); const j=await r.json();
   const o=j.override||{}, d=j.env_defaults||{};
@@ -444,6 +502,12 @@ async function loadCfg(){
     !!(o.rolling_watchlist_enabled??d.rolling_watchlist_enabled);
   document.getElementById('c_rollcad').value=o.rolling_cadence_s??d.rolling_cadence_s??30;
   document.getElementById('c_rolltn').value=o.rolling_top_n??d.rolling_top_n??3;
+  // shadow the excluded side (issue #581) — same `??` treatment: a stored
+  // `false` must beat a `true` env default
+  document.getElementById('c_shadow').checked=
+    !!(o.shadow_excluded_side??d.shadow_excluded_side);
+  document.getElementById('c_shadowmax').value=o.shadow_max_trades??d.shadow_max_trades??3;
+  syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
   const src=k=>(o[k]==null?'env default':'db');
   document.getElementById('c_rollsrc').textContent=
@@ -454,8 +518,14 @@ async function loadCfg(){
     const nea=e.no_entry_after||'09:29', ext=e.exit_time||'09:30';
     const sd=e.trade_side||'both';
     const sdLbl={both:'both',long_only:'longs only',short_only:'shorts only'}[sd]||sd;
+    // the shadowed side is watched but NEVER traded — say so on the same line
+    // that states what the day traded, so the two can't be read apart
+    const shLbl=e.shadow_side
+      ?(' + shadow '+(e.shadow_side==='S'?'shorts':'longs')+
+        ' (max '+(e.shadow_max_trades??3)+', no orders)')
+      :'';
     document.getElementById('c_eff').textContent=
-      'effective today: '+(e.instrument||'stock')+' | trade side '+sdLbl+
+      'effective today: '+(e.instrument||'stock')+' | trade side '+sdLbl+shLbl+
       (sd!=='both'?' ⚠ one-sided (parity targets measured both sides)':'')+
       ' | max trades '+(e.max_trades||3)+
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
@@ -478,7 +548,9 @@ async function saveCfg(){
     exit_time:document.getElementById('c_exit').value,
     rolling_watchlist_enabled:document.getElementById('c_roll').checked,
     rolling_cadence_s:+document.getElementById('c_rollcad').value,
-    rolling_top_n:+document.getElementById('c_rolltn').value};
+    rolling_top_n:+document.getElementById('c_rolltn').value,
+    shadow_excluded_side:document.getElementById('c_shadow').checked,
+    shadow_max_trades:+document.getElementById('c_shadowmax').value};
   const msg=document.getElementById('c_msg');
   try{
     // CSRFProtect is global (issue #446): the POST is rejected 400 without this token
@@ -491,6 +563,8 @@ async function saveCfg(){
   }catch(e){msg.textContent='error: '+e;}
   loadCfg();
 }
+document.getElementById('c_side').addEventListener('change',syncShadowUi);
+document.getElementById('c_shadow').addEventListener('change',syncShadowUi);
 loadCfg();
 </script>
 <script>
@@ -506,6 +580,7 @@ const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'
 function kindOf(e){
   if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped'||
      e.event==='entry_rejected'||e.event==='exit_paper'||e.event==='exit_sim'||
+     e.event==='entry_shadow'||e.event==='exit_shadow'||
      e.event==='fill_reconcile_row'||e.event==='liquidity_row'||
      e.event==='rejection_unverified')return 'trade';
   if(e.event==='no_entry')return 'no_entry';
@@ -528,21 +603,26 @@ async function loadDays(){
     // would be exactly the failure this badge exists to prevent.
     const isPaper=(d.paper>0)||(d.paper_pnl!=null);
     const isSim=(d.sim>0)||(d.sim_pnl!=null);
+    const isShadow=(d.shadow>0)||(d.shadow_pnl!=null);
     const paperTag=isPaper?'<span class="badge b-paper">paper</span> ':'';
     const simTag=isSim?'<span class="badge b-sim">sim</span> ':'';
+    const shadowTag=isShadow?'<span class="badge b-shadow">shadow</span> ':'';
     // real P&L wins the headline. A day with no real fills falls back to paper,
-    // then to sim — each behind its own badge, because an unbadged number in
-    // this column reads as money that was actually made.
+    // then to sim, then to shadow — each behind its own badge, because an
+    // unbadged number in this column reads as money that was actually made.
     const right=d.source==='live'?'<span class="badge b-live">live</span>'
       :skip?'<span class="badge b-skip">skipped</span>'
       :(d.pnl!=null?amt(d.pnl)
         :(d.paper_pnl!=null?(paperTag+amt(d.paper_pnl))
           :(d.sim_pnl!=null?(simTag+amt(d.sim_pnl))
-            :(isPaper?paperTag:(isSim?simTag:'<span class="muted">&mdash;</span>')))));
+            :(d.shadow_pnl!=null?(shadowTag+amt(d.shadow_pnl))
+              :(isPaper?paperTag:(isSim?simTag:(isShadow?shadowTag
+                :'<span class="muted">&mdash;</span>')))))));
     el.innerHTML='<div class="d1"><span>'+esc(d.date)+'</span>'+right+'</div>'+
       '<div class="muted">'+(skip?esc(d.status):(d.selected+' sel &middot; '+d.entered+
         ' filled'+(d.paper?(' &middot; '+d.paper+' paper'):'')+
-        (d.sim?(' &middot; '+d.sim+' sim'):'')))+'</div>';
+        (d.sim?(' &middot; '+d.sim+' sim'):'')+
+        (d.shadow?(' &middot; '+d.shadow+' shadow'):'')))+'</div>';
     el.onclick=()=>selectDay(d.date);
     box.appendChild(el);
   }
@@ -599,7 +679,11 @@ function renderChips(){
   // sim = triggers no order was ever sent for, priced at 1 lot (issue #555).
   // A THIRD bucket, never folded into paper: "the broker refused" and "we could
   // not afford it" are different facts, and one blended number states neither.
+  // shadow = the side `trade_side` switched off, priced at full slot size
+  // (issue #581). A FOURTH bucket for the same reason sim is a third one: "we
+  // could not afford it" and "we do not trade that side" are different facts.
   const sim=dig.sim??summ.sim??0;
+  const shadow=dig.shadow??summ.shadow??0;
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['instrument',armed.instrument||(summ.instrument||'—')],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
@@ -607,6 +691,7 @@ function renderChips(){
     // inserted raw), so an HTML entity here renders as the text "&middot;"
     ['entries',filled+' filled'+(paper?(' \\u00B7 '+paper+' paper'):'')+
       (sim?(' \\u00B7 '+sim+' sim'):'')+
+      (shadow?(' \\u00B7 '+shadow+' shadow'):'')+
       ' / '+(dig.selected??summ.selected??0)+' sel'],
     ['real P&amp;L <span class="net">net</span>',dig.pnl==null?'—':rupee(dig.pnl)]];
   if(paper||dig.paper_pnl!=null)
@@ -615,12 +700,17 @@ function renderChips(){
   if(sim||dig.sim_pnl!=null)
     chips.push(['sim P&amp;L <span class="net">net</span>',
       dig.sim_pnl==null?'—':rupee(dig.sim_pnl)]);
+  if(shadow||dig.shadow_pnl!=null)
+    chips.push(['shadow P&amp;L <span class="net">net</span>',
+      dig.shadow_pnl==null?'—':rupee(dig.shadow_pnl)]);
   document.getElementById('chips').innerHTML=chips.map(([k,v])=>{
     const isPaper=k.startsWith('paper P&amp;L'), isReal=k.startsWith('real P&amp;L');
-    const isSim=k.startsWith('sim P&amp;L');
-    const val=isPaper?dig.paper_pnl:(isSim?dig.sim_pnl:(isReal?dig.pnl:null));
+    const isSim=k.startsWith('sim P&amp;L'), isShadow=k.startsWith('shadow P&amp;L');
+    const val=isPaper?dig.paper_pnl
+      :(isSim?dig.sim_pnl:(isShadow?dig.shadow_pnl:(isReal?dig.pnl:null)));
     const border=isPaper?' style="border:1px solid #463a20"'
-      :(isSim?' style="border:1px solid #2b2438"':'');
+      :(isSim?' style="border:1px solid #2b2438"'
+        :(isShadow?' style="border:1px solid #153037"':''));
     return '<div class="chip"'+border+
       '><span class="k">'+k+'</span><span class="v'+
       (val!=null?(val>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>';
@@ -731,6 +821,21 @@ function renderSel(){
       r.out='<span class="badge b-paper">paper</span> '+
         '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
         esc(e.entry_price)+'</span>';
+    }else if(e.event==='entry_shadow'){
+      // issue #581 — this side is switched off by trade_side. The trigger was
+      // real and legal; no order was placed for it, so it is badged and its
+      // P&L never joins the real bucket.
+      const r=rows[e.symbol];
+      r.fill='shadow'; r.qty=e.qty; r.level=e.level??r.level; r.at=e.at;
+      r.volRatio=e.vol_ratio; r.skipReason=e.reason;
+      // BOTH legs, always (issue #555): in option mode the P&L is on the
+      // premium while the signal is on the stock, and a row showing only one
+      // cannot be reconciled against its own P&L. Shadow rows are no exception.
+      r.stockEntry=e.trigger_price;
+      if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.entry_price;}
+      r.out='<span class="badge b-shadow">shadow</span> '+
+        '<span class="muted">would have entered '+esc(e.at||'')+
+        ' &middot; no order placed ('+esc(e.reason||'side_excluded')+')</span>';
     }else if(e.event==='entry_skipped'){
       const r=rows[e.symbol];
       r.skipReason=e.reason;
@@ -745,7 +850,8 @@ function renderSel(){
       if(e.sim_quantity)r.qty=e.sim_quantity;
       r.out='skipped: '+esc(e.reason||'')+
         (e.fill==='sim'?' <span class="badge b-sim">priced 1 lot</span>':'');
-    }else if((e.event==='exit'||e.event==='exit_paper'||e.event==='exit_sim')&&e.pnl!=null){
+    }else if((e.event==='exit'||e.event==='exit_paper'||e.event==='exit_sim'||
+              e.event==='exit_shadow')&&e.pnl!=null){
       const r=rows[e.symbol];
       r.gross=e.gross; r.charges=e.charges; r.net=e.pnl; r.qty=e.qty??r.qty;
       r.stockExit=e.stock_exit_price??(e.instrument==='option'?r.stockExit:e.exit_price);
@@ -757,6 +863,7 @@ function renderSel(){
       if(e.stock_entry_price!=null)r.stockEntry=r.stockEntry??e.stock_entry_price;
       if(e.event==='exit_paper')r.fill='paper';
       if(e.event==='exit_sim')r.fill='sim';
+      if(e.event==='exit_shadow')r.fill='shadow';
       // The outcome text no longer repeats the P&L (issues #557, #559): the
       // `net P&L` column owns that number and reads it from the JOURNAL, which
       // the reconcile passes correct. Appending the EVENT's figure here printed
@@ -956,9 +1063,9 @@ function renderLiqNote(rows){
   note.innerHTML=anySpread
     ? 'Liquidity is reported in <b>LOTS</b> — raw contract counts are not comparable '+
       'across a universe whose lot sizes differ ~30&times;. <b>Spread cost is NOT deducted '+
-      'from P&amp;L</b>: sim and paper rows price both legs at the quote LTP, so their net '+
-      'is optimistic by roughly that amount; real rows use broker fills, where the spread '+
-      'is already inside the fill price.'
+      'from P&amp;L</b>: sim, paper and shadow rows price both legs at the quote LTP, so '+
+      'their net is optimistic by roughly that amount; real rows use broker fills, where '+
+      'the spread is already inside the fill price.'
     : 'Bid/ask not captured for this day &mdash; it starts with the next armed session.';
 }
 // --- liquidity derivations (issue #555) ------------------------------------
@@ -1061,8 +1168,12 @@ function shortC(c){
   return c.length>16?('\\u2026'+c.slice(-14)):c;
 }
 function qtyCell(r){
-  if(r.fill==='sim')return '<span class="muted">0</span><span class="leg">sim '+
-    esc(r.qty??'')+'</span>';
+  // `quantity` is what was ORDERED. For a bucket where nothing was ordered it
+  // is 0, and the number below it is the PRICING size — never the other way
+  // round, or a shadow row would read as a position that existed.
+  if(r.fill==='sim'||r.fill==='shadow')
+    return '<span class="muted">0</span><span class="leg">'+esc(r.fill)+' '+
+      esc(r.qty??'')+'</span>';
   return r.qty!=null?esc(r.qty):dash;
 }
 function pnlCell(r){
@@ -1070,7 +1181,8 @@ function pnlCell(r){
   const cls=r.net>=0?'pos':'neg';
   const badge={real:'<span class="badge b-real">real</span>',
     paper:'<span class="badge b-paper">paper</span>',
-    sim:'<span class="badge b-sim">sim</span>'}[r.fill]||'';
+    sim:'<span class="badge b-sim">sim</span>',
+    shadow:'<span class="badge b-shadow">shadow</span>'}[r.fill]||'';
   const src=r.pnlSource==='fill'
     ?'<span class="badge b-ok" title="gross computed from broker fill prices">fill</span>'
     :'<span class="badge b-pend" title="gross computed from quote/tick prices — '+

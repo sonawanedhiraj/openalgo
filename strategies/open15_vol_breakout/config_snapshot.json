@@ -1,6 +1,6 @@
 {
   "strategy": "open15_vol_breakout",
-  "version": "0.1.3",
+  "version": "0.1.6",
   "console_url": "/open15_vol_breakout/logs",
   "mode": "sandbox",
   "deployable": true,
@@ -13,6 +13,9 @@
     "selection": "top-3 gainers long / top-3 losers short by 09:15-open vs prev daily close",
     "trade_side": "both",
     "trade_side_note": "UI-configurable (issue #503): both | long_only | short_only. Gates selection, so an excluded side is never watched. The parity_target below is a BOTH-sides measurement — a one-sided day is not comparable to it.",
+    "shadow_excluded_side": false,
+    "shadow_max_trades": 3,
+    "shadow_note": "UI-configurable (issue #581), DEFAULT OFF. When on AND trade_side is one-sided, the EXCLUDED side is watched and triggered exactly as the traded side is, and NO ORDER IS EVER PLACED for it. Rows carry fill='shadow' priced at the full slot size (not the 1-lot sim convention) so the two cohorts are comparable; quantity stays 0 because nothing was ordered. A FOURTH P&L bucket, never summed into real/paper/sim, excluded from total_realized_pnl and so from compound sizing. Own cap shadow_max_trades - shadow rows never consume max_trades. Both seed and rolling additions are shadowed. NOTE this strategy is LIVE (real money) since 2026-07-24, which is why the excluded side is measured this way rather than switched on: July parity had the short side at -Rs2,485 / 20% win rate (options) and -Rs143 (stock).",
     "rolling_watchlist_enabled": false,
     "rolling_cadence_s": 30,
     "rolling_top_n": 3,

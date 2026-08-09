@@ -76,6 +76,27 @@ This sandbox run measures it with real fills. The journal is the experiment.
   show the added names pay** (3 incremental trades, +₹162, 1 win of 3, on 4
   usable days) — this is a MEASUREMENT, which is why every row carries
   `watch_source ∈ {seed, rolling}`. Promotion waits on the #528 sample.
+- **Shadowing the excluded side (issue #581, DEFAULT OFF):** when
+  `shadow_excluded_side` is on AND `trade_side` is one-sided, the excluded side
+  is selected, watched and triggered **exactly as the traded side is** — and
+  **no order is ever placed for it**. The trigger must be decided identically or
+  the two cohorts are not comparable, so the gate lives in the service
+  (`_journal_shadow`, checked before anything can reach `order_placer`), never
+  in the core. Rows carry `fill='shadow'`, `status='skipped'`,
+  `reason='side_excluded'`, `quantity=0` (nothing was ordered) and
+  `sim_quantity` = the **full slot size** a real entry would have used — NOT the
+  1-lot `sim` convention, because the point is comparability with the traded
+  cohort and with `parity_target`. An unaffordable contract falls back to 1 lot
+  and says so (`reason='side_excluded_unaffordable'`) rather than hiding a
+  second sizing convention inside one bucket. Own daily cap `shadow_max_trades`
+  (default 3, clamped 0–10): shadow rows never consume the real `max_trades`
+  budget, which is a real-money budget. Both **seed and rolling** additions are
+  shadowed (operator decision, 2026-08-08). At the exit time the row is priced
+  like any other non-traded row and **the position book is never read** — nothing
+  was sent, so a non-zero quantity could only be an unrelated position, and
+  acting on it would open a real square-off for a trade that never existed.
+  ⚠ This strategy is **live** (real money) as of 2026-07-24; that is precisely
+  why the excluded side is measured this way rather than simply switched on.
 - **Entry (once per symbol, 09:16–09:29):** at tick time t inside minute m:
   `cumvol_within_m(t) ≥ 1.5 × mean(completed minute volumes since 09:15)`
   AND ltp beyond the level (>H1 long / <L1 short) → MARKET MIS immediately.
@@ -119,12 +140,23 @@ reconciled row's net is gross-from-fills minus a modelled deduction. `broker_pnl
 records the position book's own realized figure as an independent cross-check;
 a gap over ₹1 is surfaced on the logs page rather than smoothed over.
 
-**Three P&L buckets, never summed** — `fill='real'` (money; the only bucket that
+**Four P&L buckets, never summed** — `fill='real'` (money; the only bucket that
 compounds), `fill='paper'` (the broker rejected the entry, #548), `fill='sim'`
 (no order was ever attempted — `unaffordable` / `max_trades_cap` — priced at
-1 lot). The sim bucket exists to answer a question the journal previously could
-not: whether the *slot capital* or the *signal* is what caps the strategy. Only
-real rows may enter any published performance number.
+1 lot), `fill='shadow'` (the side is switched off by `trade_side`, #581 — priced
+at full slot size). The sim bucket answers whether the *slot capital* or the
+*signal* caps the strategy; the shadow bucket answers whether the signal works
+on the side we do not trade. One blended figure answers neither. Only real rows
+may enter any published performance number.
+
+**Reading the shadow bucket honestly.** Shadow rows price both legs at the quote
+LTP, so their net is optimistic by roughly the round-trip spread — the same
+caveat as sim and paper (§4b), and it matters more here because the whole
+purpose is a long-vs-short comparison where only ONE side carries real fills.
+Compare shadow shorts against the *quote-priced* long figures, or discount the
+spread, before concluding anything. The decision this data feeds is whether to
+set `trade_side='both'`; the July parity it must beat is short −₹2,485 at a 20%
+win rate (options) / −₹143 (stock).
 
 ### 4b. Contract liquidity (issue #555)
 
@@ -204,6 +236,16 @@ NULL field = env default; **applies at the next 09:10 arm**):
   `top_n`). The parity targets in `config_snapshot.json` are both-sides
   numbers, so a one-sided day is not comparable to them — the logs page flags
   it.
+- `shadow_excluded_side` (issue #581) — `false` (default) | `true`. Shadow-logs
+  the side `trade_side` excludes, per §3. Meaningless (and disabled in the UI)
+  when `trade_side` is `both`, since nothing is excluded — the server derives
+  the same answer independently in `shadow_side_for`, so the greyed-out control
+  is the explanation, not the enforcement.
+- `shadow_max_trades` — daily cap on shadow rows. Default `3`, **clamped 0–10**
+  server-side. `0` is legal and means "shadow nothing". Independent of
+  `max_trades`: a shadow row places no order, so it must not spend a real-money
+  slot, and this cap is what bounds the per-trigger broker quote calls the tick
+  thread does for it.
 - `rolling_watchlist_enabled` (issue #529) — `false` (default) | `true`. The
   rolling additive watch list described in §3.
 - `rolling_cadence_s` — how often the re-rank runs, in seconds. Default `30`,
@@ -218,6 +260,7 @@ NULL field = env default; **applies at the next 09:10 arm**):
 `OPEN15_VOL_MULT` (1.5) · `OPEN15_SIZING_MODE` (fixed) · `OPEN15_TOP_N` (3) ·
 `OPEN15_MARGIN_PER_SLOT` (30000) · `OPEN15_LEVERAGE` (5) ·
 `OPEN15_TRADE_SIDE` (both) ·
+`OPEN15_SHADOW_EXCLUDED_SIDE` (**false**) · `OPEN15_SHADOW_MAX_TRADES` (3) ·
 `OPEN15_ROLLING_WATCHLIST_ENABLED` (**false**) · `OPEN15_ROLLING_CADENCE_S`
 (30) · `OPEN15_ROLLING_TOP_N` (3) ·
 `OPEN15_TICK_CAPTURE` (true) · `OPEN15_TICK_CAPTURE_UNIVERSE` (true).
@@ -253,8 +296,13 @@ actually gated entries), not the raw env default. The `max vol×` column shows
 the peak-**anywhere** ratio but colours on `max_vol_ratio_beyond` — the gate is
 `beyond and cum_in_min >= vol_mult*baseline`, so a peak-anywhere number can sit
 above the threshold on a symbol that correctly never entered (issue #525).
+The `entry_shadow` / `exit_shadow` events (issue #581) carry the same fields as
+their traded counterparts plus `fill='shadow'` and the reason, under **distinct
+event names** — the digest sums events by name, so folding them into
+`entry`/`exit` (or into the sim events) would silently merge buckets that exist
+precisely to be read apart.
 The `watchlist_add` event (issue #529) carries `{symbol, side, pct_change,
-rank, watch_size, at}` — one per rolling addition, so a day is fully replayable
+rank, watch_size, at, shadow}` — one per rolling addition, so a day is replayable
 from its own log and `watch_size` is auditable as monotonically non-decreasing.
 The effective rolling config rides the `armed` event
 (`rolling_watchlist_enabled` / `rolling_cadence_s` / `rolling_top_n`). A day

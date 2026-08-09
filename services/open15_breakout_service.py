@@ -259,6 +259,49 @@ def _rolling_enabled_default() -> bool:
     return os.getenv("OPEN15_ROLLING_WATCHLIST_ENABLED", "false").lower() == "true"
 
 
+# Shadow-log the side ``trade_side`` excludes (issue #581). OFF by default —
+# merging this is a no-op on a running install until the operator enables it
+# from /open15_vol_breakout/logs.
+_SHADOW_MAX_TRADES_MAX = 10
+
+
+def clamp_shadow_max_trades(value) -> int:
+    """Clamp the daily shadow-row cap into 0..10. Bad input -> 3.
+
+    Zero is a legal value and means "shadow nothing" — it is the same as the
+    feature being off, expressed as a budget. Clamped server-side for the same
+    reason the rolling cadence is: each shadow row spends one broker quote at
+    entry and another at exit on the tick thread, so the cap is what bounds the
+    work a bad POST can schedule there.
+    """
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return 3
+    return max(0, min(v, _SHADOW_MAX_TRADES_MAX))
+
+
+def _shadow_excluded_side_default() -> bool:
+    return os.getenv("OPEN15_SHADOW_EXCLUDED_SIDE", "false").lower() == "true"
+
+
+def _shadow_max_trades_default() -> int:
+    return clamp_shadow_max_trades(os.getenv("OPEN15_SHADOW_MAX_TRADES", "3"))
+
+
+def shadow_side_for(trade_side: str, enabled: bool) -> str | None:
+    """The side letter that is watched but NEVER traded, or ``None``.
+
+    ``both`` has no excluded side, so shadowing is meaningless there and the
+    answer is ``None`` however the flag is set — that is what the UI greys the
+    checkbox out for, expressed where it is load-bearing rather than in the
+    form.
+    """
+    if not enabled:
+        return None
+    return {"long_only": "S", "short_only": "L"}.get(trade_side)
+
+
 def _rolling_cadence_default() -> int:
     return clamp_rolling_cadence(os.getenv("OPEN15_ROLLING_CADENCE_S", "30"))
 
@@ -606,6 +649,16 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         if rolling_top_n_cfg is None
         else clamp_rolling_top_n(rolling_top_n_cfg)
     )
+    # shadow-log the excluded side (issue #581) — same ``is None`` treatment as
+    # the rolling flag, so an explicit stored ``false`` beats a ``true`` env
+    shadow_cfg = cfg.get("shadow_excluded_side")
+    shadow_enabled = _shadow_excluded_side_default() if shadow_cfg is None else bool(shadow_cfg)
+    shadow_max_cfg = cfg.get("shadow_max_trades")
+    shadow_max_trades = (
+        _shadow_max_trades_default()
+        if shadow_max_cfg is None
+        else clamp_shadow_max_trades(shadow_max_cfg)
+    )
     no_entry_after = cfg.get("no_entry_after") or _no_entry_after_default()
     exit_time = cfg.get("exit_time") or _exit_time_default()
     if validate_window(no_entry_after, exit_time):
@@ -633,6 +686,11 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "rolling_watchlist_enabled": rolling_enabled,
         "rolling_cadence_s": rolling_cadence_s,
         "rolling_top_n": rolling_top_n,
+        "shadow_excluded_side": shadow_enabled,
+        "shadow_max_trades": shadow_max_trades,
+        # derived, so exactly ONE place decides which side is shadow-only and
+        # every consumer (core, entry branch, day log, UI) reads that one answer
+        "shadow_side": shadow_side_for(trade_side, shadow_enabled),
     }
 
 
@@ -663,6 +721,7 @@ class Open15Core:
         rolling_enabled: bool = False,
         rolling_cadence_s: int = 30,
         rolling_top_n: int = 3,
+        shadow_side: str | None = None,
     ):
         self.prev_closes = prev_closes
         self.vol_mult = vol_mult
@@ -682,6 +741,15 @@ class Open15Core:
         # which sides may be selected at all (issue #503) — an excluded side is
         # never watched, so it produces no ticks, no entries and no journal rows
         self.trade_side = trade_side if trade_side in TRADE_SIDES else "both"
+        # ...unless it is being SHADOWED (issue #581): the excluded side is then
+        # watched and triggered normally, and every action it produces carries
+        # ``shadow=True``. The core stays pure — it decides nothing about
+        # orders; it only labels the action so the service can branch before it
+        # ever reaches ``order_placer``. Shadowing a side the config does not
+        # exclude is meaningless, so it is rejected here rather than trusted.
+        self.shadow_side = (
+            shadow_side if shadow_side == shadow_side_for(self.trade_side, True) else None
+        )
         # entries allowed through entry_to_min; price/minute tracking continues
         # through track_to_min (the exit minute) so the flatten's research
         # exit_price stays fresh on an extended window (issue #451)
@@ -765,6 +833,22 @@ class Open15Core:
             st["cum_prev_end"] = st["last_cum"]
             st["cur_min"] += 1
 
+    def _watches(self, side: str) -> bool:
+        """Is ``side`` on the watch list at all — to trade OR to shadow (#581)?
+
+        Selection and the rolling re-rank both ask this, so the traded-vs-
+        shadowed distinction lives in exactly one predicate. Whether a watched
+        symbol produces an ORDER is not decided here (see ``is_shadow``): the
+        core is pure and never places anything.
+        """
+        if side == self.shadow_side:
+            return True
+        return self.trade_side != ("short_only" if side == "L" else "long_only")
+
+    def is_shadow(self, side: str) -> bool:
+        """True when ``side`` is watched for measurement only (issue #581)."""
+        return self.shadow_side is not None and side == self.shadow_side
+
     def _finalize_selection(self) -> None:
         self.finalized = True
         # union: a symbol the broker snapshot covers is rankable even if its
@@ -776,10 +860,10 @@ class Open15Core:
                 self.gaps[s] = fc["open"] / pc - 1.0
         pos = sorted((s for s in self.gaps if self.gaps[s] > 0), key=lambda s: -self.gaps[s])
         neg = sorted((s for s in self.gaps if self.gaps[s] < 0), key=lambda s: self.gaps[s])
-        if self.trade_side != "short_only":
+        if self._watches("L"):
             for s in pos[: self.top_n]:
                 self.selected[s] = "L"
-        if self.trade_side != "long_only":
+        if self._watches("S"):
             for s in neg[: self.top_n]:
                 self.selected[s] = "S"
         # NB: never pass a bare dict as the sole logging arg — logging's
@@ -809,7 +893,10 @@ class Open15Core:
           - **additive only** — an entry is only ever inserted into
             ``selected`` / ``watch_source``, never removed or re-sided, so the
             09:16 seed picks stay watched for the whole session;
-          - ``trade_side`` is honoured, so an excluded side is never added;
+          - ``trade_side`` is honoured, so an excluded side is never added —
+            unless it is being shadowed (issue #581), in which case it is added
+            and every action it yields is labelled ``shadow`` so the service
+            journals it without placing an order;
           - a symbol with no usable breakout level (no broker first candle and
             no tick-built fallback) is skipped — watching it could never
             produce a legal entry.
@@ -835,9 +922,9 @@ class Open15Core:
 
         adds: list[dict[str, Any]] = []
         sides: list[tuple[str, list[str]]] = []
-        if self.trade_side != "short_only":
+        if self._watches("L"):
             sides.append(("L", sorted((s for s in pct if pct[s] > 0), key=lambda s: -pct[s])))
-        if self.trade_side != "long_only":
+        if self._watches("S"):
             sides.append(("S", sorted((s for s in pct if pct[s] < 0), key=lambda s: pct[s])))
         for side, ranked in sides:
             for rank, sym in enumerate(ranked[: self.rolling_top_n], start=1):
@@ -859,6 +946,8 @@ class Open15Core:
                     "rank": rank,
                     "watch_size": len(self.selected),
                     "at": f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}",
+                    # so the UI panel can say which additions can never trade
+                    "shadow": self.is_shadow(side),
                 }
                 self.rolling_adds.append(rec)
                 adds.append(rec)
@@ -942,6 +1031,12 @@ class Open15Core:
                 # seed vs rolling cohort (issue #529) — journaled on the row so
                 # the two can be scored separately later
                 "watch_source": self.watch_source.get(symbol, "seed"),
+                # measurement-only side (issue #581). The core still emits a
+                # normal action — identical trigger, identical legality — and
+                # the service is what refuses to send an order for it. Keeping
+                # the gate out here is deliberate: the shadow cohort is only
+                # comparable to the traded one if it was decided identically.
+                "shadow": self.is_shadow(side),
             }
             self.entered[symbol] = action
             return action
@@ -1248,6 +1343,7 @@ class Open15BreakoutService:
                 rolling_enabled=self.day_config["rolling_watchlist_enabled"],
                 rolling_cadence_s=self.day_config["rolling_cadence_s"],
                 rolling_top_n=self.day_config["rolling_top_n"],
+                shadow_side=self.day_config["shadow_side"],
             )
             self.positions = {}
             self.day_status = "armed"
@@ -1270,6 +1366,11 @@ class Open15BreakoutService:
             rolling_watchlist_enabled=self.day_config["rolling_watchlist_enabled"],
             rolling_cadence_s=self.day_config["rolling_cadence_s"],
             rolling_top_n=self.day_config["rolling_top_n"],
+            # shadow-logged excluded side (issue #581) — the effective values, so
+            # a past day can always say whether its short rows were measurable
+            shadow_excluded_side=self.day_config["shadow_excluded_side"],
+            shadow_side=self.day_config["shadow_side"],
+            shadow_max_trades=self.day_config["shadow_max_trades"],
             sizing_mode=self.day_config["sizing_mode"],
             margin_per_slot=self.day_config["margin_per_slot"],
             margin_effective=self.day_config["margin_effective"],
@@ -1483,38 +1584,42 @@ class Open15BreakoutService:
         return True
 
     def _flatten_paper(self, symbol: str, pos: dict, reason: str) -> None:
-        """Close a non-traded row as a PAPER or SIM fill (issues #548, #555).
+        """Close a non-traded row as a PAPER, SIM or SHADOW fill (#548, #555, #581).
 
         Places NO order — there is no position to close. Prices the exit exactly
         where a real flatten would have, so the row carries the full
         sandbox-equivalent measurement (exit price, gross P&L, modelled charges)
         and the day stays comparable to one that traded.
 
-        Serves both non-traded classes because the *pricing* is identical; only
-        the labels differ. A ``sim`` row keeps its ``skipped`` status and its
-        original skip reason — it was never rejected, and relabelling it would
-        blame the broker for a budget decision.
+        Serves all three non-traded classes because the *pricing* is identical;
+        only the labels differ. A ``sim`` or ``shadow`` row keeps its ``skipped``
+        status and its original reason — neither was rejected, and relabelling
+        would blame the broker for a decision we made.
         """
         from database.open15_breakout_db import update_trade
 
         is_option = pos.get("instrument") == "option"
-        is_sim = pos.get("fill") == "sim"
+        fill = pos.get("fill")
+        # ``sim`` and ``shadow`` are both "we never sent an order"; only ``paper``
+        # means the broker refused one. Deriving the labels from ONE mapping
+        # keeps a future fifth class from silently inheriting `rejected`.
+        not_ordered = fill in ("sim", "shadow")
         fields = {
             "exit_ts": dt.datetime.now(IST).isoformat(),
             "exit_order_id": "",
             "exit_status": "not_placed",
-            "status": "skipped" if is_sim else "rejected",
-            "fill": "sim" if is_sim else "paper",
+            "status": "skipped" if not_ordered else "rejected",
+            "fill": fill if not_ordered else "paper",
             "pnl_source": "quote",
             "fill_reconcile_status": "not_applicable",
             "reason": (
                 pos.get("sim_reason", reason)
-                if is_sim
+                if not_ordered
                 else (reason if reason != "eod_0930" else "entry_rejected")
             ),
             "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
         }
-        if is_sim:
+        if not_ordered:
             # the size the P&L is priced on; `quantity` stays 0 (nothing ordered)
             fields["sim_quantity"] = pos["quantity"]
         pnl = charges = None
@@ -1572,10 +1677,11 @@ class Open15BreakoutService:
         with self._lock:
             pos["status"] = "closed"
         self._log_event(
-            # a THIRD event name, not a flag on `exit_paper` (issue #555): the
-            # digest sums events by name, so folding sim into the paper event
-            # would silently merge the two buckets the operator asked to keep apart
-            "exit_sim" if is_sim else "exit_paper",
+            # a DISTINCT event name per bucket, not a flag on `exit_paper`
+            # (issues #555, #581): the digest sums events by name, so folding
+            # one bucket into another's event would silently merge the buckets
+            # the operator asked to keep apart
+            {"sim": "exit_sim", "shadow": "exit_shadow"}.get(fill, "exit_paper"),
             symbol=symbol,
             instrument="option" if is_option else "stock",
             contract=pos.get("opt_symbol"),
@@ -1593,12 +1699,12 @@ class Open15BreakoutService:
             gross=round(pnl, 2) if pnl is not None else None,
             charges=charges,
             pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
-            fill="sim" if is_sim else "paper",
-            reason=pos.get("sim_reason") if is_sim else reason,
+            fill=fields["fill"],
+            reason=pos.get("sim_reason") if not_ordered else reason,
             note=(
                 f"no order was placed ({pos.get('sim_reason')}) — priced at "
                 f"{pos['quantity']} for measurement only, no money moved"
-                if is_sim
+                if not_ordered
                 else "order was rejected — sandbox-equivalent, no money moved"
             ),
         )
@@ -1616,16 +1722,19 @@ class Open15BreakoutService:
 
         with self._lock:
             paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
-            sim_pos = {s: p for s, p in self.positions.items() if p.get("status") == "sim"}
+            # SIM (#555) and SHADOW (#581) are both "no order was ever sent"
+            unordered_pos = {
+                s: p for s, p in self.positions.items() if p.get("status") in ("sim", "shadow")
+            }
         for symbol, pos in paper_pos.items():
             if self._resolve_paper_position(symbol, pos):
                 self._flatten_paper(symbol, pos, reason)
-        # SIM rows (issue #555) skip the book verification entirely: no order was
-        # ever sent for them, so there is nothing that could have half-reached
-        # the exchange. Reading the book here could only surface an unrelated
+        # These rows skip the book verification entirely: no order was ever sent
+        # for them, so there is nothing that could have half-reached the
+        # exchange. Reading the book here could only surface an unrelated
         # same-symbol position and promote a trade we never placed into a live
         # square-off — the one failure mode this whole path must not have.
-        for symbol, pos in sim_pos.items():
+        for symbol, pos in unordered_pos.items():
             self._flatten_paper(symbol, pos, reason)
 
         with self._lock:
@@ -1796,7 +1905,7 @@ class Open15BreakoutService:
         # `core.entered` counts TRIGGERS, not placements — on 2026-08-05 it read
         # 5 on a day with zero fills (2 unaffordable skips + 3 broker rejections).
         # Report what actually happened alongside it (issue #548).
-        n_real, n_paper, n_sim = self._count_fills()
+        n_real, n_paper, n_sim, n_shadow = self._count_fills()
         drifts = []
         for s, rec in self.core.entered.items():
             close = self.core.entry_minute_close(s)
@@ -1819,6 +1928,8 @@ class Open15BreakoutService:
             paper=n_paper,
             # triggers no order was sent for, priced at 1 lot (issue #555)
             sim=n_sim,
+            # the switched-off side, priced at full slot size (issue #581)
+            shadow=n_shadow,
             # seed vs rolling split (issue #529): `selected` counts the whole
             # watch list, so without this the seed cohort is unreadable
             rolling_added=len(self.core.rolling_adds),
@@ -2130,8 +2241,8 @@ class Open15BreakoutService:
         msg = str(msg).strip()
         return msg[:500] if msg else "broker rejected the order (no message returned)"
 
-    def _count_fills(self) -> tuple[int, int, int]:
-        """``(real, paper, sim)`` position counts (issues #548, #555).
+    def _count_fills(self) -> tuple[int, int, int, int]:
+        """``(real, paper, sim, shadow)`` position counts (issues #548, #555, #581).
 
         A rejected entry frees its ``max_trades`` slot — it is not a trade, and
         on 2026-08-05 three rejections consumed the whole daily cap. Paper fills
@@ -2142,12 +2253,19 @@ class Open15BreakoutService:
         ``sim`` rows (triggers no order was ever sent for) are counted apart from
         ``paper`` and carry their own cap: they are not evidence of a broker
         problem, so letting them consume the paper budget would mask one.
+
+        ``shadow`` rows (the side ``trade_side`` switched off, issue #581) are a
+        fourth bucket with a fourth cap. **``real`` is computed by subtracting
+        every non-real class**, so a new class MUST be subtracted here as well
+        as added to ``NON_REAL_FILLS`` — miss this and shadow rows would consume
+        the real ``max_trades`` budget and be reported as ``filled``.
         """
         with self._lock:
             vals = list(self.positions.values())
         paper = sum(1 for p in vals if p.get("fill") == "paper")
         sim = sum(1 for p in vals if p.get("fill") == "sim")
-        return len(vals) - paper - sim, paper, sim
+        shadow = sum(1 for p in vals if p.get("fill") == "shadow")
+        return len(vals) - paper - sim - shadow, paper, sim, shadow
 
     def _alert_rejection(self, symbol: str, qty: int, msg: str) -> None:
         """Log loudly + Telegram once per day. Never raises into the entry path."""
@@ -2187,7 +2305,7 @@ class Open15BreakoutService:
         """
         from database.open15_breakout_db import insert_trade
 
-        _real, n_paper, _n_sim = self._count_fills()
+        _real, n_paper, _n_sim, _n_shadow = self._count_fills()
         max_trades = int((self.day_config or {}).get("max_trades") or _max_trades_default())
         priced = n_paper < max_trades
         row_id = insert_trade(
@@ -2258,7 +2376,7 @@ class Open15BreakoutService:
         """
         if not _sim_skipped_enabled():
             return {}
-        _real, _paper, n_sim = self._count_fills()
+        _real, _paper, n_sim, _n_shadow = self._count_fills()
         if n_sim >= _paper_sim_max():
             return {}
         if cfg.get("instrument") != "atm_option":
@@ -2353,15 +2471,205 @@ class Open15BreakoutService:
             **extra,
         )
 
+    def _shadow_sizing(self, action: dict, cfg: dict) -> tuple[dict, int, str] | None:
+        """``(row_extra, quantity, reason)`` for a shadow row, or ``None``.
+
+        Sizes the row EXACTLY as ``_enter`` / ``_enter_option`` would have sized
+        a real one — full slot capital, not the 1-lot ``sim`` convention — which
+        is the only way the shadow cohort is comparable to the traded cohort and
+        to ``config_snapshot.json``'s ``parity_target``.
+
+        The one place the two conventions meet is an unaffordable contract: a
+        real entry would have been skipped there, so the row falls back to 1 lot
+        and SAYS SO in ``reason``. Leaving that silent would hide a sizing split
+        inside one bucket — the defect shape #552 exists to prevent.
+
+        Returns ``None`` when the contract or its premium is unavailable; the
+        caller journals the bare skip rather than inventing a price.
+        """
+        if cfg.get("instrument") != "atm_option":
+            notional = cfg.get("notional") or _notional()
+            return {"instrument": "stock"}, max(int(notional / action["price"]), 1), "side_excluded"
+
+        from services.open15_option_shadow import resolve_atm_option
+
+        contract = resolve_atm_option(
+            action["symbol"], action["side"], action["price"], self._trade_date()
+        )
+        if not contract:
+            return None
+        liq = self._option_liquidity(contract["symbol"])
+        premium = liq["ltp"]
+        if not premium:
+            return None
+        lot = int(contract["lotsize"])
+        extra = {
+            "instrument": "option",
+            "opt_symbol": contract["symbol"],
+            "opt_lot_size": lot,
+            "opt_entry_premium": premium,
+            "opt_entry_volume": liq["volume"],
+            "opt_entry_oi": liq["oi"],
+            "opt_entry_bid": liq["bid"],
+            "opt_entry_ask": liq["ask"],
+            "opt_tick_size": contract.get("ticksize"),
+        }
+        slot_capital = float(cfg.get("margin_effective") or cfg.get("margin_per_slot") or 30_000)
+        lots = int(slot_capital // (premium * lot))
+        if lots < 1:
+            return extra, lot, "side_excluded_unaffordable"
+        return extra, lots * lot, "side_excluded"
+
+    def _journal_shadow(self, action: dict, cfg: dict) -> None:
+        """Journal a trigger on the switched-off side — NO ORDER (issue #581).
+
+        This method never calls ``order_placer``. That is the whole contract:
+        the operator trades one side with real money and wants the other side
+        measured, so a shadow row is a priced counterfactual and nothing more.
+
+        The row is registered as a position so the normal exit-time flatten
+        prices its exit, carrying ``no_order_attempted`` — nothing was sent, so
+        ``flatten`` must not read the position book for it (reading could only
+        surface an unrelated same-symbol position and promote a trade we never
+        placed into a live square-off).
+
+        Defensive by design: a failure here is logged and swallowed. Shadowing
+        is instrumentation bolted onto a strategy trading real money, and it
+        must never be able to cost the traded side an entry.
+        """
+        from database.open15_breakout_db import insert_trade
+
+        try:
+            _real, _paper, _sim, n_shadow = self._count_fills()
+            shadow_max = cfg.get("shadow_max_trades")
+            shadow_max = (
+                _shadow_max_trades_default()
+                if shadow_max is None
+                else clamp_shadow_max_trades(shadow_max)
+            )
+            sized = None if n_shadow >= shadow_max else self._shadow_sizing(action, cfg)
+            if sized is None:
+                # Capped, or no contract/premium to price against. Journaled
+                # unpriced as ``none`` — the documented "deliberately not
+                # measured" class — so the day still records that the excluded
+                # side triggered here, without a fabricated P&L.
+                reason = "shadow_cap" if n_shadow >= shadow_max else "shadow_unpriceable"
+                insert_trade(
+                    trade_date=self._trade_date(),
+                    symbol=action["symbol"],
+                    side=action["side"],
+                    mode=_mode(),
+                    instrument="option" if cfg.get("instrument") == "atm_option" else "stock",
+                    gap_pct=action["gap_pct"],
+                    level=action["level"],
+                    baseline_vol=action["baseline_vol"],
+                    cum_vol_at_trigger=action["cum_vol_at_trigger"],
+                    trigger_minute=action["trigger_minute"],
+                    trigger_second=action["trigger_second"],
+                    trigger_price=action["price"],
+                    quantity=0,
+                    watch_source=action.get("watch_source") or "seed",
+                    status="skipped",
+                    reason=reason,
+                    fill="none",
+                )
+                self._log_event(
+                    "entry_skipped",
+                    symbol=action["symbol"],
+                    reason=reason,
+                    watch_source=action.get("watch_source") or "seed",
+                    fill="none",
+                    shadow=True,
+                )
+                return
+            extra, qty, reason = sized
+            row_id = insert_trade(
+                trade_date=self._trade_date(),
+                symbol=action["symbol"],
+                side=action["side"],
+                mode=_mode(),
+                gap_pct=action["gap_pct"],
+                level=action["level"],
+                baseline_vol=action["baseline_vol"],
+                cum_vol_at_trigger=action["cum_vol_at_trigger"],
+                trigger_minute=action["trigger_minute"],
+                trigger_second=action["trigger_second"],
+                trigger_price=action["price"],
+                # ``quantity`` records what was ORDERED, and nothing was.
+                # ``sim_quantity`` is the size the P&L is priced on — the same
+                # column the sim bucket uses, at a different (full-slot) size,
+                # which ``reason`` makes explicit on every row.
+                quantity=0,
+                sim_quantity=qty,
+                watch_source=action.get("watch_source") or "seed",
+                status="skipped",
+                reason=reason,
+                fill="shadow",
+                **extra,
+            )
+            with self._lock:
+                self.positions[action["symbol"]] = {
+                    **action,
+                    "trigger_price": action["price"],
+                    "quantity": int(qty),
+                    "row_id": row_id,
+                    "status": "shadow",
+                    "fill": "shadow",
+                    "sim_reason": reason,
+                    "no_order_attempted": True,
+                    **{
+                        k: extra[k]
+                        for k in ("instrument", "opt_symbol", "opt_lot_size", "opt_entry_premium")
+                        if k in extra
+                    },
+                }
+            self._log_event(
+                "entry_shadow",
+                symbol=action["symbol"],
+                side="BUY" if extra.get("instrument") == "option" else action["side"],
+                contract=extra.get("opt_symbol"),
+                instrument=extra.get("instrument"),
+                watch_source=action.get("watch_source") or "seed",
+                qty=qty,
+                trigger_price=round(action["price"], 2),
+                entry_price=extra.get("opt_entry_premium") or round(action["price"], 2),
+                level=round(action["level"], 2),
+                at=f"{action['trigger_minute']}:{action['trigger_second']:02d}",
+                cumvol=int(action["cum_vol_at_trigger"]),
+                baseline=int(action["baseline_vol"]),
+                vol_ratio=round(action["cum_vol_at_trigger"] / max(action["baseline_vol"], 1), 2),
+                reason=reason,
+                fill="shadow",
+                note=(
+                    "no order placed — this side is switched off by trade_side; "
+                    "priced for measurement only, no money moved"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "open15: shadow journaling failed for %s — the traded side is unaffected",
+                action.get("symbol"),
+            )
+
     def _enter(self, action: dict) -> None:
         from database.open15_breakout_db import insert_trade
 
         cfg = self.day_config or {}
+        # SHADOW SIDE (issue #581) — checked FIRST, ahead of every path that can
+        # reach ``order_placer``. This side is switched off by ``trade_side``;
+        # it is watched only so the excluded cohort can be scored against the
+        # traded one, and no order is ever sent for it. It is also checked ahead
+        # of the ``max_trades`` cap because that cap is a REAL-money budget: a
+        # shadow trigger must neither consume a slot nor be diverted into a
+        # ``max_trades_cap`` sim row.
+        if action.get("shadow"):
+            self._journal_shadow(action, cfg)
+            return
         max_trades = int(cfg.get("max_trades") or _max_trades_default())
         # only REAL fills consume the daily cap (issue #548) — a broker-rejected
         # entry is not a trade, and letting rejections eat the cap is how three
         # static-IP 403s used up the whole 2026-08-05 budget
-        n_real, _n_paper, _n_sim = self._count_fills()
+        n_real, _n_paper, _n_sim, _n_shadow = self._count_fills()
         if n_real >= max_trades:
             # priced at 1 lot (issue #555) so a capped day still answers "what
             # did the trades I had no room for do?" — the cap is a budget
@@ -2510,7 +2818,7 @@ class Open15BreakoutService:
             # at 1 lot (issue #555) costs one extra quote at exit and nothing
             # more — and it is the only way to learn whether the slot capital,
             # not the signal, is what is capping the strategy
-            _real, _paper, n_sim = self._count_fills()
+            _real, _paper, n_sim, _n_shadow = self._count_fills()
             simulate = _sim_skipped_enabled() and n_sim < _paper_sim_max()
             self._journal_skip(
                 action,
@@ -2630,6 +2938,15 @@ class Open15BreakoutService:
             "instrument": (self.day_config or {}).get("instrument") or _instrument_default(),
             "max_trades": (self.day_config or {}).get("max_trades") or _max_trades_default(),
             "trade_side": (self.day_config or {}).get("trade_side") or _trade_side_default(),
+            # shadow-logged excluded side (issue #581). ``shadow_side`` is the
+            # letter that is watched but never traded — ``None`` whenever the
+            # feature is off OR ``trade_side`` is ``both`` (nothing to exclude).
+            "shadow_excluded_side": bool(
+                (self.day_config or {}).get("shadow_excluded_side", _shadow_excluded_side_default())
+            ),
+            "shadow_side": (self.day_config or {}).get("shadow_side"),
+            "shadow_max_trades": (self.day_config or {}).get("shadow_max_trades")
+            or _shadow_max_trades_default(),
             "universe_size": len(self.universe),
             "selected": dict(core.selected) if core else {},
             "gaps_pct": {s: round(g * 100, 2) for s, g in (core.gaps or {}).items()}
@@ -2650,7 +2967,9 @@ class Open15BreakoutService:
             },
             "watch_source": dict(core.watch_source) if core else {},
             "positions": {
-                s: {k: p.get(k) for k in ("side", "quantity", "trigger_price", "status")}
+                # ``fill`` included (issue #581) so a mid-window reader can tell
+                # a real position from a shadow one without waiting for the exit
+                s: {k: p.get(k) for k in ("side", "quantity", "trigger_price", "status", "fill")}
                 for s, p in self.positions.items()
             },
             "tick_capture": bool(self._tick_writer),

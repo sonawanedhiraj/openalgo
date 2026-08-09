@@ -53,10 +53,11 @@ def summarize_day(
     trades_pnl: float | None = None,
     paper_pnl: float | None = None,
     sim_pnl: float | None = None,
+    shadow_pnl: float | None = None,
 ) -> dict:
     """One-line digest of a day's decision log for the history sidebar.
 
-    ``entered`` counts REAL fills only. There are THREE P&L buckets and they are
+    ``entered`` counts REAL fills only. There are FOUR P&L buckets and they are
     never summed into one another:
 
     * ``pnl`` — real fills. The only one that is money.
@@ -64,15 +65,17 @@ def summarize_day(
       attempted and refused.
     * ``sim_pnl`` — no order was ever attempted (unaffordable / past the daily
       cap, issue #555), priced at 1 lot to answer "would it have paid?".
+    * ``shadow_pnl`` — the side is switched off by ``trade_side`` (issue #581),
+      priced at full slot size to answer "does the signal work on that side?".
 
-    Keeping them apart is the point: "the broker blocked us" and "we could not
-    afford it" are different facts about a day, and a blended figure states
-    neither while looking authoritative.
+    Keeping them apart is the point: "the broker blocked us", "we could not
+    afford it" and "we do not trade that side" are different facts about a day,
+    and a blended figure states none of them while looking authoritative.
 
-    All three are **NET** of modelled charges (issue #552), matching the
+    All four are **NET** of modelled charges (issue #552), matching the
     per-symbol rows and ``trades_pnl_by_date`` / ``paper_pnl_by_date`` /
-    ``sim_pnl_by_date``. There is one P&L convention here; do not reintroduce a
-    gross one.
+    ``sim_pnl_by_date`` / ``shadow_pnl_by_date``. There is one P&L convention
+    here; do not reintroduce a gross one.
     """
     status = "unknown"
     selected = 0
@@ -80,13 +83,16 @@ def summarize_day(
     entry_syms: set[str] = set()
     paper_syms: set[str] = set()
     sim_syms: set[str] = set()
+    shadow_syms: set[str] = set()
     rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
     pnl_from_events = 0.0
     paper_from_events = 0.0
     sim_from_events = 0.0
+    shadow_from_events = 0.0
     saw_exit_pnl = False
     saw_paper_pnl = False
     saw_sim_pnl = False
+    saw_shadow_pnl = False
     for ev in events:
         kind = ev.get("event")
         if kind in ("skipped_late_boot", "skipped_no_prev_closes"):
@@ -103,6 +109,8 @@ def summarize_day(
             paper_syms.add(ev.get("symbol", ""))
         elif kind == "entry_skipped" and ev.get("fill") == "sim":
             sim_syms.add(ev.get("symbol", ""))
+        elif kind == "entry_shadow":
+            shadow_syms.add(ev.get("symbol", ""))
         elif kind == "exit" and ev.get("pnl") is not None:
             pnl_from_events += float(ev["pnl"])
             saw_exit_pnl = True
@@ -115,6 +123,9 @@ def summarize_day(
         elif kind == "exit_sim" and ev.get("pnl") is not None:
             sim_from_events += float(ev["pnl"])
             saw_sim_pnl = True
+        elif kind == "exit_shadow" and ev.get("pnl") is not None:
+            shadow_from_events += float(ev["pnl"])
+            saw_shadow_pnl = True
         elif kind == "summary":
             status = ev.get("day") or status
             selected = ev.get("selected", selected)
@@ -122,6 +133,9 @@ def summarize_day(
     pnl = trades_pnl if trades_pnl is not None else (pnl_from_events if saw_exit_pnl else None)
     ppnl = paper_pnl if paper_pnl is not None else (paper_from_events if saw_paper_pnl else None)
     spnl = sim_pnl if sim_pnl is not None else (sim_from_events if saw_sim_pnl else None)
+    shpnl = (
+        shadow_pnl if shadow_pnl is not None else (shadow_from_events if saw_shadow_pnl else None)
+    )
     return {
         "date": date,
         "status": status,
@@ -130,9 +144,11 @@ def summarize_day(
         "entered": entered,
         "paper": len(paper_syms),
         "sim": len(sim_syms),
+        "shadow": len(shadow_syms),
         "pnl": round(pnl, 2) if pnl is not None else None,
         "paper_pnl": round(ppnl, 2) if ppnl is not None else None,
         "sim_pnl": round(spnl, 2) if spnl is not None else None,
+        "shadow_pnl": round(shpnl, 2) if shpnl is not None else None,
         "events": len(events),
     }
 
@@ -304,7 +320,27 @@ def selection_outcomes(
                 instrument=ev.get("instrument") or "stock",
                 opt_symbol=ev.get("contract"),
             )
-        elif kind in ("exit", "exit_paper", "exit_sim"):
+        elif kind == "entry_shadow":
+            # the switched-off side (issue #581): a full measurement row, but no
+            # order was placed for it — `entered` stays False so it can never be
+            # counted as a fill anywhere downstream
+            sym = ev.get("symbol")
+            if sym not in rows:
+                continue
+            rows[sym].update(
+                entered=False,
+                fill="shadow",
+                qty=ev.get("qty"),
+                trigger_price=ev.get("trigger_price"),
+                skip_reason=ev.get("reason"),
+                vol_ratio_at_trigger=ev.get("vol_ratio"),
+                instrument=ev.get("instrument") or "stock",
+                opt_symbol=ev.get("contract"),
+                opt_entry_premium=(
+                    ev.get("entry_price") if ev.get("instrument") == "option" else None
+                ),
+            )
+        elif kind in ("exit", "exit_paper", "exit_sim", "exit_shadow"):
             sym = ev.get("symbol")
             if sym not in rows:
                 continue
@@ -315,9 +351,9 @@ def selection_outcomes(
                     rows[sym]["opt_entry_premium"] = ev.get("entry_price")
             if kind == "exit_paper":
                 rows[sym]["fill"] = "paper"
-            elif kind == "exit_sim":
-                # sim rows carry a qty that is a PRICING size, not an order size
-                rows[sym].update(fill="sim", qty=ev.get("qty"))
+            elif kind in ("exit_sim", "exit_shadow"):
+                # these carry a qty that is a PRICING size, not an order size
+                rows[sym].update(fill=ev.get("fill") or "sim", qty=ev.get("qty"))
         elif kind == "entry_skipped":
             sym = ev.get("symbol")
             if sym in rows:
