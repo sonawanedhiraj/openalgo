@@ -25,9 +25,10 @@ backtest reads it; nothing here depends on NSE HTTP.
 
 Four measurement decisions, each settled by data and each regression-tested
 --------------------------------------------------------------------------
-1. **Per SIDE, never blended.** Blending CE and PE misclassified 14 of 208 names.
-   FORTIS trades 10.8x more call premium than put; BLUESTARCO runs 0.44x the other
-   way. A consumer reads the side it intends to trade.
+1. **Per SIDE, never blended.** On 20-day medians, blending CE and PE misclassifies
+   **17 of 208** names — 8 thin only on calls, 9 only on puts. UNOMINDA is the clean
+   case (CE p28 / PE p10): tradeable long, never short. A consumer reads the side it
+   intends to trade.
 2. **Premium turnover, not trade count.** An earlier draft ranked on a
    ``min(trades_pctile, turnover_pctile)`` composite and put MANAPPURAM in the bottom
    quintile — it sits mid-pack on turnover with a ~Rs 44,000 average ticket. Few

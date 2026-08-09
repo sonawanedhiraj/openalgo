@@ -153,23 +153,33 @@ units it would exceed 100%. Twelve of twelve land in a plausible first-15-minute
 
 ### 4a. Score each SIDE separately — mandatory
 
-`trade_side` is `long_only`, so the strategy buys **CE**. Blending CE and PE
-misclassifies **14 of 208** names:
+`trade_side` is `long_only`, so the strategy buys **CE**. On **20-day medians**
+(2026-06-01 → 08-07, the seeded history), blending CE and PE misclassifies
+**17 of 208** names:
 
 ```
-thin on CALLS, rescued by puts  :  HAVELLS ICICIGI IEX JINDALSTEL MAXHEALTH NBCC SBILIFE
-thin on PUTS, dragged by them   :  APLAPOLLO FORCEMOT HDFCAMC HYUNDAI JSWENERGY NMDC UNOMINDA
+thin on CALLS, rescued by puts :  BLUESTARCO GMRAIRPORT IRFC MAXHEALTH OBEROIRLTY
+                                  OIL PNBHOUSING PRESTIGE
+thin on PUTS, dragged by them  :  360ONE APLAPOLLO CROMPTON DALBHARAT GODFRYPHLP
+                                  PIDILITIND RADICO SUPREMEIND UNOMINDA
 ```
 
-The skew is not marginal — **FORTIS trades 10.8× more call premium than put**, MPHASIS
-9.4×, while BLUESTARCO and BAJFINANCE run 0.44× and 0.51× the other way.
+**UNOMINDA** is the clean case: CE **p28** against PE **p10** — perfectly tradeable as
+a long, and should never be entered short. The largest median divergences are ANGELONE
+(CE 41.9 / PE 64.3), UNOMINDA (28.2 / 9.6) and CHOLAFIN (49.3 / 65.5).
 
-Two are genuinely asymmetric rather than borderline: **UNOMINDA** (CE p48 / PE p17 —
-₹8.79 Cr of calls vs ₹1.08 Cr of puts) and **JSWENERGY** (CE p29 / PE p9). Blocking
-either as a long because its *put* book is thin would be an own-goal.
+For a future `trade_side = both`: **25 names fail both sides, 33 fail CE, 34 fail PE,
+17 fail exactly one** (8 CE-only, 9 PE-only).
 
-For a future `trade_side = both`: 35 names fail both sides, 42 fail CE, 42 fail PE,
-14 fail exactly one (7 each way).
+> ⚠ **Corrected 2026-08-09, and the correction is itself the §4d argument.** An
+> earlier draft of this document cited *"FORTIS trades 10.8× more call premium than
+> put"* and counted 14 misclassifications. Both came from a **single day** (2026-08-07),
+> and that day was a FORTIS outlier: its CE turnover spiked to ₹42.71 Cr against a
+> typical ₹1–3 Cr, scoring p89 on the day. On the 20-day median FORTIS is **CE p9.6 /
+> PE p17.5** — thin on *both* sides, with its calls the *thinner* of the two, i.e. the
+> opposite of the single-day reading. GODREJCP has the same shape (p75 on the day,
+> median p6.9). Every figure in this section is now median-based. This is exactly the
+> instability §4d quantifies, caught in our own documentation.
 
 ### 4b. Premium turnover, not trade count
 

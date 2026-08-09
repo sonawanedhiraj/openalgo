@@ -102,9 +102,14 @@ def _scored(**by_key):
 def test_sides_are_ranked_independently_never_blended():
     """The 14-of-208 misclassification regression.
 
-    FORTIS-shaped: a deep call book and a thin put book. Its CE must rank high and
-    its PE low. If both come back equal the sides have been blended, and names that
-    are thin on only one side get silently rescued (or condemned) by the other.
+    UNOMINDA-shaped: a usable call book and a thin put book (median CE p28 / PE p10).
+    Its CE must rank clearly above its PE. If both come back equal the sides have been
+    blended, and the 17-of-208 names that are thin on only one side get silently
+    rescued (or condemned) by the other.
+
+    Synthetic fixtures on purpose: a real symbol's ranking moves, and a test pinned to
+    live data would rot. FORTIS was cited here originally and turned out to be a
+    single-day outlier - see the research doc's 4a correction.
     """
     peers = {}
     for i in range(1, 5):
@@ -114,15 +119,15 @@ def test_sides_are_ranked_independently_never_blended():
         peers[f"P{i}_CE"] = (10_00_00_000.0 * i, 0, 6)
         peers[f"P{i}_PE"] = (10_00_00_000.0 * i, 0, 6)
     scored = _scored(
-        FORTIS_CE=(42_71_00_000.0, 0, 6),  # deep calls  — above every peer but P4
-        FORTIS_PE=(3_94_00_000.0, 0, 6),  # thin puts   — below every peer
+        UNOMINDA_CE=(42_71_00_000.0, 0, 6),  # usable calls — above every peer but P4
+        UNOMINDA_PE=(3_94_00_000.0, 0, 6),  # thin puts    — below every peer
         **peers,
     )
     ols.assign_percentiles(scored)
-    ce = scored[("FORTIS", "CE")]["daily_pctile"]
-    pe = scored[("FORTIS", "PE")]["daily_pctile"]
-    assert ce > 60, f"FORTIS calls should rank high, got p{ce}"
-    assert pe < 20, f"FORTIS puts should rank low, got p{pe}"
+    ce = scored[("UNOMINDA", "CE")]["daily_pctile"]
+    pe = scored[("UNOMINDA", "PE")]["daily_pctile"]
+    assert ce > 60, f"UNOMINDA calls should rank high, got p{ce}"
+    assert pe < 20, f"UNOMINDA puts should rank low, got p{pe}"
     assert ce - pe > 40, "the two sides must not collapse toward each other"
 
 

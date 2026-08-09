@@ -8,11 +8,13 @@ owns only its own table.
 
 **Keyed ``(as_of_date, symbol, side)`` — one row per SIDE, and that is load-bearing.**
 ``open15_vol_breakout`` buys a CE for a long and a PE for a short, and the two books
-are not interchangeable: measured 2026-08-07 across 208 underlyings, FORTIS traded
-10.8x more call premium than put and BLUESTARCO ran 0.44x the other way. Collapsing
-the sides into one number misclassified 14 of 208 names — 7 that are thin only on
-calls, 7 only on puts. A consumer must always read the score for the side it intends
-to trade.
+are not interchangeable. On 20-day medians over 2026-06-01..08-07, collapsing the
+sides into one number misclassifies **17 of 208** names — 8 thin only on calls
+(BLUESTARCO, GMRAIRPORT, IRFC, MAXHEALTH, OBEROIRLTY, OIL, PNBHOUSING, PRESTIGE) and
+9 only on puts (360ONE, APLAPOLLO, CROMPTON, DALBHARAT, GODFRYPHLP, PIDILITIND,
+RADICO, SUPREMEIND, UNOMINDA). UNOMINDA is the clean case: CE p28 against PE p10, so
+it is perfectly tradeable long and should never be entered short. A consumer must
+always read the score for the side it intends to trade.
 
 ``option_liquidity_pctile`` is the value consumers read; it is a **20-day median** of
 the daily percentile, not today's. Single-day scoring is far too noisy to act on
@@ -103,6 +105,15 @@ class OptionLiquidityDaily(Base):
     n_days_in_median = Column(Integer, nullable=True)
 
     expiry_used = Column(Date, nullable=True)
+
+    # Which feed produced this row: ``broker_sweep`` (the runtime path) or
+    # ``bhavcopy`` (the one-time history seed). Mixing them inside one median is
+    # sound ONLY because the stored value is a rank percentile *within that day's
+    # universe* — bhavcopy turnover is lots x lot_size x close while the broker's is
+    # volume_units x ltp, so any systematic scale difference cancels in the ranking.
+    # The column exists so a mixed median is visible rather than assumed.
+    source = Column(String(16), nullable=True)
+
     details_json = Column(Text, nullable=True)
     computed_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -115,10 +126,45 @@ Index("idx_option_liquidity_date", OptionLiquidityDaily.as_of_date)
 Index("idx_option_liquidity_sym_side", OptionLiquidityDaily.symbol, OptionLiquidityDaily.side)
 
 
+#: Columns added after the table first shipped. ``create_all`` NEVER alters an
+#: existing table, so any new column must be listed here or it will simply not exist
+#: on an install that already ran init_db — which fails at INSERT time, not at boot.
+#: (Learned the hard way: ``source`` was added a day later and the backfill died with
+#: "table option_liquidity_daily has no column named source" after scoring 49 days.)
+_WANTED_COLUMNS: dict[str, str] = {
+    "source": "VARCHAR(16)",
+}
+
+
+def _ensure_columns() -> None:
+    """Add any missing column to an existing table. Idempotent, fail-graceful."""
+    from sqlalchemy import text
+
+    try:
+        with engine.begin() as conn:
+            have = {
+                r[1]
+                for r in conn.execute(text("PRAGMA table_info(option_liquidity_daily)")).fetchall()
+            }
+            if not have:
+                return  # table doesn't exist yet; create_all will make it complete
+            for col, ddl in _WANTED_COLUMNS.items():
+                if col not in have:
+                    conn.execute(text(f"ALTER TABLE option_liquidity_daily ADD COLUMN {col} {ddl}"))
+                    logger.info("option_liquidity_daily: added missing column %s", col)
+    except Exception:
+        logger.exception("option_liquidity_daily: column migration failed")
+
+
 def init_db():
-    """Create the ``option_liquidity_daily`` table if missing. Idempotent."""
+    """Create the ``option_liquidity_daily`` table if missing, and migrate columns.
+
+    Idempotent. ``create_all`` handles a fresh install; ``_ensure_columns`` handles an
+    install that predates a later column.
+    """
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_columns()
         logger.info("option_liquidity_daily table ready")
     except Exception as e:
         logger.exception(f"Failed to init option_liquidity_daily table: {e}")
@@ -145,6 +191,7 @@ def _row_to_dict(row: OptionLiquidityDaily) -> dict:
         "daily_pctile": row.daily_pctile,
         "n_days_in_median": row.n_days_in_median,
         "expiry_used": row.expiry_used.isoformat() if row.expiry_used else None,
+        "source": row.source,
         "details": json.loads(row.details_json) if row.details_json else {},
         "computed_at": row.computed_at.isoformat() if row.computed_at else None,
     }
@@ -183,6 +230,7 @@ def upsert_scores(as_of_date: _date, rows: list[dict]) -> int:
                     daily_pctile=r.get("daily_pctile"),
                     n_days_in_median=r.get("n_days_in_median"),
                     expiry_used=r.get("expiry_used"),
+                    source=r.get("source"),
                     details_json=json.dumps(r.get("details") or {}, default=str),
                     computed_at=datetime.utcnow(),
                 )
