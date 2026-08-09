@@ -62,8 +62,20 @@ def config():
     import os as _os
 
     from database.open15_breakout_db import get_config, save_config
+
+    # The option-liquidity defaults are read from the SERVICE, never re-derived
+    # here — see the note in the env_defaults block below.
     from services.open15_breakout_service import (
         TRADE_SIDES,
+        _impact_gate_enabled_default,
+        _impact_max_pct_default,
+        _liq_backfill_rank_default,
+        _liq_gate_enabled_default,
+        _liq_max_staleness_default,
+        _liq_min_days_default,
+        _liq_min_pctile_default,
+        _liq_reentry_days_default,
+        _liq_reentry_pctile_default,
         get_open15_service,
     )
     from services.open15_breakout_service import (
@@ -256,32 +268,20 @@ def config():
                 "shadow_max_trades": _clamp_shadow_max_trades(
                     _os.getenv("OPEN15_SHADOW_MAX_TRADES", "3")
                 ),
-                "option_liquidity_gate_enabled": _os.getenv(
-                    "OPEN15_LIQUIDITY_GATE_ENABLED", "true"
-                ).lower()
-                == "true",
-                "option_liquidity_min_pctile": float(
-                    _os.getenv("OPEN15_LIQUIDITY_MIN_PCTILE", "20")
-                ),
-                "option_liquidity_reentry_pctile": float(
-                    _os.getenv("OPEN15_LIQUIDITY_REENTRY_PCTILE", "25")
-                ),
-                "option_liquidity_reentry_days": int(
-                    _os.getenv("OPEN15_LIQUIDITY_REENTRY_DAYS", "3")
-                ),
-                "option_liquidity_min_days": int(_os.getenv("OPEN15_LIQUIDITY_MIN_DAYS", "10")),
-                "option_liquidity_max_staleness_days": int(
-                    _os.getenv("OPEN15_LIQUIDITY_MAX_STALENESS_DAYS", "3")
-                ),
-                "option_liquidity_backfill_rank": _os.getenv(
-                    "OPEN15_LIQUIDITY_BACKFILL_RANK", "true"
-                ).lower()
-                == "true",
-                "option_impact_gate_enabled": _os.getenv(
-                    "OPEN15_IMPACT_GATE_ENABLED", "true"
-                ).lower()
-                == "true",
-                "option_impact_max_pct": float(_os.getenv("OPEN15_IMPACT_MAX_PCT", "2.0")),
+                # Call the SERVICE getters rather than re-deriving from os.getenv.
+                # Duplicating a default in two places is how the UI ends up showing
+                # "on" while the engine resolves "off": this block said "true" while
+                # _liq_gate_enabled_default() said false, and the page rendered a
+                # ticked box for a gate that would never fire. One default, one place.
+                "option_liquidity_gate_enabled": _liq_gate_enabled_default(),
+                "option_liquidity_min_pctile": _liq_min_pctile_default(),
+                "option_liquidity_reentry_pctile": _liq_reentry_pctile_default(),
+                "option_liquidity_reentry_days": _liq_reentry_days_default(),
+                "option_liquidity_min_days": _liq_min_days_default(),
+                "option_liquidity_max_staleness_days": _liq_max_staleness_default(),
+                "option_liquidity_backfill_rank": _liq_backfill_rank_default(),
+                "option_impact_gate_enabled": _impact_gate_enabled_default(),
+                "option_impact_max_pct": _impact_max_pct_default(),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),

@@ -329,3 +329,24 @@ def test_gate_default_is_off():
 
     assert _liq_gate_enabled_default() is False
     assert resolve_day_config(None, 0.0)["option_liquidity_gate_enabled"] is False
+
+
+def test_ui_env_defaults_match_the_service_defaults():
+    """The config API must not re-derive a default the service already owns.
+
+    Caught in the UI walkthrough: the blueprint read
+    ``os.getenv("OPEN15_LIQUIDITY_GATE_ENABLED", "true")`` while the service default
+    had moved to false, so the page rendered a TICKED "exclude illiquid option books"
+    box for a gate that would never fire. Two encodings of one default is how a UI
+    and an engine silently disagree.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path("blueprints/open15_breakout.py").read_text(encoding="utf-8")
+    block = src.split('"env_defaults"', 1)[1].split("},", 1)[0]
+    offenders = re.findall(r'"(option_(?:liquidity|impact)_\w+)":\s*[^,\n]*getenv', block)
+    assert not offenders, (
+        f"env_defaults re-derives {offenders} from os.getenv instead of calling the "
+        "service default getter — the UI and the engine will drift apart"
+    )
