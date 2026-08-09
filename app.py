@@ -134,6 +134,7 @@ from database.journal_reflection_db import init_db as ensure_journal_reflection_
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
 from database.open15_breakout_db import init_db as ensure_open15_tables_exists
+from database.option_liquidity_db import init_db as ensure_option_liquidity_tables_exists
 from database.postmarket_review_db import init_db as ensure_postmarket_review_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
@@ -711,6 +712,7 @@ def setup_environment(app):
                 ("Daily Intent DB", ensure_daily_intent_tables_exists),
                 ("Strategy Daily Intent DB", ensure_strategy_daily_intent_tables_exists),
                 ("Data Health DB", ensure_data_health_tables_exists),
+                ("Option Liquidity DB", ensure_option_liquidity_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Scanner Comparison DB", ensure_scanner_comparison_tables_exists),
