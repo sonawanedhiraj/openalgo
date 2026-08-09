@@ -150,6 +150,16 @@ class Open15Trade(Base):
     # being discarded). Two endpoint snapshots cannot show whether OI was
     # BUILDING or UNWINDING while the position was held; this can.
     opt_liquidity_path = Column(Text, nullable=True)
+
+    # Gate 2, issue #583 — what the MARKET order was projected to pay by walking the
+    # 5 visible ask levels at the trigger, measured from the MID (never the LTP).
+    # ``opt_depth_exhausted`` means those levels could not fill the order at all, in
+    # which case ``opt_impact_pct`` is computed on a PARTIAL fill and UNDERSTATES the
+    # true cost. Recorded on skipped rows too, so a blocked entry can be scored later
+    # against the ones that were allowed through.
+    opt_impact_pct = Column(Float, nullable=True)
+    opt_depth_levels_used = Column(Integer, nullable=True)
+    opt_depth_exhausted = Column(Integer, nullable=True)
     # how this symbol got onto the watch list (issue #529): ``seed`` = the 09:16
     # gap ranking, ``rolling`` = appended by an intraday re-rank. Load-bearing
     # for the measurement — without it the two cohorts cannot be scored apart.
@@ -279,6 +289,9 @@ def _ensure_columns():
             "opt_exit_ask": "FLOAT",
             "opt_tick_size": "FLOAT",
             "opt_liquidity_path": "TEXT",
+            "opt_impact_pct": "FLOAT",
+            "opt_depth_levels_used": "INTEGER",
+            "opt_depth_exhausted": "INTEGER",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
