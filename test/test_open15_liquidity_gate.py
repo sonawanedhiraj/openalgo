@@ -164,8 +164,10 @@ def test_insufficient_history_is_included_not_excluded(monkeypatch):
     monkeypatch.setattr("database.option_liquidity_db.get_daily_pctile_history", lambda *a: {})
     cfg = resolve_day_config(None, 0.0)
     g = build_gate(cfg, dt.date(2026, 8, 10))
-    assert g.stage1("NEW") is None, "too-new must not be treated as illiquid"
-    assert g.stage1("OLD") is not None
+    # ``would_exclude``, not ``stage1``: the shipped default is enforcement OFF, and
+    # stage1 honours that. The VERDICT is what this test is about.
+    assert g.would_exclude("NEW") is None, "too-new must not be treated as illiquid"
+    assert g.would_exclude("OLD") is not None
 
 
 def test_build_gate_fails_open_when_the_read_raises(monkeypatch):
@@ -177,7 +179,7 @@ def test_build_gate_fails_open_when_the_read_raises(monkeypatch):
     monkeypatch.setattr("database.option_liquidity_db.get_latest_scores", _boom)
     g = build_gate(resolve_day_config(None, 0.0), dt.date(2026, 8, 10))
     assert g.have_scores is False
-    assert g.stage1("AAA") is None
+    assert g.would_exclude("AAA") is None, "a failed read must fail OPEN even as a verdict"
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +289,43 @@ def test_gate_respects_trade_side(side_cfg, blocked_side):
     assert "GOOD" not in c.selected or c.selected.get("GOOD") != (
         "L" if blocked_side == "CE" else "S"
     )
+
+
+# ---------------------------------------------------------------------------
+# measure-without-acting (the placebo failed, 2026-08-09)
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_gate_still_records_what_it_would_have_excluded():
+    """Enforcement off must NOT switch off the data that could overturn it.
+
+    Replayed against the R60 July option-leg trades, excluding the real bottom
+    quintile was indistinguishable from excluding the same number of symbols at
+    random (placebo >= real 48.4% / 51.8%), so the gate ships measuring. The
+    exclusions still have to be logged or the cohort never accrues evidence.
+    """
+    g = _gate({("GOOD", "CE"): 4.0})
+    g.enabled = False
+    c = _core(g, top_n=1)
+    c.apply_first_candles(FIRST_CANDLES)
+    c.on_tick("GOOD", 102.0, 1000, t(9, 16, 1))
+    assert c.selected.get("GOOD") == "L", "a disabled gate must not change selection"
+    rec = [e for e in c.liquidity_exclusions if e["symbol"] == "GOOD"]
+    assert rec, "a disabled gate must still RECORD the verdict"
+    assert rec[0]["enforced"] is False
+
+
+def test_enabled_gate_marks_its_exclusions_enforced():
+    c = _core(_gate({("GOOD", "CE"): 4.0}), top_n=1)
+    c.apply_first_candles(FIRST_CANDLES)
+    c.on_tick("GOOD", 102.0, 1000, t(9, 16, 1))
+    assert "GOOD" not in c.selected
+    assert all(e["enforced"] is True for e in c.liquidity_exclusions)
+
+
+def test_gate_default_is_off():
+    """The shipped default must be OFF until the placebo is beaten."""
+    from services.open15_breakout_service import _liq_gate_enabled_default, resolve_day_config
+
+    assert _liq_gate_enabled_default() is False
+    assert resolve_day_config(None, 0.0)["option_liquidity_gate_enabled"] is False

@@ -18,6 +18,34 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 option-liquidity GATES — default OFF, placebo failed (issue #583, 2026-08-09)
+
+`OPEN15_LIQUIDITY_GATE_ENABLED` ships **`false`**, and that is an evidence decision,
+not caution. Replayed against the R60 July backtest restricted to option-leg trades
+(the fair test — the gate only runs in `atm_option` mode), excluding the real bottom
+quintile was **indistinguishable from excluding the same number of symbols at
+random**: placebo >= real in **48.4%** of 20,000 draws on one arm and **51.8%** on the
+other. In the larger arm the excluded trades averaged **+Rs 834** against **+Rs 743**
+for the kept — the gate removes ABOVE-average trades, which is #488's inversion again
+on a bigger sample.
+
+**Scoring stays on and stays logged.** A disabled gate still computes every verdict and
+emits `universe_excluded` with `enforced=false`, so the cohort it wants to drop keeps
+accruing evidence. Switching a rule off must not switch off the data that could
+overturn it.
+
+| Parameter | Default | Note |
+|---|---|---|
+| `OPEN15_LIQUIDITY_GATE_ENABLED` | **`false`** | Gate 1. Measure-only until the placebo is beaten. |
+| `OPEN15_LIQUIDITY_MIN_PCTILE` | `20` | Excludes 33 of 208 CE names on current medians. |
+| `OPEN15_LIQUIDITY_REENTRY_PCTILE` | `25` | Hysteresis band; the API rejects a band below the floor. |
+| `OPEN15_LIQUIDITY_REENTRY_DAYS` | `3` | Clean sessions before readmission. |
+| `OPEN15_LIQUIDITY_MIN_DAYS` | `10` | Below this a symbol is NOT ranked — never scored low. |
+| `OPEN15_LIQUIDITY_MAX_STALENESS_DAYS` | `3` | Beyond it the gate fails OPEN. |
+| `OPEN15_LIQUIDITY_BACKFILL_RANK` | `true` | Seed path only; rolling never backfills. |
+| `OPEN15_IMPACT_GATE_ENABLED` | `true` | Gate 2. **Untested by the placebo** — the backtest has no depth data — but it is a direct "can this order fill" measure and blocks on book exhaustion, which is close to tautological. |
+| `OPEN15_IMPACT_MAX_PCT` | `2.0` | SEBI's LES illiquidity definition, our slot size instead of Rs 1 lakh. |
+
 ### open15 option-liquidity score (issue #583, added 2026-08-09)
 
 Five tunables for the daily option-liquidity sweep. All are code defaults — none is

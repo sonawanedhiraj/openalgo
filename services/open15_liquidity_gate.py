@@ -83,7 +83,7 @@ class LiquidityGate:
     never touches the database.
     """
 
-    enabled: bool
+    enabled: bool  # False = compute and LOG the verdicts, but exclude nothing
     min_pctile: float
     reentry_pctile: float
     reentry_days: int
@@ -102,6 +102,19 @@ class LiquidityGate:
         if not self.have_scores:
             return None  # data gap -> fail OPEN
         return self.excluded_sides.get((symbol, opt_side))
+
+    def would_exclude(self, symbol: str, action_side: str | None = None) -> Exclusion | None:
+        """The verdict IGNORING ``enabled`` — what the gate would do if it acted.
+
+        Used to keep logging exclusions while enforcement is off, so the cohort the
+        gate wants to drop keeps accruing evidence. Switching a rule off must not also
+        switch off the data that could overturn it (the #581 argument).
+        """
+        was, self.enabled = self.enabled, True
+        try:
+            return self.stage2(symbol, action_side) if action_side else self.stage1(symbol)
+        finally:
+            self.enabled = was
 
     # ---- stage 1: arm, side unknown ---------------------------------------
     def stage1(self, symbol: str) -> Exclusion | None:
@@ -190,8 +203,11 @@ def build_gate(cfg: dict, today: dt.date | None = None) -> LiquidityGate:
         reentry_pctile=reentry_pctile,
         reentry_days=reentry_days,
     )
-    if not enabled:
-        return gate
+    # NOTE: a DISABLED gate is still built and still computes every verdict. The
+    # callers ask ``would_exclude`` to log what it would have done and ``stage1`` /
+    # ``stage2`` to decide, and only the latter respect ``enabled``. Since the
+    # placebo failed (2026-08-09) that is the whole point: keep measuring, stop
+    # acting.
 
     try:
         from services.option_liquidity_service import option_underlyings

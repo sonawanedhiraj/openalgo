@@ -326,7 +326,20 @@ def clamp_days(raw, default: int, lo: int = 0, hi: int = 120) -> int:
 
 
 def _liq_gate_enabled_default() -> bool:
-    return os.getenv("OPEN15_LIQUIDITY_GATE_ENABLED", "true").lower() == "true"
+    """OFF by default — the placebo failed it (2026-08-09).
+
+    Replayed against the R60 July backtest, restricted to option-leg trades so the
+    comparison is fair, excluding the real bottom quintile was **indistinguishable
+    from excluding the same number of symbols at random** in both arms (placebo >=
+    real 48.4% and 51.8%). Worse, in the larger arm the excluded trades averaged
+    +Rs 834 against +Rs 743 for the kept ones — the gate removes ABOVE-average
+    trades, which is #488's inversion showing up again on a bigger sample.
+
+    The scoring stays on and stays logged (``universe_excluded`` with
+    ``enforced=false``), because the measurement is cheap, harmless, and the only
+    thing that can eventually overturn this. Enforcement waits for evidence.
+    """
+    return os.getenv("OPEN15_LIQUIDITY_GATE_ENABLED", "false").lower() == "true"
 
 
 def _liq_min_pctile_default() -> float:
@@ -976,7 +989,11 @@ class Open15Core:
         if self.liquidity_gate is None:
             return False
         try:
-            ex = self.liquidity_gate.stage2(symbol, side)
+            # ``would_exclude`` ignores the enabled flag so a DISABLED gate still
+            # RECORDS its verdict; only the return value below respects it. The
+            # placebo failed (2026-08-09), so the gate measures rather than acts.
+            ex = self.liquidity_gate.would_exclude(symbol, side)
+            enforced = bool(getattr(self.liquidity_gate, "enabled", False))
         except Exception:
             # a broken gate must never cost a selection — fail OPEN
             logger.exception("open15: liquidity gate raised for %s/%s", symbol, side)
@@ -986,8 +1003,9 @@ class Open15Core:
         rec = ex.as_event()
         rec["watch_source"] = watch_source
         rec["stage"] = 2
+        rec["enforced"] = enforced
         self.liquidity_exclusions.append(rec)
-        return True
+        return enforced
 
     def _take_top_n(self, ranked: list[str], side: str) -> list[str]:
         """The first ``top_n`` names on ``ranked`` that clear the per-side gate.
@@ -1431,21 +1449,23 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: liquidity gate build failed — gate OFF for the day")
             return None, excluded
-        if not gate.enabled:
-            return gate, excluded
-
         keep: set[str] = set()
         for sym in sorted(self.universe):
             try:
-                ex = gate.stage1(sym)
+                # ``would_exclude`` ignores the enabled flag, so a DISABLED gate still
+                # records its verdict. The placebo failed on 2026-08-09, so the gate
+                # ships measuring rather than acting — and switching a rule off must
+                # not switch off the data that could overturn it.
+                ex = gate.would_exclude(sym)
             except Exception:
                 logger.exception("open15: stage-1 gate raised for %s — keeping it", sym)
                 ex = None
-            if ex is None:
+            if ex is None or not gate.enabled:
                 keep.add(sym)
-            else:
+            if ex is not None:
                 rec = ex.as_event()
                 rec["stage"] = 1
+                rec["enforced"] = bool(gate.enabled)
                 excluded.append(rec)
         if excluded:
             self.universe = keep
@@ -1455,6 +1475,7 @@ class Open15BreakoutService:
                 n_excluded=len(excluded),
                 n_watched=len(keep),
                 min_pctile=self.day_config["option_liquidity_min_pctile"],
+                enforced=bool(gate.enabled),
                 symbols=excluded,
             )
             no_contracts = [e["symbol"] for e in excluded if e["reason"] == "no_option_contracts"]
