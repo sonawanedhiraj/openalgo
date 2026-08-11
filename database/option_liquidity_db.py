@@ -26,7 +26,7 @@ means "not enough history to rank this symbol honestly" — never "illiquid".
 import json
 import os
 from datetime import date as _date
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import (
     Column,
@@ -245,6 +245,27 @@ def upsert_scores(as_of_date: _date, rows: list[dict]) -> int:
         db_session.remove()
 
 
+def has_scores_for(as_of_date: _date) -> bool:
+    """True when at least one row exists for ``as_of_date``.
+
+    The convergence loop's probe (issue #589): cheap enough to run every tick.
+    Fails towards ``False`` — a re-sweep is harmless (``upsert_scores`` replaces
+    the day), whereas skipping one leaves a permanent hole.
+    """
+    try:
+        return (
+            db_session.query(OptionLiquidityDaily.id)
+            .filter(OptionLiquidityDaily.as_of_date == as_of_date)
+            .first()
+            is not None
+        )
+    except Exception:
+        logger.exception("option_liquidity: has_scores_for probe failed")
+        return False
+    finally:
+        db_session.remove()
+
+
 def get_scores_for_date(as_of_date: _date) -> list[dict]:
     """Every (symbol, side) row for one date."""
     try:
@@ -259,14 +280,55 @@ def get_scores_for_date(as_of_date: _date) -> list[dict]:
         db_session.remove()
 
 
+def sessions_behind(as_of: _date, ref: _date, cap: int = 40) -> int:
+    """Trading days in ``(as_of, ref]`` — how many sessions the score has missed.
+
+    A weekend or an NSE holiday contributes **zero**: Friday's scores are 0
+    sessions behind on Saturday and Sunday, 1 on Monday, and still 1 on the
+    Tuesday after a Monday holiday (issue #589 — calendar-day staleness went
+    dark on 2026-08-11 with the scores a single session old, and would do so
+    again every long weekend, e.g. Tue 2026-09-15 after Ganesh Chaturthi).
+
+    Delegates to ``data_freshness_service.is_trading_day`` (weekday AND not a
+    ``market_holidays`` row, fail-open per #253). If that import or call ever
+    raises, this degrades to weekday-only counting rather than failing — a
+    broken calendar must not dark the gate. The walk is capped at ``cap``
+    calendar days: anything that far back is stale under every convention.
+    """
+    try:
+        from services.data_freshness_service import is_trading_day
+    except Exception:  # circular-import guard — weekday-only fallback
+        logger.exception("option_liquidity: is_trading_day import failed — weekday fallback")
+
+        def is_trading_day(d, exchange=None):
+            return d.weekday() < 5
+
+    n = 0
+    d = as_of + timedelta(days=1)
+    end = min(ref, as_of + timedelta(days=cap))
+    while d <= end:
+        try:
+            if is_trading_day(d):
+                n += 1
+        except Exception:
+            if d.weekday() < 5:
+                n += 1
+        d += timedelta(days=1)
+    if ref > as_of + timedelta(days=cap):
+        n += 1  # walk capped: force "behind" past the horizon regardless
+    return n
+
+
 def get_latest_scores(max_age_days: int | None = None, today: _date | None = None) -> dict:
     """Latest scored day, as ``{(symbol, side): row}``.
 
-    Returns ``{}`` when nothing has been scored, or when the newest scored day is
-    older than ``max_age_days``. Consumers MUST treat an empty result as *"we have
-    no data"* and fail OPEN — never as *"everything is illiquid"*. Darkening a
-    universe because a collection job failed is the failure shape issue #390 was
-    filed for.
+    Returns ``{}`` when nothing has been scored, or when the newest scored day
+    is more than ``max_age_days`` **trading sessions** behind ``today`` (issue
+    #589 — sessions, not calendar days, so weekends and NSE holidays never
+    burn the budget). Consumers MUST treat an empty result as *"we have no
+    data"* and fail OPEN — never as *"everything is illiquid"*. Darkening a
+    universe because a collection job failed is the failure shape issue #390
+    was filed for.
     """
     try:
         newest = (
@@ -279,11 +341,14 @@ def get_latest_scores(max_age_days: int | None = None, today: _date | None = Non
         as_of = newest[0]
         if max_age_days is not None:
             ref = today or datetime.now().date()
-            if (ref - as_of).days > max_age_days:
+            behind = sessions_behind(as_of, ref)
+            if behind > max_age_days:
                 logger.warning(
-                    "option_liquidity: newest score is %s, older than %d days — "
-                    "callers must fail OPEN",
+                    "option_liquidity: newest score is %s, %d trading sessions behind "
+                    "%s (max %d) — callers must fail OPEN",
                     as_of,
+                    behind,
+                    ref,
                     max_age_days,
                 )
                 return {}

@@ -63,11 +63,16 @@ from __future__ import annotations
 import datetime as dt
 import os
 import statistics
+import threading as _threading
 from typing import Any
+
+import pytz
 
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_IST = pytz.timezone("Asia/Kolkata")
 
 _DEFAULT_TIME = "15:45"
 
@@ -658,6 +663,107 @@ def _eod_job() -> None:
         logger.exception("option_liquidity: EOD job failed")
 
 
+# ---------------------------------------------------------------------------
+# Missed-sweep convergence (issue #589)
+# ---------------------------------------------------------------------------
+#
+# The 15:45 cron is the only writer, so an app that is down at 15:45 leaves a
+# permanent hole in the score history — the gate then goes stale and fails
+# open. The quote sweep stays valid ANY time after close the same day (the
+# broker quote's ``volume`` is the day's cumulative until the next session
+# opens), so a boot or periodic tick later the same evening can still recover
+# the day. Mirrors the sector_follow / scanner backfill convergence pattern.
+#
+# The tick can NOT recover a fully-missed day the next morning: the quote
+# volume has reset and ``sweep_is_credible`` would (correctly) refuse the
+# all-zero sweep. That gap is what the trading-day-aware staleness in
+# ``get_latest_scores`` absorbs.
+
+_CONV_INTERVAL_SEC = 20 * 60
+#: Let the 15:45 cron fire first — the convergence is a backstop, not a race.
+_CONV_GRACE_MIN = 10
+
+_conv_stop = _threading.Event()
+_conv_thread: _threading.Thread | None = None
+
+
+def _convergence_enabled() -> bool:
+    return os.getenv("OPTION_LIQUIDITY_CONVERGENCE_ENABLED", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _convergence_tick(now: dt.datetime | None = None) -> bool:
+    """Run the sweep iff today is a scoreable, unscored trading day past the
+    sweep time. Returns True when a sweep was attempted. Never raises."""
+    try:
+        if not _enabled() or not _convergence_enabled():
+            return False
+        now = now or dt.datetime.now(_IST)
+        today = now.date()
+        from services.data_freshness_service import is_trading_day
+
+        if not is_trading_day(today):
+            return False
+        hour, minute = _parse_hh_mm(os.environ.get("OPTION_LIQUIDITY_EOD_TIME", _DEFAULT_TIME))
+        total = min(hour * 60 + minute + _CONV_GRACE_MIN, 23 * 60 + 59)
+        earliest = dt.time(total // 60, total % 60)
+        if now.time() < earliest:
+            return False
+        from database.option_liquidity_db import has_scores_for
+
+        if has_scores_for(today):
+            return False
+        logger.warning(
+            "option_liquidity: no scores for %s after the %02d:%02d sweep time — "
+            "running catch-up sweep (issue #589)",
+            today,
+            hour,
+            minute,
+        )
+        run_for_date(today)
+        return True
+    except Exception:
+        logger.exception("option_liquidity: convergence tick failed")
+        return False
+
+
+def _convergence_loop() -> None:
+    from services.thread_registry import beat as _beat
+
+    logger.info("option_liquidity convergence loop started (every %ds)", _CONV_INTERVAL_SEC)
+    while not _conv_stop.is_set():
+        _beat("OptionLiquidityConvergence")
+        _convergence_tick()
+        _conv_stop.wait(_CONV_INTERVAL_SEC)
+    logger.info("option_liquidity convergence loop stopped")
+
+
+def start_convergence_loop() -> bool:
+    """Start the catch-up daemon (idempotent). Returns True when started."""
+    global _conv_thread
+    if not _convergence_enabled():
+        logger.info(
+            "option_liquidity convergence disabled (OPTION_LIQUIDITY_CONVERGENCE_ENABLED!=true)"
+        )
+        return False
+    if _conv_thread is not None and _conv_thread.is_alive():
+        return False
+    _conv_stop.clear()
+    _conv_thread = _threading.Thread(
+        target=_convergence_loop, daemon=True, name="OptionLiquidityConvergence"
+    )
+    _conv_thread.start()
+    return True
+
+
+def stop_convergence_loop() -> None:
+    """Signal the loop to exit (tests / shutdown)."""
+    _conv_stop.set()
+
+
 def register_jobs(scheduler=None) -> None:
     """Register the daily sweep on the shared Historify scheduler.
 
@@ -695,6 +801,9 @@ def init_option_liquidity_service(scheduler=None) -> None:
     except Exception:
         logger.exception("option_liquidity: table init failed")
     register_jobs(scheduler)
+    # Missed-sweep catch-up (issue #589): an evening boot after a 15:45 outage
+    # recovers today's score instead of leaving a permanent hole.
+    start_convergence_loop()
 
 
 # ---------------------------------------------------------------------------

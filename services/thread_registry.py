@@ -128,6 +128,21 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_GUARDED,
     ),
     ThreadSpec(
+        thread_name="OptionLiquidityConvergence",
+        label="Option-liquidity missed-sweep catch-up",
+        group=GROUP_LOOP,
+        owner="services/option_liquidity_service.py",
+        description=(
+            "After the 15:45 sweep time on a trading day, re-runs the "
+            "option-liquidity sweep if today has no score rows (issue #589) — "
+            "an evening boot after an outage recovers the day."
+        ),
+        cadence_sec=20 * 60,
+        window="15:55-24:00 IST, trading days",
+        env_flag="OPTION_LIQUIDITY_CONVERGENCE_ENABLED",
+        tier=TIER_FREE,
+    ),
+    ThreadSpec(
         thread_name="ScannerStragglerRecheck",
         label="Scanner straggler re-check",
         group=GROUP_LOOP,

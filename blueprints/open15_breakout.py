@@ -526,7 +526,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label class="muted">min days
    <input id="c_liqmindays" type="number" min="1" max="120" step="1" style="width:44px"></label>
   <label class="muted" style="margin-left:10px">max staleness
-   <input id="c_liqstale" type="number" min="0" max="60" step="1" style="width:44px"> d</label>
+   <input id="c_liqstale" type="number" min="0" max="60" step="1" style="width:44px"> sessions</label>
   <label style="margin-left:14px"><input id="c_impactgate" type="checkbox"> skip on impact cost</label>
   <label class="muted" style="margin-left:10px">above
    <input id="c_impactmax" type="number" min="0" max="100" step="0.5" style="width:52px"> %</label>

@@ -475,3 +475,118 @@ def test_registered_job_id_is_catalogued():
     from services.scheduler_registry import CATALOG
 
     assert any(j.job_id == "option_liquidity_eod" for j in CATALOG)
+
+
+# ---------------------------------------------------------------------------
+# Trading-day-aware staleness (issue #589)
+# ---------------------------------------------------------------------------
+
+
+def test_sessions_behind_weekend_counts_zero(_db):
+    """Friday's scores are 0 sessions behind all weekend, 1 on Monday, 2 on
+    Tuesday. (The temp DB has no 2026 holiday rows, so ``is_trading_day``
+    fail-opens to weekday-only — deterministic here.)"""
+    fri = dt.date(2026, 8, 7)
+    assert _db.sessions_behind(fri, dt.date(2026, 8, 8)) == 0  # Sat
+    assert _db.sessions_behind(fri, dt.date(2026, 8, 9)) == 0  # Sun
+    assert _db.sessions_behind(fri, dt.date(2026, 8, 10)) == 1  # Mon
+    assert _db.sessions_behind(fri, dt.date(2026, 8, 11)) == 2  # Tue
+
+
+def test_the_2026_08_11_outage_shape_stays_fresh(_db):
+    """The exact regression that filed #589: Friday scores + weekend + one-day
+    outage = 4 CALENDAR days read as stale, with the data only 2 SESSIONS old.
+    The gate must keep its data here."""
+    _db.upsert_scores(dt.date(2026, 8, 7), [_row("A", "CE", 10.0)])
+    fresh = _db.get_latest_scores(max_age_days=3, today=dt.date(2026, 8, 11))
+    assert fresh and ("A", "CE") in fresh
+
+
+def test_holiday_monday_does_not_burn_the_staleness_budget(_db, monkeypatch):
+    """Fri 2026-09-11 scores at Tue 09-15's arm, with Ganesh Chaturthi Monday
+    (09-14) in between: 1 session behind -> fresh. The pre-#589 calendar check
+    read this healthy long weekend as 4 days = stale."""
+    holiday = dt.date(2026, 9, 14)
+    monkeypatch.setattr(
+        "services.data_freshness_service.is_trading_day",
+        lambda d, exchange=None: d.weekday() < 5 and d != holiday,
+    )
+    assert _db.sessions_behind(dt.date(2026, 9, 11), dt.date(2026, 9, 15)) == 1
+    _db.upsert_scores(dt.date(2026, 9, 11), [_row("A", "CE", 10.0)])
+    fresh = _db.get_latest_scores(max_age_days=3, today=dt.date(2026, 9, 15))
+    assert fresh and ("A", "CE") in fresh
+
+
+def test_genuinely_stale_scores_still_fail_open(_db):
+    """More than max_age_days SESSIONS behind -> empty dict, callers fail open.
+    Fri 08-07 .. Fri 08-14 = 5 sessions."""
+    _db.upsert_scores(dt.date(2026, 8, 7), [_row("A", "CE", 10.0)])
+    assert _db.get_latest_scores(max_age_days=3, today=dt.date(2026, 8, 14)) == {}
+
+
+def test_sessions_behind_walk_is_capped(_db):
+    """A gap past the cap horizon reports behind regardless — no unbounded walk."""
+    assert _db.sessions_behind(dt.date(2026, 1, 1), dt.date(2026, 8, 1)) > 3
+
+
+# ---------------------------------------------------------------------------
+# Missed-sweep convergence loop (issue #589)
+# ---------------------------------------------------------------------------
+
+
+def _ist(y, mo, d, h, mi):
+    import pytz
+
+    return pytz.timezone("Asia/Kolkata").localize(dt.datetime(y, mo, d, h, mi))
+
+
+@pytest.fixture()
+def _conv(monkeypatch):
+    """Common convergence-tick harness: trading day, records run_for_date calls."""
+    calls = []
+    monkeypatch.setattr(
+        "services.data_freshness_service.is_trading_day", lambda d, exchange=None: True
+    )
+    monkeypatch.setattr(ols, "run_for_date", lambda *a, **k: calls.append(a) or {"status": "ok"})
+    monkeypatch.setattr("database.option_liquidity_db.has_scores_for", lambda d: False)
+    return calls
+
+
+def test_convergence_runs_when_day_unscored_after_sweep_time(_conv):
+    # Tue 2026-08-11 16:30 IST, trading day, no rows -> catch-up sweep
+    assert ols._convergence_tick(_ist(2026, 8, 11, 16, 30)) is True
+    assert len(_conv) == 1
+
+
+def test_convergence_waits_for_the_cron_grace(_conv):
+    # 15:50 is inside the 15:45+10min grace — the cron fire owns the slot
+    assert ols._convergence_tick(_ist(2026, 8, 11, 15, 50)) is False
+    assert _conv == []
+
+
+def test_convergence_noops_when_day_already_scored(_conv, monkeypatch):
+    monkeypatch.setattr("database.option_liquidity_db.has_scores_for", lambda d: True)
+    assert ols._convergence_tick(_ist(2026, 8, 11, 16, 30)) is False
+    assert _conv == []
+
+
+def test_convergence_noops_on_non_trading_day(_conv, monkeypatch):
+    monkeypatch.setattr(
+        "services.data_freshness_service.is_trading_day", lambda d, exchange=None: False
+    )
+    assert ols._convergence_tick(_ist(2026, 8, 9, 16, 30)) is False
+    assert _conv == []
+
+
+def test_convergence_respects_its_flag(_conv, monkeypatch):
+    monkeypatch.setenv("OPTION_LIQUIDITY_CONVERGENCE_ENABLED", "false")
+    assert ols._convergence_tick(_ist(2026, 8, 11, 16, 30)) is False
+    assert _conv == []
+
+
+def test_convergence_thread_is_catalogued():
+    """``test_thread_registry`` enforces this globally; asserting here names the
+    thread if it drifts."""
+    from services.thread_registry import CATALOG
+
+    assert any(t.thread_name == "OptionLiquidityConvergence" for t in CATALOG)
