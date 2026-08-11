@@ -2251,6 +2251,32 @@ ran in the 15:30-17:00 periodic window).
 - **History:**
   - **2026-08-07:** Introduced by issue #562.
 
+## `OPTION_LIQUIDITY_CONVERGENCE_ENABLED` (default `true`) + staleness unit change (issue #589)
+
+- **What:** two related changes from issue #589 / PR #590:
+  1. **NEW flag `OPTION_LIQUIDITY_CONVERGENCE_ENABLED`** (default `true`) — gates
+     the `OptionLiquidityConvergence` daemon loop (20 min tick): after
+     15:55 IST on a trading day whose `option_liquidity_daily` rows are missing,
+     it re-runs the sweep. The quote sweep stays valid until the next session
+     opens, so an evening boot after a missed 15:45 recovers the day. It never
+     attempts next-morning recovery (quote volumes reset; `sweep_is_credible`
+     would refuse the all-zero sweep).
+  2. **Semantics change, no default change:** the gate-consumer staleness
+     (`get_latest_scores(max_age_days)`, surfaced in the open15 config as
+     `option_liquidity_max_staleness_days`, default 3) now counts **trading
+     sessions** via `data_freshness_service.is_trading_day`, not calendar days.
+     Weekends and NSE holidays no longer burn the budget — pre-#589 the gate
+     went dark every long weekend (observed 2026-08-11: Friday scores read as
+     "4 days stale" when 2 sessions old; Tue 2026-09-15 after Ganesh Chaturthi
+     would have repeated it with the app healthy).
+- **Why:** a gate that silently switches itself off on ordinary holiday
+  weekends produces an uninterpretable exclusion cohort, and a single missed
+  15:45 sweep left a permanent score hole.
+- **How to roll back:** `OPTION_LIQUIDITY_CONVERGENCE_ENABLED=false` stops the
+  catch-up loop; the sessions-based staleness has no flag (it is the bug fix).
+- **History:**
+  - **2026-08-11:** Introduced by issue #589 / PR #590.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
