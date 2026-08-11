@@ -891,6 +891,16 @@ def _boot_worker(
         )
         return
 
+    # Login triggers the master-contract download, so a session appearing means
+    # a SymToken swap may be in flight — wait it out (fail-open) before the
+    # per-symbol broker fallback fetches start (issue #587).
+    try:
+        from services.broker_session_health import wait_for_master_contract_ready
+
+        wait_for_master_contract_ready()
+    except Exception:
+        logger.exception("aggregator_seeder: master-contract gate raised — proceeding")
+
     start_ts = _time.monotonic()
     summary = seed_aggregator(aggregator, symbols, bar_15m_history=bar_15m_history)
     elapsed = _time.monotonic() - start_ts

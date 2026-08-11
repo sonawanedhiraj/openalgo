@@ -24,10 +24,18 @@ existing ``BrokerSessionRefreshedEvent`` bus instead of polling.
 from __future__ import annotations
 
 import importlib
+import os
+import time
 
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# How long boot fetch workers wait for the master-contract download before
+# proceeding anyway (fail-open). The download normally takes ~20-30s; the
+# status DB auto-fails a download stuck >5min, which terminates the wait early.
+_DEFAULT_MC_GATE_TIMEOUT_SEC = 240
+_MC_GATE_POLL_SEC = 2.0
 
 
 def _broker_response_indicates_failure(funds_data) -> str | None:
@@ -126,3 +134,96 @@ def is_live_broker_session() -> bool:
     except Exception:
         logger.exception("broker_session_health: live-session probe raised")
         return False
+
+
+def _active_broker() -> str | None:
+    """Return the broker of the first non-revoked auth row, or None."""
+    try:
+        from database.auth_db import Auth
+
+        auth_obj = Auth.query.filter_by(is_revoked=False).first()
+        return auth_obj.broker if auth_obj and auth_obj.broker else None
+    except Exception:
+        logger.exception("broker_session_health: active-broker lookup raised")
+        return None
+
+
+def wait_for_master_contract_ready(
+    deadline_sec: int | None = None,
+    poll_sec: float = _MC_GATE_POLL_SEC,
+    stop_event=None,
+) -> bool:
+    """Wait (bounded) for the active broker's master-contract download to finish.
+
+    The daily download fires on broker login — the same instant boot-time
+    backfill workers see a live session — and while it swaps the SymToken
+    table a concurrent token lookup can race the refresh (issue #587). Boot
+    fetch workers call this AFTER the session wait and proceed regardless of
+    the outcome (fail-open): only ``pending``/``downloading`` are worth
+    waiting out; on ``error``/``unknown``/timeout the table still holds the
+    previous contract, which the fetches can use.
+
+    Returns True when the status reached ``success``, False otherwise (the
+    caller should proceed either way). Never raises. Gated by
+    ``MASTER_CONTRACT_BOOT_GATE_ENABLED`` (default true).
+    """
+    if os.getenv("MASTER_CONTRACT_BOOT_GATE_ENABLED", "true").lower() != "true":
+        return True
+
+    if deadline_sec is None:
+        try:
+            deadline_sec = int(
+                os.getenv(
+                    "MASTER_CONTRACT_BOOT_GATE_TIMEOUT_SEC", str(_DEFAULT_MC_GATE_TIMEOUT_SEC)
+                )
+            )
+        except ValueError:
+            deadline_sec = _DEFAULT_MC_GATE_TIMEOUT_SEC
+
+    broker = _active_broker()
+    if not broker:
+        return True
+
+    try:
+        from database.master_contract_status_db import get_status
+    except Exception:
+        logger.exception("broker_session_health: master_contract_status_db unavailable")
+        return False
+
+    start = time.monotonic()
+    deadline = start + deadline_sec
+    while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        try:
+            status = str(get_status(broker).get("status", "unknown")).lower()
+        except Exception:
+            logger.exception("broker_session_health: master-contract status read raised")
+            return False
+        if status == "success":
+            elapsed = time.monotonic() - start
+            if elapsed > poll_sec:
+                logger.info(
+                    "broker_session_health: master contract ready for %s after %.1fs",
+                    broker,
+                    elapsed,
+                )
+            return True
+        if status not in ("pending", "downloading"):
+            logger.warning(
+                "broker_session_health: master contract status=%s for %s — "
+                "proceeding with the previous contract",
+                status,
+                broker,
+            )
+            return False
+        if stop_event is not None:
+            stop_event.wait(poll_sec)
+        else:
+            time.sleep(poll_sec)
+    logger.warning(
+        "broker_session_health: master contract not ready for %s after %ds — proceeding anyway",
+        broker,
+        deadline_sec,
+    )
+    return False

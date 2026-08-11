@@ -52,36 +52,28 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
-def delete_symtoken_table():
-    logger.info("Deleting Symtoken Table")
-    SymToken.query.delete()
-    db_session.commit()
+def replace_symtoken_table(df):
+    """Atomically replace the SymToken table contents with the given dataframe.
 
-
-def copy_from_dataframe(df):
-    logger.info("Performing Bulk Insert")
-    # Convert DataFrame to a list of dictionaries
+    The DELETE and the bulk INSERT MUST share one transaction (single commit):
+    concurrent readers on their own connections keep seeing the previous
+    contract until the commit lands, so there is never an empty-table window
+    in which token lookups fail (issue #587). A failed insert rolls back to
+    the previous contract — never an empty table — and propagates so the
+    download is reported as an error instead of a silent success.
+    """
+    logger.info("Replacing Symtoken Table (atomic swap)")
     data_dict = df.to_dict(orient="records")
-
-    # Retrieve existing tokens to filter them out from the insert
-    existing_tokens = {result.token for result in db_session.query(SymToken.token).all()}
-
-    # Filter out data_dict entries with tokens that already exist
-    filtered_data_dict = [row for row in data_dict if row["token"] not in existing_tokens]
-
-    # Insert in bulk the filtered records
     try:
-        if filtered_data_dict:  # Proceed only if there's anything to insert
-            db_session.bulk_insert_mappings(SymToken, filtered_data_dict)
-            db_session.commit()
-            logger.info(
-                f"Bulk insert completed successfully with {len(filtered_data_dict)} new records."
-            )
-        else:
-            logger.info("No new records to insert.")
-    except Exception as e:
-        logger.error(f"Error during bulk insert: {e}")
+        SymToken.query.delete()
+        if data_dict:
+            db_session.bulk_insert_mappings(SymToken, data_dict)
+        db_session.commit()
+        logger.info(f"Symtoken swap committed with {len(data_dict)} records.")
+    except Exception:
         db_session.rollback()
+        logger.exception("Symtoken swap failed — previous contract retained")
+        raise
 
 
 def download_csv_zerodha_data(output_path):
@@ -409,8 +401,7 @@ def master_contract_download():
 
         # token_df = token_df.drop_duplicates(subset='symbol', keep='first')
 
-        delete_symtoken_table()  # Consider the implications of this action
-        copy_from_dataframe(token_df)
+        replace_symtoken_table(token_df)
 
         return socketio.emit(
             "master_contract_download", {"status": "success", "message": "Successfully Downloaded"}
