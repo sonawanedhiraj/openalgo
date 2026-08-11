@@ -18,6 +18,21 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 ATM lot-cost coverage ladder (issue #591, added 2026-08-11)
+
+Observational only — the 09:10 arm emits one `atm_lot_cost` decision-log event
+(priced from the previous EOD option-liquidity sweep, zero broker calls) and the
+`/open15_vol_breakout/logs` page renders it as the coverage-ladder card. Nothing
+gates or trades on any of it. First real data (2026-08-11 sweep): cover-all was
+Rs 46,650 (MANAPPURAM costliest), 90% coverage Rs 26,531 — read the ladder on a
+**post-rollover (cycle-start) day** before resizing `capital/slot`, because ATM
+premiums decay through the expiry cycle and jump at rollover.
+
+| Parameter | Default | Note |
+|---|---|---|
+| `OPEN15_ATM_LOT_COST_ENABLED` | `true` | Per-arm gate on the event. Off = no card for that day; nothing else changes. |
+| `OPEN15_COVERAGE_TARGET_PCT` | `90` | The "cover MOST" ladder row. Clamped 50–100; UI-overridable via `open15_config.coverage_target_pct` (NULL = env default), applied at the next 09:10 arm. |
+
 ### open15 option-liquidity GATES — default OFF, placebo failed (issue #583, 2026-08-09)
 
 `OPEN15_LIQUIDITY_GATE_ENABLED` ships **`false`**, and that is an evidence decision,
