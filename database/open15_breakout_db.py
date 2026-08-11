@@ -255,6 +255,9 @@ class Open15Config(Base):
     option_liquidity_backfill_rank = Column(Integer, nullable=True)  # 0/1 - seed path only
     option_impact_gate_enabled = Column(Integer, nullable=True)  # 0/1 - Gate 2
     option_impact_max_pct = Column(Float, nullable=True)  # SEBI LES shape, our slot size
+    # ATM lot-cost coverage ladder target % (issue #591). NULL = env default (90);
+    # clamped 50..100 by the service. Observational only — nothing gates on it.
+    coverage_target_pct = Column(Integer, nullable=True)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -327,6 +330,8 @@ def _ensure_columns():
             # the env default (OFF), so the next arm behaves exactly as before
             "shadow_excluded_side": "INTEGER",
             "shadow_max_trades": "INTEGER",
+            # issue #591 — NULL resolves to the env default (90)
+            "coverage_target_pct": "INTEGER",
         },
     }
     try:
@@ -399,6 +404,8 @@ def get_config() -> dict | None:
                 else bool(row.option_impact_gate_enabled)
             ),
             "option_impact_max_pct": row.option_impact_max_pct,
+            # issue #591 — None stays None so env supplies the default
+            "coverage_target_pct": row.coverage_target_pct,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -433,6 +440,7 @@ def save_config(
     option_liquidity_backfill_rank: bool | None = None,
     option_impact_gate_enabled: bool | None = None,
     option_impact_max_pct: float | None = None,
+    coverage_target_pct: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -476,6 +484,7 @@ def save_config(
             None if option_impact_gate_enabled is None else int(bool(option_impact_gate_enabled))
         )
         row.option_impact_max_pct = option_impact_max_pct
+        row.coverage_target_pct = coverage_target_pct
         row.updated_by = updated_by
         db_session.commit()
         return True

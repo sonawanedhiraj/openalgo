@@ -199,6 +199,26 @@ def _fill_reconcile_enabled() -> bool:
     return os.getenv("OPEN15_FILL_RECONCILE_ENABLED", "true").lower() == "true"
 
 
+def _atm_lot_cost_enabled() -> bool:
+    """Daily ATM lot-cost coverage-ladder event at arm (issue #591, observational)."""
+    return os.getenv("OPEN15_ATM_LOT_COST_ENABLED", "true").lower() == "true"
+
+
+_COVERAGE_TARGET_DEFAULT = 90
+
+
+def clamp_coverage_target(v) -> int:
+    """Coverage-target % for the lot-cost ladder, clamped 50..100 (issue #591)."""
+    try:
+        return max(50, min(int(float(v)), 100))
+    except (TypeError, ValueError):
+        return _COVERAGE_TARGET_DEFAULT
+
+
+def _coverage_target_default() -> int:
+    return clamp_coverage_target(os.getenv("OPEN15_COVERAGE_TARGET_PCT", "90"))
+
+
 def _instrument_default() -> str:
     """What the entry BUYS: the stock itself, or its ATM option (issue #437)."""
     v = os.getenv("OPEN15_INSTRUMENT", "stock").lower()
@@ -814,6 +834,13 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
             _impact_max_pct_default()
             if cfg.get("option_impact_max_pct") is None
             else clamp_pctile(cfg.get("option_impact_max_pct"), _impact_max_pct_default())
+        ),
+        # ATM lot-cost coverage ladder (issue #591) — the "most of the universe"
+        # the operator wants covered, as a percentile of priced names
+        "coverage_target_pct": (
+            _coverage_target_default()
+            if cfg.get("coverage_target_pct") is None
+            else clamp_coverage_target(cfg.get("coverage_target_pct"))
         ),
     }
 
@@ -1657,6 +1684,26 @@ class Open15BreakoutService:
             option_liquidity_excluded=sorted(e["symbol"] for e in stage1_excluded),
             option_liquidity_universe_after=len(self.universe),
         )
+        # ATM lot-cost coverage ladder (issue #591) — what capital/slot covers
+        # how much of the universe, priced from the latest EOD option-liquidity
+        # sweep (zero broker calls). Purely observational: a failure or a
+        # missing/stale sweep skips the event, never the trading day.
+        if _atm_lot_cost_enabled():
+            try:
+                from services.open15_atm_lot_cost import compute_event
+
+                ev = compute_event(
+                    self.universe,
+                    self.day_config["margin_effective"],
+                    self.day_config["coverage_target_pct"],
+                    now.date(),
+                )
+                if ev:
+                    self._log_event("atm_lot_cost", **ev)
+                else:
+                    logger.info("open15: atm_lot_cost skipped — no usable liquidity sweep")
+            except Exception:
+                logger.exception("open15: atm_lot_cost ladder failed — skipped (observational)")
         self._ensure_zmq_thread()
         if _opt_shadow_enabled() or _fill_reconcile_enabled():
             # catch-up pricing for rows the 09:35 broker-lag left unpriced (the
