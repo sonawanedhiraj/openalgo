@@ -741,6 +741,15 @@ def _boot_worker() -> None:
 
     _beat("ScannerBackfillBoot")
     if _wait_for_broker_session():
+        # Login triggers the master-contract download, so a session appearing
+        # means a SymToken swap may be in flight — wait it out (fail-open)
+        # before the resettle/stale fetches start (issue #587).
+        try:
+            from services.broker_session_health import wait_for_master_contract_ready
+
+            wait_for_master_contract_ready(stop_event=_stop_event)
+        except Exception:
+            logger.exception("scanner backfill: master-contract gate raised — proceeding")
         # Serialise the convergence work against sibling schedulers so the four
         # boot backfill jobs don't burst onto historify.duckdb simultaneously
         # (see services/boot_convergence.py and issue #140).
