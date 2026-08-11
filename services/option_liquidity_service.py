@@ -403,10 +403,34 @@ def score_band(contracts: list[dict], quotes: dict[tuple[str, str], dict]) -> di
         if sp["pct"] is not None:
             spreads.append(sp["pct"])
 
+    # The ATM contract itself (issue #591): ``contracts`` arrive sorted nearest-
+    # strike-first from resolve_band, so [0] is the money. Its LTP x lot size is
+    # the capital one lot costs — the open15 coverage ladder's input. Recorded
+    # only when the ATM contract's own quote came back with a positive LTP;
+    # a zero/absent quote stays None rather than pretending the lot is free.
+    atm_strike = atm_ltp = atm_lot_cost = None
+    atm_lot_size = None
+    if contracts:
+        atm_q = quotes.get((contracts[0]["symbol"], "NFO")) or {}
+        try:
+            ltp0 = float(atm_q.get("ltp") or 0)
+        except (TypeError, ValueError):
+            ltp0 = 0.0
+        lot0 = contracts[0].get("lotsize")
+        if ltp0 > 0 and lot0:
+            atm_strike = float(contracts[0]["strike"])
+            atm_ltp = round(ltp0, 2)
+            atm_lot_size = int(lot0)
+            atm_lot_cost = round(ltp0 * int(lot0), 2)
+
     return {
         "atm_premium_turnover": round(turnover, 2) if measured else None,
         "atm_zero_vol_strikes": zero_vol if measured else None,
         "band_strikes": measured,
+        "atm_strike": atm_strike,
+        "atm_ltp": atm_ltp,
+        "atm_lot_size": atm_lot_size,
+        "atm_lot_cost_inr": atm_lot_cost,
         "atm_spread_pct": round(statistics.median(spreads), 4) if spreads else None,
         "atm_volume_lots": lots(vol_units, lot_size) if measured else None,
         "atm_oi_lots": lots(oi_units, lot_size) if measured else None,

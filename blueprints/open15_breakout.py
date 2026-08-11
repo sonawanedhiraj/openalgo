@@ -67,6 +67,7 @@ def config():
     # here — see the note in the env_defaults block below.
     from services.open15_breakout_service import (
         TRADE_SIDES,
+        _coverage_target_default,
         _impact_gate_enabled_default,
         _impact_max_pct_default,
         _liq_backfill_rank_default,
@@ -190,6 +191,16 @@ def config():
         liq_backfill = _opt_bool("option_liquidity_backfill_rank")
         impact_gate = _opt_bool("option_impact_gate_enabled")
         impact_max = _opt_pct("option_impact_max_pct", 2.0)
+        # ATM lot-cost coverage target (issue #591) — clamp-don't-reject, like
+        # every other numeric knob on this form
+        from services.open15_breakout_service import (
+            clamp_coverage_target as _clamp_coverage_target,
+        )
+
+        coverage_target = body.get("coverage_target_pct")
+        coverage_target = (
+            None if coverage_target in (None, "") else _clamp_coverage_target(coverage_target)
+        )
         if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
             # an inverted band would readmit a name the same day it was excluded,
             # which is the flapping the hysteresis exists to prevent
@@ -237,6 +248,7 @@ def config():
             option_liquidity_backfill_rank=liq_backfill,
             option_impact_gate_enabled=impact_gate,
             option_impact_max_pct=impact_max,
+            coverage_target_pct=coverage_target,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -282,6 +294,7 @@ def config():
                 "option_liquidity_backfill_rank": _liq_backfill_rank_default(),
                 "option_impact_gate_enabled": _impact_gate_enabled_default(),
                 "option_impact_max_pct": _impact_max_pct_default(),
+                "coverage_target_pct": _coverage_target_default(),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -444,6 +457,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  /* issue #583 — amber like the other "held, not traded" events, and distinct
     from the red rejection colours: an exclusion is a decision, not a failure */
  .ev-universe_excluded{color:#f9e2af}
+ .ev-atm_lot_cost{color:#7dc4e4}
  .b-liq{background:#463a20;color:#f9e2af}
  .b-nocontract{background:#3a2028;color:#f38ba8}
  .b-newlisting{background:#232c36;color:#8aa0b4}
@@ -471,6 +485,21 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .chip .net{background:#232c36;border-radius:3px;padding:0 3px;color:#8aa0b4}
  .fbtn{font-size:11px;padding:2px 10px;border-radius:10px}.fbtn.on{background:#2a3138;color:#7dc4e4}
  .sec{color:#8aa0b4;font-size:12px;margin:14px 0 0}
+ /* ATM lot-cost coverage ladder (issue #591) */
+ .atmcard{border:1px solid #2a3138;border-radius:6px;padding:10px 14px;margin:4px 0 10px;background:#121820}
+ .atmcard .atitle{color:#7dc4e4;font-size:12px;letter-spacing:.5px}
+ .atmcard .asub{color:#6b7886;font-size:11px;margin-left:8px}
+ .covtbl{width:auto}
+ .covtbl td,.covtbl th{font-size:12px;padding:3px 12px;border-bottom:1px solid #1c232b}
+ .covtbl tr.crow{cursor:pointer}
+ .covtbl tr.crow:hover td{background:#161d25}
+ .covtbl tr.cur td{background:#1b2b3a;color:#89b4fa}
+ .covtbl tr.tgt td{background:#152030}
+ .covtbl .hl{color:#89b4fa}
+ .covtbl tr.rall .hl{color:#a6e3a1}
+ .atmdet{margin-top:8px;background:#12181f;border-radius:6px;padding:8px 12px;font-size:12px}
+ .atmdet .dh{color:#89b4fa;font-size:10px;letter-spacing:.5px;margin-bottom:5px}
+ .atmfoot{margin-top:8px;color:#6b7886;font-size:11px}
 </style></head><body>
 <h2>open15_vol_breakout — decision log</h2>
 <div class="muted">Every day is persisted — pick one from the history list. Today auto-refreshes 5s during the window.
@@ -534,6 +563,13 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    measured from the MID. A book that cannot fill the order at all is skipped whatever the
    percentage says. Stale scores FAIL OPEN &mdash; nothing is excluded.</span>
  </div>
+ <div style="margin-top:6px">
+  <label class="muted">ATM lot-cost coverage target
+   <input id="c_covtgt" type="number" min="50" max="100" step="1" style="width:48px"> %</label>
+  <span class="leg">the &quot;cover MOST&quot; row of each day's coverage-ladder card &mdash; the minimum
+   capital/slot at which this share of priced names is affordable (1 ATM lot, worst of CE/PE).
+   Observational: nothing gates on it. Clamped 50&ndash;100 server-side.</span>
+ </div>
  <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
  <div id="c_rollsrc" class="muted" style="margin-top:6px"></div>
@@ -548,6 +584,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="status" class="muted"></div>
   <div id="rejbox"></div>
   <div class="chips" id="chips"></div>
+  <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
    <span class="muted">&mdash; click a row for fills, liquidity and the decision detail</span></div>
   <div id="rollCfg" class="muted"></div>
@@ -623,6 +660,8 @@ async function loadCfg(){
     !!(o.option_impact_gate_enabled??d.option_impact_gate_enabled);
   document.getElementById('c_impactmax').value=
     o.option_impact_max_pct??d.option_impact_max_pct??2.0;
+  document.getElementById('c_covtgt').value=
+    o.coverage_target_pct??d.coverage_target_pct??90;
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
   const src=k=>(o[k]==null?'env default':'db');
@@ -675,7 +714,8 @@ async function saveCfg(){
     option_liquidity_max_staleness_days:+document.getElementById('c_liqstale').value,
     option_liquidity_backfill_rank:document.getElementById('c_liqbackfill').checked,
     option_impact_gate_enabled:document.getElementById('c_impactgate').checked,
-    option_impact_max_pct:+document.getElementById('c_impactmax').value};
+    option_impact_max_pct:+document.getElementById('c_impactmax').value,
+    coverage_target_pct:+document.getElementById('c_covtgt').value};
   const msg=document.getElementById('c_msg');
   try{
     // CSRFProtect is global (issue #446): the POST is rejected 400 without this token
@@ -701,6 +741,10 @@ let expanded=new Set();
 // only published to the decision log at the exit job, so mid-window it comes
 // from /api/status instead. Cleared whenever a past day is selected.
 let liveWatch={}, liveNeeded=null;
+// which coverage-ladder row's drill-down is open (issue #591) — kept across
+// the 5s live refresh so it does not collapse under the operator, cleared
+// when a different day is picked (same contract as `expanded` above)
+let atmOpenPct=null;
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function kindOf(e){
   if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped'||
@@ -764,7 +808,7 @@ async function loadLiveWatch(){
   }catch(e){liveWatch={}; liveNeeded=null;}
 }
 async function selectDay(date){
-  if(date!==curDate)expanded.clear();   // a different day's rows are different rows
+  if(date!==curDate){expanded.clear();atmOpenPct=null;} // a different day's rows are different rows
   curDate=date;
   document.getElementById('dayjson').href='/open15_vol_breakout/api/decision_log?date='+date;
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
@@ -772,7 +816,7 @@ async function selectDay(date){
   curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
-  renderRejected(); renderChips(); renderRolling(); renderSel(); renderTimeline();
+  renderRejected(); renderChips(); renderAtmLadder(); renderRolling(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
 }
@@ -846,6 +890,97 @@ function renderChips(){
 }
 function srcBadge(src){
   return '<span class="badge '+(src==='rolling'?'b-roll':'b-seed')+'">'+esc(src||'seed')+'</span>';
+}
+// ---- ATM lot-cost coverage ladder (issue #591) ------------------------------
+// One `atm_lot_cost` event per day (09:10 arm), priced from the previous EOD
+// option-liquidity sweep. Days without the event (all history before #591)
+// render no card at all.
+const rupeeIN=v=>'\\u20B9'+Math.round(v).toLocaleString('en-IN');
+function atmWatchedSet(){
+  const w=new Set();
+  for(const e of curEvents){
+    if(e.event==='selection')Object.keys(e.selected||{}).forEach(s=>w.add(s));
+    if(e.event==='watchlist_add'&&e.symbol)w.add(e.symbol);
+  }
+  return w;
+}
+function renderAtmLadder(){
+  const ev=curEvents.find(e=>e.event==='atm_lot_cost');
+  const box=document.getElementById('atmcard');
+  if(!ev||!(ev.ladder||[]).length){box.innerHTML='';box.style.display='none';return;}
+  box.style.display='';
+  let rows='';
+  for(const r of ev.ladder){
+    const cur=r.marker==='current_slot', tgt=r.marker==='target', all=r.pct===100&&!cur;
+    const note=cur?('\\u25C0 your capital/slot')
+      :tgt?'\\u25C0 coverage target (configurable above)'
+      :(r.costliest?('costliest: '+esc(r.costliest)
+        +(ev.drop_top&&ev.drop_top['5']?(' \\u00B7 drop top 5 \\u2192 '+rupeeIN(ev.drop_top['5'])):'')
+        +(ev.drop_top&&ev.drop_top['10']?(' \\u00B7 top 10 \\u2192 '+rupeeIN(ev.drop_top['10'])):'')):'');
+    rows+='<tr class="crow'+(cur?' cur':'')+(tgt?' tgt':'')+(all?' rall':'')
+      +'" data-cap="'+r.capital+'" data-pct="'+r.pct+'">'
+      +'<td class="'+((tgt||all)?'hl':'')+'">'+r.pct+'%</td>'
+      +'<td>'+r.names+' / '+ev.priced+'</td>'
+      +'<td class="'+((tgt||all)?'hl':'')+'">'+rupeeIN(r.capital)+'</td>'
+      +'<td class="muted">'+note+'</td></tr>';
+  }
+  const u=ev.unresolved||{n:0};
+  const parts=[];
+  if((u.not_scored||[]).length)parts.push('no contract/score: '+u.not_scored.map(esc).join(', '));
+  if((u.no_quote||[]).length)parts.push('no ATM quote: '+u.no_quote.map(esc).join(', '));
+  const unres=u.n?('<span style="color:#f9e2af">'+u.n+' unresolved</span> ('
+    +parts.join(' \\u00B7 ')+') \\u2014 excluded from all counts \\u00B7 '):'';
+  box.innerHTML='<span class="atitle">ATM LOT COST \\u2014 COVERAGE LADDER</span>'
+    +'<span class="asub">capital/slot \\u2192 names affordable (1 lot, worst of CE/PE)'
+    +' \\u00B7 priced from the '+esc(ev.as_of||'?')+' option sweep'
+    +' \\u00B7 front expiry '+esc(ev.expiry||'?')+(ev.dte!=null?(' ('+ev.dte+' DTE)'):'')
+    +' \\u00B7 '+ev.priced+'/'+ev.universe_n+' priced</span>'
+    +'<table class="covtbl"><thead><tr><th>coverage</th><th>names</th>'
+    +'<th>capital/slot needed</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'
+    +'<div id="atmdet"></div>'
+    +'<div class="atmfoot">'+unres
+    +'click a row for the names excluded at that capital'
+    +' \\u00B7 lot costs are the sweep day\\u2019s close premiums \\u2014 overnight gaps move them'
+    +' \\u00B7 costs fall through the expiry cycle and jump at rollover: size to a cycle-start day</div>';
+  box.querySelectorAll('tr.crow').forEach(tr=>tr.onclick=()=>{
+    const pct=+tr.dataset.pct;
+    atmOpenPct=(atmOpenPct===pct)?null:pct;
+    renderAtmDetail(ev,+tr.dataset.cap,pct);
+  });
+  if(atmOpenPct!=null){
+    const tr=[...box.querySelectorAll('tr.crow')].find(t=>+t.dataset.pct===atmOpenPct);
+    if(tr)renderAtmDetail(ev,+tr.dataset.cap,atmOpenPct);else atmOpenPct=null;
+  }
+}
+function renderAtmDetail(ev,cap,pct){
+  const det=document.getElementById('atmdet');
+  if(!det)return;
+  if(atmOpenPct==null||atmOpenPct!==pct){det.innerHTML='';return;}
+  const watched=atmWatchedSet();
+  // excluded = costlier than this row's capital, costliest first — the names
+  // this capital level gives up, which is the actionable list
+  const excl=(ev.costs||[]).filter(c=>c.w>cap).reverse();
+  if(!excl.length){
+    det.innerHTML='<div class="atmdet"><div class="dh">nothing excluded at '+rupeeIN(cap)
+      +' \\u2014 every priced name is affordable</div></div>';
+    return;
+  }
+  const MAX=40;
+  let rows='';
+  for(const c of excl.slice(0,MAX)){
+    rows+='<tr><td'+(watched.has(c.s)?' style="color:#94e2d5"':'')+'>'+esc(c.s)+'</td>'
+      +'<td>'+(c.k!=null?c.k:'\\u2014')+'</td><td>'+(c.lot!=null?c.lot:'\\u2014')+'</td>'
+      +'<td>'+(c.ce!=null?rupeeIN(c.ce):'\\u2014')+'</td>'
+      +'<td>'+(c.pe!=null?rupeeIN(c.pe):'\\u2014')+'</td>'
+      +'<td>'+rupeeIN(c.w)+'</td></tr>';
+  }
+  det.innerHTML='<div class="atmdet"><div class="dh">EXCLUDED AT '+pct+'% / '+rupeeIN(cap)
+    +' \\u2014 '+excl.length+' name'+(excl.length===1?'':'s')+', costliest first'
+    +' <span style="color:#6b7886">(teal = on today\\u2019s watch list)</span></div>'
+    +'<table class="covtbl"><thead><tr><th>symbol</th><th>ATM strike</th><th>lot</th>'
+    +'<th>CE lot cost</th><th>PE lot cost</th><th>worst</th></tr></thead><tbody>'+rows
+    +(excl.length>MAX?('<tr><td colspan="6" class="muted">\\u2026 +'+(excl.length-MAX)+' more</td></tr>'):'')
+    +'</tbody></table></div>';
 }
 function renderRolling(){
   // issue #529 config summary. The per-add TABLE is gone (issue #559): every
@@ -1324,6 +1459,9 @@ function renderTimeline(){
   for(const e of curEvents){
     if(curFilter!=='all'&&kindOf(e)!==curFilter)continue;
     const{ts,event,...rest}=e;
+    // the sorted per-name cost list is the card's data, not timeline prose —
+    // rendered raw it is a ~15 KB cell (issue #591)
+    if(event==='atm_lot_cost')rest.costs='['+(rest.costs||[]).length+' names — see ladder card]';
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+esc(ts)+'</td><td class="ev-'+esc(event)+'">'+esc(event)+'</td><td>'+
       esc(JSON.stringify(rest).slice(1,-1).replaceAll('"',''))+'</td>';

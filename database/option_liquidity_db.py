@@ -106,6 +106,15 @@ class OptionLiquidityDaily(Base):
 
     expiry_used = Column(Date, nullable=True)
 
+    # --- the ATM contract itself (issue #591) --------------------------------
+    # The nearest-strike contract the band was centred on. ``atm_lot_cost_inr``
+    # (= atm_ltp x atm_lot_size) is the capital one lot costs — the input to the
+    # open15 coverage ladder. Diagnostic like the block above: never gate on it.
+    atm_strike = Column(Float, nullable=True)
+    atm_ltp = Column(Float, nullable=True)
+    atm_lot_size = Column(Integer, nullable=True)
+    atm_lot_cost_inr = Column(Float, nullable=True)
+
     # Which feed produced this row: ``broker_sweep`` (the runtime path) or
     # ``bhavcopy`` (the one-time history seed). Mixing them inside one median is
     # sound ONLY because the stored value is a rank percentile *within that day's
@@ -133,6 +142,11 @@ Index("idx_option_liquidity_sym_side", OptionLiquidityDaily.symbol, OptionLiquid
 #: "table option_liquidity_daily has no column named source" after scoring 49 days.)
 _WANTED_COLUMNS: dict[str, str] = {
     "source": "VARCHAR(16)",
+    # ATM contract snapshot (issue #591)
+    "atm_strike": "FLOAT",
+    "atm_ltp": "FLOAT",
+    "atm_lot_size": "INTEGER",
+    "atm_lot_cost_inr": "FLOAT",
 }
 
 
@@ -191,6 +205,10 @@ def _row_to_dict(row: OptionLiquidityDaily) -> dict:
         "daily_pctile": row.daily_pctile,
         "n_days_in_median": row.n_days_in_median,
         "expiry_used": row.expiry_used.isoformat() if row.expiry_used else None,
+        "atm_strike": row.atm_strike,
+        "atm_ltp": row.atm_ltp,
+        "atm_lot_size": row.atm_lot_size,
+        "atm_lot_cost_inr": row.atm_lot_cost_inr,
         "source": row.source,
         "details": json.loads(row.details_json) if row.details_json else {},
         "computed_at": row.computed_at.isoformat() if row.computed_at else None,
@@ -230,6 +248,10 @@ def upsert_scores(as_of_date: _date, rows: list[dict]) -> int:
                     daily_pctile=r.get("daily_pctile"),
                     n_days_in_median=r.get("n_days_in_median"),
                     expiry_used=r.get("expiry_used"),
+                    atm_strike=r.get("atm_strike"),
+                    atm_ltp=r.get("atm_ltp"),
+                    atm_lot_size=r.get("atm_lot_size"),
+                    atm_lot_cost_inr=r.get("atm_lot_cost_inr"),
                     source=r.get("source"),
                     details_json=json.dumps(r.get("details") or {}, default=str),
                     computed_at=datetime.utcnow(),
