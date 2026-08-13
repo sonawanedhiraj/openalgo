@@ -1754,13 +1754,34 @@ class Open15BreakoutService:
         if not _enabled():
             self.day_status = "idle"
             return
-        now = dt.datetime.now(IST)
-        self.day_log = []
+        now = self._now_ist()
         self._log_date = now.strftime("%Y-%m-%d")
         self._first_min_buffer = {}
         self._capture_flushed = False
         if now.time() >= dt.time(9, 15, 30):
             self.day_status = "skipped_late_boot"
+            # issue #597: a mid-day RESTART on a date that already has a
+            # persisted day log (the day traded before the restart) must not
+            # replace that log with a lone skip event — load it and append a
+            # restart marker instead, so the real selections/fills survive.
+            existing = self._load_persisted_day_log(self._log_date)
+            if existing:
+                self.day_log = existing
+                self._log_event(
+                    "late_boot_restart",
+                    armed_at=now.strftime("%H:%M:%S"),
+                    preserved_events=len(existing),
+                )
+                logger.warning(
+                    "open15: re-armed at %s after 09:15 IST — day log for %s already "
+                    "has %d events; preserved (restart marker appended). This process "
+                    "will not trade today.",
+                    now.strftime("%H:%M:%S"),
+                    self._log_date,
+                    len(existing),
+                )
+                return
+            self.day_log = []
             self._log_event(
                 "skipped_late_boot",
                 armed_at=now.strftime("%H:%M:%S"),
@@ -1773,6 +1794,7 @@ class Open15BreakoutService:
             )
             self._persist_day_log()
             return
+        self.day_log = []
         self.universe = self._load_universe()
         prev = self._load_prev_closes(self.universe, now.date())
         # issue #456: PRIMARY = one batched broker quote call at the moment of
@@ -2535,6 +2557,17 @@ class Open15BreakoutService:
                 save_day_log(self._log_date, list(self.day_log))
         except Exception:
             logger.exception("open15: day-log persist failed")
+
+    @staticmethod
+    def _load_persisted_day_log(trade_date: str) -> list[dict[str, Any]]:
+        """Persisted decision log for a date, or []. Never raises (issue #597)."""
+        try:
+            from database.open15_breakout_db import get_day_log
+
+            return get_day_log(trade_date) or []
+        except Exception:
+            logger.exception("open15: existing day-log read failed for %s", trade_date)
+            return []
 
     def register_jobs(self, scheduler=None) -> None:
         """Register the 5 cron jobs.
