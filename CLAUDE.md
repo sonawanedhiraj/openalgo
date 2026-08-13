@@ -1276,6 +1276,28 @@ and per-level `orders`; all are dropped by the shared broker mappers, so
 capturing them means changing a mapper every broker uses. The WS feed is not a
 source — open15 subscribes `NSE_<sym>_LTP` only, which carries neither depth
 nor OI.
+**Broker-OI watch-list filter (issue #595): mirror Zerodha's absolute rule,
+don't model it.** Zerodha blocks MIS orders on stock option contracts with OI
+< **500 LOTS** — per-CONTRACT and absolute, so no percentile screen can
+reproduce it (2026-08-13: 4 of 5 entries rejected; KALYANKJIL at **p96** was
+among them — Gate 1's band-SUM OI, relative rank, and yesterday's-ATM-strike
+basis are each blind to it, and gappers select precisely the strike where OI
+has not accumulated). The filter runs at the ONLY moment slots are allocated:
+seed selection and rolling additions judge the candidate pool with ONE batched
+quote (`production_oi_filter` → `get_multiquotes`, OI ÷ lot size), a blocked
+name skips with a `universe_excluded` event (`reason=oi_below_broker_min`,
+stage 3) and the next rank is promoted — always, no backfill flag: an
+OI-blocked contract can fill under NO variant, so an empty slot measures
+nothing. Verdicts are day-cached per (symbol, side). **Shadow candidates are
+filtered identically** (operator decision — a shadow fill on a contract the
+broker would block is unrealizable P&L, exactly what the #581 cohort must not
+accumulate; shadow P&L is not comparable across the ship date). **Entry has NO
+check** — the broker is the authority there and the #548 paper path is the
+backstop; a rejection frees its `max_trades` slot (only real fills consume
+it). Fail OPEN three ways: no verdict, unknown OI (the mapper's 0 = "not
+available", #555), and a failed/raising batch call (#390). Config
+`option_min_oi_lots` (UI, default 500 = the broker's rule, 0 = off, env seed
+`OPEN15_MIN_OI_LOTS`); the effective floor is stamped into the `armed` event.
 Alert: `logger.error` + Telegram `open15_breakout`, deduped once per day. The
 digest/summary report `filled` and `paper` separately — `core.entered` counts
 TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows

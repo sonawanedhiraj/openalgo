@@ -386,6 +386,26 @@ def _liq_backfill_rank_default() -> bool:
     return os.getenv("OPEN15_LIQUIDITY_BACKFILL_RANK", "true").lower() == "true"
 
 
+def clamp_min_oi_lots(raw) -> int:
+    """0..5000 lots; 0 disables the check. The UI number input is a hint,
+    never a trust boundary."""
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return 500
+    return min(5000, max(0, v))
+
+
+def _min_oi_lots_default() -> int:
+    """Zerodha blocks MIS orders on stock option contracts whose OI is below
+    500 LOTS (issue #595 — on 2026-08-13 it rejected 4 of 5 entries this way,
+    and ``oi/lot_size < 500`` separated every rejection from the one fill).
+    The default mirrors the broker's rule exactly; raise it for headroom
+    against the snapshot-timing skew between our quote read and their list.
+    """
+    return clamp_min_oi_lots(os.getenv("OPEN15_MIN_OI_LOTS", "500"))
+
+
 def _impact_gate_enabled_default() -> bool:
     return os.getenv("OPEN15_IMPACT_GATE_ENABLED", "true").lower() == "true"
 
@@ -835,6 +855,14 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
             if cfg.get("option_impact_max_pct") is None
             else clamp_pctile(cfg.get("option_impact_max_pct"), _impact_max_pct_default())
         ),
+        # broker OI floor (issue #595) — Zerodha's own per-CONTRACT MIS rule
+        # (OI >= 500 lots), mirrored at watch-list construction so a name that
+        # can never fill does not occupy a seed/rolling slot. 0 = off.
+        "option_min_oi_lots": (
+            _min_oi_lots_default()
+            if cfg.get("option_min_oi_lots") is None
+            else clamp_min_oi_lots(cfg.get("option_min_oi_lots"))
+        ),
         # ATM lot-cost coverage ladder (issue #591) — the "most of the universe"
         # the operator wants covered, as a percentile of priced names
         "coverage_target_pct": (
@@ -875,6 +903,7 @@ class Open15Core:
         shadow_side: str | None = None,
         liquidity_gate=None,
         liquidity_backfill_rank: bool = True,
+        oi_filter_fn=None,
     ):
         self.prev_closes = prev_closes
         # Gate 1 stage 2 (issue #583): the per-SIDE option-liquidity check, applied
@@ -886,6 +915,17 @@ class Open15Core:
         self.liquidity_gate = liquidity_gate
         self.liquidity_backfill_rank = bool(liquidity_backfill_rank)
         self.liquidity_exclusions: list[dict[str, Any]] = []
+        # Broker-OI mirror (issue #595): a service-injected BATCH callable —
+        # ``fn(candidates) -> {(symbol, side): verdict}`` — consulted at the same
+        # two moments as the gate above. Injected rather than imported so the
+        # core stays unit-testable; ``None`` (stock mode / disabled) checks
+        # nothing. Applied to shadow candidates too (operator decision, #595):
+        # a shadow fill on a contract the broker would block is unrealizable
+        # P&L, which is exactly what the #581 cohort must not accumulate.
+        self.oi_filter_fn = oi_filter_fn
+        # (symbol, side) -> verdict, cached for the day so a persistently-thin
+        # name is quoted once, not on every 30s rolling pass
+        self.oi_verdicts: dict[tuple[str, str], dict] = {}
         self.vol_mult = vol_mult
         self.top_n = top_n
         # rolling additive watch list (issue #529): every ``rolling_cadence_s``
@@ -1034,6 +1074,71 @@ class Open15Core:
         self.liquidity_exclusions.append(rec)
         return enforced
 
+    def _candidate_spot(self, symbol: str) -> float | None:
+        """Best current price for ATM-strike resolution: last tick, else the
+        09:15 candle. ``None`` means the OI check cannot run — fail open."""
+        px = self.last_price.get(symbol)
+        if px:
+            return px
+        fc = self.first_candle(symbol)
+        if fc:
+            return fc.get("close") or fc.get("open")
+        return None
+
+    def _prefetch_oi_verdicts(self, pairs: list[tuple[str, str]]) -> None:
+        """One batched broker call for every (symbol, side) not yet judged (#595).
+
+        Verdicts cache for the day. A failed batch caches NOTHING, so the next
+        selection moment retries — transient broker trouble heals instead of
+        silently waving the whole day through unchecked.
+        """
+        if self.oi_filter_fn is None:
+            return
+        candidates = []
+        for sym, side in pairs:
+            if (sym, side) in self.oi_verdicts:
+                continue
+            spot = self._candidate_spot(sym)
+            if spot:
+                candidates.append({"symbol": sym, "side": side, "spot": spot})
+        if not candidates:
+            return
+        try:
+            verdicts = self.oi_filter_fn(candidates) or {}
+        except Exception:
+            # a broken OI check must never cost a selection — fail OPEN (#390)
+            logger.exception("open15: oi filter raised — OI check skipped this pass")
+            return
+        for key, v in verdicts.items():
+            if isinstance(key, tuple) and isinstance(v, dict):
+                self.oi_verdicts[key] = v
+
+    def _oi_blocked(self, symbol: str, side: str, watch_source: str) -> bool:
+        """Consume the prefetched verdict; record the exclusion when it fires.
+
+        No verdict = fail open. Always-promote (no ``liquidity_backfill_rank``
+        branch): an OI-blocked contract cannot fill under ANY variant of the
+        strategy, so leaving its slot empty would measure nothing — unlike the
+        percentile gate, where promoting #4 is arguably a different signal.
+        """
+        v = self.oi_verdicts.get((symbol, side))
+        if not v or not v.get("blocked"):
+            return False
+        self.liquidity_exclusions.append(
+            {
+                "symbol": symbol,
+                "reason": "oi_below_broker_min",
+                "side": "long" if side == "L" else "short",
+                "oi_lots": v.get("oi_lots"),
+                "min_lots": v.get("min_lots"),
+                "opt_symbol": v.get("opt_symbol"),
+                "watch_source": watch_source,
+                "stage": 3,
+                "enforced": True,
+            }
+        )
+        return True
+
     def _take_top_n(self, ranked: list[str], side: str) -> list[str]:
         """The first ``top_n`` names on ``ranked`` that clear the per-side gate.
 
@@ -1051,6 +1156,8 @@ class Open15Core:
                     # consume the slot without filling it
                     out.append(None)  # type: ignore[arg-type]
                 continue
+            if self._oi_blocked(s, side, "seed"):
+                continue
             out.append(s)
         return [s for s in out if s is not None]
 
@@ -1065,6 +1172,16 @@ class Open15Core:
                 self.gaps[s] = fc["open"] / pc - 1.0
         pos = sorted((s for s in self.gaps if self.gaps[s] > 0), key=lambda s: -self.gaps[s])
         neg = sorted((s for s in self.gaps if self.gaps[s] < 0), key=lambda s: self.gaps[s])
+        # broker-OI mirror (issue #595): judge the whole candidate pool in ONE
+        # batched call, so a blocked name's backfill promotion needs no second
+        # round trip. Pool = top_n + 5 per side; anything ranked deeper than
+        # that arrives unjudged and fails open.
+        pool: list[tuple[str, str]] = []
+        if self._watches("L"):
+            pool += [(s, "L") for s in pos[: self.top_n + 5]]
+        if self._watches("S"):
+            pool += [(s, "S") for s in neg[: self.top_n + 5]]
+        self._prefetch_oi_verdicts(pool)
         if self._watches("L"):
             for s in self._take_top_n(pos, "L"):
                 self.selected[s] = "L"
@@ -1131,6 +1248,7 @@ class Open15Core:
             sides.append(("L", sorted((s for s in pct if pct[s] > 0), key=lambda s: -pct[s])))
         if self._watches("S"):
             sides.append(("S", sorted((s for s in pct if pct[s] < 0), key=lambda s: pct[s])))
+        pending: list[tuple[str, str, int]] = []
         for side, ranked in sides:
             for rank, sym in enumerate(ranked[: self.rolling_top_n], start=1):
                 if sym in self.selected or self.first_candle(sym) is None:
@@ -1143,27 +1261,34 @@ class Open15Core:
                 # with its own cap, not a funded max_trades slot.
                 if self._side_excluded(sym, side, "rolling"):
                     continue
-                # seed the stats key BEFORE publishing the symbol into
-                # ``selected``, so a concurrent ``watch_snapshot`` read can
-                # never see a watched symbol with no stats entry
-                self.watch_stats.setdefault(
-                    sym,
-                    {"max_vol_ratio": None, "max_vol_ratio_beyond": None, "level_broken": False},
-                )
-                self.watch_source[sym] = "rolling"
-                self.selected[sym] = side
-                rec = {
-                    "symbol": sym,
-                    "side": side,
-                    "pct_change": round(pct[sym] * 100, 2),
-                    "rank": rank,
-                    "watch_size": len(self.selected),
-                    "at": f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}",
-                    # so the UI panel can say which additions can never trade
-                    "shadow": self.is_shadow(side),
-                }
-                self.rolling_adds.append(rec)
-                adds.append(rec)
+                pending.append((sym, side, rank))
+        # broker-OI mirror (issue #595): one batched call covers everything this
+        # pass wants to add; day-cached verdicts make repeat passes free.
+        self._prefetch_oi_verdicts([(s, sd) for s, sd, _ in pending])
+        for sym, side, rank in pending:
+            if self._oi_blocked(sym, side, "rolling"):
+                continue
+            # seed the stats key BEFORE publishing the symbol into
+            # ``selected``, so a concurrent ``watch_snapshot`` read can
+            # never see a watched symbol with no stats entry
+            self.watch_stats.setdefault(
+                sym,
+                {"max_vol_ratio": None, "max_vol_ratio_beyond": None, "level_broken": False},
+            )
+            self.watch_source[sym] = "rolling"
+            self.selected[sym] = side
+            rec = {
+                "symbol": sym,
+                "side": side,
+                "pct_change": round(pct[sym] * 100, 2),
+                "rank": rank,
+                "watch_size": len(self.selected),
+                "at": f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}",
+                # so the UI panel can say which additions can never trade
+                "shadow": self.is_shadow(side),
+            }
+            self.rolling_adds.append(rec)
+            adds.append(rec)
         if adds:
             logger.info(
                 "open15: rolling watch-list +%d (size %d) — %s",
@@ -1387,6 +1512,72 @@ def production_quote_ltp(symbol: str, exchange: str) -> float | None:
     return snap["ltp"] if snap else None
 
 
+def production_oi_filter(candidates: list[dict], min_lots: int, trade_date: str) -> dict:
+    """Broker-OI verdicts for watch-list candidates (issue #595), ONE batched call.
+
+    Zerodha blocks MIS orders on stock option contracts with OI < 500 LOTS —
+    a per-contract, absolute rule that no per-name percentile can reproduce
+    (2026-08-13: KALYANKJIL at p96 was blocked; its 605CE held 433 lots).
+    This mirrors that rule at the only moment slots are allocated.
+
+    ``candidates`` are ``{"symbol", "side" ("L"/"S"), "spot"}``; returns
+    ``{(symbol, side): {"blocked", "oi_lots", "opt_symbol", "min_lots"}}``.
+    Fail-open contract, three ways: a candidate whose ATM contract cannot be
+    resolved gets NO verdict (gate-1's no-contract check owns that fact); a
+    resolved contract whose quote is missing or reports ``oi`` of 0/None is
+    "unknown", never "thin" — the Zerodha mapper defaults absent fields to 0
+    (#555); and any raised failure returns ``{}`` so a broken batch call can
+    never dark the seed list (#390). The broker's own rejection + the #548
+    paper path remain the backstop for whatever slips through.
+    """
+    from services.open15_option_shadow import resolve_atm_option
+
+    resolved: dict[tuple[str, str], dict] = {}
+    for c in candidates:
+        try:
+            contract = resolve_atm_option(c["symbol"], c["side"], c["spot"], trade_date)
+        except Exception:
+            logger.exception("open15 oi-filter: contract resolve raised for %s", c.get("symbol"))
+            contract = None
+        if contract and contract.get("lotsize"):
+            resolved[(c["symbol"], c["side"])] = contract
+    if not resolved:
+        return {}
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.quotes_service import get_multiquotes
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            logger.warning("open15 oi-filter: no api key — OI check FAILS OPEN")
+            return {}
+        payload = [{"symbol": ct["symbol"], "exchange": "NFO"} for ct in resolved.values()]
+        ok, data, _status = get_multiquotes(payload, api_key=api_key)
+        if not ok:
+            logger.warning("open15 oi-filter: batch quote failed — OI check FAILS OPEN")
+            return {}
+        quotes = {
+            r.get("symbol"): (r.get("data") or {})
+            for r in ((data or {}).get("results") or [])
+            if isinstance(r, dict)
+        }
+    except Exception:
+        logger.exception("open15 oi-filter: batch quote raised — OI check FAILS OPEN")
+        return {}
+    out: dict[tuple[str, str], dict] = {}
+    for key, ct in resolved.items():
+        oi = _as_int((quotes.get(ct["symbol"]) or {}).get("oi"))
+        lot = int(ct["lotsize"])
+        oi_lots = (oi / lot) if oi and lot else None  # 0/None = unknown, never "thin"
+        out[key] = {
+            "blocked": bool(oi_lots is not None and oi_lots < min_lots),
+            "oi_lots": round(oi_lots, 1) if oi_lots is not None else None,
+            "opt_symbol": ct["symbol"],
+            "min_lots": min_lots,
+        }
+    return out
+
+
 class Open15BreakoutService:
     def __init__(
         self,
@@ -1517,6 +1708,24 @@ class Open15BreakoutService:
                 )
         return gate, excluded
 
+    def _build_oi_filter(self, now: dt.datetime):
+        """The #595 broker-OI mirror for the core, or ``None`` (= no check).
+
+        Option mode only — Zerodha's 500-lot MIS rule is about option
+        contracts, so in stock mode there is nothing to mirror. A floor of 0
+        is the operator's off switch.
+        """
+        if self.day_config.get("instrument") != "atm_option":
+            return None
+        try:
+            min_lots = int(self.day_config.get("option_min_oi_lots") or 0)
+        except (TypeError, ValueError):
+            min_lots = 0
+        if min_lots <= 0:
+            return None
+        trade_date = now.strftime("%Y-%m-%d")
+        return lambda candidates: production_oi_filter(candidates, min_lots, trade_date)
+
     @staticmethod
     def _load_prev_closes(universe: set[str], today: dt.date) -> dict[str, float]:
         """Last settled daily close per symbol from historify (read-only)."""
@@ -1618,6 +1827,7 @@ class Open15BreakoutService:
         # core. Option-mode only: in stock mode option liquidity is irrelevant and
         # must not shrink the universe.
         gate, stage1_excluded = self._apply_liquidity_stage1(now.date())
+        oi_filter_fn = self._build_oi_filter(now)
         nea_min, exit_min = self._window_minutes()
         self._apply_exit_schedule()
         with self._lock:
@@ -1636,6 +1846,7 @@ class Open15BreakoutService:
                 shadow_side=self.day_config["shadow_side"],
                 liquidity_gate=gate,
                 liquidity_backfill_rank=self.day_config["option_liquidity_backfill_rank"],
+                oi_filter_fn=oi_filter_fn,
             )
             self.positions = {}
             self.day_status = "armed"
@@ -1683,6 +1894,10 @@ class Open15BreakoutService:
             option_liquidity_backfill_rank=self.day_config["option_liquidity_backfill_rank"],
             option_liquidity_excluded=sorted(e["symbol"] for e in stage1_excluded),
             option_liquidity_universe_after=len(self.universe),
+            # broker-OI mirror (issue #595) — the effective floor, so a past
+            # day's selection is replayable against the rule it actually ran
+            option_min_oi_lots=self.day_config["option_min_oi_lots"],
+            oi_filter_active=oi_filter_fn is not None,
         )
         # ATM lot-cost coverage ladder (issue #591) — what capital/slot covers
         # how much of the universe, priced from the latest EOD option-liquidity

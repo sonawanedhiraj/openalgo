@@ -71,3 +71,25 @@ registry-verified-historify chain per symbol/on failure. Cost: one broker API
 call per trading day. Learning: **a verification layer that depends on another
 job's side effects inherits that job's timing — fetch the truth at the moment
 of use.**
+
+### 2026-08-13 — #595: broker-OI (500-lot) watch-list filter; percentile screens cannot mirror an absolute broker rule
+Zerodha rejected 4 of 5 option entries ("MIS LIMIT orders are blocked ... OI
+less than 500 lots"): UNOMINDA 282 / KALYANKJIL 433 / ADANIENSOL 339 / BDL 460
+lots vs the one fill ASHOKLEY at 2,791 — `opt_entry_oi / opt_lot_size < 500`
+separated them perfectly, on data the journal was already capturing. Gate 1
+(percentile) is structurally blind three ways: band-SUM OI (BDL band 4,255
+lots vs 460 in its single strike), RELATIVE rank (KALYANKJIL at p96 was
+blocked), and YESTERDAY's ATM strike (gappers select precisely the strike
+where OI hasn't accumulated). Fix: mirror the broker's absolute per-contract
+rule at watch-list construction only — seed + rolling candidates get ONE
+batched `/quote` (OI in lots via `production_oi_filter`), blocked names skip
+and promote the next rank; entry keeps NO check (broker is the authority, #548
+paper path is the backstop; a rejection frees its `max_trades` slot —
+already pinned by `test_rejection_releases_its_max_trades_slot`). Config
+`option_min_oi_lots` (default 500, 0=off, env `OPEN15_MIN_OI_LOTS`).
+Learnings: **when the broker enforces an absolute rule, mirror the rule —
+don't model it**; and **an excluded-side shadow cohort must pass the same
+tradeability filters as the traded side, or it accrues unrealizable P&L**.
+⚠ Cohort boundary: from the first armed session after this ships, shadow AND
+seed selection exclude sub-500-lot names — shadow/parity P&L is not directly
+comparable across this date (same class of note as the #581 start date).
