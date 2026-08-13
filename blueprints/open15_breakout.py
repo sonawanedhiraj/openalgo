@@ -77,7 +77,11 @@ def config():
         _liq_min_pctile_default,
         _liq_reentry_days_default,
         _liq_reentry_pctile_default,
+        _min_oi_lots_default,
         get_open15_service,
+    )
+    from services.open15_breakout_service import (
+        clamp_min_oi_lots as _clamp_min_oi_lots,
     )
     from services.open15_breakout_service import (
         clamp_rolling_cadence as _clamp_rolling_cadence,
@@ -191,6 +195,9 @@ def config():
         liq_backfill = _opt_bool("option_liquidity_backfill_rank")
         impact_gate = _opt_bool("option_impact_gate_enabled")
         impact_max = _opt_pct("option_impact_max_pct", 2.0)
+        # broker OI floor (issue #595) — clamp-don't-reject; empty = env default
+        min_oi_lots = body.get("option_min_oi_lots")
+        min_oi_lots = None if min_oi_lots in (None, "") else _clamp_min_oi_lots(min_oi_lots)
         # ATM lot-cost coverage target (issue #591) — clamp-don't-reject, like
         # every other numeric knob on this form
         from services.open15_breakout_service import (
@@ -248,6 +255,7 @@ def config():
             option_liquidity_backfill_rank=liq_backfill,
             option_impact_gate_enabled=impact_gate,
             option_impact_max_pct=impact_max,
+            option_min_oi_lots=min_oi_lots,
             coverage_target_pct=coverage_target,
         )
         if not ok:
@@ -294,6 +302,7 @@ def config():
                 "option_liquidity_backfill_rank": _liq_backfill_rank_default(),
                 "option_impact_gate_enabled": _impact_gate_enabled_default(),
                 "option_impact_max_pct": _impact_max_pct_default(),
+                "option_min_oi_lots": _min_oi_lots_default(),
                 "coverage_target_pct": _coverage_target_default(),
             },
             "override": get_config(),
@@ -564,6 +573,15 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    percentage says. Stale scores FAIL OPEN &mdash; nothing is excluded.</span>
  </div>
  <div style="margin-top:6px">
+  <label class="muted">broker OI floor
+   <input id="c_minoi" type="number" min="0" max="5000" step="50" style="width:56px"> lots</label>
+  <span class="leg">Zerodha blocks MIS orders on stock option contracts whose OI is under
+   <b>500 lots</b> &mdash; a per-CONTRACT, absolute rule (2026-08-13: 4 of 5 entries rejected;
+   KALYANKJIL at p96 was among them). Candidates whose live ATM-contract OI &divide; lot size is
+   below this floor are skipped at seed/rolling selection and the slot promotes the next name.
+   0 switches the check off; unknown OI FAILS OPEN. Applies in option mode only.</span>
+ </div>
+ <div style="margin-top:6px">
   <label class="muted">ATM lot-cost coverage target
    <input id="c_covtgt" type="number" min="50" max="100" step="1" style="width:48px"> %</label>
   <span class="leg">the &quot;cover MOST&quot; row of each day's coverage-ladder card &mdash; the minimum
@@ -660,6 +678,8 @@ async function loadCfg(){
     !!(o.option_impact_gate_enabled??d.option_impact_gate_enabled);
   document.getElementById('c_impactmax').value=
     o.option_impact_max_pct??d.option_impact_max_pct??2.0;
+  document.getElementById('c_minoi').value=
+    o.option_min_oi_lots??d.option_min_oi_lots??500;
   document.getElementById('c_covtgt').value=
     o.coverage_target_pct??d.coverage_target_pct??90;
   syncShadowUi();
@@ -715,6 +735,7 @@ async function saveCfg(){
     option_liquidity_backfill_rank:document.getElementById('c_liqbackfill').checked,
     option_impact_gate_enabled:document.getElementById('c_impactgate').checked,
     option_impact_max_pct:+document.getElementById('c_impactmax').value,
+    option_min_oi_lots:+document.getElementById('c_minoi').value,
     coverage_target_pct:+document.getElementById('c_covtgt').value};
   const msg=document.getElementById('c_msg');
   try{

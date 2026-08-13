@@ -255,6 +255,11 @@ class Open15Config(Base):
     option_liquidity_backfill_rank = Column(Integer, nullable=True)  # 0/1 - seed path only
     option_impact_gate_enabled = Column(Integer, nullable=True)  # 0/1 - Gate 2
     option_impact_max_pct = Column(Float, nullable=True)  # SEBI LES shape, our slot size
+    # broker OI floor in LOTS (issue #595) — mirrors Zerodha's per-contract MIS
+    # block (OI < 500 lots). NULL = env default (500); 0 = off. Absolute, not a
+    # percentile: the broker's rule is absolute, and no relative rank can
+    # reproduce it (KALYANKJIL at p96 was blocked on 2026-08-13).
+    option_min_oi_lots = Column(Integer, nullable=True)
     # ATM lot-cost coverage ladder target % (issue #591). NULL = env default (90);
     # clamped 50..100 by the service. Observational only — nothing gates on it.
     coverage_target_pct = Column(Integer, nullable=True)
@@ -326,6 +331,8 @@ def _ensure_columns():
             "option_liquidity_backfill_rank": "INTEGER",
             "option_impact_gate_enabled": "INTEGER",
             "option_impact_max_pct": "FLOAT",
+            # issue #595 — NULL resolves to the env default (500 lots)
+            "option_min_oi_lots": "INTEGER",
             # issue #581 — both NULL on an existing install, which resolves to
             # the env default (OFF), so the next arm behaves exactly as before
             "shadow_excluded_side": "INTEGER",
@@ -404,6 +411,8 @@ def get_config() -> dict | None:
                 else bool(row.option_impact_gate_enabled)
             ),
             "option_impact_max_pct": row.option_impact_max_pct,
+            # issue #595 — None stays None so env supplies the default (500)
+            "option_min_oi_lots": row.option_min_oi_lots,
             # issue #591 — None stays None so env supplies the default
             "coverage_target_pct": row.coverage_target_pct,
             "updated_by": row.updated_by,
@@ -440,6 +449,7 @@ def save_config(
     option_liquidity_backfill_rank: bool | None = None,
     option_impact_gate_enabled: bool | None = None,
     option_impact_max_pct: float | None = None,
+    option_min_oi_lots: int | None = None,
     coverage_target_pct: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
@@ -484,6 +494,7 @@ def save_config(
             None if option_impact_gate_enabled is None else int(bool(option_impact_gate_enabled))
         )
         row.option_impact_max_pct = option_impact_max_pct
+        row.option_min_oi_lots = option_min_oi_lots
         row.coverage_target_pct = coverage_target_pct
         row.updated_by = updated_by
         db_session.commit()
