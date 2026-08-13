@@ -223,6 +223,7 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
             {
                 "id": r.id,
                 "symbol": r.symbol,
+                "opt_symbol": r.opt_symbol,
                 "side": r.side,
                 "instrument": r.instrument or "stock",
                 "quantity": r.quantity,
@@ -256,8 +257,11 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
             fields.update(exit_fill_price=exit_["price"], exit_fill_qty=exit_["qty"])
 
         # the broker's own number rides along whether or not both legs reported —
-        # it is an independent observation, not a product of ours
-        symbol_key = (row["symbol"] or "").upper()
+        # it is an independent observation, not a product of ours. The position
+        # book keys NFO option positions by the CONTRACT symbol (issue #593), so
+        # an option row must look itself up by its opt_symbol, not the underlying.
+        lookup = row["opt_symbol"] if row["instrument"] == "option" else row["symbol"]
+        symbol_key = (lookup or "").upper()
         if symbol_key in book:
             fields["broker_pnl"] = round(book[symbol_key], 2)
 

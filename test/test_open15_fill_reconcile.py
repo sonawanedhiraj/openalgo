@@ -180,6 +180,71 @@ def test_fill_prices_overwrite_the_quote_derived_pnl_in_place(monkeypatch):
     db_session.remove()
 
 
+def test_an_option_rows_broker_pnl_is_looked_up_by_the_contract_symbol(monkeypatch):
+    """Issue #593. The broker's position book keys NFO option positions by the
+    CONTRACT symbol (ASHOKLEY25AUG26180CE), while the journal row's ``symbol`` is
+    the underlying (ASHOKLEY). Looking the book up by the underlying means
+    ``broker_pnl`` is ALWAYS null for option rows — the strategy's default
+    instrument since #437 — so the cross-check the column exists for never ran.
+    Confirmed live 2026-08-13: row id=30 reconciled gross 2000.00 matching the
+    book's 2000.0 for the contract, yet broker_pnl stayed null.
+    """
+    from database.open15_breakout_db import Open15Trade, db_session
+    from services.open15_fill_reconcile import reconcile_fills
+
+    row_id = _insert_real_row(
+        symbol="ASHOKLEY",
+        instrument="option",
+        opt_symbol="ASHOKLEY25AUG26180CE",
+        quantity=10000,
+        pnl=1500.0,
+    )
+    _stub_order_status(
+        monkeypatch,
+        {
+            "E-1": {"average_price": 5.66, "quantity": 10000, "order_status": "complete"},
+            "X-1": {"average_price": 5.86, "quantity": 10000, "order_status": "complete"},
+        },
+    )
+    # the book as the broker returns it: keyed by the CONTRACT, not the underlying
+    monkeypatch.setattr(
+        "services.open15_fill_reconcile.broker_pnl_by_symbol",
+        lambda _k: {"ASHOKLEY25AUG26180CE": 2000.0},
+    )
+
+    res = reconcile_fills("2026-08-06")
+    assert res["reconciled"] == 1
+
+    row = db_session.query(Open15Trade).filter(Open15Trade.id == row_id).first()
+    assert row.broker_pnl == 2000.0, "the cross-check must match on the contract symbol"
+    assert row.pnl == pytest.approx((5.86 - 5.66) * 10000)
+    assert row.pnl_source == "fill" and row.fill_reconcile_status == "reconciled"
+    db_session.remove()
+
+
+def test_a_stock_rows_broker_pnl_still_matches_on_the_underlying(monkeypatch):
+    """The #593 fix must not disturb stock rows, whose book key IS the symbol."""
+    from database.open15_breakout_db import Open15Trade, db_session
+    from services.open15_fill_reconcile import reconcile_fills
+
+    row_id = _insert_real_row()
+    _stub_order_status(
+        monkeypatch,
+        {
+            "E-1": {"average_price": 100.5, "quantity": 100, "order_status": "complete"},
+            "X-1": {"average_price": 102.5, "quantity": 100, "order_status": "complete"},
+        },
+    )
+    monkeypatch.setattr(
+        "services.open15_fill_reconcile.broker_pnl_by_symbol", lambda _k: {"HAL": 200.0}
+    )
+
+    reconcile_fills("2026-08-06")
+    row = db_session.query(Open15Trade).filter(Open15Trade.id == row_id).first()
+    assert row.broker_pnl == 200.0
+    db_session.remove()
+
+
 def test_an_unreported_exit_leg_leaves_the_row_pending_and_its_pnl_alone(monkeypatch):
     """Half a reconciliation is not a reconciliation.
 
