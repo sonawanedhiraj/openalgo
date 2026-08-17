@@ -54,7 +54,6 @@ def summarize_day(
     paper_pnl: float | None = None,
     sim_pnl: float | None = None,
     shadow_pnl: float | None = None,
-    replay_pnl: float | None = None,
 ) -> dict:
     """One-line digest of a day's decision log for the history sidebar.
 
@@ -85,7 +84,6 @@ def summarize_day(
     paper_syms: set[str] = set()
     sim_syms: set[str] = set()
     shadow_syms: set[str] = set()
-    replay_syms: set[str] = set()
     rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
     # option-liquidity exclusions (#583): stage 1 = both sides dead, at arm;
     # stage 2 = the assigned side is dead, at seed selection or a rolling add
@@ -94,12 +92,10 @@ def summarize_day(
     paper_from_events = 0.0
     sim_from_events = 0.0
     shadow_from_events = 0.0
-    replay_from_events = 0.0
     saw_exit_pnl = False
     saw_paper_pnl = False
     saw_sim_pnl = False
     saw_shadow_pnl = False
-    saw_replay_pnl = False
     for ev in events:
         kind = ev.get("event")
         if kind in ("skipped_late_boot", "skipped_no_prev_closes"):
@@ -127,12 +123,6 @@ def summarize_day(
             sim_syms.add(ev.get("symbol", ""))
         elif kind == "entry_shadow":
             shadow_syms.add(ev.get("symbol", ""))
-        elif kind == "entry_replay":
-            # issue #600 — a session the strategy never ran, rebuilt from
-            # 1m bars. A FIFTH bucket, never folded into any other: its
-            # entry price is not resolvable from bars, so the figure is a
-            # band, not a measurement.
-            replay_syms.add(ev.get("symbol", ""))
         elif kind == "exit" and ev.get("pnl") is not None:
             pnl_from_events += float(ev["pnl"])
             saw_exit_pnl = True
@@ -142,9 +132,6 @@ def summarize_day(
             # read `pnl`. Both events carry gross/charges/pnl(net) alike.
             paper_from_events += float(ev["pnl"])
             saw_paper_pnl = True
-        elif kind == "exit_replay" and ev.get("pnl") is not None:
-            replay_from_events += float(ev["pnl"])
-            saw_replay_pnl = True
         elif kind == "exit_sim" and ev.get("pnl") is not None:
             sim_from_events += float(ev["pnl"])
             saw_sim_pnl = True
@@ -161,9 +148,6 @@ def summarize_day(
     shpnl = (
         shadow_pnl if shadow_pnl is not None else (shadow_from_events if saw_shadow_pnl else None)
     )
-    rpnl = (
-        replay_pnl if replay_pnl is not None else (replay_from_events if saw_replay_pnl else None)
-    )
     return {
         "date": date,
         "status": status,
@@ -176,12 +160,10 @@ def summarize_day(
         "paper": len(paper_syms),
         "sim": len(sim_syms),
         "shadow": len(shadow_syms),
-        "replay": len(replay_syms),
         "pnl": round(pnl, 2) if pnl is not None else None,
         "paper_pnl": round(ppnl, 2) if ppnl is not None else None,
         "sim_pnl": round(spnl, 2) if spnl is not None else None,
         "shadow_pnl": round(shpnl, 2) if shpnl is not None else None,
-        "replay_pnl": round(rpnl, 2) if rpnl is not None else None,
         "events": len(events),
     }
 
@@ -387,30 +369,6 @@ def selection_outcomes(
             elif kind in ("exit_sim", "exit_shadow"):
                 # these carry a qty that is a PRICING size, not an order size
                 rows[sym].update(fill=ev.get("fill") or "sim", qty=ev.get("qty"))
-        elif kind == "entry_replay":
-            # issue #615 — mirror of the page's renderSel branch. The distinct
-            # event names (#604) keep the digest buckets apart; both row
-            # builders still have to recognise them.
-            sym = ev.get("symbol")
-            if sym in rows:
-                rows[sym].update(
-                    fill="replay",
-                    entered=True,
-                    qty=ev.get("quantity"),
-                    level=ev.get("level"),
-                    trigger_price=ev.get("trigger_price"),
-                    instrument="option" if ev.get("opt_symbol") else None,
-                    opt_symbol=ev.get("opt_symbol"),
-                    opt_entry_premium=ev.get("opt_entry_premium"),
-                )
-        elif kind == "exit_replay" and ev.get("pnl") is not None:
-            sym = ev.get("symbol")
-            if sym in rows:
-                rows[sym].update(
-                    fill="replay",
-                    pnl=ev.get("pnl"),
-                    opt_exit_premium=ev.get("opt_exit_premium"),
-                )
         elif kind == "entry_skipped":
             sym = ev.get("symbol")
             if sym in rows:

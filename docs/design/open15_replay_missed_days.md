@@ -1,5 +1,19 @@
 # open15_vol_breakout — one-click replay of a missed session
 
+> **REMOVED 2026-08-17 (issue #620).** This feature was built and then removed
+> the same day. Replayed P&L is *structurally* undecidable — the gate fires at a
+> tick inside a minute, 1m bars bound the entry price by the minute's open and
+> close, and on ATM options that band crosses zero (2026-08-17: −₹13,501 to
+> +₹13,112). The tick data that would resolve it is absent by construction,
+> because the only two ways a day gets missed are a dead feed (no ticks) and a
+> late boot (capture never starts). It also **overwrote the decision logs of the
+> days it reconstructed**, destroying the evidence of both incidents — the #597
+> clobber pattern, reintroduced by design. See
+> [`open15_replay_removal.md`](open15_replay_removal.md).
+>
+> Kept below as the design record. **Do not rebuild this without reading the
+> removal plan first.**
+
 **Status:** proposal · **Date:** 2026-08-17 · **Prompted by:** 2026-08-12 (feed
 delivered zero ticks) and 2026-08-17 (`skipped_late_boot`) — two of six trading
 days lost, both leaving a blank day on `/open15_vol_breakout/logs`.
