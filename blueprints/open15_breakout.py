@@ -640,7 +640,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <div class="main">
   <div id="status" class="muted"></div>
   <div id="rejbox"></div>
-  <div id="rpbox"></div>
+  <div id="lostbox"></div>
+<div id="rpbox"></div>
 <div class="chips" id="chips"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
@@ -897,7 +898,7 @@ async function selectDay(date){
   curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
-  renderRejected(); renderReplayBanner(); renderChips(); renderAtmLadder();
+  renderRejected(); renderLogLostBanner(); renderReplayBanner(); renderChips(); renderAtmLadder();
   renderRolling(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
@@ -977,6 +978,28 @@ function pollReplay(date){
   };
   setTimeout(tick,1200);
 }
+function renderLogLostBanner(){
+  // issue #612 — say why the timeline is missing, above the numbers, in the
+  // same place the rejection banner says its rows are simulated. Without this
+  // the page asserted "no selection this day" beside a real +Rs1438 and left
+  // the reader to reconcile it.
+  const box=document.getElementById('lostbox');
+  if(!box)return;
+  const lost=(curJournal||[]).length>0&&!curEvents.some(e=>e.event==='selection');
+  if(!lost){box.innerHTML='';return;}
+  const real=(curJournal||[]).filter(j=>!j.fill||j.fill==='real').length;
+  box.innerHTML='<div class="rejbanner" style="border-left-color:#f9e2af;background:#241f14">'+
+    '<div class="rt" style="color:#f9e2af">Decision timeline lost &mdash; the trades are intact'+
+    '</div><div class="rm">A late-boot arm overwrote the log for this day with a single '+
+    '<code>skipped_late_boot</code> event (the pre-#597 clobber; restarts now append '+
+    '<code>late_boot_restart</code> instead). The '+(curJournal||[]).length+
+    ' trade'+((curJournal||[]).length===1?'':'s')+' below '+
+    ((curJournal||[]).length===1?'is':'are')+' read from the journal, which was never '+
+    'touched'+(real?(' &mdash; '+real+' real fill'+(real===1?'':'s')):'')+'.</div>'+
+    '<div class="rn">Gone for good: the gap ranking, per-symbol volume ratios, the rolling '+
+    'additions and the universe exclusions. Not reconstructed &mdash; a partial rebuild would '+
+    'look like a record.</div></div>';
+}
 function renderReplayBanner(){
   // A replayed day must SAY it is a reconstruction, above the numbers, in the
   // same place the broker-rejection banner says its rows are simulated.
@@ -1029,7 +1052,12 @@ function renderChips(){
   const armed=curEvents.find(e=>e.event==='armed')||{};
   const summ=curEvents.find(e=>e.event==='summary')||{};
   const dig=digests.find(d=>d.date===curDate)||{};
-  const filled=dig.entered??summ.filled??0;
+  // When the log was destroyed but the journal survived (#612), the EVENT-derived
+  // counts are false — 2026-08-13 read "0 filled" beside a real +Rs1438. Count
+  // the journal instead, which is what the P&L chips already read.
+  const jFills=(curJournal||[]).filter(j=>!j.fill||j.fill==='real').length;
+  const logLost=(curJournal||[]).length>0&&!curEvents.some(e=>e.event==='selection');
+  const filled=logLost?jFills:(dig.entered??summ.filled??0);
   const paper=dig.paper??summ.paper??0;
   const rupee=v=>(v>=0?'+':'')+'\\u20B9'+Math.round(v);
   // real and paper P&L are NEVER summed into one figure — paper money was
@@ -1053,7 +1081,7 @@ function renderChips(){
     ['entries',filled+' filled'+(paper?(' \\u00B7 '+paper+' paper'):'')+
       (sim?(' \\u00B7 '+sim+' sim'):'')+
       (shadow?(' \\u00B7 '+shadow+' shadow'):'')+
-      ' / '+(dig.selected??summ.selected??0)+' sel'],
+      ' / '+(logLost?(curJournal||[]).length:(dig.selected??summ.selected??0))+' sel'],
     ['real P&amp;L <span class="net">net</span>',dig.pnl==null?'—':rupee(dig.pnl)]];
   if(paper||dig.paper_pnl!=null)
     chips.push(['paper P&amp;L <span class="net">net</span>',
@@ -1334,6 +1362,23 @@ function renderSel(){
       rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+vb+
         '&times; &lt; '+e.needed+' while beyond'):'level never broken';
     }
+  }
+  // A day whose LOG was destroyed still has its JOURNAL (issue #612). On
+  // 2026-08-13 a late-boot arm at 14:33 overwrote the whole log with one
+  // skipped_late_boot event (the #597 class), yet the 8 trades survived — so
+  // this table said "no selection this day" beside a real +Rs1438. Seed a row
+  // for any journal symbol the events never mentioned. Mirrors the same block
+  // in selection_outcomes(); the parity test compares the SYMBOL SETS, so both
+  // sides must seed or they diverge the moment a journal is passed.
+  // NARROW on purpose — only when the log has NO selection event, i.e. the
+  // whole timeline is gone. A stray journal symbol beside an INTACT selection is
+  // anomalous and must not be seeded (the Python twin's invariant test).
+  const logLostRows=!curEvents.some(e=>e.event==='selection');
+  for(const j of (logLostRows?(curJournal||[]):[])){
+    if(!j.symbol||rows[j.symbol])continue;
+    rows[j.symbol]={side:j.side,src:j.watch_source,fromJournal:true,
+      out:'<span class="muted">decision detail lost — log overwritten by a '+
+          'late-boot arm; the trade below is from the journal</span>'};
   }
   // the journal wins over anything the timeline said (issue #557) — applied
   // here, immediately after the event loop, so it is part of the row-building

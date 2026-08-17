@@ -405,6 +405,39 @@ def selection_outcomes(
     # CATCH-UP, whose whole purpose is to run on a later day. Those events stay
     # in the timeline as an audit of when reconciliation happened; they no
     # longer feed a row.
+    # A day whose LOG was destroyed still has its JOURNAL (issue #612). On
+    # 2026-08-13 a late-boot arm at 14:33 overwrote the whole log with one
+    # `skipped_late_boot` event (the #597 class, fixed after that date), yet the
+    # 8 trades survived in `open15_trades` — so the page reported "0 filled /
+    # 0 sel" and "no selection this day" directly beside a real +Rs1438. Seed a
+    # row for any journal symbol the events never mentioned, so the outcomes
+    # table states what actually happened instead of contradicting the P&L.
+    #
+    # A journal symbol absent from the log ALWAYS means the log lost
+    # information: the reconcile passes correct rows on later days but only for
+    # symbols the log already recorded.
+    # NARROW on purpose. `test_the_journal_never_invents_a_row_for_a_symbol_that
+    # _never_triggered` protects the case where the log DID record a selection
+    # and a stray journal symbol sits outside it — genuinely anomalous, and
+    # seeding it there would be indistinguishable from a selection the log
+    # failed to record. That invariant stands. This block fires only when the
+    # log has NO selection event at all, i.e. the whole timeline is gone.
+    log_lost = not any(ev.get("event") == "selection" for ev in events)
+    for j in journal or [] if log_lost else []:
+        sym = j.get("symbol")
+        if not sym or sym in rows:
+            continue
+        rows[sym] = dict.fromkeys(CSV_COLUMNS)
+        rows[sym].update(
+            date=date,
+            symbol=sym,
+            side=j.get("side"),
+            watch_source=j.get("watch_source"),
+            entered=bool(j.get("entry_status")),
+            # the decision detail (gap, vol ratio, level-broken, drift) is
+            # genuinely gone — left NULL rather than guessed
+            from_journal=True,
+        )
     apply_journal(rows, journal)
     return list(rows.values())
 
