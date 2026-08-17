@@ -325,6 +325,11 @@ def _ensure_columns():
             "opt_impact_pct": "FLOAT",
             "opt_depth_levels_used": "INTEGER",
             "opt_depth_exhausted": "INTEGER",
+            # issue #600 — replay rows only; NULL everywhere else. This belongs
+            # to the TRADES table: it shipped in the config block by mistake
+            # (#602), which no test could catch because tests build their tables
+            # from the ORM model and only a pre-existing install runs this ALTER.
+            "opt_entry_premium_early": "FLOAT",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -352,8 +357,6 @@ def _ensure_columns():
             "shadow_max_trades": "INTEGER",
             # issue #591 — NULL resolves to the env default (90)
             "coverage_target_pct": "INTEGER",
-            # issue #600 — replay rows only; NULL everywhere else
-            "opt_entry_premium_early": "FLOAT",
         },
     }
     try:
