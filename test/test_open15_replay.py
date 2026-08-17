@@ -569,3 +569,95 @@ def test_a_replayed_day_can_be_replayed_again():
     out = R.eligibility_or_reason("2026-08-12", events, False, dt.datetime(2026, 8, 16, 20, 0))
     assert out["eligible"] is True
     assert out["reason"] == "re_replay"
+
+
+# --------------------------------------------------------------------------- #
+# Both config paths must satisfy run_core's contract (issue #617)
+# --------------------------------------------------------------------------- #
+# Every key run_core / price_legs reads off the day config. Asserted as a SET so
+# the next key added to either is caught here, rather than by a KeyError in a
+# background worker two weeks later.
+_CONFIG_CONTRACT = {
+    "vol_mult",
+    "top_n",
+    "trade_side",
+    "shadow_side",
+    "shadow_max_trades",
+    "max_trades",
+    "margin_effective",
+    "instrument",
+    "rolling_enabled",
+    "rolling_cadence_s",
+    "rolling_top_n",
+    "no_entry_after",
+    "exit_time",
+    "option_min_oi_lots",
+    "excluded",
+    "config_source",
+}
+
+_ARMED_LOG = [
+    {
+        "event": "armed",
+        "vol_mult": 1.5,
+        "top_n": 3,
+        "trade_side": "long_only",
+        "shadow_side": "S",
+        "shadow_max_trades": 3,
+        "max_trades": 3,
+        "margin_effective": 60000.0,
+        "instrument": "atm_option",
+        "rolling_watchlist_enabled": True,
+        "rolling_cadence_s": 30,
+        "rolling_top_n": 3,
+        "no_entry_after": "09:29",
+        "exit_time": "09:30",
+        "option_min_oi_lots": 500,
+    },
+]
+# a day that NEVER armed — the skipped_late_boot case the feature exists for
+_NEVER_ARMED_LOG = [{"event": "skipped_late_boot", "armed_at": "09:17:09"}]
+
+
+@pytest.mark.parametrize(
+    ("log", "expect_source"),
+    [
+        (_ARMED_LOG, "armed_event"),
+        (_NEVER_ARMED_LOG, "open15_config_row"),
+        ([], "open15_config_row"),
+    ],
+)
+def test_both_config_paths_satisfy_the_run_core_contract(monkeypatch, log, expect_source):
+    """2026-08-17 crashed with KeyError 'top_n' (#617).
+
+    ``resolve_day_config`` does not return ``top_n`` — the service reads it
+    separately from ``OPEN15_TOP_N`` — so the fallback path died on every day
+    that never armed, i.e. precisely the case replay is for. 2026-08-12 worked
+    only because it armed at 09:10 before its feed went silent.
+    """
+    import database.open15_breakout_db as db
+
+    monkeypatch.setattr(db, "get_day_log", lambda d: log)
+    cfg = R.resolve_replay_config("2026-08-17")
+
+    assert cfg["config_source"] == expect_source
+    missing = _CONFIG_CONTRACT - set(cfg)
+    assert not missing, f"config from {expect_source} is missing {sorted(missing)}"
+    # and the values must be USABLE, not just present
+    assert isinstance(cfg["top_n"], int) and cfg["top_n"] >= 1
+    assert cfg["vol_mult"] > 0
+    assert cfg["exit_time"] and cfg["no_entry_after"]
+
+
+def test_a_never_armed_day_replays_through_run_core(day, monkeypatch):
+    """The end-to-end shape of #617: config from the fallback path must drive
+    the core without raising."""
+    import database.open15_breakout_db as db
+
+    monkeypatch.setattr(db, "get_day_log", lambda d: _NEVER_ARMED_LOG)
+    cfg = R.resolve_replay_config("2026-08-14")
+    cfg["excluded"] = []
+    run = R.run_core("2026-08-14", cfg, day["bars"], day["prev_closes"], {})
+
+    assert run["universe_n"] > 0
+    assert isinstance(run["selected"], dict)
