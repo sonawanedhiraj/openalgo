@@ -117,15 +117,33 @@ def _in_window(t: dt.time, cfg: PullbackConfig) -> bool:
     return (cfg.morning[0] <= t < cfg.morning[1]) or (cfg.afternoon[0] <= t < cfg.afternoon[1])
 
 
+def _naive(t: dt.datetime | None) -> dt.datetime | None:
+    """Drop tzinfo so aware and naive timestamps compare.
+
+    Every timestamp that reaches this module — aggregator bars, history bars, journal
+    entry/exit times, the service's ``now`` — is already IST wall time; only the presence
+    of ``tzinfo`` varies by source. Comparing the two forms directly raises TypeError.
+    """
+    return t.replace(tzinfo=None) if (t is not None and t.tzinfo is not None) else t
+
+
 class StockState:
     """Per-stock intraday state machine for ONE side (long or short).
 
     Call ``process_candle`` for each closed 5m candle in chronological order. It returns a list of
     zero or more actions (an entry, and/or an exit) that the service should mirror into real orders.
     The state machine itself tracks the open position and stop, so exits (SL/EOD) are emitted here.
+
+    ``replay_floor`` makes the warm-up replay safe (issue #624). After a mid-session restart the
+    service re-feeds the day's candles from 09:15 to rebuild ``prior_vols`` and ``ref`` — but the
+    position it is managing was opened hours into that replay. Without a floor the first replayed
+    candle breaches a stop that did not exist yet (a phantom ``SL`` stamped 09:15), and the replay
+    then re-reaches the original breakout and opens a duplicate position. Candles at or before the
+    floor therefore rebuild STATE ONLY: no action is ever emitted and ``pos`` is never mutated.
+    Decisions are forward-only; warm-up is not a decision.
     """
 
-    def __init__(self, side: str, cfg: PullbackConfig):
+    def __init__(self, side: str, cfg: PullbackConfig, replay_floor: dt.datetime | None = None):
         if side not in ("L", "S"):
             raise ValueError(f"side must be 'L' or 'S', got {side!r}")
         self.side = side
@@ -135,6 +153,8 @@ class StockState:
         self.pos: tuple | None = None  # (entry_ts, entry_price, stop_price)
         self.prior_vols: list[float] = []  # volumes of already-processed candles
         self.done = False  # set by noreentry-after-SL
+        # candles at/before this are warm-up: state is rebuilt, no action is emitted (#624)
+        self.replay_floor: dt.datetime | None = _naive(replay_floor)
         # per-day diagnostics — why an entry did/didn't fire (observability, not logic)
         self.diag = {
             "candles": 0,  # candles evaluated
@@ -144,6 +164,7 @@ class StockState:
             "no_slot": 0,  # a breakout that couldn't enter (both slots busy)
             "entries": 0,
             "exits": 0,
+            "replayed": 0,  # warm-up candles rebuilt without deciding anything (#624)
         }
 
     @property
@@ -175,10 +196,26 @@ class StockState:
     def has_open_position(self) -> bool:
         return self.pos is not None
 
+    def _is_warmup(self, ts: dt.datetime) -> bool:
+        """Is this candle part of the post-restart warm-up replay? (issue #624)"""
+        floor = self.replay_floor
+        return floor is not None and (_naive(ts) or ts) <= floor
+
     def process_candle(self, candle: Candle, ctx: GateContext) -> list:
         ts, o, h, lo, c, v = candle
         actions: list = []
         self.diag["candles"] += 1
+
+        # 0) warm-up replay: rebuild state, decide nothing (issue #624).
+        # Mirrors the live control flow below with every action and every `pos` mutation
+        # removed — while a position is held the live path never updates `ref` either, so
+        # the state this leaves behind is the state the live run would have had.
+        if self._is_warmup(ts):
+            self.diag["replayed"] += 1
+            if self.pos is None:
+                self._maybe_set_ref(o, h, lo, c, v)
+            self.prior_vols.append(v)
+            return actions
 
         # 1) manage an open position first (stop / EOD) — frees the slot
         if self.pos is not None:
@@ -234,15 +271,19 @@ class StockState:
 
         # 2) update the reference candle (skipped only when we just entered)
         if not entered:
-            prev2 = self.prior_vols[-2:]
-            low_vol = (not prev2) or (v <= min(prev2))
-            is_ref = (c < o) if self.side == "L" else (c > o)
-            if is_ref and low_vol:
-                self.ref = (o, h, lo, v)
-                self.diag["ref_formed"] += 1
+            self._maybe_set_ref(o, h, lo, c, v)
 
         self.prior_vols.append(v)
         return actions
+
+    def _maybe_set_ref(self, o: float, h: float, lo: float, c: float, v: float) -> None:
+        """Latch this candle as the no-supply reference if it is a low-volume pullback."""
+        prev2 = self.prior_vols[-2:]
+        low_vol = (not prev2) or (v <= min(prev2))
+        is_ref = (c < o) if self.side == "L" else (c > o)
+        if is_ref and low_vol:
+            self.ref = (o, h, lo, v)
+            self.diag["ref_formed"] += 1
 
     def reason(self) -> str:
         """One-line explanation of why this pick did / didn't produce an entry today."""

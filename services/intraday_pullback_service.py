@@ -46,6 +46,10 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 _CONFIG_PATH = (
     Path(__file__).resolve().parent.parent / "strategies" / STRATEGY_NAME / "config_snapshot.json"
 )
+# How far behind the wall clock a candle may be and still justify an order (issue #624).
+# Default 10 min = one 5m candle + a tick's worth of grace. An action older than this means
+# a replay leaked into the decision path: entries are refused, exits are re-priced.
+_STALE_ACTION_MAX_MIN = float(os.getenv("INTRADAY_PULLBACK_STALE_ACTION_MAX_MIN", "10"))
 
 
 # --------------------------------------------------------------------------------------------
@@ -555,7 +559,12 @@ class IntradayPullbackService:
         self.picks = select_top2(
             self.side, stock_returns, self.sector_map, sector_returns, self.cfg
         )
-        self.states = {s: StockState(self.side, self.cfg) for s in self.picks}
+        # On a LATE boot the day's candles are replayed to rebuild prior_vols/ref. A breakout
+        # that fired before boot is history — entering it now would place a MARKET order at an
+        # hours-old price, outside the window that qualified it (issue #624). Floor the replay
+        # at boot time so warm-up rebuilds state and only fresh candles can trade.
+        floor = _naive_ist(now) if historical else None
+        self.states = {s: StockState(self.side, self.cfg, replay_floor=floor) for s in self.picks}
         self.last_fed = dict.fromkeys(self.picks, 0)
         self.pick_meta = {
             s: {
@@ -651,8 +660,12 @@ class IntradayPullbackService:
         self.prev_close = {k: v for k, v in prev.items() if v}
         self.states = {}
         for sym in picks:
-            st = StockState(self.side, self.cfg)
             srows = [r for r in rows if r["symbol"] == sym]
+            # Warm-up floor (issue #624): the replay below re-feeds the day from 09:15 to rebuild
+            # prior_vols/ref, so every candle up to this symbol's last journalled event must be
+            # state-only. Without it the first replayed candle stops out a position opened hours
+            # later (a phantom SL stamped 09:15) and the replay then re-enters the same breakout.
+            st = StockState(self.side, self.cfg, replay_floor=_last_journal_ts(srows))
             st.attempts = len(srows)
             if st._noreentry and any(
                 r["status"] == "closed" and r["exit_reason"] == "SL" for r in srows
@@ -721,8 +734,30 @@ class IntradayPullbackService:
         elif isinstance(action, ExitAction):
             self._place_exit(sym, action)
 
+    def _action_age_min(self, action) -> float:
+        """Minutes between the candle that produced ``action`` and the wall clock."""
+        ts = _naive_ist(action.ts)
+        now = _naive_ist(self._now())
+        if ts is None or now is None:
+            return 0.0
+        return (now - ts).total_seconds() / 60.0
+
     def _place_entry(self, sym: str, sector: str, action: EntryAction):
         if self.open_count >= self.slots:
+            return
+        # Staleness guard (issue #624, defense in depth). The replay floor should mean an entry
+        # action never carries an old candle, but a stale entry is never right: the price has
+        # moved, and the wall clock may sit outside the window that qualified the candle (the
+        # 2026-08-17 duplicate landed at 11:45, inside the 11:00-13:00 no-trade window). Refuse
+        # loudly rather than place it. Exits are deliberately NOT blocked — see _place_exit.
+        age = self._action_age_min(action)
+        if age > _STALE_ACTION_MAX_MIN:
+            msg = (
+                f"🚨 intraday_pullback: REFUSED stale entry {sym} — candle "
+                f"{action.ts} is {age:.0f} min old (max {_STALE_ACTION_MAX_MIN})"
+            )
+            logger.error(msg)
+            self._notify(msg)
             return
         qty = int(self._notional_per_slot() / action.price) if action.price else 0
         if qty <= 0:
@@ -798,6 +833,24 @@ class IntradayPullbackService:
         pos = self.open_positions.get(sym)
         if pos is None:
             return
+        # Staleness guard (issue #624, defense in depth). Unlike an entry this is NEVER blocked —
+        # the position is real and must always be able to square off. But it must not be booked
+        # at a stale candle's price or timestamp (the 2026-08-17 phantom SL journalled a 09:15
+        # exit at the stop price for a position opened at 10:25). Re-price to the live tick,
+        # stamp the exit now, and say so.
+        age = self._action_age_min(action)
+        if age > _STALE_ACTION_MAX_MIN:
+            live = self._price(sym, self._now())
+            logger.warning(
+                "intraday_pullback: stale exit %s — candle %s is %.0f min old; "
+                "re-pricing %.2f -> %s and stamping exit now",
+                sym,
+                action.ts,
+                age,
+                action.price,
+                f"{live:.2f}" if live else "unchanged (no live price)",
+            )
+            action = ExitAction(ts=self._now(), price=live or action.price, reason=action.reason)
         qty = pos["qty"]
         side = pos["side"]
         exit_action = "SELL" if side == "L" else "BUY"
@@ -1126,6 +1179,33 @@ def _parse_iso(s) -> datetime | None:
         return datetime.fromisoformat(str(s))
     except Exception:  # noqa: BLE001
         return None
+
+
+def _naive_ist(d: datetime | None) -> datetime | None:
+    """Normalize a datetime to naive IST wall time (the state machine's comparison basis)."""
+    if d is None:
+        return None
+    return d.astimezone(_IST).replace(tzinfo=None) if d.tzinfo else d
+
+
+def _last_journal_ts(rows: list) -> datetime | None:
+    """Latest entry/exit timestamp across today's journal rows for one symbol (issue #624).
+
+    This is the warm-up floor for a resume replay: everything up to and including the last
+    thing this stock actually did is history to be rebuilt, never re-decided. Taking the max
+    over BOTH columns covers the closed-row case too — a stock stopped out at 10:50 must not
+    re-enter on its own replayed 10:25 breakout candle.
+    """
+    stamps = [
+        t
+        for r in rows
+        for t in (
+            _naive_ist(_parse_iso(r.get("entry_time"))),
+            _naive_ist(_parse_iso(r.get("exit_time"))),
+        )
+        if t is not None
+    ]
+    return max(stamps) if stamps else None
 
 
 def _build_pullback_config(raw: dict) -> PullbackConfig:
