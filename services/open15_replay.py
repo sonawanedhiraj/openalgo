@@ -114,8 +114,16 @@ def check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
         return {"eligible": False, "reason": "check_failed", "detail": "", "warning": None}
 
 
-def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
-    from database.open15_breakout_db import get_day_log, has_real_fill
+def eligibility_from(
+    date: str, events: list, real_fill: bool, now: dt.datetime | None = None
+) -> dict:
+    """PURE eligibility — no DB, no clock unless ``now`` is omitted.
+
+    Split out so the sidebar can judge ~20 days from data it ALREADY has
+    (issue #606). The per-card endpoint used to be called once per day per 5 s
+    refresh — 140 requests in 18 s, each running a ``has_real_fill`` query and a
+    full day-log JSON parse against the live DB while the strategy was trading.
+    """
     from services.data_freshness_service import is_trading_day
 
     try:
@@ -126,7 +134,7 @@ def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
     if not is_trading_day(day):
         raise ReplayIneligible("not_a_trading_day", date)
 
-    now = _now_ist()
+    now = now or _now_ist()
     # Market hours is a COST concern, not a correctness one — a replay is ~250
     # historical calls against the same 3 req/s budget the live strategy needs.
     # Operator decision (2026-08-17): warn, do not block. It rides the result as
@@ -143,26 +151,49 @@ def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
         raise ReplayIneligible("future_date", date)
 
     # THE guard: a day that traded is never rewritten (G4).
-    if has_real_fill(date):
+    if real_fill:
         raise ReplayIneligible("day_was_traded", "journal holds a real fill for this date")
+
+    kinds = {e.get("event") for e in (events or []) if isinstance(e, dict)}
+    ok = {"eligible": True, "detail": "", "warning": warning}
+    if not events:
+        return {**ok, "reason": "no_day_log", "detail": "app was down"}
+    hit = kinds & set(_SKIP_EVENTS)
+    if hit:
+        return {**ok, "reason": sorted(hit)[0]}
+    if "replay_meta" in kinds:
+        return {**ok, "reason": "re_replay"}
+    raise ReplayIneligible("day_ran_normally", "the session armed and ran; nothing to reconstruct")
+
+
+def eligibility_or_reason(
+    date: str, events: list, real_fill: bool, now: dt.datetime | None = None
+) -> dict:
+    """:func:`eligibility_from` with the exception folded into the result."""
+    try:
+        return eligibility_from(date, events, real_fill, now)
+    except ReplayIneligible as e:
+        return {"eligible": False, "reason": e.reason, "detail": e.detail, "warning": None}
+    except Exception:
+        logger.exception("open15 replay: eligibility check failed for %s", date)
+        return {"eligible": False, "reason": "check_failed", "detail": "", "warning": None}
+
+
+def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
+    """Single-date eligibility, reading what it needs from the DB.
+
+    The authoritative path for the POST re-check. The sidebar does NOT use this —
+    see :func:`eligibility_from`.
+    """
+    from database.open15_breakout_db import get_day_log, has_real_fill
 
     events = get_day_log(date) or []
     kinds = {e.get("event") for e in events if isinstance(e, dict)}
     if "replay_meta" in kinds and not allow_rereplay:
+        # checked here rather than in the pure helper: "already replayed" is a
+        # UI-affordance rule, not a safety one, and force=true lifts it
         raise ReplayIneligible("already_replayed", "pass force=true to re-run")
-    if not events:
-        return {
-            "eligible": True,
-            "reason": "no_day_log",
-            "detail": "app was down",
-            "warning": warning,
-        }
-    hit = kinds & set(_SKIP_EVENTS)
-    if hit:
-        return {"eligible": True, "reason": sorted(hit)[0], "detail": "", "warning": warning}
-    if "replay_meta" in kinds:
-        return {"eligible": True, "reason": "re_replay", "detail": "", "warning": warning}
-    raise ReplayIneligible("day_ran_normally", "the session armed and ran; nothing to reconstruct")
+    return eligibility_from(date, events, has_real_fill(date))
 
 
 # --------------------------------------------------------------------------- #

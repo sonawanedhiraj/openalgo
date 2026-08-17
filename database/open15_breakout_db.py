@@ -770,6 +770,27 @@ def delete_replay_rows(trade_date: str) -> int:
         db_session.remove()
 
 
+def real_fill_dates() -> set[str] | None:
+    """Every trade_date holding at least one REAL fill, in ONE query (#606).
+
+    The sidebar judges ~20 days per refresh. Asking :func:`has_real_fill` per day
+    meant 20 queries every 5 s against the live DB while the strategy traded.
+
+    Returns ``None`` — not an empty set — when the query fails. Callers must
+    treat that as "unknown" and refuse to offer a replay, matching
+    :func:`has_real_fill`'s fail-CLOSED contract. An empty set would read as
+    "no day ever traded" and would offer a rewrite of every one of them.
+    """
+    try:
+        rows = db_session.query(Open15Trade.trade_date).filter(_REAL_FILL).distinct().all()
+        return {d for (d,) in rows}
+    except Exception:
+        logger.exception("open15: bulk real-fill scan failed — treating ALL dates as traded")
+        return None
+    finally:
+        db_session.remove()
+
+
 def early_entry_net_pnl(row) -> float | None:
     """Optimistic end of a replay row's band, or None when not applicable.
 

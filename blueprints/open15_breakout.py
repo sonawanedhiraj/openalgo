@@ -382,6 +382,7 @@ def decision_log_days():
     """Digest of every stored day for the history sidebar (issue #444)."""
     from database.open15_breakout_db import (
         paper_pnl_by_date,
+        real_fill_dates,
         replay_pnl_by_date,
         shadow_pnl_by_date,
         sim_pnl_by_date,
@@ -395,6 +396,11 @@ def decision_log_days():
         sim_by_date = sim_pnl_by_date()
         shadow_by_date = shadow_pnl_by_date()
         replay_by_date = replay_pnl_by_date()
+        # ONE query for the whole sidebar (#606). None = unknown -> every day
+        # is treated as traded, so no replay is offered. Fail CLOSED.
+        traded = real_fill_dates()
+        from services.open15_replay import eligibility_or_reason
+
         out = []
         for date, events, source in _all_day_logs():
             digest = summarize_day(
@@ -407,6 +413,14 @@ def decision_log_days():
                 replay_pnl=replay_by_date.get(date),
             )
             digest["source"] = source
+            # Replay affordance, computed from data already in hand — the events
+            # are right here and `traded` was one query. Costs no extra request
+            # and no extra DB round trip per day (#606).
+            elig = eligibility_or_reason(date, events, True if traded is None else (date in traded))
+            digest["replay_eligible"] = elig["eligible"]
+            digest["replay_reason"] = elig["reason"]
+            digest["replay_detail"] = elig.get("detail") or ""
+            digest["replay_warning"] = elig.get("warning")
             out.append(digest)
         return jsonify({"days": out})
     except Exception:
@@ -776,6 +790,7 @@ document.getElementById('c_shadow').addEventListener('change',syncShadowUi);
 loadCfg();
 </script>
 <script>
+let replayPolling={};
 let curDate=null, curEvents=[], curJournal=[], curFilter='all', digests=[];
 // symbols whose detail row is open, so the 5s live refresh does not collapse
 // them under the operator (issue #559). Cleared when a different day is picked.
@@ -850,7 +865,7 @@ async function loadDays(){
     // the replay affordance is added asynchronously: eligibility is a server
     // decision (traded day? market hours? already replayed?) and the button
     // must never appear on a day the server would refuse.
-    maybeAddReplayBtn(el,d.date);
+    maybeAddReplayBtn(el,d);
     box.appendChild(el);
   }
   if(!curDate&&digests.length)selectDay(digests[0].date);
@@ -876,35 +891,34 @@ async function selectDay(date){
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
 }
-async function maybeAddReplayBtn(el,date){
-  // Eligibility is the SERVER's call — the button is only a hint, and every
-  // POST is re-checked. So the day a run would be refused, no button appears.
-  let e;
-  try{
-    const r=await fetch('/open15_vol_breakout/api/replay/eligibility?date='+date);
-    e=await r.json();
-  }catch(err){return;}
+function maybeAddReplayBtn(el,d){
+  // SYNCHRONOUS on purpose (issue #606). This used to fetch eligibility per
+  // card, and the sidebar re-renders every 5s — 140 requests in 18s, each one
+  // a DB query plus a full day-log parse, hammering the live DB while the
+  // strategy traded. Eligibility now rides the days digest the sidebar already
+  // fetches, so the affordance costs zero extra requests.
   const head=el.querySelector('.d1');
-  if(!head)return;
+  if(!head||d.replay_eligible===undefined)return;
+  const running=(replayPolling[d.date]===true);
   const b=document.createElement('button');
   b.className='rbtn'; b.innerHTML='&#8635;';
-  if(e.running){b.disabled=true; b.title='replay running…'; pollReplay(date);}
-  else if(!e.eligible){
-    // Show it disabled WITH the reason rather than hiding it: "why is there no
-    // button?" is the question an operator would otherwise have to read code
-    // to answer. day_was_traded is the one that matters most — clicking through
-    // THAT would overwrite a real trading day, so it stays a hard block.
+  if(running){b.disabled=true; b.title='replay running…';}
+  else if(!d.replay_eligible){
+    // Disabled WITH the reason rather than hidden: "why is there no button?" is
+    // the question an operator would otherwise have to read code to answer.
+    // day_was_traded is the one that matters — clicking through THAT would
+    // overwrite a real trading day, so it stays a hard block.
     b.disabled=true;
-    b.title='cannot replay — '+(e.reason||'ineligible')+(e.detail?(': '+e.detail):'');
-  }else if(e.busy){b.disabled=true; b.title='another replay is running';}
-  else{
-    b.title=(e.reason==='re_replay'||e.reason==='already_replayed')
+    b.title='cannot replay — '+(d.replay_reason||'ineligible')+
+      (d.replay_detail?(': '+d.replay_detail):'');
+  }else{
+    b.title=(d.replay_reason==='re_replay')
       ? 'replay again from 1m bars' : 'reconstruct this session from 1m bars';
     // A cost worth stating is not a reason to take the choice away (operator
     // decision 2026-08-17): the button stays live and the tooltip carries the
     // warning. Only correctness blocks disable it.
-    if(e.warning){b.classList.add('warn'); b.title='⚠ '+e.warning+' — '+b.title;}
-    b.onclick=(ev)=>{ev.stopPropagation(); startReplay(date,b);};
+    if(d.replay_warning){b.classList.add('warn'); b.title='⚠ '+d.replay_warning+' — '+b.title;}
+    b.onclick=(ev)=>{ev.stopPropagation(); startReplay(d.date,b);};
   }
   head.appendChild(b);
 }
@@ -924,6 +938,8 @@ function replayMsg(date,text){
   if(m){m.style.display=''; m.textContent=text;}
 }
 function pollReplay(date){
+  if(replayPolling[date])return;   // one poller per date
+  replayPolling[date]=true;
   const bar=document.getElementById('rp-'+date);
   if(bar)bar.style.display='';
   const tick=async()=>{
@@ -939,6 +955,7 @@ function pollReplay(date){
       setTimeout(tick,3000); return;
     }
     if(bar)bar.style.display='none';
+    replayPolling[date]=false;
     if(s.status==='done'){
       replayMsg(date,'replayed — '+(s.rows_written||0)+' rows');
       await loadDays(); selectDay(date);

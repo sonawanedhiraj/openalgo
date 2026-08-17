@@ -456,3 +456,67 @@ def test_replay_early_premium_is_migrated_onto_the_trades_table():
     src = inspect.getsource(db._ensure_columns)
     trades = src[src.index('"open15_trades": {') : src.index('"open15_config": {')]
     assert "opt_entry_premium_early" in trades
+
+
+# --------------------------------------------------------------------------- #
+# The sidebar must not hammer the DB (issue #606)
+# --------------------------------------------------------------------------- #
+def test_sidebar_does_not_fetch_eligibility_per_card():
+    """The affordance must cost ZERO extra requests.
+
+    The first cut fetched eligibility per day card, and the sidebar re-renders
+    every 5 s: 140 requests in 18 s, each running a real-fill query AND a full
+    day-log JSON parse against the live DB while the strategy was trading.
+    Eligibility now rides the days digest the sidebar already fetches.
+    """
+    import blueprints.open15_breakout as bp
+
+    src = Path(bp.__file__).read_text(encoding="utf-8")
+    start = src.index("function maybeAddReplayBtn(")
+    body = src[start : src.index("function startReplay(", start)]
+    assert "fetch(" not in body, "the day-card renderer must not issue a request"
+    assert "async" not in body.split("{", 1)[0], "it must be synchronous"
+
+
+def test_bulk_real_fill_scan_fails_closed(monkeypatch):
+    """Unknown must never read as 'no day ever traded'.
+
+    An empty set would offer a replay — i.e. a destructive rewrite — of every
+    date in the sidebar. ``None`` is the sentinel the caller turns into
+    'treat every day as traded'.
+    """
+    import database.open15_breakout_db as db
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(db.db_session, "query", boom)
+    assert db.real_fill_dates() is None
+
+
+def test_unknown_traded_set_offers_no_replay():
+    """The caller's half of the fail-closed contract."""
+    from services.open15_replay import eligibility_or_reason
+
+    traded = None  # scan failed
+    out = eligibility_or_reason(
+        "2026-08-12", [{"event": "skipped_late_boot"}], True if traded is None else False
+    )
+    assert out["eligible"] is False
+    assert out["reason"] == "day_was_traded"
+
+
+def test_pure_eligibility_touches_no_database(monkeypatch):
+    """``eligibility_from`` is the hot path — it must stay DB-free."""
+    import database.open15_breakout_db as db
+
+    def boom(*a, **k):
+        raise AssertionError("eligibility_from must not query the DB")
+
+    monkeypatch.setattr(db, "has_real_fill", boom)
+    monkeypatch.setattr(db, "get_day_log", boom)
+
+    out = R.eligibility_from(
+        "2026-08-12", [{"event": "skipped_late_boot"}], False, dt.datetime(2026, 8, 16, 20, 0)
+    )
+    assert out["eligible"] is True
