@@ -370,3 +370,48 @@ def _rebind(db, tmp_path, monkeypatch):
 
 def _count(db, date: str) -> int:
     return db.db_session.query(db.Open15Trade).filter(db.Open15Trade.trade_date == date).count()
+
+
+def test_ensure_columns_map_matches_the_orm_models():
+    """Every migration column must exist on the table it is filed under (#602).
+
+    ``_ensure_columns`` is the ONLY path that adds a column to a table that
+    already exists — i.e. the only path that runs on a real install. Tests build
+    their tables with ``Base.metadata.create_all()`` straight from the ORM
+    model, so a column filed under the WRONG table passes every test and then
+    fails in production with ``no such column`` on the first insert.
+
+    That is exactly what happened to ``opt_entry_premium_early``: it shipped in
+    the ``open15_config`` block (its anchor, ``coverage_target_pct``, is a
+    config column that reads like a trades one), so ``open15_trades`` never got
+    it. This test fails against that tree.
+    """
+    import inspect
+
+    import database.open15_breakout_db as db
+
+    src = inspect.getsource(db._ensure_columns)
+    ns: dict = {}
+    start = src.index("wanted_by_table = {")
+    end = src.index("    try:", start)
+    exec(src[start:end].replace("wanted_by_table", "wanted"), ns)  # noqa: S102
+    wanted = ns["wanted"]
+
+    by_table = {m.__tablename__: m for m in (db.Open15Trade, db.Open15Config, db.Open15DayLog)}
+    for table, cols in wanted.items():
+        model = by_table.get(table)
+        assert model is not None, f"{table} has no ORM model in this check"
+        declared = set(model.__table__.columns.keys())
+        stray = sorted(set(cols) - declared)
+        assert not stray, f"{table} migration lists columns not on its model: {stray}"
+
+
+def test_replay_early_premium_is_migrated_onto_the_trades_table():
+    """The specific #602 regression, named so a failure is self-explaining."""
+    import inspect
+
+    import database.open15_breakout_db as db
+
+    src = inspect.getsource(db._ensure_columns)
+    trades = src[src.index('"open15_trades": {') : src.index('"open15_config": {')]
+    assert "opt_entry_premium_early" in trades
