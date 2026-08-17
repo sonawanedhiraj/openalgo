@@ -874,6 +874,22 @@ function renderLogLostBanner(){
     'additions and the universe exclusions. Not reconstructed &mdash; a partial rebuild would '+
     'look like a record.</div></div>';
 }
+function renderRejected(){
+  // broker-rejected entries (issue #548): no position was taken, and every
+  // number on those rows is a sandbox-equivalent simulation. Say so once,
+  // loudly, above the numbers — not in a tooltip.
+  const rej=curEvents.filter(e=>e.event==='entry_rejected');
+  const box=document.getElementById('rejbox');
+  if(!rej.length){box.innerHTML='';return;}
+  const msgs=[...new Set(rej.map(e=>e.error).filter(Boolean))];
+  const capped=rej.filter(e=>e.paper_capped).length;
+  box.innerHTML='<div class="rejbanner"><div class="rt">'+rej.length+
+    ' '+(rej.length===1?'entry':'entries')+' rejected by broker — no live position was taken</div>'+
+    msgs.map(m=>'<div class="rm">'+esc(m)+'</div>').join('')+
+    '<div class="rn">Values below are simulated as if the day had run in sandbox. No money moved.'+
+    (capped?(' '+capped+' beyond the paper cap '+(capped===1?'was':'were')+' left unpriced.'):'')+
+    '</div></div>';
+}
 function renderChips(){
   const armed=curEvents.find(e=>e.event==='armed')||{};
   const summ=curEvents.find(e=>e.event==='summary')||{};

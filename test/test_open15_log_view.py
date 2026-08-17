@@ -656,3 +656,36 @@ def test_js_and_python_agree_on_a_clobbered_day():
         for r in selection_outcomes("2026-08-13", _CLOBBERED, journal=_CLOBBERED_JOURNAL)
     }
     assert set(js) == set(py)
+
+
+def test_logs_page_every_render_callee_is_defined():
+    """A missing page function is invisible to `node --check` (issue #622).
+
+    Removing the replay feature (#620) cut `renderReplayBanner .. renderChips`,
+    and `renderRejected` — the #548 broker-rejection banner — sat between them.
+    The file still PARSED, so the syntax check passed, but `selectDay` threw
+    `ReferenceError: renderRejected is not defined` and the whole page went dark
+    for every day.
+
+    Resolving the call graph is the only check that catches that class, so it is
+    asserted here rather than left to a browser click.
+    """
+    import re
+
+    from blueprints.open15_breakout import _LOGS_PAGE
+
+    defined = set(re.findall(r"(?:async\s+)?function\s+(\w+)\s*\(", _LOGS_PAGE))
+    # the orchestrators: whatever these call must exist
+    for caller in ("selectDay", "loadDays"):
+        body_start = _LOGS_PAGE.index(f"function {caller}(")
+        body = _LOGS_PAGE[body_start : body_start + 2200]
+        # bare `name(` calls — not `.method(`, not a definition
+        callees = {
+            m
+            for m in re.findall(r"(?<![.\w])([a-z]\w{3,})\s*\(", body)
+            if m not in {"function", "async", "await", "return", "if", "for", "while", "catch"}
+        }
+        # the page's own helpers follow these prefixes; every one must be defined
+        page_fns = {c for c in callees if re.match(r"(render|load|apply|maybe|poll|start|csrf)", c)}
+        missing = sorted(page_fns - defined)
+        assert not missing, f"{caller} calls undefined page functions: {missing}"
