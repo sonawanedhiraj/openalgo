@@ -94,7 +94,11 @@ def test_summarize_day_traded():
         # absent rather than 0, so "the excluded side was never watched" stays
         # distinguishable from "it was watched and broke even"
         "shadow": 0,
+        # issue #600 — the replay bucket. A day the strategy really ran has
+        # none, and it must never absorb any of the counts above.
+        "replay": 0,
         "shadow_pnl": None,
+        "replay_pnl": None,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
     }

@@ -607,7 +607,11 @@ def build_events(date: str, cfg: dict, run: dict, rows: list[dict], meta: dict) 
         ev.append(
             {
                 "ts": f"{r['trigger_minute']}:{r.get('trigger_second') or 0:02d}.000",
-                "event": "entry",
+                # a DISTINCT name, like entry_shadow (#581): the digest counts
+                # `entry` only when order_status=='success', so a replay entry
+                # would silently vanish from every bucket — and if that guard
+                # ever loosened it would be counted as a real fill instead.
+                "event": "entry_replay",
                 "replay": True,
                 "fill": "replay",
                 "quantity": r.get("quantity"),
