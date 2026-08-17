@@ -116,6 +116,19 @@ class Open15Trade(Base):
     opt_charges_inr = Column(Float, nullable=True)  # modelled option round-trip, 1 lot
     opt_pnl = Column(Float, nullable=True)  # NET premium pnl for 1 lot
 
+    # Entry-timing sensitivity for REPLAY rows only (issue #600). A replayed
+    # session is rebuilt from 1m bars, which can only trigger at a minute's
+    # CLOSE, while the live gate fires somewhere inside that minute at a better
+    # price. This is the trigger minute's option OPEN — the early end of the
+    # range the true fill sits in.
+    #
+    # It is a PRICE, deliberately, not a second P&L. Deriving the optimistic net
+    # by running ``net_pnl_of_row`` against this entry price keeps ONE net
+    # convention (issue #552); storing a second pnl+charges pair would create a
+    # parallel convention that rots the moment the charge model changes.
+    # NULL on every non-replay row.
+    opt_entry_premium_early = Column(Float, nullable=True)
+
     # contract liquidity at the two decision moments (issue #488) — measurement
     # only, nothing gates on them. Recorded so exit slippage can eventually be
     # regressed against the contract's own flow instead of a guessed threshold:
@@ -339,6 +352,8 @@ def _ensure_columns():
             "shadow_max_trades": "INTEGER",
             # issue #591 — NULL resolves to the env default (90)
             "coverage_target_pct": "INTEGER",
+            # issue #600 — replay rows only; NULL everywhere else
+            "opt_entry_premium_early": "FLOAT",
         },
     }
     try:
@@ -515,7 +530,10 @@ def save_config(
 # form silently reclassified every future class as REAL, so adding ``sim``
 # (issue #555) would have folded simulated money straight into realized P&L and
 # into tomorrow's compound position size. A new fill class must be added here.
-NON_REAL_FILLS = ("paper", "sim", "none", "shadow")
+# ``replay`` (issue #600) is a session the strategy never ran, rebuilt from 1m
+# bars after the fact. Its P&L carries an entry-timing band wide enough to flip
+# sign, so it must never reach compound sizing or any published figure.
+NON_REAL_FILLS = ("paper", "sim", "none", "shadow", "replay")
 
 _REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill.notin_(NON_REAL_FILLS))
 
@@ -684,6 +702,89 @@ def shadow_pnl_by_date() -> dict[str, float]:
     be added to the real number.
     """
     return _pnl_by_date("shadow")
+
+
+def replay_pnl_by_date() -> dict[str, float]:
+    """NET REPLAY journal P&L per trade_date (issue #600).
+
+    A FIFTH bucket, for a session the strategy never ran at all — rebuilt from
+    1m bars after the fact. It is not merely counterfactual like ``shadow``; the
+    entry PRICE is not resolvable from bars, so the figure carries a band wide
+    enough to flip sign. This is its CLOSE-ENTRY (conservative) end; the
+    optimistic end is derived from ``opt_entry_premium_early``.
+
+    Never add it to any other bucket. A replayed day is evidence about what the
+    strategy would have WATCHED and SELECTED — the parts that reproduce exactly
+    — not about what it would have earned.
+    """
+    return _pnl_by_date("replay")
+
+
+def has_real_fill(trade_date: str) -> bool:
+    """Did this date produce even one REAL journal row? (issue #600)
+
+    The guard that makes a replay refuse to touch a traded day. Fails CLOSED —
+    an unreadable journal returns True, because "we could not check" must block
+    a destructive rewrite, never wave it through. This is the #597 class: a
+    late-boot arm clobbering a traded day's persisted log.
+    """
+    try:
+        return (
+            db_session.query(Open15Trade.id)
+            .filter(Open15Trade.trade_date == trade_date, _REAL_FILL)
+            .first()
+            is not None
+        )
+    except Exception:
+        logger.exception("open15: real-fill check failed for %s — treating as TRADED", trade_date)
+        return True
+    finally:
+        db_session.remove()
+
+
+def delete_replay_rows(trade_date: str) -> int:
+    """Drop this date's REPLAY rows so a re-run replaces rather than duplicates.
+
+    Scoped to ``fill == 'replay'`` by an explicit equality, never to "everything
+    for this date" — the delete must be incapable of reaching a real, paper, sim
+    or shadow row even if it is somehow called on a traded day.
+    """
+    try:
+        n = (
+            db_session.query(Open15Trade)
+            .filter(Open15Trade.trade_date == trade_date, Open15Trade.fill == "replay")
+            .delete(synchronize_session=False)
+        )
+        db_session.commit()
+        if n:
+            logger.info("open15: cleared %d replay rows for %s", n, trade_date)
+        return n
+    except Exception:
+        db_session.rollback()
+        logger.exception("open15: replay-row delete failed for %s", trade_date)
+        return 0
+    finally:
+        db_session.remove()
+
+
+def early_entry_net_pnl(row) -> float | None:
+    """Optimistic end of a replay row's band, or None when not applicable.
+
+    Re-derives the row's net through the SAME convention as
+    :func:`net_pnl_of_row` (issue #552) with the entry price swapped for
+    ``opt_entry_premium_early`` — one definition, two inputs. Returns None on a
+    row that carries no early premium, i.e. every non-replay row.
+    """
+    get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
+    early, entry = get("opt_entry_premium_early"), get("opt_entry_premium")
+    exit_prem, qty = get("opt_exit_premium"), get("quantity") or get("sim_quantity")
+    if not early or not entry or not exit_prem or not qty:
+        return None
+    from services.open15_option_shadow import option_round_trip_charges
+
+    gross = (float(exit_prem) - float(early)) * float(qty)
+    charges = option_round_trip_charges(float(early) * float(qty), float(exit_prem) * float(qty))
+    return round(gross - (charges or 0.0), 2)
 
 
 def get_day_log(trade_date: str) -> list | None:
