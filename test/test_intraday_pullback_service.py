@@ -13,10 +13,15 @@ from services.intraday_pullback_service import IntradayPullbackService
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 D = dt.date(2026, 1, 5)  # a Monday
+# The journal is a per-process temp DB shared by every test module, and the resume path reads
+# EVERY row for the day — so the two resume tests below own their own trading dates. Without
+# that, one test's rows inflate another's `attempts` (which is how issue #624 stayed hidden).
+D_RESUME = dt.date(2026, 1, 20)  # a Tuesday
+D_RECONCILE = dt.date(2026, 1, 21)  # a Wednesday
 
 
-def _c(hh, mm, o, h, lo, c, v):
-    return (dt.datetime.combine(D, dt.time(hh, mm)), o, h, lo, c, v)
+def _c(hh, mm, o, h, lo, c, v, d=None):
+    return (dt.datetime.combine(d or D, dt.time(hh, mm)), o, h, lo, c, v)
 
 
 class RecordingPlacer:
@@ -81,7 +86,9 @@ def test_long_day_entry_then_stop_out_places_and_journals():
     assert svc.open_count == 0
     from database import intraday_pullback_db as journal
 
-    trades = journal.get_trades(svc.strategy_id, mode="sandbox")
+    # scoped to THIS day: the journal is a per-process temp DB shared by every test module,
+    # so an unscoped read counts other tests' rows too (issue #624)
+    trades = journal.get_trades(svc.strategy_id, trade_date=D.isoformat(), mode="sandbox")
     assert len(trades) == 1
     t = trades[0]
     assert t["side"] == "L" and t["status"] == "closed" and t["exit_reason"] == "SL"
@@ -202,7 +209,7 @@ def test_resume_reconstructs_open_position_from_journal():
     from database import intraday_pullback_db as journal
 
     journal.init_db()
-    today = D.isoformat()
+    today = D_RESUME.isoformat()
     journal.record_entry(
         strategy_id=None,
         mode="sandbox",
@@ -210,7 +217,7 @@ def test_resume_reconstructs_open_position_from_journal():
         symbol="AAA",
         trade_date=today,
         quantity=1000,
-        entry_time=dt.datetime.combine(D, dt.time(9, 50)),
+        entry_time=dt.datetime.combine(D_RESUME, dt.time(9, 50)),
         entry_price=100.5,
         stop_price=99.5,
         status="open",
@@ -218,15 +225,17 @@ def test_resume_reconstructs_open_position_from_journal():
     )
     try:
         # boot at 10:15 (past the live 09:30 tick) -> resume path reconstructs from the journal
-        svc = _mk_service(now=dt.datetime.combine(D, dt.time(10, 15), IST))
-        svc.run_eval_tick(dt.datetime.combine(D, dt.time(10, 15), IST))
+        svc = _mk_service(now=dt.datetime.combine(D_RESUME, dt.time(10, 15), IST))
+        svc.run_eval_tick(dt.datetime.combine(D_RESUME, dt.time(10, 15), IST))
         assert svc.side == "L"
         assert svc.picks == ["AAA"]
         assert abs(svc.nifty_930 - 0.5) < 1e-6
         assert svc.open_count == 1  # exactly one OPEN row reconciled
         assert "AAA" in svc.open_positions and svc.open_positions["AAA"]["stop"] == 99.5
-        # attempts counts ALL of today's entries for the stock (>=1; correct for resume)
-        assert svc.states["AAA"].pos is not None and svc.states["AAA"].attempts >= 1
+        # attempts counts today's journalled entries for the stock — EXACTLY one here.
+        # `>= 1` used to hide the replay bug (issue #624): a duplicate entry opened by the
+        # resume replay also satisfies it. See test_intraday_pullback_resume_replay.py.
+        assert svc.states["AAA"].pos is not None and svc.states["AAA"].attempts == 1
     finally:
         t = journal.get_trades(None, trade_date=today)
         assert t  # sanity
@@ -236,7 +245,7 @@ def test_resume_reconciled_position_exits_on_stop_after_restart():
     from database import intraday_pullback_db as journal
 
     journal.init_db()
-    today = D.isoformat()
+    today = D_RECONCILE.isoformat()
     journal.record_entry(
         strategy_id=None,
         mode="sandbox",
@@ -244,17 +253,22 @@ def test_resume_reconciled_position_exits_on_stop_after_restart():
         symbol="AAA",
         trade_date=today,
         quantity=1000,
-        entry_time=dt.datetime.combine(D, dt.time(9, 50)),
+        entry_time=dt.datetime.combine(D_RECONCILE, dt.time(9, 50)),
         entry_price=100.5,
         stop_price=99.5,
         status="open",
         gate={"nifty_930": 0.5},
     )
     placer = RecordingPlacer()
-    # after restart the aggregator warms up; the next candle breaches the stop
-    bars = {"AAA": [_c(10, 20, 100.0, 100.2, 99.4, 99.6, 300)]}  # low 99.4 <= stop 99.5 -> SL
-    svc = _mk_service(bars=bars, placer=placer, now=dt.datetime.combine(D, dt.time(10, 20), IST))
-    svc.run_eval_tick(dt.datetime.combine(D, dt.time(10, 20), IST))
+    # after restart the aggregator warms up; the next candle breaches the stop.
+    # NOTE this fixture is a post-entry TAIL — production replays the whole day from 09:15,
+    # which is the case issue #624 fixed and test_intraday_pullback_resume_replay.py covers.
+    bars = {
+        "AAA": [_c(10, 20, 100.0, 100.2, 99.4, 99.6, 300, d=D_RECONCILE)]
+    }  # low 99.4 <= stop 99.5 -> SL
+    at = dt.datetime.combine(D_RECONCILE, dt.time(10, 20), IST)
+    svc = _mk_service(bars=bars, placer=placer, now=at)
+    svc.run_eval_tick(at)
     # the reconciled position is flattened (a SELL exit placed, journal closed, slot freed)
     assert any(o["action"] == "SELL" and o["symbol"] == "AAA" for _m, o in placer.calls)
     assert svc.open_count == 0
