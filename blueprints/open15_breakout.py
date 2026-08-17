@@ -1301,6 +1301,18 @@ function renderSel(){
       r.out='<span class="badge b-paper">paper</span> '+
         '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
         esc(e.entry_price)+'</span>';
+    }else if(e.event==='entry_replay'){
+      // issue #615 — replay uses DISTINCT event names so the digest cannot fold
+      // a reconstruction into a traded bucket (#604). The renderer has to know
+      // them too, or every replayed row reads "no trigger" beside its own P&L.
+      const r=rows[e.symbol];
+      r.fill='replay'; r.qty=e.quantity; r.level=e.level??r.level;
+      r.stockEntry=e.trigger_price;
+      if(e.opt_symbol){r.instr='option'; r.contract=e.opt_symbol; r.optEntry=e.opt_entry_premium;
+        r.lotSize=e.opt_lot_size;}
+      r.out='<span class="badge b-replay">replay</span> '+
+        '<span class="muted">reconstructed trigger '+esc(e.trigger_minute||'')+
+        ' &middot; no order was ever placed</span>';
     }else if(e.event==='entry_shadow'){
       // issue #581 — this side is switched off by trade_side. The trigger was
       // real and legal; no order was placed for it, so it is badged and its
@@ -1330,6 +1342,12 @@ function renderSel(){
       if(e.sim_quantity)r.qty=e.sim_quantity;
       r.out='skipped: '+esc(e.reason||'')+
         (e.fill==='sim'?' <span class="badge b-sim">priced 1 lot</span>':'');
+    }else if(e.event==='exit_replay'&&e.pnl!=null){
+      const r=rows[e.symbol];
+      r.fill='replay'; r.gross=e.gross; r.charges=e.charges; r.net=e.pnl;
+      r.optExit=e.opt_exit_premium; r.contract=e.opt_symbol??r.contract;
+      r.netEarly=e.net_early;   // the optimistic end of the band (#600)
+      if(e.reason==='degenerate_hold')r.degenerate=true;
     }else if((e.event==='exit'||e.event==='exit_paper'||e.event==='exit_sim'||
               e.event==='exit_shadow')&&e.pnl!=null){
       const r=rows[e.symbol];

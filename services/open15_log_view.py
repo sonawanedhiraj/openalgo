@@ -387,6 +387,30 @@ def selection_outcomes(
             elif kind in ("exit_sim", "exit_shadow"):
                 # these carry a qty that is a PRICING size, not an order size
                 rows[sym].update(fill=ev.get("fill") or "sim", qty=ev.get("qty"))
+        elif kind == "entry_replay":
+            # issue #615 — mirror of the page's renderSel branch. The distinct
+            # event names (#604) keep the digest buckets apart; both row
+            # builders still have to recognise them.
+            sym = ev.get("symbol")
+            if sym in rows:
+                rows[sym].update(
+                    fill="replay",
+                    entered=True,
+                    qty=ev.get("quantity"),
+                    level=ev.get("level"),
+                    trigger_price=ev.get("trigger_price"),
+                    instrument="option" if ev.get("opt_symbol") else None,
+                    opt_symbol=ev.get("opt_symbol"),
+                    opt_entry_premium=ev.get("opt_entry_premium"),
+                )
+        elif kind == "exit_replay" and ev.get("pnl") is not None:
+            sym = ev.get("symbol")
+            if sym in rows:
+                rows[sym].update(
+                    fill="replay",
+                    pnl=ev.get("pnl"),
+                    opt_exit_premium=ev.get("opt_exit_premium"),
+                )
         elif kind == "entry_skipped":
             sym = ev.get("symbol")
             if sym in rows:
