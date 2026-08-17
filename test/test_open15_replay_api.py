@@ -134,3 +134,36 @@ def test_worker_reports_ineligible_as_a_reason_not_a_crash(monkeypatch):
     state = bp._replay_get("2026-08-13")
     assert state["status"] == "failed"
     assert "day_was_traded" in state["error"]
+
+
+def test_every_page_post_sends_the_csrf_header():
+    """CSRFProtect is global — a POST without the header is a silent 400 (#613).
+
+    The replay button shipped with a hand-rolled POST that omitted
+    ``X-CSRFToken``, so clicking it did nothing at all:
+
+        WARNING in app: CSRF Error on /open15_vol_breakout/api/replay:
+        400 Bad Request: The CSRF token is missing.
+
+    Asserted over the page source rather than one call site, because the defect
+    is "someone hand-rolled another POST", not "this POST is wrong".
+    """
+    import re
+
+    from blueprints.open15_breakout import _LOGS_PAGE
+
+    posts = [m.start() for m in re.finditer(r"method:\s*'POST'", _LOGS_PAGE)]
+    assert posts, "no POST found — did the page change shape?"
+    for at in posts:
+        window = _LOGS_PAGE[at : at + 400]
+        assert "X-CSRFToken" in window, f"a POST at offset {at} omits X-CSRFToken; use csrfToken()"
+
+
+def test_csrf_helper_failure_does_not_throw():
+    """A failed token fetch must degrade to an empty string, not an exception —
+    otherwise the click handler dies before it can report anything."""
+    from blueprints.open15_breakout import _LOGS_PAGE
+
+    at = _LOGS_PAGE.index("async function csrfToken()")
+    body = _LOGS_PAGE[at : _LOGS_PAGE.index("}", _LOGS_PAGE.index("catch", at))]
+    assert "catch" in body and "return ''" in body
