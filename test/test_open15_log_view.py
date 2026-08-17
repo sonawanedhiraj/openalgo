@@ -585,3 +585,146 @@ def test_summarize_day_counts_liquidity_exclusions():
     assert d["liq_excluded"] == 4
     assert d["liq_excluded_stage1"] == 3
     assert d["liq_excluded_stage2"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# A clobbered log still has its journal (issue #612)
+# --------------------------------------------------------------------------- #
+_CLOBBERED = [{"ts": "14:33:09.391", "event": "skipped_late_boot", "armed_at": "14:33:09"}]
+_CLOBBERED_JOURNAL = [
+    {
+        "symbol": "ASHOKLEY",
+        "side": "L",
+        "fill": "real",
+        "watch_source": "rolling",
+        "pnl": 2000.0,
+        "charges_inr": 561.84,
+        "entry_status": "success",
+        "trigger_price": 179.9,
+    },
+    {
+        "symbol": "ZYDUSLIFE",
+        "side": "S",
+        "fill": "shadow",
+        "watch_source": "rolling",
+        "pnl": 4455.0,
+        "charges_inr": 570.81,
+    },
+]
+
+
+def test_a_clobbered_log_still_renders_its_trades():
+    """2026-08-13: a late-boot arm overwrote the log; the 8 trades survived.
+
+    The page reported "0 filled / 0 sel" and "no selection this day" directly
+    beside a real +Rs1438 — it asserted nothing happened AND showed the money.
+    """
+    import pytest
+
+    from services.open15_log_view import selection_outcomes
+
+    rows = {
+        r["symbol"]: r
+        for r in selection_outcomes("2026-08-13", _CLOBBERED, journal=_CLOBBERED_JOURNAL)
+    }
+    assert set(rows) == {"ASHOKLEY", "ZYDUSLIFE"}
+    assert rows["ASHOKLEY"]["from_journal"] is True
+    assert rows["ASHOKLEY"]["fill"] == "real"
+    # NET, never gross (#552): 2000 - 561.84
+    assert rows["ASHOKLEY"]["pnl"] == pytest.approx(1438.16)
+    # the decision detail is genuinely gone — left NULL, never guessed
+    assert rows["ASHOKLEY"]["gap_pct"] is None
+    assert rows["ASHOKLEY"]["max_vol_ratio"] is None
+
+
+def test_an_intact_log_is_unchanged_by_the_clobber_path():
+    """The narrow condition: a stray journal symbol beside a REAL selection is
+    still refused (the #557 invariant), because that case is anomalous rather
+    than a lost timeline."""
+    from services.open15_log_view import selection_outcomes
+
+    day = [{"ts": "09:16", "event": "selection", "selected": {"HAL": "L"}, "gaps_pct": {}}]
+    journal = [{"symbol": "STRAY", "pnl": 1.0, "charges_inr": 0.0, "fill": "real"}]
+    rows = selection_outcomes("2026-08-06", day, journal=journal)
+    assert [r["symbol"] for r in rows] == ["HAL"]
+
+
+def test_js_and_python_agree_on_a_clobbered_day():
+    """Both row builders must seed the same symbols — the parity test compares
+    SETS, so one side seeding alone is a silent divergence."""
+    from services.open15_log_view import selection_outcomes
+
+    js = _run_render_sel(_CLOBBERED, journal=_CLOBBERED_JOURNAL)
+    py = {
+        r["symbol"]: r
+        for r in selection_outcomes("2026-08-13", _CLOBBERED, journal=_CLOBBERED_JOURNAL)
+    }
+    assert set(js) == set(py)
+
+
+# --------------------------------------------------------------------------- #
+# Replay events must reach the row builders (issue #615)
+# --------------------------------------------------------------------------- #
+_REPLAY_DAY = [
+    {"ts": "09:10", "event": "replay_meta", "replay": True, "ran_at": "2026-08-17 14:11:42"},
+    {
+        "ts": "09:16",
+        "event": "selection",
+        "replay": True,
+        "selected": {"MAXHEALTH": "S"},
+        "gaps_pct": {"MAXHEALTH": -0.885},
+    },
+    {
+        "ts": "09:29",
+        "event": "entry_replay",
+        "replay": True,
+        "fill": "replay",
+        "symbol": "MAXHEALTH",
+        "side": "S",
+        "level": 1029.0,
+        "trigger_price": 1021.3,
+        "trigger_minute": "09:29",
+        "quantity": 2100,
+        "opt_symbol": "MAXHEALTH25AUG261030PE",
+        "opt_entry_premium": 27.15,
+    },
+    {
+        "ts": "09:30",
+        "event": "exit_replay",
+        "replay": True,
+        "fill": "replay",
+        "symbol": "MAXHEALTH",
+        "gross": 0.0,
+        "charges": 556.03,
+        "pnl": -556.03,
+        "net_early": 4083.21,
+        "opt_exit_premium": 27.15,
+        "reason": "degenerate_hold",
+    },
+]
+
+
+def test_a_replayed_row_states_its_trigger_and_exit():
+    """The first real replay rendered six rows saying "no trigger" beside their
+    own P&L (#615): the distinct event names #604 introduced were never taught
+    to the row builders."""
+    from services.open15_log_view import selection_outcomes
+
+    row = selection_outcomes("2026-08-12", _REPLAY_DAY)[0]
+    assert row["fill"] == "replay"
+    assert row["entered"] is True
+    assert row["trigger_price"] == 1021.3
+    assert row["qty"] == 2100
+    assert row["opt_exit_premium"] == 27.15
+    assert row["pnl"] == -556.03
+
+
+def test_js_and_python_agree_on_a_replay_day():
+    """Both builders must recognise entry_replay / exit_replay identically."""
+    from services.open15_log_view import selection_outcomes
+
+    js = _run_render_sel(_REPLAY_DAY)
+    py = {r["symbol"]: r for r in selection_outcomes("2026-08-12", _REPLAY_DAY)}
+    assert set(js) == set(py)
+    assert js["MAXHEALTH"]["fill"] == py["MAXHEALTH"]["fill"] == "replay"
+    assert "no trigger" not in (js["MAXHEALTH"].get("out") or "")
