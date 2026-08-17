@@ -761,6 +761,73 @@ protection. Branch protection on `dev`/`main` is configured via the GitHub UI
 GitHub Actions guard `code-direct-push-guard.yml` alerts on direct-to-dev code
 pushes — alert-only, no block. See `.github/workflows/README.md`.
 
+## Pre-ship checklist — the surfaces the test suite cannot see
+
+Added 2026-08-17 after the `open15` replay feature (#600 → #604) shipped **four**
+defects in about two hours, every one of them invisible to pytest *by
+construction* — while 346 passing tests were being taken as evidence of
+production safety. Two were caught only when the operator said "watch the UI".
+
+Each item names the defect it would have caught, so this reads as evidence
+rather than process. Run through it before opening a PR, not before closing the
+issue.
+
+1. **A rule that classifies EXISTING data — enumerate the real shapes first.**
+   One query, before writing the predicate. #608: eligibility treated any
+   `skipped_late_boot` as "session missed", but 2026-08-11's log held three of
+   them *alongside* a full run (`selection`, 10 watchlist adds, 3 entries, 2
+   exits) because a late-boot restart appends to a log that already recorded a
+   session. The counter-example was sitting in the DB the whole time —
+   `SELECT` the event-kind distribution across all stored days and the two-day
+   sample stops being the spec.
+
+2. **A migration must be tested by RUNNING the migration.**
+   `Base.metadata.create_all()` builds tables from the ORM model, which already
+   has the new column — so `_ensure_columns`-style ALTER paths have no coverage
+   at all, and only a pre-existing install executes them. #602: a column was
+   added to the `open15_config` block instead of `open15_trades` (the anchor,
+   `coverage_target_pct`, reads like a trades column) and every test passed.
+   Create the table at the OLD schema, run the ensure function, then assert the
+   ORM can SELECT. Minimum bar: assert every column in every ALTER map exists on
+   that table's model.
+
+3. **A fetch inside a render function — do the arithmetic on paper.**
+   N items × refresh frequency, written down, before the code. #606: an
+   eligibility fetch per day card in a sidebar that re-renders every 5 s over ~20
+   days produced **140 requests in 18 seconds**, each running a DB query *and* a
+   full JSON parse against the live database while the strategy traded. If the
+   renderer is on an interval, the fetch belongs outside it or batched into a
+   call the page already makes. This was visible without a browser.
+
+4. **A change to a page gets a browser pass BEFORE the PR.**
+   Not after merge, and not "when the issue closes". #608's layout regression
+   (a third child added to a fixed-width flex row, wrapping dates onto two
+   lines) and #606's request storm were both a single screenshot / network-panel
+   read away. Use `claude-in-chrome` — the in-app browser has no login session
+   (see the UI-validation notes in `docs/COWORK_SESSION_LEARNINGS.md`).
+
+5. **`_LOGS_PAGE`-class surfaces: small diffs, and syntax-check the JS.**
+   `blueprints/open15_breakout.py` holds a ~1000-line hand-written HTML string
+   with inline JS that no linter, formatter or test touches — a syntax error
+   takes the whole page down. ~300 lines went in as one commit in #604. Extract
+   each `<script>` block and run `node --check` on it, and keep the diffs small
+   enough to read.
+
+**Two process rules from the same session**, cheap and mechanical:
+
+- **`git stash show` before `git stash pop`.** A speculative pop applied an
+  unrelated three-month-old stash and destroyed uncommitted work in two files
+  (recovered from `.cache/pre-commit/patch*`).
+- **`gh pr view <N> --json state` before pushing follow-ups to a branch.** Two
+  commits were pushed to a branch whose PR had already merged, so a fix sat
+  outside `dev` for 40 minutes while the storming code was live.
+
+**What this does NOT replace.** The phasing that made all four defects
+survivable — backend first, inert on merge, UI last — worked, and is worth
+keeping. None of them reached real money: `NON_REAL_FILLS`, `has_real_fill` and
+the traded-day writer re-check all held. The safety architecture was sound; the
+integration verification did not exist.
+
 ## Test DB isolation — pytest can NEVER write to the live databases
 
 Every `database/*.py` module binds its SQLAlchemy `engine` to
