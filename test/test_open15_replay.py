@@ -194,6 +194,30 @@ def test_g3_registers_no_scheduler_job_or_thread():
         assert forbidden not in src, f"replay must not use {forbidden}"
 
 
+def test_control_harness_never_writes():
+    """The control harness scores TRADED days — it must be read-only.
+
+    It deliberately bypasses ``check_eligibility`` (every control day would be
+    refused as ``day_was_traded``), so the thing standing between it and a
+    destructive rewrite is that it never calls a writer at all.
+    """
+    from services import open15_replay_control as C
+
+    src = Path(C.__file__).read_text(encoding="utf-8")
+    # call syntax, not prose — the docstring is allowed to NAME these
+    for forbidden in (
+        "insert_trade(",
+        "update_trade(",
+        "delete_replay_rows(",
+        "save_day_log(",
+        "R.persist(",
+        "R.replay_session(",
+        ".commit(",
+        ".delete(",
+    ):
+        assert forbidden not in src, f"control harness must not call {forbidden}"
+
+
 def test_g2_replay_pnl_is_excluded_from_real_aggregates():
     """Without this, replay money compounds into tomorrow's real position size."""
     from database.open15_breakout_db import NON_REAL_FILLS
