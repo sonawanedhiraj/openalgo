@@ -38,9 +38,10 @@ This strategy trades real money. Nothing here may reach it:
   registers no scheduler job and starts no thread;
 * **it cannot overwrite a traded day** — :func:`check_eligibility` refuses one,
   and :func:`replay_session` re-checks immediately before writing;
-* **it does not contend with the live feed** — it reads the broker HISTORICAL
-  API through ``history_service`` (already rate-limited) and never subscribes
-  ZMQ or opens ``historify.duckdb`` read-write.
+* **it does not touch the live feed** — it reads the broker HISTORICAL API
+  through ``history_service`` (already rate-limited) and never subscribes ZMQ
+  or opens ``historify.duckdb`` read-write. It DOES share the broker's 3 req/s
+  budget, so running one inside market hours is warned about, not blocked.
 
 CLI: ``uv run python -m services.open15_replay --date YYYY-MM-DD [--apply]``
 (dry-run by default).
@@ -63,7 +64,8 @@ _FIRST_MINUTE = "09:15"
 # before this reads a truncated session and silently under-reports.
 _SAME_DAY_READY_AFTER = dt.time(9, 45)
 # Replay makes ~250 historical calls against the same 3 req/s budget the live
-# strategy needs. Never during the session.
+# strategy needs. Inside this window that is WARNED about, not blocked
+# (operator decision 2026-08-17) — the cost is the operator's to accept.
 _MARKET_OPEN, _MARKET_CLOSE = dt.time(9, 0), dt.time(15, 40)
 
 _SKIP_EVENTS = ("skipped_late_boot", "skipped_no_prev_closes", "no_ticks_received")
@@ -97,17 +99,19 @@ def bar_minute(ts: int) -> str:
 def check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
     """Is ``date`` replayable? Returns a dict; raises nothing.
 
-    ``{"eligible": bool, "reason": str, "detail": str}``. The reason is what the
-    UI shows in the button's tooltip, so it names the condition, not a stack.
+    ``{"eligible": bool, "reason": str, "detail": str, "warning": str|None}``.
+    The reason is what the button's tooltip shows, so it names the condition,
+    not a stack. ``warning`` is set on a day that IS replayable but carries a
+    cost worth stating — currently only market hours.
     """
     try:
         return _check_eligibility(date, allow_rereplay=allow_rereplay)
     except ReplayIneligible as e:
-        return {"eligible": False, "reason": e.reason, "detail": e.detail}
+        return {"eligible": False, "reason": e.reason, "detail": e.detail, "warning": None}
     except Exception:
         # an eligibility check that raises must not render the button clickable
         logger.exception("open15 replay: eligibility check failed for %s", date)
-        return {"eligible": False, "reason": "check_failed", "detail": ""}
+        return {"eligible": False, "reason": "check_failed", "detail": "", "warning": None}
 
 
 def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
@@ -123,8 +127,16 @@ def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
         raise ReplayIneligible("not_a_trading_day", date)
 
     now = _now_ist()
+    # Market hours is a COST concern, not a correctness one — a replay is ~250
+    # historical calls against the same 3 req/s budget the live strategy needs.
+    # Operator decision (2026-08-17): warn, do not block. It rides the result as
+    # a `warning` so the UI can say so without taking the choice away.
+    warning = None
     if _MARKET_OPEN <= now.time() <= _MARKET_CLOSE and is_trading_day(now.date()):
-        raise ReplayIneligible("market_hours", "replay competes with the live strategy for quota")
+        warning = "market hours — ~250 broker calls will compete with the live strategy's quota"
+    # These two stay HARD blocks: they are about the answer being WRONG, not
+    # expensive. A same-day replay before the broker's history has caught up
+    # silently reconstructs a truncated session.
     if day == now.date() and now.time() < _SAME_DAY_READY_AFTER:
         raise ReplayIneligible("too_early", "broker current-day history lags 5-15 min")
     if day > now.date():
@@ -139,12 +151,17 @@ def _check_eligibility(date: str, *, allow_rereplay: bool = False) -> dict:
     if "replay_meta" in kinds and not allow_rereplay:
         raise ReplayIneligible("already_replayed", "pass force=true to re-run")
     if not events:
-        return {"eligible": True, "reason": "no_day_log", "detail": "app was down"}
+        return {
+            "eligible": True,
+            "reason": "no_day_log",
+            "detail": "app was down",
+            "warning": warning,
+        }
     hit = kinds & set(_SKIP_EVENTS)
     if hit:
-        return {"eligible": True, "reason": sorted(hit)[0], "detail": ""}
+        return {"eligible": True, "reason": sorted(hit)[0], "detail": "", "warning": warning}
     if "replay_meta" in kinds:
-        return {"eligible": True, "reason": "re_replay", "detail": ""}
+        return {"eligible": True, "reason": "re_replay", "detail": "", "warning": warning}
     raise ReplayIneligible("day_ran_normally", "the session armed and ran; nothing to reconstruct")
 
 

@@ -486,6 +486,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .rbtn{border:1px solid #3a4650;color:#7dc4e4;border-radius:4px;padding:0 6px;cursor:pointer;
    font-size:12px;background:none;line-height:1.5}
  .rbtn:hover{background:#232c36}.rbtn[disabled]{color:#4a5560;border-color:#2a3138;cursor:default}
+ /* replayable, but with a cost worth stating (market hours) — amber, still clickable */
+ .rbtn.warn{color:#f9e2af;border-color:#463a20}
  .rprog{height:3px;background:#232c36;border-radius:2px;margin-top:5px}
  .rprog > div{height:3px;background:#7f77dd;border-radius:2px;width:0}
  .b-newlisting{background:#232c36;color:#8aa0b4}
@@ -890,13 +892,18 @@ async function maybeAddReplayBtn(el,date){
   else if(!e.eligible){
     // Show it disabled WITH the reason rather than hiding it: "why is there no
     // button?" is the question an operator would otherwise have to read code
-    // to answer. day_was_traded is the one that matters most.
+    // to answer. day_was_traded is the one that matters most — clicking through
+    // THAT would overwrite a real trading day, so it stays a hard block.
     b.disabled=true;
     b.title='cannot replay — '+(e.reason||'ineligible')+(e.detail?(': '+e.detail):'');
   }else if(e.busy){b.disabled=true; b.title='another replay is running';}
   else{
     b.title=(e.reason==='re_replay'||e.reason==='already_replayed')
       ? 'replay again from 1m bars' : 'reconstruct this session from 1m bars';
+    // A cost worth stating is not a reason to take the choice away (operator
+    // decision 2026-08-17): the button stays live and the tooltip carries the
+    // warning. Only correctness blocks disable it.
+    if(e.warning){b.classList.add('warn'); b.title='⚠ '+e.warning+' — '+b.title;}
     b.onclick=(ev)=>{ev.stopPropagation(); startReplay(date,b);};
   }
   head.appendChild(b);

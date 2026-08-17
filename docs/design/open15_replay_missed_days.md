@@ -64,7 +64,7 @@ The live fill sits between them. On both missed days the band spans zero.
 | no day log at all (app was down) | eligible |
 | day log exists, armed cleanly, and simply had no triggers | ineligible — `day_ran_normally` |
 | date is today and now < 09:45 IST | ineligible — `too_early` (broker current-day history lags 5–15 min) |
-| market hours (09:00–15:40 IST) | ineligible — `market_hours` |
+| market hours (09:00–15:40 IST) | **eligible, with a `warning`** (operator decision 2026-08-17) |
 
 The last two are load-bearing operationally: replay makes ~250 historical calls,
 and running it during the session competes with the live strategy for the
