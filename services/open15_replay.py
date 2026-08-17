@@ -226,7 +226,7 @@ def resolve_replay_config(date: str) -> dict:
         if isinstance(ev, dict) and ev.get("event") == "armed":
             cfg = {
                 "vol_mult": ev.get("vol_mult"),
-                "top_n": ev.get("top_n"),
+                "top_n": ev.get("top_n") or _top_n_default(),
                 "trade_side": ev.get("trade_side", "both"),
                 "shadow_side": ev.get("shadow_side"),
                 "shadow_max_trades": ev.get("shadow_max_trades", 3),
@@ -248,15 +248,21 @@ def resolve_replay_config(date: str) -> dict:
             }
             return cfg
 
+    # resolve_day_config does NOT return every key this config needs — `top_n`
+    # in particular is read separately by the service from OPEN15_TOP_N, and
+    # indexing it here raised KeyError on every day that never armed (#617),
+    # i.e. exactly the skipped_late_boot case the feature exists for. Every
+    # lookup is `.get()` with an explicit default so a future change to that
+    # function's keys degrades instead of crashing a replay.
     live = resolve_day_config(get_config(), 0.0)
     return {
-        "vol_mult": live["vol_mult"],
-        "top_n": live["top_n"],
-        "trade_side": live["trade_side"],
+        "vol_mult": live.get("vol_mult", 1.5),
+        "top_n": _top_n_default(),
+        "trade_side": live.get("trade_side", "both"),
         "shadow_side": live.get("shadow_side"),
         "shadow_max_trades": live.get("shadow_max_trades", 3),
         "max_trades": live.get("max_trades", 3),
-        "margin_effective": live.get("margin_effective") or live.get("margin_per_slot"),
+        "margin_effective": live.get("margin_effective") or live.get("margin_per_slot") or 30_000,
         "instrument": live.get("instrument", "stock"),
         "rolling_enabled": bool(live.get("rolling_watchlist_enabled")),
         "rolling_cadence_s": live.get("rolling_cadence_s", 30),
@@ -267,6 +273,13 @@ def resolve_replay_config(date: str) -> dict:
         "excluded": [],
         "config_source": "open15_config_row",
     }
+
+
+def _top_n_default() -> int:
+    """``OPEN15_TOP_N`` via the service's own reader — one definition, not two."""
+    from services.open15_breakout_service import _top_n
+
+    return _top_n()
 
 
 def universe_symbols() -> list[str]:
