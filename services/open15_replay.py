@@ -158,6 +158,18 @@ def eligibility_from(
     ok = {"eligible": True, "detail": "", "warning": warning}
     if not events:
         return {**ok, "reason": "no_day_log", "detail": "app was down"}
+    # A `selection` event means the 09:16 ranking FINALIZED — the session was
+    # live and watching. That outranks any skip event in the same log, because a
+    # late-boot restart LATER in the day appends `skipped_late_boot` to a log
+    # that already recorded a full session (2026-08-11: 3 skip events alongside
+    # `selection`, 10 watchlist adds, 3 shadow entries and 2 exits). Judging on
+    # the skip event alone offered a replay of a day that genuinely ran, which
+    # would mix reconstruction rows into real observations — not a money risk,
+    # since replay is its own bucket, but it would corrupt the measurement.
+    if "selection" in kinds and "replay_meta" not in kinds:
+        raise ReplayIneligible(
+            "day_ran_normally", "the session selected and ran; nothing to reconstruct"
+        )
     hit = kinds & set(_SKIP_EVENTS)
     if hit:
         return {**ok, "reason": sorted(hit)[0]}

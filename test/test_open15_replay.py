@@ -520,3 +520,52 @@ def test_pure_eligibility_touches_no_database(monkeypatch):
         "2026-08-12", [{"event": "skipped_late_boot"}], False, dt.datetime(2026, 8, 16, 20, 0)
     )
     assert out["eligible"] is True
+
+
+def test_a_day_that_ran_is_not_replayable_even_with_a_skip_event():
+    """2026-08-11's real log: a full session PLUS 3 late-boot skip events.
+
+    A late-boot restart later in the day appends ``skipped_late_boot`` to a log
+    that already recorded a complete session. Judging on the skip event alone
+    offered a replay of a day that genuinely ran — which would mix
+    reconstruction rows into real observations. A finalized ``selection`` is the
+    proof the session was live, and it outranks any skip event beside it.
+    """
+    events = [
+        {"event": "skipped_late_boot"},
+        {"event": "armed"},
+        {"event": "selection", "selected": {"X": "L"}},
+        {"event": "entry_shadow", "symbol": "X"},
+        {"event": "summary", "day": "done"},
+        {"event": "skipped_late_boot"},
+    ]
+    out = R.eligibility_or_reason("2026-08-11", events, False, dt.datetime(2026, 8, 16, 20, 0))
+    assert out["eligible"] is False
+    assert out["reason"] == "day_ran_normally"
+
+
+def test_zero_tick_day_is_replayable_despite_arming_and_summarising():
+    """2026-08-12's real shape: it armed and summarised but never SELECTED,
+    because the feed delivered no ticks. That is the canonical missed day."""
+    events = [
+        {"event": "armed"},
+        {"event": "first_candles", "covered": 0},
+        {"event": "no_ticks_received"},
+        {"event": "summary", "selected": 0},
+    ]
+    out = R.eligibility_or_reason("2026-08-12", events, False, dt.datetime(2026, 8, 16, 20, 0))
+    assert out["eligible"] is True
+    assert out["reason"] == "no_ticks_received"
+
+
+def test_a_replayed_day_can_be_replayed_again():
+    """``replay_meta`` marks a reconstruction, and its own ``selection`` event
+    must not then read as 'this session ran for real'."""
+    events = [
+        {"event": "replay_meta"},
+        {"event": "armed"},
+        {"event": "selection", "selected": {"X": "L"}},
+    ]
+    out = R.eligibility_or_reason("2026-08-12", events, False, dt.datetime(2026, 8, 16, 20, 0))
+    assert out["eligible"] is True
+    assert out["reason"] == "re_replay"

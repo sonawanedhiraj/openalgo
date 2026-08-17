@@ -470,10 +470,14 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .muted{color:#6b7886;font-size:12px}
  button{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 10px;cursor:pointer}
  .layout{display:flex;gap:18px;align-items:flex-start;margin-top:12px}
- .side{width:200px;flex:none}
+ .side{width:232px;flex:none}
  .day{border:1px solid #2a3138;border-radius:6px;padding:6px 10px;margin-bottom:6px;cursor:pointer}
  .day:hover{background:#161d25}.day.sel{background:#1e2630;border-color:#7dc4e4}
- .day .d1{display:flex;justify-content:space-between}
+ .day .d1{display:flex;justify-content:space-between;align-items:center;gap:4px}
+ /* the date must never wrap, and the replay control must never shrink the
+    badge+amount into a second line (issue #606) */
+ .day .d1 > span:first-child{white-space:nowrap}
+ .day .d1 .rbtn{flex:none;margin-left:auto}
  .pos{color:#a6e3a1}.neg{color:#f38ba8}
  .badge{font-size:10px;border-radius:8px;padding:1px 7px}
  .b-live{background:#12324a;color:#89b4fa}.b-skip{background:#463a20;color:#f9e2af}
