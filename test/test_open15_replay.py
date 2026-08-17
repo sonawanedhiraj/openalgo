@@ -343,8 +343,15 @@ def test_eligibility(monkeypatch, events, real_fill, expect_ok, reason):
     assert out["reason"] == reason
 
 
-def test_market_hours_block(monkeypatch):
-    """Replay makes ~250 historical calls against the live strategy's quota."""
+def test_market_hours_warns_but_does_not_block(monkeypatch):
+    """Operator decision (2026-08-17): market hours is a COST, not a defect.
+
+    A replay is ~250 historical calls against the live strategy's 3 req/s
+    budget. That is worth stating, but it is the operator's call to accept —
+    so it rides the result as ``warning`` and the day stays eligible. Contrast
+    ``day_was_traded`` below, which is about the ANSWER being wrong and stays
+    a hard block.
+    """
     import database.open15_breakout_db as db
     import services.data_freshness_service as fresh
 
@@ -353,7 +360,41 @@ def test_market_hours_block(monkeypatch):
     monkeypatch.setattr(fresh, "is_trading_day", lambda d, exchange=None: True)
     monkeypatch.setattr(R, "_now_ist", lambda: dt.datetime(2026, 8, 17, 10, 30))
 
-    assert R.check_eligibility("2026-08-12")["reason"] == "market_hours"
+    out = R.check_eligibility("2026-08-12")
+    assert out["eligible"] is True
+    assert out["reason"] == "skipped_late_boot"
+    assert "market hours" in (out["warning"] or "")
+
+
+def test_a_traded_day_is_still_blocked_during_market_hours(monkeypatch):
+    """The cost guard relaxing must not relax the integrity guard with it."""
+    import database.open15_breakout_db as db
+    import services.data_freshness_service as fresh
+
+    monkeypatch.setattr(db, "get_day_log", lambda d: [{"event": "skipped_late_boot"}])
+    monkeypatch.setattr(db, "has_real_fill", lambda d: True)
+    monkeypatch.setattr(fresh, "is_trading_day", lambda d, exchange=None: True)
+    monkeypatch.setattr(R, "_now_ist", lambda: dt.datetime(2026, 8, 17, 10, 30))
+
+    out = R.check_eligibility("2026-08-13")
+    assert out["eligible"] is False
+    assert out["reason"] == "day_was_traded"
+
+
+def test_same_day_before_history_catches_up_is_still_blocked(monkeypatch):
+    """``too_early`` is a CORRECTNESS block — it would rebuild a truncated
+    session and report it as complete. Not relaxed with market hours."""
+    import database.open15_breakout_db as db
+    import services.data_freshness_service as fresh
+
+    monkeypatch.setattr(db, "get_day_log", lambda d: [{"event": "skipped_late_boot"}])
+    monkeypatch.setattr(db, "has_real_fill", lambda d: False)
+    monkeypatch.setattr(fresh, "is_trading_day", lambda d, exchange=None: True)
+    monkeypatch.setattr(R, "_now_ist", lambda: dt.datetime(2026, 8, 17, 9, 30))
+
+    out = R.check_eligibility("2026-08-17")
+    assert out["eligible"] is False
+    assert out["reason"] == "too_early"
 
 
 def _rebind(db, tmp_path, monkeypatch):

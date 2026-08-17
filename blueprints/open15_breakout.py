@@ -23,6 +23,9 @@ GET /open15_vol_breakout/api/decision_log/export.csv
 
 from __future__ import annotations
 
+import datetime as dt
+import threading
+
 from flask import Blueprint, jsonify, request
 
 from utils.logging import get_logger
@@ -379,6 +382,7 @@ def decision_log_days():
     """Digest of every stored day for the history sidebar (issue #444)."""
     from database.open15_breakout_db import (
         paper_pnl_by_date,
+        replay_pnl_by_date,
         shadow_pnl_by_date,
         sim_pnl_by_date,
         trades_pnl_by_date,
@@ -390,6 +394,7 @@ def decision_log_days():
         paper_by_date = paper_pnl_by_date()
         sim_by_date = sim_pnl_by_date()
         shadow_by_date = shadow_pnl_by_date()
+        replay_by_date = replay_pnl_by_date()
         out = []
         for date, events, source in _all_day_logs():
             digest = summarize_day(
@@ -399,6 +404,7 @@ def decision_log_days():
                 paper_pnl=paper_by_date.get(date),
                 sim_pnl=sim_by_date.get(date),
                 shadow_pnl=shadow_by_date.get(date),
+                replay_pnl=replay_by_date.get(date),
             )
             digest["source"] = source
             out.append(digest)
@@ -469,6 +475,21 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .ev-atm_lot_cost{color:#7dc4e4}
  .b-liq{background:#463a20;color:#f9e2af}
  .b-nocontract{background:#3a2028;color:#f38ba8}
+ /* issue #600 — replay is a RECONSTRUCTION, not a trade. Its own colour,
+    deliberately not green/amber/teal (real/paper/shadow), so a replayed
+    number can never be mistaken for one of those buckets at a glance. */
+ .b-replay{background:#2b2b3d;color:#b4b0e8}
+ .ev-replay_meta,.ev-entry_replay,.ev-exit_replay{color:#b4b0e8}
+ .rpbanner{background:#1c1a2b;border-left:3px solid #7f77dd;padding:9px 12px;margin-bottom:12px}
+ .rpbanner .rt{color:#b4b0e8}.rpbanner .rm{color:#8aa0b4;margin-top:4px}
+ .rpbanner .rn{color:#6b7886;margin-top:4px}
+ .rbtn{border:1px solid #3a4650;color:#7dc4e4;border-radius:4px;padding:0 6px;cursor:pointer;
+   font-size:12px;background:none;line-height:1.5}
+ .rbtn:hover{background:#232c36}.rbtn[disabled]{color:#4a5560;border-color:#2a3138;cursor:default}
+ /* replayable, but with a cost worth stating (market hours) — amber, still clickable */
+ .rbtn.warn{color:#f9e2af;border-color:#463a20}
+ .rprog{height:3px;background:#232c36;border-radius:2px;margin-top:5px}
+ .rprog > div{height:3px;background:#7f77dd;border-radius:2px;width:0}
  .b-newlisting{background:#232c36;color:#8aa0b4}
  .b-ok{background:#16331f;color:#a6e3a1}.b-warn{background:#463a20;color:#f9e2af}
  .b-pend{background:#232c36;color:#8aa0b4}
@@ -601,7 +622,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <div class="main">
   <div id="status" class="muted"></div>
   <div id="rejbox"></div>
-  <div class="chips" id="chips"></div>
+  <div id="rpbox"></div>
+<div class="chips" id="chips"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
    <span class="muted">&mdash; click a row for fills, liquidity and the decision detail</span></div>
@@ -803,7 +825,12 @@ async function loadDays(){
     // real P&L wins the headline. A day with no real fills falls back to paper,
     // then to sim, then to shadow — each behind its own badge, because an
     // unbadged number in this column reads as money that was actually made.
-    const right=d.source==='live'?'<span class="badge b-live">live</span>'
+    const isReplay=(d.replay>0)||(d.replay_pnl!=null);
+    const replayTag='<span class="badge b-replay">replay</span> ';
+    // replay OUTRANKS the skipped badge: a reconstructed day is no longer
+    // just "skipped", and the badge is what stops its number reading as money.
+    const right=d.source==='live'&&!isReplay?'<span class="badge b-live">live</span>'
+      :isReplay?(replayTag+(d.replay_pnl!=null?amt(d.replay_pnl):''))
       :skip?'<span class="badge b-skip">skipped</span>'
       :(d.pnl!=null?amt(d.pnl)
         :(d.paper_pnl!=null?(paperTag+amt(d.paper_pnl))
@@ -812,11 +839,18 @@ async function loadDays(){
               :(isPaper?paperTag:(isSim?simTag:(isShadow?shadowTag
                 :'<span class="muted">&mdash;</span>')))))));
     el.innerHTML='<div class="d1"><span>'+esc(d.date)+'</span>'+right+'</div>'+
-      '<div class="muted">'+(skip?esc(d.status):(d.selected+' sel &middot; '+d.entered+
+      '<div class="muted">'+(skip&&!d.replay?esc(d.status):(d.selected+' sel &middot; '+d.entered+
         ' filled'+(d.paper?(' &middot; '+d.paper+' paper'):'')+
         (d.sim?(' &middot; '+d.sim+' sim'):'')+
-        (d.shadow?(' &middot; '+d.shadow+' shadow'):'')))+'</div>';
+        (d.shadow?(' &middot; '+d.shadow+' shadow'):'')+
+        (d.replay?(' &middot; '+d.replay+' replayed'):'')))+'</div>'+
+      '<div class="rprog" id="rp-'+d.date+'" style="display:none"><div></div></div>'+
+      '<div class="muted" id="rpmsg-'+d.date+'" style="display:none"></div>';
     el.onclick=()=>selectDay(d.date);
+    // the replay affordance is added asynchronously: eligibility is a server
+    // decision (traded day? market hours? already replayed?) and the button
+    // must never appear on a day the server would refuse.
+    maybeAddReplayBtn(el,d.date);
     box.appendChild(el);
   }
   if(!curDate&&digests.length)selectDay(digests[0].date);
@@ -837,9 +871,114 @@ async function selectDay(date){
   curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
-  renderRejected(); renderChips(); renderAtmLadder(); renderRolling(); renderSel(); renderTimeline();
+  renderRejected(); renderReplayBanner(); renderChips(); renderAtmLadder();
+  renderRolling(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
+}
+async function maybeAddReplayBtn(el,date){
+  // Eligibility is the SERVER's call — the button is only a hint, and every
+  // POST is re-checked. So the day a run would be refused, no button appears.
+  let e;
+  try{
+    const r=await fetch('/open15_vol_breakout/api/replay/eligibility?date='+date);
+    e=await r.json();
+  }catch(err){return;}
+  const head=el.querySelector('.d1');
+  if(!head)return;
+  const b=document.createElement('button');
+  b.className='rbtn'; b.innerHTML='&#8635;';
+  if(e.running){b.disabled=true; b.title='replay running…'; pollReplay(date);}
+  else if(!e.eligible){
+    // Show it disabled WITH the reason rather than hiding it: "why is there no
+    // button?" is the question an operator would otherwise have to read code
+    // to answer. day_was_traded is the one that matters most — clicking through
+    // THAT would overwrite a real trading day, so it stays a hard block.
+    b.disabled=true;
+    b.title='cannot replay — '+(e.reason||'ineligible')+(e.detail?(': '+e.detail):'');
+  }else if(e.busy){b.disabled=true; b.title='another replay is running';}
+  else{
+    b.title=(e.reason==='re_replay'||e.reason==='already_replayed')
+      ? 'replay again from 1m bars' : 'reconstruct this session from 1m bars';
+    // A cost worth stating is not a reason to take the choice away (operator
+    // decision 2026-08-17): the button stays live and the tooltip carries the
+    // warning. Only correctness blocks disable it.
+    if(e.warning){b.classList.add('warn'); b.title='⚠ '+e.warning+' — '+b.title;}
+    b.onclick=(ev)=>{ev.stopPropagation(); startReplay(date,b);};
+  }
+  head.appendChild(b);
+}
+async function startReplay(date,btn){
+  btn.disabled=true; btn.title='starting…';
+  let j={};
+  try{
+    const r=await fetch('/open15_vol_breakout/api/replay',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,force:true})});
+    j=await r.json();
+    if(!r.ok){replayMsg(date,'refused — '+(j.reason||j.message||r.status));return;}
+  }catch(err){replayMsg(date,'request failed');return;}
+  replayMsg(date,'starting…'); pollReplay(date);
+}
+function replayMsg(date,text){
+  const m=document.getElementById('rpmsg-'+date);
+  if(m){m.style.display=''; m.textContent=text;}
+}
+function pollReplay(date){
+  const bar=document.getElementById('rp-'+date);
+  if(bar)bar.style.display='';
+  const tick=async()=>{
+    let s={};
+    try{
+      const r=await fetch('/open15_vol_breakout/api/replay/status?date='+date);
+      s=await r.json();
+    }catch(err){setTimeout(tick,4000);return;}
+    if(s.status==='running'){
+      const pct=s.total?Math.round(100*(s.progress||0)/s.total):0;
+      if(bar)bar.firstChild.style.width=pct+'%';
+      replayMsg(date,'replaying '+(s.progress||0)+(s.total?('/'+s.total):'')+'…');
+      setTimeout(tick,3000); return;
+    }
+    if(bar)bar.style.display='none';
+    if(s.status==='done'){
+      replayMsg(date,'replayed — '+(s.rows_written||0)+' rows');
+      await loadDays(); selectDay(date);
+    }else if(s.status==='failed'){
+      replayMsg(date,'failed — '+(s.error||'unknown'));
+    }else{replayMsg(date,'');}
+  };
+  setTimeout(tick,1200);
+}
+function renderReplayBanner(){
+  // A replayed day must SAY it is a reconstruction, above the numbers, in the
+  // same place the broker-rejection banner says its rows are simulated.
+  const meta=curEvents.find(e=>e.event==='replay_meta');
+  const box=document.getElementById('rpbox');
+  if(!box)return;
+  if(!meta){box.innerHTML='';return;}
+  const summ=curEvents.find(e=>e.event==='summary')||{};
+  const degen=curEvents.filter(e=>e.event==='exit_replay'&&e.reason==='degenerate_hold').length;
+  box.innerHTML='<div class="rpbanner"><div class="rt">Reconstruction &mdash; this session was '+
+    'never traded</div>'+
+    '<div class="rm">'+esc(meta.eligible_reason||'missed')+'; rebuilt from broker 1m candles at '+
+    esc(meta.ran_at||'')+'. Selection, gates and OI verdicts are exact. Entry <b>price</b> is '+
+    'not &mdash; the gate fires mid-minute and bars only close it, so P&amp;L is a band.</div>'+
+    '<div class="rn">config from '+esc(meta.config_source||'?')+' &middot; '+
+    esc(String(meta.symbols_fetched||'?'))+'/'+esc(String(meta.symbols_requested||'?'))+
+    ' symbols &middot; '+esc(String(meta.contracts_resolved||0))+' contracts'+
+    (degen?(' &middot; '+degen+' degenerate '+(degen===1?'hold':'holds')+
+      ' (triggered in the last entry minute, ~0s hold)'):'')+
+    ' &middot; not real money: excluded from realised P&amp;L and from compound sizing</div></div>';
+  if(summ.net_close_entry!=null){
+    const rupee=v=>(v>=0?'+':'')+'\\u20B9'+Math.round(v);
+    const cls=v=>v>=0?'pos':'neg';
+    box.insertAdjacentHTML('beforeend','<div class="chips">'+
+      '<div class="chip"><span class="k">close-entry (conservative)</span>'+
+      '<span class="v '+cls(summ.net_close_entry)+'">'+rupee(summ.net_close_entry)+'</span></div>'+
+      (summ.net_early_entry!=null?('<div class="chip"><span class="k">early-entry (optimistic)'+
+        '</span><span class="v '+cls(summ.net_early_entry)+'">'+rupee(summ.net_early_entry)+
+        '</span></div>'):'')+
+      '</div>');
+  }
 }
 function renderRejected(){
   // broker-rejected entries (issue #548): no position was taken, and every
@@ -1635,3 +1774,148 @@ def trades():
         return jsonify([]), 500
     finally:
         db_session.remove()
+
+
+# --------------------------------------------------------------------------- #
+# Replay of a missed session (issue #604 — endpoints for the #600 engine)
+# --------------------------------------------------------------------------- #
+# One run at a time, process-wide. A replay is ~250 broker historical calls
+# against the same 3 req/s budget the live strategy needs, so two concurrent
+# runs (a double-click, two browser tabs) would be materially worse than slow —
+# they would contend with the strategy itself. The lock is the enforcement; the
+# UI's disabled button is only the hint.
+_REPLAY_LOCK = threading.Lock()
+_REPLAY_STATE: dict = {}  # date -> {status, progress, total, error, started_at}
+_REPLAY_STATE_LOCK = threading.Lock()
+
+
+def _replay_set(date: str, **fields) -> None:
+    with _REPLAY_STATE_LOCK:
+        _REPLAY_STATE.setdefault(date, {}).update(fields)
+
+
+def _replay_get(date: str) -> dict:
+    with _REPLAY_STATE_LOCK:
+        return dict(_REPLAY_STATE.get(date) or {})
+
+
+def _replay_worker(date: str, force: bool) -> None:
+    """Run the replay on a real OS thread and record the outcome.
+
+    A REAL thread, not an eventlet green thread: the engine makes blocking
+    broker calls, and under gunicorn's eventlet worker a blocking call on the
+    hub stalls every other request in the process (the same reason the Stage-1
+    veto uses an unpatched thread).
+    """
+    from services.open15_replay import ReplayIneligible, replay_session
+
+    try:
+        out = replay_session(
+            date,
+            apply=True,
+            force=force,
+            progress=lambda n, total: _replay_set(date, progress=n, total=total),
+        )
+        summary = out["events"][-1]
+        _replay_set(
+            date,
+            status="done",
+            rows_written=out["persisted"]["rows_written"],
+            net_close_entry=summary.get("net_close_entry"),
+            net_early_entry=summary.get("net_early_entry"),
+            error=None,
+        )
+        logger.info(
+            "open15 replay %s: done — %d rows, net %s",
+            date,
+            out["persisted"]["rows_written"],
+            summary.get("net_close_entry"),
+        )
+    except ReplayIneligible as e:
+        # Not a crash: the day stopped qualifying between the click and the
+        # write (most importantly ``day_was_traded``). Report the reason.
+        _replay_set(date, status="failed", error=f"{e.reason}: {e.detail}".strip(": "))
+        logger.warning("open15 replay %s: refused — %s", date, e)
+    except Exception as e:
+        _replay_set(date, status="failed", error=str(e) or e.__class__.__name__)
+        logger.exception("open15 replay %s: failed", date)
+    finally:
+        _REPLAY_LOCK.release()
+
+
+@open15_bp.route("/api/replay/eligibility", methods=["GET"])
+@check_session_validity
+def replay_eligibility():
+    """Can this date be replayed? Drives the button and its tooltip."""
+    date = (request.args.get("date") or "").strip()
+    if not date:
+        return jsonify({"status": "error", "message": "date is required"}), 400
+    try:
+        from services.open15_replay import check_eligibility
+
+        out = check_eligibility(date, allow_rereplay=True)
+        # An in-flight run is not an eligibility fact, but the button must not
+        # offer a second one, so it rides the same response.
+        out["running"] = _replay_get(date).get("status") == "running"
+        out["busy"] = _REPLAY_LOCK.locked()
+        return jsonify(out)
+    except Exception:
+        logger.exception("open15: replay eligibility failed for %s", date)
+        return jsonify({"eligible": False, "reason": "check_failed"}), 500
+
+
+@open15_bp.route("/api/replay", methods=["POST"])
+@check_session_validity
+def replay_start():
+    """Start a replay. 403 if ineligible, 409 if one is already running."""
+    body = request.get_json(silent=True) or {}
+    date = str(body.get("date") or "").strip()
+    force = bool(body.get("force"))
+    if not date:
+        return jsonify({"status": "error", "message": "date is required"}), 400
+
+    from services.open15_replay import check_eligibility
+
+    # Server-side re-check: the button is a hint, this is the gate. A crafted
+    # POST must not be able to replay a traded day or run during market hours.
+    elig = check_eligibility(date, allow_rereplay=force)
+    if not elig.get("eligible"):
+        return jsonify(
+            {
+                "status": "error",
+                "reason": elig.get("reason"),
+                "message": elig.get("detail") or elig.get("reason"),
+            }
+        ), 403
+
+    if not _REPLAY_LOCK.acquire(blocking=False):
+        return jsonify(
+            {"status": "error", "reason": "busy", "message": "a replay is already running"}
+        ), 409
+
+    # released by the worker's finally, including on failure
+    _replay_set(
+        date,
+        status="running",
+        progress=0,
+        total=None,
+        error=None,
+        started_at=dt.datetime.now().isoformat(timespec="seconds"),
+    )
+    threading.Thread(
+        target=_replay_worker, args=(date, force), name=f"open15-replay-{date}", daemon=True
+    ).start()
+    return jsonify({"status": "success", "date": date}), 202
+
+
+@open15_bp.route("/api/replay/status", methods=["GET"])
+@check_session_validity
+def replay_status():
+    """Progress for a replay started in this process."""
+    date = (request.args.get("date") or "").strip()
+    if not date:
+        return jsonify({"status": "error", "message": "date is required"}), 400
+    state = _replay_get(date)
+    if not state:
+        return jsonify({"status": "idle", "date": date})
+    return jsonify({"date": date, **state})
