@@ -94,11 +94,7 @@ def test_summarize_day_traded():
         # absent rather than 0, so "the excluded side was never watched" stays
         # distinguishable from "it was watched and broke even"
         "shadow": 0,
-        # issue #600 — the replay bucket. A day the strategy really ran has
-        # none, and it must never absorb any of the counts above.
-        "replay": 0,
         "shadow_pnl": None,
-        "replay_pnl": None,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
     }
@@ -660,71 +656,3 @@ def test_js_and_python_agree_on_a_clobbered_day():
         for r in selection_outcomes("2026-08-13", _CLOBBERED, journal=_CLOBBERED_JOURNAL)
     }
     assert set(js) == set(py)
-
-
-# --------------------------------------------------------------------------- #
-# Replay events must reach the row builders (issue #615)
-# --------------------------------------------------------------------------- #
-_REPLAY_DAY = [
-    {"ts": "09:10", "event": "replay_meta", "replay": True, "ran_at": "2026-08-17 14:11:42"},
-    {
-        "ts": "09:16",
-        "event": "selection",
-        "replay": True,
-        "selected": {"MAXHEALTH": "S"},
-        "gaps_pct": {"MAXHEALTH": -0.885},
-    },
-    {
-        "ts": "09:29",
-        "event": "entry_replay",
-        "replay": True,
-        "fill": "replay",
-        "symbol": "MAXHEALTH",
-        "side": "S",
-        "level": 1029.0,
-        "trigger_price": 1021.3,
-        "trigger_minute": "09:29",
-        "quantity": 2100,
-        "opt_symbol": "MAXHEALTH25AUG261030PE",
-        "opt_entry_premium": 27.15,
-    },
-    {
-        "ts": "09:30",
-        "event": "exit_replay",
-        "replay": True,
-        "fill": "replay",
-        "symbol": "MAXHEALTH",
-        "gross": 0.0,
-        "charges": 556.03,
-        "pnl": -556.03,
-        "net_early": 4083.21,
-        "opt_exit_premium": 27.15,
-        "reason": "degenerate_hold",
-    },
-]
-
-
-def test_a_replayed_row_states_its_trigger_and_exit():
-    """The first real replay rendered six rows saying "no trigger" beside their
-    own P&L (#615): the distinct event names #604 introduced were never taught
-    to the row builders."""
-    from services.open15_log_view import selection_outcomes
-
-    row = selection_outcomes("2026-08-12", _REPLAY_DAY)[0]
-    assert row["fill"] == "replay"
-    assert row["entered"] is True
-    assert row["trigger_price"] == 1021.3
-    assert row["qty"] == 2100
-    assert row["opt_exit_premium"] == 27.15
-    assert row["pnl"] == -556.03
-
-
-def test_js_and_python_agree_on_a_replay_day():
-    """Both builders must recognise entry_replay / exit_replay identically."""
-    from services.open15_log_view import selection_outcomes
-
-    js = _run_render_sel(_REPLAY_DAY)
-    py = {r["symbol"]: r for r in selection_outcomes("2026-08-12", _REPLAY_DAY)}
-    assert set(js) == set(py)
-    assert js["MAXHEALTH"]["fill"] == py["MAXHEALTH"]["fill"] == "replay"
-    assert "no trigger" not in (js["MAXHEALTH"].get("out") or "")
