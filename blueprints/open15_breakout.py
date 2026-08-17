@@ -779,8 +779,7 @@ async function saveCfg(){
     coverage_target_pct:+document.getElementById('c_covtgt').value};
   const msg=document.getElementById('c_msg');
   try{
-    // CSRFProtect is global (issue #446): the POST is rejected 400 without this token
-    const tok=(await (await fetch('/auth/csrf-token')).json()).csrf_token||'';
+    const tok=await csrfToken();
     const r=await fetch('/open15_vol_breakout/api/config',{method:'POST',
       headers:{'Content-Type':'application/json','X-CSRFToken':tok},body:JSON.stringify(body)});
     const j=await r.json();
@@ -819,6 +818,14 @@ function kindOf(e){
   // the other "watched but not traded" rows rather than buried in sys noise
   if(e.event==='universe_excluded')return 'no_entry';
   return 'sys';
+}
+async function csrfToken(){
+  // CSRFProtect is global (issue #446): ANY POST from this page is rejected 400
+  // without this header. Factored into one helper because the replay POST
+  // (#613) shipped without it and the button silently did nothing — a second
+  // hand-rolled POST is exactly how that recurs.
+  try{return (await (await fetch('/auth/csrf-token')).json()).csrf_token||'';}
+  catch(e){return '';}
 }
 async function loadDays(){
   const r=await fetch('/open15_vol_breakout/api/decision_log/days'); const j=await r.json();
@@ -931,7 +938,8 @@ async function startReplay(date,btn){
   let j={};
   try{
     const r=await fetch('/open15_vol_breakout/api/replay',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,force:true})});
+      headers:{'Content-Type':'application/json','X-CSRFToken':await csrfToken()},
+      body:JSON.stringify({date:date,force:true})});
     j=await r.json();
     if(!r.ok){replayMsg(date,'refused — '+(j.reason||j.message||r.status));return;}
   }catch(err){replayMsg(date,'request failed');return;}
