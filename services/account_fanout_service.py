@@ -155,6 +155,52 @@ def compute_opening_qty(
     return int(math.floor(capital_per_trade / price))
 
 
+def _funds_check_enabled() -> bool:
+    """Per-order affordability check on child mirrors (issue #637)."""
+    return os.getenv("MULTI_ACCOUNT_FUNDS_CHECK", "true").lower() == "true"
+
+
+def read_child_cash(broker: str, token: str) -> float | None:
+    """The CHILD's own spendable cash, or None if it cannot be read (issue #637).
+
+    Read with the child's token, never the parent's. A child is a separate
+    broker account with a separate balance, and #626 got this exact axis wrong
+    once already by routing a funds read through a resolver that answered for a
+    different book.
+
+    ``get_funds_with_auth`` is called WITHOUT ``original_data`` deliberately:
+    that argument is what makes it consult the analyze overlay, and a child
+    mirror only ever fires on a LIVE parent order against a real broker account.
+
+    None means "we do not know" and is never coerced to 0 — a zero would block
+    every mirror on a transient funds-API failure.
+    """
+    try:
+        from services.funds_service import get_funds_with_auth
+
+        ok, resp, _ = get_funds_with_auth(token, broker)
+        if not ok:
+            logger.warning("mirror: funds read failed for %s — not gating: %s", broker, resp)
+            return None
+        cash = (resp or {}).get("data", {}).get("availablecash")
+        return float(cash) if cash is not None else None
+    except Exception:
+        logger.exception("mirror: funds read raised — not gating")
+        return None
+
+
+def can_afford(order_value: float, available_cash: float | None) -> bool:
+    """Whether the child can pay for this order (issue #637).
+
+    Fails OPEN on an unknown balance: the broker still enforces the real limit,
+    and with the ACK-vs-fill reconciliation in place a refusal is now recorded
+    honestly rather than as a mirror that never happened.
+    """
+    if available_cash is None:
+        return True
+    return order_value <= available_cash
+
+
 def _mirror_to_account(
     account: dict,
     order_data: dict,
@@ -265,6 +311,29 @@ def _mirror_to_account(
                     f"cannot afford 1 {unit} of {symbol} at ₹{sizing_price:,.2f}."
                 )
                 return
+
+            # Can the CHILD pay for this? (issue #637 — the #626 defect, one
+            # account over.) Sized value, not the raw per-trade cap:
+            # compute_opening_qty floors, so the real cost is <= the cap.
+            # Deliberately inside the opening branch — an EXIT must never be
+            # gated on cash, or a funds blip strands a live child position.
+            if _funds_check_enabled():
+                cash = read_child_cash(broker, token)
+                order_value = child_qty * sizing_price
+                if not can_afford(order_value, cash):
+                    account_orders_db.record_mirror_attempt(
+                        **journal,
+                        child_qty=0,
+                        status="skipped_insufficient_funds",
+                        error_text=(f"needs Rs{order_value:,.0f}, available Rs{cash:,.0f}"),
+                        sizing_price=sizing_price,
+                    )
+                    _notify_operator(
+                        f"⚠ Mirror skipped — {name}: {action} {symbol} needs "
+                        f"₹{order_value:,.0f} but only ₹{cash:,.0f} is available. "
+                        f"No order placed."
+                    )
+                    return
 
         child_order = copy.deepcopy(order_data)
         child_order["quantity"] = child_qty

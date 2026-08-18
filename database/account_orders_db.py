@@ -47,6 +47,9 @@ VALID_STATUSES = (
     "skipped_no_position",
     "skipped_no_capital",
     "skipped_no_quote",
+    # the child cannot pay for the sized order (issue #637) — distinct from
+    # skipped_zero_qty, which means the per-trade CAP could not buy one unit
+    "skipped_insufficient_funds",
     "error",
 )
 
