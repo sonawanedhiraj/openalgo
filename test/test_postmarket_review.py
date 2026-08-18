@@ -21,6 +21,9 @@ Coverage:
 * ``run_review_for_date`` persists idempotently (one row per date) and dispatches
   through ``notification_service.notify`` with the ``postmarket_review`` event,
 * a Telegram failure does not abort persistence,
+* the orchestration path consumes the stubbed agent seam and never spawns the
+  ``claude`` CLI (#632 — an unstubbed spawn hangs the whole run, it does not
+  fail one test),
 * the per-fire ``POSTMARKET_REVIEW_ENABLED`` flag gates the job body,
 * ``register_jobs`` is idempotent and honours ``POSTMARKET_REVIEW_TIME``.
 """
@@ -341,6 +344,49 @@ def review_table(monkeypatch, tmp_path):
     return prdb
 
 
+# The agent reply ``run_review_for_date`` would otherwise go to a real
+# ``claude -p`` subprocess for. Empty ``findings`` keeps the filing path a no-op
+# (``file_findings`` never reaches ``gh``) so these tests stay about orchestration.
+_AGENT_REPLY = json.dumps(
+    {"day_assessment": "Quiet day. No contract violations worth escalating.", "findings": []}
+)
+
+
+@pytest.fixture
+def stub_llm(monkeypatch):
+    """Cut the LLM subprocess out of ``run_review_for_date`` (issue #632).
+
+    Without this the orchestration tests reach
+    ``postmarket_investigation.investigate()`` -> ``invoke_claude_agent()``, which
+    spawns the real ``claude`` CLI and blocks on ``thread.join(605s)``. That does
+    not fail the test — it hangs the run until ``pytest-timeout`` kills it and
+    takes every remaining test with it. The exposure is load-dependent:
+    ``investigate()`` returns early when the digest carries no violations and no
+    errors, so this file passes in isolation and bricks the full suite.
+
+    Both flags are pinned rather than left to the ambient environment, because
+    ``POSTMARKET_INVESTIGATION_ENABLED=false`` would route the same call through
+    the triage fallback and its own CLI seam.
+
+    Patched on the *client* modules, not on ``postmarket_investigation`` —
+    ``investigate()`` imports the name inside the function body, so patching the
+    consumer rebinds nothing.
+    """
+    monkeypatch.setenv("POSTMARKET_INVESTIGATION_ENABLED", "true")
+    monkeypatch.setenv("POSTMARKET_FILING_MODE", "dry_run")
+
+    agent = MagicMock(return_value=(_AGENT_REPLY, "sid"))
+    monkeypatch.setattr("services.llm_agent_client.invoke_claude_agent", agent)
+    # The triage fallback only runs if the investigation is switched off, which
+    # the flag above rules out. Stubbed anyway so a future default flip degrades
+    # to a failing assertion rather than a hung suite.
+    monkeypatch.setattr(
+        "services.llm_review_client.invoke_claude_review",
+        MagicMock(side_effect=AssertionError("triage fallback should not run here")),
+    )
+    return agent
+
+
 def test_non_trading_day_is_skipped_and_persists_nothing(review_table):
     from services import postmarket_review_service as prs
 
@@ -351,7 +397,7 @@ def test_non_trading_day_is_skipped_and_persists_nothing(review_table):
     assert review_table.get_review(WEEKEND) is None
 
 
-def test_run_review_persists_idempotently_and_notifies(review_table):
+def test_run_review_persists_idempotently_and_notifies(review_table, stub_llm):
     from services import postmarket_review_service as prs
 
     fake = MagicMock()
@@ -374,7 +420,7 @@ def test_run_review_persists_idempotently_and_notifies(review_table):
     assert stored["summary_text"]
 
 
-def test_telegram_failure_does_not_abort_persistence(review_table):
+def test_telegram_failure_does_not_abort_persistence(review_table, stub_llm):
     from services import postmarket_review_service as prs
 
     fake = MagicMock()
@@ -385,6 +431,53 @@ def test_telegram_failure_does_not_abort_persistence(review_table):
     assert result["telegram_sent"] is False
     assert result["persisted"] is True
     assert review_table.get_review(DATE) is not None
+
+
+def test_review_never_spawns_the_claude_cli(review_table, stub_llm, monkeypatch):
+    """The orchestration path goes through the stubbed agent seam, not a subprocess.
+
+    Regression guard for #632. A contract violation is injected because that is
+    the load-dependent trigger: ``investigate()`` returns early on a digest with
+    no violations and no errors, which is why this file passed in isolation while
+    hanging the full suite. With the violation present the agent call is
+    unconditional, so an unstubbed seam fails here every time instead of
+    sometimes.
+
+    The suite-wide tripwire in ``test/conftest.py`` catches an unstubbed spawn
+    anywhere; this pins the *specific* seam ``run_review_for_date`` depends on, so
+    a refactor that moves the call out from under the fixture fails with a clear
+    cause rather than a generic tripwire hit.
+    """
+    from services import postmarket_review_service as prs
+
+    monkeypatch.setattr(
+        "services.strategy_expectations.evaluate_expectations",
+        lambda digest: {
+            "violations": [
+                {
+                    "fingerprint": "38bd638a20a9",  # pragma: allowlist secret
+                    "severity": "P0",
+                    "strategy": "futures_follow_cap50",
+                    "contract_id": "t1_exit_for_carry",
+                    "description": "carry is exited T+1",
+                    "summary": "8 lots open, 0 exits today",
+                    "observed": {},
+                }
+            ],
+            "counts": {},
+            "unknown_contracts": [],
+            "evaluated": True,
+        },
+    )
+
+    with patch("services.notification_service.get_notification_service", return_value=MagicMock()):
+        result = prs.run_review_for_date(DATE, dispatch_telegram=False, persist=True)
+
+    assert stub_llm.call_count == 1
+    # The stubbed reply reached the result, so the investigation really ran rather
+    # than degrading to an "agent unavailable" status.
+    assert result["triage"]["status"] == "ok"
+    assert result["triage"]["day_assessment"].startswith("Quiet day.")
 
 
 def test_job_respects_per_fire_enable_flag(monkeypatch):
