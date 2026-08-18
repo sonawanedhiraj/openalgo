@@ -122,3 +122,24 @@ def test_fractional_lot_count_is_never_printed():
     (cell,) = _render([{"qty": 250, "lotSize": 200, "fill": "real"}])
     assert "1.25" not in cell
     assert "lot 200" in cell
+
+
+def test_lots_term_is_nowrap_but_leg_generally_is_not():
+    """The lots term must not split across lines (issue #638) -- `2 x 6,150`
+    breaking after the `x` is the same ambiguity #630 removed. Scoped to the
+    term, NOT to `.leg`: that class is shared with the contract line and the
+    gross/charges line, both of which must stay wrappable or they overflow."""
+    (cell,) = _render([{"qty": 12300, "lotSize": 6150, "fill": "real"}])
+    assert '<span class="nw">2 &times; 6,150</span>' in cell
+    assert ".nw{white-space:nowrap}" in _LOGS_PAGE
+    # the shared class itself must NOT have been made nowrap
+    leg_rule = _LOGS_PAGE.split(".leg{")[1].split("}")[0]
+    assert "nowrap" not in leg_rule
+
+
+def test_sim_row_lots_term_is_also_nowrap():
+    """The sim/shadow cell appends the term after `sim 200 ·`; it gets the same
+    treatment without making the whole sub-line unwrappable."""
+    (cell,) = _render([{"qty": 200, "lotSize": 200, "fill": "sim"}])
+    assert '<span class="nw">1 &times; 200</span>' in cell
+    assert cell.startswith('<span class="muted">0</span>')

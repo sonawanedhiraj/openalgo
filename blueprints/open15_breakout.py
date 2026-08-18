@@ -475,6 +475,9 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .b-liq{background:#463a20;color:#f9e2af}
  .b-nocontract{background:#3a2028;color:#f38ba8}
  .leg{color:#8aa0b4;font-size:11px;display:block;margin-top:2px}
+ /* the lots term only (issue #638) — `.leg` is shared with the contract and
+    gross/charges lines, which MUST stay wrappable or they overflow the table */
+ .nw{white-space:nowrap}
  .opt{color:#94e2d5}.slip{color:#f9e2af}
  /* merged symbol table (issue #559): one row per watched symbol, detail on click */
  tr.main{cursor:pointer}tr.main:hover{background:#161d25}tr.main.open{background:#161d25}
@@ -1516,9 +1519,12 @@ function lotsLeg(r){
   const lots=q/lot;
   // a fractional lot count cannot be true — it means `qty` and `lotSize` came
   // from different sources. Print the lot alone rather than invent a count.
-  return Number.isInteger(lots)
+  // wrapped nowrap at the source, so BOTH call sites get it and neither can
+  // split `2 &times; 6,150` across lines (issue #638)
+  const txt=Number.isInteger(lots)
     ? lots+' &times; '+lot.toLocaleString('en-IN')
     : 'lot '+lot.toLocaleString('en-IN');
+  return '<span class="nw">'+txt+'</span>';
 }
 function qtyCell(r){
   // `quantity` is what was ORDERED. For a bucket where nothing was ordered it
