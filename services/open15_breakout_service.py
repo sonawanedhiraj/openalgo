@@ -181,6 +181,29 @@ def _sim_skipped_enabled() -> bool:
     return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
 
 
+def _funds_clamp_enabled() -> bool:
+    """Clamp the day's slot budget to the account balance (issue #626)."""
+    return os.getenv("OPEN15_FUNDS_CLAMP", "true").lower() == "true"
+
+
+def _verify_entries_enabled() -> bool:
+    """Deferred post-ACK entry verification (issue #626).
+
+    Rollback switch. Off = the pre-#626 behaviour, where an acknowledged order
+    was trusted as filled until the exit.
+    """
+    return os.getenv("OPEN15_VERIFY_ENTRIES", "true").lower() == "true"
+
+
+def _confirm_exit_position() -> bool:
+    """Verify the book before squaring off an `open` row (issue #626).
+
+    The rollback switch for the pre-exit check. Off = the pre-#626 behaviour,
+    where an acknowledged-then-RMS-rejected entry sent an unbacked square-off.
+    """
+    return os.getenv("OPEN15_CONFIRM_EXIT_POSITION", "true").lower() == "true"
+
+
 def _paper_sim_max() -> int:
     """Daily cap on simulated rows.
 
@@ -713,6 +736,91 @@ def verify_prev_closes(closes: dict[str, float], today: dt.date) -> tuple[dict[s
     except Exception:
         logger.exception("open15: prev-close verification failed — using historify values as-is")
         return closes, {"enabled": True, "error": True}
+
+
+def clamp_slots_to_funds(
+    margin_per_slot: float, max_trades: int, available_cash: float | None
+) -> tuple[int, str | None]:
+    """How many slots the account can actually pay for (issue #626).
+
+    Returns ``(effective_max_trades, note)``; ``note`` is None when nothing was
+    clamped.
+
+    The strategy's budget was `margin_per_slot x max_trades` and was never
+    compared with the money in the account. On 2026-08-18 that budget was
+    5 x Rs60,000 = Rs3,00,000 against Rs1,22,252.80 of cash: the first two
+    entries filled, the third asked for Rs62,000 the account did not have, and
+    Zerodha refused it — "Margin required: 149255.00" being the CUMULATIVE
+    requirement of all three, not the third alone.
+
+    **`max_trades` is what shrinks, never `margin_per_slot`.** Cutting the slot
+    instead would silently change the position size this deployment exists to
+    measure, making the day incomparable to every day before it. Fewer trades at
+    the configured size stays comparable; smaller trades do not.
+
+    Fails OPEN (returns `max_trades` unchanged) when the balance is unknown. An
+    unreadable funds call must not be able to switch the strategy off — the
+    broker still enforces the real limit, and a rejection is now handled
+    correctly rather than published as a fill.
+    """
+    if available_cash is None or margin_per_slot <= 0:
+        return max_trades, None
+    affordable = int(available_cash // margin_per_slot)
+    if affordable >= max_trades:
+        return max_trades, None
+    note = (
+        f"funds clamp: Rs{available_cash:,.0f} available covers {affordable} of "
+        f"{max_trades} slots at Rs{margin_per_slot:,.0f} each"
+    )
+    return max(affordable, 0), note
+
+
+def read_available_cash() -> float | None:
+    """The spendable cash OF THE BOOK THIS STRATEGY TRADES (issue #626).
+
+    Routed by ``resolve_order_mode(STRATEGY_NAME)`` — the same resolver that
+    routes the orders — which is the #497 rule. ``funds_service.get_funds``
+    cannot be used directly here: it dispatches on ``resolve_effective_mode()``,
+    the *analyze overlay*, which returns LIVE whenever the navbar toggle is off
+    regardless of what this strategy is set to. A sandbox open15 would then size
+    itself against the REAL broker balance instead of the virtual Rs1Cr book and
+    silently clamp a measurement run that has no funding constraint at all.
+
+    None means "we do not know" and is never coerced to 0 — a zero would clamp
+    the strategy to no trades on a transient funds-API failure.
+    """
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.mode_service import EffectiveMode, resolve_order_mode
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            return None
+
+        if resolve_order_mode(STRATEGY_NAME) is EffectiveMode.SANDBOX:
+            from services.sandbox_service import sandbox_get_funds
+
+            ok, resp, _ = sandbox_get_funds(api_key, {"apikey": api_key})
+        else:
+            from database.auth_db import get_auth_token_broker
+            from services.funds_service import get_funds_with_auth
+
+            auth_token, broker = get_auth_token_broker(api_key)
+            if not auth_token:
+                return None
+            # no ``original_data`` on purpose: that argument is what makes
+            # get_funds_with_auth consult the analyze overlay, and the routing
+            # decision has already been made above by the correct resolver
+            ok, resp, _ = get_funds_with_auth(auth_token, broker)
+
+        if not ok:
+            logger.warning("open15: funds read failed — sizing not clamped: %s", resp)
+            return None
+        cash = (resp or {}).get("data", {}).get("availablecash")
+        return float(cash) if cash is not None else None
+    except Exception:
+        logger.exception("open15: funds read raised — sizing not clamped")
+        return None
 
 
 def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
@@ -1843,6 +1951,17 @@ class Open15BreakoutService:
             logger.exception("open15: config load failed — using env defaults")
             cfg_row, cum_pnl = None, 0.0
         self.day_config = resolve_day_config(cfg_row, cum_pnl)
+        # The budget must fit the ACCOUNT, not just the config (issue #626).
+        # Done here rather than in resolve_day_config because it needs a broker
+        # read and that function is pure. Once per day, at arm.
+        configured_max = self.day_config["max_trades"]
+        available_cash = read_available_cash() if _funds_clamp_enabled() else None
+        eff_max, clamp_note = clamp_slots_to_funds(
+            self.day_config["margin_effective"], configured_max, available_cash
+        )
+        if clamp_note:
+            logger.warning("open15: %s", clamp_note)
+            self.day_config["max_trades"] = eff_max
         # Gate 1 stage 1 (issue #583) — side-INDEPENDENT, so it can run before the
         # 09:16 ranking assigns one. Only drops symbols that fail on BOTH sides (or
         # have no NFO contracts at all); the per-side half is stage 2, inside the
@@ -1902,6 +2021,13 @@ class Open15BreakoutService:
             notional=self.day_config["notional"],
             cum_realized_pnl=self.day_config["cum_realized_pnl"],
             config_source="ui" if cfg_row else "env_defaults",
+            # what the account could actually pay for (issue #626). Stamped even
+            # when nothing was clamped, so a past day can always say whether the
+            # signal or the balance was what limited it.
+            max_trades_configured=configured_max,
+            max_trades_effective=self.day_config["max_trades"],
+            available_cash=available_cash,
+            funds_clamp=clamp_note,
             tick_capture=bool(self._tick_writer),
             tick_capture_universe=bool(self._tick_writer) and self._capture_universe,
             prev_close_check=prev_check,
@@ -2267,6 +2393,124 @@ class Open15BreakoutService:
             ),
         )
 
+    def verify_entries(self) -> int:
+        """Ask the broker what really happened to each ACK'd entry (issue #626).
+
+        An ACK is not a fill. Zerodha returns HTTP 200 with an order id and its
+        RMS can refuse the order afterwards — on 2026-08-18 TIINDIA was accepted,
+        rejected for insufficient funds, and sat in `self.positions` as a live
+        `open` position for ten minutes: it consumed a `max_trades` slot it was
+        not entitled to, and `flatten` later tried to square it off.
+
+        Deferred by construction, and that is the whole reason this is a job
+        rather than a line in `_enter`. Entries are placed from the ZMQ tick
+        callback; a synchronous broker round-trip there would stall every other
+        symbol's tick processing — the same constraint that keeps fill
+        reconciliation at the summary job.
+
+        Demotes ONLY on a terminal-unfilled answer (`rejected` / `cancelled`).
+        `open` and `complete` are both left alone: the first is still working,
+        and the second is exactly what we want. An unreadable answer changes
+        nothing — this runs every minute, and `flatten` re-checks the book.
+
+        Returns the number of positions demoted.
+        """
+        if not _verify_entries_enabled():
+            return 0
+        from database.open15_breakout_db import update_trade
+        from services.open15_fill_reconcile import fetch_fill, is_terminal_unfilled
+
+        try:
+            from database.auth_db import get_first_available_api_key
+
+            api_key = get_first_available_api_key()
+        except Exception:
+            logger.exception("open15 entry-verify: api key lookup failed")
+            return 0
+        if not api_key:
+            return 0
+
+        with self._lock:
+            pending = [
+                (sym, dict(pos))
+                for sym, pos in self.positions.items()
+                if pos.get("status") == "open"
+                and pos.get("entry_order_id")
+                and not pos.get("entry_verified")
+            ]
+
+        demoted = 0
+        for symbol, pos in pending:
+            leg = fetch_fill(pos["entry_order_id"], api_key)
+            if leg is None:
+                continue
+            status = leg["order_status"]
+            if not is_terminal_unfilled(status):
+                # `complete` is settled; `open` may still fill, so it is not
+                # marked verified and gets asked again on the next tick.
+                if status == "complete":
+                    with self._lock:
+                        if symbol in self.positions:
+                            self.positions[symbol]["entry_verified"] = True
+                continue
+
+            msg = leg["message"] or f"broker reported the entry {status}"
+            # The position dict is what `_count_fills` reads for the max_trades
+            # budget and what `flatten` dispatches on, so both have to move — a
+            # journal-only update would free the slot in the report and not in
+            # the run.
+            with self._lock:
+                if symbol in self.positions:
+                    self.positions[symbol].update(status="paper", fill="paper", entry_verified=True)
+            update_trade(
+                pos["row_id"],
+                status="rejected",
+                entry_status="rejected",
+                fill="paper",
+                error_message=msg[:255],
+                reason="entry_rejected",
+            )
+            # `entry_rejected`, NOT a new event name. The digest and the row
+            # builder in open15_log_view already render this one, and the /logs
+            # page has twice gone dark on an event nobody taught it (#615, #622).
+            # It IS a rejected entry — only the moment of discovery differs.
+            self._log_event(
+                "entry_rejected",
+                symbol=symbol,
+                instrument=pos.get("instrument") or "stock",
+                contract=pos.get("opt_symbol"),
+                qty=pos.get("quantity"),
+                entry_price=pos.get("opt_entry_premium") or pos.get("trigger_price"),
+                watch_source=pos.get("watch_source") or "seed",
+                order_id=pos["entry_order_id"],
+                order_status=status,
+                error=msg,
+                fill="paper",
+                paper_capped=False,
+                slot_released=True,
+                # what separates this from a placement-time rejection: the
+                # broker had already ACKNOWLEDGED the order when we entered it
+                post_ack=True,
+            )
+            self._alert_rejection(symbol, pos.get("quantity") or 0, msg)
+            demoted += 1
+        return demoted
+
+    def _entry_never_filled(self, symbol: str, pos: dict) -> bool:
+        """True only when the book AFFIRMATIVELY says we hold nothing (issue #626).
+
+        Deliberately not the inverse of "confirmed held". ``_broker_qty`` returns
+        None for an unreadable book, and None must NOT stop the square-off of a
+        position we believe is real — that is the direction that strands an
+        overnight lot. Only a definite 0 diverts to paper.
+        """
+        if not _confirm_exit_position():
+            return False
+        is_option = pos.get("instrument") == "option"
+        sym = pos["opt_symbol"] if is_option else symbol
+        qty = self._broker_qty(sym, "NFO" if is_option else "NSE")
+        return qty == 0
+
     def flatten(self, reason: str = "eod_0930") -> None:
         """Configured exit time (default 09:30 IST) — market-out every open
         position (also the +2 min retry backstop).
@@ -2299,6 +2543,30 @@ class Open15BreakoutService:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
         for symbol, pos in open_pos.items():
             is_option = pos.get("instrument") == "option"
+            # An ACK is not a fill (issue #626). Zerodha accepts the order, hands
+            # back an order id, and RMS can still refuse it downstream — which is
+            # exactly what happened to TIINDIA on 2026-08-18. The row said
+            # `status='open'` and this loop sent a SELL for 800 calls we did not
+            # own: a NAKED SHORT, which the broker priced at Rs4.45L of SPAN and
+            # refused only because the funds were not there either.
+            #
+            # So the #548 rule — only an AFFIRMATIVE non-zero position book
+            # justifies a square-off — applies here too, not just to rows already
+            # labelled paper. Zero means the entry never filled: paper it and send
+            # nothing. An UNREADABLE book (None) still squares off, because the
+            # asymmetry runs the other way once an entry is believed filled — an
+            # unsent exit strands a real overnight position, while an unnecessary
+            # one is caught by the broker's own 15:15 MIS auto-square-off.
+            if self._entry_never_filled(symbol, pos):
+                logger.error(
+                    "open15: %s entry never filled (book flat) — papering instead of "
+                    "sending an unbacked %s",
+                    symbol,
+                    "SELL" if is_option or pos["side"] == "L" else "BUY",
+                )
+                pos["fill"] = "paper"
+                self._flatten_paper(symbol, pos, "entry_rejected")
+                continue
             if is_option:
                 # option exit is always a SELL of the bought CE/PE (issue #437)
                 action = "SELL"
@@ -2618,13 +2886,35 @@ class Open15BreakoutService:
                 CronTrigger(hour=sh, minute=sm, day_of_week="mon-fri", timezone=tz),
                 _summary_job,
             ),
+            (
+                # Every minute from the first possible entry to the exit, so the
+                # last entry of the day is still checked before `flatten`
+                # dispatches on it. Cheap: the job early-returns without touching
+                # the broker unless the day is armed AND holds an unverified
+                # entry, of which there are at most `max_trades` in a day.
+                #
+                # Bounded to 09:xx on purpose. A configured exit later than that
+                # (the window is operator-editable up to 15:10) leaves the tail
+                # unverified, and that is acceptable: verification only buys back
+                # a `max_trades` slot sooner. Correctness does not rest on it —
+                # the exit-time book check and the summary reconciliation both
+                # still catch an unfilled entry.
+                "open15_entry_verify",
+                CronTrigger(
+                    hour=9,
+                    minute=f"17-{max(em, 17) if eh == 9 else 59}",
+                    day_of_week="mon-fri",
+                    timezone=tz,
+                ),
+                _entry_verify_job,
+            ),
         ]
         for job_id, trigger, fn in jobs:
             sched.add_job(fn, trigger, id=job_id, replace_existing=True, misfire_grace_time=60)
         logger.info(
-            "open15: 5 scheduler jobs registered (arm 09:10 / first-candles 09:16 / "
+            "open15: 6 scheduler jobs registered (arm 09:10 / first-candles 09:16 / "
             "exit %02d:%02d / retry %02d:%02d "
-            "/ summary %02d:%02d IST)",
+            "/ summary %02d:%02d IST / entry-verify every 1 min in the entry window)",
             eh,
             em,
             rh,
@@ -3303,6 +3593,9 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open",
                 "fill": "real",
+                # kept so the deferred verification can ask the broker what
+                # really happened to this order (issue #626)
+                "entry_order_id": str(resp.get("orderid") or ""),
             }
         self._log_event(
             "entry",
@@ -3538,6 +3831,9 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open",
                 "fill": "real",
+                # kept so the deferred verification can ask the broker what
+                # really happened to this order (issue #626)
+                "entry_order_id": str(resp.get("orderid") or ""),
                 "instrument": "option",
                 "opt_symbol": contract["symbol"],
                 "opt_lot_size": lot,
@@ -3692,6 +3988,19 @@ def _eod_retry_job() -> None:
     svc = get_open15_service()
     if svc is not None:
         svc.flatten("eod_retry_0932")
+
+
+def _entry_verify_job() -> None:
+    """Minute-cadence post-ACK entry verification (issue #626)."""
+    svc = get_open15_service()
+    if svc is None or svc.day_status != "armed":
+        return
+    try:
+        svc.verify_entries()
+    except Exception:
+        # never let a verification failure escape into the scheduler; the exit
+        # path re-checks the book and the reconciler re-checks at summary
+        logger.exception("open15: entry verification raised")
 
 
 def _summary_job() -> None:

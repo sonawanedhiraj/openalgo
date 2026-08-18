@@ -1208,6 +1208,82 @@ placed for it**. Four rules, each load-bearing:
 - **A rejection frees its `max_trades` slot** (it is not a trade), while paper
   fills carry their own cap of `max_trades` so a persistently-rejecting broker
   cannot simulate an unbounded day.
+**An ACK is NOT a fill — a broker can accept an order and then refuse it
+(issue #626).** #548 above covers the rejection Zerodha gives at *placement*
+time (`status != success`). On 2026-08-18 it did the other thing: returned
+**HTTP 200 with an order id**, then RMS rejected the order for insufficient
+funds. Nothing observed it, and every layer meant to catch exactly this read
+the rejection as a fill — TIINDIA was published as a broker-confirmed
+**+₹7,680** trade, and the day's real P&L was **+₹5,534 when the truth was
+−₹1,509**. Five rules, each load-bearing:
+- **`average_price` is the only field that means "what was transacted".**
+  `fetch_fill` read `average_price or price`; on a rejected order
+  `average_price` is 0 (falsy) and **`price` is the LIMIT PRICE WE ASKED FOR**,
+  so the fallback priced an order that never reached the market. A
+  terminal-unfilled order (`rejected`/`cancelled`) is now priced `None`
+  whatever any field says, and `filled_quantity` is read **by presence, not
+  truthiness** — 0 is the ANSWER on a rejected order, and `or` discarded it for
+  the ordered size (the same mistake, one field over). **Never resolve a broker
+  field with `or` here**: on a rejected order every meaningful value is 0.
+- **The two rejection shapes are NOT symmetric.** A rejected **ENTRY** means
+  nothing was ever held → demote to `fill='paper'`. A rejected **EXIT** on a
+  filled entry means a REAL position may still be open → `status='error'`,
+  never papered, and alerted. Collapsing them into one branch erases a live
+  position from the record.
+- **Only an AFFIRMATIVE non-zero book justifies a square-off — on `open` rows
+  too.** `flatten` dispatched on the believed state and sent a SELL for 800
+  calls we did not own; Kite priced that **naked short** at ₹4.45L of SPAN and
+  refused it only because the funds were not there either. Note the deliberate
+  *opposite* default from `_resolve_paper_position`: there the entry was known
+  REFUSED so an unreadable book papers; here it is believed FILLED, so an
+  unreadable book still squares off — not sending strands a real position.
+  Where the verify verdict and the book disagree, **the book wins**.
+- **Detection is deferred, never on the tick thread.** `open15_entry_verify`
+  (every minute across the entry window) asks the broker per unverified entry
+  and demotes in BOTH the journal and `self.positions` — the latter is what
+  `_count_fills` budgets against and what `flatten` dispatches on, so a
+  journal-only update frees the slot in the report and not in the run. Entries
+  are placed from the ZMQ callback, where a synchronous broker call stalls
+  every other symbol (the same constraint that keeps fill reconciliation at the
+  summary job).
+- **Every broker read routes by `resolve_order_mode(STRATEGY_NAME)`, never the
+  analyze overlay.** open15 defaults to **sandbox**, so this is not a corner
+  case. `funds_service.get_funds` dispatches on `resolve_effective_mode()` —
+  which returns LIVE whenever the navbar Analyze toggle is off, whatever the
+  strategy is set to — so reading funds through it sizes a virtual-₹1Cr
+  measurement run against the REAL broker balance and clamps a run with no
+  funding constraint at all. `read_available_cash` therefore picks
+  `sandbox_get_funds` vs `get_funds_with_auth` itself. The order-status and
+  position-book reads were already correct: `get_order_status` falls back to
+  `sandbox_order_exists(orderid, apikey)` so a sandbox order id is answered
+  from `sandbox.db`, and `_broker_qty` passes `mode_key`. Same #497 rule, and
+  it applies to the funds axis too.
+- **The budget must fit the ACCOUNT.** `margin_per_slot × max_trades` was never
+  compared with the balance: 5 × ₹60,000 = ₹3L configured against ₹1,22,252.80
+  of cash. Zerodha's "Margin required: 149255.00" was the **cumulative**
+  requirement of all three orders, which is why sizing each slot in isolation
+  could never catch it. At arm, `max_trades` is clamped to
+  `floor(cash / margin_per_slot)` — **`max_trades` shrinks, never
+  `margin_per_slot`**, because cutting the slot changes the position size this
+  deployment exists to measure. Fails OPEN on an unreadable balance.
+
+The demotion reuses the existing **`entry_rejected`** event (with
+`post_ack: true`) rather than a new name — the `/logs` page has twice gone dark
+on an event nobody taught the row builders (#615, #622). It also forced
+`entered = len(entry_syms - paper_syms)` in the digest: a post-ACK rejection
+emits BOTH `entry` and `entry_rejected`, and the raw count showed one symbol as
+entered *and* paper. Zerodha's `transform_order_data` now keeps
+**`status_message` and `filled_quantity`** — the reason existed in Kite's
+orderbook the whole time and appeared nowhere in our logs; the fields it did
+keep (`price`, `quantity`) are what we *asked for* and read identically on a
+rejected order and a filled one. The other 31 brokers' mappers still drop them.
+One-off repair for pre-#626 rows (journal AND the day log): `uv run python -m
+services.open15_postack_reject_repair --date YYYY-MM-DD [--apply]` — it resets
+the row and re-runs the FIXED `reconcile_fills` rather than hand-editing, so
+repair and live behaviour cannot drift apart; it needs the broker orderbook to
+still carry the order, i.e. **the same trading day**. Flags
+`OPEN15_VERIFY_ENTRIES`, `OPEN15_CONFIRM_EXIT_POSITION`, `OPEN15_FUNDS_CLAMP`.
+
 **Reported P&L is reconciled against the broker's own fills, and there are
 THREE buckets (issue #555).** Every price the strategy journals is a *decision*
 observation — `trigger_price` is the tick that fired the volume gate,

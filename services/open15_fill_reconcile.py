@@ -67,6 +67,25 @@ def _as_float(value) -> float | None:
     return out if out > 0 else None
 
 
+def _first_present(data: dict, *keys: str):
+    """First key actually present with a non-None value — never truthiness.
+
+    ``a or b`` silently discards a legitimate 0. On a rejected order every
+    meaningful field IS 0, so truthiness reads the wrong one every time
+    (issue #626).
+    """
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def is_terminal_unfilled(order_status: str | None) -> bool:
+    """True when the broker has given a final answer and no fill is coming."""
+    return str(order_status or "").lower() in _TERMINAL_UNFILLED
+
+
 def _as_int(value) -> int | None:
     try:
         return int(float(value))
@@ -98,10 +117,27 @@ def fetch_fill(order_id: str, api_key: str) -> dict | None:
             )
             return None
         data = (resp or {}).get("data") or {}
+        status = str(data.get("order_status") or data.get("status") or "").lower()
+        # ``average_price`` is the ONLY field that means "what was transacted".
+        # ``price`` is what we ASKED for — on a rejected order it is the limit
+        # price of an order that never touched the market, and reading it here
+        # is what let a REJECTED TIINDIA leg be published as a +Rs7,680 fill
+        # (issue #626). A terminal-unfilled order is priced None regardless of
+        # what any field says; there is no fill to find and asking again is
+        # pointless. Both books supply ``average_price`` (sandbox's own order
+        # manager returns it too), so nothing legitimate depends on the
+        # fallback that used to sit here.
         return {
-            "price": _as_float(data.get("average_price") or data.get("price")),
-            "qty": _as_int(data.get("quantity") or data.get("filled_quantity")),
-            "order_status": str(data.get("order_status") or data.get("status") or "").lower(),
+            "price": None if is_terminal_unfilled(status) else _as_float(data.get("average_price")),
+            # ``filled_quantity`` first: ``quantity`` is the size ORDERED, which
+            # a rejected or partly-filled order still reports in full. Tested
+            # for None, never truthiness — a filled quantity of 0 is the ANSWER
+            # on a rejected order, and ``or`` would discard it for the ordered
+            # size. That is the identical mistake the price fallback made.
+            "qty": _as_int(_first_present(data, "filled_quantity", "quantity")),
+            "order_status": status,
+            # the broker's own reason, when the mapper preserves it (issue #626)
+            "message": str(data.get("status_message") or data.get("message") or "").strip() or None,
         }
     except Exception:
         logger.exception("open15 fill-reconcile: order status raised for %s", order_id)
@@ -180,6 +216,22 @@ def broker_pnl_by_symbol(api_key: str) -> dict[str, float]:
         return {}
 
 
+def _alert(message: str) -> None:
+    """Log loudly + Telegram. Never raises into the scheduler.
+
+    A rejection discovered here is not housekeeping: it means a number the logs
+    page already published was wrong, and in the exit case that a real position
+    may still be open. Silence is how #626 stayed invisible for a whole session.
+    """
+    logger.error("%s", message)
+    try:
+        from services.notification_service import get_notification_service
+
+        get_notification_service().notify("open15_breakout", f"⚠ {message}")
+    except Exception:
+        logger.exception("open15 fill-reconcile: alert failed")
+
+
 def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
     """Stamp broker fill prices onto REAL rows and re-derive their P&L.
 
@@ -242,7 +294,7 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
         return {"status": "ok", "reconciled": 0, "pending": 0}
 
     book = broker_pnl_by_symbol(api_key)
-    reconciled = pending = 0
+    reconciled = pending = demoted = unresolved = 0
     # per-row detail for the caller to write into the decision log — the module
     # itself stays free of the service so it can be run standalone from the CLI
     details: list[dict] = []
@@ -251,6 +303,7 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
         entry = fetch_fill(row["entry_order_id"], api_key)
         exit_ = fetch_fill(row["exit_order_id"], api_key) if row["exit_order_id"] else None
         fields: dict = {}
+        priced = False
         if entry and entry["price"]:
             fields.update(entry_fill_price=entry["price"], entry_fill_qty=entry["qty"])
         if exit_ and exit_["price"]:
@@ -265,8 +318,56 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
         if symbol_key in book:
             fields["broker_pnl"] = round(book[symbol_key], 2)
 
-        both = fields.get("entry_fill_price") and fields.get("exit_fill_price")
-        if both:
+        # ---- terminal-unfilled legs are resolved BEFORE any pricing ------- #
+        # Order matters (issue #626). The old code reached ``_resolve_status``
+        # only in the ``else`` branch, so a rejected leg that had produced a
+        # price never got here at all. The two rejection shapes are NOT
+        # symmetric and must never be collapsed into one:
+        entry_dead = entry is not None and is_terminal_unfilled(entry["order_status"])
+        exit_dead = exit_ is not None and is_terminal_unfilled(exit_["order_status"])
+        if entry_dead:
+            # Nothing was ever held. The row becomes a PAPER fill on the #548
+            # convention: `mode` still records the run's real mode, `fill` is
+            # the axis that says this did not happen. Its quote-derived P&L is
+            # left ALONE — that is exactly the sandbox-equivalent pricing a
+            # paper row is supposed to carry, and it is already excluded from
+            # realized P&L by NON_REAL_FILLS.
+            fields = {
+                "fill": "paper",
+                "status": "rejected",
+                "entry_status": "rejected",
+                "pnl_source": "quote",
+                "fill_reconcile_status": "unavailable",
+                "error_message": (entry.get("message") or "broker rejected the entry")[:255],
+            }
+            demoted += 1
+            _alert(
+                f"open15: entry for {row['symbol']} was REJECTED by the broker after "
+                f"acknowledgement — recorded as a PAPER fill, excluded from realized P&L.\n"
+                f"{entry.get('message') or 'no reason supplied by the broker'}"
+            )
+        elif exit_dead:
+            # The DANGEROUS shape: the entry filled, so a real position existed,
+            # and the square-off did not go through. This must never be papered
+            # — that would erase a position that may still be open. Flag it and
+            # make the operator look.
+            fields["fill_reconcile_status"] = "unavailable"
+            fields["status"] = "error"
+            fields["error_message"] = (
+                exit_.get("message") or "broker rejected the exit — position may still be open"
+            )[:255]
+            fields.pop("pnl", None)
+            fields.pop("pnl_source", None)
+            unresolved += 1
+            _alert(
+                f"open15: EXIT for {row['symbol']} was REJECTED by the broker — the entry "
+                f"filled, so a REAL position may still be open. P&L for this row is NOT "
+                f"reconciled.\n{exit_.get('message') or 'no reason supplied by the broker'}"
+            )
+            logger.error(
+                "open15 fill-reconcile: %s exit rejected — position may be open", row["symbol"]
+            )
+        elif fields.get("entry_fill_price") and fields.get("exit_fill_price"):
             gross, charges = recompute_pnl(
                 row, fields["entry_fill_price"], fields["exit_fill_price"]
             )
@@ -277,6 +378,7 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
                 fill_reconcile_status="reconciled",
             )
             reconciled += 1
+            priced = True
         else:
             fields["fill_reconcile_status"] = _resolve_status(entry, exit_)
             pending += 1
@@ -296,7 +398,7 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
                 "status": fields["fill_reconcile_status"],
             }
         )
-        if both:
+        if priced:
             logger.info(
                 "open15 fill-reconcile: %s entry %.2f exit %.2f qty %s -> gross %.2f "
                 "charges %s (was quote-derived)",
@@ -308,7 +410,16 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
                 fields["charges_inr"],
             )
 
-    return {"status": "ok", "reconciled": reconciled, "pending": pending, "rows": details}
+    return {
+        "status": "ok",
+        "reconciled": reconciled,
+        "pending": pending,
+        # a row the broker refused after acknowledging it, demoted to paper
+        "demoted": demoted,
+        # entry filled but exit refused — a real position may still be open
+        "unresolved": unresolved,
+        "rows": details,
+    }
 
 
 if __name__ == "__main__":  # pragma: no cover - operator one-shot

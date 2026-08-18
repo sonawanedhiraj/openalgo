@@ -293,6 +293,18 @@ CATALOG: tuple[JobSpec, ...] = (
         description="Per-day decision-log summary.",
         tier=TIER_FREE,
     ),
+    JobSpec(
+        job_id="open15_entry_verify",
+        label="Entry verification",
+        group=_O15,
+        scheduler=SCHED_SHARED,
+        schedule="every 1 min in the entry window",
+        description=(
+            "Asks the broker what happened to each acknowledged entry; demotes a "
+            "post-ACK RMS rejection to a paper fill and frees its max_trades slot."
+        ),
+        tier=TIER_FREE,
+    ),
     # ---- intraday_pullback_top2 -----------------------------------------
     JobSpec(
         job_id="intraday_pullback_daily_reset",

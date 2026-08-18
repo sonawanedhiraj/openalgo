@@ -2292,6 +2292,45 @@ ran in the 15:30-17:00 periodic window).
 - **History:**
   - **2026-08-11:** Introduced by issue #589 / PR #590.
 
+## `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` (issue #626)
+
+- **What:** two rollback switches for the post-ACK rejection handling, both
+  default `true`.
+  - `OPEN15_VERIFY_ENTRIES` — the minute-cadence `open15_entry_verify` job that
+    asks the broker what happened to each acknowledged entry and demotes a
+    post-ACK RMS rejection to a paper fill, releasing its `max_trades` slot.
+  - `OPEN15_CONFIRM_EXIT_POSITION` — `flatten` confirms the position book
+    before squaring off a `status='open'` row.
+- **Why:** an ACK is not a fill. On 2026-08-18 Zerodha accepted an open15 order
+  (HTTP 200 + order id) and its RMS then refused it for insufficient funds.
+  Nothing observed the rejection, so the row lived as an `open` real position:
+  `flatten` sent a SELL for 800 calls we did not own — a NAKED SHORT the broker
+  priced at Rs4.45L of SPAN — and the reconciler published the trade as a
+  broker-confirmed +Rs7,680 fill.
+- **How to roll back:** set either to `false`. Correctness does not rest on the
+  verification job alone: with it off, the exit-time book check and the summary
+  reconciliation both still catch an unfilled entry (later, and after the slot
+  has been held for the session).
+- **History:**
+  - **2026-08-18:** Introduced by issue #626.
+
+## `OPEN15_FUNDS_CLAMP` (issue #626)
+
+- **What:** default `true`. At the 09:10 arm, open15 reads the account balance
+  and clamps `max_trades` to `floor(available_cash / margin_per_slot)`. The
+  configured and effective values, the balance, and any clamp note are stamped
+  into the `armed` decision-log event.
+- **Why:** the slot budget was never compared with the money in the account. On
+  2026-08-18 it was 5 x Rs60,000 = Rs3,00,000 against Rs1,22,252.80 of cash; the
+  third entry asked for Rs62,000 that was not there and was rejected by RMS.
+- **Note:** `max_trades` shrinks, never `margin_per_slot`. Cutting the slot
+  would change the position size this deployment exists to measure and make the
+  day incomparable to earlier ones. Fails OPEN when the balance cannot be read —
+  a transient funds-API failure must not switch the strategy off.
+- **How to roll back:** `OPEN15_FUNDS_CLAMP=false`.
+- **History:**
+  - **2026-08-18:** Introduced by issue #626.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

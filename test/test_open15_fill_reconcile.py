@@ -292,6 +292,178 @@ def test_a_rejected_leg_is_unavailable_not_pending_forever(monkeypatch):
     db_session.remove()
 
 
+# --------------------------------------------------------------------------- #
+# issue #626 — a broker-REJECTED order must never be priced or published
+#
+# The two pre-#626 tests above were GREEN against the bug. Their mocks omitted
+# ``price``, and ``price`` is the field the real broker always sends: on a
+# rejected order it carries the LIMIT PRICE WE ASKED FOR. The old
+# ``average_price or price`` fallback took it, both legs "priced", and a
+# rejection was stamped ``pnl_source='fill'`` carrying a +Rs7,680 P&L.
+#
+# So every fixture here is the SHAPE ZERODHA ACTUALLY RETURNS. A mock that
+# leaves out the field which caused the incident cannot witness the fix.
+# --------------------------------------------------------------------------- #
+def _rejected_leg(price, *, qty=800, message="Insufficient funds. Margin required: 149255.00."):
+    """A REJECTED order exactly as the broker reports it (issue #626).
+
+    ``average_price`` and ``filled_quantity`` are 0 — but ``price`` and
+    ``quantity`` are fully populated, which is the whole trap.
+    """
+    return {
+        "order_status": "rejected",
+        "average_price": 0.0,
+        "price": price,
+        "quantity": qty,
+        "filled_quantity": 0,
+        "status_message": message,
+    }
+
+
+def _complete_leg(avg, *, price=None, qty=800):
+    return {
+        "order_status": "complete",
+        "average_price": avg,
+        "price": price if price is not None else avg + 3.0,
+        "quantity": qty,
+        "filled_quantity": qty,
+        "status_message": None,
+    }
+
+
+def test_a_rejected_order_is_never_priced_from_the_limit_price_we_asked_for(monkeypatch):
+    """The #626 regression, at the seam where it happened.
+
+    77.5 was the price we ASKED for on an order the exchange never accepted.
+    Reading it as a fill is how a trade that did not exist got a P&L.
+    """
+    from services.open15_fill_reconcile import fetch_fill
+
+    _stub_order_status(monkeypatch, {"T-1": _rejected_leg(77.5)})
+    out = fetch_fill("T-1", "key")
+    assert out is not None
+    assert out["price"] is None, "a rejected order has no fill price, whatever `price` says"
+    assert out["order_status"] == "rejected"
+    assert out["qty"] == 0, "`filled_quantity` wins over the size we merely ordered"
+    assert "Insufficient funds" in (out["message"] or "")
+
+
+def test_a_rejected_entry_is_demoted_to_paper_and_never_reported_as_a_fill(monkeypatch):
+    """TIINDIA, 2026-08-18: ACK'd, RMS-rejected, published as +Rs7,680.
+
+    Both legs were rejected, so the pre-#626 code priced BOTH from their limit
+    prices, took the ``both`` branch, and stamped the row broker-confirmed.
+    """
+    from database.open15_breakout_db import Open15Trade, db_session
+    from services.open15_fill_reconcile import reconcile_fills
+
+    row_id = _insert_real_row(symbol="TIINDIA", quantity=800, pnl=12880.0, charges_inr=635.4)
+    _stub_order_status(monkeypatch, {"E-1": _rejected_leg(77.5), "X-1": _rejected_leg(87.1)})
+    monkeypatch.setattr("services.open15_fill_reconcile.broker_pnl_by_symbol", lambda _k: {})
+    alerts = []
+    monkeypatch.setattr(
+        "services.open15_fill_reconcile._alert", lambda m: alerts.append(m), raising=False
+    )
+
+    res = reconcile_fills("2026-08-06")
+    assert res["reconciled"] == 0, "nothing filled, so nothing can be reconciled"
+    assert res["demoted"] == 1
+
+    row = db_session.query(Open15Trade).filter(Open15Trade.id == row_id).first()
+    assert row.fill == "paper", "no position existed — this must not count as real"
+    assert row.status == "rejected"
+    assert row.pnl_source != "fill", "a rejection must never wear the broker-confirmed badge"
+    assert row.entry_fill_price is None and row.exit_fill_price is None
+    assert "Insufficient funds" in (row.error_message or ""), "the broker's reason is kept"
+    assert row.fill_reconcile_status == "unavailable", "a final answer — stop re-querying"
+    assert alerts, "a rejection discovered here is loud, never housekeeping"
+    db_session.remove()
+
+
+def test_a_demoted_row_leaves_real_realized_pnl_untouched(monkeypatch):
+    """The point of the demotion: fabricated money must not compound.
+
+    ``total_realized_pnl`` sizes tomorrow's REAL orders, so a rejected trade
+    left as real would size the next day off money that was never made.
+    """
+    from database.open15_breakout_db import total_realized_pnl
+    from services.open15_fill_reconcile import reconcile_fills
+
+    _insert_real_row(symbol="TIINDIA", quantity=800, pnl=12880.0)
+    _stub_order_status(monkeypatch, {"E-1": _rejected_leg(77.5), "X-1": _rejected_leg(87.1)})
+    monkeypatch.setattr("services.open15_fill_reconcile.broker_pnl_by_symbol", lambda _k: {})
+    monkeypatch.setattr("services.open15_fill_reconcile._alert", lambda _m: None, raising=False)
+
+    reconcile_fills("2026-08-06")
+    assert total_realized_pnl() == 0.0
+
+
+def test_a_rejected_exit_on_a_filled_entry_is_never_papered(monkeypatch):
+    """The dangerous asymmetry (issue #626).
+
+    A rejected ENTRY means nothing was ever held. A rejected EXIT means the
+    entry DID fill and the square-off did not go through — so a real position
+    may still be open. Papering that would erase it from the record, so the two
+    shapes must never be collapsed into one branch.
+    """
+    from database.open15_breakout_db import Open15Trade, db_session
+    from services.open15_fill_reconcile import reconcile_fills
+
+    row_id = _insert_real_row(quantity=100, pnl=300.0)
+    _stub_order_status(
+        monkeypatch,
+        {
+            "E-1": _complete_leg(100.5, qty=100),
+            "X-1": _rejected_leg(103.0, qty=100, message="RMS: margin exceeds available"),
+        },
+    )
+    monkeypatch.setattr("services.open15_fill_reconcile.broker_pnl_by_symbol", lambda _k: {})
+    alerts = []
+    monkeypatch.setattr(
+        "services.open15_fill_reconcile._alert", lambda m: alerts.append(m), raising=False
+    )
+
+    res = reconcile_fills("2026-08-06")
+    assert res["unresolved"] == 1 and res["demoted"] == 0
+
+    row = db_session.query(Open15Trade).filter(Open15Trade.id == row_id).first()
+    assert row.fill == "real", "the entry filled — this position was real"
+    assert row.status == "error", "an unclosed position must not read as a clean close"
+    assert row.pnl_source != "fill"
+    assert "margin" in (row.error_message or "").lower()
+    assert alerts and "may still be open" in alerts[0]
+    db_session.remove()
+
+
+def test_a_complete_order_still_reconciles_from_its_average_price(monkeypatch):
+    """The fix must not break the path it protects.
+
+    ``price`` (the limit) and ``average_price`` (the fill) differ on every real
+    order; only the latter may ever produce a P&L.
+    """
+    from database.open15_breakout_db import Open15Trade, db_session
+    from services.open15_fill_reconcile import reconcile_fills
+
+    row_id = _insert_real_row(quantity=100, pnl=300.0)
+    _stub_order_status(
+        monkeypatch,
+        {
+            "E-1": _complete_leg(100.5, price=101.0, qty=100),
+            "X-1": _complete_leg(104.0, price=103.0, qty=100),
+        },
+    )
+    monkeypatch.setattr("services.open15_fill_reconcile.broker_pnl_by_symbol", lambda _k: {})
+
+    res = reconcile_fills("2026-08-06")
+    assert res["reconciled"] == 1
+
+    row = db_session.query(Open15Trade).filter(Open15Trade.id == row_id).first()
+    assert (row.entry_fill_price, row.exit_fill_price) == (100.5, 104.0)
+    assert row.pnl == 350.0, "(104.0 - 100.5) * 100 — from the FILLS, not the limits"
+    assert row.pnl_source == "fill"
+    db_session.remove()
+
+
 def test_reconciled_rows_are_not_re_queried(monkeypatch):
     """Idempotence: the arm-time catch-up runs every day, forever."""
     from services.open15_fill_reconcile import reconcile_fills
