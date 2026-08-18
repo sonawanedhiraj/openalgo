@@ -268,3 +268,68 @@ def test_start_news_ingest_scheduler_is_idempotent(monkeypatch):
         assert second["reason"] == "already running"
     finally:
         nis.stop_news_ingest_scheduler()
+
+
+# ---------------------------------------------------------------------------
+# Locked-DB recovery (issue #627)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_ingest_cycle_recovers_after_a_locked_database(monkeypatch, tmp_path):
+    """A contended cycle must not disable ingest for the life of the process.
+
+    On 2026-08-18 the 08:25 cycle hit a locked DB, the scoped session was left
+    in an aborted transaction, and every later insert raised
+    ``PendingRollbackError`` until the operator restarted OpenAlgo. Ingest was
+    dead for 11 minutes with only WARNINGs to show for it.
+
+    Pre-fix the SECOND cycle here returns ``total_new == 0``.
+    """
+    import sqlite3
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool
+
+    from database import market_intel_db as mid
+
+    db_file = tmp_path / "intel.db"
+    engine = create_engine(
+        f"sqlite:///{db_file}",
+        poolclass=NullPool,
+        connect_args={"check_same_thread": False, "timeout": 0.2},
+    )
+    mid.Base.metadata.create_all(engine)
+    original = mid.engine
+    mid.db_session.remove()
+    mid.db_session.configure(bind=engine)
+
+    items = [
+        {"dedup_hash": "r1", "title": "first", "source": "s", "link": "l", "published": ""},
+        {"dedup_hash": "r2", "title": "second", "source": "s", "link": "l", "published": ""},
+    ]
+
+    try:
+        with (
+            patch.object(nis, "_parse_feeds_env", return_value=[("http://x", "feed")]),
+            patch.object(nis, "fetch_feed_items", return_value=items),
+            patch.object(nis, "get_existing_hashes", return_value=set()),
+        ):
+            blocker = sqlite3.connect(str(db_file), timeout=0.2)
+            blocker.execute("BEGIN EXCLUSIVE")
+            try:
+                locked = nis.run_ingest_cycle()
+            finally:
+                blocker.rollback()
+                blocker.close()
+
+            # Everything failed while the lock was held — expected, and logged.
+            assert locked["total_new"] == 0
+
+            # The lock is gone; the very next cycle must write normally.
+            recovered = nis.run_ingest_cycle()
+            assert recovered["total_new"] == 2
+    finally:
+        mid.db_session.remove()
+        mid.db_session.configure(bind=original)
+        engine.dispose()

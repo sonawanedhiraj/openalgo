@@ -71,27 +71,41 @@ def insert_intel(kind: str, payload_json: str, captured_at: str | None = None) -
     if captured_at is None:
         captured_at = datetime.now(pytz.timezone("Asia/Kolkata")).isoformat()
     row = MarketIntel(captured_at=captured_at, kind=kind, payload_json=payload_json)
-    db_session.add(row)
-    db_session.commit()
-    return int(row.id)
+    try:
+        db_session.add(row)
+        db_session.commit()
+        return int(row.id)
+    except Exception:
+        # Load-bearing (issue #627): without this rollback a single contended
+        # commit leaves the session in an aborted transaction, and EVERY later
+        # write in the process raises PendingRollbackError until the app is
+        # restarted. This runs from an APScheduler thread, so Flask's
+        # teardown_appcontext never reclaims the session either.
+        db_session.rollback()
+        raise
+    finally:
+        db_session.remove()
 
 
 def latest_intel(kind: str) -> dict | None:
     """Return the most recent row of ``kind`` as a dict, or ``None``."""
-    row = (
-        db_session.query(MarketIntel)
-        .filter(MarketIntel.kind == kind)
-        .order_by(MarketIntel.id.desc())
-        .first()
-    )
-    if row is None:
-        return None
-    return {
-        "id": row.id,
-        "captured_at": row.captured_at,
-        "kind": row.kind,
-        "payload_json": row.payload_json,
-    }
+    try:
+        row = (
+            db_session.query(MarketIntel)
+            .filter(MarketIntel.kind == kind)
+            .order_by(MarketIntel.id.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return {
+            "id": row.id,
+            "captured_at": row.captured_at,
+            "kind": row.kind,
+            "payload_json": row.payload_json,
+        }
+    finally:
+        db_session.remove()
 
 
 def latest_intel_by_kind(
@@ -109,39 +123,42 @@ def latest_intel_by_kind(
     ``captured_at`` lies within the last N minutes of "now in IST".
     Rows with malformed timestamps are skipped when the filter is active.
     """
-    query = (
-        db_session.query(MarketIntel)
-        .filter(MarketIntel.kind == kind)
-        .order_by(MarketIntel.id.desc())
-        .limit(limit)
-    )
-    rows = query.all()
-
-    cutoff = None
-    if since_minutes is not None:
-        cutoff = datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(minutes=since_minutes)
-
-    out: list[dict] = []
-    for row in rows:
-        if cutoff is not None:
-            try:
-                ts = datetime.fromisoformat(row.captured_at)
-            except (TypeError, ValueError):
-                continue
-            if ts.tzinfo is None:
-                ts = pytz.timezone("Asia/Kolkata").localize(ts)
-            if ts < cutoff:
-                continue
-        try:
-            payload = json.loads(row.payload_json)
-        except (TypeError, ValueError):
-            payload = row.payload_json
-        out.append(
-            {
-                "id": row.id,
-                "captured_at": row.captured_at,
-                "kind": row.kind,
-                "payload_json": payload,
-            }
+    try:
+        query = (
+            db_session.query(MarketIntel)
+            .filter(MarketIntel.kind == kind)
+            .order_by(MarketIntel.id.desc())
+            .limit(limit)
         )
-    return out
+        rows = query.all()
+
+        cutoff = None
+        if since_minutes is not None:
+            cutoff = datetime.now(pytz.timezone("Asia/Kolkata")) - timedelta(minutes=since_minutes)
+
+        out: list[dict] = []
+        for row in rows:
+            if cutoff is not None:
+                try:
+                    ts = datetime.fromisoformat(row.captured_at)
+                except (TypeError, ValueError):
+                    continue
+                if ts.tzinfo is None:
+                    ts = pytz.timezone("Asia/Kolkata").localize(ts)
+                if ts < cutoff:
+                    continue
+            try:
+                payload = json.loads(row.payload_json)
+            except (TypeError, ValueError):
+                payload = row.payload_json
+            out.append(
+                {
+                    "id": row.id,
+                    "captured_at": row.captured_at,
+                    "kind": row.kind,
+                    "payload_json": payload,
+                }
+            )
+        return out
+    finally:
+        db_session.remove()

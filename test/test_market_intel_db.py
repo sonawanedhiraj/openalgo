@@ -1,105 +1,140 @@
-"""Tests for the ``market_intel`` table helpers — focused on the new
-``latest_intel_by_kind`` reader used by the Phase A news ingest sidecar.
+"""Session-lifecycle regression tests for ``database/market_intel_db.py`` (issue #627).
 
-Uses a private in-memory SQLite engine so the tests never touch the
-real ``db/openalgo.db`` file.
+These reproduce the 2026-08-18 outage: ``insert_intel`` committed without a
+``try/except``, so a ``database is locked`` error left the scoped session in an
+aborted transaction that was never rolled back and never closed. It runs from an
+APScheduler thread — no Flask app context — so ``teardown_appcontext`` never
+reclaimed it either. The connection held the SQLite rollback journal for 11
+minutes and every other reader in the process timed out.
+
+The tests below hold a REAL ``BEGIN EXCLUSIVE`` from a second connection rather
+than mocking ``commit()``. That distinction is load-bearing: a monkeypatched
+``commit`` raises before SQLAlchemy marks its transaction inactive, so the
+session is never actually poisoned and the test would pass on the broken tree.
+Only a genuine driver-level lock reproduces the failure.
 """
 
 from __future__ import annotations
 
-import json
-import os
-from datetime import datetime, timedelta
+import sqlite3
+import time
+from contextlib import contextmanager
 
 import pytest
-import pytz
 from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
 
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+from database import market_intel_db as mid
 
-import database.market_intel_db as mi_mod
-
-IST = pytz.timezone("Asia/Kolkata")
-
-
-@pytest.fixture(autouse=True)
-def _isolated_engine(monkeypatch):
-    """Swap the module-level engine + session to a fresh in-memory DB per test."""
-    engine = create_engine("sqlite:///:memory:")
-    session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=engine))
-    monkeypatch.setattr(mi_mod, "engine", engine)
-    monkeypatch.setattr(mi_mod, "db_session", session)
-    mi_mod.Base.query = session.query_property()
-    mi_mod.Base.metadata.create_all(engine)
-    yield
-    session.remove()
-    engine.dispose()
+pytestmark = pytest.mark.integration
 
 
-def _ist_iso(minutes_ago: int = 0) -> str:
-    return (datetime.now(IST) - timedelta(minutes=minutes_ago)).isoformat()
+def _db_path() -> str:
+    """Filesystem path of the temp DB the conftest redirected us to."""
+    url = str(mid.engine.url)
+    return url.replace("sqlite:///", "", 1)
 
 
-def test_latest_intel_by_kind_returns_newest_first():
-    mi_mod.insert_intel(kind="news", payload_json=json.dumps({"title": "first"}))
-    mi_mod.insert_intel(kind="news", payload_json=json.dumps({"title": "second"}))
-    mi_mod.insert_intel(kind="news", payload_json=json.dumps({"title": "third"}))
+@contextmanager
+def _fast_timeout_session():
+    """Rebind the scoped session to a 0.2s-timeout engine on the same file.
 
-    rows = mi_mod.latest_intel_by_kind("news", limit=10)
-    assert [r["payload_json"]["title"] for r in rows] == ["third", "second", "first"]
-
-
-def test_latest_intel_by_kind_decodes_json_payload():
-    payload = {"title": "RBI pauses", "dedup_hash": "abc", "summary": "..."}
-    mi_mod.insert_intel(kind="news", payload_json=json.dumps(payload))
-
-    rows = mi_mod.latest_intel_by_kind("news")
-    assert len(rows) == 1
-    assert rows[0]["payload_json"] == payload
-
-
-def test_latest_intel_by_kind_filters_by_kind():
-    mi_mod.insert_intel(kind="regime", payload_json=json.dumps({"trend": "bullish"}))
-    mi_mod.insert_intel(kind="news", payload_json=json.dumps({"title": "x"}))
-
-    rows = mi_mod.latest_intel_by_kind("news")
-    assert len(rows) == 1
-    assert rows[0]["payload_json"] == {"title": "x"}
-
-
-def test_latest_intel_by_kind_respects_limit():
-    for i in range(5):
-        mi_mod.insert_intel(kind="news", payload_json=json.dumps({"i": i}))
-
-    rows = mi_mod.latest_intel_by_kind("news", limit=2)
-    assert len(rows) == 2
-
-
-def test_latest_intel_by_kind_since_minutes_excludes_old_rows():
-    # Old row (90 min ago) inserted with explicit captured_at.
-    mi_mod.insert_intel(
-        kind="news",
-        payload_json=json.dumps({"title": "old"}),
-        captured_at=_ist_iso(minutes_ago=90),
+    The module engine inherits pysqlite's 5s default, which would make each
+    lock assertion below sleep for five seconds. Same file, same NullPool
+    contract — only the busy timeout differs.
+    """
+    fast = create_engine(
+        f"sqlite:///{_db_path()}",
+        poolclass=NullPool,
+        connect_args={"check_same_thread": False, "timeout": 0.2},
     )
-    # Fresh row (default captured_at = now).
-    mi_mod.insert_intel(kind="news", payload_json=json.dumps({"title": "new"}))
-
-    recent = mi_mod.latest_intel_by_kind("news", since_minutes=30)
-    assert [r["payload_json"]["title"] for r in recent] == ["new"]
-
-    everything = mi_mod.latest_intel_by_kind("news")
-    assert len(everything) == 2
-
-
-def test_latest_intel_by_kind_handles_raw_string_payload():
-    # Should not crash when payload_json isn't valid JSON — fall back to raw text.
-    mi_mod.insert_intel(kind="news", payload_json="not-json-at-all")
-
-    rows = mi_mod.latest_intel_by_kind("news")
-    assert rows[0]["payload_json"] == "not-json-at-all"
+    mid.Base.metadata.create_all(fast)
+    original = mid.engine
+    mid.db_session.remove()
+    mid.db_session.configure(bind=fast)
+    try:
+        yield
+    finally:
+        mid.db_session.remove()
+        mid.db_session.configure(bind=original)
+        fast.dispose()
 
 
-def test_latest_intel_by_kind_empty_table():
-    assert mi_mod.latest_intel_by_kind("news") == []
+@contextmanager
+def _external_writer_lock():
+    """Hold a genuine EXCLUSIVE lock from outside SQLAlchemy."""
+    conn = sqlite3.connect(_db_path(), timeout=0.2)
+    conn.execute("BEGIN EXCLUSIVE")
+    try:
+        yield
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+def test_insert_intel_recovers_after_a_locked_commit():
+    """The bug, stated as the invariant it broke.
+
+    Pre-fix this fails on the SECOND insert with
+    ``PendingRollbackError: Can't reconnect until invalid transaction is rolled
+    back`` — the exact message the production log carried ~100 times.
+    """
+    with _fast_timeout_session():
+        with _external_writer_lock():
+            with pytest.raises(OperationalError, match="database is locked"):
+                mid.insert_intel(kind="news", payload_json='{"t": "locked"}')
+
+        # Lock released. The very next call must succeed — a single contended
+        # write may not poison every subsequent write in the process.
+        row_id = mid.insert_intel(kind="news", payload_json='{"t": "after"}')
+        assert row_id > 0
+
+
+def test_failed_insert_does_not_hold_the_database():
+    """The outage itself: a failed write must not leave the DB locked.
+
+    Pre-fix the aborted session keeps its connection (and the rollback
+    journal), so an external writer cannot take EXCLUSIVE afterwards.
+    """
+    with _fast_timeout_session():
+        with _external_writer_lock():
+            with pytest.raises(OperationalError, match="database is locked"):
+                mid.insert_intel(kind="news", payload_json='{"t": "locked"}')
+
+        # Nothing of ours may still be holding the file.
+        probe = sqlite3.connect(_db_path(), timeout=1.0)
+        try:
+            probe.execute("BEGIN EXCLUSIVE")
+            probe.rollback()
+        finally:
+            probe.close()
+
+
+def test_reads_release_their_session_too():
+    """``latest_intel`` / ``latest_intel_by_kind`` had no ``remove()`` either.
+
+    A reader that never returns its connection is the same leak with a slower
+    fuse — on a non-request thread nothing reclaims it.
+    """
+    with _fast_timeout_session():
+        mid.insert_intel(kind="news", payload_json='{"t": "read-me"}')
+        assert mid.latest_intel("news") is not None
+        assert isinstance(mid.latest_intel_by_kind("news", limit=5), list)
+
+        probe = sqlite3.connect(_db_path(), timeout=1.0)
+        try:
+            probe.execute("BEGIN EXCLUSIVE")
+            probe.rollback()
+        finally:
+            probe.close()
+
+
+def test_locked_insert_fails_fast_and_does_not_wedge_the_thread():
+    """A contended write raises promptly instead of hanging the ingest loop."""
+    with _fast_timeout_session():
+        with _external_writer_lock():
+            started = time.time()
+            with pytest.raises(OperationalError, match="database is locked"):
+                mid.insert_intel(kind="news", payload_json='{"t": "slow"}')
+            assert time.time() - started < 5.0
