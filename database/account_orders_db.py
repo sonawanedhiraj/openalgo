@@ -223,6 +223,36 @@ def last_opposite_attempt_status(
         db_session.remove()
 
 
+def update_status(row_id: int, *, status: str, error_text: str | None = None) -> bool:
+    """Correct one mirror attempt's outcome (issue #637).
+
+    Used by the fill reconciliation to turn a `placed` row the broker actually
+    refused into `rejected` with the broker's own reason. An unknown status is
+    REFUSED here rather than silently coerced: `record_mirror_attempt` maps a
+    bad status to `error`, which is right when journalling a live attempt but
+    wrong when correcting a record — it would replace one wrong answer with
+    another.
+    """
+    if status not in VALID_STATUSES:
+        logger.error("account_orders: refusing to set unknown status %r on row %s", status, row_id)
+        return False
+    try:
+        row = db_session.query(AccountOrder).filter(AccountOrder.id == row_id).first()
+        if row is None:
+            return False
+        row.status = status
+        if error_text is not None:
+            row.error_text = error_text
+        db_session.commit()
+        return True
+    except Exception:
+        db_session.rollback()
+        logger.exception("account_orders: status update failed for row %s", row_id)
+        return False
+    finally:
+        db_session.remove()
+
+
 def list_orders(date_utc: str | None = None, account_id: int | None = None) -> list[dict]:
     """Mirror attempts, newest first. ``date_utc`` filters by YYYY-MM-DD prefix."""
     try:

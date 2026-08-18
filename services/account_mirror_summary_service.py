@@ -24,6 +24,10 @@ logger = get_logger(__name__)
 
 LOGIN_REMINDER_TIMES = ((9, 0), (15, 0))  # IST
 EOD_SUMMARY_TIME = (15, 35)  # IST — after the 15:25/15:28 exit/watchdog window
+# IST. open15 exits at 09:30, so its mirrors are settled well before this;
+# without a morning pass a post-ACK rejection on a 09:1x mirror would be
+# reported as a placed trade until 15:35 (issue #637).
+FILL_RECONCILE_TIME = (9, 40)
 
 
 def _is_trading_day_today() -> bool:
@@ -115,11 +119,38 @@ def _eod_summary_job() -> None:
         if not is_multi_account_enabled() or not _is_trading_day_today():
             return
         today = datetime.utcnow().strftime("%Y-%m-%d")
+        # Correct the record BEFORE summarising it (issue #637): `placed` is
+        # only the broker's acknowledgement, and a summary built on unchecked
+        # ACKs reports trades that never happened.
+        _reconcile_now(today)
         message = build_eod_summary(list_orders(date_utc=today), overview()["accounts"])
         if message:
             _notify(message)
     except Exception:
         logger.exception("multi-account EOD mirror summary job failed")
+
+
+def _reconcile_now(date_utc: str) -> None:
+    """Run the child fill reconciliation; never let it break the caller."""
+    try:
+        from services.account_fill_reconcile import reconcile_account_fills
+
+        result = reconcile_account_fills(date_utc=date_utc)
+        if result.get("corrected"):
+            logger.warning("multi-account: fill reconcile corrected %s row(s)", result["corrected"])
+    except Exception:
+        logger.exception("multi-account: fill reconcile failed")
+
+
+def _fill_reconcile_job() -> None:
+    try:
+        from services.broker_accounts_service import is_multi_account_enabled
+
+        if not is_multi_account_enabled() or not _is_trading_day_today():
+            return
+        _reconcile_now(datetime.utcnow().strftime("%Y-%m-%d"))
+    except Exception:
+        logger.exception("multi-account fill reconcile job failed")
 
 
 def register_jobs(scheduler=None) -> None:
@@ -159,7 +190,20 @@ def register_jobs(scheduler=None) -> None:
         replace_existing=True,
         name=f"Multi-account EOD mirror summary ({hour:02d}:{minute:02d} IST)",
     )
-    logger.info("multi-account observability jobs registered (09:00/15:00/15:35 IST mon-fri)")
+    hour, minute = FILL_RECONCILE_TIME
+    sched.add_job(
+        _fill_reconcile_job,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=hour, minute=minute, timezone="Asia/Kolkata"
+        ),
+        id="multi_account_fill_reconcile",
+        replace_existing=True,
+        name=f"Multi-account child fill reconciliation ({hour:02d}:{minute:02d} IST)",
+    )
+    logger.info(
+        "multi-account observability jobs registered "
+        "(09:00/15:00 reminders, 09:40 fill reconcile, 15:35 EOD summary IST mon-fri)"
+    )
 
 
 def init_account_mirror_summary_service(scheduler=None) -> None:

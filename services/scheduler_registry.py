@@ -499,6 +499,21 @@ CATALOG: tuple[JobSpec, ...] = (
         env_flag="MULTI_ACCOUNT_ENABLED",
     ),
     JobSpec(
+        job_id="multi_account_fill_reconcile",
+        label="Child fill reconciliation",
+        group=_REPORTS,
+        scheduler=SCHED_SHARED,
+        schedule="09:40 mon-fri",
+        description=(
+            "Re-asks each child broker what happened to orders journalled as "
+            "'placed' — an ACK is not a fill — and corrects a post-ACK rejection "
+            "with the broker's own reason. Also runs inline before the 15:35 EOD "
+            "summary so that report is built on a corrected record."
+        ),
+        tier=TIER_FREE,
+        env_flag="MULTI_ACCOUNT_ENABLED",
+    ),
+    JobSpec(
         job_id="multi_account_eod_summary",
         label="Mirror EOD summary",
         group=_REPORTS,

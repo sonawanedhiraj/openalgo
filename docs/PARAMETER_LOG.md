@@ -2331,6 +2331,30 @@ ran in the 15:30-17:00 periodic window).
 - **History:**
   - **2026-08-18:** Introduced by issue #626.
 
+## `MULTI_ACCOUNT_FUNDS_CHECK` / `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED` (issue #637)
+
+- **What:** two rollback switches for the child-mirror hardening, both default
+  `true`.
+  - `MULTI_ACCOUNT_FUNDS_CHECK` — before an OPENING mirror, read the child's own
+    balance and skip (`skipped_insufficient_funds`) if the sized order value
+    exceeds it.
+  - `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED` — the `multi_account_fill_reconcile`
+    job (09:40 IST, plus inline before the 15:35 EOD summary) that re-asks each
+    child broker what happened to orders journalled as `placed` and corrects a
+    post-ACK rejection with the broker's own reason.
+- **Why:** #626 fixed both defects on the PARENT path. The child had the same
+  two, one account over: it sized every mirror against `capital_per_trade_inr`
+  without ever reading the balance, and `status='placed'` came from the HTTP 200
+  ACK with **no reconciliation anywhere** — so a refused child order was
+  reported as a trade for ever.
+- **Notes:** the funds check never gates an EXIT (flattening must not depend on
+  cash) and fails OPEN on an unreadable balance. The reconciliation only ever
+  corrects a row DOWNWARDS — a confirmed fill is left alone, because promoting
+  rows on our own authority is how an ACK became a fill in the first place.
+- **How to roll back:** set either to `false`.
+- **History:**
+  - **2026-08-18:** Introduced by issue #637.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
