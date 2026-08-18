@@ -777,7 +777,8 @@ shipped without the rebind and wrote real `trade_journal` rows to the live DB.
 Full write-up: [`outputs/2026-06-11_retrospective_and_plan.md`](outputs/2026-06-11_retrospective_and_plan.md)
 (Section 4).
 
-Three layers, all in `test/conftest.py`:
+Four layers, all in `test/conftest.py` (layer 4 guards a different resource —
+the `claude` CLI — but shares the same discipline: structural, not per-file):
 1. **Unconditional env redirect** at module top — every DB env var is repointed to
    a throwaway per-process `tempfile.mkdtemp()` dir *before* any `database.*`
    import binds its engine. **Ordering is load-bearing:** `utils.config`'s
@@ -793,6 +794,24 @@ Three layers, all in `test/conftest.py`:
    (returncode 2) if `DATABASE_URL` ever resolves to the live `db/openalgo.db`, or
    if the caller explicitly aimed pytest at it (`DATABASE_URL=sqlite:///db/openalgo.db
    pytest`). A run can no longer *start* against the live DB even if layer 1 regresses.
+4. **No-real-`claude`-CLI tripwire** (`_block_real_claude_cli`, function-autouse,
+   issue #632) — wraps `subprocess.run` and raises on any argv whose program
+   basename is `claude`; every other subprocess (git, uv, node) passes through.
+   `services/llm_review_client.py` and `services/llm_agent_client.py` spawn
+   `claude -p` on an unpatched OS thread and block on `thread.join(timeout_s + 5)`
+   with **minute-scale** budgets (240s bare review, 600s tool-enabled agent), so an
+   unstubbed call does not fail one test — it **hangs the run** until
+   `pytest-timeout` kills it and takes every remaining test with it. The guard sits
+   at the process boundary rather than on the `invoke_*` functions because
+   `postmarket_investigation.investigate()` imports the name *inside the function
+   body* (patching the consumer module rebinds nothing), and because
+   `test/test_llm_review_client.py` must stay free to drive the real client against
+   its own `subprocess.run` fake. Callers wrap the spawn in a broad
+   `except Exception` that degrades to an "LLM unavailable" status, so the tripwire
+   also prints the offending test to stderr — otherwise the raise can be swallowed
+   into a green test. **Stub the client module**
+   (`services.llm_agent_client.invoke_claude_agent` /
+   `services.llm_review_client.invoke_claude_review`), never the consumer.
 
 Subdir conftests (e.g. `test/e2e/conftest.py`) may still `monkeypatch`-rebind
 individual modules to per-test temp DBs; that layers cleanly on top and is
