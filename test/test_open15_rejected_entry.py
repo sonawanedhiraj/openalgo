@@ -469,3 +469,177 @@ def test_the_pre_exit_check_can_be_switched_off(monkeypatch):
     svc.flatten("eod_0930")
 
     assert len(orders) == 2, "with the flag off, the pre-#626 behaviour is restored"
+
+
+# --------------------------------------------------------------------------- #
+# issue #626 — the deferred post-ACK entry check
+#
+# Between the entry and the exit, a phantom position holds a `max_trades` slot
+# it never earned. On 2026-08-18 the day reported `entered: 9, filled: 3` while
+# one of those three had been refused by RMS. This asks the broker, once a
+# minute, what actually happened — off the tick thread, because a synchronous
+# broker call in the ZMQ callback stalls every other symbol.
+# --------------------------------------------------------------------------- #
+def _stub_broker_answer(monkeypatch, answer):
+    """Point verify_entries' broker seam at one canned order-status answer."""
+    import services.open15_fill_reconcile as recon
+
+    monkeypatch.setattr(recon, "fetch_fill", lambda _oid, _key: answer)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "database.auth_db",
+        type("M", (), {"get_first_available_api_key": staticmethod(lambda: "k")}),
+    )
+
+
+def _rejected_answer(msg="Insufficient funds. Margin required: 149255.00."):
+    return {"price": None, "qty": 0, "order_status": "rejected", "message": msg}
+
+
+def test_a_post_ack_rejection_is_demoted_and_frees_its_slot(monkeypatch):
+    """The TIINDIA shape: accepted, then refused, and nothing noticed."""
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+    assert svc._count_fills()[0] == 1, "the ACK'd entry counts as real until verified"
+
+    _stub_broker_answer(monkeypatch, _rejected_answer())
+    monkeypatch.setattr(svc, "_alert_rejection", lambda *a, **k: None)
+    assert svc.verify_entries() == 1
+
+    n_real, n_paper, _sim, _shadow = svc._count_fills()
+    assert (n_real, n_paper) == (0, 1), "a rejection is not a trade — the slot is released"
+
+    row = db_session.query(Open15Trade).filter(Open15Trade.symbol == "AAA").first()
+    assert row.status == "rejected" and row.fill == "paper"
+    assert "Insufficient funds" in row.error_message
+
+    ev = [e for e in svc.day_log if e["event"] == "entry_unfilled"]
+    assert len(ev) == 1 and ev[0]["slot_released"] is True
+    db_session.remove()
+
+
+def test_a_demoted_entry_is_never_squared_off(monkeypatch):
+    """The two fixes compose: verification demotes, flatten sends no order."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    # coherent with the rejection the verification is about to report: the order
+    # was refused, so the book holds nothing
+    svc._broker_qty = lambda symbol, exchange: 0
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    _stub_broker_answer(monkeypatch, _rejected_answer())
+    monkeypatch.setattr(svc, "_alert_rejection", lambda *a, **k: None)
+    svc.verify_entries()
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 1, "entry only — the demoted row must never reach the broker"
+
+
+def test_an_affirmative_book_overrides_a_rejection_verdict(monkeypatch):
+    """When the two layers disagree, the POSITION wins (issue #626).
+
+    `verify_entries` says the order was rejected; the book says we hold 300.
+    That combination should not happen, but if it does, the only safe reading is
+    that something is held — so the row is promoted back and squared off. An
+    unsent exit on a real position is the failure that costs money; a redundant
+    one is not.
+    """
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: 300  # the book insists
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    _stub_broker_answer(monkeypatch, _rejected_answer())
+    monkeypatch.setattr(svc, "_alert_rejection", lambda *a, **k: None)
+    svc.verify_entries()
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 2, "an affirmative position is always squared off"
+
+
+def test_a_complete_entry_is_verified_once_and_left_alone(monkeypatch):
+    """The happy path costs exactly one broker call, then stops asking."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = []
+    import services.open15_fill_reconcile as recon
+
+    def _fetch(oid, key):
+        calls.append(oid)
+        return {"price": 103.5, "qty": 300, "order_status": "complete", "message": None}
+
+    monkeypatch.setattr(recon, "fetch_fill", _fetch)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "database.auth_db",
+        type("M", (), {"get_first_available_api_key": staticmethod(lambda: "k")}),
+    )
+
+    assert svc.verify_entries() == 0
+    assert svc.verify_entries() == 0
+    assert len(calls) == 1, "a settled entry is not re-queried every minute"
+    assert svc._count_fills()[0] == 1
+
+
+def test_a_still_open_order_is_asked_again(monkeypatch):
+    """`open` is not an answer — it may still fill, so it stays unverified."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = []
+    import services.open15_fill_reconcile as recon
+
+    def _fetch(oid, key):
+        calls.append(oid)
+        return {"price": None, "qty": 0, "order_status": "open", "message": None}
+
+    monkeypatch.setattr(recon, "fetch_fill", _fetch)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "database.auth_db",
+        type("M", (), {"get_first_available_api_key": staticmethod(lambda: "k")}),
+    )
+
+    svc.verify_entries()
+    svc.verify_entries()
+    assert len(calls) == 2, "a working order is re-checked until it settles"
+    assert svc._count_fills()[0] == 1, "and is still treated as a live position meanwhile"
+
+
+def test_an_unreadable_answer_changes_nothing(monkeypatch):
+    """Fail-open: the exit-time book check and the reconciler are still behind it."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    _stub_broker_answer(monkeypatch, None)
+    assert svc.verify_entries() == 0
+    assert svc._count_fills()[0] == 1

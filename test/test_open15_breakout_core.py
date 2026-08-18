@@ -214,6 +214,8 @@ def test_register_jobs_with_persistent_jobstore():
             "open15_exit",
             "open15_exit_retry",
             "open15_summary",
+            # issue #626 — module-level function, so it pickles like the rest
+            "open15_entry_verify",
         }
     finally:
         sched.shutdown(wait=False)

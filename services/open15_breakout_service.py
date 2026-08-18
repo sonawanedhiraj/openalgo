@@ -181,6 +181,15 @@ def _sim_skipped_enabled() -> bool:
     return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
 
 
+def _verify_entries_enabled() -> bool:
+    """Deferred post-ACK entry verification (issue #626).
+
+    Rollback switch. Off = the pre-#626 behaviour, where an acknowledged order
+    was trusted as filled until the exit.
+    """
+    return os.getenv("OPEN15_VERIFY_ENTRIES", "true").lower() == "true"
+
+
 def _confirm_exit_position() -> bool:
     """Verify the book before squaring off an `open` row (issue #626).
 
@@ -2276,6 +2285,95 @@ class Open15BreakoutService:
             ),
         )
 
+    def verify_entries(self) -> int:
+        """Ask the broker what really happened to each ACK'd entry (issue #626).
+
+        An ACK is not a fill. Zerodha returns HTTP 200 with an order id and its
+        RMS can refuse the order afterwards — on 2026-08-18 TIINDIA was accepted,
+        rejected for insufficient funds, and sat in `self.positions` as a live
+        `open` position for ten minutes: it consumed a `max_trades` slot it was
+        not entitled to, and `flatten` later tried to square it off.
+
+        Deferred by construction, and that is the whole reason this is a job
+        rather than a line in `_enter`. Entries are placed from the ZMQ tick
+        callback; a synchronous broker round-trip there would stall every other
+        symbol's tick processing — the same constraint that keeps fill
+        reconciliation at the summary job.
+
+        Demotes ONLY on a terminal-unfilled answer (`rejected` / `cancelled`).
+        `open` and `complete` are both left alone: the first is still working,
+        and the second is exactly what we want. An unreadable answer changes
+        nothing — this runs every minute, and `flatten` re-checks the book.
+
+        Returns the number of positions demoted.
+        """
+        if not _verify_entries_enabled():
+            return 0
+        from database.open15_breakout_db import update_trade
+        from services.open15_fill_reconcile import fetch_fill, is_terminal_unfilled
+
+        try:
+            from database.auth_db import get_first_available_api_key
+
+            api_key = get_first_available_api_key()
+        except Exception:
+            logger.exception("open15 entry-verify: api key lookup failed")
+            return 0
+        if not api_key:
+            return 0
+
+        with self._lock:
+            pending = [
+                (sym, dict(pos))
+                for sym, pos in self.positions.items()
+                if pos.get("status") == "open"
+                and pos.get("entry_order_id")
+                and not pos.get("entry_verified")
+            ]
+
+        demoted = 0
+        for symbol, pos in pending:
+            leg = fetch_fill(pos["entry_order_id"], api_key)
+            if leg is None:
+                continue
+            status = leg["order_status"]
+            if not is_terminal_unfilled(status):
+                # `complete` is settled; `open` may still fill, so it is not
+                # marked verified and gets asked again on the next tick.
+                if status == "complete":
+                    with self._lock:
+                        if symbol in self.positions:
+                            self.positions[symbol]["entry_verified"] = True
+                continue
+
+            msg = leg["message"] or f"broker reported the entry {status}"
+            # The position dict is what `_count_fills` reads for the max_trades
+            # budget and what `flatten` dispatches on, so both have to move — a
+            # journal-only update would free the slot in the report and not in
+            # the run.
+            with self._lock:
+                if symbol in self.positions:
+                    self.positions[symbol].update(status="paper", fill="paper", entry_verified=True)
+            update_trade(
+                pos["row_id"],
+                status="rejected",
+                entry_status="rejected",
+                fill="paper",
+                error_message=msg[:255],
+                reason="entry_rejected",
+            )
+            self._log_event(
+                "entry_unfilled",
+                symbol=symbol,
+                order_id=pos["entry_order_id"],
+                order_status=status,
+                error=msg,
+                slot_released=True,
+            )
+            self._alert_rejection(symbol, pos.get("quantity") or 0, msg)
+            demoted += 1
+        return demoted
+
     def _entry_never_filled(self, symbol: str, pos: dict) -> bool:
         """True only when the book AFFIRMATIVELY says we hold nothing (issue #626).
 
@@ -2666,13 +2764,35 @@ class Open15BreakoutService:
                 CronTrigger(hour=sh, minute=sm, day_of_week="mon-fri", timezone=tz),
                 _summary_job,
             ),
+            (
+                # Every minute from the first possible entry to the exit, so the
+                # last entry of the day is still checked before `flatten`
+                # dispatches on it. Cheap: the job early-returns without touching
+                # the broker unless the day is armed AND holds an unverified
+                # entry, of which there are at most `max_trades` in a day.
+                #
+                # Bounded to 09:xx on purpose. A configured exit later than that
+                # (the window is operator-editable up to 15:10) leaves the tail
+                # unverified, and that is acceptable: verification only buys back
+                # a `max_trades` slot sooner. Correctness does not rest on it —
+                # the exit-time book check and the summary reconciliation both
+                # still catch an unfilled entry.
+                "open15_entry_verify",
+                CronTrigger(
+                    hour=9,
+                    minute=f"17-{max(em, 17) if eh == 9 else 59}",
+                    day_of_week="mon-fri",
+                    timezone=tz,
+                ),
+                _entry_verify_job,
+            ),
         ]
         for job_id, trigger, fn in jobs:
             sched.add_job(fn, trigger, id=job_id, replace_existing=True, misfire_grace_time=60)
         logger.info(
-            "open15: 5 scheduler jobs registered (arm 09:10 / first-candles 09:16 / "
+            "open15: 6 scheduler jobs registered (arm 09:10 / first-candles 09:16 / "
             "exit %02d:%02d / retry %02d:%02d "
-            "/ summary %02d:%02d IST)",
+            "/ summary %02d:%02d IST / entry-verify every 1 min in the entry window)",
             eh,
             em,
             rh,
@@ -3351,6 +3471,9 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open",
                 "fill": "real",
+                # kept so the deferred verification can ask the broker what
+                # really happened to this order (issue #626)
+                "entry_order_id": str(resp.get("orderid") or ""),
             }
         self._log_event(
             "entry",
@@ -3586,6 +3709,9 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open",
                 "fill": "real",
+                # kept so the deferred verification can ask the broker what
+                # really happened to this order (issue #626)
+                "entry_order_id": str(resp.get("orderid") or ""),
                 "instrument": "option",
                 "opt_symbol": contract["symbol"],
                 "opt_lot_size": lot,
@@ -3740,6 +3866,19 @@ def _eod_retry_job() -> None:
     svc = get_open15_service()
     if svc is not None:
         svc.flatten("eod_retry_0932")
+
+
+def _entry_verify_job() -> None:
+    """Minute-cadence post-ACK entry verification (issue #626)."""
+    svc = get_open15_service()
+    if svc is None or svc.day_status != "armed":
+        return
+    try:
+        svc.verify_entries()
+    except Exception:
+        # never let a verification failure escape into the scheduler; the exit
+        # path re-checks the book and the reconciler re-checks at summary
+        logger.exception("open15: entry verification raised")
 
 
 def _summary_job() -> None:
