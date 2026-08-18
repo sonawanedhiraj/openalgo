@@ -689,3 +689,82 @@ def test_logs_page_every_render_callee_is_defined():
         page_fns = {c for c in callees if re.match(r"(render|load|apply|maybe|poll|start|csrf)", c)}
         missing = sorted(page_fns - defined)
         assert not missing, f"{caller} calls undefined page functions: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# issue #626 — a post-ACK rejection emits BOTH `entry` and `entry_rejected`
+# --------------------------------------------------------------------------- #
+def _postack_rejection_events():
+    """One symbol the broker acknowledged and then refused."""
+    return [
+        {"ts": "09:10:00.000", "event": "armed", "universe": 5, "mode": "live"},
+        {
+            "ts": "09:19:58.000",
+            "event": "entry",
+            "symbol": "TIINDIA",
+            "side": "BUY",
+            "qty": 800,
+            "order_status": "success",
+            "order_id": "260818190112881",
+        },
+        {
+            "ts": "09:21:00.000",
+            "event": "entry_rejected",
+            "symbol": "TIINDIA",
+            "qty": 800,
+            "error": "Insufficient funds. Margin required: 149255.00.",
+            "fill": "paper",
+            "slot_released": True,
+            "post_ack": True,
+        },
+    ]
+
+
+def test_a_post_ack_rejection_is_not_counted_as_entered_and_paper_both():
+    """The digest must not show one symbol twice under two labels.
+
+    Before post-ACK rejection was detectable the two event kinds could never
+    describe the same symbol, so a plain count was correct. Now they can.
+    """
+    from services.open15_log_view import summarize_day
+
+    digest = summarize_day("2026-08-18", _postack_rejection_events())
+    assert digest["entered"] == 0, "an entry the broker ultimately refused did not stand"
+    assert digest["paper"] == 1
+
+
+def test_a_placement_time_rejection_still_counts_exactly_once():
+    """The #548 shape is unchanged: no `entry` event, one paper row."""
+    from services.open15_log_view import summarize_day
+
+    events = [
+        {"ts": "09:10:00.000", "event": "armed", "universe": 5, "mode": "live"},
+        {
+            "ts": "09:19:58.000",
+            "event": "entry_rejected",
+            "symbol": "DLF",
+            "qty": 100,
+            "error": "IP is not allowed to place orders for this app.",
+            "fill": "paper",
+            "slot_released": True,
+        },
+    ]
+    digest = summarize_day("2026-08-05", events)
+    assert (digest["entered"], digest["paper"]) == (0, 1)
+
+
+def test_a_genuine_fill_is_still_counted_as_entered():
+    """The subtraction must not eat the normal case."""
+    from services.open15_log_view import summarize_day
+
+    events = _postack_rejection_events()[:2] + [
+        {
+            "ts": "09:22:00.000",
+            "event": "entry",
+            "symbol": "DIXON",
+            "qty": 150,
+            "order_status": "success",
+        }
+    ]
+    digest = summarize_day("2026-08-18", events)
+    assert digest["entered"] == 2, "both ACKs stand while neither has been refused"

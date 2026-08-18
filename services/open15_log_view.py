@@ -141,7 +141,12 @@ def summarize_day(
         elif kind == "summary":
             status = ev.get("day") or status
             selected = ev.get("selected", selected)
-    entered = len(entry_syms)
+    # A symbol can now emit BOTH `entry` (the broker ACK'd) and `entry_rejected`
+    # (RMS refused it afterwards, issue #626). Before post-ACK rejection was
+    # detectable the two sets were disjoint, so a plain count was right; now it
+    # double-counts, showing the same symbol as entered AND paper. An entry that
+    # was ultimately refused did not stand.
+    entered = len(entry_syms - paper_syms)
     pnl = trades_pnl if trades_pnl is not None else (pnl_from_events if saw_exit_pnl else None)
     ppnl = paper_pnl if paper_pnl is not None else (paper_from_events if saw_paper_pnl else None)
     spnl = sim_pnl if sim_pnl is not None else (sim_from_events if saw_sim_pnl else None)

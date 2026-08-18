@@ -518,8 +518,9 @@ def test_a_post_ack_rejection_is_demoted_and_frees_its_slot(monkeypatch):
     assert row.status == "rejected" and row.fill == "paper"
     assert "Insufficient funds" in row.error_message
 
-    ev = [e for e in svc.day_log if e["event"] == "entry_unfilled"]
-    assert len(ev) == 1 and ev[0]["slot_released"] is True
+    # the existing, already-rendered event name — see the note in verify_entries
+    ev = [e for e in svc.day_log if e["event"] == "entry_rejected"]
+    assert len(ev) == 1 and ev[0]["slot_released"] is True and ev[0]["post_ack"] is True
     db_session.remove()
 
 

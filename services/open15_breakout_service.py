@@ -2362,13 +2362,27 @@ class Open15BreakoutService:
                 error_message=msg[:255],
                 reason="entry_rejected",
             )
+            # `entry_rejected`, NOT a new event name. The digest and the row
+            # builder in open15_log_view already render this one, and the /logs
+            # page has twice gone dark on an event nobody taught it (#615, #622).
+            # It IS a rejected entry — only the moment of discovery differs.
             self._log_event(
-                "entry_unfilled",
+                "entry_rejected",
                 symbol=symbol,
+                instrument=pos.get("instrument") or "stock",
+                contract=pos.get("opt_symbol"),
+                qty=pos.get("quantity"),
+                entry_price=pos.get("opt_entry_premium") or pos.get("trigger_price"),
+                watch_source=pos.get("watch_source") or "seed",
                 order_id=pos["entry_order_id"],
                 order_status=status,
                 error=msg,
+                fill="paper",
+                paper_capped=False,
                 slot_released=True,
+                # what separates this from a placement-time rejection: the
+                # broker had already ACKNOWLEDGED the order when we entered it
+                post_ack=True,
             )
             self._alert_rejection(symbol, pos.get("quantity") or 0, msg)
             demoted += 1
