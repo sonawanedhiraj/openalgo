@@ -1,16 +1,24 @@
-"""SQLite concurrency contract for every app engine (issue #633).
+"""SQLite concurrency contract for app engines (issue #633).
 
 The 2026-08-18 pre-open outage: `openalgo.db` (100 MB, rollback-journal mode)
 became unreadable for ~11 minutes on the daily master-contract boot. The swap
 writes 114,268 symtoken rows, then the cache hook reads all of them back in a
 single 38.88 s pass. In rollback-journal mode a writer that needs EXCLUSIVE
 while that long read holds SHARED escalates to PENDING — and PENDING blocks
-every NEW reader. Each one then died on pysqlite's 5 s default timeout, which
-is exactly the 5-7 s failure cadence in the log.
+every NEW reader. Each died on the driver's 5 s timeout, which is exactly the
+5-7 s failure cadence in the production log.
 
 WAL removes the class: readers never block writers and writers never block
-readers. These tests pin that as a contract on the engines the app actually
-uses, not on a hand-rolled connection.
+readers.
+
+Every test here builds its OWN file-backed engine and never reads a
+`database.*` module's ambient engine. That is not fastidiousness — an earlier
+draft asserted on `market_intel_db.engine`, passed on Windows, and failed on
+Linux CI with `assert 'memory' == 'wal'`: `test/test_action_center.py` sets
+`os.environ["DATABASE_URL"] = "sqlite:///:memory:"` at MODULE level, so under
+xdist any module imported after it binds to an in-memory database, where WAL is
+impossible and every connection sees a different empty DB. The contract under
+test is about file-backed databases, so the test must supply one.
 """
 
 from __future__ import annotations
@@ -18,11 +26,24 @@ from __future__ import annotations
 import sqlite3
 
 import pytest
-from sqlalchemy import text
-
-from database import market_intel_db as mid
+from sqlalchemy import create_engine, text
 
 pytestmark = pytest.mark.integration
+
+_CREATE = "CREATE TABLE IF NOT EXISTS probe (id INTEGER PRIMARY KEY, v TEXT)"
+
+
+@pytest.fixture
+def file_engine(tmp_path):
+    """An engine built exactly as the app builds one, on a real file."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'concurrency.db'}")
+    with engine.connect() as conn:
+        conn.execute(text(_CREATE))
+        conn.commit()
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 def _pragma(engine, name: str):
@@ -30,87 +51,80 @@ def _pragma(engine, name: str):
         return conn.execute(text(f"PRAGMA {name}")).scalar()
 
 
-def test_app_sqlite_engines_run_in_wal_mode():
-    """Every engine built by a `database.*` module must be WAL.
+def test_file_backed_engines_run_in_wal_mode(file_engine):
+    """Pre-fix this returns 'delete' — the mode that let a long read lock everyone out."""
+    assert str(_pragma(file_engine, "journal_mode")).lower() == "wal"
 
-    Pre-fix this returns 'delete' — the rollback journal that made a long
-    read able to wall off the whole database.
+
+def test_busy_timeout_is_set_explicitly(file_engine):
+    """Regression guard, NOT a repro — pysqlite's default already supplies 5000 ms.
+
+    It exists so a future change to `timeout=0` is caught.
     """
-    assert str(_pragma(mid.engine, "journal_mode")).lower() == "wal"
+    assert int(_pragma(file_engine, "busy_timeout")) >= 1000
 
 
-def test_busy_timeout_is_set_explicitly():
-    """A 0 / driver-default timeout is what turned contention into hard errors."""
-    assert int(_pragma(mid.engine, "busy_timeout")) >= 1000
-
-
-def test_a_long_reader_does_not_block_a_writer():
+def test_a_long_reader_does_not_block_a_writer(file_engine):
     """The outage shape, reduced to two connections.
 
-    A reader holds an open read transaction (the cache load); a writer commits
-    (news ingest). Pre-fix the commit raises `database is locked`.
+    A reader holds an open read transaction (the 38.88 s cache load); a writer
+    commits (news ingest). Pre-fix the commit raises `database is locked`.
     """
-    mid.Base.metadata.create_all(mid.engine)
-
-    reader = mid.engine.raw_connection()
-    writer = mid.engine.raw_connection()
+    reader = file_engine.raw_connection()
+    writer = file_engine.raw_connection()
     try:
         rc = reader.cursor()
         rc.execute("BEGIN")
-        rc.execute("SELECT count(*) FROM market_intel").fetchone()  # holds the read open
+        rc.execute("SELECT count(*) FROM probe").fetchone()  # holds the read open
 
         wc = writer.cursor()
         wc.execute("PRAGMA busy_timeout=500")  # fail fast rather than stall the suite
-        wc.execute(
-            "INSERT INTO market_intel (captured_at, kind, payload_json) VALUES (?, ?, ?)",
-            ("2026-08-18T09:00:00+05:30", "news", "{}"),
-        )
+        wc.execute("INSERT INTO probe (v) VALUES ('written-under-a-long-read')")
         writer.commit()  # <-- pre-fix: sqlite3.OperationalError: database is locked
+
+        assert _pragma(file_engine, "journal_mode").lower() == "wal"
     finally:
-        try:
-            reader.rollback()
-        except sqlite3.Error:
-            pass
-        reader.close()
-        writer.close()
+        for conn in (reader, writer):
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            conn.close()
 
 
-def test_a_pending_writer_does_not_block_new_readers():
-    """The second half: PENDING is what made every *reader* fail, not the write."""
-    mid.Base.metadata.create_all(mid.engine)
+def test_a_writer_does_not_block_new_readers(file_engine):
+    """Regression guard, NOT a repro.
 
-    writer = mid.engine.raw_connection()
-    reader = mid.engine.raw_connection()
+    It passes on both trees: a writer only blocks readers during the brief
+    EXCLUSIVE phase of commit, which cannot be held open deterministically.
+    Kept because the READER-blocked half is what actually took the app down,
+    so a future regression there must not go unnoticed.
+    """
+    writer = file_engine.raw_connection()
+    reader = file_engine.raw_connection()
     try:
         wc = writer.cursor()
         wc.execute("BEGIN IMMEDIATE")
-        wc.execute(
-            "INSERT INTO market_intel (captured_at, kind, payload_json) VALUES (?, ?, ?)",
-            ("2026-08-18T09:01:00+05:30", "news", "{}"),
-        )
+        wc.execute("INSERT INTO probe (v) VALUES ('uncommitted')")
 
         rc = reader.cursor()
         rc.execute("PRAGMA busy_timeout=500")
-        rc.execute("SELECT count(*) FROM market_intel").fetchone()
+        rc.execute("SELECT count(*) FROM probe").fetchone()
     finally:
-        try:
-            writer.rollback()
-        except sqlite3.Error:
-            pass
-        writer.close()
-        reader.close()
+        for conn in (writer, reader):
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            conn.close()
 
 
-def test_listener_covers_engines_created_anywhere(tmp_path):
+def test_listener_covers_engines_created_after_import(tmp_path):
     """The ~30 broker `master_contract_db` engines are the real target.
 
-    They build their own `create_engine(DATABASE_URL)` with no knowledge of
-    this listener, and the zerodha one performs the 114,268-row symtoken swap.
-    A class-level listener must reach an engine constructed independently and
-    AFTER import — that is the whole reason this is not a per-module change.
+    They call `create_engine(DATABASE_URL)` with no knowledge of this listener,
+    and the zerodha one performs the 114,268-row symtoken swap.
     """
-    from sqlalchemy import create_engine
-
     independent = create_engine(f"sqlite:///{tmp_path / 'broker_like.db'}")
     try:
         assert str(_pragma(independent, "journal_mode")).lower() == "wal"
@@ -119,13 +133,21 @@ def test_listener_covers_engines_created_anywhere(tmp_path):
         independent.dispose()
 
 
-def test_journal_mode_is_overridable_for_rollback(monkeypatch, tmp_path):
-    """`SQLITE_JOURNAL_MODE=DELETE` must restore the old behaviour.
+def test_in_memory_databases_are_exempt_not_broken():
+    """`:memory:` reports 'memory' and cannot be WAL — the listener must accept it.
 
-    A change this broad needs a switch that does not require a code edit.
+    Several tests bind modules to `sqlite:///:memory:`, so treating that as a
+    failure would spam a warning on every connect in the suite.
     """
-    from sqlalchemy import create_engine
+    mem = create_engine("sqlite:///:memory:")
+    try:
+        assert str(_pragma(mem, "journal_mode")).lower() == "memory"
+    finally:
+        mem.dispose()
 
+
+def test_journal_mode_is_overridable_for_rollback(monkeypatch, tmp_path):
+    """`SQLITE_JOURNAL_MODE=DELETE` must restore the old behaviour."""
     from database import sqlite_tuning
 
     monkeypatch.setattr(sqlite_tuning, "JOURNAL_MODE", "DELETE")
