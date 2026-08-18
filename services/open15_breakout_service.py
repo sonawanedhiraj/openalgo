@@ -181,6 +181,15 @@ def _sim_skipped_enabled() -> bool:
     return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
 
 
+def _confirm_exit_position() -> bool:
+    """Verify the book before squaring off an `open` row (issue #626).
+
+    The rollback switch for the pre-exit check. Off = the pre-#626 behaviour,
+    where an acknowledged-then-RMS-rejected entry sent an unbacked square-off.
+    """
+    return os.getenv("OPEN15_CONFIRM_EXIT_POSITION", "true").lower() == "true"
+
+
 def _paper_sim_max() -> int:
     """Daily cap on simulated rows.
 
@@ -2267,6 +2276,21 @@ class Open15BreakoutService:
             ),
         )
 
+    def _entry_never_filled(self, symbol: str, pos: dict) -> bool:
+        """True only when the book AFFIRMATIVELY says we hold nothing (issue #626).
+
+        Deliberately not the inverse of "confirmed held". ``_broker_qty`` returns
+        None for an unreadable book, and None must NOT stop the square-off of a
+        position we believe is real — that is the direction that strands an
+        overnight lot. Only a definite 0 diverts to paper.
+        """
+        if not _confirm_exit_position():
+            return False
+        is_option = pos.get("instrument") == "option"
+        sym = pos["opt_symbol"] if is_option else symbol
+        qty = self._broker_qty(sym, "NFO" if is_option else "NSE")
+        return qty == 0
+
     def flatten(self, reason: str = "eod_0930") -> None:
         """Configured exit time (default 09:30 IST) — market-out every open
         position (also the +2 min retry backstop).
@@ -2299,6 +2323,30 @@ class Open15BreakoutService:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
         for symbol, pos in open_pos.items():
             is_option = pos.get("instrument") == "option"
+            # An ACK is not a fill (issue #626). Zerodha accepts the order, hands
+            # back an order id, and RMS can still refuse it downstream — which is
+            # exactly what happened to TIINDIA on 2026-08-18. The row said
+            # `status='open'` and this loop sent a SELL for 800 calls we did not
+            # own: a NAKED SHORT, which the broker priced at Rs4.45L of SPAN and
+            # refused only because the funds were not there either.
+            #
+            # So the #548 rule — only an AFFIRMATIVE non-zero position book
+            # justifies a square-off — applies here too, not just to rows already
+            # labelled paper. Zero means the entry never filled: paper it and send
+            # nothing. An UNREADABLE book (None) still squares off, because the
+            # asymmetry runs the other way once an entry is believed filled — an
+            # unsent exit strands a real overnight position, while an unnecessary
+            # one is caught by the broker's own 15:15 MIS auto-square-off.
+            if self._entry_never_filled(symbol, pos):
+                logger.error(
+                    "open15: %s entry never filled (book flat) — papering instead of "
+                    "sending an unbacked %s",
+                    symbol,
+                    "SELL" if is_option or pos["side"] == "L" else "BUY",
+                )
+                pos["fill"] = "paper"
+                self._flatten_paper(symbol, pos, "entry_rejected")
+                continue
             if is_option:
                 # option exit is always a SELL of the bought CE/PE (issue #437)
                 action = "SELL"

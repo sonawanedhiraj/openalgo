@@ -82,9 +82,13 @@ def _mk_service(orders, *, reject=True, max_trades=3):
         {"margin_per_slot": 30000, "sizing_mode": "fixed", "vol_mult": 1.5}, 0
     )
     svc.day_config["max_trades"] = max_trades
-    # the book confirms flat by default — the static-IP case, where the order
-    # provably never reached the exchange
-    svc._broker_qty = lambda symbol, exchange: 0
+    # The book must AGREE with what the broker was made to do, or the fixture
+    # describes a state that cannot exist (issue #626). Rejecting => provably
+    # flat (the static-IP case, where the order never reached the exchange).
+    # Accepting => a position exists; leaving this at 0 would describe an order
+    # that was filled and simultaneously never filled, and the pre-exit check
+    # now (correctly) papers exactly that.
+    svc._broker_qty = (lambda symbol, exchange: 0) if reject else (lambda symbol, exchange: 300)
     return svc
 
 
@@ -371,3 +375,97 @@ def test_journal_row_and_day_log_share_one_date_key():
     assert {r.trade_date for r in rows} == {svc._log_date}
     assert get_day_log(svc._log_date), "the day log is filed under the same key"
     db_session.remove()
+
+
+# --------------------------------------------------------------------------- #
+# issue #626 — an ACK is not a fill, and flatten must not sell what we never got
+#
+# #548 covered the rejection the broker gives at PLACEMENT time (the static-IP
+# 403 above): `ok` is False, the row is papered immediately, done. It does not
+# cover the shape that hit TIINDIA on 2026-08-18 — Zerodha returned HTTP 200
+# with an order id, and RMS refused the order afterwards. The row was written
+# `status='open'`, so `flatten` sent a SELL for 800 calls we did not own. Kite
+# priced that as a naked short (Rs4.45L SPAN) and refused it too; with funds
+# available it would have opened a real short position.
+# --------------------------------------------------------------------------- #
+def test_an_acknowledged_but_unfilled_entry_is_never_squared_off():
+    """The book says flat, so the exit is papered and NO order is sent."""
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)  # broker ACKs the entry
+    svc._broker_qty = lambda symbol, exchange: 0  # ...but nothing was ever filled
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    assert len(orders) == 1, "the entry was accepted, so it was attempted"
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 1, (
+        "no exit order may be sent for a position that was never filled — "
+        "that order is a NAKED SHORT, not a square-off"
+    )
+    row = db_session.query(Open15Trade).filter(Open15Trade.symbol == "AAA").first()
+    assert row.fill == "paper", "nothing was held, so this cannot count as real money"
+    assert row.exit_status == "not_placed"
+    db_session.expire_all()
+    db_session.remove()
+
+
+def test_a_confirmed_position_is_still_squared_off_normally():
+    """The guard must not stop the exit it exists to protect."""
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: 300  # the book confirms we hold it
+    _run_to_selection(svc)
+    _trigger(svc)
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 2, "a real position is squared off exactly as before"
+    assert orders[1]["action"] == "SELL"
+    row = db_session.query(Open15Trade).filter(Open15Trade.symbol == "AAA").first()
+    assert row.fill == "real" and row.status == "closed"
+    db_session.expire_all()
+    db_session.remove()
+
+
+def test_an_unreadable_book_still_squares_off():
+    """The asymmetry, stated (issue #626).
+
+    `None` means "we could not ask", and once an entry is believed filled the
+    dangerous direction reverses: NOT sending the exit strands a real position,
+    while an unnecessary exit is caught by the 15:15 MIS auto-square-off. This
+    is the opposite default from `_resolve_paper_position`, where the entry was
+    known to have been REFUSED — and the difference is deliberate.
+    """
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: None  # broker session down
+    _run_to_selection(svc)
+    _trigger(svc)
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 2, "an unverifiable position is still squared off"
+
+
+def test_the_pre_exit_check_can_be_switched_off(monkeypatch):
+    """Rollback switch, so a misbehaving book cannot strand every exit."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    monkeypatch.setenv("OPEN15_CONFIRM_EXIT_POSITION", "false")
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: 0
+    _run_to_selection(svc)
+    _trigger(svc)
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 2, "with the flag off, the pre-#626 behaviour is restored"
