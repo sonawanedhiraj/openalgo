@@ -1506,14 +1506,30 @@ function shortC(c){
   if(!c)return '';
   return c.length>16?('\\u2026'+c.slice(-14)):c;
 }
+function lotsLeg(r){
+  // `qty` is a CONTRACT count, and lot sizes across this universe span 20 to
+  // 71,475 — a 3,574x spread (issue #630). A bare count is therefore not
+  // comparable between two rows and reads as the lot size itself, which is
+  // what cast doubt on the coverage ladder. Decompose it.
+  const lot=+r.lotSize, q=+r.qty;
+  if(!(lot>0)||!(q>0))return '';   // stock rows have no lot: nothing to split
+  const lots=q/lot;
+  // a fractional lot count cannot be true — it means `qty` and `lotSize` came
+  // from different sources. Print the lot alone rather than invent a count.
+  return Number.isInteger(lots)
+    ? lots+' &times; '+lot.toLocaleString('en-IN')
+    : 'lot '+lot.toLocaleString('en-IN');
+}
 function qtyCell(r){
   // `quantity` is what was ORDERED. For a bucket where nothing was ordered it
   // is 0, and the number below it is the PRICING size — never the other way
   // round, or a shadow row would read as a position that existed.
+  const leg=lotsLeg(r);
   if(r.fill==='sim'||r.fill==='shadow')
     return '<span class="muted">0</span><span class="leg">'+esc(r.fill)+' '+
-      esc(r.qty??'')+'</span>';
-  return r.qty!=null?esc(r.qty):dash;
+      esc(r.qty??'')+(leg?(' &middot; '+leg):'')+'</span>';
+  if(r.qty==null)return dash;
+  return esc(r.qty)+(leg?('<span class="leg">'+leg+'</span>'):'');
 }
 function pnlCell(r){
   if(r.net==null)return dash;
