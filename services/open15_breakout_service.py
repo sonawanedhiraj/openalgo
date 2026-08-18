@@ -181,6 +181,11 @@ def _sim_skipped_enabled() -> bool:
     return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
 
 
+def _funds_clamp_enabled() -> bool:
+    """Clamp the day's slot budget to the account balance (issue #626)."""
+    return os.getenv("OPEN15_FUNDS_CLAMP", "true").lower() == "true"
+
+
 def _verify_entries_enabled() -> bool:
     """Deferred post-ACK entry verification (issue #626).
 
@@ -731,6 +736,67 @@ def verify_prev_closes(closes: dict[str, float], today: dt.date) -> tuple[dict[s
     except Exception:
         logger.exception("open15: prev-close verification failed — using historify values as-is")
         return closes, {"enabled": True, "error": True}
+
+
+def clamp_slots_to_funds(
+    margin_per_slot: float, max_trades: int, available_cash: float | None
+) -> tuple[int, str | None]:
+    """How many slots the account can actually pay for (issue #626).
+
+    Returns ``(effective_max_trades, note)``; ``note`` is None when nothing was
+    clamped.
+
+    The strategy's budget was `margin_per_slot x max_trades` and was never
+    compared with the money in the account. On 2026-08-18 that budget was
+    5 x Rs60,000 = Rs3,00,000 against Rs1,22,252.80 of cash: the first two
+    entries filled, the third asked for Rs62,000 the account did not have, and
+    Zerodha refused it — "Margin required: 149255.00" being the CUMULATIVE
+    requirement of all three, not the third alone.
+
+    **`max_trades` is what shrinks, never `margin_per_slot`.** Cutting the slot
+    instead would silently change the position size this deployment exists to
+    measure, making the day incomparable to every day before it. Fewer trades at
+    the configured size stays comparable; smaller trades do not.
+
+    Fails OPEN (returns `max_trades` unchanged) when the balance is unknown. An
+    unreadable funds call must not be able to switch the strategy off — the
+    broker still enforces the real limit, and a rejection is now handled
+    correctly rather than published as a fill.
+    """
+    if available_cash is None or margin_per_slot <= 0:
+        return max_trades, None
+    affordable = int(available_cash // margin_per_slot)
+    if affordable >= max_trades:
+        return max_trades, None
+    note = (
+        f"funds clamp: Rs{available_cash:,.0f} available covers {affordable} of "
+        f"{max_trades} slots at Rs{margin_per_slot:,.0f} each"
+    )
+    return max(affordable, 0), note
+
+
+def read_available_cash() -> float | None:
+    """The account's spendable cash, or None if it cannot be read (issue #626).
+
+    None means "we do not know" and is never coerced to 0 — a zero would clamp
+    the strategy to no trades at all on a transient funds-API failure.
+    """
+    try:
+        from database.auth_db import get_first_available_api_key
+        from services.funds_service import get_funds
+
+        api_key = get_first_available_api_key()
+        if not api_key:
+            return None
+        ok, resp, _ = get_funds(api_key=api_key)
+        if not ok:
+            logger.warning("open15: funds read failed — sizing not clamped: %s", resp)
+            return None
+        cash = (resp or {}).get("data", {}).get("availablecash")
+        return float(cash) if cash is not None else None
+    except Exception:
+        logger.exception("open15: funds read raised — sizing not clamped")
+        return None
 
 
 def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
@@ -1861,6 +1927,17 @@ class Open15BreakoutService:
             logger.exception("open15: config load failed — using env defaults")
             cfg_row, cum_pnl = None, 0.0
         self.day_config = resolve_day_config(cfg_row, cum_pnl)
+        # The budget must fit the ACCOUNT, not just the config (issue #626).
+        # Done here rather than in resolve_day_config because it needs a broker
+        # read and that function is pure. Once per day, at arm.
+        configured_max = self.day_config["max_trades"]
+        available_cash = read_available_cash() if _funds_clamp_enabled() else None
+        eff_max, clamp_note = clamp_slots_to_funds(
+            self.day_config["margin_effective"], configured_max, available_cash
+        )
+        if clamp_note:
+            logger.warning("open15: %s", clamp_note)
+            self.day_config["max_trades"] = eff_max
         # Gate 1 stage 1 (issue #583) — side-INDEPENDENT, so it can run before the
         # 09:16 ranking assigns one. Only drops symbols that fail on BOTH sides (or
         # have no NFO contracts at all); the per-side half is stage 2, inside the
@@ -1920,6 +1997,13 @@ class Open15BreakoutService:
             notional=self.day_config["notional"],
             cum_realized_pnl=self.day_config["cum_realized_pnl"],
             config_source="ui" if cfg_row else "env_defaults",
+            # what the account could actually pay for (issue #626). Stamped even
+            # when nothing was clamped, so a past day can always say whether the
+            # signal or the balance was what limited it.
+            max_trades_configured=configured_max,
+            max_trades_effective=self.day_config["max_trades"],
+            available_cash=available_cash,
+            funds_clamp=clamp_note,
             tick_capture=bool(self._tick_writer),
             tick_capture_universe=bool(self._tick_writer) and self._capture_universe,
             prev_close_check=prev_check,

@@ -2314,6 +2314,23 @@ ran in the 15:30-17:00 periodic window).
 - **History:**
   - **2026-08-18:** Introduced by issue #626.
 
+## `OPEN15_FUNDS_CLAMP` (issue #626)
+
+- **What:** default `true`. At the 09:10 arm, open15 reads the account balance
+  and clamps `max_trades` to `floor(available_cash / margin_per_slot)`. The
+  configured and effective values, the balance, and any clamp note are stamped
+  into the `armed` decision-log event.
+- **Why:** the slot budget was never compared with the money in the account. On
+  2026-08-18 it was 5 x Rs60,000 = Rs3,00,000 against Rs1,22,252.80 of cash; the
+  third entry asked for Rs62,000 that was not there and was rejected by RMS.
+- **Note:** `max_trades` shrinks, never `margin_per_slot`. Cutting the slot
+  would change the position size this deployment exists to measure and make the
+  day incomparable to earlier ones. Fails OPEN when the balance cannot be read —
+  a transient funds-API failure must not switch the strategy off.
+- **How to roll back:** `OPEN15_FUNDS_CLAMP=false`.
+- **History:**
+  - **2026-08-18:** Introduced by issue #626.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
