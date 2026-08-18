@@ -2177,6 +2177,24 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
   Fire-and-forget per-child isolation; every attempt journaled to
   `account_orders`; every non-placed outcome Telegrams
   (`multi_account_mirror`).
+- **The child checks its OWN balance, and an ACK is not a fill (issue #637).**
+  Both #626 defects existed here too, one account over. (a) Sizing read
+  `capital_per_trade_inr` and never the balance, so a parent taking N trades
+  asked the child for N × its per-trade size and the Nth was refused —
+  `read_child_cash` now gates OPENING mirrors on the **sized order value**
+  (`compute_opening_qty` floors, so the real cost is ≤ the cap), read with the
+  **child's own token**, never gating an EXIT, failing OPEN on an unreadable
+  balance. (b) `status='placed'` came from the HTTP 200 ACK and **nothing ever
+  re-checked it** — `services/account_fill_reconcile.py` (job
+  `multi_account_fill_reconcile` 09:40 IST, plus inline before the 15:35 EOD
+  summary so that report is built on a corrected record) re-reads each child's
+  **RAW** orderbook (`get_order_book(token)` — the mapper drops
+  `status_message`) and turns a post-ACK rejection into `rejected` with the
+  broker's reason, alerting. It only ever corrects **downwards**: a confirmed
+  fill is left alone, because promoting rows on our own authority is what
+  produced the fabricated fill in the first place. Idempotent with no marker
+  column (a corrected row is no longer `placed`). Flags
+  `MULTI_ACCOUNT_FUNDS_CHECK`, `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED`.
 - **Observability** (`services/account_mirror_summary_service.py`): orderbook
   "Mirror Orders" card + `/accounts` today chips; login reminders 09:00/15:00
   IST and a 15:35 IST EOD mirror summary — all fire-time gated on the master

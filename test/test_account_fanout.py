@@ -358,3 +358,147 @@ def test_broker_exception_journals_error(fanout_env):
     row = orders_db.list_orders()[0]
     assert row["status"] == "error"
     assert "broker exploded" in row["error_text"]
+
+
+# ---------------------------------------------------------------------------
+# issue #637 — the child must check ITS OWN balance before an opening mirror
+#
+# #626 fixed this on the parent: the slot budget was never compared with the
+# account balance, so the Nth order was refused for insufficient funds. The
+# child had the identical hole one account over — it sized every mirror against
+# `capital_per_trade_inr` alone, and the parent's clamp cannot help, because the
+# child is a different account with a different balance and its own per-trade
+# size.
+# ---------------------------------------------------------------------------
+
+
+def _with_cash(monkeypatch, amount, *, record=None):
+    """Stub the child's funds read; optionally record the args it was given."""
+    import services.account_fanout_service as svc_mod
+
+    def _read(broker, token):
+        if record is not None:
+            record.append((broker, token))
+        return amount
+
+    monkeypatch.setattr(svc_mod, "read_child_cash", _read)
+
+
+def test_an_unaffordable_opening_mirror_places_nothing(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, notifications = fanout_env
+    _make_child(accounts_db, per_trade=15000.0)
+    # price 500 -> 30 shares -> Rs15,000 needed, Rs9,000 available
+    _with_cash(monkeypatch, 9000.0)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert stub.placed_orders == [], "no order may be sent that the child cannot pay for"
+    row = orders_db.list_orders()[0]
+    assert row["status"] == "skipped_insufficient_funds"
+    assert row["child_qty"] == 0
+    assert "15,000" in (row["error_text"] or "") and "9,000" in (row["error_text"] or "")
+    assert any("only" in n for n in notifications)
+
+
+def test_an_affordable_mirror_is_placed_normally(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    _make_child(accounts_db, per_trade=15000.0)
+    _with_cash(monkeypatch, 500_000.0)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert len(stub.placed_orders) == 1
+    assert orders_db.list_orders()[0]["status"] == "placed"
+
+
+def test_an_exit_is_never_gated_on_cash(fanout_env, monkeypatch):
+    """The load-bearing carve-out.
+
+    A funds blip must never strand a live child position. The reducing branch
+    already bypasses capital and quote lookups; the balance check has to sit
+    inside the opening branch for exactly the same reason.
+    """
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    _make_child(accounts_db, per_trade=15000.0)
+    stub.open_qty = 30  # the child holds a position to flatten
+    _with_cash(monkeypatch, 0.0)
+
+    exit_order = {**EQ_ORDER, "action": "SELL"}
+    svc.maybe_fan_out(exit_order, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert len(stub.placed_orders) == 1, "a broke child must still be able to flatten"
+    assert orders_db.list_orders()[0]["status"] == "placed"
+
+
+def test_an_unreadable_balance_fails_open(fanout_env, monkeypatch):
+    """None is "unknown", never 0.
+
+    The broker still enforces the real limit, and since #637 a refusal is
+    recorded honestly — so failing open costs a rejection, whereas failing
+    closed would silently stop mirroring altogether.
+    """
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    _make_child(accounts_db, per_trade=15000.0)
+    _with_cash(monkeypatch, None)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert len(stub.placed_orders) == 1
+    assert orders_db.list_orders()[0]["status"] == "placed"
+
+
+def test_the_balance_is_read_with_the_childs_own_token(fanout_env, monkeypatch):
+    """#626 got this exact axis wrong once — a funds read answered for another book.
+
+    Asserted on the token actually handed to the funds call, not on a mocked
+    return value; mocking only the return is what would hide a parent-token read.
+    """
+    svc, accounts_db, _orders_db, _stub, _n = fanout_env
+    _make_child(accounts_db, per_trade=15000.0)
+    seen = []
+    _with_cash(monkeypatch, 500_000.0, record=seen)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert seen, "the funds read must actually happen"
+    broker, token = seen[0]
+    assert broker == "zerodha"
+    assert token == "k:tok", "the CHILD's session token (upserted as acct:<id>)"
+
+
+def test_the_check_can_be_switched_off(fanout_env, monkeypatch):
+    svc, accounts_db, _orders_db, stub, _n = fanout_env
+    monkeypatch.setenv("MULTI_ACCOUNT_FUNDS_CHECK", "false")
+    _make_child(accounts_db, per_trade=15000.0)
+    _with_cash(monkeypatch, 1.0)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert len(stub.placed_orders) == 1, "with the flag off, the pre-#637 behaviour returns"
+
+
+def test_the_sized_value_is_compared_not_the_raw_per_trade_cap(fanout_env, monkeypatch):
+    """`compute_opening_qty` floors, so the real cost is <= capital_per_trade.
+
+    Comparing the raw cap would refuse orders the child can actually afford —
+    here Rs15,000 configured, Rs14,500 genuinely needed, Rs14,600 in the account.
+    """
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    import services.account_fanout_service as svc_mod
+
+    _make_child(accounts_db, per_trade=15000.0)
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: 725.0)  # 20 sh = 14,500
+    _with_cash(monkeypatch, 14_600.0)
+
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert len(stub.placed_orders) == 1, "14,500 fits in 14,600; the raw 15,000 cap would not"
+    assert orders_db.list_orders()[0]["status"] == "placed"
+
+
+def test_can_afford_is_pure_and_fails_open():
+    from services.account_fanout_service import can_afford
+
+    assert can_afford(100.0, 100.0), "exactly affordable is affordable"
+    assert not can_afford(100.01, 100.0)
+    assert can_afford(1_000_000.0, None), "unknown balance never blocks"

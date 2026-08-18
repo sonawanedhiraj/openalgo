@@ -47,6 +47,9 @@ VALID_STATUSES = (
     "skipped_no_position",
     "skipped_no_capital",
     "skipped_no_quote",
+    # the child cannot pay for the sized order (issue #637) — distinct from
+    # skipped_zero_qty, which means the per-trade CAP could not buy one unit
+    "skipped_insufficient_funds",
     "error",
 )
 
@@ -216,6 +219,36 @@ def last_opposite_attempt_status(
     except Exception:
         logger.exception("last_opposite_attempt_status read failed — failing open")
         return None
+    finally:
+        db_session.remove()
+
+
+def update_status(row_id: int, *, status: str, error_text: str | None = None) -> bool:
+    """Correct one mirror attempt's outcome (issue #637).
+
+    Used by the fill reconciliation to turn a `placed` row the broker actually
+    refused into `rejected` with the broker's own reason. An unknown status is
+    REFUSED here rather than silently coerced: `record_mirror_attempt` maps a
+    bad status to `error`, which is right when journalling a live attempt but
+    wrong when correcting a record — it would replace one wrong answer with
+    another.
+    """
+    if status not in VALID_STATUSES:
+        logger.error("account_orders: refusing to set unknown status %r on row %s", status, row_id)
+        return False
+    try:
+        row = db_session.query(AccountOrder).filter(AccountOrder.id == row_id).first()
+        if row is None:
+            return False
+        row.status = status
+        if error_text is not None:
+            row.error_text = error_text
+        db_session.commit()
+        return True
+    except Exception:
+        db_session.rollback()
+        logger.exception("account_orders: status update failed for row %s", row_id)
+        return False
     finally:
         db_session.remove()
 
