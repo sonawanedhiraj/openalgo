@@ -30,41 +30,48 @@ from database import market_intel_db as mid
 pytestmark = pytest.mark.integration
 
 
-def _db_path() -> str:
-    """Filesystem path of the temp DB the conftest redirected us to."""
-    url = str(mid.engine.url)
-    return url.replace("sqlite:///", "", 1)
+@pytest.fixture
+def intel_db(tmp_path):
+    """A dedicated SQLite file with the session rebound to it.
 
+    Deriving the path from ``mid.engine.url`` (an earlier draft) broke on CI:
+    the table landed somewhere the insert never looked, so every assertion met
+    ``no such table`` instead of ``database is locked`` — the tests failed on
+    Linux and, worse, would have passed for the wrong reason had the raises()
+    been loose. A dedicated ``tmp_path`` file removes the guesswork.
 
-@contextmanager
-def _fast_timeout_session():
-    """Rebind the scoped session to a 0.2s-timeout engine on the same file.
-
-    The module engine inherits pysqlite's 5s default, which would make each
-    lock assertion below sleep for five seconds. Same file, same NullPool
-    contract — only the busy timeout differs.
+    The 0.2s busy timeout (vs pysqlite's 5s default) keeps the lock assertions
+    fast; same file, same NullPool contract otherwise.
     """
-    fast = create_engine(
-        f"sqlite:///{_db_path()}",
+    db_file = tmp_path / "intel.db"
+    engine = create_engine(
+        f"sqlite:///{db_file}",
         poolclass=NullPool,
         connect_args={"check_same_thread": False, "timeout": 0.2},
     )
-    mid.Base.metadata.create_all(fast)
+    mid.Base.metadata.create_all(engine)
+
+    # Fail loudly if the harness itself is broken, rather than letting a
+    # missing table masquerade as the lock error we are trying to assert.
+    with sqlite3.connect(str(db_file)) as check:
+        names = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "market_intel" in names, f"harness failed to create the table: {names}"
+
     original = mid.engine
     mid.db_session.remove()
-    mid.db_session.configure(bind=fast)
+    mid.db_session.configure(bind=engine)
     try:
-        yield
+        yield str(db_file)
     finally:
         mid.db_session.remove()
         mid.db_session.configure(bind=original)
-        fast.dispose()
+        engine.dispose()
 
 
 @contextmanager
-def _external_writer_lock():
+def _external_writer_lock(db_file: str):
     """Hold a genuine EXCLUSIVE lock from outside SQLAlchemy."""
-    conn = sqlite3.connect(_db_path(), timeout=0.2)
+    conn = sqlite3.connect(db_file, timeout=0.2, isolation_level=None)
     conn.execute("BEGIN EXCLUSIVE")
     try:
         yield
@@ -73,68 +80,64 @@ def _external_writer_lock():
         conn.close()
 
 
-def test_insert_intel_recovers_after_a_locked_commit():
+def test_insert_intel_recovers_after_a_locked_commit(intel_db):
     """The bug, stated as the invariant it broke.
 
     Pre-fix this fails on the SECOND insert with
     ``PendingRollbackError: Can't reconnect until invalid transaction is rolled
     back`` — the exact message the production log carried ~100 times.
     """
-    with _fast_timeout_session():
-        with _external_writer_lock():
-            with pytest.raises(OperationalError, match="database is locked"):
-                mid.insert_intel(kind="news", payload_json='{"t": "locked"}')
+    with _external_writer_lock(intel_db):
+        with pytest.raises(OperationalError, match="database is locked"):
+            mid.insert_intel(kind="news", payload_json='{"t": "locked"}')
 
-        # Lock released. The very next call must succeed — a single contended
-        # write may not poison every subsequent write in the process.
-        row_id = mid.insert_intel(kind="news", payload_json='{"t": "after"}')
-        assert row_id > 0
+    # Lock released. The very next call must succeed — a single contended
+    # write may not poison every subsequent write in the process.
+    row_id = mid.insert_intel(kind="news", payload_json='{"t": "after"}')
+    assert row_id > 0
 
 
-def test_failed_insert_does_not_hold_the_database():
+def test_failed_insert_does_not_hold_the_database(intel_db):
     """The outage itself: a failed write must not leave the DB locked.
 
     Pre-fix the aborted session keeps its connection (and the rollback
     journal), so an external writer cannot take EXCLUSIVE afterwards.
     """
-    with _fast_timeout_session():
-        with _external_writer_lock():
-            with pytest.raises(OperationalError, match="database is locked"):
-                mid.insert_intel(kind="news", payload_json='{"t": "locked"}')
+    with _external_writer_lock(intel_db):
+        with pytest.raises(OperationalError, match="database is locked"):
+            mid.insert_intel(kind="news", payload_json='{"t": "locked"}')
 
-        # Nothing of ours may still be holding the file.
-        probe = sqlite3.connect(_db_path(), timeout=1.0)
-        try:
-            probe.execute("BEGIN EXCLUSIVE")
-            probe.rollback()
-        finally:
-            probe.close()
+    # Nothing of ours may still be holding the file.
+    probe = sqlite3.connect(intel_db, timeout=1.0)
+    try:
+        probe.execute("BEGIN EXCLUSIVE")
+        probe.rollback()
+    finally:
+        probe.close()
 
 
-def test_reads_release_their_session_too():
+def test_reads_release_their_session_too(intel_db):
     """``latest_intel`` / ``latest_intel_by_kind`` had no ``remove()`` either.
 
     A reader that never returns its connection is the same leak with a slower
     fuse — on a non-request thread nothing reclaims it.
     """
-    with _fast_timeout_session():
-        mid.insert_intel(kind="news", payload_json='{"t": "read-me"}')
-        assert mid.latest_intel("news") is not None
-        assert isinstance(mid.latest_intel_by_kind("news", limit=5), list)
+    mid.insert_intel(kind="news", payload_json='{"t": "read-me"}')
+    assert mid.latest_intel("news") is not None
+    assert isinstance(mid.latest_intel_by_kind("news", limit=5), list)
 
-        probe = sqlite3.connect(_db_path(), timeout=1.0)
-        try:
-            probe.execute("BEGIN EXCLUSIVE")
-            probe.rollback()
-        finally:
-            probe.close()
+    probe = sqlite3.connect(intel_db, timeout=1.0)
+    try:
+        probe.execute("BEGIN EXCLUSIVE")
+        probe.rollback()
+    finally:
+        probe.close()
 
 
-def test_locked_insert_fails_fast_and_does_not_wedge_the_thread():
+def test_locked_insert_fails_fast_and_does_not_wedge_the_thread(intel_db):
     """A contended write raises promptly instead of hanging the ingest loop."""
-    with _fast_timeout_session():
-        with _external_writer_lock():
-            started = time.time()
-            with pytest.raises(OperationalError, match="database is locked"):
-                mid.insert_intel(kind="news", payload_json='{"t": "slow"}')
-            assert time.time() - started < 5.0
+    with _external_writer_lock(intel_db):
+        started = time.time()
+        with pytest.raises(OperationalError, match="database is locked"):
+            mid.insert_intel(kind="news", payload_json='{"t": "slow"}')
+        assert time.time() - started < 5.0
