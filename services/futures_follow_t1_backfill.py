@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -275,8 +274,22 @@ def main() -> int:
 
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     for db in (main_db, sandbox_db):
-        shutil.copy2(db, db.with_suffix(db.suffix + f".bak.{stamp}"))
-        print(f"backed up {db.name} -> {db.name}.bak.{stamp}")
+        dest = db.with_suffix(db.suffix + f".bak.{stamp}")
+        # Must be the sqlite backup API, NOT shutil.copy2 (issue #633). These
+        # databases run in WAL mode, so recent commits live in the -wal sidecar
+        # until a checkpoint. A plain file copy of a live WAL database yields a
+        # backup that silently omits them — measured: copying a 2-row WAL DB
+        # produced a copy where the TABLE itself did not exist yet. A backup
+        # that looks fine and is missing data is worse than no backup, and this
+        # one is taken immediately before a write that rewrites trade rows.
+        src_con = sqlite3.connect(db)
+        dst_con = sqlite3.connect(dest)
+        try:
+            src_con.backup(dst_con)
+        finally:
+            dst_con.close()
+            src_con.close()
+        print(f"backed up {db.name} -> {dest.name}")
 
     # Operator decision (2026-08-08): backfilled exits are labelled IDENTICALLY
     # to real strategy fills — same note, same strategy tag, same order-id shape.

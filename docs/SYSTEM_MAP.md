@@ -508,7 +508,18 @@ symtoken swap followed by a 38.88 s cache-load read), 50 minutes before market
 open. Under WAL readers and writers never block each other, so no single long
 read can wall off the database. `synchronous` is deliberately left at its
 default (FULL) — WAL is often paired with NORMAL for speed, but that trades
-durability on power loss and this DB holds order state. Rollback:
+durability on power loss and this DB holds order state. **Two brokers
+(`deltaexchange`, `indmoney`) already set WAL on this same DB at import time**,
+and additionally set `synchronous=NORMAL`; this listener makes the mode
+deterministic for every broker rather than a side effect of which plugin loaded.
+
+⚠️ **Never back up a live database with `cp` / `shutil.copy2` under WAL.** Recent
+commits live in the `-wal` sidecar until a checkpoint, so a plain file copy of a
+running DB silently omits them — measured: copying a 2-row WAL database produced
+a copy in which the table did not exist. Use the sqlite backup API
+(`src.backup(dst)`, as `services/futures_follow_t1_backfill.py` now does) or stop
+the app first. Read-only (`mode=ro`) access is unaffected, both while running and
+after a clean shutdown. Rollback:
 `SQLITE_JOURNAL_MODE=DELETE` (journal mode is persisted in the file, so a
 rollback also needs a restart). Does not apply to `db/historify.duckdb`, which
 is not SQLite.

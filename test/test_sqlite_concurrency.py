@@ -156,3 +156,48 @@ def test_journal_mode_is_overridable_for_rollback(monkeypatch, tmp_path):
         assert str(_pragma(rolled_back, "journal_mode")).lower() == "delete"
     finally:
         rolled_back.dispose()
+
+
+def test_a_plain_file_copy_of_a_wal_db_is_not_a_valid_backup(tmp_path):
+    """WAL's one real regression, pinned so nobody re-introduces `cp` backups.
+
+    Under WAL, recent commits live in the `-wal` sidecar until a checkpoint, so
+    copying only the `.db` file of a LIVE database silently loses them. Measured
+    while adding WAL (#633): a plain copy of a 2-row database produced a copy in
+    which the table did not exist at all.
+
+    `services/futures_follow_t1_backfill.py` used `shutil.copy2` here, right
+    before rewriting trade rows — a backup that looks fine and is missing data
+    is worse than no backup. It now uses the sqlite backup API, which this test
+    pins as the correct alternative.
+    """
+    import shutil
+
+    src = tmp_path / "live.db"
+    engine = create_engine(f"sqlite:///{src}")
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(_CREATE))
+            conn.execute(text("INSERT INTO probe (v) VALUES ('committed')"))
+            conn.commit()
+        assert str(_pragma(engine, "journal_mode")).lower() == "wal"
+
+        live = sqlite3.connect(str(src))  # hold it open, as the running app does
+        try:
+            naive = tmp_path / "naive.db"
+            shutil.copy2(src, naive)
+            with pytest.raises(sqlite3.Error):
+                sqlite3.connect(str(naive)).execute("SELECT count(*) FROM probe").fetchone()
+
+            proper = tmp_path / "proper.db"
+            dst = sqlite3.connect(str(proper))
+            try:
+                live.backup(dst)
+            finally:
+                dst.close()
+            got = sqlite3.connect(str(proper)).execute("SELECT count(*) FROM probe").fetchone()[0]
+            assert got == 1
+        finally:
+            live.close()
+    finally:
+        engine.dispose()
