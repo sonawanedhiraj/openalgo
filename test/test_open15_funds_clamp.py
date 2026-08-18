@@ -69,3 +69,97 @@ def test_a_nonsense_slot_size_is_not_divided_by():
 def test_the_clamp_floors_rather_than_rounds(cash, expected):
     """Rounding up would reintroduce the exact rejection this prevents."""
     assert clamp_slots_to_funds(60_000, 5, cash)[0] == expected
+
+
+# --------------------------------------------------------------------------- #
+# The funds read must follow the BOOK THE ORDERS GO TO (the #497 rule)
+#
+# `funds_service.get_funds` dispatches on `resolve_effective_mode()` — the
+# ANALYZE OVERLAY, which returns LIVE whenever the navbar toggle is off, no
+# matter what this strategy is set to. open15 defaults to sandbox, so reading
+# funds through it would size a virtual-Rs1Cr measurement run against the real
+# broker balance and clamp a run that has no funding constraint at all. That is
+# the same class of bug as #497, where a sandbox strategy read the empty LIVE
+# position book and fired no exits for four trading days.
+# --------------------------------------------------------------------------- #
+def _stub_modes(monkeypatch, order_mode, *, sandbox_cash=None, broker_cash=None):
+    import sys
+
+    from services.mode_service import EffectiveMode
+
+    monkeypatch.setattr(
+        "services.mode_service.resolve_order_mode", lambda _key: order_mode, raising=False
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "database.auth_db",
+        type(
+            "M",
+            (),
+            {
+                "get_first_available_api_key": staticmethod(lambda: "k"),
+                "get_auth_token_broker": staticmethod(lambda _k: ("tok", "zerodha")),
+            },
+        ),
+    )
+    called = {}
+
+    def _sandbox_funds(api_key, original):
+        called["sandbox"] = True
+        return True, {"data": {"availablecash": sandbox_cash}}, 200
+
+    def _broker_funds(auth_token, broker, original_data=None):
+        called["broker"] = True
+        return True, {"data": {"availablecash": broker_cash}}, 200
+
+    monkeypatch.setitem(
+        sys.modules,
+        "services.sandbox_service",
+        type("M", (), {"sandbox_get_funds": staticmethod(_sandbox_funds)}),
+    )
+    monkeypatch.setattr("services.funds_service.get_funds_with_auth", _broker_funds, raising=False)
+    return called, EffectiveMode
+
+
+def test_a_sandbox_strategy_reads_the_sandbox_book_not_the_broker_balance(monkeypatch):
+    """The regression: open15 runs in sandbox by default, with Analyze OFF."""
+    from services.mode_service import EffectiveMode
+    from services.open15_breakout_service import read_available_cash
+
+    called, _ = _stub_modes(
+        monkeypatch, EffectiveMode.SANDBOX, sandbox_cash="10000000.00", broker_cash="122252.80"
+    )
+    cash = read_available_cash()
+
+    assert cash == 10_000_000.00, "the virtual Rs1Cr book, not the real balance"
+    assert called.get("sandbox") and not called.get("broker")
+
+
+def test_a_live_strategy_reads_the_real_broker_balance(monkeypatch):
+    from services.mode_service import EffectiveMode
+    from services.open15_breakout_service import read_available_cash
+
+    called, _ = _stub_modes(
+        monkeypatch, EffectiveMode.LIVE, sandbox_cash="10000000.00", broker_cash="122252.80"
+    )
+    cash = read_available_cash()
+
+    assert cash == 122_252.80
+    assert called.get("broker") and not called.get("sandbox")
+
+
+def test_a_sandbox_run_is_not_clamped_by_the_real_accounts_shortfall(monkeypatch):
+    """End-to-end of the same point, at the decision the clamp actually makes.
+
+    2026-08-18's real balance would cut 5 slots to 2. A sandbox run must keep
+    all 5 — its book is not what ran out of money.
+    """
+    from services.mode_service import EffectiveMode
+    from services.open15_breakout_service import clamp_slots_to_funds, read_available_cash
+
+    _stub_modes(
+        monkeypatch, EffectiveMode.SANDBOX, sandbox_cash="10000000.00", broker_cash="122252.80"
+    )
+    eff, note = clamp_slots_to_funds(60_000, 5, read_available_cash())
+
+    assert eff == 5 and note is None

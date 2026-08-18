@@ -330,9 +330,18 @@ process and need no external scheduler.
 > The `futures_follow_cap50` strategy likewise registers its own
 > reset/entry/exit/watchdog/EOD jobs (09:00/15:20/15:25/15:28/15:30 IST) — see the
 > FuturesFollowService process entry (§5).
-> The `open15_vol_breakout` strategy (issue #425, sandbox) registers 4 jobs on
-> this same scheduler: `open15_arm` 09:10 / `open15_exit` / `open15_exit_retry`
-> (+2 min) / `open15_summary` (+5 min), mon-fri. Exit defaults to 09:30 (so
+> The `open15_vol_breakout` strategy (issue #425, sandbox) registers 6 jobs on
+> this same scheduler: `open15_arm` 09:10 / `open15_first_candles` 09:16 /
+> `open15_entry_verify` (every minute across the entry window) / `open15_exit` /
+> `open15_exit_retry` (+2 min) / `open15_summary` (+5 min), mon-fri.
+> `open15_entry_verify` (issue #626) asks the broker what happened to each
+> ACKNOWLEDGED entry and demotes a post-ACK RMS rejection to a paper fill,
+> releasing its `max_trades` slot — an ACK is not a fill, and on 2026-08-18 a
+> refused order was carried as a live position and published as a +Rs7,680 gain.
+> It runs on the scheduler rather than at entry because entries are placed from
+> the ZMQ tick callback, where a synchronous broker call stalls every symbol.
+> Flags `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` /
+> `OPEN15_FUNDS_CLAMP` (all default `true`). Exit defaults to 09:30 (so
 > retry 09:32 / summary 09:35) but is **UI-configurable** together with the
 > entry cutoff (issue #451: `open15_config.no_entry_after`/`exit_time`, env
 > defaults `OPEN15_NO_ENTRY_AFTER` 09:29 / `OPEN15_EXIT_TIME` 09:30, exit

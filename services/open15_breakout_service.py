@@ -776,19 +776,43 @@ def clamp_slots_to_funds(
 
 
 def read_available_cash() -> float | None:
-    """The account's spendable cash, or None if it cannot be read (issue #626).
+    """The spendable cash OF THE BOOK THIS STRATEGY TRADES (issue #626).
+
+    Routed by ``resolve_order_mode(STRATEGY_NAME)`` — the same resolver that
+    routes the orders — which is the #497 rule. ``funds_service.get_funds``
+    cannot be used directly here: it dispatches on ``resolve_effective_mode()``,
+    the *analyze overlay*, which returns LIVE whenever the navbar toggle is off
+    regardless of what this strategy is set to. A sandbox open15 would then size
+    itself against the REAL broker balance instead of the virtual Rs1Cr book and
+    silently clamp a measurement run that has no funding constraint at all.
 
     None means "we do not know" and is never coerced to 0 — a zero would clamp
-    the strategy to no trades at all on a transient funds-API failure.
+    the strategy to no trades on a transient funds-API failure.
     """
     try:
         from database.auth_db import get_first_available_api_key
-        from services.funds_service import get_funds
+        from services.mode_service import EffectiveMode, resolve_order_mode
 
         api_key = get_first_available_api_key()
         if not api_key:
             return None
-        ok, resp, _ = get_funds(api_key=api_key)
+
+        if resolve_order_mode(STRATEGY_NAME) is EffectiveMode.SANDBOX:
+            from services.sandbox_service import sandbox_get_funds
+
+            ok, resp, _ = sandbox_get_funds(api_key, {"apikey": api_key})
+        else:
+            from database.auth_db import get_auth_token_broker
+            from services.funds_service import get_funds_with_auth
+
+            auth_token, broker = get_auth_token_broker(api_key)
+            if not auth_token:
+                return None
+            # no ``original_data`` on purpose: that argument is what makes
+            # get_funds_with_auth consult the analyze overlay, and the routing
+            # decision has already been made above by the correct resolver
+            ok, resp, _ = get_funds_with_auth(auth_token, broker)
+
         if not ok:
             logger.warning("open15: funds read failed — sizing not clamped: %s", resp)
             return None
