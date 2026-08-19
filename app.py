@@ -42,6 +42,9 @@ from blueprints.auth import auth_bp
 from blueprints.backtest import backtest_bp  # MVP backtester endpoints
 from blueprints.brlogin import brlogin_bp
 from blueprints.broker_accounts import broker_accounts_bp  # Multi-account child accounts (#468)
+from blueprints.broker_auto_login import (
+    broker_auto_login_bp,  # Broker headless auto-login (issue #654)
+)
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
@@ -345,6 +348,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(flow_bp)  # Register Flow blueprint
     app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
     app.register_blueprint(broker_totp_bp)  # Broker external-TOTP helper (Zerodha 2FA code)
+    app.register_blueprint(broker_auto_login_bp)  # Broker headless auto-login (issue #654)
     app.register_blueprint(broker_accounts_bp)  # Multi-account child accounts (#468)
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
     app.register_blueprint(strategy_portfolio_bp)  # Register Strategy Portfolio blueprint

@@ -112,6 +112,7 @@ def update_account(account_id: int):
             "api_key",
             "api_secret",
             "totp_secret",
+            "password",  # issue #654: Kite login password for headless auto-login
         )
         if k in data
     }
@@ -159,6 +160,32 @@ def login_url(account_id: int):
     if not url:
         return jsonify({"status": "error", "message": "Account not found."}), 404
     return jsonify({"status": "success", "login_url": url})
+
+
+@broker_accounts_bp.route("/<int:account_id>/auto_login", methods=["POST"])
+@require_login
+def auto_login(account_id: int):
+    """Run the headless auto-login for one child now (issue #654).
+
+    Requires the child to have a stored password (+ TOTP secret + user-id). The
+    result mirrors the primary endpoint's shape; the password is never echoed.
+    """
+    account = accounts_db.get_account(account_id)
+    if not account:
+        return jsonify({"status": "error", "message": "Account not found."}), 404
+
+    from services.broker_auto_login_service import _auto_login_child
+
+    name = account.get("display_name") or f"account:{account_id}"
+    result = _auto_login_child(account_id, name)
+    code = 200 if result.get("ok") else 502
+    return jsonify(
+        {
+            "status": "success" if result.get("ok") else "error",
+            "ok": result.get("ok", False),
+            "message": result.get("message", ""),
+        }
+    ), code
 
 
 @broker_accounts_bp.route("/<int:account_id>/disconnect", methods=["POST"])
