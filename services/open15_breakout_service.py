@@ -2452,6 +2452,19 @@ class Open15BreakoutService:
                     with self._lock:
                         if symbol in self.positions:
                             self.positions[symbol]["entry_verified"] = True
+                    # The broker just told us the REAL entry fill — persist it
+                    # instead of discarding it (issue #641: on 2026-08-19 this
+                    # job saw MANKIND's true entry 35.7 at 09:25 and threw it
+                    # away, so the 09:30 exit still priced the entry from a
+                    # stale quote). The exit-time reconcile then only has the
+                    # exit leg left to resolve. P&L is NOT recomputed here —
+                    # reconcile_fills stays the single writer of pnl/pnl_source.
+                    if leg["price"]:
+                        update_trade(
+                            pos["row_id"],
+                            entry_fill_price=leg["price"],
+                            entry_fill_qty=leg["qty"],
+                        )
                 continue
 
             msg = leg["message"] or f"broker reported the entry {status}"
@@ -2511,6 +2524,38 @@ class Open15BreakoutService:
         qty = self._broker_qty(sym, "NFO" if is_option else "NSE")
         return qty == 0
 
+    def _reconcile_and_log(self, attempts: int = 1, delay_s: float = 0.0) -> None:
+        """Run the broker fill reconcile and log its events (issues #555/#641).
+
+        The one writer of the ``fill_reconcile_row`` / ``fill_reconcile`` event
+        shape, shared by the post-flatten immediate pass and the summary-job
+        backstop so the two cannot drift apart. Retries up to ``attempts``
+        times while legs are still ``pending`` (fills propagate to the broker
+        orderbook within seconds of a MARKET exit). Never raises into the
+        scheduler.
+        """
+        if not _fill_reconcile_enabled():
+            return
+        import time
+
+        from services.open15_fill_reconcile import reconcile_fills
+
+        for attempt in range(attempts):
+            if attempt:
+                time.sleep(delay_s)
+            try:
+                res = reconcile_fills(self._trade_date())
+            except Exception:
+                logger.exception("open15: fill reconciliation failed")
+                return
+            # one event per row FIRST, so the per-symbol table and the CSV
+            # carry the transacted prices, then the roll-up
+            for detail in res.pop("rows", []):
+                self._log_event("fill_reconcile_row", **detail)
+            self._log_event("fill_reconcile", **res)
+            if not res.get("pending"):
+                return
+
     def flatten(self, reason: str = "eod_0930") -> None:
         """Configured exit time (default 09:30 IST) — market-out every open
         position (also the +2 min retry backstop).
@@ -2541,6 +2586,7 @@ class Open15BreakoutService:
 
         with self._lock:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
+        exit_orders_sent = 0
         for symbol, pos in open_pos.items():
             is_option = pos.get("instrument") == "option"
             # An ACK is not a fill (issue #626). Zerodha accepts the order, hands
@@ -2585,6 +2631,7 @@ class Open15BreakoutService:
                     _mode(), {"symbol": symbol, "action": action, "quantity": pos["quantity"]}
                 )
             ok = resp.get("status") == "success"
+            exit_orders_sent += 1
             last_px = (self.core.last_price.get(symbol) if self.core else None) or pos[
                 "trigger_price"
             ]
@@ -2678,6 +2725,19 @@ class Open15BreakoutService:
                 order_status=resp.get("status"),
                 reason=reason,
             )
+        if exit_orders_sent:
+            # Publish the FILL-true P&L now, not at the exit+5 summary (issue
+            # #641). The quote-derived numbers written above are estimates made
+            # BEFORE the market order filled; on 2026-08-19 they overstated the
+            # day by ~Rs6,470 for five minutes. This thread is an APScheduler
+            # worker — not the ZMQ tick thread the #555 "deferred, never
+            # synchronous" rule protects — and it already made a synchronous
+            # broker quote call per position above, so one more round-trip here
+            # costs nothing new. A MARKET fill usually reaches the orderbook in
+            # a second or two; one short in-pass retry covers the lag, and the
+            # summary job + next-day arm remain the backstops for anything
+            # still pending.
+            self._reconcile_and_log(attempts=2, delay_s=4.0)
         if reason == "eod_0930":
             self.day_status = "done"
             # loud dead-feed diagnostics: an armed day with no/partial ticks must
@@ -2762,23 +2822,13 @@ class Open15BreakoutService:
             day=self.day_status,
             captured_drift=drifts,
         )
-        if _fill_reconcile_enabled():
-            # Broker fill reconciliation (issue #555). Runs HERE and not in the
-            # entry/exit paths: entries are placed from the ZMQ tick callback,
-            # where a synchronous broker round-trip would stall every other
-            # symbol's ticks. Legs the broker has not reported yet stay
-            # `pending` and are retried by the next 09:10 arm.
-            try:
-                from services.open15_fill_reconcile import reconcile_fills
-
-                res = reconcile_fills(self._trade_date())
-                # one event per row FIRST, so the per-symbol table and the CSV
-                # carry the transacted prices, then the roll-up
-                for detail in res.pop("rows", []):
-                    self._log_event("fill_reconcile_row", **detail)
-                self._log_event("fill_reconcile", **res)
-            except Exception:
-                logger.exception("open15: fill reconciliation failed")
+        # Broker fill reconciliation backstop (issues #555/#641). The primary
+        # pass now runs at the tail of `flatten` — seconds after the exits —
+        # so this normally finds nothing left to do; it exists for legs the
+        # broker had not reported yet (they stay `pending` and are retried by
+        # the next 09:10 arm) and for days where the flatten-time pass failed.
+        # Kept OFF the tick thread like everything broker-synchronous here.
+        self._reconcile_and_log()
         if _opt_shadow_enabled():
             # ATM option shadow pricing (issue #435). Broker current-day 1m
             # history lags ~5-15 min, so rows left unpriced here are retried
