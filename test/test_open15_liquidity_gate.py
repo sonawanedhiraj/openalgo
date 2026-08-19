@@ -26,7 +26,6 @@ import pytest  # noqa: E402
 from services.open15_breakout_service import Open15Core, resolve_day_config  # noqa: E402
 from services.open15_liquidity_gate import (  # noqa: E402
     REASON_ILLIQUID,
-    REASON_NO_CONTRACTS,
     Exclusion,
     LiquidityGate,
     _hysteresis_excluded,
@@ -47,7 +46,7 @@ FIRST_CANDLES = {
 PREV = dict.fromkeys(FIRST_CANDLES, 100.0)
 
 
-def _gate(excluded: dict, contracts=None, have_scores=True):
+def _gate(excluded: dict, have_scores=True):
     """``excluded`` maps ``(symbol, 'CE'|'PE')`` -> pctile."""
     g = LiquidityGate(
         enabled=True, min_pctile=20, reentry_pctile=25, reentry_days=3, have_scores=have_scores
@@ -56,7 +55,6 @@ def _gate(excluded: dict, contracts=None, have_scores=True):
         g.excluded_sides[(sym, side)] = Exclusion(
             sym, REASON_ILLIQUID, side="long" if side == "CE" else "short", pctile=p
         )
-    g.contract_underlyings = set(contracts) if contracts is not None else set()
     return g
 
 
@@ -98,18 +96,26 @@ def test_stage1_both_side_exclusion_reports_both():
 def test_data_gap_fails_open():
     """No usable scores must INCLUDE everything. Darkening a universe because a
     collection job failed is the #390 shape."""
-    g = _gate({}, contracts={"GOOD"}, have_scores=False)
+    g = _gate({}, have_scores=False)
     assert g.stage1("GOOD") is None
     assert g.stage2("GOOD", "L") is None
 
 
-def test_missing_contracts_fails_closed_even_with_no_scores():
-    """A symbol with no NFO contracts is a stale SCANNER_SYMBOLS, not an illiquidity
-    verdict — and it must be excluded even when the score read failed."""
-    g = _gate({}, contracts={"GOOD"}, have_scores=False)
-    ex = g.stage1("GONE")
-    assert ex is not None and ex.reason == REASON_NO_CONTRACTS
-    assert g.stage2("GONE", "L").reason == REASON_NO_CONTRACTS
+def test_the_gate_no_longer_answers_whether_contracts_exist():
+    """Moved out in #647, and the move is the fix.
+
+    Existence is a FACT and was being answered by a class whose first line is
+    `if not self.enabled: return None` — so switching off the percentile
+    JUDGEMENT switched off the fact with it, and SAMMAANCAP stayed in the
+    universe on 2026-08-19 with the verdict recorded as `enforced: false`.
+    `fno_universe.filter_to_fno` now removes such names from the universe
+    before the gate is ever built, so the gate never sees them and must not
+    grow an opinion about them again."""
+    g = _gate({}, have_scores=False)
+
+    # a symbol the gate has never heard of is simply not its business
+    assert g.stage1("GONE") is None
+    assert g.stage2("GONE", "L") is None
 
 
 def test_disabled_gate_excludes_nothing():

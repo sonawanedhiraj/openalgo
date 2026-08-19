@@ -1445,6 +1445,34 @@ and per-level `orders`; all are dropped by the shared broker mappers, so
 capturing them means changing a mapper every broker uses. The WS feed is not a
 source — open15 subscribes `NSE_<sym>_LTP` only, which carries neither depth
 nor OI.
+**Not in F&O = not watched, and that is a FACT not a gate (issue #647).**
+`option_underlyings()` reads the master contract — re-downloaded every morning,
+so it tracks NSE's own additions and removals with no list to maintain — and
+`services/fno_universe.filter_to_fno` removes anything missing from it at the
+09:10 arm, **option mode only, unconditionally**. The check used to live inside
+`LiquidityGate`, and being there is what broke it: that class decides whether a
+book is too THIN — a percentile judgement that ships OFF because its placebo
+failed on 2026-08-09 — and its first line is `if not self.enabled: return
+None`, so switching off the judgement switched off the existence check with it.
+On 2026-08-19 SAMMAANCAP was recorded `no_option_contracts, enforced: false`,
+kept its rolling watch slot, triggered at 09:17:38 and died at
+`no_option_contract`. **The two claims are different in kind**: "this book is
+thin" can be wrong, so measure first; "there are no contracts" cannot be wrong
+and cannot be measured around — such a name fills under NO variant, so watching
+it produces no data (the #595 argument). Applied to `self.universe` before the
+gate is built, which makes it total: `_handle_raw` discards ticks for symbols
+outside the universe, so one check covers the 09:16 seed ranking AND every
+rolling addition. `prev` is pruned alongside so the `armed` event's `universe`
+and `prev_closes` describe one set. **Fails OPEN, always** — a raising read or
+an implausibly small underlying set (< 50 against a normal 214) keeps the whole
+universe and drops nothing, because a real exclusion is 1-3 names while a broken
+instrument dump looks like 200 (the #390 shape). There is **no env flag**: a
+plausibility floor is a safety limit, not a policy knob. Re-inclusion is
+automatic — the next morning's dump carries the name and it is simply kept
+(its liquidity score will be missing, which the gate already treats as
+`insufficient_history` → included). Emits `universe_excluded · stage 0 ·
+reason=not_in_fno · enforced=true`.
+
 **Broker-OI watch-list filter (issue #595): mirror Zerodha's absolute rule,
 don't model it.** Zerodha blocks MIS orders on stock option contracts with OI
 < **500 LOTS** — per-CONTRACT and absolute, so no percentile screen can

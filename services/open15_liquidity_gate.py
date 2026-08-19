@@ -20,13 +20,20 @@ ranking lets an illiquid name occupy a top-N slot first.
 
 Rules that are load-bearing, not stylistic
 ------------------------------------------
-**Fail OPEN on a DATA gap, fail CLOSED on a CONTRACT gap.** Missing, stale or
-unreadable scores mean *our collection* broke, so the symbol is INCLUDED and a warning
-is logged — darkening a universe because a job failed is the #390 shape, where 3 stale
-symbols of 216 held the entire scanner all session. A symbol with **no NFO option
-contracts at all** is a different fact: that is a stale ``SCANNER_SYMBOLS``, not an
-illiquidity verdict, and it is excluded loudly (EXIDEIND, NUVAMA and SAMMAANCAP are in
-exactly that state today).
+**Fail OPEN on a data gap.** Missing, stale or unreadable scores mean *our
+collection* broke, so the symbol is INCLUDED and a warning is logged — darkening a
+universe because a job failed is the #390 shape, where 3 stale symbols of 216 held the
+entire scanner all session.
+
+**This module judges liquidity only. It does not answer whether a symbol has option
+contracts at all** — that is a fact rather than a verdict, it lives in
+``services/fno_universe.py``, and it is applied to the universe before this gate is
+built (issue #647). It used to live here, and being here is what broke it: the class
+opens with ``if not self.enabled: return None``, so switching off the percentile
+judgement — which ships OFF, because its placebo failed on 2026-08-09 — switched off
+the existence check with it. SAMMAANCAP was recorded ``no_option_contracts,
+enforced: false`` on 2026-08-19, kept its watch slot, triggered, and died at
+``no_option_contract``. Do not move it back.
 
 **Insufficient history is NOT a low score.** A newly listed F&O name reports
 ``insufficient_history`` and is *included*; scoring it low would be indistinguishable
@@ -51,7 +58,6 @@ logger = get_logger(__name__)
 # nothing to trade", and "too new to judge" call for completely different operator
 # responses, and a single blended reason hides which one happened.
 REASON_ILLIQUID = "illiquid_options"
-REASON_NO_CONTRACTS = "no_option_contracts"
 REASON_INSUFFICIENT = "insufficient_history"
 
 SIDE_FOR = {"L": "CE", "S": "PE"}
@@ -89,7 +95,6 @@ class LiquidityGate:
     reentry_days: int
     scores: dict = field(default_factory=dict)  # (symbol, side) -> row
     excluded_sides: dict = field(default_factory=dict)  # (symbol, side) -> Exclusion
-    contract_underlyings: set = field(default_factory=set)
     have_scores: bool = True
 
     # ---- per-side verdict -------------------------------------------------
@@ -97,8 +102,6 @@ class LiquidityGate:
         """``None`` when tradeable; an ``Exclusion`` when not."""
         if not self.enabled:
             return None
-        if self.contract_underlyings and symbol not in self.contract_underlyings:
-            return Exclusion(symbol, REASON_NO_CONTRACTS, side="both")
         if not self.have_scores:
             return None  # data gap -> fail OPEN
         return self.excluded_sides.get((symbol, opt_side))
@@ -121,8 +124,6 @@ class LiquidityGate:
         """Exclude only when BOTH sides fail — the side-independent verdict."""
         if not self.enabled:
             return None
-        if self.contract_underlyings and symbol not in self.contract_underlyings:
-            return Exclusion(symbol, REASON_NO_CONTRACTS, side="both")
         if not self.have_scores:
             return None
         ce = self.excluded_sides.get((symbol, "CE"))
@@ -210,14 +211,6 @@ def build_gate(cfg: dict, today: dt.date | None = None) -> LiquidityGate:
     # acting.
 
     try:
-        from services.option_liquidity_service import option_underlyings
-
-        gate.contract_underlyings = option_underlyings()
-    except Exception:
-        logger.exception("open15 gate: master-contract read failed — no contract check")
-        gate.contract_underlyings = set()
-
-    try:
         from database.option_liquidity_db import get_daily_pctile_history, get_latest_scores
 
         scores = get_latest_scores(max_age_days=max_stale, today=today)
@@ -264,11 +257,9 @@ def build_gate(cfg: dict, today: dt.date | None = None) -> LiquidityGate:
             )
 
     logger.info(
-        "open15 gate: %d scored sides, %d excluded, %d insufficient history, %d "
-        "underlyings with contracts",
+        "open15 gate: %d scored sides, %d excluded, %d insufficient history",
         len(scores),
         len(gate.excluded_sides),
         n_insufficient,
-        len(gate.contract_underlyings),
     )
     return gate
