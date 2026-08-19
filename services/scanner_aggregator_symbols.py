@@ -48,8 +48,20 @@ logger = get_logger(__name__)
 
 
 def _scanner_symbols() -> list[str]:
-    raw = os.environ.get("SCANNER_SYMBOLS", "")
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    """The TRADEABLE scanner universe (issue #648).
+
+    Aggregating bars for a symbol the strategy can never act on spends a
+    subscription slot and an aggregator series for nothing. Falls back to the
+    raw env list if the shared loader is unavailable.
+    """
+    try:
+        from services.scanner_universe import tradeable_universe
+
+        return sorted(tradeable_universe())
+    except Exception:
+        logger.exception("scanner_aggregator_symbols: tradeable universe unavailable")
+        raw = os.environ.get("SCANNER_SYMBOLS", "")
+        return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 def _regime_symbols() -> list[str]:

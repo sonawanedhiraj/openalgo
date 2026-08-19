@@ -1670,6 +1670,31 @@ YYYY-MM-DD`; stock 1m `uv run python -m services.sector_follow_stock_backfill
 only needed to backfill a multi-day outage beyond the small lookback window — the
 boot+periodic path handles routine staleness automatically.
 
+### Scanner universe: watched vs tradeable (issue #648)
+
+`SCANNER_SYMBOLS` is hand-maintained and NSE moves stocks in and out of F&O on
+its own schedule, so the list drifts (2026-08-19: 211 watched, 3 with no option
+contracts at all). `services/scanner_universe.py` answers it twice:
+
+- **`scanner_universe()` — what we COLLECT data for.** The raw env list. Used by
+  `scanner_universe_backfill` / `scanner_backfill_scheduler`.
+- **`tradeable_universe()` — what we ACT on.** Minus anything absent from
+  today's master contract, via `fno_universe.filter_to_fno` (#647). Used by the
+  aggregator (`scanner_aggregator_symbols`), the rules' history provider, the
+  smoke check's coverage denominator, the WS pre-subscribe nudge and the
+  tick-liveness heal.
+
+**The split is load-bearing.** If dropped names also left data maintenance,
+their 1m/`D` series would freeze the day NSE excluded them, and a later
+re-inclusion would arrive with a months-wide hole the convergence check cannot
+heal (it only fetches symbols behind *today's* close). **Collect on everything;
+act only on the F&O names.** Day-cached on `(date, frozenset(watched))` — the
+whole set, not its length, or two same-sized universes collide.
+`option_liquidity_service.load_equity_universe()` stays RAW on purpose: it is
+`reconcile_universe`'s input, and filtering it would make `missing_contracts`
+permanently empty — the report is the point. `sector_follow` is untouched
+(`LOCK_STATIC_30` is its own list). Fail-open is inherited from #647.
+
 ### Scanner-universe feed convergence (`scanner_backfill_scheduler`)
 
 The scanner-side sibling of the sector_follow convergence above. It is the

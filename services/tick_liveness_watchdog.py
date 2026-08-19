@@ -208,8 +208,12 @@ def heal_step_resubscribe() -> bool:
     if not user_id:
         logger.warning("tick_liveness auto-heal step 1: no broker session — cannot re-subscribe")
         return False
-    raw = os.getenv("SCANNER_SYMBOLS", "")
-    symbols = sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+    # re-subscribe the TRADEABLE set (issue #648) — the heal must restore the
+    # same subscriptions the boot path made, or the watchdog quietly re-widens
+    # the universe every time it fires
+    from services.scanner_universe import tradeable_universe
+
+    symbols = sorted(tradeable_universe())
     if not symbols:
         logger.warning("tick_liveness auto-heal step 1: SCANNER_SYMBOLS empty — nothing to do")
         return False

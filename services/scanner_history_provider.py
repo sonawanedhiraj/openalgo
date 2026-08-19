@@ -192,8 +192,12 @@ def get_provider() -> ScannerHistoryProvider:
     if _default_provider is None:
         with _default_lock:
             if _default_provider is None:
-                raw = os.getenv("SCANNER_SYMBOLS", "")
-                symbols = [s.strip() for s in raw.split(",") if s.strip()]
+                # TRADEABLE, not raw (issue #648): the rules are the F&O
+                # intraday screeners, so a non-F&O name can only produce a hit
+                # Chartink structurally cannot emit
+                from services.scanner_universe import tradeable_universe
+
+                symbols = sorted(tradeable_universe())
                 exchange = os.getenv("SCANNER_EXCHANGE", "NSE")
                 _default_provider = ScannerHistoryProvider(symbols, exchange=exchange)
     return _default_provider

@@ -236,7 +236,12 @@ def _main() -> None:  # pragma: no cover - operator CLI
         if args.target is not None
         else day_cfg.get("coverage_target_pct", _coverage_target_default())
     )
-    universe = Open15BreakoutService._load_universe()
+    # the runtime path passes ``svc.universe``, already F&O-filtered at arm
+    # (issue #647). The CLI must price the SAME denominator or its ladder
+    # disagrees with the card the page renders.
+    from services.scanner_universe import tradeable_universe
+
+    universe = tradeable_universe() or Open15BreakoutService._load_universe()
     if not universe:
         print("SCANNER_SYMBOLS empty — nothing to price")
         return

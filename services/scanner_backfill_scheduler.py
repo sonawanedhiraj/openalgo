@@ -508,8 +508,11 @@ def run_preentry_scanner_refresh(today=None) -> dict:
                     from database.auth_db import get_broker_name
 
                     broker = get_broker_name(user_id)
-                    raw = os.getenv("SCANNER_SYMBOLS", "")
-                    symbols = sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+                    # subscription = a DECISION path (issue #648): no reason to
+                    # spend a WS slot on a name the strategy can never act on
+                    from services.scanner_universe import tradeable_universe
+
+                    symbols = sorted(tradeable_universe())
                     if symbols:
                         n = scanner_pre_subscriber.ensure(user_id, broker, symbols)
                         logger.info(
