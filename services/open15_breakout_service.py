@@ -186,6 +186,49 @@ def _funds_clamp_enabled() -> bool:
     return os.getenv("OPEN15_FUNDS_CLAMP", "true").lower() == "true"
 
 
+def _residual_sizing_enabled_default() -> bool:
+    """Spend the cash left over after earlier fills (issue #643).
+
+    First-boot seed only — the ``open15_config`` row wins once it is set.
+    Default OFF: it changes position size, which is the one thing
+    ``clamp_slots_to_funds`` was written to hold constant.
+    """
+    return os.getenv("OPEN15_RESIDUAL_SIZING", "false").lower() == "true"
+
+
+def clamp_residual_reserve_pct(value) -> float:
+    """Headroom kept back from the residual, 0..25 % (issue #643).
+
+    Charges are not in the premium debit, and #626's lesson is that the broker
+    checks the CUMULATIVE requirement — so sizing an entry at exactly the last
+    rupee is how a residual entry earns a rejection.
+    """
+    try:
+        return min(max(float(value), 0.0), 25.0)
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def clamp_residual_min_lots(value) -> int:
+    """Smallest residual entry worth taking, 1..10 lots (issue #643).
+
+    1 = take whatever the cash affords. Raise it if quarter-size rows prove to
+    distort the per-trade statistics this deployment measures.
+    """
+    try:
+        return min(max(int(value), 1), 10)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _residual_reserve_pct_default() -> float:
+    return clamp_residual_reserve_pct(os.getenv("OPEN15_RESIDUAL_RESERVE_PCT", "3"))
+
+
+def _residual_min_lots_default() -> int:
+    return clamp_residual_min_lots(os.getenv("OPEN15_RESIDUAL_MIN_LOTS", "1"))
+
+
 def _verify_entries_enabled() -> bool:
     """Deferred post-ACK entry verification (issue #626).
 
@@ -775,6 +818,35 @@ def clamp_slots_to_funds(
     return max(affordable, 0), note
 
 
+def resolve_entry_budget(
+    slot_capital: float, cash_remaining: float | None, reserve_pct: float
+) -> tuple[float, str]:
+    """What this ONE entry may spend, and what that size is derived from (#643).
+
+    Returns ``(budget, basis)`` where ``basis`` is ``"slot"`` or ``"residual"``.
+
+    The full slot is always preferred: residual sizing exists to spend money the
+    account genuinely has left, not to shrink trades. On 2026-08-19 two fills
+    consumed Rs1,21,635 of Rs1,61,365 and the remaining Rs39,730 — two lots of
+    the third signal's contract — was simply not spent, because
+    ``clamp_slots_to_funds`` had already cut the day to 2 slots.
+
+    **Fails OPEN to the full slot** when the balance is unknown (``None``): the
+    ledger not knowing must never silently halve a position. The broker is the
+    backstop, and a rejection is journaled correctly since #548/#626.
+
+    ``reserve_pct`` is held back from the residual only. A full slot is a
+    configured number the operator chose; the residual is our own arithmetic
+    against a balance that also has to cover brokerage and STT.
+    """
+    if cash_remaining is None:
+        return slot_capital, "slot"
+    usable = max(cash_remaining, 0.0) * (1.0 - min(max(reserve_pct, 0.0), 100.0) / 100.0)
+    if usable >= slot_capital:
+        return slot_capital, "slot"
+    return max(usable, 0.0), "residual"
+
+
 def read_available_cash() -> float | None:
     """The spendable cash OF THE BOOK THIS STRATEGY TRADES (issue #626).
 
@@ -881,6 +953,24 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         if shadow_max_cfg is None
         else clamp_shadow_max_trades(shadow_max_cfg)
     )
+    # residual-cash sizing (issue #643) — ``is None`` again, so a stored false
+    # beats a true env seed and vice versa
+    residual_cfg = cfg.get("residual_sizing_enabled")
+    residual_enabled = (
+        _residual_sizing_enabled_default() if residual_cfg is None else bool(residual_cfg)
+    )
+    residual_reserve_cfg = cfg.get("residual_reserve_pct")
+    residual_reserve_pct = (
+        _residual_reserve_pct_default()
+        if residual_reserve_cfg is None
+        else clamp_residual_reserve_pct(residual_reserve_cfg)
+    )
+    residual_min_lots_cfg = cfg.get("residual_min_lots")
+    residual_min_lots = (
+        _residual_min_lots_default()
+        if residual_min_lots_cfg is None
+        else clamp_residual_min_lots(residual_min_lots_cfg)
+    )
     no_entry_after = cfg.get("no_entry_after") or _no_entry_after_default()
     exit_time = cfg.get("exit_time") or _exit_time_default()
     if validate_window(no_entry_after, exit_time):
@@ -910,6 +1000,10 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "rolling_top_n": rolling_top_n,
         "shadow_excluded_side": shadow_enabled,
         "shadow_max_trades": shadow_max_trades,
+        # ---- residual-cash sizing (issue #643) -----------------------------
+        "residual_sizing_enabled": residual_enabled,
+        "residual_reserve_pct": residual_reserve_pct,
+        "residual_min_lots": residual_min_lots,
         # derived, so exactly ONE place decides which side is shadow-only and
         # every consumer (core, entry branch, day log, UI) reads that one answer
         "shadow_side": shadow_side_for(trade_side, shadow_enabled),
@@ -1709,6 +1803,14 @@ class Open15BreakoutService:
         self.day_log: list[dict[str, Any]] = []
         self._log_date: str | None = None
         self.day_config: dict[str, Any] = resolve_day_config(None, 0.0)
+        # ---- cash ledger (issue #643) --------------------------------------
+        # ``_cash_at_arm`` is the broker balance read once at 09:10; the per-
+        # symbol reservations are what entries have committed of it. Remaining
+        # cash = arm balance - sum(reservations), so sizing never has to make a
+        # broker call on the ZMQ tick thread.
+        self._cash_at_arm: float | None = None
+        self._cash_reserved: dict[str, float] = {}
+        self._cash_refetched = False
         # tick capture. Universe mode (#528, default): every universe symbol's
         # ticks stream to disk for the whole window. Targeted mode (legacy):
         # only the day's SELECTED symbols are persisted, plus their 09:15
@@ -1721,6 +1823,9 @@ class Open15BreakoutService:
         # or RMS block rejects EVERY entry the same way, and three identical
         # Telegram messages is how an alert channel gets muted.
         self._rejection_alert_date: str | None = None
+        # separate dedup for an entry that RAISED (issue #643) — a code fault
+        # must not be silenced by an earlier broker rejection
+        self._entry_error_alert_date: str | None = None
 
     def _log_event(self, event: str, **detail: Any) -> None:
         rec = {
@@ -1955,13 +2060,27 @@ class Open15BreakoutService:
         # Done here rather than in resolve_day_config because it needs a broker
         # read and that function is pure. Once per day, at arm.
         configured_max = self.day_config["max_trades"]
-        available_cash = read_available_cash() if _funds_clamp_enabled() else None
+        residual_sizing = bool(self.day_config.get("residual_sizing_enabled"))
+        # the ledger needs the balance too, so read it whenever EITHER feature is on
+        available_cash = (
+            read_available_cash() if (_funds_clamp_enabled() or residual_sizing) else None
+        )
         eff_max, clamp_note = clamp_slots_to_funds(
             self.day_config["margin_effective"], configured_max, available_cash
         )
         if clamp_note:
             logger.warning("open15: %s", clamp_note)
-            self.day_config["max_trades"] = eff_max
+            # With residual sizing ON the slot count is no longer the budget —
+            # the CASH is (issue #643). Dropping the whole third trade because it
+            # cannot afford a full slot is what left Rs39,730 idle on 2026-08-19.
+            # The note is still computed and logged: it is what the /logs capital
+            # card reports, and it is the rollback path when the feature is off.
+            if not residual_sizing:
+                self.day_config["max_trades"] = eff_max
+        # seed the cash ledger for the day (issue #643)
+        self._cash_at_arm = available_cash
+        self._cash_reserved = {}
+        self._cash_refetched = False
         # Gate 1 stage 1 (issue #583) — side-INDEPENDENT, so it can run before the
         # 09:16 ranking assigns one. Only drops symbols that fail on BOTH sides (or
         # have no NFO contracts at all); the per-side half is stage 2, inside the
@@ -2026,6 +2145,10 @@ class Open15BreakoutService:
             # signal or the balance was what limited it.
             max_trades_configured=configured_max,
             max_trades_effective=self.day_config["max_trades"],
+            # issue #643 — what the page's capital card renders for a past day
+            residual_sizing=residual_sizing,
+            residual_reserve_pct=self.day_config["residual_reserve_pct"],
+            residual_min_lots=self.day_config["residual_min_lots"],
             available_cash=available_cash,
             funds_clamp=clamp_note,
             tick_capture=bool(self._tick_writer),
@@ -2475,6 +2598,10 @@ class Open15BreakoutService:
             with self._lock:
                 if symbol in self.positions:
                     self.positions[symbol].update(status="paper", fill="paper", entry_verified=True)
+            # RMS refused it after the ACK — nothing was bought, so give the cash
+            # back to the ledger (issue #643). Without this a post-ACK rejection
+            # keeps shrinking every later entry for the rest of the morning.
+            self._release_cash(symbol)
             update_trade(
                 pos["row_id"],
                 status="rejected",
@@ -3050,7 +3177,16 @@ class Open15BreakoutService:
             # capture is instrumentation — it must never cost an entry (#528)
             logger.exception("open15: tick capture failed")
         if action:
-            self._enter(action)
+            try:
+                self._enter(action)
+            except Exception as exc:
+                # A trigger ALWAYS produces exactly one terminal event (#643).
+                # Before this, a raise anywhere in ``_enter`` unwound to the ZMQ
+                # loop's generic handler and the symbol simply vanished: no
+                # journal row, no event, and a /logs row still showing the
+                # 'no trigger' default it was given at selection — beside a
+                # green volume cell saying the gate had been cleared.
+                self._journal_entry_error(action, exc)
 
     def _zmq_loop(self) -> None:
         """Own SUB socket on the proxy bus; active only around the open."""
@@ -3181,6 +3317,69 @@ class Open15BreakoutService:
         shadow = sum(1 for p in vals if p.get("fill") == "shadow")
         return len(vals) - paper - sim - shadow, paper, sim, shadow
 
+    # ---- cash ledger (issue #643) ------------------------------------------ #
+    def _reserve_cash(self, symbol: str, amount: float) -> None:
+        """Commit ``amount`` of the day's cash to ``symbol``'s entry.
+
+        Called immediately before the order is placed, so a second trigger in
+        the same second cannot be sized against money the first one has already
+        spent. Entries are serialised on the ZMQ thread; the lock is for the
+        status reader.
+        """
+        with self._lock:
+            self._cash_reserved[symbol] = self._cash_reserved.get(symbol, 0.0) + max(amount, 0.0)
+
+    def _release_cash(self, symbol: str) -> float:
+        """Give ``symbol``'s reservation back — the entry never stood.
+
+        Three callers, and all three are load-bearing: a placement rejection
+        (#548), a post-ACK rejection found by ``verify_entries`` (#626), and an
+        ``entry_error`` (#643). Miss one and the ledger drifts down all morning
+        until the strategy quietly stops sizing anything.
+
+        Exits deliberately do NOT release: the entry window closes at 09:29 and
+        the flatten is 09:30, so nothing can be recycled inside a session.
+        """
+        with self._lock:
+            return self._cash_reserved.pop(symbol, 0.0)
+
+    def _cash_remaining(self) -> float | None:
+        """Spendable cash left today, or ``None`` when it is unknown (#643).
+
+        ``None`` is not zero — it means "do not clamp", and every caller treats
+        it as the full slot. Only meaningful with residual sizing on; with the
+        feature off this returns ``None`` so sizing is bit-for-bit what it was.
+
+        One mid-day broker re-read, at the only moment precision matters: the
+        first time the ledger says less than a full slot is left. Other
+        strategies share the account, so the 09:10 balance can be stale by then
+        — but re-reading on EVERY entry would put a synchronous broker call on
+        the tick thread, which is what #626 forbids. The lower of the two wins.
+        """
+        if not (self.day_config or {}).get("residual_sizing_enabled"):
+            return None
+        if self._cash_at_arm is None:
+            return None
+        with self._lock:
+            remaining = self._cash_at_arm - sum(self._cash_reserved.values())
+        slot = float((self.day_config or {}).get("margin_effective") or 0.0)
+        if remaining >= slot or self._cash_refetched:
+            return remaining
+        self._cash_refetched = True
+        fresh = read_available_cash()
+        if fresh is None:
+            logger.warning(
+                "open15: residual funds re-read failed — using the ledger (Rs%.0f)", remaining
+            )
+            return remaining
+        if fresh < remaining:
+            logger.warning(
+                "open15: broker says Rs%.0f left, ledger said Rs%.0f — using the broker's figure",
+                fresh,
+                remaining,
+            )
+        return min(remaining, fresh)
+
     def _alert_rejection(self, symbol: str, qty: int, msg: str) -> None:
         """Log loudly + Telegram once per day. Never raises into the entry path."""
         logger.error(
@@ -3219,6 +3418,9 @@ class Open15BreakoutService:
         """
         from database.open15_breakout_db import insert_trade
 
+        # the order never reached the market, so the cash it reserved is still
+        # ours to spend on a later trigger (issue #643)
+        self._release_cash(action["symbol"])
         _real, n_paper, _n_sim, _n_shadow = self._count_fills()
         max_trades = int((self.day_config or {}).get("max_trades") or _max_trades_default())
         priced = n_paper < max_trades
@@ -3304,15 +3506,26 @@ class Open15BreakoutService:
         )
         if not contract:
             return {}
-        premium, opt_volume, opt_oi = self._option_liquidity(contract["symbol"])
+        # a DICT since #555 — this line unpacked it as the old 3-tuple until
+        # #643, so every option-mode call raised ValueError. The raise unwound
+        # past ``_enter`` into the ZMQ loop's generic handler, which is why
+        # GVT&D produced no journal row and no event at all on 2026-08-19:
+        # the page showed a green (gate-cleared) volume beside "no trigger".
+        liq = self._option_liquidity(contract["symbol"])
+        premium = liq["ltp"]
         if not premium:
             return {}
         return {
             "opt_symbol": contract["symbol"],
             "opt_lot_size": int(contract["lotsize"]),
             "opt_entry_premium": premium,
-            "opt_entry_volume": opt_volume,
-            "opt_entry_oi": opt_oi,
+            "opt_entry_volume": liq["volume"],
+            "opt_entry_oi": liq["oi"],
+            # free — they rode in the quote response above (issue #555), and a
+            # sim row without them cannot be compared with a real one
+            "opt_entry_bid": liq["bid"],
+            "opt_entry_ask": liq["ask"],
+            "opt_tick_size": contract.get("ticksize"),
             # ONE lot: the minimum tradeable unit, which is what "would this have
             # paid?" means for a trade we could not afford. It also keeps rows
             # comparable across contracts whose lot sizes differ 30-fold
@@ -3602,9 +3815,24 @@ class Open15BreakoutService:
             self._enter_option(action, cfg)
             return
 
-        notional = cfg.get("notional") or _notional()
+        # Stock mode is leveraged intraday, so the CASH a slot consumes is
+        # ``notional / leverage`` = the slot itself. Sized through the same
+        # ``resolve_entry_budget`` as the option path (issue #643) so the two
+        # branches can never disagree about what "the residual" means.
+        leverage = float(cfg.get("leverage") or 1.0) or 1.0
+        slot_capital = float(cfg.get("margin_effective") or cfg.get("margin_per_slot") or 30_000)
+        budget, sizing_basis = resolve_entry_budget(
+            slot_capital,
+            self._cash_remaining(),
+            float(cfg.get("residual_reserve_pct") or 0.0),
+        )
+        notional = (
+            (cfg.get("notional") or _notional()) if sizing_basis == "slot" else budget * leverage
+        )
         qty = max(int(notional / action["price"]), 1)
         side_word = "BUY" if action["side"] == "L" else "SELL"
+        # commit the cash BEFORE placing (issue #643)
+        self._reserve_cash(action["symbol"], qty * action["price"] / leverage)
         resp = self.order_placer(
             _mode(), {"symbol": action["symbol"], "action": side_word, "quantity": qty}
         )
@@ -3623,6 +3851,7 @@ class Open15BreakoutService:
             "trigger_second": action["trigger_second"],
             "trigger_price": action["price"],
             "watch_source": action.get("watch_source") or "seed",
+            "sizing_basis": sizing_basis,
         }
         if not ok:
             self._journal_rejection(action, row_kw, qty, self._order_error(resp))
@@ -3659,9 +3888,88 @@ class Open15BreakoutService:
             cumvol=int(action["cum_vol_at_trigger"]),
             baseline=int(action["baseline_vol"]),
             vol_ratio=round(action["cum_vol_at_trigger"] / max(action["baseline_vol"], 1), 2),
+            sizing_basis=sizing_basis,
+            slot_capital_used=round(budget, 2),
             order_status=resp.get("status"),
             order_id=resp.get("orderid"),
         )
+
+    def _journal_entry_error(self, action: dict, exc: BaseException) -> None:
+        """Terminal row + event for a trigger whose entry RAISED (issue #643).
+
+        Not a rejection and not a skip: the broker never gave us an answer, so
+        the row is ``status='error'`` with no fill class — it must never join
+        any P&L bucket, real or simulated. Any cash the entry had already
+        committed is released, otherwise a crash halfway through sizing would
+        silently shrink every later entry.
+
+        Deliberately does not re-raise, and never itself raises into the tick
+        thread: one symbol's failure must not cost every other symbol its ticks.
+        """
+        symbol = action.get("symbol", "?")
+        self._release_cash(symbol)
+        msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("open15: entry FAILED for %s — %s", symbol, msg)
+        try:
+            from database.open15_breakout_db import insert_trade
+
+            insert_trade(
+                trade_date=self._trade_date(),
+                symbol=symbol,
+                side=action.get("side"),
+                mode=_mode(),
+                gap_pct=action.get("gap_pct"),
+                level=action.get("level"),
+                baseline_vol=action.get("baseline_vol"),
+                cum_vol_at_trigger=action.get("cum_vol_at_trigger"),
+                trigger_minute=action.get("trigger_minute"),
+                trigger_second=action.get("trigger_second"),
+                trigger_price=action.get("price"),
+                quantity=0,
+                watch_source=action.get("watch_source") or "seed",
+                status="error",
+                reason="entry_error",
+                error_message=msg[:255],
+            )
+        except Exception:
+            logger.exception("open15: entry-error journal write failed for %s", symbol)
+        try:
+            self._log_event(
+                "entry_error",
+                symbol=symbol,
+                watch_source=action.get("watch_source") or "seed",
+                trigger_price=round(float(action.get("price") or 0.0), 2),
+                at=f"{action.get('trigger_minute')}:{int(action.get('trigger_second') or 0):02d}",
+                error=msg,
+                # the slot was never consumed — nothing was ordered
+                slot_released=True,
+            )
+        except Exception:
+            logger.exception("open15: entry-error event log failed for %s", symbol)
+        self._alert_entry_error(symbol, msg)
+
+    def _alert_entry_error(self, symbol: str, msg: str) -> None:
+        """Telegram once per day. Never raises into the entry path."""
+        logger.error("[%s] open15 ENTRY ERROR %s — %s", _mode(), symbol, msg)
+        today = dt.datetime.now(IST).strftime("%Y-%m-%d")
+        # its OWN dedup key, not the rejection one: a broker rejection and a
+        # code fault are different failures and the operator must see both
+        if self._entry_error_alert_date == today:
+            return
+        self._entry_error_alert_date = today
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().notify(
+                "open15_breakout",
+                f"⚠ open15_vol_breakout [{_mode()}]: entry FAILED for {symbol}"
+                f"\n{msg}\n\n"
+                f"The trigger was legal and no order was placed — the entry code "
+                f"raised. The row is journaled status='error' and is excluded from "
+                f"every P&L bucket.",
+            )
+        except Exception:
+            logger.exception("open15: entry-error alert failed for %s", symbol)
 
     def _option_liquidity(self, opt_symbol: str) -> dict:
         """``{ltp, volume, oi, bid, ask}`` for an option contract (#488, #555).
@@ -3786,7 +4094,20 @@ class Open15BreakoutService:
             "opt_tick_size": contract.get("ticksize"),
         }
         slot_capital = float(cfg.get("margin_effective") or cfg.get("margin_per_slot") or 30_000)
-        lots = int(slot_capital // (premium * lot))
+        # what THIS entry may spend (issue #643): the full slot when the cash is
+        # there, otherwise whatever is genuinely left. ``basis`` is journaled so
+        # a smaller row is never mistaken for a full-size one.
+        budget, sizing_basis = resolve_entry_budget(
+            slot_capital,
+            self._cash_remaining(),
+            float(cfg.get("residual_reserve_pct") or 0.0),
+        )
+        lots = int(budget // (premium * lot))
+        min_lots = int(cfg.get("residual_min_lots") or 1)
+        if sizing_basis == "residual" and lots < min_lots:
+            # the residual bought something, but less than the operator judged
+            # worth trading — say WHICH constraint bound, never a bare "unaffordable"
+            lots = 0
         if lots < 1:
             # the contract and its premium are already in hand, so pricing this
             # at 1 lot (issue #555) costs one extra quote at exit and nothing
@@ -3796,13 +4117,14 @@ class Open15BreakoutService:
             simulate = _sim_skipped_enabled() and n_sim < _paper_sim_max()
             self._journal_skip(
                 action,
-                "unaffordable",
+                "unaffordable_residual" if sizing_basis == "residual" else "unaffordable",
                 instrument="option",
                 opt_symbol=contract["symbol"],
                 opt_lot_size=lot,
                 opt_entry_premium=premium,
                 opt_entry_volume=opt_volume,
                 opt_entry_oi=opt_oi,
+                sizing_basis=sizing_basis,
                 **liq_kw,
                 **({"sim_quantity": lot} if simulate else {}),
             )
@@ -3836,6 +4158,9 @@ class Open15BreakoutService:
                 **impact["columns"],
             )
             return
+        # commit the cash BEFORE placing (issue #643) — the next trigger in the
+        # same second must be sized against what is left, not what was left
+        self._reserve_cash(action["symbol"], premium * qty)
         resp = self.order_placer(
             _mode(),
             {"symbol": contract["symbol"], "action": "BUY", "quantity": qty, "exchange": "NFO"},
@@ -3860,6 +4185,7 @@ class Open15BreakoutService:
             "opt_entry_premium": premium,
             "opt_entry_volume": opt_volume,
             "opt_entry_oi": opt_oi,
+            "sizing_basis": sizing_basis,
             **liq_kw,
         }
         if not ok:
@@ -3909,6 +4235,10 @@ class Open15BreakoutService:
             qty=qty,
             trigger_price=round(action["price"], 2),
             at=f"{action['trigger_minute']}:{action['trigger_second']:02d}",
+            # issue #643 — a residual row is a DIFFERENT SIZE from a slot row,
+            # and the page badges it so the two are never read as comparable
+            sizing_basis=sizing_basis,
+            slot_capital_used=round(budget, 2),
             order_status=resp.get("status"),
             order_id=resp.get("orderid"),
         )
@@ -3942,6 +4272,17 @@ class Open15BreakoutService:
             "notional_per_trade": _notional(),
             "instrument": (self.day_config or {}).get("instrument") or _instrument_default(),
             "max_trades": (self.day_config or {}).get("max_trades") or _max_trades_default(),
+            # live cash ledger (issue #643) — what the /logs capital card reads
+            # DURING the window; a past day reads the same facts off the
+            # ``armed`` event plus its journal rows.
+            "cash_at_arm": self._cash_at_arm,
+            "cash_reserved": round(sum(self._cash_reserved.values()), 2),
+            "cash_remaining": (
+                None
+                if self._cash_at_arm is None
+                else round(self._cash_at_arm - sum(self._cash_reserved.values()), 2)
+            ),
+            "residual_sizing": bool((self.day_config or {}).get("residual_sizing_enabled")),
             "trade_side": (self.day_config or {}).get("trade_side") or _trade_side_default(),
             # shadow-logged excluded side (issue #581). ``shadow_side`` is the
             # letter that is watched but never traded — ``None`` whenever the

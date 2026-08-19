@@ -178,6 +178,14 @@ class Open15Trade(Base):
     # for the measurement — without it the two cohorts cannot be scored apart.
     # NULL on rows written before #529 shipped; read as ``seed``.
     watch_source = Column(String(8), nullable=True)
+    # What capital the size was derived from (issue #643):
+    #   ``slot``     — the full configured ``margin_per_slot``.
+    #   ``residual`` — the cash left after earlier fills, less than a slot.
+    # A residual row is REAL money and stays in real P&L, but it is a
+    # DIFFERENT SIZE from every other row, so research that compares
+    # per-trade outcomes across days has to be able to filter it out.
+    # NULL on every row written before #643 = ``slot``.
+    sizing_basis = Column(String(8), nullable=True)
     status = Column(String(16), default="open")  # open / closed / error / observe / rejected
     # Did an order actually fill (issue #548)? Four classes, and the difference
     # between them is the difference between money that moved and money that did
@@ -276,6 +284,13 @@ class Open15Config(Base):
     # ATM lot-cost coverage ladder target % (issue #591). NULL = env default (90);
     # clamped 50..100 by the service. Observational only — nothing gates on it.
     coverage_target_pct = Column(Integer, nullable=True)
+    # Residual-cash sizing (issue #643). NULL = env default (OFF). When on, an
+    # entry that cannot afford a full ``margin_per_slot`` is sized against the
+    # cash actually left in the account instead of being dropped — on
+    # 2026-08-19 Rs39,730 sat idle while the day's third signal was skipped.
+    residual_sizing_enabled = Column(Integer, nullable=True)  # 0/1
+    residual_reserve_pct = Column(Float, nullable=True)  # headroom for charges
+    residual_min_lots = Column(Integer, nullable=True)  # floor, 0 = no entry
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -330,6 +345,8 @@ def _ensure_columns():
             # (#602), which no test could catch because tests build their tables
             # from the ORM model and only a pre-existing install runs this ALTER.
             "opt_entry_premium_early": "FLOAT",
+            # issue #643 — NULL on every existing row, which reads as ``slot``
+            "sizing_basis": "VARCHAR(8)",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -357,6 +374,12 @@ def _ensure_columns():
             "shadow_max_trades": "INTEGER",
             # issue #591 — NULL resolves to the env default (90)
             "coverage_target_pct": "INTEGER",
+            # issue #643 — all three NULL on an existing install, which
+            # resolves to the env default (residual sizing OFF), so the next
+            # arm behaves exactly as it did before
+            "residual_sizing_enabled": "INTEGER",
+            "residual_reserve_pct": "FLOAT",
+            "residual_min_lots": "INTEGER",
         },
     }
     try:
@@ -433,6 +456,12 @@ def get_config() -> dict | None:
             "option_min_oi_lots": row.option_min_oi_lots,
             # issue #591 — None stays None so env supplies the default
             "coverage_target_pct": row.coverage_target_pct,
+            # issue #643 — None stays None so env supplies the default (OFF)
+            "residual_sizing_enabled": (
+                None if row.residual_sizing_enabled is None else bool(row.residual_sizing_enabled)
+            ),
+            "residual_reserve_pct": row.residual_reserve_pct,
+            "residual_min_lots": row.residual_min_lots,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -469,6 +498,9 @@ def save_config(
     option_impact_max_pct: float | None = None,
     option_min_oi_lots: int | None = None,
     coverage_target_pct: int | None = None,
+    residual_sizing_enabled: bool | None = None,
+    residual_reserve_pct: float | None = None,
+    residual_min_lots: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -514,6 +546,11 @@ def save_config(
         row.option_impact_max_pct = option_impact_max_pct
         row.option_min_oi_lots = option_min_oi_lots
         row.coverage_target_pct = coverage_target_pct
+        row.residual_sizing_enabled = (
+            None if residual_sizing_enabled is None else int(bool(residual_sizing_enabled))
+        )
+        row.residual_reserve_pct = residual_reserve_pct
+        row.residual_min_lots = residual_min_lots
         row.updated_by = updated_by
         db_session.commit()
         return True

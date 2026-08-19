@@ -2355,6 +2355,44 @@ ran in the 15:30-17:00 periodic window).
 - **History:**
   - **2026-08-18:** Introduced by issue #637.
 
+## `OPEN15_RESIDUAL_SIZING` / `OPEN15_RESIDUAL_RESERVE_PCT` / `OPEN15_RESIDUAL_MIN_LOTS` (issue #643)
+
+- **What:** first-boot seeds for three UI-editable fields on
+  `/open15_vol_breakout/logs` (`open15_config.residual_sizing_enabled` /
+  `residual_reserve_pct` / `residual_min_lots`). Defaults `false` / `3` / `1`;
+  the DB row wins once saved.
+  - `OPEN15_RESIDUAL_SIZING` — when on, an entry that cannot afford a full
+    `margin_per_slot` is sized against the cash actually left in the account
+    instead of being dropped, and `clamp_slots_to_funds` no longer shrinks
+    `max_trades` (it still computes its note for the /logs capital card).
+  - `OPEN15_RESIDUAL_RESERVE_PCT` — headroom held back from the residual only
+    (clamped 0–25). Charges are not part of the premium debit, and #626's lesson
+    is that the broker checks the CUMULATIVE requirement, so sizing to the last
+    rupee earns a rejection.
+  - `OPEN15_RESIDUAL_MIN_LOTS` — smallest residual entry worth taking (clamped
+    1–10). Below it the trigger journals `unaffordable_residual`, which names
+    the constraint that actually bound.
+- **Why:** on 2026-08-19 the funds clamp cut the day to 2 of 3 slots
+  (`floor(161365.10 / 60000)`), the two fills consumed Rs1,21,635, and the
+  remaining **Rs39,730 sat idle** while the day's third signal (GVT&D, 2.73x
+  volume against a 1.5x gate) was dropped for want of capital that was in the
+  account. Two lots of its contract cost Rs28,088.
+- **Notes:** **default OFF on purpose.** This deliberately breaks
+  `clamp_slots_to_funds`'s own rule that *"`max_trades` is what shrinks, never
+  `margin_per_slot`"*, which exists so every row is the same size and days stay
+  comparable. Comparability is preserved by LABELLING instead: the journal's new
+  `sizing_basis` column (`slot` / `residual`) and the `entry` event's
+  `sizing_basis` / `slot_capital_used`, so the residual cohort can be filtered
+  out of per-trade research. Residual rows are real money and stay in real P&L.
+  Sizing reads an in-process cash ledger seeded at arm, not a broker call per
+  entry (entries are placed on the ZMQ tick thread); there is exactly ONE
+  mid-day funds re-read, the first time the ledger says less than a slot is left.
+- **How to roll back:** untick "spend the residual cash" on the /logs config
+  form, or `OPEN15_RESIDUAL_SIZING=false` on a fresh install. Off is
+  bit-for-bit the pre-#643 behaviour (regression-tested).
+- **History:**
+  - **2026-08-19:** Introduced by issue #643.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

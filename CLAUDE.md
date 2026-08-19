@@ -1303,6 +1303,49 @@ repair and live behaviour cannot drift apart; it needs the broker orderbook to
 still carry the order, i.e. **the same trading day**. Flags
 `OPEN15_VERIFY_ENTRIES`, `OPEN15_CONFIRM_EXIT_POSITION`, `OPEN15_FUNDS_CLAMP`.
 
+**A trigger ALWAYS produces exactly one terminal event, and the residual cash is
+spendable (issue #643).** On 2026-08-19 GVT&D triggered a legal short (2.73x
+volume while beyond the level against a 1.5x gate) and **vanished** — no journal
+row, no event, no alert — while `/logs` rendered a GREEN (gate-cleared) volume
+cell beside the outcome text `no trigger`. Two independent defects:
+- **A raise inside `_enter` was invisible.** `_sim_context` still unpacked
+  `_option_liquidity` as the pre-#555 3-tuple, so the `max_trades_cap` branch
+  (which prices the miss at 1 lot) raised `ValueError`; the exception unwound
+  past `_enter` into the ZMQ loop's generic handler and the row kept the
+  `'no trigger'` default it was given at selection. Now every trigger ends in
+  one of `entry` / `entry_rejected` / `entry_skipped` / `entry_shadow` /
+  **`entry_error`** — the last journals `status='error'` with **no fill class**
+  (it must never join a P&L bucket), Telegram-alerts on its own dedup key, and
+  is rendered in red by BOTH row builders (the JS in `blueprints/` and its
+  Python twin `open15_log_view.selection_outcomes` — the /logs page has twice
+  gone dark on an event nobody taught it, #615/#622).
+- **The leftover capital was never spent.** #626's clamp cut the day to
+  `floor(161365.10 / 60000)` = 2 slots; the two fills used Rs1,21,635 and
+  **Rs39,730 sat idle**. With `residual_sizing_enabled` on (UI, default OFF) an
+  entry that cannot afford a full slot is sized against an in-process **cash
+  ledger** — seeded from the arm-time balance, debited per real fill, and
+  released on all three non-fill outcomes (placement rejection, post-ACK
+  demotion, `entry_error`); miss one release and every later entry silently
+  shrinks. Sizing never calls the broker per entry (entries run on the ZMQ tick
+  thread, the #626 rule); there is ONE mid-day re-read, the first time the
+  ledger drops below a slot. `clamp_slots_to_funds` then stops shrinking
+  `max_trades` and only reports.
+  ⚠ This deliberately breaks that function's own rule — *"`max_trades` is what
+  shrinks, never `margin_per_slot`"* — which existed so every row is the same
+  size. **Comparability is preserved by LABELLING, not by refusing**:
+  `open15_trades.sizing_basis ∈ {slot, residual}` plus `sizing_basis` /
+  `slot_capital_used` on the `entry` event, so per-trade research can exclude
+  the cohort. Residual rows are REAL money and stay in real P&L.
+  A residual below `residual_min_lots` journals `unaffordable_residual`, naming
+  the constraint that bound.
+The `/logs` page also grew a **capital card** (cash at arm / used / left,
+configured-vs-funded slots, the clamp note) — the `armed` event had carried
+`available_cash`, `max_trades_configured/effective` and `funds_clamp` since #626
+and the page rendered NONE of it, while its effective-config line read a
+`max_trades` key the event does not have and silently fell back to a hardcoded
+`3` on a day that ran with 2. Flags `OPEN15_RESIDUAL_SIZING`,
+`OPEN15_RESIDUAL_RESERVE_PCT`, `OPEN15_RESIDUAL_MIN_LOTS`.
+
 **Reported P&L is reconciled against the broker's own fills, and there are
 THREE buckets (issue #555).** Every price the strategy journals is a *decision*
 observation — `trigger_price` is the tick that fired the volume gate,

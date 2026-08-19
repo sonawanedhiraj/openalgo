@@ -81,6 +81,9 @@ def config():
         _liq_reentry_days_default,
         _liq_reentry_pctile_default,
         _min_oi_lots_default,
+        _residual_min_lots_default,
+        _residual_reserve_pct_default,
+        _residual_sizing_enabled_default,
         get_open15_service,
     )
     from services.open15_breakout_service import (
@@ -211,6 +214,28 @@ def config():
         coverage_target = (
             None if coverage_target in (None, "") else _clamp_coverage_target(coverage_target)
         )
+        # residual-cash sizing (issue #643) — clamp-don't-reject, same as every
+        # other numeric knob here. The checkbox always posts a bool, so an absent
+        # key means "leave it at the env default" rather than "off".
+        from services.open15_breakout_service import (
+            clamp_residual_min_lots as _clamp_residual_min_lots,
+        )
+        from services.open15_breakout_service import (
+            clamp_residual_reserve_pct as _clamp_residual_reserve_pct,
+        )
+
+        residual_enabled = body.get("residual_sizing_enabled")
+        residual_enabled = None if residual_enabled is None else bool(residual_enabled)
+        residual_reserve = body.get("residual_reserve_pct")
+        residual_reserve = (
+            None
+            if residual_reserve in (None, "")
+            else _clamp_residual_reserve_pct(residual_reserve)
+        )
+        residual_min_lots = body.get("residual_min_lots")
+        residual_min_lots = (
+            None if residual_min_lots in (None, "") else _clamp_residual_min_lots(residual_min_lots)
+        )
         if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
             # an inverted band would readmit a name the same day it was excluded,
             # which is the flapping the hysteresis exists to prevent
@@ -260,6 +285,9 @@ def config():
             option_impact_max_pct=impact_max,
             option_min_oi_lots=min_oi_lots,
             coverage_target_pct=coverage_target,
+            residual_sizing_enabled=residual_enabled,
+            residual_reserve_pct=residual_reserve,
+            residual_min_lots=residual_min_lots,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -307,6 +335,10 @@ def config():
                 "option_impact_max_pct": _impact_max_pct_default(),
                 "option_min_oi_lots": _min_oi_lots_default(),
                 "coverage_target_pct": _coverage_target_default(),
+                # issue #643 — residual-cash sizing seeds
+                "residual_sizing_enabled": _residual_sizing_enabled_default(),
+                "residual_reserve_pct": _residual_reserve_pct_default(),
+                "residual_min_lots": _residual_min_lots_default(),
             },
             "override": get_config(),
             "effective_today": (svc.day_config if svc else None),
@@ -467,6 +499,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  /* issue #581 — its OWN colour: a shadow row is not a sim row, and the page
     must never let the two read as one bucket */
  .b-shadow{background:#153037;color:#94e2d5}
+ .b-residual{background:#3a2a16;color:#fab387}
+ .b-err{background:#3a1b1b;color:#f38ba8}
  .ev-entry_shadow,.ev-exit_shadow{color:#94e2d5}
  /* issue #583 — amber like the other "held, not traded" events, and distinct
     from the red rejection colours: an exclusion is a decision, not a failure */
@@ -593,6 +627,20 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    capital/slot at which this share of priced names is affordable (1 ATM lot, worst of CE/PE).
    Observational: nothing gates on it. Clamped 50&ndash;100 server-side.</span>
  </div>
+ <div style="margin-top:6px">
+  <label><input id="c_residual" type="checkbox"> spend the residual cash</label>
+  <label class="muted" style="margin-left:14px">keep back
+   <input id="c_residualres" type="number" min="0" max="25" step="0.5" style="width:48px"> %</label>
+  <label class="muted" style="margin-left:10px">min
+   <input id="c_residualmin" type="number" min="1" max="10" step="1" style="width:40px"> lots</label>
+  <span class="leg">issue #643. OFF: the day's slot count is clamped to
+   <code>floor(cash / margin per slot)</code> and anything left over is never spent &mdash; on
+   2026-08-19 that idled &#8377;39,730 and dropped the day's third signal. ON: a trigger that
+   cannot afford a full slot is sized against the cash actually left, less the reserve
+   (charges are not in the premium debit, and the broker checks the CUMULATIVE requirement).
+   Such rows are REAL money and badged <span class="badge b-residual">residual</span> &mdash;
+   they are a different SIZE, so exclude them when comparing per-trade outcomes across days.</span>
+ </div>
  <button onclick="saveCfg()" style="margin-left:14px;background:#1e2630;color:#a6e3a1;border:1px solid #2a3138;padding:4px 12px;cursor:pointer">save</button>
  <span id="c_msg" class="muted" style="margin-left:10px"></span>
  <div id="c_rollsrc" class="muted" style="margin-top:6px"></div>
@@ -608,6 +656,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="rejbox"></div>
   <div id="lostbox"></div>
 <div class="chips" id="chips"></div>
+  <div id="capcard" class="atmcard" style="display:none"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
    <span class="muted">&mdash; click a row for fills, liquidity and the decision detail</span></div>
@@ -642,6 +691,17 @@ function syncShadowUi(){
       ?('watches the '+(document.getElementById('c_side').value==='long_only'?'SHORT':'LONG')+
         ' side and journals it — no orders, excluded from real P&L and from compound sizing')
       :'off — the excluded side is not watched at all');
+}
+function effMaxTrades(e){
+  // `effective_today` (the live day config) carries `max_trades`; a past day's
+  // `armed` event carries `max_trades_configured` / `max_trades_effective`
+  // instead. Reading only `max_trades` fell back to a hardcoded 3 and hid the
+  // #626 funds clamp entirely (issue #643) — on 2026-08-19 the page said
+  // "max trades 3" on a day that ran with 2.
+  const eff=e.max_trades??e.max_trades_effective;
+  const cfgd=e.max_trades_configured;
+  if(eff==null)return '—';
+  return (cfgd!=null&&cfgd!==eff)?(eff+' (of '+cfgd+' configured — funds)'):String(eff);
 }
 async function loadCfg(){
   const r=await fetch('/open15_vol_breakout/api/config'); const j=await r.json();
@@ -688,6 +748,13 @@ async function loadCfg(){
     o.option_min_oi_lots??d.option_min_oi_lots??500;
   document.getElementById('c_covtgt').value=
     o.coverage_target_pct??d.coverage_target_pct??90;
+  // residual-cash sizing (issue #643) — `??` so a stored false beats a true env
+  document.getElementById('c_residual').checked=
+    !!(o.residual_sizing_enabled??d.residual_sizing_enabled);
+  document.getElementById('c_residualres').value=
+    o.residual_reserve_pct??d.residual_reserve_pct??3;
+  document.getElementById('c_residualmin').value=
+    o.residual_min_lots??d.residual_min_lots??1;
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
   const src=k=>(o[k]==null?'env default':'db');
@@ -708,14 +775,17 @@ async function loadCfg(){
     document.getElementById('c_eff').textContent=
       'effective today: '+(e.instrument||'stock')+' | trade side '+sdLbl+shLbl+
       (sd!=='both'?' ⚠ one-sided (parity targets measured both sides)':'')+
-      ' | max trades '+(e.max_trades||3)+
+      ' | max trades '+effMaxTrades(e)+
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
       ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult+
       ' | entries 09:16–'+nea+' | exit '+ext+
       ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'')+
       ' | rolling watch-list '+(e.rolling_watchlist_enabled
-        ?('every '+e.rolling_cadence_s+'s, top '+e.rolling_top_n+'/side'):'disabled');
+        ?('every '+e.rolling_cadence_s+'s, top '+e.rolling_top_n+'/side'):'disabled')+
+      ' | residual cash '+((e.residual_sizing_enabled??e.residual_sizing)
+        ?('spent (keep '+(e.residual_reserve_pct??3)+'%, min '+
+          (e.residual_min_lots??1)+' lot)'):'not spent');
   }
 }
 async function saveCfg(){
@@ -742,7 +812,10 @@ async function saveCfg(){
     option_impact_gate_enabled:document.getElementById('c_impactgate').checked,
     option_impact_max_pct:+document.getElementById('c_impactmax').value,
     option_min_oi_lots:+document.getElementById('c_minoi').value,
-    coverage_target_pct:+document.getElementById('c_covtgt').value};
+    coverage_target_pct:+document.getElementById('c_covtgt').value,
+    residual_sizing_enabled:document.getElementById('c_residual').checked,
+    residual_reserve_pct:+document.getElementById('c_residualres').value,
+    residual_min_lots:+document.getElementById('c_residualmin').value};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -850,7 +923,7 @@ async function selectDay(date){
   curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
-  renderRejected(); renderLogLostBanner(); renderChips(); renderAtmLadder();
+  renderRejected(); renderLogLostBanner(); renderChips(); renderCapital(); renderAtmLadder();
   renderRolling(); renderSel(); renderTimeline();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
@@ -918,6 +991,11 @@ function renderChips(){
   // could not afford it" and "we do not trade that side" are different facts.
   const sim=dig.sim??summ.sim??0;
   const shadow=dig.shadow??summ.shadow??0;
+  // issue #643 — triggers whose ENTRY RAISED. Not a fill, not a rejection and
+  // not a skip: no order was placed and no P&L bucket may claim them. Counted
+  // on the entries chip because a lost trigger is a fact about the day, and
+  // before #643 its only trace was a line in errors.jsonl.
+  const errors=dig.errors??curEvents.filter(e=>e.event==='entry_error').length;
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['instrument',armed.instrument||(summ.instrument||'—')],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
@@ -926,6 +1004,7 @@ function renderChips(){
     ['entries',filled+' filled'+(paper?(' \\u00B7 '+paper+' paper'):'')+
       (sim?(' \\u00B7 '+sim+' sim'):'')+
       (shadow?(' \\u00B7 '+shadow+' shadow'):'')+
+      (errors?(' \\u00B7 '+errors+' error'+(errors===1?'':'s')):'')+
       ' / '+(logLost?(curJournal||[]).length:(dig.selected??summ.selected??0))+' sel'],
     ['real P&amp;L <span class="net">net</span>',dig.pnl==null?'—':rupee(dig.pnl)]];
   if(paper||dig.paper_pnl!=null)
@@ -965,6 +1044,51 @@ function atmWatchedSet(){
     if(e.event==='watchlist_add'&&e.symbol)w.add(e.symbol);
   }
   return w;
+}
+function renderCapital(){
+  // issue #643 — the `armed` event has carried `available_cash`,
+  // `max_trades_configured/effective` and the #626 funds-clamp note since
+  // 2026-08-18 and the page rendered NONE of it. On 2026-08-19 an operator
+  // could not tell from this page that the day ran with 2 of 3 slots, why, or
+  // that Rs39,730 went unspent — the question had to be asked of the DB.
+  const box=document.getElementById('capcard');
+  const armed=curEvents.find(e=>e.event==='armed');
+  if(!armed||armed.available_cash==null){box.innerHTML='';box.style.display='none';return;}
+  box.style.display='';
+  const R=v=>'\\u20B9'+Math.round(v).toLocaleString('en-IN');
+  // what the fills actually consumed, from the JOURNAL (issue #557 — the
+  // journal is corrected by the reconcile passes, the events are not)
+  let used=0, n=0;
+  for(const j of (curJournal||[])){
+    if(j.fill&&j.fill!=='real')continue;           // only real money is spent
+    const px=j.entry_fill_price??j.opt_entry_premium??j.trigger_price;
+    if(px==null||!j.quantity)continue;
+    used+=px*j.quantity; n++;
+  }
+  const left=armed.available_cash-used;
+  const slot=armed.margin_effective??armed.margin_per_slot;
+  const cfgd=armed.max_trades_configured, eff=armed.max_trades_effective;
+  const residual=!!armed.residual_sizing;
+  // "idle" is the honest word only when the residual is NOT being spent: with
+  // the feature on, what is left is what no signal came along to use.
+  const leftLbl=residual?'left':'left (idle)';
+  const slots=(cfgd!=null&&eff!=null&&cfgd!==eff)
+    ?(residual
+      ?(cfgd+' configured &middot; '+eff+' fully funded, the rest sized from cash')
+      :('<span class="neg">'+eff+' of '+cfgd+' funded</span> at '+R(slot)+' each'))
+    :((eff??cfgd??'—')+' at '+R(slot)+' each');
+  box.innerHTML='<span class="atitle">CAPITAL</span>'+
+    '<span class="asub">'+R(armed.available_cash)+' at arm · '+
+    R(used)+' used ('+n+' fill'+(n===1?'':'s')+') · '+
+    '<span class="'+(left>=slot?'pos':'muted')+'">'+R(left)+' '+leftLbl+'</span>'+
+    ' · slots: '+slots+'</span>'+
+    (armed.funds_clamp?('<div class="leg">'+esc(armed.funds_clamp)+
+      (residual?' &mdash; slot count NOT clamped: residual sizing is on, so the cash is the budget'
+              :' &mdash; the third slot was dropped rather than part-sized')+'</div>'):'')+
+    (residual?('<div class="leg">residual sizing ON &mdash; keeping back '+
+      (armed.residual_reserve_pct??3)+'% for charges, minimum '+
+      (armed.residual_min_lots??1)+' lot. Rows sized this way are badged '+
+      '<span class="badge b-residual">residual</span>.</div>'):'');
 }
 function renderAtmLadder(){
   const ev=curEvents.find(e=>e.event==='atm_lot_cost');
@@ -1128,6 +1252,9 @@ function renderSel(){
       r.fill='real'; r.qty=e.qty; r.stockEntry=e.trigger_price;
       r.level=e.level??r.level; r.at=e.at; r.volRatio=e.vol_ratio;
       r.orderId=e.order_id;
+      // issue #643 — slot vs residual sizing. Absent on pre-#643 events, which
+      // is exactly the full slot they were.
+      r.sizingBasis=e.sizing_basis; r.slotUsed=e.slot_capital_used;
       // in option mode the money is on the premium while `trigger_price` is the
       // stock — record BOTH legs (issue #555), never one standing in for the other
       if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.premium;
@@ -1146,6 +1273,16 @@ function renderSel(){
       r.out='<span class="badge b-paper">paper</span> '+
         '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
         esc(e.entry_price)+'</span>';
+    }else if(e.event==='entry_error'){
+      // issue #643 — the trigger was legal and the entry code RAISED. Before
+      // this event existed the exception unwound into the ZMQ loop and the row
+      // kept its 'no trigger' default, which is what the page showed for GVT&D
+      // on 2026-08-19 beside a GREEN (gate-cleared) volume cell.
+      const r=rows[e.symbol];
+      r.entryError=true; r.stockEntry=r.stockEntry??e.trigger_price;
+      r.out='<span class="badge b-err">error</span> '+
+        '<span class="neg" title="'+esc(e.error||'')+'">entry failed '+esc(e.at||'')+
+        ' &middot; no order placed</span>';
     }else if(e.event==='entry_shadow'){
       // issue #581 — this side is switched off by trade_side. The trigger was
       // real and legal; no order was placed for it, so it is badged and its
@@ -1535,7 +1672,14 @@ function qtyCell(r){
     return '<span class="muted">0</span><span class="leg">'+esc(r.fill)+' '+
       esc(r.qty??'')+(leg?(' &middot; '+leg):'')+'</span>';
   if(r.qty==null)return dash;
-  return esc(r.qty)+(leg?('<span class="leg">'+leg+'</span>'):'');
+  // issue #643 — a residual row is real money at a SMALLER size than every
+  // other row. Badge it here, on the quantity, which is the number that differs.
+  const res=(r.sizingBasis==='residual')
+    ?'<span class="badge b-residual" title="sized from the cash left after '+
+      'earlier fills'+(r.slotUsed?(' \\u2014 \\u20B9'+Math.round(r.slotUsed).toLocaleString('en-IN')):'')+
+      ', not the full slot">residual</span>':'';
+  return esc(r.qty)+(leg?('<span class="leg">'+leg+'</span>'):'')+
+    (res?('<span class="leg">'+res+'</span>'):'');
 }
 function pnlCell(r){
   if(r.net==null)return dash;
@@ -1629,6 +1773,9 @@ def serialize_trade(r) -> dict:
         # seed (09:16 gap ranking) vs rolling (intraday re-rank),
         # issue #529. Pre-#529 rows are NULL — they are all seeds.
         "watch_source": r.watch_source or "seed",
+        # slot vs residual sizing (issue #643) — NULL on every pre-#643 row,
+        # which is exactly what "the full configured slot" was then
+        "sizing_basis": r.sizing_basis or "slot",
         "gap_pct": r.gap_pct,
         "level": r.level,
         "baseline_vol": r.baseline_vol,

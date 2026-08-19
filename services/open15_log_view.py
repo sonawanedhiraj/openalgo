@@ -44,6 +44,10 @@ CSV_COLUMNS = [
     "entry_fill_price",
     "exit_fill_price",
     "pnl_source",
+    # issue #643. ``slot`` = the full configured slot; ``residual`` = the cash
+    # left after earlier fills, so the row is a different SIZE and per-trade
+    # comparisons across days have to be able to exclude it.
+    "sizing_basis",
 ]
 
 
@@ -84,6 +88,7 @@ def summarize_day(
     paper_syms: set[str] = set()
     sim_syms: set[str] = set()
     shadow_syms: set[str] = set()
+    error_syms: set[str] = set()  # entries that RAISED (issue #643)
     rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
     # option-liquidity exclusions (#583): stage 1 = both sides dead, at arm;
     # stage 2 = the assigned side is dead, at seed selection or a rolling add
@@ -123,6 +128,12 @@ def summarize_day(
             sim_syms.add(ev.get("symbol", ""))
         elif kind == "entry_shadow":
             shadow_syms.add(ev.get("symbol", ""))
+        elif kind == "entry_error":
+            # issue #643 — the entry code RAISED. Not a fill, not a rejection and
+            # not a skip: no order was placed and no P&L bucket may claim it. It
+            # is counted so a day that silently lost a trigger says so on the
+            # history sidebar instead of looking like a quiet day.
+            error_syms.add(ev.get("symbol", ""))
         elif kind == "exit" and ev.get("pnl") is not None:
             pnl_from_events += float(ev["pnl"])
             saw_exit_pnl = True
@@ -146,7 +157,7 @@ def summarize_day(
     # detectable the two sets were disjoint, so a plain count was right; now it
     # double-counts, showing the same symbol as entered AND paper. An entry that
     # was ultimately refused did not stand.
-    entered = len(entry_syms - paper_syms)
+    entered = len(entry_syms - paper_syms - error_syms)
     pnl = trades_pnl if trades_pnl is not None else (pnl_from_events if saw_exit_pnl else None)
     ppnl = paper_pnl if paper_pnl is not None else (paper_from_events if saw_paper_pnl else None)
     spnl = sim_pnl if sim_pnl is not None else (sim_from_events if saw_sim_pnl else None)
@@ -165,6 +176,7 @@ def summarize_day(
         "paper": len(paper_syms),
         "sim": len(sim_syms),
         "shadow": len(shadow_syms),
+        "errors": len(error_syms),
         "pnl": round(pnl, 2) if pnl is not None else None,
         "paper_pnl": round(ppnl, 2) if ppnl is not None else None,
         "sim_pnl": round(spnl, 2) if spnl is not None else None,
@@ -194,6 +206,9 @@ _JOURNAL_OWNED = {
     "error_message": "error_message",
     "skip_reason": "reason",
     "level": "level",
+    # issue #643 — the journal is written at placement and never revised, but it
+    # is still the authority, and the overlay keeps the page and the CSV agreeing
+    "sizing_basis": "sizing_basis",
 }
 
 
@@ -299,6 +314,9 @@ def selection_outcomes(
                 instrument=ev.get("instrument") or "stock",
                 opt_symbol=ev.get("contract"),
                 opt_entry_premium=ev.get("premium"),
+                # issue #643 — slot vs residual sizing. Pre-#643 events carry
+                # neither, which reads as the full slot they in fact were.
+                sizing_basis=ev.get("sizing_basis"),
             )
         elif kind == "watch_stats":
             # every selected symbol, entered ones included (issue #524). Only
@@ -339,6 +357,20 @@ def selection_outcomes(
                 error_message=ev.get("error"),
                 instrument=ev.get("instrument") or "stock",
                 opt_symbol=ev.get("contract"),
+            )
+        elif kind == "entry_error":
+            # issue #643 — the trigger was legal and the entry code raised. The
+            # row exists so the CSV and the page state what happened; ``entered``
+            # stays False and no fill class is set, so it can never be counted as
+            # a trade or priced into any P&L bucket.
+            sym = ev.get("symbol")
+            if sym not in rows:
+                continue
+            rows[sym].update(
+                entered=False,
+                trigger_price=ev.get("trigger_price"),
+                skip_reason="entry_error",
+                error_message=ev.get("error"),
             )
         elif kind == "entry_shadow":
             # the switched-off side (issue #581): a full measurement row, but no
