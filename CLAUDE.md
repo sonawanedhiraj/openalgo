@@ -1346,6 +1346,26 @@ and the page rendered NONE of it, while its effective-config line read a
 `3` on a day that ran with 2. Flags `OPEN15_RESIDUAL_SIZING`,
 `OPEN15_RESIDUAL_RESERVE_PCT`, `OPEN15_RESIDUAL_MIN_LOTS`.
 
+**"Effective today" describes the ARM, not the process (issue #645).**
+`/api/config` served `svc.day_config`, which `arm()` sets at 09:10 and which
+reverts to the constructor's env-only defaults on any restart — so after the
+2026-08-19 11:33 restart the line read `stock | max trades 3 | margin 30000 |
+rolling watch-list disabled` for a session that ran `atm_option` / 2 funded
+slots / Rs60,000 / rolling on. Harmless-looking staleness until #643's capital
+card landed two rows below stating the truth, at which point one page asserted
+two different days (`stock` printed directly above a chip reading
+`atm_option`). `_effective_today()` now resolves three cases and the page
+LABELS which one it got: `armed` (this process armed today), `armed_log`
+(reshaped from the persisted `armed` event — *"from the 09:10 arm — restarted
+since"*), `not_armed` (*"not armed today — the next 09:10 arm will use:"*,
+never presented as the day's settings). The reshape
+(`open15_log_view.effective_from_armed`) is pure and handles the event's own
+vocabulary: the cap is split `max_trades_configured`/`_effective`, residual
+sizing is `residual_sizing`, and **`leverage` was never recorded** — it is
+derived from `notional / margin_effective`, because `'x '+undefined` is a
+silent string, not an error. An unreadable day log degrades to `not_armed`
+rather than 500ing the endpoint the config form depends on.
+
 **Reported P&L is reconciled against the broker's own fills, and there are
 THREE buckets (issue #555).** Every price the strategy journals is a *decision*
 observation — `trigger_price` is the tick that fired the volume gate,

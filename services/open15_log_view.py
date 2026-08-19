@@ -51,6 +51,71 @@ CSV_COLUMNS = [
 ]
 
 
+# The `armed` event's own vocabulary differs from ``day_config``'s in three
+# places, and each one is a rename the page would otherwise render as
+# "undefined": the cap is split into configured/effective, residual sizing is
+# recorded as ``residual_sizing``, and ``leverage`` is not recorded at all.
+_ARMED_PASSTHROUGH = (
+    "instrument",
+    "trade_side",
+    "sizing_mode",
+    "vol_mult",
+    "margin_per_slot",
+    "margin_effective",
+    "notional",
+    "cum_realized_pnl",
+    "no_entry_after",
+    "exit_time",
+    "rolling_watchlist_enabled",
+    "rolling_cadence_s",
+    "rolling_top_n",
+    "shadow_excluded_side",
+    "shadow_side",
+    "shadow_max_trades",
+    "residual_reserve_pct",
+    "residual_min_lots",
+    "max_trades_configured",
+    "max_trades_effective",
+    "available_cash",
+    "funds_clamp",
+)
+
+
+def effective_from_armed(event: dict[str, Any] | None) -> dict | None:
+    """Today's ARMED config in ``day_config``'s shape (issue #645).
+
+    ``/api/config`` serves ``svc.day_config`` as "effective today", but that
+    attribute is set by ``arm()`` at 09:10 and reverts to the constructor's
+    env-only defaults on any restart. On 2026-08-19 the app was restarted at
+    11:33 and the line then read ``stock | max trades 3 | margin 30000 |
+    rolling watch-list disabled`` for a session that had actually run
+    ``atm_option`` / 2 funded slots / Rs60,000 / rolling enabled — directly
+    above a capital card stating the truth.
+
+    The ``armed`` event is the durable record of that snapshot, so this
+    reshapes it back. Returns ``None`` for anything that is not an ``armed``
+    event, so the caller falls through rather than inventing a day.
+
+    ``leverage`` is derived because the event never carried it; a zero or
+    missing margin yields ``None`` rather than a division error, and the page
+    prints the notional alone.
+    """
+    if not event or event.get("event") != "armed":
+        return None
+    out: dict[str, Any] = {k: event[k] for k in _ARMED_PASSTHROUGH if k in event}
+    # the page reads `max_trades`; the event splits it in two (issue #626)
+    if "max_trades_effective" in event:
+        out["max_trades"] = event["max_trades_effective"]
+    # `residual_sizing` in the event, `residual_sizing_enabled` in day_config
+    if "residual_sizing" in event:
+        out["residual_sizing_enabled"] = event["residual_sizing"]
+    margin = event.get("margin_effective")
+    notional = event.get("notional")
+    if margin and notional:
+        out["leverage"] = round(notional / margin, 4)
+    return out
+
+
 def summarize_day(
     date: str,
     events: list[dict[str, Any]],
