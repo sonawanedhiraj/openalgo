@@ -1,5 +1,6 @@
 import { BookOpen, ExternalLink, Info, Loader2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { ZerodhaAutoLogin } from '@/components/broker/ZerodhaAutoLogin'
 import { ZerodhaTotpHelper } from '@/components/broker/ZerodhaTotpHelper'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -284,11 +285,14 @@ export default function BrokerSelect() {
                 )}
 
                 {selectedBroker === 'zerodha' && (
-                  <ZerodhaTotpHelper
-                    onCodeChange={(code) => {
-                      totpCodeRef.current = code
-                    }}
-                  />
+                  <>
+                    <ZerodhaTotpHelper
+                      onCodeChange={(code) => {
+                        totpCodeRef.current = code
+                      }}
+                    />
+                    <ZerodhaAutoLogin />
+                  </>
                 )}
 
                 <Button type="submit" className="w-full" disabled={!selectedBroker || isSubmitting}>
