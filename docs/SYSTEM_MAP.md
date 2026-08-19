@@ -340,8 +340,9 @@ process and need no external scheduler.
 > refused order was carried as a live position and published as a +Rs7,680 gain.
 > It runs on the scheduler rather than at entry because entries are placed from
 > the ZMQ tick callback, where a synchronous broker call stalls every symbol.
-> Flags `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` /
-> `OPEN15_FUNDS_CLAMP` (all default `true`). Exit defaults to 09:30 (so
+> **Not flag-gated** — `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` /
+> `OPEN15_FUNDS_CLAMP` were retired by issue #651 and the behaviour is
+> unconditional. Exit defaults to 09:30 (so
 > retry 09:32 / summary 09:35) but is **UI-configurable** together with the
 > entry cutoff (issue #451: `open15_config.no_entry_after`/`exit_time`, env
 > defaults `OPEN15_NO_ENTRY_AFTER` 09:29 / `OPEN15_EXIT_TIME` 09:30, exit
