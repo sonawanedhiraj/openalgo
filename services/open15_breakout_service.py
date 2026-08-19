@@ -1859,6 +1859,58 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: liquidity exclusion logging failed")
 
+    def _apply_fno_filter(self, prev: dict) -> None:
+        """Drop watched symbols that have no NFO option contracts (issue #647).
+
+        Option mode only — in stock mode there is nothing to require, and
+        shrinking the universe there would silently change what the strategy
+        watches.
+
+        Mutates ``self.universe`` in place, which is what makes the exclusion
+        total: ``_handle_raw`` discards any tick whose symbol is not in the
+        universe, so a dropped name never reaches ``core.last_price`` and the
+        rolling re-rank can never see it either. One check here covers seed AND
+        rolling, which is why no per-stage check is needed anywhere else.
+
+        ``prev`` is pruned alongside so the ``armed`` event's ``universe`` and
+        ``prev_closes`` counts describe the same set of symbols.
+
+        Fail-open is delegated to ``filter_to_fno``: on any degraded read the
+        universe is returned untouched and nothing is dropped.
+        """
+        if self.day_config.get("instrument") != "atm_option":
+            return
+        try:
+            from services.fno_universe import filter_to_fno
+
+            kept, dropped, degraded = filter_to_fno(self.universe)
+        except Exception:
+            logger.exception("open15: F&O universe filter raised — universe untouched")
+            return
+        if degraded or not dropped:
+            return
+        self.universe = kept
+        for sym in dropped:
+            prev.pop(sym, None)
+        # NOT an illiquidity verdict: SCANNER_SYMBOLS has drifted from the master
+        # contract. Enforced regardless, and the operator is told so they can
+        # prune the list (or let #648 do it for every consumer).
+        logger.error(
+            "open15: %d watched symbols have NO NFO option contracts and were "
+            "DROPPED from today's universe — SCANNER_SYMBOLS is stale: %s",
+            len(dropped),
+            ", ".join(dropped),
+        )
+        self._log_event(
+            "universe_excluded",
+            stage=0,
+            reason="not_in_fno",
+            n_excluded=len(dropped),
+            n_watched=len(kept),
+            enforced=True,
+            symbols=[{"symbol": s, "reason": "not_in_fno", "side": "both"} for s in dropped],
+        )
+
     def _apply_liquidity_stage1(self, today: dt.date):
         """Gate 1 stage 1 — drop symbols that fail on BOTH option sides.
 
@@ -2081,6 +2133,15 @@ class Open15BreakoutService:
         self._cash_at_arm = available_cash
         self._cash_reserved = {}
         self._cash_refetched = False
+        # NOT IN F&O -> NOT WATCHED (issue #647). A fact from today's master
+        # contract, applied unconditionally in option mode: a symbol with no NFO
+        # contracts cannot fill under any variant, so watching it produces no
+        # data — only a wasted watch slot and a trigger that dies at
+        # `no_option_contract` (SAMMAANCAP, 2026-08-19 09:17:38). This ran ahead
+        # of the liquidity gate on purpose: existence is not a liquidity verdict
+        # and must not inherit that gate's off switch, which is exactly how the
+        # verdict came to be recorded as `enforced: false` and ignored.
+        self._apply_fno_filter(prev)
         # Gate 1 stage 1 (issue #583) — side-INDEPENDENT, so it can run before the
         # 09:16 ranking assigns one. Only drops symbols that fail on BOTH sides (or
         # have no NFO contracts at all); the per-side half is stage 2, inside the
