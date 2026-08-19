@@ -155,14 +155,23 @@ def test_check_and_alert_respects_the_master_flag(monkeypatch):
 
 
 def test_alert_failure_does_not_propagate(monkeypatch):
-    """A broken notifier must not take down the watchdog loop hosting this."""
+    """A broken notifier must not take down the watchdog loop hosting this.
+
+    Asserts membership rather than an exact count: ``_beats`` is process-global,
+    so when a real registry-beating daemon (e.g. TickLivenessWatchdog) is alive
+    elsewhere in the same test process — which happens under the parallelized CI
+    run — it can add a second degraded row between the reset fixture and this
+    call. The invariants that matter are that the broken notifier is swallowed
+    (a list is returned, not an exception) and the thread we beat is reported.
+    """
     monkeypatch.setattr(tr, "_live_thread_names", lambda: set())
     monkeypatch.setattr(
         "services.notification_service.get_notification_service",
         lambda: (_ for _ in ()).throw(RuntimeError("telegram down")),
     )
     tr.beat("TickLivenessWatchdog")
-    assert len(tr.check_and_alert(now=0.0)) == 1
+    fired = tr.check_and_alert(now=0.0)
+    assert "TickLivenessWatchdog" in {row["thread_name"] for row in fired}
 
 
 # ---------------------------------------------------------------------------
