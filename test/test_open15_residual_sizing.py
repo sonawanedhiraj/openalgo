@@ -283,6 +283,53 @@ def test_the_js_and_python_row_builders_agree_on_an_entry_error():
     assert "entry failed" in js["AAA"]["out"]
 
 
+def test_the_chips_row_runs_without_a_reference_error():
+    """A variable used but never declared is INVISIBLE to ``node --check``.
+
+    Caught in review: the ``errors`` count reached the chips string while its
+    ``const`` did not land in the file. The page PARSED, and ``renderChips``
+    threw ``ReferenceError: errors is not defined`` at runtime — which on this
+    page means the whole day goes blank, the #615/#622 failure mode one more
+    time. Parsing is not running, so this EXECUTES the real extracted function.
+    """
+    import json
+    import shutil
+    import subprocess
+
+    from blueprints.open15_breakout import _LOGS_PAGE
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not available")
+    body = _LOGS_PAGE.split("function renderChips(){")[1].split("\nfunction srcBadge(")[0]
+    # the split lands after renderChips' own closing brace — drop it, the
+    # wrapper below supplies one
+    body = body.rstrip().removesuffix("}")
+    events = [
+        {"event": "armed", "universe": 4, "mode": "live", "vol_mult": 1.5},
+        {"event": "selection", "selected": {"AAA": "L"}, "gaps_pct": {}},
+        {"event": "entry_error", "symbol": "AAA", "error": "boom"},
+        {"event": "summary", "day": "done", "selected": 1},
+    ]
+    script = (
+        "const esc=s=>String(s);\n"
+        "const out={};\n"
+        "const document={getElementById:()=>({set innerHTML(v){out.html=v;}})};\n"
+        f"const curEvents={json.dumps(events)};\n"
+        "const curJournal=[];\n"
+        "const curDate='2026-08-19';\n"
+        "const digests=[{date:'2026-08-19',status:'done',selected:1,entered:0,"
+        "paper:0,sim:0,shadow:0,errors:1,pnl:null}];\n"
+        f"function renderChips(){{{body}}}\n"
+        "renderChips();console.log(JSON.stringify(out));"
+    )
+    out = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert out.returncode == 0, out.stderr
+    assert "1 error" in json.loads(out.stdout)["html"]
+
+
 # --------------------------------------------------------------------------- #
 # 3. resolve_entry_budget — the pure sizing decision
 # --------------------------------------------------------------------------- #

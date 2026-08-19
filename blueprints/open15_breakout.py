@@ -991,6 +991,11 @@ function renderChips(){
   // could not afford it" and "we do not trade that side" are different facts.
   const sim=dig.sim??summ.sim??0;
   const shadow=dig.shadow??summ.shadow??0;
+  // issue #643 — triggers whose ENTRY RAISED. Not a fill, not a rejection and
+  // not a skip: no order was placed and no P&L bucket may claim them. Counted
+  // on the entries chip because a lost trigger is a fact about the day, and
+  // before #643 its only trace was a line in errors.jsonl.
+  const errors=dig.errors??curEvents.filter(e=>e.event==='entry_error').length;
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['instrument',armed.instrument||(summ.instrument||'—')],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
