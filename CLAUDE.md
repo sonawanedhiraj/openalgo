@@ -277,7 +277,12 @@ All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-alig
 - **SEBI static IP mandate** (effective April 1, 2026): All transactional API orders require broker-side static IP whitelisting. Delta Exchange (crypto) also enforces this. Stolen broker credentials CANNOT be used from an attacker's machine — the broker rejects requests from non-registered IPs. However, attacks routed THROUGH the OpenAlgo server (which has the registered IP) are still viable.
 - External platforms (TradingView, GoCharting, Chartink) send API keys in JSON body or URL query params — they cannot set custom HTTP headers. This is an accepted architectural trade-off.
 - The MCP server (`mcp/mcpserver.py`) is local-only, communicates via stdio with Claude Desktop/Cursor/Windsurf. It is NOT remotely exposed.
-- Indian broker tokens expire daily at ~3:00 AM IST. Session management is aligned to this schedule.
+- Indian broker (Zerodha/Kite) tokens are flushed at the **daily reset ~06:30–07:30 AM IST** (NOT 3 AM — a
+  common misstatement in older notes), and can additionally be invalidated **mid-session at any time**
+  because Kite enforces one active session per user (a separate Kite web/app login, or a `logout`, kills the
+  API token). Session management aligns to the reset; the opt-in headless auto-login watcher (issue #654,
+  `services/broker_auto_login_watcher.py`, `BROKER_AUTO_LOGIN_ENABLED`) treats expiry as an event to detect
+  (re-login on a confirmed dead session) rather than a fixed time, covering both paths.
 
 ## Development Environment Setup
 
