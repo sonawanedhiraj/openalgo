@@ -132,6 +132,12 @@ def transform_order_data(orders):
             # populated on an order that never reached the market.
             "filled_quantity": order.get("filled_quantity", 0),
             "status_message": order.get("status_message") or "",
+            # Kite's own volume-weighted fill price across every partial
+            # execution (issue #641). Dropping it forced orderstatus_service to
+            # re-derive the fill from the tradebook, where its first-match loop
+            # recorded the FIRST partial's price as the whole order's fill —
+            # a Rs912.50 P&L error on 2026-08-19 (19 trades across 4 orders).
+            "average_price": order.get("average_price", 0.0),
         }
 
         transformed_orders.append(transformed_order)

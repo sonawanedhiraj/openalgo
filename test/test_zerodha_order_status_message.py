@@ -68,6 +68,23 @@ def test_the_fields_that_survived_could_not_tell_a_rejection_from_a_fill():
     assert rejected["filled_quantity"] != filled["filled_quantity"]
 
 
+def test_the_brokers_weighted_average_fill_survives_the_mapper():
+    """Kite's ``average_price`` is the volume-weighted fill across every partial
+    execution (issue #641). Dropping it forced a tradebook re-derivation whose
+    first-match loop recorded the FIRST partial's price as the whole order's
+    fill — a Rs912.50 P&L error on 2026-08-19.
+    """
+    filled = transform_order_data(
+        [_kite_order(status="COMPLETE", filled_quantity=800, average_price=77.12)]
+    )[0]
+    assert filled["average_price"] == 77.12
+
+    # a rejection still has NO fill — average_price 0 keeps the #626 rule
+    # (downstream treats 0 as "not filled", never as a price)
+    rejected = transform_order_data([_kite_order()])[0]
+    assert rejected["average_price"] == 0
+
+
 def test_a_normal_order_reports_an_empty_reason_not_none():
     """A completed order has no message; downstream string handling stays simple."""
     mapped = transform_order_data(

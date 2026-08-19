@@ -1313,10 +1313,21 @@ slippage was unmeasurable. `services/open15_fill_reconcile.py` reads the broker'
 live book automatically through `sandbox_order_exists`) into
 `entry_fill_price`/`exit_fill_price` and **re-derives `pnl`/`charges_inr` in
 place**, stamping `pnl_source='fill'` — it does NOT add a second number, so the
-#552 one-convention rule survives untouched. It runs at the summary job (exit+5)
-and is retried by the next 09:10 arm; **never** in `_enter`/`flatten`, because
-entries are placed from the ZMQ tick callback where a synchronous broker call
-would stall every other symbol's ticks. Charges stay **modelled** — no broker
+#552 one-convention rule survives untouched. Since #641 the primary pass runs
+at the **tail of `flatten`** (an APScheduler thread that already makes
+synchronous broker quote calls — NOT the ZMQ tick thread the deferral rule
+protects), with one short in-pass retry for orderbook propagation, so the page
+shows fill-true P&L seconds after the exit instead of at exit+5; the summary
+job and the next 09:10 arm remain the backstops. `verify_entries` (#626)
+additionally persists `entry_fill_price`/`entry_fill_qty` the moment an entry
+reports `complete`. It still **never** runs in `_enter`, because entries are
+placed from the ZMQ tick callback where a synchronous broker call would stall
+every other symbol's ticks. The fill price itself is the broker's
+**volume-weighted average across partials** (#641): Zerodha's mapper keeps the
+orderbook's own `average_price`, and `orderstatus_service`'s tradebook fallback
+volume-weights ALL of the order's trades — the old first-match `break` recorded
+the first partial's price as the whole fill, a Rs912.50 day error on
+2026-08-19. Charges stay **modelled** — no broker
 exposes per-order charges via API — but on the actual fill turnover, and the UI
 labels them as modelled. The quote columns are deliberately NOT overwritten:
 `fill − quote` is the slippage this deployment exists to measure. The four

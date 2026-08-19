@@ -644,3 +644,106 @@ def test_an_unreadable_answer_changes_nothing(monkeypatch):
     _stub_broker_answer(monkeypatch, None)
     assert svc.verify_entries() == 0
     assert svc._count_fills()[0] == 1
+
+
+# --------------------------------------------------------------------------- #
+# issue #641 — the fill-true P&L lands at exit time, not at exit+5
+#
+# On 2026-08-19 the 09:30 page published a quote-derived +14,138 gross that the
+# 09:35 summary reconcile corrected to +7,670. Two changes close the gap: the
+# per-minute verify job PERSISTS the entry fill it was already fetching (and
+# discarding), and `flatten` runs the reconcile itself seconds after the exits.
+# --------------------------------------------------------------------------- #
+def test_a_complete_entry_stamps_its_broker_fill(monkeypatch):
+    """The verify job keeps the fill it fetched instead of throwing it away."""
+    from database.open15_breakout_db import Open15Trade, db_session, init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    _stub_broker_answer(
+        monkeypatch, {"price": 103.5, "qty": 300, "order_status": "complete", "message": None}
+    )
+    svc.verify_entries()
+
+    row = db_session.query(Open15Trade).filter(Open15Trade.symbol == "AAA").first()
+    assert row.entry_fill_price == 103.5
+    assert row.entry_fill_qty == 300
+    # P&L is untouched — reconcile_fills stays the SINGLE writer of
+    # pnl/pnl_source (#552), this only pre-stages the entry leg
+    assert row.pnl_source is None
+    db_session.remove()
+
+
+def _stub_reconcile(monkeypatch, results):
+    """Replace reconcile_fills with a scripted sequence; record the calls."""
+    import services.open15_fill_reconcile as recon
+
+    calls = []
+
+    def _fake(trade_date=None, max_rows=20):
+        calls.append(trade_date)
+        return dict(results[min(len(calls), len(results)) - 1], rows=[])
+
+    monkeypatch.setattr(recon, "reconcile_fills", _fake)
+    return calls
+
+
+def test_flatten_reconciles_fills_immediately(monkeypatch):
+    """A real exit is followed by the broker reconcile in the SAME pass."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = _stub_reconcile(monkeypatch, [{"status": "ok", "reconciled": 1, "pending": 0}])
+    svc.flatten("eod_0930")
+
+    assert calls == [svc._trade_date()], "one reconcile, for today, right after the exits"
+    assert any(e["event"] == "fill_reconcile" for e in svc.day_log)
+
+
+def test_flatten_retries_once_while_legs_are_pending(monkeypatch):
+    """A fill not yet in the orderbook is asked again seconds later — and the
+    still-pending case is left to the summary/next-arm backstops, not looped."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = _stub_reconcile(
+        monkeypatch,
+        [
+            {"status": "ok", "reconciled": 0, "pending": 1},
+            {"status": "ok", "reconciled": 1, "pending": 0},
+        ],
+    )
+    svc.flatten("eod_0930")
+
+    assert len(calls) == 2, "exactly one in-pass retry"
+
+
+def test_flatten_with_no_real_exit_never_reconciles(monkeypatch):
+    """A paper-only day sends no orders, so there is nothing to ask the broker."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=True)  # entry rejected at placement -> paper
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = _stub_reconcile(monkeypatch, [{"status": "ok", "reconciled": 0, "pending": 0}])
+    svc.flatten("eod_0930")
+
+    assert calls == [], "no exit order sent -> no broker round-trip"
