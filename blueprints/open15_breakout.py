@@ -294,6 +294,9 @@ def config():
         return jsonify({"status": "success", "saved": get_config()})
 
     svc = get_open15_service()
+    # resolved ONCE — two calls could straddle an arm and disagree about the
+    # config and the label describing it
+    effective, effective_source = _effective_today(svc)
     return jsonify(
         {
             "env_defaults": {
@@ -341,10 +344,56 @@ def config():
                 "residual_min_lots": _residual_min_lots_default(),
             },
             "override": get_config(),
-            "effective_today": (svc.day_config if svc else None),
+            "effective_today": effective,
+            # WHERE that came from (issue #645) — the page says so, because
+            # "armed" and "the defaults the next arm will use" are different
+            # claims and only one of them describes what traded today
+            "effective_source": effective_source,
             "note": "changes apply at the next 09:10 IST arm",
         }
     )
+
+
+def _effective_today(svc) -> tuple[dict | None, str]:
+    """``(effective_config, source)`` for today (issue #645).
+
+    ``svc.day_config`` is only today's snapshot while the process that armed is
+    still running. A restart reverts it to env-only defaults, and serving those
+    as "effective today" made the page contradict its own capital card two rows
+    below — `stock | max trades 3 | margin 30000` above `2 of 3 funded at
+    Rs60,000 each` (2026-08-19, restarted 11:33 after the 09:10 arm).
+
+    Sources, in order:
+      ``armed``       — the running process armed today; ``day_config`` is live.
+      ``armed_log``   — it armed today and we restarted since; reshaped from the
+                        persisted ``armed`` event, which is the durable record.
+      ``not_armed``   — no arm today. The config is what the NEXT arm will use,
+                        and the page must say so rather than assert it as fact.
+
+    Never raises: an unreadable day log degrades to ``not_armed`` rather than
+    taking down the config endpoint the form depends on.
+    """
+    import datetime as _dt
+
+    import pytz as _pytz
+
+    from services.open15_log_view import effective_from_armed
+
+    if svc is None:
+        return None, "not_armed"
+    today = _dt.datetime.now(_pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    if svc.day_status == "armed" and svc._log_date == today:
+        return svc.day_config, "armed"
+    try:
+        from database.open15_breakout_db import get_day_log
+
+        for ev in reversed(get_day_log(today) or []):
+            armed = effective_from_armed(ev)
+            if armed:
+                return armed, "armed_log"
+    except Exception:
+        logger.exception("open15: armed-snapshot lookup failed")
+    return svc.day_config, "not_armed"
 
 
 @open15_bp.route("/api/decision_log", methods=["GET"])
@@ -772,13 +821,26 @@ async function loadCfg(){
       ?(' + shadow '+(e.shadow_side==='S'?'shorts':'longs')+
         ' (max '+(e.shadow_max_trades??3)+', no orders)')
       :'';
+    // WHOSE config this is (issue #645). `svc.day_config` reverts to env
+    // defaults on a restart, so an unlabelled line asserted boot defaults as
+    // the day's settings — directly above a capital card saying otherwise.
+    const src=j.effective_source||'armed';
+    const srcLbl={
+      armed:'effective today: ',
+      armed_log:'effective today (from the 09:10 arm — restarted since): ',
+      not_armed:'not armed today — the next 09:10 arm will use: '
+    }[src]||'effective today: ';
+    // the armed event never recorded leverage; print the notional alone rather
+    // than the string "undefined"
+    const lev=(e.leverage!=null)?(') x '+e.leverage+' = notional '+e.notional)
+                                :(') → notional '+e.notional);
     document.getElementById('c_eff').textContent=
-      'effective today: '+(e.instrument||'stock')+' | trade side '+sdLbl+shLbl+
+      srcLbl+(e.instrument||'stock')+' | trade side '+sdLbl+shLbl+
       (sd!=='both'?' ⚠ one-sided (parity targets measured both sides)':'')+
       ' | max trades '+effMaxTrades(e)+
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
-      ') x '+e.leverage+' = notional '+e.notional+' | vol_mult '+e.vol_mult+
+      lev+' | vol_mult '+e.vol_mult+
       ' | entries 09:16–'+nea+' | exit '+ext+
       ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'')+
       ' | rolling watch-list '+(e.rolling_watchlist_enabled
