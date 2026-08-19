@@ -93,3 +93,38 @@ tradeability filters as the traded side, or it accrues unrealizable P&L**.
 ⚠ Cohort boundary: from the first armed session after this ships, shadow AND
 seed selection exclude sub-500-lot names — shadow/parity P&L is not directly
 comparable across this date (same class of note as the #581 start date).
+
+### 2026-08-19 — #643: a raise in `_enter` erased a trigger, and Rs39,730 of the book sat idle
+GVT&D triggered a legal short at 09:24:45 (2.73x volume while beyond the level,
+gate 1.5x) and produced **nothing**: no journal row, no decision-log event, no
+alert. `/logs` rendered a GREEN (gate-cleared) volume cell beside the outcome
+text `no trigger` — the page stating the opposite of what happened. Cause:
+`_sim_context` still unpacked `_option_liquidity` as the pre-#555 3-tuple, so
+the `max_trades_cap` branch raised `ValueError` and the exception unwound past
+`_enter` into the ZMQ loop's generic handler. The `sim` cohort — which exists to
+answer *"what did the trades I had no room for do?"* — recorded nothing on the
+one day it had something to say (that miss would have measured a ~Rs8,000 loss
+the cap avoided, i.e. direct evidence FOR the clamp).
+
+The cap was 2 because #626 floors `cash / slot`: `floor(161365.10 / 60000)`. The
+two fills actually consumed Rs1,21,635, so **Rs39,730 sat idle** — two lots of
+the contract the third signal wanted (4100 PE @ ~Rs112 x 125 = Rs14,044/lot).
+
+Fixes: (1) every trigger now ends in exactly ONE terminal event, the new
+`entry_error` included — journaled `status='error'` with no fill class, so it
+can never join a P&L bucket; (2) optional residual-cash sizing off an in-process
+ledger, released on all three non-fill outcomes; (3) a capital card on `/logs`,
+which had rendered none of the funds facts the `armed` event has carried since
+#626 and read a `max_trades` key that event does not have (falling back to a
+hardcoded 3 on a day that ran with 2).
+
+Learnings: **a `try/except` that logs and continues is a silent drop unless the
+handler also writes to the surface the operator reads** — the traceback was in
+`errors.jsonl` all along and the page still said "no trigger"; and **a green
+cell beside a contradictory outcome is a bug report, not a display quirk** —
+the two came from different code paths and only one had been taught the failure.
+
+⚠ Cohort boundary: rows sized from the residual carry `sizing_basis='residual'`
+and are a DIFFERENT SIZE from every other row. They are real money and stay in
+real P&L, but per-trade comparisons across days must filter them out (same class
+of note as #581 and #595).

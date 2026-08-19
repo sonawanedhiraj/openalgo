@@ -95,6 +95,10 @@ def test_summarize_day_traded():
         # distinguishable from "it was watched and broke even"
         "shadow": 0,
         "shadow_pnl": None,
+        # a pre-#643 day has no entry_error events: no trigger was ever lost to
+        # a raise. 0, not None — this is a COUNT, and the absence of errors is
+        # a fact, unlike an absent P&L bucket which was never measured.
+        "errors": 0,
         "pnl": 82.0,
         "events": len(TRADED_DAY),
     }
