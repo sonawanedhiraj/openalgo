@@ -1301,7 +1301,16 @@ services.open15_postack_reject_repair --date YYYY-MM-DD [--apply]` — it resets
 the row and re-runs the FIXED `reconcile_fills` rather than hand-editing, so
 repair and live behaviour cannot drift apart; it needs the broker orderbook to
 still carry the order, i.e. **the same trading day**. Flags
-`OPEN15_VERIFY_ENTRIES`, `OPEN15_CONFIRM_EXIT_POSITION`, `OPEN15_FUNDS_CLAMP`.
+**None of this is flag-gated** (issue #651): `OPEN15_VERIFY_ENTRIES`,
+`OPEN15_CONFIRM_EXIT_POSITION` and `OPEN15_FUNDS_CLAMP` were RETIRED and the
+behaviour is unconditional. They shipped as rollback switches in case the fix
+itself was wrong — a shipping-time concern with a shelf life — and keeping one
+past that turns a correctness guarantee into a preference. This codebase has
+already paid for exactly that: #647's contract-existence FACT sat behind the
+liquidity gate's `enabled` flag, so switching off a percentile JUDGEMENT
+switched off the fact too. **Do not make a correctness guard configurable.**
+The guards' internal fail-open behaviour is unchanged and is not a switch: an
+unreadable book still squares off, an unreadable balance still does not clamp.
 
 **A trigger ALWAYS produces exactly one terminal event, and the residual cash is
 spendable (issue #643).** On 2026-08-19 GVT&D triggered a legal short (2.73x
@@ -1412,9 +1421,11 @@ book**: nothing was sent, so the book could only surface an unrelated same-symbo
 position and promote a trade we never placed into a live square-off. `_REAL_FILL`
 is an explicit exclusion **list** (`NON_REAL_FILLS`), not `!= 'paper'`: the old
 form silently classified every future class as REAL, which would have compounded
-tomorrow's real position size off simulated money. Flags
-`OPEN15_FILL_RECONCILE_ENABLED`, `OPEN15_SIM_SKIPPED_ENABLED`,
-`OPEN15_PAPER_SIM_MAX`.
+tomorrow's real position size off simulated money. Fill reconciliation is
+**unconditional** (`OPEN15_FILL_RECONCILE_ENABLED` retired by #651 — a published
+P&L being the broker's own number rather than a quote is not an operator
+preference); the measurement knobs `OPEN15_SIM_SKIPPED_ENABLED` and
+`OPEN15_PAPER_SIM_MAX` remain.
 **Option liquidity: read every count in LOTS, and the spread is the cost
 (issue #555).** Lot sizes across this universe differ ~30× (HAL 150 vs SAIL
 4700), so #488's raw `opt_*_volume`/`opt_*_oi` contract counts were never

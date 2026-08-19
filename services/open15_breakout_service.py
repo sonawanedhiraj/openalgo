@@ -181,11 +181,6 @@ def _sim_skipped_enabled() -> bool:
     return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
 
 
-def _funds_clamp_enabled() -> bool:
-    """Clamp the day's slot budget to the account balance (issue #626)."""
-    return os.getenv("OPEN15_FUNDS_CLAMP", "true").lower() == "true"
-
-
 def _residual_sizing_enabled_default() -> bool:
     """Spend the cash left over after earlier fills (issue #643).
 
@@ -229,24 +224,6 @@ def _residual_min_lots_default() -> int:
     return clamp_residual_min_lots(os.getenv("OPEN15_RESIDUAL_MIN_LOTS", "1"))
 
 
-def _verify_entries_enabled() -> bool:
-    """Deferred post-ACK entry verification (issue #626).
-
-    Rollback switch. Off = the pre-#626 behaviour, where an acknowledged order
-    was trusted as filled until the exit.
-    """
-    return os.getenv("OPEN15_VERIFY_ENTRIES", "true").lower() == "true"
-
-
-def _confirm_exit_position() -> bool:
-    """Verify the book before squaring off an `open` row (issue #626).
-
-    The rollback switch for the pre-exit check. Off = the pre-#626 behaviour,
-    where an acknowledged-then-RMS-rejected entry sent an unbacked square-off.
-    """
-    return os.getenv("OPEN15_CONFIRM_EXIT_POSITION", "true").lower() == "true"
-
-
 def _paper_sim_max() -> int:
     """Daily cap on simulated rows.
 
@@ -258,11 +235,6 @@ def _paper_sim_max() -> int:
         return max(int(os.getenv("OPEN15_PAPER_SIM_MAX", "10")), 0)
     except (TypeError, ValueError):
         return 10
-
-
-def _fill_reconcile_enabled() -> bool:
-    """Reconcile real rows against the broker's own fills (issue #555)."""
-    return os.getenv("OPEN15_FILL_RECONCILE_ENABLED", "true").lower() == "true"
 
 
 def _atm_lot_cost_enabled() -> bool:
@@ -2113,10 +2085,11 @@ class Open15BreakoutService:
         # read and that function is pure. Once per day, at arm.
         configured_max = self.day_config["max_trades"]
         residual_sizing = bool(self.day_config.get("residual_sizing_enabled"))
-        # the ledger needs the balance too, so read it whenever EITHER feature is on
-        available_cash = (
-            read_available_cash() if (_funds_clamp_enabled() or residual_sizing) else None
-        )
+        # ALWAYS read the balance (issue #651): the clamp is not optional. It was
+        # briefly flag-gated as a rollback switch for #626, which made "size the
+        # day without ever looking at the account" a setting — the exact state
+        # that put 5 x Rs60,000 of orders against Rs1,22,252 on 2026-08-18.
+        available_cash = read_available_cash()
         eff_max, clamp_note = clamp_slots_to_funds(
             self.day_config["margin_effective"], configured_max, available_cash
         )
@@ -2252,13 +2225,14 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: atm_lot_cost ladder failed — skipped (observational)")
         self._ensure_zmq_thread()
-        if _opt_shadow_enabled() or _fill_reconcile_enabled():
-            # catch-up pricing for rows the 09:35 broker-lag left unpriced (the
-            # #435 shadow premiums and the #555 fill prices, each gated inside)
-            # — daemon thread, never blocks arm
-            threading.Thread(
-                target=self._opt_shadow_catchup, name="open15-opt-shadow", daemon=True
-            ).start()
+        # catch-up pricing for rows the 09:35 broker-lag left unpriced (the #435
+        # shadow premiums and the #555 fill prices). Unconditional since #651 —
+        # fill reconciliation is how a published P&L becomes the broker's own
+        # number rather than a quote, which is not an operator preference. The
+        # shadow half still checks its own flag inside.
+        threading.Thread(
+            target=self._opt_shadow_catchup, name="open15-opt-shadow", daemon=True
+        ).start()
         logger.info(
             "open15: ARMED for %s — universe %d, prev-closes %d, vol_mult %.2f, top_n %d, mode %s",
             now.date(),
@@ -2319,8 +2293,6 @@ class Open15BreakoutService:
                 logger.info("open15 liquidity-path catch-up: %s", res)
         except Exception:
             logger.exception("open15: liquidity-path catch-up failed")
-        if not _fill_reconcile_enabled():
-            return
         try:
             from services.open15_fill_reconcile import reconcile_fills
 
@@ -2599,8 +2571,6 @@ class Open15BreakoutService:
 
         Returns the number of positions demoted.
         """
-        if not _verify_entries_enabled():
-            return 0
         from database.open15_breakout_db import update_trade
         from services.open15_fill_reconcile import fetch_fill, is_terminal_unfilled
 
@@ -2705,8 +2675,6 @@ class Open15BreakoutService:
         position we believe is real — that is the direction that strands an
         overnight lot. Only a definite 0 diverts to paper.
         """
-        if not _confirm_exit_position():
-            return False
         is_option = pos.get("instrument") == "option"
         sym = pos["opt_symbol"] if is_option else symbol
         qty = self._broker_qty(sym, "NFO" if is_option else "NSE")
@@ -2722,8 +2690,6 @@ class Open15BreakoutService:
         orderbook within seconds of a MARKET exit). Never raises into the
         scheduler.
         """
-        if not _fill_reconcile_enabled():
-            return
         import time
 
         from services.open15_fill_reconcile import reconcile_fills

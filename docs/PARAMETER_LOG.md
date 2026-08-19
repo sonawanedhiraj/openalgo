@@ -2162,6 +2162,16 @@ ran in the 15:30-17:00 periodic window).
 
 ## `OPEN15_FILL_RECONCILE_ENABLED` (default `true`)
 
+> **RETIRED 2026-08-19 (issue #651) — the flag no longer exists.** The behaviour
+> is unconditional. Operator's reasoning: *"why are they even configurable? The
+> default one should be the expected behaviour."* Each of these shipped as a
+> rollback switch in case the fix itself was wrong; that is a shipping-time
+> concern with a shelf life, and keeping it past that turns a correctness
+> guarantee into a preference. Setting the variable now does nothing
+> (`test/test_open15_no_correctness_flags.py` fails if any of them is read
+> again). The entry kept below is the historical record of what the flag did.
+
+
 - **Where:** `services/open15_fill_reconcile.py` `_enabled()`; also gated in
   `services/open15_breakout_service.py` (`_fill_reconcile_enabled`).
 - **What it controls:** whether open15_vol_breakout asks the broker what it
@@ -2294,6 +2304,16 @@ ran in the 15:30-17:00 periodic window).
 
 ## `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` (issue #626)
 
+> **RETIRED 2026-08-19 (issue #651) — the flag no longer exists.** The behaviour
+> is unconditional. Operator's reasoning: *"why are they even configurable? The
+> default one should be the expected behaviour."* Each of these shipped as a
+> rollback switch in case the fix itself was wrong; that is a shipping-time
+> concern with a shelf life, and keeping it past that turns a correctness
+> guarantee into a preference. Setting the variable now does nothing
+> (`test/test_open15_no_correctness_flags.py` fails if any of them is read
+> again). The entry kept below is the historical record of what the flag did.
+
+
 - **What:** two rollback switches for the post-ACK rejection handling, both
   default `true`.
   - `OPEN15_VERIFY_ENTRIES` — the minute-cadence `open15_entry_verify` job that
@@ -2307,14 +2327,25 @@ ran in the 15:30-17:00 periodic window).
   `flatten` sent a SELL for 800 calls we did not own — a NAKED SHORT the broker
   priced at Rs4.45L of SPAN — and the reconciler published the trade as a
   broker-confirmed +Rs7,680 fill.
-- **How to roll back:** set either to `false`. Correctness does not rest on the
-  verification job alone: with it off, the exit-time book check and the summary
-  reconciliation both still catch an unfilled entry (later, and after the slot
-  has been held for the session).
+- **How to roll back:** none — retired by #651. (The layered defence described
+  here still holds: the exit-time book check and the summary reconciliation are
+  independent of the verification job. What is gone is the ability to switch any
+  of the three off.)
 - **History:**
   - **2026-08-18:** Introduced by issue #626.
+  - **2026-08-19:** RETIRED by issue #651; both behaviours are unconditional.
 
 ## `OPEN15_FUNDS_CLAMP` (issue #626)
+
+> **RETIRED 2026-08-19 (issue #651) — the flag no longer exists.** The behaviour
+> is unconditional. Operator's reasoning: *"why are they even configurable? The
+> default one should be the expected behaviour."* Each of these shipped as a
+> rollback switch in case the fix itself was wrong; that is a shipping-time
+> concern with a shelf life, and keeping it past that turns a correctness
+> guarantee into a preference. Setting the variable now does nothing
+> (`test/test_open15_no_correctness_flags.py` fails if any of them is read
+> again). The entry kept below is the historical record of what the flag did.
+
 
 - **What:** default `true`. At the 09:10 arm, open15 reads the account balance
   and clamps `max_trades` to `floor(available_cash / margin_per_slot)`. The
@@ -2327,9 +2358,10 @@ ran in the 15:30-17:00 periodic window).
   would change the position size this deployment exists to measure and make the
   day incomparable to earlier ones. Fails OPEN when the balance cannot be read —
   a transient funds-API failure must not switch the strategy off.
-- **How to roll back:** `OPEN15_FUNDS_CLAMP=false`.
+- **How to roll back:** none — retired by #651.
 - **History:**
   - **2026-08-18:** Introduced by issue #626.
+  - **2026-08-19:** RETIRED by issue #651; the clamp is unconditional.
 
 ## `MULTI_ACCOUNT_FUNDS_CHECK` / `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED` (issue #637)
 

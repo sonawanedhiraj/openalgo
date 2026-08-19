@@ -455,20 +455,25 @@ def test_an_unreadable_book_still_squares_off():
     assert len(orders) == 2, "an unverifiable position is still squared off"
 
 
-def test_the_pre_exit_check_can_be_switched_off(monkeypatch):
-    """Rollback switch, so a misbehaving book cannot strand every exit."""
+def test_the_pre_exit_check_has_no_off_switch(monkeypatch):
+    """#651 deleted the rollback flag; the legacy path no longer exists.
+
+    Setting the old env var must be INERT. Squaring off a position the book says
+    is not there is how #626 sent a naked 800-lot SELL that Kite priced at
+    Rs4.45L of SPAN — not a behaviour anyone should be able to select back on.
+    """
     from database.open15_breakout_db import init_db
 
     init_db()
-    monkeypatch.setenv("OPEN15_CONFIRM_EXIT_POSITION", "false")
+    monkeypatch.setenv("OPEN15_CONFIRM_EXIT_POSITION", "false")  # inert since #651
     orders = []
     svc = _mk_service(orders, reject=False)
-    svc._broker_qty = lambda symbol, exchange: 0
+    svc._broker_qty = lambda symbol, exchange: 0  # book says we hold nothing
     _run_to_selection(svc)
     _trigger(svc)
     svc.flatten("eod_0930")
 
-    assert len(orders) == 2, "with the flag off, the pre-#626 behaviour is restored"
+    assert len(orders) == 1, "the flag is dead — no square-off without a position"
 
 
 # --------------------------------------------------------------------------- #

@@ -49,10 +49,6 @@ STRATEGY_NAME = "open15_vol_breakout"
 _TERMINAL_UNFILLED = ("rejected", "cancelled", "canceled")
 
 
-def _enabled() -> bool:
-    return os.getenv("OPEN15_FILL_RECONCILE_ENABLED", "true").lower() == "true"
-
-
 def _as_float(value) -> float | None:
     """Coerce a broker price field to float; None when absent or unusable.
 
@@ -239,9 +235,6 @@ def reconcile_fills(trade_date: str | None = None, max_rows: int = 20) -> dict:
     Only ``fill='real'`` rows are touched: paper and sim rows have no orders to
     reconcile, by definition.
     """
-    if not _enabled():
-        return {"status": "disabled", "reconciled": 0, "pending": 0}
-
     from sqlalchemy import or_
 
     from database.open15_breakout_db import Open15Trade, db_session, update_trade
