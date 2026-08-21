@@ -142,8 +142,8 @@ def _run_browser_login(
                 page = context.new_page()
                 page.set_default_timeout(timeout)
 
-                # Capture request_token from the redirect navigation request — the
-                # app bounces the tokenless browser to /login, losing it from the URL.
+                # Capture request_token from the redirect (fires for every request,
+                # independent of routing — this is the proven path).
                 def _on_request(req) -> None:
                     if "request_token=" in req.url and "token" not in captured:
                         tok = _extract_request_token(req.url)
@@ -151,6 +151,24 @@ def _run_browser_login(
                             captured["token"] = tok
 
                 page.on("request", _on_request)
+
+                # ABORT the navigation to our callback so the browser never loads it.
+                # Load-bearing for CHILD accounts: the callback's ``?account_id=N``
+                # branch exchanges the single-use token immediately (regardless of
+                # session), so letting the browser reach it would consume the token
+                # and make the service's own exchange fail. Capture (above) already
+                # happened on the request event, so aborting loses nothing. Kept a
+                # separate concern from capture so capture never depends on it.
+                def _abort_callback(route) -> None:
+                    try:
+                        route.abort()
+                    except Exception:
+                        try:
+                            route.continue_()
+                        except Exception:
+                            pass
+
+                page.route("**request_token=**", _abort_callback)
 
                 page.goto(url, wait_until="domcontentloaded")
 
