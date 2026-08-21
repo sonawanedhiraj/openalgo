@@ -24,11 +24,28 @@ export interface StrategySummary {
   name: string
   display_name: string
   mode: string
+  /** Actual order routing right now (issue #440): 'live' only when the navbar
+   *  is on Live AND this strategy's row is live — else 'sandbox'. */
+  effective_routing?: 'live' | 'sandbox'
   llm_mode: LLMMode
   llm_veto_enabled: boolean
+  /** Advisory metadata from the STATIC config_snapshot.json (issue #561).
+   *  Gates the sandbox→live direction ONLY. It must never gate live→sandbox,
+   *  and never decide what routing the card displays — `mode` /
+   *  `effective_routing` (the strategy_mode row) are the truth for that. */
   deployable: boolean
+  /** `mode` as declared in config_snapshot.json — advisory, often stale. */
+  config_declared_mode?: string | null
+  /** True when the static config claims scaffold/non-deployable while the
+   *  strategy actually routes live. Surfaced, never silently resolved. */
+  config_conflict?: boolean
   version: string
   open_positions: number
+  /** Per-mode open-position split (issue #562). Sandbox and live counts are
+   *  reported separately and NEVER summed — the #552 convention. */
+  open_positions_by_mode?: Record<string, number> | null
+  /** Which mode `open_positions` refers to (the strategy's current routing). */
+  open_positions_mode?: string | null
   today_net_pnl: number | null
   today_trade_count: number
   last_trade_at: string | null
@@ -41,13 +58,42 @@ export interface StrategySummary {
 // Detail endpoint
 // ---------------------------------------------------------------------------
 
+// Per-direction (long/short) sub-aggregate (issue #458). A side with no closed
+// trades has n_trades=0 and null stats — rendered as '—', never 0%.
+export interface SideSplit {
+  n_trades: number
+  // Journal-derived splits always carry `wins`; a backtest split declared in a
+  // config_snapshot may publish only per-side trade count + net P&L when the
+  // source report never broke out per-side win rate (issue #508).
+  wins?: number | null
+  win_rate_pct?: number | null
+  net_pnl_inr: number | null
+}
+
+// ATM-option variant of a mode's performance (issue #455). Backtest basis is
+// fit-to-capital lots; sandbox/live basis is the 1-lot shadow (issue #435) —
+// directionally comparable, not rupee-for-rupee.
+export interface OptionsPerf {
+  n_trades: number | null
+  win_rate_pct: number | null
+  net_pnl_inr: number | null
+  max_dd_pct?: number | null
+  basis?: string
+  long?: SideSplit | null
+  short?: SideSplit | null
+}
+
 export interface BacktestPerf {
   cagr_pct: number | null
   sharpe: number | null
   max_dd_pct: number | null
   win_rate_pct: number | null
   n_trades: number | null
+  net_pnl_inr?: number | null
   window: string | null
+  options?: OptionsPerf | null
+  long?: SideSplit | null
+  short?: SideSplit | null
 }
 
 export interface LivePerf {
@@ -59,6 +105,31 @@ export interface LivePerf {
   cum_net_pnl?: number | null
   win_rate_pct?: number | null
   closed_trades?: number
+  options?: OptionsPerf | null
+  long?: SideSplit | null
+  short?: SideSplit | null
+  // Realized performance metrics computed from the closed-trade daily P&L
+  // series (issue #568). Null while there is not yet enough history — `notes`
+  // carries the human-readable reason, surfaced as a cell tooltip.
+  // `max_dd_inr` is the honest absolute figure; `max_dd_pct` is relative to
+  // `capital_basis_inr`, which for the simplified engine is a per-trade
+  // risk-sizing base rather than a compounding book (`capital_basis_is_notional`).
+  cagr_pct?: number | null
+  sharpe?: number | null
+  max_dd_pct?: number | null
+  max_dd_inr?: number | null
+  roc_pct?: number | null
+  trading_days?: number
+  capital_basis_inr?: number | null
+  capital_basis_is_notional?: boolean
+  notes?: string | null
+  // Decomposition behind cum_net_pnl (issue #579). `cum_net_pnl` is NET of
+  // `charges_inr`; the journal's own P&L column is gross. `uncosted_trades`
+  // counts closed rows with no modelled charge yet — those contribute at gross,
+  // so a non-zero count means the net figure is optimistic by that much.
+  gross_pnl_inr?: number | null
+  charges_inr?: number | null
+  uncosted_trades?: number
 }
 
 export interface StrategyPerformance {
@@ -108,6 +179,17 @@ export interface RecentTrade {
   entry_date: string
   created_at: string | null
   llm?: TradeLLMReview | null
+  /** open15: mid-bar entry moment "HH:MM:SS" IST (trigger_minute + trigger_second) */
+  trigger?: string | null
+  /** open15: exit timestamp (ISO, IST offset) stamped at the 09:30 flatten */
+  exit_ts?: string | null
+  /** open15: ATM option shadow trade (issue #435) — research-only, 1 lot */
+  opt_symbol?: string | null
+  opt_lot_size?: number | null
+  opt_entry_premium?: number | null
+  opt_exit_premium?: number | null
+  opt_charges_inr?: number | null
+  opt_pnl?: number | null
 }
 
 // Latest data-freshness (data_health_check) state for the strategy's feed (#237).
@@ -126,6 +208,8 @@ export interface StrategyDetail {
   name: string
   display_name: string
   mode: string
+  /** Actual order routing right now (issue #440) — see StrategySummary. */
+  effective_routing?: 'live' | 'sandbox'
   llm_mode: LLMMode
   llm_veto_enabled: boolean
   deployable: boolean
@@ -139,6 +223,8 @@ export interface StrategyDetail {
   llm_unmatched_skips?: UnmatchedSkipDecision[]
   version_log: VersionLogEntry[]
   backtest_refs: string[]
+  /** Optional per-strategy console page (decision log / settings), e.g. open15's /logs */
+  console_url?: string | null
 }
 
 // ---------------------------------------------------------------------------

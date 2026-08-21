@@ -1,4 +1,9 @@
-"""Tests for Stage-0 resolver wired into ``split_order_with_auth``."""
+"""Tests for the per-strategy dispatch wired into ``split_order_with_auth``.
+
+Issue #440 — UI-driven routing: a split order fires on the live broker ONLY
+when Analyze is off AND the payload's strategy has a ``strategy_mode`` row set
+to live. Everything else routes to sandbox (default deny).
+"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,23 +14,19 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 
 @pytest.fixture
-def fresh_intent_db(monkeypatch):
-    from database import daily_intent_db as dim
+def fresh_mode_db(monkeypatch):
+    """Point strategy_mode_db at a fresh in-memory SQLite for one test."""
+    from database import strategy_mode_db as sm
 
-    test_engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
-
-    monkeypatch.setattr(dim, "engine", test_engine)
-    monkeypatch.setattr(dim, "db_session", test_session)
-    dim.Base.metadata.create_all(test_engine)
-
-    yield dim
-
-    test_session.remove()
-    test_engine.dispose()
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(sm, "engine", eng)
+    monkeypatch.setattr(sm, "db_session", sess)
+    sm.Base.query = sess.query_property()
+    sm.Base.metadata.create_all(eng)
+    yield sm
+    sess.remove()
+    eng.dispose()
 
 
 def _split_payload():
@@ -42,17 +43,23 @@ def _split_payload():
     }
 
 
-def _patch_modes(monkeypatch, analyze=False):
+def _patch_analyze(monkeypatch, analyze=False):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: analyze)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
 
-def test_split_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
+def _stub_quotes(monkeypatch):
+    """Stub quotes_service to avoid a REST call in the sandbox branch."""
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
+
+
+def test_split_routes_to_broker_when_strategy_live(fresh_mode_db, monkeypatch):
+    """strategy_mode row='live' + analyze off → broker.place_order_api fires."""
     from services import split_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
@@ -76,12 +83,12 @@ def test_split_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     sandbox_mock.assert_not_called()
 
 
-def test_split_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatch):
+def test_split_routes_to_sandbox_when_strategy_row_sandbox(fresh_mode_db, monkeypatch):
+    """A sandbox-flagged strategy stays sandbox even with analyze off."""
     from services import split_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "sandbox", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
@@ -91,10 +98,7 @@ def test_split_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatc
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    # Stub quotes_service to avoid REST call
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
+    _stub_quotes(monkeypatch)
 
     success, _, status = split_order_service.split_order_with_auth(
         _split_payload(),
@@ -109,12 +113,12 @@ def test_split_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatc
     broker_place.assert_not_called()
 
 
-def test_split_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
+def test_split_routes_to_sandbox_when_live_but_analyze_on(fresh_mode_db, monkeypatch):
+    """Analyze mode is the platform kill switch: a live row cannot beat it."""
     from services import split_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch, analyze=True)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch, analyze=True)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
@@ -124,9 +128,7 @@ def test_split_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
+    _stub_quotes(monkeypatch)
 
     split_order_service.split_order_with_auth(
         _split_payload(),
@@ -139,13 +141,11 @@ def test_split_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monke
     broker_place.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_split_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
+def test_split_routes_to_sandbox_when_no_row_default_denies(fresh_mode_db, monkeypatch):
+    """Default deny: no strategy_mode row → sandbox even with analyze off."""
     from services import split_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    _patch_analyze(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
     broker_place = MagicMock()
@@ -155,9 +155,7 @@ def test_split_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkey
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
+    _stub_quotes(monkeypatch)
 
     success, response, status = split_order_service.split_order_with_auth(
         _split_payload(),
@@ -172,11 +170,12 @@ def test_split_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkey
     broker_place.assert_not_called()
 
 
-def test_split_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
+def test_split_retired_global_row_has_no_effect(fresh_mode_db, monkeypatch):
+    """A manually re-created __global__ live row must not route anything live."""
     from services import split_order_service
 
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("__global__", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200))
     broker_place = MagicMock()
@@ -186,9 +185,7 @@ def test_split_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
+    _stub_quotes(monkeypatch)
 
     success, response, status = split_order_service.split_order_with_auth(
         _split_payload(),
@@ -203,13 +200,11 @@ def test_split_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
     broker_place.assert_not_called()
 
 
-def test_split_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+def test_split_reject_response_shape_matches_existing_convention(fresh_mode_db, monkeypatch):
     """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import split_order_service
-    from services.mode_service import set_daily_intent
 
-    _patch_modes(monkeypatch)
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
+    _patch_analyze(monkeypatch)
     monkeypatch.setattr(
         "services.sandbox_service.sandbox_place_order",
         MagicMock(return_value=(True, {"status": "success", "orderid": "SBX"}, 200)),
@@ -219,9 +214,9 @@ def test_split_reject_response_shape_matches_existing_convention(fresh_intent_db
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
-    from services import quotes_service as qs
+    _stub_quotes(monkeypatch)
 
-    monkeypatch.setattr(qs, "get_quotes", lambda **kw: (False, {"message": "stub"}, 500))
+    # ---- sandbox shape (no strategy_mode row → default deny) ----
     reject_result = split_order_service.split_order_with_auth(
         _split_payload(),
         auth_token="dummy",
@@ -229,7 +224,8 @@ def test_split_reject_response_shape_matches_existing_convention(fresh_intent_db
         original_data=_split_payload(),
     )
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
+    # ---- live shape (live row + analyze off) ----
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
     broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID"))
     monkeypatch.setattr(
         split_order_service,

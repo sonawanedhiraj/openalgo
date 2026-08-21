@@ -246,6 +246,7 @@ def test_poster_active_mode_posts_with_correct_url_and_payload(fresh_scanner_db)
     assert call["json"] == {
         "stocks": "RELIANCE",
         "scan_name": "BUY in-house screener",
+        "source": "inhouse_scanner",
     }
     assert _read_posted_flag(scan_result_id) == 1
 
@@ -262,7 +263,11 @@ def test_poster_active_mode_multi_symbol_payload_via_build():
         screener_type="sell",
         scan_name="",
     )
-    assert payload == {"stocks": "SYM1,SYM2,SYM3", "scan_name": "SELL in-house screener"}
+    assert payload == {
+        "stocks": "SYM1,SYM2,SYM3",
+        "scan_name": "SELL in-house screener",
+        "source": "inhouse_scanner",
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -154,3 +154,89 @@ def test_mixed_case_sell_routes_to_screener_sell(app_with_chartink, fresh_cycle_
     cycle = _cycle(fresh_cycle_db)
     assert _as_list(cycle.screener_sell) == ["NATIONALUM"]
     assert _as_list(cycle.screener_buy) == []
+
+
+def test_underscore_sell_scan_name_routes_to_screener_sell(
+    app_with_chartink, fresh_cycle_db, monkeypatch
+):
+    """Issue #447 regression: the in-house poster's scan_name is the scan
+    definition name ('fno_intraday_sell_20') — one whitespace token, so the
+    old ``"SELL" in scan_name.upper().split()`` check misfiled every SELL
+    echo into ``screener_buy``. Tokenizing on non-alphabetic characters must
+    route it to ``screener_sell``."""
+    _wire(monkeypatch, ["SWIGGY"])
+    resp = _post(
+        app_with_chartink.test_client(),
+        {"scan_name": "fno_intraday_sell_20", "stocks": "SWIGGY"},
+    )
+    assert resp.status_code == 200, resp.data
+
+    cycle = (
+        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
+        .order_by(fresh_cycle_db.ScanCycle.id.desc())
+        .first()
+    )
+    assert _as_list(cycle.screener_sell) == ["SWIGGY"]
+    assert _as_list(cycle.screener_buy) == []
+
+
+def test_short_token_routes_to_screener_sell(app_with_chartink, fresh_cycle_db, monkeypatch):
+    """SHORT/COVER tokens mirror the engine's _infer_direction so the audit
+    column can never disagree with the armed direction."""
+    _wire(monkeypatch, ["SAIL"])
+    resp = _post(
+        app_with_chartink.test_client(),
+        {"scan_name": "FnO short breakdown", "stocks": "SAIL"},
+    )
+    assert resp.status_code == 200, resp.data
+
+    cycle = _cycle(fresh_cycle_db)
+    assert _as_list(cycle.screener_sell) == ["SAIL"]
+    assert _as_list(cycle.screener_buy) == []
+
+
+def test_inhouse_echo_reclassified_to_inhouse_echo_cycle_kind(
+    app_with_chartink, fresh_cycle_db, monkeypatch
+):
+    """Issue #447: a poster echo (payload carries source='inhouse_scanner')
+    must NOT be audited as a Chartink cycle — the EOD comparison and the
+    #321 miss-debug set both treat cycle_kind='chartink' as Chartink truth."""
+    _wire(monkeypatch, ["SWIGGY"])
+    resp = _post(
+        app_with_chartink.test_client(),
+        {
+            "scan_name": "fno_intraday_sell_20",
+            "stocks": "SWIGGY",
+            "source": "inhouse_scanner",
+        },
+    )
+    assert resp.status_code == 200, resp.data
+
+    # No row may remain classified as a chartink cycle...
+    assert _cycle(fresh_cycle_db) is None
+    # ...the row is reclassified as an in-house echo, sides still correct.
+    echo = (
+        fresh_cycle_db.db_session.query(fresh_cycle_db.ScanCycle)
+        .filter_by(cycle_kind="inhouse_echo")
+        .first()
+    )
+    assert echo is not None
+    assert _as_list(echo.screener_sell) == ["SWIGGY"]
+    assert _as_list(echo.screener_buy) == []
+
+
+def test_genuine_chartink_payload_keeps_chartink_cycle_kind(
+    app_with_chartink, fresh_cycle_db, monkeypatch
+):
+    """A payload without the poster's source tag stays cycle_kind='chartink'."""
+    _wire(monkeypatch, ["TRENT"])
+    resp = _post(
+        app_with_chartink.test_client(),
+        {"scan_name": "SELL FnO Intraday Sell", "stocks": "TRENT"},
+    )
+    assert resp.status_code == 200, resp.data
+
+    cycle = _cycle(fresh_cycle_db)
+    assert cycle is not None
+    assert cycle.cycle_kind == "chartink"
+    assert _as_list(cycle.screener_sell) == ["TRENT"]

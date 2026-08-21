@@ -508,8 +508,11 @@ def run_preentry_scanner_refresh(today=None) -> dict:
                     from database.auth_db import get_broker_name
 
                     broker = get_broker_name(user_id)
-                    raw = os.getenv("SCANNER_SYMBOLS", "")
-                    symbols = sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+                    # subscription = a DECISION path (issue #648): no reason to
+                    # spend a WS slot on a name the strategy can never act on
+                    from services.scanner_universe import tradeable_universe
+
+                    symbols = sorted(tradeable_universe())
                     if symbols:
                         n = scanner_pre_subscriber.ensure(user_id, broker, symbols)
                         logger.info(
@@ -594,7 +597,10 @@ def _periodic_loop() -> None:
         end_t.hour,
         end_t.minute,
     )
+    from services.thread_registry import beat as _beat
+
     while not _stop_event.is_set():
+        _beat("ScannerBackfillPeriodic")
         now = datetime.now(_IST)
         try:
             ran, res = _periodic_tick(now, end_t)
@@ -678,7 +684,10 @@ def _straggler_loop() -> None:
         "scanner straggler re-check loop started (every %ds, window 09:20..15:30 IST)",
         interval,
     )
+    from services.thread_registry import beat as _beat
+
     while not _stop_event.is_set():
+        _beat("ScannerStragglerRecheck")
         now = datetime.now(_IST)
         try:
             _straggler_tick(now)
@@ -731,7 +740,19 @@ def _wait_for_broker_session(max_wait_sec: int = _BOOT_WAIT_MAX_SEC) -> bool:
 
 
 def _boot_worker() -> None:
+    from services.thread_registry import beat as _beat
+
+    _beat("ScannerBackfillBoot")
     if _wait_for_broker_session():
+        # Login triggers the master-contract download, so a session appearing
+        # means a SymToken swap may be in flight — wait it out (fail-open)
+        # before the resettle/stale fetches start (issue #587).
+        try:
+            from services.broker_session_health import wait_for_master_contract_ready
+
+            wait_for_master_contract_ready(stop_event=_stop_event)
+        except Exception:
+            logger.exception("scanner backfill: master-contract gate raised — proceeding")
         # Serialise the convergence work against sibling schedulers so the four
         # boot backfill jobs don't burst onto historify.duckdb simultaneously
         # (see services/boot_convergence.py and issue #140).

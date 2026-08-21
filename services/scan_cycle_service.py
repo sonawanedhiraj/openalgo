@@ -156,7 +156,13 @@ def complete_cycle(
             row.effective_mode = effective_mode
         if operator_intent is not None:
             row.operator_intent = operator_intent
-        if cycle_kind is None:
+        if cycle_kind is not None:
+            # Issue #447: allow the caller to reclassify the row at completion —
+            # the simplified-engine webhook starts every cycle as 'chartink'
+            # before the payload is parsed, and an in-house ScanHitPoster echo
+            # must not be audited as a Chartink cycle.
+            row.cycle_kind = cycle_kind
+        else:
             cycle_kind = row.cycle_kind
 
         sess.commit()

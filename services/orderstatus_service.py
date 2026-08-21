@@ -66,12 +66,16 @@ def get_order_status_with_auth(
     if "apikey" in request_data:
         request_data.pop("apikey", None)
 
-    # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
-    # SKIP/DISABLED are not order rejections for reads — operator still wants
-    # to see state. is_analyze_mode is kept as a boolean for downstream label
+    # Read path (issue #440): sandbox source when Analyze is ON, or when the
+    # orderid is a sandbox-book order (mixed-mode operation) — otherwise the
+    # broker source. is_analyze_mode is kept as a boolean for downstream label
     # formatting (error responses route to analyzer_db vs apilog_db).
-    is_analyze_mode = resolve_effective_mode() is EffectiveMode.SANDBOX
     orderid = status_data.get("orderid")
+    is_analyze_mode = resolve_effective_mode() is EffectiveMode.SANDBOX
+    if not is_analyze_mode and orderid and original_data.get("apikey"):
+        from services.sandbox_service import sandbox_order_exists
+
+        is_analyze_mode = sandbox_order_exists(orderid, original_data["apikey"])
     logger.info(
         f"[OrderStatus] Processing order status request - Mode: {'ANALYZE' if is_analyze_mode else 'LIVE'}, OrderID: {orderid}, Broker: {broker}"
     )
@@ -181,63 +185,78 @@ def get_order_status_with_auth(
             log_executor.submit(async_log_order, "orderstatus", original_data, error_response)
         return False, error_response, 404
 
-    # Fetch average_price from tradebook if order is executed
+    # Resolve the order's fill price (issue #641). Preference order:
+    #
+    # 1. The orderbook's OWN ``average_price`` — the broker's volume-weighted
+    #    average across every partial execution, when the mapper preserves it
+    #    (Zerodha does as of #641).
+    # 2. The tradebook, volume-weighting ALL trades belonging to the order.
+    #    The old code ``break``-ed on the FIRST matching trade, so an order
+    #    filled in several partials reported the first partial's price as the
+    #    whole order's fill — a Rs912.50 P&L error across two open15 trades on
+    #    2026-08-19 (19 trades for 4 orders that day).
     average_price = 0.0
     order_status = order_found.get("order_status", "")
 
-    logger.info(
-        f"[OrderStatus] Order status is '{order_status}', checking if tradebook lookup needed"
-    )
-
-    # Only fetch average_price for complete orders
-    # Order statuses can be: open, complete, rejected
+    # Only resolve a fill price for complete orders — a rejected/cancelled
+    # order has no fill, and its ``price`` field is the LIMIT we asked for
+    # (the #626 rule).
     if order_status.lower() == "complete":
-        logger.info("[OrderStatus] Order is complete, fetching average price from tradebook")
         try:
-            # Use tradebook_service to get trade data
-            success, tradebook_response, status_code = get_tradebook(
-                auth_token=auth_token, broker=broker
+            native_avg = float(order_found.get("average_price") or 0.0)
+        except (TypeError, ValueError):
+            native_avg = 0.0
+        if native_avg > 0:
+            average_price = native_avg
+            logger.info(
+                f"[OrderStatus] Using orderbook's own weighted average_price for OrderID {orderid}: {average_price}"
             )
-
-            logger.debug(
-                f"[OrderStatus] Tradebook service response: success={success}, status_code={status_code}"
-            )
-
-            if success and tradebook_response.get("status") == "success":
-                # Get trades list from response
-                trades_list = tradebook_response.get("data", [])
-                logger.debug(f"[OrderStatus] Tradebook returned {len(trades_list)} trades")
-
-                # Find matching trade by orderid and get average_price
-                logger.info(
-                    f"[OrderStatus] Searching for OrderID {orderid} in {len(trades_list)} trades"
+        else:
+            logger.info("[OrderStatus] Order is complete, deriving average price from tradebook")
+            try:
+                # Use tradebook_service to get trade data
+                success, tradebook_response, status_code = get_tradebook(
+                    auth_token=auth_token, broker=broker
                 )
-                for trade_idx, trade in enumerate(trades_list):
-                    trade_orderid = str(trade.get("orderid"))
-                    # Log all trades for better debugging
-                    logger.debug(
-                        f"[OrderStatus] Trade {trade_idx + 1}: OrderID={trade_orderid}, Symbol={trade.get('symbol')}, AvgPrice={trade.get('average_price')}"
-                    )
 
-                    if trade_orderid == str(orderid):
-                        # Extract average_price from trade data
-                        avg_price_raw = trade.get("average_price", 0.0)
-                        average_price = float(avg_price_raw) if avg_price_raw else 0.0
+                if success and tradebook_response.get("status") == "success":
+                    trades_list = tradebook_response.get("data", [])
+                    logger.info(
+                        f"[OrderStatus] Searching for OrderID {orderid} in {len(trades_list)} trades"
+                    )
+                    # Volume-weight every trade of this order — one order can
+                    # fill in several partials, each its own tradebook row.
+                    total_qty = 0.0
+                    total_value = 0.0
+                    for trade in trades_list:
+                        if str(trade.get("orderid")) != str(orderid):
+                            continue
+                        try:
+                            t_qty = float(trade.get("quantity") or 0.0)
+                            t_px = float(trade.get("average_price") or 0.0)
+                        except (TypeError, ValueError):
+                            continue
+                        if t_qty > 0 and t_px > 0:
+                            total_qty += t_qty
+                            total_value += t_qty * t_px
+                    if total_qty > 0:
+                        average_price = round(total_value / total_qty, 4)
                         logger.info(
-                            f"[OrderStatus] Found trade for OrderID {orderid}, average_price: {average_price} (raw: {avg_price_raw})"
+                            f"[OrderStatus] Weighted average_price for OrderID {orderid}: {average_price} over qty {total_qty:g}"
                         )
-                        break
+                    else:
+                        logger.warning(
+                            f"[OrderStatus] No trade found for OrderID {orderid} in tradebook. Available order IDs: {[str(t.get('orderid')) for t in trades_list[:5]]}"
+                        )
                 else:
                     logger.warning(
-                        f"[OrderStatus] No trade found for OrderID {orderid} in tradebook. Available order IDs: {[str(t.get('orderid')) for t in trades_list[:5]]}"
+                        f"[OrderStatus] Tradebook service call failed: {tradebook_response.get('message', 'Unknown error')}"
                     )
-            else:
-                logger.warning(
-                    f"[OrderStatus] Tradebook service call failed: {tradebook_response.get('message', 'Unknown error')}"
+            except Exception as e:
+                logger.error(
+                    f"[OrderStatus] Exception while fetching tradebook: {e}", exc_info=True
                 )
-        except Exception as e:
-            logger.error(f"[OrderStatus] Exception while fetching tradebook: {e}", exc_info=True)
-            # Continue without average price if tradebook fetch fails
+                # Continue without average price if tradebook fetch fails
     else:
         logger.info(
             f"[OrderStatus] Order status '{order_status}' is not complete (open/rejected/other) - skipping average_price fetch"

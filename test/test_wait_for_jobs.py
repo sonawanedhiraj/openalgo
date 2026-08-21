@@ -64,8 +64,11 @@ def test_pending_then_completed_blocks_until_done():
         elapsed = _time.monotonic() - started
 
     assert result == {"job-x": "completed"}
-    # Slept through at least 2 poll intervals (2 * 0.1s = 0.2s) before completing.
-    assert elapsed >= 0.2
+    # Slept through ~2 poll intervals (2 * 0.1s) before completing. The margin
+    # below the nominal 0.2s absorbs Windows' ~15.6ms timer granularity —
+    # time.sleep(0.1) can wake early vs monotonic() deltas (a full-suite run
+    # measured 0.188s). The call count is the strict functional proof.
+    assert elapsed >= 0.15
     assert calls["count"] >= 3
 
 

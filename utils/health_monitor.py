@@ -599,7 +599,10 @@ def _collector_loop():
 
     logger.debug(f"Health monitoring collector started (interval: {HEALTH_SAMPLE_INTERVAL}s)")
 
+    from services.thread_registry import beat as _beat
+
     while _collector_running:
+        _beat("HealthCollector")
         try:
             collect_metrics()
         except Exception as e:

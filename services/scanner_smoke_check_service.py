@@ -336,9 +336,15 @@ def production_freshness_reader(strategy_name: str) -> dict | None:
 
 
 def production_universe_provider() -> list[str]:
-    """The same ``SCANNER_SYMBOLS`` source the rest of the scanner uses."""
-    raw = os.getenv("SCANNER_SYMBOLS", "")
-    return sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+    """The same TRADEABLE universe the rest of the scanner acts on (issue #648).
+
+    Coverage must be measured over the symbols that can actually produce a
+    signal; counting names with no option contracts against the threshold would
+    drag the fraction down and hold the scanner for a gap that cannot matter.
+    """
+    from services.scanner_universe import tradeable_universe
+
+    return sorted(tradeable_universe())
 
 
 def production_notifier(message: str) -> None:

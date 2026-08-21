@@ -127,8 +127,13 @@ def scanner_universe_symbols() -> list[str]:
     ``services.scanner_presubscribe`` read, so the backfill universe tracks the
     scanner config automatically.
     """
-    raw = os.getenv("SCANNER_SYMBOLS", "")
-    return sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+    # the RAW list on purpose (issue #648): data maintenance covers everything
+    # in SCANNER_SYMBOLS, including names NSE has dropped from F&O. Freezing a
+    # symbol's 1m/D history the day it leaves the segment is what would make its
+    # eventual re-inclusion arrive with a months-wide hole.
+    from services.scanner_universe import scanner_universe
+
+    return sorted(scanner_universe())
 
 
 def _symbols_payload(symbols: list[str]) -> list[dict[str, str]]:

@@ -68,6 +68,15 @@ class TradeJournal(Base):
     # rows predate the column, and signal-less exits (EOD flatten) have no LTP.
     ltp_at_signal = Column(Float, nullable=True)
 
+    # Which book the order actually routed to — 'sandbox' | 'live' (issue #568).
+    # Load-bearing for the strategies dashboard: without it the whole journal is
+    # attributed to whatever mode the strategy is in *today*, so flipping a
+    # strategy live silently re-labels its entire sandbox history as live
+    # performance. Nullable because rows predating the column exist; readers
+    # MUST treat NULL as 'sandbox' via ``mode_of_row`` rather than as 'unknown'
+    # — every pre-#568 row was written while the engine defaulted to sandbox.
+    mode = Column(String(16), nullable=True)
+
     # Context at entry — Stage 1.7 will fill these richer. nifty_pct + vix
     # are kept as top-level columns so the reflection loop can group/filter
     # cheaply without parsing JSON; the regime_snapshot blob carries the
@@ -84,8 +93,17 @@ class TradeJournal(Base):
     exit_reason = Column(String(32), nullable=True)
 
     # Outcome
+    #
+    # ``pnl`` is GROSS — (exit - entry) * qty — and ``charges_inr`` carries the
+    # modelled round-trip cost separately (issue #579), exactly as
+    # ``open15_trades`` splits them. Never report ``pnl`` as "the P&L": on the
+    # 231 sandbox trades to 2026-08-07 gross read +Rs8,740 while charges were
+    # Rs17,385, so the honest net was -Rs8,645 — the dashboard showed a
+    # profitable strategy that was losing money. Route every consumer through
+    # ``net_pnl_expr`` / ``net_pnl_of_row``.
     pnl = Column(Float, nullable=True)
     pnl_pct = Column(Float, nullable=True)
+    charges_inr = Column(Float, nullable=True)
     hold_duration_seconds = Column(Integer, nullable=True)
 
     # Audit
@@ -99,7 +117,93 @@ class TradeJournal(Base):
         Index("idx_trade_journal_strategy", "strategy_name"),
         Index("idx_trade_journal_exit_reason", "exit_reason"),
         Index("idx_trade_journal_signal_decision", "signal_decision_id"),
+        Index("idx_trade_journal_mode", "mode"),
     )
+
+
+#: Books an order can route to. Mirrors ``services.mode_service`` vocabulary.
+MODE_SANDBOX = "sandbox"
+MODE_LIVE = "live"
+
+#: Rows written before the ``mode`` column existed (issue #568) carry NULL. The
+#: simplified engine ran ``SIMPLIFIED_ENGINE_MODE=sandbox`` for the whole of that
+#: history, so NULL means sandbox — never "unknown". Resolving it anywhere else
+#: would re-introduce the leak the column exists to prevent.
+DEFAULT_MODE = MODE_SANDBOX
+
+
+def net_pnl_expr():
+    """SQL expression for a row's NET P&L — the ONE P&L convention (issue #579).
+
+    ``pnl`` is gross and the modelled MIS round-trip charges live separately in
+    ``charges_inr``, so every consumer reporting "the P&L" must deduct them.
+    This is the same split ``open15_trades`` uses, and the same lesson: before
+    #552 four open15 consumers derived net independently and three disagreed.
+    Here the failure was worse — nothing deducted charges at all, so the
+    strategies dashboard reported **+Rs8,740** on 231 sandbox trades whose true
+    net was **-Rs8,645** (charges 199% of gross). The sign was wrong, not just
+    the magnitude.
+
+    A NULL ``charges_inr`` coalesces to 0, i.e. net degrades to gross rather
+    than to NULL — an un-stamped row must not blank out a whole aggregate.
+    Such rows are the pre-#579 backlog and are backfilled at migration time.
+
+    Never write ``sum(pnl)`` against this journal again — route through here or
+    :func:`net_pnl_of_row`.
+    """
+    from sqlalchemy import func
+
+    return TradeJournal.pnl - func.coalesce(TradeJournal.charges_inr, 0.0)
+
+
+def net_pnl_of_row(row) -> float | None:
+    """Python-side twin of :func:`net_pnl_expr` for an ORM row / mapping.
+
+    Returns ``None`` when the row has no gross P&L (still open, or an unpriced
+    exit) so callers can skip it rather than count an open position as a
+    Rs0 scratch.
+    """
+    get = row.get if isinstance(row, dict) else lambda k, d=None: getattr(row, k, d)
+    gross = get("pnl")
+    if gross is None:
+        return None
+    return float(gross) - float(get("charges_inr") or 0.0)
+
+
+def compute_charges_for_row(row) -> float | None:
+    """Modelled MIS round-trip charges for a closed row, or None if not derivable.
+
+    Delegates to the engine's own ``compute_zerodha_intraday_charges`` — the
+    model already calibrated against Kite's ``/charges/orders`` endpoint (it
+    carries the NBCC per-leg-brokerage-cap correction). Deliberately NOT a second
+    implementation: a journal that disagreed with the engine about cost would be
+    the #552 divergence all over again.
+    """
+    get = row.get if isinstance(row, dict) else lambda k, d=None: getattr(row, k, d)
+    entry, exit_px, qty = get("entry_price"), get("exit_price"), get("quantity")
+    if entry is None or exit_px is None or not qty:
+        return None
+    try:
+        from services.simplified_stock_engine_core import compute_zerodha_intraday_charges
+
+        q = abs(int(qty))
+        buy_value = float(entry) * q
+        sell_value = float(exit_px) * q
+        return round(compute_zerodha_intraday_charges(buy_value, sell_value).total, 2)
+    except Exception:
+        logger.exception("trade_journal: charge computation failed")
+        return None
+
+
+def mode_of_row(row) -> str:
+    """Resolve a journal row's book, treating NULL/blank as ``sandbox``.
+
+    The single definition of that fallback — callers must not re-derive it, for
+    the same reason ``net_pnl_expr``/``net_pnl_of_row`` are centralized in
+    ``open15_breakout_db`` (issue #552): three call sites deriving one convention
+    independently is how the dashboard and the logs page ended up disagreeing.
+    """
+    return (getattr(row, "mode", None) or DEFAULT_MODE).strip().lower() or DEFAULT_MODE
 
 
 def init_db():
@@ -123,7 +227,7 @@ def _ensure_columns():
 
     # ALTER TABLE ADD COLUMN clause keyed by column name. SQLite has no
     # native bool/decimal types; REAL maps to the SQLAlchemy Float column.
-    pending = {"ltp_at_signal": "REAL"}
+    pending = {"ltp_at_signal": "REAL", "mode": "VARCHAR(16)", "charges_inr": "REAL"}
     try:
         inspector = inspect(engine)
         existing = {col["name"] for col in inspector.get_columns("trade_journal")}
@@ -142,6 +246,89 @@ def _ensure_columns():
             logger.info("trade_journal: added column %s %s", name, sql_type)
         except Exception as e:
             logger.warning("trade_journal: failed adding column %s: %s", name, e)
+            continue
+        if name == "mode":
+            _backfill_mode()
+
+    # Costing runs on EVERY boot, not only in the branch that just added the
+    # column. Tying it to column-creation is fragile: on 2026-08-08 the dev
+    # server auto-reloaded midway through this change, applied the ALTER, and
+    # left every row unstamped forever — the `continue` above meant the backfill
+    # could never fire again. It is idempotent and cheap (one indexed filter on
+    # `charges_inr IS NULL`), so an unconditional call is strictly safer and
+    # also repairs rows imported by any other path.
+    backfill_charges()
+
+
+def _backfill_mode() -> None:
+    """One-shot: stamp pre-#568 rows as ``sandbox``.
+
+    Runs only in the branch that just *added* the column, so it can never
+    re-stamp a row a later live session wrote. Verified before shipping: the
+    ``strategy_mode`` row for ``simplified_engine`` has read ``sandbox`` since
+    2026-06-12 and was never flipped, and it is the only strategy with journal
+    rows — so every existing row genuinely is a sandbox trade.
+
+    ``mode_of_row`` already resolves NULL to sandbox, so this is belt-and-braces;
+    its real value is making raw SQL (``GROUP BY mode``) agree with the ORM
+    readers instead of silently bucketing history under NULL.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.begin() as conn:
+            res = conn.execute(
+                text(f"UPDATE trade_journal SET mode = '{MODE_SANDBOX}' WHERE mode IS NULL")
+            )
+        logger.info("trade_journal: backfilled mode=sandbox on %s legacy row(s)", res.rowcount)
+    except Exception as e:
+        logger.warning("trade_journal: mode backfill failed (readers fall back): %s", e)
+
+
+def backfill_charges() -> int:
+    """Stamp ``charges_inr`` on every closed row that lacks it. Returns the count.
+
+    Deterministic — charges are a pure function of entry price, exit price and
+    quantity — so this is safe to re-run and is idempotent by the
+    ``charges_inr IS NULL`` predicate. Called once when the column is first
+    added; also exposed for an operator re-run after an import.
+
+    Rows that are still open, or whose exit was never priced (the #350
+    watchdog-stamped class), are skipped rather than stamped 0 — a fabricated
+    zero cost would be indistinguishable from a genuinely free trade.
+    """
+    stamped = 0
+    sess = db_session()
+    try:
+        rows = (
+            sess.query(TradeJournal)
+            .filter(
+                TradeJournal.charges_inr.is_(None),
+                TradeJournal.pnl.isnot(None),
+                TradeJournal.entry_price.isnot(None),
+                TradeJournal.exit_price.isnot(None),
+            )
+            .all()
+        )
+        for row in rows:
+            c = compute_charges_for_row(row)
+            if c is not None:
+                row.charges_inr = c
+                stamped += 1
+        sess.commit()
+        logger.info("trade_journal: backfilled charges_inr on %s closed row(s)", stamped)
+    except Exception as e:
+        logger.warning("trade_journal: charges backfill failed: %s", e)
+        try:
+            sess.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            sess.remove()
+        except Exception:
+            pass
+    return stamped
 
 
 def _now_iso() -> str:
@@ -163,6 +350,7 @@ def _row_to_dict(row: TradeJournal) -> dict:
         "entry_order_id": row.entry_order_id,
         "entry_fill_at": row.entry_fill_at,
         "ltp_at_signal": row.ltp_at_signal,
+        "mode": mode_of_row(row),
         "regime_snapshot": row.regime_snapshot,
         "nifty_pct_at_entry": row.nifty_pct_at_entry,
         "india_vix_at_entry": row.india_vix_at_entry,
@@ -172,6 +360,10 @@ def _row_to_dict(row: TradeJournal) -> dict:
         "exit_reason": row.exit_reason,
         "pnl": row.pnl,
         "pnl_pct": row.pnl_pct,
+        # gross (`pnl`), modelled cost, and the ONE net definition — consumers
+        # must read `net_pnl`, never `pnl` (issue #579).
+        "charges_inr": row.charges_inr,
+        "net_pnl": net_pnl_of_row(row),
         "hold_duration_seconds": row.hold_duration_seconds,
         "notes": row.notes,
         "created_at": row.created_at,

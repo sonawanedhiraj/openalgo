@@ -84,6 +84,7 @@ def record_entry(
     ltp_at_signal: float | None = None,
     signal_decision_id: int | None = None,
     scan_cycle_id: int | None = None,
+    mode: str | None = None,
     regime_snapshot: dict[str, Any] | None = None,
     nifty_pct: float | None = None,
     india_vix: float | None = None,
@@ -92,6 +93,12 @@ def record_entry(
     """Insert a partial row at order placement. Returns the new row id, or 0
     on DB failure. ``placed_at``, ``created_at``, ``updated_at`` are all set
     to "now" in IST.
+
+    ``mode`` records which book the order actually routed to ('sandbox' |
+    'live', issue #568). Pass the value the ORDER was dispatched with —
+    ``services.mode_service.resolve_order_mode(mode_key)`` — never the
+    strategy's configured mode, so the journal and the book can never disagree.
+    Omitting it leaves NULL, which readers resolve to ``sandbox``.
     """
     sess = _session()
     try:
@@ -114,6 +121,7 @@ def record_entry(
             entry_price=entry_price,
             entry_order_id=entry_order_id,
             ltp_at_signal=ltp_at_signal,
+            mode=(mode or "").strip().lower() or None,
             regime_snapshot=_json_or_none(regime_snapshot),
             nifty_pct_at_entry=nifty_pct,
             india_vix_at_entry=india_vix,
@@ -252,6 +260,22 @@ def record_exit(
                 hold_duration_seconds = None
         if hold_duration_seconds is not None:
             row.hold_duration_seconds = int(hold_duration_seconds)
+
+        # Modelled MIS round-trip cost (issue #579). `pnl` above is GROSS; this
+        # is the other half of the pair every consumer needs to report an honest
+        # net. Stamped here so a live trade never depends on the backfill.
+        # Best-effort: a costing failure must not lose the exit itself, which is
+        # the row that stops a position being counted as still open.
+        try:
+            from database.trade_journal_db import compute_charges_for_row
+
+            charges = compute_charges_for_row(row)
+            if charges is not None:
+                row.charges_inr = charges
+        except Exception:
+            logger.exception(
+                "trade_journal.record_exit: charge computation failed (id=%s)", journal_id
+            )
 
         row.updated_at = now_iso
         sess.commit()

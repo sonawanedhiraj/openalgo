@@ -41,9 +41,11 @@ from blueprints.apikey import api_key_bp
 from blueprints.auth import auth_bp
 from blueprints.backtest import backtest_bp  # MVP backtester endpoints
 from blueprints.brlogin import brlogin_bp
+from blueprints.broker_accounts import broker_accounts_bp  # Multi-account child accounts (#468)
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
+from blueprints.broker_totp import broker_totp_bp  # Broker external-TOTP helper
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
 from blueprints.core import core_bp
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
@@ -68,6 +70,7 @@ from blueprints.master_contract_status import (
 from blueprints.mode_status import mode_status_bp  # Stage-0 mode resolver status endpoint
 from blueprints.oiprofile import oiprofile_bp  # Import the OI Profile blueprint
 from blueprints.oitracker import oitracker_bp  # Import the OI tracker blueprint
+from blueprints.open15_breakout import open15_bp  # open15_vol_breakout control/observability
 from blueprints.orders import orders_bp
 from blueprints.platforms import platforms_bp
 from blueprints.playground import playground_bp  # Import the API playground blueprint
@@ -104,11 +107,14 @@ from blueprints.websocket_example import websocket_bp  # Import the websocket ex
 from blueprints.whatsapp import whatsapp_bp  # Import the WhatsApp blueprint
 from cors import cors  # Import the CORS instance
 from csp import apply_csp_middleware  # Import the CSP middleware
+from database.account_orders_db import init_db as ensure_account_orders_tables_exists
 from database.action_center_db import init_db as ensure_action_center_tables_exists
 from database.analyzer_db import init_db as ensure_analyzer_tables_exists
 from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.auth_db import init_db as ensure_auth_tables_exists
 from database.backtest_db import init_db as ensure_backtest_tables_exists
+from database.broker_accounts_db import init_db as ensure_broker_accounts_tables_exists
+from database.broker_totp_db import init_db as ensure_broker_totp_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
 from database.data_health_db import init_db as ensure_data_health_tables_exists
@@ -123,9 +129,13 @@ from database.intraday_pullback_db import init_db as ensure_intraday_pullback_ta
 from database.intraday_pullback_eval_db import (
     init_db as ensure_intraday_pullback_eval_tables_exists,
 )
+from database.job_run_db import init_db as ensure_job_run_tables_exists
 from database.journal_reflection_db import init_db as ensure_journal_reflection_tables_exists
 from database.latency_db import init_latency_db as ensure_latency_tables_exists
 from database.leverage_db import init_db as ensure_leverage_tables_exists
+from database.open15_breakout_db import init_db as ensure_open15_tables_exists
+from database.option_liquidity_db import init_db as ensure_option_liquidity_tables_exists
+from database.postmarket_review_db import init_db as ensure_postmarket_review_tables_exists
 from database.sandbox_db import init_db as ensure_sandbox_tables_exists
 from database.scan_cycle_db import init_db as ensure_scan_cycle_tables_exists
 from database.scanner_comparison_db import (
@@ -296,6 +306,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
     app.register_blueprint(intraday_pullback_bp)  # intraday_pullback_top2 control/observability
+    app.register_blueprint(open15_bp)  # open15_vol_breakout control/observability
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
@@ -330,6 +341,8 @@ def create_app(testing: bool = False):
     app.register_blueprint(oiprofile_bp)  # Register OI Profile blueprint
     app.register_blueprint(flow_bp)  # Register Flow blueprint
     app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
+    app.register_blueprint(broker_totp_bp)  # Broker external-TOTP helper (Zerodha 2FA code)
+    app.register_blueprint(broker_accounts_bp)  # Multi-account child accounts (#468)
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
     app.register_blueprint(strategy_portfolio_bp)  # Register Strategy Portfolio blueprint
 
@@ -699,14 +712,20 @@ def setup_environment(app):
                 ("Daily Intent DB", ensure_daily_intent_tables_exists),
                 ("Strategy Daily Intent DB", ensure_strategy_daily_intent_tables_exists),
                 ("Data Health DB", ensure_data_health_tables_exists),
+                ("Option Liquidity DB", ensure_option_liquidity_tables_exists),
                 ("Scan Cycle DB", ensure_scan_cycle_tables_exists),
                 ("Scanner DB", ensure_scanner_tables_exists),
                 ("Scanner Comparison DB", ensure_scanner_comparison_tables_exists),
                 ("Signal Decision DB", ensure_signal_decision_tables_exists),
                 ("Trade Journal DB", ensure_trade_journal_tables_exists),
                 ("Journal Reflection DB", ensure_journal_reflection_tables_exists),
+                ("Job Run DB", ensure_job_run_tables_exists),
+                ("Post-market Review DB", ensure_postmarket_review_tables_exists),
                 ("Backtest DB", ensure_backtest_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
+                ("Broker TOTP DB", ensure_broker_totp_tables_exists),
+                ("Broker Accounts DB", ensure_broker_accounts_tables_exists),
+                ("Account Orders DB", ensure_account_orders_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
                 ("Latency DB", ensure_latency_tables_exists),
                 ("Strategy DB", ensure_strategy_tables_exists),
@@ -721,6 +740,7 @@ def setup_environment(app):
                 ("Intraday Pullback DB", ensure_intraday_pullback_tables_exists),
                 ("Intraday Pullback Config DB", ensure_intraday_pullback_config_tables_exists),
                 ("Intraday Pullback Eval DB", ensure_intraday_pullback_eval_tables_exists),
+                ("Open15 Breakout DB", ensure_open15_tables_exists),
                 ("Futures Follow Eval DB", ensure_futures_follow_eval_tables_exists),
                 ("Leverage DB", ensure_leverage_tables_exists),
                 ("Strategy Portfolio DB", ensure_strategy_portfolio_tables_exists),
@@ -754,9 +774,17 @@ def setup_environment(app):
             # safety-guard table exist on every boot. Without this, the engines'
             # runtime-override reads and the safety guards' override writes would
             # hit a missing table (and silently fail-open / fail-safe).
+            # strategy_mode_audit belongs here too (issue #575): it is the ONLY
+            # history of who flipped a strategy and when — `strategy_mode` keeps
+            # one row per strategy and overwrites it in place. Missing at boot,
+            # every flip (accepted AND preflight-blocked) was dropped, including
+            # the live->sandbox flip that remediated #561.
             try:
                 from database.strategy_llm_config_db import (
                     init_db as _init_strategy_llm_config,
+                )
+                from database.strategy_mode_audit_db import (
+                    init_db as _init_strategy_mode_audit,
                 )
                 from database.strategy_mode_db import init_db as _init_strategy_mode
                 from database.strategy_runtime_override_db import (
@@ -764,6 +792,7 @@ def setup_environment(app):
                 )
 
                 _init_strategy_mode()
+                _init_strategy_mode_audit()
                 _init_strategy_runtime_override()
                 _init_strategy_llm_config()
             except Exception as e:
@@ -794,6 +823,18 @@ def setup_environment(app):
                 logger.debug("Historify scheduler initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Historify scheduler: {e}")
+
+            # Job-run audit — attach BEFORE any service registers its jobs so a
+            # job that fires immediately at boot is still recorded. Records one
+            # `job_run` row per fire so "did the 15:20 entry job run?" is a
+            # one-row lookup rather than a 5 MB log grep.
+            try:
+                from services.job_run_audit import init_job_run_audit
+
+                init_job_run_audit()
+                logger.debug("Job run audit initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize job run audit: {e}")
 
             # Probe historify.duckdb for orphan-process contention BEFORE wiring
             # any backfill scheduler. If a foreign python.exe is holding the
@@ -940,6 +981,16 @@ def setup_environment(app):
             except Exception as e:
                 logger.error(f"Failed to initialize Intraday Pullback service: {e}")
 
+            # open15_vol_breakout — mid-bar volume-surge breakout, sandbox (#425).
+            # See strategies/open15_vol_breakout/ and OPEN15_* env flags.
+            try:
+                from services.open15_breakout_service import init_open15_breakout_service
+
+                init_open15_breakout_service(app=app)
+                logger.debug("Open15 breakout service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize Open15 breakout service: {e}")
+
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
             # single 15:45 IST mon-fri job that compares the in-house scanner's
@@ -955,6 +1006,48 @@ def setup_environment(app):
                 logger.debug("Scanner comparison EOD job registered")
             except Exception as e:
                 logger.error(f"Failed to register Scanner comparison EOD job: {e}")
+
+            # open15 option-liquidity sweep (issue #583) — 15:45 IST, while the
+            # broker session is still alive (the sweep needs a live token, and
+            # Zerodha's expires overnight). Batched get_multiquotes over the
+            # near-the-money band of every F&O underlying, scored PER SIDE into
+            # option_liquidity_daily. Phase 1 only MEASURES — nothing reads the
+            # table yet; gated per-fire by OPTION_LIQUIDITY_ENABLED.
+            try:
+                from services.option_liquidity_service import init_option_liquidity_service
+
+                init_option_liquidity_service()
+                logger.debug("Option liquidity EOD job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Option liquidity EOD job: {e}")
+
+            # Daily post-market review (issue #511) — 17:15 IST, after the
+            # 15:30-17:00 backfill-convergence window closes so every input it
+            # reads has settled. Read-only on every DB except its own table;
+            # gated per-fire by POSTMARKET_REVIEW_ENABLED.
+            try:
+                from services.postmarket_review_service import (
+                    init_postmarket_review_service,
+                )
+
+                init_postmarket_review_service()
+                logger.debug("Post-market review job registered")
+            except Exception as e:
+                logger.error(f"Failed to register Post-market review job: {e}")
+
+            # Multi-account observability jobs (issue #476): child-login
+            # reminders (09:00 + 15:00 IST) and the 15:35 IST EOD mirror
+            # summary. Fire-time gated on MULTI_ACCOUNT_ENABLED + trading-day —
+            # silent for single-account installs.
+            try:
+                from services.account_mirror_summary_service import (
+                    init_account_mirror_summary_service,
+                )
+
+                init_account_mirror_summary_service()
+                logger.debug("Multi-account observability jobs registered")
+            except Exception as e:
+                logger.error(f"Failed to register multi-account observability jobs: {e}")
 
             # Trading-day funnel (issue #159). Registers a single 15:35 IST
             # mon-fri job that walks the signal → engine → order → journal

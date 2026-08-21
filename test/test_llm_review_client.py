@@ -210,3 +210,72 @@ def test_probe_health_generic_runtime_error_is_error(monkeypatch):
     out = lrc.probe_claude_health(timeout_s=5.0)
     assert out["reachable"] is False
     assert out["reason"] == "error"
+
+
+# --------------------------------------------------------------------------
+# Logged-out CLI detection (issue #534)
+# --------------------------------------------------------------------------
+#
+# The CLI signals "not logged in" in TWO shapes, and neither reaches the caller
+# as an error without the handling below:
+#
+#   1. exit 0 + `is_error: true` in the envelope  → `result` was returned as if
+#      it were the model's answer, so the veto saw "Not logged in · Please run
+#      /login" as reasoning text and the triage layer would have filed it as a
+#      day assessment.
+#   2. exit 1 + EMPTY stderr, diagnostic in STDOUT → the error message read
+#      "claude review exited 1: " with nothing after the colon, which cost
+#      `_AUTH_MARKERS` its only evidence and reported "error" to the operator
+#      instead of the one-command fix.
+
+_LOGGED_OUT_ENVELOPE = (
+    '{"type":"result","subtype":"success","is_error":true,'
+    '"result":"Not logged in \u00b7 Please run /login",'
+    '"session_id":"abc123"}'
+)
+
+
+def test_envelope_is_error_raises_instead_of_returning_the_message():
+    import pytest
+
+    from services.llm_review_client import _parse_envelope
+
+    with pytest.raises(RuntimeError, match="Not logged in"):
+        _parse_envelope(_LOGGED_OUT_ENVELOPE)
+
+
+def test_successful_envelope_still_parses():
+    from services.llm_review_client import _parse_envelope
+
+    text, session = _parse_envelope('{"result":"all good","session_id":"s1"}')
+
+    assert text == "all good"
+    assert session == "s1"
+
+
+def test_nonzero_exit_falls_back_to_stdout_when_stderr_is_empty():
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    from services import llm_review_client as client
+
+    completed = MagicMock(returncode=1, stdout=_LOGGED_OUT_ENVELOPE, stderr="")
+    with patch.object(client.subprocess, "run", return_value=completed):
+        with pytest.raises(RuntimeError, match="Not logged in"):
+            client.invoke_claude_review("hi", 5.0)
+
+
+def test_probe_classifies_a_logged_out_cli_as_not_logged_in():
+    from unittest.mock import MagicMock, patch
+
+    from services import llm_review_client as client
+
+    completed = MagicMock(returncode=1, stdout=_LOGGED_OUT_ENVELOPE, stderr="")
+    with patch.object(client.subprocess, "run", return_value=completed):
+        health = client.probe_claude_health(5.0)
+
+    assert health["reachable"] is False
+    # The operator needs "run claude login", not a generic "error".
+    assert health["reason"] == "not_logged_in"
+    assert "login" in health["detail"].lower()

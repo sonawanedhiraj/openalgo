@@ -16,7 +16,12 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
 - **DBs written:** `db/openalgo.db`, `db/logs.db`, `db/sandbox.db`,
   `db/historify.duckdb`, `db/latency.db`, `db/health.db`
 - **Logs:** `log/openalgo_YYYY-MM-DD.log` (text, if `LOG_TO_FILE=True`),
-  `log/errors.jsonl` (structured ERROR+, always on)
+  `log/errors.jsonl` (structured ERROR+, always on — **capped at 1000 lines and
+  truncated on every app startup**, so it is a rolling window, not a history),
+  `log/error_digest_YYYY-MM-DD.json` (issue #511 — the durable per-day error
+  digest written by `services/postmarket_log_digest`; templates bucketed by
+  `(logger, normalized_message)` with counts + exemplars, merged max-wise on each
+  run so a restart-truncation can no longer erase the day's earlier errors)
 - **Boot sequence:** imports ~22 `init_db()` functions (`app.py:90-114`) → multi-DB
   table init → master-contract load → scanner-history warm-up thread
   (`app.py:842-851`, gated by `SCANNER_HISTORY_WARMUP_ENABLED`) → WS subscribe →
@@ -239,17 +244,85 @@ never rolls it).
   `test/test_tick_liveness_watchdog.py`, `test/test_ws_proxy_supervisor.py`,
   `test/test_scanner_live_bar_heartbeat.py`.
 
+## Live inventory — `/admin/schedulers` (issue #539)
+
+**Start here, not with this document.** The tables below are hand-written prose
+and drift; the page is generated from the running process. It merges a
+declarative catalog with live introspection, so it shows what this file cannot:
+which jobs are actually registered *right now*, when each next fires, how the
+last fire went (from `job_run`), and whether each long-lived thread is alive
+**and beating**.
+
+- **Jobs:** `services/scheduler_registry.py`. Catalogs every job across the
+  **seven** APScheduler instances (see the table below), then merges with live
+  `get_jobs()` + `job_run`. Three states: `registered`, `not_registered` (in the
+  catalog but absent from its scheduler — usually an env flag skipped
+  registration; **introspection alone can never surface this row**), and
+  `unregistered` (live but uncatalogued — where user-defined historify / python
+  / flow / chartink schedules land).
+- **Threads:** `services/thread_registry.py`. Catalogs ~32 long-lived threads by
+  class (`loop` / `transport` / `poller` / `boot`) and adds an in-memory
+  heartbeat, because `is_alive()` stays `True` for a thread wedged on a socket
+  read. States: `running`, `stale`, `dead`, `not_started`, `completed`.
+- **Read-only.** Neither module calls `add_job` / `pause_job` / `remove_job`, and
+  scheduler resolution reads `sys.modules` rather than importing (importing
+  `blueprints.python_strategy` runs a strategy cleanup). Controls — a durable
+  `scheduler_job_control` table, fire-time guards, tiered toggles — are Phase 2.
+- **Tiers** are recorded but not yet enforced: `protected` (exits, EOD flattens,
+  square-offs, daily resets — never disableable, each carries a `safety_note`
+  explaining why), `guarded`, `free`.
+- **API:** `GET /admin/api/schedulers` (session auth). Each half degrades
+  independently into `sources_failed`.
+- **Alerting:** a thread that beat at least once and then went silent past
+  `THREAD_HEARTBEAT_STALE_MULTIPLIER` x its cadence — or vanished — raises a
+  dedup'd alert from the thread-watchdog loop. A thread that never beat is
+  `not_started` and never alerts. This closes the gap that
+  `thread_watchdog_service` structurally cannot cover: it counts threads and
+  detects a *leak*, but has no expected-set and so cannot detect a **dead** one.
+- **Adding a job or a long-lived thread? Add it to the matching catalog.**
+  `test/test_scheduler_registry.py` parses every `add_job(..., id="X")` in
+  `services/`, `blueprints/` and `sandbox/` and fails when one is uncatalogued;
+  `test/test_thread_registry.py` does the same for `Thread(name="X")`.
+
+## Daemon threads (OpenAlgo worker)
+
+Not everything scheduled is an APScheduler job. Live state is on the page above;
+this is the map. Full per-thread detail lives in `thread_registry.CATALOG`.
+
+| Class | Members | Notes |
+|---|---|---|
+| **Recurring loops** | `ScannerBackfillPeriodic` (30 min, 15:30-17:00), `ScannerStragglerRecheck` (15 min, 09:20-15:30), `SectorFollowBackfillPeriodic` (30 min, 15:30-17:00), `OptionLiquidityConvergence` (20 min, after 15:55 on trading days — re-runs the option-liquidity sweep if today has no score rows, issue #589), `TickLivenessWatchdog` (30 s), `WSProxySupervisor` (30 s), `ScannerWsWatchdog` (60 s), `ThreadWatchdog` (30 s), `HealthCollector` (10 s), `MarketDataHealthCheck` (5 s), `MarketDataCleanup` (300 s), `FlowPriceMonitor` (5 s) | Cron jobs in all but name. Each stamps `thread_registry.beat()` at the top of its tick — that heartbeat, not `is_alive()`, is what proves the loop is working. |
+| **Feed / transport** | `ZerodhaWS`, `ZerodhaWSSubscriptions`, `ZerodhaWSHealthCheck`, `WebSocketProxyServer`, `WebSocketClientLoop`, `ScannerZMQSubscriber`, `open15-zmq` (windowed 09:14:50 → exit+5 s), `SimplifiedTickLogWriter` | All `protected`. Everything downstream depends on them. |
+| **Bot pollers** | `TelegramBotThread`, `TelegramInboundThread`, `WhatsAppBotThread` | One poller per token — the inbound poller refuses to start while the UI bot owns it (issue #238). `telegram_bot_service_v2.py` / `_fixed.py` are **not imported anywhere**; their pollers never start. |
+| **Boot one-shots** | `ScannerBackfillBoot`, `SectorFollowBackfillBoot`, `ScannerAggregatorSeed`, `ScannerPreSubscribe`, `RegimeSectorPreSubscribe`, `ScannerHistoryWarmup`, `AbandonedExitRecovery`, `futures_follow_rehydrate`, `IntradayPullbackBootResume`, `WhatsAppAutoStart` | Run once and exit; `completed` is the healthy state, not `dead`. |
+| **Excluded** | Per-item ephemeral workers (chartink/strategy order processors, flow workflow runs, `execute_schedule`, `connect-cb-*`, open15 opt-shadow catch-up) | Thousands per session; they belong in logs, not an inventory. |
+
 ## In-process APScheduler jobs (OpenAlgo worker)
 
-These cron jobs run **inside** the single eventlet worker on the shared
-APScheduler instance (`services/historify_scheduler_service.py`). They are NOT
-Cowork host tasks (§3 above) — they live and die with the OpenAlgo process and
-need no external scheduler.
+Most of these run **inside** the single eventlet worker on the shared
+APScheduler instance (`services/historify_scheduler_service.py`), but that is
+**not the only scheduler** — there are seven:
+
+| Scheduler | Owner | Holds |
+|---|---|---|
+| shared "historify" | `services/historify_scheduler_service.py` | every strategy + report job |
+| EOD watchdog | `services/eod_watchdog_service.py` | `eod_watchdog_<strategy>` (15:14) |
+| sandbox square-off | `sandbox/squareoff_thread.py` | `squareoff_*`, `t1_settlement`, `auto_reset`, `daily_pnl_*` |
+| Flow | `services/flow_scheduler_service.py` | user Flow triggers |
+| Python strategies | `blueprints/python_strategy.py` | user strategies + `daily_trading_day_check`, `market_hours_enforcer`, `reap_dead_strategies` |
+| Chartink | `blueprints/chartink.py` | webhook strategy schedules |
+| Strategy | `blueprints/strategy.py` | webhook strategy schedules |
+
+They are NOT Cowork host tasks (§3 above) — they live and die with the OpenAlgo
+process and need no external scheduler.
 
 | Job id | Cron (IST) | What it does | Gating / writes |
 |---|---|---|---|
 | `scanner_comparison_eod` | `45 15 * * 1-5` (15:45 IST) | **In-house-scanner-vs-Chartink EOD comparison** — the in-process replacement for the retired Cowork `scanner-vs-chartink-daily-comparison` task (§3). For today: unions the Chartink BUY/SELL webhook lists (`scan_cycle`, `cycle_kind='chartink'`) and the in-house scanner hits (`scan_results`, `source='inhouse'`, grouped by `scan_definition.screener_type`), computes per-side counts/intersection/Jaccard/recall + a tuning verdict, writes one `scanner_comparison` row per side (idempotent delete-then-insert per `(date, side)`), and Telegrams the summary via `notify()`. Read-only on every DB except its own table. | Per-fire gate env `SCANNER_COMPARISON_EOD_ENABLED` (default `true`); fire time env `SCANNER_COMPARISON_EOD_TIME` (default `15:45`); Telegram toggle `NOTIFY_SCANNER_COMPARISON` (default `true`). Body: `services/scanner_comparison_eod_service._eod_comparison_job` (registered by `init_scanner_comparison_eod_service`). |
+| `option_liquidity_eod` | `45 15 * * 1-5` (15:45 IST) | **open15 option-liquidity sweep (issue #583, Phase 1 — MEASURES ONLY, nothing reads it yet).** For each `SCANNER_SYMBOLS` name resolving to `NSE`: one batched `get_multiquotes` pass for the equity spot, then a second batched pass over the **front-month nearest-6-strikes-per-side** option band (~2,500 contracts, ~5 calls, ~6 s). Derives per `(symbol, side)`: `atm_premium_turnover` (Σ `volume × ltp` — **no lot multiply**, the broker quote's volume is already in UNITS, unlike the NSE bhavcopy's LOTS), `atm_zero_vol_strikes` (≥ half the band forces the score to exactly 0.0), median `atm_spread_pct` of the MID, plus lots/OI diagnostics. Ranks by mid-rank percentile **within side, within the day's universe** (mid-rank so an exact 0.0 stays reserved for the dead-band floor), then stores the **20-day median** — NULL below `OPTION_LIQUIDITY_MIN_DAYS` sessions, which means *"cannot rank"*, never *"illiquid"*. **15:45 because the sweep needs a live broker session**; no session ⇒ **no row written** (the median tolerates a gap; a half-swept day would corrupt a percentile that is a rank within that day's universe). Also logs the `SCANNER_SYMBOLS`-vs-`SymToken` churn diff both ways and **never edits `SCANNER_SYMBOLS`** (the scanner, sector_follow and the aggregator all read it). Read-only on every DB except its own table. | Per-fire gate env `OPTION_LIQUIDITY_ENABLED` (default `true`); fire time `OPTION_LIQUIDITY_EOD_TIME` (default `15:45`); `OPTION_LIQUIDITY_BAND_PER_SIDE` (6), `OPTION_LIQUIDITY_MEDIAN_DAYS` (20), `OPTION_LIQUIDITY_MIN_DAYS` (10). Writes `option_liquidity_daily`. Body: `services/option_liquidity_service._eod_job` (registered by `init_option_liquidity_service`). **Issue #589 hardening:** (1) consumer staleness (`get_latest_scores(max_age_days)`) counts **trading sessions** via `data_freshness_service.is_trading_day`, not calendar days — weekends/NSE holidays never burn the budget (pre-#589 the gate went dark every long weekend, e.g. Tue after a Mon holiday); (2) the `OptionLiquidityConvergence` daemon loop (20 min, `OPTION_LIQUIDITY_CONVERGENCE_ENABLED` default `true`) re-runs the sweep after 15:55 IST on a trading day whose rows are missing — the quote sweep stays valid until the next session opens, so an evening boot after an outage recovers the day. A fully-missed day (down 15:45→next open) stays a hole; the session-based staleness absorbs it. |
+| `postmarket_review` | `15 17 * * 1-5` (17:15 IST) | **Daily post-market review (issue #511, Phase 1).** Builds the day digest — per-job fire summary from `job_run`, per-strategy journal counts (`trade_journal` split by strategy/direction incl. open-at-EOD and #350-style unpriced exits, plus `futures_follow_trades` / `sector_follow_trades` / `open15_trades` / `intraday_pullback_trades`), `signal_decision` taken-vs-vetoed, scanner hits + `scan_cycle` post outcomes, futures **carry walk** (FIFO over BUY/SELL legs → `open_lots_carried`, `oldest_open_entry_date`, `carry_age_days`), latest `data_health_check` per universe, `scanner_comparison`, `account_orders` mirror outcomes, `sandbox_orders` cross-check, and the compacted log view — then writes one `postmarket_review` row and Telegrams the summary. Each section is independently wrapped: a dead source degrades to `null` and is named in `sources_failed` rather than killing the run. Also prunes `job_run` beyond `JOB_RUN_RETENTION_DAYS`. **17:15 because the scanner backfill convergence loop runs until 17:00** — reviewing earlier reads half-written data. Non-trading days return early and persist nothing. Read-only on every DB except its own table. **Phase 2 (#532)** adds deterministic **expectation contracts** (`services/strategy_expectations.py`): declarative per-strategy pass/fail predicates evaluated over the digest, whose violations lead the Telegram summary and persist to `postmarket_review.violations_json` / `n_violations` / `contracts_json` (columns migrated in by `_ensure_columns`). Contracts read the digest ONLY (so any past day replays), a missing digest section resolves to **`unknown`, never `fail`** (a collection gap is not a strategy fault), and each violation carries a **fingerprint** over `strategy|contract_id|shape` — deliberately excluding observed values so one recurring problem dedupes to one Phase-4 issue instead of one per day. **Phase 3 (#534)** adds the `claude -p` triage pass (`services/postmarket_triage.py`) over those violations via the same in-process seam the Stage-1 veto uses (`llm_review_client.invoke_claude_review`, real unpatched OS thread under eventlet): it returns a day assessment, per-violation likely-cause / recurrence / recommended action and draft issue text, persisted to `triage_json` / `llm_status` / `llm_latency_ms`. **The model cannot create findings** — every triage entry must carry a `fingerprint` present in the input, and unrecognised ones are dropped and logged, so injected log text cannot manufacture a violation. Log-derived content rides in a delimited `<untrusted_log_data>` block and the model's output is used only as text and ranking, never as a command or filing decision. Failure is LOUD (`llm_status ∈ ok|skipped_clean_day|skipped_disabled|not_logged_in|cli_missing|unreachable|timeout|parse_failed|error`) and stated in the Telegram summary — a silent skip is the failure this feature exists to catch. GitHub issue filing (Phases 4/5) lands later. | Per-fire gate env `POSTMARKET_REVIEW_ENABLED` (default `true`); fire time env `POSTMARKET_REVIEW_TIME` (default `17:15`); Telegram toggle `NOTIFY_POSTMARKET_REVIEW` (default `true`). Body: `services/postmarket_review_service._postmarket_review_job` (registered by `init_postmarket_review_service`). Digest: `services/postmarket_day_digest.build_day_digest`; log compaction: `services/postmarket_log_digest.build_log_digest`. Contract gates: `POSTMARKET_CONTRACTS_ENABLED` (default `true`), `POSTMARKET_CONTRACTS_DISABLED` (comma-separated `contract_id` or `strategy:contract_id`). Triage gates: `POSTMARKET_TRIAGE_ENABLED` (default `true`), `POSTMARKET_TRIAGE_ON_CLEAN_DAYS` (default `false`), `POSTMARKET_TRIAGE_TIMEOUT_SECONDS` (default `240`); needs the `claude` CLI logged in on the host. Replay: `uv run python -m services.postmarket_review_service --date YYYY-MM-DD --dry-run`. |
 | `telegram_inbound_morning_prompt` | ~~`45 8 * * 1-5`~~ | **RETIRED (mode-only, 2026-06-12, B5).** The morning intent prompt is gone — there is no per-day run/pause/halt to set (strategies run continuously in their persistent `strategy_mode`). `register_jobs` no longer schedules this job and removes any stale instance. The Telegram bot now only serves `/status` (reports modes); all intent commands return a deprecation notice pointing at `/api/pause`. | No longer registered. Was gated on `TELEGRAM_INBOUND_ENABLED=true`. |
+| `multi_account_login_reminder_0900` / `_1500` + `multi_account_fill_reconcile` + `multi_account_eod_summary` | `0 9 * * 1-5`, `0 15 * * 1-5`, `40 9 * * 1-5`, `35 15 * * 1-5` (IST) | **Multi-account observability (issue #476).** Reminders: Telegram-lists enabled child accounts with strategies selected but no fresh `acct:<id>` session (the 15:00 firing is a LAST-CALL nudge before the 15:20 entries). EOD summary: one line per child account over today's `account_orders` rows (placed/skipped/rejected). **Fill reconciliation (issue #637):** `placed` is only the broker's ACK — Zerodha returns 200 with an order id and can RMS-reject afterwards, and nothing re-checked it, so a refused child order was reported as a trade for ever. `services/account_fill_reconcile.py` re-reads each child's **RAW** orderbook (`get_order_book(token)`; the shared mapper drops `status_message`) with the CHILD's own `acct:<id>` token and turns a post-ACK rejection into `rejected` with the broker's reason, alerting. It corrects only DOWNWARDS — a confirmed fill is left alone. Runs at 09:40 (so a 09:1x open15 mirror does not stay wrong until the afternoon) AND inline at the head of the 15:35 summary, so that report is built on a corrected record. Idempotent with no marker column: a corrected row is no longer `placed`. | All three fire-time gated on `MULTI_ACCOUNT_ENABLED` (default `false`) AND `data_freshness_service.is_trading_day` — silent for single-account installs and on holidays. Body: `services/account_mirror_summary_service.py` (registered by `init_account_mirror_summary_service` from `app.py`). |
 | `eod_watchdog_<strategy>` | `mon-fri` at `min(strategy.eod_exit_time, SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME)` — default **15:14** for `trending_equity_intraday` | Safety-net EOD flatten for the simplified engine. One cron job per registered intraday strategy; calls `flatten_strategy_positions` (open `trade_journal` rows → opposite-side MARKET via `place_order`, mode-aware sandbox/live). Backstop for the tick-driven `_maybe_flatten_eod`, which can't fire when the broker tick stream dies before close. **Fires at 15:14, one minute before the 15:15 sandbox/broker MIS auto-square-off** — the cap is the 2026-06-10 fix: the watchdog used to fire at the declared 15:20, *after* sandbox had force-closed and started rejecting flatten orders, stranding OIL/HINDZINC/TATAELXSI. Belt to the 15:30 EOD reconciliation suspenders. | Runs on a **dedicated `BackgroundScheduler`** (not the shared instance), `services/eod_watchdog_service.py`. Gated by env `SIMPLIFIED_ENGINE_EOD_WATCHDOG_ENABLED` (default `true`); cap via `SIMPLIFIED_ENGINE_EOD_WATCHDOG_TIME` (default `15:14`). `misfire_grace_time=300`. Started from `app.py` boot after journal rehydrate. |
 
 > The `sector_follow_cap5_vol` strategy also registers its own entry/exit/reset/
@@ -257,6 +330,51 @@ need no external scheduler.
 > The `futures_follow_cap50` strategy likewise registers its own
 > reset/entry/exit/watchdog/EOD jobs (09:00/15:20/15:25/15:28/15:30 IST) — see the
 > FuturesFollowService process entry (§5).
+> The `open15_vol_breakout` strategy (issue #425, sandbox) registers 6 jobs on
+> this same scheduler: `open15_arm` 09:10 / `open15_first_candles` 09:16 /
+> `open15_entry_verify` (every minute across the entry window) / `open15_exit` /
+> `open15_exit_retry` (+2 min) / `open15_summary` (+5 min), mon-fri.
+> `open15_entry_verify` (issue #626) asks the broker what happened to each
+> ACKNOWLEDGED entry and demotes a post-ACK RMS rejection to a paper fill,
+> releasing its `max_trades` slot — an ACK is not a fill, and on 2026-08-18 a
+> refused order was carried as a live position and published as a +Rs7,680 gain.
+> It runs on the scheduler rather than at entry because entries are placed from
+> the ZMQ tick callback, where a synchronous broker call stalls every symbol.
+> **Not flag-gated** — `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` /
+> `OPEN15_FUNDS_CLAMP` were retired by issue #651 and the behaviour is
+> unconditional. Exit defaults to 09:30 (so
+> retry 09:32 / summary 09:35) but is **UI-configurable** together with the
+> entry cutoff (issue #451: `open15_config.no_entry_after`/`exit_time`, env
+> defaults `OPEN15_NO_ENTRY_AFTER` 09:29 / `OPEN15_EXIT_TIME` 09:30, exit
+> capped 15:10 to precede the 15:15 MIS square-off) — jobs are (re)pointed at
+> the effective times at boot registration and every 09:10 arm. The **trade
+> side** is UI-configurable too (issue #503: `open15_config.trade_side`, env
+> default `OPEN15_TRADE_SIDE` `both`) — `long_only` / `short_only` gate the
+> 09:15 selection itself, so the excluded side is never watched, never
+> triggers and never journals a row. A **rolling additive watch list** is
+> UI-configurable as well (issue #529: `open15_config.rolling_watchlist_enabled`
+> / `rolling_cadence_s` / `rolling_top_n`, env defaults
+> `OPEN15_ROLLING_WATCHLIST_ENABLED` **false** / `OPEN15_ROLLING_CADENCE_S` 30
+> (clamped 10-300) / `OPEN15_ROLLING_TOP_N` 3 (clamped 1-10)) — when ON, the
+> universe is re-ranked on live LTP every cadence inside the entry window and
+> the current top-N movers per side are **appended** to the watch list (never
+> removed; the entry gate and the `max_trades` cap are unchanged). Each
+> addition emits a `watchlist_add` decision-log event and the resulting trade
+> row carries `open15_trades.watch_source ∈ {seed, rolling}`. Its tick feed
+> is an **own additive
+> ZMQ SUB** on the proxy bus (5555), active only 09:14:50 .. exit+5s IST
+> (`services/open15_breakout_service.py`). **Ops: the app must be booted before
+> 09:15 IST or the day is marked `skipped_late_boot`** — the 09:15 first candle is
+> built from live ticks and cannot be reconstructed. Journal: `open15_trades` +
+> `open15_day_logs` (per-day decision-log JSON) in `db/openalgo.db`
+> (`database/open15_breakout_db.py`); API `/open15_vol_breakout/api/status|trades|decision_log`
+> + self-contained viewer at `/open15_vol_breakout/logs`. **Tick capture:** every
+> universe symbol's ticks across the whole 09:14:50 → exit+5s window are persisted
+> to `tick_logs/open15/` (365d retention; `OPEN15_TICK_CAPTURE` +
+> `OPEN15_TICK_CAPTURE_UNIVERSE` both default true; ~120k ticks ≈ 10 MB/day, no
+> extra broker load — issue #528). `OPEN15_TICK_CAPTURE_UNIVERSE=false` restores
+> the pre-#528 selected-symbols-only capture. Tick-resolution replay data for
+> re-backtesting. Flags `OPEN15_*` (PARAMETER_LOG).
 
 **sector_follow 1m feed: boot-time + periodic state-convergence (not a cron).**
 The `sector_follow_index_backfill` (`5 16 * * 1-5`) and `sector_follow_stock_backfill`
@@ -387,9 +505,38 @@ intraday instead of at 15:30. Gated by `SCANNER_STRAGGLER_RECHECK_ENABLED`
 
 ## Databases
 
+**SQLite pragma contract (issue #633).** Every SQLAlchemy engine in the process
+— the 24 under `database/`, the ~30 `broker/*/database/master_contract_db.py`
+engines, and any added later — runs in **WAL** journal mode with an explicit
+**10 s `busy_timeout`**, applied by a single `Engine`-level `connect` listener in
+[`database/sqlite_tuning.py`](../database/sqlite_tuning.py), armed by importing
+the `database` package. This is not a tuning preference: in the previous
+rollback-journal mode a long read blocked writers, a blocked writer escalated to
+PENDING, and PENDING blocked every NEW reader — which took `openalgo.db` offline
+for ~11 minutes on the 2026-08-18 daily master-contract boot (114,268-row
+symtoken swap followed by a 38.88 s cache-load read), 50 minutes before market
+open. Under WAL readers and writers never block each other, so no single long
+read can wall off the database. `synchronous` is deliberately left at its
+default (FULL) — WAL is often paired with NORMAL for speed, but that trades
+durability on power loss and this DB holds order state. **Two brokers
+(`deltaexchange`, `indmoney`) already set WAL on this same DB at import time**,
+and additionally set `synchronous=NORMAL`; this listener makes the mode
+deterministic for every broker rather than a side effect of which plugin loaded.
+
+⚠️ **Never back up a live database with `cp` / `shutil.copy2` under WAL.** Recent
+commits live in the `-wal` sidecar until a checkpoint, so a plain file copy of a
+running DB silently omits them — measured: copying a 2-row WAL database produced
+a copy in which the table did not exist. Use the sqlite backup API
+(`src.backup(dst)`, as `services/futures_follow_t1_backfill.py` now does) or stop
+the app first. Read-only (`mode=ro`) access is unaffected, both while running and
+after a clean shutdown. Rollback:
+`SQLITE_JOURNAL_MODE=DELETE` (journal mode is persisted in the file, so a
+rollback also needs a restart). Does not apply to `db/historify.duckdb`, which
+is not SQLite.
+
 | DB | Holds | Notes |
 |---|---|---|
-| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **futures_follow_trades** (futures_follow_cap50 journal — one row per NIFTY-futures order leg in sandbox/live; futures-specific columns `nifty_symbol`/`lots`/`entry_price`/`exit_price`/`gross_pnl`/`charges_inr`/`net_pnl`/`margin_inr`/`signal_id`; created idempotently by `database/futures_follow_db.init_db`, also in the boot `db_init_functions` list), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **strategy_mode** (mode-only architecture: the single *persistent* per-strategy operator control — `{strategy_name PK, mode ∈ {live, sandbox} default sandbox, updated_at, updated_by, notes}`; created by `database/strategy_mode_db.init_db`; backfilled from the latest `strategy_daily_intent` row per strategy by `scripts/migrate_strategy_daily_intent_to_strategy_mode.py` (drops the intent/cap axes; legacy `mode='skip'` → `sandbox`); read via `services/mode_service.resolve_mode`; supersedes the `strategy_daily_intent` `mode` column — the intent/pause/halt axis is being moved to a separate self-expiring `strategy_runtime_override` table for automated safety guards), **strategy_runtime_override** (mode-only architecture: the ephemeral, self-expiring safety-guard table — `{id PK, strategy_name, override_type ∈ {pause, kill_switch}, expires_at (UTC), reason, set_by, created_at}`; created by `database/strategy_runtime_override_db.init_db`; written ONLY by automated guards (data-health auto-pause, daily kill-switch) and the sector_follow `/api/pause` emergency override — never an operator daily prompt or Telegram; **lazy expiry** — reads ignore rows past `expires_at`; blocks new ENTRIES only, never exits/EOD; read at engine job-entry via `is_entry_blocked`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job AND by the scanner backfill convergence — one row per interval, `strategy_name='scanner_universe_1m'`/`'scanner_universe_D'`, via `services/scanner_backfill_scheduler`), **signal_decision** (Stage-1 LLM veto-layer audit — one row per candidate review; `direction` TEXT column (`BUY`/`SELL`, nullable) records the side the engine armed, added 2026-06-11 via idempotent boot-time `ALTER TABLE` in `signal_decision_db._migrate_add_direction_column`; previously the side was unrecoverable because the chartink `source` string carries "buy" for both legs), **futures_follow_eval_snapshots** (issue #352: one row per `(strategy_name, eval_date)` — the 15:20 futures_follow entry-evaluation breakdown as JSON (`payload_json`): per-symbol sector_ret/stock_ret/vol_ratio/intraday_source/outcome sorted by closeness to passing, plus source counts, per-gate fail counts, cap-skips and LLM vetoes; created by `database/futures_follow_eval_db.init_db`; written fail-graceful by `FuturesFollowService.run_entry` AFTER placement decisions, idempotent upsert per day; read by `GET /futures_follow_cap50/api/entry_breakdown`), **scanner_comparison** (daily in-house-scanner-vs-Chartink parity verdict — one row per `(date, screener_side)`: `inhouse_count`, `chartink_count`, `intersection_count`, `jaccard`, `ratio`, `false_positives_json`, `false_negatives_json`, `tuning_suggestion`, `telegram_sent`; created by `database/scanner_comparison_db.init_db`; written by the 15:45 IST `scanner_comparison_eod` job; idempotent delete-then-insert per date+side) | Main DB. Pooling: `NullPool` |
+| `db/openalgo.db` | users, orders, positions, settings, **scan_cycle** (canonical Chartink fire history), strategies, **trade_journal** (one row per round trip; `ltp_at_signal` REAL holds the decision-time LTP for slippage analysis, added 2026-06-07 via boot-time `ALTER TABLE` in `trade_journal_db.init_db`), **sector_follow_trades** (sector_follow_cap5_vol journal — one row per entry/exit in all modes; created idempotently by `database/sector_follow_db.init_db`), **futures_follow_trades** (futures_follow_cap50 journal — one row per NIFTY-futures order leg in sandbox/live; futures-specific columns `nifty_symbol`/`lots`/`entry_price`/`exit_price`/`gross_pnl`/`charges_inr`/`net_pnl`/`margin_inr`/`signal_id`; created idempotently by `database/futures_follow_db.init_db`, also in the boot `db_init_functions` list), **daily_intent** (legacy simplified-engine per-day intent, still read), **strategy_daily_intent** (unified per-strategy `{mode, intent, daily_capital_cap}` control surface keyed `(strategy_name, intent_date)`; created by `database/strategy_daily_intent_db.init_db`; legacy `daily_intent` rows backfilled into it at boot via `migrate_legacy_daily_intent`; read via `services/mode_service.resolve_strategy_mode`), **strategy_mode** (mode-only architecture: the single *persistent* per-strategy operator control — `{strategy_name PK, mode ∈ {live, sandbox} default sandbox, updated_at, updated_by, notes}`; created by `database/strategy_mode_db.init_db`; backfilled from the latest `strategy_daily_intent` row per strategy by `scripts/migrate_strategy_daily_intent_to_strategy_mode.py` (drops the intent/cap axes; legacy `mode='skip'` → `sandbox`); read via `services/mode_service.resolve_mode`; supersedes the `strategy_daily_intent` `mode` column — the intent/pause/halt axis is being moved to a separate self-expiring `strategy_runtime_override` table for automated safety guards), **strategy_runtime_override** (mode-only architecture: the ephemeral, self-expiring safety-guard table — `{id PK, strategy_name, override_type ∈ {pause, kill_switch}, expires_at (UTC), reason, set_by, created_at}`; created by `database/strategy_runtime_override_db.init_db`; written ONLY by automated guards (data-health auto-pause, daily kill-switch) and the sector_follow `/api/pause` emergency override — never an operator daily prompt or Telegram; **lazy expiry** — reads ignore rows past `expires_at`; blocks new ENTRIES only, never exits/EOD; read at engine job-entry via `is_entry_blocked`), **data_health_check** (daily market-data freshness verdicts per strategy — `check_at`, `overall_ok`, `stale_symbols` JSON, `details_json`, `alert_sent`; created by `database/data_health_db.init_db`; written by the 16:30 IST `sector_follow_data_health` job AND by the scanner backfill convergence — one row per interval, `strategy_name='scanner_universe_1m'`/`'scanner_universe_D'`, via `services/scanner_backfill_scheduler`), **signal_decision** (Stage-1 LLM veto-layer audit — one row per candidate review; `direction` TEXT column (`BUY`/`SELL`, nullable) records the side the engine armed, added 2026-06-11 via idempotent boot-time `ALTER TABLE` in `signal_decision_db._migrate_add_direction_column`; previously the side was unrecoverable because the chartink `source` string carries "buy" for both legs), **futures_follow_eval_snapshots** (issue #352: one row per `(strategy_name, eval_date)` — the 15:20 futures_follow entry-evaluation breakdown as JSON (`payload_json`): per-symbol sector_ret/stock_ret/vol_ratio/intraday_source/outcome sorted by closeness to passing, plus source counts, per-gate fail counts, cap-skips and LLM vetoes; created by `database/futures_follow_eval_db.init_db`; written fail-graceful by `FuturesFollowService.run_entry` AFTER placement decisions, idempotent upsert per day; read by `GET /futures_follow_cap50/api/entry_breakdown`), **option_liquidity_daily** (issue #583 — per-underlying, **per-SIDE** option-liquidity score, keyed `(as_of_date, symbol, side)`: `atm_premium_turnover`, `atm_zero_vol_strikes`/`band_strikes`, `atm_spread_pct`, `atm_volume_lots`/`atm_oi_lots`, `atm_trades`/`avg_ticket_inr` (NULL on the broker path — the quote carries no trade count), `daily_pctile` (mid-rank within side) and `option_liquidity_pctile` (its 20-day median, NULL below `OPTION_LIQUIDITY_MIN_DAYS`), `n_days_in_median`, `expiry_used`; created by `database/option_liquidity_db.init_db`; written by the 15:45 IST `option_liquidity_eod` job, idempotent delete-then-insert per date. **Per-side is load-bearing** — on 20-day medians, blending CE and PE misclassifies 17 of 208 names (8 thin only on calls, 9 only on puts; UNOMINDA is CE p28 / PE p10). An empty read means *no data* and consumers MUST fail OPEN), **scanner_comparison** (daily in-house-scanner-vs-Chartink parity verdict — one row per `(date, screener_side)`: `inhouse_count`, `chartink_count`, `intersection_count`, `jaccard`, `ratio`, `false_positives_json`, `false_negatives_json`, `tuning_suggestion`, `telegram_sent`; created by `database/scanner_comparison_db.init_db`; written by the 15:45 IST `scanner_comparison_eod` job; idempotent delete-then-insert per date+side), **broker_accounts** + **account_strategies** (multi-account Phase 1, issue #468 — child broker accounts that will mirror the primary's strategy orders in Phase 2: `broker_accounts` = `{id PK, display_name UNIQUE, broker, broker_client_id, api_key_encrypted, api_secret_encrypted, totp_secret_encrypted NULL, capital_inr, is_enabled default FALSE, last_login_at, created_at, updated_at}` with Kite Connect app credentials Fernet-encrypted via `database.auth_db.encrypt_token`; `account_strategies` = allow-list rows `(account_id, strategy_name) PK` — a row means "this account mirrors this strategy"; created by `database/broker_accounts_db.init_db` (in the boot `db_init_functions` list); a child's DAILY access token is NOT here — it lives in the existing `auth` table under `name='acct:<id>'` written by `services/broker_accounts_service.complete_login` with none of the primary-login side effects; managed via `/broker_accounts/api/*` (blueprint `broker_accounts.py`, session-gated `"user" in session` per #462) and the React `/accounts` page; Phase-2 fan-out gates on the UI master switch — **multi_account_settings** single-row table (issue #484: `{enabled default FALSE, primary_book_capital default 10L, updated_at, updated_by}`; DB row WINS, env `MULTI_ACCOUNT_ENABLED`/`PRIMARY_BOOK_CAPITAL` are only the first-read seed/fallback; written via `PUT /broker_accounts/api/settings` from the /accounts control card; consulted at fire time so UI flips apply without restart), **account_orders** (multi-account Phase 2, issue #474 — one row per ATTEMPTED child mirror order: `{account_id, strategy_name, symbol, exchange, action, product, parent_qty, child_qty, factor, parent_orderid, status ∈ {placed, rejected, skipped_no_session, skipped_zero_qty, skipped_no_position, skipped_no_capital, skipped_no_quote, skipped_insufficient_funds, error}, broker_orderid, error_text, created_at}`; created by `database/account_orders_db.init_db` (boot list); written fail-graceful by `services/account_fanout_service.py`, which is invoked fire-and-forget from the ONE seam at the tail of `place_order_service.place_order_with_auth`'s LIVE-accepted branch — mirrors fire ONLY when `MULTI_ACCOUNT_ENABLED=true` AND the parent resolved LIVE AND was broker-accepted AND the `mode_key` is a known strategy with ≥1 enabled child selecting it; sizing is CAPITAL-PER-TRADE (issue #496, supersedes the ratio model): each `account_strategies` row carries `capital_per_trade_inr` (boot ALTER; unset → `skipped_no_capital`, default deny) and OPENING qty = floor(capital ÷ price) / floor(capital ÷ (premium × lotsize)) × lotsize, priced via parent LIMIT price or a live quote (`resolve_sizing_price`, journaled in `account_orders.sizing_price`; quote failure → `skipped_no_quote`); `multi_account_settings.primary_book_capital` is RETIRED from sizing (dormant column), EXIT orders flatten the child's own broker position (`get_open_position` with the child's `acct:<id>` token) instead of scaling; children placed via `broker.<broker>.api.order_api.place_order_api` directly (no recursion through `place_order`); every non-placed outcome Telegrams via `notify("multi_account_mirror", …)`), **job_run** (issue #511 — one row per APScheduler job fire: `{job_id, job_name, scheduled_at (naive UTC), fired_at, run_date (IST YYYY-MM-DD, denormalised), status ∈ {ok, error, missed}, duration_ms, error}`; created by `database/job_run_db.init_db` (boot list); written by the `services/job_run_audit` listener attached to the shared Historify scheduler for `EVENT_JOB_ADDED|SUBMITTED|EXECUTED|ERROR|MISSED` — attached in `app.py` immediately after `init_historify_scheduler` and **before** any service registers jobs, so a boot-time fire is still recorded; makes "did the 15:20 entry job run?" a one-row lookup instead of a 5 MB log grep — the gap that let `journal_reflection` run 3 times in 2 months against a daily schedule unnoticed; pruned to `JOB_RUN_RETENTION_DAYS` (default 90) by the `postmarket_review` job; gated by `JOB_RUN_AUDIT_ENABLED` default `true`), **postmarket_review** (issue #511 — one row per reviewed IST date: `{review_date UNIQUE, created_at, is_trading_day, digest_json, sources_failed, summary_text, elapsed_ms, telegram_sent}`; created by `database/postmarket_review_db.init_db` (boot list); written idempotently (delete-then-insert per date) by the 17:15 IST `postmarket_review` job; #532 added `violations_json` / `n_violations` / `contracts_json` and #534 added `triage_json` / `llm_status` / `llm_latency_ms`, all migrated onto existing installs by `_ensure_columns` since `create_all` never adds columns to an existing table) | Main DB. Pooling: `NullPool` |
 | `db/logs.db` | `traffic_logs` (HTTP request log) | Polluted by pytest hitting localhost |
 | `db/latency.db` | latency monitoring | `NullPool` |
 | `db/health.db` | health monitoring | `NullPool` |
@@ -481,11 +628,19 @@ optional `daily_capital_cap`. The engines consult
 exits. Fall-through when no row exists (flag on): legacy `daily_intent`
 (simplified only) → env mode flag → `sandbox/run` default — so deploy is a no-op
 until the operator inserts a row. Feature-flagged by
-`STRATEGY_DAILY_INTENT_ENABLED` (default `true`). `place_order_service` is
-deliberately NOT wired through this — its global `resolve_effective_mode` floor
-is unchanged; the gate lives in the engines (the simplified engine's sandbox
-dispatch bypasses `place_order_service` entirely). Full design:
-`docs/design/strategy_daily_intent.md`.
+`STRATEGY_DAILY_INTENT_ENABLED` (default `true`). Since issue #440 (2026-07-23)
+`place_order_service` (and basket/split/smart/GTT-place/close_position)
+dispatches live-vs-sandbox **per strategy** via
+`services/mode_service.resolve_order_mode(mode_key)`: LIVE only when the navbar
+Analyze/Live toggle is on Live AND that strategy's `strategy_mode` row says
+`live` (the strategies-page toggle); no row / unknown label → sandbox (default
+deny). The hidden `strategy_mode['__global__']` gate and legacy `daily_intent`
+fall-through are retired from dispatch (leftover `__global__` rows are purged
+at boot); env mode flags are capped at sandbox. `resolve_effective_mode()`
+survives as the analyze overlay only (read decorations + cancel/modify/close
+routing, with a sandbox-book orderid lookup for per-order targeting). The
+simplified engine's sandbox dispatch still bypasses `place_order_service`
+entirely. Full design: `docs/design/strategy_daily_intent.md` + issue #440.
 
 `sector_follow_trades` columns (`database/sector_follow_db.py`): `id`, `strategy_id`,
 `mode`, `side` (BUY/SELL), `symbol`, `exchange`, `product`, `quantity`, `price`

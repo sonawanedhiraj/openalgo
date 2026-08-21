@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Account — Sample Screens (mockups)</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#171e2e; --panel2:#1d2537; --border:#2a3550;
+    --text:#e6ebf5; --muted:#8b96ad; --accent:#4f8cff; --green:#2ecc8f;
+    --red:#ff5c6c; --amber:#f5b942; --chip:#232d44;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--text); padding:32px; line-height:1.45;}
+  h1{font-size:22px; margin-bottom:4px;}
+  .sub{color:var(--muted); margin-bottom:28px; font-size:13px;}
+  .screen{max-width:960px; margin:0 auto 48px; border:1px solid var(--border); border-radius:14px; overflow:hidden; background:var(--panel);}
+  .screen-label{background:var(--accent); color:#fff; font-size:12px; font-weight:600; padding:6px 14px; letter-spacing:.5px;}
+  .navbar{display:flex; align-items:center; gap:18px; padding:10px 18px; background:var(--panel2); border-bottom:1px solid var(--border); font-size:13px;}
+  .navbar .logo{font-weight:700; color:var(--accent);}
+  .navbar a{color:var(--muted); text-decoration:none;}
+  .navbar a.active{color:var(--text); border-bottom:2px solid var(--accent); padding-bottom:2px;}
+  .navbar .spacer{flex:1;}
+  .toggle-pill{background:var(--chip); border:1px solid var(--border); border-radius:20px; padding:3px 10px; font-size:11px; color:var(--green);}
+  .body{padding:20px;}
+  .card{background:var(--panel2); border:1px solid var(--border); border-radius:10px; padding:16px 18px; margin-bottom:16px;}
+  .card h3{font-size:14px; margin-bottom:8px;}
+  .row{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+  .led{display:inline-block; width:9px; height:9px; border-radius:50%;}
+  .led.g{background:var(--green); box-shadow:0 0 6px var(--green);}
+  .led.r{background:var(--red); box-shadow:0 0 6px var(--red);}
+  .badge{font-size:11px; padding:2px 8px; border-radius:10px; background:var(--chip); border:1px solid var(--border); color:var(--muted);}
+  .badge.primary{color:var(--accent); border-color:var(--accent);}
+  .badge.ok{color:var(--green); border-color:var(--green);}
+  .badge.warn{color:var(--amber); border-color:var(--amber);}
+  .badge.err{color:var(--red); border-color:var(--red);}
+  table{width:100%; border-collapse:collapse; font-size:13px;}
+  th{color:var(--muted); text-align:left; font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; padding:8px 10px; border-bottom:1px solid var(--border);}
+  td{padding:10px; border-bottom:1px solid var(--border); vertical-align:middle;}
+  tr:last-child td{border-bottom:none;}
+  .btn{display:inline-block; font-size:12px; padding:5px 12px; border-radius:7px; border:1px solid var(--border); background:var(--chip); color:var(--text); cursor:pointer;}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff;}
+  .btn.ghost{background:transparent;}
+  .btn.danger{color:var(--red); border-color:var(--red);}
+  .switch{width:34px; height:18px; border-radius:10px; background:var(--border); position:relative; display:inline-block; cursor:pointer;}
+  .switch.on{background:var(--green);}
+  .switch::after{content:''; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#fff; transition:.15s;}
+  .switch.on::after{left:18px;}
+  .muted{color:var(--muted); font-size:12px;}
+  .totp{font-family:Consolas,monospace; font-size:15px; letter-spacing:2px; color:var(--amber); background:var(--chip); padding:2px 8px; border-radius:6px;}
+  .expand{background:var(--panel); border:1px dashed var(--border); border-radius:8px; padding:12px 14px; margin:6px 0 2px;}
+  .strategy-line{display:flex; align-items:center; gap:10px; padding:6px 0; font-size:13px;}
+  .cb{width:14px; height:14px; border:1.5px solid var(--muted); border-radius:3px; display:inline-block;}
+  .cb.checked{background:var(--accent); border-color:var(--accent); position:relative;}
+  .cb.checked::after{content:'✓'; color:#fff; font-size:10px; position:absolute; top:-2px; left:2px;}
+  .preview{margin-left:auto; font-size:11px;}
+  /* modal mock */
+  .modal-wrap{background:rgba(8,11,18,.75); padding:36px;}
+  .modal{max-width:440px; margin:0 auto; background:var(--panel2); border:1px solid var(--border); border-radius:12px; padding:20px 22px;}
+  .modal h3{font-size:15px; margin-bottom:14px;}
+  .field{margin-bottom:12px;}
+  .field label{display:block; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; margin-bottom:4px;}
+  .field input{width:100%; background:var(--panel); border:1px solid var(--border); border-radius:7px; padding:8px 10px; color:var(--text); font-size:13px;}
+  .hint{font-size:11px; color:var(--muted); margin-top:3px;}
+  .modal .actions{display:flex; justify-content:flex-end; gap:10px; margin-top:18px;}
+  .chips{display:flex; gap:6px; flex-wrap:wrap;}
+  .banner{background:rgba(245,185,66,.08); border:1px solid var(--amber); color:var(--amber); border-radius:8px; padding:8px 12px; font-size:12px; margin-bottom:16px;}
+</style>
+</head>
+<body>
+
+<h1>Multi-Account Trading — Sample Screens</h1>
+<p class="sub">Mockups only. Screens 1–4: Accounts page · Add Account modal · Strategy selection · Order book mirror card.<br>
+Screens 5–9: the daily broker login flow — morning state · Kite login (external) · callback success · TOTP enrollment · one-time setup checklist.</p>
+
+<!-- ============ SCREEN 1 : /accounts ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 1 — /accounts (new page)</div>
+  <div class="navbar">
+    <span class="logo">OpenAlgo</span>
+    <a href="#">Dashboard</a><a href="#">Orderbook</a><a href="#">Positions</a>
+    <a href="#">Strategies</a><a class="active" href="#">Accounts</a>
+    <span class="spacer"></span>
+    <span class="toggle-pill">● Live Mode</span>
+  </div>
+  <div class="body">
+
+    <div class="card">
+      <h3>Primary Account <span class="badge primary">PRIMARY</span></h3>
+      <div class="row">
+        <span class="led g"></span> <b>Zerodha · DH0000</b>
+        <span class="badge ok">Session fresh (07:42 IST)</span>
+        <span class="muted">Runs the WebSocket feed, historical data, scanner and all strategy signals. Configured via .env — not editable here.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+        <h3 style="margin:0;">Child Accounts <span class="muted">(mirror trades only)</span></h3>
+        <span class="btn primary">+ Add Account</span>
+      </div>
+      <table>
+        <tr>
+          <th>Account</th><th>Session</th><th>Capital</th><th>Factor</th>
+          <th>Strategies</th><th>Today</th><th>TOTP</th><th>Enabled</th><th></th>
+        </tr>
+        <tr>
+          <td><b>Dad — Zerodha</b><div class="muted">AB1234</div></td>
+          <td><span class="led g"></span> <span class="badge ok">Connected</span></td>
+          <td>₹2,50,000</td>
+          <td>0.25×</td>
+          <td><div class="chips"><span class="badge">sector_follow</span><span class="badge">simplified</span></div></td>
+          <td><span class="badge ok">4 placed</span> <span class="badge">0 skipped</span></td>
+          <td><span class="totp">483 921</span></td>
+          <td><span class="switch on"></span></td>
+          <td><span class="btn ghost">Edit ▾</span></td>
+        </tr>
+        <tr>
+          <td><b>Spouse — Zerodha</b><div class="muted">CD5678</div></td>
+          <td><span class="led r"></span> <span class="badge err">Login needed</span> <span class="btn">Connect</span></td>
+          <td>₹5,00,000</td>
+          <td>0.50×</td>
+          <td><div class="chips"><span class="badge">futures_follow</span></div></td>
+          <td><span class="badge warn">2 skipped (no session)</span></td>
+          <td><span class="totp">102 664</span></td>
+          <td><span class="switch on"></span></td>
+          <td><span class="btn ghost">Edit ▾</span></td>
+        </tr>
+        <tr>
+          <td><b>Test — Zerodha</b><div class="muted">EF9012</div></td>
+          <td><span class="led g"></span> <span class="badge ok">Connected</span></td>
+          <td>₹50,000</td>
+          <td>0.05×</td>
+          <td><span class="muted">none selected</span></td>
+          <td><span class="badge">—</span></td>
+          <td><span class="muted">not enrolled</span></td>
+          <td><span class="switch"></span></td>
+          <td><span class="btn ghost">Edit ▾</span></td>
+        </tr>
+      </table>
+      <p class="muted" style="margin-top:10px;">Factor = account capital ÷ primary book capital (₹10,00,000). Mirrored order quantity = primary quantity × factor, rounded down to lots. Disabled accounts and unselected strategies never receive orders.</p>
+    </div>
+
+  </div>
+</div>
+
+<!-- ============ SCREEN 2 : Add account modal ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 2 — Add Account (modal)</div>
+  <div class="modal-wrap">
+    <div class="modal">
+      <h3>Add Child Account</h3>
+      <div class="field"><label>Display name</label><input value="Dad — Zerodha"></div>
+      <div class="field"><label>Broker</label><input value="Zerodha" disabled></div>
+      <div class="field"><label>Broker Client ID</label><input value="AB1234"></div>
+      <div class="field"><label>Kite Connect API Key</label><input value="kx7f……" >
+        <div class="hint">From a new app created under the OPERATOR's developer profile (developers.kite.trade — same profile as the primary; the whitelisted IP is profile-level). Set the app's redirect URL to <code>…/zerodha/callback?account_id=&lt;auto&gt;</code> — shown after save.</div></div>
+      <div class="field"><label>Kite Connect API Secret</label><input type="password" value="••••••••••••">
+        <div class="hint">Stored encrypted. Write-only — never displayed again.</div></div>
+      <div class="field"><label>Capital (₹)</label><input value="2,50,000">
+        <div class="hint">Mirror factor will be 0.25× of the primary book (₹10,00,000).</div></div>
+      <div class="banner">⚠ Remember: this account must whitelist this server's static IP with Zerodha (SEBI mandate), and needs its own daily login.</div>
+      <div class="actions"><span class="btn ghost">Cancel</span><span class="btn primary">Save (starts disabled)</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 3 : Strategy selection (expanded row) ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 3 — Per-account strategy selection (row expanded on /accounts)</div>
+  <div class="body">
+    <div class="card">
+      <div class="row"><span class="led g"></span><b>Dad — Zerodha (AB1234)</b>
+        <span class="badge">₹2,50,000 · 0.25×</span></div>
+      <div class="expand">
+        <p class="muted" style="margin-bottom:6px;">Select which strategies this account mirrors. Preview shows the mirrored size for a typical primary order.</p>
+        <div class="strategy-line"><span class="cb checked"></span> sector_follow_cap5_vol
+          <span class="badge ok">live</span>
+          <span class="preview muted">primary ₹50k/position → mirrors ~₹12.5k/position</span></div>
+        <div class="strategy-line"><span class="cb checked"></span> simplified_engine
+          <span class="badge">sandbox</span>
+          <span class="preview muted">sandbox — no mirror orders until strategy goes live</span></div>
+        <div class="strategy-line"><span class="cb"></span> futures_follow_cap50
+          <span class="badge ok">live</span>
+          <span class="preview" style="color:var(--amber);">⚠ 1 lot × 0.25 → 0 lots — would never place. Increase capital or leave unselected.</span></div>
+        <div class="strategy-line"><span class="cb"></span> open15_vol_breakout
+          <span class="badge">sandbox</span>
+          <span class="preview muted">measurement strategy — mirroring not recommended</span></div>
+        <div class="row" style="margin-top:10px;"><span class="btn primary">Save selection</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 4 : Orderbook mirror card ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 4 — /orderbook · "Mirror Orders" card (new)</div>
+  <div class="body">
+    <div class="card">
+      <h3>Mirror Orders — today</h3>
+      <table>
+        <tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Primary Qty</th><th>Child Accounts</th></tr>
+        <tr>
+          <td>15:20:04</td><td>sector_follow</td><td>TATAMOTORS</td><td><span class="badge ok">BUY</span></td><td>52</td>
+          <td class="chips">
+            <span class="badge ok">AB1234 · 13 ✓</span>
+            <span class="badge err">CD5678 · skipped: no session</span>
+          </td>
+        </tr>
+        <tr>
+          <td>15:20:04</td><td>sector_follow</td><td>HDFCBANK</td><td><span class="badge ok">BUY</span></td><td>31</td>
+          <td class="chips">
+            <span class="badge ok">AB1234 · 7 ✓</span>
+            <span class="badge err">CD5678 · skipped: no session</span>
+          </td>
+        </tr>
+        <tr>
+          <td>15:25:01</td><td>futures_follow</td><td>NIFTY28JUL26FUT</td><td><span class="badge err">SELL</span></td><td>2 lots</td>
+          <td class="chips">
+            <span class="badge ok">CD5678 · 1 lot ✓ (from held position)</span>
+          </td>
+        </tr>
+        <tr>
+          <td>15:25:03</td><td>sector_follow</td><td>INFY</td><td><span class="badge err">SELL</span></td><td>44</td>
+          <td class="chips">
+            <span class="badge warn">AB1234 · rejected: margin</span>
+          </td>
+        </tr>
+      </table>
+      <p class="muted" style="margin-top:10px;">Exit quantities come from each child's actual held position, not scaling — so a partially-rejected entry still flattens cleanly. Failures alert via Telegram and never block the primary.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 5 : Morning login state ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 5 — /accounts · morning state (after ~3 AM token expiry)</div>
+  <div class="navbar">
+    <span class="logo">OpenAlgo</span>
+    <a href="#">Dashboard</a><a href="#">Orderbook</a><a href="#">Strategies</a>
+    <a class="active" href="#">Accounts</a>
+    <span class="spacer"></span>
+    <span class="toggle-pill">● Live Mode</span>
+  </div>
+  <div class="body">
+    <div class="banner">🔔 2 of 2 enabled child accounts need login. Entries fire at 15:20 IST — connect before then or their mirrors will be skipped.</div>
+
+    <div class="card">
+      <h3>Primary Account <span class="badge primary">PRIMARY</span></h3>
+      <div class="row"><span class="led g"></span> <b>Zerodha · DH0000</b>
+        <span class="badge ok">Session fresh (07:42 IST)</span>
+        <span class="muted">Logged in via the usual /broker flow.</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Child Accounts</h3>
+      <table>
+        <tr><th>Account</th><th>Session</th><th>TOTP code</th><th>Action</th></tr>
+        <tr>
+          <td><b>Dad — Zerodha</b><div class="muted">AB1234 · ₹2,50,000 · 0.25×</div></td>
+          <td><span class="led r"></span> <span class="badge err">Login needed (token expired 03:00)</span></td>
+          <td><span class="totp">483 921</span> <span class="muted">(14s)</span></td>
+          <td><span class="btn primary">Connect →</span></td>
+        </tr>
+        <tr>
+          <td><b>Spouse — Zerodha</b><div class="muted">CD5678 · ₹5,00,000 · 0.50×</div></td>
+          <td><span class="led r"></span> <span class="badge err">Login needed (token expired 03:00)</span></td>
+          <td><span class="muted">not enrolled — code from phone</span></td>
+          <td><span class="btn primary">Connect →</span></td>
+        </tr>
+      </table>
+      <p class="muted" style="margin-top:10px;">Connect opens that account's own Kite login in a new tab. Each account logs in with its own client id, password and TOTP — passwords are never stored in OpenAlgo.</p>
+    </div>
+
+    <div class="card">
+      <h3>Telegram reminder (09:00 IST, and 15:00 if still disconnected)</h3>
+      <div class="expand" style="font-family:Consolas,monospace; font-size:12px;">
+        ⚠ <b>Child accounts not logged in</b><br>
+        &nbsp;&nbsp;• Dad — Zerodha (AB1234) — mirrors sector_follow, simplified<br>
+        &nbsp;&nbsp;• Spouse — Zerodha (CD5678) — mirrors futures_follow<br>
+        Connect at http://127.0.0.1:5000/accounts before 15:20 IST.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 6 : Kite login (external, schematic) ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 6 — Kite login for a child account (EXTERNAL — Zerodha's own page, schematic only)</div>
+  <div class="modal-wrap">
+    <div class="modal" style="max-width:400px; background:#e9ecf2; color:#222; border-color:#c6ccd8;">
+      <p style="font-size:11px; color:#777; margin-bottom:10px;">kite.zerodha.com/connect/login?api_key=&lt;child app key&gt;&v=3 — new browser tab, not an OpenAlgo page</p>
+      <h3 style="color:#222;">Login — step 1 of 2</h3>
+      <div class="field"><label style="color:#777;">User ID</label><input style="background:#fff; color:#222; border-color:#c6ccd8;" value="AB1234"></div>
+      <div class="field"><label style="color:#777;">Password</label><input type="password" style="background:#fff; color:#222; border-color:#c6ccd8;" value="••••••••"></div>
+      <div class="actions"><span class="btn primary" style="width:100%; text-align:center;">Login</span></div>
+      <hr style="border:none; border-top:1px solid #c6ccd8; margin:16px 0;">
+      <h3 style="color:#222;">Step 2 of 2 — TOTP</h3>
+      <div class="field"><label style="color:#777;">External TOTP</label><input style="background:#fff; color:#222; border-color:#c6ccd8; letter-spacing:4px; font-family:Consolas,monospace;" value="483921"></div>
+      <p style="font-size:11px; color:#777;">← operator copies this from the Accounts page TOTP column (Screen 5) or the account holder's phone</p>
+      <div class="actions"><span class="btn primary" style="width:100%; text-align:center;">Continue</span></div>
+    </div>
+  </div>
+  <div class="body" style="padding-top:0;">
+    <p class="muted">On success Zerodha redirects to the child app's configured URL:
+      <code>/zerodha/callback?account_id=2&amp;request_token=…</code> — the <code>account_id</code> baked into the redirect URL is how OpenAlgo knows which account this login belongs to.</p>
+  </div>
+</div>
+
+<!-- ============ SCREEN 7 : Callback success ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 7 — back on /accounts after the callback</div>
+  <div class="body">
+    <div class="card" style="border-color:var(--green);">
+      <div class="row"><span class="led g"></span> <b>Dad — Zerodha (AB1234) connected</b>
+        <span class="badge ok">token fresh · valid until ~03:00 IST</span></div>
+      <p class="muted" style="margin-top:6px;">Auth stored as <code>acct:2</code>. No feed, no contract download, no session change — this account only receives mirror orders. 1 of 2 accounts still needs login.</p>
+    </div>
+    <div class="card">
+      <h3>Child Accounts</h3>
+      <table>
+        <tr><th>Account</th><th>Session</th><th>TOTP code</th><th>Action</th></tr>
+        <tr>
+          <td><b>Dad — Zerodha</b><div class="muted">AB1234</div></td>
+          <td><span class="led g"></span> <span class="badge ok">Connected (09:04 IST)</span></td>
+          <td><span class="totp">102 664</span></td>
+          <td><span class="btn ghost">Disconnect</span></td>
+        </tr>
+        <tr>
+          <td><b>Spouse — Zerodha</b><div class="muted">CD5678</div></td>
+          <td><span class="led r"></span> <span class="badge err">Login needed</span></td>
+          <td><span class="muted">not enrolled</span></td>
+          <td><span class="btn primary">Connect →</span></td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 8 : TOTP enrollment (per account) ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 8 — enroll TOTP secret for a child account (modal, one-time)</div>
+  <div class="modal-wrap">
+    <div class="modal">
+      <h3>TOTP helper — Dad — Zerodha (AB1234)</h3>
+      <p class="muted" style="margin-bottom:12px;">Paste the TOTP secret shown when enabling external-TOTP 2FA on this Zerodha account. OpenAlgo will display the rolling 6-digit code on the Accounts page — same helper as the primary (#460), stored per account, Fernet-encrypted.</p>
+      <div class="field"><label>TOTP secret (base32)</label><input value="JBSWY3DPEHPK3PXP…">
+        <div class="hint">Write-only after save. The secret should also be on the account holder's phone as backup.</div></div>
+      <div class="card" style="margin:12px 0; text-align:center;">
+        <div class="muted" style="font-size:11px; margin-bottom:4px;">PREVIEW — code from the secret above</div>
+        <span class="totp" style="font-size:22px;">483 921</span> <span class="muted">refreshes in 14s</span>
+      </div>
+      <div class="banner">One-shot enrollment: saving replaces any earlier secret for this account. Enrollment does not change anything on Zerodha's side.</div>
+      <div class="actions"><span class="btn ghost">Cancel</span><span class="btn primary">Save secret</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SCREEN 9 : One-time setup checklist (after Add Account) ============ -->
+<div class="screen">
+  <div class="screen-label">SCREEN 9 — setup checklist shown after saving a new account (row expanded)</div>
+  <div class="body">
+    <div class="card">
+      <div class="row"><b>Spouse — Zerodha (CD5678)</b> <span class="badge warn">setup incomplete</span></div>
+      <div class="expand">
+        <div class="strategy-line"><span class="cb checked"></span> API key &amp; secret saved (encrypted)</div>
+        <div class="strategy-line"><span class="cb checked"></span> Capital set — ₹5,00,000 (factor 0.50×)</div>
+        <div class="strategy-line"><span class="cb"></span> Set this redirect URL in the Kite Connect app
+          <span class="preview"><code style="background:var(--chip); padding:2px 6px; border-radius:5px;">http://127.0.0.1:5000/zerodha/callback?account_id=3</code> <span class="btn ghost">Copy</span></span></div>
+        <div class="strategy-line"><span class="cb"></span> File the family static-IP declaration with Zerodha (SEBI: spouse / dependent child / dependent parent; 2FA consent)
+          <span class="preview muted">server IP 203.0.113.42</span></div>
+        <div class="strategy-line"><span class="cb"></span> Enroll TOTP secret <span class="preview"><span class="btn ghost">Enroll…</span> <span class="muted">optional — else read code from phone daily</span></span></div>
+        <div class="strategy-line"><span class="cb"></span> First login <span class="preview"><span class="btn primary">Connect →</span></span></div>
+        <div class="strategy-line"><span class="cb"></span> Select strategies &amp; enable <span class="preview muted">account stays disabled until you flip the toggle</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

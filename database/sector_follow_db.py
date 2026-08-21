@@ -71,6 +71,14 @@ class SectorFollowTrade(Base):
     error_message = Column(String(255), nullable=True)  # broker/exception message on failure
     note = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Fill reconciliation (issue #562). `status='placed'` records only that the
+    # broker ACKNOWLEDGED the order and handed back an id — a Kite order can
+    # still be rejected downstream by RMS. 6 of 7 live orders in 2026-07/08 were
+    # acknowledged and never filled, and every row stayed 'placed' forever.
+    fill_price = Column(Float, nullable=True)  # broker average_price
+    fill_qty = Column(Integer, nullable=True)  # broker filled quantity
+    # reconciled | unavailable | pending  (None = never attempted)
+    fill_reconcile_status = Column(String(16), nullable=True)
 
 
 def _ensure_columns():
@@ -86,6 +94,14 @@ def _ensure_columns():
     wanted = {
         "status": "VARCHAR(12) NOT NULL DEFAULT 'placed'",
         "error_message": "VARCHAR(255)",
+        # Issue #562 — fill reconciliation. `price` is the DECISION price (a
+        # quote at signal time) and `status='placed'` is only the broker's
+        # ACKNOWLEDGEMENT; neither says the order actually transacted. These
+        # record what the broker really did, so `fill_price - price` stays
+        # measurable as slippage rather than overwriting the decision record.
+        "fill_price": "FLOAT",
+        "fill_qty": "INTEGER",
+        "fill_reconcile_status": "VARCHAR(16)",
     }
     try:
         with engine.connect() as conn:
@@ -172,3 +188,65 @@ def get_open_entries(strategy_id, entry_date):
         return []
     finally:
         db_session.remove()
+
+
+def get_unexited_entries(strategy_id=None, mode=None):
+    """Per-symbol summary of entries this journal believes are still open (#563).
+
+    Nets ``placed`` BUY against ``placed`` SELL quantity **within each symbol**
+    and returns one dict per symbol whose net is positive::
+
+        {"symbol", "quantity", "entry_price", "entry_date", "order_id", "mode"}
+
+    ``entry_date`` / ``entry_price`` come from that symbol's OLDEST still-open
+    BUY row, so the T+1 predicate (``entry_date != today``) acts on the session
+    the position was actually opened in rather than a synthesised date.
+
+    This is the journal's *belief* only. It is NEVER sufficient to justify a
+    square-off on its own — the caller must confirm against the broker/sandbox
+    position book (the #497/#548 rule). Returns [] on any error; never raises.
+    """
+    try:
+        q = SectorFollowTrade.query.filter_by(status="placed")
+        if strategy_id is not None:
+            q = q.filter_by(strategy_id=strategy_id)
+        if mode is not None:
+            q = q.filter_by(mode=mode)
+        rows = q.order_by(SectorFollowTrade.id.asc()).all()
+    except Exception as e:
+        logger.exception(f"Failed to query unexited sector_follow entries: {e}")
+        return []
+    finally:
+        db_session.remove()
+
+    net: dict[str, int] = {}
+    first_buy: dict[str, SectorFollowTrade] = {}
+    for r in rows:
+        qty = int(r.quantity or 0)
+        if r.side == "BUY":
+            net[r.symbol] = net.get(r.symbol, 0) + qty
+            first_buy.setdefault(r.symbol, r)
+        elif r.side == "SELL":
+            net[r.symbol] = net.get(r.symbol, 0) - qty
+            # A symbol fully closed and later re-entered must anchor on the NEW
+            # entry, not the stale one — drop the anchor when the book goes flat.
+            if net.get(r.symbol, 0) <= 0:
+                first_buy.pop(r.symbol, None)
+
+    out = []
+    for symbol, qty in net.items():
+        row = first_buy.get(symbol)
+        if qty <= 0 or row is None:
+            continue
+        out.append(
+            {
+                "symbol": symbol,
+                "quantity": qty,
+                "entry_price": float(row.price or 0.0),
+                "entry_date": row.entry_date,
+                "order_id": row.order_id,
+                "mode": row.mode,
+                "vol_ratio": float(row.vol_ratio or 0.0),
+            }
+        )
+    return out

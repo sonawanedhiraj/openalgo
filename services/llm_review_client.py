@@ -60,6 +60,17 @@ def _parse_envelope(stdout: str) -> tuple[str, str]:
     ``model_text`` is the prose Claude emitted (the ``result`` field), or the
     raw stdout when the envelope can't be parsed. ``session_id`` is the Claude
     Code session id when present, else the empty string.
+
+    Raises:
+        RuntimeError: when the envelope sets ``is_error``. **The CLI signals some
+            failures with exit code 0 and ``is_error: true`` in the envelope** —
+            a logged-out CLI returns exactly that, with ``result`` set to
+            "Not logged in · Please run /login". Without this check that string
+            is returned as if it were the model's answer: the veto would treat it
+            as unparseable reasoning and the triage layer would file it as a day
+            assessment. Raising here routes it through the caller's existing
+            error handling, where ``_AUTH_MARKERS`` classifies it as
+            ``not_logged_in``.
     """
     model_text = stdout
     session_id = ""
@@ -72,6 +83,8 @@ def _parse_envelope(stdout: str) -> tuple[str, str]:
         if isinstance(result, str):
             model_text = result
         session_id = str(envelope.get("session_id", "") or "")
+        if envelope.get("is_error"):
+            raise RuntimeError(f"claude reported an error: {model_text[:300]}")
     return model_text, session_id
 
 
@@ -133,10 +146,52 @@ def invoke_claude_review(prompt: str, timeout_s: float) -> tuple[str, str]:
 
     completed = payload  # type: ignore[assignment]
     if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        raise RuntimeError(f"claude review exited {completed.returncode}: {stderr[:500]}")
+        # The CLI writes its diagnostic to STDOUT (inside the JSON envelope), not
+        # stderr — a logged-out CLI exits 1 with stderr EMPTY and
+        # `result: "Not logged in · Please run /login"` in stdout. Reporting only
+        # stderr produced a useless "claude review exited 1: " and cost the
+        # `_AUTH_MARKERS` classification its only evidence, so the operator was
+        # told "error" instead of "run claude login".
+        detail = (completed.stderr or "").strip()
+        if not detail:
+            detail = _envelope_error_text(completed.stdout or "")
+        raise RuntimeError(f"claude review exited {completed.returncode}: {detail[:500]}")
 
     return _parse_envelope(completed.stdout or "")
+
+
+def _envelope_error_text(stdout: str) -> str:
+    """Best-effort human-readable reason out of a failed run's stdout envelope."""
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        return stdout.strip()[:500]
+    if isinstance(envelope, dict):
+        result = envelope.get("result")
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+    return stdout.strip()[:500]
+
+
+def classify_invocation_error(exc: BaseException) -> str:
+    """Map an :func:`invoke_claude_review` failure to a reason code.
+
+    Lets a caller classify the **real** call's failure instead of paying for a
+    separate pre-flight probe. That matters: a cold ``claude -p`` takes longer
+    than the probe's default 12 s budget, so probing first reports ``timeout``
+    on a perfectly healthy CLI and skips the work — a false negative that only
+    shows up against a live model, never against a stub.
+
+    Returns one of ``timeout`` | ``cli_missing`` | ``not_logged_in`` | ``error``.
+    """
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, FileNotFoundError):
+        return "cli_missing"
+    message = str(exc).lower()
+    if any(marker in message for marker in _AUTH_MARKERS):
+        return "not_logged_in"
+    return "error"
 
 
 # Substrings that mark a non-zero ``claude`` exit as an auth/login problem rather

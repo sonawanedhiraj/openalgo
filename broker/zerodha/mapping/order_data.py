@@ -125,6 +125,19 @@ def transform_order_data(orders):
             "orderid": order.get("order_id", ""),
             "order_status": order_status,
             "timestamp": order.get("order_timestamp", ""),
+            # How much of it actually traded, and — when the broker refused it —
+            # WHY (issue #626). Dropping these made a rejection indistinguishable
+            # from a fill downstream: the reconciler saw only ``price`` (the limit
+            # we asked for) and ``quantity`` (the size we asked for), both fully
+            # populated on an order that never reached the market.
+            "filled_quantity": order.get("filled_quantity", 0),
+            "status_message": order.get("status_message") or "",
+            # Kite's own volume-weighted fill price across every partial
+            # execution (issue #641). Dropping it forced orderstatus_service to
+            # re-derive the fill from the tradebook, where its first-match loop
+            # recorded the FIRST partial's price as the whole order's fill —
+            # a Rs912.50 P&L error on 2026-08-19 (19 trades across 4 orders).
+            "average_price": order.get("average_price", 0.0),
         }
 
         transformed_orders.append(transformed_order)

@@ -446,17 +446,21 @@ def test_preentry_refresh_wait_failure_is_swallowed(monkeypatch):
 
 
 def test_preentry_refresh_time_default_and_override(monkeypatch):
+    # Issue #512: default moved 15:17 -> 15:02 with the whole entry chain, so the
+    # refresh still precedes the smoke check now that entry fires at 15:05.
     monkeypatch.delenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", raising=False)
-    assert sched.preentry_refresh_time() == time(15, 17)
-    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", "15:10")
-    assert sched.preentry_refresh_time() == time(15, 10)
+    assert sched.preentry_refresh_time() == time(15, 2)
+    monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", "14:55")
+    assert sched.preentry_refresh_time() == time(14, 55)
     # Malformed → safe default.
     monkeypatch.setenv("SECTOR_FOLLOW_PREENTRY_REFRESH_TIME", "notatime")
-    assert sched.preentry_refresh_time() == time(15, 17)
+    assert sched.preentry_refresh_time() == time(15, 2)
 
 
 def test_preentry_refresh_time_before_smoke_check():
-    """The refresh must fire strictly before the 15:18 smoke check so the smoke
-    sees fresh data."""
-    t = sched.preentry_refresh_time()
-    assert (t.hour, t.minute) < (15, 18)
+    """The refresh must fire strictly before the smoke check so the smoke sees
+    fresh data. Both moved earlier in #512 (CAS) — assert against the resolved
+    smoke time rather than a literal, so the pair can never drift apart."""
+    from services.sector_follow_service import resolve_schedule
+
+    assert sched.preentry_refresh_time() < resolve_schedule()["smoke"]

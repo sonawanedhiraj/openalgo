@@ -12,7 +12,12 @@ What it compares, per side (BUY / SELL):
 
 * **Chartink** = the union of the symbol lists Chartink posted via webhook,
   recorded in ``scan_cycle`` rows with ``cycle_kind='chartink'`` for the day
-  (``screener_buy`` for BUY, ``screener_sell`` for SELL).
+  (``screener_buy`` for BUY, ``screener_sell`` for SELL). In-house
+  ``ScanHitPoster`` echoes into the same webhook are recorded as
+  ``cycle_kind='inhouse_echo'`` (issue #447) and therefore excluded here —
+  before that fix the poster's own hits polluted this side (SELL echoes
+  misfiled as BUY), making every comparison from ~2026-07-01 to 2026-07-24
+  self-referential.
 * **In-house** = the union of the symbols the live tick-driven ``ScannerService``
   flagged that day — ``scan_results`` rows with ``source='inhouse'``, grouped by
   the ``screener_type`` of the matched ``scan_definition``.

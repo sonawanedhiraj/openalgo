@@ -1,31 +1,13 @@
-"""Tests for Stage-0 resolver wired into ``modify_order_with_auth``."""
+"""Tests for order-management routing wired into ``modify_order_with_auth``.
+
+Issue #440 — order management is NOT strategy-gated: Analyze ON → sandbox
+book only; Analyze OFF → route by where the order actually lives
+(``sandbox_order_exists``) — a sandbox orderid modifies on the sandbox book,
+anything else falls through to the broker.
+"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
-
-
-@pytest.fixture
-def fresh_intent_db(monkeypatch):
-    from database import daily_intent_db as dim
-
-    test_engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
-
-    monkeypatch.setattr(dim, "engine", test_engine)
-    monkeypatch.setattr(dim, "db_session", test_session)
-    dim.Base.metadata.create_all(test_engine)
-
-    yield dim
-
-    test_session.remove()
-    test_engine.dispose()
 
 
 def _order_data():
@@ -42,17 +24,16 @@ def _order_data():
     }
 
 
-def _patch_modes(monkeypatch, analyze=False):
+def _patch_analyze(monkeypatch, analyze=False):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: analyze)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
 
-def test_modify_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
+def test_modify_routes_to_broker_when_analyze_off(monkeypatch):
+    """Analyze off + orderid not in the sandbox book → broker.modify_order."""
     from services import modify_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    _patch_analyze(monkeypatch)
+    monkeypatch.setattr("services.sandbox_service.sandbox_order_exists", lambda *a, **k: False)
 
     broker_mod = MagicMock(return_value=({"status": "success"}, 200))
     monkeypatch.setattr(
@@ -76,39 +57,11 @@ def test_modify_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     sandbox_mock.assert_not_called()
 
 
-def test_modify_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatch):
+def test_modify_routes_to_sandbox_when_analyze_on(monkeypatch):
+    """Analyze ON is the platform overlay — modify never touches the broker."""
     from services import modify_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
-
-    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
-    monkeypatch.setattr("services.sandbox_service.sandbox_modify_order", sandbox_mock)
-    broker_mod = MagicMock()
-    monkeypatch.setattr(
-        modify_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(modify_order=broker_mod),
-    )
-
-    modify_order_service.modify_order_with_auth(
-        _order_data(),
-        auth_token="dummy",
-        broker="zerodha",
-        original_data=_order_data(),
-    )
-
-    sandbox_mock.assert_called_once()
-    broker_mod.assert_not_called()
-
-
-def test_modify_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
-    from services import modify_order_service
-    from services.mode_service import set_daily_intent
-
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch, analyze=True)
+    _patch_analyze(monkeypatch, analyze=True)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_modify_order", sandbox_mock)
@@ -130,17 +83,17 @@ def test_modify_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
     broker_mod.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_modify_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
+def test_modify_routes_to_sandbox_book_order_when_analyze_off(monkeypatch):
+    """Analyze off + orderid found in the sandbox book → sandbox modify, not
+    broker (mixed-mode operation, issue #440)."""
     from services import modify_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    _patch_analyze(monkeypatch)
+    monkeypatch.setattr("services.sandbox_service.sandbox_order_exists", lambda *a, **k: True)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
-    broker_mod = MagicMock()
     monkeypatch.setattr("services.sandbox_service.sandbox_modify_order", sandbox_mock)
+    broker_mod = MagicMock()
     monkeypatch.setattr(
         modify_order_service,
         "import_broker_module",
@@ -160,41 +113,12 @@ def test_modify_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monke
     broker_mod.assert_not_called()
 
 
-def test_modify_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
-    from services import modify_order_service
-
-    _patch_modes(monkeypatch)
-
-    sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
-    broker_mod = MagicMock()
-    monkeypatch.setattr("services.sandbox_service.sandbox_modify_order", sandbox_mock)
-    monkeypatch.setattr(
-        modify_order_service,
-        "import_broker_module",
-        lambda _b: SimpleNamespace(modify_order=broker_mod),
-    )
-
-    success, response, status = modify_order_service.modify_order_with_auth(
-        _order_data(),
-        auth_token="dummy",
-        broker="zerodha",
-        original_data=_order_data(),
-    )
-
-    assert success is True
-    assert status == 200
-    sandbox_mock.assert_called_once()
-    broker_mod.assert_not_called()
-
-
-def test_modify_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+def test_modify_reject_response_shape_matches_existing_convention(monkeypatch):
     """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import modify_order_service
-    from services.mode_service import set_daily_intent
 
-    _patch_modes(monkeypatch)
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
+    # ---- sandbox shape (analyze ON) ----
+    _patch_analyze(monkeypatch, analyze=True)
     monkeypatch.setattr(
         "services.sandbox_service.sandbox_modify_order",
         MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200)),
@@ -211,7 +135,9 @@ def test_modify_reject_response_shape_matches_existing_convention(fresh_intent_d
         original_data=_order_data(),
     )
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
+    # ---- broker shape (analyze OFF, order not in sandbox book) ----
+    _patch_analyze(monkeypatch)
+    monkeypatch.setattr("services.sandbox_service.sandbox_order_exists", lambda *a, **k: False)
     broker_mod = MagicMock(return_value=({"status": "success"}, 200))
     monkeypatch.setattr(
         modify_order_service,

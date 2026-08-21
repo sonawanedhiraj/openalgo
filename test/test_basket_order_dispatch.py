@@ -1,4 +1,10 @@
-"""Tests for Stage-0 resolver wired into ``process_basket_order_with_auth``."""
+"""Tests for the per-strategy dispatch wired into ``process_basket_order_with_auth``.
+
+Issue #440 — UI-driven routing: a basket fires on the live broker ONLY when the
+Analyze/Live navbar toggle is on Live AND the basket's strategy has a
+``strategy_mode`` row set to live. Everything else — sandbox row, no row,
+Analyze ON — routes to sandbox (default deny).
+"""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -9,23 +15,19 @@ from sqlalchemy.orm import scoped_session, sessionmaker
 
 
 @pytest.fixture
-def fresh_intent_db(monkeypatch):
-    from database import daily_intent_db as dim
+def fresh_mode_db(monkeypatch):
+    """Point strategy_mode_db at a fresh in-memory SQLite for one test."""
+    from database import strategy_mode_db as sm
 
-    test_engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-    )
-    test_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=test_engine))
-
-    monkeypatch.setattr(dim, "engine", test_engine)
-    monkeypatch.setattr(dim, "db_session", test_session)
-    dim.Base.metadata.create_all(test_engine)
-
-    yield dim
-
-    test_session.remove()
-    test_engine.dispose()
+    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
+    monkeypatch.setattr(sm, "engine", eng)
+    monkeypatch.setattr(sm, "db_session", sess)
+    sm.Base.query = sess.query_property()
+    sm.Base.metadata.create_all(eng)
+    yield sm
+    sess.remove()
+    eng.dispose()
 
 
 def _basket():
@@ -45,17 +47,23 @@ def _basket():
     }
 
 
-def _patch_modes(monkeypatch, analyze=False):
+def _patch_analyze(monkeypatch, analyze=False):
     monkeypatch.setattr("services.mode_service.get_analyze_mode", lambda: analyze)
-    monkeypatch.setattr("services.mode_service._today_ist_str", lambda: "2026-05-28")
 
 
-def test_basket_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
+def _stub_multiquotes(monkeypatch):
+    """Avoid touching quotes_service in the sandbox branch."""
+    from services import quotes_service as qs
+
+    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
+
+
+def test_basket_routes_to_broker_when_strategy_live(fresh_mode_db, monkeypatch):
+    """strategy_mode row='live' + analyze off → broker.place_order_api fires."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
@@ -79,12 +87,14 @@ def test_basket_routes_to_broker_when_live(fresh_intent_db, monkeypatch):
     sandbox_mock.assert_not_called()
 
 
-def test_basket_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypatch):
+def test_basket_routes_to_sandbox_when_strategy_row_sandbox(fresh_mode_db, monkeypatch):
+    """A sandbox-flagged strategy stays sandbox even with analyze off AND other
+    strategies live — the per-strategy protection at the heart of #440."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("sandbox", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("other_strategy", "live", updated_by="op")
+    fresh_mode_db._set_mode_unchecked("ut", "sandbox", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
@@ -94,14 +104,7 @@ def test_basket_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypat
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    # Avoid touching quotes_service in the analyze branch
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(
-        qs,
-        "get_multiquotes",
-        lambda **kw: (False, {"message": "skipped"}, 500),
-    )
+    _stub_multiquotes(monkeypatch)
 
     success, _, status = basket_order_service.process_basket_order_with_auth(
         _basket(),
@@ -116,12 +119,12 @@ def test_basket_routes_to_sandbox_when_sandbox_intent(fresh_intent_db, monkeypat
     broker_place.assert_not_called()
 
 
-def test_basket_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monkeypatch):
+def test_basket_routes_to_sandbox_when_live_but_analyze_on(fresh_mode_db, monkeypatch):
+    """Analyze mode is the platform kill switch: a live row cannot beat it."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch, analyze=True)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch, analyze=True)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     monkeypatch.setattr("services.sandbox_service.sandbox_place_order", sandbox_mock)
@@ -131,13 +134,7 @@ def test_basket_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(
-        qs,
-        "get_multiquotes",
-        lambda **kw: (False, {"message": "skipped"}, 500),
-    )
+    _stub_multiquotes(monkeypatch)
 
     basket_order_service.process_basket_order_with_auth(
         _basket(),
@@ -150,13 +147,12 @@ def test_basket_routes_to_sandbox_when_live_but_analyze_on(fresh_intent_db, monk
     broker_place.assert_not_called(), "Live broker fired despite analyze_mode=True!"
 
 
-def test_basket_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): legacy intent 'skip' collapses to SANDBOX, not a rejection."""
+def test_basket_routes_to_sandbox_when_no_row_default_denies(fresh_mode_db, monkeypatch):
+    """Default deny: no strategy_mode row for the label → sandbox even with
+    analyze off (issue #440)."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    _patch_analyze(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     broker_place = MagicMock()
@@ -166,9 +162,7 @@ def test_basket_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monke
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
+    _stub_multiquotes(monkeypatch)
 
     success, response, status = basket_order_service.process_basket_order_with_auth(
         _basket(),
@@ -183,11 +177,12 @@ def test_basket_routes_to_sandbox_when_skip_legacy_intent(fresh_intent_db, monke
     broker_place.assert_not_called()
 
 
-def test_basket_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
-    """Mode-only (B2): no daily_intent row → SANDBOX default (was DISABLED reject)."""
+def test_basket_retired_global_row_has_no_effect(fresh_mode_db, monkeypatch):
+    """A manually re-created __global__ live row must not route anything live."""
     from services import basket_order_service
 
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("__global__", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     sandbox_mock = MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200))
     broker_place = MagicMock()
@@ -197,9 +192,7 @@ def test_basket_routes_to_sandbox_when_no_intent(fresh_intent_db, monkeypatch):
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=broker_place),
     )
-    from services import quotes_service as qs
-
-    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
+    _stub_multiquotes(monkeypatch)
 
     success, response, status = basket_order_service.process_basket_order_with_auth(
         _basket(),
@@ -232,14 +225,13 @@ def _multi_basket(symbols):
     }
 
 
-def test_basket_all_orders_failed_reports_error(fresh_intent_db, monkeypatch):
+def test_basket_all_orders_failed_reports_error(fresh_mode_db, monkeypatch):
     """Silent-drop P0-1: a basket where the broker rejects EVERY order must
     NOT report top-level status="success"."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     def _reject(order_data, auth_token):
         return SimpleNamespace(status=400), {"message": "rejected"}, None
@@ -264,14 +256,13 @@ def test_basket_all_orders_failed_reports_error(fresh_intent_db, monkeypatch):
     assert response["total_orders"] == 2
 
 
-def test_basket_partial_fill_reports_partial(fresh_intent_db, monkeypatch):
+def test_basket_partial_fill_reports_partial(fresh_mode_db, monkeypatch):
     """Silent-drop P0-1: a basket where some orders fill and some are rejected
     must report top-level status="partial"."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
-    _patch_modes(monkeypatch)
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
+    _patch_analyze(monkeypatch)
 
     def _mixed(order_data, auth_token):
         if order_data["symbol"] == "INFY":
@@ -297,12 +288,11 @@ def test_basket_partial_fill_reports_partial(fresh_intent_db, monkeypatch):
     assert response["failed_orders"] == 2
 
 
-def test_basket_reject_response_shape_matches_existing_convention(fresh_intent_db, monkeypatch):
+def test_basket_reject_response_shape_matches_existing_convention(fresh_mode_db, monkeypatch):
+    """Both sandbox and live returns are (bool, dict, int) — same outer shape."""
     from services import basket_order_service
-    from services.mode_service import set_daily_intent
 
-    _patch_modes(monkeypatch)
-    set_daily_intent("skip", set_by="operator", date_str="2026-05-28")
+    _patch_analyze(monkeypatch)
     monkeypatch.setattr(
         "services.sandbox_service.sandbox_place_order",
         MagicMock(return_value=(True, {"status": "success", "orderid": "SBX-1"}, 200)),
@@ -312,9 +302,9 @@ def test_basket_reject_response_shape_matches_existing_convention(fresh_intent_d
         "import_broker_module",
         lambda _b: SimpleNamespace(place_order_api=MagicMock()),
     )
-    from services import quotes_service as qs
+    _stub_multiquotes(monkeypatch)
 
-    monkeypatch.setattr(qs, "get_multiquotes", lambda **kw: (False, {"message": "skipped"}, 500))
+    # ---- sandbox shape (no strategy_mode row → default deny) ----
     reject_result = basket_order_service.process_basket_order_with_auth(
         _basket(),
         auth_token="dummy",
@@ -322,7 +312,8 @@ def test_basket_reject_response_shape_matches_existing_convention(fresh_intent_d
         original_data=_basket(),
     )
 
-    set_daily_intent("live", set_by="operator", date_str="2026-05-28")
+    # ---- live shape (live row + analyze off) ----
+    fresh_mode_db._set_mode_unchecked("ut", "live", updated_by="op")
     broker_place = MagicMock(return_value=(SimpleNamespace(status=200), {"status": "ok"}, "OID-1"))
     monkeypatch.setattr(
         basket_order_service,

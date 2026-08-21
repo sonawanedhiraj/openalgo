@@ -865,6 +865,43 @@ class SimplifiedStockEngineService:
             return "eod_squareoff"
         return reason
 
+    def _journal_routed_mode(self) -> str:
+        """The book this entry actually routed to — 'sandbox' | 'live' (#568).
+
+        Resolved through ``resolve_order_mode('simplified_engine')``, the SAME
+        dispatch the order itself went through (issue #440), NOT ``self.mode``.
+        Using the configured mode would let the journal claim 'live' while the
+        Analyze kill-switch was silently routing the order to sandbox — exactly
+        the write-here/read-there divergence that stranded futures_follow's T+1
+        exits in #497.
+        """
+        try:
+            from services.mode_service import EffectiveMode, resolve_order_mode
+
+            routed = resolve_order_mode("simplified_engine")
+            return MODE_LIVE if routed is EffectiveMode.LIVE else MODE_SANDBOX
+        except Exception:
+            # Never block an order on a bookkeeping lookup. Sandbox is the
+            # safe attribution: it keeps unproven P&L out of the live column.
+            logger.exception("[SIMPLIFIED-ENTRY] routed-mode resolution failed; recording sandbox")
+            return MODE_SANDBOX
+
+    def _journal_market_context(self) -> dict:
+        """Best-effort ``{nifty_pct, india_vix, regime_snapshot}`` at entry (#568).
+
+        These journal columns sat 0/235 populated, which made every
+        market-condition question ("were entries worse in quiet hours?")
+        untestable except by clock-time proxy. Fail-safe: any fetch problem
+        yields empty slots rather than blocking the entry.
+        """
+        try:
+            from services import signal_review_service
+
+            return signal_review_service.build_market_context()
+        except Exception:
+            logger.exception("[SIMPLIFIED-ENTRY] market-context capture failed; journaling without")
+            return {}
+
     def _journal_record_entry(
         self, signal: EntrySignal, decision_id: int | None, order_id: str | None
     ) -> int:
@@ -872,6 +909,7 @@ class SimplifiedStockEngineService:
         try:
             from services import trade_journal_service
 
+            ctx = self._journal_market_context()
             return trade_journal_service.record_entry(
                 symbol=signal.symbol,
                 direction="LONG" if signal.action == DIRECTION_BUY else "SHORT",
@@ -886,6 +924,10 @@ class SimplifiedStockEngineService:
                 ltp_at_signal=float(signal.reference_price),
                 entry_order_id=str(order_id) if order_id else None,
                 signal_decision_id=decision_id,
+                mode=self._journal_routed_mode(),
+                nifty_pct=ctx.get("nifty_pct"),
+                india_vix=ctx.get("india_vix"),
+                regime_snapshot=ctx.get("regime_snapshot"),
             )
         except Exception:
             logger.exception(
@@ -1132,9 +1174,12 @@ class SimplifiedStockEngineService:
         - sandbox: call sandbox_service.sandbox_place_order directly so the engine
           can run against virtual Rs1Cr capital regardless of the global
           analyze_mode setting.
-        - live: call services.place_order_service.place_order, which still honors
-          the global analyze_mode flag (so an operator can flip the whole
-          installation into analyzer mode and the engine follows).
+        - live: call services.place_order_service.place_order with
+          mode_key='simplified_engine' — the payload's ``strategy`` is the
+          webhook label, not the strategy_mode key, so without the explicit
+          key the per-strategy dispatch (issue #440) would default-deny the
+          order to sandbox. Live routing still requires the strategies-page
+          toggle (strategy_mode row) AND Analyze mode off.
 
         Returns (success, response_dict). Both modes produce a response with an
         "orderid" on success; the caller uses _wait_for_fill to confirm.
@@ -1159,7 +1204,9 @@ class SimplifiedStockEngineService:
         if self.mode == MODE_LIVE:
             from services.place_order_service import place_order
 
-            success, response, _ = place_order(payload, api_key=api_key)
+            success, response, _ = place_order(
+                payload, api_key=api_key, mode_key="simplified_engine"
+            )
             return success, response
 
         # Should be unreachable -- disabled is short-circuited by callers, and
@@ -1292,10 +1339,16 @@ class SimplifiedStockEngineService:
         that the engine has no record of. The engine's own check_eod_exits already
         emits exits for positions it knows about, so this pass only catches the
         orphans and any engine↔store qty mismatch (reconciled via #265).
+
+        ``mode_key='simplified_engine'`` matches the order-dispatch key used by
+        ``_place_exit_order`` so this read resolves the same book the orders were
+        written to (issue #497 — the analyze overlay is not the strategy's mode).
         """
         from services.positionbook_service import get_positionbook
 
-        success, response, status_code = get_positionbook(api_key=api_key)
+        success, response, status_code = get_positionbook(
+            api_key=api_key, mode_key="simplified_engine"
+        )
         if not success:
             logger.warning(
                 "[SIMPLIFIED-EOD] positionbook fetch failed status=%s response=%s",
@@ -1776,19 +1829,15 @@ class SimplifiedStockEngineService:
             return MODE_DISABLED
         if self.mode == MODE_SANDBOX:
             return MODE_SANDBOX
-        # mode == MODE_LIVE: still surface whether the global toggle would
-        # override us into sandbox.
-        #
-        # TODO(stage-0): this is a status-payload label only, not a routing
-        # decision — actual order routing in this engine goes through
-        # services.place_order which already uses resolve_effective_mode().
-        # Migrating the label to the resolver is intertwined with the engine's
-        # own mode flag (SIMPLIFIED_ENGINE_MODE) and the operator's
-        # daily_intent. Defer to the Stage 2/3 cleanup of the simplified
-        # engine's mode handling. See docs/SIMPLIFIED_ENGINE_HANDOFF.md.
-        from database.settings_db import get_analyze_mode
+        # mode == MODE_LIVE: this is a status-payload label only, not a
+        # routing decision — actual order routing goes through
+        # services.place_order which uses the per-strategy
+        # resolve_order_mode('simplified_engine') dispatch (issue #440).
+        # Surface what that dispatch would actually do.
+        from services.mode_service import EffectiveMode, resolve_order_mode
 
-        return "analyze" if get_analyze_mode() else MODE_LIVE
+        routed = resolve_order_mode("simplified_engine")
+        return MODE_LIVE if routed is EffectiveMode.LIVE else "analyze"
 
     # ------------------------------------------------------------------
     # P0 — EOD safety net (services/eod_watchdog_service.py is the caller).
@@ -1943,12 +1992,17 @@ def _reconcile_store_close(
     """Return a store-reconciled close decision, or ``None`` in disabled/error mode.
 
     Runs in BOTH ``sandbox`` AND ``live`` mode: the underlying position read
-    (``reconcile_exit`` → ``get_open_position``) is mode-aware, so it consults
-    ``sandbox.db`` in sandbox and the broker positionbook in live. Returns a
+    (``reconcile_exit`` → ``get_open_position``) consults ``sandbox.db`` in
+    sandbox and the broker positionbook in live. Returns a
     ``ReconcileDecision`` (proceed / clamp / suppress) in those modes. ``None``
     means "no reconciliation ran" — either ``disabled`` mode (never sends orders)
     or an import failure — and the caller then falls back to its legacy
     (non-reconciled) path. Never raises.
+
+    ``mode_key='simplified_engine'`` is passed explicitly (issue #507) and is
+    NOT the ``strategy`` argument: ``strategy`` here is the webhook payload's
+    label, which ``resolve_order_mode`` would not recognise — it would default
+    to sandbox and read the wrong book on a live engine.
     """
     if mode == MODE_DISABLED:
         return None
@@ -1957,6 +2011,7 @@ def _reconcile_store_close(
 
         return recon.reconcile_exit(
             strategy=strategy,
+            mode_key="simplified_engine",
             api_key=api_key,
             symbol=symbol,
             exchange=exchange,
@@ -2151,7 +2206,12 @@ def flatten_strategy_positions(
         try:
             from services.place_order_service import place_order
 
-            success, response, status_code = place_order(payload, api_key=api_key)
+            # mode_key: trade_journal rows are the simplified engine's — the
+            # journal 'strategy' label is a webhook name, not the engine's
+            # strategy_mode key, so route by the engine's key (issue #440).
+            success, response, status_code = place_order(
+                payload, api_key=api_key, mode_key="simplified_engine"
+            )
         except Exception as e:
             logger.exception("[EOD-FLATTEN] %s %s place_order raised", strategy_name, symbol)
             summary["failed"].append({"symbol": symbol, "error": f"exception:{e}"})

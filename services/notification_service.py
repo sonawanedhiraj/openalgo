@@ -188,6 +188,15 @@ class NotificationService:
             # an empty journal the operator has to forensic-query the next
             # morning. See services/trading_day_funnel_service.py.
             "trading_day_funnel": _env_bool("NOTIFY_TRADING_DAY_FUNNEL", default=True),
+            # Daily post-market review (issue #511). Fires once per trading day
+            # at POSTMARKET_REVIEW_TIME (default 17:15 IST) with the day digest:
+            # which scheduled jobs fired, what each strategy journalled, feed and
+            # scanner health, and the compacted error picture. Default ON — it is
+            # the one message that says whether the day behaved, and a silent
+            # review is indistinguishable from a review that never ran (the
+            # failure mode that hid journal_reflection's dead schedule).
+            # Caller: services/postmarket_review_service.py.
+            "postmarket_review": _env_bool("NOTIFY_POSTMARKET_REVIEW", default=True),
             # Runtime source-divergence alerts (issue #231). Default ON — the
             # helper services.source_divergence_alerts.check_and_alert fires
             # this event_type when two data sources for the same value (e.g.
@@ -223,6 +232,12 @@ class NotificationService:
             # daily restart cap is exhausted. Default ON. Caller:
             # services/ws_proxy_supervisor.py.
             "ws_proxy_died": _env_bool("NOTIFY_WS_PROXY_DIED", default=True),
+            # open15_vol_breakout broker-rejected entry (issue #548). Fires once
+            # per day when the broker refuses an entry order (static-IP block,
+            # RMS reject) — the strategy took no position and the trade is
+            # recorded as a PAPER fill instead. Default ON. Caller:
+            # services/open15_breakout_service.py.
+            "open15_breakout": _env_bool("NOTIFY_OPEN15_BREAKOUT", default=True),
         }
         # Whether to deliver messages for event_types NOT in per_event (i.e.
         # future callers that ship without a registry entry). When True (default)

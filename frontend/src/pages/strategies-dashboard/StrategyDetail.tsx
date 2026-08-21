@@ -39,10 +39,12 @@ import {
   type EntryBreakdownPayload,
   type EntryBreakdownSummary,
   type EntryBreakdownSymbol,
+  type LivePerf,
   type LLMFlipOutcome,
   type LLMMode,
   type PnlWindow,
   type RecentTrade,
+  type SideSplit,
   type StrategyDetail,
   strategiesDashboardApi,
   type TradeLLMReview,
@@ -53,6 +55,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { IntradayPullbackEvalCard } from './IntradayPullbackEvalCard'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -169,19 +172,49 @@ function DataHealthBadge({ dataHealth }: { dataHealth: DataHealth }) {
   )
 }
 
-function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) {
+// mode = the strategy's toggle; effectiveRouting = the per-strategy dispatch
+// verdict right now (issue #440) — 'Live (held)' when Analyze mode gates a
+// live toggle down to sandbox routing.
+function ModeBadge({
+  mode,
+  deployable,
+  effectiveRouting,
+}: {
+  mode: string
+  deployable: boolean
+  effectiveRouting?: 'live' | 'sandbox'
+}) {
   if (!deployable || mode.includes('scaffold'))
     return (
       <Badge variant="outline" className="text-muted-foreground">
         Scaffold-only
       </Badge>
     )
-  if (mode === 'live')
-    return <Badge className="bg-green-600 text-white hover:bg-green-700">Live</Badge>
+  if (mode === 'live') {
+    if (effectiveRouting === 'sandbox')
+      return (
+        <Badge
+          variant="secondary"
+          className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+          title="Toggle is LIVE but orders route to sandbox — Analyze mode is ON (navbar)"
+        >
+          Live (held: Analyze on)
+        </Badge>
+      )
+    return (
+      <Badge
+        className="bg-green-600 text-white hover:bg-green-700"
+        title="Orders route to the REAL broker"
+      >
+        Live
+      </Badge>
+    )
+  }
   return (
     <Badge
       variant="secondary"
       className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+      title="Orders route to the sandbox book"
     >
       Sandbox
     </Badge>
@@ -416,58 +449,332 @@ function TradeStatusBadge({ status }: { status: string }) {
 // Performance comparison table
 // ---------------------------------------------------------------------------
 
+// A cell value with an optional ATM-options sub-value rendered beneath it
+// (issue #455). `opt` stays undefined for strategies without option pricing.
+// `tone` colors the main value (long/short P&L sub-rows, issue #458).
+// `title` surfaces the backend's `notes` as a hover tooltip so a '—' can say why
+// it is blank ("Sharpe needs >=20 trading days (7 so far)") instead of reading as
+// broken (issue #568).
+type PairedCell = { main: string; opt?: string; tone?: 'pos' | 'neg'; title?: string }
+
+function PerfCell({ cell, sub }: { cell: PairedCell; sub?: boolean }) {
+  const toneCls =
+    cell.tone === 'pos'
+      ? 'text-green-600 dark:text-green-400'
+      : cell.tone === 'neg'
+        ? 'text-red-600 dark:text-red-400'
+        : ''
+  return (
+    <td
+      title={cell.title}
+      className={`px-4 text-right tabular-nums font-mono align-top ${sub ? 'py-1 text-xs' : 'py-2'}`}
+    >
+      <span className={toneCls}>{cell.main}</span>
+      {cell.opt != null && (
+        <div className={`text-blue-600 dark:text-blue-400 ${sub ? 'text-[11px]' : 'text-xs'}`}>
+          {cell.opt}
+        </div>
+      )}
+    </td>
+  )
+}
+
+// '75% (6/8)' for a side with trades; '—' for an empty side (never 0%).
+// Realized-metric cells for the Sandbox/Live columns (issue #568). These used to
+// be a hardcoded '—' with no backend behind them. A null metric keeps the dash
+// but carries `notes` as a tooltip, so "not enough history yet" is visibly
+// different from "broken".
+function metricCell(
+  p: LivePerf | null | undefined,
+  key: 'cagr_pct' | 'sharpe',
+  suffix = ''
+): PairedCell {
+  if (!p) return { main: '—' }
+  return { main: fmt(p[key], suffix), title: p.notes || undefined }
+}
+
+// CAGR cell for the Sandbox/Live columns (issue #573).
+//
+// CAGR is withheld until there are enough trading days to annualise honestly
+// (60 — below that, simplified_engine's 41 days of +Rs8,220 on Rs20,000 prints
+// a >700% "CAGR"). Rather than leave the cell blank, fall back to the window
+// return the backend already computes, tagged with the trading-day count so it
+// can never be read as an annualised figure. Once `cagr_pct` exists it takes
+// over and the day-count marker disappears — that is the signal that the number
+// changed meaning.
+function cagrOrReturnCell(p: LivePerf | null | undefined): PairedCell {
+  if (!p) return { main: '—' }
+  if (p.cagr_pct != null) {
+    return { main: fmt(p.cagr_pct, '%'), title: p.notes || undefined }
+  }
+  if (p.roc_pct == null) return { main: '—', title: p.notes || undefined }
+  const days = p.trading_days
+  return {
+    main: fmt(p.roc_pct, '%'),
+    opt: days ? `${days}d` : undefined,
+    title:
+      `Window return over ${days ?? '?'} trading days — NOT annualised. ` +
+      `${p.notes || ''}`.trim(),
+  }
+}
+
+// Charges are a modelled figure, not a broker-reported one — no Indian broker
+// exposes per-order charges via API, so the label says so rather than implying
+// these were billed (issue #579, same convention as open15).
+const CHARGES_NOTE =
+  'Modelled Zerodha MIS intraday charges (brokerage, STT, exchange, SEBI, stamp, GST). ' +
+  'Deducted from Gross to give Net. No broker exposes per-order charges via API.'
+
+function pnlTone(v: number | null | undefined): 'pos' | 'neg' | undefined {
+  if (v == null) return undefined
+  return v >= 0 ? 'pos' : 'neg'
+}
+
+function chargesCell(p: LivePerf | null | undefined): string {
+  if (!p || p.charges_inr == null) return '—'
+  const base = fmtPnl(-Math.abs(p.charges_inr))
+  // A closed trade with no modelled charge contributes at gross, so the net
+  // above is optimistic by that much. Say so rather than quietly rounding it in.
+  return p.uncosted_trades ? `${base} (${p.uncosted_trades} uncosted)` : base
+}
+
+function maxDdCell(p: LivePerf | null | undefined): PairedCell {
+  if (!p) return { main: '—' }
+  const notional = p.capital_basis_is_notional
+    ? ' % is of the declared capital, which is a per-trade risk-sizing base, not a compounding book.'
+    : ''
+  return {
+    main: p.max_dd_inr != null ? fmtPnl(p.max_dd_inr) : '—',
+    opt: p.max_dd_pct != null ? fmt(p.max_dd_pct, '%') : undefined,
+    title: `${p.notes || ''}${notional}`.trim() || undefined,
+  }
+}
+
+function fmtSideRate(s: SideSplit | null | undefined): string {
+  if (!s || !s.n_trades) return '—'
+  // A split that carries trade count + P&L but no per-side win rate (a backtest
+  // whose source report never published one) renders '—' rather than a
+  // half-formed 'undefined/155'. issue #508.
+  if (s.win_rate_pct == null || s.wins == null) return '—'
+  return `${fmt(s.win_rate_pct, '%')} (${s.wins}/${s.n_trades})`
+}
+
+function fmtSidePnl(s: SideSplit | null | undefined): string {
+  if (!s || !s.n_trades) return '—'
+  return fmtPnl(s.net_pnl_inr)
+}
+
+function sideTone(s: SideSplit | null | undefined): 'pos' | 'neg' | undefined {
+  if (!s || !s.n_trades || s.net_pnl_inr == null) return undefined
+  return s.net_pnl_inr >= 0 ? 'pos' : 'neg'
+}
+
+// '15 (8L / 7S)' when the split exists, else the plain count.
+function withSideCounts(
+  main: string,
+  long: SideSplit | null | undefined,
+  short: SideSplit | null | undefined
+): string {
+  if (main === '—' || !long || !short) return main
+  return `${main} (${long.n_trades}L / ${short.n_trades}S)`
+}
+
 function PerfTable({ data }: { data: StrategyDetail }) {
   const bt = data.performance.backtest
   const sb = data.performance.sandbox
   const lv = data.performance.live
+  const btOpt = bt.options
+  const sbOpt = sb?.options
+  const lvOpt = lv?.options
+  const hasOptions = Boolean(btOpt || sbOpt || lvOpt)
 
-  const rows = [
-    { label: 'CAGR', bt: fmt(bt.cagr_pct, '%'), sb: '—', lv: '—' },
-    { label: 'Sharpe', bt: fmt(bt.sharpe), sb: '—', lv: '—' },
-    { label: 'Max DD', bt: fmt(bt.max_dd_pct, '%'), sb: '—', lv: '—' },
-    // Backtest win-rate is the 2.5yr figure; Sandbox/Live show the *running*
+  // Option-mode-unaffordable signals are visible as the stock-vs-options trade
+  // count gap (fit-to-capital sizing can price out a high-premium contract).
+  const btOptTrades =
+    btOpt?.n_trades != null
+      ? bt.n_trades != null && bt.n_trades > btOpt.n_trades
+        ? `${btOpt.n_trades} (${bt.n_trades - btOpt.n_trades} skip)`
+        : String(btOpt.n_trades)
+      : undefined
+
+  // Long/short sub-rows render only when some column carries the split
+  // (open15_vol_breakout today; other strategies are unaffected). issue #458.
+  const hasSideSplit = Boolean(
+    bt.long || bt.short || sb?.long || sb?.short || lv?.long || lv?.short
+  )
+
+  const sideRateRow = (label: string, key: 'long' | 'short') => ({
+    label,
+    sub: true,
+    bt: {
+      main: fmtSideRate(bt[key]),
+      opt: btOpt?.[key]?.n_trades ? fmtSideRate(btOpt[key]) : undefined,
+    },
+    sb: {
+      main: fmtSideRate(sb?.[key]),
+      opt: sbOpt?.[key]?.n_trades ? fmtSideRate(sbOpt[key]) : undefined,
+    },
+    lv: {
+      main: fmtSideRate(lv?.[key]),
+      opt: lvOpt?.[key]?.n_trades ? fmtSideRate(lvOpt[key]) : undefined,
+    },
+  })
+
+  const sidePnlRow = (label: string, key: 'long' | 'short') => ({
+    label,
+    sub: true,
+    bt: {
+      main: fmtSidePnl(bt[key]),
+      tone: sideTone(bt[key]),
+      opt: btOpt?.[key]?.n_trades ? fmtSidePnl(btOpt[key]) : undefined,
+    },
+    sb: {
+      main: fmtSidePnl(sb?.[key]),
+      tone: sideTone(sb?.[key]),
+      opt: sbOpt?.[key]?.n_trades ? fmtSidePnl(sbOpt[key]) : undefined,
+    },
+    lv: {
+      main: fmtSidePnl(lv?.[key]),
+      tone: sideTone(lv?.[key]),
+      opt: lvOpt?.[key]?.n_trades ? fmtSidePnl(lvOpt[key]) : undefined,
+    },
+  })
+
+  const rows: { label: string; sub?: boolean; bt: PairedCell; sb: PairedCell; lv: PairedCell }[] = [
+    {
+      // Sandbox/Live fall back to the window return until CAGR is annualisable
+      // (issue #573), so the row covers both — the '(Nd)' marker distinguishes
+      // them. Backtest is always a true CAGR or '—'.
+      label: 'CAGR / Return',
+      bt: { main: fmt(bt.cagr_pct, '%') },
+      sb: cagrOrReturnCell(sb),
+      lv: cagrOrReturnCell(lv),
+    },
+    {
+      label: 'Sharpe',
+      bt: { main: fmt(bt.sharpe) },
+      sb: metricCell(sb, 'sharpe'),
+      lv: metricCell(lv, 'sharpe'),
+    },
+    {
+      // Sandbox/Live show drawdown in rupees as the primary figure — it is the
+      // honest one. The %-of-capital reading is the paired `opt` sub-value and
+      // is caveated in the tooltip whenever the basis is notional (issue #568).
+      label: 'Max DD',
+      bt: { main: fmt(bt.max_dd_pct, '%'), opt: btOpt ? fmt(btOpt.max_dd_pct, '%') : undefined },
+      sb: maxDdCell(sb),
+      lv: maxDdCell(lv),
+    },
+    // Backtest win-rate is the window figure; Sandbox/Live show the *running*
     // win-rate over closed trades so far (issue #323).
     {
       label: 'Win Rate',
-      bt: fmt(bt.win_rate_pct, '%'),
-      sb: fmt(sb?.win_rate_pct, '%'),
-      lv: fmt(lv?.win_rate_pct, '%'),
+      bt: {
+        main: fmt(bt.win_rate_pct, '%'),
+        opt: btOpt ? fmt(btOpt.win_rate_pct, '%') : undefined,
+      },
+      sb: {
+        main: fmt(sb?.win_rate_pct, '%'),
+        opt: sbOpt ? fmt(sbOpt.win_rate_pct, '%') : undefined,
+      },
+      lv: {
+        main: fmt(lv?.win_rate_pct, '%'),
+        opt: lvOpt ? fmt(lvOpt.win_rate_pct, '%') : undefined,
+      },
     },
+    ...(hasSideSplit ? [sideRateRow('Long', 'long'), sideRateRow('Short', 'short')] : []),
     // Backtest N is the window trade count; Sandbox/Live show closed trades so
     // far, the denominator behind the running win-rate + cumulative P&L.
     {
       label: 'N Trades',
-      bt: fmt(bt.n_trades),
-      sb: sb?.closed_trades != null ? String(sb.closed_trades) : '—',
-      lv: lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+      bt: { main: withSideCounts(fmt(bt.n_trades), bt.long, bt.short), opt: btOptTrades },
+      sb: {
+        main: withSideCounts(
+          sb?.closed_trades != null ? String(sb.closed_trades) : '—',
+          sb?.long,
+          sb?.short
+        ),
+        opt: sbOpt?.n_trades != null ? String(sbOpt.n_trades) : undefined,
+      },
+      lv: {
+        main: withSideCounts(
+          lv?.closed_trades != null ? String(lv.closed_trades) : '—',
+          lv?.long,
+          lv?.short
+        ),
+        opt: lvOpt?.n_trades != null ? String(lvOpt.n_trades) : undefined,
+      },
     },
     {
       label: 'Open Pos',
-      bt: '—',
-      sb: sb?.open_positions != null ? String(sb.open_positions) : '—',
-      lv: lv?.open_positions != null ? String(lv.open_positions) : '—',
+      bt: { main: '—' },
+      sb: { main: sb?.open_positions != null ? String(sb.open_positions) : '—' },
+      lv: { main: lv?.open_positions != null ? String(lv.open_positions) : '—' },
     },
-    // Cumulative realized P&L since the strategy started trading in that mode.
+    // Cumulative realized P&L: backtest window total vs since-inception per
+    // mode. Gross and charges are shown as sub-rows above the net headline
+    // (issue #579) — this row previously displayed the GROSS journal sum under
+    // a "Net P&L" label, which reported +Rs8,740 on trades whose true net was
+    // -Rs8,868. Showing the decomposition makes that class of error visible
+    // instead of silent.
+    ...(sb?.gross_pnl_inr != null || lv?.gross_pnl_inr != null
+      ? [
+          {
+            label: 'Gross P&L',
+            sub: true,
+            bt: { main: '—' },
+            sb: { main: fmtPnl(sb?.gross_pnl_inr), tone: pnlTone(sb?.gross_pnl_inr) },
+            lv: { main: fmtPnl(lv?.gross_pnl_inr), tone: pnlTone(lv?.gross_pnl_inr) },
+          },
+          {
+            label: 'Charges (modelled)',
+            sub: true,
+            bt: { main: '—' },
+            sb: { main: chargesCell(sb), title: CHARGES_NOTE },
+            lv: { main: chargesCell(lv), title: CHARGES_NOTE },
+          },
+        ]
+      : []),
     {
-      label: 'Cum P&L',
-      bt: '—',
-      sb: fmtPnl(sb?.cum_net_pnl),
-      lv: fmtPnl(lv?.cum_net_pnl),
+      label: 'Net P&L',
+      bt: {
+        main: fmtPnl(bt.net_pnl_inr),
+        opt: btOpt ? fmtPnl(btOpt.net_pnl_inr) : undefined,
+      },
+      sb: {
+        main: fmtPnl(sb?.cum_net_pnl),
+        tone: pnlTone(sb?.cum_net_pnl),
+        opt: sbOpt ? fmtPnl(sbOpt.net_pnl_inr) : undefined,
+      },
+      lv: {
+        main: fmtPnl(lv?.cum_net_pnl),
+        tone: pnlTone(lv?.cum_net_pnl),
+        opt: lvOpt ? fmtPnl(lvOpt.net_pnl_inr) : undefined,
+      },
     },
+    ...(hasSideSplit ? [sidePnlRow('Long', 'long'), sidePnlRow('Short', 'short')] : []),
     {
       label: 'Today P&L',
-      bt: '—',
-      sb: fmtPnl(sb?.today_net_pnl),
-      lv: fmtPnl(lv?.today_net_pnl),
+      bt: { main: '—' },
+      sb: { main: fmtPnl(sb?.today_net_pnl) },
+      lv: { main: fmtPnl(lv?.today_net_pnl) },
     },
   ]
 
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <FileBarChart2 className="h-4 w-4" /> Performance Comparison
-        </CardTitle>
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle className="text-sm flex items-center gap-2">
+            <FileBarChart2 className="h-4 w-4" /> Performance Comparison
+          </CardTitle>
+          {hasOptions && (
+            <span className="text-xs text-muted-foreground">
+              per cell: stock ·{' '}
+              <span className="text-blue-600 dark:text-blue-400 font-medium">options</span>
+            </span>
+          )}
+        </div>
         {bt.window && <p className="text-xs text-muted-foreground">Backtest window: {bt.window}</p>}
       </CardHeader>
       <CardContent className="p-0">
@@ -484,17 +791,35 @@ function PerfTable({ data }: { data: StrategyDetail }) {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => (
-                <tr key={r.label} className="border-b last:border-0 hover:bg-muted/20">
-                  <td className="px-4 py-2 text-muted-foreground">{r.label}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono">{r.bt}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono">{r.sb}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono">{r.lv}</td>
+              {rows.map((r, i) => (
+                <tr
+                  key={`${r.label}-${i}`}
+                  className={`border-b last:border-0 hover:bg-muted/20 ${r.sub ? 'bg-muted/20' : ''}`}
+                >
+                  <td
+                    className={
+                      r.sub
+                        ? 'pl-8 pr-4 py-1 text-xs text-muted-foreground'
+                        : 'px-4 py-2 text-muted-foreground'
+                    }
+                  >
+                    {r.sub ? `↳ ${r.label}` : r.label}
+                  </td>
+                  <PerfCell cell={r.bt} sub={r.sub} />
+                  <PerfCell cell={r.sb} sub={r.sub} />
+                  <PerfCell cell={r.lv} sub={r.sub} />
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        {hasOptions && (
+          <p className="px-4 py-2 text-xs text-muted-foreground border-t">
+            Options basis differs by column: backtest = fit-to-capital lots (₹30k slot);
+            sandbox/live = 1-lot ATM shadow per trade — directionally comparable, not
+            rupee-for-rupee.
+          </p>
+        )}
       </CardContent>
     </Card>
   )
@@ -625,6 +950,13 @@ type MergedRow =
   | { kind: 'trade'; ts: number; trade: RecentTrade }
   | { kind: 'skip'; ts: number; skip: UnmatchedSkipDecision }
 
+// "BAJAJ-AUTO28JUL2610700CE" -> "10700CE 28JUL" (compact contract label for the
+// Opt Entry cell). Falls back to the raw symbol if the format is unexpected.
+function optContractLabel(optSymbol: string): string {
+  const m = optSymbol.match(/^(.+?)(\d{2}[A-Z]{3})(\d{2})(\d+(?:\.\d+)?)(CE|PE)$/)
+  return m ? `${m[4]}${m[5]} ${m[2]}` : optSymbol
+}
+
 export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
   const [sortAsc, setSortAsc] = useState(false)
   const trades = data.recent_trades
@@ -649,10 +981,14 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
 
   // Gross P&L / Charges / Capital are only populated for strategies that journal
   // them per leg (futures_follow_cap50). Show those columns only when present so
-  // the sector_follow / simplified views stay compact.
-  const hasFinancials = trades.some(
-    (t) => t.gross_pnl != null || t.charges_inr != null || t.margin_inr != null
-  )
+  // the sector_follow / simplified views stay compact. charges_inr alone does NOT
+  // qualify — open15 journals charges but renders them in its entry/exit block.
+  const hasFinancials = trades.some((t) => t.gross_pnl != null || t.margin_inr != null)
+  // open15: rows carry the mid-bar trigger time + flatten timestamp — render the
+  // Entry/Exit price+time (+ charges) block for those (issue #433).
+  const hasEntryExit = trades.some((t) => t.trigger != null || t.exit_ts != null)
+  // open15: ATM option shadow trade columns (issue #435, research-only).
+  const hasOptShadow = trades.some((t) => t.opt_entry_premium != null)
   // LLM columns render for veto-wired strategies (or whenever a verdict/skip
   // actually exists) — sector_follow stays compact.
   const hasLLM = data.llm_veto_enabled || skips.length > 0 || trades.some((t) => t.llm)
@@ -711,6 +1047,46 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Side</th>
                   <th className="text-left px-3 py-2 font-medium text-muted-foreground">Symbol</th>
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">Qty</th>
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="LTP at the legal mid-bar trigger moment"
+                    >
+                      Entry Price
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Mid-bar trigger time (IST)"
+                    >
+                      Entry Time
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Last tick at the 09:30 flatten"
+                    >
+                      Exit Price
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Flatten timestamp (IST)"
+                    >
+                      Exit Time
+                    </th>
+                  )}
+                  {hasEntryExit && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Modelled MIS round-trip charges (brokerage + STT + txn + stamp + GST); Net P&L deducts these"
+                    >
+                      Charges
+                    </th>
+                  )}
                   {hasFinancials && (
                     <th
                       className="text-right px-3 py-2 font-medium text-muted-foreground"
@@ -743,6 +1119,46 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                   <th className="text-right px-3 py-2 font-medium text-muted-foreground">
                     Net P&L
                   </th>
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="ATM option shadow trade (research, no orders): premium at entry — open of the minute after the trigger"
+                    >
+                      Opt Entry
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Premium at the 09:30 flatten (bar open)"
+                    >
+                      Opt Exit
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Contract lot size from the master contract"
+                    >
+                      Lot Size
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Modelled option round-trip charges for 1 lot (brokerage + txn + STT + GST)"
+                    >
+                      Opt Charges
+                    </th>
+                  )}
+                  {hasOptShadow && (
+                    <th
+                      className="text-right px-3 py-2 font-medium text-muted-foreground"
+                      title="Net premium P&L for 1 lot (after modelled charges)"
+                    >
+                      Opt P&L / lot
+                    </th>
+                  )}
                   {hasFinancials && (
                     <th
                       className="text-right px-3 py-2 font-medium text-muted-foreground"
@@ -799,6 +1215,21 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                         </td>
                         <td className="px-3 py-1.5 font-mono">{s.symbol}</td>
                         <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasEntryExit && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
                         {hasFinancials && (
                           <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
                         )}
@@ -812,6 +1243,21 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                           <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
                         )}
                         <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
+                        {hasOptShadow && (
+                          <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
+                        )}
                         {hasFinancials && (
                           <td className="px-3 py-1.5 text-right text-muted-foreground">—</td>
                         )}
@@ -853,6 +1299,41 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                       </td>
                       <td className="px-3 py-1.5 font-mono">{t.symbol}</td>
                       <td className="px-3 py-1.5 text-right tabular-nums">{t.quantity}</td>
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.entry_price != null ? (
+                            fmtPrice(t.entry_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground whitespace-nowrap">
+                          {t.trigger ?? '—'}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono">
+                          {t.exit_price != null ? (
+                            fmtPrice(t.exit_price)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground whitespace-nowrap">
+                          {/* exit_ts is IST-offset ISO — chars 11-18 are HH:MM:SS in IST,
+                              locale/timezone-stable (no Date parsing) */}
+                          {t.exit_ts ? t.exit_ts.slice(11, 19) : '—'}
+                        </td>
+                      )}
+                      {hasEntryExit && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground">
+                          {t.charges_inr != null ? fmtInr(t.charges_inr) : '—'}
+                        </td>
+                      )}
                       {hasFinancials && (
                         <td className="px-3 py-1.5 text-right tabular-nums font-mono">
                           {t.entry_price != null ? (
@@ -908,6 +1389,62 @@ export function TradesAndDecisionsCard({ data }: { data: StrategyDetail }) {
                           <span className="text-muted-foreground">—</span>
                         )}
                       </td>
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums">
+                          {t.opt_entry_premium != null ? (
+                            <>
+                              <span className="font-mono">{fmtPrice(t.opt_entry_premium)}</span>
+                              {t.opt_symbol && (
+                                <div className="text-[11px] text-muted-foreground whitespace-nowrap">
+                                  {optContractLabel(t.opt_symbol)}
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono align-top">
+                          {t.opt_exit_premium != null ? (
+                            fmtPrice(t.opt_exit_premium)
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono align-top">
+                          {t.opt_lot_size != null ? (
+                            t.opt_lot_size
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono text-muted-foreground align-top">
+                          {t.opt_charges_inr != null ? fmtInr(t.opt_charges_inr) : '—'}
+                        </td>
+                      )}
+                      {hasOptShadow && (
+                        <td className="px-3 py-1.5 text-right tabular-nums font-mono align-top">
+                          {t.opt_pnl != null ? (
+                            <span
+                              className={
+                                t.opt_pnl >= 0
+                                  ? 'text-green-600 dark:text-green-400'
+                                  : 'text-red-600 dark:text-red-400'
+                              }
+                            >
+                              {fmtPnl(t.opt_pnl)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                      )}
                       {hasFinancials && (
                         // Capital (SPAN margin) is committed by the entry (BUY) and
                         // released by the T+1 exit (SELL) — so show it on the entry
@@ -1641,23 +2178,36 @@ export default function StrategyDetailPage() {
             <h1 className="text-2xl font-semibold">{data.display_name}</h1>
             <HealthBadge health={data.health} />
             <DataHealthBadge dataHealth={data.data_health} />
-            <ModeBadge mode={data.mode} deployable={data.deployable} />
+            <ModeBadge
+              mode={data.mode}
+              deployable={data.deployable}
+              effectiveRouting={data.effective_routing}
+            />
             <LLMModeBadge llmMode={data.llm_mode} />
           </div>
           <p className="text-sm text-muted-foreground font-mono pl-7">
             {data.name} · v{data.version}
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => refetch()}
-          disabled={isFetching}
-          className="gap-1.5"
-        >
-          <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
-          Refresh
-        </Button>
+        <div className="flex items-center gap-2">
+          {data.console_url && (
+            <a href={data.console_url}>
+              <Button variant="default" size="sm" className="gap-1.5">
+                Decision log &amp; settings
+              </Button>
+            </a>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => refetch()}
+            disabled={isFetching}
+            className="gap-1.5"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {/* Active overrides */}
@@ -1674,6 +2224,9 @@ export default function StrategyDetailPage() {
 
       {/* 15:20 entry-evaluation breakdown + history (issues #352, #395) */}
       {data.name === 'futures_follow_cap50' && <EntryEvaluationCard />}
+
+      {/* Today's per-pick evaluation — why entries did/didn't fire (issue #412) */}
+      {data.name === 'intraday_pullback_top2' && <IntradayPullbackEvalCard />}
 
       {/* Trades + LLM decisions (merged, issue #358) */}
       <TradesAndDecisionsCard data={data} />

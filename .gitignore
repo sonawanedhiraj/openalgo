@@ -116,3 +116,6 @@ strategies/futures_follow_cap50/eod_reports/
 # Agent/boot diagnostic logs (transient; real logs are openalgo_*.log / errors.jsonl)
 log/_*
 log/boot_*
+# Per-day error digests written by the post-market review (issue #511) — runtime
+# state that outlives the 1000-line errors.jsonl truncation, not source
+log/error_digest_*.json

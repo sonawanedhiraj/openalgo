@@ -79,11 +79,24 @@ see the carve-out below). Capability reference:
    PR-list scan without having to click through. Docs-only PRs are exempt from
    the link-guard block but should still link a `type:docs` issue and carry the
    `[#N]` prefix.
-4. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
+4. **Validate before close (operator rule, 2026-07-21).** Every NEW issue MUST
+   carry a `## Validation` section: concrete acceptance checks that prove the
+   requirement is met, not just that code merged. For UI work the check is a
+   **walkthrough from the user's navigation entry point** (e.g. /strategies →
+   click through to the feature) with screenshot evidence — a feature reachable
+   only by a hand-typed URL is NOT done, and the missing link IS part of the
+   requirement (the open15 decision-log miss, issues #430/#425). **Evidence is
+   posted to the ISSUE before it closes — strictly in that order.** When a
+   check needs the running app, validate from the checked-out BRANCH (restart
+   loads branch code) so evidence lands pre-merge; only then merge (auto-close
+   fires with evidence already on the issue). If an issue ever auto-closes
+   without evidence, REOPEN it until the evidence is posted.
+5. **Close on done.** Merging the PR into `dev`/`main` auto-closes the issue
    (the `issue-autoclose.yml` Action parses `Closes #N` — GitHub's native
    keyword close only fires on the default branch, so we do it ourselves).
-   No-PR/manual work (a doc edit, a closed-as-wontfix) → close it yourself with
-   a result comment.
+   **Auto-close certifies "merged", not "validated"** — step 4's evidence must
+   exist either way. No-PR/manual work (a doc edit, a closed-as-wontfix) →
+   close it yourself with a result comment.
 
 **Labels** (filterable; bootstrap via `bash scripts/gh/bootstrap_labels.sh`):
 `type:*` (kind), `status:*` (lifecycle), `session:*` (which session opened it),
@@ -764,7 +777,8 @@ shipped without the rebind and wrote real `trade_journal` rows to the live DB.
 Full write-up: [`outputs/2026-06-11_retrospective_and_plan.md`](outputs/2026-06-11_retrospective_and_plan.md)
 (Section 4).
 
-Three layers, all in `test/conftest.py`:
+Four layers, all in `test/conftest.py` (layer 4 guards a different resource —
+the `claude` CLI — but shares the same discipline: structural, not per-file):
 1. **Unconditional env redirect** at module top — every DB env var is repointed to
    a throwaway per-process `tempfile.mkdtemp()` dir *before* any `database.*`
    import binds its engine. **Ordering is load-bearing:** `utils.config`'s
@@ -780,6 +794,24 @@ Three layers, all in `test/conftest.py`:
    (returncode 2) if `DATABASE_URL` ever resolves to the live `db/openalgo.db`, or
    if the caller explicitly aimed pytest at it (`DATABASE_URL=sqlite:///db/openalgo.db
    pytest`). A run can no longer *start* against the live DB even if layer 1 regresses.
+4. **No-real-`claude`-CLI tripwire** (`_block_real_claude_cli`, function-autouse,
+   issue #632) — wraps `subprocess.run` and raises on any argv whose program
+   basename is `claude`; every other subprocess (git, uv, node) passes through.
+   `services/llm_review_client.py` and `services/llm_agent_client.py` spawn
+   `claude -p` on an unpatched OS thread and block on `thread.join(timeout_s + 5)`
+   with **minute-scale** budgets (240s bare review, 600s tool-enabled agent), so an
+   unstubbed call does not fail one test — it **hangs the run** until
+   `pytest-timeout` kills it and takes every remaining test with it. The guard sits
+   at the process boundary rather than on the `invoke_*` functions because
+   `postmarket_investigation.investigate()` imports the name *inside the function
+   body* (patching the consumer module rebinds nothing), and because
+   `test/test_llm_review_client.py` must stay free to drive the real client against
+   its own `subprocess.run` fake. Callers wrap the spawn in a broad
+   `except Exception` that degrades to an "LLM unavailable" status, so the tripwire
+   also prints the offending test to stderr — otherwise the raise can be swallowed
+   into a green test. **Stub the client module**
+   (`services.llm_agent_client.invoke_claude_agent` /
+   `services.llm_review_client.invoke_claude_review`), never the consumer.
 
 Subdir conftests (e.g. `test/e2e/conftest.py`) may still `monkeypatch`-rebind
 individual modules to per-test temp DBs; that layers cleanly on top and is
@@ -931,14 +963,64 @@ the operator hands-on sooner — no safety rails removed.
 
 **Scaffold strategy**: [`strategies/sector_follow_cap5_vol/`](strategies/sector_follow_cap5_vol/)
 — an intraday sector-follow strategy (spawned from R40 winner `V_SF_CAP5_VOL`):
-at 15:20 IST it buys ≤5 names whose mapped sector index is up >1% intraday AND the
+at **15:05 IST** it buys ≤5 names whose mapped sector index is up >1% intraday AND the
 stock is up >0.5% AND volume >1× its 20d average (vol-ratio tiebreaker), holds to a
-T+1 15:25 MARKET exit, with a 3%-of-capital daily kill switch. Universe is the
+T+1 **15:10** MARKET exit, with a 3%-of-capital daily kill switch. Universe is the
 Phase-0.5 `LOCK_STATIC_30` set; ₹2.5L capital, ₹50k/position.
-**SCAFFOLD ONLY — not live** (`mode: scaffold-only`, `deployable: false`). Unlike
+**Timing changed 2026-08-03 (issue #512 — NSE Closing Auction Session).** It was
+entry 15:20 / exit 15:25 until then. From 2026-08-03 NSE ends continuous trading in
+CAS-eligible cash scrips — **every F&O name, i.e. the entire `LOCK_STATIC_30`
+universe** — at **15:15 IST**, then runs the auction 15:15–15:35 whose 15:25–15:30
+phase accepts **LIMIT orders only**. This strategy places **CNC MARKET** orders and,
+being CNC, has **no MIS auto-square-off backstop**, so a rejected T+1 exit would
+silently carry to T+2 (the #497 failure shape). The whole chain therefore moved
+inside continuous trading — refresh 15:02 → smoke 15:03 → entry 15:05 → exit 15:10 —
+and the times are env-tunable (`SECTOR_FOLLOW_{ENTRY,EXIT,SMOKE_CHECK}_TIME`,
+`SECTOR_FOLLOW_PREENTRY_REFRESH_TIME`) but **hard-clamped to 15:10** by
+`resolve_schedule()`: an operator override can never push a MARKET order into the
+auction. ⚠️ **A 15:05 entry is a DIFFERENT signal from the backtested 15:20 one** (a
+different snapshot of the intraday move and of volume accumulation) — every R40/R41
+result predates the change, so post-2026-08-03 sessions are **unvalidated** until a
+re-backtest on the new window lands.
+**The `strategy_mode` row said `live` from 2026-06-24 to 2026-08-07 — and that
+was NOT an intentional operator flip** (this paragraph used to call it "operator
+flip via the harness"; the 2026-08-06 investigation disproved it). It was a
+direct `_set_mode_unchecked` write by an automated harness that bypassed the
+preflight-gated `flip_mode`, exactly the write the helper's own docstring now
+warns about. The write path was hardened afterwards; **the row it created was
+never reverted**, and the strategy began routing real CNC orders to Zerodha on
+2026-07-29 (masked until then, most likely by the Analyze navbar toggle). Three
+defects kept it invisible and unstoppable, all fixed in
+[#561](https://github.com/sonawanedhiraj/openalgo/issues/561)/[#562](https://github.com/sonawanedhiraj/openalgo/issues/562)/[#563](https://github.com/sonawanedhiraj/openalgo/issues/563):
+
+1. **The dashboard read a STATIC file.** `config_snapshot.json` still said
+   `{"mode": "scaffold-only", "deployable": false}`, so the card showed a
+   "Scaffold" badge and a **disabled** toggle — the one strategy placing real
+   orders was the one with no off-switch. Badge/toggle now derive from the
+   `strategy_mode` row; **a live strategy ALWAYS renders "Switch to SANDBOX"**
+   (`deployable` gates sandbox→live only), and a `config_conflict` flag surfaces
+   any file-vs-row disagreement instead of silently preferring the file.
+2. **Acknowledgement was recorded as a fill.** `status='placed'` came from the
+   broker ACK; 6 of 7 live orders were rejected downstream by RMS with nothing
+   alerting. `services/sector_follow_fill_reconcile.py` now asks
+   `get_order_status` what really happened (EOD job, never the order path),
+   corrects the row, alerts loudly, and records the fill in `fill_price` so
+   `fill_price - price` stays measurable as slippage. Flag
+   `SECTOR_FOLLOW_FILL_RECONCILE_ENABLED`.
+3. **The T+1 exit read an in-memory dict.** `paper_book` had no rehydrate, so a
+   restart erased the position and `run_exit` squared off **0** every day (19
+   entries, 0 SELL rows ever). `rehydrate_from_positionbook()` now combines the
+   journal (entry session) with `get_positionbook(mode_key=STRATEGY_NAME)`
+   (authoritative quantity) — the #497 rule. An **unreadable** book rehydrates
+   nothing and alerts; it is never treated as flat. Runs at boot, at the head of
+   `run_exit`, and on `broker_session_refreshed` (the #403 boot race).
+
+The env default `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` is only the first-boot
+seed and is superseded by the DB row (per the #440 per-strategy dispatch rules).
+Unlike
 sector_rotation_etf, this strategy IS wired into the runtime: `SectorFollowService`
 (`services/sector_follow_service.py`) is built at boot and registers 4 APScheduler
-jobs (entry 15:20 / exit 15:25 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
+jobs (entry 15:05 / exit 15:10 / daily-reset 09:00 / EOD-summary 15:30 IST), but the
 default `SECTOR_FOLLOW_CAP5_VOL_MODE=scaffold` places **no orders** — it computes
 signals, logs, and writes the `sector_follow_trades` journal only. Flip to
 `sandbox` / `live` is operator-only. Key files:
@@ -946,6 +1028,7 @@ signals, logs, and writes the `sector_follow_trades` journal only. Flip to
 `blueprints/sector_follow.py` (control API at `/sector_follow_cap5_vol/api/*` —
 status/positions/pause/resume/close_all),
 `database/sector_follow_db.py` (`sector_follow_trades` journal),
+`services/sector_follow_fill_reconcile.py` (ACK-vs-fill reconciliation, #562),
 `services/sector_follow_index_backfill.py` + `services/sector_follow_stock_backfill.py`
 (sector-index + universe-stock 1m feed; refreshed by the boot+periodic
 state-convergence check below, not a cron). Plan + locked operator
@@ -1066,6 +1149,406 @@ Backtest reports:
 (NIFTY-only CAP50 control) and `2026-06-14_futures_10L.md`. Daily EOD report mirror
 written to `strategies/futures_follow_cap50/eod_reports/YYYY-MM-DD.md` at 15:30 IST
 (git-ignored, observational).
+
+**Sandbox measurement strategy**: [`strategies/open15_vol_breakout/`](strategies/open15_vol_breakout/)
+— opening 15-min **mid-bar volume-surge breakout** (issue #425). Top-3 pre-open
+gainers long / losers short; tick-driven entry the moment cumvol-in-minute ≥1.5×
+the running-avg minute volume AND price breaks the 09:15 candle level; hard
+flatten at the configured exit time. **Deployed as a measurement, not a
+validated edge**: Round 58
+proved every honest bar-level variant of this signal loses (the published edge
+was entry-level look-ahead); the journal's level/trigger-second/trigger-price/
+minute-close columns measure how much of the ~0.54% intra-bar burst a legal
+real-time entry captures (decision rule in SPEC §4). `Open15BreakoutService`
+(`services/open15_breakout_service.py`) has its own additive ZMQ tick SUB and 4
+APScheduler jobs (arm 09:10 / exit / retry +2 / summary +5). The entry cutoff
+and exit time are **UI-configurable** on `/open15_vol_breakout/logs` (issue
+#451: `open15_config.no_entry_after`/`exit_time`, env defaults
+`OPEN15_NO_ENTRY_AFTER` 09:29 / `OPEN15_EXIT_TIME` 09:30 = the R58-measured
+window; exit capped 15:10 so the retry precedes the 15:15 MIS square-off) —
+applied at the next 09:10 arm, with the effective window recorded in the day's
+`armed` decision-log event.
+**Rolling additive watch list (issue #529, default OFF):** when enabled from the
+same UI form, the universe is re-ranked on live LTP every `rolling_cadence_s`
+(default 30 s, clamped 10–300, **UI-editable** — the operator-facing knob) inside
+the entry window and the top-N movers per side are **appended** to the watch
+list. Strictly additive (the 09:16 seed picks are never dropped), the entry gate
+and `max_trades` cap are untouched, and every addition emits a `watchlist_add`
+decision-log event rendered in the "Rolling watch-list" panel on
+`/open15_vol_breakout/logs`. Trades carry `open15_trades.watch_source ∈ {seed,
+rolling}` so the two cohorts can be scored apart. ⚠ **Measurement, not a
+validated edge** — the 2026-08-03 replay showed the 09:16 ranking misses the
+day's biggest movers but could NOT show the added names pay (3 incremental
+trades on 4 usable days); a promotion decision waits on the #528 sample.
+**Broker-rejected entries become PAPER fills (issue #548).** On 2026-08-05
+Zerodha rejected three live entries with a static-IP 403; the message was
+discarded, `flatten` only ever looked at `status='open'` so the rows sat at
+`status='error'` forever with no exit, the rejections ate the whole `max_trades`
+cap, and nothing alerted. Now a rejected entry is journaled
+`status='rejected'` + **`fill='paper'`** with the broker text in
+`error_message`, and at the exit time it is priced exactly as a sandbox run
+would have been (exit price, gross P&L, modelled charges) — **no order is ever
+placed for it**. Four rules, each load-bearing:
+- **`mode` still records what the run genuinely was** (`live`). A paper row is
+  never disguised as a sandbox run; `fill` is the axis that says "this did not
+  happen".
+- **Paper P&L never merges into real P&L.** `total_realized_pnl()` (which drives
+  compound sizing) and `trades_pnl_by_date()` exclude `fill='paper'`;
+  `paper_pnl_by_date()` reports it separately and the UI badges every paper
+  number. Blending them would compound tomorrow's real position size off money
+  that was never made.
+- **Every reported P&L is NET, and is derived in exactly ONE place** (issue
+  #552). `open15_trades.pnl` is gross with modelled charges in `charges_inr`
+  (#433), so "the P&L" is a *derived* value — and before #552 four consumers
+  derived it independently with three different answers, putting a **gross**
+  +₹2109 in the logs-page chip above rows totalling **net** +₹1383.81 (charges
+  were 34% of gross), and flipping 2026-07-23's sign (+₹82 gross vs −₹17.82
+  net). `net_pnl_expr()` (SQL) and `net_pnl_of_row()` (Python) in
+  `database/open15_breakout_db.py` are now the only definition; the `exit` and
+  `exit_paper` decision-log events emit the identical `gross`/`charges`/`pnl`
+  (net) triple so the page never has to know which kind of exit it is reading.
+  **Never write `sum(pnl)` against this journal again** — route through the
+  helpers. The regression that catches this class asserts the day digest equals
+  the sum of the rows the page renders, which is the invariant nothing
+  expressed before (a pre-#552 test pinned the digest at 150.0 three lines
+  above the row it renders at 120.0).
+- **One date key per day.** The journal's `trade_date` comes from
+  `Open15BreakoutService._trade_date()` — the arm-time `_log_date` that
+  `save_day_log` also uses — not from a fresh clock read (issue #553). Deriving
+  it twice filed a row and its own day log under different dates, which left
+  two #548 tests green only on the day they were written.
+- **Only an AFFIRMATIVE non-zero position book justifies a square-off.** A 403 is
+  unambiguous but a timeout is not, so `flatten` verifies via
+  `get_positionbook(mode_key='open15_vol_breakout')` (the #497 rule). A non-zero
+  quantity promotes the row back to a real `open` and squares it off; an
+  **unreadable** book papers it with a loud warning — sending an unjustified
+  square-off would open a naked position, whereas a genuinely-filled lot is
+  still caught by the 15:15 MIS auto-square-off.
+- **A rejection frees its `max_trades` slot** (it is not a trade), while paper
+  fills carry their own cap of `max_trades` so a persistently-rejecting broker
+  cannot simulate an unbounded day.
+**An ACK is NOT a fill — a broker can accept an order and then refuse it
+(issue #626).** #548 above covers the rejection Zerodha gives at *placement*
+time (`status != success`). On 2026-08-18 it did the other thing: returned
+**HTTP 200 with an order id**, then RMS rejected the order for insufficient
+funds. Nothing observed it, and every layer meant to catch exactly this read
+the rejection as a fill — TIINDIA was published as a broker-confirmed
+**+₹7,680** trade, and the day's real P&L was **+₹5,534 when the truth was
+−₹1,509**. Five rules, each load-bearing:
+- **`average_price` is the only field that means "what was transacted".**
+  `fetch_fill` read `average_price or price`; on a rejected order
+  `average_price` is 0 (falsy) and **`price` is the LIMIT PRICE WE ASKED FOR**,
+  so the fallback priced an order that never reached the market. A
+  terminal-unfilled order (`rejected`/`cancelled`) is now priced `None`
+  whatever any field says, and `filled_quantity` is read **by presence, not
+  truthiness** — 0 is the ANSWER on a rejected order, and `or` discarded it for
+  the ordered size (the same mistake, one field over). **Never resolve a broker
+  field with `or` here**: on a rejected order every meaningful value is 0.
+- **The two rejection shapes are NOT symmetric.** A rejected **ENTRY** means
+  nothing was ever held → demote to `fill='paper'`. A rejected **EXIT** on a
+  filled entry means a REAL position may still be open → `status='error'`,
+  never papered, and alerted. Collapsing them into one branch erases a live
+  position from the record.
+- **Only an AFFIRMATIVE non-zero book justifies a square-off — on `open` rows
+  too.** `flatten` dispatched on the believed state and sent a SELL for 800
+  calls we did not own; Kite priced that **naked short** at ₹4.45L of SPAN and
+  refused it only because the funds were not there either. Note the deliberate
+  *opposite* default from `_resolve_paper_position`: there the entry was known
+  REFUSED so an unreadable book papers; here it is believed FILLED, so an
+  unreadable book still squares off — not sending strands a real position.
+  Where the verify verdict and the book disagree, **the book wins**.
+- **Detection is deferred, never on the tick thread.** `open15_entry_verify`
+  (every minute across the entry window) asks the broker per unverified entry
+  and demotes in BOTH the journal and `self.positions` — the latter is what
+  `_count_fills` budgets against and what `flatten` dispatches on, so a
+  journal-only update frees the slot in the report and not in the run. Entries
+  are placed from the ZMQ callback, where a synchronous broker call stalls
+  every other symbol (the same constraint that keeps fill reconciliation at the
+  summary job).
+- **Every broker read routes by `resolve_order_mode(STRATEGY_NAME)`, never the
+  analyze overlay.** open15 defaults to **sandbox**, so this is not a corner
+  case. `funds_service.get_funds` dispatches on `resolve_effective_mode()` —
+  which returns LIVE whenever the navbar Analyze toggle is off, whatever the
+  strategy is set to — so reading funds through it sizes a virtual-₹1Cr
+  measurement run against the REAL broker balance and clamps a run with no
+  funding constraint at all. `read_available_cash` therefore picks
+  `sandbox_get_funds` vs `get_funds_with_auth` itself. The order-status and
+  position-book reads were already correct: `get_order_status` falls back to
+  `sandbox_order_exists(orderid, apikey)` so a sandbox order id is answered
+  from `sandbox.db`, and `_broker_qty` passes `mode_key`. Same #497 rule, and
+  it applies to the funds axis too.
+- **The budget must fit the ACCOUNT.** `margin_per_slot × max_trades` was never
+  compared with the balance: 5 × ₹60,000 = ₹3L configured against ₹1,22,252.80
+  of cash. Zerodha's "Margin required: 149255.00" was the **cumulative**
+  requirement of all three orders, which is why sizing each slot in isolation
+  could never catch it. At arm, `max_trades` is clamped to
+  `floor(cash / margin_per_slot)` — **`max_trades` shrinks, never
+  `margin_per_slot`**, because cutting the slot changes the position size this
+  deployment exists to measure. Fails OPEN on an unreadable balance.
+
+The demotion reuses the existing **`entry_rejected`** event (with
+`post_ack: true`) rather than a new name — the `/logs` page has twice gone dark
+on an event nobody taught the row builders (#615, #622). It also forced
+`entered = len(entry_syms - paper_syms)` in the digest: a post-ACK rejection
+emits BOTH `entry` and `entry_rejected`, and the raw count showed one symbol as
+entered *and* paper. Zerodha's `transform_order_data` now keeps
+**`status_message` and `filled_quantity`** — the reason existed in Kite's
+orderbook the whole time and appeared nowhere in our logs; the fields it did
+keep (`price`, `quantity`) are what we *asked for* and read identically on a
+rejected order and a filled one. The other 31 brokers' mappers still drop them.
+One-off repair for pre-#626 rows (journal AND the day log): `uv run python -m
+services.open15_postack_reject_repair --date YYYY-MM-DD [--apply]` — it resets
+the row and re-runs the FIXED `reconcile_fills` rather than hand-editing, so
+repair and live behaviour cannot drift apart; it needs the broker orderbook to
+still carry the order, i.e. **the same trading day**. Flags
+**None of this is flag-gated** (issue #651): `OPEN15_VERIFY_ENTRIES`,
+`OPEN15_CONFIRM_EXIT_POSITION` and `OPEN15_FUNDS_CLAMP` were RETIRED and the
+behaviour is unconditional. They shipped as rollback switches in case the fix
+itself was wrong — a shipping-time concern with a shelf life — and keeping one
+past that turns a correctness guarantee into a preference. This codebase has
+already paid for exactly that: #647's contract-existence FACT sat behind the
+liquidity gate's `enabled` flag, so switching off a percentile JUDGEMENT
+switched off the fact too. **Do not make a correctness guard configurable.**
+The guards' internal fail-open behaviour is unchanged and is not a switch: an
+unreadable book still squares off, an unreadable balance still does not clamp.
+
+**A trigger ALWAYS produces exactly one terminal event, and the residual cash is
+spendable (issue #643).** On 2026-08-19 GVT&D triggered a legal short (2.73x
+volume while beyond the level against a 1.5x gate) and **vanished** — no journal
+row, no event, no alert — while `/logs` rendered a GREEN (gate-cleared) volume
+cell beside the outcome text `no trigger`. Two independent defects:
+- **A raise inside `_enter` was invisible.** `_sim_context` still unpacked
+  `_option_liquidity` as the pre-#555 3-tuple, so the `max_trades_cap` branch
+  (which prices the miss at 1 lot) raised `ValueError`; the exception unwound
+  past `_enter` into the ZMQ loop's generic handler and the row kept the
+  `'no trigger'` default it was given at selection. Now every trigger ends in
+  one of `entry` / `entry_rejected` / `entry_skipped` / `entry_shadow` /
+  **`entry_error`** — the last journals `status='error'` with **no fill class**
+  (it must never join a P&L bucket), Telegram-alerts on its own dedup key, and
+  is rendered in red by BOTH row builders (the JS in `blueprints/` and its
+  Python twin `open15_log_view.selection_outcomes` — the /logs page has twice
+  gone dark on an event nobody taught it, #615/#622).
+- **The leftover capital was never spent.** #626's clamp cut the day to
+  `floor(161365.10 / 60000)` = 2 slots; the two fills used Rs1,21,635 and
+  **Rs39,730 sat idle**. With `residual_sizing_enabled` on (UI, default OFF) an
+  entry that cannot afford a full slot is sized against an in-process **cash
+  ledger** — seeded from the arm-time balance, debited per real fill, and
+  released on all three non-fill outcomes (placement rejection, post-ACK
+  demotion, `entry_error`); miss one release and every later entry silently
+  shrinks. Sizing never calls the broker per entry (entries run on the ZMQ tick
+  thread, the #626 rule); there is ONE mid-day re-read, the first time the
+  ledger drops below a slot. `clamp_slots_to_funds` then stops shrinking
+  `max_trades` and only reports.
+  ⚠ This deliberately breaks that function's own rule — *"`max_trades` is what
+  shrinks, never `margin_per_slot`"* — which existed so every row is the same
+  size. **Comparability is preserved by LABELLING, not by refusing**:
+  `open15_trades.sizing_basis ∈ {slot, residual}` plus `sizing_basis` /
+  `slot_capital_used` on the `entry` event, so per-trade research can exclude
+  the cohort. Residual rows are REAL money and stay in real P&L.
+  A residual below `residual_min_lots` journals `unaffordable_residual`, naming
+  the constraint that bound.
+The `/logs` page also grew a **capital card** (cash at arm / used / left,
+configured-vs-funded slots, the clamp note) — the `armed` event had carried
+`available_cash`, `max_trades_configured/effective` and `funds_clamp` since #626
+and the page rendered NONE of it, while its effective-config line read a
+`max_trades` key the event does not have and silently fell back to a hardcoded
+`3` on a day that ran with 2. Flags `OPEN15_RESIDUAL_SIZING`,
+`OPEN15_RESIDUAL_RESERVE_PCT`, `OPEN15_RESIDUAL_MIN_LOTS`.
+
+**"Effective today" describes the ARM, not the process (issue #645).**
+`/api/config` served `svc.day_config`, which `arm()` sets at 09:10 and which
+reverts to the constructor's env-only defaults on any restart — so after the
+2026-08-19 11:33 restart the line read `stock | max trades 3 | margin 30000 |
+rolling watch-list disabled` for a session that ran `atm_option` / 2 funded
+slots / Rs60,000 / rolling on. Harmless-looking staleness until #643's capital
+card landed two rows below stating the truth, at which point one page asserted
+two different days (`stock` printed directly above a chip reading
+`atm_option`). `_effective_today()` now resolves three cases and the page
+LABELS which one it got: `armed` (this process armed today), `armed_log`
+(reshaped from the persisted `armed` event — *"from the 09:10 arm — restarted
+since"*), `not_armed` (*"not armed today — the next 09:10 arm will use:"*,
+never presented as the day's settings). The reshape
+(`open15_log_view.effective_from_armed`) is pure and handles the event's own
+vocabulary: the cap is split `max_trades_configured`/`_effective`, residual
+sizing is `residual_sizing`, and **`leverage` was never recorded** — it is
+derived from `notional / margin_effective`, because `'x '+undefined` is a
+silent string, not an error. An unreadable day log degrades to `not_armed`
+rather than 500ing the endpoint the config form depends on.
+
+**Reported P&L is reconciled against the broker's own fills, and there are
+THREE buckets (issue #555).** Every price the strategy journals is a *decision*
+observation — `trigger_price` is the tick that fired the volume gate,
+`opt_entry_premium` the option quote at that instant — so before #555 every
+published P&L was a quote-derived estimate that had never been checked, and
+slippage was unmeasurable. `services/open15_fill_reconcile.py` reads the broker's
+`average_price` per leg (via `get_order_status`, which routes to the sandbox or
+live book automatically through `sandbox_order_exists`) into
+`entry_fill_price`/`exit_fill_price` and **re-derives `pnl`/`charges_inr` in
+place**, stamping `pnl_source='fill'` — it does NOT add a second number, so the
+#552 one-convention rule survives untouched. Since #641 the primary pass runs
+at the **tail of `flatten`** (an APScheduler thread that already makes
+synchronous broker quote calls — NOT the ZMQ tick thread the deferral rule
+protects), with one short in-pass retry for orderbook propagation, so the page
+shows fill-true P&L seconds after the exit instead of at exit+5; the summary
+job and the next 09:10 arm remain the backstops. `verify_entries` (#626)
+additionally persists `entry_fill_price`/`entry_fill_qty` the moment an entry
+reports `complete`. It still **never** runs in `_enter`, because entries are
+placed from the ZMQ tick callback where a synchronous broker call would stall
+every other symbol's ticks. The fill price itself is the broker's
+**volume-weighted average across partials** (#641): Zerodha's mapper keeps the
+orderbook's own `average_price`, and `orderstatus_service`'s tradebook fallback
+volume-weights ALL of the order's trades — the old first-match `break` recorded
+the first partial's price as the whole fill, a Rs912.50 day error on
+2026-08-19. Charges stay **modelled** — no broker
+exposes per-order charges via API — but on the actual fill turnover, and the UI
+labels them as modelled. The quote columns are deliberately NOT overwritten:
+`fill − quote` is the slippage this deployment exists to measure. The four
+P&L buckets are never summed into one another:
+- **real** (`fill='real'`) — money. The only bucket that compounds.
+- **paper** (`fill='paper'`) — the broker REJECTED the entry (#548). An order was
+  attempted and refused.
+- **sim** (`fill='sim'`) — no order was ever attempted (`unaffordable` /
+  `max_trades_cap`), priced at **1 lot** so a capped or under-funded day can say
+  whether the slot capital or the signal is what limited it.
+- **shadow** (`fill='shadow'`) — the side is switched off by `trade_side`
+  (issue #581), priced at the **full slot size** a real entry would have used.
+  Kept apart from `sim` deliberately: *sim* asks "was the budget the
+  constraint?", *shadow* asks "does the signal work on the side we don't
+  trade?" — one blended number answers neither, and the sizing conventions
+  differ because shadow rows exist to be compared against the traded cohort.
+A sim row places nothing and — unlike a rejection — **never reads the position
+book**: nothing was sent, so the book could only surface an unrelated same-symbol
+position and promote a trade we never placed into a live square-off. `_REAL_FILL`
+is an explicit exclusion **list** (`NON_REAL_FILLS`), not `!= 'paper'`: the old
+form silently classified every future class as REAL, which would have compounded
+tomorrow's real position size off simulated money. Fill reconciliation is
+**unconditional** (`OPEN15_FILL_RECONCILE_ENABLED` retired by #651 — a published
+P&L being the broker's own number rather than a quote is not an operator
+preference); the measurement knobs `OPEN15_SIM_SKIPPED_ENABLED` and
+`OPEN15_PAPER_SIM_MAX` remain.
+**Option liquidity: read every count in LOTS, and the spread is the cost
+(issue #555).** Lot sizes across this universe differ ~30× (HAL 150 vs SAIL
+4700), so #488's raw `opt_*_volume`/`opt_*_oi` contract counts were never
+comparable between contracts — measured 2026-08-06, raw counts made SAIL look
+**26× more liquid** than HAL when in lots it is the *smaller* book. That
+inversion is the simplest explanation for #488's own note that "every ex-ante
+metric ranked the two live trades backwards". `services/open15_liquidity.py`
+owns every derivation and never reports a bare contract count. The strategy
+sends **MARKET** orders, so it crosses the book twice: `opt_*_bid`/`opt_*_ask` +
+`opt_tick_size` are now captured at both decision moments at **zero broker
+cost** (the pair always rode in the quote response `_option_liquidity` already
+fetched and was discarded). Spread % is of the **MID**, never the LTP — the LTP
+is whichever side last traded, so quoting against it moves the metric without
+the market moving. ⚠ **Spread cost is reported, never deducted from `pnl`**:
+sim/paper rows price both legs at the quote LTP so their net is optimistic by
+roughly `spread_cost_inr`, while real rows use fills where the spread is already
+inside the price — deducting it would break the #552 single convention and make
+every older row incomparable. `opt_liquidity_path` stores per-minute `{m,v,oi}`
+over the hold from the 1m bars the option-shadow already fetches (per-bar `v` is
+incremental and may be summed; the quote's `volume` is cumulative and must not
+be), answering *building vs unwinding* — which endpoint snapshots cannot.
+**Nothing gates on any of it.** Flag `OPEN15_LIQUIDITY_PATH_ENABLED`. Kite also
+returns `average_price`, `last_trade_time`, whole-book `buy_quantity`/
+`sell_quantity` (OpenAlgo's `totalbuyqty` is only the 5 visible levels — 750 vs
+105,150 for HAL at one instant), `oi_day_high/low`, circuit limits, the
+`low/high_limit_price_protection` band (NSE rejects MARKET orders outside it)
+and per-level `orders`; all are dropped by the shared broker mappers, so
+capturing them means changing a mapper every broker uses. The WS feed is not a
+source — open15 subscribes `NSE_<sym>_LTP` only, which carries neither depth
+nor OI.
+**Not in F&O = not watched, and that is a FACT not a gate (issue #647).**
+`option_underlyings()` reads the master contract — re-downloaded every morning,
+so it tracks NSE's own additions and removals with no list to maintain — and
+`services/fno_universe.filter_to_fno` removes anything missing from it at the
+09:10 arm, **option mode only, unconditionally**. The check used to live inside
+`LiquidityGate`, and being there is what broke it: that class decides whether a
+book is too THIN — a percentile judgement that ships OFF because its placebo
+failed on 2026-08-09 — and its first line is `if not self.enabled: return
+None`, so switching off the judgement switched off the existence check with it.
+On 2026-08-19 SAMMAANCAP was recorded `no_option_contracts, enforced: false`,
+kept its rolling watch slot, triggered at 09:17:38 and died at
+`no_option_contract`. **The two claims are different in kind**: "this book is
+thin" can be wrong, so measure first; "there are no contracts" cannot be wrong
+and cannot be measured around — such a name fills under NO variant, so watching
+it produces no data (the #595 argument). Applied to `self.universe` before the
+gate is built, which makes it total: `_handle_raw` discards ticks for symbols
+outside the universe, so one check covers the 09:16 seed ranking AND every
+rolling addition. `prev` is pruned alongside so the `armed` event's `universe`
+and `prev_closes` describe one set. **Fails OPEN, always** — a raising read or
+an implausibly small underlying set (< 50 against a normal 214) keeps the whole
+universe and drops nothing, because a real exclusion is 1-3 names while a broken
+instrument dump looks like 200 (the #390 shape). There is **no env flag**: a
+plausibility floor is a safety limit, not a policy knob. Re-inclusion is
+automatic — the next morning's dump carries the name and it is simply kept
+(its liquidity score will be missing, which the gate already treats as
+`insufficient_history` → included). Emits `universe_excluded · stage 0 ·
+reason=not_in_fno · enforced=true`.
+
+**Broker-OI watch-list filter (issue #595): mirror Zerodha's absolute rule,
+don't model it.** Zerodha blocks MIS orders on stock option contracts with OI
+< **500 LOTS** — per-CONTRACT and absolute, so no percentile screen can
+reproduce it (2026-08-13: 4 of 5 entries rejected; KALYANKJIL at **p96** was
+among them — Gate 1's band-SUM OI, relative rank, and yesterday's-ATM-strike
+basis are each blind to it, and gappers select precisely the strike where OI
+has not accumulated). The filter runs at the ONLY moment slots are allocated:
+seed selection and rolling additions judge the candidate pool with ONE batched
+quote (`production_oi_filter` → `get_multiquotes`, OI ÷ lot size), a blocked
+name skips with a `universe_excluded` event (`reason=oi_below_broker_min`,
+stage 3) and the next rank is promoted — always, no backfill flag: an
+OI-blocked contract can fill under NO variant, so an empty slot measures
+nothing. Verdicts are day-cached per (symbol, side). **Shadow candidates are
+filtered identically** (operator decision — a shadow fill on a contract the
+broker would block is unrealizable P&L, exactly what the #581 cohort must not
+accumulate; shadow P&L is not comparable across the ship date). **Entry has NO
+check** — the broker is the authority there and the #548 paper path is the
+backstop; a rejection frees its `max_trades` slot (only real fills consume
+it). Fail OPEN three ways: no verdict, unknown OI (the mapper's 0 = "not
+available", #555), and a failed/raising batch call (#390). Config
+`option_min_oi_lots` (UI, default 500 = the broker's rule, 0 = off, env seed
+`OPEN15_MIN_OI_LOTS`); the effective floor is stamped into the `armed` event.
+Alert: `logger.error` + Telegram `open15_breakout`, deduped once per day. The
+digest/summary report `filled` and `paper` separately — `core.entered` counts
+TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows
+(journal AND the day log, which is what the `/logs` page renders):
+`uv run python -m services.open15_rejection_backfill --date YYYY-MM-DD [--apply]`
+(dry-run default, NOT wired into the runtime).
+
+**The excluded side can be measured without being traded (issue #581, default
+OFF).** `trade_side` was set to `long_only` because July parity had the short
+side at **−₹2,485 / 20% win rate** (options) against longs at +₹13,680 — but
+switching a side off also stops collecting the data that would say whether that
+verdict still holds, and this strategy has been **live (real money) since
+2026-07-24**, so simply turning shorts back on is not the cheap experiment it
+looks like. With `shadow_excluded_side` on, the excluded side is selected,
+watched and triggered **exactly as the traded side is** — and no order is ever
+placed for it. Five rules, each load-bearing:
+- **The gate is in the service, never the core.** `Open15Core` still emits a
+  normal action carrying `shadow=True`; `_enter` diverts to `_journal_shadow`
+  before anything can reach `order_placer`. Gating inside the core would make
+  the shadow cohort a *different decision* from the traded one, which is
+  precisely what destroys comparability.
+- **Full slot sizing, not the 1-lot `sim` convention.** The point is comparing
+  against the traded cohort and `parity_target`. The one case the conventions
+  meet — an unaffordable contract — falls back to 1 lot and SAYS SO
+  (`reason='side_excluded_unaffordable'`) rather than hiding a sizing split
+  inside one bucket.
+- **`shadow` is in `NON_REAL_FILLS`, and `_count_fills` subtracts it.** Both are
+  required: the list keeps it out of `total_realized_pnl` (and so out of
+  compound sizing), while `_count_fills` computes `real` by subtracting every
+  non-real class — miss that and shadow rows consume the real `max_trades`
+  budget and report as `filled`.
+- **Its own cap** (`shadow_max_trades`, default 3, clamped 0–10). `max_trades`
+  is a real-money budget; measurement must not spend it.
+- **The position book is never read for a shadow row** at exit. Nothing was
+  sent, so a non-zero quantity could only be an unrelated position, and acting
+  on it would open a real square-off for a trade that never existed.
+Both **seed and rolling** additions are shadowed. Distinct `entry_shadow` /
+`exit_shadow` events (the digest sums by event name). Flags
+`OPEN15_SHADOW_EXCLUDED_SIDE`, `OPEN15_SHADOW_MAX_TRADES`.
+
+**Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
+day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
+`NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.
 
 ## Data freshness validation (sector_follow_cap5_vol)
 
@@ -1197,6 +1680,31 @@ YYYY-MM-DD`; stock 1m `uv run python -m services.sector_follow_stock_backfill
 --from YYYY-MM-DD --to YYYY-MM-DD`. With the convergence check, the CLI is now
 only needed to backfill a multi-day outage beyond the small lookback window — the
 boot+periodic path handles routine staleness automatically.
+
+### Scanner universe: watched vs tradeable (issue #648)
+
+`SCANNER_SYMBOLS` is hand-maintained and NSE moves stocks in and out of F&O on
+its own schedule, so the list drifts (2026-08-19: 211 watched, 3 with no option
+contracts at all). `services/scanner_universe.py` answers it twice:
+
+- **`scanner_universe()` — what we COLLECT data for.** The raw env list. Used by
+  `scanner_universe_backfill` / `scanner_backfill_scheduler`.
+- **`tradeable_universe()` — what we ACT on.** Minus anything absent from
+  today's master contract, via `fno_universe.filter_to_fno` (#647). Used by the
+  aggregator (`scanner_aggregator_symbols`), the rules' history provider, the
+  smoke check's coverage denominator, the WS pre-subscribe nudge and the
+  tick-liveness heal.
+
+**The split is load-bearing.** If dropped names also left data maintenance,
+their 1m/`D` series would freeze the day NSE excluded them, and a later
+re-inclusion would arrive with a months-wide hole the convergence check cannot
+heal (it only fetches symbols behind *today's* close). **Collect on everything;
+act only on the F&O names.** Day-cached on `(date, frozenset(watched))` — the
+whole set, not its length, or two same-sized universes collide.
+`option_liquidity_service.load_equity_universe()` stays RAW on purpose: it is
+`reconcile_universe`'s input, and filtering it would make `missing_contracts`
+permanently empty — the report is the point. `sector_follow` is untouched
+(`LOCK_STATIC_30` is its own list). Fail-open is inherited from #647.
 
 ### Scanner-universe feed convergence (`scanner_backfill_scheduler`)
 
@@ -1417,6 +1925,267 @@ broker-known prior close, with every existing guard alert-only). Three parts:
     `test/test_scanner_service.py` (per-symbol enforcement),
     `test/test_scanner_watchdog_and_backfill_gate.py` (straggler tick).
 
+## Scheduler + daemon-thread registry (`/admin/schedulers`, issue #539)
+
+The single live answer to "what is scheduled, and is it actually running?"
+Phase 1 is **read-only observability**; controls are Phase 2.
+
+**Why a catalog and not just introspection.** Scheduling is spread across
+**seven** APScheduler instances (shared historify, EOD watchdog, sandbox
+square-off, Flow, python_strategy, chartink, strategy) plus ~32 long-lived
+daemon threads, several of which are cron jobs in all but name. Enumerating
+live jobs misses the row that matters most: a job whose registration was
+skipped by an env flag is simply **absent**, which is exactly the case an
+operator is trying to explain ("why did nothing happen at 16:00?").
+
+- **`services/scheduler_registry.py`** — declarative `CATALOG` of `JobSpec`s
+  merged at read time with live `get_jobs()` across all seven instances and the
+  last fire from `job_run`. States: `registered` / `not_registered` (catalogued
+  but absent) / `unregistered` (live but uncatalogued — user-defined historify,
+  python, flow and chartink schedules land here without needing entries).
+  Resolution reads `sys.modules` and **never imports** — importing
+  `blueprints.python_strategy` runs a strategy cleanup, so an observability call
+  that imported it would have real side effects.
+- **`services/thread_registry.py`** — same shape for daemon threads, by class
+  (`loop` / `transport` / `poller` / `boot`), plus an **in-memory heartbeat**
+  (`beat()`) stamped at the top of each recurring loop's tick. The heartbeat is
+  the point: `Thread.is_alive()` stays `True` forever for a thread wedged on a
+  socket read, so liveness alone proves nothing. States: `running` / `stale` /
+  `dead` / `not_started` / `completed`.
+- **Alerting is deliberately narrow** and rides the existing `ThreadWatchdog`
+  30 s loop (no new thread to watch threads): only a thread that **beat at least
+  once and then went silent or vanished** alerts. `not_started` never alerts,
+  because it is the normal state for most catalog entries on a normal install
+  (no broker session, outside the window, flag off, bot not configured) — daily
+  noise is how an alert channel gets ignored. Flags `THREAD_REGISTRY_ENABLED`,
+  `THREAD_HEARTBEAT_STALE_MULTIPLIER` (3.0), `THREAD_REGISTRY_ALERT_DEDUP_MIN`
+  (30), `NOTIFY_THREAD_REGISTRY`. See `docs/PARAMETER_LOG.md`.
+- **This closes a real gap.** `thread_watchdog_service` alerts on a thread
+  *leak* (count climbing); with no expected-set it structurally cannot detect
+  the opposite — a thread that died or wedged, the 2026-07-07 silent tick-flow
+  death shape.
+- **Tiers** are recorded now, enforced in Phase 2: `protected` (exits, EOD
+  flattens, square-offs, daily resets, market-hours enforcer — never disableable
+  from the UI; each carries a `safety_note` saying why, because the reason is
+  what stops a future maintainer from downgrading it), `guarded` (typed
+  confirmation + mandatory expiry), `free`.
+- **API + UI:** `GET /admin/api/schedulers` (`@check_session_validity`,
+  read-only, each half degrades independently into `sources_failed`) rendered by
+  `frontend/src/pages/admin/Schedulers.tsx`, reachable from the Admin dashboard
+  card at `/admin`.
+
+**⚠ When you add a scheduled job or a long-lived thread, add it to the matching
+catalog in the same commit.** This is enforced, not advisory:
+`test/test_scheduler_registry.py` parses every `add_job(..., id="X")` literal in
+`services/`, `blueprints/` and `sandbox/` and fails on anything uncatalogued;
+`test/test_thread_registry.py` does the same for `Thread(name="X")` literals.
+A catalog that falls behind the code answers "what runs?" *wrongly*, which is
+worse than not answering — so the tests treat drift as a build failure. Long-
+lived threads must also be **named** (`Thread(..., name="X")`); the name is the
+only join key against a live process.
+
+**Not yet built** (Phase 2+, separate issues): durable `scheduler_job_control`
+table, fire-time guard wrapper, per-tick loop gate, tiered toggles, run-now,
+per-job fire history, and post-market expectation contracts that read the
+control table so an operator-disabled job is not reported as a failure.
+
+## Daily post-market review (`postmarket_review`) + job-run audit
+
+An in-process APScheduler job (**17:15 IST mon-fri, trading days only**) that
+records what the day actually did, and the `job_run` audit table it stands on.
+Issue #511, Phase 1 of a phased build.
+
+**Why it exists.** Two failures motivated it. (1) `futures_follow_cap50` T+1
+exits were silently dead for **four trading days** (2026-07-27..30, issue #497)
+while open NRML lots climbed to 110% of book — every individual layer looked
+healthy. (2) `journal_reflection`, the 16:00 IST nightly LLM job, has run **three
+times in two months** against a daily mon-fri schedule: it posts to the Cowork
+bridge on :5001, which is normally down, and fails silently. Nobody noticed
+because **nothing recorded whether a scheduled job fired**.
+
+**The load-bearing rule for every later phase: Python detects, the LLM triages.**
+Invariants are asserted in code and are either true or false; the model only
+ranks severity, correlates, and drafts prose. It never decides whether something
+is broken. That split is what stops the report from inventing problems on a quiet
+day — and it is why Phase 1 ships with **no verdicts and no LLM call at all**.
+
+- **`job_run` audit** (`database/job_run_db.py` + `services/job_run_audit.py`) —
+  one row per APScheduler fire (`ok` / `error` / `missed`, with `duration_ms`,
+  `scheduled_at`, exception text). The listener attaches to the shared Historify
+  scheduler in `app.py` **immediately after `init_historify_scheduler` and before
+  any service registers jobs**, so a boot-time fire is still captured. Two
+  non-obvious details, both regression-tested: the SUBMITTED event spells it
+  `scheduled_run_times` (a *list*) while EXECUTED uses `scheduled_run_time`
+  (singular) — keying only the singular form silently produced `duration_ms=None`
+  for every job; and job names are cached on `EVENT_JOB_ADDED` because a one-shot
+  (`date`-trigger) job is removed from the jobstore *before* it is submitted, so
+  a later `get_job` lookup returns None. Pruned to `JOB_RUN_RETENTION_DAYS`
+  (default 90) by the review job. Flag `JOB_RUN_AUDIT_ENABLED` (default `true`).
+- **Day digest** (`services/postmarket_day_digest.build_day_digest`) — read-only
+  aggregation over `job_run`, `trade_journal` (per strategy/direction, incl.
+  open-at-EOD and #350-style unpriced exits), `signal_decision`, `scan_results` +
+  `scan_cycle`, the four per-strategy journals, `data_health_check`,
+  `scanner_comparison`, `account_orders`, `sandbox_orders`, and the compacted
+  logs. **Every section is independently wrapped**: a dead source degrades to
+  `None` and is named in `sources_failed` rather than killing the run.
+  The **futures carry walk** is the #497 detector: exits are *separate SELL rows*
+  (`exit_price` is never back-filled onto the BUY leg), so carry is a FIFO lot
+  balance — replaying 2026-07-24..30 yields open lots `1→2→4→6→8` with
+  `exits_today=0` every day and `carry_age_days` reaching 13 on a T+1 strategy.
+- **Log compaction** (`services/postmarket_log_digest`) — the daily text log is
+  **~5 MB** and `errors.jsonl` is **capped at 1000 lines and truncated on every
+  app startup**, so raw logs can never go into a digest (or, later, a prompt) and
+  error history is otherwise lost on restart. Errors bucket by
+  `(logger, normalized_message)`; the text log is streamed for level counts and
+  known structured markers only — **raw log text never enters the digest**. A
+  durable `log/error_digest_<date>.json` snapshot is merged **max-wise** on each
+  run, which both survives the truncation and keeps re-runs idempotent (summing
+  would double-count everything already captured).
+- **Persistence + report** — one `postmarket_review` row per date (idempotent
+  delete-then-insert) plus a Telegram summary via `notify("postmarket_review")`.
+  A **non-trading day returns early and persists nothing** — an empty row for a
+  Saturday is noise, not a record.
+- **Replay CLI** — `uv run python -m services.postmarket_review_service --date
+  YYYY-MM-DD --dry-run`. Use it to develop against known-bad days before
+  anything runs live.
+- **Flags:** `POSTMARKET_REVIEW_ENABLED` (default `true`, per-fire),
+  `POSTMARKET_REVIEW_TIME` (default `17:15`), `NOTIFY_POSTMARKET_REVIEW`,
+  `JOB_RUN_AUDIT_ENABLED`, `JOB_RUN_RETENTION_DAYS`. See `docs/PARAMETER_LOG.md`.
+  **17:15 is not arbitrary** — the scanner backfill convergence loop runs until
+  17:00 (`SCANNER_BACKFILL_PERIODIC_END_TIME`); reviewing earlier reads
+  half-written data. Move one and you must move the other.
+
+**Phase 2 — expectation contracts (issue #532, `services/strategy_expectations.py`).**
+This is what turns the digest from a report into a **verdict**. `EXPECTATIONS` is
+a registry of declarative `Expect(contract_id, strategy, predicate, severity,
+requires, shape, ...)` entries; `evaluate_expectations(digest)` returns
+violations, which lead the Telegram summary and persist to
+`postmarket_review.violations_json` / `n_violations` / `contracts_json`.
+
+Four rules, each load-bearing — break one and the report stops being trusted:
+
+- **Contracts read the digest ONLY, never the DB.** That is what makes every
+  contract replayable against any past day through the CLI, and testable without
+  fixtures for ten tables.
+- **Missing input is `unknown`, NEVER `fail`.** A degraded digest section means
+  *our collection* broke, not that a strategy misbehaved. Contracts declare
+  `requires` paths and short-circuit to `unknown`. Related: a contract that
+  depends on `job_run` checks `audit_earliest_date` first, so replaying a day
+  from before the audit shipped reports `unknown` instead of a phantom "nothing
+  fired". Accusing a strategy of a collection gap is how a report earns being
+  ignored.
+- **Fingerprints exclude observed values.** `strategy|contract_id|shape` only.
+  The #497 outage failed the same contract on four consecutive days with
+  different lot counts (2/4/6/8); Phase 4 must see one recurring problem, not
+  four. Renaming a `contract_id` re-files its issue — treat ids as an API.
+- **A raising predicate is contained as `unknown`.** One broken rule must not
+  take down the report it is part of.
+
+Evidence it works, from replaying real history: **2026-07-17** (a healthy day
+with a real exit) produces **zero** violations, while **2026-07-27** — day *one*
+of the #497 window — fires `futures_follow_cap50/t1_exit_for_carry` as **P0**,
+and all four broken days share the identical fingerprint. The bug that took four
+trading days to notice is caught on the first.
+
+Flags: `POSTMARKET_CONTRACTS_ENABLED` (default `true`) and
+`POSTMARKET_CONTRACTS_DISABLED` (comma-separated `contract_id` or
+`strategy:contract_id`) — the latter silences one contract surgically so a rule
+that starts crying wolf can be muted same-day without a code change. A muted
+contract should get an issue to fix or delete it: a permanently disabled contract
+is worse than no contract, because the report still *looks* complete.
+
+**Phase 3 — LLM triage (issue #534, `services/postmarket_triage.py`).** Adds
+judgment on top of the verdict: a `claude -p` pass over the Phase 2 violations
+returning a day assessment, per-violation likely-cause / recurrence / recommended
+action, and draft issue title+body. It uses the **same in-process seam as the
+Stage-1 veto** (`llm_review_client.invoke_claude_review` — a blocking subprocess
+on a real, unpatched OS thread, because the app runs under eventlet). Persisted
+to `triage_json` / `llm_status` / `llm_latency_ms`.
+
+- **The model cannot create findings — enforced structurally, not by prompt.**
+  Every triage entry must carry a `fingerprint` that was in the input; entries
+  with an unrecognised fingerprint are dropped and logged. A model that invents
+  a problem produces nothing, whether it hallucinated or was steered there by
+  text injected into the logs it was shown. The model's `severity_assessment` is
+  **advisory** — the contract's own severity stays authoritative.
+- **Untrusted input.** Violation summaries and error templates originate in logs
+  containing arbitrary third-party text. Mitigations in order of real weight:
+  (1) the output is used only as text and ranking — never a command, path, shell
+  argument or filing decision (Phase 4 builds its `gh` argv in Python from a
+  fixed template regardless of what comes back); (2) log content rides inside a
+  delimited `<untrusted_log_data>` block; (3) the fingerprint allow-list above.
+  Prompt wording is not treated as a security boundary.
+- **Failure is LOUD.** Unlike the veto — which fails *open* to "take" on purpose
+  so a dead LLM never blocks a trade — a failed triage must be visible.
+  `llm_status ∈ ok | skipped_clean_day | skipped_disabled | not_logged_in |
+  cli_missing | unreachable | timeout | parse_failed | error`, and a non-skip
+  failure is stated in the Telegram summary. A silent no-op is exactly how
+  `journal_reflection` hid a dead schedule for two months.
+- **Clean days do not call the LLM** by default
+  (`POSTMARKET_TRIAGE_ON_CLEAN_DAYS=false`): with nothing proven broken the
+  output is speculative and Phase 4 would not file it.
+- **Operator prerequisite:** the `claude` CLI must be **logged in on the host**
+  (subscription auth via the CLI — there is no API key in this codebase).
+
+**Two logged-out-CLI bugs fixed in `llm_review_client` while building this
+(#534)** — both affected the live Stage-1 veto too. The CLI reports "not logged
+in" in two shapes and neither reached the caller as an error: (1) **exit 0 with
+`is_error: true`** in the envelope, whose `result` ("Not logged in · Please run
+/login") was returned as if it were the model's answer; and (2) **exit 1 with an
+EMPTY stderr**, the diagnostic being in *stdout*, which produced the useless
+message `"claude review exited 1: "` and cost `_AUTH_MARKERS` its only evidence
+— so the operator was told "error" instead of the one-command fix. `_parse_envelope`
+now raises on `is_error`, and a non-zero exit falls back to the stdout envelope's
+`result`. Regression tests in `test/test_llm_review_client.py`.
+
+**Phase 3b/4 — investigating agent + issue filing (issue #536).** The agent now
+gets **read-only access to the source tree and the logs** and does two jobs:
+**verify** each deterministic violation against the actual code (`confirmed` /
+`refuted` / `unverified`, citing `file:line`), and **propose** problems the
+contracts do not cover. Confirmed findings are filed as GitHub issues.
+
+- **Seam:** `services/llm_agent_client.py` — same unpatched-OS-thread subprocess
+  pattern as the bare client, but with `--allowedTools Read Grep Glob`,
+  `--disallowedTools Bash Write Edit MultiEdit NotebookEdit WebFetch WebSearch
+  Task`, and CLI-level `--settings` deny rules on `.env*`, `db/`, `.git/`,
+  `*.key`, `*.pem`. **The deny-list is load-bearing, not tidy:** `.env` holds
+  `API_KEY_PEPPER`/`FERNET_SALT`, every encrypted secret in `openalgo.db` is
+  sealed against them, and the pipeline's whole purpose is to *publish* what the
+  agent writes. Read access plus a publish path is an exfiltration channel.
+- **Evidence replaces the fingerprint allow-list.** Phase 3 kept the model honest
+  by only letting it speak about violations Python had proven; that has to relax
+  once it can find new things. Instead: every finding must cite a repo path (or a
+  log template present in today's digest), and **cited paths are checked against
+  the filesystem in Python** — a confident citation of a file that isn't there is
+  the cheapest hallucination tell there is. Uncited findings are dropped.
+- **`services/publish_guard.py`** — `detect-secrets` plus an explicit pattern set
+  for this install's crown jewels, run over any model-authored text before it
+  leaves the machine. **Fails closed**: if the scanner cannot run, publishing is
+  refused. A scanner that degrades to "looks fine" is worse than none, because it
+  is trusted.
+- **`services/github_cli_client.py`** — the only path to GitHub. An **allow-list
+  of verbs** (`list/view/create/comment/edit/reopen/close`), argv built from fixed
+  templates, every body guarded. `pr merge`, `push`, `workflow run`, `release` are
+  structurally unreachable, so **model output is only ever a value inside a fixed
+  template, never part of the command shape**.
+- **Filing:** only `confirmed` + `worth_filing` findings become issues — an issue
+  asserts something *is* wrong, so refuted/unverified findings are reported to the
+  operator and never filed. Recurrences comment on the existing issue (matched via
+  a `<!-- postmarket-fingerprint: … -->` body marker) rather than opening a
+  second. Rate-capped by `POSTMARKET_MAX_ISSUES_PER_DAY` with overflow appended to
+  `audit/proposed_fixes.jsonl` — the cap bounds noise, never the record.
+  **`POSTMARKET_FILING_MODE` defaults to `dry_run`.**
+- **Read-only on code, always.** The agent never edits, branches, or commits —
+  the same carve-out the Cowork scheduled tasks run under. A human owns every fix,
+  and each filed issue says so.
+
+**Not yet built:** the closed-issue validation sweep (#537 — the agent runs the
+acceptance checks it can, posts evidence, and reopens on failure; it must never
+tick a box it did not actually verify). Tests:
+`test/test_job_run_audit.py`, `test/test_postmarket_review.py`,
+`test/test_strategy_expectations.py`, `test/test_postmarket_triage.py`,
+`test/test_postmarket_investigation.py`.
+
 ## Scanner-vs-Chartink EOD comparison (`scanner_comparison_eod`)
 
 A daily in-process APScheduler job (**15:45 IST mon-fri**) that scores how the
@@ -1446,6 +2215,24 @@ Telegrammed every trading day.
   sees ticks the engine subscribed (the "in-house scanner starved" learning) — a
   fully-disjoint result usually means tick starvation, not a threshold mismatch.
   The tuning verdict calls this out.
+- **Echo exclusion (issue #447):** the in-house `ScanHitPoster` posts scanner
+  hits into the *same* simplified-engine webhook Chartink uses. Those payloads
+  carry `source='inhouse_scanner'` and the webhook audits them as
+  `cycle_kind='inhouse_echo'`, so the comparison's Chartink side (and the #321
+  miss-debug set in `scanner_service._today_chartink_symbols`) sees only genuine
+  Chartink cycles. Before 2026-07-24 the echoes were recorded as `'chartink'`
+  with SELL hits misfiled into `screener_buy` (the webhook's old
+  whitespace-token side check vs the poster's single-token
+  `fno_intraday_sell_20` scan name) — every `scanner_comparison` row from
+  ~2026-07-01 to 2026-07-24 was self-referential. The side
+  check now tokenizes on non-alphabetic chars (SELL/SHORT/COVER), mirroring the
+  engine's `_infer_direction`, so audit and armed direction cannot diverge.
+  **The polluted window was repaired on 2026-07-24** (issue #449): the one-time
+  operator CLI `services/scanner_comparison_echo_backfill.py` (dry-run default,
+  `--apply` to write) reclassified the 5,412 pre-fix echo rows heuristically
+  (single-symbol `chartink` row matching an in-house `scan_results` hit within
+  ±3 s) and recomputed the 18 affected `scanner_comparison` days without
+  Telegram. NOT wired into the runtime.
 
 Registered at boot in `app.py` next to `init_sector_follow_service`. One-shot
 backfill / re-run for a past day: `run_comparison_for_date(date='YYYY-MM-DD')`.
@@ -1511,6 +2298,68 @@ auto-square-off. This is load-bearing: sandbox *rejects* MIS orders placed at/af
 15:15, so a watchdog at the old declared 15:20 was always too late (the 2026-06-10
 OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 
+## Multi-account mirror trading (issues #468/#474/#476/#478)
+
+One install can drive multiple **family** Zerodha accounts: the PRIMARY account
+keeps everything it always did (feed, historical data, scanner, signals,
+sandbox); CHILD accounts exist only to **mirror LIVE strategy orders**, scaled
+to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design/multi_account_plan.md).
+
+- **Setup/login** (`/accounts` page, `blueprints/broker_accounts.py`,
+  `services/broker_accounts_service.py`): child rows in `broker_accounts`
+  (Kite app credentials encrypted, per-account TOTP, capital, `is_enabled`
+  default false) + `account_strategies` allow-list. Each child's daily token
+  lives in the `auth` table under `name='acct:<id>'`; the Zerodha callback
+  routes to the child path ONLY when `?account_id=<N>` (each child Kite app's
+  redirect URL carries it — all apps under ONE developer profile because the
+  static-IP whitelist is profile-level; SEBI family-only IP sharing).
+  Child login performs NONE of the primary-login side effects.
+- **Fan-out** (`services/account_fanout_service.py`): fires from ONE seam at
+  the tail of `place_order_with_auth`'s LIVE-accepted branch (covers entries,
+  exits, watchdog flattens, kill-switch closes uniformly). Gating: env
+  the UI master switch (`multi_account_settings.enabled`, default **false**;
+  issue #484 — env vars are only the first-boot seed) + LIVE parent +
+  broker-accepted + known strategy + enabled child selecting it.
+  **Sizing is capital-per-trade (issue #496, supersedes the ratio model):**
+  each (child, strategy) row carries `capital_per_trade_inr` — OPENING
+  quantity = `floor(capital ÷ price)` (equity) or `floor(capital ÷
+  (premium × lotsize)) × lotsize` (derivatives), priced from the parent's
+  LIMIT price or a live quote at mirror time (`resolve_sizing_price`;
+  journaled as `account_orders.sizing_price`). Unset capital →
+  `skipped_no_capital`, quote failure → `skipped_no_quote`, unaffordable →
+  `skipped_zero_qty` — all loud, never guessed. EXITS flatten the child's
+  own broker position (never blocked by capital/quote availability); a flat
+  child whose entry attempt recently FAILED gets `skipped_no_position`
+  (never a naked position — issue #478 guard).
+  Fire-and-forget per-child isolation; every attempt journaled to
+  `account_orders`; every non-placed outcome Telegrams
+  (`multi_account_mirror`).
+- **The child checks its OWN balance, and an ACK is not a fill (issue #637).**
+  Both #626 defects existed here too, one account over. (a) Sizing read
+  `capital_per_trade_inr` and never the balance, so a parent taking N trades
+  asked the child for N × its per-trade size and the Nth was refused —
+  `read_child_cash` now gates OPENING mirrors on the **sized order value**
+  (`compute_opening_qty` floors, so the real cost is ≤ the cap), read with the
+  **child's own token**, never gating an EXIT, failing OPEN on an unreadable
+  balance. (b) `status='placed'` came from the HTTP 200 ACK and **nothing ever
+  re-checked it** — `services/account_fill_reconcile.py` (job
+  `multi_account_fill_reconcile` 09:40 IST, plus inline before the 15:35 EOD
+  summary so that report is built on a corrected record) re-reads each child's
+  **RAW** orderbook (`get_order_book(token)` — the mapper drops
+  `status_message`) and turns a post-ACK rejection into `rejected` with the
+  broker's reason, alerting. It only ever corrects **downwards**: a confirmed
+  fill is left alone, because promoting rows on our own authority is what
+  produced the fabricated fill in the first place. Idempotent with no marker
+  column (a corrected row is no longer `placed`). Flags
+  `MULTI_ACCOUNT_FUNDS_CHECK`, `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED`.
+- **Observability** (`services/account_mirror_summary_service.py`): orderbook
+  "Mirror Orders" card + `/accounts` today chips; login reminders 09:00/15:00
+  IST and a 15:35 IST EOD mirror summary — all fire-time gated on the master
+  flag + trading day (silent for single-account installs).
+- **Ops**: every child account needs its own daily Kite login (Connect button
+  + per-account TOTP code on `/accounts`); child fills/P&L live in the child's
+  own broker book — OpenAlgo does not track child positions.
+
 ## Unified strategy daily intent (`strategy_daily_intent`)
 
 > **Mode-only migration in progress (2026-06-12).** A new `strategy_mode` table
@@ -1524,14 +2373,48 @@ OIL/HINDZINC/TATAELXSI orphans). Do not move the cap to ≥15:15.
 > mode forward (drops intent/cap; `skip` → `sandbox`). The sections below describe the
 > table being retired; they are rewritten progressively as the refactor lands.
 >
-> **Global order-gate default changed (B2, 2026-06-12):** `resolve_effective_mode()`
-> — the external `/api/v1` place/cancel/close gate used by `place_order_service` &
-> friends — **no longer returns `DISABLED` when nothing is configured; it returns
-> `SANDBOX`.** Unconfigured external callers route to the virtual ₹1Cr book instead
-> of being refused. Live external orders require an explicit persistent `strategy_mode`
-> row for the reserved `__global__` key (and `analyze_mode` off); the `analyze_mode`
-> conservative overlay is preserved. The change only ever makes the path *more*
-> sandboxy, never more live. See `docs/PARAMETER_LOG.md` (mode-only architecture).
+> **Per-strategy UI-driven order dispatch (issue #440, 2026-07-23 — supersedes
+> B2):** live-vs-sandbox routing is now decided **per order, per strategy**, by
+> exactly two visible controls and nothing else: the navbar **Analyze/Live
+> toggle** (`analyze_mode`, the platform kill switch — Analyze ON forces
+> sandbox for everything) and the per-strategy **Live/Sandbox toggle** on
+> `/strategies` (a `strategy_mode` row written via the preflight-gated
+> `strategy_mode_service.flip_mode`). `place_order` (and basket/split/smart/
+> GTT-place/close_position) dispatch on
+> `services.mode_service.resolve_order_mode(mode_key)`: LIVE **only** when
+> Analyze is off AND that strategy's row says `live`; no row / unknown label /
+> env-only resolution → SANDBOX (**default deny**). In-repo engines pass their
+> canonical `mode_key` explicitly (the simplified engine's payload `strategy`
+> is a webhook label, so it passes `mode_key='simplified_engine'`). The hidden
+> `strategy_mode['__global__']` gate and the legacy `daily_intent` fall-through
+> are **retired from dispatch** (a leftover `__global__` row is purged at
+> boot), and env mode flags (`SIMPLIFIED_ENGINE_MODE` etc.) are **capped at
+> sandbox** — an env var can never escalate to live. The residual
+> `resolve_effective_mode()` is now the analyze overlay only (SANDBOX iff
+> Analyze ON, else LIVE) and is used ONLY by read decorations (which book the
+> UI shows) and order management (cancel/modify route per-order via a
+> sandbox-book orderid lookup, `sandbox_order_exists`; cancel-all sweeps both
+> books when Analyze is off) — it must never gate a new order live.
+> Observability: `/mode/status` lists every strategy row with its
+> `effective_routing`, and the strategies page badges show routing truth
+> (e.g. "Live (held: Analyze on)").
+>
+> **A strategy reading back its OWN positions is NOT a read decoration
+> (issue #497).** `get_positionbook(mode_key=...)` /
+> `get_positionbook_with_auth(mode_key=...)` resolve the book with
+> `resolve_order_mode(mode_key)` — the *same* resolver that routed the order —
+> so the write and the read can never land on different books. Omitting
+> `mode_key` keeps the analyze-overlay behavior for UI reads. This is
+> load-bearing: with Analyze OFF the overlay returns LIVE, so a `sandbox`
+> strategy wrote into `sandbox.db` and read the empty LIVE broker book —
+> `futures_follow_cap50` rehydrated 0 positions and fired **no T+1 exits for
+> four trading days** (2026-07-27..30, 7 NIFTY lots stranded at 110% of book
+> against a 50% cap). It surfaced there first because it trades **NRML**, which
+> has no MIS auto-square-off underneath it. In-repo callers pass their canonical
+> key (`futures_follow_cap50`, `simplified_engine`). **When adding a position
+> read to a strategy, pass `mode_key` — and test the routing, not a mocked
+> `get_positionbook`** (mocking that call is what hid #497 from 5 existing
+> rehydrate tests). See `test/test_positionbook_mode_routing.py`.
 >
 > **Engines + preflight wired to runtime_override (B3, 2026-06-12):** both engines
 > now consult `strategy_runtime_override.is_entry_blocked(strategy)` at job-entry
@@ -1570,9 +2453,10 @@ in-memory pause flag as the canonical *pre-market* control. One row per
 The single read path is
 `services.mode_service.resolve_strategy_mode(strategy_name, date=None)`, which
 returns an `EffectiveDecision(mode, intent, daily_capital_cap, source)`. It is a
-**separate** function from the load-bearing legacy global
-`resolve_effective_mode()` (an enum used by `place_order_service` /
-`/mode/status`) — see `docs/design/strategy_daily_intent.md` for why.
+**separate** function from the order-dispatch gate — since issue #440 that gate
+is the per-strategy `resolve_order_mode(mode_key)` (see the #440 block above);
+`resolve_effective_mode()` survives only as the analyze overlay for read paths
+and order management — see `docs/design/strategy_daily_intent.md` for history.
 
 **Fall-through (flag on):** unified row → legacy `daily_intent` (simplified
 only) → env mode flag (`SIMPLIFIED_ENGINE_MODE` / `SECTOR_FOLLOW_CAP5_VOL_MODE`)

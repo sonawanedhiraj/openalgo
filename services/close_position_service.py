@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
 from events import AnalyzerErrorEvent, PositionClosedEvent
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import EffectiveMode, resolve_effective_mode, resolve_order_mode
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -87,31 +87,11 @@ def close_position_with_auth(
     if "apikey" in position_request_data:
         position_request_data.pop("apikey", None)
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
-    mode = resolve_effective_mode()
-
-    if mode is EffectiveMode.SKIP:
-        logger.info("Close position rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Close position rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
+    # Per-strategy UI-driven dispatch (issue #440): close-position acts on the
+    # CALLER's book. A sandbox-flagged (or unregistered) strategy squares off
+    # the sandbox book; only a live-flagged strategy (with Analyze off)
+    # reaches the broker's account-wide close.
+    mode = resolve_order_mode(position_data.get("strategy") or original_data.get("strategy"))
 
     if mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_close_position
@@ -154,7 +134,7 @@ def close_position_with_auth(
 
         return success, response, status_code
 
-    # mode is EffectiveMode.LIVE — proceed with actual broker close.
+    # mode is EffectiveMode.LIVE — live-flagged strategy, broker close.
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}

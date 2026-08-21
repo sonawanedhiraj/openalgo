@@ -231,7 +231,7 @@ class TestEodLayerTwoWatchdog:
 
         placed: list[dict] = []
 
-        def fake_place_order(payload, api_key=None):
+        def fake_place_order(payload, api_key=None, **kwargs):
             placed.append(payload)
             return (True, {"orderid": "wdg-1", "status": "success"}, 200)
 
@@ -257,7 +257,7 @@ class TestEodLayerTwoWatchdog:
 
         placed: list[dict] = []
 
-        def fake_place_order(payload, api_key=None):
+        def fake_place_order(payload, api_key=None, **kwargs):
             placed.append(payload)
             return (True, {"orderid": "wdg-2", "status": "success"}, 200)
 

@@ -37,6 +37,34 @@ def get_user_id_from_apikey(api_key: str) -> str | None:
         return None
 
 
+def sandbox_order_exists(orderid: str, api_key: str) -> bool:
+    """True when ``orderid`` is a sandbox-book order for this user.
+
+    Used by the order-management services (cancel/modify) to route a
+    mixed-mode request to the right book (issue #440): a sandbox orderid must
+    never be sent to the live broker and vice versa. Read-only; never raises —
+    an unreadable sandbox DB returns False (broker fallback).
+    """
+    try:
+        user_id = get_user_id_from_apikey(api_key)
+        if not user_id:
+            return False
+        from database.sandbox_db import SandboxOrders, db_session
+
+        try:
+            return (
+                db_session.query(SandboxOrders)
+                .filter_by(orderid=str(orderid), user_id=user_id)
+                .first()
+                is not None
+            )
+        finally:
+            db_session.remove()
+    except Exception:
+        logger.exception(f"sandbox_order_exists check failed for orderid={orderid}")
+        return False
+
+
 def sandbox_place_order(
     order_data: dict[str, Any],
     api_key: str,

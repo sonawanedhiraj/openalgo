@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from database.auth_db import get_auth_token_broker
 from events import AnalyzerErrorEvent, GTTFailedEvent, GTTPlacedEvent
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import EffectiveMode, resolve_order_mode
 from utils.event_bus import bus
 from utils.logging import get_logger
 
@@ -55,31 +55,10 @@ def place_gtt_order_with_auth(
     order_request_data.pop("apikey", None)
     api_key = original_data.get("apikey", "")
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
-    mode = resolve_effective_mode()
-
-    if mode is EffectiveMode.SKIP:
-        logger.info("Place GTT rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Place GTT rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
+    # Per-strategy UI-driven dispatch (issue #440): a GTT arms real broker-side
+    # exposure, so it routes LIVE only when analyze is off AND this order's
+    # strategy has a strategy_mode row set to live.
+    mode = resolve_order_mode(order_data.get("strategy") or original_data.get("strategy"))
 
     if mode is EffectiveMode.SANDBOX:
         # Sandbox GTT not implemented yet — clean 501 until Phase 3.

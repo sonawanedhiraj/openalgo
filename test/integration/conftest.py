@@ -14,9 +14,40 @@ fixtures are deliberately re-exported, not unused.
 
 from __future__ import annotations
 
+import pytest
+
 from test.fixtures.mid_session import (  # noqa: F401
     at_09_30_cold_start,
     at_10_00_post_relogin,
     at_14_30_restart,
     at_15_10_stale_daily,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_strategy_runtime_overrides():
+    """Wipe strategy_runtime_override rows this test left behind (issue #472).
+
+    The phase3/phase4 integration tests write pause/kill_switch rows into the
+    session-scoped shared temp DB and most never clean up. The rows then leak
+    into every later-collected test that counts or reads overrides globally
+    (test_kill_switch_db_first's ``assert len(rows) == 1`` saw 14). Clearing the
+    table after each test keeps the shared DB at its empty baseline.
+    """
+    yield
+    try:
+        from database.strategy_runtime_override_db import (
+            StrategyRuntimeOverride,
+            db_session,
+        )
+
+        try:
+            db_session.query(StrategyRuntimeOverride).delete()
+            db_session.commit()
+        except Exception:
+            db_session.rollback()
+        finally:
+            db_session.remove()
+    except Exception:
+        # Best-effort: an import failure here must not mask the test's own result.
+        pass

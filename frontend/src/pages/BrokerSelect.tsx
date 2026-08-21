@@ -1,5 +1,6 @@
 import { BookOpen, ExternalLink, Info, Loader2 } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { ZerodhaTotpHelper } from '@/components/broker/ZerodhaTotpHelper'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -80,6 +81,8 @@ export default function BrokerSelect() {
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [brokerConfig, setBrokerConfig] = useState<BrokerConfig | null>(null)
+  // Latest Zerodha TOTP code, kept in a ref so Connect can copy it without re-renders.
+  const totpCodeRef = useRef<string | null>(null)
 
   useEffect(() => {
     // Fetch broker configuration
@@ -184,6 +187,10 @@ export default function BrokerSelect() {
 
       case 'zerodha':
         loginUrl = `https://kite.trade/connect/login?api_key=${broker_api_key}`
+        // Auto-copy the current TOTP code so Kite's 2FA step is a single paste.
+        if (totpCodeRef.current) {
+          navigator.clipboard.writeText(totpCodeRef.current).catch(() => {})
+        }
         break
 
       case 'paytm':
@@ -274,6 +281,14 @@ export default function BrokerSelect() {
                         : 'Dhan requires an active Data API subscription for market data access.'}
                     </AlertDescription>
                   </Alert>
+                )}
+
+                {selectedBroker === 'zerodha' && (
+                  <ZerodhaTotpHelper
+                    onCodeChange={(code) => {
+                      totpCodeRef.current = code
+                    }}
+                  />
                 )}
 
                 <Button type="submit" className="w-full" disabled={!selectedBroker || isSubmitting}>

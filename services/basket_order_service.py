@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from database.auth_db import get_auth_token_broker
 from events import AnalyzerErrorEvent, BasketCompletedEvent, OrderFailedEvent
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import EffectiveMode, resolve_order_mode
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -120,6 +120,7 @@ def place_single_order(
     auth_token: str,
     total_orders: int,
     order_index: int,
+    broker: str | None = None,
 ) -> dict[str, Any]:
     """
     Place a single order (no per-order event emission - summary event emitted at end)
@@ -130,11 +131,26 @@ def place_single_order(
         auth_token: Authentication token
         total_orders: Total number of orders in the basket
         order_index: Index of the current order
+        broker: Broker name (for the stock-option MARKET→LIMIT conversion)
 
     Returns:
         Order result dictionary
     """
     try:
+        # Stock/commodity-option MARKET/SL-M orders are RMS-blocked live —
+        # convert to a protective LIMIT or reject this order (issue #438).
+        from services.synthetic_market_order_service import ensure_live_safe_pricetype
+
+        order_data, _conversion, conversion_error = ensure_live_safe_pricetype(
+            order_data, auth_token, broker or broker_module.__name__.split(".")[1]
+        )
+        if conversion_error:
+            return {
+                "symbol": order_data.get("symbol", "Unknown"),
+                "status": "error",
+                "message": conversion_error,
+            }
+
         # Place the order
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
@@ -188,31 +204,9 @@ def process_basket_order_with_auth(
 
     api_key = basket_data.get("apikey")
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
-    mode = resolve_effective_mode()
-
-    if mode is EffectiveMode.SKIP:
-        logger.info("Basket order rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Basket order rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
+    # Per-strategy UI-driven dispatch (issue #440): LIVE only when analyze is
+    # off AND this basket's strategy has a strategy_mode row set to live.
+    mode = resolve_order_mode(basket_data.get("strategy"))
 
     if mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_place_order
@@ -395,6 +389,7 @@ def process_basket_order_with_auth(
                     auth_token,
                     total_orders,
                     batch_start + idx,
+                    broker,
                 ): order_data
                 for idx, order_data in enumerate(batch)
             }

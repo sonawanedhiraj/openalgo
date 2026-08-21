@@ -646,9 +646,20 @@ def journal_db(monkeypatch):
         sess = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=eng))
         monkeypatch.setattr(tjdb, "engine", eng)
         monkeypatch.setattr(tjdb, "db_session", sess)
+        # Base.query must be restored too — a plain assignment leaks the
+        # temp-dir-bound scoped session to every later test that touches
+        # TradeJournal.query ("unable to open database file" once the
+        # TemporaryDirectory is gone; issue #472). monkeypatch.setattr can't be
+        # used here: its getattr-to-save-old-value triggers the query_property
+        # descriptor on the unmapped Base and raises ArgumentError. Save the raw
+        # descriptor via __dict__ and restore it manually.
+        _orig_query = tjdb.Base.__dict__["query"]
         tjdb.Base.query = sess.query_property()
         tjdb.Base.metadata.create_all(bind=eng)
-        yield tjdb
+        try:
+            yield tjdb
+        finally:
+            tjdb.Base.query = _orig_query
 
 
 class TestEodSummarySemantics:

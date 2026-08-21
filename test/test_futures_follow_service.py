@@ -459,6 +459,97 @@ def test_run_exit_rehydrate_before_exit_is_noop_when_store_empty():
 
 
 # --------------------------------------------------------------------------- #
+# #497 — the read path must resolve the SAME book the write path chose
+# --------------------------------------------------------------------------- #
+def test_rehydrate_passes_strategy_mode_key_to_positionbook():
+    """The rehydrate read MUST identify itself with the strategy's mode_key.
+
+    Without it the read falls through to the platform analyze overlay
+    (`resolve_effective_mode()`), which returns LIVE whenever Analyze is off —
+    so a `sandbox` strategy read the real broker book, got an empty position
+    list, and squared off nothing for four trading days. The routing itself is
+    covered end-to-end in test/test_positionbook_mode_routing.py; this pins the
+    contract at the call site so it cannot silently regress to an untagged read.
+    """
+    from services.futures_follow_service import STRATEGY_NAME
+
+    svc = _make_service(mode="sandbox")
+    empty = (True, {"status": "success", "data": []}, 200)
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=empty) as store,
+    ):
+        svc.rehydrate_paper_book_from_store()
+
+    store.assert_called_once()
+    assert store.call_args.kwargs.get("mode_key") == STRATEGY_NAME == "futures_follow_cap50"
+
+
+def test_t1_exit_survives_a_restart_between_entry_and_exit_day():
+    """Day-boundary regression (#497): entry day -> process restart (paper_book
+    lost) -> exit day still squares off.
+
+    The T+1 overnight hold is this strategy's defining feature, but every prior
+    test exercised entry-day and exit-day as independent single-day units with
+    `paper_book` handed in pre-built. That is exactly the seam the #440 read/write
+    mode split fell through: entries kept working, the restart-rehydrate silently
+    returned 0, and nothing failed loudly.
+    """
+    entry_day = datetime(2026, 7, 27, 15, 20, tzinfo=_IST)
+    exit_day = datetime(2026, 7, 28, 15, 25, tzinfo=_IST)
+    clock = {"now": entry_day}
+
+    svc = _make_service(
+        signals=[_sig("AAA")],
+        mode="sandbox",
+        now=lambda: clock["now"],
+        price_fetcher=lambda s, e: 24106.0,
+    )
+
+    # --- Day 1, 15:20: entry lands in the (sandbox) book -------------------- #
+    svc.run_entry()
+    assert svc.lots_held() == 1
+    held = next(iter(svc.paper_book.values()))
+    assert held.entry_date == "2026-07-27"
+
+    # --- Overnight restart: the in-memory paper_book is gone ---------------- #
+    svc.paper_book.clear()
+    assert svc.lots_held() == 0
+
+    # The store still holds the position — this is what the 15:25 exit rehydrates
+    # from, and what a misrouted read returned empty.
+    store_book = (
+        True,
+        {
+            "status": "success",
+            "data": [
+                {
+                    "symbol": held.nifty_symbol,
+                    "exchange": "NFO",
+                    "product": "NRML",
+                    "quantity": held.quantity,
+                    "average_price": str(held.entry_price),
+                }
+            ],
+        },
+        200,
+    )
+
+    # --- Day 2, 15:25: the T+1 exit must find and square off the carry ------ #
+    clock["now"] = exit_day
+    svc._test_placed.clear()
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch("services.positionbook_service.get_positionbook", return_value=store_book),
+    ):
+        exited = svc.run_exit()
+
+    assert len(exited) == 1, "the carried position was stranded across the restart"
+    assert svc.lots_held() == 0
+    assert svc._test_placed[0][1]["action"] == "SELL"
+
+
+# --------------------------------------------------------------------------- #
 # Kill switch
 # --------------------------------------------------------------------------- #
 def test_kill_switch_fires_at_3pct_loss():
@@ -1225,6 +1316,36 @@ def test_rehydrate_derives_lots_by_ceiling_not_floor(monkeypatch):
     assert len(sell_rows) == 1
     assert sell_rows[0]["quantity"] == 130
     assert sell_rows[0]["lots"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# #507 — the exit reconciliation must route by this strategy's dispatch key
+# --------------------------------------------------------------------------- #
+def test_exit_reconciliation_passes_canonical_mode_key():
+    """Without ``mode_key`` the store read resolves through the analyze overlay
+    and a sandbox position reads flat, so the guard suppresses a real exit —
+    this strategy lost every T+1 exit from 2026-07-17 to 2026-08-07 that way.
+    The full routing behaviour is pinned in
+    ``test/test_openposition_mode_routing.py``; this asserts the caller's half."""
+    from services import futures_follow_service as ffs
+    from services import live_position_reconciliation_service as recon
+
+    svc = _make_service(mode="sandbox", price_fetcher=lambda s, e: 24100.0)
+    _seed_position(svc, "P1", entry_date="2026-06-09")
+
+    with (
+        patch("services.futures_follow_service._resolve_exit_api_key", return_value="k"),
+        patch.object(recon, "reconcile_exit") as rec,
+    ):
+        rec.return_value = recon.ReconcileDecision(
+            broker_qty=75,
+            action=recon.ACTION_PROCEED,
+            guarded_qty=75,
+            reason="ok",
+        )
+        svc.run_exit()
+
+    assert rec.call_args.kwargs["mode_key"] == ffs.STRATEGY_NAME == "futures_follow_cap50"
 
 
 # --------------------------------------------------------------------------- #

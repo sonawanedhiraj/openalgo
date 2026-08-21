@@ -87,47 +87,21 @@ def cancel_all_orders_with_auth(
     if "apikey" in order_request_data:
         order_request_data.pop("apikey", None)
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
+    # Order-management routing (issue #440): cancel-all is protective, so
+    # under mixed-mode operation it sweeps BOTH books — the sandbox book
+    # always (when an api_key is available), and the broker book too when
+    # Analyze is off.
     mode = resolve_effective_mode()
 
-    if mode is EffectiveMode.SKIP:
-        logger.info("Cancel-all rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Cancel-all rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.SANDBOX:
+    sandbox_sweep: dict[str, Any] | None = None
+    api_key = original_data.get("apikey")
+    if api_key:
         from services.sandbox_service import sandbox_cancel_all_orders
 
-        api_key = original_data.get("apikey")
-        if not api_key:
-            return (
-                False,
-                emit_analyzer_error(original_data, "API key required for sandbox mode"),
-                400,
-            )
-
-        # Route to sandbox cancel all orders
         success, response_data, status_code = sandbox_cancel_all_orders(
             order_data, api_key, original_data
         )
+        sandbox_sweep = response_data if isinstance(response_data, dict) else {}
 
         # Store complete request data without apikey
         analyzer_request = order_request_data.copy()
@@ -154,9 +128,16 @@ def cancel_all_orders_with_auth(
                 api_key=order_data.get("apikey", ""),
             )
         )
-        return success, response_data, status_code
+        if mode is EffectiveMode.SANDBOX:
+            return success, response_data, status_code
+    elif mode is EffectiveMode.SANDBOX:
+        return (
+            False,
+            emit_analyzer_error(original_data, "API key required for sandbox mode"),
+            400,
+        )
 
-    # mode is EffectiveMode.LIVE — proceed with actual broker cancel-all.
+    # Analyze is off — sweep the broker book too.
     broker_module = import_broker_module(broker)
     if broker_module is None:
         error_response = {"status": "error", "message": "Broker-specific module not found"}
@@ -195,7 +176,12 @@ def cancel_all_orders_with_auth(
         )
         return False, error_response, 500
 
-    # Prepare response data
+    # Prepare response data — fold in the sandbox-book sweep (if it ran) so
+    # the caller sees the combined mixed-mode result.
+    sandbox_canceled = (sandbox_sweep or {}).get("canceled_orders") or []
+    sandbox_failed = (sandbox_sweep or {}).get("failed_cancellations") or []
+    canceled_orders = list(canceled_orders) + list(sandbox_canceled)
+    failed_cancellations = list(failed_cancellations) + list(sandbox_failed)
     response_data = {
         "status": "success",
         "canceled_orders": canceled_orders,

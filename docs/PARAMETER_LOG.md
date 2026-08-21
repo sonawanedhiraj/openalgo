@@ -18,6 +18,304 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 ATM lot-cost coverage ladder (issue #591, added 2026-08-11)
+
+Observational only — the 09:10 arm emits one `atm_lot_cost` decision-log event
+(priced from the previous EOD option-liquidity sweep, zero broker calls) and the
+`/open15_vol_breakout/logs` page renders it as the coverage-ladder card. Nothing
+gates or trades on any of it. First real data (2026-08-11 sweep): cover-all was
+Rs 46,650 (MANAPPURAM costliest), 90% coverage Rs 26,531 — read the ladder on a
+**post-rollover (cycle-start) day** before resizing `capital/slot`, because ATM
+premiums decay through the expiry cycle and jump at rollover.
+
+| Parameter | Default | Note |
+|---|---|---|
+| `OPEN15_ATM_LOT_COST_ENABLED` | `true` | Per-arm gate on the event. Off = no card for that day; nothing else changes. |
+| `OPEN15_COVERAGE_TARGET_PCT` | `90` | The "cover MOST" ladder row. Clamped 50–100; UI-overridable via `open15_config.coverage_target_pct` (NULL = env default), applied at the next 09:10 arm. |
+
+### open15 option-liquidity GATES — default OFF, placebo failed (issue #583, 2026-08-09)
+
+`OPEN15_LIQUIDITY_GATE_ENABLED` ships **`false`**, and that is an evidence decision,
+not caution. Replayed against the R60 July backtest restricted to option-leg trades
+(the fair test — the gate only runs in `atm_option` mode), excluding the real bottom
+quintile was **indistinguishable from excluding the same number of symbols at
+random**: placebo >= real in **48.4%** of 20,000 draws on one arm and **51.8%** on the
+other. In the larger arm the excluded trades averaged **+Rs 834** against **+Rs 743**
+for the kept — the gate removes ABOVE-average trades, which is #488's inversion again
+on a bigger sample.
+
+**Scoring stays on and stays logged.** A disabled gate still computes every verdict and
+emits `universe_excluded` with `enforced=false`, so the cohort it wants to drop keeps
+accruing evidence. Switching a rule off must not switch off the data that could
+overturn it.
+
+| Parameter | Default | Note |
+|---|---|---|
+| `OPEN15_LIQUIDITY_GATE_ENABLED` | **`false`** | Gate 1. Measure-only until the placebo is beaten. |
+| `OPEN15_LIQUIDITY_MIN_PCTILE` | `20` | Excludes 33 of 208 CE names on current medians. |
+| `OPEN15_LIQUIDITY_REENTRY_PCTILE` | `25` | Hysteresis band; the API rejects a band below the floor. |
+| `OPEN15_LIQUIDITY_REENTRY_DAYS` | `3` | Clean sessions before readmission. |
+| `OPEN15_LIQUIDITY_MIN_DAYS` | `10` | Below this a symbol is NOT ranked — never scored low. |
+| `OPEN15_LIQUIDITY_MAX_STALENESS_DAYS` | `3` | Beyond it the gate fails OPEN. |
+| `OPEN15_LIQUIDITY_BACKFILL_RANK` | `true` | Seed path only; rolling never backfills. |
+| `OPEN15_IMPACT_GATE_ENABLED` | `true` | Gate 2. **Untested by the placebo** — the backtest has no depth data — but it is a direct "can this order fill" measure and blocks on book exhaustion, which is close to tautological. |
+| `OPEN15_IMPACT_MAX_PCT` | `2.0` | SEBI's LES illiquidity definition, our slot size instead of Rs 1 lakh. |
+
+### open15 option-liquidity score (issue #583, added 2026-08-09)
+
+Five tunables for the daily option-liquidity sweep. All are code defaults — none is
+set in `.env`. **Phase 1 MEASURES ONLY**: the job writes `option_liquidity_daily` and
+nothing reads it, so merging changed nothing about what any strategy does. The gates
+that consume the score ship separately, because the score needs ~10 sessions of
+history before it can be trusted.
+
+| Parameter | Default | Why this value |
+|---|---|---|
+| `OPTION_LIQUIDITY_ENABLED` | `true` | Per-fire gate. Registration always happens; flipping this needs only a restart. |
+| `OPTION_LIQUIDITY_EOD_TIME` | `15:45` | **Load-bearing**: the sweep needs a LIVE broker session, and the Zerodha token expires overnight. Do not move it after the close. |
+| `OPTION_LIQUIDITY_BAND_PER_SIDE` | `6` | Strikes each side of the money. Measured: the p20 exclusion set is on a stable plateau from ~3/side outward (6/side and 10/side agree exactly), while a 1-strike band differs by 20 of 42 names — the picked strike is ATM to the *post-gap* trigger, so gaps of 0.14–2.55% move it 1–2 steps. |
+| `OPTION_LIQUIDITY_MEDIAN_DAYS` | `20` | **Required, not smoothing.** Single-day scoring churns ~30 names a day (consecutive-day Jaccard 0.48); the 20-day median cuts that to 3.4 (Jaccard 0.91), replayed over 2026-02..05. Shortening this re-introduces the churn. |
+| `OPTION_LIQUIDITY_MIN_DAYS` | `10` | Below this the score is **NULL, not low** — "cannot rank yet" for a newly listed F&O name, which is a different fact from "illiquid". NSE does the same for newly listed securities. |
+
+Rationale and every measurement behind these:
+[`docs/research/strategy/open15_vol_breakout/2026-08-09_option_liquidity_screen_design.md`](research/strategy/open15_vol_breakout/2026-08-09_option_liquidity_screen_design.md).
+
+### open15 shadow-logged excluded side (issue #581, added 2026-08-08)
+
+Two new tunables for measuring the side `trade_side` switches off. Both are code
+defaults — neither is set in `.env` — and the shipped behaviour is **OFF**, so
+merging changed nothing about what the next 09:10 arm does. The live install's
+`open15_config` row has both columns NULL, which resolves to the env default.
+
+⚠ Context that makes the default load-bearing: `open15_vol_breakout` has been
+**live (real money)** since 2026-07-24, trading `long_only`. Shadowing exists so
+the short side can be measured **without** placing a short order.
+
+#### OPEN15_SHADOW_EXCLUDED_SIDE
+- **Value:** code default `false`. Read at the 09:10 arm via
+  `resolve_day_config`; the UI row (`open15_config.shadow_excluded_side`) wins
+  when set, and a stored `false` beats a `true` env default (`is None`, not
+  truthiness).
+- **What it gates:** whether the excluded side is watched at all. When off, the
+  pre-#581 behaviour is exact — the side is never selected, so it never
+  triggers and never journals. When on, it triggers normally and journals
+  `fill='shadow'` rows, and **no order is ever placed for it**
+  (`_journal_shadow` runs before anything can reach `order_placer`).
+- **No effect when `trade_side='both'`** — nothing is excluded, so
+  `shadow_side_for` returns `None` however the flag is set.
+
+#### OPEN15_SHADOW_MAX_TRADES
+- **Value:** code default `3`. **Clamped 0–10** server-side on both the env read
+  and the saved row (`clamp_shadow_max_trades`); bad input falls back to 3.
+  `0` is legal and means "shadow nothing".
+- **What it bounds:** shadow rows per day. **Independent of `max_trades`** —
+  that cap is a real-money budget and a shadow row places no order, so spending
+  it on measurement would silently reduce how much the strategy actually trades.
+  This cap is also what bounds the per-trigger broker quote calls the tick
+  thread makes for a shadow row (one at entry, one at exit).
+
+### Scheduler + daemon-thread registry (issue #539, added 2026-08-03)
+
+Tunables introduced with Phase 1 of the scheduler/thread inventory. All are code
+defaults — none is set in `.env`, so the shipped behaviour is the default. The
+registries themselves are **read-only**: these flags govern *alerting*, never
+whether a job or thread runs.
+
+#### THREAD_REGISTRY_ENABLED
+- **Value:** code default `true`. Consulted **per check**, inside
+  `thread_registry.check_and_alert()`, so a flip takes effect on the next tick
+  of the thread watchdog's 30 s loop without a restart.
+- **What it gates:** only the Telegram/alert publish for a stale or dead thread.
+  `snapshot()` and `GET /admin/api/schedulers` keep working when it is `false` —
+  the page must never go blank because alerting was silenced.
+
+#### THREAD_HEARTBEAT_STALE_MULTIPLIER
+- **Value:** code default `3.0`. Values `<= 1` fall back to `3.0` (a multiplier
+  of 1 would flag a loop stale the instant it is one tick late, which is normal
+  jitter, not a fault).
+- **What it does:** a loop thread is `stale` once its last heartbeat is older
+  than `cadence_sec * multiplier`. At the default that is 90 s for a 30 s
+  watchdog and 90 min for the 30 min backfill convergence loop.
+- **Why a multiplier and not a fixed deadline:** cadences in the catalog span
+  5 s to 30 min. One absolute deadline would either spam on the slow loops or
+  never fire on the fast ones.
+
+#### THREAD_REGISTRY_ALERT_DEDUP_MIN
+- **Value:** code default `30` (minutes), per thread.
+- **What it does:** a thread that stays wedged re-alerts at most once per window
+  — a reminder rather than a storm. Same policy shape as
+  `THREAD_WATCHDOG_DEDUP_WINDOW_MIN`.
+
+#### NOTIFY_THREAD_REGISTRY
+- **Value:** per-event Telegram toggle consumed by
+  `notification_service.notify("thread_registry", ...)`. Unregistered event
+  types fall through the `NOTIFY_UNKNOWN_EVENTS` fail-open path, so the alert is
+  delivered either way; register it to control it explicitly.
+
+**Not a parameter, but load-bearing:** alerts fire *only* for threads that beat
+at least once and then went silent or vanished. A thread that never started is
+reported as `not_started` and never alerts, because that is the normal state for
+most catalog entries on a normal install (no broker session, outside the window,
+flag off, bot not configured). Widening this is how the channel becomes noise.
+
+### Daily post-market review + job-run audit (issue #511, added 2026-08-02)
+
+New tunables introduced with Phase 1 of the post-market review scheduler. All are
+code defaults — none is set in `.env`, so the shipped behaviour is the default.
+
+#### POSTMARKET_REVIEW_ENABLED
+- **Value:** code default `true`. Per-fire gate, read **inside** the job body, so
+  flipping it needs no re-registration.
+- **What it gates:** whether the 17:15 IST `postmarket_review` job does anything.
+  `false` makes it a logged no-op; the job stays registered.
+
+#### POSTMARKET_REVIEW_TIME
+- **Value:** code default `17:15` (IST, `HH:MM`, mon-fri). Malformed values fall
+  back to `17:15`.
+- **Why 17:15 and not "right after the close":** the deterministic EOD chain runs
+  15:35 (trading-day funnel) → 15:45 (scanner comparison) → 16:00 (historify) →
+  16:30 (sector_follow data health), and the scanner backfill **convergence loop
+  runs until 17:00** (`SCANNER_BACKFILL_PERIODIC_END_TIME`). Reviewing before
+  that window closes reads half-written data and reports phantom staleness.
+  **If `SCANNER_BACKFILL_PERIODIC_END_TIME` is moved later, move this too.**
+
+#### NOTIFY_POSTMARKET_REVIEW
+- **Value:** code default `true` (still subject to the master
+  `NOTIFY_TELEGRAM_ENABLED`).
+- **What it gates:** the daily Telegram summary. Default ON because a silent
+  review is indistinguishable from a review that never ran — precisely the
+  failure mode that hid `journal_reflection`'s dead schedule for two months.
+
+#### JOB_RUN_AUDIT_ENABLED
+- **Value:** code default `true`. Per-fire gate read inside each listener handler.
+- **What it gates:** whether APScheduler fires are recorded to `job_run`. Off
+  means the review's job section reports zero recorded jobs — which looks
+  identical to "no jobs fired", so leave it on unless write volume is actually a
+  problem.
+
+#### JOB_RUN_RETENTION_DAYS
+- **Value:** code default `90` (IST days).
+- **What it does:** `job_run` rows older than this are pruned by the
+  `postmarket_review` job. Without pruning the table grows on every scheduler
+  tick forever. Lower it only if the table is measurably large — Phase 2's
+  expectation contracts want enough history to spot a job that *stopped* firing.
+
+### Post-market expectation contracts (issue #532, added 2026-08-03)
+
+#### POSTMARKET_CONTRACTS_ENABLED
+- **Value:** code default `true`. Read at evaluation time.
+- **What it gates:** whether the post-market review evaluates expectation
+  contracts at all. `false` keeps the digest and the Telegram summary, but drops
+  the verdict section — the report degrades to Phase 1 behaviour.
+
+#### POSTMARKET_CONTRACTS_DISABLED
+- **Value:** code default empty. Comma-separated `contract_id` or
+  `strategy:contract_id` (e.g. `futures_follow_cap50:t1_exit_for_carry`).
+- **What it does:** silences individual contracts **surgically** — every other
+  contract keeps evaluating. Exists so a rule that starts crying wolf can be
+  muted the same day without a code change and without disabling the layer.
+  A contract silenced here should get an issue to fix or delete it; a permanently
+  disabled contract is worse than no contract, because the report still looks
+  complete.
+
+### Post-market investigating agent + issue filing (issue #536, added 2026-08-03)
+
+#### POSTMARKET_FILING_MODE
+- **Value:** code default **`dry_run`**. Only the literal `live` enables writes.
+- **What it does:** whether confirmed findings actually become GitHub issues.
+  Default-deny on purpose: the first week should show what it *would* have filed
+  while the findings are still being tuned. An automated reporter that files
+  wrong issues gets muted, and a muted reporter is worse than none.
+
+#### POSTMARKET_MAX_ISSUES_PER_DAY
+- **Value:** code default `3`.
+- **What it does:** caps issues created per run. Overflow is appended to
+  `audit/proposed_fixes.jsonl` and named in the result — the cap bounds issue
+  noise, never the record.
+
+#### POSTMARKET_INVESTIGATION_ENABLED
+- **Value:** code default `true`.
+- **What it gates:** the tool-enabled investigating agent. When `false` the review
+  falls back to the #534 no-tools triage, which still produces a day assessment.
+
+#### POSTMARKET_INVESTIGATION_TIMEOUT_SECONDS
+- **Value:** code default `600`.
+- **Why so much larger than triage's 240:** tool use means several model turns
+  (Grep, then Read, then reason). Runs on a real OS thread and is killed at this
+  budget, so a hang cannot wedge the scheduler.
+
+#### POSTMARKET_REPO_ROOT
+- **Value:** code default = the repo containing `services/`.
+- **What it does:** the directory the agent's read-only tools are rooted at.
+
+#### GH_CMD
+- **Value:** code default `gh` (resolved on PATH).
+- **Note:** auth is the operator's ambient `gh auth` (keyring on this host);
+  `GH_TOKEN` is honoured if set. **If this install ever moves to a service
+  account or Docker, the keyring is unavailable and filing goes dark** — set
+  `GH_TOKEN` there.
+
+**Security note (not tunable, deliberately):** the agent may use only `Read`,
+`Grep`, `Glob`; `Bash`/`Write`/`Edit`/`WebFetch` are denied; and `.env*`, `db/`,
+`.git/`, `*.key`, `*.pem` are unreadable via the CLI's own deny rules. `.env`
+holds `API_KEY_PEPPER` and `FERNET_SALT`, and every encrypted secret in
+`openalgo.db` is sealed against them. Everything the agent writes also passes a
+`detect-secrets` gate before it can reach GitHub, and that gate **fails closed**
+if the scanner cannot run.
+
+### Post-market LLM triage (issue #534, added 2026-08-03)
+
+#### POSTMARKET_TRIAGE_ENABLED
+- **Value:** code default `true`.
+- **What it gates:** the `claude -p` triage pass over the Phase 2 violations.
+  `false` keeps the deterministic report intact and skips the LLM entirely.
+
+#### POSTMARKET_TRIAGE_ON_CLEAN_DAYS
+- **Value:** code default **`false`**.
+- **What it does:** whether to spend an LLM call on a day with zero violations.
+  Off by default because with nothing proven broken the output is speculative by
+  construction, and Phase 4 would not file it anyway. Turn on if the day
+  assessment is wanted every day regardless of cost.
+
+#### POSTMARKET_TRIAGE_TIMEOUT_SECONDS
+- **Value:** code default `240`.
+- **Why so much higher than the veto's 25-60s:** the triage prompt carries the
+  violations, prior-occurrence history, day context and error templates, and
+  asks for several paragraphs plus draft issue bodies. The call runs on a real
+  OS thread and is killed at this budget, so a hang cannot wedge the scheduler.
+
+**Operator prerequisite:** triage needs the `claude` CLI **logged in** on the
+box running OpenAlgo (it uses the CLI's own subscription auth — there is no API
+key anywhere in this codebase). As of 2026-08-03 it is **not** logged in: the
+review will report `llm_status='not_logged_in'` until someone runs `claude
+login`. Everything deterministic still runs and reports.
+
+### Multi-account mirror trading (issues #468/#474/#476/#478/#482, added 2026-07-28)
+
+#### MULTI_ACCOUNT_ENABLED
+- **Value:** `true` (in `.env`; code default `false`) — enabled 2026-07-28 by the operator.
+- **What it gates:** the Phase-2 order fan-out to child broker accounts
+  (`services/account_fanout_service.py`) and the Phase-3 observability jobs
+  (login reminders 09:00/15:00 IST, EOD mirror summary 15:35 IST). Account
+  setup/login on `/accounts` is never gated.
+- **CORRECTION (same day):** the first version of this entry said enabling was
+  inert because "every strategy runs sandbox" — WRONG. Verified against
+  `strategy_mode`: `open15_vol_breakout` is **live** (operator flip 2026-07-24)
+  and `sector_follow_cap5_vol` is **live** (2026-06-24). With the flag on,
+  **mirroring is ARMED from the next trading day**: open15's live orders mirror
+  into Swapna-zerodha (₹15,000, factor 0.015, open15 selected — ~₹2,250/slot).
+  sector_follow is live but NOT selected by any child → no mirrors for it.
+- **Rollback:** set `false` + restart (or delete the line — code default is false).
+
+#### PRIMARY_BOOK_CAPITAL
+- **Value:** `1000000` (₹10L, in `.env`; matches the code default — pinned
+  explicitly so sizing intent is visible).
+- **What it does:** denominator for child mirror sizing —
+  `factor = child.capital_inr / PRIMARY_BOOK_CAPITAL`, floored to shares/lots.
+  Only read when `MULTI_ACCOUNT_ENABLED=true`.
+- **Why ₹10L:** the consolidated primary book target (see the 2026-06 consolidated
+  ₹10L research). A ₹15k child ⇒ factor 0.015.
+
 ### futures_follow OPTION_C same-minute@15:25 entry (issue #406, added 2026-07-14)
 The 15:20 entry seeds its 50% margin cap from `lots_held()`, which counts the
 still-open prior-day lot (it exits at 15:25) — under-sizing carry days (issue #405).
@@ -1714,6 +2012,418 @@ ran in the 15:30-17:00 periodic window).
   - **2026-07-10:** Introduced by issue #390 / PR #393. Fourth layer of the
     smoke-hold saga: #305 (enforce) -> #319 (release wiring) -> #338 (verified
     health rows) -> #390 (per-symbol + intraday heal).
+
+## `OPEN15_*` — open15_vol_breakout mid-bar breakout strategy (issue #425)
+
+- **What:** `OPEN15_ENABLED` (default `true`) master switch; `OPEN15_MODE`
+  (`sandbox` | `observe`, default `sandbox`) — observe journals signals without
+  orders; `OPEN15_VOL_MULT` (default `1.5`) — cumvol-in-minute must reach this ×
+  the running-avg completed-minute volume; `OPEN15_TOP_N` (default `3`) — top-N
+  gainers long / losers short; `OPEN15_MARGIN_PER_SLOT` (default `30000`) and
+  `OPEN15_LEVERAGE` (default `5`) → ₹150k notional per trade;
+  `OPEN15_TICK_CAPTURE` (default `true`) — master switch for persisting ticks
+  to `tick_logs/open15/` for backtest replay;
+  `OPEN15_TICK_CAPTURE_UNIVERSE` (default `true`, issue #528) — capture EVERY
+  universe symbol's ticks across the whole 09:14:50 → `exit_time`+5s window
+  instead of only the day's 3 selected symbols. `false` restores the pre-#528
+  targeted behaviour (unselected symbols' 09:15 ticks buffered then dropped).
+  `OPEN15_SIZING_MODE` (default `fixed`) — `fixed` | `compound` capital sizing.
+  `OPEN15_TRADE_SIDE` (default `both`) — `both` | `long_only` | `short_only`;
+  which sides the 09:15 selection may pick at all.
+  **Rolling additive watch list (issue #529):**
+  `OPEN15_ROLLING_WATCHLIST_ENABLED` (default **`false`**) — master switch;
+  `OPEN15_ROLLING_CADENCE_S` (default `30`, clamped **10–300**) — how often the
+  universe is re-ranked on live LTP inside the entry window;
+  `OPEN15_ROLLING_TOP_N` (default `3`, clamped **1–10**) — how many movers per
+  side each cycle may append. All three are UI-editable (below); the clamps are
+  applied server-side on BOTH the env read and the saved row, so neither a bad
+  `.env` value nor a hand-crafted POST can set a 1-second re-rank.
+  **UI overrides:** `margin_per_slot`, `sizing_mode`, `vol_mult`, `instrument`,
+  `max_trades`, `no_entry_after`, `exit_time`, `trade_side`,
+  `rolling_watchlist_enabled`, `rolling_cadence_s`, and `rolling_top_n` are editable
+  from `/open15_vol_breakout/logs` (stored in the `open15_config`
+  row; NULL = env default; applied at the next 09:10 arm and recorded in the
+  day's `armed` decision-log event). The env vars are the DEFAULTS layer.
+  **Data-sourcing (issue #502):** `OPEN15_FIRST_CANDLE_SOURCE`
+  (`quotes` | `ticks`, default `quotes`) — where the 09:15 candle's
+  open/high/low come from. `quotes` = ONE batched broker quote call at 09:16
+  (the `open15_first_candles` job); `ticks` restores the pre-#502 tick-built
+  candle. `OPEN15_BASELINE_INCLUDE_FIRST_MINUTE` (default `false`) — whether
+  the 09:15 minute stays in the volume baseline.
+- **Why these defaults:** mirrors the Round 58 research configuration so the
+  sandbox measurement is comparable to the backtest grid; sizing mirrors
+  intraday_pullback_top2's ₹30k/slot convention.
+- **History:**
+  - **2026-07-20:** Introduced by issue #425. Strategy is a measurement
+    deployment — see `strategies/open15_vol_breakout/SPEC.md` §2 before tuning
+    anything (the bar-level signal has NO honest edge; the mid-bar capture
+    fraction is what's being measured).
+  - **2026-07-31:** `OPEN15_TRADE_SIDE` added by issue #503 (default `both` =
+    no behavior change). Gates `Open15Core._finalize_selection`, so an excluded
+    side is never selected, watched, entered or journalled. Note the published
+    parity targets are BOTH-sides numbers — a one-sided day is not comparable
+    to them, and the logs page flags it.
+  - **2026-07-31:** Added `OPEN15_FIRST_CANDLE_SOURCE` (default `quotes`) and
+    `OPEN15_BASELINE_INCLUDE_FIRST_MINUTE` (default `false`) — issue #502. The
+    tick feed is a ~1/sec sample that starts whenever the first tick arrives,
+    so it must not define the 09:15 open (wrong selection: MPHASIS 2026-07-31
+    ranked #1 short on a phantom −4.15% vs a real −0.94%/#11) or the breakout
+    level (high understated 24/24, low overstated 24/24). Keeping the 09:15
+    minute in the baseline inflated it 1.06×–1.67×, so the configured
+    `OPEN15_VOL_MULT=1.5` behaved like ~2.5× and produced zero entries on 3 of
+    4 sessions. **`OPEN15_VOL_MULT` itself is unchanged at 1.5** — the gate
+    now simply means what it says. Both new flags are rollback switches.
+  - **2026-08-03:** `OPEN15_TICK_CAPTURE_UNIVERSE` added by issue #528 (default
+    `true`). Selected-only capture made the strategy's own entry window
+    un-backtestable for any symbol outside the 09:16 gap ranking — the only
+    full-universe tick source (`tick_logs/`, written by the simplified engine)
+    starts ~09:20-09:23, covering <45% of the 09:16-09:29 window on 4 of 19
+    days. **No new broker load** (the ticks already arrive on the service's own
+    ZMQ SUB and are parsed before the filter); this changes only what is
+    written to disk: ~211 symbols × ~0.6 ticks/s × 900 s ≈ **120k ticks/day
+    ≈ 10 MB/day** (retention stays 365 days ⇒ ~2.5 GB/year steady state — revisit
+    if disk pressure appears). The writer's queue/batch are widened to
+    50000/500 in universe mode so the first-minute burst cannot overflow.
+    Set `false` to roll back without touching the master switch.
+  - **2026-08-03:** `OPEN15_ROLLING_WATCHLIST_ENABLED` / `_CADENCE_S` /
+    `_TOP_N` added by issue #529. **Default OFF — the deploy is a no-op** until
+    the operator ticks the box on `/open15_vol_breakout/logs`. Rationale: the
+    2026-08-03 replay showed the 09:16 gap ranking put the day's four biggest
+    movers at ranks #22/#106/#130/#134, so a one-shot snapshot watches the
+    wrong names — but the SAME study could NOT show the added names are
+    profitable (3 incremental trades, +₹162, 1 win of 3, on 4 usable days).
+    This ships as a MEASUREMENT (journal column `open15_trades.watch_source ∈
+    {seed, rolling}` scores the two cohorts apart), NOT as a validated edge; a
+    promotion decision waits on the #528 sample. The entry gate is untouched —
+    added symbols compete for the same `max_trades` slots — and the list is
+    strictly additive, so the 09:16 seed picks are never dropped. Cadence
+    default 30 s: fast enough to catch a leaderboard that churns within the
+    13-minute window, slow enough that the re-rank (a sort over ~211 floats on
+    the tick thread) is negligible.
+
+## `INTRADAY_PULLBACK_TRADE_SIDE` — intraday_pullback_top2 trade side (issue #509)
+
+- **Value:** `both` (default) | `long_only` | `short_only`. Env var is the
+  DEFAULTS layer; a `trade_side` value in the `intraday_pullback_config` row
+  (set from the strategy settings page or `POST
+  /intraday_pullback_top2/api/settings`) overrides it. NULL/unset = env → the
+  `trade_side` key in `config_snapshot.json` → `both`.
+- **What it does:** gates which book may run, enforced in
+  `IntradayPullbackService.run_selection` immediately after the 09:30 NIFTY day
+  gate. An excluded side is never selected, never watched, never triggers and
+  never journals a row — the same shape as open15's `OPEN15_TRADE_SIDE` (#503).
+  Applied at the 09:00 daily reset, like the other editable settings.
+- **Load-bearing semantics — this is NOT a rebalance.** The long and short
+  books are **mutually exclusive by the day gate** (NIFTY up at 09:30 → long
+  book only; NIFTY down → short book only). Excluding a side therefore means the
+  strategy **does not trade at all** on the days that side would have run:
+  `long_only` gives up every NIFTY-down day (~half the calendar), it does not
+  run longs on down-days. A skip records
+  `skip_reason='trade_side=…'` on `get_status()` / `entry_breakdown()` so it
+  stays distinguishable from a data outage.
+- **Why default `both`:** it is the backtested configuration. The R53 figures
+  (PF 1.60, +97.6% fixed, Sharpe 2.96, MaxDD −8.9%) are **both-sides numbers** —
+  a one-sided run is not comparable to them, and the settings page flags this.
+  Per-side backtest contribution: long 155 trades / PF 1.72 / +₹44,202; short
+  80 trades / PF 1.40 / +₹14,362.
+- **Failure mode:** an unrecognised env or stored value falls back to `both`
+  with a WARNING rather than darkening a book on a typo.
+- **History:**
+  - **2026-08-02:** Introduced by issue #509 (default `both` = no behaviour
+    change). Motivated by the strategy's own LEARNINGS: *"Long is the validated
+    primary; the short is promising-but-unproven"*, with the deep-loser short
+    called out as the most slippage-fragile leg — so disabling the short during
+    the sandbox measurement phase needed to be an operator control rather than a
+    code edit. First tunable cataloged for this strategy.
+
+## `NOTIFY_OPEN15_BREAKOUT`
+
+- **Default:** `true` (gated, as every `NOTIFY_*` is, by the master switch
+  `NOTIFY_TELEGRAM_ENABLED`).
+- **Where:** `services/notification_service.py` `per_event` registry; caller is
+  `services/open15_breakout_service.py` `_alert_rejection`.
+- **What it controls:** the operator Telegram alert when the broker REJECTS an
+  open15_vol_breakout entry order — no position was taken and the trade is
+  recorded as a PAPER fill instead.
+- **Deduped once per day, deliberately.** A static-IP or RMS block rejects every
+  entry with the identical message; on 2026-08-05 that would have been three
+  identical alerts. Repeated identical alerts are how a channel gets muted, and
+  a muted channel is worse than no alert.
+- **Failure mode:** the alert is fail-open — a dead Telegram bot never blocks or
+  delays an entry. The `logger.error` line (which reaches `log/errors.jsonl`)
+  fires unconditionally and is the durable record; Telegram is the nudge.
+- **History:**
+  - **2026-08-05:** Introduced by issue #548. Before it, open15 had **no alert
+    path at all** — three live entries were rejected with a static-IP 403 and
+    the only trace was an INFO decision-log line reading `order_status: error`,
+    with the broker's message discarded entirely. `sector_follow` had logged
+    `[live] … ENTRY REJECTED … <message>` at ERROR since its own build-out; this
+    brings open15 to parity and adds the Telegram leg.
+
+## `OPEN15_FILL_RECONCILE_ENABLED` (default `true`)
+
+> **RETIRED 2026-08-19 (issue #651) — the flag no longer exists.** The behaviour
+> is unconditional. Operator's reasoning: *"why are they even configurable? The
+> default one should be the expected behaviour."* Each of these shipped as a
+> rollback switch in case the fix itself was wrong; that is a shipping-time
+> concern with a shelf life, and keeping it past that turns a correctness
+> guarantee into a preference. Setting the variable now does nothing
+> (`test/test_open15_no_correctness_flags.py` fails if any of them is read
+> again). The entry kept below is the historical record of what the flag did.
+
+
+- **Where:** `services/open15_fill_reconcile.py` `_enabled()`; also gated in
+  `services/open15_breakout_service.py` (`_fill_reconcile_enabled`).
+- **What it controls:** whether open15_vol_breakout asks the broker what it
+  ACTUALLY filled (`average_price` per leg) and re-derives the row's gross P&L
+  and modelled charges from those prices instead of the quote/tick prices the
+  decision was made on.
+- **Why it is off the hot path.** It runs at the summary job (exit+5 min) and is
+  retried by the next 09:10 arm — never inside `_enter`/`flatten`. Entries are
+  placed from the ZMQ tick callback, where a synchronous broker round-trip would
+  stall every other symbol's tick processing.
+- **One P&L convention is preserved (issue #552).** Reconciliation OVERWRITES
+  `pnl` / `charges_inr` in place and stamps `pnl_source='fill'`; it does not add
+  a second number. `net_pnl_expr()` and every consumer are untouched.
+- **Charges remain MODELLED even when enabled.** No broker exposes per-order
+  charges through its API (Zerodha publishes them on the next-day contract note
+  only), so the Zerodha formula is kept — but applied to the actual fill
+  turnover. Gross matches the broker; charges are a labelled estimate.
+- **Failure mode:** fail-graceful. A leg the broker has not reported leaves the
+  row `pending` with its quote-derived P&L intact and is retried; a terminally
+  rejected/cancelled leg is marked `unavailable` so the retry loop stops.
+- **History:**
+  - **2026-08-06:** Introduced by issue #555. Before it, every P&L the strategy
+    published was a quote-derived estimate that had never been checked against
+    the broker, and slippage was structurally unmeasurable.
+
+## `OPEN15_SIM_SKIPPED_ENABLED` (default `true`) / `OPEN15_PAPER_SIM_MAX` (default `10`)
+
+- **Where:** `services/open15_breakout_service.py` `_sim_skipped_enabled()` /
+  `_paper_sim_max()`, consumed by `_sim_context` and `_journal_skip`.
+- **What they control:** whether a trigger the strategy did NOT send an order for
+  (`unaffordable`, `max_trades_cap`) is priced at **1 lot** so the journal can
+  answer "would it have paid?", and how many such rows a day may carry.
+- **Never an order.** A sim row places nothing and — unlike a broker *rejection*
+  — never reads the position book: no order was sent, so the book could only
+  surface an unrelated same-symbol position and promote a trade we never placed
+  into a live square-off.
+- **Sim money is never real money.** `fill='sim'` is excluded from
+  `total_realized_pnl()` (which sizes tomorrow's real orders under compound
+  sizing) and reported as its own third bucket by `sim_pnl_by_date()`, never
+  folded into `paper`.
+- **Why a cap:** each sim row spends a broker quote at entry and another at exit.
+  Setting `OPEN15_PAPER_SIM_MAX=0` disables pricing while leaving the bare skip
+  rows exactly as they were pre-#555.
+- **History:**
+  - **2026-08-06:** Introduced by issue #555. Before it, an unaffordable trigger
+    journaled a contract and an entry premium and then stopped — no exit, no
+    P&L, no label — so it was impossible to tell whether the slot capital or the
+    signal was what capped the strategy.
+
+## `OPEN15_LIQUIDITY_PATH_ENABLED` (default `true`)
+
+- **Where:** `services/open15_option_shadow.py` `enrich_liquidity_paths()`.
+- **What it controls:** whether the per-minute `{minute, volume, oi}` path over
+  each option position's hold is stored in `open15_trades.opt_liquidity_path`.
+- **Costs no broker call.** It is built from the 1m bars the option-shadow
+  already fetches — `volume` and `oi` are on every bar (the historical endpoint
+  is called with `oi=1`) and were simply being discarded.
+- **Why a path and not two snapshots:** endpoints give a delta but cannot say
+  whether open interest was *building* or *unwinding* during the hold, which is
+  the question the series exists to answer.
+- **Failure mode:** fail-graceful and idempotent — a row whose bars the broker
+  has not published yet (current-day history lags 5-15 min) stays NULL and is
+  retried by the next 09:10 arm, exactly like the option-shadow premiums.
+- **Note:** the bid/ask liquidity capture that shipped alongside it (issue #555)
+  has **no flag** — it reads two fields out of a quote response the strategy
+  already fetches, so there is nothing to switch off and no cost to avoid.
+- **History:**
+  - **2026-08-06:** Introduced by issue #555, alongside `opt_*_bid`/`opt_*_ask`
+    and `opt_tick_size`. Before it, #488's raw contract counts were the only
+    liquidity data, and they are not comparable across a universe whose lot
+    sizes differ ~30x — which is the likely explanation for #488's own note
+    that "every ex-ante metric ranked the two live trades backwards".
+
+## `SECTOR_FOLLOW_FILL_RECONCILE_ENABLED` (issue #562)
+
+- **Default:** `true`
+- **Where:** `services/sector_follow_fill_reconcile.py`, consulted per run.
+- **What it gates:** asking the broker what it actually FILLED for every
+  `sector_follow_trades` row still sitting at `status='placed'` with an
+  `order_id`. Runs at the 15:30 EOD summary job and on the next boot for legs
+  the broker had not yet reported — never on the 15:05 order path, where a
+  synchronous status round-trip per order would delay later signals in the
+  same batch.
+- **Why it exists:** `status='placed'` was written from the broker's
+  *acknowledgement*. A Kite `place_order` returns an `order_id` the moment the
+  request is accepted; the order can still be rejected downstream by RMS. Seven
+  live orders were acknowledged 2026-07-29..08-06 and **only one filled** — the
+  other six were rejected silently, with nothing alerting and every row frozen
+  at `placed` forever, so the journal, the dashboard and the P&L all reported
+  acknowledgements as trades.
+- **Failure mode:** fail-graceful and idempotent. An unreadable order status
+  leaves the row untouched and marks it `pending` for retry — it NEVER
+  downgrades a row to `rejected` on a failed lookup, which would invent a
+  rejection the broker never reported. A terminal rejection corrects `status`
+  and raises an operator alert (silence is the bug this fixes).
+- **Note:** the decision price in `price` is never overwritten; the broker's
+  `average_price` lands in the new `fill_price` column, so `fill_price - price`
+  stays measurable as slippage.
+- **Related:** mirrors `OPEN15_FILL_RECONCILE_ENABLED` (issue #555), which
+  solved the identical problem for `open15_vol_breakout` — the only strategy
+  that had fill reconciliation before this.
+- **History:**
+  - **2026-08-07:** Introduced by issue #562.
+
+## `OPTION_LIQUIDITY_CONVERGENCE_ENABLED` (default `true`) + staleness unit change (issue #589)
+
+- **What:** two related changes from issue #589 / PR #590:
+  1. **NEW flag `OPTION_LIQUIDITY_CONVERGENCE_ENABLED`** (default `true`) — gates
+     the `OptionLiquidityConvergence` daemon loop (20 min tick): after
+     15:55 IST on a trading day whose `option_liquidity_daily` rows are missing,
+     it re-runs the sweep. The quote sweep stays valid until the next session
+     opens, so an evening boot after a missed 15:45 recovers the day. It never
+     attempts next-morning recovery (quote volumes reset; `sweep_is_credible`
+     would refuse the all-zero sweep).
+  2. **Semantics change, no default change:** the gate-consumer staleness
+     (`get_latest_scores(max_age_days)`, surfaced in the open15 config as
+     `option_liquidity_max_staleness_days`, default 3) now counts **trading
+     sessions** via `data_freshness_service.is_trading_day`, not calendar days.
+     Weekends and NSE holidays no longer burn the budget — pre-#589 the gate
+     went dark every long weekend (observed 2026-08-11: Friday scores read as
+     "4 days stale" when 2 sessions old; Tue 2026-09-15 after Ganesh Chaturthi
+     would have repeated it with the app healthy).
+- **Why:** a gate that silently switches itself off on ordinary holiday
+  weekends produces an uninterpretable exclusion cohort, and a single missed
+  15:45 sweep left a permanent score hole.
+- **How to roll back:** `OPTION_LIQUIDITY_CONVERGENCE_ENABLED=false` stops the
+  catch-up loop; the sessions-based staleness has no flag (it is the bug fix).
+- **History:**
+  - **2026-08-11:** Introduced by issue #589 / PR #590.
+
+## `OPEN15_VERIFY_ENTRIES` / `OPEN15_CONFIRM_EXIT_POSITION` (issue #626)
+
+> **RETIRED 2026-08-19 (issue #651) — the flag no longer exists.** The behaviour
+> is unconditional. Operator's reasoning: *"why are they even configurable? The
+> default one should be the expected behaviour."* Each of these shipped as a
+> rollback switch in case the fix itself was wrong; that is a shipping-time
+> concern with a shelf life, and keeping it past that turns a correctness
+> guarantee into a preference. Setting the variable now does nothing
+> (`test/test_open15_no_correctness_flags.py` fails if any of them is read
+> again). The entry kept below is the historical record of what the flag did.
+
+
+- **What:** two rollback switches for the post-ACK rejection handling, both
+  default `true`.
+  - `OPEN15_VERIFY_ENTRIES` — the minute-cadence `open15_entry_verify` job that
+    asks the broker what happened to each acknowledged entry and demotes a
+    post-ACK RMS rejection to a paper fill, releasing its `max_trades` slot.
+  - `OPEN15_CONFIRM_EXIT_POSITION` — `flatten` confirms the position book
+    before squaring off a `status='open'` row.
+- **Why:** an ACK is not a fill. On 2026-08-18 Zerodha accepted an open15 order
+  (HTTP 200 + order id) and its RMS then refused it for insufficient funds.
+  Nothing observed the rejection, so the row lived as an `open` real position:
+  `flatten` sent a SELL for 800 calls we did not own — a NAKED SHORT the broker
+  priced at Rs4.45L of SPAN — and the reconciler published the trade as a
+  broker-confirmed +Rs7,680 fill.
+- **How to roll back:** none — retired by #651. (The layered defence described
+  here still holds: the exit-time book check and the summary reconciliation are
+  independent of the verification job. What is gone is the ability to switch any
+  of the three off.)
+- **History:**
+  - **2026-08-18:** Introduced by issue #626.
+  - **2026-08-19:** RETIRED by issue #651; both behaviours are unconditional.
+
+## `OPEN15_FUNDS_CLAMP` (issue #626)
+
+> **RETIRED 2026-08-19 (issue #651) — the flag no longer exists.** The behaviour
+> is unconditional. Operator's reasoning: *"why are they even configurable? The
+> default one should be the expected behaviour."* Each of these shipped as a
+> rollback switch in case the fix itself was wrong; that is a shipping-time
+> concern with a shelf life, and keeping it past that turns a correctness
+> guarantee into a preference. Setting the variable now does nothing
+> (`test/test_open15_no_correctness_flags.py` fails if any of them is read
+> again). The entry kept below is the historical record of what the flag did.
+
+
+- **What:** default `true`. At the 09:10 arm, open15 reads the account balance
+  and clamps `max_trades` to `floor(available_cash / margin_per_slot)`. The
+  configured and effective values, the balance, and any clamp note are stamped
+  into the `armed` decision-log event.
+- **Why:** the slot budget was never compared with the money in the account. On
+  2026-08-18 it was 5 x Rs60,000 = Rs3,00,000 against Rs1,22,252.80 of cash; the
+  third entry asked for Rs62,000 that was not there and was rejected by RMS.
+- **Note:** `max_trades` shrinks, never `margin_per_slot`. Cutting the slot
+  would change the position size this deployment exists to measure and make the
+  day incomparable to earlier ones. Fails OPEN when the balance cannot be read —
+  a transient funds-API failure must not switch the strategy off.
+- **How to roll back:** none — retired by #651.
+- **History:**
+  - **2026-08-18:** Introduced by issue #626.
+  - **2026-08-19:** RETIRED by issue #651; the clamp is unconditional.
+
+## `MULTI_ACCOUNT_FUNDS_CHECK` / `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED` (issue #637)
+
+- **What:** two rollback switches for the child-mirror hardening, both default
+  `true`.
+  - `MULTI_ACCOUNT_FUNDS_CHECK` — before an OPENING mirror, read the child's own
+    balance and skip (`skipped_insufficient_funds`) if the sized order value
+    exceeds it.
+  - `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED` — the `multi_account_fill_reconcile`
+    job (09:40 IST, plus inline before the 15:35 EOD summary) that re-asks each
+    child broker what happened to orders journalled as `placed` and corrects a
+    post-ACK rejection with the broker's own reason.
+- **Why:** #626 fixed both defects on the PARENT path. The child had the same
+  two, one account over: it sized every mirror against `capital_per_trade_inr`
+  without ever reading the balance, and `status='placed'` came from the HTTP 200
+  ACK with **no reconciliation anywhere** — so a refused child order was
+  reported as a trade for ever.
+- **Notes:** the funds check never gates an EXIT (flattening must not depend on
+  cash) and fails OPEN on an unreadable balance. The reconciliation only ever
+  corrects a row DOWNWARDS — a confirmed fill is left alone, because promoting
+  rows on our own authority is how an ACK became a fill in the first place.
+- **How to roll back:** set either to `false`.
+- **History:**
+  - **2026-08-18:** Introduced by issue #637.
+
+## `OPEN15_RESIDUAL_SIZING` / `OPEN15_RESIDUAL_RESERVE_PCT` / `OPEN15_RESIDUAL_MIN_LOTS` (issue #643)
+
+- **What:** first-boot seeds for three UI-editable fields on
+  `/open15_vol_breakout/logs` (`open15_config.residual_sizing_enabled` /
+  `residual_reserve_pct` / `residual_min_lots`). Defaults `false` / `3` / `1`;
+  the DB row wins once saved.
+  - `OPEN15_RESIDUAL_SIZING` — when on, an entry that cannot afford a full
+    `margin_per_slot` is sized against the cash actually left in the account
+    instead of being dropped, and `clamp_slots_to_funds` no longer shrinks
+    `max_trades` (it still computes its note for the /logs capital card).
+  - `OPEN15_RESIDUAL_RESERVE_PCT` — headroom held back from the residual only
+    (clamped 0–25). Charges are not part of the premium debit, and #626's lesson
+    is that the broker checks the CUMULATIVE requirement, so sizing to the last
+    rupee earns a rejection.
+  - `OPEN15_RESIDUAL_MIN_LOTS` — smallest residual entry worth taking (clamped
+    1–10). Below it the trigger journals `unaffordable_residual`, which names
+    the constraint that actually bound.
+- **Why:** on 2026-08-19 the funds clamp cut the day to 2 of 3 slots
+  (`floor(161365.10 / 60000)`), the two fills consumed Rs1,21,635, and the
+  remaining **Rs39,730 sat idle** while the day's third signal (GVT&D, 2.73x
+  volume against a 1.5x gate) was dropped for want of capital that was in the
+  account. Two lots of its contract cost Rs28,088.
+- **Notes:** **default OFF on purpose.** This deliberately breaks
+  `clamp_slots_to_funds`'s own rule that *"`max_trades` is what shrinks, never
+  `margin_per_slot`"*, which exists so every row is the same size and days stay
+  comparable. Comparability is preserved by LABELLING instead: the journal's new
+  `sizing_basis` column (`slot` / `residual`) and the `entry` event's
+  `sizing_basis` / `slot_capital_used`, so the residual cohort can be filtered
+  out of per-trade research. Residual rows are real money and stay in real P&L.
+  Sizing reads an in-process cash ledger seeded at arm, not a broker call per
+  entry (entries are placed on the ZMQ tick thread); there is exactly ONE
+  mid-day funds re-read, the first time the ledger says less than a slot is left.
+- **How to roll back:** untick "spend the residual cash" on the /logs config
+  form, or `OPEN15_RESIDUAL_SIZING=false` on a fresh install. Off is
+  bit-for-bit the pre-#643 behaviour (regression-tested).
+- **History:**
+  - **2026-08-19:** Introduced by issue #643.
 
 ## Other tunables (placeholder — populate as discovered)
 

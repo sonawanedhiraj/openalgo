@@ -27,12 +27,14 @@ from apscheduler.triggers.cron import CronTrigger
 
 from database import intraday_pullback_db as journal
 from services.intraday_pullback_core import (
+    TRADE_SIDES,
     EntryAction,
     ExitAction,
     GateContext,
     PullbackConfig,
     StockState,
     select_top2,
+    trade_side_allows,
 )
 from utils.logging import get_logger
 
@@ -44,6 +46,10 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 _CONFIG_PATH = (
     Path(__file__).resolve().parent.parent / "strategies" / STRATEGY_NAME / "config_snapshot.json"
 )
+# How far behind the wall clock a candle may be and still justify an order (issue #624).
+# Default 10 min = one 5m candle + a tick's worth of grace. An action older than this means
+# a replay leaked into the decision path: entries are refused, exits are re-priced.
+_STALE_ACTION_MAX_MIN = float(os.getenv("INTRADAY_PULLBACK_STALE_ACTION_MAX_MIN", "10"))
 
 
 # --------------------------------------------------------------------------------------------
@@ -225,7 +231,7 @@ def production_order_placer(mode: str, order: dict) -> dict:
             "pricetype": "MARKET",
             "quantity": str(order["quantity"]),
         }
-        success, response, _ = place_order(payload, api_key=api_key)
+        success, response, _ = place_order(payload, api_key=api_key, mode_key=STRATEGY_NAME)
         response = dict(response or {})
         response.setdefault("status", "success" if success else "error")
         return response
@@ -305,8 +311,8 @@ class IntradayPullbackService:
         # Mode resolution mirrors futures_follow / sector_follow: env var is the default,
         # a persistent strategy_mode[STRATEGY_NAME] row (set via strategy_mode_service.flip_mode
         # / the strategies dashboard toggle) overrides it. Actual sandbox-vs-live ORDER routing
-        # is still the platform-global gate (place_order -> resolve_effective_mode(__global__)),
-        # identical to every other strategy. An explicit constructor `mode` (tests) wins outright.
+        # is the per-strategy gate (place_order -> resolve_order_mode(STRATEGY_NAME), issue
+        # #440), identical to every other strategy. An explicit constructor `mode` (tests) wins.
         self._mode_forced = mode is not None
         self.mode = (mode or os.getenv("INTRADAY_PULLBACK_MODE", "sandbox")).lower()
         if self.mode not in VALID_MODES:
@@ -345,6 +351,10 @@ class IntradayPullbackService:
             str, dict
         ] = {}  # sym -> {gain930, sector, sector930} for the breakdown
         self.selected = False
+        # Why the day produced no picks, when that was a deliberate gate rather
+        # than a data gap (issue #509) — surfaced on get_status/entry_breakdown
+        # so a trade_side skip is never mistaken for a broken feed.
+        self.skip_reason: str | None = None
         self.manual_pause = False
         self.kill_switch = False
         self.today_realized = 0.0
@@ -400,10 +410,15 @@ class IntradayPullbackService:
             m_end = _parse_time(row.get("no_trade_start")) or self.cfg.morning[1]
             a_start = _parse_time(row.get("afternoon_start")) or self.cfg.afternoon[0]
             a_end = _parse_time(row.get("afternoon_end")) or self.cfg.afternoon[1]
+            # issue #509: a stored value outside the enum is ignored (keep the
+            # env/JSON default) rather than darkening a book on bad data.
+            side_sel = str(row.get("trade_side") or "").lower()
+            trade_side = side_sel if side_sel in TRADE_SIDES else self.cfg.trade_side
             self.cfg = replace(
                 self.cfg,
                 morning=(self.cfg.morning[0], m_end),
                 afternoon=(a_start, a_end),
+                trade_side=trade_side,
             )
         except Exception:  # noqa: BLE001
             logger.debug("intraday_pullback editable-config load failed", exc_info=True)
@@ -414,6 +429,7 @@ class IntradayPullbackService:
         return {
             "base_capital": self.base_capital,
             "sizing_mode": self.sizing_mode,
+            "trade_side": self.cfg.trade_side,
             "slots": self.slots,
             "margin_per_slot": round(self.base_capital / self.slots, 0),
             "morning": [
@@ -437,10 +453,11 @@ class IntradayPullbackService:
         self._apply_mode_override()
         self._apply_editable_config()
         logger.info(
-            "intraday_pullback daily reset (mode=%s cap=%.0f sizing=%s)",
+            "intraday_pullback daily reset (mode=%s cap=%.0f sizing=%s trade_side=%s)",
             self.mode,
             self.base_capital,
             self.sizing_mode,
+            self.cfg.trade_side,
         )
         self._reset_state()
 
@@ -522,12 +539,32 @@ class IntradayPullbackService:
             logger.info("intraday_pullback: NIFTY flat at 09:30 — no book today")
             self.selected = True
             return
+        # Operator trade-side gate (issue #509). The books are mutually exclusive
+        # by the day gate above, so an excluded side means NO TRADING today —
+        # not a switch to the other book. Enforced here, before selection, so the
+        # excluded side is never picked, never watched, never journals a row.
+        if not trade_side_allows(self.cfg.trade_side, self.side):
+            logger.info(
+                "intraday_pullback: NIFTY %s at 09:30 -> %s book, but trade_side=%s "
+                "— no trading today",
+                "up" if self.side == "L" else "down",
+                "long" if self.side == "L" else "short",
+                self.cfg.trade_side,
+            )
+            self.skip_reason = f"trade_side={self.cfg.trade_side}"
+            self.selected = True
+            return
         sector_returns = {idx: rets.get(idx) for idx in self.index_syms}
         stock_returns = {s: rets.get(s) for s in self.universe if rets.get(s) is not None}
         self.picks = select_top2(
             self.side, stock_returns, self.sector_map, sector_returns, self.cfg
         )
-        self.states = {s: StockState(self.side, self.cfg) for s in self.picks}
+        # On a LATE boot the day's candles are replayed to rebuild prior_vols/ref. A breakout
+        # that fired before boot is history — entering it now would place a MARKET order at an
+        # hours-old price, outside the window that qualified it (issue #624). Floor the replay
+        # at boot time so warm-up rebuilds state and only fresh candles can trade.
+        floor = _naive_ist(now) if historical else None
+        self.states = {s: StockState(self.side, self.cfg, replay_floor=floor) for s in self.picks}
         self.last_fed = dict.fromkeys(self.picks, 0)
         self.pick_meta = {
             s: {
@@ -623,8 +660,12 @@ class IntradayPullbackService:
         self.prev_close = {k: v for k, v in prev.items() if v}
         self.states = {}
         for sym in picks:
-            st = StockState(self.side, self.cfg)
             srows = [r for r in rows if r["symbol"] == sym]
+            # Warm-up floor (issue #624): the replay below re-feeds the day from 09:15 to rebuild
+            # prior_vols/ref, so every candle up to this symbol's last journalled event must be
+            # state-only. Without it the first replayed candle stops out a position opened hours
+            # later (a phantom SL stamped 09:15) and the replay then re-enters the same breakout.
+            st = StockState(self.side, self.cfg, replay_floor=_last_journal_ts(srows))
             st.attempts = len(srows)
             if st._noreentry and any(
                 r["status"] == "closed" and r["exit_reason"] == "SL" for r in srows
@@ -693,8 +734,30 @@ class IntradayPullbackService:
         elif isinstance(action, ExitAction):
             self._place_exit(sym, action)
 
+    def _action_age_min(self, action) -> float:
+        """Minutes between the candle that produced ``action`` and the wall clock."""
+        ts = _naive_ist(action.ts)
+        now = _naive_ist(self._now())
+        if ts is None or now is None:
+            return 0.0
+        return (now - ts).total_seconds() / 60.0
+
     def _place_entry(self, sym: str, sector: str, action: EntryAction):
         if self.open_count >= self.slots:
+            return
+        # Staleness guard (issue #624, defense in depth). The replay floor should mean an entry
+        # action never carries an old candle, but a stale entry is never right: the price has
+        # moved, and the wall clock may sit outside the window that qualified the candle (the
+        # 2026-08-17 duplicate landed at 11:45, inside the 11:00-13:00 no-trade window). Refuse
+        # loudly rather than place it. Exits are deliberately NOT blocked — see _place_exit.
+        age = self._action_age_min(action)
+        if age > _STALE_ACTION_MAX_MIN:
+            msg = (
+                f"🚨 intraday_pullback: REFUSED stale entry {sym} — candle "
+                f"{action.ts} is {age:.0f} min old (max {_STALE_ACTION_MAX_MIN})"
+            )
+            logger.error(msg)
+            self._notify(msg)
             return
         qty = int(self._notional_per_slot() / action.price) if action.price else 0
         if qty <= 0:
@@ -770,6 +833,24 @@ class IntradayPullbackService:
         pos = self.open_positions.get(sym)
         if pos is None:
             return
+        # Staleness guard (issue #624, defense in depth). Unlike an entry this is NEVER blocked —
+        # the position is real and must always be able to square off. But it must not be booked
+        # at a stale candle's price or timestamp (the 2026-08-17 phantom SL journalled a 09:15
+        # exit at the stop price for a position opened at 10:25). Re-price to the live tick,
+        # stamp the exit now, and say so.
+        age = self._action_age_min(action)
+        if age > _STALE_ACTION_MAX_MIN:
+            live = self._price(sym, self._now())
+            logger.warning(
+                "intraday_pullback: stale exit %s — candle %s is %.0f min old; "
+                "re-pricing %.2f -> %s and stamping exit now",
+                sym,
+                action.ts,
+                age,
+                action.price,
+                f"{live:.2f}" if live else "unchanged (no live price)",
+            )
+            action = ExitAction(ts=self._now(), price=live or action.price, reason=action.reason)
         qty = pos["qty"]
         side = pos["side"]
         exit_action = "SELL" if side == "L" else "BUY"
@@ -950,6 +1031,10 @@ class IntradayPullbackService:
             "side_today": self.side,
             "nifty_930_pct": self.nifty_930,
             "selected": self.selected,
+            # issue #509: an operator trade-side gate is a DELIBERATE no-trade
+            # day. Naming it here keeps it distinguishable from a data gap.
+            "trade_side": self.cfg.trade_side,
+            "skip_reason": self.skip_reason,
             "picks": self.picks,
             "n_trades_today": sum(1 for e in evaluation if e["position"] != "none"),
             "evaluation": evaluation,
@@ -973,6 +1058,8 @@ class IntradayPullbackService:
             "base_capital": self.base_capital,
             "deployable_capital": round(self.deployable_capital(), 0),
             "sizing_mode": self.sizing_mode,
+            "trade_side": self.cfg.trade_side,
+            "skip_reason": self.skip_reason,
             "today_realized_net": round(self.today_realized, 0),
             "open_positions": [
                 {"symbol": s, **{k: v for k, v in p.items() if k != "trade_id"}}
@@ -1094,6 +1181,33 @@ def _parse_iso(s) -> datetime | None:
         return None
 
 
+def _naive_ist(d: datetime | None) -> datetime | None:
+    """Normalize a datetime to naive IST wall time (the state machine's comparison basis)."""
+    if d is None:
+        return None
+    return d.astimezone(_IST).replace(tzinfo=None) if d.tzinfo else d
+
+
+def _last_journal_ts(rows: list) -> datetime | None:
+    """Latest entry/exit timestamp across today's journal rows for one symbol (issue #624).
+
+    This is the warm-up floor for a resume replay: everything up to and including the last
+    thing this stock actually did is history to be rebuilt, never re-decided. Taking the max
+    over BOTH columns covers the closed-row case too — a stock stopped out at 10:50 must not
+    re-enter on its own replayed 10:25 breakout candle.
+    """
+    stamps = [
+        t
+        for r in rows
+        for t in (
+            _naive_ist(_parse_iso(r.get("entry_time"))),
+            _naive_ist(_parse_iso(r.get("exit_time"))),
+        )
+        if t is not None
+    ]
+    return max(stamps) if stamps else None
+
+
 def _build_pullback_config(raw: dict) -> PullbackConfig:
     def _t(s, default):
         try:
@@ -1126,7 +1240,22 @@ def _build_pullback_config(raw: dict) -> PullbackConfig:
         market_gate_pct=float(lng.get("fresh_gate_nifty_pct", 0.30)),
         stop_floor_pct=float(lng.get("stop_floor_pct", 0.3)),
         max_attempts=int(lng.get("max_attempts", 2)),
+        trade_side=_env_trade_side(raw),
     )
+
+
+def _env_trade_side(raw: dict) -> str:
+    """Resolve the trade-side default: env var, else config_snapshot, else 'both'.
+
+    An unrecognised value falls back to 'both' with a WARNING rather than
+    darkening a book on a typo (issue #509).
+    """
+    raw_val = os.getenv("INTRADAY_PULLBACK_TRADE_SIDE") or raw.get("trade_side") or "both"
+    val = str(raw_val).strip().lower()
+    if val not in TRADE_SIDES:
+        logger.warning("intraday_pullback: invalid trade_side %r — falling back to 'both'", raw_val)
+        return "both"
+    return val
 
 
 def _seed_strategy_id() -> int | None:

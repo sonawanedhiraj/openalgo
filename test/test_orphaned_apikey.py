@@ -15,37 +15,100 @@ import hashlib
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Force in-memory DB for testing
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+# NOTE: this module must NOT mutate os.environ["DATABASE_URL"] at import time.
+# Under pytest, test/conftest.py already redirects every DB to a throwaway temp
+# dir, and a module-level ``DATABASE_URL=sqlite:///:memory:`` leaks into the
+# rest of the session: any database.* module first-imported AFTER this file
+# binds its engine to an empty per-connection :memory: DB and every query fails
+# with "no such table". Standalone execution sets it in ``__main__`` below.
+
+
+@pytest.fixture(autouse=True)
+def _restore_auth_db_binding():
+    """Undo ``setup_test_db``'s rebinding of database.auth_db after each test.
+
+    ``setup_test_db`` swaps ``auth_mod.db_session`` / ``Base.query`` to a
+    StaticPool :memory: engine seeded with an ACTIVE user + API key and never
+    restored it. Left in place, every later test in the pytest session sees
+    ``get_first_available_api_key()`` return a real key — which let the scanner
+    boot-convergence tests fire an UNMOCKED ``resettle_recent_daily`` broker
+    download whose ``wait_for_jobs`` poll hung the full suite (2026-07-26).
+    """
+    import database.auth_db as auth_mod
+
+    orig_session = auth_mod.db_session
+    orig_engine = auth_mod.engine
+    # Raw descriptor lookup — ``Base.query`` would INVOKE the query_property
+    # descriptor on the unmapped Base class and raise ArgumentError.
+    orig_query = auth_mod.Base.__dict__["query"]
+    yield
+    leaked = auth_mod.db_session
+    if leaked is not orig_session:
+        try:
+            leaked.remove()
+        except Exception:
+            pass
+    leaked_engine = auth_mod.engine
+    if leaked_engine is not orig_engine:
+        try:
+            leaked_engine.dispose()
+        except Exception:
+            pass
+    auth_mod.db_session = orig_session
+    auth_mod.engine = orig_engine
+    auth_mod.Base.query = orig_query
+    # Remove the temp DB files this test created. Best-effort: a leftover temp
+    # dir is harmless, a failed teardown that masks a real error is not.
+    import shutil
+
+    while _TEMP_DB_DIRS:
+        shutil.rmtree(_TEMP_DB_DIRS.pop(), ignore_errors=True)
+    # The tests plant entries keyed by their fake API keys; don't let them
+    # shadow real lookups later in the session.
+    auth_mod.auth_cache.clear()
+    auth_mod.verified_api_key_cache.clear()
+    auth_mod.invalid_api_key_cache.clear()
+
+
+# Temp directories created by ``setup_test_db``, cleaned up after each test.
+_TEMP_DB_DIRS: list[str] = []
 
 
 def setup_test_db():
-    """Create a fresh in-memory database with test data.
+    """Create a fresh **file-backed** test database, seeded and rebound.
 
-    Two structural fixes were needed here (#231 surfaced both under Linux CI
-    xdist worker grouping; the prior code happened to pass on Windows local
-    and on most worker groupings but flaked on Linux when PR #233's 13 new
-    contract tests shifted the schedule):
+    History (three fixes, the third because the first two were not enough):
 
-    1. ``sqlite:///:memory:`` + the default ``QueuePool`` gives every
-       connection its OWN isolated in-memory database. ``create_all`` ran on
-       connection A; the session's later query checked out connection B from
-       the pool, which saw an empty DB → ``no such table: api_keys``. Fix:
-       ``poolclass=StaticPool`` so every connection shares the one in-memory
-       DB. Also pass ``check_same_thread=False`` because the scoped_session
-       hands its single SQLite connection across threads.
+    1. ``sqlite:///:memory:`` + the default ``QueuePool`` gives every connection
+       its OWN isolated in-memory database — ``create_all`` ran on connection A
+       and the session later checked out connection B, which saw an empty DB.
+       (#231)
+    2. The prior ``scoped_session`` lingered in the thread-local registry, so
+       rebinding ``auth_mod.db_session`` alone was not enough; it is explicitly
+       ``.remove()``-d first. (#231)
+    3. ``StaticPool`` fixed (1) only by making one connection *the* database —
+       which means if that connection is ever recycled, invalidated, or opened
+       from another thread than the one ``create_all`` ran on, the DB is silently
+       EMPTY again and every query fails ``no such table: auth``. That is
+       schedule-dependent, so it reappeared whenever a PR added tests and shifted
+       the xdist grouping: #233 (13 contract tests), and again on `dev` itself at
+       606aa324 and on #536.
 
-    2. The prior ``scoped_session`` lingered in the thread-local registry.
-       Even rebinding ``auth_mod.db_session`` left the stale session
-       reachable; we explicitly ``.remove()`` it before rebinding.
+       Fixed properly by using a **temp file** instead of ``:memory:``. Connection
+       identity then stops mattering at all: every connection, on any thread, at
+       any point in the pool's lifetime, opens the same file and sees the same
+       tables. ``NullPool`` matches production (see CLAUDE.md, which bans
+       ``StaticPool`` for exactly this class of bug).
     """
-    # Re-import to pick up the in-memory DATABASE_URL
-    # We need to patch the module's engine before it's used
+    import tempfile
+
     from sqlalchemy import create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
-    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.pool import NullPool
 
     import database.auth_db as auth_mod
 
@@ -58,11 +121,16 @@ def setup_test_db():
         except Exception:
             pass
 
+    tmp_dir = tempfile.mkdtemp(prefix="orphaned_apikey_")
+    _TEMP_DB_DIRS.append(tmp_dir)
     engine = create_engine(
-        "sqlite:///:memory:",
+        f"sqlite:///{tmp_dir}/auth_test.db",
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        poolclass=NullPool,
     )
+    # Rebind the module's engine too — some auth_db helpers reach for it
+    # directly rather than going through db_session.
+    auth_mod.engine = engine
     auth_mod.db_session = scoped_session(
         sessionmaker(autocommit=False, autoflush=False, bind=engine)
     )
@@ -241,6 +309,11 @@ def test_only_admin_revoked_reproduces_original_bug():
 
 
 if __name__ == "__main__":
+    # Standalone (non-pytest) safety belt: make sure a direct `python` run can
+    # never touch the live DB. Under pytest this is unnecessary (conftest
+    # redirects) and harmful at import time (see module note above).
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
     print("=" * 60)
     print("Testing orphaned API key handling")
     print("=" * 60)

@@ -23,6 +23,7 @@ import {
   Settings,
   TrendingUp,
   User,
+  Users,
   Workflow,
   Wrench,
 } from 'lucide-react'
@@ -46,6 +47,7 @@ export const navItems: NavItem[] = [
   { href: '/tools', label: 'Tools', icon: Wrench },
   { href: '/scanner', label: 'Scanner', icon: ScanLine },
   { href: '/strategies', label: 'Strategies', icon: Activity },
+  { href: '/accounts', label: 'Accounts', icon: Users },
 ]
 
 // Items shown in mobile bottom navigation

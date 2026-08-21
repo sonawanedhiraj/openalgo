@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from database.auth_db import get_auth_token_broker
 from database.settings_db import get_analyze_mode
 from events import AnalyzerErrorEvent, OrderFailedEvent, SplitCompletedEvent
-from services.mode_service import EffectiveMode, resolve_effective_mode
+from services.mode_service import EffectiveMode, resolve_order_mode
 from utils.constants import (
     REQUIRED_ORDER_FIELDS,
     VALID_ACTIONS,
@@ -94,6 +94,7 @@ def place_single_order(
     auth_token: str,
     order_num: int,
     total_orders: int,
+    broker: str | None = None,
 ) -> dict[str, Any]:
     """
     Place a single order (no per-order event emission - summary event emitted at end)
@@ -104,11 +105,27 @@ def place_single_order(
         auth_token: Authentication token
         order_num: Order number in the sequence
         total_orders: Total number of orders
+        broker: Broker name (for the stock-option MARKET→LIMIT conversion)
 
     Returns:
         Order result dictionary
     """
     try:
+        # Stock/commodity-option MARKET/SL-M orders are RMS-blocked live —
+        # convert to a protective LIMIT or reject this order (issue #438).
+        from services.synthetic_market_order_service import ensure_live_safe_pricetype
+
+        order_data, _conversion, conversion_error = ensure_live_safe_pricetype(
+            order_data, auth_token, broker or broker_module.__name__.split(".")[1]
+        )
+        if conversion_error:
+            return {
+                "order_num": order_num,
+                "quantity": int(order_data["quantity"]),
+                "status": "error",
+                "message": conversion_error,
+            }
+
         # Place the order using place_order_api
         res, response_data, order_id = broker_module.place_order_api(order_data, auth_token)
 
@@ -226,31 +243,9 @@ def split_order_with_auth(
         )
         return False, error_response, 400
 
-    # Resolve effective mode from operator's daily_intent + analyze_mode.
-    mode = resolve_effective_mode()
-
-    if mode is EffectiveMode.SKIP:
-        logger.info("Split order rejected: daily_intent is 'skip' for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "operator_intent_skip",
-            "message": "Order rejected: daily intent is 'skip' for today.",
-            "mode": "rejected",
-        }
-        return False, rejection, 200
-
-    if mode is EffectiveMode.DISABLED:
-        logger.warning("Split order rejected: no daily_intent declared for today.")
-        rejection = {
-            "status": "rejected",
-            "reason": "no_daily_intent",
-            "message": (
-                "Order rejected: no daily_intent row for today. "
-                "Set one via the helper before placing orders."
-            ),
-            "mode": "rejected",
-        }
-        return False, rejection, 200
+    # Per-strategy UI-driven dispatch (issue #440): LIVE only when analyze is
+    # off AND this order's strategy has a strategy_mode row set to live.
+    mode = resolve_order_mode(split_data.get("strategy"))
 
     if mode is EffectiveMode.SANDBOX:
         from services.sandbox_service import sandbox_place_order
@@ -414,7 +409,9 @@ def split_order_with_auth(
             time.sleep(order_delay)  # Rate limit delay between orders
         order_data = copy.deepcopy(split_data)
         order_data["quantity"] = str(split_size)
-        result = place_single_order(order_data, broker_module, auth_token, i + 1, total_orders)
+        result = place_single_order(
+            order_data, broker_module, auth_token, i + 1, total_orders, broker
+        )
         results.append(result)
 
     # Place remaining quantity order if any
@@ -424,7 +421,7 @@ def split_order_with_auth(
         order_data = copy.deepcopy(split_data)
         order_data["quantity"] = str(remaining_qty)
         result = place_single_order(
-            order_data, broker_module, auth_token, total_orders, total_orders
+            order_data, broker_module, auth_token, total_orders, total_orders, broker
         )
         results.append(result)
 

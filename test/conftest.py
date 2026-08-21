@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 import tempfile
 
 import pytest
@@ -154,6 +155,7 @@ _INIT_TARGETS = [
     ("database.strategy_runtime_override_db", "init_db"),
     ("database.daily_intent_db", "init_db"),
     ("database.data_health_db", "init_db"),
+    ("database.option_liquidity_db", "init_db"),  # issue #583 — option-liquidity score
     ("database.market_calendar_db", "init_db"),  # issue #253 — holiday calendar
     ("database.signal_decision_db", "init_db"),
     ("database.scan_cycle_db", "init_db"),
@@ -194,4 +196,86 @@ def _isolate_databases():
                 f"{module_path}.{init_name}(): {exc!r}",
                 stacklevel=1,
             )
+    yield
+
+
+# --------------------------------------------------------------------------- #
+# Layer 4 — no test may spawn the real ``claude`` CLI (issue #632).
+#
+# ``services/llm_review_client.py`` and ``services/llm_agent_client.py`` run
+# ``claude -p`` through ``subprocess.run`` on an unpatched OS thread and block on
+# ``thread.join(timeout_s + 5)``. The budgets are minutes (240s bare review, 600s
+# tool-enabled agent), so a single unstubbed call does not fail a test — it
+# *hangs the run* until ``pytest-timeout`` kills it, taking every remaining test
+# with it. That is exactly how ``test_postmarket_review.py`` bricked the suite:
+# ``run_review_for_date`` reaches the investigating agent only when the day's
+# digest happens to carry violations, so the exposure is load-dependent and the
+# file passes in isolation.
+#
+# The guard sits at the process boundary rather than on the ``invoke_*``
+# functions themselves, for two reasons: it survives the function-local import in
+# ``postmarket_investigation.investigate()`` (which rebinds the name on every
+# call, so patching the *consumer* module is a no-op), and it leaves
+# ``test_llm_review_client.py`` free to exercise the real ``invoke_claude_review``
+# against its own ``subprocess.run`` fake.
+#
+# Every other subprocess (git, uv, node) passes straight through.
+# --------------------------------------------------------------------------- #
+
+_CLAUDE_CLI_TRIPWIRE = (
+    "test/conftest.py: a test tried to spawn the real `claude` CLI ({argv0!r}).\n"
+    "This blocks for minutes and hangs the whole pytest run rather than failing "
+    "one test.\n"
+    "Stub the seam instead — patch `services.llm_agent_client.invoke_claude_agent` "
+    "and/or `services.llm_review_client.invoke_claude_review` (patch the *client* "
+    "module, not the consumer: `postmarket_investigation.investigate()` imports the "
+    "name inside the function body).\n"
+    "To drive the client itself, patch `subprocess.run` as "
+    "`test/test_llm_review_client.py` does."
+)
+
+
+def _looks_like_claude_cli(args) -> bool:
+    """True when this argv would launch the Claude Code CLI."""
+    if isinstance(args, (str, bytes, os.PathLike)):
+        program = args
+    else:
+        try:
+            program = next(iter(args))
+        except (TypeError, StopIteration):
+            return False
+    if isinstance(program, bytes):
+        program = program.decode("utf-8", "replace")
+    elif isinstance(program, os.PathLike):
+        program = os.fspath(program)
+    if not isinstance(program, str):
+        return False
+    # Matches `claude`, `claude.cmd`, `claude.exe` and any absolute path to them,
+    # which also covers a `CLAUDE_CMD` override pointing at a non-PATH install.
+    return os.path.basename(program).lower().split(".")[0] == "claude"
+
+
+@pytest.fixture(autouse=True)
+def _block_real_claude_cli(monkeypatch):
+    """Turn a real ``claude`` spawn into a loud, immediate failure."""
+    import subprocess
+
+    real_run = subprocess.run
+
+    def guarded_run(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        if _looks_like_claude_cli(argv):
+            argv0 = argv if isinstance(argv, str) else next(iter(argv), argv)
+            message = _CLAUDE_CLI_TRIPWIRE.format(argv0=argv0)
+            # Printed as well as raised: the callers wrap the spawn in a worker
+            # thread behind a broad ``except Exception`` that degrades to an
+            # "LLM unavailable" status, so the raise alone can be swallowed into
+            # a green test. The stderr line names the offending test either way.
+            current = os.environ.get("PYTEST_CURRENT_TEST", "?")
+            print(f"[claude-cli-tripwire] {current}", file=sys.stderr)
+            print(message, file=sys.stderr)
+            raise AssertionError(message)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded_run)
     yield

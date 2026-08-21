@@ -247,7 +247,10 @@ class WSProxySupervisor:
     # -- daemon loop ---------------------------------------------------------
 
     def _loop(self) -> None:
+        from services.thread_registry import beat as _beat
+
         while not self._stop.is_set():
+            _beat("WSProxySupervisor")
             try:
                 with self._lock:
                     self.check()

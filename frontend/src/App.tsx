@@ -87,6 +87,9 @@ const PythonStrategyGuide = lazy(() => import('@/pages/python-strategy/PythonStr
 const ScannerIndex = lazy(() => import('@/pages/scanner/ScannerIndex'))
 const ScannerDetail = lazy(() => import('@/pages/scanner/ScannerDetail'))
 
+// Multi-account child accounts (issue #468)
+const AccountsPage = lazy(() => import('@/pages/accounts/AccountsPage'))
+
 // Strategies Dashboard (Tier 2 — read-only strategy browser)
 const StrategiesDashboardIndex = lazy(
   () => import('@/pages/strategies-dashboard/StrategiesDashboardIndex')
@@ -137,6 +140,8 @@ const FreezeQty = lazy(() => import('@/pages/admin/FreezeQty'))
 const Holidays = lazy(() => import('@/pages/admin/Holidays'))
 const MarketTimings = lazy(() => import('@/pages/admin/MarketTimings'))
 const Diagnostics = lazy(() => import('@/pages/admin/Diagnostics'))
+// Scheduler + daemon-thread registry (issue #539, read-only)
+const Schedulers = lazy(() => import('@/pages/admin/Schedulers'))
 const RemoteMcp = lazy(() => import('@/pages/admin/RemoteMcp'))
 
 // Telegram pages
@@ -224,6 +229,8 @@ function App() {
                 {/* In-house Scanner Browser (Tier 1 read-only) */}
                 <Route path="/scanner" element={<ScannerIndex />} />
                 <Route path="/scanner/:id" element={<ScannerDetail />} />
+                {/* Multi-account child accounts (issue #468) */}
+                <Route path="/accounts" element={<AccountsPage />} />
                 {/* Strategies Dashboard (Tier 2 read-only) */}
                 <Route path="/strategies" element={<StrategiesDashboardIndex />} />
                 <Route
@@ -277,6 +284,7 @@ function App() {
                 <Route path="/admin/holidays" element={<Holidays />} />
                 <Route path="/admin/timings" element={<MarketTimings />} />
                 <Route path="/admin/diagnostics" element={<Diagnostics />} />
+                <Route path="/admin/schedulers" element={<Schedulers />} />
                 <Route path="/admin/remote-mcp" element={<RemoteMcp />} />
                 {/* Phase 7: Telegram */}
                 <Route path="/telegram" element={<TelegramIndex />} />

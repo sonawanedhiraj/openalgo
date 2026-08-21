@@ -125,10 +125,11 @@ def test_override_self_expiring():
         set_by="test",
     )
 
-    # Row still exists in DB
-    rows = list_overrides(include_expired=True)
+    # Row still exists in DB. Count only THIS test's strategy — the temp DB is
+    # session-scoped and other test files may legitimately hold rows for their
+    # own strategies (issue #472's cross-test pollution class).
+    rows = [r for r in list_overrides(include_expired=True) if r["strategy_name"] == strategy]
     assert len(rows) == 1
-    assert rows[0]["strategy_name"] == strategy
 
     # But is_entry_blocked sees it as expired and returns False
     blocked, ov = is_entry_blocked(strategy)

@@ -70,8 +70,35 @@ def init_db():
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("strategy_mode table ready")
+        purge_retired_global_row()
     except Exception as e:
         logger.exception(f"Failed to init strategy_mode table: {e}")
+
+
+def purge_retired_global_row() -> None:
+    """Delete the retired hidden ``__global__`` gate row if one exists.
+
+    Issue #440: order dispatch is per-strategy and UI-driven — the hidden
+    ``strategy_mode['__global__']`` key no longer participates in any
+    resolution, so a leftover row is dead config that could mislead an
+    operator inspecting the table. Idempotent; runs at every boot.
+    """
+    try:
+        row = db_session.query(StrategyMode).filter_by(strategy_name="__global__").first()
+        if row is not None:
+            logger.warning(
+                "Removing retired strategy_mode['__global__'] row (mode=%s, updated_by=%s) — "
+                "the hidden global gate no longer exists (issue #440)",
+                row.mode,
+                row.updated_by,
+            )
+            db_session.delete(row)
+            db_session.commit()
+    except Exception:
+        db_session.rollback()
+        logger.exception("Failed to purge retired __global__ strategy_mode row")
+    finally:
+        db_session.remove()
 
 
 # Explicit alias for callers that prefer the long name (e.g. boot wiring).

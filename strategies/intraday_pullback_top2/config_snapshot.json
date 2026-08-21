@@ -66,6 +66,9 @@
   "candle_minutes": 5,
   "intraday_source_chain": ["aggregator", "broker_quotes", "historify"],
 
+  "trade_side": "both",
+  "_trade_side_notes": "issue #509. both | long_only | short_only; UI-editable, env default INTRADAY_PULLBACK_TRADE_SIDE. The long/short books are mutually exclusive by the 09:30 NIFTY day gate, so an excluded side means NO TRADING on the days it would have run (long_only gives up every NIFTY-down day) - it is not a rebalance. 'both' is the backtested configuration; the figures under `backtest` are both-sides numbers.",
+
   "backtest": {
     "window": "2024-11-01..2026-07-06",
     "universe": "163 stocks / 15 sectors, real NIFTY+15 sector indices, real Zerodha charges, slippage NOT modelled",
@@ -73,6 +76,19 @@
     "combined_compound": {"pf": 1.60, "return_pct": 162.1, "sharpe": 2.93, "maxdd_pct": -11.6},
     "long_contribution": {"trades": 155, "pf": 1.72, "net": 44202},
     "short_contribution": {"trades": 80, "pf": 1.40, "net": 14362}
+  },
+
+  "parity_target": {
+    "window": "2024-11-01..2026-07-06",
+    "n_trades": 235,
+    "win_rate_pct": 48,
+    "sharpe": 2.96,
+    "max_dd_pct": -8.9,
+    "net_pnl_inr": 58564,
+    "cagr_pct": null,
+    "long": {"n_trades": 155, "net_pnl_inr": 44202},
+    "short": {"n_trades": 80, "net_pnl_inr": 14362},
+    "_notes": "Dashboard Backtest column (issue #508). Combined fixed-sizing book on Rs60k: PF 1.60, +97.6% (= Rs58,564 on the Rs60k base = long Rs44,202 + short Rs14,362), Sharpe 2.96, MaxDD -8.9%, 15/21 months positive. cagr_pct is deliberately null: the headline +97.6% is FIXED (non-reinvested) sizing, so annualizing it would misrepresent the compounding basis. Per-side win_rate_pct is omitted because the R53 report publishes per-side trade count / PF / net only, never a per-side win rate - the UI renders those cells '-' rather than inventing them. SLIPPAGE IS NOT MODELLED in any of these figures (LEARNINGS open risk #1); expect the sandbox column to trail this, most of all on the deep-loser short."
   },
 
   "llm_context": {

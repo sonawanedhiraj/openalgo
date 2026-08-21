@@ -32,6 +32,8 @@ from flask import Blueprint, Flask
 from sqlalchemy import create_engine
 from sqlalchemy.orm import scoped_session, sessionmaker
 
+from services.strategy_performance_metrics import MIN_TRADING_DAYS_SHARPE
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -155,6 +157,51 @@ def strategies_dir(tmp_path):
     tei.mkdir()
     (tei / "LEARNINGS.md").write_text("# Trending Equity Intraday\n", encoding="utf-8")
 
+    # open15_vol_breakout — measurement deployment: parity_target is
+    # deliberately null (R58), so its Backtest column stays empty while the
+    # Sandbox/Live columns aggregate open15_trades (issue #442).
+    o15 = tmp_path / "open15_vol_breakout"
+    o15.mkdir()
+    (o15 / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "0.1.0",
+                "mode": "sandbox",
+                "deployable": True,
+                "parity_target": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # intraday_pullback_top2 — combined long+short book whose two sides are
+    # mutually exclusive by day gate, so the Backtest column publishes a
+    # per-side split WITHOUT per-side win rates (the R53 report never broke
+    # those out). issue #508.
+    ip = tmp_path / "intraday_pullback_top2"
+    ip.mkdir()
+    (ip / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "0.1.0",
+                "mode": "sandbox",
+                "deployable": True,
+                "parity_target": {
+                    "window": "2024-11-01..2026-07-06",
+                    "n_trades": 235,
+                    "win_rate_pct": 48,
+                    "sharpe": 2.96,
+                    "max_dd_pct": -8.9,
+                    "net_pnl_inr": 58564,
+                    "cagr_pct": None,
+                    "long": {"n_trades": 155, "net_pnl_inr": 44202},
+                    "short": {"n_trades": 80, "net_pnl_inr": 14362},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
     return tmp_path
 
 
@@ -169,6 +216,12 @@ def wired_dbs(monkeypatch):
     import blueprints.strategies_dashboard_api as sda
     from database import (
         futures_follow_db as ffdb,
+    )
+    from database import (
+        intraday_pullback_db as ipdb,
+    )
+    from database import (
+        open15_breakout_db as o15db,
     )
     from database import (
         sector_follow_db as sfdb,
@@ -188,6 +241,8 @@ def wired_dbs(monkeypatch):
     sm_eng, sm_sess = _mk_engine()
     sr_eng, sr_sess = _mk_engine()
     tj_eng, tj_sess = _mk_engine()
+    o15_eng, o15_sess = _mk_engine()
+    ip_eng, ip_sess = _mk_engine()
 
     # Create tables on the in-memory engines
     sfdb.Base.metadata.create_all(sf_eng)
@@ -195,6 +250,8 @@ def wired_dbs(monkeypatch):
     smdb.Base.metadata.create_all(sm_eng)
     srodb.Base.metadata.create_all(sr_eng)
     tjdb.Base.metadata.create_all(tj_eng)
+    o15db.Base.metadata.create_all(o15_eng)
+    ipdb.Base.metadata.create_all(ip_eng)
 
     # Patch the database modules (for ORM lookups that go through the module)
     monkeypatch.setattr(sfdb, "engine", sf_eng)
@@ -207,6 +264,13 @@ def wired_dbs(monkeypatch):
     monkeypatch.setattr(srodb, "db_session", sr_sess)
     monkeypatch.setattr(tjdb, "engine", tj_eng)
     monkeypatch.setattr(tjdb, "db_session", tj_sess)
+    # open15 is imported lazily inside the routes/helpers, so patching the
+    # database module alone is sufficient (no blueprint-level alias exists).
+    monkeypatch.setattr(o15db, "engine", o15_eng)
+    monkeypatch.setattr(o15db, "db_session", o15_sess)
+    # intraday_pullback is likewise imported lazily inside the helpers.
+    monkeypatch.setattr(ipdb, "engine", ip_eng)
+    monkeypatch.setattr(ipdb, "db_session", ip_sess)
 
     # ALSO patch the blueprint's module-level session aliases — these are bound
     # at import time and would otherwise still point at the live-DB sessions.
@@ -222,11 +286,13 @@ def wired_dbs(monkeypatch):
         "sm": (sm_eng, sm_sess, smdb),
         "sr": (sr_eng, sr_sess, srodb),
         "tj": (tj_eng, tj_sess, tjdb),
+        "o15": (o15_eng, o15_sess, o15db),
+        "ip": (ip_eng, ip_sess, ipdb),
     }
 
-    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess):
+    for sess in (sf_sess, ff_sess, sm_sess, sr_sess, tj_sess, o15_sess, ip_sess):
         sess.remove()
-    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng):
+    for eng in (sf_eng, ff_eng, sm_eng, sr_eng, tj_eng, o15_eng, ip_eng):
         eng.dispose()
 
 
@@ -313,6 +379,128 @@ def test_list_futures_is_healthy(app):
     ff = next(s for s in body["data"] if s["name"] == "futures_follow_cap50")
     assert ff["deployable"] is True
     assert ff["health"] == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# Issue #561 — routing truth beats the static config_snapshot.json
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-06 incident: sector_follow_cap5_vol routed LIVE to Zerodha from
+# 2026-07-29 while its config_snapshot.json still said
+# {"mode": "scaffold-only", "deployable": false} from June. The dashboard
+# trusted the FILE, so the card rendered a "Scaffold" badge, a "scaffold"
+# health LED and a DISABLED toggle — on the one strategy placing real orders,
+# leaving the operator no way to switch it off from the UI.
+#
+# The strategies_dir fixture reproduces that exact shape (sector_follow is
+# scaffold-only/deployable:false), so writing a live strategy_mode row is all
+# it takes. On the pre-fix tree these assertions fail: health was "scaffold"
+# and config_conflict did not exist.
+
+
+def _set_mode(wired_dbs, name: str, mode: str) -> None:
+    """Insert a strategy_mode row on the in-memory test engine."""
+    _eng, sess, smdb = wired_dbs["sm"]
+    sess.add(smdb.StrategyMode(strategy_name=name, mode=mode, updated_by="test"))
+    sess.commit()
+
+
+def test_live_strategy_is_not_reported_as_scaffold(app, wired_dbs):
+    """A live strategy_mode row wins over a stale scaffold-only config file."""
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    assert sf["mode"] == "live"
+    # The LED must not call a live strategy a scaffold.
+    assert sf["health"] == "healthy"
+    # `deployable` stays as the file declares it — it is advisory metadata that
+    # gates sandbox→live only, NOT a statement about current routing.
+    assert sf["deployable"] is False
+    # ...and the disagreement is surfaced, not silently resolved.
+    assert sf["config_conflict"] is True
+    assert sf["config_declared_mode"] == "scaffold-only"
+
+
+def test_non_live_scaffold_still_reads_as_scaffold(app, wired_dbs):
+    """No regression: a genuinely non-deployable, non-live strategy is a scaffold."""
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "sandbox")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    assert sf["mode"] == "sandbox"
+    assert sf["health"] == "scaffold"
+    assert sf["config_conflict"] is False
+
+
+def test_deployable_sandbox_strategy_has_no_conflict(app, wired_dbs):
+    """A deployable strategy in sandbox is the ordinary case — no warning."""
+    _set_mode(wired_dbs, "futures_follow_cap50", "sandbox")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    ff = next(s for s in resp.get_json()["data"] if s["name"] == "futures_follow_cap50")
+    assert ff["config_conflict"] is False
+    assert ff["health"] == "healthy"
+
+
+def test_open_positions_never_sum_sandbox_and_live(app, wired_dbs):
+    """Issue #562 — the #552 convention: real and sandbox are not one number.
+
+    The live card showed "Open 10" by netting 12 sandbox positions together
+    with 7 live ones, which made the real book unreadable off the dashboard.
+    """
+    _eng, sess, sfdb = wired_dbs["sf"]
+    for symbol, mode in (("AAA", "sandbox"), ("BBB", "sandbox"), ("CCC", "live")):
+        sess.add(
+            sfdb.SectorFollowTrade(
+                strategy_id=1,
+                mode=mode,
+                side="BUY",
+                symbol=symbol,
+                exchange="NSE",
+                product="CNC",
+                quantity=10,
+                price=100.0,
+                entry_date="2026-08-06",
+                status="placed",
+            )
+        )
+    sess.commit()
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    sf = next(s for s in resp.get_json()["data"] if s["name"] == "sector_follow_cap5_vol")
+    # Headline = the book the strategy would trade RIGHT NOW, not the blend.
+    assert sf["open_positions"] == 1
+    assert sf["open_positions_mode"] == "live"
+    assert sf["open_positions_by_mode"] == {"sandbox": 2, "live": 1}
+
+
+def test_detail_endpoint_agrees_with_card_on_routing_truth(app, wired_dbs):
+    """/api/<name> must not contradict /api/list — same contract, same fields."""
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/sector_follow_cap5_vol")
+
+    data = resp.get_json()["data"]
+    assert data["mode"] == "live"
+    assert data["health"] == "healthy"
+    assert data["config_conflict"] is True
+    assert data["config_declared_mode"] == "scaffold-only"
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +1051,516 @@ def test_futures_pnl_curve_keys_exit_by_execution_date(app, wired_dbs):
 
 
 # ---------------------------------------------------------------------------
+# open15_vol_breakout — Sandbox/Live performance columns (issue #442)
+# ---------------------------------------------------------------------------
+
+
+def _o15_row(o15db, **kw):
+    """An Open15Trade row with sensible closed-sandbox defaults."""
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    defaults = {
+        "trade_date": today,
+        "symbol": "RELIANCE",
+        "side": "L",
+        "mode": "sandbox",
+        "quantity": 100,
+        "trigger_price": 1500.0,
+        "exit_price": 1510.0,
+        "status": "closed",
+        "pnl": 1000.0,
+        "charges_inr": 60.0,
+        "created_at": _utc_naive_for_ist_today(hour_ist=9, minute_ist=21),
+    }
+    defaults.update(kw)
+    return o15db.Open15Trade(**defaults)
+
+
+def test_open15_sandbox_column_populated(app, wired_dbs):
+    """The Sandbox column aggregates open15_trades: cumulative NET P&L
+    (gross pnl minus modelled charges, the #433 convention), running win-rate,
+    closed-trade count, today's net P&L, and open positions."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    # One win (+1000 gross - 60 charges), one loss (-500 gross - 40 charges).
+    sess.add(_o15_row(o15db))
+    sess.add(_o15_row(o15db, symbol="TCS", side="S", pnl=-500.0, charges_inr=40.0))
+    # An open row (entered, not yet flattened) counts as an open position.
+    sess.add(_o15_row(o15db, symbol="INFY", status="open", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    assert resp.status_code == 200
+    perf = resp.get_json()["data"]["performance"]
+    sb = perf["sandbox"]
+    assert sb["cum_net_pnl"] == 400.0  # (1000-60) + (-500-40)
+    assert sb["closed_trades"] == 2
+    assert sb["win_rate_pct"] == 50.0
+    assert sb["today_net_pnl"] == 400.0  # all rows are today's
+    assert sb["open_positions"] == 1
+    # Never flipped live, no live rows → Live column stays empty ('—' in UI).
+    assert perf["live"] is None
+    # Backtest column stays empty by design (parity_target: null, R58).
+    assert perf["backtest"]["win_rate_pct"] is None
+
+
+def test_open15_live_column_isolated_from_sandbox(app, wired_dbs):
+    """A live-mode closed row populates the Live column with its own history;
+    sandbox history never leaks across (futures_follow precedent)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))  # sandbox win, net +940
+    sess.add(_o15_row(o15db, symbol="SBIN", mode="live", pnl=300.0, charges_inr=50.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["cum_net_pnl"] == 940.0
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["live"]["cum_net_pnl"] == 250.0  # 300 - 50
+    assert perf["live"]["closed_trades"] == 1
+    assert perf["live"]["win_rate_pct"] == 100.0
+
+
+def test_open15_observe_rows_excluded(app, wired_dbs):
+    """observe-mode rows are journal-only dry runs (no orders placed) — they
+    must not inflate either column or the card stats."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db, mode="observe"))
+    sess.add(_o15_row(o15db, symbol="INFY", mode="observe", status="open", pnl=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    perf = resp.get_json()["data"]["performance"]
+    sb = perf["sandbox"]
+    assert sb["closed_trades"] == 0
+    assert sb["cum_net_pnl"] is None  # UI renders '—', not a misleading ₹0
+    assert sb["open_positions"] == 0
+    assert perf["live"] is None
+
+
+def test_open15_unpriced_exit_surfaced_not_summed(app, wired_dbs):
+    """A closed-today row with pnl=None (exit tick unavailable at flatten) is
+    counted as an unpriced exit, not silently folded into today's ₹ figure."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))
+    sess.add(_o15_row(o15db, symbol="TCS", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["today_net_pnl"] == 940.0
+    assert sb["today_unpriced_exits"] == 1
+
+
+def test_open15_list_card_carries_today_stats(app, wired_dbs):
+    """The /api/list summary card shows today's trade count / net P&L / open
+    positions for open15 (previously all defaults — issue #442)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))
+    sess.add(_o15_row(o15db, symbol="INFY", status="open", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/list")
+
+    card = next(s for s in resp.get_json()["data"] if s["name"] == "open15_vol_breakout")
+    assert card["today_trade_count"] == 2
+    assert card["today_net_pnl"] == 940.0
+    assert card["open_positions"] == 1
+    assert card["last_trade_at"] is not None
+
+
+def test_open15_sandbox_long_short_split(app, wired_dbs):
+    """Sandbox column carries long/short sub-aggregates keyed off the journal's
+    side column, for both the stock leg and the option shadow (issue #458)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    # Longs: one win (+940 net), one loss (-540 net). Short: one win (+260 net).
+    sess.add(_o15_row(o15db, opt_pnl=500.0))
+    sess.add(_o15_row(o15db, symbol="TCS", pnl=-500.0, charges_inr=40.0, opt_pnl=-200.0))
+    sess.add(_o15_row(o15db, symbol="SBIN", side="S", pnl=300.0, charges_inr=40.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": 400.0,  # 940 - 540
+    }
+    assert sb["short"] == {
+        "n_trades": 1,
+        "wins": 1,
+        "win_rate_pct": 100.0,
+        "net_pnl_inr": 260.0,
+    }
+    # Option shadow split: only the two long rows carry opt_pnl.
+    opt = sb["options"]
+    assert opt["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": 300.0,  # 500 - 200
+    }
+    assert opt["short"]["n_trades"] == 0
+    assert opt["short"]["win_rate_pct"] is None
+
+
+def test_open15_side_split_empty_side_renders_none(app, wired_dbs):
+    """A side with no closed trades reports n_trades=0 and None stats — the UI
+    must render '—', never 0% (issue #458)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))  # single long win
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"]["n_trades"] == 1
+    assert sb["short"] == {
+        "n_trades": 0,
+        "wins": 0,
+        "win_rate_pct": None,
+        "net_pnl_inr": None,
+    }
+
+
+def test_open15_backtest_side_split_passthrough(app, wired_dbs, strategies_dir):
+    """parity_target.long/.short (and options_variant.long/.short) pass through
+    to the Backtest column verbatim (issue #458)."""
+    import json as _json
+
+    (strategies_dir / "open15_vol_breakout" / "config_snapshot.json").write_text(
+        _json.dumps(
+            {
+                "version": "0.1.0",
+                "mode": "sandbox",
+                "deployable": True,
+                "parity_target": {
+                    "window": "Jul 2026 R59",
+                    "n_trades": 15,
+                    "win_rate_pct": 60.0,
+                    "net_pnl_inr": 2564,
+                    "long": {"n_trades": 8, "wins": 6, "win_rate_pct": 75.0, "net_pnl_inr": 2707},
+                    "short": {"n_trades": 7, "wins": 3, "win_rate_pct": 42.9, "net_pnl_inr": -143},
+                    "options_variant": {
+                        "n_trades": 13,
+                        "win_rate_pct": 62.0,
+                        "net_pnl_inr": 11195,
+                        "long": {
+                            "n_trades": 8,
+                            "wins": 7,
+                            "win_rate_pct": 87.5,
+                            "net_pnl_inr": 13680,
+                        },
+                        "short": {
+                            "n_trades": 5,
+                            "wins": 1,
+                            "win_rate_pct": 20.0,
+                            "net_pnl_inr": -2485,
+                        },
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    bt = resp.get_json()["data"]["performance"]["backtest"]
+    assert bt["long"]["win_rate_pct"] == 75.0
+    assert bt["short"]["net_pnl_inr"] == -143
+    assert bt["options"]["long"]["win_rate_pct"] == 87.5
+    assert bt["options"]["short"]["n_trades"] == 5
+    # Long + short must reconcile with the aggregate.
+    assert bt["long"]["net_pnl_inr"] + bt["short"]["net_pnl_inr"] == bt["net_pnl_inr"]
+
+
+# ---------------------------------------------------------------------------
+# intraday_pullback_top2 (issue #508)
+# ---------------------------------------------------------------------------
+
+
+def _ip_row(ipdb, **kw):
+    """An IntradayPullbackTrade row with sensible closed-sandbox defaults.
+
+    Unlike open15, this journal stamps ``net_pnl`` directly (charges already
+    deducted), so the fixtures set net_pnl rather than gross+charges.
+    """
+    today = dt.datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
+    defaults = {
+        "trade_date": today,
+        "symbol": "SHRIRAMFIN",
+        "side": "L",
+        "mode": "sandbox",
+        "sector": "FINNIFTY",
+        "session": "AFT",
+        "quantity": 100,
+        "entry_price": 1000.0,
+        "entry_time": dt.datetime(2026, 7, 31, 13, 25, 0),
+        "exit_price": 1010.0,
+        "status": "closed",
+        "gross_pnl": 1000.0,
+        "charges_inr": 100.0,
+        "net_pnl": 900.0,
+        "created_at": _utc_naive_for_ist_today(hour_ist=13, minute_ist=25),
+    }
+    defaults.update(kw)
+    return ipdb.IntradayPullbackTrade(**defaults)
+
+
+def test_intraday_pullback_sandbox_column_populated(app, wired_dbs):
+    """The Sandbox column aggregates intraday_pullback_trades: cumulative net
+    P&L, running win-rate, closed-trade count, today's net P&L, open positions."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))  # +900
+    sess.add(_ip_row(ipdb, symbol="LTF", net_pnl=-400.0, gross_pnl=-300.0))
+    sess.add(_ip_row(ipdb, symbol="VBL", status="open", gross_pnl=None, net_pnl=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["closed_trades"] == 2
+    assert sb["cum_net_pnl"] == 500.0
+    assert sb["win_rate_pct"] == 50.0
+    assert sb["today_net_pnl"] == 500.0
+    assert sb["open_positions"] == 1
+
+
+def test_intraday_pullback_long_short_split(app, wired_dbs):
+    """Sandbox column carries long/short sub-aggregates keyed off the journal's
+    L/S side column — the two books are mutually exclusive by day gate, so the
+    blended headline hides which one is working (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))  # long win +900
+    sess.add(_ip_row(ipdb, symbol="LTF", net_pnl=-400.0))  # long loss
+    sess.add(_ip_row(ipdb, symbol="YESBANK", side="S", net_pnl=-429.44))  # short loss
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": 500.0,
+    }
+    assert sb["short"] == {
+        "n_trades": 1,
+        "wins": 0,
+        "win_rate_pct": 0.0,
+        "net_pnl_inr": -429.44,
+    }
+    # The split must reconcile with the blended aggregate.
+    assert sb["long"]["net_pnl_inr"] + sb["short"]["net_pnl_inr"] == sb["cum_net_pnl"]
+
+
+def test_intraday_pullback_empty_side_renders_none(app, wired_dbs):
+    """A side with no closed trades reports n_trades=0 and None stats so the UI
+    renders '—', never a misleading 0% (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"]["n_trades"] == 1
+    assert sb["short"] == {
+        "n_trades": 0,
+        "wins": 0,
+        "win_rate_pct": None,
+        "net_pnl_inr": None,
+    }
+
+
+def test_intraday_pullback_live_column_isolated_from_sandbox(app, wired_dbs):
+    """Sandbox history must never leak into the Live column, and the Live column
+    stays absent until that mode has realized history (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+    assert resp.get_json()["data"]["performance"]["live"] is None
+
+    sess.add(_ip_row(ipdb, symbol="MPHASIS", mode="live", net_pnl=250.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["cum_net_pnl"] == 900.0
+    assert perf["live"]["cum_net_pnl"] == 250.0
+    assert perf["live"]["closed_trades"] == 1
+
+
+def test_intraday_pullback_observe_rows_excluded(app, wired_dbs):
+    """observe-mode rows are journal-only dry runs (no orders placed) and must
+    not inflate either column (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.add(_ip_row(ipdb, symbol="SBICARD", mode="observe", net_pnl=99999.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["sandbox"]["cum_net_pnl"] == 900.0
+    assert perf["live"] is None
+
+
+def test_intraday_pullback_unpriced_exit_surfaced_not_summed(app, wired_dbs):
+    """A closed-but-unpriced exit is counted separately, never booked as ₹0 —
+    same contract as #350 / open15."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))
+    sess.add(_ip_row(ipdb, symbol="POLICYBZR", gross_pnl=None, net_pnl=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["today_net_pnl"] == 900.0
+    assert sb["today_unpriced_exits"] == 1
+    assert sb["closed_trades"] == 1  # the unpriced row is not a realized trade
+
+
+def test_intraday_pullback_net_pnl_falls_back_to_gross_minus_charges(app, wired_dbs):
+    """A row stamped with gross+charges but no net still prices correctly."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, net_pnl=None, gross_pnl=1000.0, charges_inr=101.32))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["cum_net_pnl"] == 898.68
+    assert sb["today_unpriced_exits"] == 0
+
+
+def test_intraday_pullback_recent_trades(app, wired_dbs):
+    """Recent Trades is populated from intraday_pullback_trades (issue #508) —
+    the regression this issue was opened for ('No trades yet' with 7 rows in
+    the journal)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, exit_reason="EOD"))
+    sess.add(_ip_row(ipdb, symbol="SBICARD", side="S", net_pnl=-551.57, exit_reason="SL"))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    trades = resp.get_json()["data"]["recent_trades"]
+    assert len(trades) == 2
+    newest = trades[0]
+    assert newest["symbol"] == "SBICARD"
+    assert newest["side"] == "S"
+    assert newest["net_pnl"] == -551.57
+    assert newest["exit_reason"] == "SL"
+    assert newest["mode"] == "sandbox"
+    assert newest["status"] == "closed"
+    # `trigger` drives the shared table's "Entry Time" cell.
+    assert newest["trigger"] == "13:25:00"
+    # gross_pnl must NOT be sent: it would switch on the shared table's
+    # futures-labelled column group ("Buy Price"/"Sell Price") and duplicate
+    # the Charges column for an equity intraday strategy.
+    assert "gross_pnl" not in newest
+    assert newest["charges_inr"] == 100.0
+
+
+def test_intraday_pullback_pnl_curve(app, wired_dbs):
+    """The curve keys off trade_date — the strategy is intraday, so entry and
+    its 15:15 flatten share that date (issue #508)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, trade_date="2026-07-29", net_pnl=1762.30))
+    sess.add(_ip_row(ipdb, symbol="TATAELXSI", trade_date="2026-07-29", net_pnl=3.38))
+    sess.add(_ip_row(ipdb, symbol="SHRIRAMFIN", trade_date="2026-07-31", net_pnl=-399.52))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2/pnl-curve")
+
+    points = resp.get_json()["data"]["points"]
+    assert points == [
+        {"date": "2026-07-29", "pnl": 1765.68},
+        {"date": "2026-07-31", "pnl": -399.52},
+    ]
+
+
+def test_intraday_pullback_backtest_side_split_without_win_rates(app, wired_dbs):
+    """The Backtest column publishes per-side trade count + net P&L but NO
+    per-side win rate (the R53 report never broke one out). The keys must pass
+    through as-is rather than being invented (issue #508)."""
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    bt = resp.get_json()["data"]["performance"]["backtest"]
+    assert bt["n_trades"] == 235
+    assert bt["net_pnl_inr"] == 58564
+    assert bt["long"] == {"n_trades": 155, "net_pnl_inr": 44202}
+    assert bt["short"] == {"n_trades": 80, "net_pnl_inr": 14362}
+    assert "win_rate_pct" not in bt["long"]
+    # Sides reconcile with the aggregate, and with the n_trades headline.
+    assert bt["long"]["net_pnl_inr"] + bt["short"]["net_pnl_inr"] == bt["net_pnl_inr"]
+    assert bt["long"]["n_trades"] + bt["short"]["n_trades"] == bt["n_trades"]
+    # CAGR is deliberately null: the headline is fixed (non-reinvested) sizing.
+    assert bt["cagr_pct"] is None
+
+
+def test_other_strategies_have_no_side_split(app, wired_dbs):
+    """Strategies without a long/short split carry no long/short keys — the UI
+    renders no sub-rows for them (issue #458)."""
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert "long" not in (perf["sandbox"] or {})
+    assert perf["backtest"].get("long") is None
+
+
+# ---------------------------------------------------------------------------
 # GET /strategies/api/<name>/parameters/diff
 # ---------------------------------------------------------------------------
 
@@ -975,9 +1673,14 @@ def _seed_simplified_journal_row(
     pnl: float | None = None,
     exit_reason: str | None = None,
     signal_decision_id: int | None = None,
+    mode: str | None = None,
 ):
     """Insert one trade_journal row under the simplified engine's REGISTERED
-    journal name (trending_equity_intraday) — the real persisted name."""
+    journal name (trending_equity_intraday) — the real persisted name.
+
+    ``mode`` defaults to None on purpose: that is what every pre-#568 row looks
+    like, and readers must resolve it to 'sandbox'.
+    """
     row = tjdb.TradeJournal(
         placed_at=placed_at,
         symbol=symbol,
@@ -991,6 +1694,7 @@ def _seed_simplified_journal_row(
         exit_reason=exit_reason,
         pnl=pnl,
         signal_decision_id=signal_decision_id,
+        mode=mode,
         created_at=placed_at,
         updated_at=placed_at,
     )
@@ -1134,6 +1838,84 @@ def test_pnl_curve_resolves_simplified_engine(app, wired_dbs):
     assert len(points) == 1
     assert points[0]["date"] == "2026-06-29"
     assert points[0]["pnl"] == 350.0  # 500 + (-150)
+
+
+def test_simplified_engine_long_short_split(app, wired_dbs):
+    """The simplified engine's column carries long/short sub-aggregates keyed off
+    trade_journal.direction (issue #494). The blended headline hides that the two
+    sides diverge, so both must reconcile against the aggregate."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    # Longs: one win (+500), one loss (-800) => net -300, 50% win rate.
+    # Shorts: one win (+900) => net +900, 100% win rate.
+    for symbol, direction, pnl in (
+        ("RVNL", "LONG", 500.0),
+        ("INDIANB", "LONG", -800.0),
+        ("TATAELXSI", "SHORT", 900.0),
+    ):
+        _seed_simplified_journal_row(
+            tj_sess,
+            tjdb,
+            symbol=symbol,
+            direction=direction,
+            placed_at="2026-06-29T09:30:00+05:30",
+            exited_at="2026-06-29T15:14:00+05:30",
+            exit_price=110.0,
+            pnl=pnl,
+            exit_reason="eod_squareoff",
+        )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["cum_net_pnl"] == 600.0  # 500 - 800 + 900
+    assert sb["closed_trades"] == 3
+    assert sb["long"] == {
+        "n_trades": 2,
+        "wins": 1,
+        "win_rate_pct": 50.0,
+        "net_pnl_inr": -300.0,
+    }
+    assert sb["short"] == {
+        "n_trades": 1,
+        "wins": 1,
+        "win_rate_pct": 100.0,
+        "net_pnl_inr": 900.0,
+    }
+    # The two sides must account for the whole book — no trade falls through.
+    assert sb["long"]["n_trades"] + sb["short"]["n_trades"] == sb["closed_trades"]
+    assert sb["long"]["net_pnl_inr"] + sb["short"]["net_pnl_inr"] == sb["cum_net_pnl"]
+
+
+def test_simplified_engine_empty_side_renders_none(app, wired_dbs):
+    """A side with no closed trades reports n_trades=0 and None stats so the UI
+    renders '—', never a misleading 0% / ₹0 (issue #494)."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol="RVNL",
+        direction="LONG",
+        placed_at="2026-06-29T09:30:00+05:30",
+        exited_at="2026-06-29T15:14:00+05:30",
+        exit_price=110.0,
+        pnl=500.0,
+        exit_reason="eod_squareoff",
+    )
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/simplified_engine")
+
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["long"]["n_trades"] == 1
+    assert sb["short"] == {
+        "n_trades": 0,
+        "wins": 0,
+        "win_rate_pct": None,
+        "net_pnl_inr": None,
+    }
 
 
 def test_other_strategies_unaffected_by_simplified_bridge(app, wired_dbs):
@@ -1707,3 +2489,268 @@ def test_non_veto_strategy_has_no_llm_enrichment(app, wired_dbs, wired_llm_dbs):
 
     assert data["llm_unmatched_skips"] == []
     assert "llm" not in data["recent_trades"][0] or data["recent_trades"][0]["llm"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-mode split + realized performance metrics (issue #568)
+# ---------------------------------------------------------------------------
+
+
+def _seed_closed(
+    tj_sess, tjdb, *, symbol, pnl, day, mode=None, direction="LONG", reason="stop_loss"
+):
+    return _seed_simplified_journal_row(
+        tj_sess,
+        tjdb,
+        symbol=symbol,
+        direction=direction,
+        placed_at=f"{day}T09:30:00+05:30",
+        exited_at=f"{day}T15:14:00+05:30",
+        exit_price=110.0,
+        pnl=pnl,
+        exit_reason=reason,
+        mode=mode,
+    )
+
+
+def test_sandbox_history_never_leaks_into_the_live_column(app, wired_dbs):
+    """THE regression this issue exists for.
+
+    Before #568 trade_journal had no `mode`, so the endpoint attributed the whole
+    journal to whatever mode the strategy sat in *today*. Flipping the engine
+    live would have re-labelled every sandbox trade as live P&L. The Live column
+    must contain live rows and nothing else.
+    """
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    _seed_closed(tj_sess, tjdb, symbol="INDIANB", pnl=-200.0, day="2026-06-30", mode="sandbox")
+    _seed_closed(tj_sess, tjdb, symbol="TATAELXSI", pnl=1000.0, day="2026-07-01", mode="live")
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["closed_trades"] == 2
+    assert perf["sandbox"]["cum_net_pnl"] == 300.0
+    assert perf["live"]["closed_trades"] == 1
+    assert perf["live"]["cum_net_pnl"] == 1000.0
+    # The two buckets partition the book — no row counted twice, none dropped.
+    assert perf["sandbox"]["closed_trades"] + perf["live"]["closed_trades"] == 3
+
+
+def test_legacy_null_mode_rows_resolve_to_sandbox(app, wired_dbs):
+    """Every pre-#568 row carries mode=NULL. The engine ran sandbox for all of
+    that history, so NULL means sandbox — never 'unknown', and never live."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=250.0, day="2026-06-29", mode=None)
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["sandbox"]["cum_net_pnl"] == 250.0
+    # No live rows => the Live column stays absent so the UI renders '—'.
+    assert perf["live"] is None
+
+
+def test_phantom_cleanup_rows_are_not_counted_as_trades(app, wired_dbs):
+    """The 2026-06-11 pytest-pollution tombstones carry pnl=0.0. Counting them
+    scored 28 phantom rows as losses and dragged the reported win rate down."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    for i in range(3):
+        _seed_closed(
+            tj_sess,
+            tjdb,
+            symbol="RELIANCE",
+            pnl=0.0,
+            day=f"2026-06-1{i}",
+            mode="sandbox",
+            reason="phantom_cleanup_pytest_pollution_2026-06-11",
+        )
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["closed_trades"] == 1
+    assert perf["sandbox"]["win_rate_pct"] == 100.0  # not 25.0
+
+
+def test_sandbox_column_carries_realized_metrics(app, wired_dbs):
+    """CAGR/Sharpe/MaxDD were hardcoded '—' in the UI with nothing behind them."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    for i in range(MIN_TRADING_DAYS_SHARPE + 5):
+        day = (dt.date(2026, 6, 1) + dt.timedelta(days=i)).isoformat()
+        _seed_closed(
+            tj_sess,
+            tjdb,
+            symbol=f"SYM{i}",
+            pnl=(300.0 if i % 3 else -150.0),
+            day=day,
+            mode="sandbox",
+        )
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"]
+
+    sb = perf["sandbox"]
+    assert sb["sharpe"] is not None
+    assert sb["max_dd_inr"] is not None
+    assert sb["trading_days"] == MIN_TRADING_DAYS_SHARPE + 5
+    # Short window => CAGR withheld with a stated reason, not extrapolated.
+    assert sb["cagr_pct"] is None
+    assert "CAGR needs" in sb["notes"]
+
+
+def test_backtest_cagr_does_not_fall_back_to_sharpe_daily(app, tmp_path, monkeypatch):
+    """A parity_target with sharpe_daily but no cagr_pct used to render the
+    Sharpe (2.19) as a CAGR of '2.19%' — a wrong number that looks real."""
+    import blueprints.strategies_dashboard_api as sda
+
+    d = tmp_path / "sector_follow_cap5_vol"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config_snapshot.json").write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "deployable": True,
+                "parity_target": {"sharpe_daily": 2.19, "win_rate_pct": 56.3},
+            }
+        )
+    )
+    monkeypatch.setattr(sda, "_STRATEGIES_DIR", tmp_path)
+
+    with app.test_client() as client:
+        _login(client)
+        bt = client.get("/strategies/api/sector_follow_cap5_vol").get_json()["data"]["performance"][
+            "backtest"
+        ]
+
+    assert bt["cagr_pct"] is None, "CAGR must stay blank, not borrow the Sharpe"
+    # sharpe_daily IS a Sharpe, so that row legitimately keeps its fallback.
+    assert bt["sharpe"] == 2.19
+
+
+# ---------------------------------------------------------------------------
+# Gross vs NET reporting (issue #579)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_reports_net_not_gross(app, wired_dbs):
+    """THE regression. `trade_journal.pnl` is GROSS; before #579 the dashboard
+    summed it under a "Net P&L" label. On the real sandbox book that showed
+    +Rs8,740 for trades whose true net was negative — the sign was wrong, not
+    just the magnitude."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    # Two trades, +200 and +150 gross, with 120 of charges each => net +110.
+    for sym, pnl in (("RVNL", 200.0), ("INDIANB", 150.0)):
+        row = _seed_closed(tj_sess, tjdb, symbol=sym, pnl=pnl, day="2026-06-29", mode="sandbox")
+        row.charges_inr = 120.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["gross_pnl_inr"] == 350.0
+    assert sb["charges_inr"] == 240.0
+    assert sb["cum_net_pnl"] == 110.0, "headline must be NET, not the 350 gross"
+
+
+def test_net_can_flip_the_sign_of_a_gross_profit(app, wired_dbs):
+    """Charges were 199% of gross on the real book. A dashboard that cannot show
+    a loss where gross is positive is the bug this issue is about."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    row = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=50.0, day="2026-06-29", mode="sandbox")
+    row.charges_inr = 130.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["gross_pnl_inr"] == 50.0
+    assert sb["cum_net_pnl"] == -80.0
+    # A gross win that is a net loss must NOT count toward the win rate.
+    assert sb["win_rate_pct"] == 0.0
+
+
+def test_headline_equals_sum_of_rendered_trade_rows(app, wired_dbs):
+    """The #552 invariant, ported to this journal: the number in the summary must
+    equal the sum of the per-trade `net_pnl` values the table renders. A
+    pre-#579 test could pin the headline and the rows at different values and
+    still pass, which is exactly how the divergence survived."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    for sym, pnl, ch in (
+        ("RVNL", 500.0, 90.0),
+        ("INDIANB", -300.0, 85.0),
+        ("TATAELXSI", 40.0, 75.0),
+    ):
+        row = _seed_closed(tj_sess, tjdb, symbol=sym, pnl=pnl, day="2026-06-29", mode="sandbox")
+        row.charges_inr = ch
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        data = client.get("/strategies/api/simplified_engine").get_json()["data"]
+
+    headline = data["performance"]["sandbox"]["cum_net_pnl"]
+    rows_total = sum(t["net_pnl"] for t in data["recent_trades"] if t.get("net_pnl") is not None)
+    # (500-90) + (-300-85) + (40-75) = 410 - 385 - 35 = -10
+    assert headline == round(rows_total, 2) == -10.0
+
+
+def test_recent_trades_net_pnl_is_not_an_alias_for_gross(app, wired_dbs):
+    """`net_pnl` used to be `r.pnl` verbatim — a gross number under a net key."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    row = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    row.charges_inr = 90.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        t = client.get("/strategies/api/simplified_engine").get_json()["data"]["recent_trades"][0]
+
+    assert t["gross_pnl"] == 500.0
+    assert t["charges_inr"] == 90.0
+    assert t["net_pnl"] == 410.0
+
+
+def test_uncosted_rows_are_counted_and_fall_back_to_gross(app, wired_dbs):
+    """A closed row with no modelled charge must not blank the aggregate, but the
+    optimism it introduces has to be visible."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    a = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=300.0, day="2026-06-29", mode="sandbox")
+    a.charges_inr = 100.0
+    _seed_closed(tj_sess, tjdb, symbol="INDIANB", pnl=200.0, day="2026-06-30", mode="sandbox")
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/simplified_engine").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["cum_net_pnl"] == 400.0  # 200 net + 200 gross-only
+    assert sb["uncosted_trades"] == 1
+
+
+def test_pnl_curve_is_net(app, wired_dbs):
+    """The curve must agree with the headline, or the page contradicts itself."""
+    _tj_eng, tj_sess, tjdb = wired_dbs["tj"]
+    row = _seed_closed(tj_sess, tjdb, symbol="RVNL", pnl=500.0, day="2026-06-29", mode="sandbox")
+    row.charges_inr = 90.0
+    tj_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        pts = client.get("/strategies/api/simplified_engine/pnl-curve").get_json()["data"]["points"]
+
+    assert [p["pnl"] for p in pts] == [410.0]

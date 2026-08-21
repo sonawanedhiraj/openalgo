@@ -66,25 +66,79 @@ function HealthLed({ health }: { health: StrategyHealth }) {
 // Mode badge
 // ---------------------------------------------------------------------------
 
-function ModeBadge({ mode, deployable }: { mode: string; deployable: boolean }) {
+// mode = the strategy's toggle (strategy_mode row); effectiveRouting = what an
+// order placed RIGHT NOW would do (issue #440: per-strategy dispatch with the
+// Analyze/Live navbar toggle as the platform kill switch). When the toggle
+// says Live but Analyze mode holds routing at sandbox, show that truthfully.
+function ModeBadge({
+  mode,
+  deployable,
+  effectiveRouting,
+}: {
+  mode: string
+  deployable: boolean
+  effectiveRouting?: 'live' | 'sandbox'
+}) {
+  // Issue #561: routing truth FIRST. `deployable` is advisory metadata from a
+  // static JSON file and must never mask what the strategy actually does — it
+  // did exactly that for sector_follow_cap5_vol, which showed "Scaffold" while
+  // placing real CNC orders. A strategy is only shown as a scaffold when it is
+  // genuinely not live.
+  if (mode === 'live') {
+    if (effectiveRouting === 'sandbox')
+      return (
+        <Badge
+          variant="secondary"
+          className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+          title="Toggle is LIVE but orders route to sandbox — Analyze mode is ON (navbar)"
+        >
+          Live (held: Analyze on)
+        </Badge>
+      )
+    return (
+      <Badge
+        className="bg-green-600 text-white hover:bg-green-700"
+        title="Orders route to the REAL broker"
+      >
+        Live
+      </Badge>
+    )
+  }
+  // Not live: a non-deployable strategy is a genuine scaffold.
   if (!deployable || mode.includes('scaffold'))
     return (
       <Badge variant="outline" className="text-muted-foreground">
         Scaffold
       </Badge>
     )
-  if (mode === 'live')
-    return <Badge className="bg-green-600 text-white hover:bg-green-700">Live</Badge>
   if (mode === 'sandbox')
     return (
       <Badge
         variant="secondary"
         className="text-amber-700 bg-amber-100 dark:text-amber-300 dark:bg-amber-900/30"
+        title="Orders route to the sandbox book"
       >
         Sandbox
       </Badge>
     )
   return <Badge variant="outline">{mode}</Badge>
+}
+
+// Issue #561: the static config_snapshot.json disagrees with the strategy_mode
+// row that actually drives dispatch. Show it rather than silently preferring
+// the file — that silence is what kept a live strategy labelled "Scaffold".
+function ConfigConflictNotice({ s }: { s: StrategySummary }) {
+  if (!s.config_conflict) return null
+  return (
+    <div className="rounded-md bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 p-2 flex gap-1.5">
+      <AlertTriangle className="h-3 w-3 text-orange-600 dark:text-orange-400 shrink-0 mt-0.5" />
+      <p className="text-xs text-orange-700 dark:text-orange-300">
+        Routes <strong>LIVE</strong> but <code>config_snapshot.json</code> still declares{' '}
+        {s.config_declared_mode ? <code>{s.config_declared_mode}</code> : 'not deployable'}. The DB
+        row wins for routing — the file is stale.
+      </p>
+    </div>
+  )
 }
 
 // LLM control badge (issue #266 Phase 2) — a compact indicator of the current
@@ -233,9 +287,17 @@ function ModeToggleButton({ s }: { s: StrategySummary }) {
   const queryClient = useQueryClient()
   const [blockers, setBlockers] = useState<string[] | null>(null)
 
-  // Scaffold-only strategies have no LIVE path — disable the toggle entirely.
-  const isScaffold = !s.deployable || s.mode.includes('scaffold')
   const targetMode: 'live' | 'sandbox' = s.mode === 'live' ? 'sandbox' : 'live'
+
+  // Issue #561 — THE load-bearing invariant: a strategy that is LIVE always
+  // gets an off-switch. `deployable` (static JSON) gates the sandbox→live
+  // direction only. Going TO sandbox is the safe direction and preflight
+  // passes it unconditionally, so nothing may block it. Before this, a stale
+  // `deployable: false` disabled the toggle on the one strategy that was
+  // placing real orders, leaving the operator no way to stop it from the UI.
+  const isLive = s.mode === 'live'
+  const noLivePath = !s.deployable || s.mode.includes('scaffold')
+  const toggleDisabled = !isLive && noLivePath
 
   const flip = useMutation({
     mutationFn: () => strategiesDashboardApi.flipMode(s.name, targetMode),
@@ -259,7 +321,7 @@ function ModeToggleButton({ s }: { s: StrategySummary }) {
   })
 
   const handleClick = () => {
-    if (isScaffold) return
+    if (toggleDisabled) return
     // Light confirm for the LIVE direction only; sandbox is always safe.
     if (targetMode === 'live') {
       const ok = window.confirm(
@@ -274,7 +336,7 @@ function ModeToggleButton({ s }: { s: StrategySummary }) {
     flip.mutate()
   }
 
-  if (isScaffold) {
+  if (toggleDisabled) {
     return (
       <Button
         variant="ghost"
@@ -292,7 +354,7 @@ function ModeToggleButton({ s }: { s: StrategySummary }) {
   return (
     <div className="space-y-1.5">
       <Button
-        variant={targetMode === 'live' ? 'default' : 'outline'}
+        variant={targetMode === 'live' ? 'default' : 'destructive'}
         size="sm"
         className="w-full text-xs"
         onClick={handleClick}
@@ -343,7 +405,11 @@ function StrategyCard({ s }: { s: StrategySummary }) {
           </div>
           <div className="flex items-center gap-1.5">
             <LLMBadge llmMode={s.llm_mode} />
-            <ModeBadge mode={s.mode} deployable={s.deployable} />
+            <ModeBadge
+              mode={s.mode}
+              deployable={s.deployable}
+              effectiveRouting={s.effective_routing}
+            />
           </div>
         </div>
         <p className="text-xs text-muted-foreground font-mono">
@@ -395,6 +461,10 @@ function StrategyCard({ s }: { s: StrategySummary }) {
             })}
           </p>
         )}
+
+        {/* Stale-config warning (issue #561) — shown when the static
+            config_snapshot.json contradicts the strategy_mode row. */}
+        <ConfigConflictNotice s={s} />
 
         {/* Mode flip toggle (issue #162) — gated by server-side preflight.
             On block, the blockers list is rendered below the button so the

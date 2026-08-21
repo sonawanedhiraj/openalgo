@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import re
 import threading
 import time as time_module
 import uuid
@@ -1008,6 +1009,16 @@ def simplified_stock_engine_webhook(webhook_id):
             )
             return jsonify({"status": "error", "error": "No data received"}), 400
 
+        # Issue #447: the in-house ScanHitPoster echoes scanner hits into this
+        # same webhook. Those invocations must NOT be audited as Chartink
+        # cycles — the EOD scanner-vs-Chartink comparison and the #321
+        # miss-debug set both read cycle_kind='chartink' as "what Chartink
+        # said", and the echoes made the comparison self-referential. The
+        # poster tags its payloads with source='inhouse_scanner'; reclassify
+        # the audit row at completion. Engine processing is unaffected.
+        is_inhouse_echo = str(data.get("source") or "").strip().lower() == "inhouse_scanner"
+        cycle_kind_override = "inhouse_echo" if is_inhouse_echo else None
+
         if strategy.is_intraday:
             current_time = datetime.now(pytz.timezone("Asia/Kolkata")).time()
             start_time = datetime.strptime(strategy.start_time, "%H:%M").time()
@@ -1016,7 +1027,9 @@ def simplified_stock_engine_webhook(webhook_id):
 
             if current_time < start_time:
                 scan_cycle_service.heartbeat(cycle_id, "preflight", "skipped", "before start_time")
-                scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
+                scan_cycle_service.complete_cycle(
+                    cycle_id, post_status="skipped", cycle_kind=cycle_kind_override
+                )
                 return jsonify(
                     {"status": "error", "error": "Cannot arm engine before start time"}
                 ), 400
@@ -1024,13 +1037,17 @@ def simplified_stock_engine_webhook(webhook_id):
                 scan_cycle_service.heartbeat(
                     cycle_id, "preflight", "skipped", "after squareoff_time"
                 )
-                scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
+                scan_cycle_service.complete_cycle(
+                    cycle_id, post_status="skipped", cycle_kind=cycle_kind_override
+                )
                 return jsonify(
                     {"status": "error", "error": "Cannot arm engine after square off time"}
                 ), 400
             if current_time >= end_time:
                 scan_cycle_service.heartbeat(cycle_id, "preflight", "skipped", "after end_time")
-                scan_cycle_service.complete_cycle(cycle_id, post_status="skipped")
+                scan_cycle_service.complete_cycle(
+                    cycle_id, post_status="skipped", cycle_kind=cycle_kind_override
+                )
                 return jsonify(
                     {"status": "error", "error": "Cannot arm new entries after end time"}
                 ), 400
@@ -1044,8 +1061,13 @@ def simplified_stock_engine_webhook(webhook_id):
         # Default to BUY when scan_name is absent (backward compat with older
         # scans that omit it). Engine processing is unaffected by this — the
         # engine derives direction from its own logic.
+        # Issue #447: tokenize on non-alphabetic characters, not whitespace —
+        # a whitespace .split() left 'fno_intraday_sell_20' as ONE token, so
+        # SELL echoes were audited into screener_buy. SELL/SHORT/COVER mirror
+        # the engine's own _infer_direction so audit and arming can't diverge.
         scan_name = (data.get("scan_name") or "").strip()
-        is_sell_leg = "SELL" in scan_name.upper().split()
+        scan_name_tokens = set(re.split(r"[^A-Z]+", scan_name.upper()))
+        is_sell_leg = bool(scan_name_tokens & {"SELL", "SHORT", "COVER"})
         scan_stage = "scan_sell" if is_sell_leg else "scan_buy"
 
         # Parse symbols up-front for the audit. parse_chartink_symbols is the
@@ -1061,15 +1083,15 @@ def simplified_stock_engine_webhook(webhook_id):
             syms = []
         scan_cycle_service.heartbeat(cycle_id, scan_stage, "ok", f"{len(syms)} syms")
 
-        # Capture today's effective mode for the audit. Best-effort — if the
-        # resolver throws (e.g. DailyIntent table missing on an old install),
-        # we record None and continue. Order placement is unchanged by this.
+        # Capture the engine's effective order routing for the audit —
+        # per-strategy dispatch (issue #440). Best-effort: on resolver failure
+        # record None and continue. Order placement is unchanged by this.
         try:
-            from services.mode_service import resolve_effective_mode
+            from services.mode_service import resolve_order_mode
 
-            effective_mode = resolve_effective_mode().value
+            effective_mode = resolve_order_mode("simplified_engine").value
         except Exception as e:
-            logger.warning("resolve_effective_mode failed (non-fatal): %s", e)
+            logger.warning("resolve_order_mode failed (non-fatal): %s", e)
             effective_mode = None
 
         from services.simplified_stock_engine_service import (
@@ -1106,6 +1128,7 @@ def simplified_stock_engine_webhook(webhook_id):
             screener_sell=syms if is_sell_leg else [],
             engine_response=result,
             effective_mode=effective_mode,
+            cycle_kind=cycle_kind_override,
         )
         return jsonify(result), status_code
 

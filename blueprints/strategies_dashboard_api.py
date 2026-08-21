@@ -54,8 +54,9 @@ from database.sector_follow_db import db_session as sf_session
 from database.strategy_mode_db import StrategyMode
 from database.strategy_mode_db import db_session as mode_session
 from database.strategy_runtime_override_db import db_session as override_session
-from database.trade_journal_db import TradeJournal
+from database.trade_journal_db import TradeJournal, mode_of_row, net_pnl_of_row
 from database.trade_journal_db import db_session as tj_session
+from services.strategy_performance_metrics import compute_realized_metrics
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -78,6 +79,10 @@ _STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"
 # "simplified_engine" strategy that has no journal rows → 0 positions / 0 P&L.
 _SIMPLIFIED_ENGINE_FOLDER = "simplified_engine"
 _SIMPLIFIED_ENGINE_JOURNAL_NAME = "trending_equity_intraday"
+
+# trade_journal.direction is 'LONG' | 'SHORT' (database/trade_journal_db.py) —
+# unlike open15, which stores 'L' | 'S'. Anything else buckets into neither side.
+_SIMPLIFIED_ENGINE_SIDE_KEY = {"LONG": "long", "SHORT": "short"}
 
 # Strategies to surface (read from filesystem, filtered below).
 # trending_equity_intraday is the journal-name twin of the simplified_engine folder
@@ -224,6 +229,8 @@ def _get_strategy_mode(name: str) -> str:
 # sector_follow still has no veto call, so its decisions view is empty by
 # construction. The UI notes this rather than faking rows.
 _FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
+_INTRADAY_PULLBACK_FOLDER = "intraday_pullback_top2"
+_SECTOR_FOLLOW_FOLDER = "sector_follow_cap5_vol"
 _VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
 # Map a dashboard strategy name → the signal_decision source filters its veto
@@ -443,22 +450,42 @@ def _sector_follow_stats(since: datetime | None = None) -> dict:
             t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
         ]
         placed = [t for t in trades if (t.status or "") == "placed"]
-        net_qty_by_symbol: dict[str, int] = {}
+        # Issue #562: net WITHIN each mode. Sandbox and live positions are not
+        # the same kind of thing and must never be summed into one number — the
+        # #552 convention. Before this, the card blended 12 sandbox positions
+        # with 7 live ones into a single "Open 10", which is what made a live
+        # book impossible to read off the dashboard.
+        net_by_mode: dict[str, dict[str, int]] = {}
         for t in placed:
             sign = 1 if t.side == "BUY" else -1
-            net_qty_by_symbol[t.symbol] = net_qty_by_symbol.get(t.symbol, 0) + sign * int(
-                t.quantity or 0
-            )
-        open_count = sum(1 for qty in net_qty_by_symbol.values() if qty > 0)
+            bucket = net_by_mode.setdefault((t.mode or "sandbox").lower(), {})
+            bucket[t.symbol] = bucket.get(t.symbol, 0) + sign * int(t.quantity or 0)
+        open_by_mode = {
+            mode: sum(1 for qty in symbols.values() if qty > 0)
+            for mode, symbols in net_by_mode.items()
+        }
+        # The headline number is the book the strategy would trade RIGHT NOW,
+        # so it answers "what am I exposed to?" rather than "what has this
+        # journal ever contained". The per-mode split rides alongside it.
+        current_mode = _get_strategy_mode(_SECTOR_FOLLOW_FOLDER)
+        open_count = open_by_mode.get(current_mode, 0)
         last = max((t.created_at for t in trades), default=None)
         return {
             "open_positions": open_count,
+            "open_positions_by_mode": open_by_mode,
+            "open_positions_mode": current_mode,
             "last_trade_at": last.isoformat() if last else None,
             "today_trade_count": len(today_entries) + len(today_exits),
         }
     except Exception:
         logger.exception("Failed to aggregate sector_follow_stats")
-        return {"open_positions": 0, "last_trade_at": None, "today_trade_count": 0}
+        return {
+            "open_positions": 0,
+            "open_positions_by_mode": {},
+            "open_positions_mode": None,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
 
 
 def _lot_size_from_rows(rows: list) -> int:
@@ -572,7 +599,8 @@ def _simplified_engine_stats() -> dict:
             exited = r.exited_at or ""
             if exited.startswith(today_str):
                 if r.pnl is not None:
-                    today_pnl += float(r.pnl)
+                    # NET, never gross (issue #579) — `pnl` excludes charges.
+                    today_pnl += net_pnl_of_row(r) or 0.0
                 else:
                     # Closed today but never priced (e.g. a watchdog exit whose
                     # fill wasn't reconciled yet — issue #350). Surfaced so ₹X
@@ -647,13 +675,31 @@ def _futures_follow_lifetime() -> dict[str, dict]:
     return out
 
 
-def _simplified_engine_lifetime() -> dict:
-    """Since-inception realized P&L + win-rate from the simplified engine's closed
-    ``trade_journal`` rows (``exited_at`` + ``pnl`` present).
+def _simplified_engine_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized stats for the simplified
+    engine's closed ``trade_journal`` rows (``exited_at`` + ``pnl`` present).
 
-    ``trade_journal`` has no mode column, so the caller attributes this to the
-    strategy's current resolved mode (the engine is sandbox by default).
+    Splitting on the row's own ``mode`` column (issue #568) is what keeps the
+    Live column honest. Previously ``trade_journal`` had no mode and the caller
+    attributed the WHOLE journal to whatever mode the strategy sat in today — so
+    flipping the engine live would have silently re-labelled 235 sandbox trades
+    as live performance. Rows written before the column exists resolve to
+    ``sandbox`` via ``mode_of_row``.
+
+    Carries ``long``/``short`` sub-aggregates keyed off the journal's
+    ``direction`` column (issue #494) — the two sides of this strategy diverge
+    sharply, which the blended headline hides — plus realized CAGR / Sharpe /
+    Max DD per mode (issue #568).
     """
+    empty = {
+        **_lifetime_from_pnls([]),
+        **_side_split({}),
+        **_simplified_engine_metrics([]),
+        "gross_pnl_inr": None,
+        "charges_inr": None,
+        "uncosted_trades": 0,
+    }
+    out: dict[str, dict] = {"sandbox": dict(empty), "live": dict(empty)}
     try:
         rows = (
             tj_session.query(TradeJournal)
@@ -664,10 +710,419 @@ def _simplified_engine_lifetime() -> dict:
             )
             .all()
         )
-        return _lifetime_from_pnls([float(r.pnl) for r in rows])
+        buckets: dict[str, list] = {"sandbox": [], "live": []}
+        for r in rows:
+            if _is_non_trade_row(r):
+                continue
+            bucket = buckets.get(mode_of_row(r))
+            if bucket is not None:
+                bucket.append(r)
+
+        for mode_key, mode_rows in buckets.items():
+            # Every aggregate below is NET of modelled charges (issue #579).
+            # Summing `pnl` here reported +Rs8,740 on trades whose true net was
+            # -Rs8,645 — a profitable-looking strategy that was losing money.
+            pnls = [net_pnl_of_row(r) or 0.0 for r in mode_rows]
+            sides: dict[str, list[float]] = {"long": [], "short": []}
+            for r in mode_rows:
+                side_key = _SIMPLIFIED_ENGINE_SIDE_KEY.get((r.direction or "").upper())
+                if side_key:
+                    sides[side_key].append(net_pnl_of_row(r) or 0.0)
+            out[mode_key] = {
+                **_lifetime_from_pnls(pnls),
+                **_side_split(sides),
+                **_simplified_engine_metrics(mode_rows),
+                # The decomposition behind `cum_net_pnl`, surfaced so the page
+                # can never again imply a gross number is net (issue #579).
+                "gross_pnl_inr": round(sum(float(r.pnl) for r in mode_rows), 2)
+                if mode_rows
+                else None,
+                "charges_inr": round(sum(float(r.charges_inr or 0.0) for r in mode_rows), 2)
+                if mode_rows
+                else None,
+                "uncosted_trades": sum(1 for r in mode_rows if r.charges_inr is None),
+            }
+        return out
     except Exception:
         logger.exception("Failed to aggregate simplified_engine lifetime stats")
-        return _lifetime_from_pnls([])
+        return out
+
+
+#: Exit reasons marking rows that are NOT trades — data-repair tombstones left by
+#: the 2026-06-11 pytest-pollution cleanup. They carry ``pnl=0.0``, so counting
+#: them scores 28 phantom rows as losses and drags the reported win rate down
+#: (issue #568). Matched by prefix so a future cleanup tag is excluded too.
+_NON_TRADE_EXIT_PREFIXES = ("phantom_cleanup",)
+
+
+def _is_non_trade_row(row) -> bool:
+    return str(row.exit_reason or "").startswith(_NON_TRADE_EXIT_PREFIXES)
+
+
+def _simplified_engine_metrics(rows: list) -> dict:
+    """Realized CAGR / Sharpe / Max DD for a set of closed journal rows.
+
+    The capital basis is read from the strategy's own ``config_snapshot.json``
+    so it tracks the declared config instead of being duplicated here. It is
+    flagged ``notional`` because R56 is explicit that the engine's ₹20,000 is a
+    per-trade risk-sizing base rather than a compounding book — the maths is
+    still run (operator's call), but the caveat rides along to the UI instead of
+    being silently dropped.
+    """
+    daily: list[tuple[date, float]] = []
+    for r in rows:
+        day = _ist_date_of(r.exited_at or r.placed_at)
+        if day is not None:
+            # NET series — Sharpe / Max DD / window return must be costed
+            # (issue #579), otherwise every risk metric is optimistic.
+            daily.append((day, net_pnl_of_row(r) or 0.0))
+
+    capital = None
+    try:
+        capital = float(
+            (_load_config_snapshot(_SIMPLIFIED_ENGINE_FOLDER).get("config") or {}).get("capital")
+            or 0
+        )
+    except Exception:
+        logger.exception("simplified_engine: could not read capital basis from config_snapshot")
+
+    return compute_realized_metrics(
+        daily,
+        capital_inr=capital,
+        capital_is_notional=True,
+    )
+
+
+def _ist_date_of(ts: str | None) -> date | None:
+    """Calendar (IST) date of an ISO journal timestamp, or None if unparseable.
+
+    Journal timestamps are written with an explicit +05:30 offset, so the date
+    component is already IST and is taken directly — no tz conversion that could
+    shift a 15:2x exit onto the previous day.
+    """
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts)).date()
+    except Exception:
+        return None
+
+
+def _open15_net_pnl(row) -> float:
+    """Net P&L for a closed ``open15_trades`` row.
+
+    The journal ``pnl`` is gross (trigger price -> exit price); the modelled MIS
+    round-trip charges live separately in ``charges_inr`` (issue #433). Deduct
+    them when stamped — same convention as the Recent Trades table's ``net_pnl``.
+
+    Delegates to the journal's own helper so this file cannot drift from it
+    again (issue #552): a local copy here is exactly how the logs page ended up
+    reporting gross while this dashboard reported net.
+    """
+    from database.open15_breakout_db import net_pnl_of_row
+
+    return net_pnl_of_row(row)
+
+
+def _open15_stats() -> dict:
+    """Today's open positions, realized net P&L, trade count, and last trade
+    time from ``open15_trades`` (issue #442).
+
+    The strategy is intraday (entry and its 09:30 flatten share ``trade_date``),
+    so "today" keys directly off ``trade_date``. ``observe``-mode rows are
+    journal-only dry runs (no orders placed) and are excluded so they can't
+    inflate the book. ``created_at`` is naive UTC (``datetime.utcnow`` default),
+    which is exactly the card's ``last_trade_at`` contract (issue #317).
+    """
+    try:
+        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import db_session as o15_session
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        rows = (
+            o15_session.query(Open15Trade).filter(Open15Trade.mode.in_(("sandbox", "live"))).all()
+        )
+        open_count = 0
+        today_trade_count = 0
+        today_pnl = 0.0
+        today_unpriced_exits = 0
+        last_at: datetime | None = None
+        for r in rows:
+            if (r.status or "") == "open":
+                open_count += 1
+            if r.created_at is not None and (last_at is None or r.created_at > last_at):
+                last_at = r.created_at
+            if r.trade_date != today_str:
+                continue
+            today_trade_count += 1
+            if (r.status or "") == "closed":
+                if r.pnl is not None:
+                    today_pnl += _open15_net_pnl(r)
+                else:
+                    # Closed but never priced (e.g. exit tick unavailable at
+                    # flatten) — surfaced so ₹X with N unpriced trades can't
+                    # masquerade as a complete ₹X (same contract as #350).
+                    today_unpriced_exits += 1
+        return {
+            "open_positions": open_count,
+            "today_net_pnl": round(today_pnl, 2),
+            "today_unpriced_exits": today_unpriced_exits,
+            "last_trade_at": last_at.isoformat() if last_at else None,
+            "today_trade_count": today_trade_count,
+        }
+    except Exception:
+        logger.exception("Failed to aggregate open15 stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
+
+
+_OPEN15_SIDE_KEY = {"L": "long", "S": "short"}
+
+
+def _side_split(pnls_by_side: dict[str, list[float]]) -> dict[str, dict]:
+    """Long/short sub-aggregates for the performance table (issue #458).
+
+    Uniform shape across all three columns: ``{n_trades, wins, win_rate_pct,
+    net_pnl_inr}``. A side with no closed trades keeps ``n_trades=0`` and
+    ``None`` stats so the UI renders '—' rather than a misleading 0%.
+    """
+    out: dict[str, dict] = {}
+    for key in ("long", "short"):
+        pnls = pnls_by_side.get(key) or []
+        n = len(pnls)
+        wins = sum(1 for p in pnls if p > 0)
+        out[key] = {
+            "n_trades": n,
+            "wins": wins,
+            "win_rate_pct": round(100.0 * wins / n, 1) if n else None,
+            "net_pnl_inr": round(sum(pnls), 2) if n else None,
+        }
+    return out
+
+
+def _open15_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized net P&L + win-rate from
+    closed ``open15_trades`` rows (issue #442).
+
+    Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
+    columns honest once the strategy is flipped live — sandbox history never
+    leaks into the live column and vice-versa (futures_follow precedent).
+    ``observe`` rows fall outside both buckets by construction. Each mode also
+    carries ``long``/``short`` sub-aggregates keyed off the journal's ``side``
+    column (issue #458).
+    """
+    out = {
+        "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
+        "live": {**_lifetime_from_pnls([]), **_side_split({})},
+    }
+    try:
+        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import db_session as o15_session
+
+        rows = (
+            o15_session.query(Open15Trade)
+            .filter(Open15Trade.status == "closed", Open15Trade.pnl.isnot(None))
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        sides: dict[str, dict[str, list[float]]] = {
+            "sandbox": {"long": [], "short": []},
+            "live": {"long": [], "short": []},
+        }
+        for r in rows:
+            m = (r.mode or "").lower()
+            if m not in buckets:
+                continue
+            pnl = _open15_net_pnl(r)
+            buckets[m].append(pnl)
+            side_key = _OPEN15_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[m][side_key].append(pnl)
+        out = {m: {**_lifetime_from_pnls(p), **_side_split(sides[m])} for m, p in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate open15 lifetime stats")
+    return out
+
+
+def _open15_opt_shadow() -> dict[str, dict | None]:
+    """Per-mode (sandbox|live) aggregate of the 1-lot ATM option shadow (#435).
+
+    Closed stock-instrument rows carry ``opt_pnl`` (net of modelled option
+    charges, 1 lot). Option-MODE rows are excluded — their real fills already
+    ARE the mode's P&L, not a shadow. Returns ``None`` for a mode with no
+    priced shadow rows so the UI renders '—' instead of a misleading 0.
+    """
+    out: dict[str, dict | None] = {"sandbox": None, "live": None}
+    try:
+        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import db_session as o15_session
+
+        rows = (
+            o15_session.query(Open15Trade)
+            .filter(Open15Trade.status == "closed", Open15Trade.opt_pnl.isnot(None))
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        sides: dict[str, dict[str, list[float]]] = {
+            "sandbox": {"long": [], "short": []},
+            "live": {"long": [], "short": []},
+        }
+        for r in rows:
+            if r.instrument not in (None, "stock"):
+                continue
+            m = (r.mode or "").lower()
+            if m not in buckets:
+                continue
+            pnl = float(r.opt_pnl)
+            buckets[m].append(pnl)
+            side_key = _OPEN15_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[m][side_key].append(pnl)
+        for m, pnls in buckets.items():
+            if pnls:
+                wins = sum(1 for p in pnls if p > 0)
+                out[m] = {
+                    "n_trades": len(pnls),
+                    "win_rate_pct": round(100.0 * wins / len(pnls), 1),
+                    "net_pnl_inr": round(sum(pnls), 2),
+                    "basis": "1-lot ATM shadow",
+                    **_side_split(sides[m]),
+                }
+    except Exception:
+        logger.exception("Failed to aggregate open15 option shadow")
+    return out
+
+
+_INTRADAY_PULLBACK_SIDE_KEY = {"L": "long", "S": "short"}
+
+
+def _intraday_pullback_net_pnl(row) -> float | None:
+    """Net P&L for a closed ``intraday_pullback_trades`` row.
+
+    Unlike ``open15_trades`` (gross ``pnl`` + separate ``charges_inr``), this
+    journal stamps ``net_pnl`` directly. Fall back to ``gross_pnl - charges_inr``
+    only when the net column was never stamped, and return ``None`` when neither
+    is available so the caller can count it as an unpriced exit rather than
+    silently booking a ₹0 trade (issue #350 contract).
+    """
+    if row.net_pnl is not None:
+        return float(row.net_pnl)
+    if row.gross_pnl is not None:
+        return float(row.gross_pnl) - float(row.charges_inr or 0.0)
+    return None
+
+
+def _intraday_pullback_stats() -> dict:
+    """Today's open positions, realized net P&L, trade count, and last trade time
+    from ``intraday_pullback_trades`` (issue #508).
+
+    The strategy is intraday (entry and its 15:15 flatten share ``trade_date``),
+    so "today" keys directly off ``trade_date``. ``observe``-mode rows are
+    journal-only dry runs (no orders placed) and are excluded so they can't
+    inflate the book — same contract as open15. ``created_at`` is naive UTC
+    (``datetime.utcnow`` default), which is exactly the card's ``last_trade_at``
+    contract (issue #317).
+    """
+    try:
+        from database.intraday_pullback_db import IntradayPullbackTrade
+        from database.intraday_pullback_db import db_session as ip_session
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        rows = (
+            ip_session.query(IntradayPullbackTrade)
+            .filter(IntradayPullbackTrade.mode.in_(("sandbox", "live")))
+            .all()
+        )
+        open_count = 0
+        today_trade_count = 0
+        today_pnl = 0.0
+        today_unpriced_exits = 0
+        last_at: datetime | None = None
+        for r in rows:
+            if (r.status or "") == "open":
+                open_count += 1
+            if r.created_at is not None and (last_at is None or r.created_at > last_at):
+                last_at = r.created_at
+            if r.trade_date != today_str:
+                continue
+            today_trade_count += 1
+            if (r.status or "") == "closed":
+                pnl = _intraday_pullback_net_pnl(r)
+                if pnl is not None:
+                    today_pnl += pnl
+                else:
+                    today_unpriced_exits += 1
+        return {
+            "open_positions": open_count,
+            "today_net_pnl": round(today_pnl, 2),
+            "today_unpriced_exits": today_unpriced_exits,
+            "last_trade_at": last_at.isoformat() if last_at else None,
+            "today_trade_count": today_trade_count,
+        }
+    except Exception:
+        logger.exception("Failed to aggregate intraday_pullback stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
+
+
+def _intraday_pullback_lifetime() -> dict[str, dict]:
+    """Per-mode (sandbox|live) since-inception realized net P&L + win-rate from
+    closed ``intraday_pullback_trades`` rows (issue #508).
+
+    Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
+    columns honest once the strategy is flipped live — sandbox history never
+    leaks into the live column and vice-versa (futures_follow / open15
+    precedent). ``observe`` rows fall outside both buckets by construction.
+
+    Each mode also carries ``long``/``short`` sub-aggregates keyed off the
+    journal's ``side`` column (``L``/``S``). The split matters here more than
+    elsewhere: the two books are mutually exclusive by day gate (NIFTY up →
+    long, NIFTY down → short) and the deep-loser short is the unvalidated,
+    slippage-fragile leg — a blended headline hides which book is working.
+    """
+    out = {
+        "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
+        "live": {**_lifetime_from_pnls([]), **_side_split({})},
+    }
+    try:
+        from database.intraday_pullback_db import IntradayPullbackTrade
+        from database.intraday_pullback_db import db_session as ip_session
+
+        rows = (
+            ip_session.query(IntradayPullbackTrade)
+            .filter(IntradayPullbackTrade.status == "closed")
+            .all()
+        )
+        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        sides: dict[str, dict[str, list[float]]] = {
+            "sandbox": {"long": [], "short": []},
+            "live": {"long": [], "short": []},
+        }
+        for r in rows:
+            m = (r.mode or "").lower()
+            if m not in buckets:
+                continue
+            pnl = _intraday_pullback_net_pnl(r)
+            if pnl is None:
+                continue
+            buckets[m].append(pnl)
+            side_key = _INTRADAY_PULLBACK_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[m][side_key].append(pnl)
+        out = {m: {**_lifetime_from_pnls(p), **_side_split(sides[m])} for m, p in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate intraday_pullback lifetime stats")
+    return out
 
 
 def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
@@ -690,7 +1145,8 @@ def _pnl_curve_simplified_engine(window_days: int | None) -> list[dict]:
             d = (r.exited_at or "")[:10]
             if not d:
                 continue
-            by_date[d] = by_date.get(d, 0.0) + float(r.pnl or 0.0)
+            # NET (issue #579) — the curve must agree with the headline P&L.
+            by_date[d] = by_date.get(d, 0.0) + (net_pnl_of_row(r) or 0.0)
         return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
     except Exception:
         logger.exception("Failed to build pnl_curve for simplified_engine")
@@ -741,15 +1197,55 @@ def _pnl_curve_futures_follow(window_days: int | None) -> list[dict]:
         return []
 
 
+def _pnl_curve_intraday_pullback(window_days: int | None) -> list[dict]:
+    """Daily realized-net-P&L series from ``intraday_pullback_trades`` (#508).
+
+    The strategy is intraday — entry and its 15:15 flatten share ``trade_date``
+    — so the realization date IS ``trade_date``, and no created_at/entry_date
+    reconciliation (the futures_follow T+1 problem) applies. ``observe`` rows
+    are excluded to match the card's stats.
+    """
+    try:
+        from database.intraday_pullback_db import IntradayPullbackTrade
+        from database.intraday_pullback_db import db_session as ip_session
+
+        q = ip_session.query(IntradayPullbackTrade).filter(
+            IntradayPullbackTrade.status == "closed",
+            IntradayPullbackTrade.mode.in_(("sandbox", "live")),
+        )
+        if window_days:
+            cutoff = datetime.utcnow() - timedelta(days=window_days)
+            q = q.filter(IntradayPullbackTrade.created_at >= cutoff)
+        rows = q.order_by(IntradayPullbackTrade.created_at).all()
+        by_date: dict[str, float] = {}
+        for r in rows:
+            pnl = _intraday_pullback_net_pnl(r)
+            if pnl is None:
+                continue
+            by_date[r.trade_date] = by_date.get(r.trade_date, 0.0) + pnl
+        return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
+    except Exception:
+        logger.exception("Failed to build pnl_curve for intraday_pullback")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Health LED
 # ---------------------------------------------------------------------------
 
 
-def _health_led(name: str, overrides: list[dict], config: dict) -> str:
-    """Return 'healthy' | 'paused' | 'scaffold' | 'unknown'."""
+def _health_led(name: str, overrides: list[dict], config: dict, is_live: bool = False) -> str:
+    """Return 'healthy' | 'paused' | 'scaffold' | 'unknown'.
+
+    ``is_live`` is the resolved routing from the ``strategy_mode`` row. It wins
+    over the static ``config_snapshot.json`` (issue #561): a strategy that is
+    actually routing orders to the real broker is never a "scaffold", whatever
+    a stale JSON file claims. Defaults False so existing callers are unchanged.
+    """
     if any(o["type"] in ("pause", "kill_switch") for o in overrides):
         return "paused"
+    if is_live:
+        return "healthy"
     mode_val = config.get("mode", "")
     if "scaffold" in str(mode_val).lower():
         return "scaffold"
@@ -818,22 +1314,62 @@ def _build_summary(name: str) -> dict:
         stats = _futures_follow_stats()
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
+    elif name == "open15_vol_breakout":
+        stats = _open15_stats()
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        stats = _intraday_pullback_stats()
+
+    # Effective order routing RIGHT NOW (issue #440): the per-strategy
+    # dispatch verdict an order would get — 'live' only when the navbar is on
+    # Live AND this strategy's row says live. Lets the UI show routing truth
+    # next to the toggle (e.g. "live" toggle but "sandbox (Analyze on)").
+    try:
+        from services.mode_service import resolve_order_mode
+
+        effective_routing = resolve_order_mode(name).value
+    except Exception:
+        logger.exception("resolve_order_mode failed for %s", name)
+        effective_routing = "sandbox"
+
+    # Issue #561: `deployable` comes from the STATIC config_snapshot.json and is
+    # advisory metadata only — it gates the sandbox→live direction, never the
+    # live→sandbox one, and it must never decide what routing the card DISPLAYS.
+    # sector_follow_cap5_vol shipped `deployable: false, mode: "scaffold-only"`
+    # in June and kept it while the strategy routed live to Zerodha from
+    # 2026-07-29; the card rendered "Scaffold" with no off-switch because the UI
+    # trusted this file over the strategy_mode row that actually drives dispatch.
+    # `config_conflict` names that disagreement so the UI can show it instead of
+    # silently preferring the JSON.
+    deployable = bool(config.get("deployable", False))
+    config_declared_mode = config.get("mode")
+    config_conflict = bool(
+        (mode_val == "live" or effective_routing == "live")
+        and (not deployable or "scaffold" in str(config_declared_mode or "").lower())
+    )
 
     return {
         "name": name,
         "display_name": name.replace("_", " ").title(),
         "mode": mode_val,
+        "effective_routing": effective_routing,
         "llm_mode": _get_llm_mode(name),
         "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
-        "deployable": config.get("deployable", False),
+        "deployable": deployable,
+        "config_declared_mode": config_declared_mode,
+        "config_conflict": config_conflict,
         "version": config.get("version", "—"),
         "open_positions": stats.get("open_positions", 0),
+        # Issue #562: sandbox and live position counts are reported separately —
+        # never summed (the #552 convention). Absent for strategies that do not
+        # yet split, so the UI falls back to the single headline number.
+        "open_positions_by_mode": stats.get("open_positions_by_mode"),
+        "open_positions_mode": stats.get("open_positions_mode"),
         "today_net_pnl": stats.get("today_net_pnl", None),
         "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
         "today_trade_count": stats.get("today_trade_count", 0),
         "last_trade_at": stats.get("last_trade_at"),
         "active_overrides": overrides,
-        "health": _health_led(name, overrides, config),
+        "health": _health_led(name, overrides, config, is_live=(mode_val == "live")),
     }
 
 
@@ -871,16 +1407,48 @@ def strategy_detail(name: str):
     version_log = _load_version_log(name)
     backtest_refs = _list_backtest_refs(name)
 
-    # 3-column performance data
-    parity = config.get("parity_target", {})
+    # 3-column performance data.
+    # NB: `or {}` (not a .get default) — a config_snapshot with an explicit
+    # `"parity_target": null` returns None from .get and crashed the endpoint
+    # with AttributeError (open15_vol_breakout, 2026-07-20).
+    parity = config.get("parity_target") or {}
+    # Optional instrument-variant sub-object (issue #455): a backtest that also
+    # priced the ATM-option leg records it under parity_target.options_variant;
+    # normalized here so the UI's paired stock/options cells can render it.
+    opt_variant = parity.get("options_variant") or {}
+    bt_options = (
+        {
+            "n_trades": opt_variant.get("n_trades"),
+            "win_rate_pct": opt_variant.get("win_rate_pct"),
+            "net_pnl_inr": opt_variant.get("net_pnl_inr"),
+            "max_dd_pct": opt_variant.get("max_dd_pct"),
+            "basis": "fit-to-capital lots",
+            # Optional long/short sub-aggregates (issue #458) — pass-through
+            # from the config snapshot; absent for strategies without a split.
+            "long": opt_variant.get("long"),
+            "short": opt_variant.get("short"),
+        }
+        if opt_variant
+        else None
+    )
     performance = {
         "backtest": {
-            "cagr_pct": parity.get("cagr_pct") or parity.get("sharpe_daily"),
+            # NB: `cagr_pct` must NOT fall back to `sharpe_daily` (issue #568).
+            # It used to, which rendered sector_follow_cap5_vol's Sharpe of 2.19
+            # as a CAGR of "2.19%" — a wrong number that looks real, which is
+            # worse than the '—' an honestly-absent metric produces. `sharpe`
+            # keeps its fallback: sharpe_daily IS a Sharpe, just a daily-series
+            # one, so it belongs in that row.
+            "cagr_pct": parity.get("cagr_pct"),
             "sharpe": parity.get("sharpe") or parity.get("sharpe_daily"),
             "max_dd_pct": parity.get("max_dd_pct"),
             "win_rate_pct": parity.get("win_rate_pct"),
             "n_trades": parity.get("n_trades_window") or parity.get("n_trades"),
+            "net_pnl_inr": parity.get("net_pnl_inr"),
             "window": parity.get("window"),
+            "options": bt_options,
+            "long": parity.get("long"),
+            "short": parity.get("short"),
         },
         "sandbox": None,
         "live": None,
@@ -913,16 +1481,48 @@ def strategy_detail(name: str):
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
         lifetime = _simplified_engine_lifetime()
-        perf = {
+        # Per-mode split off the journal's own `mode` column (issue #568) — the
+        # Live column is populated only by genuinely-live rows, so flipping the
+        # strategy live no longer re-labels its sandbox history as live P&L.
+        # Today's open/P&L counters remain whole-journal and are attached to the
+        # currently-routing mode, which is the only one that can still change.
+        current = "live" if mode_val == "live" else "sandbox"
+        performance["sandbox"] = {**lifetime["sandbox"]}
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
+        performance[current] = {
+            **(performance[current] or lifetime[current]),
             "open_positions": stats["open_positions"],
             "today_net_pnl": stats["today_net_pnl"],
             "today_unpriced_exits": stats.get("today_unpriced_exits", 0),
             "last_trade_at": stats["last_trade_at"],
-            **lifetime,
         }
-        # trade_journal carries no mode column, so attribute the whole view to the
-        # strategy's current resolved mode (sandbox by default).
-        performance["live" if mode_val == "live" else "sandbox"] = perf
+    elif name == "open15_vol_breakout":
+        stats = _open15_stats()
+        lifetime = _open15_lifetime()
+        opt_shadow = _open15_opt_shadow()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
+            "options": opt_shadow["sandbox"],
+        }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"], "options": opt_shadow["live"]}
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        stats = _intraday_pullback_stats()
+        lifetime = _intraday_pullback_lifetime()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
+        }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []
@@ -982,6 +1582,93 @@ def strategy_detail(name: str):
             ]
         except Exception:
             logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == "open15_vol_breakout":
+        try:
+            from database.open15_breakout_db import Open15Trade
+            from database.open15_breakout_db import db_session as o15_session
+
+            rows = o15_session.query(Open15Trade).order_by(Open15Trade.id.desc()).limit(50).all()
+            recent_trades = [
+                {
+                    "id": r.id,
+                    "side": r.side,
+                    "symbol": r.symbol,
+                    "instrument": r.instrument or "stock",
+                    "quantity": r.quantity,
+                    "entry_price": r.trigger_price,
+                    "exit_price": r.exit_price,
+                    "charges_inr": r.charges_inr,
+                    # journal pnl is gross (trigger -> exit); net deducts the
+                    # modelled MIS round-trip charges when stamped (issue #433)
+                    "net_pnl": round(r.pnl - r.charges_inr, 2)
+                    if (r.pnl is not None and r.charges_inr is not None)
+                    else r.pnl,
+                    "mode": r.mode,
+                    "status": r.status,
+                    "entry_date": r.trade_date,
+                    "trigger": f"{r.trigger_minute}:{r.trigger_second:02d}"
+                    if r.trigger_minute
+                    else None,
+                    "exit_ts": r.exit_ts,
+                    # ATM option shadow trade (issue #435) — research columns
+                    "opt_symbol": r.opt_symbol,
+                    "opt_lot_size": r.opt_lot_size,
+                    "opt_entry_premium": r.opt_entry_premium,
+                    "opt_exit_premium": r.opt_exit_premium,
+                    "opt_charges_inr": r.opt_charges_inr,
+                    "opt_pnl": r.opt_pnl,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        try:
+            from database.intraday_pullback_db import IntradayPullbackTrade
+            from database.intraday_pullback_db import db_session as ip_session
+
+            rows = (
+                ip_session.query(IntradayPullbackTrade)
+                .order_by(IntradayPullbackTrade.id.desc())
+                .limit(50)
+                .all()
+            )
+            recent_trades = [
+                {
+                    "id": r.id,
+                    "side": r.side,
+                    "symbol": r.symbol,
+                    "sector": r.sector,
+                    "session": r.session,
+                    "quantity": r.quantity,
+                    "entry_price": r.entry_price,
+                    "exit_price": r.exit_price,
+                    "stop_price": r.stop_price,
+                    "exit_reason": r.exit_reason,
+                    # `trigger` is the shared table's "Entry Time" cell (named
+                    # for open15's mid-bar trigger); here it is the 5m breakout
+                    # candle's entry timestamp.
+                    "trigger": r.entry_time.strftime("%H:%M:%S") if r.entry_time else None,
+                    # gross_pnl is deliberately NOT sent: it flips the shared
+                    # table's `hasFinancials` group on, which is labelled for
+                    # the NIFTY-futures sleeve ("Buy Price"/"Sell Price" of the
+                    # future) and duplicates the Charges column. Gross is
+                    # net + charges, both of which ARE shown.
+                    "charges_inr": r.charges_inr,
+                    # The journal stamps net_pnl directly (charges already
+                    # deducted) — unlike open15, no derivation needed here.
+                    "net_pnl": _intraday_pullback_net_pnl(r),
+                    "mode": r.mode,
+                    "status": r.status,
+                    "entry_date": r.trade_date,
+                    "exit_ts": r.exit_time.isoformat() if r.exit_time else None,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         try:
             rows = (
@@ -1007,7 +1694,12 @@ def strategy_detail(name: str):
                     "signal_decision_id": r.signal_decision_id,
                     # Normalized aliases so the shared RecentTrades UI renders
                     # P&L / Mode / Status / Time for journal rows too (#358).
-                    "net_pnl": r.pnl,
+                    # `net_pnl` used to alias the GROSS `pnl` verbatim, which is
+                    # how a table of gross rows summed to a "Net P&L" headline
+                    # (issue #579). All three are now reported separately.
+                    "gross_pnl": r.pnl,
+                    "charges_inr": r.charges_inr,
+                    "net_pnl": net_pnl_of_row(r),
                     "created_at": r.placed_at,
                     "mode": r.signal_source,
                     "status": "closed" if r.exited_at else "open",
@@ -1023,6 +1715,15 @@ def strategy_detail(name: str):
     matched_decision_ids = _attach_llm_reviews(name, recent_trades)
     llm_unmatched_skips = _unmatched_skip_decisions(name, matched_decision_ids)
 
+    # Effective order routing RIGHT NOW (issue #440) — see _build_summary.
+    try:
+        from services.mode_service import resolve_order_mode
+
+        effective_routing = resolve_order_mode(name).value
+    except Exception:
+        logger.exception("resolve_order_mode failed for %s", name)
+        effective_routing = "sandbox"
+
     return jsonify(
         {
             "status": "success",
@@ -1030,19 +1731,34 @@ def strategy_detail(name: str):
                 "name": name,
                 "display_name": name.replace("_", " ").title(),
                 "mode": mode_val,
+                "effective_routing": effective_routing,
                 "llm_mode": _get_llm_mode(name),
                 "llm_veto_enabled": name in _VETO_ENABLED_STRATEGIES,
-                "deployable": config.get("deployable", False),
+                "deployable": bool(config.get("deployable", False)),
+                # Issue #561 — same routing-truth contract as /api/list.
+                "config_declared_mode": config.get("mode"),
+                "config_conflict": bool(
+                    (mode_val == "live" or effective_routing == "live")
+                    and (
+                        not config.get("deployable", False)
+                        or "scaffold" in str(config.get("mode") or "").lower()
+                    )
+                ),
                 "version": config.get("version", "—"),
                 "config_snapshot": config,
                 "active_overrides": overrides,
-                "health": _health_led(name, overrides, config),
+                "health": _health_led(name, overrides, config, is_live=(mode_val == "live")),
                 "data_health": _data_health_summary(name),
                 "performance": performance,
                 "recent_trades": recent_trades,
                 "llm_unmatched_skips": llm_unmatched_skips,
                 "version_log": version_log,
                 "backtest_refs": backtest_refs,
+                # optional per-strategy console page (decision log / settings),
+                # declared in config_snapshot.json — rendered as a header button
+                # on the React detail page (issue #430: requirements must be
+                # REACHABLE from the strategies section, not URL-only).
+                "console_url": config.get("console_url"),
             },
         }
     )
@@ -1072,6 +1788,8 @@ def pnl_curve(name: str):
         points = _pnl_curve_futures_follow(window_days)
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         points = _pnl_curve_simplified_engine(window_days)
+    elif name == _INTRADAY_PULLBACK_FOLDER:
+        points = _pnl_curve_intraday_pullback(window_days)
     # Other strategies: empty series (no journal yet)
 
     return jsonify({"status": "success", "data": {"window": window, "points": points}})
@@ -1228,13 +1946,27 @@ def strategy_mode_audit(name: str):
         limit = 10
     limit = max(1, min(limit, 100))
 
+    # A failed query must NOT render as an empty history (issue #575). Before
+    # this, a missing strategy_mode_audit table returned `success` with rows=[],
+    # so "this strategy has never been flipped" and "we cannot answer" looked
+    # identical — which is how the table being absent from boot went unnoticed
+    # while every flip was dropped.
     try:
         from database.strategy_mode_audit_db import list_attempts
 
         rows = list_attempts(strategy_name=name, limit=limit)
-    except Exception:
+    except Exception as exc:
         logger.exception("strategy_mode_audit: list_attempts failed for %s", name)
-        rows = []
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": f"Could not read the mode-flip audit trail: {exc}",
+                    "data": {"name": name, "rows": [], "limit": limit, "degraded": True},
+                }
+            ),
+            500,
+        )
 
     return jsonify({"status": "success", "data": {"name": name, "rows": rows, "limit": limit}})
 

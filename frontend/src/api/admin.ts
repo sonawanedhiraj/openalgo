@@ -14,6 +14,7 @@ import type {
   MCPSettingsUpdateRequest,
   MCPSettingsUpdateResponse,
   OAuthClientsResponse,
+  SchedulersResponse,
   SystemInfo,
   TimingsResponse,
   TodayTiming,
@@ -277,6 +278,15 @@ export const adminApi = {
       '/admin/api/mcp/settings',
       payload
     )
+    return response.data
+  },
+
+  // ============================================================================
+  // Scheduler + daemon-thread registry (issue #539) — read-only
+  // ============================================================================
+
+  getSchedulers: async (): Promise<SchedulersResponse> => {
+    const response = await webClient.get<SchedulersResponse>('/admin/api/schedulers')
     return response.data
   },
 }
