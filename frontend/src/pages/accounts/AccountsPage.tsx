@@ -536,7 +536,7 @@ export default function AccountsPage() {
       </Card>
 
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
-        <DialogContent>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Add Child Account</DialogTitle>
           </DialogHeader>
@@ -606,7 +606,7 @@ export default function AccountsPage() {
       </Dialog>
 
       <Dialog open={editAccount !== null} onOpenChange={(open) => !open && setEditAccount(null)}>
-        <DialogContent>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Edit — {editAccount?.display_name}</DialogTitle>
           </DialogHeader>
