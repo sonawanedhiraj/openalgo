@@ -262,9 +262,15 @@ OFF) headless login for the primary and enabled children:
   derived key as auth tokens / the TOTP secret) — primary in
   `broker_login_credentials`, children in `broker_accounts.password_encrypted`.
   Write-only: no API ever returns it.
-- Login is **direct HTTP** to Kite's web endpoints (`services/zerodha_web_login`):
-  `/api/login` → `/api/twofa` (TOTP via `pyotp`) → `connect/login` redirect →
-  `request_token`, then the existing checksum exchange. No browser/Selenium.
+- Login is **browser-driven via Playwright/Chromium** (`services/zerodha_web_login`):
+  it fills user-id/password then the External-TOTP field (pyotp) on Kite's own
+  pages and captures `request_token` from the redirect, then the existing
+  checksum exchange. **Direct HTTP was tried first and does NOT work** — Kite's
+  `/api/twofa` rejects a provably-correct TOTP with `TwoFAException` from any HTTP
+  client (httpx/requests, browser headers, connect `sess_id` all fail); the 2FA
+  step requires real-browser context. Playwright runs on a real OS thread
+  (eventlet-safe) and the browser binary must be installed on the host
+  (`uv run playwright install chromium`).
 - Triggered three ways, all reusing `services/broker_auto_login_service`: a manual
   button (`/api/broker-auto-login/login`, child `POST /<id>/auto_login`), a boot
   hook, and the **continuous watcher** (`services/broker_auto_login_watcher`) that

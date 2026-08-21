@@ -282,7 +282,11 @@ All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-alig
   because Kite enforces one active session per user (a separate Kite web/app login, or a `logout`, kills the
   API token). Session management aligns to the reset; the opt-in headless auto-login watcher (issue #654,
   `services/broker_auto_login_watcher.py`, `BROKER_AUTO_LOGIN_ENABLED`) treats expiry as an event to detect
-  (re-login on a confirmed dead session) rather than a fixed time, covering both paths.
+  (re-login on a confirmed dead session) rather than a fixed time, covering both paths. Headless login is
+  **browser-driven (Playwright/Chromium)** — Kite's `/api/twofa` rejects a valid TOTP from any pure-HTTP
+  client, so `services/zerodha_web_login.py` drives Kite's real login pages on a real OS thread. The host
+  needs the Chromium binary (`uv run playwright install chromium`); flags `ZERODHA_LOGIN_HEADLESS` (default
+  true), `ZERODHA_LOGIN_TIMEOUT_MS`.
 
 ## Development Environment Setup
 
