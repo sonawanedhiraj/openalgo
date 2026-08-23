@@ -286,7 +286,11 @@ All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-alig
   **browser-driven (Playwright/Chromium)** — Kite's `/api/twofa` rejects a valid TOTP from any pure-HTTP
   client, so `services/zerodha_web_login.py` drives Kite's real login pages on a real OS thread. The host
   needs the Chromium binary (`uv run playwright install chromium`); flags `ZERODHA_LOGIN_HEADLESS` (default
-  true), `ZERODHA_LOGIN_TIMEOUT_MS`.
+  true), `ZERODHA_LOGIN_TIMEOUT_MS`. The automatic behaviour is toggled from the **UI** — a master switch on
+  `/broker` and a per-child `Auto` switch on `/accounts`, both **DB-backed** (`broker_auto_login_settings`
+  master row + `broker_accounts.auto_login_enabled`); the DB wins, `BROKER_AUTO_LOGIN_ENABLED` is only a
+  first-boot seed, and a flip applies within one watcher tick with no restart. The manual "Auto login now" /
+  "Auto login" buttons ignore both flags (they always work).
 
 ## Development Environment Setup
 

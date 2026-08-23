@@ -419,8 +419,7 @@ def establish_login_session(user_session_key, broker, feed_token=None, user_id=N
     session_id = secrets.token_hex(32)
     session["session_id"] = session_id
     try:
-        from database.auth_db import get_active_sessions, register_session
-        from extensions import socketio
+        from database.auth_db import register_session
 
         register_session(
             username=user_session_key,
@@ -429,10 +428,20 @@ def establish_login_session(user_session_key, broker, feed_token=None, user_id=N
             ip_address=get_real_ip(),
             broker=broker,
         )
+    except Exception:
+        logger.exception("establish_login_session: session registration failed")
+
+    # The active-sessions SocketIO nudge is purely cosmetic and often has no
+    # initialised socketio (e.g. auto-login off the request path) — a failure
+    # here must not log a scary traceback. Best-effort, quiet.
+    try:
+        from database.auth_db import get_active_sessions
+        from extensions import socketio
+
         active = get_active_sessions(user_session_key)
         socketio.emit("active_sessions_update", {"count": len(active), "sessions": active})
-    except Exception:
-        logger.exception("establish_login_session: session registration/emit failed")
+    except Exception as e:
+        logger.debug(f"establish_login_session: active-sessions emit skipped ({e})")
 
 
 def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, user_id=None):
