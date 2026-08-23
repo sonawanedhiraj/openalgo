@@ -2376,6 +2376,20 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
   "Mirror Orders" card + `/accounts` today chips; login reminders 09:00/15:00
   IST and a 15:35 IST EOD mirror summary — all fire-time gated on the master
   flag + trading day (silent for single-account installs).
+- **Child open15 verification card (issue #663,
+  `services/account_open15_service.py`)**: the `/accounts` "Child trades —
+  open15" card shows, per child, today's `open15_vol_breakout` mirror attempts,
+  whether every traded symbol is flat in the CHILD's own broker book once the
+  strategy's configured exit time (default 09:30 IST) has passed, and the
+  child's broker-sourced day P&L (`GET /broker_accounts/api/open15_status`).
+  A position still open past the deadline renders a **Square off** button
+  (`POST /broker_accounts/api/<id>/squareoff`) that places a MARKET opposite
+  order for the BOOK's own quantity re-read at click time — it REFUSES on a
+  flat or unreadable book (the #497 rule), journals to `account_orders`
+  (`parent_orderid='manual_squareoff'`), and its success is an ACK, not a fill
+  (the #637 reconcile verifies afterwards). Flat vs unreadable are kept
+  distinct on purpose; no env flags (#651 rule — verification is not a
+  preference).
 - **Ops**: every child account needs its own daily Kite login (Connect button
   + per-account TOTP code on `/accounts`); child fills/P&L live in the child's
   own broker book — OpenAlgo does not track child positions.

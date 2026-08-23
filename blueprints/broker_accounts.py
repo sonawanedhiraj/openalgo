@@ -267,6 +267,46 @@ def mirror_orders():
     return jsonify({"status": "success", "date": date_utc, "orders": rows})
 
 
+@broker_accounts_bp.route("/open15_status", methods=["GET"])
+@require_login
+def open15_status():
+    """Per-child open15 verification payload (issue #663).
+
+    Today's mirror attempts, open-position check against the strategy's exit
+    time (child's OWN broker book), and broker-sourced day P&L. Read-only.
+    """
+    from services import account_open15_service
+
+    return jsonify({"status": "success", **account_open15_service.open15_status()})
+
+
+@broker_accounts_bp.route("/<int:account_id>/squareoff", methods=["POST"])
+@require_login
+def squareoff(account_id: int):
+    """Manually flatten one open child position (issue #663).
+
+    Refuses unless the child's book affirmatively shows a non-zero quantity at
+    call time; the quantity placed is the book's, never the journal's. Success
+    is a broker ACK, not a fill — the fill reconcile verifies afterwards.
+    """
+    from services import account_open15_service
+
+    data = request.get_json(silent=True) or {}
+    symbol = (data.get("symbol") or "").strip()
+    exchange = (data.get("exchange") or "").strip()
+    product = (data.get("product") or "").strip()
+    if not symbol or not exchange or not product:
+        return jsonify(
+            {"status": "error", "message": "symbol, exchange and product are required."}
+        ), 400
+
+    ok, payload = account_open15_service.square_off(account_id, symbol, exchange, product)
+    if ok:
+        return jsonify({"status": "success", **payload})
+    code = 404 if payload.get("reason") == "unknown_account" else 409
+    return jsonify({"status": "error", **payload}), code
+
+
 @broker_accounts_bp.route("/<int:account_id>/totp", methods=["GET"])
 @require_login
 def totp_code(account_id: int):
