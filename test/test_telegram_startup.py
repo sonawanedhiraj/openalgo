@@ -14,9 +14,13 @@ eventlet = pytest.importorskip("eventlet")
 # Add project root to path to allow top-level imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Set a dummy env var for db before other imports
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
-os.environ["APP_KEY"] = "test-key"
+# DB isolation is inherited from test/conftest.py (temp-DB redirect). This file
+# used to force DATABASE_URL=:memory: at module level, which leaked into the
+# process env for the rest of the pytest run (issue #666, the #662 pollution
+# class). Do not reintroduce it. APP_KEY is only defaulted (never overwritten):
+# the import chain below needs *a* value, but clobbering the real one would
+# poison every module that reads it after this file is collected.
+os.environ.setdefault("APP_KEY", "test-key")
 
 eventlet.monkey_patch()
 

@@ -1,83 +1,53 @@
+"""Test to verify Telegram bot configuration saving and loading.
+
+DB isolation is inherited from ``test/conftest.py``, which redirects
+``DATABASE_URL`` to a per-process temp dir before any ``database.*`` import
+and inits the ``telegram_db`` schema there. This file used to carry its own
+pre-conftest isolation hack — a module-level
+``os.environ["DATABASE_URL"] = "sqlite:///:memory:"`` plus a rebind of
+``telegram_db`` module globals onto a private in-memory engine. Both ran at
+collection time and never reverted (issue #666, the #662 pollution class):
+the env write poisoned any ``database.*`` module first imported afterwards
+(NullPool + ``:memory:`` = a fresh empty DB per connection → "no such
+table"), and the rebind detached ``telegram_db`` from the conftest temp DB
+for every later test. Do not reintroduce either; the row cleanup below keeps
+this file hermetic in the shared temp DB instead.
+
+Run: uv run pytest test/test_telegram_config.py -v
 """
-Test script to verify Telegram bot configuration saving and loading
-"""
 
-import os
-import sys
+import pytest
 
-# === Live-DB isolation: must be set BEFORE any database.* import.
-# database.telegram_db resolves DATABASE_URL at import time. Without this,
-# update_bot_config() below writes 'test_token_123456789' to the operator's
-# real bot_config row in db/openalgo.db, breaking Telegram autostart on the
-# next restart. See fix/test-live-db-isolation.
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
-
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
-
-import database.telegram_db as _tdb
-
-# The module engine uses NullPool, so a bare sqlite ":memory:" loses its
-# tables between operations (each NullPool connection is a fresh empty DB).
-# Rebind to a private default-pool in-memory engine whose connection persists,
-# mirroring test/test_market_intel_db.py and test/test_orphaned_apikey.py.
-_engine = create_engine("sqlite:///:memory:")
-_tdb.db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=_engine))
-_tdb.Base.query = _tdb.db_session.query_property()
-_tdb.Base.metadata.create_all(_engine)
-
+import database.telegram_db as telegram_db
 from database.telegram_db import get_bot_config, update_bot_config
 
 
+@pytest.fixture(autouse=True)
+def _clean_bot_config():
+    """The conftest temp DB is shared by the whole pytest run; drop the
+    singleton ``bot_config`` row after each test so the test token written
+    here never leaks into later tests reading the bot config."""
+    yield
+    try:
+        telegram_db.db_session.query(telegram_db.BotConfig).delete(synchronize_session=False)
+        telegram_db.db_session.commit()
+    finally:
+        telegram_db.db_session.remove()
+
+
 def test_config():
-    """Test configuration save and load"""
-    print("Testing Telegram Bot Configuration")
-    print("=" * 50)
-
-    # Get current config
-    print("\n1. Current Configuration:")
-    config = get_bot_config()
-    for key, value in config.items():
-        if key in ["bot_token", "token"]:
-            if value:
-                print(f"   {key}: {value[:10]}..." if value else f"   {key}: None")
-            else:
-                print(f"   {key}: None")
-        else:
-            print(f"   {key}: {value}")
-
-    # Test saving configuration
-    print("\n2. Testing Save Configuration:")
-    test_config = {
+    """Configuration saves and loads back, token round-tripping through
+    encryption at rest."""
+    payload = {
         "bot_token": "test_token_123456789",
         "broadcast_enabled": True,
         "rate_limit_per_minute": 60,
     }
 
-    success = update_bot_config(test_config)
-    print(f"   Save result: {'Success' if success else 'Failed'}")
+    assert update_bot_config(payload) is True
 
-    # Verify saved configuration
-    print("\n3. Configuration After Save:")
     config = get_bot_config()
-    for key, value in config.items():
-        if key in ["bot_token", "token"]:
-            if value:
-                print(f"   {key}: {value[:10]}..." if value else f"   {key}: None")
-            else:
-                print(f"   {key}: None")
-        else:
-            print(f"   {key}: {value}")
-
-    # Check specific fields
-    print("\n4. Verification:")
-    print(f"   Token saved correctly: {config.get('bot_token', '').startswith('test_token')}")
-    print(f"   Broadcast enabled: {config.get('broadcast_enabled')}")
-    print(f"   Rate limit: {config.get('rate_limit_per_minute')}")
-
-
-if __name__ == "__main__":
-    test_config()
+    assert config.get("bot_token", "").startswith("test_token")
+    assert config.get("token") == config.get("bot_token")  # backward-compat alias
+    assert config.get("broadcast_enabled") is True
+    assert config.get("rate_limit_per_minute") == 60
