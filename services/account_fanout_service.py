@@ -96,6 +96,220 @@ def _child_open_qty(broker_module, symbol: str, exchange: str, product: str, tok
         return 0
 
 
+def _child_book_qty(broker_module, symbol: str, exchange: str, product: str, token: str):
+    """Child's own net position (signed int), or **None when unreadable**.
+
+    Deliberately distinct from ``_child_open_qty`` (which collapses failure to
+    0 — right for the mirror path, where 0 routes to the safe opening-scale
+    branch). The orphan-flatten sweep (issue #659) needs the #626 distinction:
+    an affirmative 0 means "nothing held, send nothing", while an unreadable
+    book on a believed-filled mirror still squares off.
+    """
+    try:
+        net = broker_module.get_open_position(symbol, exchange, product, token)
+        return int(float(net))
+    except Exception:
+        logger.exception(f"child book read failed for {symbol}:{exchange}")
+        return None
+
+
+def compute_mirror_net(rows: list[dict]) -> dict:
+    """Net PLACED mirror quantity per (account_id, symbol, exchange, product).
+
+    Pure (unit-tested directly). BUY adds, SELL subtracts; a non-zero net means
+    the child's mirrors did not round-trip — either the exit mirror never fired
+    (parent paper-demotion, issue #659 gap A) or it was rejected (gap B). Each
+    value carries the latest contributing ``parent_orderid`` so the sweep's own
+    journal row groups with the trade it repairs.
+    """
+    nets: dict = {}
+    for r in rows:
+        action = (r.get("action") or "").upper()
+        if action not in ("BUY", "SELL"):
+            continue
+        key = (r["account_id"], r["symbol"], r["exchange"], r.get("product") or "MIS")
+        entry = nets.setdefault(key, {"net": 0, "parent_orderid": None})
+        entry["net"] += (1 if action == "BUY" else -1) * int(r.get("child_qty") or 0)
+        entry["parent_orderid"] = r.get("parent_orderid") or entry["parent_orderid"]
+    return nets
+
+
+def flatten_stranded_child_mirrors(
+    mode_key: str,
+    symbols: list[str] | None = None,
+    reason: str = "",
+) -> int:
+    """Close child positions whose mirrors did not round-trip (issue #659).
+
+    Covers both stranding shapes: the parent entry was demoted to paper so no
+    parent exit ever fired (gap A), and the child's exit mirror was rejected
+    with nothing retrying it (gap B). For every (account, symbol) whose net
+    PLACED mirror quantity today is non-zero, sends a reducing MARKET order:
+
+    - quantity is ``min(|net|, |book|)`` — never more than WE placed (a child's
+      unrelated same-symbol position is not ours to close) and never more than
+      it holds;
+    - an affirmative 0 book sends nothing (the child's own entry never filled);
+    - an **unreadable** book still squares off, capped at ``|net|`` — the #626
+      believed-filled asymmetry: an unsent exit strands a real position, while
+      a redundant MIS order is caught by the broker's own square-off;
+    - a book whose sign disagrees with the net is alerted and left alone;
+    - master switch OFF → alert-only, no orders (the operator said stop).
+
+    Idempotent: the sweep's own ``placed`` row enters the next computation, so
+    a repaired key nets to 0. Synchronous and never raises; callers are
+    scheduler threads, NEVER the ZMQ tick thread. ⚠ Do not call this right
+    after a flatten that just scheduled exit mirrors — they are fire-and-forget
+    on the pool, and racing them double-exits (open15 sweeps at summary time,
+    +5 min, for exactly this reason). Returns the number of orders sent.
+    """
+    try:
+        rows = account_orders_db.todays_placed_rows(mode_key)
+        if symbols is not None:
+            wanted = set(symbols)
+            rows = [r for r in rows if r["symbol"] in wanted]
+        stranded = {k: v for k, v in compute_mirror_net(rows).items() if v["net"] != 0}
+        if not stranded:
+            return 0
+
+        if not is_multi_account_enabled():
+            _notify_operator(
+                f"⚠ Stranded child mirror position(s) found for {mode_key} "
+                f"({', '.join(sorted(k[1] for k in stranded))}) but mirroring is "
+                f"DISABLED — not touching child accounts. Close manually."
+            )
+            return 0
+
+        eligible = {a["id"]: a for a in broker_accounts_db.accounts_for_strategy(mode_key)}
+        sent = 0
+        for (account_id, symbol, exchange, product), info in stranded.items():
+            try:
+                sent += _flatten_one_stranded_key(
+                    account_id=account_id,
+                    symbol=symbol,
+                    exchange=exchange,
+                    product=product,
+                    net=info["net"],
+                    parent_orderid=info["parent_orderid"],
+                    account=eligible.get(account_id),
+                    mode_key=mode_key,
+                    reason=reason,
+                )
+            except Exception:
+                logger.exception(
+                    f"orphan flatten failed for account {account_id} {symbol} — continuing"
+                )
+        return sent
+    except Exception:
+        logger.exception("orphan-flatten sweep failed")
+        return 0
+
+
+def _flatten_one_stranded_key(
+    *,
+    account_id: int,
+    symbol: str,
+    exchange: str,
+    product: str,
+    net: int,
+    parent_orderid: str | None,
+    account: dict | None,
+    mode_key: str,
+    reason: str,
+) -> int:
+    """Flatten one stranded (account, symbol). Returns 1 if an order was sent."""
+    if account is None:
+        # Disabled or deselected since the mirror placed — still stranded, but
+        # an account the operator pulled out of mirroring is not ours to trade.
+        _notify_operator(
+            f"⚠ Stranded child position — account {account_id} holds a {mode_key} "
+            f"mirror of {symbol} (net {net}) but is no longer enabled for the "
+            f"strategy. Close manually."
+        )
+        return 0
+    name = account["display_name"]
+    marker = f"orphan_flatten: {reason}" if reason else "orphan_flatten"
+    journal = {
+        "account_id": account_id,
+        "strategy_name": mode_key,
+        "symbol": symbol,
+        "exchange": exchange,
+        "action": "SELL" if net > 0 else "BUY",
+        "product": product,
+        "parent_qty": 0,
+        "parent_orderid": parent_orderid,
+    }
+
+    token = get_auth_token(broker_accounts_db.auth_name(account_id))
+    if not token:
+        account_orders_db.record_mirror_attempt(
+            **journal, child_qty=0, status="skipped_no_session", error_text=marker
+        )
+        _notify_operator(
+            f"⚠ Stranded child position — {name}: {symbol} (net {net}) cannot be "
+            f"closed, no broker session. Log in at /accounts or close manually."
+        )
+        return 0
+
+    broker_module = import_module(f"broker.{account['broker']}.api.order_api")
+    book = _child_book_qty(broker_module, symbol, exchange, product, token)
+    if book == 0:
+        # Affirmatively flat: the child's own entry never filled, or something
+        # already closed it. Nothing to repair, nothing to journal.
+        logger.info(f"orphan flatten — {name}: {symbol} book is flat, nothing to do")
+        return 0
+    if book is not None and (book > 0) != (net > 0):
+        _notify_operator(
+            f"⚠ Orphan flatten SKIPPED — {name}: {symbol} book ({book}) disagrees "
+            f"in direction with the mirror net ({net}). Not trading against an "
+            f"inconsistent read; check the child account."
+        )
+        return 0
+    qty = abs(net) if book is None else min(abs(net), abs(book))
+
+    child_order = {
+        "symbol": symbol,
+        "exchange": exchange,
+        "action": journal["action"],
+        "product": product,
+        "pricetype": "MARKET",
+        "price": "0",
+        "quantity": qty,
+        "strategy": mode_key,
+    }
+    res, response_data, order_id = broker_module.place_order_api(child_order, token)
+    if getattr(res, "status", None) == 200:
+        account_orders_db.record_mirror_attempt(
+            **journal,
+            child_qty=qty,
+            status="placed",
+            broker_orderid=str(order_id),
+            error_text=marker,
+        )
+        _notify_operator(
+            f"🧹 Orphan flatten — {name}: {journal['action']} {qty} {symbol} sent "
+            f"({reason or 'stranded mirror'}). The parent-side exit for this child "
+            f"never happened — investigate why."
+        )
+        return 1
+    message = (
+        response_data.get("message", "broker rejected")
+        if isinstance(response_data, dict)
+        else "broker rejected"
+    )
+    account_orders_db.record_mirror_attempt(
+        **journal,
+        child_qty=qty,
+        status="rejected",
+        error_text=f"{marker}: {message}",
+    )
+    _notify_operator(
+        f"⚠ Orphan flatten REJECTED — {name}: {journal['action']} {qty} {symbol}: "
+        f"{message}. Position remains until the broker square-off; close manually."
+    )
+    return 1
+
+
 def resolve_sizing_price(order_data: dict) -> float | None:
     """Price used to size an OPENING child order (issue #496).
 
@@ -249,13 +463,58 @@ def _mirror_to_account(
         lotsize = _lookup_lotsize(symbol, exchange) if exchange in DERIVATIVE_EXCHANGES else None
         child_net = _child_open_qty(broker_module, symbol, exchange, product, token)
 
-        # Rejected-entry exit guard (issue #478): the child is FLAT but the
-        # journal shows its opposite-side entry was recently attempted and did
-        # NOT place — this parent order is an exit of a position the child
-        # never got. Scaling it would open a fresh naked position; skip it.
-        # A flat child with NO opposite-attempt history is a genuine opening
-        # order (e.g. a short entry) and scales normally below.
+        action_upper = (action or "").upper()
+
         if child_net == 0:
+            # Duplicate-exit echo guard (issue #659): the child is FLAT and
+            # today's placed mirrors show the position already round-tripped on
+            # the child side (net 0 with the closing leg last — an earlier exit
+            # mirror or an orphan-flatten sweep), OR a sweep row with this same
+            # action exists (the partial-fill case, where the sweep capped at
+            # the book and the net never reaches 0). Either way this parent
+            # exit is an echo with nothing left to reduce; without the guard it
+            # falls into the OPENING branch below and sizes a fresh naked
+            # position from capital. A same-direction repeat while the net is
+            # still open (a second entry) passes through, as does a fresh entry
+            # after today's T+1 exit (net != 0, no sweep row).
+            today_rows = [
+                r
+                for r in account_orders_db.todays_placed_rows(
+                    mode_key, account_id=account_id, symbol=symbol
+                )
+                if r["exchange"] == exchange
+            ]
+            net_today = sum(
+                (1 if (r.get("action") or "").upper() == "BUY" else -1)
+                * int(r.get("child_qty") or 0)
+                for r in today_rows
+            )
+            closed_round_trip = (
+                today_rows
+                and net_today == 0
+                and (today_rows[-1].get("action") or "").upper() == action_upper
+            )
+            swept_same_action = any(
+                (r.get("action") or "").upper() == action_upper
+                and (r.get("error_text") or "").startswith("orphan_flatten")
+                for r in today_rows
+            )
+            if closed_round_trip or swept_same_action:
+                account_orders_db.record_mirror_attempt(
+                    **journal, child_qty=0, status="skipped_no_position"
+                )
+                _notify_operator(
+                    f"⚠ Mirror skipped — {name}: {action} {symbol} already sent today "
+                    f"and the child is flat. Duplicate exit echo — nothing to do."
+                )
+                return
+
+            # Rejected-entry exit guard (issue #478): the journal shows the
+            # opposite-side entry was recently attempted and did NOT place —
+            # this parent order is an exit of a position the child never got.
+            # Scaling it would open a fresh naked position; skip it. A flat
+            # child with NO opposite-attempt history is a genuine opening
+            # order (e.g. a short entry) and scales normally below.
             prior = account_orders_db.last_opposite_attempt_status(
                 account_id, symbol, exchange, mode_key, action
             )
@@ -269,7 +528,6 @@ def _mirror_to_account(
                 )
                 return
 
-        action_upper = (action or "").upper()
         reducing = (action_upper == "SELL" and child_net > 0) or (
             action_upper == "BUY" and child_net < 0
         )

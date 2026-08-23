@@ -2365,6 +2365,33 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
   produced the fabricated fill in the first place. Idempotent with no marker
   column (a corrected row is no longer `placed`). Flags
   `MULTI_ACCOUNT_FUNDS_CHECK`, `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED`.
+- **A child position must never depend on a parent event that will not come
+  (issue #659).** Child orders are echoes of parent order events, and two
+  echo failures used to strand a REAL child position until the broker's MIS
+  square-off, silently: (gap A) the fan-out fires at the parent's **ACK**, so
+  a child can fill an entry the parent's RMS later refuses — the parent's
+  paper row then sends no exit, and no child exit mirror ever fires; (gap B)
+  a child's exit mirror the broker REJECTS has nothing retrying it (the
+  parent's retry job re-flattens parent rows only).
+  `account_fanout_service.flatten_stranded_child_mirrors(mode_key, symbols,
+  reason)` is the repair: for every (account, symbol) whose net **placed**
+  mirror quantity today (IST) is non-zero it sends a reducing MARKET order —
+  capped at `min(|net|, |book|)` (a child's unrelated same-symbol holding is
+  not ours to close), nothing on an affirmative-0 book, still squaring off on
+  an *unreadable* book capped at `|net|` (the #626 believed-filled
+  asymmetry), alert-only when the book's sign disagrees or the master switch
+  is off. Idempotent (its own `placed` row nets the key to 0; marker
+  `orphan_flatten:` in `error_text`). open15 wires it three ways: targeted at
+  both paper-demotion seams (`verify_entries` — corroborated by our own
+  affirmatively-flat book, since `flatten` can re-promote on book
+  disagreement — and the `_entry_never_filled` branch), and a full sweep at
+  the **summary job only** — deliberately NOT at exit/retry time, because
+  exit mirrors are fire-and-forget on the pool and a racing sweep could
+  double-exit. The sweep's flip side is the **duplicate-exit echo guard** in
+  `_mirror_to_account`: a flat child whose mirrors already round-tripped
+  today (net 0 with the closing leg last, or a same-action `orphan_flatten`
+  row) skips a late parent exit as `skipped_no_position` — without it the
+  echo falls into the OPENING branch and sizes a naked position from capital.
 - **Observability** (`services/account_mirror_summary_service.py`): orderbook
   "Mirror Orders" card + `/accounts` today chips; login reminders 09:00/15:00
   IST and a 15:35 IST EOD mirror summary — all fire-time gated on the master
