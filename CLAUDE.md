@@ -277,7 +277,20 @@ All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-alig
 - **SEBI static IP mandate** (effective April 1, 2026): All transactional API orders require broker-side static IP whitelisting. Delta Exchange (crypto) also enforces this. Stolen broker credentials CANNOT be used from an attacker's machine — the broker rejects requests from non-registered IPs. However, attacks routed THROUGH the OpenAlgo server (which has the registered IP) are still viable.
 - External platforms (TradingView, GoCharting, Chartink) send API keys in JSON body or URL query params — they cannot set custom HTTP headers. This is an accepted architectural trade-off.
 - The MCP server (`mcp/mcpserver.py`) is local-only, communicates via stdio with Claude Desktop/Cursor/Windsurf. It is NOT remotely exposed.
-- Indian broker tokens expire daily at ~3:00 AM IST. Session management is aligned to this schedule.
+- Indian broker (Zerodha/Kite) tokens are flushed at the **daily reset ~06:30–07:30 AM IST** (NOT 3 AM — a
+  common misstatement in older notes), and can additionally be invalidated **mid-session at any time**
+  because Kite enforces one active session per user (a separate Kite web/app login, or a `logout`, kills the
+  API token). Session management aligns to the reset; the opt-in headless auto-login watcher (issue #654,
+  `services/broker_auto_login_watcher.py`, `BROKER_AUTO_LOGIN_ENABLED`) treats expiry as an event to detect
+  (re-login on a confirmed dead session) rather than a fixed time, covering both paths. Headless login is
+  **browser-driven (Playwright/Chromium)** — Kite's `/api/twofa` rejects a valid TOTP from any pure-HTTP
+  client, so `services/zerodha_web_login.py` drives Kite's real login pages on a real OS thread. The host
+  needs the Chromium binary (`uv run playwright install chromium`); flags `ZERODHA_LOGIN_HEADLESS` (default
+  true), `ZERODHA_LOGIN_TIMEOUT_MS`. The automatic behaviour is toggled from the **UI** — a master switch on
+  `/broker` and a per-child `Auto` switch on `/accounts`, both **DB-backed** (`broker_auto_login_settings`
+  master row + `broker_accounts.auto_login_enabled`); the DB wins, `BROKER_AUTO_LOGIN_ENABLED` is only a
+  first-boot seed, and a flip applies within one watcher tick with no restart. The manual "Auto login now" /
+  "Auto login" buttons ignore both flags (they always work).
 
 ## Development Environment Setup
 

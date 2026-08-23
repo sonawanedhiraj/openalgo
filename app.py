@@ -42,6 +42,9 @@ from blueprints.auth import auth_bp
 from blueprints.backtest import backtest_bp  # MVP backtester endpoints
 from blueprints.brlogin import brlogin_bp
 from blueprints.broker_accounts import broker_accounts_bp  # Multi-account child accounts (#468)
+from blueprints.broker_auto_login import (
+    broker_auto_login_bp,  # Broker headless auto-login (issue #654)
+)
 from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
@@ -114,6 +117,12 @@ from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.auth_db import init_db as ensure_auth_tables_exists
 from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.broker_accounts_db import init_db as ensure_broker_accounts_tables_exists
+from database.broker_auto_login_settings_db import (
+    init_db as ensure_broker_auto_login_settings_tables_exists,
+)
+from database.broker_login_credentials_db import (
+    init_db as ensure_broker_login_credentials_tables_exists,
+)
 from database.broker_totp_db import init_db as ensure_broker_totp_tables_exists
 from database.chartink_db import init_db as ensure_chartink_tables_exists
 from database.daily_intent_db import init_db as ensure_daily_intent_tables_exists
@@ -342,6 +351,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(flow_bp)  # Register Flow blueprint
     app.register_blueprint(broker_credentials_bp)  # Register Broker credentials blueprint
     app.register_blueprint(broker_totp_bp)  # Broker external-TOTP helper (Zerodha 2FA code)
+    app.register_blueprint(broker_auto_login_bp)  # Broker headless auto-login (issue #654)
     app.register_blueprint(broker_accounts_bp)  # Multi-account child accounts (#468)
     app.register_blueprint(system_permissions_bp)  # Register System permissions blueprint
     app.register_blueprint(strategy_portfolio_bp)  # Register Strategy Portfolio blueprint
@@ -724,6 +734,8 @@ def setup_environment(app):
                 ("Backtest DB", ensure_backtest_tables_exists),
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Broker TOTP DB", ensure_broker_totp_tables_exists),
+                ("Broker Login Credentials DB", ensure_broker_login_credentials_tables_exists),
+                ("Broker Auto-Login Settings DB", ensure_broker_auto_login_settings_tables_exists),
                 ("Broker Accounts DB", ensure_broker_accounts_tables_exists),
                 ("Account Orders DB", ensure_account_orders_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),
@@ -888,6 +900,21 @@ def setup_environment(app):
                 logger.debug("Scanner backfill convergence initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Scanner backfill convergence: {e}")
+
+            # Broker auto-login watcher (issue #654). A no-op unless
+            # BROKER_AUTO_LOGIN_ENABLED=true. When on: a boot worker auto-logs-in
+            # the primary + enabled children if the session is dead, then an
+            # all-day daemon loop re-logs-in on a confirmed dead session (the
+            # daily-reset flush that lands after boot, and mid-session
+            # single-session invalidation). Non-blocking daemon thread. See
+            # services/broker_auto_login_watcher.py.
+            try:
+                from services.broker_auto_login_watcher import init_broker_auto_login
+
+                init_broker_auto_login(app=app)
+                logger.debug("Broker auto-login watcher initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize broker auto-login watcher: {e}")
 
             # Sector Follow CAP5_VOL strategy (R40 deployable variant). Default
             # mode=scaffold means loading this changes ZERO live trading behavior

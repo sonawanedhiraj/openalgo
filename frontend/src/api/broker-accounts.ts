@@ -15,6 +15,10 @@ export interface ChildAccount {
   api_key_masked: string | null
   has_api_secret: boolean
   has_totp_secret: boolean
+  // issue #654: whether a Kite login password is stored for headless auto-login.
+  has_password: boolean
+  // issue #654: per-child opt-in for automatic (watcher) re-login.
+  auto_login_enabled: boolean
   last_login_at: string | null
   created_at: string | null
   updated_at: string | null
@@ -96,6 +100,16 @@ export interface UpdateAccountPayload {
   api_key?: string
   api_secret?: string
   totp_secret?: string
+  // issue #654: Kite login password for headless auto-login (write-only).
+  password?: string
+  // issue #654: per-child automatic re-login opt-in.
+  auto_login_enabled?: boolean
+}
+
+export interface AutoLoginResult {
+  status: string
+  ok: boolean
+  message: string
 }
 
 const BASE = '/broker_accounts/api'
@@ -135,6 +149,11 @@ export const brokerAccountsApi = {
 
   disconnect: async (id: number): Promise<void> => {
     await webClient.post(`${BASE}/${id}/disconnect`)
+  },
+
+  autoLogin: async (id: number): Promise<AutoLoginResult> => {
+    const { data } = await webClient.post(`${BASE}/${id}/auto_login`)
+    return data
   },
 
   setStrategies: async (

@@ -197,6 +197,12 @@ class BrokerAccount(Base):
     api_key_encrypted = Column(Text, nullable=False)
     api_secret_encrypted = Column(Text, nullable=False)
     totp_secret_encrypted = Column(Text, nullable=True)
+    # issue #654: encrypted Kite login password for headless auto-login. Nullable —
+    # accounts without it keep the manual login flow. Write-only, never echoed.
+    password_encrypted = Column(Text, nullable=True)
+    # issue #654: per-child opt-in for automatic (watcher) re-login. Gated ALSO by
+    # the global master flag; the manual "Auto login" button ignores it.
+    auto_login_enabled = Column(Boolean, nullable=False, default=False)
     capital_inr = Column(Float, nullable=False, default=0.0)
     is_enabled = Column(Boolean, nullable=False, default=False)
     last_login_at = Column(DateTime, nullable=True)
@@ -260,6 +266,23 @@ def _migrate_add_capital_override() -> None:
                 )
                 conn.commit()
                 logger.info("account_strategies.min_one_lot column added (issue #490)")
+            acct_cols = [
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(broker_accounts)")).fetchall()
+            ]
+            if acct_cols and "password_encrypted" not in acct_cols:
+                conn.execute(text("ALTER TABLE broker_accounts ADD COLUMN password_encrypted TEXT"))
+                conn.commit()
+                logger.info("broker_accounts.password_encrypted column added (issue #654)")
+            if acct_cols and "auto_login_enabled" not in acct_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE broker_accounts "
+                        "ADD COLUMN auto_login_enabled BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+                conn.commit()
+                logger.info("broker_accounts.auto_login_enabled column added (issue #654)")
     except Exception:
         logger.exception("capital_override_inr migration failed")
 
@@ -318,6 +341,8 @@ def _row_to_dict(row: BrokerAccount) -> dict:
         "api_key_masked": _mask_api_key(row.api_key_encrypted),
         "has_api_secret": bool(row.api_secret_encrypted),
         "has_totp_secret": row.totp_secret_encrypted is not None,
+        "has_password": row.password_encrypted is not None,
+        "auto_login_enabled": bool(row.auto_login_enabled),
         "last_login_at": row.last_login_at.isoformat() if row.last_login_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
@@ -415,6 +440,16 @@ def update_account(account_id: int, **fields) -> dict | None:
             secret = str(fields["totp_secret"] or "").strip()
             row.totp_secret_encrypted = encrypt_token(secret) if secret else None
             replaced.append("totp_secret" if secret else "totp_secret(cleared)")
+        if "password" in fields:
+            pwd = str(fields["password"] or "").strip()
+            row.password_encrypted = encrypt_token(pwd) if pwd else None
+            replaced.append("password" if pwd else "password(cleared)")
+            # Saving a password opts the child into automatic re-login by default
+            # (still gated by the global master flag); clearing it opts out.
+            if "auto_login_enabled" not in fields:
+                row.auto_login_enabled = bool(pwd)
+        if "auto_login_enabled" in fields and fields["auto_login_enabled"] is not None:
+            row.auto_login_enabled = bool(fields["auto_login_enabled"])
         if "last_login_at" in fields:
             row.last_login_at = fields["last_login_at"]
         row.updated_at = datetime.utcnow()
@@ -470,6 +505,29 @@ def get_totp_secret(account_id: int) -> str | None:
         if not row or not row.totp_secret_encrypted:
             return None
         return decrypt_token(row.totp_secret_encrypted) or None
+    finally:
+        db_session.remove()
+
+
+def get_password(account_id: int) -> str | None:
+    """Decrypted Kite login password for headless auto-login (issue #654), or None.
+
+    Server-side only — never route the returned password to an HTTP response.
+    """
+    try:
+        row = db_session.query(BrokerAccount).filter_by(id=account_id).first()
+        if not row or not row.password_encrypted:
+            return None
+        return decrypt_token(row.password_encrypted) or None
+    finally:
+        db_session.remove()
+
+
+def get_user_id(account_id: int) -> str | None:
+    """The child's Kite user-id (``broker_client_id``) for web login, or None."""
+    try:
+        row = db_session.query(BrokerAccount).filter_by(id=account_id).first()
+        return (row.broker_client_id or None) if row else None
     finally:
         db_session.remove()
 

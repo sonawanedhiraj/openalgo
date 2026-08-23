@@ -391,6 +391,59 @@ def notify_broker_session_refreshed(username, broker):
         logger.exception("Failed to publish broker_session_refreshed to event bus")
 
 
+def establish_login_session(user_session_key, broker, feed_token=None, user_id=None):
+    """Mark the Flask login session logged-in after a broker session already exists.
+
+    The manual OAuth flow gets this as part of ``handle_auth_success``. The
+    headless auto-login (issue #654) writes the broker token via the service
+    layer out-of-band, then calls this so the browser session is marked
+    ``logged_in`` — otherwise the dashboard bounces straight back to ``/broker``.
+    This is only the SESSION block of ``handle_auth_success`` (no ``upsert_auth``,
+    no master-contract download — the caller already did the broker-side work).
+    Must run inside a request context. Never raises.
+    """
+    import secrets
+
+    session["logged_in"] = True
+    if feed_token:
+        session["FEED_TOKEN"] = feed_token
+    if user_id:
+        session["USER_ID"] = user_id
+    session["user_session_key"] = user_session_key
+    session["broker"] = broker
+
+    app.config["PERMANENT_SESSION_LIFETIME"] = get_session_expiry_time()
+    session.permanent = True
+    set_session_login_time()
+
+    session_id = secrets.token_hex(32)
+    session["session_id"] = session_id
+    try:
+        from database.auth_db import register_session
+
+        register_session(
+            username=user_session_key,
+            session_id=session_id,
+            device_info=request.headers.get("User-Agent", "")[:500],
+            ip_address=get_real_ip(),
+            broker=broker,
+        )
+    except Exception:
+        logger.exception("establish_login_session: session registration failed")
+
+    # The active-sessions SocketIO nudge is purely cosmetic and often has no
+    # initialised socketio (e.g. auto-login off the request path) — a failure
+    # here must not log a scary traceback. Best-effort, quiet.
+    try:
+        from database.auth_db import get_active_sessions
+        from extensions import socketio
+
+        active = get_active_sessions(user_session_key)
+        socketio.emit("active_sessions_update", {"count": len(active), "sessions": active})
+    except Exception as e:
+        logger.debug(f"establish_login_session: active-sessions emit skipped ({e})")
+
+
 def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, user_id=None):
     """
     Handles common tasks after successful authentication.

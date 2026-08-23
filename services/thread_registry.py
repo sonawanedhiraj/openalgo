@@ -192,6 +192,21 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_PROTECTED,
     ),
     ThreadSpec(
+        thread_name="BrokerAutoLoginWatcher",
+        label="Broker auto-login watcher",
+        group=GROUP_LOOP,
+        owner="services/broker_auto_login_watcher.py",
+        description=(
+            "Detects a dead primary/child broker session (N confirmed dead probes) "
+            "and re-logs-in headlessly — catches the daily-reset flush and "
+            "mid-session single-session invalidation (issue #654)."
+        ),
+        cadence_sec=5 * 60,
+        window="06:15-23:30 IST, trading days",
+        env_flag="BROKER_AUTO_LOGIN_ENABLED",
+        tier=TIER_GUARDED,
+    ),
+    ThreadSpec(
         thread_name="ScannerWsWatchdog",
         label="Scanner WS watchdog",
         group=GROUP_LOOP,
@@ -366,6 +381,15 @@ CATALOG: tuple[ThreadSpec, ...] = (
         group=GROUP_BOOT,
         owner="services/sector_follow_backfill_scheduler.py",
         description="Boot-time index + stock feed convergence.",
+        tier=TIER_GUARDED,
+    ),
+    ThreadSpec(
+        thread_name="BrokerAutoLoginBoot",
+        label="Broker auto-login (boot)",
+        group=GROUP_BOOT,
+        owner="services/broker_auto_login_watcher.py",
+        description="If the broker session is dead at boot, auto-login once, then start the watcher.",
+        env_flag="BROKER_AUTO_LOGIN_ENABLED",
         tier=TIER_GUARDED,
     ),
     ThreadSpec(

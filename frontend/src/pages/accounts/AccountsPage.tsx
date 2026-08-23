@@ -196,6 +196,7 @@ export default function AccountsPage() {
     capital_inr: 0,
     api_key: '',
     api_secret: '',
+    password: '',
   })
 
   const openEdit = (account: ChildAccount) => {
@@ -207,6 +208,7 @@ export default function AccountsPage() {
       capital_inr: account.capital_inr,
       api_key: '',
       api_secret: '',
+      password: '',
     })
   }
 
@@ -218,6 +220,7 @@ export default function AccountsPage() {
         capital_inr: editForm.capital_inr,
         ...(replaceCreds && editForm.api_key ? { api_key: editForm.api_key } : {}),
         ...(replaceCreds && editForm.api_secret ? { api_secret: editForm.api_secret } : {}),
+        ...(replaceCreds && editForm.password ? { password: editForm.password } : {}),
       }),
     onSuccess: () => {
       toast.success('Account updated')
@@ -228,6 +231,36 @@ export default function AccountsPage() {
       const message =
         (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
         'Failed to update account'
+      toast.error(message)
+    },
+  })
+
+  const autoToggleMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      brokerAccountsApi.update(id, { auto_login_enabled: enabled }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['broker-accounts'] }),
+    onError: (e: unknown) => {
+      const message =
+        (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Failed to update auto-login'
+      toast.error(message)
+    },
+  })
+
+  const autoLoginMutation = useMutation({
+    mutationFn: (id: number) => brokerAccountsApi.autoLogin(id),
+    onSuccess: (result) => {
+      if (result.ok) {
+        toast.success('Auto-login succeeded')
+        queryClient.invalidateQueries({ queryKey: ['broker-accounts'] })
+      } else {
+        toast.error(result.message || 'Auto-login failed — use Connect →')
+      }
+    },
+    onError: (e: unknown) => {
+      const message =
+        (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Auto-login failed — use Connect →'
       toast.error(message)
     },
   })
@@ -444,6 +477,32 @@ export default function AccountsPage() {
                       Connect →
                     </Button>
                   )}
+                  {!account.connected && account.has_password && account.has_totp_secret && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => autoLoginMutation.mutate(account.id)}
+                      disabled={autoLoginMutation.isPending}
+                      data-testid={`auto-login-${account.id}`}
+                    >
+                      Auto login
+                    </Button>
+                  )}
+                  {account.has_password && (
+                    <div
+                      className="flex items-center gap-1 text-xs text-muted-foreground"
+                      title="Automatically re-login this child when its session expires (needs the master switch on /broker on)"
+                    >
+                      Auto
+                      <Switch
+                        checked={account.auto_login_enabled}
+                        onCheckedChange={(checked) =>
+                          autoToggleMutation.mutate({ id: account.id, enabled: checked })
+                        }
+                        data-testid={`auto-toggle-${account.id}`}
+                      />
+                    </div>
+                  )}
                   <div className="flex items-center gap-1 text-xs text-muted-foreground">
                     Enabled
                     <Switch
@@ -504,7 +563,7 @@ export default function AccountsPage() {
       </Card>
 
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
-        <DialogContent>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Add Child Account</DialogTitle>
           </DialogHeader>
@@ -574,7 +633,7 @@ export default function AccountsPage() {
       </Dialog>
 
       <Dialog open={editAccount !== null} onOpenChange={(open) => !open && setEditAccount(null)}>
-        <DialogContent>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Edit — {editAccount?.display_name}</DialogTitle>
           </DialogHeader>
@@ -624,6 +683,14 @@ export default function AccountsPage() {
                     <span className="text-destructive">none on file</span>
                   )}
                 </div>
+                <div>
+                  <span className="text-muted-foreground">Login password: </span>
+                  {editAccount?.has_password ? (
+                    <span>stored</span>
+                  ) : (
+                    <span className="text-muted-foreground">not set (manual login)</span>
+                  )}
+                </div>
               </div>
               <label className="flex items-center gap-2 text-sm">
                 <Checkbox
@@ -662,8 +729,25 @@ export default function AccountsPage() {
                       data-testid="edit-api-secret"
                     />
                   </div>
+                  <div>
+                    <Label>Kite login password (for auto-login)</Label>
+                    <Input
+                      type="password"
+                      name="child-kite-password"
+                      autoComplete="new-password"
+                      value={editForm.password}
+                      onChange={(e) => setEditForm({ ...editForm, password: e.target.value })}
+                      placeholder="optional — enables headless auto-login"
+                      data-testid="edit-password"
+                    />
+                    <p className="text-muted-foreground text-xs mt-1">
+                      Stored encrypted, write-only. With this + the TOTP secret set, the child gets
+                      an "Auto login" button and is re-logged-in automatically when
+                      BROKER_AUTO_LOGIN_ENABLED is on.
+                    </p>
+                  </div>
                   <p className="text-muted-foreground text-xs">
-                    Both fields are optional — a blank field keeps the stored value. Type these
+                    All fields are optional — a blank field keeps the stored value. Type these
                     yourself; never accept a browser autofill here.
                   </p>
                 </>

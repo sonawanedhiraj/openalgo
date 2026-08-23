@@ -241,13 +241,47 @@ publishes is harmless for `acct:N` names — the WS proxy holds no adapter under
 that key. The callback route keeps `brlogin`'s existing gate (`"user" in
 session`), NOT `check_session_validity` (destructive on failure — issue #462).
 
-### 5.4 No headless auto-login — deliberate
+### 5.4 Headless auto-login — built under operator sign-off (issue #654, 2026-08-19)
 
-Child passwords are **never stored**; the daily login is manual by design. This
-mirrors the #460 decision for the primary (external TOTP helper yes, headless
-Phase-2 auto-login deliberately not built): storing broker passwords for
-unattended login is a materially different risk class, and Zerodha's ToS
-disallow it. The TOTP-code display is the only automation.
+> **This reverses the original "deliberately not built" decision.** The section
+> below is kept for the record; the operator explicitly authorized headless
+> auto-login on 2026-08-19 (both the primary and enabled children), accepting the
+> risk trade-off it records.
+
+**Original decision (superseded):** child passwords were never stored and the
+daily login was manual by design — mirroring the #460 primary decision (external
+TOTP helper yes, headless auto-login no), because storing broker passwords for
+unattended login is a materially different risk class and Zerodha's ToS
+discourage login automation (the exchange mandates a manual login at least once a
+day; Kite deems automation "not recommended").
+
+**What shipped (issue #654):** an **opt-in** (`BROKER_AUTO_LOGIN_ENABLED`, default
+OFF) headless login for the primary and enabled children:
+
+- The Kite login password is stored **Fernet-encrypted** (same `API_KEY_PEPPER`-
+  derived key as auth tokens / the TOTP secret) — primary in
+  `broker_login_credentials`, children in `broker_accounts.password_encrypted`.
+  Write-only: no API ever returns it.
+- Login is **browser-driven via Playwright/Chromium** (`services/zerodha_web_login`):
+  it fills user-id/password then the External-TOTP field (pyotp) on Kite's own
+  pages and captures `request_token` from the redirect, then the existing
+  checksum exchange. **Direct HTTP was tried first and does NOT work** — Kite's
+  `/api/twofa` rejects a provably-correct TOTP with `TwoFAException` from any HTTP
+  client (httpx/requests, browser headers, connect `sess_id` all fail); the 2FA
+  step requires real-browser context. Playwright runs on a real OS thread
+  (eventlet-safe) and the browser binary must be installed on the host
+  (`uv run playwright install chromium`).
+- Triggered three ways, all reusing `services/broker_auto_login_service`: a manual
+  button (`/api/broker-auto-login/login`, child `POST /<id>/auto_login`), a boot
+  hook, and the **continuous watcher** (`services/broker_auto_login_watcher`) that
+  re-logs-in on a confirmed dead session — covering both the ~06:30-07:30 IST
+  daily-reset flush (which can land after a morning boot) and mid-session
+  single-session invalidation.
+- **Risk trade-off accepted:** the password is the first unattended-usable broker
+  credential in the repo. Mitigations: opt-in default-OFF, encrypted at rest,
+  write-only APIs, a daily attempt cap + backoff so a wrong password can't hammer
+  Kite, loud failure that falls back to the always-available manual flow, and the
+  standing rule to never rotate `API_KEY_PEPPER`/`FERNET_SALT`.
 
 ### 5.5 Reminders & stale-child safety
 
