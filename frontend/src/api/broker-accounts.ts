@@ -112,6 +112,58 @@ export interface AutoLoginResult {
   message: string
 }
 
+// Child open15 verification card (issue #663).
+
+export interface Open15Trade {
+  id: number
+  symbol: string
+  exchange: string
+  action: string
+  product: string | null
+  child_qty: number
+  status: string
+  broker_orderid: string | null
+  error_text: string | null
+  created_at: string | null
+}
+
+export interface Open15Position {
+  symbol: string
+  exchange: string
+  product: string
+  open_qty: number
+  pnl: number | null
+}
+
+export interface Open15AccountStatus {
+  account_id: number
+  display_name: string
+  broker: string
+  connected: boolean
+  trades: Open15Trade[]
+  positions: Open15Position[]
+  positions_readable: boolean
+  open_after_exit: boolean
+  day_pnl: number | null
+}
+
+export interface Open15Status {
+  status: string
+  strategy: string
+  exit_time: string
+  after_exit_time: boolean
+  now_ist: string
+  date: string
+  accounts: Open15AccountStatus[]
+}
+
+export interface SquareOffResult {
+  status: string
+  message: string
+  broker_orderid?: string
+  reason?: string
+}
+
 const BASE = '/broker_accounts/api'
 
 export const brokerAccountsApi = {
@@ -170,6 +222,19 @@ export const brokerAccountsApi = {
 
   totpCode: async (id: number): Promise<TotpCode> => {
     const { data } = await webClient.get(`${BASE}/${id}/totp`)
+    return data
+  },
+
+  open15Status: async (): Promise<Open15Status> => {
+    const { data } = await webClient.get(`${BASE}/open15_status`)
+    return data
+  },
+
+  squareOff: async (
+    id: number,
+    payload: { symbol: string; exchange: string; product: string }
+  ): Promise<SquareOffResult> => {
+    const { data } = await webClient.post(`${BASE}/${id}/squareoff`, payload)
     return data
   },
 

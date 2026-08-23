@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { toast } from 'sonner'
 import { type AddAccountPayload, brokerAccountsApi, type ChildAccount } from '@/api/broker-accounts'
+import ChildOpen15Card from '@/components/accounts/ChildOpen15Card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -561,6 +562,8 @@ export default function AccountsPage() {
           </div>
         </CardContent>
       </Card>
+
+      <ChildOpen15Card />
 
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
         <DialogContent className="max-h-[90vh] overflow-y-auto">
