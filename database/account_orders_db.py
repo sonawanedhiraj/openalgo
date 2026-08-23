@@ -253,6 +253,44 @@ def update_status(row_id: int, *, status: str, error_text: str | None = None) ->
         db_session.remove()
 
 
+def todays_placed_rows(
+    strategy_name: str,
+    account_id: int | None = None,
+    symbol: str | None = None,
+) -> list[dict]:
+    """Today's (IST trading day) ``placed`` mirror rows for one strategy.
+
+    Feed for the orphan-flatten sweep and the duplicate-exit guard (issue
+    #659). ``created_at`` is naive UTC; the IST day [00:00, 24:00) maps to the
+    UTC window [D-1 18:30, D 18:30). Only ``placed`` rows count — a skipped or
+    rejected mirror opened nothing, so it must not enter the net. Fail-open to
+    ``[]``: a read failure must never manufacture a phantom flatten.
+    """
+    from datetime import time, timedelta
+
+    try:
+        ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        day_start_utc = datetime.combine(ist_now.date(), time(0, 0)) - timedelta(
+            hours=5, minutes=30
+        )
+        q = db_session.query(AccountOrder).filter(
+            AccountOrder.strategy_name == strategy_name,
+            AccountOrder.status == "placed",
+            AccountOrder.created_at >= day_start_utc,
+            AccountOrder.created_at < day_start_utc + timedelta(days=1),
+        )
+        if account_id is not None:
+            q = q.filter(AccountOrder.account_id == account_id)
+        if symbol is not None:
+            q = q.filter(AccountOrder.symbol == symbol)
+        return [_row_to_dict(r) for r in q.order_by(AccountOrder.id).all()]
+    except Exception:
+        logger.exception("todays_placed_rows read failed — failing open to []")
+        return []
+    finally:
+        db_session.remove()
+
+
 def list_orders(date_utc: str | None = None, account_id: int | None = None) -> list[dict]:
     """Mirror attempts, newest first. ``date_utc`` filters by YYYY-MM-DD prefix."""
     try:

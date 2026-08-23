@@ -2664,6 +2664,12 @@ class Open15BreakoutService:
                 post_ack=True,
             )
             self._alert_rejection(symbol, pos.get("quantity") or 0, msg)
+            # Gap A (issue #659): our entry was refused, but the child mirror
+            # fired at ACK time and may have filled. No parent exit will ever
+            # fire for a paper row, so close the child now, not at 15:20.
+            self._flatten_child_mirrors_for(
+                symbol, pos, "parent entry demoted to paper (post-ACK reject)"
+            )
             demoted += 1
         return demoted
 
@@ -2679,6 +2685,38 @@ class Open15BreakoutService:
         sym = pos["opt_symbol"] if is_option else symbol
         qty = self._broker_qty(sym, "NFO" if is_option else "NSE")
         return qty == 0
+
+    def _flatten_child_mirrors_for(
+        self, symbol: str, pos: dict, reason: str, corroborated: bool = False
+    ) -> None:
+        """Close a child-account mirror stranded by a paper demotion (issue #659).
+
+        The child mirror fired at ACK time and can be FILLED in the child's own
+        account even though OUR entry was refused — the child has its own
+        balance and RMS. Demoting the parent to paper suppresses the parent
+        exit, which is the only trigger the child exit had; without this call
+        the child position rides unmanaged until the broker's MIS square-off.
+
+        ``corroborated=False`` re-checks our own book first: ``flatten`` can
+        RE-promote a demoted row when the book disagrees with the reject
+        verdict (#626 "the book wins"), and in that case the parent WILL exit
+        and the normal exit mirror handles the child — sweeping it early would
+        leave that later exit mirror echoing against a flat child. Only an
+        AFFIRMATIVE 0 sweeps; an unreadable book defers to the post-summary
+        sweep. Never raises — this must not disturb the demotion it rides on.
+        """
+        try:
+            is_option = pos.get("instrument") == "option"
+            mirrored = pos.get("opt_symbol") if is_option else symbol
+            if not mirrored:
+                return
+            if not corroborated and self._broker_qty(mirrored, "NFO" if is_option else "NSE") != 0:
+                return
+            from services.account_fanout_service import flatten_stranded_child_mirrors
+
+            flatten_stranded_child_mirrors(STRATEGY_NAME, symbols=[mirrored], reason=reason)
+        except Exception:
+            logger.exception("open15: child-mirror orphan flatten failed for %s", symbol)
 
     def _reconcile_and_log(self, attempts: int = 1, delay_s: float = 0.0) -> None:
         """Run the broker fill reconcile and log its events (issues #555/#641).
@@ -2766,6 +2804,12 @@ class Open15BreakoutService:
                 )
                 pos["fill"] = "paper"
                 self._flatten_paper(symbol, pos, "entry_rejected")
+                # Gap A (issue #659): `_entry_never_filled` just AFFIRMED our
+                # book is flat (corroborated), but the child mirror fired at
+                # the ACK and may hold a real position with no exit coming.
+                self._flatten_child_mirrors_for(
+                    symbol, pos, "parent entry papered at exit (book flat)", corroborated=True
+                )
                 continue
             if is_option:
                 # option exit is always a SELL of the bought CE/PE (issue #437)
@@ -4425,6 +4469,19 @@ def _summary_job() -> None:
     svc = get_open15_service()
     if svc is not None:
         svc.summary()
+        # Orphan-flatten sweep (issue #659, gap B): a child whose exit mirror
+        # was REJECTED has nothing retrying it — the exit-retry job re-flattens
+        # parent rows only. Deliberately at summary time (exit+5), NOT at the
+        # exit/retry jobs: exit mirrors are fire-and-forget on the fan-out
+        # pool, and a sweep racing them could double-exit a child. By now every
+        # mirror of the day has journaled; any non-zero net is stranded. No-op
+        # in sandbox mode (fan-out never fires, so there are no rows).
+        try:
+            from services.account_fanout_service import flatten_stranded_child_mirrors
+
+            flatten_stranded_child_mirrors(STRATEGY_NAME, reason="open15 post-summary sweep")
+        except Exception:
+            logger.exception("open15: post-summary child-mirror sweep failed")
 
 
 def init_open15_breakout_service(app=None) -> Open15BreakoutService | None:
