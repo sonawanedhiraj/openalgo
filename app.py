@@ -117,6 +117,9 @@ from database.apilog_db import init_db as ensure_api_log_tables_exists
 from database.auth_db import init_db as ensure_auth_tables_exists
 from database.backtest_db import init_db as ensure_backtest_tables_exists
 from database.broker_accounts_db import init_db as ensure_broker_accounts_tables_exists
+from database.broker_auto_login_settings_db import (
+    init_db as ensure_broker_auto_login_settings_tables_exists,
+)
 from database.broker_login_credentials_db import (
     init_db as ensure_broker_login_credentials_tables_exists,
 )
@@ -732,6 +735,7 @@ def setup_environment(app):
                 ("Chartink DB", ensure_chartink_tables_exists),
                 ("Broker TOTP DB", ensure_broker_totp_tables_exists),
                 ("Broker Login Credentials DB", ensure_broker_login_credentials_tables_exists),
+                ("Broker Auto-Login Settings DB", ensure_broker_auto_login_settings_tables_exists),
                 ("Broker Accounts DB", ensure_broker_accounts_tables_exists),
                 ("Account Orders DB", ensure_account_orders_tables_exists),
                 ("Traffic Logs DB", ensure_traffic_logs_exists),

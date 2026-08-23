@@ -71,7 +71,18 @@ _watch_thread: threading.Thread | None = None
 # Env knobs
 # --------------------------------------------------------------------------- #
 def watcher_enabled() -> bool:
-    return os.getenv("BROKER_AUTO_LOGIN_ENABLED", "false").lower() == "true"
+    """Master auto-login flag — DB-backed (UI toggle), env is only the seed.
+
+    Read fresh every tick so a UI flip applies within one interval, no restart.
+    Falls back to the env var if the settings module is unavailable.
+    """
+    try:
+        from database.broker_auto_login_settings_db import get_enabled
+
+        return get_enabled()
+    except Exception:
+        logger.exception("watcher_enabled: settings read failed — falling back to env")
+        return os.getenv("BROKER_AUTO_LOGIN_ENABLED", "false").lower() == "true"
 
 
 def _interval_seconds() -> int:
@@ -306,12 +317,18 @@ def _login_primary() -> dict:
 
 
 def _list_child_targets() -> list[tuple[int, str]]:
-    """Enabled Zerodha children that have a stored password (auto-login candidates)."""
+    """Children eligible for AUTOMATIC re-login: enabled + password + per-child opt-in.
+
+    The per-child ``auto_login_enabled`` flag is the UI toggle; the manual "Auto
+    login" button ignores it (it calls the service directly).
+    """
     from database import broker_accounts_db as accounts_db
 
     targets: list[tuple[int, str]] = []
     for acct in accounts_db.list_accounts():
         if not acct.get("is_enabled") or not acct.get("has_password"):
+            continue
+        if not acct.get("auto_login_enabled"):
             continue
         targets.append((acct["id"], acct.get("display_name") or f"account:{acct['id']}"))
     return targets
@@ -363,6 +380,11 @@ def _watch_loop() -> None:
     state = WatcherState()
     while not _stop_event.is_set():
         _beat("BrokerAutoLoginWatcher")
+        # Master flag is read every tick (DB-backed) so a UI toggle applies within
+        # one interval without a restart. Disabled → beat + sleep, no logins.
+        if not watcher_enabled():
+            _stop_event.wait(interval)
+            continue
         try:
             results = evaluate_once(
                 state,
@@ -397,7 +419,7 @@ def _boot_worker() -> None:
     # Small settle delay so plugins / DBs are initialised before the first probe.
     _stop_event.wait(_BOOT_WAIT_POLL_SEC)
     try:
-        if not _probe_primary():
+        if watcher_enabled() and not _probe_primary():
             logger.info("broker auto-login: no live session at boot — attempting auto-login")
             from services.broker_auto_login_service import auto_login_all
 
@@ -408,11 +430,12 @@ def _boot_worker() -> None:
 
 
 def start_watcher() -> bool:
-    """Start the watch daemon thread (idempotent). Returns True if started."""
+    """Start the watch daemon thread (idempotent). Returns True if started.
+
+    Always starts the thread — it no-ops each tick while the DB master flag is
+    off, so flipping the UI toggle on takes effect without a restart.
+    """
     global _watch_thread
-    if not watcher_enabled():
-        logger.info("broker auto-login watcher disabled (BROKER_AUTO_LOGIN_ENABLED!=true)")
-        return False
     if _watch_thread is not None and _watch_thread.is_alive():
         return False
     _stop_event.clear()
@@ -427,15 +450,12 @@ def stop_watcher() -> None:
 
 
 def init_broker_auto_login(app=None) -> None:
-    """Boot hook: attempt a boot login if needed, then start the watcher.
+    """Boot hook: start the watcher (always) + a one-shot boot login if enabled.
 
-    Non-blocking — runs on a daemon thread. A no-op when the feature flag is off
-    (the boot worker still runs to honour a flag flipped on later? No: gated
-    here so a disabled install starts nothing).
+    The watcher thread always starts so a UI toggle applies without a restart; it
+    no-ops while the DB master flag is off. The boot one-shot login inside
+    ``_boot_worker`` is itself gated on the flag.
     """
-    if not watcher_enabled():
-        logger.info("broker auto-login disabled (BROKER_AUTO_LOGIN_ENABLED!=true) — not started")
-        return
     _stop_event.clear()
     threading.Thread(target=_boot_worker, daemon=True, name="BrokerAutoLoginBoot").start()
     logger.info("broker auto-login boot+watcher initialized")

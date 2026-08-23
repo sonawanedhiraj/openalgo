@@ -200,6 +200,9 @@ class BrokerAccount(Base):
     # issue #654: encrypted Kite login password for headless auto-login. Nullable —
     # accounts without it keep the manual login flow. Write-only, never echoed.
     password_encrypted = Column(Text, nullable=True)
+    # issue #654: per-child opt-in for automatic (watcher) re-login. Gated ALSO by
+    # the global master flag; the manual "Auto login" button ignores it.
+    auto_login_enabled = Column(Boolean, nullable=False, default=False)
     capital_inr = Column(Float, nullable=False, default=0.0)
     is_enabled = Column(Boolean, nullable=False, default=False)
     last_login_at = Column(DateTime, nullable=True)
@@ -271,6 +274,15 @@ def _migrate_add_capital_override() -> None:
                 conn.execute(text("ALTER TABLE broker_accounts ADD COLUMN password_encrypted TEXT"))
                 conn.commit()
                 logger.info("broker_accounts.password_encrypted column added (issue #654)")
+            if acct_cols and "auto_login_enabled" not in acct_cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE broker_accounts "
+                        "ADD COLUMN auto_login_enabled BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+                conn.commit()
+                logger.info("broker_accounts.auto_login_enabled column added (issue #654)")
     except Exception:
         logger.exception("capital_override_inr migration failed")
 
@@ -330,6 +342,7 @@ def _row_to_dict(row: BrokerAccount) -> dict:
         "has_api_secret": bool(row.api_secret_encrypted),
         "has_totp_secret": row.totp_secret_encrypted is not None,
         "has_password": row.password_encrypted is not None,
+        "auto_login_enabled": bool(row.auto_login_enabled),
         "last_login_at": row.last_login_at.isoformat() if row.last_login_at else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
@@ -431,6 +444,12 @@ def update_account(account_id: int, **fields) -> dict | None:
             pwd = str(fields["password"] or "").strip()
             row.password_encrypted = encrypt_token(pwd) if pwd else None
             replaced.append("password" if pwd else "password(cleared)")
+            # Saving a password opts the child into automatic re-login by default
+            # (still gated by the global master flag); clearing it opts out.
+            if "auto_login_enabled" not in fields:
+                row.auto_login_enabled = bool(pwd)
+        if "auto_login_enabled" in fields and fields["auto_login_enabled"] is not None:
+            row.auto_login_enabled = bool(fields["auto_login_enabled"])
         if "last_login_at" in fields:
             row.last_login_at = fields["last_login_at"]
         row.updated_at = datetime.utcnow()

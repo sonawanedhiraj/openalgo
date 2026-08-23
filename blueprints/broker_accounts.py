@@ -113,6 +113,7 @@ def update_account(account_id: int):
             "api_secret",
             "totp_secret",
             "password",  # issue #654: Kite login password for headless auto-login
+            "auto_login_enabled",  # issue #654: per-child automatic re-login opt-in
         )
         if k in data
     }

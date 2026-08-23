@@ -235,6 +235,18 @@ export default function AccountsPage() {
     },
   })
 
+  const autoToggleMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      brokerAccountsApi.update(id, { auto_login_enabled: enabled }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['broker-accounts'] }),
+    onError: (e: unknown) => {
+      const message =
+        (e as { response?: { data?: { message?: string } } })?.response?.data?.message ??
+        'Failed to update auto-login'
+      toast.error(message)
+    },
+  })
+
   const autoLoginMutation = useMutation({
     mutationFn: (id: number) => brokerAccountsApi.autoLogin(id),
     onSuccess: (result) => {
@@ -475,6 +487,21 @@ export default function AccountsPage() {
                     >
                       Auto login
                     </Button>
+                  )}
+                  {account.has_password && (
+                    <div
+                      className="flex items-center gap-1 text-xs text-muted-foreground"
+                      title="Automatically re-login this child when its session expires (needs the master switch on /broker on)"
+                    >
+                      Auto
+                      <Switch
+                        checked={account.auto_login_enabled}
+                        onCheckedChange={(checked) =>
+                          autoToggleMutation.mutate({ id: account.id, enabled: checked })
+                        }
+                        data-testid={`auto-toggle-${account.id}`}
+                      />
+                    </div>
                   )}
                   <div className="flex items-center gap-1 text-xs text-muted-foreground">
                     Enabled

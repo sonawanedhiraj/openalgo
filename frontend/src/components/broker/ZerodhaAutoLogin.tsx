@@ -4,6 +4,7 @@ import { webClient } from '@/api/client'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 
 interface AutoLoginStatus {
   status: string
@@ -115,6 +116,18 @@ export function ZerodhaAutoLogin() {
     }
   }
 
+  const handleToggleAuto = async (next: boolean) => {
+    setError(null)
+    // Optimistic flip; revert on failure.
+    setStatus((s) => (s ? { ...s, enabled: next } : s))
+    try {
+      await webClient.put('/api/broker-auto-login/settings', { enabled: next })
+    } catch {
+      setStatus((s) => (s ? { ...s, enabled: !next } : s))
+      setError('Failed to update the auto-login setting')
+    }
+  }
+
   if (status === null) return null
 
   const canAutoLogin = status.has_credentials && status.has_totp
@@ -171,10 +184,18 @@ export function ZerodhaAutoLogin() {
               Set up the Zerodha TOTP key above to enable auto-login.
             </p>
           )}
+          <div className="flex items-center justify-between rounded-md bg-muted/50 px-3 py-2">
+            <div>
+              <div className="text-sm font-medium">Automatic re-login</div>
+              <div className="text-xs text-muted-foreground">
+                Re-logs in on its own when the session expires
+              </div>
+            </div>
+            <Switch checked={status.enabled} onCheckedChange={handleToggleAuto} />
+          </div>
           <p className="text-xs text-muted-foreground">
-            {status.enabled
-              ? 'Automatic re-login is ON — the app also re-logs-in on its own if the session expires.'
-              : 'One-click login. Automatic re-login is off (set BROKER_AUTO_LOGIN_ENABLED to turn it on).'}
+            The button works anytime. The switch controls only the automatic boot + all-day
+            re-login, and applies immediately — no restart.
           </p>
         </>
       ) : (

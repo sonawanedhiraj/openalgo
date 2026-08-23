@@ -17,6 +17,8 @@ export interface ChildAccount {
   has_totp_secret: boolean
   // issue #654: whether a Kite login password is stored for headless auto-login.
   has_password: boolean
+  // issue #654: per-child opt-in for automatic (watcher) re-login.
+  auto_login_enabled: boolean
   last_login_at: string | null
   created_at: string | null
   updated_at: string | null
@@ -100,6 +102,8 @@ export interface UpdateAccountPayload {
   totp_secret?: string
   // issue #654: Kite login password for headless auto-login (write-only).
   password?: string
+  // issue #654: per-child automatic re-login opt-in.
+  auto_login_enabled?: boolean
 }
 
 export interface AutoLoginResult {

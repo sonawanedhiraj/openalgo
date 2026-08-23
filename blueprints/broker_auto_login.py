@@ -91,6 +91,22 @@ def status():
     )
 
 
+@broker_auto_login_bp.route("/settings", methods=["PUT"])
+@require_login
+def update_settings():
+    """Flip the master auto-login switch (DB-backed, applies immediately)."""
+    data = request.get_json(silent=True) or {}
+    if "enabled" not in data:
+        return jsonify({"status": "error", "message": "enabled is required."}), 400
+
+    from database.broker_auto_login_settings_db import set_enabled
+
+    who = f"user:{session.get('user', '')}"
+    if not set_enabled(bool(data["enabled"]), updated_by=who):
+        return jsonify({"status": "error", "message": "Failed to save setting."}), 500
+    return jsonify({"status": "success", "enabled": bool(data["enabled"])})
+
+
 @broker_auto_login_bp.route("/credentials", methods=["POST"])
 @require_login
 def save_credentials():
