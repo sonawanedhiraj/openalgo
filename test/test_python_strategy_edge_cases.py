@@ -19,7 +19,12 @@ from unittest.mock import patch
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
+# DB isolation is inherited from test/conftest.py (temp-DB redirect). This file
+# used to force DATABASE_URL=:memory: at module level, which leaked into the
+# process env for the rest of the pytest run (issue #666, the #662 pollution
+# class). Do not reintroduce it — the calendar_db fixture below builds its own
+# private engine and restores the module's original bindings on teardown.
 
 import pytz  # noqa: E402
 
@@ -31,13 +36,24 @@ IST = pytz.timezone("Asia/Kolkata")
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def calendar_db():
+    """Module-scoped with teardown: the rebind of the market_calendar_db module
+    globals is reverted (and the calendar cache cleared) once this module's
+    tests finish, so later test modules see the conftest temp DB again
+    (issue #666 — a session-scoped rebind here never restored them)."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import scoped_session, sessionmaker
     from sqlalchemy.pool import StaticPool
 
     import database.market_calendar_db as mc
+
+    original_engine = mc.engine
+    original_session = mc.db_session
+    # Base.query is a query_property() descriptor; plain attribute access on
+    # the class would *invoke* it (and raise on the unmapped Base) — grab the
+    # raw descriptor object instead.
+    original_query = mc.Base.__dict__["query"]
 
     engine = create_engine(
         "sqlite:///:memory:",
@@ -53,7 +69,14 @@ def calendar_db():
     mc.seed_holidays_2026()
     mc.seed_market_timings()
 
-    return mc
+    yield mc
+
+    mc.db_session.remove()
+    mc.engine = original_engine
+    mc.db_session = original_session
+    mc.Base.query = original_query
+    mc.clear_market_calendar_cache()
+    engine.dispose()
 
 
 @pytest.fixture()

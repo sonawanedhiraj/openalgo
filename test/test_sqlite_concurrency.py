@@ -14,11 +14,13 @@ readers.
 Every test here builds its OWN file-backed engine and never reads a
 `database.*` module's ambient engine. That is not fastidiousness — an earlier
 draft asserted on `market_intel_db.engine`, passed on Windows, and failed on
-Linux CI with `assert 'memory' == 'wal'`: `test/test_action_center.py` sets
-`os.environ["DATABASE_URL"] = "sqlite:///:memory:"` at MODULE level, so under
-xdist any module imported after it binds to an in-memory database, where WAL is
-impossible and every connection sees a different empty DB. The contract under
-test is about file-backed databases, so the test must supply one.
+Linux CI with `assert 'memory' == 'wal'`: at the time, `test/test_action_center.py`
+set `os.environ["DATABASE_URL"] = "sqlite:///:memory:"` at MODULE level, so
+under xdist any module imported after it bound to an in-memory database, where
+WAL is impossible and every connection sees a different empty DB. Those
+module-level env writes are gone (issues #662/#666), but the lesson stands:
+the contract under test is about file-backed databases, so the test must
+supply one rather than trust any ambient engine.
 """
 
 from __future__ import annotations

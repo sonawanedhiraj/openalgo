@@ -1,44 +1,45 @@
-import os
-import sys
+"""Round-trip test for the ``bot_config.broadcast_enabled`` field.
 
-# === Live-DB isolation: must be set BEFORE any database.* import.
-# database.telegram_db resolves DATABASE_URL at import time. This file calls
-# update_bot_config({"broadcast_enabled": False}) at MODULE IMPORT time, so
-# merely *collecting* the test would otherwise flip the operator's live
-# broadcast setting off in db/openalgo.db. See fix/test-live-db-isolation.
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+DB isolation is inherited from ``test/conftest.py``, which redirects
+``DATABASE_URL`` to a per-process temp dir before any ``database.*`` import
+and inits the ``telegram_db`` schema there. This file used to carry its own
+pre-conftest isolation hack — a module-level
+``os.environ["DATABASE_URL"] = "sqlite:///:memory:"`` plus a rebind of
+``telegram_db`` module globals onto a private in-memory engine — and ran its
+whole body (two ``update_bot_config`` writes) at *import* time. Both leaked
+(issue #666, the #662 pollution class): the env write poisoned any
+``database.*`` module first imported afterwards, and the import-time writes
+fired during collection. Do not reintroduce either; the row cleanup below
+keeps this file hermetic in the shared temp DB instead.
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+Run: uv run pytest test/test_broadcast_save.py -v
+"""
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
+import pytest
 
-import database.telegram_db as _tdb
-
-# The module engine uses NullPool, so a bare sqlite ":memory:" loses its
-# tables between operations (each NullPool connection is a fresh empty DB).
-# Rebind to a private default-pool in-memory engine whose connection persists,
-# mirroring test/test_market_intel_db.py and test/test_orphaned_apikey.py.
-_engine = create_engine("sqlite:///:memory:")
-_tdb.db_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=_engine))
-_tdb.Base.query = _tdb.db_session.query_property()
-_tdb.Base.metadata.create_all(_engine)
-
+import database.telegram_db as telegram_db
 from database.telegram_db import get_bot_config, update_bot_config
 
-# Test saving with broadcast disabled
-print("Testing broadcast_enabled field:")
-print("1. Setting broadcast_enabled to False")
-update_bot_config({"broadcast_enabled": False})
 
-config = get_bot_config()
-print(f"2. After save - broadcast_enabled: {config.get('broadcast_enabled')}")
-print(f"   Type: {type(config.get('broadcast_enabled'))}")
+@pytest.fixture(autouse=True)
+def _clean_bot_config():
+    """The conftest temp DB is shared by the whole pytest run; drop the
+    singleton ``bot_config`` row after each test so the flags written here
+    never leak into later tests reading the bot config."""
+    yield
+    try:
+        telegram_db.db_session.query(telegram_db.BotConfig).delete(synchronize_session=False)
+        telegram_db.db_session.commit()
+    finally:
+        telegram_db.db_session.remove()
 
-# Try again with True
-print("\n3. Setting broadcast_enabled to True")
-update_bot_config({"broadcast_enabled": True})
 
-config = get_bot_config()
-print(f"4. After save - broadcast_enabled: {config.get('broadcast_enabled')}")
-print(f"   Type: {type(config.get('broadcast_enabled'))}")
+def test_broadcast_enabled_roundtrips_as_bool():
+    """broadcast_enabled must save and load as a real bool, both ways."""
+    assert update_bot_config({"broadcast_enabled": False}) is True
+    config = get_bot_config()
+    assert config.get("broadcast_enabled") is False
+
+    assert update_bot_config({"broadcast_enabled": True}) is True
+    config = get_bot_config()
+    assert config.get("broadcast_enabled") is True
