@@ -139,6 +139,13 @@ def login_now():
     from services.broker_auto_login_service import auto_login_primary
 
     result = auto_login_primary()
+    if result.get("ok"):
+        # The service wrote the broker token but NOT the Flask login session, so
+        # mark this browser session logged-in — else the dashboard bounces back to
+        # /broker (issue #654). Uses the current session user as the key.
+        from utils.auth_utils import establish_login_session
+
+        establish_login_session(session["user"], broker)
     code = 200 if result.get("ok") else 502
     return jsonify(
         {
