@@ -290,7 +290,14 @@ All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-alig
   `/broker` and a per-child `Auto` switch on `/accounts`, both **DB-backed** (`broker_auto_login_settings`
   master row + `broker_accounts.auto_login_enabled`); the DB wins, `BROKER_AUTO_LOGIN_ENABLED` is only a
   first-boot seed, and a flip applies within one watcher tick with no restart. The manual "Auto login now" /
-  "Auto login" buttons ignore both flags (they always work).
+  "Auto login" buttons ignore both flags (they always work). **The watcher's probes are broker-verified
+  (issue #658):** the child probe layers `broker_session_health.probe_token` (the primary's own
+  `test_auth_token` core — child auth rows store the identical `"<api_key>:<access_token>"` format) on top
+  of the date-only `_is_connected` pre-filter, so a mid-session token kill reads dead. Every ENABLED child
+  is probed, not just auto-login ones: a confirmed-dead session that was alive earlier today on a child
+  with the `Auto` switch OFF Telegram-alerts once/day ("manual login needed") instead of healing. Note the
+  `/accounts` UI badge itself is still the date-only check — the watcher (master switch ON) is what
+  detects a killed session.
 
 ## Development Environment Setup
 

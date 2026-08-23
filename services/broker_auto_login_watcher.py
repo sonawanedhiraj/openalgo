@@ -10,13 +10,21 @@ all-day daemon loop is the mechanism that catches both.
 Each tick (default every ``AUTO_LOGIN_WATCH_INTERVAL_MIN`` = 5 min, on trading
 days inside the watch window):
 
-1. **Probe** the primary (``is_live_broker_session``) and each enabled child with
-   a stored password (``broker_accounts_service._is_connected``).
+1. **Probe** the primary (``is_live_broker_session``) and each enabled child.
+   Both probes are BROKER-VERIFIED (issue #658): the child probe layers a real
+   ``broker_session_health.probe_token`` call on top of the cheap
+   ``broker_accounts_service._is_connected`` date pre-filter, so a token Kite
+   killed mid-session reads dead — a date-only check cannot see that.
 2. **Confirm** — a target must read dead ``AUTO_LOGIN_DEAD_CONFIRM_COUNT`` (2)
    ticks in a row before we act, so a transient network blip never triggers a
    needless re-login.
-3. **Re-login** via ``broker_auto_login_service`` (primary / that child). A
-   success heals the live feed automatically: the ``upsert_auth`` inside publishes
+3. **Re-login** via ``broker_auto_login_service`` (primary / that child) — for
+   children with the per-child ``auto_login_enabled`` UI toggle ON. A child
+   WITHOUT it is still probed: a confirmed-dead session that was alive earlier
+   today Telegram-alerts once per day ("manual login needed") instead of
+   healing, so a mid-session kill on a manual-login child is no longer silent
+   until a mirror order fails (issue #658). A success heals the live feed
+   automatically: the ``upsert_auth`` inside publishes
    the ZMQ ``CACHE_INVALIDATE`` (WS-proxy reconnect) and
    ``notify_broker_session_refreshed`` drives ``ws_recovery_service`` to backfill
    the bars missed while the token was dead — no restart.
@@ -133,12 +141,22 @@ class TargetState:
     attempts_today: int = 0
     attempts_date: date | None = None
     last_attempt_ts: float = 0.0
+    # Alert-only targets (child with auto-login OFF, issue #658): only a session
+    # that was seen ALIVE today and then died is a mid-session kill worth an
+    # alert — a not-yet-logged-in morning is the 09:00/15:00 login reminders'
+    # job, and re-alerting it here daily would just train the operator to
+    # ignore the channel. In-memory, so a restart between death and alert
+    # loses the flag (fail-quiet; mirror-failure alerts remain the backstop).
+    was_alive_today: bool = False
+    alerted_today: bool = False
 
     def roll_day(self, today: date) -> None:
         if self.attempts_date != today:
             self.attempts_date = today
             self.attempts_today = 0
             self.last_attempt_ts = 0.0
+            self.was_alive_today = False
+            self.alerted_today = False
 
 
 @dataclass
@@ -188,10 +206,17 @@ def evaluate_once(
     All IO is injected:
       * ``probe_primary() -> bool`` — True when the primary session is live.
       * ``login_primary() -> dict`` — the auto_login_primary result.
-      * ``list_child_targets() -> list[(id, name)]`` — enabled children with a
-        stored password.
-      * ``probe_child(id) -> bool`` — True when that child is connected today.
+      * ``list_child_targets() -> list[(id, name, can_heal)]`` — every enabled
+        child; ``can_heal`` says whether automatic re-login may fix it (stored
+        password + per-child opt-in). 2-tuples ``(id, name)`` are accepted for
+        backward compatibility and imply ``can_heal=True``.
+      * ``probe_child(id) -> bool`` — True when that child's broker session is
+        live (broker-verified, issue #658).
       * ``login_child(id, name) -> dict`` — the child auto-login result.
+
+    A confirmed-dead target with ``can_heal=False`` never attempts a login: if
+    it was alive earlier today (a mid-session kill, not a not-yet-logged-in
+    morning) it alerts once per day instead.
 
     Never raises: a probe/login that throws is treated as a failure for that
     target and logged.
@@ -224,7 +249,9 @@ def evaluate_once(
     except Exception:
         logger.exception("auto-login watcher: listing child targets failed")
         children = []
-    for account_id, name in children:
+    for child in children:
+        account_id, name, *rest = child
+        can_heal = bool(rest[0]) if rest else True
         key = f"child:{account_id}"
         results.extend(
             _evaluate_target(
@@ -236,6 +263,7 @@ def evaluate_once(
                 login=lambda aid=account_id, nm=name: login_child(aid, nm),
                 dead_confirm=dead_confirm,
                 max_attempts=max_attempts,
+                alert_only=not can_heal,
             )
         )
     return results
@@ -251,8 +279,13 @@ def _evaluate_target(
     login,
     dead_confirm: int,
     max_attempts: int,
+    alert_only: bool = False,
 ) -> list[dict]:
-    """Evaluate one target: probe → confirm → (attempt if under cap + backoff-ready)."""
+    """Evaluate one target: probe → confirm → (attempt if under cap + backoff-ready).
+
+    ``alert_only`` (issue #658): never login; a confirmed mid-session death
+    (was alive earlier today) alerts once per day instead.
+    """
     target.roll_day(today)
 
     try:
@@ -263,6 +296,7 @@ def _evaluate_target(
 
     if alive:
         target.dead_streak = 0
+        target.was_alive_today = True
         return []
 
     target.dead_streak += 1
@@ -271,6 +305,15 @@ def _evaluate_target(
             f"auto-login watcher: {key} dead ({target.dead_streak}/{dead_confirm}) — "
             "waiting for confirmation before re-login"
         )
+        return []
+
+    if alert_only:
+        if target.was_alive_today and not target.alerted_today:
+            target.alerted_today = True
+            _alert(
+                f"auto-login: {key} broker session went DEAD mid-session and auto-login "
+                "is OFF for this account — manual login needed (/accounts)"
+            )
         return []
 
     if target.attempts_today >= max_attempts:
@@ -316,30 +359,49 @@ def _login_primary() -> dict:
     return auto_login_primary()
 
 
-def _list_child_targets() -> list[tuple[int, str]]:
-    """Children eligible for AUTOMATIC re-login: enabled + password + per-child opt-in.
+def _list_child_targets() -> list[tuple[int, str, bool]]:
+    """Every ENABLED child, with whether AUTOMATIC re-login may heal it (issue #658).
 
-    The per-child ``auto_login_enabled`` flag is the UI toggle; the manual "Auto
-    login" button ignores it (it calls the service directly).
+    ``can_heal`` = stored password + per-child ``auto_login_enabled`` (the UI
+    toggle; the manual "Auto login" button ignores it — it calls the service
+    directly). Children without it are still probed so a mid-session token kill
+    is detected and alerted rather than surfacing as a failed mirror order.
     """
     from database import broker_accounts_db as accounts_db
 
-    targets: list[tuple[int, str]] = []
+    targets: list[tuple[int, str, bool]] = []
     for acct in accounts_db.list_accounts():
-        if not acct.get("is_enabled") or not acct.get("has_password"):
+        if not acct.get("is_enabled"):
             continue
-        if not acct.get("auto_login_enabled"):
-            continue
-        targets.append((acct["id"], acct.get("display_name") or f"account:{acct['id']}"))
+        can_heal = bool(acct.get("has_password")) and bool(acct.get("auto_login_enabled"))
+        targets.append((acct["id"], acct.get("display_name") or f"account:{acct['id']}", can_heal))
     return targets
 
 
 def _probe_child(account_id: int) -> bool:
+    """Broker-verified child-session probe (issue #658).
+
+    ``_is_connected`` alone is a DATE check (auth row + last_login_at today) —
+    it cannot see a token Kite killed mid-session (one active session per
+    user). It stays as the cheap pre-filter: a stale date is dead without a
+    broker call (tokens die at the daily reset regardless). A fresh date is
+    then verified with a real broker probe on the child's own token — the same
+    ``probe_token`` core the primary's ``is_live_broker_session`` uses, valid
+    here because child auth rows store the identical
+    ``"<api_key>:<access_token>"`` format.
+    """
     from database import broker_accounts_db as accounts_db
+    from database.auth_db import get_auth_token
     from services.broker_accounts_service import _is_connected
+    from services.broker_session_health import probe_token
 
     acct = accounts_db.get_account(account_id)
-    return bool(acct and _is_connected(acct))
+    if not acct or not _is_connected(acct):
+        return False
+    token = get_auth_token(accounts_db.auth_name(account_id))
+    if not token:
+        return False
+    return probe_token(acct.get("broker") or "zerodha", token)
 
 
 def _login_child(account_id: int, name: str) -> dict:

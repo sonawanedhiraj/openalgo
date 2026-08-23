@@ -166,6 +166,7 @@ def test_daily_attempt_counter_rolls_over():
 
 
 def test_children_evaluated_and_isolated():
+    """2-tuple children (legacy shape) still work and imply can_heal=True."""
     state = w.WatcherState()
     children = [(1, "kid1"), (2, "kid2")]
 
@@ -184,3 +185,152 @@ def test_children_evaluated_and_isolated():
     )
     assert child_login_calls == [1]
     assert any(r["scope"] == "child:1" and r["ok"] for r in results)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #658: alert-only children (auto-login OFF) + broker-verified probe
+# --------------------------------------------------------------------------- #
+def test_alert_only_child_mid_session_kill_alerts_once_never_logs_in(monkeypatch):
+    """A non-healable child that was alive today and then dies alerts once/day."""
+    alerts = []
+    monkeypatch.setattr(w, "_alert", lambda msg: alerts.append(msg))
+    state = w.WatcherState()
+    children = [(1, "manual-kid", False)]
+    login_calls = []
+
+    def login(aid, name):
+        login_calls.append(aid)
+        return _ok(f"child:{aid}")
+
+    # Tick 1: alive → was_alive_today recorded.
+    _run(state, NOW, primary_alive=True, children=children, child_alive=lambda aid: True)
+    assert state.get("child:1").was_alive_today is True
+
+    # Tick 2: dead, unconfirmed → quiet.
+    _run(
+        state,
+        NOW,
+        primary_alive=True,
+        children=children,
+        child_alive=lambda aid: False,
+        child_login=login,
+    )
+    assert alerts == []
+
+    # Tick 3: confirmed dead → alert fires, login does NOT.
+    _run(
+        state,
+        NOW,
+        primary_alive=True,
+        children=children,
+        child_alive=lambda aid: False,
+        child_login=login,
+    )
+    assert len(alerts) == 1
+    assert "manual login needed" in alerts[0]
+    assert login_calls == []
+
+    # Tick 4: still dead → no second alert today.
+    _run(
+        state,
+        NOW,
+        primary_alive=True,
+        children=children,
+        child_alive=lambda aid: False,
+        child_login=login,
+    )
+    assert len(alerts) == 1
+
+
+def test_alert_only_child_never_alive_today_stays_quiet(monkeypatch):
+    """Not-yet-logged-in morning is the login reminders' job, not the watcher's."""
+    alerts = []
+    monkeypatch.setattr(w, "_alert", lambda msg: alerts.append(msg))
+    state = w.WatcherState()
+    children = [(1, "manual-kid", False)]
+
+    for _ in range(5):
+        _run(state, NOW, primary_alive=True, children=children, child_alive=lambda aid: False)
+    assert alerts == []
+
+
+def test_alert_only_flags_reset_next_day(monkeypatch):
+    """A new day re-arms the once-a-day alert (roll_day resets both flags)."""
+    alerts = []
+    monkeypatch.setattr(w, "_alert", lambda msg: alerts.append(msg))
+    state = w.WatcherState()
+    children = [(1, "manual-kid", False)]
+
+    # Day 1: alive → dead ×2 → alert.
+    _run(state, NOW, primary_alive=True, children=children, child_alive=lambda aid: True)
+    for _ in range(2):
+        _run(state, NOW, primary_alive=True, children=children, child_alive=lambda aid: False)
+    assert len(alerts) == 1
+
+    # Day 2: same pattern → alerts again.
+    day2 = NOW.replace(day=NOW.day + 1)
+    _run(state, day2, primary_alive=True, children=children, child_alive=lambda aid: True)
+    for _ in range(2):
+        _run(state, day2, primary_alive=True, children=children, child_alive=lambda aid: False)
+    assert len(alerts) == 2
+
+
+def test_healable_child_still_heals_without_being_alive_first():
+    """can_heal=True keeps #654 semantics: morning auto-login needs no prior-alive."""
+    state = w.WatcherState()
+    children = [(1, "kid", True)]
+    login_calls = []
+
+    for _ in range(2):
+        _run(
+            state,
+            NOW,
+            primary_alive=True,
+            children=children,
+            child_alive=lambda aid: False,
+            child_login=lambda aid, name: login_calls.append(aid) or _ok(f"child:{aid}"),
+        )
+    assert login_calls == [1]
+
+
+def test_probe_child_is_broker_verified(monkeypatch):
+    """_probe_child layers probe_token on the date pre-filter (issue #658)."""
+    import database.auth_db as auth_db
+    import database.broker_accounts_db as adb
+    import services.broker_accounts_service as accounts_svc
+    import services.broker_session_health as health
+
+    acct = {"id": 7, "broker": "zerodha"}
+    monkeypatch.setattr(adb, "get_account", lambda aid: acct)
+    monkeypatch.setattr(adb, "auth_name", lambda aid: f"acct:{aid}")
+    monkeypatch.setattr(auth_db, "get_auth_token", lambda name: "key:token")
+
+    probe_calls = []
+
+    def fake_probe(broker, token):
+        probe_calls.append((broker, token))
+        return True
+
+    monkeypatch.setattr(health, "probe_token", fake_probe)
+
+    # Fresh date + live token → alive, probe consulted.
+    monkeypatch.setattr(accounts_svc, "_is_connected", lambda a: True)
+    assert w._probe_child(7) is True
+    assert probe_calls == [("zerodha", "key:token")]
+
+    # Broker says dead → dead, even with a fresh date.
+    monkeypatch.setattr(health, "probe_token", lambda b, t: False)
+    assert w._probe_child(7) is False
+
+    # Stale date short-circuits WITHOUT a broker call.
+    probe_calls.clear()
+    monkeypatch.setattr(health, "probe_token", fake_probe)
+    monkeypatch.setattr(accounts_svc, "_is_connected", lambda a: False)
+    assert w._probe_child(7) is False
+    assert probe_calls == []
+
+    # Missing token row → dead, no broker call.
+    monkeypatch.setattr(accounts_svc, "_is_connected", lambda a: True)
+    monkeypatch.setattr(auth_db, "get_auth_token", lambda name: None)
+    assert w._probe_child(7) is False
+    assert probe_calls == []

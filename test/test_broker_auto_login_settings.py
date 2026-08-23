@@ -48,7 +48,8 @@ def test_watcher_enabled_reads_db(settings_db, monkeypatch):
     assert w.watcher_enabled() is False
 
 
-def test_child_targets_respect_auto_login_flag(monkeypatch):
+def test_child_targets_probe_all_enabled_heal_only_opted_in(monkeypatch):
+    """Issue #658: every ENABLED child is probed; can_heal needs password + opt-in."""
     import services.broker_auto_login_watcher as w
 
     accounts = [
@@ -73,9 +74,18 @@ def test_child_targets_respect_auto_login_flag(monkeypatch):
             "has_password": False,
             "auto_login_enabled": True,
         },
+        {
+            "id": 4,
+            "display_name": "disabled",
+            "is_enabled": False,
+            "has_password": True,
+            "auto_login_enabled": True,
+        },
     ]
     import database.broker_accounts_db as adb
 
     monkeypatch.setattr(adb, "list_accounts", lambda: accounts)
     targets = w._list_child_targets()
-    assert targets == [(1, "on")]  # only enabled + password + auto_login_enabled
+    # Disabled accounts are excluded entirely; the rest are probed (alert-only
+    # when automatic re-login cannot heal them).
+    assert targets == [(1, "on", True), (2, "off", False), (3, "nopw", False)]

@@ -76,11 +76,58 @@ def _broker_response_indicates_failure(funds_data) -> str | None:
     return None
 
 
+def probe_token(broker: str, auth_token: str) -> bool:
+    """Return True only when the broker answers a live-session probe for this token.
+
+    The probing core shared by the primary (:func:`is_live_broker_session`) and
+    the auto-login watcher's child probe (issue #658) — child auth rows store the
+    same ``"<api_key>:<access_token>"`` format the primary does, so one probe
+    serves both and the two can never drift. Calls ``test_auth_token`` when the
+    broker exposes one, else ``get_margin_data``. Never raises; any failure
+    (missing/import-broken broker module, raising call, failure payload) is False.
+    """
+    try:
+        if not broker or not auth_token:
+            return False
+        try:
+            broker_module = importlib.import_module(f"broker.{broker}.api.funds")
+        except ImportError:
+            logger.exception(
+                "broker_session_health: could not import broker.%s.api.funds",
+                broker,
+            )
+            return False
+
+        if hasattr(broker_module, "test_auth_token"):
+            is_valid, error_message = broker_module.test_auth_token(auth_token)
+            if not is_valid:
+                logger.debug(
+                    "broker_session_health: token probe failed for %s: %s",
+                    broker,
+                    error_message,
+                )
+            return bool(is_valid)
+
+        funds_data = broker_module.get_margin_data(auth_token)
+        failure_reason = _broker_response_indicates_failure(funds_data)
+        if failure_reason:
+            logger.debug(
+                "broker_session_health: funds probe failed for %s: %s",
+                broker,
+                failure_reason,
+            )
+            return False
+        return True
+    except Exception:
+        logger.exception("broker_session_health: token probe raised")
+        return False
+
+
 def is_live_broker_session() -> bool:
     """Return True only when a probe against the stored broker token succeeds.
 
-    Probes the first non-revoked auth row by calling ``test_auth_token`` (if
-    the broker exposes one) or ``get_margin_data``. Returns False when:
+    Probes the first non-revoked auth row via :func:`probe_token`. Returns
+    False when:
 
     - No non-revoked auth row exists.
     - The stored auth token is empty / undecryptable.
@@ -101,36 +148,7 @@ def is_live_broker_session() -> bool:
         if not auth_token:
             return False
 
-        try:
-            broker_module = importlib.import_module(f"broker.{auth_obj.broker}.api.funds")
-        except ImportError:
-            logger.exception(
-                "broker_session_health: could not import broker.%s.api.funds",
-                auth_obj.broker,
-            )
-            return False
-
-        if hasattr(broker_module, "test_auth_token"):
-            is_valid, error_message = broker_module.test_auth_token(auth_token)
-            if not is_valid:
-                logger.debug(
-                    "broker_session_health: token probe failed for %s: %s",
-                    auth_obj.broker,
-                    error_message,
-                )
-                return False
-            return True
-
-        funds_data = broker_module.get_margin_data(auth_token)
-        failure_reason = _broker_response_indicates_failure(funds_data)
-        if failure_reason:
-            logger.debug(
-                "broker_session_health: funds probe failed for %s: %s",
-                auth_obj.broker,
-                failure_reason,
-            )
-            return False
-        return True
+        return probe_token(auth_obj.broker, auth_token)
     except Exception:
         logger.exception("broker_session_health: live-session probe raised")
         return False
