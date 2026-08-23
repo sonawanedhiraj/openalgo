@@ -752,3 +752,118 @@ def test_flatten_with_no_real_exit_never_reconciles(monkeypatch):
     svc.flatten("eod_0930")
 
     assert calls == [], "no exit order sent -> no broker round-trip"
+
+
+# --------------------------------------------------------------------------- #
+# issue #659 — a paper demotion must also close the CHILD account's mirror
+#
+# The fan-out fires at ACK time, so a child can be genuinely FILLED on an entry
+# our own RMS later refused. Demoting the parent to paper suppresses the parent
+# exit — the only trigger the child exit had — so the demotion now sweeps the
+# child mirror directly (corroborated by our own affirmatively-flat book).
+# --------------------------------------------------------------------------- #
+def _capture_sweep(monkeypatch):
+    import services.account_fanout_service as fanout
+
+    calls = []
+    monkeypatch.setattr(
+        fanout,
+        "flatten_stranded_child_mirrors",
+        lambda mode_key, symbols=None, reason="": calls.append(
+            {"mode_key": mode_key, "symbols": symbols, "reason": reason}
+        ),
+    )
+    return calls
+
+
+def test_post_ack_demotion_sweeps_the_child_mirror(monkeypatch):
+    """Gap A: demotion with a corroborating flat book → targeted child sweep."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: 0  # our book corroborates the reject
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = _capture_sweep(monkeypatch)
+    _stub_broker_answer(monkeypatch, _rejected_answer())
+    monkeypatch.setattr(svc, "_alert_rejection", lambda *a, **k: None)
+    assert svc.verify_entries() == 1
+
+    assert calls == [
+        {
+            "mode_key": "open15_vol_breakout",
+            "symbols": ["AAA"],
+            "reason": "parent entry demoted to paper (post-ACK reject)",
+        }
+    ]
+
+
+def test_demotion_with_a_disagreeing_book_does_not_sweep(monkeypatch):
+    """When OUR book insists we hold the lot, flatten will re-promote and exit
+    normally (#626 "the book wins") — the normal exit mirror handles the child,
+    and an early sweep would leave that mirror echoing against a flat child."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: 300  # the book disagrees
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = _capture_sweep(monkeypatch)
+    _stub_broker_answer(monkeypatch, _rejected_answer())
+    monkeypatch.setattr(svc, "_alert_rejection", lambda *a, **k: None)
+    svc.verify_entries()
+
+    assert calls == [], "a possibly-real parent position defers to the normal exit mirror"
+
+
+def test_flatten_paper_branch_sweeps_the_child_mirror(monkeypatch):
+    """Gap A at exit time: the book affirms our entry never filled → the row is
+    papered and the child mirror is swept in the same breath."""
+    from database.open15_breakout_db import init_db
+
+    init_db()
+    orders = []
+    svc = _mk_service(orders, reject=False)
+    svc._broker_qty = lambda symbol, exchange: 0  # entry never filled on OUR side
+    _run_to_selection(svc)
+    _trigger(svc)
+
+    calls = _capture_sweep(monkeypatch)
+    svc.flatten("eod_0930")
+
+    assert len(orders) == 1, "paper row — no parent exit order"
+    assert calls == [
+        {
+            "mode_key": "open15_vol_breakout",
+            "symbols": ["AAA"],
+            "reason": "parent entry papered at exit (book flat)",
+        }
+    ]
+
+
+def test_summary_job_runs_the_full_sweep(monkeypatch):
+    """Gap B: the post-summary sweep is the retry a rejected child exit gets."""
+    import services.open15_breakout_service as mod
+
+    calls = _capture_sweep(monkeypatch)
+
+    class _Svc:
+        def summary(self):
+            pass
+
+    monkeypatch.setattr(mod, "get_open15_service", lambda: _Svc())
+    mod._summary_job()
+
+    assert calls == [
+        {
+            "mode_key": "open15_vol_breakout",
+            "symbols": None,
+            "reason": "open15 post-summary sweep",
+        }
+    ]
