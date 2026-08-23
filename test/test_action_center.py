@@ -1,42 +1,27 @@
 """
 Unit tests for Action Center and Order Mode functionality
 
-Run with: python -m pytest test/test_action_center.py -v
+Run with: uv run pytest test/test_action_center.py -v
+
+DB isolation is inherited from ``test/conftest.py``, which redirects every DB
+env var to a per-process temp dir *before* any ``database.*`` import and inits
+the ``action_center_db`` + ``auth_db`` schemas there. This file used to carry
+its own pre-conftest isolation hack — a module-level
+``os.environ["DATABASE_URL"] = "sqlite:///:memory:"`` plus rebinds of
+``action_center_db``/``auth_db`` module globals onto a private in-memory
+engine. Both ran at collection time and never reverted (issue #662): the env
+write poisoned any ``database.*`` module first imported afterwards (NullPool +
+``:memory:`` = a fresh empty DB per connection → "no such table"), and the
+rebinds detached ``auth_db`` from the conftest temp DB for every later test —
+the 6 ``test_fanout_seam_integration.py`` full-suite setup errors. Do not
+reintroduce either; per-test row cleanup below keeps this file hermetic in the
+shared temp DB instead.
 """
 
-# === Live-DB isolation: must be set BEFORE any database.* import.
-# Without this, every test below writes test_user ApiKeys rows, pending
-# orders, and order-mode flips into the operator's real db/openalgo.db.
-# Mirrors test/test_market_intel_db.py: set DATABASE_URL to :memory: to keep
-# import-time init off the live DB, then rebind both coupled modules
-# (action_center_db + auth_db) to a single shared default-pool in-memory
-# engine whose connection persists (the module engines use NullPool, which
-# drops :memory: tables between operations). See fix/test-live-db-isolation.
-import os
-
-os.environ["DATABASE_URL"] = "sqlite:///:memory:"
-
-import json
-
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
 
-import database.action_center_db as _acdb
-import database.auth_db as _adb
-
-_engine = create_engine("sqlite:///:memory:")
-_session = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=_engine))
-for _mod in (_acdb, _adb):
-    _mod.engine = _engine
-    _mod.db_session = _session
-    _mod.Base.query = _session.query_property()
-_acdb.Base.metadata.create_all(_engine)
-_adb.Base.metadata.create_all(_engine)
-
-# Import names AFTER the rebind so the captured `db_session` is the shared one
-# and the imported helpers resolve the shared module-global session at call time.
 from database.action_center_db import (
+    PendingOrder,
     approve_pending_order,
     create_pending_order,
     delete_pending_order,
@@ -46,6 +31,7 @@ from database.action_center_db import (
     reject_pending_order,
     update_broker_status,
 )
+from database.action_center_db import db_session as ac_db_session
 from database.auth_db import ApiKeys, db_session, get_order_mode, update_order_mode
 from services.action_center_service import get_action_center_data
 from services.order_router_service import queue_order, should_route_to_pending
@@ -72,6 +58,24 @@ def _seed_test_user_api_key():
     if created:
         ApiKeys.query.filter_by(user_id=user_id).delete()
         db_session.commit()
+
+
+_PENDING_ORDER_USERS = ("test_user", "count_test_user", "ac_test_user", "stats_user")
+
+
+@pytest.fixture(autouse=True)
+def _clean_pending_orders():
+    """The conftest temp DB is shared by the whole pytest run; drop this
+    module's pending-order rows after each test so counts stay fresh here and
+    nothing leaks into later tests."""
+    yield
+    try:
+        ac_db_session.query(PendingOrder).filter(
+            PendingOrder.user_id.in_(_PENDING_ORDER_USERS)
+        ).delete(synchronize_session=False)
+        ac_db_session.commit()
+    finally:
+        ac_db_session.remove()
 
 
 class TestOrderModeDatabase:
