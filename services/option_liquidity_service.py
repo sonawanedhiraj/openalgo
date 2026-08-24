@@ -263,11 +263,18 @@ def _parse_expiry(raw: Any) -> dt.date | None:
 def resolve_band(
     underlying: str, spot: float, trade_date: dt.date, per_side: int | None = None
 ) -> dict[str, list[dict]]:
-    """``{"CE": [...], "PE": [...]}`` — the front-month strikes nearest the money.
+    """``{"CE": [...], "PE": [...]}`` — the tradeable-month strikes nearest the money.
 
     Front month is ``min(expiry) >= trade_date``, matching
     ``open15_option_shadow.pick_contract`` so the score measures the book the strategy
-    would actually hit. Each side is resolved independently: the two legs can have
+    would actually hit — including that picker's expiry-week roll (issue #669):
+    the block-window question is asked for the **next trading day after
+    ``trade_date``**, because this EOD sweep's scores are consumed by the NEXT
+    morning's arm and coverage ladder. Friday's sweep before a Tuesday expiry
+    therefore prices the next month (Monday is broker-blocked), keeping the
+    #591 ladder's lot costs on the contracts the strategy will actually buy.
+    Fails OPEN to the plain front month when every alive expiry is blocked.
+    Each side is resolved independently: the two legs can have
     different strike coverage, and forcing them onto a shared strike list would
     quietly change what is measured on the thinner side.
     """
@@ -296,7 +303,18 @@ def resolve_band(
                 alive.append((exp, r))
         if not alive:
             return out
-        front = min(exp for exp, _ in alive)
+        from services.open15_option_shadow import is_expiry_blocked, next_trading_day
+
+        consumed_on = next_trading_day(trade_date)
+        expiries = sorted({exp for exp, _ in alive})
+        # skip expiries that are dead OR broker-blocked on the consumption day —
+        # an expiry-day sweep must not hand tomorrow's ladder a dead contract
+        front = next(
+            (e for e in expiries if e >= consumed_on and not is_expiry_blocked(e, consumed_on)),
+            None,
+        )
+        if front is None:
+            front = expiries[0]
         for side in ("CE", "PE"):
             leg = [r for exp, r in alive if exp == front and r.instrumenttype == side]
             leg.sort(key=lambda r: abs(float(r.strike) - spot))

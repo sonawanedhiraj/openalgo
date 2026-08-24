@@ -177,6 +177,21 @@ def compute_event(
         return None
     as_of = next(iter(scores.values())).get("as_of_date")
     expiry, dte = _front_expiry(scores, today)
+    # Honesty guard (issue #669): the sweep normally already rolls past the
+    # broker's physical-delivery block window for its consumption day, but this
+    # ladder tolerates sweeps up to ``max_staleness_sessions`` old — a pre-roll
+    # sweep (data gap, pre-#669 rows) can still land here on a blocked day. Its
+    # lot costs would then describe front-month contracts the strategy cannot
+    # buy today (next-month ATM premiums are materially higher), so the card
+    # must say the coverage is overstated rather than present it as clean.
+    expiry_blocked_today = False
+    if expiry:
+        try:
+            from services.open15_option_shadow import is_expiry_blocked
+
+            expiry_blocked_today = is_expiry_blocked(dt.date.fromisoformat(expiry), today)
+        except Exception:
+            logger.exception("atm_lot_cost: expiry block-window check failed — flag omitted")
     out = {
         "as_of": as_of,
         "capital_per_slot": round(float(capital_per_slot), 2),
@@ -186,6 +201,7 @@ def compute_event(
         "unresolved": unresolved,
         "expiry": expiry,
         "dte": dte,
+        **({"expiry_blocked_today": True} if expiry_blocked_today else {}),
         # the full sorted distribution rides along so the page can answer
         # "who is excluded at THIS capital?" for any ladder row without a
         # second endpoint. ~200 rows x ~70 B ≈ 15 KB once per day.

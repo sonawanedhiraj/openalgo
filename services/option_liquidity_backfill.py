@@ -116,7 +116,9 @@ def score_day(rows: list[dict], universe: set[str], per_side: int) -> dict:
 
     scored: dict[tuple[str, str], dict] = {}
     for sym, rs in by_sym.items():
-        # front month — the same choice pick_contract makes
+        # front month — deliberately WITHOUT pick_contract's expiry-week roll
+        # (issue #669): this reconstructs history from before the roll existed,
+        # and rolling past days would change what those sessions actually saw
         try:
             front = min(r["XpryDt"] for r in rs)
         except (ValueError, KeyError):

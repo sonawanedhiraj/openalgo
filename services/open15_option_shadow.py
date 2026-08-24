@@ -8,7 +8,10 @@ question "does option buying beat stock on this signal?".
 
 Conventions (locked with the operator, 2026-07-23):
   - Contract: strike nearest the equity trigger price, nearest NON-EXPIRED
-    expiry, resolved from the master contract (``SymToken``).
+    expiry, resolved from the master contract (``SymToken``). Since issue #669
+    the pick also skips expiries inside Zerodha's physical-delivery block
+    window (expiry day + the trading day before — fresh stock-option buys are
+    broker-rejected there), rolling to the next month on those two days.
   - Entry premium = OPEN of the minute AFTER the trigger minute (a market
     order at second :59 fills on the next prints); fallback trigger-minute
     close. Exit premium = 09:30 bar OPEN (the flatten fires at 09:30:0x);
@@ -56,12 +59,95 @@ def option_round_trip_charges(buy_premium_value: float, sell_premium_value: floa
     return round(brokerage + exch_txn + stt + sebi + stamp + gst, 2)
 
 
+def _prev_trading_day(day: dt.date) -> dt.date:
+    """The trading day immediately before ``day`` (holiday-aware, fail-open).
+
+    Delegates to ``data_freshness_service.is_trading_day`` (weekday AND not an
+    NSE holiday, itself fail-open to weekday-only per issue #253). If even that
+    import raises, degrades to plain weekday-walking — this helper feeds a
+    broker-mirroring guard and must never raise into a resolution path.
+    """
+    try:
+        from services.data_freshness_service import is_trading_day
+    except Exception:  # pragma: no cover - import failure is environmental
+
+        def is_trading_day(d: dt.date) -> bool:
+            return d.weekday() < 5
+
+    d = day - dt.timedelta(days=1)
+    for _ in range(14):
+        try:
+            if is_trading_day(d):
+                return d
+        except Exception:
+            if d.weekday() < 5:
+                return d
+        d -= dt.timedelta(days=1)
+    return day - dt.timedelta(days=1)
+
+
+def next_trading_day(day: dt.date) -> dt.date:
+    """The trading day immediately after ``day`` — same fail-open discipline
+    as :func:`_prev_trading_day`. Used by the EOD option-liquidity sweep to ask
+    the block-window question for the day its scores get CONSUMED (issue #669):
+    the ~15:40 sweep on day D feeds day D+1's 09:10 arm and coverage ladder.
+    """
+    try:
+        from services.data_freshness_service import is_trading_day
+    except Exception:  # pragma: no cover - import failure is environmental
+
+        def is_trading_day(d: dt.date) -> bool:
+            return d.weekday() < 5
+
+    d = day + dt.timedelta(days=1)
+    for _ in range(14):
+        try:
+            if is_trading_day(d):
+                return d
+        except Exception:
+            if d.weekday() < 5:
+                return d
+        d += dt.timedelta(days=1)
+    return day + dt.timedelta(days=1)
+
+
+def is_expiry_blocked(expiry: dt.date, trade_date: dt.date) -> bool:
+    """Is a fresh long position in a STOCK option of this expiry broker-blocked
+    on ``trade_date``?
+
+    Zerodha blocks fresh buy orders in current-month stock options on the
+    expiry day and the trading day before it ("Monday and Tuesday" of expiry
+    week — expiry is Tuesday) because of compulsory physical delivery. Verified
+    2026-08-24 against their physical-settlement policy page after all 4 live
+    entries were rejected with exactly this reason (issue #669). Stock options
+    only — index options are cash-settled and never blocked; open15's universe
+    is all stocks, so every caller here is in scope.
+
+    An already-expired contract is NOT this check's job (returns False) —
+    aliveness is filtered separately, and conflating the two would let a stale
+    candidate list read as "blocked" instead of "expired".
+    """
+    if trade_date > expiry:
+        return False
+    return trade_date == expiry or trade_date == _prev_trading_day(expiry)
+
+
 def pick_contract(candidates: list[dict], spot: float, trade_date: str) -> dict | None:
-    """Pure contract picker: nearest strike, then nearest non-expired expiry.
+    """Pure contract picker: nearest strike, then nearest non-expired AND
+    non-broker-blocked expiry (issue #669).
 
     ``candidates`` are dicts with ``symbol``/``strike``/``expiry`` (``DD-MMM-YY``)
     /``lotsize``. ``trade_date`` is ``YYYY-MM-DD``; a contract expiring ON the
-    trade date is still alive intraday and allowed.
+    trade date is still alive intraday and allowed — but Zerodha refuses fresh
+    stock-option buys on the expiry day and the trading day before it
+    (:func:`is_expiry_blocked`), so on those two days the pick rolls to the next
+    expiry. The roll is stamped on the returned dict (``expiry_rolled`` /
+    ``rolled_from``) so the entry event can say the contract is next-month.
+
+    Fails OPEN: if every alive expiry is blocked (master contract carries no
+    later month), the nearest alive one is returned un-rolled with a warning —
+    a rejected attempt lands in the #548 paper path, which beats resolving
+    nothing at all.
     """
     today = dt.date.fromisoformat(trade_date)
     alive = []
@@ -74,9 +160,25 @@ def pick_contract(candidates: list[dict], spot: float, trade_date: str) -> dict 
             alive.append((exp, c))
     if not alive:
         return None
-    nearest_expiry = min(exp for exp, _ in alive)
-    same_expiry = [c for exp, c in alive if exp == nearest_expiry]
-    return min(same_expiry, key=lambda c: abs(float(c["strike"]) - spot))
+    expiries = sorted({exp for exp, _ in alive})
+    chosen = next((exp for exp in expiries if not is_expiry_blocked(exp, today)), None)
+    rolled_from: dt.date | None = None
+    if chosen is None:
+        chosen = expiries[0]
+        logger.warning(
+            "open15 pick_contract: every alive expiry (%s) is in the broker's "
+            "physical-delivery block window on %s — failing open to %s",
+            ", ".join(str(e) for e in expiries),
+            trade_date,
+            chosen,
+        )
+    elif chosen != expiries[0]:
+        rolled_from = expiries[0]
+    same_expiry = [c for exp, c in alive if exp == chosen]
+    best = min(same_expiry, key=lambda c: abs(float(c["strike"]) - spot))
+    if rolled_from is not None:
+        return {**best, "expiry_rolled": True, "rolled_from": rolled_from.isoformat()}
+    return best
 
 
 def resolve_atm_option(underlying: str, side: str, spot: float, trade_date: str) -> dict | None:

@@ -1183,6 +1183,13 @@ function renderAtmLadder(){
     +' \\u00B7 priced from the '+esc(ev.as_of||'?')+' option sweep'
     +' \\u00B7 front expiry '+esc(ev.expiry||'?')+(ev.dte!=null?(' ('+ev.dte+' DTE)'):'')
     +' \\u00B7 '+ev.priced+'/'+ev.universe_n+' priced</span>'
+    // issue #669 — a pre-roll sweep consumed on a broker-blocked day (expiry
+    // day / day before): its lot costs price a contract the strategy cannot
+    // buy today, and next-month premiums are materially higher
+    +(ev.expiry_blocked_today?('<div class="leg"><span class="neg">\\u26A0 priced on '
+      +esc(ev.expiry||'?')+', which is inside the physical-delivery block window today'
+      +'</span> \\u2014 entries roll to next month, whose lots cost more: coverage below is '
+      +'OVERSTATED</div>'):'')
     +'<table class="covtbl"><thead><tr><th>coverage</th><th>names</th>'
     +'<th>capital/slot needed</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'
     +'<div id="atmdet"></div>'

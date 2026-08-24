@@ -280,6 +280,29 @@ def test_band_skips_expired_months(_contracts):
     assert {c["expiry"] for c in band["CE"]} == {dt.date(2026, 9, 29)}
 
 
+def test_band_rolls_when_consumed_on_a_blocked_day(_contracts):
+    """The sweep's scores are consumed the NEXT morning (issue #669).
+
+    Friday 2026-08-21's ~15:40 sweep feeds Monday 2026-08-24 — inside the
+    broker's physical-delivery block window for the 25-AUG expiry — so the band
+    must price September, or the #591 ladder quotes lot costs on contracts the
+    strategy cannot buy that day. Same for Monday's sweep (consumed on expiry
+    day), and for the expiry-day sweep itself (consumed Wednesday, when the
+    front month is DEAD, not merely blocked).
+    """
+    for sweep_day in (dt.date(2026, 8, 21), dt.date(2026, 8, 24), dt.date(2026, 8, 25)):
+        band = ols.resolve_band("ZZ", spot=100.0, trade_date=sweep_day, per_side=2)
+        assert {c["expiry"] for c in band["CE"] + band["PE"]} == {dt.date(2026, 9, 29)}, sweep_day
+
+
+def test_band_keeps_front_month_outside_the_window(_contracts):
+    """Mid-cycle (Wed 2026-08-19 sweep -> consumed Thu 2026-08-20) the front
+    month stays — the roll is two days a month, never a general preference for
+    the back month."""
+    band = ols.resolve_band("ZZ", spot=100.0, trade_date=dt.date(2026, 8, 19), per_side=2)
+    assert {c["expiry"] for c in band["CE"]} == {dt.date(2026, 8, 25)}
+
+
 def test_band_empty_without_a_spot(_contracts):
     assert ols.resolve_band("ZZ", spot=0.0, trade_date=dt.date(2026, 8, 10)) == {
         "CE": [],
