@@ -4312,6 +4312,16 @@ class Open15BreakoutService:
             slot_capital_used=round(budget, 2),
             order_status=resp.get("status"),
             order_id=resp.get("orderid"),
+            # issue #669 — inside the broker's physical-delivery block window
+            # (expiry day + the trading day before) the contract is next-month,
+            # a structurally different book (lower gamma, wider spread, thinner
+            # OI); the flag lets research segment those rows without parsing
+            # opt_symbol
+            **(
+                {"expiry_rolled": True, "rolled_from": contract.get("rolled_from")}
+                if contract.get("expiry_rolled")
+                else {}
+            ),
         )
 
     # ---- status for the blueprint ---------------------------------------- #

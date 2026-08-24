@@ -158,6 +158,26 @@ def test_compute_event_payload(monkeypatch):
     assert cur["names"] == 1  # only AAA (worst 22k) fits 25k
 
 
+def test_compute_event_flags_blocked_expiry_today(monkeypatch):
+    """A pre-roll sweep consumed on a broker-blocked day (issue #669): the
+    ladder's lot costs price a contract the strategy cannot buy today (entries
+    roll to next month, whose lots cost more) — the event must carry the
+    ``expiry_blocked_today`` flag so the card says coverage is overstated."""
+    import database.option_liquidity_db as db
+
+    scores = _scores({"AAA": (20_000.0, 22_000.0)})
+    monkeypatch.setattr(db, "get_latest_scores", lambda **kw: scores)
+    # Monday 2026-08-24, the day before the 25-AUG expiry — the golden incident
+    ev = alc.compute_event({"AAA"}, 25_000, 90, today=dt.date(2026, 8, 24))
+    assert ev["expiry_blocked_today"] is True
+    # expiry day itself is also blocked
+    ev = alc.compute_event({"AAA"}, 25_000, 90, today=dt.date(2026, 8, 25))
+    assert ev["expiry_blocked_today"] is True
+    # mid-cycle: no flag at all (absence, not False — the payload stays lean)
+    ev = alc.compute_event({"AAA"}, 25_000, 90, today=dt.date(2026, 8, 11))
+    assert "expiry_blocked_today" not in ev
+
+
 def test_compute_event_denominator_is_priced_names_only(monkeypatch):
     """An unresolved name must never be counted as "covered" — the 100% row
     covers all PRICED names and says so via priced/universe_n."""

@@ -5,6 +5,7 @@ import datetime as dt
 import pytz
 
 from services.open15_option_shadow import (
+    is_expiry_blocked,
     option_round_trip_charges,
     pick_contract,
     premiums_from_bars,
@@ -33,6 +34,66 @@ def test_pick_contract_nearest_strike_and_expiry():
     assert got["symbol"] == "AAA28JUL2610800CE"
     # all expired -> None
     assert pick_contract(cands, spot=10700.0, trade_date="2026-09-30") is None
+
+
+def test_is_expiry_blocked_window():
+    """Zerodha's physical-delivery block (issue #669): the expiry day and the
+    trading day before it, nothing else — and an already-expired contract is
+    NOT this check's job (aliveness is filtered separately)."""
+    exp = dt.date(2026, 8, 25)  # Tuesday — the Aug 2026 stock-F&O expiry
+    assert is_expiry_blocked(exp, dt.date(2026, 8, 24))  # Monday before
+    assert is_expiry_blocked(exp, dt.date(2026, 8, 25))  # expiry day
+    assert not is_expiry_blocked(exp, dt.date(2026, 8, 21))  # Friday before
+    assert not is_expiry_blocked(exp, dt.date(2026, 8, 19))  # mid-cycle
+    assert not is_expiry_blocked(exp, dt.date(2026, 8, 26))  # expired != blocked
+
+
+def test_is_expiry_blocked_holiday_shifts_window(monkeypatch):
+    """With the Monday a market holiday, the trading day before a Tuesday
+    expiry is the Friday — the window must follow the calendar, not weekdays."""
+    import services.data_freshness_service as dfs
+
+    monkeypatch.setattr(
+        dfs,
+        "is_trading_day",
+        lambda d, exchange=None: d.weekday() < 5 and d != dt.date(2026, 8, 24),
+    )
+    exp = dt.date(2026, 8, 25)
+    assert is_expiry_blocked(exp, dt.date(2026, 8, 21))  # Friday is now blocked
+    assert not is_expiry_blocked(exp, dt.date(2026, 8, 24))  # holiday — closed anyway
+
+
+def test_pick_contract_rolls_in_expiry_block_window():
+    """Golden incident 2026-08-24 (issue #669): Monday before the Tuesday
+    expiry — Zerodha rejected all 4 live entries on the front month. The pick
+    must roll to September and say so."""
+    cands = [
+        {"symbol": "BIOCON25AUG26410PE", "strike": 410.0, "expiry": "25-AUG-26", "lotsize": 2500},
+        {"symbol": "BIOCON25AUG26415PE", "strike": 415.0, "expiry": "25-AUG-26", "lotsize": 2500},
+        {"symbol": "BIOCON29SEP26410PE", "strike": 410.0, "expiry": "29-SEP-26", "lotsize": 2500},
+    ]
+    got = pick_contract(cands, spot=410.5, trade_date="2026-08-24")
+    assert got["symbol"] == "BIOCON29SEP26410PE"
+    assert got["expiry_rolled"] is True and got["rolled_from"] == "2026-08-25"
+    # expiry day itself is blocked too
+    got = pick_contract(cands, spot=410.5, trade_date="2026-08-25")
+    assert got["symbol"] == "BIOCON29SEP26410PE"
+    # the Friday before is OUTSIDE the window — front month, no roll marker
+    got = pick_contract(cands, spot=410.5, trade_date="2026-08-21")
+    assert got["symbol"] == "BIOCON25AUG26410PE"
+    assert "expiry_rolled" not in got
+
+
+def test_pick_contract_fails_open_when_every_expiry_is_blocked():
+    """Master contract with no later month: return the front month un-rolled —
+    a rejected attempt lands in the #548 paper path, which beats resolving
+    nothing at all."""
+    cands = [
+        {"symbol": "AAA25AUG26100CE", "strike": 100.0, "expiry": "25-AUG-26", "lotsize": 100},
+    ]
+    got = pick_contract(cands, spot=100.0, trade_date="2026-08-24")
+    assert got["symbol"] == "AAA25AUG26100CE"
+    assert "expiry_rolled" not in got
 
 
 def test_option_charges_model():
