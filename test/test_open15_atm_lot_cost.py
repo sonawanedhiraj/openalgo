@@ -192,6 +192,54 @@ def test_compute_event_denominator_is_priced_names_only(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# next_arm_date / build_ladder_preview (issue #671 — the /logs planning panel)
+# ---------------------------------------------------------------------------
+
+
+def test_next_arm_date_before_and_after_the_arm():
+    """Before 09:10 on a trading day the next arm is TODAY's; from 09:10 on it
+    is the next trading day's — the boundary the evening preview exists for."""
+    assert alc.next_arm_date(dt.datetime(2026, 8, 19, 8, 0)) == dt.date(2026, 8, 19)
+    assert alc.next_arm_date(dt.datetime(2026, 8, 19, 9, 10)) == dt.date(2026, 8, 20)
+    assert alc.next_arm_date(dt.datetime(2026, 8, 19, 15, 50)) == dt.date(2026, 8, 20)
+
+
+def test_next_arm_date_weekend_rolls_to_monday():
+    # Friday evening and Saturday morning both plan for Monday — Saturday is
+    # before 09:10 but not a trading day, the case a bare time check misses
+    assert alc.next_arm_date(dt.datetime(2026, 8, 21, 16, 0)) == dt.date(2026, 8, 24)
+    assert alc.next_arm_date(dt.datetime(2026, 8, 22, 8, 0)) == dt.date(2026, 8, 24)
+
+
+def test_build_ladder_preview_ok(monkeypatch):
+    """Evening call → tomorrow's arm date, same compute_event payload the arm
+    would emit. The panel and the day card must share one derivation."""
+    import database.option_liquidity_db as db
+    import services.scanner_universe as su
+
+    scores = _scores({"AAA": (20_000.0, 22_000.0)})
+    monkeypatch.setattr(db, "get_latest_scores", lambda **kw: scores)
+    monkeypatch.setattr(su, "tradeable_universe", lambda: {"AAA"})
+    out = alc.build_ladder_preview(dt.datetime(2026, 8, 19, 20, 0))
+    assert out["status"] == "ok" and out["arm_date"] == "2026-08-20"
+    assert out["event"]["priced"] == 1
+    assert any(r.get("marker") == "current_slot" for r in out["event"]["ladder"])
+
+
+def test_build_ladder_preview_no_sweep_is_labelled(monkeypatch):
+    """No usable sweep → a labelled status + message, never a raise and never
+    an unlabelled empty payload (#615/#622 — the panel renders this text)."""
+    import database.option_liquidity_db as db
+    import services.scanner_universe as su
+
+    monkeypatch.setattr(db, "get_latest_scores", lambda **kw: {})
+    monkeypatch.setattr(su, "tradeable_universe", lambda: {"AAA"})
+    out = alc.build_ladder_preview(dt.datetime(2026, 8, 19, 20, 0))
+    assert out["status"] == "no_sweep" and out["arm_date"] == "2026-08-20"
+    assert "sweep" in out["message"]
+
+
+# ---------------------------------------------------------------------------
 # config plumbing
 # ---------------------------------------------------------------------------
 
