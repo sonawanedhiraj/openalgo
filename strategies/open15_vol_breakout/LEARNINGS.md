@@ -128,3 +128,38 @@ the two came from different code paths and only one had been taught the failure.
 and are a DIFFERENT SIZE from every other row. They are real money and stay in
 real P&L, but per-trade comparisons across days must filter them out (same class
 of note as #581 and #595).
+
+
+### 2026-08-24 — #669: expiry-week roll — the broker refuses the front month 2 days a month
+
+All 4 entries (BIOCON, DIVISLAB, HEROMOTOCO, CROMPTON — all shorts, all
+rolling-sourced) were rejected at placement: *"Fresh buy orders are not allowed
+for stock options using MIS due to compulsory physical delivery. Try next
+month's expiry."* Today was the Monday before the Tuesday 25-AUG stock-F&O
+expiry, and Zerodha's published policy blocks fresh long stock-option positions
+in the current month on the **expiry day and the trading day before it**.
+`pick_contract` always chose the nearest alive expiry, so this recurs 2 trading
+days every month. The #548 paper path contained it perfectly (3 papered, 1
+paper-capped) and paper P&L says the blocked shorts would have LOST ~Rs11,675
+net — no money left on the table, but a zero-real-measurement day.
+
+Fix (#669 / PR #670): `is_expiry_blocked` (holiday-proof, fail-open) at the one
+shared seam — `pick_contract` rolls to next month inside the window and stamps
+`expiry_rolled`/`rolled_from` on the contract and the `entry` event. The EOD
+option-liquidity sweep's `resolve_band` asks the same question for the **next
+trading day** (its scores are consumed by the next morning's arm), so the #591
+coverage ladder prices the contracts the strategy will actually buy; a stale
+pre-roll sweep consumed on a blocked day is flagged `expiry_blocked_today` and
+the ladder card says coverage is overstated.
+
+Learnings: **a broker policy with a calendar is part of contract resolution,
+not an error to handle** — the rejection message even named the fix
+("Try next month's expiry"); and **when a resolver is reimplemented for a
+different consumer (sweep vs entry), a rule change must land in both or the
+measurement silently prices the wrong instrument** — `resolve_band` "matched
+pick_contract" only by comment, which is exactly how the pair drifts.
+
+⚠ Cohort boundary: rolled-day rows (`expiry_rolled` on the entry event, or a
+next-month `opt_symbol`) trade a structurally different book — lower gamma,
+wider spreads, thinner OI, higher lot cost. Real money, stays in real P&L, but
+per-trade comparisons should segment them (same class of note as #581/#595/#643).

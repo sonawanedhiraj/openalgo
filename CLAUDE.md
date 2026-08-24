@@ -1504,6 +1504,28 @@ automatic — the next morning's dump carries the name and it is simply kept
 `insufficient_history` → included). Emits `universe_excluded · stage 0 ·
 reason=not_in_fno · enforced=true`.
 
+**Expiry-week roll (issue #669): the front month is broker-refused 2 days a
+month.** Zerodha blocks fresh long STOCK-option positions in the current month
+on the **expiry day and the trading day before it** (compulsory physical
+delivery — verified 2026-08-24 on their policy page after all 4 live entries
+were rejected with "Try next month's expiry"). `pick_contract`
+(`services/open15_option_shadow.py`) — the single seam every consumer funnels
+through (live entry, sim/paper pricers, the #595 OI filter, the option shadow)
+— skips expiries inside that window via `is_expiry_blocked` (holiday-proof
+through `data_freshness_service.is_trading_day`, fail-open) and rolls to the
+next month, stamping `expiry_rolled`/`rolled_from` on the contract and the
+`entry` event (no new event names — the #615/#622 rule). Fails OPEN to the
+front month when no later month exists (the #548 paper path is the backstop).
+The EOD option-liquidity sweep's `resolve_band` asks the same question for the
+**next trading day** — its ~15:40 scores are consumed by the next morning's arm
+— so the #591 coverage ladder prices the contracts the strategy will actually
+buy; a stale pre-roll sweep consumed on a blocked day is flagged
+`expiry_blocked_today` and the ladder card renders a "coverage overstated"
+warning. Rolled-day rows trade a structurally different book (lower gamma,
+wider spreads, thinner OI) — segment them in research via the event flag or the
+next-month `opt_symbol`. The bhavcopy backfill deliberately stays front-month
+(it reconstructs pre-roll history).
+
 **Broker-OI watch-list filter (issue #595): mirror Zerodha's absolute rule,
 don't model it.** Zerodha blocks MIS orders on stock option contracts with OI
 < **500 LOTS** — per-CONTRACT and absolute, so no percentile screen can
