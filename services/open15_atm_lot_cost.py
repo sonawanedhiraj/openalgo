@@ -52,6 +52,95 @@ _UNRESOLVED_LIST_CAP = 50
 #: long weekend must not dark it (the #589 sessions-not-days rule).
 DEFAULT_MAX_STALENESS_SESSIONS = 5
 
+#: When the daily arm fires. Only used to decide whether "the next arm" is
+#: still today's or already tomorrow's (issue #671) — the schedule itself
+#: lives with the APScheduler job registration.
+ARM_TIME = dt.time(9, 10)
+
+
+def next_arm_date(now: dt.datetime | None = None) -> dt.date:
+    """The date of the NEXT 09:10 arm: today if today's arm has not fired yet
+    on a trading day, else the next trading day (issue #671).
+
+    Holiday-aware through ``data_freshness_service.is_trading_day``; fails open
+    to weekday-only exactly like the #669 helpers — a planning preview must
+    never raise out of a calendar lookup.
+    """
+    from services.open15_option_shadow import next_trading_day
+
+    now = now or dt.datetime.now()
+    if now.time() < ARM_TIME:
+        try:
+            from services.data_freshness_service import is_trading_day
+
+            if is_trading_day(now.date()):
+                return now.date()
+        except Exception:
+            if now.date().weekday() < 5:
+                return now.date()
+    return next_trading_day(now.date())
+
+
+def build_ladder_preview(now: dt.datetime | None = None) -> dict:
+    """Payload for the /logs "NEXT ARM — planning ladder" panel (issue #671).
+
+    Same derivation as the 09:10 arm's ``atm_lot_cost`` event — the existing
+    :func:`compute_event` evaluated for the NEXT arm date, with the saved
+    config's capital/target — so the panel and the day card can never disagree
+    about how a ladder is priced. Ephemeral by design: computed per request,
+    never written into any day log (the #553 one-date-key rule; the arm-time
+    event stays the sole record).
+
+    Never raises: every failure shape returns a labelled ``status`` +
+    ``message`` the panel renders verbatim, because an unlabelled empty box is
+    how a page goes quietly dark (#615/#622).
+    """
+    arm_date = next_arm_date(now)
+    out: dict = {"arm_date": arm_date.isoformat()}
+    try:
+        from database.open15_breakout_db import get_config, total_realized_pnl
+        from services.open15_breakout_service import (
+            Open15BreakoutService,
+            _coverage_target_default,
+            resolve_day_config,
+        )
+        from services.scanner_universe import tradeable_universe
+
+        try:
+            cfg_row = get_config()
+        except Exception:
+            cfg_row = None
+        try:
+            cum = float(total_realized_pnl())
+        except Exception:
+            cum = 0.0
+        day_cfg = resolve_day_config(cfg_row, cum)
+        universe = tradeable_universe() or Open15BreakoutService._load_universe()
+        if not universe:
+            return {
+                **out,
+                "status": "no_universe",
+                "message": "SCANNER_SYMBOLS is empty — nothing to price",
+            }
+        ev = compute_event(
+            universe,
+            day_cfg["margin_effective"],
+            day_cfg.get("coverage_target_pct", _coverage_target_default()),
+            today=arm_date,
+        )
+        if not ev:
+            return {
+                **out,
+                "status": "no_sweep",
+                "message": (
+                    "no usable option-liquidity sweep yet — it runs ~15:40 IST on trading days"
+                ),
+            }
+        return {**out, "status": "ok", "event": ev}
+    except Exception:
+        logger.exception("atm_lot_cost: ladder preview failed")
+        return {**out, "status": "error", "message": "preview unavailable — see logs"}
+
 
 def worst_side_costs(
     scores: dict[tuple[str, str], dict], universe: set[str]

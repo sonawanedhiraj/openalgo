@@ -19,6 +19,11 @@ GET /open15_vol_breakout/api/decision_log/days
 GET /open15_vol_breakout/api/decision_log/export.csv
     All stored days flattened to one row per selected symbol — the
     backtest-facing export (issue #444).
+
+GET /open15_vol_breakout/api/ladder_preview
+    The ATM lot-cost coverage ladder for the NEXT 09:10 arm, priced from the
+    latest EOD option-liquidity sweep (issue #671) — the /logs planning panel.
+    Ephemeral: computed per request, never written to a day log.
 """
 
 from __future__ import annotations
@@ -396,6 +401,21 @@ def _effective_today(svc) -> tuple[dict | None, str]:
     return svc.day_config, "not_armed"
 
 
+@open15_bp.route("/api/ladder_preview", methods=["GET"])
+@check_session_validity
+def ladder_preview():
+    """Coverage ladder for the NEXT 09:10 arm (issue #671) — read-only.
+
+    The whole derivation lives in ``open15_atm_lot_cost.build_ladder_preview``
+    (testable without a Flask client); this route only serializes it. Always
+    HTTP 200 with a labelled ``status`` — the panel renders failure shapes as
+    text, never as an empty box.
+    """
+    from services.open15_atm_lot_cost import build_ladder_preview
+
+    return jsonify(build_ladder_preview())
+
+
 @open15_bp.route("/api/decision_log", methods=["GET"])
 @check_session_validity
 def decision_log():
@@ -676,6 +696,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    capital/slot at which this share of priced names is affordable (1 ATM lot, worst of CE/PE).
    Observational: nothing gates on it. Clamped 50&ndash;100 server-side.</span>
  </div>
+ <div id="plancard" class="atmcard" style="display:none;margin-top:8px"></div>
  <div style="margin-top:6px">
   <label><input id="c_residual" type="checkbox"> spend the residual cash</label>
   <label class="muted" style="margin-left:14px">keep back
@@ -888,6 +909,9 @@ async function saveCfg(){
       :('error: '+((j.errors&&j.errors.length)?j.errors.join('; '):(j.message||j.error||('HTTP '+r.status))));
   }catch(e){msg.textContent='error: '+e;}
   loadCfg();
+  // capital/slot and coverage target feed the planning ladder (issue #671) —
+  // defined in the later script block, so guard for ordering
+  if(window.loadLadderPreview)loadLadderPreview();
 }
 document.getElementById('c_side').addEventListener('change',syncShadowUi);
 document.getElementById('c_shadow').addEventListener('change',syncShadowUi);
@@ -904,8 +928,11 @@ let expanded=new Set();
 let liveWatch={}, liveNeeded=null;
 // which coverage-ladder row's drill-down is open (issue #591) — kept across
 // the 5s live refresh so it does not collapse under the operator, cleared
-// when a different day is picked (same contract as `expanded` above)
-let atmOpenPct=null;
+// when a different day is picked (same contract as `expanded` above). Keyed
+// per card since #671: the day card ('atm') and the next-arm planning panel
+// ('plan') are the same renderer over different events, with independent
+// drill-down state.
+const ladderOpen={atm:null,plan:null};
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 function kindOf(e){
   if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped'||
@@ -977,7 +1004,7 @@ async function loadLiveWatch(){
   }catch(e){liveWatch={}; liveNeeded=null;}
 }
 async function selectDay(date){
-  if(date!==curDate){expanded.clear();atmOpenPct=null;} // a different day's rows are different rows
+  if(date!==curDate){expanded.clear();ladderOpen.atm=null;} // a different day's rows are different rows
   curDate=date;
   document.getElementById('dayjson').href='/open15_vol_breakout/api/decision_log?date='+date;
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
@@ -1152,9 +1179,12 @@ function renderCapital(){
       (armed.residual_min_lots??1)+' lot. Rows sized this way are badged '+
       '<span class="badge b-residual">residual</span>.</div>'):'');
 }
-function renderAtmLadder(){
-  const ev=curEvents.find(e=>e.event==='atm_lot_cost');
-  const box=document.getElementById('atmcard');
+// Shared ladder renderer (issue #671): the day card ('atm') and the next-arm
+// planning panel ('plan') are the SAME table/drill-down over different events.
+// One renderer on purpose — two hand-matched copies is exactly how the sweep's
+// front-month selection drifted from pick_contract (#669).
+// opts: {key, detId, title, subLead, blockedWhen, watched, footExtra}
+function renderLadderInto(ev,box,opts){
   if(!ev||!(ev.ladder||[]).length){box.innerHTML='';box.style.display='none';return;}
   box.style.display='';
   let rows='';
@@ -1178,40 +1208,49 @@ function renderAtmLadder(){
   if((u.no_quote||[]).length)parts.push('no ATM quote: '+u.no_quote.map(esc).join(', '));
   const unres=u.n?('<span style="color:#f9e2af">'+u.n+' unresolved</span> ('
     +parts.join(' \\u00B7 ')+') \\u2014 excluded from all counts \\u00B7 '):'';
-  box.innerHTML='<span class="atitle">ATM LOT COST \\u2014 COVERAGE LADDER</span>'
-    +'<span class="asub">capital/slot \\u2192 names affordable (1 lot, worst of CE/PE)'
+  box.innerHTML='<span class="atitle">'+opts.title+'</span>'
+    +'<span class="asub">'+(opts.subLead||'')
+    +'capital/slot \\u2192 names affordable (1 lot, worst of CE/PE)'
     +' \\u00B7 priced from the '+esc(ev.as_of||'?')+' option sweep'
-    +' \\u00B7 front expiry '+esc(ev.expiry||'?')+(ev.dte!=null?(' ('+ev.dte+' DTE)'):'')
+    +' \\u00B7 expiry '+esc(ev.expiry||'?')+(ev.dte!=null?(' ('+ev.dte+' DTE)'):'')
     +' \\u00B7 '+ev.priced+'/'+ev.universe_n+' priced</span>'
     // issue #669 — a pre-roll sweep consumed on a broker-blocked day (expiry
     // day / day before): its lot costs price a contract the strategy cannot
     // buy today, and next-month premiums are materially higher
     +(ev.expiry_blocked_today?('<div class="leg"><span class="neg">\\u26A0 priced on '
-      +esc(ev.expiry||'?')+', which is inside the physical-delivery block window today'
+      +esc(ev.expiry||'?')+', which is inside the physical-delivery block window '
+      +(opts.blockedWhen||'today')
       +'</span> \\u2014 entries roll to next month, whose lots cost more: coverage below is '
       +'OVERSTATED</div>'):'')
     +'<table class="covtbl"><thead><tr><th>coverage</th><th>names</th>'
     +'<th>capital/slot needed</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>'
-    +'<div id="atmdet"></div>'
+    +'<div id="'+opts.detId+'"></div>'
     +'<div class="atmfoot">'+unres
     +'click a row for the names excluded at that capital'
     +' \\u00B7 lot costs are the sweep day\\u2019s close premiums \\u2014 overnight gaps move them'
-    +' \\u00B7 costs fall through the expiry cycle and jump at rollover: size to a cycle-start day</div>';
+    +' \\u00B7 costs fall through the expiry cycle and jump at rollover: size to a cycle-start day'
+    +(opts.footExtra||'')+'</div>';
   box.querySelectorAll('tr.crow').forEach(tr=>tr.onclick=()=>{
     const pct=+tr.dataset.pct;
-    atmOpenPct=(atmOpenPct===pct)?null:pct;
-    renderAtmDetail(ev,+tr.dataset.cap,pct);
+    ladderOpen[opts.key]=(ladderOpen[opts.key]===pct)?null:pct;
+    renderLadderDetail(ev,+tr.dataset.cap,pct,opts);
   });
-  if(atmOpenPct!=null){
-    const tr=[...box.querySelectorAll('tr.crow')].find(t=>+t.dataset.pct===atmOpenPct);
-    if(tr)renderAtmDetail(ev,+tr.dataset.cap,atmOpenPct);else atmOpenPct=null;
+  if(ladderOpen[opts.key]!=null){
+    const tr=[...box.querySelectorAll('tr.crow')].find(t=>+t.dataset.pct===ladderOpen[opts.key]);
+    if(tr)renderLadderDetail(ev,+tr.dataset.cap,ladderOpen[opts.key],opts);else ladderOpen[opts.key]=null;
   }
 }
-function renderAtmDetail(ev,cap,pct){
-  const det=document.getElementById('atmdet');
+function renderAtmLadder(){
+  renderLadderInto(curEvents.find(e=>e.event==='atm_lot_cost'),
+    document.getElementById('atmcard'),
+    {key:'atm',detId:'atmdet',title:'ATM LOT COST \\u2014 AS ARMED (09:10)',
+     blockedWhen:'today',watched:atmWatchedSet});
+}
+function renderLadderDetail(ev,cap,pct,opts){
+  const det=document.getElementById(opts.detId);
   if(!det)return;
-  if(atmOpenPct==null||atmOpenPct!==pct){det.innerHTML='';return;}
-  const watched=atmWatchedSet();
+  if(ladderOpen[opts.key]==null||ladderOpen[opts.key]!==pct){det.innerHTML='';return;}
+  const watched=(opts.watched||(()=>new Set()))();
   // excluded = costlier than this row's capital, costliest first — the names
   // this capital level gives up, which is the actionable list
   const excl=(ev.costs||[]).filter(c=>c.w>cap).reverse();
@@ -1783,6 +1822,31 @@ document.querySelectorAll('.fbtn').forEach(b=>{b.onclick=()=>{
   curFilter=b.dataset.f;
   document.querySelectorAll('.fbtn').forEach(x=>x.classList.toggle('on',x===b));
   renderTimeline();};});
+// NEXT ARM planning ladder (issue #671): same compute as the arm's event,
+// evaluated for the next arm date from the latest EOD sweep — visible from
+// ~15:45 the evening before, decoupled from the day card. Failure shapes are
+// rendered as labelled text, never an empty box (#615/#622).
+async function loadLadderPreview(){
+  const box=document.getElementById('plancard');
+  if(!box)return;
+  try{
+    const r=await fetch('/open15_vol_breakout/api/ladder_preview'); const j=await r.json();
+    const title='NEXT ARM \\u2014 PLANNING LADDER';
+    if(j.status!=='ok'||!j.event){
+      box.style.display='';
+      box.innerHTML='<span class="atitle">'+title+'</span>'
+        +'<span class="asub">'+(j.arm_date?('for the '+esc(j.arm_date)+' arm \\u00B7 '):'')
+        +esc(j.message||'preview unavailable')+'</span>';
+      return;
+    }
+    renderLadderInto(j.event,box,{key:'plan',detId:'plandet',title:title,
+      subLead:'for the <b>'+esc(j.arm_date)+'</b> arm \\u00B7 ',
+      blockedWhen:'on the arm date',
+      footExtra:' \\u00B7 this is a FORECAST for the next arm \\u2014 the day card\\u2019s'
+        +' ladder stays the record of what an arm actually saw'});
+  }catch(e){box.innerHTML='';box.style.display='none';}
+}
+loadLadderPreview();
 loadDays();
 setInterval(()=>{
   const today=digests.length&&digests[0].source==='live'?digests[0].date:null;
