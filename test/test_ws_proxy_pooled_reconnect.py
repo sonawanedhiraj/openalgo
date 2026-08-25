@@ -219,7 +219,12 @@ def _with_index(proxy, index, user_mapping):
 
 def test_index_restores_when_snapshot_is_blind(monkeypatch):
     """Snapshot yields nothing but the proxy's own clients hold symbols: the
-    reconnect must restore them from subscription_index and log ERROR."""
+    reconnect must restore them from subscription_index. This is the PRIMARY
+    path on login-driven reconnects (the login flow disconnects the pool —
+    clearing subscription_map — before the CACHE_INVALIDATE is consumed, live
+    finding 2026-08-25 10:12:33), so a full successful restore is a WARNING,
+    never an ERROR — a daily expected ERROR trains the operator to ignore
+    errors."""
     mock_logger = MagicMock()
     monkeypatch.setattr("websocket_proxy.server.logger", mock_logger)
 
@@ -238,7 +243,8 @@ def test_index_restores_when_snapshot_is_blind(monkeypatch):
 
     restored = {(c[1], c[2], c[3]) for c in adapter.calls if c[0] == "subscribe"}
     assert restored == {("RELIANCE", "NSE", 2), ("INFY", "NSE", 1)}
-    assert mock_logger.error.called
+    assert mock_logger.warning.called
+    assert not mock_logger.error.called  # full restore succeeded — expected path
 
 
 def test_index_layer_idle_when_snapshot_restore_complete(monkeypatch):
@@ -259,6 +265,7 @@ def test_index_layer_idle_when_snapshot_restore_complete(monkeypatch):
     subscribe_calls = [c for c in wrapper._pool.calls if c[0] == "subscribe"]
     assert len(subscribe_calls) == 2
     assert not mock_logger.error.called
+    assert not mock_logger.warning.called
 
 
 def test_index_layer_noop_on_empty_index(monkeypatch):
@@ -277,8 +284,11 @@ def test_index_layer_noop_on_empty_index(monkeypatch):
 
 def test_index_restore_is_per_symbol_isolated(monkeypatch):
     """One failing re-subscribe must not abort the rest (matches the existing
-    per-symbol isolation convention in the reconnect resubscribe loop)."""
-    monkeypatch.setattr("websocket_proxy.server.logger", MagicMock())
+    per-symbol isolation convention in the reconnect resubscribe loop), and an
+    INCOMPLETE restore — unlike the expected full one — escalates to ERROR:
+    those symbols have no live feed until the next heal."""
+    mock_logger = MagicMock()
+    monkeypatch.setattr("websocket_proxy.server.logger", mock_logger)
 
     class PartiallyFailingAdapter(ShapeDriftedAdapter):
         def subscribe(self, symbol, exchange, mode=2, depth_level=5):
@@ -297,3 +307,4 @@ def test_index_restore_is_per_symbol_isolated(monkeypatch):
 
     restored = {(c[1], c[2], c[3]) for c in adapter.calls if c[0] == "subscribe"}
     assert restored == {("INFY", "NSE", 1)}
+    assert mock_logger.error.called  # incomplete restore is the ERROR case

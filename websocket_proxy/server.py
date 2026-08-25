@@ -1504,8 +1504,14 @@ class WebSocketProxy:
         ``subscription_index`` is client-driven truth and survives an adapter
         wipe (client WS connections are untouched by an adapter reconnect), so
         it is immune to the adapter-shape drift that produced the 0/0 restore.
-        Strictly additive — never unsubscribes — and a shortfall is an ERROR:
-        it means the snapshot path regressed again. Returns the count restored.
+        It is also the PRIMARY mechanism on login-driven reconnects, not a
+        fallback: live validation (2026-08-25 10:12:33) showed the login flow
+        disconnects the pool — clearing ``subscription_map`` — BEFORE the
+        CACHE_INVALIDATE event is even consumed, so no adapter-side snapshot
+        can survive a re-login. The restore is therefore a WARNING (expected
+        on every daily auto-login); ERROR is reserved for index re-subscribes
+        that themselves fail. Strictly additive — never unsubscribes. Returns
+        the count restored.
         """
         index = getattr(self, "subscription_index", None)
         if not index:
@@ -1522,21 +1528,29 @@ class WebSocketProxy:
         missing = wanted - live
         if not missing:
             return 0
-        logger.error(
+        logger.warning(
             f"Reconnect restored fewer subscriptions than clients hold for user "
             f"{user_id}: {len(missing)} missing vs subscription_index — "
             f"re-subscribing from the index (issue #673)"
         )
         restored = 0
+        failed = 0
         for symbol, exchange, mode in missing:
             try:
                 adapter.subscribe(symbol, exchange, mode)
                 restored += 1
             except Exception as sub_err:
+                failed += 1
                 logger.warning(
                     f"Reconnect: index re-subscribe failed for {exchange}:{symbol} "
                     f"for user {user_id}: {sub_err}"
                 )
+        if failed:
+            logger.error(
+                f"Reconnect: index restore incomplete for user {user_id}: "
+                f"{failed}/{len(missing)} re-subscribe(s) failed — those symbols "
+                f"have NO live feed until the next heal (issue #673)"
+            )
         return restored
 
     def _reconnect_broker_adapter(self, user_id: str) -> bool:
