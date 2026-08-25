@@ -18,10 +18,24 @@ import pytest
 import services.scan_rules.fno_intraday_buy_chartink as buymod
 import services.scan_rules.fno_intraday_sell_chartink as sellmod
 import services.scanner_service as scanner_service
+from services import scanner_reference_data
 
 # Re-use the existing synthetic frame builders from the BUY rule's test
 # module so frame layouts stay in sync.
 from test.test_fno_intraday_buy_chartink import happy as _happy_buy
+
+
+@pytest.fixture(autouse=True)
+def _reset_reference_registry():
+    """Consumer-side hardening (issue #680): these tests call the rules
+    directly, and the #305 reference gate consults the process-global,
+    same-IST-day ``scanner_reference_data`` registry BEFORE the divergence
+    block these tests assert on. A prev-close leaked by any earlier
+    same-worker test (test_mid_session_moments' TCS→100.1) made the rule
+    reject early and the caplog assertions fail order-dependently."""
+    scanner_reference_data.reset_for_tests()
+    yield
+    scanner_reference_data.reset_for_tests()
 
 
 def _freeze_buy(monkeypatch, hour=16, minute=0):
