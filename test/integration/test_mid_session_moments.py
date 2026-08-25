@@ -65,13 +65,34 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from services import scanner_aggregator_seeder
+import pytest
+
+from services import scanner_aggregator_seeder, scanner_reference_data
 from test.fixtures.mid_session import pin_clock_in
 
 # Fixtures (``at_14_30_restart`` &c.) are registered as a pytest plugin via
 # ``test/integration/conftest.py`` so they appear in this module's fixture
 # namespace without an explicit ``from ... import`` (which would trip
 # ruff F811 against the test function parameters of the same name).
+
+
+@pytest.fixture(autouse=True)
+def _reset_reference_registry():
+    """Clean the broker prev-close registry per test (issue #680).
+
+    The seeder's broker-fallback arm records each symbol's T-1 settled close
+    into the process-global, same-IST-day ``scanner_reference_data`` registry
+    (issue #305 side effect). Without this reset, the TCS→100.1 recording from
+    the 14:30 seeding test leaked into any later same-worker test evaluating a
+    scanner rule for TCS — the #305 reference gate rejected the symbol early
+    and test_scanner_observability_205's divergence-warning assertions failed
+    order-dependently (the CI trio that failed on dev 2026-08-23 and PR #679).
+    Same pattern as test_golden_2026_07_02_delhivery.py.
+    """
+    scanner_reference_data.reset_for_tests()
+    yield
+    scanner_reference_data.reset_for_tests()
+
 
 # ============================================================================
 # 14:30 IST mid-session restart — PR #200 (commit 19b0a4fec)
