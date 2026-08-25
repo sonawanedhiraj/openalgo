@@ -548,6 +548,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .ev-fill_reconcile,.ev-fill_reconcile_row{color:#94e2d5}
  .b-seed{background:#1b2b3a;color:#89b4fa}.b-roll{background:#3a2436;color:#f5c2e7}
  .ev-skipped_late_boot,.ev-skipped_no_prev_closes{color:#f38ba8;font-weight:bold}
+ .ev-feed_health{color:#f9e2af;font-weight:bold}
+ .feed-ok{background:#12291c;color:#a6e3a1;border:1px solid #2e5140}
+ .feed-degraded{background:#332a17;color:#f9e2af;border:1px solid #5c4d2a}
+ .feed-dead{background:#3a1e24;color:#f38ba8;border:1px solid #6b3542;font-weight:bold}
  input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
  .muted{color:#6b7886;font-size:12px}
  button{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 10px;cursor:pointer}
@@ -925,7 +929,7 @@ let expanded=new Set();
 // live max-vol overlay for today (issue #524): the tick-by-tick running max is
 // only published to the decision log at the exit job, so mid-window it comes
 // from /api/status instead. Cleared whenever a past day is selected.
-let liveWatch={}, liveNeeded=null;
+let liveWatch={}, liveNeeded=null, liveFeed=null;
 // which coverage-ladder row's drill-down is open (issue #591) — kept across
 // the 5s live refresh so it does not collapse under the operator, cleared
 // when a different day is picked (same contract as `expanded` above). Keyed
@@ -1001,7 +1005,8 @@ async function loadLiveWatch(){
   try{
     const r=await fetch('/open15_vol_breakout/api/status'); const s=await r.json();
     liveWatch=s.watch_stats||{}; liveNeeded=s.vol_needed??null;
-  }catch(e){liveWatch={}; liveNeeded=null;}
+    liveFeed=s.feed_health||null;
+  }catch(e){liveWatch={}; liveNeeded=null; liveFeed=null;}
 }
 async function selectDay(date){
   if(date!==curDate){expanded.clear();ladderOpen.atm=null;} // a different day's rows are different rows
@@ -1010,7 +1015,7 @@ async function selectDay(date){
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
   curEvents=j.events||[];
   curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
-  if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null;}
+  if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null; liveFeed=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderRejected(); renderLogLostBanner(); renderChips(); renderCapital(); renderAtmLadder();
   renderRolling(); renderSel(); renderTimeline();
@@ -1105,6 +1110,24 @@ function renderChips(){
   if(shadow||dig.shadow_pnl!=null)
     chips.push(['shadow P&amp;L <span class="net">net</span>',
       dig.shadow_pnl==null?'—':rupee(dig.shadow_pnl)]);
+  // feed-health chip (issue #677): live status for today, else the day's last
+  // feed_health event. Days with neither (all history pre-#677, healthy days)
+  // render no chip — absence means "nothing observed", never "ok".
+  let fh=liveFeed&&liveFeed.state?liveFeed:null;
+  if(!fh){
+    const ev=[...curEvents].reverse().find(e=>e.event==='feed_health');
+    if(ev)fh={state:ev.state,symbols_ticking:ev.symbols_ticking,universe:ev.universe,
+      last_tick:ev.last_tick,selection_source:ev.selection_source};
+  }
+  let feedHtml='';
+  if(fh&&fh.state){
+    const selEv=curEvents.find(e=>e.event==='selection');
+    const src=fh.selection_source||(selEv&&selEv.source)||null;
+    feedHtml='<div class="chip feed-'+esc(fh.state)+'"><span class="k">feed</span><span class="v">'
+      +esc(fh.state.toUpperCase())+' \\u00B7 '+(fh.symbols_ticking??0)+'/'+(fh.universe??'?')+' ticking'
+      +(fh.last_tick?(' \\u00B7 last '+esc(fh.last_tick)):' \\u00B7 no ticks')
+      +(src?(' \\u00B7 sel:'+esc(src)):'')+'</span></div>';
+  }
   document.getElementById('chips').innerHTML=chips.map(([k,v])=>{
     const isPaper=k.startsWith('paper P&amp;L'), isReal=k.startsWith('real P&amp;L');
     const isSim=k.startsWith('sim P&amp;L'), isShadow=k.startsWith('shadow P&amp;L');
@@ -1116,7 +1139,7 @@ function renderChips(){
     return '<div class="chip"'+border+
       '><span class="k">'+k+'</span><span class="v'+
       (val!=null?(val>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>';
-  }).join('');
+  }).join('')+feedHtml;
 }
 function srcBadge(src){
   return '<span class="badge '+(src==='rolling'?'b-roll':'b-seed')+'">'+esc(src||'seed')+'</span>';
