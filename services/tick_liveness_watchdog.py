@@ -80,6 +80,16 @@ _WINDOW_END = dt_time(15, 30)
 # Poll cadence + ladder step pacing. Module constants by design (not envs).
 _POLL_SEC = 30.0
 _STEP_WAIT_SEC = 120.0  # ~2 min for a step to show effect before escalating
+# Issue #675 — the ladder paces on TICKS, the health verdict stays on BARS.
+# With the scanner on 5m bars, a bar close lags a genuine tick recovery by up
+# to a full bucket (a bar closes only when a tick lands in a LATER bucket), so
+# a successful heal step structurally cannot show a fresh bar inside the 120s
+# step wait. Ticks fresher than _TICK_FRESH_SEC hold the ladder; if ticks stay
+# fresh but no bar closes within _BAR_WAIT_AFTER_TICKS_SEC (5m bucket + one
+# poll of grace), the pipeline is wedged AFTER ingestion and the ladder
+# resumes with a distinct alert.
+_TICK_FRESH_SEC = 90.0
+_BAR_WAIT_AFTER_TICKS_SEC = 330.0
 _INSTRUMENTATION_INTERVAL_SEC = 3600.0
 
 
@@ -150,6 +160,17 @@ def production_last_bar_provider() -> float | None:
         return get_last_live_bar_close_wall()
     except Exception:
         logger.debug("tick_liveness: last-bar provider failed", exc_info=True)
+        return None
+
+
+def production_last_tick_provider() -> float | None:
+    """Wall-clock of the scanner's last ingested live tick (issue #675)."""
+    try:
+        from services.scanner_service import get_last_live_tick_wall
+
+        return get_last_live_tick_wall()
+    except Exception:
+        logger.debug("tick_liveness: last-tick provider failed", exc_info=True)
         return None
 
 
@@ -363,8 +384,16 @@ class TickLivenessWatchdog:
         trading_day_checker: Callable[[date], bool] = production_trading_day_checker,
         heal_steps: list[tuple[str, Callable[[], bool]]] | None = None,
         started_wall: float | None = None,
+        last_tick_provider: Callable[[], float | None] | None = None,
     ) -> None:
         self._last_bar = last_bar_provider
+        # Issue #675: deliberately defaults to None (no tick signal — ladder
+        # behavior byte-identical to pre-#675), NOT the production provider.
+        # The production provider reads a process-wide scanner global; a
+        # default read here would let one test's stamped tick silently hold
+        # the ladder in another test file (the #470/#472 pollution class).
+        # init_tick_liveness_watchdog wires the production provider explicitly.
+        self._last_tick = last_tick_provider
         self._notifier = notifier
         self._now = now_provider or (lambda: datetime.now(tz=_IST))
         self._is_trading_day = trading_day_checker
@@ -382,6 +411,9 @@ class TickLivenessWatchdog:
         self._ladder_step_idx: int = 0
         self._ladder_last_step_wall: float | None = None
         self._ladder_terminal_alerted: bool = False
+        # Tick-aware ladder hold (issue #675).
+        self._ticks_resumed_wall: float | None = None
+        self._tick_wedge_alerted: bool = False
         # Instrumentation cadence.
         self._last_instrumentation_wall: float = 0.0
         # Thread plumbing.
@@ -397,6 +429,8 @@ class TickLivenessWatchdog:
         self._ladder_step_idx = 0
         self._ladder_last_step_wall = None
         self._ladder_terminal_alerted = False
+        self._ticks_resumed_wall = None
+        self._tick_wedge_alerted = False
         # NOTE: _ladder_started_wall is intentionally kept — it anchors the
         # once-per-cooldown rule across outage episodes.
 
@@ -505,6 +539,46 @@ class TickLivenessWatchdog:
         if not autoheal_enabled():
             return "autoheal_off"
 
+        # Tick-aware hold (issue #675). On 2026-08-25, heal step 1 restored
+        # ticks at 09:25:25 but the 5m bar-close verdict could not appear
+        # before the 09:30:00 roll — step 2 escalated at +120s and re-killed
+        # the feed its own step 1 had healed. With ticks fresh, escalating is
+        # always wrong: a re-subscribe/reconnect cannot help a pipeline that
+        # is already RECEIVING. Hold the ladder and let the bar close deliver
+        # the RECOVERED verdict; only if ticks stay fresh while bars stay
+        # silent past a full bucket is the wedge AFTER ingestion, and the
+        # ladder resumes with a distinct alert saying so.
+        tick_last = None
+        if self._last_tick is not None:
+            try:
+                tick_last = self._last_tick()
+            except Exception:
+                logger.debug("tick_liveness: last-tick provider raised", exc_info=True)
+        if tick_last is not None and (now_wall - tick_last) <= _TICK_FRESH_SEC:
+            if self._ticks_resumed_wall is None:
+                self._ticks_resumed_wall = now_wall
+                logger.info(
+                    "tick_liveness: ticks RESUMED (last tick %.0fs ago) — holding the "
+                    "heal ladder while the %dm bar close confirms the pipeline",
+                    now_wall - tick_last,
+                    int(_BAR_WAIT_AFTER_TICKS_SEC // 60),
+                )
+            if (now_wall - self._ticks_resumed_wall) <= _BAR_WAIT_AFTER_TICKS_SEC:
+                return "ticks_fresh_awaiting_bar"
+            if not self._tick_wedge_alerted:
+                self._tick_wedge_alerted = True
+                message = (
+                    "🚨 Tick-liveness: ticks are FLOWING but no bar has closed for "
+                    f"{int(_BAR_WAIT_AFTER_TICKS_SEC)}s — the wedge is AFTER tick "
+                    "ingestion (aggregator/evaluation side). Resuming the heal "
+                    "ladder, but re-subscribe/reconnect may not help this class. "
+                    "Issue #675."
+                )
+                logger.error(f"tick_liveness: {message}")
+                self._safe_notify(message)
+        else:
+            self._ticks_resumed_wall = None
+
         starting_fresh = self._ladder_step_idx == 0 and self._ladder_last_step_wall is None
         if starting_fresh:
             cooldown_sec = ladder_cooldown_min() * 60.0
@@ -550,8 +624,9 @@ class TickLivenessWatchdog:
             outcome = "raised"
         message = (
             f"🔧 Tick-liveness auto-heal step {step_no}/{len(self._steps)} "
-            f"({name}): {outcome}. Watching ~{int(_STEP_WAIT_SEC)}s for bars "
-            "to resume before escalating."
+            f"({name}): {outcome}. Watching for ticks to resume (fresh ticks "
+            f"hold the ladder for the bar-close verdict; escalating after "
+            f"~{int(_STEP_WAIT_SEC)}s if ticks stay dark)."
         )
         logger.warning(f"tick_liveness: {message}")
         self._safe_notify(message)
@@ -619,7 +694,10 @@ def init_tick_liveness_watchdog(app=None) -> TickLivenessWatchdog | None:
     try:
         if _watchdog is not None:
             return _watchdog
-        _watchdog = TickLivenessWatchdog()
+        # The tick provider is wired HERE, not as a constructor default — a
+        # default read of the process-wide scanner stamp would let one test's
+        # tick silently hold the ladder in another test file (issue #675).
+        _watchdog = TickLivenessWatchdog(last_tick_provider=production_last_tick_provider)
         _watchdog.start()
         if app is not None:
             app.tick_liveness_watchdog = _watchdog
