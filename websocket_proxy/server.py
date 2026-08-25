@@ -1473,14 +1473,85 @@ class WebSocketProxy:
     @staticmethod
     def _snapshot_subscriptions(adapter) -> list:
         """Capture an adapter's current subscriptions as (symbol, exchange, mode)
-        tuples. Must be called BEFORE disconnect(), which clears the set."""
+        tuples. Must be called BEFORE disconnect(), which clears the set.
+
+        Raw broker adapters track ``subscribed_symbols``; the pooled wrappers
+        (``broker_factory._PooledAdapterWrapper`` and the
+        ``connection_manager`` factory twin) expose the pool's ``subscriptions``
+        instead — reading only the former is what wiped every pooled reconnect
+        to 0 subscriptions and killed the tick feed (issue #673). Precedence is
+        load-bearing: raw adapters carry BOTH attributes (``base_adapter``
+        initializes an empty ``subscriptions`` the broker code may never
+        maintain), so ``subscribed_symbols`` must stay first."""
         snapshot = []
         try:
-            for sub in adapter.subscribed_symbols.values():
+            subs = getattr(adapter, "subscribed_symbols", None)
+            if subs is None:
+                subs = getattr(adapter, "subscriptions", None)
+            for sub in (subs or {}).values():
                 snapshot.append((sub.get("symbol"), sub.get("exchange"), sub.get("mode", 2)))
         except Exception as snap_err:
-            logger.warning(f"Could not snapshot subscriptions: {snap_err}")
+            # ERROR, not warning: the warning form ran unnoticed for 13 days
+            # while every pooled reconnect killed the feed (issue #673).
+            logger.error(f"Could not snapshot subscriptions: {snap_err}")
         return snapshot
+
+    def _restore_missing_from_index(self, user_id: str, adapter) -> int:
+        """Defense-in-depth for the reconnect path (issue #673): re-subscribe
+        any symbol the proxy's OWN clients hold that the adapter-side restore
+        missed.
+
+        ``subscription_index`` is client-driven truth and survives an adapter
+        wipe (client WS connections are untouched by an adapter reconnect), so
+        it is immune to the adapter-shape drift that produced the 0/0 restore.
+        It is also the PRIMARY mechanism on login-driven reconnects, not a
+        fallback: live validation (2026-08-25 10:12:33) showed the login flow
+        disconnects the pool — clearing ``subscription_map`` — BEFORE the
+        CACHE_INVALIDATE event is even consumed, so no adapter-side snapshot
+        can survive a re-login. The restore is therefore a WARNING (expected
+        on every daily auto-login); ERROR is reserved for index re-subscribes
+        that themselves fail. Strictly additive — never unsubscribes. Returns
+        the count restored.
+        """
+        index = getattr(self, "subscription_index", None)
+        if not index:
+            return 0
+        user_mapping = getattr(self, "user_mapping", None) or {}
+        if user_mapping:
+            user_clients = {cid for cid, uid in user_mapping.items() if uid == user_id}
+            wanted = {key for key, clients in index.items() if clients & user_clients}
+        else:
+            # No client→user mapping available (partial init): the index can
+            # only belong to the single feed user.
+            wanted = set(index.keys())
+        live = set(self._snapshot_subscriptions(adapter))
+        missing = wanted - live
+        if not missing:
+            return 0
+        logger.warning(
+            f"Reconnect restored fewer subscriptions than clients hold for user "
+            f"{user_id}: {len(missing)} missing vs subscription_index — "
+            f"re-subscribing from the index (issue #673)"
+        )
+        restored = 0
+        failed = 0
+        for symbol, exchange, mode in missing:
+            try:
+                adapter.subscribe(symbol, exchange, mode)
+                restored += 1
+            except Exception as sub_err:
+                failed += 1
+                logger.warning(
+                    f"Reconnect: index re-subscribe failed for {exchange}:{symbol} "
+                    f"for user {user_id}: {sub_err}"
+                )
+        if failed:
+            logger.error(
+                f"Reconnect: index restore incomplete for user {user_id}: "
+                f"{failed}/{len(missing)} re-subscribe(s) failed — those symbols "
+                f"have NO live feed until the next heal (issue #673)"
+            )
+        return restored
 
     def _reconnect_broker_adapter(self, user_id: str) -> bool:
         """
@@ -1579,15 +1650,22 @@ class WebSocketProxy:
                     f"for user {user_id}: {sub_err}"
                 )
 
-        # Keep the live adapter in the registry (idempotent — do NOT delete it) and
-        # refresh the snapshot from the now-live adapter.
+        # Keep the live adapter in the registry (idempotent — do NOT delete it),
+        # verify the restore against the proxy's own client subscription index
+        # (issue #673), then refresh the snapshot from the now-live adapter.
         self.broker_adapters[user_id] = adapter
+        restored_from_index = self._restore_missing_from_index(user_id, adapter)
         live_snapshot = self._snapshot_subscriptions(adapter)
         if live_snapshot:
             self._last_known_subscriptions[user_id] = live_snapshot
+        index_note = (
+            f" (+{restored_from_index} restored from the client subscription index)"
+            if restored_from_index
+            else ""
+        )
         logger.info(
             f"Reconnect: broker adapter for user {user_id} reconnected; "
-            f"re-subscribed {resubscribed}/{len(saved_subscriptions)} symbol(s)"
+            f"re-subscribed {resubscribed}/{len(saved_subscriptions)} symbol(s){index_note}"
         )
         return True
 
