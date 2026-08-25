@@ -49,7 +49,14 @@ incident):** two in-process daemons now watch for this (issue #376). The
 (`tick_liveness`) when NO live scanner bar closes for
 `SCANNER_LIVENESS_MAX_SILENT_MIN` (default 10) min in market hours, then runs an
 auto-heal ladder (re-subscribe → adapter reconnect → WS-proxy restart →
-terminal CRIT) and logs an hourly handle/TCP resource-trend line. The
+terminal CRIT) and logs an hourly handle/TCP resource-trend line. **The ladder
+paces on TICKS; the health verdict stays on BARS (issue #675):** with the
+scanner on 5m bars, a bar close lags a genuine recovery by up to a full bucket
+(bars close on tick-driven rolls), so on 2026-08-25 step 2 escalated at +120s
+and re-killed the feed step 1 had just healed. Fresh ticks (scanner-ingested,
+`get_last_live_tick_wall`) now HOLD the ladder while the bar close confirms;
+ticks-fresh-but-bars-silent past a full bucket means the wedge is AFTER
+ingestion → one distinct alert, then the ladder resumes. The
 **WS-proxy supervisor** (`services/ws_proxy_supervisor.py`) auto-restarts the
 `websocket_proxy` subprocess on unexpected exit (`ws_proxy_died` alert, capped
 `WS_PROXY_MAX_RESTARTS_PER_DAY`/day). See `docs/SYSTEM_MAP.md` Processes §6.

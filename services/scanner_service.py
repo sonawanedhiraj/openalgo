@@ -187,6 +187,40 @@ def _reset_live_bar_close_for_tests() -> None:
     _last_live_bar_close_wall = None
 
 
+# Tick-granular heartbeat (issue #675). The bar-close stamp above is the
+# HEALTH verdict, but with intervals=['5m'] it lags a genuine recovery by up
+# to a full bucket: a bar only closes when a tick lands in a LATER bucket, so
+# on 2026-08-25 heal step 1 restored ticks at 09:25:25 and the earliest
+# possible stamp was the 09:30:00 roll — the heal ladder's 120s step wait
+# escalated to step 2 first and re-killed the feed. This stamp answers the
+# narrower question "is the scanner RECEIVING ticks?" within seconds; the
+# ladder paces on it while the bar close remains the recovery verdict.
+# Replay safety is by construction: replays enter via
+# ``MultiIntervalAggregator.replay_bars``, never through ``_ingest_message``.
+
+_last_live_tick_wall: float | None = None
+
+
+def _mark_live_tick() -> None:
+    """Stamp the wall-clock time of the most recent live tick the scanner
+    ingested for a watched symbol. One assignment per tick — no locks."""
+    global _last_live_tick_wall  # noqa: PLW0603 — process-wide heartbeat by design
+    _last_live_tick_wall = _time.time()
+
+
+def get_last_live_tick_wall() -> float | None:
+    """Wall-clock (``time.time()``) of the last live tick ingested, or None if
+    none since process start. Read by the tick-liveness heal ladder; never
+    raises."""
+    return _last_live_tick_wall
+
+
+def _reset_live_tick_for_tests() -> None:
+    """Reset the tick heartbeat — tests only."""
+    global _last_live_tick_wall  # noqa: PLW0603
+    _last_live_tick_wall = None
+
+
 def _default_completeness_notifier(message: str) -> None:
     """Route a completeness alert to Telegram via the shared notification service.
     Lazily imported so the scanner module stays cheap to import; never raises."""
@@ -1306,6 +1340,7 @@ class ScannerService:
         tick = _normalize_tick(market_data)
         if tick is None:
             return
+        _mark_live_tick()  # issue #675 — tick-granular heartbeat for the heal ladder
         self.aggregator.on_tick(symbol, tick)
         builder_15m = self._bar_15m_history.get(symbol)
         if builder_15m is not None:
