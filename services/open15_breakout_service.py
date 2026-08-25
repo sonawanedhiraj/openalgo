@@ -1153,6 +1153,26 @@ class Open15Core:
         # per-selected-symbol near-miss stats for the decision log: how close a
         # non-entered watch got (max cumvol/baseline ratio, ever beyond level)
         self.watch_stats: dict[str, dict[str, Any]] = {}
+        # issue #677: selection can finalize from TWO threads — the ZMQ tick
+        # path and the scheduler's 09:17 deadline — so the guard is a lock,
+        # not a bare flag check.
+        self._finalize_lock = threading.Lock()
+
+    def ensure_finalized(self) -> bool:
+        """Finalize selection exactly once, from whichever path gets here first.
+
+        Issue #677: the tick-path "hard fail-open deadline" needs a tick to
+        run, so a totally dead feed silently skipped the day (2026-08-25 —
+        zero seeds, no alert, and when ticks resumed at 09:25 the selection
+        only started then). The scheduler's minute job now calls this at/after
+        09:17, so the watch list exists with or without ticks. Returns True
+        when THIS call performed the finalize.
+        """
+        with self._finalize_lock:
+            if self.finalized:
+                return False
+            self._finalize_selection()
+            return True
 
     def apply_first_candles(self, candles: dict[str, dict[str, float]]) -> None:
         """Install the broker's 09:15 open/high/low and release the selection.
@@ -1486,7 +1506,7 @@ class Open15Core:
         # whatever we have rather than lose the day to a slow quote call.
         if not self.finalized and minute >= _ENTRY_FROM:
             if self._snapshot_applied or minute > _ENTRY_FROM:
-                self._finalize_selection()
+                self.ensure_finalized()
 
         if minute == _FIRST_MIN:
             fc = st["fc"]
@@ -1798,6 +1818,17 @@ class Open15BreakoutService:
         # separate dedup for an entry that RAISED (issue #643) — a code fault
         # must not be silenced by an earlier broker rejection
         self._entry_error_alert_date: str | None = None
+        # ---- feed health (issue #677) --------------------------------------
+        # Written ONLY by the ZMQ tick thread (single writer, cheap ops);
+        # read by the scheduler minute job and get_status. `_feed_state` is
+        # the last state the scheduler *reported* — None until the first
+        # non-ok observation so a normal day journals nothing extra.
+        self._feed_ticks = 0
+        self._feed_symbols: set[str] = set()
+        self._feed_last_tick: dt.datetime | None = None
+        self._feed_state: str | None = None
+        self._feed_alert_date: str | None = None
+        self._selection_source: str | None = None
 
     def _log_event(self, event: str, **detail: Any) -> None:
         rec = {
@@ -2144,6 +2175,11 @@ class Open15BreakoutService:
             )
             self.positions = {}
             self.day_status = "armed"
+            self._feed_ticks = 0
+            self._feed_symbols = set()
+            self._feed_last_tick = None
+            self._feed_state = None
+            self._selection_source = None
         self._log_event(
             "armed",
             universe=len(self.universe),
@@ -3208,6 +3244,11 @@ class Open15BreakoutService:
         tick = _normalize_tick(json.loads(data_str))
         if tick is None:
             return
+        # feed-health counters (issue #677): single-writer (this thread), read
+        # by the scheduler minute job — three cheap ops, no locks, no broker.
+        self._feed_ticks += 1
+        self._feed_symbols.add(symbol)
+        self._feed_last_tick = now
         # minute attribution uses the tick's exchange timestamp (naive IST);
         # the wall-clock gate above only bounds the processing window.
         tick_ts = tick.get("ts") or now.replace(tzinfo=None)
@@ -3222,9 +3263,10 @@ class Open15BreakoutService:
         # 09:15 open gap where their %-at-add belonged). Emitting it here also
         # means the decision log keeps its selection record when tick capture
         # is switched off — ``_capture_tick`` returns early with no writer.
-        if not was_finalized and core.finalized:
+        if not was_finalized and core.finalized and self._selection_source is None:
             try:
-                self._log_selection_event(core)
+                self._selection_source = "tick"
+                self._log_selection_event(core, source="tick")
             except Exception:
                 logger.exception("open15: selection event log failed")
         # Gate-1 stage-2 exclusions (issue #583) — drained rather than re-read, so
@@ -3286,12 +3328,16 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: tick handling failed")
 
-    def _log_selection_event(self, core: Open15Core) -> None:
+    def _log_selection_event(self, core: Open15Core, source: str = "tick") -> None:
         """Record the 09:16 SEED picks in the decision log (issue #545).
 
         ``watch_source`` is the authoritative seed-vs-rolling split, so the
         filter here holds even if a future change reorders the caller — the
         ordering fragility it guards against is exactly what caused #545.
+
+        ``source`` (issue #677) says which path finalized: ``tick`` (normal)
+        or ``scheduler`` (the 09:17 deadline ran because no tick had) — on a
+        dead-feed day it is the tell that selection was rescued by the clock.
         """
         seed = [s for s in core.selected if core.watch_source.get(s, "seed") == "seed"]
         self._log_event(
@@ -3302,7 +3348,102 @@ class Open15BreakoutService:
             # so a selection oddity is auditable straight from the day log
             prev_closes={s: core.prev_closes.get(s) for s in seed},
             candidates=len(core.gaps),
+            source=source,
         )
+
+    # ---- feed health (issue #677) ----------------------------------------- #
+    FEED_DEGRADED_FRACTION = 0.5
+
+    def check_feed_health(self) -> None:
+        """Minute-cadence feed-health check + the clock-based selection deadline.
+
+        Runs on the scheduler thread (never the ZMQ tick thread — the #626
+        rule; it makes no broker calls either way). Two jobs:
+
+        1. **Deadline finalize.** The tick-path fail-open needs a tick to run,
+           so a dead feed used to skip the day silently (2026-08-25, #673).
+           Past 09:17 an armed-but-unfinalized day is finalized here from the
+           09:16 quote snapshot — so a mid-window feed recovery finds the
+           watch list already armed instead of losing the day.
+        2. **State transitions.** ``dead`` (zero ticks since arm) /
+           ``degraded`` (ticking fraction below ``FEED_DEGRADED_FRACTION``) /
+           ``ok``. Each transition journals ONE ``feed_health`` event (the
+           initial transition INTO ``ok`` is deliberately silent — a normal
+           day must not grow a daily noise row), and ``dead`` additionally
+           Telegram-alerts once per day.
+        """
+        core = self.core
+        if core is None or self.day_status != "armed":
+            return
+        now = self._now_ist()
+        if not core.finalized and now.time() >= dt.time(9, 17):
+            try:
+                if core.ensure_finalized():
+                    self._selection_source = "scheduler"
+                    self._log_selection_event(core, source="scheduler")
+            except Exception:
+                logger.exception("open15: scheduler deadline finalize failed")
+        universe_n = len(self.universe)
+        ticking = len(self._feed_symbols)
+        if self._feed_ticks == 0:
+            state = "dead"
+        elif universe_n and ticking / universe_n < self.FEED_DEGRADED_FRACTION:
+            state = "degraded"
+        else:
+            state = "ok"
+        prev = self._feed_state
+        if state == prev or (prev is None and state == "ok"):
+            self._feed_state = state
+            return
+        self._feed_state = state
+        last_tick = self._feed_last_tick.strftime("%H:%M:%S") if self._feed_last_tick else None
+        self._log_event(
+            "feed_health",
+            state=state,
+            prev=prev,
+            ticks=self._feed_ticks,
+            symbols_ticking=ticking,
+            universe=universe_n,
+            last_tick=last_tick,
+            selection_source=self._selection_source,
+        )
+        if state == "dead":
+            logger.error(
+                "open15 FEED DEAD: 0 ticks since the %s arm (universe %d) — "
+                "selection %s; entries cannot trigger until ticks resume",
+                self._log_date,
+                universe_n,
+                "finalized from the 09:16 quote snapshot"
+                if core.finalized
+                else "NOT finalized yet",
+            )
+            today = now.strftime("%Y-%m-%d")
+            if self._feed_alert_date != today:
+                self._feed_alert_date = today
+                try:
+                    from services.notification_service import get_notification_service
+
+                    get_notification_service().notify(
+                        "open15_breakout",
+                        f"🚨 open15_vol_breakout [{_mode()}]: FEED DEAD — 0 ticks since "
+                        f"the 09:10 arm (universe {universe_n}). Selection was finalized "
+                        f"from the 09:16 quote snapshot so the watch list is armed, but "
+                        f"no entry can trigger until ticks resume. Check the WS proxy / "
+                        f"tick-liveness watchdog (#673 class).",
+                    )
+                except Exception:
+                    logger.exception("open15: feed-dead alert failed")
+        elif state == "degraded":
+            logger.warning(
+                "open15 feed DEGRADED: %d/%d symbols ticking (last tick %s)",
+                ticking,
+                universe_n,
+                last_tick,
+            )
+        else:
+            logger.info(
+                "open15 feed RECOVERED: %d/%d symbols ticking after %s", ticking, universe_n, prev
+            )
 
     def _capture_tick(
         self,
@@ -4383,6 +4524,32 @@ class Open15BreakoutService:
             # live near-miss stats so the decision-log UI can fill `max vol×`
             # during the window instead of waiting for the exit job (issue #524)
             "watch_stats": core.watch_snapshot() if core else {},
+            # feed health (issue #677) — what the /logs chip reads live. State
+            # is computed HERE (not the minute job's transition memory) so the
+            # chip is current even between job ticks.
+            "feed_health": {
+                "state": (
+                    "dead"
+                    if self._feed_ticks == 0
+                    else (
+                        "degraded"
+                        if self.universe
+                        and len(self._feed_symbols) / len(self.universe)
+                        < self.FEED_DEGRADED_FRACTION
+                        else "ok"
+                    )
+                )
+                if self.day_status == "armed"
+                else None,
+                "ticks": self._feed_ticks,
+                "symbols_ticking": len(self._feed_symbols),
+                "universe": len(self.universe),
+                "last_tick": self._feed_last_tick.strftime("%H:%M:%S")
+                if self._feed_last_tick
+                else None,
+                "finalized": bool(core.finalized) if core else False,
+                "selection_source": self._selection_source,
+            },
             "vol_needed": self._vol_needed(),
             # rolling additive watch list (issue #529) — the effective config and
             # today's additions so far, readable mid-window
@@ -4463,10 +4630,17 @@ def _eod_retry_job() -> None:
 
 
 def _entry_verify_job() -> None:
-    """Minute-cadence post-ACK entry verification (issue #626)."""
+    """Minute-cadence post-ACK entry verification (issue #626) + feed health
+    and the clock-based selection deadline (issue #677)."""
     svc = get_open15_service()
     if svc is None or svc.day_status != "armed":
         return
+    try:
+        # health first: with a dead feed there are no entries to verify, and
+        # the deadline finalize must not wait behind a broker call
+        svc.check_feed_health()
+    except Exception:
+        logger.exception("open15: feed-health check raised")
     try:
         svc.verify_entries()
     except Exception:

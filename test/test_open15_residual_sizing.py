@@ -307,8 +307,16 @@ def test_the_chips_row_runs_without_a_reference_error():
     body = body.rstrip().removesuffix("}")
     events = [
         {"event": "armed", "universe": 4, "mode": "live", "vol_mult": 1.5},
-        {"event": "selection", "selected": {"AAA": "L"}, "gaps_pct": {}},
+        {"event": "selection", "selected": {"AAA": "L"}, "gaps_pct": {}, "source": "scheduler"},
         {"event": "entry_error", "symbol": "AAA", "error": "boom"},
+        {
+            "event": "feed_health",
+            "state": "dead",
+            "symbols_ticking": 0,
+            "universe": 4,
+            "last_tick": None,
+            "selection_source": "scheduler",
+        },
         {"event": "summary", "day": "done", "selected": 1},
     ]
     script = (
@@ -318,6 +326,8 @@ def test_the_chips_row_runs_without_a_reference_error():
         f"const curEvents={json.dumps(events)};\n"
         "const curJournal=[];\n"
         "const curDate='2026-08-19';\n"
+        # mirrors the page's own `let liveWatch={}, liveNeeded=null, liveFeed=null;`
+        "const liveFeed=null;\n"
         "const digests=[{date:'2026-08-19',status:'done',selected:1,entered:0,"
         "paper:0,sim:0,shadow:0,errors:1,pnl:null}];\n"
         f"function renderChips(){{{body}}}\n"
@@ -327,7 +337,11 @@ def test_the_chips_row_runs_without_a_reference_error():
         [node, "-e", script], capture_output=True, text=True, timeout=60, check=False
     )
     assert out.returncode == 0, out.stderr
-    assert "1 error" in json.loads(out.stdout)["html"]
+    html = json.loads(out.stdout)["html"]
+    assert "1 error" in html
+    # feed-health chip (issue #677): renders from the day's feed_health event
+    # (liveFeed is null here — the historical-day path) with the state class
+    assert "feed-dead" in html and "sel:scheduler" in html
 
 
 # --------------------------------------------------------------------------- #

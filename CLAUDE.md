@@ -1588,6 +1588,25 @@ Both **seed and rolling** additions are shadowed. Distinct `entry_shadow` /
 `exit_shadow` events (the digest sums by event name). Flags
 `OPEN15_SHADOW_EXCLUDED_SIDE`, `OPEN15_SHADOW_MAX_TRADES`.
 
+**A dead feed is LOUD, and the selection deadline is clock-based (issue
+#677).** Selection used to finalize only inside the tick handler, so on
+2026-08-25 (feed dead from open, #673) the day silently produced no seeds — a
+/logs page indistinguishable from a quiet market. The per-minute
+`open15_entry_verify` job now also runs `check_feed_health()`: past 09:17 an
+armed-but-unfinalized day is finalized from the 09:16 quote snapshot (the
+`selection` event carries `source: tick|scheduler` — on a dead-feed day
+`scheduler` is the tell), so a mid-window feed recovery finds the watch list
+already armed instead of losing the day. Feed state (`ok` / `degraded` <50%
+of universe ticking / `dead` = zero ticks since arm) is computed on the
+scheduler thread from counters the ZMQ thread writes (never a broker call on
+the tick thread — the #626 rule); each state TRANSITION journals one
+`feed_health` event (the initial transition into `ok` is silent — a normal
+day grows no noise row), `dead` Telegram-alerts once/day, and the /logs page
+renders a colored feed chip (live from `/api/status` during the window, else
+from the day's last `feed_health` event; absence means "nothing observed",
+never "ok"). Finalize is race-safe across the tick and scheduler paths
+(`Open15Core.ensure_finalized`, shared lock). No env flag (#651 rule).
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.
