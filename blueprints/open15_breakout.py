@@ -374,6 +374,8 @@ def _effective_today(svc) -> tuple[dict | None, str]:
                         persisted ``armed`` event, which is the durable record.
       ``not_armed``   — no arm today. The config is what the NEXT arm will use,
                         and the page must say so rather than assert it as fact.
+      ``holiday``     — the arm's #682 trading-day gate fired: NSE is closed
+                        today, deliberately no arm and no day log.
 
     Never raises: an unreadable day log degrades to ``not_armed`` rather than
     taking down the config endpoint the form depends on.
@@ -389,6 +391,8 @@ def _effective_today(svc) -> tuple[dict | None, str]:
     today = _dt.datetime.now(_pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
     if svc.day_status == "armed" and svc._log_date == today:
         return svc.day_config, "armed"
+    if svc.day_status == "holiday" and svc._log_date == today:
+        return svc.day_config, "holiday"
     try:
         from database.open15_breakout_db import get_day_log
 
@@ -552,6 +556,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .feed-ok{background:#12291c;color:#a6e3a1;border:1px solid #2e5140}
  .feed-degraded{background:#332a17;color:#f9e2af;border:1px solid #5c4d2a}
  .feed-dead{background:#3a1e24;color:#f38ba8;border:1px solid #6b3542;font-weight:bold}
+ .feed-waiting{background:#16222f;color:#89b4fa;border:1px solid #2c4a6e}
  input{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 8px}
  .muted{color:#6b7886;font-size:12px}
  button{background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px 10px;cursor:pointer}
@@ -853,7 +858,8 @@ async function loadCfg(){
     const srcLbl={
       armed:'effective today: ',
       armed_log:'effective today (from the 09:10 arm — restarted since): ',
-      not_armed:'not armed today — the next 09:10 arm will use: '
+      not_armed:'not armed today — the next 09:10 arm will use: ',
+      holiday:'NSE holiday — market closed today, no arm. The next arm will use: '
     }[src]||'effective today: ';
     // the armed event never recorded leverage; print the notional alone rather
     // than the string "undefined"
@@ -938,6 +944,14 @@ let liveWatch={}, liveNeeded=null, liveFeed=null;
 // drill-down state.
 const ladderOpen={atm:null,plan:null};
 const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// pre-open countdown for the WAITING feed chip (issue #682). The chip is
+// rebuilt every 5s from /api/status; this 1s tick keeps the m:ss moving in
+// between, clamped at 0:00 until the next refresh flips the state.
+function cdFmt(s){s=Math.max(0,Math.round(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
+setInterval(()=>{
+  const el=document.getElementById('feedcd');
+  if(el)el.textContent=cdFmt((+el.dataset.t0-Date.now())/1000);
+},1000);
 function kindOf(e){
   if(e.event==='entry'||e.event==='exit'||e.event==='entry_skipped'||
      e.event==='entry_rejected'||e.event==='exit_paper'||e.event==='exit_sim'||
@@ -1120,7 +1134,15 @@ function renderChips(){
       last_tick:ev.last_tick,selection_source:ev.selection_source};
   }
   let feedHtml='';
-  if(fh&&fh.state){
+  if(fh&&fh.state==='waiting'){
+    // issue #682 — armed but before the 09:15 open: the feed was never live
+    // to be dead, so no red and no tick counts; a countdown to the open,
+    // anchored to the server's opens_in_s (never the host clock's timezone)
+    const t0=Date.now()+((fh.opens_in_s||0)*1000);
+    feedHtml='<div class="chip feed-waiting"><span class="k">feed</span><span class="v">'
+      +'WAITING \\u00B7 ticks start at '+esc(fh.opens_at||'09:15')
+      +' \\u00B7 in <span id="feedcd" data-t0="'+t0+'">'+cdFmt(fh.opens_in_s||0)+'</span></span></div>';
+  }else if(fh&&fh.state){
     const selEv=curEvents.find(e=>e.event==='selection');
     const src=fh.selection_source||(selEv&&selEv.source)||null;
     feedHtml='<div class="chip feed-'+esc(fh.state)+'"><span class="k">feed</span><span class="v">'
