@@ -1785,7 +1785,7 @@ class Open15BreakoutService:
         self.core: Open15Core | None = None
         self._sched = None  # scheduler handle from register_jobs (arm reschedules on it)
         self.positions: dict[str, dict[str, Any]] = {}  # symbol -> journal/fill info
-        self.day_status = "idle"  # idle / armed / skipped_late_boot / done
+        self.day_status = "idle"  # idle / armed / skipped_late_boot / holiday / done
         self.universe: set[str] = set()
         self._lock = threading.Lock()
         self._zmq_thread: threading.Thread | None = None
@@ -2026,6 +2026,28 @@ class Open15BreakoutService:
         self._log_date = now.strftime("%Y-%m-%d")
         self._first_min_buffer = {}
         self._capture_flushed = False
+        # Holiday gate (issue #682): the cron is a plain mon-fri, so an NSE
+        # weekday holiday used to ARM (broker quotes still return prev-closes)
+        # and then read as a dead feed all day — a guaranteed false alarm from
+        # the #677 watchdog. A non-trading day arms nothing and PERSISTS
+        # nothing (the postmarket rule — the history rail stays clean, like a
+        # weekend). Fail-open inherited from #253: an empty calendar year
+        # degrades to weekday-only, never worse than the pre-gate behavior.
+        try:
+            from services.data_freshness_service import is_trading_day
+
+            trading = is_trading_day(now.date())
+        except Exception:
+            logger.exception("open15: trading-day check failed — arming anyway (fail-open)")
+            trading = True
+        if not trading:
+            self.day_status = "holiday"
+            self.day_log = []
+            logger.info(
+                "open15: %s is not a trading day (NSE holiday) — no arm, no day log",
+                self._log_date,
+            )
+            return
         if now.time() >= dt.time(9, 15, 30):
             self.day_status = "skipped_late_boot"
             # issue #597: a mid-day RESTART on a date that already has a
@@ -3353,6 +3375,10 @@ class Open15BreakoutService:
 
     # ---- feed health (issue #677) ----------------------------------------- #
     FEED_DEGRADED_FRACTION = 0.5
+    #: When NSE continuous trading starts. Before this there is nothing to
+    #: judge — the feed was never live to be dead (issue #682); the live chip
+    #: shows a ``waiting`` countdown instead and the minute job stays silent.
+    MARKET_OPEN = dt.time(9, 15)
 
     def check_feed_health(self) -> None:
         """Minute-cadence feed-health check + the clock-based selection deadline.
@@ -3376,6 +3402,12 @@ class Open15BreakoutService:
         if core is None or self.day_status != "armed":
             return
         now = self._now_ist()
+        # issue #682: before the 09:15 open there is nothing to judge — the
+        # feed was never live to be dead. No transition, no journal, no alert;
+        # /api/status shows ``waiting`` instead. Guarded HERE rather than by
+        # the job's start time, so the invariant survives a schedule edit.
+        if now.time() < self.MARKET_OPEN:
+            return
         if not core.finalized and now.time() >= dt.time(9, 17):
             try:
                 if core.ensure_finalized():
@@ -4466,6 +4498,51 @@ class Open15BreakoutService:
         )
 
     # ---- status for the blueprint ---------------------------------------- #
+    def _feed_health_status(self, core) -> dict:
+        """Live feed block for ``/api/status`` (issues #677/#682).
+
+        ``waiting`` (armed, before the 09:15 open) is a LIVE-ONLY state: the
+        feed was never live to be dead, so pre-open the chip counts down to
+        the open instead of crying DEAD — red before an alarm is possible
+        trains the operator to ignore red. Never journaled, so a past day's
+        page can never show it (the #677 "absence means nothing observed"
+        rule survives). From 09:15:00 the #677 derivation is unchanged.
+        ``opens_in_s`` is server-computed so the chip's countdown never
+        guesses the host clock's timezone.
+        """
+        now = self._now_ist()
+        if self.day_status != "armed":
+            state = None
+        elif now.time() < self.MARKET_OPEN:
+            state = "waiting"
+        elif self._feed_ticks == 0:
+            state = "dead"
+        elif (
+            self.universe
+            and len(self._feed_symbols) / len(self.universe) < self.FEED_DEGRADED_FRACTION
+        ):
+            state = "degraded"
+        else:
+            state = "ok"
+        out = {
+            "state": state,
+            "ticks": self._feed_ticks,
+            "symbols_ticking": len(self._feed_symbols),
+            "universe": len(self.universe),
+            "last_tick": self._feed_last_tick.strftime("%H:%M:%S")
+            if self._feed_last_tick
+            else None,
+            "finalized": bool(core.finalized) if core else False,
+            "selection_source": self._selection_source,
+        }
+        if state == "waiting":
+            opens = now.replace(
+                hour=self.MARKET_OPEN.hour, minute=self.MARKET_OPEN.minute, second=0, microsecond=0
+            )
+            out["opens_at"] = self.MARKET_OPEN.strftime("%H:%M")
+            out["opens_in_s"] = max(0, int((opens - now).total_seconds()))
+        return out
+
     def _vol_needed(self) -> float:
         """The multiplier that actually gated today's entries (issue #524).
 
@@ -4524,32 +4601,10 @@ class Open15BreakoutService:
             # live near-miss stats so the decision-log UI can fill `max vol×`
             # during the window instead of waiting for the exit job (issue #524)
             "watch_stats": core.watch_snapshot() if core else {},
-            # feed health (issue #677) — what the /logs chip reads live. State
-            # is computed HERE (not the minute job's transition memory) so the
-            # chip is current even between job ticks.
-            "feed_health": {
-                "state": (
-                    "dead"
-                    if self._feed_ticks == 0
-                    else (
-                        "degraded"
-                        if self.universe
-                        and len(self._feed_symbols) / len(self.universe)
-                        < self.FEED_DEGRADED_FRACTION
-                        else "ok"
-                    )
-                )
-                if self.day_status == "armed"
-                else None,
-                "ticks": self._feed_ticks,
-                "symbols_ticking": len(self._feed_symbols),
-                "universe": len(self.universe),
-                "last_tick": self._feed_last_tick.strftime("%H:%M:%S")
-                if self._feed_last_tick
-                else None,
-                "finalized": bool(core.finalized) if core else False,
-                "selection_source": self._selection_source,
-            },
+            # feed health (issues #677/#682) — what the /logs chip reads live.
+            # State is computed HERE (not the minute job's transition memory)
+            # so the chip is current even between job ticks.
+            "feed_health": self._feed_health_status(core),
             "vol_needed": self._vol_needed(),
             # rolling additive watch list (issue #529) — the effective config and
             # today's additions so far, readable mid-window
