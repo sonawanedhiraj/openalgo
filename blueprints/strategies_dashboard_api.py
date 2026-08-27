@@ -526,44 +526,64 @@ def _futures_follow_stats(since: datetime | None = None) -> dict:
     total is converted to a lot/position count for display using
     ``_lot_size_from_rows`` (see there for why it isn't the hardcoded config
     lot size).
+
+    Counters are split by the row's own ``mode`` (issue #684, the
+    ``_futures_follow_lifetime`` rule) and surfaced under ``by_mode`` so the
+    detail endpoint attaches each mode's today/open chips to its own
+    Sandbox/Live column — previously the blended totals landed under Sandbox
+    only. The top-level keys stay the across-mode totals for the index card's
+    single headline.
     """
+    empty = {"open_positions": 0, "today_net_pnl": 0.0, "today_trade_count": 0}
     try:
         q = ff_session.query(FuturesFollowTrade)
         if since:
             q = q.filter(FuturesFollowTrade.created_at >= since)
         trades = q.all()
         today_str = datetime.now(_IST).strftime("%Y-%m-%d")
-        entries_today = [t for t in trades if t.side == "BUY" and t.entry_date == today_str]
-        exits_today = [
-            t for t in trades if t.side == "SELL" and _ist_date_str(t.created_at) == today_str
-        ]
-        today_pnl = sum((t.net_pnl or 0.0) for t in exits_today if t.net_pnl is not None)
-        # Open = net placed QUANTITY across ALL sessions (placed BUY qty − placed
-        # SELL qty), so an overnight-held position stays counted until its T+1
-        # exit fills. (Pairing today's exits against today's entries is wrong:
-        # today's SELL closes YESTERDAY's entry, not one of today's.)
-        placed = [t for t in trades if (t.status or "") == "placed"]
-        open_qty = max(
-            0,
-            sum(int(t.quantity or 0) for t in placed if t.side == "BUY")
-            - sum(int(t.quantity or 0) for t in placed if t.side == "SELL"),
-        )
-        lot_size = _lot_size_from_rows(placed)
-        open_count = (open_qty + lot_size - 1) // lot_size if lot_size else 0
-        last = max((t.created_at for t in trades), default=None)
+        by_mode = {"sandbox": dict(empty), "live": dict(empty)}
+        placed_by_mode: dict[str, list] = {"sandbox": [], "live": []}
+        last: datetime | None = None
+        for t in trades:
+            if t.created_at is not None and (last is None or t.created_at > last):
+                last = t.created_at
+            bucket = by_mode.get((t.mode or "").lower())
+            if bucket is None:
+                continue
+            # Open = net placed QUANTITY across ALL sessions (placed BUY qty −
+            # placed SELL qty), so an overnight-held position stays counted
+            # until its T+1 exit fills. (Pairing today's exits against today's
+            # entries is wrong: today's SELL closes YESTERDAY's entry.)
+            if (t.status or "") == "placed":
+                placed_by_mode[(t.mode or "").lower()].append(t)
+            if t.side == "BUY" and t.entry_date == today_str:
+                bucket["today_trade_count"] += 1
+            elif t.side == "SELL" and _ist_date_str(t.created_at) == today_str:
+                bucket["today_trade_count"] += 1
+                if t.net_pnl is not None:
+                    bucket["today_net_pnl"] += float(t.net_pnl)
+        for m, placed in placed_by_mode.items():
+            open_qty = max(
+                0,
+                sum(int(t.quantity or 0) for t in placed if t.side == "BUY")
+                - sum(int(t.quantity or 0) for t in placed if t.side == "SELL"),
+            )
+            lot_size = _lot_size_from_rows(placed)
+            by_mode[m]["open_positions"] = (open_qty + lot_size - 1) // lot_size if lot_size else 0
+            by_mode[m]["today_net_pnl"] = round(by_mode[m]["today_net_pnl"], 2)
+        totals = {k: sum(b[k] for b in by_mode.values()) for k in empty}
+        totals["today_net_pnl"] = round(totals["today_net_pnl"], 2)
         return {
-            "open_positions": open_count,
-            "today_net_pnl": round(today_pnl, 2),
+            **totals,
             "last_trade_at": last.isoformat() if last else None,
-            "today_trade_count": len(entries_today) + len(exits_today),
+            "by_mode": by_mode,
         }
     except Exception:
         logger.exception("Failed to aggregate futures_follow_stats")
         return {
-            "open_positions": 0,
-            "today_net_pnl": 0.0,
+            **empty,
             "last_trade_at": None,
-            "today_trade_count": 0,
+            "by_mode": {"sandbox": dict(empty), "live": dict(empty)},
         }
 
 
@@ -624,6 +644,22 @@ def _simplified_engine_stats() -> dict:
             "last_trade_at": None,
             "today_trade_count": 0,
         }
+
+
+def _mode_has_today_activity(mode_bucket: dict) -> bool:
+    """Whether a mode's per-day counters justify materializing its column
+    (issue #684).
+
+    The Live column used to appear only once live had a CLOSED trade — but the
+    day the strategy goes live, its open position and today chips exist before
+    the first close, and hiding the column would leave that live activity
+    invisible (or, pre-#684, mis-filed under Sandbox).
+    """
+    return bool(
+        mode_bucket.get("today_trade_count")
+        or mode_bucket.get("open_positions")
+        or mode_bucket.get("today_unpriced_exits")
+    )
 
 
 def _lifetime_from_pnls(pnls: list[float]) -> dict:
@@ -833,51 +869,73 @@ def _open15_stats() -> dict:
     journal-only dry runs (no orders placed) and are excluded so they can't
     inflate the book. ``created_at`` is naive UTC (``datetime.utcnow`` default),
     which is exactly the card's ``last_trade_at`` contract (issue #317).
+
+    Two disciplines added by issue #684:
+
+    - **Counters split by the row's own ``mode``** (the ``_open15_lifetime``
+      rule), surfaced under ``by_mode`` so the detail endpoint can attach each
+      mode's today chips to its own Sandbox/Live column — attaching the blended
+      totals to the Sandbox column rendered +₹11,511 of LIVE money in the
+      Sandbox cell on 2026-08-27. The top-level keys stay whole-journal (both
+      modes summed) for the index card's single headline.
+    - **Only REAL fills count.** sim/shadow/paper/replay rows carry the run's
+      genuine ``mode`` plus a stamped ``pnl`` by design (#548/#555), so without
+      the journal's own ``NON_REAL_FILLS`` exclusion a shadow row inflated the
+      card's trade count (4 shown vs 3 real trades on 2026-08-27) and its
+      simulated money leaked into the published today figure.
     """
+    empty = {
+        "open_positions": 0,
+        "today_net_pnl": 0.0,
+        "today_unpriced_exits": 0,
+        "today_trade_count": 0,
+    }
     try:
-        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import NON_REAL_FILLS, Open15Trade
         from database.open15_breakout_db import db_session as o15_session
 
         today_str = datetime.now(_IST).strftime("%Y-%m-%d")
         rows = (
             o15_session.query(Open15Trade).filter(Open15Trade.mode.in_(("sandbox", "live"))).all()
         )
-        open_count = 0
-        today_trade_count = 0
-        today_pnl = 0.0
-        today_unpriced_exits = 0
+        by_mode = {"sandbox": dict(empty), "live": dict(empty)}
         last_at: datetime | None = None
         for r in rows:
+            if r.fill is not None and r.fill in NON_REAL_FILLS:
+                continue
+            bucket = by_mode.get((r.mode or "").lower())
+            if bucket is None:
+                continue
             if (r.status or "") == "open":
-                open_count += 1
+                bucket["open_positions"] += 1
             if r.created_at is not None and (last_at is None or r.created_at > last_at):
                 last_at = r.created_at
             if r.trade_date != today_str:
                 continue
-            today_trade_count += 1
+            bucket["today_trade_count"] += 1
             if (r.status or "") == "closed":
                 if r.pnl is not None:
-                    today_pnl += _open15_net_pnl(r)
+                    bucket["today_net_pnl"] += _open15_net_pnl(r)
                 else:
                     # Closed but never priced (e.g. exit tick unavailable at
                     # flatten) — surfaced so ₹X with N unpriced trades can't
                     # masquerade as a complete ₹X (same contract as #350).
-                    today_unpriced_exits += 1
+                    bucket["today_unpriced_exits"] += 1
+        for bucket in by_mode.values():
+            bucket["today_net_pnl"] = round(bucket["today_net_pnl"], 2)
+        totals = {k: sum(b[k] for b in by_mode.values()) for k in empty}
+        totals["today_net_pnl"] = round(totals["today_net_pnl"], 2)
         return {
-            "open_positions": open_count,
-            "today_net_pnl": round(today_pnl, 2),
-            "today_unpriced_exits": today_unpriced_exits,
+            **totals,
             "last_trade_at": last_at.isoformat() if last_at else None,
-            "today_trade_count": today_trade_count,
+            "by_mode": by_mode,
         }
     except Exception:
         logger.exception("Failed to aggregate open15 stats")
         return {
-            "open_positions": 0,
-            "today_net_pnl": 0.0,
-            "today_unpriced_exits": 0,
+            **empty,
             "last_trade_at": None,
-            "today_trade_count": 0,
+            "by_mode": {"sandbox": dict(empty), "live": dict(empty)},
         }
 
 
@@ -915,13 +973,19 @@ def _open15_lifetime() -> dict[str, dict]:
     ``observe`` rows fall outside both buckets by construction. Each mode also
     carries ``long``/``short`` sub-aggregates keyed off the journal's ``side``
     column (issue #458).
+
+    Only REAL fills count (issue #684): sim/shadow/paper/replay rows carry the
+    run's genuine ``mode`` plus a stamped ``pnl`` by design (#548/#555), but
+    that money was never made — folding it into the published cumulative
+    Sandbox/Live P&L is exactly what the journal's ``NON_REAL_FILLS``
+    convention exists to prevent.
     """
     out = {
         "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
         "live": {**_lifetime_from_pnls([]), **_side_split({})},
     }
     try:
-        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import NON_REAL_FILLS, Open15Trade
         from database.open15_breakout_db import db_session as o15_session
 
         rows = (
@@ -935,6 +999,8 @@ def _open15_lifetime() -> dict[str, dict]:
             "live": {"long": [], "short": []},
         }
         for r in rows:
+            if r.fill is not None and r.fill in NON_REAL_FILLS:
+                continue
             m = (r.mode or "").lower()
             if m not in buckets:
                 continue
@@ -956,10 +1022,15 @@ def _open15_opt_shadow() -> dict[str, dict | None]:
     charges, 1 lot). Option-MODE rows are excluded — their real fills already
     ARE the mode's P&L, not a shadow. Returns ``None`` for a mode with no
     priced shadow rows so the UI renders '—' instead of a misleading 0.
+
+    Non-real fills are excluded too (issue #684): this column is the ATM
+    shadow of the trades the mode actually took, so a sim/shadow/paper row's
+    ``opt_pnl`` — the option shadow of a trade that never happened, including
+    the #581 excluded-side cohort — must not blend into it.
     """
     out: dict[str, dict | None] = {"sandbox": None, "live": None}
     try:
-        from database.open15_breakout_db import Open15Trade
+        from database.open15_breakout_db import NON_REAL_FILLS, Open15Trade
         from database.open15_breakout_db import db_session as o15_session
 
         rows = (
@@ -973,6 +1044,8 @@ def _open15_opt_shadow() -> dict[str, dict | None]:
             "live": {"long": [], "short": []},
         }
         for r in rows:
+            if r.fill is not None and r.fill in NON_REAL_FILLS:
+                continue
             if r.instrument not in (None, "stock"):
                 continue
             m = (r.mode or "").lower()
@@ -1027,7 +1100,18 @@ def _intraday_pullback_stats() -> dict:
     inflate the book — same contract as open15. ``created_at`` is naive UTC
     (``datetime.utcnow`` default), which is exactly the card's ``last_trade_at``
     contract (issue #317).
+
+    Counters are split by the row's own ``mode`` (issue #684, the
+    ``_intraday_pullback_lifetime`` rule) and surfaced under ``by_mode`` so
+    each mode's today chips land in their own Sandbox/Live column; top-level
+    keys stay the across-mode totals for the index card headline.
     """
+    empty = {
+        "open_positions": 0,
+        "today_net_pnl": 0.0,
+        "today_unpriced_exits": 0,
+        "today_trade_count": 0,
+    }
     try:
         from database.intraday_pullback_db import IntradayPullbackTrade
         from database.intraday_pullback_db import db_session as ip_session
@@ -1038,40 +1122,40 @@ def _intraday_pullback_stats() -> dict:
             .filter(IntradayPullbackTrade.mode.in_(("sandbox", "live")))
             .all()
         )
-        open_count = 0
-        today_trade_count = 0
-        today_pnl = 0.0
-        today_unpriced_exits = 0
+        by_mode = {"sandbox": dict(empty), "live": dict(empty)}
         last_at: datetime | None = None
         for r in rows:
+            bucket = by_mode.get((r.mode or "").lower())
+            if bucket is None:
+                continue
             if (r.status or "") == "open":
-                open_count += 1
+                bucket["open_positions"] += 1
             if r.created_at is not None and (last_at is None or r.created_at > last_at):
                 last_at = r.created_at
             if r.trade_date != today_str:
                 continue
-            today_trade_count += 1
+            bucket["today_trade_count"] += 1
             if (r.status or "") == "closed":
                 pnl = _intraday_pullback_net_pnl(r)
                 if pnl is not None:
-                    today_pnl += pnl
+                    bucket["today_net_pnl"] += pnl
                 else:
-                    today_unpriced_exits += 1
+                    bucket["today_unpriced_exits"] += 1
+        for bucket in by_mode.values():
+            bucket["today_net_pnl"] = round(bucket["today_net_pnl"], 2)
+        totals = {k: sum(b[k] for b in by_mode.values()) for k in empty}
+        totals["today_net_pnl"] = round(totals["today_net_pnl"], 2)
         return {
-            "open_positions": open_count,
-            "today_net_pnl": round(today_pnl, 2),
-            "today_unpriced_exits": today_unpriced_exits,
+            **totals,
             "last_trade_at": last_at.isoformat() if last_at else None,
-            "today_trade_count": today_trade_count,
+            "by_mode": by_mode,
         }
     except Exception:
         logger.exception("Failed to aggregate intraday_pullback stats")
         return {
-            "open_positions": 0,
-            "today_net_pnl": 0.0,
-            "today_unpriced_exits": 0,
+            **empty,
             "last_trade_at": None,
-            "today_trade_count": 0,
+            "by_mode": {"sandbox": dict(empty), "live": dict(empty)},
         }
 
 
@@ -1457,27 +1541,45 @@ def strategy_detail(name: str):
     # Sandbox / live stats. Today's open+P&L come from the per-day aggregators;
     # the since-inception cumulative P&L + running win-rate come from the lifetime
     # helpers (issue #323). The Live column is populated only when that mode has
-    # realized history, so it stays '—' until the strategy is actually flipped live.
+    # realized history OR today activity, so it stays '—' until the strategy is
+    # actually flipped live. Today's chips attach to the column of the rows' OWN
+    # mode (issue #684) — attaching the blended stats to Sandbox rendered live
+    # money in the Sandbox cell.
     if name == "futures_follow_cap50":
         stats = _futures_follow_stats()
         lifetime = _futures_follow_lifetime()
+        today_by_mode = stats.get("by_mode") or {}
+        sb_today = today_by_mode.get("sandbox") or {}
+        lv_today = today_by_mode.get("live") or {}
         performance["sandbox"] = {
-            "open_positions": stats["open_positions"],
-            "today_net_pnl": stats["today_net_pnl"],
+            "open_positions": sb_today.get("open_positions", 0),
+            "today_net_pnl": sb_today.get("today_net_pnl", 0.0),
             "last_trade_at": stats["last_trade_at"],
             **lifetime["sandbox"],
         }
-        if lifetime["live"]["closed_trades"] > 0:
-            performance["live"] = {**lifetime["live"]}
+        if lifetime["live"]["closed_trades"] > 0 or _mode_has_today_activity(lv_today):
+            performance["live"] = {
+                **lifetime["live"],
+                "open_positions": lv_today.get("open_positions", 0),
+                "today_net_pnl": lv_today.get("today_net_pnl", 0.0),
+                "last_trade_at": stats["last_trade_at"],
+            }
     elif name == "sector_follow_cap5_vol":
         # sector_follow journals no realized net P&L (its curve uses price as a
         # proxy), so cumulative P&L / win-rate aren't meaningful here — only
-        # open positions are surfaced.
+        # open positions are surfaced, each mode's count under its own column
+        # (issue #684; the per-mode counts already existed per #562).
         stats = _sector_follow_stats()
+        open_by_mode = stats.get("open_positions_by_mode") or {}
         performance["sandbox"] = {
-            "open_positions": stats["open_positions"],
+            "open_positions": open_by_mode.get("sandbox", 0),
             "last_trade_at": stats["last_trade_at"],
         }
+        if open_by_mode.get("live"):
+            performance["live"] = {
+                "open_positions": open_by_mode["live"],
+                "last_trade_at": stats["last_trade_at"],
+            }
     elif name == _SIMPLIFIED_ENGINE_FOLDER:
         stats = _simplified_engine_stats()
         lifetime = _simplified_engine_lifetime()
@@ -1501,28 +1603,47 @@ def strategy_detail(name: str):
         stats = _open15_stats()
         lifetime = _open15_lifetime()
         opt_shadow = _open15_opt_shadow()
+        today_by_mode = stats.get("by_mode") or {}
+        sb_today = today_by_mode.get("sandbox") or {}
+        lv_today = today_by_mode.get("live") or {}
         performance["sandbox"] = {
-            "open_positions": stats["open_positions"],
-            "today_net_pnl": stats["today_net_pnl"],
-            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "open_positions": sb_today.get("open_positions", 0),
+            "today_net_pnl": sb_today.get("today_net_pnl", 0.0),
+            "today_unpriced_exits": sb_today.get("today_unpriced_exits", 0),
             "last_trade_at": stats["last_trade_at"],
             **lifetime["sandbox"],
             "options": opt_shadow["sandbox"],
         }
-        if lifetime["live"]["closed_trades"] > 0:
-            performance["live"] = {**lifetime["live"], "options": opt_shadow["live"]}
+        if lifetime["live"]["closed_trades"] > 0 or _mode_has_today_activity(lv_today):
+            performance["live"] = {
+                **lifetime["live"],
+                "options": opt_shadow["live"],
+                "open_positions": lv_today.get("open_positions", 0),
+                "today_net_pnl": lv_today.get("today_net_pnl", 0.0),
+                "today_unpriced_exits": lv_today.get("today_unpriced_exits", 0),
+                "last_trade_at": stats["last_trade_at"],
+            }
     elif name == _INTRADAY_PULLBACK_FOLDER:
         stats = _intraday_pullback_stats()
         lifetime = _intraday_pullback_lifetime()
+        today_by_mode = stats.get("by_mode") or {}
+        sb_today = today_by_mode.get("sandbox") or {}
+        lv_today = today_by_mode.get("live") or {}
         performance["sandbox"] = {
-            "open_positions": stats["open_positions"],
-            "today_net_pnl": stats["today_net_pnl"],
-            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "open_positions": sb_today.get("open_positions", 0),
+            "today_net_pnl": sb_today.get("today_net_pnl", 0.0),
+            "today_unpriced_exits": sb_today.get("today_unpriced_exits", 0),
             "last_trade_at": stats["last_trade_at"],
             **lifetime["sandbox"],
         }
-        if lifetime["live"]["closed_trades"] > 0:
-            performance["live"] = {**lifetime["live"]}
+        if lifetime["live"]["closed_trades"] > 0 or _mode_has_today_activity(lv_today):
+            performance["live"] = {
+                **lifetime["live"],
+                "open_positions": lv_today.get("open_positions", 0),
+                "today_net_pnl": lv_today.get("today_net_pnl", 0.0),
+                "today_unpriced_exits": lv_today.get("today_unpriced_exits", 0),
+                "last_trade_at": stats["last_trade_at"],
+            }
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []
