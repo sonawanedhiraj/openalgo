@@ -168,6 +168,9 @@ def strategies_dir(tmp_path):
                 "version": "0.1.0",
                 "mode": "sandbox",
                 "deployable": True,
+                # Declared slot budget — the capital basis for realized
+                # metrics is margin_per_slot × max_concurrent (issue #686).
+                "params": {"margin_per_slot": 30000, "max_concurrent": 6},
                 "parity_target": None,
             }
         ),
@@ -186,6 +189,8 @@ def strategies_dir(tmp_path):
                 "version": "0.1.0",
                 "mode": "sandbox",
                 "deployable": True,
+                # capital.base_capital is the realized-metrics basis (#686).
+                "capital": {"base_capital": 60000, "slots": 2, "leverage": 5},
                 "parity_target": {
                     "window": "2024-11-01..2026-07-06",
                     "n_trades": 235,
@@ -2754,3 +2759,252 @@ def test_pnl_curve_is_net(app, wired_dbs):
         pts = client.get("/strategies/api/simplified_engine/pnl-curve").get_json()["data"]["points"]
 
     assert [p["pnl"] for p in pts] == [410.0]
+
+
+# ---------------------------------------------------------------------------
+# Per-mode realized metrics for open15 / futures_follow / intraday_pullback
+# (issue #686 — generalizing #568/#573 beyond the simplified engine)
+# ---------------------------------------------------------------------------
+
+
+def _ff_sell(ffdb, *, day: dt.date, net_pnl: float, mode="sandbox", entry_date=None, **kw):
+    """A closed futures_follow SELL exit whose created_at falls on ``day`` IST.
+
+    10:30 IST == 05:00 UTC — safely inside the same IST calendar day, so the
+    execution-date bucketing is what the test exercises, not a tz edge.
+    """
+    defaults = {
+        "mode": mode,
+        "side": "SELL",
+        "nifty_symbol": "NIFTY28JUL26FUT",
+        "lots": 1,
+        "quantity": 75,
+        "entry_price": 24500.0,
+        "exit_price": 24500.0 + net_pnl / 75.0,
+        "entry_date": entry_date or (day - dt.timedelta(days=1)).isoformat(),
+        "net_pnl": net_pnl,
+        "status": "placed",
+        "created_at": dt.datetime(day.year, day.month, day.day, 5, 0, 0),
+    }
+    defaults.update(kw)
+    return ffdb.FuturesFollowTrade(**defaults)
+
+
+def test_open15_sandbox_carries_realized_metrics(app, wired_dbs):
+    """CAGR/Sharpe/MaxDD were '—' for open15 because only the simplified engine
+    computed them. Enough distinct trade_dates must yield Sharpe + Max-DD, with
+    CAGR withheld (short window, #573) and the window return in its place."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    n_days = MIN_TRADING_DAYS_SHARPE + 5
+    for i in range(n_days):
+        day = (dt.date(2026, 7, 1) + dt.timedelta(days=i)).isoformat()
+        sess.add(
+            _o15_row(
+                o15db,
+                symbol=f"SYM{i}",
+                trade_date=day,
+                pnl=(300.0 if i % 3 else -150.0),
+                charges_inr=50.0,
+            )
+        )
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/open15_vol_breakout").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["sharpe"] is not None
+    assert sb["max_dd_inr"] is not None
+    assert sb["trading_days"] == n_days
+    # Short window => CAGR withheld with a stated reason, not extrapolated.
+    assert sb["cagr_pct"] is None
+    assert "CAGR needs" in sb["notes"]
+    # Capital basis = margin_per_slot × max_concurrent from the snapshot
+    # (30000 × 6 = 180000), flagged notional (UI-tunable, funds-clamped).
+    assert sb["capital_basis_inr"] == 180000
+    assert sb["capital_basis_is_notional"] is True
+    assert sb["roc_pct"] is not None
+    assert sb["max_dd_pct"] is not None
+
+
+def test_open15_non_real_fills_never_reach_lifetime_or_metrics(app, wired_dbs):
+    """paper/sim/shadow/replay rows carry a stamped pnl by design (#548/#555),
+    but that money was never made. NON_REAL_FILLS is mirrored from the journal:
+    every published lifetime number — cum P&L, win-rate, side splits AND the
+    metric series — must describe the real-fill row set only (#684)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db, trade_date="2026-07-01"))  # fill NULL => real, +940
+    for i, fill in enumerate(("paper", "sim", "shadow", "replay", "none")):
+        sess.add(
+            _o15_row(
+                o15db,
+                symbol=f"FAKE{i}",
+                trade_date=f"2026-07-{2 + i:02d}",
+                fill=fill,
+                pnl=10000.0,
+                charges_inr=0.0,
+            )
+        )
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/open15_vol_breakout").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["closed_trades"] == 1
+    assert sb["cum_net_pnl"] == 940.0
+    assert sb["win_rate_pct"] == 100.0
+    assert sb["long"]["n_trades"] == 1  # side split filtered too
+    assert sb["trading_days"] == 1  # metric series saw only the real day
+
+
+def test_open15_metric_series_is_mode_isolated(app, wired_dbs):
+    """Live rows must never contribute to the sandbox metric series (the #568
+    leak shape, applied to trading_days)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db, trade_date="2026-07-01"))
+    sess.add(_o15_row(o15db, symbol="TCS", trade_date="2026-07-02"))
+    sess.add(_o15_row(o15db, symbol="SBIN", trade_date="2026-07-03", mode="live"))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/open15_vol_breakout").get_json()["data"]["performance"]
+
+    assert perf["sandbox"]["trading_days"] == 2
+    assert perf["live"]["trading_days"] == 1
+
+
+def test_futures_follow_sandbox_carries_realized_metrics(app, wired_dbs):
+    """Same #568 keys from futures_follow_trades: capital basis is the declared
+    capital_inr book (₹10L — the backtest / kill-switch denominator), NOT
+    flagged notional."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    n_days = MIN_TRADING_DAYS_SHARPE + 2
+    for i in range(n_days):
+        day = dt.date(2026, 6, 1) + dt.timedelta(days=i)
+        ff_sess.add(_ff_sell(ffdb, day=day, net_pnl=(1500.0 if i % 3 else -700.0)))
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/futures_follow_cap50").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["sharpe"] is not None
+    assert sb["max_dd_inr"] is not None
+    assert sb["trading_days"] == n_days
+    assert sb["cagr_pct"] is None  # short window (#573)
+    assert "CAGR needs" in sb["notes"]
+    assert sb["capital_basis_inr"] == 1000000
+    assert sb["capital_basis_is_notional"] is False
+    assert sb["roc_pct"] is not None
+
+
+def test_futures_follow_exits_bucket_by_execution_date(app, wired_dbs):
+    """Two T+1 exits that FILLED the same day are one trading day in the metric
+    series, whatever their entry sessions were (the #301 execution-date
+    convention the P&L curve already uses)."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    day = dt.date(2026, 7, 7)
+    ff_sess.add(_ff_sell(ffdb, day=day, net_pnl=1000.0, entry_date="2026-07-03"))
+    ff_sess.add(_ff_sell(ffdb, day=day, net_pnl=-400.0, entry_date="2026-07-06"))
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/futures_follow_cap50").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["closed_trades"] == 2
+    assert sb["trading_days"] == 1
+
+
+def test_futures_follow_missing_capital_degrades_to_sharpe_and_rupee_dd(
+    app, strategies_dir, wired_dbs
+):
+    """A config_snapshot without capital_inr must still yield Sharpe + Max-DD ₹
+    (scale-free), with every %-of-capital metric None and the reason stated —
+    never a guessed denominator, never a 500."""
+    ff_dir = strategies_dir / "futures_follow_cap50"
+    snap = json.loads((ff_dir / "config_snapshot.json").read_text(encoding="utf-8"))
+    del snap["capital_inr"]
+    (ff_dir / "config_snapshot.json").write_text(json.dumps(snap), encoding="utf-8")
+
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    for i in range(MIN_TRADING_DAYS_SHARPE + 2):
+        day = dt.date(2026, 6, 1) + dt.timedelta(days=i)
+        ff_sess.add(_ff_sell(ffdb, day=day, net_pnl=(900.0 if i % 2 else -500.0)))
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50")
+
+    assert resp.status_code == 200
+    sb = resp.get_json()["data"]["performance"]["sandbox"]
+    assert sb["sharpe"] is not None
+    assert sb["max_dd_inr"] is not None
+    assert sb["capital_basis_inr"] is None
+    assert sb["cagr_pct"] is None
+    assert sb["roc_pct"] is None
+    assert sb["max_dd_pct"] is None
+    assert "capital basis" in sb["notes"]
+
+
+def test_intraday_pullback_sandbox_carries_realized_metrics(app, wired_dbs):
+    """Same #568 keys from intraday_pullback_trades: capital basis is the
+    snapshot's capital.base_capital fixed margin, flagged notional (fixed
+    sizing, 5× MIS leverage)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    n_days = MIN_TRADING_DAYS_SHARPE + 1
+    for i in range(n_days):
+        day = (dt.date(2026, 7, 1) + dt.timedelta(days=i)).isoformat()
+        sess.add(
+            _ip_row(
+                ipdb,
+                symbol=f"SYM{i}",
+                trade_date=day,
+                net_pnl=(600.0 if i % 3 else -250.0),
+                gross_pnl=(700.0 if i % 3 else -150.0),
+            )
+        )
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        sb = client.get("/strategies/api/intraday_pullback_top2").get_json()["data"]["performance"][
+            "sandbox"
+        ]
+
+    assert sb["sharpe"] is not None
+    assert sb["max_dd_inr"] is not None
+    assert sb["trading_days"] == n_days
+    assert sb["cagr_pct"] is None  # short window (#573)
+    assert "CAGR needs" in sb["notes"]
+    assert sb["capital_basis_inr"] == 60000
+    assert sb["capital_basis_is_notional"] is True
+    assert sb["roc_pct"] is not None
+
+
+def test_intraday_pullback_metric_series_is_mode_isolated(app, wired_dbs):
+    """Live rows never contribute to the sandbox metric series (#568 shape)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb, trade_date="2026-07-01"))
+    sess.add(_ip_row(ipdb, symbol="LTF", trade_date="2026-07-02", mode="live"))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        perf = client.get("/strategies/api/intraday_pullback_top2").get_json()["data"][
+            "performance"
+        ]
+
+    assert perf["sandbox"]["trading_days"] == 1
+    assert perf["live"]["trading_days"] == 1

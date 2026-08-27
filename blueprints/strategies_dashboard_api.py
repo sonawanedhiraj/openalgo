@@ -126,6 +126,26 @@ def _load_config_snapshot(name: str) -> dict:
         return {}
 
 
+def _snapshot_capital(name: str, *path: str) -> float | None:
+    """Capital basis (₹) read from strategies/<name>/config_snapshot.json at a
+    nested key path (issue #686, generalizing the #568 read).
+
+    The basis tracks the strategy's own declared config instead of being
+    duplicated in code. Returns None on a missing key or non-positive value —
+    ``compute_realized_metrics`` then degrades to Sharpe + Max-DD ₹ and states
+    why in ``notes``, rather than publishing a percent of a guessed number.
+    """
+    try:
+        node: object = _load_config_snapshot(name)
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        val = float(node or 0)
+        return val if val > 0 else None
+    except Exception:
+        logger.exception("%s: could not read capital basis from config_snapshot", name)
+        return None
+
+
 def _load_version_log(name: str) -> list[dict]:
     """Parse strategies/<name>/VERSION_LOG.md into a list of {version, date, body}."""
     p = _STRATEGIES_DIR / name / "VERSION_LOG.md"
@@ -653,8 +673,29 @@ def _futures_follow_lifetime() -> dict[str, dict]:
     Splitting by the row's own ``mode`` keeps the Sandbox and Live dashboard
     columns honest once the strategy is flipped live — sandbox history never
     leaks into the live column and vice-versa.
+
+    Also carries realized CAGR / Sharpe / Max DD per mode (issue #686, same
+    keys as #568). The daily series buckets each exit by its IST *execution*
+    date (the day the P&L was realized — the #301 convention the P&L curve
+    already uses), so two T+1 exits filling the same day are one trading day.
+    The capital basis is the config snapshot's declared ``capital_inr`` book —
+    the same ₹10L the backtest CAGR and the daily kill switch are measured
+    against, so the Sandbox/Live and Backtest columns share a denominator.
     """
-    out = {"sandbox": _lifetime_from_pnls([]), "live": _lifetime_from_pnls([])}
+    capital = _snapshot_capital("futures_follow_cap50", "capital_inr")
+
+    def _agg(rows: list) -> dict:
+        pnls = [float(r.net_pnl or 0.0) for r in rows]
+        daily = [
+            (_date_of_str(_ist_date_str(r.created_at) or r.entry_date), p)
+            for r, p in zip(rows, pnls, strict=True)
+        ]
+        return {
+            **_lifetime_from_pnls(pnls),
+            **compute_realized_metrics(daily, capital_inr=capital),
+        }
+
+    out = {"sandbox": _agg([]), "live": _agg([])}
     try:
         rows = (
             ff_session.query(FuturesFollowTrade)
@@ -664,12 +705,12 @@ def _futures_follow_lifetime() -> dict[str, dict]:
             )
             .all()
         )
-        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
+        buckets: dict[str, list] = {"sandbox": [], "live": []}
         for r in rows:
             m = (r.mode or "").lower()
             if m in buckets:
-                buckets[m].append(float(r.net_pnl or 0.0))
-        out = {m: _lifetime_from_pnls(p) for m, p in buckets.items()}
+                buckets[m].append(r)
+        out = {m: _agg(rs) for m, rs in buckets.items()}
     except Exception:
         logger.exception("Failed to aggregate futures_follow lifetime stats")
     return out
@@ -777,18 +818,9 @@ def _simplified_engine_metrics(rows: list) -> dict:
             # (issue #579), otherwise every risk metric is optimistic.
             daily.append((day, net_pnl_of_row(r) or 0.0))
 
-    capital = None
-    try:
-        capital = float(
-            (_load_config_snapshot(_SIMPLIFIED_ENGINE_FOLDER).get("config") or {}).get("capital")
-            or 0
-        )
-    except Exception:
-        logger.exception("simplified_engine: could not read capital basis from config_snapshot")
-
     return compute_realized_metrics(
         daily,
-        capital_inr=capital,
+        capital_inr=_snapshot_capital(_SIMPLIFIED_ENGINE_FOLDER, "config", "capital"),
         capital_is_notional=True,
     )
 
@@ -805,6 +837,20 @@ def _ist_date_of(ts: str | None) -> date | None:
     try:
         return datetime.fromisoformat(str(ts)).date()
     except Exception:
+        return None
+
+
+def _date_of_str(s: str | None) -> date | None:
+    """``date`` for a ``YYYY-MM-DD`` journal key, or None if unparseable.
+
+    ``compute_realized_metrics`` drops None-dated entries, so an unparseable
+    date degrades that row out of the metric series rather than raising.
+    """
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(str(s)[:10])
+    except ValueError:
         return None
 
 
@@ -915,35 +961,69 @@ def _open15_lifetime() -> dict[str, dict]:
     ``observe`` rows fall outside both buckets by construction. Each mode also
     carries ``long``/``short`` sub-aggregates keyed off the journal's ``side``
     column (issue #458).
+
+    **Real fills only** (issues #686/#684): paper/sim/shadow/replay rows carry
+    a stamped ``pnl`` (that is their point — a rejected or capped day stays
+    measurable) but that money was never made, and the journal's own
+    ``NON_REAL_FILLS`` convention (#548/#555) forbids it from reaching any
+    published figure. The filter mirrors the journal's NULL-tolerant predicate
+    so pre-#548 rows keep counting as real, and it applies to EVERY number in
+    the column — cum P&L, win-rate, side splits and the metric series describe
+    the same row set.
+
+    Also carries realized CAGR / Sharpe / Max DD per mode (issue #686, same
+    keys as #568), keyed by ``trade_date`` (the strategy is intraday — entry
+    and flatten share the date). The capital basis is the declared slot budget
+    ``margin_per_slot × max_concurrent`` from the config snapshot, flagged
+    notional: the live day budget is UI-tunable, funds-clamped (#626) and
+    residual-sized (#643), so %-of-capital readings carry the caveat.
     """
-    out = {
-        "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
-        "live": {**_lifetime_from_pnls([]), **_side_split({})},
-    }
+    capital: float | None = None
     try:
-        from database.open15_breakout_db import Open15Trade
+        params = _load_config_snapshot("open15_vol_breakout").get("params") or {}
+        slot = float(params.get("margin_per_slot") or 0)
+        slots = float(params.get("max_concurrent") or 0)
+        capital = slot * slots if slot > 0 and slots > 0 else None
+    except Exception:
+        logger.exception("open15: could not read capital basis from config_snapshot")
+
+    def _agg(rows: list) -> dict:
+        pnls = [_open15_net_pnl(r) for r in rows]
+        sides: dict[str, list[float]] = {"long": [], "short": []}
+        for r, p in zip(rows, pnls, strict=True):
+            side_key = _OPEN15_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[side_key].append(p)
+        daily = [(_date_of_str(r.trade_date), p) for r, p in zip(rows, pnls, strict=True)]
+        return {
+            **_lifetime_from_pnls(pnls),
+            **_side_split(sides),
+            **compute_realized_metrics(daily, capital_inr=capital, capital_is_notional=True),
+        }
+
+    out = {"sandbox": _agg([]), "live": _agg([])}
+    try:
+        from database.open15_breakout_db import NON_REAL_FILLS, Open15Trade
         from database.open15_breakout_db import db_session as o15_session
 
         rows = (
             o15_session.query(Open15Trade)
-            .filter(Open15Trade.status == "closed", Open15Trade.pnl.isnot(None))
+            .filter(
+                Open15Trade.status == "closed",
+                Open15Trade.pnl.isnot(None),
+                # The journal's real-fill predicate (NULL-tolerant, explicit
+                # exclusion list — never `!= 'paper'`, which would silently
+                # reclassify every future fill class as real).
+                (Open15Trade.fill.is_(None)) | (Open15Trade.fill.notin_(NON_REAL_FILLS)),
+            )
             .all()
         )
-        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
-        sides: dict[str, dict[str, list[float]]] = {
-            "sandbox": {"long": [], "short": []},
-            "live": {"long": [], "short": []},
-        }
+        buckets: dict[str, list] = {"sandbox": [], "live": []}
         for r in rows:
             m = (r.mode or "").lower()
-            if m not in buckets:
-                continue
-            pnl = _open15_net_pnl(r)
-            buckets[m].append(pnl)
-            side_key = _OPEN15_SIDE_KEY.get((r.side or "").upper())
-            if side_key:
-                sides[m][side_key].append(pnl)
-        out = {m: {**_lifetime_from_pnls(p), **_side_split(sides[m])} for m, p in buckets.items()}
+            if m in buckets:
+                buckets[m].append(r)
+        out = {m: _agg(rs) for m, rs in buckets.items()}
     except Exception:
         logger.exception("Failed to aggregate open15 lifetime stats")
     return out
@@ -1089,11 +1169,31 @@ def _intraday_pullback_lifetime() -> dict[str, dict]:
     elsewhere: the two books are mutually exclusive by day gate (NIFTY up →
     long, NIFTY down → short) and the deep-loser short is the unvalidated,
     slippage-fragile leg — a blended headline hides which book is working.
+
+    Also carries realized CAGR / Sharpe / Max DD per mode (issue #686, same
+    keys as #568), keyed by ``trade_date`` (intraday — entry and its 15:15
+    flatten share the date). The capital basis is the config snapshot's
+    ``capital.base_capital`` (the fixed margin committed across slots), flagged
+    notional: sizing is fixed rather than compounding and the MIS book runs 5×
+    leverage, so %-of-capital readings carry the caveat.
     """
-    out = {
-        "sandbox": {**_lifetime_from_pnls([]), **_side_split({})},
-        "live": {**_lifetime_from_pnls([]), **_side_split({})},
-    }
+    capital = _snapshot_capital(_INTRADAY_PULLBACK_FOLDER, "capital", "base_capital")
+
+    def _agg(rows_pnls: list[tuple]) -> dict:
+        pnls = [p for _r, p in rows_pnls]
+        sides: dict[str, list[float]] = {"long": [], "short": []}
+        for r, p in rows_pnls:
+            side_key = _INTRADAY_PULLBACK_SIDE_KEY.get((r.side or "").upper())
+            if side_key:
+                sides[side_key].append(p)
+        daily = [(_date_of_str(r.trade_date), p) for r, p in rows_pnls]
+        return {
+            **_lifetime_from_pnls(pnls),
+            **_side_split(sides),
+            **compute_realized_metrics(daily, capital_inr=capital, capital_is_notional=True),
+        }
+
+    out = {"sandbox": _agg([]), "live": _agg([])}
     try:
         from database.intraday_pullback_db import IntradayPullbackTrade
         from database.intraday_pullback_db import db_session as ip_session
@@ -1103,11 +1203,7 @@ def _intraday_pullback_lifetime() -> dict[str, dict]:
             .filter(IntradayPullbackTrade.status == "closed")
             .all()
         )
-        buckets: dict[str, list[float]] = {"sandbox": [], "live": []}
-        sides: dict[str, dict[str, list[float]]] = {
-            "sandbox": {"long": [], "short": []},
-            "live": {"long": [], "short": []},
-        }
+        buckets: dict[str, list[tuple]] = {"sandbox": [], "live": []}
         for r in rows:
             m = (r.mode or "").lower()
             if m not in buckets:
@@ -1115,11 +1211,8 @@ def _intraday_pullback_lifetime() -> dict[str, dict]:
             pnl = _intraday_pullback_net_pnl(r)
             if pnl is None:
                 continue
-            buckets[m].append(pnl)
-            side_key = _INTRADAY_PULLBACK_SIDE_KEY.get((r.side or "").upper())
-            if side_key:
-                sides[m][side_key].append(pnl)
-        out = {m: {**_lifetime_from_pnls(p), **_side_split(sides[m])} for m, p in buckets.items()}
+            buckets[m].append((r, pnl))
+        out = {m: _agg(rp) for m, rp in buckets.items()}
     except Exception:
         logger.exception("Failed to aggregate intraday_pullback lifetime stats")
     return out
