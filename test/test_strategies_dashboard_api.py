@@ -1296,6 +1296,171 @@ def test_open15_backtest_side_split_passthrough(app, wired_dbs, strategies_dir):
 
 
 # ---------------------------------------------------------------------------
+# Today's chips attach to the column of the rows' OWN mode, and only REAL
+# fills count (issue #684). 2026-08-27: +₹11,511 of live money rendered in
+# the Sandbox column's Today P&L cell, and a non-real fill inflated the
+# card's today trade count (4 shown vs 3 real trades).
+# ---------------------------------------------------------------------------
+
+
+def test_open15_live_today_pnl_lands_in_live_column(app, wired_dbs):
+    """A mode='live' today row lands in the LIVE column's today_net_pnl; the
+    Sandbox column's today chips carry only sandbox money (issue #684)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db))  # sandbox win, net +940
+    sess.add(_o15_row(o15db, symbol="SBIN", mode="live", pnl=12000.0, charges_inr=489.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["live"]["today_net_pnl"] == 11511.0
+    assert perf["sandbox"]["today_net_pnl"] == 940.0  # live money never lands here
+
+
+def test_open15_live_column_appears_on_open_live_position(app, wired_dbs):
+    """The day the strategy goes live, an OPEN live position (no closed live
+    history yet) must materialize the Live column — pre-#684 it was hidden
+    (and its open count mis-filed under Sandbox)."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db, mode="live", status="open", pnl=None, charges_inr=None))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["live"]["open_positions"] == 1
+    assert perf["live"]["closed_trades"] == 0
+    assert perf["live"]["cum_net_pnl"] is None
+    assert perf["sandbox"]["open_positions"] == 0
+
+
+def test_open15_sim_row_never_counts_as_trade(app, wired_dbs):
+    """sim/shadow/paper/replay rows carry the run's genuine mode ('live') plus
+    a stamped pnl by design (#548/#555) — they must not increment the card's
+    today_trade_count nor fold into any published today/lifetime P&L."""
+    _eng, sess, o15db = wired_dbs["o15"]
+    sess.add(_o15_row(o15db, mode="live"))  # real live win, net +940
+    sess.add(_o15_row(o15db, symbol="TCS", mode="live", fill="sim", pnl=5000.0))
+    sess.add(_o15_row(o15db, symbol="INFY", mode="live", fill="shadow", pnl=3000.0))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp_card = client.get("/strategies/api/list")
+        resp = client.get("/strategies/api/open15_vol_breakout")
+
+    card = next(s for s in resp_card.get_json()["data"] if s["name"] == "open15_vol_breakout")
+    assert card["today_trade_count"] == 1  # only the real fill is a trade
+    assert card["today_net_pnl"] == 940.0
+
+    lv = resp.get_json()["data"]["performance"]["live"]
+    assert lv["today_net_pnl"] == 940.0
+    assert lv["cum_net_pnl"] == 940.0  # simulated money never compounds in
+    assert lv["closed_trades"] == 1
+
+
+def test_futures_live_today_pnl_lands_in_live_column(app, wired_dbs):
+    """futures_follow shares the wiring: a live T+1 SELL filling today lands in
+    the LIVE column's today chips, not Sandbox's (issue #684)."""
+    _ff_eng, ff_sess, ffdb = wired_dbs["ff"]
+    yesterday = (dt.datetime.now(pytz.timezone("Asia/Kolkata")) - dt.timedelta(days=1)).strftime(
+        "%Y-%m-%d"
+    )
+    common = {
+        "nifty_symbol": "NIFTY29SEP26FUT",
+        "exchange": "NFO",
+        "product": "NRML",
+        "lots": 1,
+        "quantity": 75,
+        "entry_price": 24000.0,
+        "entry_date": yesterday,
+        "status": "placed",
+    }
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="live",
+            side="SELL",
+            exit_price=24100.0,
+            net_pnl=7031.84,
+            created_at=_utc_naive_for_ist_today(),
+            **common,
+        )
+    )
+    # A sandbox position still open from yesterday.
+    ff_sess.add(
+        ffdb.FuturesFollowTrade(
+            mode="sandbox",
+            side="BUY",
+            created_at=_utc_naive_for_ist_today() - dt.timedelta(days=1),
+            **common,
+        )
+    )
+    ff_sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/futures_follow_cap50")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["live"]["today_net_pnl"] == 7031.84
+    assert perf["sandbox"]["today_net_pnl"] == 0.0
+    assert perf["sandbox"]["open_positions"] == 1
+    assert perf["live"]["open_positions"] == 0
+
+
+def test_intraday_pullback_live_today_pnl_lands_in_live_column(app, wired_dbs):
+    """intraday_pullback shares the wiring too (issue #684)."""
+    _eng, sess, ipdb = wired_dbs["ip"]
+    sess.add(_ip_row(ipdb))  # sandbox +900
+    sess.add(_ip_row(ipdb, symbol="YESBANK", mode="live", net_pnl=1234.5))
+    sess.commit()
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/intraday_pullback_top2")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["live"]["today_net_pnl"] == 1234.5
+    assert perf["sandbox"]["today_net_pnl"] == 900.0
+
+
+def test_sector_follow_live_open_positions_land_in_live_column(app, wired_dbs):
+    """sector_follow surfaces only open positions — each mode's count must sit
+    under its own column (issue #684; per-mode counts already existed, #562)."""
+    _eng, sess, sfdb = wired_dbs["sf"]
+    for symbol, mode in (("AAA", "sandbox"), ("CCC", "live")):
+        sess.add(
+            sfdb.SectorFollowTrade(
+                strategy_id=1,
+                mode=mode,
+                side="BUY",
+                symbol=symbol,
+                exchange="NSE",
+                product="CNC",
+                quantity=10,
+                price=100.0,
+                entry_date="2026-08-26",
+                status="placed",
+            )
+        )
+    sess.commit()
+    _set_mode(wired_dbs, "sector_follow_cap5_vol", "live")
+
+    with app.test_client() as client:
+        _login(client)
+        resp = client.get("/strategies/api/sector_follow_cap5_vol")
+
+    perf = resp.get_json()["data"]["performance"]
+    assert perf["sandbox"]["open_positions"] == 1
+    assert perf["live"]["open_positions"] == 1
+
+
+# ---------------------------------------------------------------------------
 # intraday_pullback_top2 (issue #508)
 # ---------------------------------------------------------------------------
 
