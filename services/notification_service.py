@@ -60,6 +60,8 @@ _EVENT_TYPES = (
     "veto_decision",
     "task_complete",
     "trading_day_funnel",
+    "broker_auto_login",
+    "option_liquidity",
 )
 
 _SEVERITY_PREFIX = {
@@ -238,6 +240,19 @@ class NotificationService:
             # recorded as a PAPER fill instead. Default ON. Caller:
             # services/open15_breakout_service.py.
             "open15_breakout": _env_bool("NOTIFY_OPEN15_BREAKOUT", default=True),
+            # Broker auto-login run summaries + watcher alerts (issues #654/#658).
+            # Fires after each auto-login run (ok/failed per scope) and when the
+            # watcher detects a dead session it cannot heal ("manual login
+            # needed"). Default ON — the callers additionally gate on the same
+            # env var before calling, so this entry is the registry's record of
+            # that toggle. Callers: services/broker_auto_login_service.py,
+            # services/broker_auto_login_watcher.py.
+            "broker_auto_login": _env_bool("NOTIFY_BROKER_AUTO_LOGIN", default=True),
+            # option_liquidity sweep discarded as not credible (too many
+            # zero-turnover underlying-sides — feed outage / dead token /
+            # closed market). Default ON. Caller:
+            # services/option_liquidity_service.py.
+            "option_liquidity": _env_bool("NOTIFY_OPTION_LIQUIDITY", default=True),
         }
         # Whether to deliver messages for event_types NOT in per_event (i.e.
         # future callers that ship without a registry entry). When True (default)

@@ -10,6 +10,8 @@ child selection — is exercised without network or DB.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 import services.broker_auto_login_service as svc
@@ -149,3 +151,34 @@ def test_all_isolation_primary_fails_child_succeeds(monkeypatch):
     results = svc.auto_login_all(notify=False)
     assert results[0]["scope"] == "primary" and results[0]["ok"] is False
     assert any(r["scope"] == "child:kid1" and r["ok"] for r in results)
+
+
+def test_notify_summary_reaches_notification_service(monkeypatch):
+    """Regression (#688): ``_notify_summary`` imported a module-level ``notify``
+    that ``services.notification_service`` never had, so the ImportError was
+    swallowed by the best-effort try/except and every run summary was silently
+    dropped. Exercise the REAL dispatch path — down to the
+    ``get_notification_service()`` lookup — with only the service singleton
+    replaced by a recorder."""
+    monkeypatch.setenv("NOTIFY_BROKER_AUTO_LOGIN", "true")
+    import services.notification_service as ns
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        ns,
+        "get_notification_service",
+        lambda: SimpleNamespace(notify=lambda event, msg, **md: sent.append((event, msg))),
+    )
+
+    svc._notify_summary(
+        [
+            {"scope": "primary", "ok": True, "message": "logged in"},
+            {"scope": "child:kid1", "ok": False, "message": "boom"},
+        ]
+    )
+
+    assert sent, "summary never reached the notification service (the #688 silent drop)"
+    event, msg = sent[0]
+    assert event == "broker_auto_login"
+    assert "1 ok, 1 failed" in msg
+    assert "child:kid1" in msg
