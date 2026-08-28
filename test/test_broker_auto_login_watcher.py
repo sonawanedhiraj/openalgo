@@ -334,3 +334,28 @@ def test_probe_child_is_broker_verified(monkeypatch):
     monkeypatch.setattr(auth_db, "get_auth_token", lambda name: None)
     assert w._probe_child(7) is False
     assert probe_calls == []
+
+
+def test_alert_reaches_notification_service(monkeypatch):
+    """Regression (#688): ``_alert`` imported a module-level ``notify`` that
+    ``services.notification_service`` never had — the ImportError was swallowed
+    and the watcher's loud alerts (e.g. "manual login needed") never sent.
+    Drive the real ``_alert`` (no stubbing) down to the
+    ``get_notification_service()`` seam."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("NOTIFY_BROKER_AUTO_LOGIN", "true")
+    import services.notification_service as ns
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        ns,
+        "get_notification_service",
+        lambda: SimpleNamespace(notify=lambda event, msg, **md: sent.append((event, msg))),
+    )
+
+    w._alert("manual login needed for child kid1")
+
+    assert sent == [("broker_auto_login", "⚠️ manual login needed for child kid1")], (
+        "alert never reached the notification service (the #688 silent drop)"
+    )

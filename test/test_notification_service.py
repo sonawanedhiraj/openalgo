@@ -854,3 +854,53 @@ def test_engine_entry_notification_is_failsafe(patched_notifier, monkeypatch, ca
             100.0,
         )
     assert any("notification publish failed" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# #688 — event-type registry + the bare-`notify` import bug class.
+# ---------------------------------------------------------------------------
+
+
+def test_broker_auto_login_and_option_liquidity_are_registered_events(monkeypatch):
+    """#688 registered both event types so they deliver via their own toggle
+    instead of the unknown-event fallback (which WARNs on every send)."""
+    from services.notification_service import NotificationService
+
+    per_event = NotificationService().per_event
+    assert per_event.get("broker_auto_login") is True
+    assert per_event.get("option_liquidity") is True
+
+    monkeypatch.setenv("NOTIFY_BROKER_AUTO_LOGIN", "false")
+    monkeypatch.setenv("NOTIFY_OPTION_LIQUIDITY", "false")
+    per_event = NotificationService().per_event
+    assert per_event.get("broker_auto_login") is False
+    assert per_event.get("option_liquidity") is False
+
+
+def test_no_bare_notify_imports_in_tree():
+    """``services.notification_service`` exposes no module-level ``notify`` —
+    ``from services.notification_service import notify`` raises ImportError at
+    call time, and every call site wraps dispatch in a best-effort try/except,
+    so the bug class is a SILENT alert drop (#688: broker_auto_login summary +
+    watcher alerts + option_liquidity credibility alert, all dead in
+    production). Scan the tree so a new call site cannot reintroduce it."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    pattern = re.compile(
+        r"from\s+services\.notification_service\s+import\s+(?:[\w\s,()]*\bnotify\b)(?!\w)"
+    )
+    offenders = []
+    for folder in ("services", "blueprints", "sandbox", "restx_api", "utils"):
+        for path in (root / folder).rglob("*.py"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for match in pattern.finditer(text):
+                # `notify_...` names and `get_notification_service` are fine;
+                # the regex's \b already excludes them, so any hit is real.
+                offenders.append(f"{path.relative_to(root)}: {match.group(0).strip()}")
+    assert not offenders, (
+        "bare `notify` import from services.notification_service (no such symbol; "
+        "alerts are silently dropped — use get_notification_service().notify): "
+        + "; ".join(offenders)
+    )

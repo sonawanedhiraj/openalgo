@@ -654,9 +654,9 @@ def run_for_date(trade_date: dt.date | None = None, dry_run: bool = False) -> di
             stats["limit"] * 100,
         )
         try:
-            from services.notification_service import notify
+            from services.notification_service import get_notification_service
 
-            notify(
+            get_notification_service().notify(
                 "option_liquidity",
                 f"option_liquidity sweep on {today} discarded: {stats['dead']}/"
                 f"{stats['total']} underlying-sides had zero turnover. No score written.",

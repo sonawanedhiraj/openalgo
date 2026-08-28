@@ -416,9 +416,9 @@ def _alert(message: str) -> None:
     try:
         if os.getenv("NOTIFY_BROKER_AUTO_LOGIN", "true").lower() != "true":
             return
-        from services.notification_service import notify
+        from services.notification_service import get_notification_service
 
-        notify("broker_auto_login", f"⚠️ {message}")
+        get_notification_service().notify("broker_auto_login", f"⚠️ {message}")
     except Exception:
         logger.exception("auto-login watcher: alert notification failed")
 

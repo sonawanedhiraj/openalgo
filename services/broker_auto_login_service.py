@@ -221,8 +221,8 @@ def _notify_summary(results: list[dict]) -> None:
         for r in results:
             mark = "✅" if r["ok"] else "❌"
             lines.append(f"{mark} {r['scope']}: {r['message']}")
-        from services.notification_service import notify
+        from services.notification_service import get_notification_service
 
-        notify("broker_auto_login", "\n".join(lines))
+        get_notification_service().notify("broker_auto_login", "\n".join(lines))
     except Exception:
         logger.exception("Failed to send auto-login summary notification")
