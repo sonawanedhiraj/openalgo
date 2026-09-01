@@ -31,6 +31,17 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   WS often does not resume cleanly; triggers a ~3-second SQLite "database locked"
   burst (~180 errors) during the multi-DB init.
 - **Manage via:** `uv run app.py`, or bridge `POST /restart-app`.
+- **Dashboard shutdown control (issue #694):** the React `/dashboard` renders a
+  System card (`blueprints/system_control.py`) — `GET /system/api/status`
+  (read-only: PID/uptime/branch@commit/live-job counts) and
+  `POST /system/api/shutdown` (session + CSRF; body must carry
+  `confirm:"SHUTDOWN"`; refused 09:00–15:35 IST on trading days unless
+  `override_market_hours:true`, with best-effort open-position hints in the
+  refusal). Confirmed shutdown responds 200, Telegram-alerts
+  (`system_shutdown` event), stands the WS-proxy supervisor and reachable
+  APScheduler instances down, then `os._exit(0)` from the catalogued
+  `system_shutdown_exit` thread. **Shutdown only — restart stays manual**
+  (`uv run app.py`); the process cannot resurrect itself.
 
 ### 2. Bridge FastAPI (port 5001)
 - **Entry:** `bridge/server.py` (`uv run python bridge/server.py`)

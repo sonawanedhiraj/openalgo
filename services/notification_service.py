@@ -253,6 +253,10 @@ class NotificationService:
             # closed market). Default ON. Caller:
             # services/option_liquidity_service.py.
             "option_liquidity": _env_bool("NOTIFY_OPTION_LIQUIDITY", default=True),
+            # Operator-requested process exit from the dashboard (issue #694).
+            # A shutdown must never be silent — the alert is the audit trail
+            # that pairs with the boot dirty-check on the next start.
+            "system_shutdown": _env_bool("NOTIFY_SYSTEM_SHUTDOWN", default=True),
         }
         # Whether to deliver messages for event_types NOT in per_event (i.e.
         # future callers that ship without a registry entry). When True (default)
