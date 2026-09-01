@@ -393,6 +393,19 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_GUARDED,
     ),
     ThreadSpec(
+        thread_name="system_shutdown_exit",
+        label="Dashboard shutdown (exit worker)",
+        group=GROUP_BOOT,
+        owner="blueprints/system_control.py",
+        description=(
+            "One-shot exit worker behind the dashboard's shutdown button "
+            "(issue #694): alerts, stands the WS-proxy supervisor and "
+            "schedulers down, then os._exit(0). not_started is its normal "
+            "state for the entire life of a process."
+        ),
+        tier=TIER_PROTECTED,
+    ),
+    ThreadSpec(
         thread_name="ScannerAggregatorSeed",
         label="Scanner aggregator seed",
         group=GROUP_BOOT,

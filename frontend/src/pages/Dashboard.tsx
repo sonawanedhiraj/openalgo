@@ -1,6 +1,7 @@
 import { BarChart3, BookOpen, FileText, MessageCircle, Search, Zap } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import SystemCard from '@/components/dashboard/SystemCard'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { useOrderEventRefresh } from '@/hooks/useOrderEventRefresh'
@@ -90,7 +91,7 @@ export default function Dashboard() {
       } else {
         setError(data.message || 'Failed to fetch margin data')
       }
-    } catch (err) {
+    } catch (_err) {
       setError('Failed to fetch margin data')
     } finally {
       setIsLoading(false)
@@ -472,6 +473,9 @@ export default function Dashboard() {
           })}
         </div>
       </div>
+
+      {/* System / process control (issue #694) */}
+      <SystemCard />
     </div>
   )
 }

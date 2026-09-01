@@ -99,6 +99,7 @@ from blueprints.strategies_dashboard_api import (
 from blueprints.strategy import strategy_bp  # Import the strategy blueprint
 from blueprints.strategy_chart import strategy_chart_bp  # Import the strategy chart blueprint
 from blueprints.strategy_portfolio import strategy_portfolio_bp  # Strategy Builder portfolio
+from blueprints.system_control import system_bp  # dashboard shutdown control (issue #694)
 from blueprints.system_permissions import (
     system_permissions_bp,  # Import the system permissions blueprint
 )
@@ -318,6 +319,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(open15_bp)  # open15_vol_breakout control/observability
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
     app.register_blueprint(preflight_bp)  # Stage-0 go/no-go preflight gate
+    app.register_blueprint(system_bp)  # dashboard shutdown control (issue #694)
     app.register_blueprint(journal_bp)  # Stage 2 trade journal inspection endpoints
     app.register_blueprint(backtest_bp)  # MVP backtester trigger + inspection endpoints
     app.register_blueprint(traffic_bp)
