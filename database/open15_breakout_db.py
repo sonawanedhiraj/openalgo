@@ -291,6 +291,10 @@ class Open15Config(Base):
     residual_sizing_enabled = Column(Integer, nullable=True)  # 0/1
     residual_reserve_pct = Column(Float, nullable=True)  # headroom for charges
     residual_min_lots = Column(Integer, nullable=True)  # floor, 0 = no entry
+    # live P&L poll interval on /logs (issue #692). NULL = env default
+    # (OPEN15_LIVE_POLL_S, 5 s); clamped 3..60 by the service. Display-only —
+    # it paces the page's batched quote poll, never an order path.
+    live_poll_interval_s = Column(Integer, nullable=True)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -380,6 +384,8 @@ def _ensure_columns():
             "residual_sizing_enabled": "INTEGER",
             "residual_reserve_pct": "FLOAT",
             "residual_min_lots": "INTEGER",
+            # issue #692 — NULL resolves to the env default (5 s)
+            "live_poll_interval_s": "INTEGER",
         },
     }
     try:
@@ -462,6 +468,8 @@ def get_config() -> dict | None:
             ),
             "residual_reserve_pct": row.residual_reserve_pct,
             "residual_min_lots": row.residual_min_lots,
+            # issue #692 — None stays None so env supplies the default (5 s)
+            "live_poll_interval_s": row.live_poll_interval_s,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -501,6 +509,7 @@ def save_config(
     residual_sizing_enabled: bool | None = None,
     residual_reserve_pct: float | None = None,
     residual_min_lots: int | None = None,
+    live_poll_interval_s: int | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -551,6 +560,7 @@ def save_config(
         )
         row.residual_reserve_pct = residual_reserve_pct
         row.residual_min_lots = residual_min_lots
+        row.live_poll_interval_s = live_poll_interval_s
         row.updated_by = updated_by
         db_session.commit()
         return True

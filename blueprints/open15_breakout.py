@@ -103,6 +103,7 @@ def config():
     from services.open15_breakout_service import (
         clamp_shadow_max_trades as _clamp_shadow_max_trades,
     )
+    from services.open15_pnl_curve import _live_poll_default
 
     if request.method == "POST":
         body = request.get_json(silent=True) or {}
@@ -241,6 +242,13 @@ def config():
         residual_min_lots = (
             None if residual_min_lots in (None, "") else _clamp_residual_min_lots(residual_min_lots)
         )
+        # live P&L poll interval (issue #692) — clamp-don't-reject; empty = env
+        from services.open15_pnl_curve import (
+            clamp_live_poll_interval as _clamp_live_poll,
+        )
+
+        live_poll = body.get("live_poll_interval_s")
+        live_poll = None if live_poll in (None, "") else _clamp_live_poll(live_poll)
         if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
             # an inverted band would readmit a name the same day it was excluded,
             # which is the flapping the hysteresis exists to prevent
@@ -293,6 +301,7 @@ def config():
             residual_sizing_enabled=residual_enabled,
             residual_reserve_pct=residual_reserve,
             residual_min_lots=residual_min_lots,
+            live_poll_interval_s=live_poll,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -347,6 +356,8 @@ def config():
                 "residual_sizing_enabled": _residual_sizing_enabled_default(),
                 "residual_reserve_pct": _residual_reserve_pct_default(),
                 "residual_min_lots": _residual_min_lots_default(),
+                # issue #692 — live P&L poll interval seed (service owns it)
+                "live_poll_interval_s": _live_poll_default(),
             },
             "override": get_config(),
             "effective_today": effective,
@@ -648,6 +659,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <label class="muted" style="margin-left:14px">max trades/day <input id="c_maxt" type="number" min="1" max="6" step="1" style="width:44px"></label>
  <label class="muted" style="margin-left:14px">no entry after <input id="c_nea" type="time" min="09:16" max="15:09" style="width:92px"></label>
  <label class="muted" style="margin-left:14px">exit time <input id="c_exit" type="time" min="09:17" max="15:10" style="width:92px"></label>
+ <label class="muted" style="margin-left:14px">live poll
+  <input id="c_livepoll" type="number" min="3" max="60" step="1" style="width:44px"> s</label>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
   <span class="muted">shadow the excluded side (issue #581 — journal only, no orders, never compounds)</span>
   <label class="muted" style="margin-left:14px"><input id="c_shadow" type="checkbox"> log the excluded side's triggers</label>
@@ -735,6 +748,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="rejbox"></div>
   <div id="lostbox"></div>
 <div class="chips" id="chips"></div>
+  <div id="pnlcard" class="atmcard" style="display:none"></div>
   <div id="capcard" class="atmcard" style="display:none"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
@@ -834,6 +848,10 @@ async function loadCfg(){
     o.residual_reserve_pct??d.residual_reserve_pct??3;
   document.getElementById('c_residualmin').value=
     o.residual_min_lots??d.residual_min_lots??1;
+  // live P&L poll interval (issue #692) — `??` so a stored value beats the env
+  window.__livePollS=o.live_poll_interval_s??d.live_poll_interval_s??5;
+  document.getElementById('c_livepoll').value=window.__livePollS;
+  if(window.armLivePoll)armLivePoll();  // later script block; guarded for ordering
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
   const src=k=>(o[k]==null?'env default':'db');
@@ -908,7 +926,8 @@ async function saveCfg(){
     coverage_target_pct:+document.getElementById('c_covtgt').value,
     residual_sizing_enabled:document.getElementById('c_residual').checked,
     residual_reserve_pct:+document.getElementById('c_residualres').value,
-    residual_min_lots:+document.getElementById('c_residualmin').value};
+    residual_min_lots:+document.getElementById('c_residualmin').value,
+    live_poll_interval_s:+document.getElementById('c_livepoll').value};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -1032,7 +1051,7 @@ async function selectDay(date){
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null; liveFeed=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderRejected(); renderLogLostBanner(); renderChips(); renderCapital(); renderAtmLadder();
-  renderRolling(); renderSel(); renderTimeline();
+  renderRolling(); renderSel(); renderTimeline(); loadPnlCurve();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
 }
@@ -1891,6 +1910,165 @@ async function loadLadderPreview(){
         +' ladder stays the record of what an arm actually saw'});
   }catch(e){box.innerHTML='';box.style.display='none';}
 }
+// ---- intra-hold P&L curve, real fills only (issue #692) --------------------
+// Marks are 1m closes vs the broker entry fill; the final point is the
+// journal's own fill-derived gross P&L, so curve and journal can never
+// disagree. Server caches: settled days permanently, today for 60s — so the
+// 5s live refresh never multiplies broker history calls. The live overlay
+// polls /api/live_pnl at the configured interval; the SERVER cache is what
+// bounds broker quote calls, so extra tabs are free.
+let curveData=null, livePnl=null, liveTimer=null;
+const CURVE_COLS=['#89b4fa','#fab387','#94e2d5','#f5c2e7','#cba6f7','#a6e3a1'];
+function m2x(hhmm){const p=hhmm.split(':');return +p[0]*60+ +p[1];}
+function fmtR(v){const s=Math.round(Math.abs(v)).toLocaleString('en-IN');return (v<0?'-Rs':'+Rs')+s;}
+async function loadPnlCurve(){
+  const box=document.getElementById('pnlcard'); if(!box)return;
+  if(!curDate){box.style.display='none';return;}
+  try{const r=await fetch('/open15_vol_breakout/api/pnl_curve?date='+curDate);curveData=await r.json();}
+  catch(e){curveData=null;}
+  renderPnlCurve();
+}
+function armLivePoll(){
+  const iv=Math.max(3,Math.min(60,+(window.__livePollS||5)));
+  if(liveTimer)clearInterval(liveTimer);
+  liveTimer=setInterval(pollLivePnl,iv*1000);
+}
+window.armLivePoll=armLivePoll;
+async function pollLivePnl(){
+  // outside the hold window the endpoint answers idle/closed without touching
+  // the broker, so an idle page costs one localhost fetch per interval
+  const today=digests.length&&digests[0].source==='live'?digests[0].date:null;
+  if(!curDate||curDate!==today){livePnl=null;return;}
+  try{
+    const r=await fetch('/open15_vol_breakout/api/live_pnl'); const j=await r.json();
+    const had=!!livePnl; livePnl=(j.status==='live')?j:null;
+    if(j.poll_interval_s&&j.poll_interval_s!==+window.__livePollS){
+      window.__livePollS=j.poll_interval_s;armLivePoll();}
+    if(livePnl||had)renderPnlCurve();
+  }catch(e){livePnl=null;}
+}
+function renderPnlCurve(){
+  const box=document.getElementById('pnlcard'); if(!box)return;
+  const j=curveData;
+  const title='<span class="atitle">INTRA-HOLD P&amp;L &mdash; REAL FILLS</span>';
+  if(!j||j.status!=='ok'||!(j.trades||[]).length){box.style.display='none';box.innerHTML='';return;}
+  const usable=j.trades.filter(t=>!t.unavailable&&((t.series||[]).length||t.final));
+  const unav=j.trades.filter(t=>t.unavailable);
+  if(!usable.length){
+    // never an empty box (#615/#622): say what exists and why there is no curve
+    box.style.display='';
+    box.innerHTML=title+'<span class="asub">'+j.trades.length+' real trade'+
+      (j.trades.length===1?'':'s')+' &mdash; curve unavailable: '+
+      esc((unav[0]&&unav[0].reason)||'no minute bars yet (broker 1m history lags 5-15 min intraday)')+'</span>';
+    return;
+  }
+  const L=(livePnl&&curDate===livePnl.date)?livePnl:null;
+  const liveX=L?(function(p){return +p[0]*60+ +p[1]+ +p[2]/60;})(L.asof.split(':')):null;
+  let xmin=1e9,xmax=-1e9,ymin=0,ymax=0;
+  const lines=[];
+  usable.forEach((t,i)=>{
+    const ex=m2x(t.entry_minute)+(t.entry_second||0)/60;
+    const arr=[[ex,0]];
+    for(const q of (t.series||[]))arr.push([m2x(q[0]),q[1]]);
+    if(t.final)arr.push([m2x(t.final[0]),t.final[1]]);
+    let lv=null;
+    if(L)for(const x of (L.trades||[]))if(x.contract===t.contract&&x.mtm!=null)lv=x;
+    if(lv&&liveX!=null)arr.push([liveX,lv.mtm]);
+    for(const p of arr){xmin=Math.min(xmin,p[0]);xmax=Math.max(xmax,p[0]);
+      ymin=Math.min(ymin,p[1]);ymax=Math.max(ymax,p[1]);}
+    lines.push({t:t,arr:arr,col:CURVE_COLS[i%CURVE_COLS.length]});
+  });
+  const port=(j.portfolio||[]).map(q=>[m2x(q[0]),q[1]]);
+  if(j.portfolio_final)port.push([m2x(j.portfolio_final[0]),j.portfolio_final[1]]);
+  if(L&&L.portfolio_mtm!=null&&liveX!=null)port.push([liveX,L.portfolio_mtm]);
+  for(const p of port){if(p[0]<xmin)xmin=p[0];if(p[0]>xmax)xmax=p[0];
+    if(p[1]<ymin)ymin=p[1];if(p[1]>ymax)ymax=p[1];}
+  if(xmax-xmin<3)xmax=xmin+3;
+  const pad=Math.max((ymax-ymin)*0.1,200); ymin-=pad; ymax+=pad;
+  const W=920,H=300,ML=58,MR=170,MT=16,MB=26,PW=W-ML-MR,PH=H-MT-MB;
+  const X=v=>ML+(v-(xmin-0.4))/((xmax+0.4)-(xmin-0.4))*PW;
+  const Y=v=>MT+(ymax-v)/(ymax-ymin)*PH;
+  let s='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block">';
+  const rawStep=(ymax-ymin)/4, mag=Math.pow(10,Math.floor(Math.log10(rawStep)));
+  const step=[1,2,2.5,5,10].map(k=>k*mag).find(k=>k>=rawStep)||rawStep;
+  for(let v=Math.ceil(ymin/step)*step; v<=ymax; v+=step){
+    if(Math.abs(v)<1e-9)continue;
+    s+='<line x1="'+ML+'" x2="'+(ML+PW)+'" y1="'+Y(v)+'" y2="'+Y(v)+'" stroke="#232b33" stroke-width="1"/>';
+    s+='<text x="'+(ML-6)+'" y="'+(Y(v)+3.5)+'" text-anchor="end" font-size="10" fill="#6b7886">'+
+      (Math.abs(v)>=1000?((v<0?'-':'+')+(Math.round(Math.abs(v)/100)/10)+'k'):Math.round(v))+'</text>';
+  }
+  s+='<line x1="'+ML+'" x2="'+(ML+PW)+'" y1="'+Y(0)+'" y2="'+Y(0)+'" stroke="#4a5560" stroke-width="1.3"/>';
+  s+='<text x="'+(ML-6)+'" y="'+(Y(0)+3.5)+'" text-anchor="end" font-size="10" fill="#8aa0b4">0</text>';
+  const span=Math.ceil(xmax)-Math.floor(xmin);
+  const xstep=span<=16?1:(span<=40?5:15);
+  for(let m=Math.ceil(xmin);m<=Math.floor(xmax);m++){
+    if(m%xstep)continue;
+    s+='<line x1="'+X(m)+'" x2="'+X(m)+'" y1="'+(MT+PH)+'" y2="'+(MT+PH+3)+'" stroke="#4a5560"/>';
+    s+='<text x="'+X(m)+'" y="'+(MT+PH+14)+'" text-anchor="middle" font-size="10" fill="#6b7886">'+
+      (Math.floor(m/60)<10?'0':'')+Math.floor(m/60)+':'+(m%60<10?'0':'')+(m%60)+'</text>';
+  }
+  if(liveX!=null){
+    s+='<line x1="'+X(liveX)+'" x2="'+X(liveX)+'" y1="'+MT+'" y2="'+(MT+PH)+'" stroke="#8aa0b4" stroke-width="1" stroke-dasharray="4 3"/>';
+    s+='<text x="'+X(liveX)+'" y="'+(MT-3)+'" text-anchor="middle" font-size="9.5" fill="#8aa0b4">live '+esc(L.asof)+'</text>';
+  }
+  const labels=[];
+  const pathOf=arr=>'M'+arr.map(p=>X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join(' L');
+  for(const ln of lines){
+    s+='<path d="'+pathOf(ln.arr)+'" fill="none" stroke="'+ln.col+'" stroke-width="1.8" stroke-linejoin="round"/>';
+    s+='<circle cx="'+X(ln.arr[0][0])+'" cy="'+Y(0)+'" r="3.4" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
+    const last=ln.arr[ln.arr.length-1];
+    s+='<circle cx="'+X(last[0])+'" cy="'+Y(last[1])+'" r="3.2" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
+    labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' '+fmtR(last[1])});
+  }
+  if(port.length){
+    s+='<path d="'+pathOf(port)+'" fill="none" stroke="#d7dde4" stroke-width="2.4" stroke-linejoin="round"/>';
+    const pl=port[port.length-1];
+    s+='<circle cx="'+X(pl[0])+'" cy="'+Y(pl[1])+'" r="3.8" fill="#d7dde4" stroke="#0f1419" stroke-width="1.5"/>';
+    labels.push({y:Y(pl[1]),col:'#d7dde4',txt:'PORT '+fmtR(pl[1]),bold:1});
+  }
+  labels.sort((a,b)=>a.y-b.y);
+  for(let i=1;i<labels.length;i++)if(labels[i].y-labels[i-1].y<12)labels[i].y=labels[i-1].y+12;
+  for(const lb of labels)
+    s+='<text x="'+(ML+PW+8)+'" y="'+(lb.y+3.5)+'" font-size="10.5" fill="'+lb.col+'"'+
+      (lb.bold?' font-weight="bold"':'')+'>'+esc(lb.txt)+'</text>';
+  s+='</svg>';
+  // takeaway: best flatten-at-mark vs actual (closed days only). "Flatten at
+  // the close of minute m" implicitly means entries triggered after m never
+  // happened — two levers in one number, so the label says so.
+  let take='';
+  if(!L&&port.length&&j.net_total!=null&&j.portfolio_final){
+    const byEntry=usable.map(t=>({m:m2x(t.entry_minute),c:t.charges_inr||0}));
+    let best=null;
+    for(const p of (j.portfolio||[]).map(q=>[m2x(q[0]),q[1]])){
+      const chg=byEntry.filter(e=>e.m<p[0]).reduce((a,e)=>a+e.c,0);
+      const net=p[1]-chg;
+      if(!best||net>best.net)best={m:p[0],net:net};
+    }
+    if(best){
+      const hh=(Math.floor(best.m/60)<10?'0':'')+Math.floor(best.m/60)+':'+(best.m%60<10?'0':'')+(best.m%60);
+      take='<div class="muted" style="margin-top:6px">best exit (flatten at close of '+hh+
+        '; later entries not taken): <span class="'+(best.net>=0?'pos':'neg')+'">'+fmtR(best.net)+
+        ' net</span> &middot; actual: <span class="'+(j.net_total>=0?'pos':'neg')+'">'+fmtR(j.net_total)+
+        ' net</span> &middot; difference <span class="'+(best.net-j.net_total>=0?'pos':'neg')+'">'+
+        fmtR(best.net-j.net_total)+'</span></div>';
+    }
+  }
+  const legend=lines.map(ln=>'<span style="color:'+ln.col+'">&#9644; '+esc(ln.t.symbol)+
+    ' '+esc(ln.t.side)+(ln.t.instrument==='option'?' &middot; '+
+    esc(String(ln.t.contract||'').replace(ln.t.symbol,'')):'')+'</span>').join(' &nbsp; ')+
+    ' &nbsp; <span style="color:#d7dde4">&#9644; portfolio</span>';
+  const sub=(L?('LIVE &mdash; marks vs entry fill, one batched quote per poll ('+
+      (L.poll_interval_s||window.__livePollS||5)+'s)')
+    :'marks = 1m closes vs entry fill &middot; final point = broker fill')+
+    ' &middot; gross Rs'+
+    (unav.length?(' &middot; '+unav.length+' trade'+(unav.length===1?'':'s')+' unavailable'):'');
+  box.style.display='';
+  box.innerHTML=title+'<span class="asub">'+sub+'</span>'+
+    '<div class="muted" style="margin:6px 0 2px;font-size:11px">'+legend+'</div>'+s+take+
+    (unav.length?('<div class="muted" style="margin-top:4px">unavailable: '+
+      unav.map(t=>esc(t.symbol)+' ('+esc(t.reason||'')+')').join('; ')+'</div>'):'');
+}
+armLivePoll();
 loadLadderPreview();
 loadDays();
 setInterval(()=>{
@@ -2037,3 +2215,38 @@ def trades():
         return jsonify([]), 500
     finally:
         db_session.remove()
+
+
+@open15_bp.route("/api/pnl_curve", methods=["GET"])
+@check_session_validity
+def pnl_curve():
+    """Intra-hold P&L curve of the day's REAL fills (issue #692).
+
+    Minute-by-minute mark-to-market from broker 1m bars, final point anchored
+    to the journal's fill-derived gross P&L. Read-only; runs on the request
+    thread (a synchronous broker history fetch is fine here — never the tick
+    thread, the #626 rule). Past days work via ``?date=`` for as long as the
+    contract's bars are still fetchable (current expiry cycle).
+    """
+    import re
+
+    from services.open15_pnl_curve import _today_ist, build_pnl_curve
+
+    date = request.args.get("date") or _today_ist()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+        return jsonify({"status": "error", "message": "date must be YYYY-MM-DD"}), 400
+    return jsonify(build_pnl_curve(date))
+
+
+@open15_bp.route("/api/live_pnl", methods=["GET"])
+@check_session_validity
+def live_pnl():
+    """Live MTM of today's open real trades (issue #692).
+
+    ONE batched quote call behind an in-process cache sized to the configured
+    poll interval, so any number of open tabs produce at most one broker call
+    per interval. Strictly read-only — never drives an exit.
+    """
+    from services.open15_pnl_curve import live_pnl as _live_pnl
+
+    return jsonify(_live_pnl())
