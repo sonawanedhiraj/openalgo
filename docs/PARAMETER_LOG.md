@@ -2422,8 +2422,19 @@ ran in the 15:30-17:00 periodic window).
 - **How to roll back:** untick "spend the residual cash" on the /logs config
   form, or `OPEN15_RESIDUAL_SIZING=false` on a fresh install. Off is
   bit-for-bit the pre-#643 behaviour (regression-tested).
+- **Blast radius widened by issue #690 (2026-09-01):** the flag now also
+  governs **child mirror accounts** — with it ON, a child opening mirror that
+  cannot afford the full `capital_per_trade_inr` order is resized to that
+  child's OWN available cash (minus the same `OPEN15_RESIDUAL_RESERVE_PCT`
+  headroom) instead of being skipped `skipped_insufficient_funds`. There is
+  deliberately NO per-child knob and no new tunable; resolution goes through
+  the same `resolve_residual_params` the parent's arm uses, so the two sides
+  cannot disagree. `OPEN15_RESIDUAL_MIN_LOTS` does NOT apply to children
+  (`compute_opening_qty` naturally floors at 1 share/lot). Rolling the flag
+  back rolls both sides back together.
 - **History:**
   - **2026-08-19:** Introduced by issue #643.
+  - **2026-09-01:** Issue #690 — extended to child mirror accounts (see above).
 
 ## Other tunables (placeholder — populate as discovered)
 

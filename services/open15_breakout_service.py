@@ -224,6 +224,35 @@ def _residual_min_lots_default() -> int:
     return clamp_residual_min_lots(os.getenv("OPEN15_RESIDUAL_MIN_LOTS", "1"))
 
 
+def resolve_residual_params(cfg: dict | None) -> tuple[bool, float, int]:
+    """``(enabled, reserve_pct, min_lots)`` for residual-cash sizing (issue #643).
+
+    The ONE resolution of the residual knobs: stored ``open15_config`` value
+    wins, ``None`` falls to the env seed, clamps applied either way (``is
+    None`` — not truthiness — so a stored false beats a true env seed).
+    ``resolve_day_config`` builds the parent's day config from it, and the
+    child mirror fan-out (``account_fanout_service``, issue #690) reads the
+    parent's flag through it — enabling residual sizing on the parent enables
+    it for every child, and the two sides can never resolve it differently.
+    """
+    cfg = cfg or {}
+    enabled_cfg = cfg.get("residual_sizing_enabled")
+    enabled = _residual_sizing_enabled_default() if enabled_cfg is None else bool(enabled_cfg)
+    reserve_cfg = cfg.get("residual_reserve_pct")
+    reserve_pct = (
+        _residual_reserve_pct_default()
+        if reserve_cfg is None
+        else clamp_residual_reserve_pct(reserve_cfg)
+    )
+    min_lots_cfg = cfg.get("residual_min_lots")
+    min_lots = (
+        _residual_min_lots_default()
+        if min_lots_cfg is None
+        else clamp_residual_min_lots(min_lots_cfg)
+    )
+    return enabled, reserve_pct, min_lots
+
+
 def _paper_sim_max() -> int:
     """Daily cap on simulated rows.
 
@@ -925,24 +954,9 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         if shadow_max_cfg is None
         else clamp_shadow_max_trades(shadow_max_cfg)
     )
-    # residual-cash sizing (issue #643) — ``is None`` again, so a stored false
-    # beats a true env seed and vice versa
-    residual_cfg = cfg.get("residual_sizing_enabled")
-    residual_enabled = (
-        _residual_sizing_enabled_default() if residual_cfg is None else bool(residual_cfg)
-    )
-    residual_reserve_cfg = cfg.get("residual_reserve_pct")
-    residual_reserve_pct = (
-        _residual_reserve_pct_default()
-        if residual_reserve_cfg is None
-        else clamp_residual_reserve_pct(residual_reserve_cfg)
-    )
-    residual_min_lots_cfg = cfg.get("residual_min_lots")
-    residual_min_lots = (
-        _residual_min_lots_default()
-        if residual_min_lots_cfg is None
-        else clamp_residual_min_lots(residual_min_lots_cfg)
-    )
+    # residual-cash sizing (issue #643) — shared resolution with the child
+    # mirror fan-out (issue #690), so parent and child read one definition
+    residual_enabled, residual_reserve_pct, residual_min_lots = resolve_residual_params(cfg)
     no_entry_after = cfg.get("no_entry_after") or _no_entry_after_default()
     exit_time = cfg.get("exit_time") or _exit_time_default()
     if validate_window(no_entry_after, exit_time):
