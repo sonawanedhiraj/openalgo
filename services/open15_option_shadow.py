@@ -223,8 +223,14 @@ def resolve_atm_option(underlying: str, side: str, spot: float, trade_date: str)
             pass
 
 
-def _fetch_1m_bars(symbol: str, trade_date: str) -> list[dict] | None:
-    """Fetch the contract's 1m bars for the trade date via the broker API."""
+def _fetch_1m_bars(symbol: str, trade_date: str, exchange: str = "NFO") -> list[dict] | None:
+    """Fetch the contract's 1m bars for the trade date via the broker API.
+
+    Public alias ``fetch_1m_bars`` (issue #692): the P&L-curve service reads
+    the exact same bars for the same contracts — one fetch path, not two.
+    ``exchange`` defaults to NFO (every option consumer); stock-instrument
+    curve rows pass ``NSE``.
+    """
     try:
         from database.auth_db import get_first_available_api_key
         from services.history_service import get_history
@@ -235,7 +241,7 @@ def _fetch_1m_bars(symbol: str, trade_date: str) -> list[dict] | None:
             return None
         ok, data, _code = get_history(
             symbol=symbol,
-            exchange="NFO",
+            exchange=exchange,
             interval="1m",
             start_date=trade_date,
             end_date=trade_date,
@@ -248,6 +254,10 @@ def _fetch_1m_bars(symbol: str, trade_date: str) -> list[dict] | None:
     except Exception:
         logger.exception("open15 opt-shadow: history fetch raised for %s", symbol)
         return None
+
+
+# public name for cross-module consumers (issue #692)
+fetch_1m_bars = _fetch_1m_bars
 
 
 def premiums_from_bars(

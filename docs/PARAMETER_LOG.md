@@ -18,6 +18,19 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 intra-hold P&L curve + live P&L poll (issue #692, added 2026-09-01)
+
+Read-only observability on `/open15_vol_breakout/logs`: the "Intra-hold P&L —
+real fills" card draws each real trade's minute-by-minute MTM (1m closes vs the
+broker entry fill, final point anchored to the journal's fill-derived gross
+P&L) and, while trades are open, overlays a live mark from ONE batched quote
+call per poll. Nothing gates or trades on any of it; the curve/live endpoints
+never place orders.
+
+| Parameter | Default | Note |
+|---|---|---|
+| `OPEN15_LIVE_POLL_S` | `5` | Live P&L poll interval (seconds). First-boot seed only — the UI-saved `open15_config.live_poll_interval_s` row wins (#484 rule). Clamped 3–60 server-side (the 3 s floor keeps even the most aggressive setting inside the broker quote rate limit). Server-side quote cache TTL tracks the configured interval, so N open tabs still produce at most one broker call per interval. Applies on the next poll tick — no restart. |
+
 ### open15 ATM lot-cost coverage ladder (issue #591, added 2026-08-11)
 
 Observational only — the 09:10 arm emits one `atm_lot_cost` decision-log event
