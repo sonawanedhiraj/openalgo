@@ -2420,6 +2420,21 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
   produced the fabricated fill in the first place. Idempotent with no marker
   column (a corrected row is no longer `placed`). Flags
   `MULTI_ACCOUNT_FUNDS_CHECK`, `MULTI_ACCOUNT_FILL_RECONCILE_ENABLED`.
+- **The parent's open15 residual-sizing flag extends to children (issue
+  #690).** With open15's `residual_sizing_enabled` (issue #643) ON, a child
+  opening mirror that fails the #637 affordability check is **resized to that
+  child's own leftover cash** (minus the shared `residual_reserve_pct`
+  headroom) instead of skipped — the child-side twin of the parent's residual
+  entry. No per-child knob: enabling on the parent enables for every child,
+  resolved through the same `resolve_residual_params` the parent's arm uses so
+  the two sides cannot drift. Each child sizes against ITS OWN balance read
+  with ITS OWN token (per-child residual by construction); placed rows carry a
+  `residual_sized:` marker in `account_orders.error_text` (the #643
+  comparability-by-labelling rule, `orphan_flatten:` precedent). No ledger or
+  lock — the fresh per-order funds read is the budget, and the rare
+  same-second double-spend is the broker RMS's to refuse (journaled
+  `rejected`, corrected by the 09:40 reconcile). Exits stay cash-free; other
+  strategies and flag-OFF are byte-identical to #637.
 - **A child position must never depend on a parent event that will not come
   (issue #659).** Child orders are echoes of parent order events, and two
   echo failures used to strand a REAL child position until the broker's MIS

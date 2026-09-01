@@ -15,6 +15,12 @@ Sizing (plan §6):
 - ``factor = child.capital_inr / PRIMARY_BOOK_CAPITAL`` (env, default 10,00,000)
 - opening orders: equity ``floor(parent_qty × factor)``; derivatives floored to
   lot multiples (SymToken.lotsize); 0 after rounding → journaled skip
+- **residual-cash resize (issue #690, open15 only)**: when the PARENT's open15
+  ``residual_sizing_enabled`` flag is ON and the #637 funds check finds the
+  child's cash short of the full ``capital_per_trade_inr`` order, the mirror is
+  resized to the child's OWN leftover cash (minus the shared
+  ``residual_reserve_pct`` headroom) instead of skipped. No per-child knob;
+  placed rows carry a ``residual_sized:`` marker in ``error_text``.
 - **exit asymmetry guard**: an order that REDUCES the child's own broker
   position flattens what the child actually holds (``get_open_position`` with
   the child's token), never a blind scale — a partially-rejected entry still
@@ -374,6 +380,35 @@ def _funds_check_enabled() -> bool:
     return os.getenv("MULTI_ACCOUNT_FUNDS_CHECK", "true").lower() == "true"
 
 
+# The one strategy whose parent-side residual-sizing flag extends to children.
+_RESIDUAL_STRATEGY = "open15_vol_breakout"
+
+
+def open15_residual_params() -> tuple[bool, float]:
+    """The PARENT's open15 residual-sizing flag + reserve pct (issue #690).
+
+    Enabling residual sizing on the parent enables it for every child mirror —
+    there is deliberately NO per-child knob. Resolution goes through the same
+    ``resolve_residual_params`` the parent's own arm uses (stored
+    ``open15_config`` row, ``None`` → env seed, clamps applied), so the two
+    sides can never disagree about what the flag says. Lazy imports because
+    ``open15_breakout_service`` imports this module (inside functions) for the
+    #659 orphan-flatten sweep.
+
+    Any failure → ``(False, 0.0)`` — fail toward the pre-#690 skip behavior:
+    a broken config read must not start resizing child orders.
+    """
+    try:
+        from database.open15_breakout_db import get_config
+        from services.open15_breakout_service import resolve_residual_params
+
+        enabled, reserve_pct, _min_lots = resolve_residual_params(get_config())
+        return enabled, reserve_pct
+    except Exception:
+        logger.exception("open15 residual params read failed — child residual sizing off")
+        return False, 0.0
+
+
 def read_child_cash(broker: str, token: str) -> float | None:
     """The CHILD's own spendable cash, or None if it cannot be read (issue #637).
 
@@ -532,6 +567,10 @@ def _mirror_to_account(
             action_upper == "BUY" and child_net < 0
         )
         sizing_price = None
+        # Set only when the order was resized to the child's leftover cash
+        # (issue #690) — journaled so a smaller row is never read as full-size,
+        # the #643 comparability-by-labelling rule.
+        residual_note = None
         if reducing:
             # Exits flatten the child's ACTUAL position — no capital or price
             # needed, and a missing capital setting must never block an exit.
@@ -579,19 +618,47 @@ def _mirror_to_account(
                 cash = read_child_cash(broker, token)
                 order_value = child_qty * sizing_price
                 if not can_afford(order_value, cash):
-                    account_orders_db.record_mirror_attempt(
-                        **journal,
-                        child_qty=0,
-                        status="skipped_insufficient_funds",
-                        error_text=(f"needs Rs{order_value:,.0f}, available Rs{cash:,.0f}"),
-                        sizing_price=sizing_price,
+                    # Residual-cash sizing (issue #690): with the PARENT's open15
+                    # flag ON, resize to this child's OWN leftover cash (minus
+                    # the same charges-headroom reserve) instead of skipping —
+                    # the child-side twin of the parent's #643 behavior. cash is
+                    # a real float here: can_afford only fails on a known
+                    # balance. No ledger/lock: the fresh per-order read is the
+                    # budget, and the rare same-second double-spend is the
+                    # broker RMS's to refuse (journaled as rejected, corrected
+                    # by the 09:40 reconcile) — the same fail-open stance
+                    # can_afford itself documents.
+                    residual_qty = 0
+                    budget = 0.0
+                    enabled, reserve_pct = (
+                        open15_residual_params() if mode_key == _RESIDUAL_STRATEGY else (False, 0.0)
                     )
-                    _notify_operator(
-                        f"⚠ Mirror skipped — {name}: {action} {symbol} needs "
-                        f"₹{order_value:,.0f} but only ₹{cash:,.0f} is available. "
-                        f"No order placed."
+                    if enabled:
+                        budget = max(cash, 0.0) * (1.0 - reserve_pct / 100.0)
+                        residual_qty = compute_opening_qty(budget, sizing_price, exchange, lotsize)
+                    if residual_qty <= 0:
+                        unit = "lot" if exchange in DERIVATIVE_EXCHANGES else "share"
+                        detail = f"needs Rs{order_value:,.0f}, available Rs{cash:,.0f}"
+                        if enabled:
+                            detail += f"; residual Rs{budget:,.0f} cannot afford 1 {unit}"
+                        account_orders_db.record_mirror_attempt(
+                            **journal,
+                            child_qty=0,
+                            status="skipped_insufficient_funds",
+                            error_text=detail,
+                            sizing_price=sizing_price,
+                        )
+                        _notify_operator(
+                            f"⚠ Mirror skipped — {name}: {action} {symbol} needs "
+                            f"₹{order_value:,.0f} but only ₹{cash:,.0f} is available. "
+                            f"No order placed."
+                        )
+                        return
+                    child_qty = residual_qty
+                    residual_note = (
+                        f"residual_sized: budget Rs{budget:,.0f} "
+                        f"of Rs{float(capital_per_trade):,.0f}"
                     )
-                    return
 
         child_order = copy.deepcopy(order_data)
         child_order["quantity"] = child_qty
@@ -604,10 +671,12 @@ def _mirror_to_account(
                 status="placed",
                 broker_orderid=str(order_id),
                 sizing_price=sizing_price,
+                error_text=residual_note,
             )
             logger.info(
                 f"mirror placed — {name}: {action} {child_qty} {symbol} "
-                f"(parent {parent_qty}, price {sizing_price}, orderid {order_id})"
+                f"(parent {parent_qty}, price {sizing_price}, orderid {order_id}"
+                f"{', ' + residual_note if residual_note else ''})"
             )
         else:
             message = (
@@ -619,7 +688,7 @@ def _mirror_to_account(
                 **journal,
                 child_qty=child_qty,
                 status="rejected",
-                error_text=message,
+                error_text=f"{residual_note}; {message}" if residual_note else message,
                 sizing_price=sizing_price,
             )
             _notify_operator(

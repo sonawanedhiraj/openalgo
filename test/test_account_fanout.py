@@ -13,7 +13,10 @@ quantity. Covers:
   failure → ``skipped_no_quote``; exits are NEVER blocked by either;
 * exit asymmetry — position-reducing orders flatten the child's OWN holding;
 * end-to-end placed/rejected/no-session journaling with ``sizing_price``;
-* per-child failure isolation.
+* per-child failure isolation;
+* residual-cash resize (issue #690) — the PARENT's open15 flag resizes an
+  unaffordable opening mirror to the child's own leftover cash; flag off /
+  other strategies / unreadable cash keep the #637 behavior exactly.
 
 Hermetic: global conftest DB redirect; broker + quotes stubbed; inline executor.
 """
@@ -502,3 +505,164 @@ def test_can_afford_is_pure_and_fails_open():
     assert can_afford(100.0, 100.0), "exactly affordable is affordable"
     assert not can_afford(100.01, 100.0)
     assert can_afford(1_000_000.0, None), "unknown balance never blocks"
+
+
+# ---------------------------------------------------------------------------
+# issue #690 — the parent's open15 residual-sizing flag extends to children
+#
+# With the PARENT's `residual_sizing_enabled` ON, an opening mirror the child
+# cannot afford at full `capital_per_trade_inr` is resized to the child's OWN
+# leftover cash (minus the shared reserve) instead of skipped. No per-child
+# knob; flag OFF (or any other strategy) is byte-for-byte the #637 behavior.
+# ---------------------------------------------------------------------------
+
+O15_EQ_ORDER = {
+    **EQ_ORDER,
+    "product": "MIS",
+    "strategy": "open15_vol_breakout",
+}
+
+
+def _with_residual(monkeypatch, enabled, reserve_pct=0.0):
+    """Stub the parent-flag read (its resolution is tested separately below)."""
+    import services.account_fanout_service as svc_mod
+
+    monkeypatch.setattr(svc_mod, "open15_residual_params", lambda: (enabled, reserve_pct))
+
+
+def test_flag_on_resizes_to_the_childs_own_cash(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, notifications = fanout_env
+    _make_child(accounts_db, per_trade=15000.0, strategy="open15_vol_breakout")
+    # full size: 30 sh @500 = Rs15,000; cash Rs9,000; reserve 10% -> budget
+    # Rs8,100 -> 16 shares placed instead of a skip
+    _with_cash(monkeypatch, 9000.0)
+    _with_residual(monkeypatch, True, reserve_pct=10.0)
+
+    svc.maybe_fan_out(O15_EQ_ORDER, "open15_vol_breakout", "zerodha", "P1")
+
+    assert len(stub.placed_orders) == 1
+    assert stub.placed_orders[0][0]["quantity"] == 16
+    row = orders_db.list_orders()[0]
+    assert row["status"] == "placed"
+    assert row["child_qty"] == 16
+    # labelled, never mistaken for a full-size row (the #643 rule)
+    assert "residual_sized" in (row["error_text"] or "")
+    assert "8,100" in row["error_text"] and "15,000" in row["error_text"]
+    assert notifications == []
+
+
+def test_flag_on_derivative_residual_floors_to_lots(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    import services.account_fanout_service as svc_mod
+
+    _make_child(accounts_db, per_trade=30000.0, strategy="open15_vol_breakout")
+    # premium 150 x lot 75 = Rs11,250/lot; full cap affords 2 lots (Rs22,500)
+    # but cash is Rs15,000 -> residual affords exactly 1 lot
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: 150.0)
+    _with_cash(monkeypatch, 15000.0)
+    _with_residual(monkeypatch, True)
+
+    svc.maybe_fan_out(OPT_ORDER, "open15_vol_breakout", "zerodha", "P1")
+
+    assert stub.placed_orders[0][0]["quantity"] == 75
+    assert orders_db.list_orders()[0]["status"] == "placed"
+
+
+def test_flag_on_but_residual_cannot_afford_one_unit_still_skips(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, notifications = fanout_env
+    import services.account_fanout_service as svc_mod
+
+    _make_child(accounts_db, per_trade=15000.0, strategy="open15_vol_breakout")
+    # Rs8,000 cash against an Rs11,250 lot -> the residual buys nothing either
+    monkeypatch.setattr(svc_mod, "resolve_sizing_price", lambda od: 150.0)
+    _with_cash(monkeypatch, 8000.0)
+    _with_residual(monkeypatch, True)
+
+    svc.maybe_fan_out(OPT_ORDER, "open15_vol_breakout", "zerodha", "P1")
+
+    assert stub.placed_orders == []
+    row = orders_db.list_orders()[0]
+    assert row["status"] == "skipped_insufficient_funds"
+    # the message says WHICH constraint bound (the #643 rule)
+    assert "residual" in (row["error_text"] or "")
+    assert "1 lot" in row["error_text"]
+    assert any("only" in n for n in notifications)
+
+
+def test_flag_off_keeps_the_637_skip_exactly(fanout_env, monkeypatch):
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    _make_child(accounts_db, per_trade=15000.0, strategy="open15_vol_breakout")
+    _with_cash(monkeypatch, 9000.0)
+    _with_residual(monkeypatch, False)
+
+    svc.maybe_fan_out(O15_EQ_ORDER, "open15_vol_breakout", "zerodha", "P1")
+
+    assert stub.placed_orders == []
+    row = orders_db.list_orders()[0]
+    assert row["status"] == "skipped_insufficient_funds"
+    assert "residual" not in (row["error_text"] or "")
+
+
+def test_other_strategies_never_take_the_residual_path(fanout_env, monkeypatch):
+    """The flag is an open15 concept; a sector_follow mirror must not read it."""
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    import services.account_fanout_service as svc_mod
+
+    _make_child(accounts_db, per_trade=15000.0)
+    _with_cash(monkeypatch, 9000.0)
+
+    def _boom():
+        raise AssertionError("open15_residual_params must not be consulted")
+
+    monkeypatch.setattr(svc_mod, "open15_residual_params", _boom)
+    svc.maybe_fan_out(EQ_ORDER, "sector_follow_cap5_vol", "zerodha", "P1")
+
+    assert stub.placed_orders == []
+    assert orders_db.list_orders()[0]["status"] == "skipped_insufficient_funds"
+
+
+def test_unreadable_cash_never_reaches_the_residual_path(fanout_env, monkeypatch):
+    """None cash fails open to the FULL size — a residual of "unknown" would
+    silently halve positions, the exact drift #643's parent ledger forbids."""
+    svc, accounts_db, orders_db, stub, _n = fanout_env
+    _make_child(accounts_db, per_trade=15000.0, strategy="open15_vol_breakout")
+    _with_cash(monkeypatch, None)
+    _with_residual(monkeypatch, True)
+
+    svc.maybe_fan_out(O15_EQ_ORDER, "open15_vol_breakout", "zerodha", "P1")
+
+    assert stub.placed_orders[0][0]["quantity"] == 30, "full size, not a guess"
+    assert "residual" not in (orders_db.list_orders()[0]["error_text"] or "")
+
+
+def test_residual_params_resolve_through_the_parents_own_definition(monkeypatch):
+    """Stored config wins, None falls to the env seed, failure fails safe.
+
+    The fan-out resolves through ``resolve_residual_params`` — the same helper
+    ``resolve_day_config`` builds the parent's day config from — so the two
+    sides cannot drift.
+    """
+    import database.open15_breakout_db as o15_db
+    from services.account_fanout_service import open15_residual_params
+
+    # stored row wins (an explicit false beats a true env seed and vice versa)
+    monkeypatch.setenv("OPEN15_RESIDUAL_SIZING", "false")
+    monkeypatch.setattr(
+        o15_db,
+        "get_config",
+        lambda: {"residual_sizing_enabled": True, "residual_reserve_pct": 5.0},
+    )
+    assert open15_residual_params() == (True, 5.0)
+
+    # no row -> env seeds (reserve clamped by the parent's own clamp)
+    monkeypatch.setenv("OPEN15_RESIDUAL_SIZING", "true")
+    monkeypatch.setenv("OPEN15_RESIDUAL_RESERVE_PCT", "99")
+    monkeypatch.setattr(o15_db, "get_config", lambda: None)
+    assert open15_residual_params() == (True, 25.0)
+
+    # a broken read must not start resizing child orders
+    def _raise():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(o15_db, "get_config", _raise)
+    assert open15_residual_params() == (False, 0.0)
