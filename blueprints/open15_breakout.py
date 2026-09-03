@@ -86,9 +86,14 @@ def config():
         _liq_reentry_days_default,
         _liq_reentry_pctile_default,
         _min_oi_lots_default,
+        _profit_lock_enabled_default,
+        _profit_target_default,
         _residual_min_lots_default,
         _residual_reserve_pct_default,
         _residual_sizing_enabled_default,
+        _stop_loss_enabled_default,
+        _stop_loss_inr_default,
+        _trail_giveback_default,
         get_open15_service,
     )
     from services.open15_breakout_service import (
@@ -249,6 +254,26 @@ def config():
 
         live_poll = body.get("live_poll_interval_s")
         live_poll = None if live_poll in (None, "") else _clamp_live_poll(live_poll)
+        # risk controls (issue #696) — clamp-don't-reject; empty = env default.
+        # The checkbox always posts a bool; a 0 amount is stored as 0 and the
+        # service resolves "enabled with threshold 0" to OFF, so no consumer
+        # ever meets an armed rule with nothing to compare against.
+        from services.open15_breakout_service import clamp_risk_rupees as _clamp_rupees
+
+        profit_lock = _opt_bool("profit_lock_enabled")
+        profit_target = body.get("profit_target_inr")
+        profit_target = (
+            None if profit_target in (None, "") else _clamp_rupees(profit_target, 5000.0)
+        )
+        trail_giveback = body.get("trail_giveback_inr")
+        trail_giveback = (
+            None if trail_giveback in (None, "") else _clamp_rupees(trail_giveback, 1500.0)
+        )
+        stop_loss = _opt_bool("stop_loss_enabled")
+        stop_loss_inr = body.get("stop_loss_inr")
+        stop_loss_inr = (
+            None if stop_loss_inr in (None, "") else _clamp_rupees(stop_loss_inr, 1200.0)
+        )
         if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
             # an inverted band would readmit a name the same day it was excluded,
             # which is the flapping the hysteresis exists to prevent
@@ -302,6 +327,11 @@ def config():
             residual_reserve_pct=residual_reserve,
             residual_min_lots=residual_min_lots,
             live_poll_interval_s=live_poll,
+            profit_lock_enabled=profit_lock,
+            profit_target_inr=profit_target,
+            trail_giveback_inr=trail_giveback,
+            stop_loss_enabled=stop_loss,
+            stop_loss_inr=stop_loss_inr,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -358,6 +388,12 @@ def config():
                 "residual_min_lots": _residual_min_lots_default(),
                 # issue #692 — live P&L poll interval seed (service owns it)
                 "live_poll_interval_s": _live_poll_default(),
+                # issue #696 — risk-control seeds (service owns the defaults)
+                "profit_lock_enabled": _profit_lock_enabled_default(),
+                "profit_target_inr": _profit_target_default(),
+                "trail_giveback_inr": _trail_giveback_default(),
+                "stop_loss_enabled": _stop_loss_enabled_default(),
+                "stop_loss_inr": _stop_loss_inr_default(),
             },
             "override": get_config(),
             "effective_today": effective,
@@ -595,6 +631,16 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
     from the red rejection colours: an exclusion is a decision, not a failure */
  .ev-universe_excluded{color:#f9e2af}
  .ev-atm_lot_cost{color:#7dc4e4}
+ /* risk controls (issue #696): the lock is a decision (amber, like the other
+    held-not-traded events); the trail exit is a day-ending action (mauve,
+    like summary); a stop loss rides the normal exit event + reason. */
+ .ev-profit_target_locked{color:#f9e2af;font-weight:bold}
+ .ev-profit_trail_exit{color:#cba6f7;font-weight:bold}
+ .risk-open{background:#12291c;color:#a6e3a1;border:1px solid #2e5140}
+ .risk-locked{background:#332a17;color:#f9e2af;border:1px solid #5c4d2a}
+ .risk-done{background:#1b2b3a;color:#89b4fa;border:1px solid #2c4a6e}
+ .riskchips{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+ .riskchips .chip{min-width:88px}
  .b-liq{background:#463a20;color:#f9e2af}
  .b-nocontract{background:#3a2028;color:#f38ba8}
  .leg{color:#8aa0b4;font-size:11px;display:block;margin-top:2px}
@@ -719,6 +765,26 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    Observational: nothing gates on it. Clamped 50&ndash;100 server-side.</span>
  </div>
  <div id="plancard" class="atmcard" style="display:none;margin-top:8px"></div>
+ <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
+  <label><input id="c_plock" type="checkbox"> day profit lock</label>
+  <label class="muted" style="margin-left:14px">target (whole day)
+   &#8377;<input id="c_ptarget" type="number" min="0" max="1000000" step="500" style="width:76px"></label>
+  <label class="muted" style="margin-left:10px">trail give-back
+   &#8377;<input id="c_ptrail" type="number" min="0" max="100000" step="250" style="width:66px"></label>
+  <label style="margin-left:14px"><input id="c_sl" type="checkbox"> per-trade stop loss</label>
+  <label class="muted" style="margin-left:10px">max loss/trade
+   &#8377;<input id="c_slinr" type="number" min="0" max="100000" step="100" style="width:66px"></label>
+  <span class="leg">issue #696. <b>Profit lock is DAY-wise:</b> once the day's cumulative NET P&amp;L
+   (realized real fills + live MTM of open real rows &mdash; paper/sim/shadow never count) reaches the
+   target, no new entries for the rest of the day (journaled
+   <code>entry_skipped &middot; profit_target_locked</code>, slot not consumed; exits never gated).
+   The peak day P&amp;L is then tracked; retrace by the give-back from the peak and ALL open rows are
+   flattened (give-back 0 = book at target immediately). <b>Stop loss is TRADE-wise:</b> an open
+   trade whose OWN MTM falls to &minus;&#8377;amount is squared off alone; the day keeps trading.
+   Both rules run on a background monitor at the live-poll cadence &mdash; the same batched quotes
+   the P&amp;L chart reads, page open or not. Risk exits are normal parent orders, so child-account
+   mirrors flatten automatically. Thresholds apply at the next 09:10 arm; 0 = rule off.</span>
+ </div>
  <div style="margin-top:6px">
   <label><input id="c_residual" type="checkbox"> spend the residual cash</label>
   <label class="muted" style="margin-left:14px">keep back
@@ -748,6 +814,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="rejbox"></div>
   <div id="lostbox"></div>
 <div class="chips" id="chips"></div>
+  <div id="riskcard" class="atmcard" style="display:none"></div>
   <div id="pnlcard" class="atmcard" style="display:none"></div>
   <div id="capcard" class="atmcard" style="display:none"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
@@ -851,6 +918,12 @@ async function loadCfg(){
   // live P&L poll interval (issue #692) — `??` so a stored value beats the env
   window.__livePollS=o.live_poll_interval_s??d.live_poll_interval_s??5;
   document.getElementById('c_livepoll').value=window.__livePollS;
+  // risk controls (issue #696) — `??` so a stored false/0 beats the env default
+  document.getElementById('c_plock').checked=!!(o.profit_lock_enabled??d.profit_lock_enabled);
+  document.getElementById('c_ptarget').value=o.profit_target_inr??d.profit_target_inr??5000;
+  document.getElementById('c_ptrail').value=o.trail_giveback_inr??d.trail_giveback_inr??1500;
+  document.getElementById('c_sl').checked=!!(o.stop_loss_enabled??d.stop_loss_enabled);
+  document.getElementById('c_slinr').value=o.stop_loss_inr??d.stop_loss_inr??1200;
   if(window.armLivePoll)armLivePoll();  // later script block; guarded for ordering
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
@@ -927,7 +1000,12 @@ async function saveCfg(){
     residual_sizing_enabled:document.getElementById('c_residual').checked,
     residual_reserve_pct:+document.getElementById('c_residualres').value,
     residual_min_lots:+document.getElementById('c_residualmin').value,
-    live_poll_interval_s:+document.getElementById('c_livepoll').value};
+    live_poll_interval_s:+document.getElementById('c_livepoll').value,
+    profit_lock_enabled:document.getElementById('c_plock').checked,
+    profit_target_inr:+document.getElementById('c_ptarget').value,
+    trail_giveback_inr:+document.getElementById('c_ptrail').value,
+    stop_loss_enabled:document.getElementById('c_sl').checked,
+    stop_loss_inr:+document.getElementById('c_slinr').value};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -948,6 +1026,9 @@ loadCfg();
 </script>
 <script>
 let curDate=null, curEvents=[], curJournal=[], curFilter='all', digests=[];
+// true once the operator CLICKS a history day (issue #696): the today
+// auto-select must never yank them off a past day they chose to read
+let userPicked=false;
 // symbols whose detail row is open, so the 5s live refresh does not collapse
 // them under the operator (issue #559). Cleared when a different day is picked.
 let expanded=new Set();
@@ -1028,7 +1109,7 @@ async function loadDays(){
         ' filled'+(d.paper?(' &middot; '+d.paper+' paper'):'')+
         (d.sim?(' &middot; '+d.sim+' sim'):'')+
         (d.shadow?(' &middot; '+d.shadow+' shadow'):'')))+'</div>';
-    el.onclick=()=>selectDay(d.date);
+    el.onclick=()=>{userPicked=true;selectDay(d.date);};
     box.appendChild(el);
   }
   if(!curDate&&digests.length)selectDay(digests[0].date);
@@ -1938,14 +2019,53 @@ async function pollLivePnl(){
   // outside the hold window the endpoint answers idle/closed without touching
   // the broker, so an idle page costs one localhost fetch per interval
   const today=digests.length&&digests[0].source==='live'?digests[0].date:null;
-  if(!curDate||curDate!==today){livePnl=null;return;}
+  if(!curDate||curDate!==today){livePnl=null;renderRiskCard(null);return;}
   try{
     const r=await fetch('/open15_vol_breakout/api/live_pnl'); const j=await r.json();
     const had=!!livePnl; livePnl=(j.status==='live')?j:null;
     if(j.poll_interval_s&&j.poll_interval_s!==+window.__livePollS){
       window.__livePollS=j.poll_interval_s;armLivePoll();}
+    renderRiskCard(j);
     if(livePnl||had)renderPnlCurve();
   }catch(e){livePnl=null;}
+}
+// ---- Day Risk card (issue #696): live lock/trail/stop state ---------------
+function renderRiskCard(j){
+  const box=document.getElementById('riskcard'); if(!box)return;
+  const risk=j&&j.risk;
+  // before the arm the payload carries constructor defaults, not the day's —
+  // only an armed (or finished) day has a truthful risk state to show
+  if(!risk||(!risk.profit_lock_enabled&&!risk.stop_loss_enabled)||
+     (risk.day_status!=='armed'&&risk.day_status!=='done')){
+    box.style.display='none';box.innerHTML='';return;}
+  const mtm=(j.status==='live'&&j.portfolio_mtm!=null)?j.portfolio_mtm:0;
+  const day=(risk.realized_net||0)+mtm;
+  let state='ENTRIES OPEN',cls='risk-open';
+  if(risk.trail_done){state='DAY DONE \\u2014 profit booked';cls='risk-done';}
+  else if(risk.locked){state='PROFIT LOCKED \\u2014 trailing';cls='risk-locked';}
+  else if(!risk.profit_lock_enabled){state='STOPS ARMED';}
+  const rup=v=>(v<0?'\\u2212\\u20B9':'+\\u20B9')+Math.abs(Math.round(v)).toLocaleString('en-IN');
+  const rupAbs=v=>'\\u20B9'+Math.abs(Math.round(v)).toLocaleString('en-IN');
+  const chip=(k,v,vc)=>'<div class="chip"><span class="k">'+k+'</span>'+
+    '<span class="v'+(vc?(' '+vc):'')+'">'+v+'</span></div>';
+  box.style.display='';
+  box.innerHTML='<span class="atitle">DAY RISK</span><span class="asub">'+
+    (risk.profit_lock_enabled
+      ?('day target '+rupAbs(risk.profit_target_inr)+' \\u00B7 give-back '+
+        rupAbs(risk.trail_giveback_inr))
+      :'profit lock off')+
+    ' \\u00B7 '+(risk.stop_loss_enabled?('trade SL '+rupAbs(risk.stop_loss_inr)):'stop loss off')+
+    ' \\u00B7 monitor '+(risk.monitor_alive?'running':'not running')+
+    ' \\u00B7 open MTM is estimated gross; exit charges land at close</span>'+
+    '<div class="riskchips">'+
+    chip('state','<span class="badge '+cls+'">'+state+'</span>')+
+    chip('day P&amp;L (net, real)',rup(day),day>=0?'pos':'neg')+
+    (risk.profit_lock_enabled?chip('target',rupAbs(risk.profit_target_inr)):'')+
+    chip('peak since lock',risk.peak!=null?rupAbs(risk.peak):'\\u2014')+
+    chip('trail floor',risk.floor!=null?rupAbs(risk.floor):'\\u2014')+
+    (risk.locked_at?chip('locked at',risk.locked_at):'')+
+    (risk.trail_at?chip('booked at',risk.trail_at):'')+
+    '</div>';
 }
 function renderPnlCurve(){
   const box=document.getElementById('pnlcard'); if(!box)return;
@@ -2074,6 +2194,16 @@ loadDays();
 setInterval(()=>{
   const today=digests.length&&digests[0].source==='live'?digests[0].date:null;
   if(curDate&&curDate===today){loadDays();selectDay(curDate);}
+  else if(!today){
+    // issue #696: before the 09:10 arm there is no live digest, and this guard
+    // used to never re-check — today's log only appeared on a manual refresh
+    // at ~09:15. Re-poll the (no-quotes) day list until today shows up, then
+    // self-select it unless the operator deliberately opened a past day.
+    loadDays().then(()=>{
+      const t=digests.length&&digests[0].source==='live'?digests[0].date:null;
+      if(t&&!userPicked)selectDay(t);
+    });
+  }
 },5000);
 </script></body></html>"""
 
@@ -2243,10 +2373,20 @@ def pnl_curve():
 def live_pnl():
     """Live MTM of today's open real trades (issue #692).
 
-    ONE batched quote call behind an in-process cache sized to the configured
-    poll interval, so any number of open tabs produce at most one broker call
-    per interval. Strictly read-only — never drives an exit.
+    Since #696 the background risk monitor owns the quote fetching (one loop
+    feeds both the chart and the risk rules); this endpoint reads the shared
+    cache and, at worst, refreshes it itself when the monitor is not running.
+    Strictly read-only — never drives an exit. The ``risk`` block is the Day
+    Risk card's payload (lock/trail/stop state, issue #696).
     """
+    from services.open15_breakout_service import get_open15_service
     from services.open15_pnl_curve import live_pnl as _live_pnl
 
-    return jsonify(_live_pnl())
+    payload = dict(_live_pnl())
+    svc = get_open15_service()
+    if svc is not None:
+        try:
+            payload["risk"] = svc.risk_status()
+        except Exception:
+            logger.exception("open15: risk_status failed — live_pnl served without it")
+    return jsonify(payload)

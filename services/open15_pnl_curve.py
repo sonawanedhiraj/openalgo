@@ -22,8 +22,11 @@ Rules carried from the journal's own conventions:
 - **Net derives only via ``net_pnl_of_row``** (#552) — this module never
   invents a second P&L convention; the curve itself is GROSS and says so.
 - **Read-only.** Nothing here places, modifies or retries an order, and the
-  live poll never runs on the tick thread — both entry points are Flask
-  request handlers (#626 rule).
+  live poll never runs on the tick thread (#626 rule). Entry points are Flask
+  request handlers plus, since #696, the strategy's background risk-monitor
+  thread — which is what keeps this cache fresh with no page open. Acting on
+  the numbers (stops, trail) stays in ``open15_breakout_service``; this
+  module only ever measures.
 - **Degrades loudly, never raises to the page** (#645 shape): a trade whose
   bars cannot be fetched is returned as ``unavailable`` with a reason; the
   endpoint still answers 200 with everything it could compute.
@@ -206,6 +209,17 @@ def clear_caches() -> None:
     with _CURVE_LOCK:
         _CURVE_CACHE.clear()
         _CURVE_TTL_CACHE.clear()
+    with _LIVE_LOCK:
+        _LIVE_CACHE.clear()
+
+
+def invalidate_live_cache() -> None:
+    """Drop the live-P&L cache so the next poll re-fetches (issue #696).
+
+    Called by the risk monitor right after it exits a position — the cached
+    payload still shows that trade as open, and both the chart and the next
+    risk evaluation must not act on it.
+    """
     with _LIVE_LOCK:
         _LIVE_CACHE.clear()
 
