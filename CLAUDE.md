@@ -1614,6 +1614,52 @@ from the day's last `feed_health` event; absence means "nothing observed",
 never "ok"). Finalize is race-safe across the tick and scheduler paths
 (`Open15Core.ensure_finalized`, shared lock). No env flag (#651 rule).
 
+**Risk controls: DAY-wise profit lock + trail, TRADE-wise stop loss (issue
+#696, both default OFF, UI-configurable on `/logs`).** Once the day's
+cumulative NET P&L (realized real fills + live MTM of open REAL rows — the
+#552/#548 conventions; paper/sim/shadow never count) reaches
+`profit_target_inr`, new entries stop (`entry_skipped ·
+profit_target_locked`, sim-priced like a cap skip so the lock's opportunity
+cost is measured, no `max_trades` slot consumed; exits are never gated) and
+the peak day P&L is trailed — a retrace of `trail_giveback_inr` from the peak
+flattens every open REAL row (`profit_trail_exit`; give-back 0 = book at
+target immediately; paper/sim/shadow rows are deliberately left for the
+scheduled exit so their measurement isn't truncated). Independently, an open
+trade whose OWN MTM reaches −`stop_loss_inr` is squared off alone (`exit ·
+reason=stop_loss`; the day keeps trading). Rules, each load-bearing:
+- **One background loop owns the quotes.** The `open15-risk-monitor` daemon
+  thread (catalogued in `thread_registry`, alive only while armed) calls
+  `live_pnl()` every `live_poll_interval_s` — refreshing the SAME cache the
+  /logs chart reads — and evaluates both rules on that data, page open or
+  not. The browser is a pure reader; `/api/live_pnl` merges `risk_status()`
+  for the Day Risk card. A mid-day poll-interval save applies within one
+  cycle; the risk THRESHOLDS stay arm-frozen (a mid-day target change would
+  make the day's lock/peak state ambiguous).
+- **Stops first, day rule second — and never on the same snapshot.** A fired
+  stop invalidates the realized/MTM split, so the day rule waits for the next
+  cycle's refreshed quotes. Unknown marks (`quotes_ok` false) fire nothing.
+- **Every risk exit goes through `_exit_open_row`** — the block extracted
+  verbatim from `flatten`'s per-row loop, so book verification (#626), the
+  keep-open-on-failure retry, fill reconciliation (#641) and the `exit` event
+  shape are identical for timed, stop-loss and trail exits. A failed trail
+  exit is re-flattened at most once/60s; the scheduled exit-time flatten is
+  the final backstop.
+- **Children come free.** Risk exits are normal parent orders through
+  `order_placer` → `place_order_with_auth`, so the LIVE fan-out mirrors them
+  to every enabled child automatically (#690's no-per-child-knob rule); the
+  post-summary stranded-mirror sweep (#659) backstops a rejected child exit.
+- **No mid-day rehydration is needed**: entries exist only 09:16+, and a
+  restart after 09:15:30 takes the existing `skipped_late_boot` path (this
+  process does not manage the day), so day-scoped in-process risk state
+  satisfies the #624 never-re-decide rule by construction.
+Config: `open15_config.{profit_lock_enabled, profit_target_inr,
+trail_giveback_inr, stop_loss_enabled, stop_loss_inr}` (NULL → env seeds
+`OPEN15_PROFIT_LOCK` / `OPEN15_PROFIT_TARGET_INR` /
+`OPEN15_TRAIL_GIVEBACK_INR` / `OPEN15_STOP_LOSS` / `OPEN15_STOP_LOSS_INR`,
+first-boot only; a 0 threshold resolves the rule OFF). The `armed` event
+records the effective rules; lock/trail/stop each Telegram once (stop deduped
+per symbol/day). Tests: `test/test_open15_risk_controls.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.

@@ -35,9 +35,16 @@ Rules (locked; see SPEC):
     entries stop at the UI-configurable ``no_entry_after`` cutoff (default
     09:29 = the measured SPEC window; issue #451).
   - Exit: hard flatten at the UI-configurable ``exit_time`` (default 09:30;
-    retry backstop +2 min, capped 15:10). No stop/target. A non-default
+    retry backstop +2 min, capped 15:10). A non-default
     window departs from the R58-measured 09:29/09:30 convention — the day's
     ``armed`` decision-log event records the effective window.
+  - Risk controls (issue #696, both OFF by default, UI-configurable): a
+    DAY-wise profit lock (day net P&L >= target -> no new entries, then the
+    locked profit is trailed and a give-back retrace flattens every open
+    row) and a TRADE-wise stop loss (one open row's own MTM <= -amount ->
+    that row alone is squared off). Evaluated by a background monitor thread
+    on the same batched quotes the /logs live-P&L chart reads, at the
+    live-poll cadence, page open or not.
   - Journal (``open15_trades``) records level / trigger second / trigger price /
     entry-minute close — the captured-drift measurement.
 
@@ -471,6 +478,52 @@ def _min_oi_lots_default() -> int:
     against the snapshot-timing skew between our quote read and their list.
     """
     return clamp_min_oi_lots(os.getenv("OPEN15_MIN_OI_LOTS", "500"))
+
+
+def clamp_risk_rupees(raw, default: float) -> float:
+    """0..10,000,000 Rs; 0 disables the rule it parameterises (issue #696).
+    The UI number input is a hint, never a trust boundary."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(10_000_000.0, max(0.0, v))
+
+
+def _profit_lock_enabled_default() -> bool:
+    return os.getenv("OPEN15_PROFIT_LOCK", "false").lower() == "true"
+
+
+def _profit_target_default() -> float:
+    return clamp_risk_rupees(os.getenv("OPEN15_PROFIT_TARGET_INR", "5000"), 5000.0)
+
+
+def _trail_giveback_default() -> float:
+    """0 is legal and means "book at target": the lock flattens immediately
+    instead of trailing (issue #696)."""
+    return clamp_risk_rupees(os.getenv("OPEN15_TRAIL_GIVEBACK_INR", "1500"), 1500.0)
+
+
+def _stop_loss_enabled_default() -> bool:
+    return os.getenv("OPEN15_STOP_LOSS", "false").lower() == "true"
+
+
+def _stop_loss_inr_default() -> float:
+    return clamp_risk_rupees(os.getenv("OPEN15_STOP_LOSS_INR", "1200"), 1200.0)
+
+
+def _fresh_risk_state() -> dict:
+    """Day-scoped risk-control state (issue #696), reset at every arm."""
+    return {
+        "locked": False,
+        "locked_at": None,
+        "peak": None,
+        "floor": None,
+        "trail_done": False,
+        "trail_at": None,
+        "last_trail_retry": 0.0,
+        "sl_alerted": [],
+    }
 
 
 def _impact_gate_enabled_default() -> bool:
@@ -1058,6 +1111,47 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
             if cfg.get("coverage_target_pct") is None
             else clamp_coverage_target(cfg.get("coverage_target_pct"))
         ),
+        # ---- risk controls (issue #696) ------------------------------------
+        # Resolved to ONE effective answer here: a lock with target 0 or a stop
+        # with amount 0 is OFF, so no consumer ever has to re-derive "enabled
+        # but meaningless". Same `is None` treatment as every other flag — a
+        # stored false beats a true env default.
+        **_resolve_risk_config(cfg),
+    }
+
+
+def _resolve_risk_config(cfg: dict) -> dict:
+    """Effective risk-control config (issue #696). Pure; called by
+    ``resolve_day_config`` only, split out so the enabled/threshold coupling
+    is testable on its own."""
+    lock_cfg = cfg.get("profit_lock_enabled")
+    lock_on = _profit_lock_enabled_default() if lock_cfg is None else bool(lock_cfg)
+    target_cfg = cfg.get("profit_target_inr")
+    target = (
+        _profit_target_default()
+        if target_cfg is None
+        else clamp_risk_rupees(target_cfg, _profit_target_default())
+    )
+    giveback_cfg = cfg.get("trail_giveback_inr")
+    giveback = (
+        _trail_giveback_default()
+        if giveback_cfg is None
+        else clamp_risk_rupees(giveback_cfg, _trail_giveback_default())
+    )
+    sl_cfg = cfg.get("stop_loss_enabled")
+    sl_on = _stop_loss_enabled_default() if sl_cfg is None else bool(sl_cfg)
+    sl_inr_cfg = cfg.get("stop_loss_inr")
+    sl_inr = (
+        _stop_loss_inr_default()
+        if sl_inr_cfg is None
+        else clamp_risk_rupees(sl_inr_cfg, _stop_loss_inr_default())
+    )
+    return {
+        "profit_lock_enabled": lock_on and target > 0,
+        "profit_target_inr": target,
+        "trail_giveback_inr": giveback,
+        "stop_loss_enabled": sl_on and sl_inr > 0,
+        "stop_loss_inr": sl_inr,
     }
 
 
@@ -1843,6 +1937,16 @@ class Open15BreakoutService:
         self._feed_state: str | None = None
         self._feed_alert_date: str | None = None
         self._selection_source: str | None = None
+        # ---- risk controls (issue #696) ------------------------------------
+        # Day-scoped state for the profit lock / trail / per-trade stop. Purely
+        # in-process on purpose: entries only exist 09:16+, and a restart after
+        # 09:15:30 takes the skipped_late_boot path (this process does not
+        # manage the day), so there is never a mid-day state to rebuild — the
+        # #624 "never re-decide" rule is satisfied by not re-arming at all.
+        # Written by the risk-monitor thread; `_lock` guards the status reader.
+        self._risk_thread: threading.Thread | None = None
+        self._risk: dict[str, Any] = _fresh_risk_state()
+        self._risk_sl_alert_date: str | None = None
 
     def _log_event(self, event: str, **detail: Any) -> None:
         rec = {
@@ -2216,6 +2320,7 @@ class Open15BreakoutService:
             self._feed_last_tick = None
             self._feed_state = None
             self._selection_source = None
+            self._risk = _fresh_risk_state()
         self._log_event(
             "armed",
             universe=len(self.universe),
@@ -2275,6 +2380,13 @@ class Open15BreakoutService:
             # day's selection is replayable against the rule it actually ran
             option_min_oi_lots=self.day_config["option_min_oi_lots"],
             oi_filter_active=oi_filter_fn is not None,
+            # risk controls (issue #696) — the effective rules, so a past day's
+            # lock/trail/stop events are replayable against what actually ran
+            profit_lock_enabled=self.day_config["profit_lock_enabled"],
+            profit_target_inr=self.day_config["profit_target_inr"],
+            trail_giveback_inr=self.day_config["trail_giveback_inr"],
+            stop_loss_enabled=self.day_config["stop_loss_enabled"],
+            stop_loss_inr=self.day_config["stop_loss_inr"],
         )
         # ATM lot-cost coverage ladder (issue #591) — what capital/slot covers
         # how much of the universe, priced from the latest EOD option-liquidity
@@ -2297,6 +2409,7 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: atm_lot_cost ladder failed — skipped (observational)")
         self._ensure_zmq_thread()
+        self._ensure_risk_thread()
         # catch-up pricing for rows the 09:35 broker-lag left unpriced (the #435
         # shadow premiums and the #555 fill prices). Unconditional since #651 —
         # fill reconciliation is how a published P&L becomes the broker's own
@@ -2820,6 +2933,160 @@ class Open15BreakoutService:
             if not res.get("pending"):
                 return
 
+    def _exit_open_row(self, symbol: str, pos: dict, reason: str) -> bool:
+        """Market-out ONE open real row — the single exit path (issue #696).
+
+        Extracted verbatim from ``flatten``'s per-row loop so the per-trade
+        stop loss and the profit-trail flatten exit through the identical code
+        (book verification, option/stock pricing, journal update, event shape,
+        keep-open-on-failure retry semantics). Returns True when an exit order
+        was SENT (ok or not) — the caller decides whether to reconcile fills.
+
+        A row whose entry never filled (book affirms flat, issue #626) is
+        papered instead and returns False: nothing was sent.
+        """
+        from database.open15_breakout_db import update_trade
+
+        is_option = pos.get("instrument") == "option"
+        # An ACK is not a fill (issue #626). Zerodha accepts the order, hands
+        # back an order id, and RMS can still refuse it downstream — which is
+        # exactly what happened to TIINDIA on 2026-08-18. The row said
+        # `status='open'` and this path sent a SELL for 800 calls we did not
+        # own: a NAKED SHORT, which the broker priced at Rs4.45L of SPAN and
+        # refused only because the funds were not there either.
+        #
+        # So the #548 rule — only an AFFIRMATIVE non-zero position book
+        # justifies a square-off — applies here too, not just to rows already
+        # labelled paper. Zero means the entry never filled: paper it and send
+        # nothing. An UNREADABLE book (None) still squares off, because the
+        # asymmetry runs the other way once an entry is believed filled — an
+        # unsent exit strands a real overnight position, while an unnecessary
+        # one is caught by the broker's own 15:15 MIS auto-square-off.
+        if self._entry_never_filled(symbol, pos):
+            logger.error(
+                "open15: %s entry never filled (book flat) — papering instead of "
+                "sending an unbacked %s",
+                symbol,
+                "SELL" if is_option or pos["side"] == "L" else "BUY",
+            )
+            pos["fill"] = "paper"
+            self._flatten_paper(symbol, pos, "entry_rejected")
+            # Gap A (issue #659): `_entry_never_filled` just AFFIRMED our
+            # book is flat (corroborated), but the child mirror fired at
+            # the ACK and may hold a real position with no exit coming.
+            self._flatten_child_mirrors_for(
+                symbol, pos, "parent entry papered at exit (book flat)", corroborated=True
+            )
+            return False
+        if is_option:
+            # option exit is always a SELL of the bought CE/PE (issue #437)
+            action = "SELL"
+            resp = self.order_placer(
+                _mode(),
+                {
+                    "symbol": pos["opt_symbol"],
+                    "action": "SELL",
+                    "quantity": pos["quantity"],
+                    "exchange": "NFO",
+                },
+            )
+        else:
+            action = "SELL" if pos["side"] == "L" else "BUY"
+            resp = self.order_placer(
+                _mode(), {"symbol": symbol, "action": action, "quantity": pos["quantity"]}
+            )
+        ok = resp.get("status") == "success"
+        last_px = (self.core.last_price.get(symbol) if self.core else None) or pos["trigger_price"]
+        pnl = None
+        charges = None
+        fields = {
+            "exit_ts": dt.datetime.now(IST).isoformat(),
+            "exit_price": last_px,
+            "exit_order_id": str(resp.get("orderid") or ""),
+            "exit_status": "success" if ok else "error",
+            "status": "closed" if ok else "error",
+            "fill": "real",
+            "reason": reason,
+            "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
+        }
+        if is_option:
+            # real trade P&L is on the option premium, not the stock path
+            from services.open15_option_shadow import option_round_trip_charges
+
+            entry_prem = pos.get("opt_entry_premium")
+            liq = self._option_liquidity(pos["opt_symbol"])
+            exit_prem = liq["ltp"]
+            lot = pos.get("opt_lot_size") or 1
+            lots = pos["quantity"] // lot if lot else 1
+            # recorded even when the premium is missing — an unpriced exit is
+            # exactly the case the liquidity data is meant to explain
+            fields.update(
+                opt_exit_volume=liq["volume"],
+                opt_exit_oi=liq["oi"],
+                opt_exit_bid=liq["bid"],
+                opt_exit_ask=liq["ask"],
+            )
+            if entry_prem and exit_prem:
+                pnl = (exit_prem - entry_prem) * pos["quantity"]
+                charges = option_round_trip_charges(
+                    entry_prem * pos["quantity"], exit_prem * pos["quantity"]
+                )
+                per_lot_charges = round(charges / lots, 2) if charges and lots else None
+                fields.update(
+                    opt_exit_premium=exit_prem,
+                    opt_charges_inr=per_lot_charges,
+                    opt_pnl=round((exit_prem - entry_prem) * lot - (per_lot_charges or 0.0), 2),
+                )
+            else:
+                logger.warning(
+                    "open15: option exit premium unavailable for %s — pnl unpriced",
+                    pos.get("opt_symbol"),
+                )
+        elif last_px:
+            d = (
+                (last_px - pos["trigger_price"])
+                if pos["side"] == "L"
+                else (pos["trigger_price"] - last_px)
+            )
+            pnl = d * pos["quantity"]
+            buy_px = pos["trigger_price"] if pos["side"] == "L" else last_px
+            sell_px = last_px if pos["side"] == "L" else pos["trigger_price"]
+            charges = mis_round_trip_charges(buy_px * pos["quantity"], sell_px * pos["quantity"])
+        fields["pnl"] = pnl
+        fields["charges_inr"] = charges
+        if pos.get("row_id"):
+            update_trade(pos["row_id"], **fields)
+        with self._lock:
+            pos["status"] = "closed" if ok else "open"  # keep open on failure for retry
+        self._log_event(
+            "exit",
+            symbol=symbol,
+            action=action,
+            instrument="option" if is_option else "stock",
+            qty=pos["quantity"],
+            exit_price=last_px if not is_option else fields.get("opt_exit_premium"),
+            # BOTH legs (issue #555). In option mode `exit_price` above is
+            # the premium the P&L is computed on, so without these the page
+            # can show either the signal or the money, never both.
+            stock_entry_price=round(pos["trigger_price"], 2),
+            stock_exit_price=last_px,
+            opt_entry_premium=pos.get("opt_entry_premium"),
+            bid=fields.get("opt_exit_bid"),
+            ask=fields.get("opt_exit_ask"),
+            volume=fields.get("opt_exit_volume"),
+            oi=fields.get("opt_exit_oi"),
+            # gross/charges/pnl(NET) — the SAME shape `exit_paper` emits, so
+            # the page never has to know which kind of exit it is reading
+            # (issue #552: this used to be gross-rounded-to-0dp while its
+            # sibling was net, which is how the chip and the rows diverged).
+            gross=round(pnl, 2) if pnl is not None else None,
+            charges=charges,
+            pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
+            order_status=resp.get("status"),
+            reason=reason,
+        )
+        return True
+
     def flatten(self, reason: str = "eod_0930") -> None:
         """Configured exit time (default 09:30 IST) — market-out every open
         position (also the +2 min retry backstop).
@@ -2829,8 +3096,6 @@ class Open15BreakoutService:
         with NO order placed. They are handled first so a position promoted back
         to ``open`` by the verification is squared off in this same pass.
         """
-        from database.open15_breakout_db import update_trade
-
         with self._lock:
             paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
             # SIM (#555) and SHADOW (#581) are both "no order was ever sent"
@@ -2852,149 +3117,8 @@ class Open15BreakoutService:
             open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
         exit_orders_sent = 0
         for symbol, pos in open_pos.items():
-            is_option = pos.get("instrument") == "option"
-            # An ACK is not a fill (issue #626). Zerodha accepts the order, hands
-            # back an order id, and RMS can still refuse it downstream — which is
-            # exactly what happened to TIINDIA on 2026-08-18. The row said
-            # `status='open'` and this loop sent a SELL for 800 calls we did not
-            # own: a NAKED SHORT, which the broker priced at Rs4.45L of SPAN and
-            # refused only because the funds were not there either.
-            #
-            # So the #548 rule — only an AFFIRMATIVE non-zero position book
-            # justifies a square-off — applies here too, not just to rows already
-            # labelled paper. Zero means the entry never filled: paper it and send
-            # nothing. An UNREADABLE book (None) still squares off, because the
-            # asymmetry runs the other way once an entry is believed filled — an
-            # unsent exit strands a real overnight position, while an unnecessary
-            # one is caught by the broker's own 15:15 MIS auto-square-off.
-            if self._entry_never_filled(symbol, pos):
-                logger.error(
-                    "open15: %s entry never filled (book flat) — papering instead of "
-                    "sending an unbacked %s",
-                    symbol,
-                    "SELL" if is_option or pos["side"] == "L" else "BUY",
-                )
-                pos["fill"] = "paper"
-                self._flatten_paper(symbol, pos, "entry_rejected")
-                # Gap A (issue #659): `_entry_never_filled` just AFFIRMED our
-                # book is flat (corroborated), but the child mirror fired at
-                # the ACK and may hold a real position with no exit coming.
-                self._flatten_child_mirrors_for(
-                    symbol, pos, "parent entry papered at exit (book flat)", corroborated=True
-                )
-                continue
-            if is_option:
-                # option exit is always a SELL of the bought CE/PE (issue #437)
-                action = "SELL"
-                resp = self.order_placer(
-                    _mode(),
-                    {
-                        "symbol": pos["opt_symbol"],
-                        "action": "SELL",
-                        "quantity": pos["quantity"],
-                        "exchange": "NFO",
-                    },
-                )
-            else:
-                action = "SELL" if pos["side"] == "L" else "BUY"
-                resp = self.order_placer(
-                    _mode(), {"symbol": symbol, "action": action, "quantity": pos["quantity"]}
-                )
-            ok = resp.get("status") == "success"
-            exit_orders_sent += 1
-            last_px = (self.core.last_price.get(symbol) if self.core else None) or pos[
-                "trigger_price"
-            ]
-            pnl = None
-            charges = None
-            fields = {
-                "exit_ts": dt.datetime.now(IST).isoformat(),
-                "exit_price": last_px,
-                "exit_order_id": str(resp.get("orderid") or ""),
-                "exit_status": "success" if ok else "error",
-                "status": "closed" if ok else "error",
-                "fill": "real",
-                "reason": reason,
-                "entry_minute_close": self.core.entry_minute_close(symbol) if self.core else None,
-            }
-            if is_option:
-                # real trade P&L is on the option premium, not the stock path
-                from services.open15_option_shadow import option_round_trip_charges
-
-                entry_prem = pos.get("opt_entry_premium")
-                liq = self._option_liquidity(pos["opt_symbol"])
-                exit_prem = liq["ltp"]
-                lot = pos.get("opt_lot_size") or 1
-                lots = pos["quantity"] // lot if lot else 1
-                # recorded even when the premium is missing — an unpriced exit is
-                # exactly the case the liquidity data is meant to explain
-                fields.update(
-                    opt_exit_volume=liq["volume"],
-                    opt_exit_oi=liq["oi"],
-                    opt_exit_bid=liq["bid"],
-                    opt_exit_ask=liq["ask"],
-                )
-                if entry_prem and exit_prem:
-                    pnl = (exit_prem - entry_prem) * pos["quantity"]
-                    charges = option_round_trip_charges(
-                        entry_prem * pos["quantity"], exit_prem * pos["quantity"]
-                    )
-                    per_lot_charges = round(charges / lots, 2) if charges and lots else None
-                    fields.update(
-                        opt_exit_premium=exit_prem,
-                        opt_charges_inr=per_lot_charges,
-                        opt_pnl=round((exit_prem - entry_prem) * lot - (per_lot_charges or 0.0), 2),
-                    )
-                else:
-                    logger.warning(
-                        "open15: option exit premium unavailable for %s — pnl unpriced",
-                        pos.get("opt_symbol"),
-                    )
-            elif last_px:
-                d = (
-                    (last_px - pos["trigger_price"])
-                    if pos["side"] == "L"
-                    else (pos["trigger_price"] - last_px)
-                )
-                pnl = d * pos["quantity"]
-                buy_px = pos["trigger_price"] if pos["side"] == "L" else last_px
-                sell_px = last_px if pos["side"] == "L" else pos["trigger_price"]
-                charges = mis_round_trip_charges(
-                    buy_px * pos["quantity"], sell_px * pos["quantity"]
-                )
-            fields["pnl"] = pnl
-            fields["charges_inr"] = charges
-            if pos.get("row_id"):
-                update_trade(pos["row_id"], **fields)
-            with self._lock:
-                pos["status"] = "closed" if ok else "open"  # keep open on failure for retry
-            self._log_event(
-                "exit",
-                symbol=symbol,
-                action=action,
-                instrument="option" if is_option else "stock",
-                qty=pos["quantity"],
-                exit_price=last_px if not is_option else fields.get("opt_exit_premium"),
-                # BOTH legs (issue #555). In option mode `exit_price` above is
-                # the premium the P&L is computed on, so without these the page
-                # can show either the signal or the money, never both.
-                stock_entry_price=round(pos["trigger_price"], 2),
-                stock_exit_price=last_px,
-                opt_entry_premium=pos.get("opt_entry_premium"),
-                bid=fields.get("opt_exit_bid"),
-                ask=fields.get("opt_exit_ask"),
-                volume=fields.get("opt_exit_volume"),
-                oi=fields.get("opt_exit_oi"),
-                # gross/charges/pnl(NET) — the SAME shape `exit_paper` emits, so
-                # the page never has to know which kind of exit it is reading
-                # (issue #552: this used to be gross-rounded-to-0dp while its
-                # sibling was net, which is how the chip and the rows diverged).
-                gross=round(pnl, 2) if pnl is not None else None,
-                charges=charges,
-                pnl=round(pnl - (charges or 0.0), 2) if pnl is not None else None,
-                order_status=resp.get("status"),
-                reason=reason,
-            )
+            if self._exit_open_row(symbol, pos, reason):
+                exit_orders_sent += 1
         if exit_orders_sent:
             # Publish the FILL-true P&L now, not at the exit+5 summary (issue
             # #641). The quote-derived numbers written above are estimates made
@@ -3051,6 +3175,249 @@ class Open15BreakoutService:
                         needed=self._vol_needed(),
                     )
             self._persist_day_log()
+
+    # ---- risk controls: profit lock / trail / per-trade stop (issue #696) - #
+    def _ensure_risk_thread(self) -> None:
+        """Start the background risk monitor for the armed day.
+
+        One server-side loop owns the quote fetching for the whole feature
+        set: each cycle calls ``live_pnl()`` (which refreshes the shared cache
+        the /logs chart reads) and evaluates the risk rules on that same data —
+        page open or not, the browser is only ever a READER. Cadence is the
+        UI-configurable ``live_poll_interval_s`` (re-resolved every cycle, so a
+        mid-day save applies within one cycle). Before any entry fills,
+        ``live_pnl`` answers ``idle`` without touching the broker, so the loop
+        costs nothing until there is something to watch.
+        """
+        if self._risk_thread and self._risk_thread.is_alive():
+            return
+        self._risk_thread = threading.Thread(
+            target=self._risk_loop, name="open15-risk-monitor", daemon=True
+        )
+        self._risk_thread.start()
+
+    def _risk_loop(self) -> None:
+        import time as _time
+
+        from services.thread_registry import beat
+
+        while True:
+            beat("open15-risk-monitor")
+            if self.day_status != "armed":
+                return
+            interval = 5
+            try:
+                from services.open15_pnl_curve import resolve_live_poll_interval
+
+                interval = resolve_live_poll_interval()
+                self._risk_tick()
+            except Exception:
+                # one broken cycle must not kill the monitor for the day
+                logger.exception("open15: risk-monitor tick failed")
+            _time.sleep(max(3, interval))
+
+    def _risk_tick(self) -> None:
+        """One monitor cycle: refresh live MTM, then stops first, day rule second.
+
+        Ordering is deliberate: a fired stop changes the realized/MTM split, so
+        the day rule is evaluated on the NEXT cycle's refreshed snapshot rather
+        than on numbers this cycle's own exit just invalidated. Unknown marks
+        (`quotes_ok` false) fire nothing — fail open, the next cycle retries.
+        """
+        from services.open15_pnl_curve import invalidate_live_cache, live_pnl
+
+        payload = live_pnl()  # refreshes the shared cache — the chart reads this too
+        cfg = self.day_config or {}
+        lock_on = bool(cfg.get("profit_lock_enabled"))
+        sl_on = bool(cfg.get("stop_loss_enabled"))
+        if not (lock_on or sl_on):
+            return
+        open_trades: list[dict] = []
+        open_mtm = 0.0
+        if payload.get("status") == "live":
+            if not payload.get("quotes_ok"):
+                return
+            open_trades = payload.get("trades") or []
+            open_mtm = float(payload.get("portfolio_mtm") or 0.0)
+        r = self._risk
+        if r.get("trail_done"):
+            # a failed trail exit keeps its row open (the shared exit path's
+            # retry semantics) — keep re-flattening, gated to once a minute so
+            # a persistently-rejecting broker does not spam the journal. The
+            # scheduled exit-time flatten remains the final backstop.
+            if open_trades:
+                import time as _time
+
+                if _time.monotonic() - (r.get("last_trail_retry") or 0.0) >= 60.0:
+                    r["last_trail_retry"] = _time.monotonic()
+                    self._profit_trail_exits("profit_trail")
+            return
+        if sl_on and open_trades:
+            sl_inr = float(cfg.get("stop_loss_inr") or 0.0)
+            fired = False
+            for t in open_trades:
+                mtm = t.get("mtm")
+                symbol = t.get("symbol")
+                if mtm is None or sl_inr <= 0 or mtm > -sl_inr:
+                    continue
+                with self._lock:
+                    pos = self.positions.get(symbol)
+                if not pos or pos.get("status") != "open":
+                    continue
+                logger.warning(
+                    "open15: per-trade stop loss hit for %s (MTM %.2f <= -%.2f)",
+                    symbol,
+                    mtm,
+                    sl_inr,
+                )
+                if self._exit_open_row(symbol, pos, "stop_loss"):
+                    fired = True
+                    self._alert_stop_loss(symbol, mtm, sl_inr)
+            if fired:
+                invalidate_live_cache()
+                self._reconcile_and_log(attempts=2, delay_s=4.0)
+                return
+        if not lock_on:
+            return
+        day_pnl = self._today_realized_net() + open_mtm
+        target = float(cfg.get("profit_target_inr") or 0.0)
+        giveback = float(cfg.get("trail_giveback_inr") or 0.0)
+        if not r.get("locked"):
+            if target <= 0 or day_pnl < target:
+                return
+            with self._lock:
+                r["locked"] = True
+                r["locked_at"] = self._now_ist().strftime("%H:%M:%S")
+                r["peak"] = day_pnl
+                r["floor"] = day_pnl - giveback
+            self._log_event(
+                "profit_target_locked",
+                day_pnl=round(day_pnl, 2),
+                target=target,
+                trail_giveback=giveback,
+                floor=round(day_pnl - giveback, 2),
+                open_trades=len(open_trades),
+            )
+            try:
+                from services.notification_service import get_notification_service
+
+                get_notification_service().notify(
+                    "open15_breakout",
+                    f"🔒 open15_vol_breakout [{_mode()}]: DAY PROFIT LOCKED — "
+                    f"day P&L ₹{day_pnl:,.0f} ≥ target ₹{target:,.0f}. No new "
+                    f"entries today; trailing the locked profit with a "
+                    f"₹{giveback:,.0f} give-back from the peak.",
+                )
+            except Exception:
+                logger.exception("open15: profit-lock alert failed")
+            if giveback <= 0:
+                # give-back 0 = "book at target": flatten immediately
+                self._profit_trail_flatten(day_pnl)
+            return
+        peak = float(r.get("peak") or day_pnl)
+        if day_pnl > peak:
+            with self._lock:
+                r["peak"] = day_pnl
+                r["floor"] = day_pnl - giveback
+        elif open_trades and r.get("floor") is not None and day_pnl <= float(r["floor"]):
+            self._profit_trail_flatten(day_pnl)
+
+    def _alert_stop_loss(self, symbol: str, mtm: float, sl_inr: float) -> None:
+        """Telegram a fired stop, deduped per (symbol, day) so the 60s trail
+        retry gate can never turn one stop into a message storm."""
+        r = self._risk
+        if symbol in (r.get("sl_alerted") or []):
+            return
+        r.setdefault("sl_alerted", []).append(symbol)
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().notify(
+                "open15_breakout",
+                f"🛑 open15_vol_breakout [{_mode()}]: STOP LOSS — {symbol} "
+                f"squared off at MTM ₹{mtm:,.0f} (limit −₹{sl_inr:,.0f}). "
+                f"Other trades keep running; new entries are unaffected.",
+            )
+        except Exception:
+            logger.exception("open15: stop-loss alert failed")
+
+    def _profit_trail_flatten(self, day_pnl: float) -> None:
+        """The trail fired (or give-back is 0): book the day, flatten REAL rows.
+
+        Only rows an order was actually filled for are exited here. Paper, sim
+        and shadow rows are deliberately left for the scheduled exit-time
+        flatten — they are measurements priced to the configured exit, and an
+        early risk exit of real money must not truncate them.
+        """
+        r = self._risk
+        with self._lock:
+            r["trail_done"] = True
+            r["trail_at"] = self._now_ist().strftime("%H:%M:%S")
+        self._log_event(
+            "profit_trail_exit",
+            day_pnl=round(day_pnl, 2),
+            peak=round(float(r.get("peak") or day_pnl), 2),
+            floor=round(float(r["floor"]), 2) if r.get("floor") is not None else None,
+        )
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().notify(
+                "open15_breakout",
+                f"💰 open15_vol_breakout [{_mode()}]: PROFIT TRAIL EXIT — day "
+                f"P&L ₹{day_pnl:,.0f} retraced to the trail floor (peak "
+                f"₹{float(r.get('peak') or day_pnl):,.0f}). Flattening every "
+                f"open position; the day is done for new entries.",
+            )
+        except Exception:
+            logger.exception("open15: profit-trail alert failed")
+        self._profit_trail_exits("profit_trail")
+
+    def _profit_trail_exits(self, reason: str) -> None:
+        """Exit every open REAL row through the shared exit path + reconcile."""
+        from services.open15_pnl_curve import invalidate_live_cache
+
+        with self._lock:
+            open_pos = {s: p for s, p in self.positions.items() if p.get("status") == "open"}
+        sent = 0
+        for symbol, pos in open_pos.items():
+            if self._exit_open_row(symbol, pos, reason):
+                sent += 1
+        if sent:
+            invalidate_live_cache()
+            self._reconcile_and_log(attempts=2, delay_s=4.0)
+
+    def _today_realized_net(self) -> float:
+        """Today's NET realized P&L, real fills only (#552/#548 conventions)."""
+        from database.open15_breakout_db import trades_pnl_by_date
+
+        try:
+            return float(trades_pnl_by_date().get(self._trade_date(), 0.0))
+        except Exception:
+            logger.exception("open15: realized-net read failed")
+            return 0.0
+
+    def risk_status(self) -> dict:
+        """Live risk-control state for the /logs Day Risk card (issue #696)."""
+        cfg = self.day_config or {}
+        with self._lock:
+            r = dict(self._risk)
+        return {
+            "profit_lock_enabled": bool(cfg.get("profit_lock_enabled")),
+            "profit_target_inr": cfg.get("profit_target_inr"),
+            "trail_giveback_inr": cfg.get("trail_giveback_inr"),
+            "stop_loss_enabled": bool(cfg.get("stop_loss_enabled")),
+            "stop_loss_inr": cfg.get("stop_loss_inr"),
+            "locked": bool(r.get("locked")),
+            "locked_at": r.get("locked_at"),
+            "peak": r.get("peak"),
+            "floor": r.get("floor"),
+            "trail_done": bool(r.get("trail_done")),
+            "trail_at": r.get("trail_at"),
+            "realized_net": round(self._today_realized_net(), 2),
+            "monitor_alive": bool(self._risk_thread and self._risk_thread.is_alive()),
+            "day_status": self.day_status,
+        }
 
     def summary(self) -> None:
         """Exit+5 min — one-line research summary of today's measurement."""
@@ -4050,6 +4417,20 @@ class Open15BreakoutService:
         if action.get("shadow"):
             self._journal_shadow(action, cfg)
             return
+        # DAY profit lock (issue #696) — checked ahead of the max_trades cap so
+        # a locked-out trigger neither consumes a slot nor is mislabelled as a
+        # cap skip. Sim-priced like a cap skip, so the lock's opportunity cost
+        # ("what did the trades we declined after locking do?") is measured,
+        # not guessed. Shadow triggers pass above on purpose: they are the
+        # excluded side's measurement and place no orders anyway.
+        if cfg.get("profit_lock_enabled") and self._risk.get("locked"):
+            self._journal_skip(
+                action,
+                "profit_target_locked",
+                instrument="option" if cfg.get("instrument") == "atm_option" else "stock",
+                **self._sim_context(action, cfg),
+            )
+            return
         max_trades = int(cfg.get("max_trades") or _max_trades_default())
         # only REAL fills consume the daily cap (issue #548) — a broker-rejected
         # entry is not a trade, and letting rejections eat the cap is how three
@@ -4596,6 +4977,8 @@ class Open15BreakoutService:
                 else round(self._cash_at_arm - sum(self._cash_reserved.values()), 2)
             ),
             "residual_sizing": bool((self.day_config or {}).get("residual_sizing_enabled")),
+            # risk controls (issue #696) — what the /logs Day Risk card reads
+            "risk": self.risk_status(),
             "trade_side": (self.day_config or {}).get("trade_side") or _trade_side_default(),
             # shadow-logged excluded side (issue #581). ``shadow_side`` is the
             # letter that is watched but never traded — ``None`` whenever the

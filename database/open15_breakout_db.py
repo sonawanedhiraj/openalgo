@@ -292,9 +292,19 @@ class Open15Config(Base):
     residual_reserve_pct = Column(Float, nullable=True)  # headroom for charges
     residual_min_lots = Column(Integer, nullable=True)  # floor, 0 = no entry
     # live P&L poll interval on /logs (issue #692). NULL = env default
-    # (OPEN15_LIVE_POLL_S, 5 s); clamped 3..60 by the service. Display-only —
-    # it paces the page's batched quote poll, never an order path.
+    # (OPEN15_LIVE_POLL_S, 5 s); clamped 3..60 by the service. Since #696 it
+    # also paces the background risk monitor — one loop feeds the chart AND
+    # checks the risk rules, so the two can never observe different data.
     live_poll_interval_s = Column(Integer, nullable=True)
+    # risk controls (issue #696). NULL = env default. The profit lock is
+    # DAY-wise (cumulative net P&L, real fills only); the stop loss is
+    # TRADE-wise (a single open row's own MTM). Thresholds apply at the next
+    # 09:10 arm — never mid-day, so a day's lock/trail state is unambiguous.
+    profit_lock_enabled = Column(Integer, nullable=True)  # 0/1
+    profit_target_inr = Column(Float, nullable=True)  # day net P&L that locks
+    trail_giveback_inr = Column(Float, nullable=True)  # retrace from peak that flattens
+    stop_loss_enabled = Column(Integer, nullable=True)  # 0/1
+    stop_loss_inr = Column(Float, nullable=True)  # max loss per open trade
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -386,6 +396,14 @@ def _ensure_columns():
             "residual_min_lots": "INTEGER",
             # issue #692 — NULL resolves to the env default (5 s)
             "live_poll_interval_s": "INTEGER",
+            # issue #696 — all five NULL on an existing install, which resolves
+            # to the env defaults (both rules OFF), so the next arm behaves
+            # exactly as it did before
+            "profit_lock_enabled": "INTEGER",
+            "profit_target_inr": "FLOAT",
+            "trail_giveback_inr": "FLOAT",
+            "stop_loss_enabled": "INTEGER",
+            "stop_loss_inr": "FLOAT",
         },
     }
     try:
@@ -470,6 +488,16 @@ def get_config() -> dict | None:
             "residual_min_lots": row.residual_min_lots,
             # issue #692 — None stays None so env supplies the default (5 s)
             "live_poll_interval_s": row.live_poll_interval_s,
+            # issue #696 — None stays None so env supplies the defaults (OFF)
+            "profit_lock_enabled": (
+                None if row.profit_lock_enabled is None else bool(row.profit_lock_enabled)
+            ),
+            "profit_target_inr": row.profit_target_inr,
+            "trail_giveback_inr": row.trail_giveback_inr,
+            "stop_loss_enabled": (
+                None if row.stop_loss_enabled is None else bool(row.stop_loss_enabled)
+            ),
+            "stop_loss_inr": row.stop_loss_inr,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -510,6 +538,11 @@ def save_config(
     residual_reserve_pct: float | None = None,
     residual_min_lots: int | None = None,
     live_poll_interval_s: int | None = None,
+    profit_lock_enabled: bool | None = None,
+    profit_target_inr: float | None = None,
+    trail_giveback_inr: float | None = None,
+    stop_loss_enabled: bool | None = None,
+    stop_loss_inr: float | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -561,6 +594,13 @@ def save_config(
         row.residual_reserve_pct = residual_reserve_pct
         row.residual_min_lots = residual_min_lots
         row.live_poll_interval_s = live_poll_interval_s
+        row.profit_lock_enabled = (
+            None if profit_lock_enabled is None else int(bool(profit_lock_enabled))
+        )
+        row.profit_target_inr = profit_target_inr
+        row.trail_giveback_inr = trail_giveback_inr
+        row.stop_loss_enabled = None if stop_loss_enabled is None else int(bool(stop_loss_enabled))
+        row.stop_loss_inr = stop_loss_inr
         row.updated_by = updated_by
         db_session.commit()
         return True

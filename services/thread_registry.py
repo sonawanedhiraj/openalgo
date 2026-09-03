@@ -329,6 +329,26 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_PROTECTED,
     ),
     ThreadSpec(
+        thread_name="open15-risk-monitor",
+        label="open15 risk monitor",
+        group=GROUP_LOOP,
+        owner="services/open15_breakout_service.py",
+        description=(
+            "Background loop for the day profit lock / trail / per-trade stop "
+            "(issue #696). Each cycle refreshes the shared live-P&L cache the "
+            "/logs chart reads and evaluates the risk rules on that same data; "
+            "cadence = live_poll_interval_s. Alive only while a day is armed, "
+            "so 'not started' is normal outside the window."
+        ),
+        # declared at the CLAMP MAX (the real cadence is the UI-configurable
+        # live_poll_interval_s, 3-60s) so a slow-but-legal setting can never
+        # read as a stale heartbeat
+        cadence_sec=60,
+        window="09:10 - day done IST",
+        env_flag="OPEN15_ENABLED",
+        tier=TIER_PROTECTED,
+    ),
+    ThreadSpec(
         thread_name="SimplifiedTickLogWriter",
         label="Tick-log writer",
         group=GROUP_TRANSPORT,

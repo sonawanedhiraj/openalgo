@@ -78,6 +78,12 @@ _ARMED_PASSTHROUGH = (
     "max_trades_effective",
     "available_cash",
     "funds_clamp",
+    # risk controls (issue #696)
+    "profit_lock_enabled",
+    "profit_target_inr",
+    "trail_giveback_inr",
+    "stop_loss_enabled",
+    "stop_loss_inr",
 )
 
 
