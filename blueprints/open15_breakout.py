@@ -251,9 +251,22 @@ def config():
         from services.open15_pnl_curve import (
             clamp_live_poll_interval as _clamp_live_poll,
         )
+        from services.open15_pnl_curve import (
+            live_poll_clamp_report as _live_poll_clamp_report,
+        )
 
+        # fields whose stored value differs from what was posted (issue #698):
+        # the clamp stays server-side, but the page must be TOLD it happened —
+        # a silently different number reads as "the save reverted"
+        clamped: dict[str, dict] = {}
         live_poll = body.get("live_poll_interval_s")
-        live_poll = None if live_poll in (None, "") else _clamp_live_poll(live_poll)
+        if live_poll in (None, ""):
+            live_poll = None
+        else:
+            report = _live_poll_clamp_report(live_poll)
+            if report is not None:
+                clamped["live_poll_interval_s"] = report
+            live_poll = _clamp_live_poll(live_poll)
         # risk controls (issue #696) — clamp-don't-reject; empty = env default.
         # The checkbox always posts a bool; a 0 amount is stored as 0 and the
         # service resolves "enabled with threshold 0" to OFF, so no consumer
@@ -335,7 +348,7 @@ def config():
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
-        return jsonify({"status": "success", "saved": get_config()})
+        return jsonify({"status": "success", "saved": get_config(), "clamped": clamped})
 
     svc = get_open15_service()
     # resolved ONCE — two calls could straddle an arm and disagree about the
@@ -706,7 +719,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <label class="muted" style="margin-left:14px">no entry after <input id="c_nea" type="time" min="09:16" max="15:09" style="width:92px"></label>
  <label class="muted" style="margin-left:14px">exit time <input id="c_exit" type="time" min="09:17" max="15:10" style="width:92px"></label>
  <label class="muted" style="margin-left:14px">live poll
-  <input id="c_livepoll" type="number" min="3" max="60" step="1" style="width:44px"> s</label>
+  <input id="c_livepoll" type="number" min="2" max="60" step="1" style="width:44px"> s</label>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
   <span class="muted">shadow the excluded side (issue #581 — journal only, no orders, never compounds)</span>
   <label class="muted" style="margin-left:14px"><input id="c_shadow" type="checkbox"> log the excluded side's triggers</label>
@@ -1012,8 +1025,23 @@ async function saveCfg(){
     const r=await fetch('/open15_vol_breakout/api/config',{method:'POST',
       headers:{'Content-Type':'application/json','X-CSRFToken':tok},body:JSON.stringify(body)});
     const j=await r.json();
-    msg.textContent=(j.status==='success')?'saved ✓'
-      :('error: '+((j.errors&&j.errors.length)?j.errors.join('; '):(j.message||j.error||('HTTP '+r.status))));
+    msg.style.color='';
+    if(j.status==='success'){
+      let t='saved ✓';
+      // a server-side clamp must be VISIBLE (issue #698): the stored number
+      // differs from the one typed, and loadCfg() below overwrites the field
+      // with it — without this line the save looks like it silently reverted
+      const c=j.clamped&&j.clamped.live_poll_interval_s;
+      if(c){
+        t+=(c.reason==='not_a_number')
+          ?(' — live poll "'+c.requested+'" is not a number; saved as '+c.applied+' s')
+          :(' — live poll '+c.requested+' s is outside '+c.min+'–'+c.max+' s; saved as '+c.applied+' s');
+        msg.style.color='#f9e2af';
+      }
+      msg.textContent=t;
+    }else{
+      msg.textContent='error: '+((j.errors&&j.errors.length)?j.errors.join('; '):(j.message||j.error||('HTTP '+r.status)));
+    }
   }catch(e){msg.textContent='error: '+e;}
   loadCfg();
   // capital/slot and coverage target feed the planning ladder (issue #671) —
