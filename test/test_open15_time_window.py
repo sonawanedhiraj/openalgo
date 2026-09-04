@@ -264,3 +264,44 @@ def test_config_post_saves_valid_window(client, monkeypatch):
     assert r.status_code == 200
     assert saved["no_entry_after"] == "09:45"
     assert saved["exit_time"] == "10:00"
+
+
+# ---- live-poll clamp is REPORTED, not silent (issue #698) ---------------- #
+
+
+def test_config_post_reports_live_poll_clamp(client, monkeypatch):
+    import database.open15_breakout_db as db
+
+    saved = {}
+
+    def fake_save(*args, **kwargs):
+        saved.update(kwargs)
+        return True
+
+    monkeypatch.setattr(db, "get_config", lambda: None)
+    monkeypatch.setattr(db, "save_config", fake_save)
+    r = client.post("/open15_vol_breakout/api/config", json={"live_poll_interval_s": 1})
+    assert r.status_code == 200
+    j = r.get_json()
+    # stored at the floor, and the response SAYS so (the page used to show
+    # only "saved" and then re-render the floor, which read as a revert)
+    assert saved["live_poll_interval_s"] == 2
+    assert j["clamped"]["live_poll_interval_s"] == {
+        "requested": 1,
+        "applied": 2,
+        "min": 2,
+        "max": 60,
+        "reason": "below_min",
+    }
+
+
+def test_config_post_in_range_live_poll_has_no_clamp_notice(client, monkeypatch):
+    import database.open15_breakout_db as db
+
+    saved = {}
+    monkeypatch.setattr(db, "get_config", lambda: None)
+    monkeypatch.setattr(db, "save_config", lambda *a, **k: saved.update(k) or True)
+    r = client.post("/open15_vol_breakout/api/config", json={"live_poll_interval_s": 2})
+    assert r.status_code == 200
+    assert saved["live_poll_interval_s"] == 2
+    assert r.get_json()["clamped"] == {}

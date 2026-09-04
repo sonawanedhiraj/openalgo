@@ -211,11 +211,25 @@ def test_settled_day_cached_open_day_ttl_cached(monkeypatch):
 
 
 def test_clamp_live_poll_interval():
-    assert curve.clamp_live_poll_interval(1) == 3
+    # floor is 2 s since issue #698 (was 3)
+    assert curve.clamp_live_poll_interval(1) == 2
+    assert curve.clamp_live_poll_interval(2) == 2
     assert curve.clamp_live_poll_interval(999) == 60
     assert curve.clamp_live_poll_interval("10") == 10
     assert curve.clamp_live_poll_interval("abc") == 5
     assert curve.clamp_live_poll_interval(None) == 5
+
+
+def test_live_poll_clamp_report_describes_every_moved_value():
+    # issue #698: the endpoint returns this so the page can SAY it clamped
+    assert curve.live_poll_clamp_report(2) is None
+    assert curve.live_poll_clamp_report("10") is None
+    below = curve.live_poll_clamp_report(1)
+    assert below == {"requested": 1, "applied": 2, "min": 2, "max": 60, "reason": "below_min"}
+    above = curve.live_poll_clamp_report("999")
+    assert above["applied"] == 60 and above["reason"] == "above_max"
+    bad = curve.live_poll_clamp_report("abc")
+    assert bad["applied"] == 5 and bad["reason"] == "not_a_number"
 
 
 def test_resolve_live_poll_interval_db_row_beats_env(monkeypatch):

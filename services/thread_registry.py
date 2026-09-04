@@ -341,7 +341,7 @@ CATALOG: tuple[ThreadSpec, ...] = (
             "so 'not started' is normal outside the window."
         ),
         # declared at the CLAMP MAX (the real cadence is the UI-configurable
-        # live_poll_interval_s, 3-60s) so a slow-but-legal setting can never
+        # live_poll_interval_s, 2-60s) so a slow-but-legal setting can never
         # read as a stale heartbeat
         cadence_sec=60,
         window="09:10 - day done IST",

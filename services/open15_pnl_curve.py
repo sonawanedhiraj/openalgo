@@ -46,13 +46,16 @@ logger = get_logger(__name__)
 
 _IST = pytz.timezone("Asia/Kolkata")
 
-_LIVE_POLL_MIN_S = 3
+# floor lowered 3 -> 2 on 2026-09-04 (issue #698): one batched quote call per
+# poll at 2 s is 0.5 req/s against the broker's 3 req/s — still well inside the
+# shared budget the floor protects.
+_LIVE_POLL_MIN_S = 2
 _LIVE_POLL_MAX_S = 60
 _LIVE_POLL_FALLBACK_S = 5
 
 
 def clamp_live_poll_interval(value) -> int:
-    """Clamp a proposed live-poll interval (seconds) into 3..60. Bad input -> 5.
+    """Clamp a proposed live-poll interval (seconds) into 2..60. Bad input -> 5.
 
     Server-side clamping is deliberate (the same contract as
     ``clamp_rolling_cadence``): the UI number input is a hint, never a trust
@@ -64,6 +67,37 @@ def clamp_live_poll_interval(value) -> int:
     except (TypeError, ValueError):
         return _LIVE_POLL_FALLBACK_S
     return max(_LIVE_POLL_MIN_S, min(v, _LIVE_POLL_MAX_S))
+
+
+def live_poll_clamp_report(value) -> dict | None:
+    """Describe how ``clamp_live_poll_interval`` changed ``value``, or None.
+
+    Issue #698: a clamp that silently stores a different number than the one
+    typed reads as "the save reverted" on the page. The config endpoint returns
+    this alongside the saved row so the UI can SAY what happened. Only a
+    parseable number that was moved counts — unparseable input falls back to
+    the default exactly as before and is reported as such.
+    """
+    try:
+        requested = int(float(value))
+    except (TypeError, ValueError):
+        return {
+            "requested": value,
+            "applied": _LIVE_POLL_FALLBACK_S,
+            "min": _LIVE_POLL_MIN_S,
+            "max": _LIVE_POLL_MAX_S,
+            "reason": "not_a_number",
+        }
+    applied = clamp_live_poll_interval(requested)
+    if applied == requested:
+        return None
+    return {
+        "requested": requested,
+        "applied": applied,
+        "min": _LIVE_POLL_MIN_S,
+        "max": _LIVE_POLL_MAX_S,
+        "reason": "below_min" if requested < _LIVE_POLL_MIN_S else "above_max",
+    }
 
 
 def _live_poll_default() -> int:

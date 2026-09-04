@@ -29,7 +29,7 @@ never place orders.
 
 | Parameter | Default | Note |
 |---|---|---|
-| `OPEN15_LIVE_POLL_S` | `5` | Live P&L poll interval (seconds). First-boot seed only — the UI-saved `open15_config.live_poll_interval_s` row wins (#484 rule). Clamped 3–60 server-side (the 3 s floor keeps even the most aggressive setting inside the broker quote rate limit). Server-side quote cache TTL tracks the configured interval, so N open tabs still produce at most one broker call per interval. Applies on the next poll tick — no restart. |
+| `OPEN15_LIVE_POLL_S` | `5` | Live P&L poll interval (seconds). First-boot seed only — the UI-saved `open15_config.live_poll_interval_s` row wins (#484 rule). Clamped **2–60** server-side (floor lowered from 3 s on 2026-09-04, issue #698 — one batched quote call per poll at 2 s is 0.5 req/s against the broker's 3 req/s shared budget; the config endpoint now returns a `clamped` report and the `/logs` page shows a visible notice whenever a posted value was moved to the floor/ceiling, instead of silently re-rendering the stored value). Server-side quote cache TTL tracks the configured interval, so N open tabs still produce at most one broker call per interval. Applies on the next poll tick — no restart. |
 
 ### open15 ATM lot-cost coverage ladder (issue #591, added 2026-08-11)
 
