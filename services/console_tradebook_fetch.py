@@ -126,20 +126,52 @@ def validate_rows(rows: list[dict]) -> str | None:
     return None
 
 
-def to_csv_rows(rows: list[dict]) -> list[dict]:
-    """Project Console rows onto the CSV export columns (extra keys dropped)."""
-    out = []
-    for r in rows:
-        out.append({c: ("" if r.get(c) is None else r.get(c)) for c in CSV_COLUMNS})
+_ALIASES = {
+    # Console's API spells some export columns differently; map onto the
+    # export header the importer reads, keep the original too.
+    "symbol": ("tradingsymbol", "trading_symbol", "instrument"),
+    "trade_date": ("date",),
+    "order_execution_time": ("order_timestamp", "exchange_timestamp", "fill_timestamp"),
+}
+
+
+def normalise_row(r: dict) -> dict:
+    out = dict(r)
+    for canonical, alts in _ALIASES.items():
+        if out.get(canonical) in (None, ""):
+            for alt in alts:
+                if out.get(alt) not in (None, ""):
+                    out[canonical] = out[alt]
+                    break
     return out
+
+
+def csv_fieldnames(rows: list[dict]) -> list[str]:
+    """The export header first, then EVERY other key the API returned, so a
+    field we did not anticipate (e.g. the exchange order id) is never lost."""
+    extras: list[str] = []
+    for r in rows:
+        for k in r:
+            if k not in CSV_COLUMNS and k not in extras:
+                extras.append(k)
+    return list(CSV_COLUMNS) + sorted(extras)
+
+
+def to_csv_rows(rows: list[dict]) -> list[dict]:
+    """Project Console rows onto the CSV export columns plus any extras."""
+    rows = [normalise_row(r) for r in rows]
+    names = csv_fieldnames(rows)
+    return [{c: ("" if r.get(c) is None else r.get(c)) for c in names} for r in rows]
 
 
 def write_console_csv(rows: list[dict], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    projected = to_csv_rows(rows)
+    names = csv_fieldnames([normalise_row(r) for r in rows]) if rows else list(CSV_COLUMNS)
     with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(CSV_COLUMNS))
+        writer = csv.DictWriter(fh, fieldnames=names)
         writer.writeheader()
-        for r in to_csv_rows(rows):
+        for r in projected:
             writer.writerow(r)
     return path
 

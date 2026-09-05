@@ -88,8 +88,10 @@ def test_shape_change_is_loud_and_names_the_keys():
 def test_csv_matches_the_importer_contract(tmp_path):
     p = fetch.write_console_csv([{**ROW, "extra_key": "dropped"}], tmp_path / "x.csv")
     text = p.read_text(encoding="utf-8").splitlines()
-    assert text[0] == ",".join(fetch.CSV_COLUMNS)
-    assert "extra_key" not in text[0]
+    # The export header leads; every other key the API returned is KEPT after
+    # it (the live fetch showed `tradingsymbol` where the export says `symbol`).
+    assert text[0].startswith(",".join(fetch.CSV_COLUMNS))
+    assert text[0].endswith(",extra_key")
     from services.account_console_import import normalise_trades, read_export
 
     by_order, problems = normalise_trades(read_export(p))
