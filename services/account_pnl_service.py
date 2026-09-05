@@ -468,11 +468,15 @@ def capture_account_day(
     finalize: bool = False,
     use_broker: bool = True,
     capture_source: str = "tradebook",
+    charges_token: str | None = None,
 ) -> dict:
     """Capture + persist one child's realized P&L for one IST day.
 
     ``use_broker=False`` recomputes purely from stored fills (the Console-import
     path and any historical day — the broker cannot answer for those anyway).
+    ``charges_token`` lets that path still price legs through the broker's
+    charges calculator (it accepts historical orders) when the child happens
+    to be logged in; without it the legs are modelled and labelled so.
     Never raises.
     """
     account_id = account["id"]
@@ -491,7 +495,11 @@ def capture_account_day(
         if not rows_today:
             return result
 
-        token = get_auth_token(broker_accounts_db.auth_name(account_id)) if use_broker else None
+        token = (
+            get_auth_token(broker_accounts_db.auth_name(account_id))
+            if use_broker
+            else charges_token
+        )
         is_today = day == today_ist()
         if use_broker and is_today:
             if not token:
