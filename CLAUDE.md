@@ -2526,9 +2526,40 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
   (the #637 reconcile verifies afterwards). Flat vs unreadable are kept
   distinct on purpose; no env flags (#651 rule — verification is not a
   preference).
+- **Per-account realized P&L on the strategy page (issue #700,
+  `services/account_pnl_service.py` + `services/strategy_accounts_pnl.py`).**
+  Kite serves a child's tradebook (`GET /trades`) for **TODAY only** and has
+  no historical P&L/ledger API, so a child's realized P&L exists only if
+  OpenAlgo writes it down the same day. The 09:40 fill-reconcile (provisional)
+  and 15:35 EOD (final) jobs now read each child's RAW tradebook with the
+  child's own token, stamp `fill_price`/`fill_qty`/`fill_at` on the `placed`
+  mirror rows (`fill_qty` read BY PRESENCE — `NULL` unknown, `0` known
+  unfilled), FIFO-pair per symbol inside the strategy's rows, price each leg
+  through Kite's charges calculator (`broker/zerodha/api/charges.py`,
+  `POST /charges/orders`) with a **labelled** modelled fallback, and upsert
+  `account_daily_pnl` (account, IST day, strategy). **No day row is written
+  while any placed row's fill is unknown** — a partial number is worse than a
+  missing one. The card "Account P&L — is it making money?" on
+  `/strategies/<name>` (`GET /strategies/api/<name>/accounts-pnl?window=`,
+  default `all` = since live start) shows one row per account (Primary + every
+  mirroring child), a strategy total and a verdict that is simply the **sign**
+  of the total (no band). Rules: the Primary row is the SAME row set as the
+  Performance table's Live column (`open15_breakout_db.real_closed_rows` +
+  `net_pnl_of_row` — one definition, #552); a day with placed mirrors and no
+  captured row is **missing** (counted, excluded, never ₹0); the broker's
+  whole-account `realised` (manual trades included) is stored as a cross-check
+  and never summed in; child rows use the child's fills, never `sizing_price`
+  or the parent's fill scaled (#497/#637). Pre-ship days are back-filled once
+  per child from a Console tradebook export:
+  `uv run python -m services.account_console_import --account <id> --file
+  <csv|xlsx> [--apply]` (order_id join, conflicts reported never promoted,
+  idempotent). No env flag beyond `ACCOUNT_PNL_PAIRING_LOOKBACK_DAYS`
+  (default 7). Tests: `test/test_account_pnl_service.py`,
+  `test/test_strategy_accounts_pnl.py`, `test/test_account_console_import.py`.
 - **Ops**: every child account needs its own daily Kite login (Connect button
-  + per-account TOTP code on `/accounts`); child fills/P&L live in the child's
-  own broker book — OpenAlgo does not track child positions.
+  + per-account TOTP code on `/accounts`); child positions live in the child's
+  own broker book — OpenAlgo records child FILLS and per-day realized P&L
+  (#700) but never tracks open child positions.
 
 ## Unified strategy daily intent (`strategy_daily_intent`)
 

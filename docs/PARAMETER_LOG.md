@@ -2449,6 +2449,22 @@ ran in the 15:30-17:00 periodic window).
   - **2026-08-19:** Introduced by issue #643.
   - **2026-09-01:** Issue #690 — extended to child mirror accounts (see above).
 
+## `ACCOUNT_PNL_PAIRING_LOOKBACK_DAYS` (issue #700, 2026-09-05)
+
+- **What:** how many IST days BEFORE the day being captured the child
+  realized-P&L pairing (`services/account_pnl_service.py`) reads filled mirror
+  rows from, so a T+1 exit can meet its entry leg. Default `7`.
+- **Why 7:** every mirrored strategy today is intraday or T+1; a week covers a
+  long weekend plus a holiday with room to spare, and a wider window only costs
+  a slightly larger journal read. It does not change which round trips are
+  attributed to a day (attribution is by the CLOSING fill's IST date).
+- **Not a switch:** the capture itself has no flag (#651 rule — a child's
+  realized P&L being recorded is not an operator preference). It runs inside
+  the existing `multi_account_fill_reconcile` (09:40, provisional) and
+  `multi_account_eod_summary` (15:35, final) jobs, so it inherits their
+  `MULTI_ACCOUNT_ENABLED` + trading-day gates.
+- **History:** 2026-09-05 — introduced by issue #700.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

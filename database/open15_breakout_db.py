@@ -839,3 +839,26 @@ def update_trade(row_id: int, **kw) -> bool:
         return False
     finally:
         db_session.remove()
+
+
+def real_closed_rows(mode: str | None = None) -> list:
+    """Closed, priced, REAL-fill ``open15_trades`` rows — the one row set behind
+    every published P&L figure (issue #700 shares it between the strategy
+    dashboard's lifetime column and the per-account P&L card, so the two can
+    never disagree). ``mode`` filters to ``sandbox`` / ``live``; ``None`` = all.
+    Fail-open to ``[]``.
+    """
+    try:
+        q = db_session.query(Open15Trade).filter(
+            Open15Trade.status == "closed",
+            Open15Trade.pnl.isnot(None),
+            _REAL_FILL,
+        )
+        if mode:
+            q = q.filter(Open15Trade.mode == mode)
+        return q.all()
+    except Exception:
+        logger.exception("real_closed_rows read failed — failing open to []")
+        return []
+    finally:
+        db_session.remove()
