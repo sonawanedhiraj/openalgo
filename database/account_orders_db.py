@@ -628,3 +628,23 @@ def list_orders(date_utc: str | None = None, account_id: int | None = None) -> l
         return [_row_to_dict(r) for r in q.order_by(AccountOrder.id.desc()).limit(500)]
     finally:
         db_session.remove()
+
+
+def placed_ist_days(account_id: int, strategy_name: str, since: date | None = None) -> set[date]:
+    """IST calendar days on which this account had at least one ``placed``
+    mirror for ``strategy_name`` — the denominator for "days not captured"
+    (issue #700). Fail-open to an empty set."""
+    try:
+        q = db_session.query(AccountOrder.created_at).filter(
+            AccountOrder.account_id == account_id,
+            AccountOrder.strategy_name == strategy_name,
+            AccountOrder.status == "placed",
+        )
+        if since is not None:
+            q = q.filter(AccountOrder.created_at >= ist_day_utc_window(since)[0])
+        return {ist_date_of_utc(ts) for (ts,) in q.all() if ts is not None}
+    except Exception:
+        logger.exception("placed_ist_days read failed — failing open to set()")
+        return set()
+    finally:
+        db_session.remove()

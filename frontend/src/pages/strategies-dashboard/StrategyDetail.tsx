@@ -55,6 +55,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
+import { AccountPnlCard } from './AccountPnlCard'
 import { IntradayPullbackEvalCard } from './IntradayPullbackEvalCard'
 
 // ---------------------------------------------------------------------------
@@ -2221,6 +2222,9 @@ export default function StrategyDetailPage() {
         <PerfTable data={data} />
         <PnlCurve name={data.name} />
       </div>
+
+      {/* Per-account realized P&L — Primary + every mirroring child (issue #700) */}
+      <AccountPnlCard name={data.name} />
 
       {/* 15:20 entry-evaluation breakdown + history (issues #352, #395) */}
       {data.name === 'futures_follow_cap50' && <EntryEvaluationCard />}

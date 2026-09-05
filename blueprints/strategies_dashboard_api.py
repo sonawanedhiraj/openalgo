@@ -1003,21 +1003,12 @@ def _open15_lifetime() -> dict[str, dict]:
 
     out = {"sandbox": _agg([]), "live": _agg([])}
     try:
-        from database.open15_breakout_db import NON_REAL_FILLS, Open15Trade
-        from database.open15_breakout_db import db_session as o15_session
+        # The journal's real-fill predicate lives in ONE place (issue #700):
+        # `real_closed_rows` is shared with the per-account P&L card so the
+        # Live column here and the Primary row there are the same row set.
+        from database.open15_breakout_db import real_closed_rows
 
-        rows = (
-            o15_session.query(Open15Trade)
-            .filter(
-                Open15Trade.status == "closed",
-                Open15Trade.pnl.isnot(None),
-                # The journal's real-fill predicate (NULL-tolerant, explicit
-                # exclusion list — never `!= 'paper'`, which would silently
-                # reclassify every future fill class as real).
-                (Open15Trade.fill.is_(None)) | (Open15Trade.fill.notin_(NON_REAL_FILLS)),
-            )
-            .all()
-        )
+        rows = real_closed_rows()
         buckets: dict[str, list] = {"sandbox": [], "live": []}
         for r in rows:
             m = (r.mode or "").lower()
@@ -1883,9 +1874,56 @@ def pnl_curve(name: str):
         points = _pnl_curve_simplified_engine(window_days)
     elif name == _INTRADAY_PULLBACK_FOLDER:
         points = _pnl_curve_intraday_pullback(window_days)
+    elif name == "open15_vol_breakout":
+        points = _pnl_curve_open15(window_days)
     # Other strategies: empty series (no journal yet)
 
     return jsonify({"status": "success", "data": {"window": window, "points": points}})
+
+
+def _pnl_curve_open15(window_days: int | None) -> list[dict]:
+    """Daily NET realized P&L of the primary's LIVE open15 rows (issue #700).
+
+    Same row set as the Performance table's Live column
+    (``real_closed_rows`` + ``net_pnl_of_row``), keyed by ``trade_date``.
+    """
+    try:
+        from services.strategy_accounts_pnl import primary_daily_series
+
+        daily = primary_daily_series("open15_vol_breakout") or []
+        if window_days:
+            cutoff = (datetime.now(_IST) - timedelta(days=window_days)).date()
+            daily = [(d, v) for d, v in daily if d >= cutoff]
+        return [{"date": d.isoformat(), "pnl": round(v, 2)} for d, v in daily]
+    except Exception:
+        logger.exception("Failed to build pnl_curve for open15_vol_breakout")
+        return []
+
+
+@strategies_dashboard_bp.route("/api/<name>/accounts-pnl", methods=["GET"])
+@check_session_validity
+def accounts_pnl(name: str):
+    """Per-account realized P&L + profit/loss verdict (issue #700).
+
+    ``?window=1d|1w|1m|all`` (default ``all``). ``?recapture=1`` runs a
+    throttled same-day capture of the children's fills first, so a restart
+    between the 09:40 and 15:35 passes still gets today captured the moment
+    someone looks.
+    """
+    strategy_dir = _STRATEGIES_DIR / name
+    if not strategy_dir.exists():
+        return jsonify({"status": "error", "message": f"Strategy '{name}' not found"}), 404
+    window = request.args.get("window", "all")
+    if request.args.get("recapture") in ("1", "true"):
+        try:
+            from services.account_pnl_service import recapture_today_if_stale
+
+            recapture_today_if_stale()
+        except Exception:
+            logger.exception("accounts-pnl: on-demand recapture failed")
+    from services.strategy_accounts_pnl import build_accounts_pnl
+
+    return jsonify({"status": "success", "data": build_accounts_pnl(name, window)})
 
 
 @strategies_dashboard_bp.route("/api/<name>/parameters/diff", methods=["GET"])

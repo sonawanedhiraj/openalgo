@@ -591,3 +591,52 @@ export interface LLMHealth {
   detail: string
   checked_at: string
 }
+
+// Per-account realized P&L card (issue #700) — /strategies/api/<name>/accounts-pnl
+export type AccountsPnlVerdict = 'profit' | 'loss' | 'flat'
+export type AccountCapture = 'journal' | 'final' | 'provisional' | 'missing' | 'idle'
+
+export interface AccountPnlRow {
+  account_id: number | null
+  name: string
+  role: 'primary' | 'child'
+  connected?: boolean
+  net_inr: number | null
+  today_net_inr: number | null
+  days_traded: number
+  win_days_pct: number | null
+  max_dd_inr: number | null
+  daily: [string, number][]
+  capital_basis_inr: number | null
+  return_pct: number | null
+  charges_source: 'broker' | 'modelled' | 'mixed' | null
+  capture: AccountCapture
+  days_missing: number
+  missing_days?: string[]
+  capture_sources?: string[]
+}
+
+export interface AccountsPnlResponse {
+  strategy: string
+  window: PnlWindow
+  since: string | null
+  today: string
+  verdict: AccountsPnlVerdict
+  total: { net_inr: number | null; days_traded: number; days_missing: number; n_accounts: number }
+  accounts: AccountPnlRow[]
+  sources_failed: string[]
+}
+
+export async function getAccountsPnl(
+  name: string,
+  window: PnlWindow,
+  recapture = false
+): Promise<AccountsPnlResponse> {
+  const params: Record<string, string> = { window }
+  if (recapture) params.recapture = '1'
+  const res = await webClient.get<{ status: string; data: AccountsPnlResponse }>(
+    `/strategies/api/${encodeURIComponent(name)}/accounts-pnl`,
+    { params }
+  )
+  return res.data.data
+}
