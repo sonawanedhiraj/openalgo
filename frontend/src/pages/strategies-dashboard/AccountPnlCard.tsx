@@ -266,27 +266,27 @@ export function AccountPnlCard({ name }: { name: string }) {
                         </div>
                       </td>
                       <td
-                        className={`px-3 py-2 text-right font-mono tabular-nums font-semibold ${pnlClass(row.net_inr)}`}
+                        className={`px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap font-semibold ${pnlClass(row.net_inr)}`}
                       >
                         {inr(row.net_inr, { sign: true })}
                       </td>
                       <td
-                        className={`px-3 py-2 text-right font-mono tabular-nums ${pnlClass(row.today_net_inr)}`}
+                        className={`px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap ${pnlClass(row.today_net_inr)}`}
                       >
                         {inr(row.today_net_inr, { sign: true })}
                       </td>
-                      <td className="px-3 py-2 text-right font-mono tabular-nums">
+                      <td className="px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap">
                         {row.days_traded}
                       </td>
-                      <td className="px-3 py-2 text-right font-mono tabular-nums">
+                      <td className="px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap">
                         {row.win_days_pct === null ? '—' : `${row.win_days_pct}%`}
                       </td>
                       <td
-                        className={`px-3 py-2 text-right font-mono tabular-nums ${pnlClass(row.max_dd_inr)}`}
+                        className={`px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap ${pnlClass(row.max_dd_inr)}`}
                       >
                         {inr(row.max_dd_inr)}
                       </td>
-                      <td className="px-3 py-2 text-right font-mono tabular-nums">
+                      <td className="px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap">
                         {row.return_pct === null ? (
                           '—'
                         ) : (
@@ -311,11 +311,11 @@ export function AccountPnlCard({ name }: { name: string }) {
                   <tr className="border-t-2 bg-muted/20 font-semibold">
                     <td className="px-4 py-2">Strategy total</td>
                     <td
-                      className={`px-3 py-2 text-right font-mono tabular-nums ${pnlClass(data.total.net_inr)}`}
+                      className={`px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap ${pnlClass(data.total.net_inr)}`}
                     >
                       {inr(data.total.net_inr, { sign: true })}
                     </td>
-                    <td className="px-3 py-2 text-right font-mono tabular-nums">
+                    <td className="px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap">
                       {(() => {
                         const todays = data.accounts.filter((a) => a.today_net_inr !== null)
                         if (todays.length === 0) return '—'
@@ -323,7 +323,7 @@ export function AccountPnlCard({ name }: { name: string }) {
                         return <span className={pnlClass(t)}>{inr(t, { sign: true })}</span>
                       })()}
                     </td>
-                    <td className="px-3 py-2 text-right font-mono tabular-nums">
+                    <td className="px-3 py-2 text-right font-mono tabular-nums whitespace-nowrap">
                       {data.total.days_traded}
                     </td>
                     <td className="px-3 py-2" />
