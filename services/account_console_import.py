@@ -148,6 +148,7 @@ def plan_import(account_id: int, by_order: dict[str, list[dict]]) -> dict:
     fills: list[dict] = []
     conflicts: list[dict] = []
     days: set[date] = set()
+    fuzzy = 0
     for oid, trades in by_order.items():
         row = matched.get(oid)
         if row is None:
@@ -158,12 +159,46 @@ def plan_import(account_id: int, by_order: dict[str, list[dict]]) -> dict:
         if row["status"] != "placed":
             conflicts.append({"row": row, "fill_qty": qty, "fill_price": price})
             continue
-        fills.append({"row": row, "fill_price": price, "fill_qty": qty, "fill_at": at})
+        fills.append(
+            {"row": row, "fill_price": price, "fill_qty": qty, "fill_at": at, "match": "order_id"}
+        )
         if at is not None:
             days.add(ist_date_of_utc(at))
         else:
             created = datetime.fromisoformat(row["created_at"])
             days.add(ist_date_of_utc(created))
+
+    # Console's ``order_id`` column is the EXCHANGE order number, not Kite's
+    # own order id (verified 2026-09-05: 16-digit ``19000000…`` vs the
+    # 15-digit ``260828…`` we journal), so for pre-#700 rows the id join finds
+    # nothing. Fall back to a strict attribute match: same IST day, same
+    # side, same quantity, same broker symbol, execution within
+    # ``_FUZZY_WINDOW_S`` AFTER our placement — each journal row used once,
+    # ambiguity (two candidates equally close) refuses rather than guesses.
+    still_unmatched = [oid for oid in by_order if oid not in matched]
+    if still_unmatched:
+        taken = {f["row"]["id"] for f in fills}
+        matched_fuzzy = _fuzzy_match(account_id, by_order, still_unmatched, taken, aggregate_fill)
+        for oid, (row, price, qty, at) in matched_fuzzy.items():
+            matched[oid] = row
+            if row["status"] != "placed":
+                conflicts.append({"row": row, "fill_qty": qty, "fill_price": price})
+                continue
+            fills.append(
+                {
+                    "row": row,
+                    "fill_price": price,
+                    "fill_qty": qty,
+                    "fill_at": at,
+                    "match": "attributes",
+                }
+            )
+            fuzzy += 1
+            days.add(
+                ist_date_of_utc(at)
+                if at
+                else ist_date_of_utc(datetime.fromisoformat(row["created_at"]))
+            )
 
     unmatched = sorted(set(by_order) - set(matched))
 
@@ -184,12 +219,95 @@ def plan_import(account_id: int, by_order: dict[str, list[dict]]) -> dict:
             unfilled.append(r)
     return {
         "matched": len(matched),
+        "fuzzy": fuzzy,
         "fills": fills,
         "unfilled": unfilled,
         "conflicts": conflicts,
         "unmatched_order_ids": unmatched,
         "days": sorted(days),
     }
+
+
+_FUZZY_WINDOW_S = 180
+
+
+def _fuzzy_match(
+    account_id: int,
+    by_order: dict[str, list[dict]],
+    order_ids: list[str],
+    taken: set[int],
+    aggregate_fill,
+) -> dict[str, tuple[dict, float, int, datetime | None]]:
+    """``{console_order_id: (row, price, qty, at)}`` by strict attributes.
+
+    Candidate rows: this account's ``placed`` mirrors on the trade's IST day
+    with the same action, the same total quantity, and the same broker
+    symbol (Console reports Zerodha's tradingsymbol; the journal stores the
+    OpenAlgo symbol, mapped through the broker's own ``get_br_symbol``).
+    Among candidates, the nearest placement at or before the execution time
+    within the window wins; a tie refuses the match.
+    """
+    from services.account_pnl_service import _br_symbol
+
+    out: dict[str, tuple[dict, float, int, datetime | None]] = {}
+    account = broker_accounts_db.get_account(account_id) or {}
+    broker = account.get("broker") or "zerodha"
+    # Load once: every placed row across the file's span.
+    ats = []
+    prepared = []
+    for oid in order_ids:
+        trades = by_order[oid]
+        price, qty, at = aggregate_fill(trades)
+        if qty <= 0 or at is None:
+            continue
+        side = (trades[0].get("transaction_type") or "").upper()
+        symbol = (trades[0].get("tradingsymbol") or "").upper()
+        prepared.append((oid, price, qty, at, side, symbol))
+        ats.append(at)
+    if not prepared:
+        return out
+    lo, hi = ist_date_of_utc(min(ats)), ist_date_of_utc(max(ats))
+    start_utc = account_orders_db.ist_day_utc_window(lo)[0]
+    end_utc = account_orders_db.ist_day_utc_window(hi)[1]
+    rows = [
+        r
+        for r in account_orders_db.placed_rows_in_window(account_id, start_utc, end_utc)
+        if r["id"] not in taken
+    ]
+    br_cache: dict[tuple[str, str], str] = {}
+
+    def br(r):
+        key = (r["symbol"], r["exchange"])
+        if key not in br_cache:
+            br_cache[key] = (_br_symbol(broker, r["symbol"], r["exchange"]) or "").upper()
+        return br_cache[key]
+
+    used: set[int] = set()
+    for oid, price, qty, at, side, symbol in sorted(prepared, key=lambda p: p[3]):
+        day = ist_date_of_utc(at)
+        cands = []
+        for r in rows:
+            if r["id"] in used:
+                continue
+            created = datetime.fromisoformat(r["created_at"])
+            if ist_date_of_utc(created) != day:
+                continue
+            if (r["action"] or "").upper() != side or int(r["child_qty"]) != qty:
+                continue
+            if symbol and br(r) != symbol:
+                continue
+            delta = (at - created).total_seconds()
+            if -30 <= delta <= _FUZZY_WINDOW_S:
+                cands.append((abs(delta), r))
+        if not cands:
+            continue
+        cands.sort(key=lambda c: c[0])
+        if len(cands) > 1 and cands[0][0] == cands[1][0]:
+            continue  # ambiguous — refuse rather than guess
+        row = cands[0][1]
+        used.add(row["id"])
+        out[oid] = (row, price, qty, at)
+    return out
 
 
 def apply_import(account: dict, plan: dict) -> list[dict]:
@@ -225,8 +343,11 @@ def _print_plan(account: dict, plan: dict, problems: list[str]) -> None:
     name = account["display_name"]
     print(f"Account {account['id']} ({name})")
     print(f"  orders in file matching this account's mirrors : {plan['matched']}")
-    print(f"  placed rows that will receive a fill           : {len(plan['fills'])}")
-    print(f"  placed rows on covered days with NO trade (→0) : {len(plan['unfilled'])}")
+    print(
+        f"  placed rows that will receive a fill           : {len(plan['fills'])}"
+        f" ({plan.get('fuzzy', 0)} matched by day/side/qty/symbol — Console's order_id is the exchange id)"
+    )
+    print(f"  placed rows on covered days with NO trade (->0) : {len(plan['unfilled'])}")
     print(f"  order ids in file NOT ours (ignored)           : {len(plan['unmatched_order_ids'])}")
     print(
         f"  IST days to (re)compute                        : {', '.join(d.isoformat() for d in plan['days']) or '—'}"

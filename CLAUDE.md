@@ -2550,12 +2550,21 @@ to their capital. Full design: [`docs/design/multi_account_plan.md`](docs/design
   whole-account `realised` (manual trades included) is stored as a cross-check
   and never summed in; child rows use the child's fills, never `sizing_price`
   or the parent's fill scaled (#497/#637). Pre-ship days are back-filled once
-  per child from a Console tradebook export:
-  `uv run python -m services.account_console_import --account <id> --file
-  <csv|xlsx> [--apply]` (order_id join, conflicts reported never promoted,
-  idempotent). No env flag beyond `ACCOUNT_PNL_PAIRING_LOOKBACK_DAYS`
-  (default 7). Tests: `test/test_account_pnl_service.py`,
-  `test/test_strategy_accounts_pnl.py`, `test/test_account_console_import.py`.
+  per child from a Console tradebook — fetched **headlessly** (issue #702,
+  `services/console_tradebook_fetch.py`: the child's own stored #654
+  password + TOTP through the Playwright Kite login → Console SSO → Console's
+  own tradebook endpoint; refuses inside market hours unless `--force`
+  because Kite allows one web session per user, re-probes the API token
+  after) or exported by hand, then imported by
+  `services/account_console_import.py` (`--apply` to write; dry-run default).
+  **Console's `order_id` is the EXCHANGE order number, not Kite's** — the id
+  join matches nothing for journalled rows, so the importer falls back to a
+  strict day/side/quantity/broker-symbol match within 180 s of our placement,
+  each row used once, ties refused; conflicts reported never promoted;
+  idempotent. Back-filled 2026-09-05: 88/88 child mirrors, 17 child-days. No
+  env flag beyond `ACCOUNT_PNL_PAIRING_LOOKBACK_DAYS` (default 7). Tests:
+  `test/test_account_pnl_service.py`, `test/test_strategy_accounts_pnl.py`,
+  `test/test_account_console_import.py`, `test/test_console_tradebook_fetch.py`.
 - **Ops**: every child account needs its own daily Kite login (Connect button
   + per-account TOTP code on `/accounts`); child positions live in the child's
   own broker book — OpenAlgo records child FILLS and per-day realized P&L

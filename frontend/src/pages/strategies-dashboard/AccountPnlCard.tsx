@@ -341,10 +341,10 @@ export function AccountPnlCard({ name }: { name: string }) {
             </div>
             <p className="px-4 py-3 text-[11px] text-muted-foreground">
               Primary = this page&apos;s Performance table Live figure (same rows, same net).
-              Children = realized from each child&apos;s own broker fills, joined to mirror orders
-              by order id, net of charges (broker figure where available, modelled otherwise). A day
-              a child was not captured is excluded and counted, never shown as ₹0. Whole-account
-              P&amp;L, which would include manual trades, is not part of this table.
+              Children = realized from each child&apos;s own broker fills, matched to mirror orders,
+              net of charges (broker figure where available, modelled otherwise). A day a child was
+              not captured is excluded and counted, never shown as ₹0. Whole-account P&amp;L, which
+              would include manual trades, is not part of this table.
             </p>
           </>
         )}
