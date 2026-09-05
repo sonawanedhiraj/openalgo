@@ -72,11 +72,19 @@ def build_login_reminder(accounts: list[dict], nudge: bool = False) -> str | Non
     return "\n".join(lines)
 
 
-def build_eod_summary(rows: list[dict], accounts: list[dict]) -> str | None:
-    """Per-account one-liners for today's mirror attempts, or None if none."""
+def build_eod_summary(
+    rows: list[dict], accounts: list[dict], pnl_by_account: dict[int, dict] | None = None
+) -> str | None:
+    """Per-account one-liners for today's mirror attempts, or None if none.
+
+    ``pnl_by_account`` (issue #700) maps account_id → ``{net, source}`` for the
+    day's captured realized P&L; an account without an entry reads "P&L not
+    captured", never ₹0.
+    """
     if not rows:
         return None
     names = {a["id"]: a["display_name"] for a in accounts}
+    pnl_by_account = pnl_by_account or {}
     per_account: dict[int, dict[str, int]] = {}
     for row in rows:
         counts = per_account.setdefault(row["account_id"], {})
@@ -93,9 +101,43 @@ def build_eod_summary(rows: list[dict], accounts: list[dict]) -> str | None:
             parts.append(f"{skipped} skipped")
         if bad:
             parts.append(f"{bad} REJECTED/error")
+        pnl = pnl_by_account.get(account_id)
+        if pnl and pnl.get("net") is not None:
+            sign = "+" if pnl["net"] >= 0 else "-"
+            parts.append(
+                f"net {sign}₹{abs(pnl['net']):,.0f} ({pnl.get('source') or 'modelled'} charges)"
+            )
+        elif placed:
+            parts.append("P&L not captured")
         lines.append(f"  • {name}: {', '.join(parts)}")
-    lines.append("Details: /orderbook → Mirror Orders. P&L: each child's broker book.")
+    lines.append("Details: /orderbook → Mirror Orders. P&L: /strategies → Account P&L card.")
     return "\n".join(lines)
+
+
+def capture_pnl_now(finalize: bool) -> dict[int, dict]:
+    """Run the child realized-P&L capture for today (issue #700); never let it
+    break the caller. Returns ``{account_id: {net, source}}`` summed across the
+    account's strategies for the EOD line."""
+    out: dict[int, dict] = {}
+    try:
+        from services.account_pnl_service import capture_all
+
+        for res in capture_all(finalize=finalize):
+            if res.get("status") != "captured":
+                continue
+            net = 0.0
+            sources: set[str] = set()
+            for row in (res.get("strategies") or {}).values():
+                if not row:
+                    continue
+                net += float(row.get("realized_net") or 0.0)
+                if row.get("charges_source"):
+                    sources.add(row["charges_source"])
+            source = next(iter(sources)) if len(sources) == 1 else ("mixed" if sources else None)
+            out[res["account_id"]] = {"net": round(net, 2), "source": source}
+    except Exception:
+        logger.exception("multi-account: realized P&L capture failed")
+    return out
 
 
 def _login_reminder_job(nudge: bool = False) -> None:
@@ -123,7 +165,10 @@ def _eod_summary_job() -> None:
         # only the broker's acknowledgement, and a summary built on unchecked
         # ACKs reports trades that never happened.
         _reconcile_now(today)
-        message = build_eod_summary(list_orders(date_utc=today), overview()["accounts"])
+        # Final capture of the day's realized P&L (issue #700) — after the
+        # reconcile so a post-ACK rejection is not paired as a fill.
+        pnl = capture_pnl_now(finalize=True)
+        message = build_eod_summary(list_orders(date_utc=today), overview()["accounts"], pnl)
         if message:
             _notify(message)
     except Exception:
@@ -149,6 +194,9 @@ def _fill_reconcile_job() -> None:
         if not is_multi_account_enabled() or not _is_trading_day_today():
             return
         _reconcile_now(datetime.utcnow().strftime("%Y-%m-%d"))
+        # Provisional capture (issue #700): open15 is flat by 09:30, so this
+        # is usually the day's final number; 15:35 finalizes.
+        capture_pnl_now(finalize=False)
     except Exception:
         logger.exception("multi-account fill reconcile job failed")
 
