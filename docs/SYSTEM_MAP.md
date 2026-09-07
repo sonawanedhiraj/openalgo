@@ -274,7 +274,9 @@ last fire went (from `job_run`), and whether each long-lived thread is alive
 - **Threads:** `services/thread_registry.py`. Catalogs ~32 long-lived threads by
   class (`loop` / `transport` / `poller` / `boot`) and adds an in-memory
   heartbeat, because `is_alive()` stays `True` for a thread wedged on a socket
-  read. States: `running`, `stale`, `dead`, `not_started`, `completed`.
+  read. States: `running`, `stale`, `dead`, `not_started`, `completed` — the
+  last also for a window-scoped loop that declares its normal exit via
+  `done()` (issue #709); a loop gone without that mark is `dead` and alerts.
 - **Read-only.** Neither module calls `add_job` / `pause_job` / `remove_job`, and
   scheduler resolution reads `sys.modules` rather than importing (importing
   `blueprints.python_strategy` runs a strategy cleanup). Controls — a durable
