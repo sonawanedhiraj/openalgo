@@ -34,6 +34,13 @@ routinely legitimate: no broker session yet, outside the strategy's window,
 bot not configured, flag off. Alerting on those would produce daily noise on
 a single-broker install and train the operator to ignore the channel.
 
+A loop that is **meant** to stop — the open15 risk monitor exits once the
+armed day is done — declares that on its return path with :func:`done`, and
+is then reported ``completed`` rather than ``dead`` (issue #709). The
+"beat then vanished" rule is unchanged for a loop that exits *without*
+declaring it: that silence is exactly the failure this registry exists to
+catch, so it still alerts.
+
 Design rules
 ------------
 
@@ -74,7 +81,7 @@ STATE_RUNNING = "running"
 STATE_STALE = "stale"  # alive, but the heartbeat is older than the deadline
 STATE_DEAD = "dead"  # beat at least once, then vanished
 STATE_NOT_STARTED = "not_started"  # never seen — legitimate in many cases
-STATE_COMPLETED = "completed"  # boot one-shot that ran and exited
+STATE_COMPLETED = "completed"  # exited ON PURPOSE: a boot one-shot, or a loop that done()d
 
 _DEFAULT_STALE_MULTIPLIER = 3.0
 _DEFAULT_DEDUP_MIN = 30
@@ -500,6 +507,10 @@ _BY_NAME: dict[str, ThreadSpec] = {spec.thread_name: spec for spec in CATALOG}
 _beats: dict[str, tuple[float, float, int]] = {}
 # thread_name -> monotonic timestamp of the last alert published for it.
 _last_alert: dict[str, float] = {}
+# thread_name -> (monotonic_at, wall_clock_at) of a declared normal completion
+# (issue #709). Cleared by the next beat(), so a mark present at snapshot time
+# always post-dates the last heartbeat. Guarded by _lock.
+_done: dict[str, tuple[float, float]] = {}
 _lock = threading.Lock()
 
 
@@ -536,8 +547,28 @@ def beat(thread_name: str) -> None:
             previous = _beats.get(thread_name)
             count = (previous[2] + 1) if previous else 1
             _beats[thread_name] = (now, time.time(), count)
+            # A new tick means a new run (e.g. tomorrow's arm restarted the
+            # loop): any earlier completion mark no longer describes it.
+            _done.pop(thread_name, None)
     except Exception:  # pragma: no cover - defensive
         logger.exception("thread_registry: beat(%r) failed", thread_name)
+
+
+def done(thread_name: str) -> None:
+    """Declare that ``thread_name`` is exiting **on purpose** (issue #709).
+
+    Call it on the normal return path of a loop whose lifetime is a window
+    rather than the process — never from a ``finally``, because a crash exit
+    must still read as a death. A thread that is gone and carries this mark
+    is reported ``completed`` and never alerted; one that is gone without it
+    is ``dead`` and alerts, exactly as before. The next :func:`beat` clears
+    the mark, so a restarted run is judged fresh. Never raises.
+    """
+    try:
+        with _lock:
+            _done[thread_name] = (time.monotonic(), time.time())
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("thread_registry: done(%r) failed", thread_name)
 
 
 def _live_thread_names() -> set[str]:
@@ -571,8 +602,16 @@ def _live_thread_names() -> set[str]:
     return names
 
 
-def _classify(spec: ThreadSpec, alive: bool, beat_info, now: float) -> tuple[str, float | None]:
-    """Return ``(state, heartbeat_age_sec)`` for one catalog entry."""
+def _classify(
+    spec: ThreadSpec, alive: bool, beat_info, now: float, done_info=None
+) -> tuple[str, float | None]:
+    """Return ``(state, heartbeat_age_sec)`` for one catalog entry.
+
+    ``done_info`` is the thread's :func:`done` mark, if any. It only matters
+    once the thread is gone: a thread that declared completion and is still
+    alive is judged on its heartbeat like any other, so a loop that says
+    "done" and then hangs in its own teardown still reads ``stale``.
+    """
     age = (now - beat_info[0]) if beat_info else None
 
     if spec.group == GROUP_BOOT:
@@ -582,7 +621,13 @@ def _classify(spec: ThreadSpec, alive: bool, beat_info, now: float) -> tuple[str
         return (STATE_COMPLETED if beat_info else STATE_NOT_STARTED), age
 
     if not alive:
-        return (STATE_DEAD if beat_info else STATE_NOT_STARTED), age
+        if not beat_info:
+            return STATE_NOT_STARTED, age
+        # beat() clears the mark, so its presence here means the thread
+        # declared completion AFTER its last tick — a normal exit (#709).
+        if done_info is not None:
+            return STATE_COMPLETED, age
+        return STATE_DEAD, age
 
     if spec.group == GROUP_LOOP and spec.cadence_sec:
         if beat_info is None:
@@ -607,12 +652,14 @@ def snapshot() -> list[dict]:
     now = time.monotonic()
     with _lock:
         beats = dict(_beats)
+        dones = dict(_done)
 
     rows: list[dict] = []
     for spec in CATALOG:
         alive = spec.thread_name in live
         info = beats.get(spec.thread_name)
-        state, age = _classify(spec, alive, info, now)
+        done_info = dones.get(spec.thread_name)
+        state, age = _classify(spec, alive, info, now, done_info)
         rows.append(
             {
                 "thread_name": spec.thread_name,
@@ -630,6 +677,7 @@ def snapshot() -> list[dict]:
                 "heartbeat_age_sec": round(age, 1) if age is not None else None,
                 "last_beat_at": info[1] if info else None,
                 "beat_count": info[2] if info else 0,
+                "done_at": done_info[1] if done_info else None,
             }
         )
 
@@ -654,6 +702,7 @@ def snapshot() -> list[dict]:
                 "heartbeat_age_sec": None,
                 "last_beat_at": None,
                 "beat_count": 0,
+                "done_at": None,
             }
         )
 
@@ -672,6 +721,7 @@ def summarize(rows: list[dict] | None = None) -> dict:
         "stale": sum(1 for r in catalogued if r["state"] == STATE_STALE),
         "dead": sum(1 for r in catalogued if r["state"] == STATE_DEAD),
         "not_started": sum(1 for r in catalogued if r["state"] == STATE_NOT_STARTED),
+        "completed": sum(1 for r in catalogued if r["state"] == STATE_COMPLETED),
         "unregistered": sum(1 for r in rows if r["group"] == "unregistered"),
     }
 
@@ -747,3 +797,4 @@ def reset_for_tests() -> None:
     with _lock:
         _beats.clear()
         _last_alert.clear()
+        _done.clear()

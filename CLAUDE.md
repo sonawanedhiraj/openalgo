@@ -2098,7 +2098,12 @@ operator is trying to explain ("why did nothing happen at 16:00?").
   (`beat()`) stamped at the top of each recurring loop's tick. The heartbeat is
   the point: `Thread.is_alive()` stays `True` forever for a thread wedged on a
   socket read, so liveness alone proves nothing. States: `running` / `stale` /
-  `dead` / `not_started` / `completed`.
+  `dead` / `not_started` / `completed`. A **window-scoped loop that finishes on
+  purpose** (the open15 risk monitor returns once the armed day is done) calls
+  `done()` on its return path — never from a `finally` — so it reads
+  `completed`, not `dead` (issue #709); a loop that vanishes *without* it still
+  alerts, and the next `beat()` clears the mark so a restarted run is judged
+  fresh.
 - **Alerting is deliberately narrow** and rides the existing `ThreadWatchdog`
   30 s loop (no new thread to watch threads): only a thread that **beat at least
   once and then went silent or vanished** alerts. `not_started` never alerts,

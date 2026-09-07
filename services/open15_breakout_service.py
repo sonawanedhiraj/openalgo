@@ -3211,11 +3211,17 @@ class Open15BreakoutService:
     def _risk_loop(self) -> None:
         import time as _time
 
-        from services.thread_registry import beat
+        from services.thread_registry import beat, done
 
         while True:
             beat("open15-risk-monitor")
             if self.day_status != "armed":
+                # The day is finished: this exit is BY DESIGN, so tell the
+                # registry (issue #709) — otherwise a loop that beat and then
+                # vanished is DEAD and Telegrams every 30 min until midnight.
+                # Deliberately not in a `finally`: a crash exit must still
+                # read as a death.
+                done("open15-risk-monitor")
                 return
             interval = 5
             try:
