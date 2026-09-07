@@ -649,6 +649,22 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
     like summary); a stop loss rides the normal exit event + reason. */
  .ev-profit_target_locked{color:#f9e2af;font-weight:bold}
  .ev-profit_trail_exit{color:#cba6f7;font-weight:bold}
+ /* stop-loss counterfactual (issue #704): a measurement, muted like the other
+    enrichment events */
+ .ev-stop_counterfactual,.ev-stop_counterfactual_backfill{color:#8aa0b4}
+ .slchips{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+ .slchips .chip{min-width:110px}
+ .slbars{display:flex;align-items:flex-end;gap:5px;height:58px;margin:12px 0 20px;border-bottom:1px solid #2c3640;position:relative}
+ .slbar{flex:1;position:relative;height:100%;display:flex;flex-direction:column;justify-content:flex-end;max-width:48px}
+ .slbar i{display:block;width:100%}
+ .slbar em{position:absolute;bottom:-16px;left:0;right:0;text-align:center;font-style:normal;font-size:9px;color:#6b7886;overflow:hidden;white-space:nowrap}
+ .slrule{margin-top:10px;padding:8px 10px;border-left:3px solid #f9e2af;background:#1a2129;color:#8aa0b4;font-size:12px}
+ .slrule b{color:#d7dde4;font-weight:500}
+ .b-right{background:#12291c;color:#a6e3a1} .b-wrong{background:#3a1b1b;color:#f38ba8}
+ .b-pend{background:#332a17;color:#f9e2af} .b-src{background:#232c36;color:#8aa0b4}
+ .sltab{width:100%;border-collapse:collapse;margin-top:6px;font-variant-numeric:tabular-nums}
+ .sltab td,.sltab th{font-size:12px;padding:3px 8px;white-space:nowrap}
+ .sltab td.num,.sltab th.num{text-align:right}
  .risk-open{background:#12291c;color:#a6e3a1;border:1px solid #2e5140}
  .risk-locked{background:#332a17;color:#f9e2af;border:1px solid #5c4d2a}
  .risk-done{background:#1b2b3a;color:#89b4fa;border:1px solid #2c4a6e}
@@ -829,6 +845,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <div class="chips" id="chips"></div>
   <div id="riskcard" class="atmcard" style="display:none"></div>
   <div id="pnlcard" class="atmcard" style="display:none"></div>
+  <div id="slcard" class="atmcard" style="display:none"></div>
   <div id="capcard" class="atmcard" style="display:none"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
@@ -1160,7 +1177,7 @@ async function selectDay(date){
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null; liveFeed=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderRejected(); renderLogLostBanner(); renderChips(); renderCapital(); renderAtmLadder();
-  renderRolling(); renderSel(); renderTimeline(); loadPnlCurve();
+  renderRolling(); renderSel(); renderTimeline(); loadPnlCurve(); loadScorecard();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
 }
@@ -2026,7 +2043,7 @@ async function loadLadderPreview(){
 // 5s live refresh never multiplies broker history calls. The live overlay
 // polls /api/live_pnl at the configured interval; the SERVER cache is what
 // bounds broker quote calls, so extra tabs are free.
-let curveData=null, livePnl=null, liveTimer=null;
+let curveData=null, livePnl=null, liveTimer=null, liveGhost=null;
 const CURVE_COLS=['#89b4fa','#fab387','#94e2d5','#f5c2e7','#cba6f7','#a6e3a1'];
 function m2x(hhmm){const p=hhmm.split(':');return +p[0]*60+ +p[1];}
 function fmtR(v){const s=Math.round(Math.abs(v)).toLocaleString('en-IN');return (v<0?'-Rs':'+Rs')+s;}
@@ -2047,15 +2064,18 @@ async function pollLivePnl(){
   // outside the hold window the endpoint answers idle/closed without touching
   // the broker, so an idle page costs one localhost fetch per interval
   const today=digests.length&&digests[0].source==='live'?digests[0].date:null;
-  if(!curDate||curDate!==today){livePnl=null;renderRiskCard(null);return;}
+  if(!curDate||curDate!==today){livePnl=null;liveGhost=null;renderRiskCard(null);return;}
   try{
     const r=await fetch('/open15_vol_breakout/api/live_pnl'); const j=await r.json();
-    const had=!!livePnl; livePnl=(j.status==='live')?j:null;
+    const had=!!livePnl||!!liveGhost; livePnl=(j.status==='live')?j:null;
+    // stopped rows' marks ride the payload whatever the status (issue #704):
+    // after the last real row stops, status is 'closed' but ghosts continue
+    liveGhost=(j.ghost&&j.ghost.length&&j.asof)?{date:j.date,asof:j.asof,ghost:j.ghost}:null;
     if(j.poll_interval_s&&j.poll_interval_s!==+window.__livePollS){
       window.__livePollS=j.poll_interval_s;armLivePoll();}
     renderRiskCard(j);
-    if(livePnl||had)renderPnlCurve();
-  }catch(e){livePnl=null;}
+    if(livePnl||liveGhost||had)renderPnlCurve();
+  }catch(e){livePnl=null;liveGhost=null;}
 }
 // ---- Day Risk card (issue #696): live lock/trail/stop state ---------------
 function renderRiskCard(j){
@@ -2111,9 +2131,13 @@ function renderPnlCurve(){
     return;
   }
   const L=(livePnl&&curDate===livePnl.date)?livePnl:null;
-  const liveX=L?(function(p){return +p[0]*60+ +p[1]+ +p[2]/60;})(L.asof.split(':')):null;
+  const G=(liveGhost&&curDate===liveGhost.date)?liveGhost:null;
+  const toX=asof=>(function(p){return +p[0]*60+ +p[1]+ +p[2]/60;})(asof.split(':'));
+  const liveX=L?toX(L.asof):null;
+  const ghostX=G?toX(G.asof):null;
   let xmin=1e9,xmax=-1e9,ymin=0,ymax=0;
   const lines=[];
+  const stopped=usable.filter(t=>t.stop_loss);
   usable.forEach((t,i)=>{
     const ex=m2x(t.entry_minute)+(t.entry_second||0)/60;
     const arr=[[ex,0]];
@@ -2124,12 +2148,33 @@ function renderPnlCurve(){
     if(lv&&liveX!=null)arr.push([liveX,lv.mtm]);
     for(const p of arr){xmin=Math.min(xmin,p[0]);xmax=Math.max(xmax,p[0]);
       ymin=Math.min(ymin,p[1]);ymax=Math.max(ymax,p[1]);}
-    lines.push({t:t,arr:arr,col:CURVE_COLS[i%CURVE_COLS.length]});
+    // stop-loss counterfactual (issue #704): the contract's marks AFTER the
+    // stop, to the scheduled exit — drawn dashed from the stop point. Not
+    // money: the row's real P&L is the solid line's last point.
+    let garr=null;
+    if(t.stop_loss&&t.final){
+      garr=[arr[arr.length-1]];
+      for(const q of (t.ghost||[]))garr.push([m2x(q[0]),q[1]]);
+      let gv=null;
+      if(G)for(const x of (G.ghost||[]))if(x.row_id===t.id&&x.mtm!=null)gv=x;
+      if(gv&&ghostX!=null)garr.push([ghostX,gv.mtm]);
+      else if(t.ghost_final)garr.push([m2x(t.ghost_final[0]),t.ghost_final[1]]);
+      if(garr.length<2)garr=null;
+      else for(const p of garr){xmin=Math.min(xmin,p[0]);xmax=Math.max(xmax,p[0]);
+        ymin=Math.min(ymin,p[1]);ymax=Math.max(ymax,p[1]);}
+    }
+    lines.push({t:t,arr:arr,garr:garr,col:CURVE_COLS[i%CURVE_COLS.length]});
   });
   const port=(j.portfolio||[]).map(q=>[m2x(q[0]),q[1]]);
   if(j.portfolio_final)port.push([m2x(j.portfolio_final[0]),j.portfolio_final[1]]);
   if(L&&L.portfolio_mtm!=null&&liveX!=null)port.push([liveX,L.portfolio_mtm]);
   for(const p of port){if(p[0]<xmin)xmin=p[0];if(p[0]>xmax)xmax=p[0];
+    if(p[1]<ymin)ymin=p[1];if(p[1]>ymax)ymax=p[1];}
+  // portfolio had no row been stopped (server-derived, only on a stop day)
+  const portNS=stopped.length?(j.portfolio_no_stop||[]).map(q=>[m2x(q[0]),q[1]]):[];
+  if(portNS.length&&j.portfolio_no_stop_final)
+    portNS.push([m2x(j.portfolio_no_stop_final[0]),j.portfolio_no_stop_final[1]]);
+  for(const p of portNS){if(p[0]<xmin)xmin=p[0];if(p[0]>xmax)xmax=p[0];
     if(p[1]<ymin)ymin=p[1];if(p[1]>ymax)ymax=p[1];}
   if(xmax-xmin<3)xmax=xmin+3;
   const pad=Math.max((ymax-ymin)*0.1,200); ymin-=pad; ymax+=pad;
@@ -2161,12 +2206,32 @@ function renderPnlCurve(){
   }
   const labels=[];
   const pathOf=arr=>'M'+arr.map(p=>X(p[0]).toFixed(1)+' '+Y(p[1]).toFixed(1)).join(' L');
+  if(portNS.length>1){
+    s+='<path d="'+pathOf(portNS)+'" fill="none" stroke="#8aa0b4" stroke-width="1.5" stroke-dasharray="6 4" stroke-linejoin="round"/>';
+    const pn=portNS[portNS.length-1];
+    s+='<circle cx="'+X(pn[0])+'" cy="'+Y(pn[1])+'" r="3" fill="#8aa0b4" stroke="#0f1419" stroke-width="1.5"/>';
+    labels.push({y:Y(pn[1]),col:'#8aa0b4',txt:'PORT if no stop '+fmtR(pn[1])});
+  }
   for(const ln of lines){
     s+='<path d="'+pathOf(ln.arr)+'" fill="none" stroke="'+ln.col+'" stroke-width="1.8" stroke-linejoin="round"/>';
     s+='<circle cx="'+X(ln.arr[0][0])+'" cy="'+Y(0)+'" r="3.4" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
     const last=ln.arr[ln.arr.length-1];
-    s+='<circle cx="'+X(last[0])+'" cy="'+Y(last[1])+'" r="3.2" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
-    labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' '+fmtR(last[1])});
+    if(ln.garr){
+      s+='<path d="'+pathOf(ln.garr)+'" fill="none" stroke="'+ln.col+'" stroke-opacity=".55" stroke-width="1.6" stroke-dasharray="5 4" stroke-linejoin="round"/>';
+      const ge=ln.garr[ln.garr.length-1];
+      s+='<circle cx="'+X(ge[0])+'" cy="'+Y(ge[1])+'" r="3" fill="'+ln.col+'" fill-opacity=".55" stroke="#0f1419" stroke-width="1.5"/>';
+      // the stop itself: a mauve diamond, the risk-event colour on this page
+      const cx=X(last[0]),cy=Y(last[1]);
+      s+='<path d="M'+cx+' '+(cy-5.5)+' L'+(cx+5.5)+' '+cy+' L'+cx+' '+(cy+5.5)+' L'+(cx-5.5)+' '+cy+' Z" fill="#cba6f7" stroke="#0f1419" stroke-width="1.3"/>';
+      const sv=ln.t.stop_saved;
+      labels.push({y:Y(ge[1]),col:ln.col,dim:1,txt:ln.t.symbol+' held '+fmtR(ge[1])+
+        (sv!=null?(' (stop '+(sv>=0?'saved ':'cost ')+fmtR(sv)+' net)'):
+          (ln.t.cf_source==='curve'?' (unstamped)':''))});
+      labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' SL '+fmtR(last[1])});
+    }else{
+      s+='<circle cx="'+X(last[0])+'" cy="'+Y(last[1])+'" r="3.2" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
+      labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' '+fmtR(last[1])});
+    }
   }
   if(port.length){
     s+='<path d="'+pathOf(port)+'" fill="none" stroke="#d7dde4" stroke-width="2.4" stroke-linejoin="round"/>';
@@ -2178,7 +2243,7 @@ function renderPnlCurve(){
   for(let i=1;i<labels.length;i++)if(labels[i].y-labels[i-1].y<12)labels[i].y=labels[i-1].y+12;
   for(const lb of labels)
     s+='<text x="'+(ML+PW+8)+'" y="'+(lb.y+3.5)+'" font-size="10.5" fill="'+lb.col+'"'+
-      (lb.bold?' font-weight="bold"':'')+'>'+esc(lb.txt)+'</text>';
+      (lb.bold?' font-weight="bold"':'')+(lb.dim?' fill-opacity=".8"':'')+'>'+esc(lb.txt)+'</text>';
   s+='</svg>';
   // takeaway: best flatten-at-mark vs actual (closed days only). "Flatten at
   // the close of minute m" implicitly means entries triggered after m never
@@ -2204,7 +2269,18 @@ function renderPnlCurve(){
   const legend=lines.map(ln=>'<span style="color:'+ln.col+'">&#9644; '+esc(ln.t.symbol)+
     ' '+esc(ln.t.side)+(ln.t.instrument==='option'?' &middot; '+
     esc(String(ln.t.contract||'').replace(ln.t.symbol,'')):'')+'</span>').join(' &nbsp; ')+
-    ' &nbsp; <span style="color:#d7dde4">&#9644; portfolio</span>';
+    ' &nbsp; <span style="color:#d7dde4">&#9644; portfolio</span>'+
+    (stopped.length?(' &nbsp; <span style="color:#cba6f7">&#9670; stop-loss exit</span>'+
+      ' &nbsp; <span style="color:#8aa0b4">&#8212; &#8212; dashed = after the stop, to the scheduled exit (not held)</span>'):'');
+  let stopLine='';
+  if(stopped.length){
+    const pending=stopped.filter(t=>t.stop_saved==null).length;
+    stopLine='<div class="muted" style="margin-top:6px">stop loss today: '+stopped.length+' exit'+
+      (stopped.length===1?'':'s')+(j.stop_saved_total!=null?(' &middot; net effect <span class="'+
+      (j.stop_saved_total>=0?'pos':'neg')+'">'+fmtR(j.stop_saved_total)+'</span> (positive = the stops avoided a bigger loss)'):
+      (' &middot; '+pending+' counterfactual'+(pending===1?'':'s')+' not stamped yet (live at the exit, or bars at the summary / next arm)'))+
+      ' &middot; held-to-exit is priced at the 1m close, so it slightly flatters holding</div>';
+  }
   const sub=(L?('LIVE &mdash; marks vs entry fill, one batched quote per poll ('+
       (L.poll_interval_s||window.__livePollS||5)+'s)')
     :'marks = 1m closes vs entry fill &middot; final point = broker fill')+
@@ -2212,9 +2288,92 @@ function renderPnlCurve(){
     (unav.length?(' &middot; '+unav.length+' trade'+(unav.length===1?'':'s')+' unavailable'):'');
   box.style.display='';
   box.innerHTML=title+'<span class="asub">'+sub+'</span>'+
-    '<div class="muted" style="margin:6px 0 2px;font-size:11px">'+legend+'</div>'+s+take+
+    '<div class="muted" style="margin:6px 0 2px;font-size:11px">'+legend+'</div>'+s+take+stopLine+
     (unav.length?('<div class="muted" style="margin-top:4px">unavailable: '+
       unav.map(t=>esc(t.symbol)+' ('+esc(t.reason||'')+')').join('; ')+'</div>'):'');
+}
+// ---- stop-loss scorecard (issue #704): is the per-trade stop paying for itself?
+async function loadScorecard(){
+  const box=document.getElementById('slcard'); if(!box)return;
+  try{const r=await fetch('/open15_vol_breakout/api/stop_scorecard');renderScorecard(await r.json());}
+  catch(e){box.style.display='none';box.innerHTML='';}
+}
+function renderScorecard(j){
+  const box=document.getElementById('slcard'); if(!box)return;
+  const title='<span class="atitle">STOP-LOSS SCORECARD</span>';
+  if(!j||j.status!=='ok'){box.style.display='';box.innerHTML=title+
+    '<span class="asub">unavailable: '+esc((j&&j.message)||'scorecard failed')+'</span>';return;}
+  const rup=v=>(v<0?'-Rs':'+Rs')+Math.abs(Math.round(v)).toLocaleString('en-IN');
+  const rupAbs=v=>'Rs'+Math.abs(Math.round(v)).toLocaleString('en-IN');
+  if(!j.n_events){
+    // never an empty box (#615/#622): say what the card is waiting for
+    box.style.display='';
+    box.innerHTML=title+'<span class="asub">no stop-loss exits recorded yet &mdash; fills from the first '+
+      'row the per-trade stop closes (rule: '+esc(j.rule.text)+')</span>';
+    return;
+  }
+  const chip=(k,v,vc,sub)=>'<div class="chip"><span class="k">'+k+'</span>'+
+    '<span class="v'+(vc?(' '+vc):'')+'">'+v+'</span>'+(sub?('<span class="k">'+sub+'</span>'):'')+'</div>';
+  const vcls=j.verdict==='keep'?'b-right':(j.verdict==='disable'?'b-wrong':'b-pend');
+  const vtxt=j.verdict==='keep'?'KEEP the stop':(j.verdict==='disable'?'DISABLE the stop':'SAMPLE TOO SMALL');
+  let h=title+'<span class="asub">every stop since '+esc(j.since)+' &middot; '+j.n_events+' event'+
+    (j.n_events===1?'':'s')+' over '+j.n_days+' day'+(j.n_days===1?'':'s')+
+    (j.n_pending?(' &middot; <span style="color:#f9e2af">'+j.n_pending+' not priced yet</span>'):'')+
+    ' &middot; counterfactual = held to the scheduled exit &middot; net Rs</span>';
+  h+='<div class="slchips">'+
+    chip('stops fired',j.n_events,'',j.n_priced+' priced')+
+    chip('stop right / wrong','<span class="pos">'+j.right+'</span> / <span class="neg">'+j.wrong+'</span>','',
+      j.right_rate!=null?(Math.round(j.right_rate*100)+'% right'):'')+
+    chip('net saved by stops',j.n_priced?rup(j.net_saved):'&mdash;',j.net_saved>=0?'pos':'neg','stop exit minus held')+
+    chip('median per stop',j.median_saved!=null?rup(j.median_saved):'&mdash;',(j.median_saved||0)>=0?'pos':'neg',
+      j.mean_saved!=null?('avg '+rup(j.mean_saved)):'')+
+    chip('worst / best',j.n_priced?(rup(j.worst_saved)+' / '+rup(j.best_saved)):'&mdash;','','')+
+    chip('avg best mark after stop',j.avg_mfe_after_stop!=null?rup(j.avg_mfe_after_stop):'&mdash;',
+      (j.avg_mfe_after_stop||0)>=0?'pos':'neg','recovery we walked away from')+
+    chip('sample',j.n_priced+' / '+j.rule.min_events,'','events the rule needs')+
+    '</div>';
+  const priced=(j.events||[]).filter(e=>!e.pending);
+  if(priced.length){
+    const mx=Math.max(...priced.map(e=>Math.abs(e.saved)))||1;
+    h+='<div class="muted" style="margin-top:10px">stop saved per event (green = the stop was right)</div><div class="slbars">';
+    for(const e of priced){
+      const hh=Math.max(3,Math.round(Math.abs(e.saved)/mx*40));
+      h+='<div class="slbar" title="'+esc(e.date+' '+e.symbol+' '+rup(e.saved))+'">'+
+        (e.saved>=0?('<i style="height:'+hh+'px;background:#a6e3a1;margin-bottom:22px"></i>')
+          :('<i style="height:'+hh+'px;background:#f38ba8;margin-bottom:'+(22-hh)+'px"></i>'))+
+        '<em>'+esc(e.date.slice(5))+'</em></div>';
+    }
+    h+='</div>';
+  }
+  h+='<div class="slrule"><b>Decision rule (pre-registered):</b> '+esc(j.rule.text)+'. '+
+    '<b>Now:</b> '+j.n_priced+' of '+j.rule.min_events+' events, '+(j.n_priced?rup(j.net_saved):'&mdash;')+
+    ', '+(j.right_rate!=null?Math.round(j.right_rate*100)+'% right':'&mdash;')+
+    ' &rarr; <span class="badge '+vcls+'">'+vtxt+'</span></div>';
+  h+='<div style="overflow-x:auto"><table class="sltab"><tr><th>date</th><th>trade</th><th>stop at</th>'+
+    '<th class="num">stop exit</th><th class="num">held to exit</th><th class="num">stop saved</th>'+
+    '<th class="num">worst after</th><th class="num">best after</th><th>source</th><th>verdict</th></tr>';
+  for(const e of (j.events||[]).slice().reverse()){
+    const con=String(e.contract||'').replace(e.symbol,'');
+    h+='<tr><td>'+esc(e.date)+'</td><td>'+esc(e.symbol)+' '+esc(e.side)+(con?(' <span class="muted">'+esc(con)+'</span>'):'')+
+      ' <span class="muted">&times;'+e.qty+'</span></td>'+
+      '<td>'+esc(e.stop_at||'')+'</td>'+
+      '<td class="num '+((e.stop_net||0)>=0?'pos':'neg')+'">'+(e.stop_net!=null?rup(e.stop_net):'&mdash;')+'</td>'+
+      (e.pending?('<td class="num muted" colspan="4">not priced yet</td>'):(
+        '<td class="num '+(e.held_net>=0?'pos':'neg')+'">'+rup(e.held_net)+' <span class="muted">@'+esc(e.cf_exit_minute||'')+'</span></td>'+
+        '<td class="num '+(e.saved>=0?'pos':'neg')+'">'+rup(e.saved)+'</td>'+
+        '<td class="num">'+(e.mae!=null?(rup(e.mae)+' <span class="muted">@'+esc(e.mae_minute||'')+'</span>'):'&mdash;')+'</td>'+
+        '<td class="num">'+(e.mfe!=null?(rup(e.mfe)+' <span class="muted">@'+esc(e.mfe_minute||'')+'</span>'):'&mdash;')+'</td>'))+
+      '<td>'+(e.source?('<span class="badge b-src">'+esc(e.source==='live'?'live quote':(e.source==='bars'?'1m bars':e.source))+'</span>'):'')+'</td>'+
+      '<td>'+(e.pending?'<span class="badge b-pend">PENDING</span>':(e.verdict==='right'?
+        '<span class="badge b-right">STOP RIGHT</span>':'<span class="badge b-wrong">STOP WRONG</span>'))+'</td></tr>';
+  }
+  h+='</table></div>'+
+    '<div class="muted" style="margin-top:6px">"stop saved" = stop exit net &minus; held-to-exit net (one definition, '+
+    '<code>stop_saved_of_row</code>). "worst / best after" are the lowest and highest marks between the stop and the '+
+    'scheduled exit. <em>live quote</em> = stamped by the risk monitor at the exit; <em>1m bars</em> = back-filled '+
+    'from broker history. Held-to-exit is priced at the 1m close and slightly flatters holding.</div>';
+  box.style.display='';
+  box.innerHTML=h;
 }
 armLivePoll();
 loadLadderPreview();
@@ -2394,6 +2553,24 @@ def pnl_curve():
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
         return jsonify({"status": "error", "message": "date must be YYYY-MM-DD"}), 400
     return jsonify(build_pnl_curve(date))
+
+
+@open15_bp.route("/api/stop_scorecard", methods=["GET"])
+@check_session_validity
+def stop_scorecard():
+    """Every per-trade stop-loss exit vs its held-to-scheduled-exit
+    counterfactual, plus the pre-registered decision rule (issue #704).
+
+    Read-only on the journal; no broker call. Always HTTP 200 with a labelled
+    ``status`` — the card renders failure as text, never as an empty box.
+    """
+    from services.open15_sl_counterfactual import scorecard
+
+    try:
+        return jsonify(scorecard())
+    except Exception:
+        logger.exception("open15: stop scorecard failed")
+        return jsonify({"status": "error", "message": "scorecard failed — see logs"})
 
 
 @open15_bp.route("/api/live_pnl", methods=["GET"])

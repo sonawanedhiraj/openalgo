@@ -523,6 +523,11 @@ def _fresh_risk_state() -> dict:
         "trail_at": None,
         "last_trail_retry": 0.0,
         "sl_alerted": [],
+        # issue #704: per-poll ghost marks of stopped rows, keyed by journal
+        # row id -> [(HH:MM:SS, mtm)], plus the last quote seen per row. The
+        # flatten at the scheduled exit stamps these as the LIVE counterfactual.
+        "ghost_path": {},
+        "ghost_last": {},
     }
 
 
@@ -2488,6 +2493,9 @@ class Open15BreakoutService:
                 logger.info("open15 fill-reconcile catch-up: %s", res)
         except Exception:
             logger.exception("open15: fill-reconcile catch-up failed")
+        # stop-loss counterfactual catch-up (issue #704): any stop row, any
+        # day, whose held-to-exit mark is still NULL
+        self._backfill_stop_counterfactuals(None)
 
     def _window_minutes(self) -> tuple[int, int]:
         """Today's effective (entry-cutoff, exit) as minutes since midnight."""
@@ -3096,6 +3104,10 @@ class Open15BreakoutService:
         with NO order placed. They are handled first so a position promoted back
         to ``open`` by the verification is squared off in this same pass.
         """
+        # stop-loss counterfactual (issue #704): stamp the tracked ghost marks
+        # NOW — this job fires at the scheduled exit, the instant a held row
+        # would have been flattened. Before any exit order, off the tick thread.
+        self._stamp_ghost_counterfactuals()
         with self._lock:
             paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
             # SIM (#555) and SHADOW (#581) are both "no order was ever sent"
@@ -3227,6 +3239,10 @@ class Open15BreakoutService:
         from services.open15_pnl_curve import invalidate_live_cache, live_pnl
 
         payload = live_pnl()  # refreshes the shared cache — the chart reads this too
+        # stopped rows' ghost marks (issue #704) — recorded for the live
+        # counterfactual and NOTHING else: they are not in ``trades``, so the
+        # stop and day rules below cannot see them by construction
+        self._track_ghosts(payload)
         cfg = self.day_config or {}
         lock_on = bool(cfg.get("profit_lock_enabled"))
         sl_on = bool(cfg.get("stop_loss_enabled"))
@@ -3321,6 +3337,95 @@ class Open15BreakoutService:
                 r["floor"] = day_pnl - giveback
         elif open_trades and r.get("floor") is not None and day_pnl <= float(r["floor"]):
             self._profit_trail_flatten(day_pnl)
+
+    def _track_ghosts(self, payload: dict) -> None:
+        """Record each stopped row's live mark for the counterfactual (#704)."""
+        try:
+            ghosts = payload.get("ghost") or []
+            if not ghosts:
+                return
+            asof = payload.get("asof") or self._now_ist().strftime("%H:%M:%S")
+            with self._lock:
+                paths = self._risk.setdefault("ghost_path", {})
+                last = self._risk.setdefault("ghost_last", {})
+                for g in ghosts:
+                    rid = g.get("row_id")
+                    if rid is None or g.get("mtm") is None:
+                        continue
+                    paths.setdefault(rid, []).append((asof, float(g["mtm"])))
+                    last[rid] = float(g["ltp"])
+        except Exception:
+            logger.exception("open15: ghost tracking failed")
+
+    def _stamp_ghost_counterfactuals(self) -> None:
+        """At the scheduled exit, write the LIVE counterfactual for every
+        stopped row the monitor tracked (issue #704).
+
+        Runs at the head of ``flatten`` — the job that fires AT the scheduled
+        exit — so the stamp uses the last quote before the real exits go out,
+        the same instant a held row would have been flattened. Idempotent: a
+        row already priced is skipped, and one never tracked (restart mid-
+        window, monitor off) stays NULL for the bars backfill at the summary
+        job / next arm. Never raises into the flatten.
+        """
+        try:
+            from database.open15_breakout_db import (
+                stop_loss_rows,
+                stop_saved_of_row,
+                update_trade,
+            )
+            from services.open15_sl_counterfactual import derive_from_live, scheduled_exit_min
+
+            rows = stop_loss_rows(trade_date=self._trade_date(), unpriced_only=True)
+            if not rows:
+                return
+            with self._lock:
+                paths = dict(self._risk.get("ghost_path") or {})
+                last = dict(self._risk.get("ghost_last") or {})
+            sched = scheduled_exit_min(self._trade_date())
+            for row in rows:
+                ltp = last.get(row.id)
+                if ltp is None:
+                    continue
+                cf = derive_from_live(row, sched, ltp, paths.get(row.id) or [])
+                if cf is None:
+                    continue
+                cf["cf_source"] = "live"
+                if update_trade(row.id, **cf):
+                    saved = stop_saved_of_row(
+                        {**cf, "pnl": row.pnl, "charges_inr": row.charges_inr}
+                    )
+                    self._log_event(
+                        "stop_counterfactual",
+                        symbol=row.symbol,
+                        source="live",
+                        held_gross=cf["cf_pnl"],
+                        held_charges=cf["cf_charges_inr"],
+                        stop_saved=saved,
+                        mae=cf["cf_mae"],
+                        mfe=cf["cf_mfe"],
+                        exit_minute=cf["cf_exit_minute"],
+                    )
+        except Exception:
+            logger.exception("open15: ghost counterfactual stamp failed")
+
+    def _backfill_stop_counterfactuals(self, trade_date: str | None) -> None:
+        """Bars backstop for the live stamp (issue #704); never raises."""
+        try:
+            from services.open15_sl_counterfactual import backfill_missing
+
+            res = backfill_missing(trade_date=trade_date)
+            if res.get("checked"):
+                logger.info("open15 stop-counterfactual backfill: %s", res)
+                if trade_date:
+                    self._log_event(
+                        "stop_counterfactual_backfill",
+                        checked=res["checked"],
+                        priced=res["priced"],
+                        pending=res["pending"],
+                    )
+        except Exception:
+            logger.exception("open15: stop-counterfactual backfill failed")
 
     def _alert_stop_loss(self, symbol: str, mtm: float, sl_inr: float) -> None:
         """Telegram a fired stop, deduped per (symbol, day) so the 60s trail
@@ -3466,6 +3571,10 @@ class Open15BreakoutService:
         # the next 09:10 arm) and for days where the flatten-time pass failed.
         # Kept OFF the tick thread like everything broker-synchronous here.
         self._reconcile_and_log()
+        # stop-loss counterfactual bars backstop (issue #704) — prices any
+        # stopped row the live stamp missed; broker 1m lag means rows still
+        # NULL here are retried by the next 09:10 arm's catch-up
+        self._backfill_stop_counterfactuals(self._trade_date())
         if _opt_shadow_enabled():
             # ATM option shadow pricing (issue #435). Broker current-day 1m
             # history lags ~5-15 min, so rows left unpriced here are retried
