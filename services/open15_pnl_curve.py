@@ -275,8 +275,13 @@ def build_pnl_curve(date: str) -> dict:
         rows = _real_rows(date)
         trades = []
         all_closed = True
+        sched_exit = None
+        if any(getattr(r, "reason", None) == "stop_loss" for r in rows):
+            from services.open15_sl_counterfactual import scheduled_exit_min
+
+            sched_exit = scheduled_exit_min(date)
         for row in rows:
-            trades.append(_trade_curve(row, date))
+            trades.append(_trade_curve(row, date, sched_exit_min=sched_exit))
             if row.status != "closed":
                 all_closed = False
         payload = _assemble(date, trades)
@@ -307,8 +312,8 @@ def build_pnl_curve(date: str) -> dict:
     return payload
 
 
-def _trade_curve(row, date: str) -> dict:
-    from database.open15_breakout_db import net_pnl_of_row
+def _trade_curve(row, date: str, sched_exit_min: int | None = None) -> dict:
+    from database.open15_breakout_db import net_pnl_of_row, stop_saved_of_row
 
     contract, exchange = _row_contract(row)
     sign = _row_sign(row)
@@ -342,6 +347,17 @@ def _trade_curve(row, date: str) -> dict:
         "final": None,
         "unavailable": False,
         "reason": None,
+        # stop-loss counterfactual (issue #704): the contract's marks AFTER a
+        # stop exit, to the scheduled exit. Never money — the chart draws them
+        # dashed and the only derived figure is ``stop_saved`` (one definition,
+        # ``stop_saved_of_row``). Empty on every non-stopped row.
+        "stop_loss": (row.reason == "stop_loss") and row.status == "closed",
+        "ghost": [],
+        "ghost_final": None,
+        "cf_pnl": row.cf_pnl,
+        "cf_charges_inr": row.cf_charges_inr,
+        "cf_source": row.cf_source,
+        "stop_saved": stop_saved_of_row(row) if row.cf_pnl is not None else None,
     }
 
     if basis is None or not qty or trig_min is None:
@@ -373,6 +389,24 @@ def _trade_curve(row, date: str) -> dict:
     # final point: the journal's own (fill-derived) gross P&L, never re-derived
     if row.status == "closed" and exit_min is not None and row.pnl is not None:
         out["final"] = [_min_to_hhmm(exit_min), round(float(row.pnl), 2)]
+
+    # ghost marks: the stop minute's own bar (its close is after the stop)
+    # through the last full bar before the SCHEDULED exit (issue #704)
+    if out["stop_loss"] and exit_min is not None and sched_exit_min is not None:
+        for m in range(exit_min, sched_exit_min):
+            hhmm = _min_to_hhmm(m)
+            close = closes.get(hhmm)
+            if close is None:
+                continue
+            out["ghost"].append([hhmm, round((close - basis) * qty * sign, 2)])
+        sched_hhmm = _min_to_hhmm(sched_exit_min)
+        if row.cf_pnl is not None:
+            # stamped value wins (live quote at the exit, or the bars backfill)
+            out["ghost_final"] = [sched_hhmm, round(float(row.cf_pnl), 2)]
+        elif out["ghost"]:
+            # not stamped yet — the last bar mark stands in, labelled as such
+            out["ghost_final"] = [sched_hhmm, out["ghost"][-1][1]]
+            out["cf_source"] = "curve"
     return out
 
 
@@ -391,6 +425,31 @@ def _assemble(date: str, trades: list[dict]) -> dict:
         exit_hhmm = max(f[0] for f in finals)
         portfolio_final = [exit_hhmm, round(sum(f[1] for f in finals), 2)]
 
+    # portfolio if no stop (issue #704): the real marks plus, after each stop,
+    # that row's ghost marks — what the book would have read had every stopped
+    # row been held to the scheduled exit. Present only on a day with a stop,
+    # so a no-stop day's payload is unchanged.
+    stopped = [t for t in usable if t["stop_loss"]]
+    portfolio_no_stop = []
+    portfolio_no_stop_final = None
+    stop_saved_total = None
+    if stopped:
+        ns = dict(minutes)
+        for t in stopped:
+            for hhmm, v in t["ghost"]:
+                ns[hhmm] = round(ns.get(hhmm, 0.0) + v, 2)
+        portfolio_no_stop = [[m, ns[m]] for m in sorted(ns)]
+        if portfolio_final is not None and all(t["ghost_final"] for t in stopped):
+            # every stopped row's gross swapped for its held-to-exit gross
+            swapped = sum(t["ghost_final"][1] - t["final"][1] for t in stopped if t["final"])
+            portfolio_no_stop_final = [
+                max(t["ghost_final"][0] for t in stopped),
+                round(portfolio_final[1] + swapped, 2),
+            ]
+        saved = [t["stop_saved"] for t in stopped if t["stop_saved"] is not None]
+        if saved and len(saved) == len(stopped):
+            stop_saved_total = round(sum(saved), 2)
+
     gross = [t["gross_pnl"] for t in trades if t["gross_pnl"] is not None]
     charges = [t["charges_inr"] for t in trades if t["charges_inr"] is not None]
     nets = [t["net_pnl"] for t in trades if t["net_pnl"] is not None]
@@ -405,6 +464,10 @@ def _assemble(date: str, trades: list[dict]) -> dict:
         "net_total": round(sum(nets), 2) if nets else None,
         "n_real": len(trades),
         "n_unavailable": sum(1 for t in trades if t["unavailable"]),
+        "n_stopped": len(stopped),
+        "portfolio_no_stop": portfolio_no_stop,
+        "portfolio_no_stop_final": portfolio_no_stop_final,
+        "stop_saved_total": stop_saved_total,
     }
 
 
@@ -445,6 +508,56 @@ def _batched_ltp(contracts: list[tuple[str, str]]) -> dict[str, float] | None:
         return None
 
 
+def _ghost_rows_now(rows) -> list:
+    """Today's stop-closed rows still inside the counterfactual window.
+
+    A row already stamped (``cf_pnl`` set) or past the scheduled exit leaves
+    the batch — the quote spend stops exactly when the window closes.
+    """
+    stopped = [r for r in rows if r.reason == "stop_loss" and r.status == "closed"]
+    if not stopped:
+        return []
+    if all(r.cf_pnl is not None for r in stopped):
+        return []
+    try:
+        from services.open15_sl_counterfactual import scheduled_exit_min
+
+        now = _now_ist()
+        if now.hour * 60 + now.minute >= scheduled_exit_min(_today_ist()):
+            return []
+    except Exception:
+        logger.exception("open15 live-pnl: scheduled-exit read failed — ghosts skipped")
+        return []
+    return [r for r in stopped if r.cf_pnl is None]
+
+
+def _ghost_marks(ghost_rows, marks: dict[str, float] | None) -> list[dict]:
+    out = []
+    for r in ghost_rows:
+        contract, _ex = _row_contract(r)
+        basis, basis_src = _entry_basis(r)
+        qty = int(r.entry_fill_qty or r.quantity or 0)
+        ltp = (marks or {}).get(contract)
+        mtm = None
+        if ltp is not None and basis is not None and qty:
+            mtm = round((ltp - basis) * qty * _row_sign(r), 2)
+        out.append(
+            {
+                "row_id": r.id,
+                "symbol": r.symbol,
+                "side": r.side,
+                "contract": contract,
+                "qty": qty,
+                "entry_basis": basis,
+                "basis": basis_src,
+                "ltp": ltp,
+                "mtm": mtm,
+                "stopped_at": r.exit_ts,
+            }
+        )
+    return out
+
+
 def live_pnl() -> dict:
     """Live MTM of today's open real trades; ``status`` drives the page.
 
@@ -470,19 +583,28 @@ def live_pnl() -> dict:
     try:
         rows = _real_rows(today)
         open_rows = [r for r in rows if r.status == "open"]
+        # stopped rows keep riding the batch to the scheduled exit (issue
+        # #704) — a "ghost" mark, reported apart from the trades and NEVER
+        # summed into portfolio_mtm or read by the risk rules
+        ghost_rows = _ghost_rows_now(rows)
         if not open_rows:
             payload = {
                 "status": "closed" if rows else "idle",
                 "date": today,
                 "poll_interval_s": interval,
             }
+            if ghost_rows:
+                marks = _batched_ltp([_row_contract(r) for r in ghost_rows])
+                payload["asof"] = _now_ist().strftime("%H:%M:%S")
+                payload["ghost"] = _ghost_marks(ghost_rows, marks)
+                payload["ghost_quotes_ok"] = marks is not None
             # cache the terminal answer briefly too — the page may poll from
             # several tabs, and "no open trades" need not hit the DB each time
             with _LIVE_LOCK:
                 _LIVE_CACHE[today] = (now_mono, payload)
             return payload
 
-        marks = _batched_ltp([_row_contract(r) for r in open_rows])
+        marks = _batched_ltp([_row_contract(r) for r in open_rows + ghost_rows])
         trades = []
         total = 0.0
         for r in open_rows:
@@ -515,6 +637,9 @@ def live_pnl() -> dict:
             "portfolio_mtm": round(total, 2),
             "quotes_ok": marks is not None,
         }
+        if ghost_rows:
+            payload["ghost"] = _ghost_marks(ghost_rows, marks)
+            payload["ghost_quotes_ok"] = marks is not None
         with _LIVE_LOCK:
             _LIVE_CACHE[today] = (now_mono, payload)
         return payload

@@ -1660,6 +1660,39 @@ first-boot only; a 0 threshold resolves the rule OFF). The `armed` event
 records the effective rules; lock/trail/stop each Telegram once (stop deduped
 per symbol/day). Tests: `test/test_open15_risk_controls.py`.
 
+**A stopped contract keeps being MARKED to the scheduled exit, never held
+(issue #704).** The per-trade stop above exits a row the moment its MTM
+reaches the threshold — and until #704 the contract then vanished from every
+measurement, so "would holding to 09:30 have been better?" had no data.
+Now every real row closed with `reason=stop_loss` carries a
+**counterfactual**: `open15_trades.cf_exit_price` / `cf_pnl` (gross, held to
+the day's scheduled `exit_time` on the same entry-fill basis and quantity) /
+`cf_charges_inr` (modelled on that round trip) / `cf_mae`+`cf_mfe` (worst and
+best mark between the stop and the exit) / `cf_source`. Two sources, one
+convention: the **risk monitor** keeps stopped rows on the SAME batched
+quote call as the open ones (`live_pnl()` returns them under `ghost`, never in
+`portfolio_mtm` and never in `trades`, so the stop/day rules cannot see them
+by construction) and records each poll's mark; `flatten` — the job that fires
+AT the scheduled exit — stamps the last mark (`cf_source='live'`,
+`stop_counterfactual` event). The **summary job and the next 09:10 arm**
+back-fill any still-NULL row from the broker 1m bars the intra-hold curve
+already fetches (`cf_source='bars'`), so a restart inside the window loses
+nothing and historical stop rows are priced the same way (`uv run python -m
+services.open15_sl_counterfactual --date YYYY-MM-DD [--apply]`, dry-run
+default). Rules: **counterfactual money never joins a P&L bucket** — the one
+derived figure is `open15_breakout_db.stop_saved_of_row` = stop net − held
+net (#552 shape), read by the chart label and the scorecard alike; **the
+window ends at the SCHEDULED exit** (operator decision — the comparison is
+against the strategy without the stop, not a research hold); held-to-exit is
+priced at a 1m close, so it slightly flatters holding. On `/logs` the
+intra-hold chart continues a stopped row **dashed** from a mauve stop diamond
+to the exit line (`held ±Rs… (stop saved ±Rs…)`) beside a dashed "PORT if no
+stop", and the **STOP-LOSS SCORECARD** card lists every stop since the rule
+went live with the **pre-registered decision rule** (code constants, not
+tunables: keep the stop only if after 20 events cumulative stop-saved > 0 AND
+≥ 50% of stops were right). `GET /open15_vol_breakout/api/stop_scorecard`.
+No env flag (#651). Tests: `test/test_open15_sl_counterfactual.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.

@@ -213,6 +213,26 @@ class Open15Trade(Base):
     # nor sim P&L may be summed into realized P&L (see ``total_realized_pnl``).
     fill = Column(String(8), nullable=True)
     reason = Column(String(64), nullable=True)
+    # Stop-loss counterfactual (issue #704). A row closed with
+    # ``reason='stop_loss'`` (#696) keeps being MARKED — never held — to the
+    # day's scheduled exit, so the stop rule can be judged on data:
+    #   ``cf_exit_minute``  the scheduled exit the counterfactual is priced at
+    #   ``cf_exit_price``   contract mark at that exit (1m close, or live quote)
+    #   ``cf_pnl``          GROSS P&L had the row been held to it (entry-fill basis)
+    #   ``cf_charges_inr``  modelled round-trip charges on that counterfactual
+    #   ``cf_mae``/``cf_mfe`` worst / best 1m mark between the stop and the exit
+    #   ``cf_source``       ``live`` (risk monitor at the exit) | ``bars`` (backfill)
+    # NULL = not yet priced. Counterfactual money NEVER joins a P&L bucket
+    # (#552/#548): the one derived figure is ``stop_saved_of_row``.
+    cf_exit_minute = Column(String(5), nullable=True)
+    cf_exit_price = Column(Float, nullable=True)
+    cf_pnl = Column(Float, nullable=True)
+    cf_charges_inr = Column(Float, nullable=True)
+    cf_mae = Column(Float, nullable=True)
+    cf_mae_minute = Column(String(5), nullable=True)
+    cf_mfe = Column(Float, nullable=True)
+    cf_mfe_minute = Column(String(5), nullable=True)
+    cf_source = Column(String(8), nullable=True)
     # full broker rejection text — ``reason`` stays a short machine-readable code
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -361,6 +381,17 @@ def _ensure_columns():
             "opt_entry_premium_early": "FLOAT",
             # issue #643 — NULL on every existing row, which reads as ``slot``
             "sizing_basis": "VARCHAR(8)",
+            # issue #704 — stop-loss counterfactual; NULL = not priced yet, and
+            # the bars backfill prices any existing stop row on the next arm
+            "cf_exit_minute": "VARCHAR(5)",
+            "cf_exit_price": "FLOAT",
+            "cf_pnl": "FLOAT",
+            "cf_charges_inr": "FLOAT",
+            "cf_mae": "FLOAT",
+            "cf_mae_minute": "VARCHAR(5)",
+            "cf_mfe": "FLOAT",
+            "cf_mfe_minute": "VARCHAR(5)",
+            "cf_source": "VARCHAR(8)",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -653,6 +684,60 @@ def net_pnl_of_row(row) -> float:
     """Python-side twin of :func:`net_pnl_expr` for an ORM row / mapping."""
     get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
     return float(get("pnl") or 0.0) - float(get("charges_inr") or 0.0)
+
+
+STOP_LOSS_REASON = "stop_loss"
+
+
+def cf_net_of_row(row) -> float | None:
+    """NET counterfactual P&L (held to the scheduled exit), or None if unpriced.
+
+    Same shape as :func:`net_pnl_of_row` — gross minus modelled charges — so
+    the two sides of "stop saved" are compared on ONE convention (#552).
+    """
+    get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
+    cf_pnl = get("cf_pnl")
+    if cf_pnl is None:
+        return None
+    return float(cf_pnl) - float(get("cf_charges_inr") or 0.0)
+
+
+def stop_saved_of_row(row) -> float | None:
+    """How much the stop loss SAVED on this row, net Rs (issue #704).
+
+    ``net_pnl_of_row(row) - cf_net_of_row(row)``: positive means holding to the
+    scheduled exit would have lost more than the stop did; negative means the
+    stop cost money. None while the counterfactual is unpriced. This is the
+    ONLY definition — the chart label, the scorecard and any research read it
+    here, never re-derive it (the #552 rule, one convention).
+    """
+    cf_net = cf_net_of_row(row)
+    if cf_net is None:
+        return None
+    return round(net_pnl_of_row(row) - cf_net, 2)
+
+
+def stop_loss_rows(trade_date: str | None = None, unpriced_only: bool = False) -> list:
+    """REAL rows the per-trade stop loss closed (``reason='stop_loss'``, #696),
+    oldest first. ``unpriced_only`` narrows to rows whose counterfactual is
+    still NULL (the backfill's work list). Fail-open to ``[]``.
+    """
+    try:
+        q = db_session.query(Open15Trade).filter(
+            Open15Trade.reason == STOP_LOSS_REASON,
+            Open15Trade.status == "closed",
+            _REAL_FILL,
+        )
+        if trade_date:
+            q = q.filter(Open15Trade.trade_date == trade_date)
+        if unpriced_only:
+            q = q.filter(Open15Trade.cf_pnl.is_(None))
+        return q.order_by(Open15Trade.trade_date.asc(), Open15Trade.id.asc()).all()
+    except Exception:
+        logger.exception("open15: stop_loss_rows read failed — failing open to []")
+        return []
+    finally:
+        db_session.remove()
 
 
 def total_realized_pnl() -> float:

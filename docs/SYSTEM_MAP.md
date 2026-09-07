@@ -345,6 +345,14 @@ process and need no external scheduler.
 > this same scheduler: `open15_arm` 09:10 / `open15_first_candles` 09:16 /
 > `open15_entry_verify` (every minute across the entry window) / `open15_exit` /
 > `open15_exit_retry` (+2 min) / `open15_summary` (+5 min), mon-fri.
+> **Stop-loss counterfactual (issue #704):** a row the per-trade stop (#696)
+> closes keeps being marked to the scheduled exit — the risk monitor carries
+> it on the same batched quote as `ghost` (never in `portfolio_mtm`, never a
+> risk input), `open15_exit` stamps the last mark at the exit
+> (`cf_source='live'`), and `open15_summary` + the next `open15_arm` back-fill
+> any NULL row from broker 1m bars (`cf_source='bars'`). Columns
+> `open15_trades.cf_*`; the one derived figure is `stop_saved_of_row`;
+> `/api/stop_scorecard` + the STOP-LOSS SCORECARD card on `/logs`. No flag.
 > `open15_entry_verify` (issue #626) asks the broker what happened to each
 > ACKNOWLEDGED entry and demotes a post-ACK RMS rejection to a paper fill,
 > releasing its `max_trades` slot — an ACK is not a fill, and on 2026-08-18 a
