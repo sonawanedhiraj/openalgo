@@ -994,3 +994,36 @@ inline keyboard at 08:45 IST, etc.). Mode flips (sandbox/live) stay laptop-only.
 
 See `docs/design/strategy_daily_intent.md` and `docs/design/telegram_inbound.md` for
 full architecture.
+
+---
+
+## 2026-09-07 — R62: R61's fixes fail out-of-sample; nothing tested makes this strategy profitable
+
+Full report: `docs/research/strategy/simplified_engine/2026-09-07_r62_oos_validation_and_improvement_search.md` (issue #706).
+
+- **Net result of the whole sandbox run (06-01 → 09-04, 313 closed trades):** gross +₹4,189,
+  charges ₹24,120 (₹77/trade), **net −₹19,931**, 17/59 green days. Charges are 576% of gross.
+- **R61's recommendations do not hold on the 82 trades taken after its window.** Hold-to-EOD:
+  +₹11,385 in R61's window → **−₹15,285** on 08-08 → 09-04 (worse than the live rule). Skip
+  11:00–13:00 + hold-to-EOD: +₹14,152 → −₹9,925. Do not ship them.
+- **The long-flagged side-split backtest is done — the SHORT edge was a sample artifact.**
+  SHORT +₹1,568 (IS) → −₹9,504 (OOS); the August "top losers" bounced while NIFTY itself
+  drifted down, so it is not beta — the sell screener's stocks mean-revert. LONG is
+  −₹10,436 → −₹1,559: never profitable either.
+- **The cost-drag filters flagged under Learning #14 do not rescue it.** Notional, ATR%,
+  ₹1-floor and per-trade-gross buckets are all negative in both halves; 23 exit variants
+  (wider stops, ATR trails, breakeven, time stops, R60 retrace-limit entries) are all negative
+  out-of-sample. 59 stops fire inside 10 minutes for −₹10,644 — the 0.73%-of-price stop sits
+  inside the breakout candle's own noise, but widening it just loses more slowly.
+- **What the trade actually is:** aligned with NIFTY's rest-of-day direction the book makes
+  +₹30k at EOD, against it −₹34k. Stock-specific alpha is +0.09%/trade on LONGs (both halves)
+  — real, but under the 0.088% cost line. There is no market-direction signal in the engine.
+- **Only both-halves-positive variant:** LONG signals held overnight and sold at the T+1
+  opening print (+₹7.2k IS / +₹7.3k OOS after CNC costs). Fragile: the gap is sold in the first
+  minute (09:16 close: −₹3.7k OOS), 7 trades gapping >2% carry 111% of the total, 5 bps/leg kills
+  it. Reconfirms Learning #4 / R56 (BUY overnight drift; SHORT anti-predictive overnight).
+- **Housekeeping:** `config_snapshot.json` was stale (trail 0.8 / rr-start 1.5R / lock off vs the
+  live 0.5 / 0.6R / on) — re-synced. Four 2026-09-02 rows have no exit because the app died at
+  12:27 (bug #707; gross −₹3,499 at the 15:19 close, so that day is ≈ −₹4,100 not −₹280).
+- **Decision rule going forward:** any claim on this strategy is split IS/OOS by date, net of
+  charges, with a placebo. Recommendation: pause, or run only as a labelled measurement.
