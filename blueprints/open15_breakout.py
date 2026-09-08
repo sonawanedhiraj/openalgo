@@ -2605,19 +2605,20 @@ function olFan(j){
   const fan=(p,color,op,dash,label,dy)=>{const b=p.bootstrap; if(!b)return '';
     return '<path d="M'+x0+','+Y(0).toFixed(1)+' Q'+mx+','+((Y(0)+Y(b.p10))/2).toFixed(1)+' '+x1+','+Y(b.p10).toFixed(1)+' L'+x1+','+Y(b.p90).toFixed(1)+' Q'+mx+','+((Y(0)+Y(b.p90))/2).toFixed(1)+' '+x0+','+Y(0).toFixed(1)+' Z" fill="'+color+'" opacity="'+op+'"/>'+
       '<path d="M'+x0+','+Y(0).toFixed(1)+' Q'+mx+','+((Y(0)+Y(b.p50))/2-6).toFixed(1)+' '+x1+','+Y(b.p50).toFixed(1)+'" fill="none" stroke="'+color+'" stroke-width="'+(dash?1.5:2.2)+'"'+(dash?' stroke-dasharray="5 3"':'')+'/>'+
-      '<text x="'+(x1+4)+'" y="'+(Y(b.p50)+dy).toFixed(1)+'" fill="'+color+'" font-size="10">'+label+' '+olR(b.p50)+'</text>';};
+      '';};
   const ticks=[];const step=(hi-lo)>200000?100000:((hi-lo)>80000?50000:25000);
   for(let v=Math.ceil(lo/step)*step; v<=hi; v+=step)ticks.push(v);
-  let g='<svg viewBox="0 0 '+(W+40)+' '+H+'" role="img">';
+  let g='<svg viewBox="0 0 '+W+' '+H+'" role="img">';
   for(const v of ticks)g+='<line x1="'+x0+'" y1="'+Y(v).toFixed(1)+'" x2="'+x1+'" y2="'+Y(v).toFixed(1)+'" stroke="'+(v===0?'#3a4652':'#2c3640')+'" stroke-width="'+(v===0?1.5:1)+'"/><text x="36" y="'+(Y(v)+3).toFixed(1)+'" fill="#6b7886" font-size="10" text-anchor="end">'+(v===0?'0':(v>0?'+':'&minus;')+(Math.abs(v)>=100000?(Math.abs(v)/100000).toFixed(1)+'L':Math.round(Math.abs(v)/1000)+'k'))+'</text>';
   for(let i=0;i<=4;i++)g+='<text x="'+(x0+i*(x1-x0)/4).toFixed(1)+'" y="210" fill="#6b7886" font-size="10" text-anchor="middle">'+(i===0?'day 0':Math.round(i*j.constants.month_days/4))+'</text>';
-  g+=fan(a,'#8aa0b4',0.14,true,'as traded',4)+fan(s,'#7dc4e4',0.10,true,'saved',4)+fan(d,'#a6e3a1',0.16,false,'draft',4)+'</svg>';
+  g+=fan(a,'#8aa0b4',0.14,true,'as traded',4)+fan(s,'#7dc4e4',0.10,true,'saved',4)+fan(d,'#a6e3a1',0.16,false,'draft',4)+'</svg>'+
+    '<div class="ol-legend"><span><i style="border-color:#a6e3a1"></i>draft (config form)</span><span><i class="dash" style="border-color:#7dc4e4"></i>saved settings</span><span><i class="dash" style="border-color:#8aa0b4"></i>as traded</span><span>shading = P10&ndash;P90 &middot; line = median</span></div>';
   const row=p=>'<tr><td>'+esc(p.label)+'</td><td class="num">'+olR(p.bootstrap?p.bootstrap.p10:null)+'</td><td class="num">'+olR(p.bootstrap?p.bootstrap.p50:null)+'</td><td class="num">'+olR(p.bootstrap?p.bootstrap.p90:null)+'</td><td class="num">'+(p.bootstrap?Math.round(p.bootstrap.p_positive*100)+'%':'&mdash;')+'</td></tr>';
   return '<div class="ol-chart"><div class="t">'+j.constants.month_days+'-DAY EQUITY FAN &middot; P10 / P50 / P90</div><div class="d">'+j.constants.bootstrap_months.toLocaleString('en-IN')+' bootstrap months of '+j.constants.month_days+' days drawn from the replayed days. P50 = the typical month; P10 = only 1 month in 10 does worse; P90 = only 1 in 10 does better. Rows whose contract expired are closed-form and cannot show a stopped-out winner, so the stop is flattered.</div>'+g+
     '<table class="sltab"><tr><th>settings</th><th class="num">P10</th><th class="num">P50</th><th class="num">P90</th><th class="num">P(month &gt; 0)</th></tr>'+[a,s,d].filter(Boolean).map(row).join('')+'</table></div>';
 }
 function olPresets(j){
-  const setTxt=s=>olN(s.max_trades>=99?'&ndash;':s.max_trades)+' slots &middot; stop '+olN(s.stop_on===false?0:s.stop)+' &middot; lock '+olN(s.lock_on===false?0:s.target)+' &middot; trail '+olN(s.trail);
+  const setTxt=s=>(s.max_trades>=99?'&ndash;':olN(s.max_trades))+' slots &middot; stop '+olN(s.stop_on===false?0:s.stop)+' &middot; lock '+olN(s.lock_on===false?0:s.target)+' &middot; trail '+olN(s.trail);
   let h='<div class="sec">setting presets &mdash; <span class="muted">same engine, same sample &middot; replayed net over the recorded days, then bootstrapped</span></div><div style="overflow-x:auto"><table class="sltab"><tr><th>preset</th><th>settings</th><th class="num">replayed net</th><th class="num">trades</th><th class="num">win rate</th><th class="num">stops</th><th class="num">lock days</th><th class="num">skipped</th><th class="num">P10</th><th class="num">P50</th><th class="num">P90</th><th class="num">P(&gt;0)</th><th>engine</th></tr>';
   for(const p of j.presets){const b=p.bootstrap||{};
     h+='<tr'+(p.key==='saved'?' class="cur"':'')+'><td>'+esc(p.label)+'</td><td>'+setTxt(p.settings)+'</td><td class="num '+olSign(p.net)+'">'+olR(p.net)+'</td><td class="num">'+p.n+'</td><td class="num">'+olP(p.win_rate)+'</td><td class="num">'+p.stops+'</td><td class="num">'+p.lock_days+'</td><td class="num">'+p.skipped+'</td><td class="num">'+olR(b.p10)+'</td><td class="num">'+olR(b.p50)+'</td><td class="num">'+olR(b.p90)+'</td><td class="num">'+(b.p_positive!=null?Math.round(b.p_positive*100)+'%':'&mdash;')+'</td><td><span class="badge b-pend">replay '+(p.n-p.closed_form_rows)+' &middot; closed-form '+p.closed_form_rows+'</span></td></tr>';}
