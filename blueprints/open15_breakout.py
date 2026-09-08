@@ -24,6 +24,12 @@ GET /open15_vol_breakout/api/ladder_preview
     The ATM lot-cost coverage ladder for the NEXT 09:10 arm, priced from the
     latest EOD option-liquidity sweep (issue #671) — the /logs planning panel.
     Ephemeral: computed per request, never written to a day log.
+
+GET /open15_vol_breakout/api/settings_outlook?stop_loss_inr=&profit_target_inr=&...
+    The /logs SETTINGS OUTLOOK card (issue #711): three-check profitability
+    verdict, overall / long / short P&L as traded AND replayed through the
+    saved or draft stop / lock / trail on the intra-hold minute paths, and the
+    rule-derived recommendations. Read-only; the draft is never saved.
 """
 
 from __future__ import annotations
@@ -712,6 +718,53 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .atmdet{margin-top:8px;background:#12181f;border-radius:6px;padding:8px 12px;font-size:12px}
  .atmdet .dh{color:#89b4fa;font-size:10px;letter-spacing:.5px;margin-bottom:5px}
  .atmfoot{margin-top:8px;color:#6b7886;font-size:11px}
+ /* SETTINGS OUTLOOK (issue #711) */
+ .ol-verdict{margin-left:auto;font-size:12px;color:#8aa0b4;float:right}
+ .ol-pill{font-size:11px;padding:3px 10px;border-radius:10px;background:#332a17;color:#f9e2af;border:1px solid #5c4d2a;font-weight:600;letter-spacing:.3px}
+ .ol-pill.ok{background:#12291c;color:#a6e3a1;border-color:#2e5140} .ol-pill.bad{background:#3a1e24;color:#f38ba8;border-color:#6b3542}
+ .ol-strip{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;padding:8px 10px;background:#161d25;border-radius:6px;clear:both}
+ .ol-vbox{margin-top:12px;border:1px solid #2c3640;border-radius:6px;background:#161d25;padding:12px 14px}
+ .ol-vbox .q{font-size:15px;color:#d7dde4;margin:0 0 2px} .ol-vbox .a{font-size:13px;color:#8aa0b4;line-height:1.5;max-width:78ch} .ol-vbox .a b{color:#d7dde4;font-weight:500}
+ .ol-scope{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px;padding:8px 10px;background:#1e2630;border-radius:6px;font-size:12px;color:#8aa0b4}
+ .ol-seg{display:inline-flex;border:1px solid #2a3138;border-radius:6px;overflow:hidden}
+ .ol-seg button{border:0;border-right:1px solid #2a3138;background:transparent;color:#8aa0b4;padding:4px 10px;font-size:11.5px}
+ .ol-seg button:last-child{border-right:0} .ol-seg button.on{background:#1b2b3a;color:#89b4fa}
+ .ol-cls{display:flex;gap:6px;flex-wrap:wrap;margin-left:auto} .ol-cls span{font-size:10.5px;border-radius:8px;padding:1px 8px;border:1px solid #2a3138;color:#6b7886}
+ .ol-cls span.in{border-color:#2e5140;color:#a6e3a1} .ol-cls span.sim.in{border-color:#5c4d2a;color:#f9e2af} .ol-cls span.out{text-decoration:line-through;opacity:.7}
+ .ol-cmp{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin-top:12px}
+ .ol-cmp .big{background:#1e2630;border-radius:6px;padding:10px 16px;min-width:150px} .ol-cmp .big .k{display:block;font-size:10px;color:#6b7886;letter-spacing:.4px}
+ .ol-cmp .big .v{font-size:26px;line-height:1.15;font-variant-numeric:tabular-nums} .ol-cmp .big .s{display:block;font-size:11px;color:#8aa0b4;margin-top:2px}
+ .ol-cmp .vs{align-self:center;color:#6b7886;font-size:12px;padding:0 4px} .ol-cmp .gap{align-self:center;font-size:12px;color:#8aa0b4;line-height:1.5;max-width:32ch} .ol-cmp .gap b{font-weight:500}
+ .ol-checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;margin-top:12px}
+ .ol-chk{display:flex;gap:10px;padding:10px 12px;border-radius:6px;background:#1e2630;border-left:3px solid} .ol-chk.ok{border-color:#a6e3a1} .ol-chk.bad{border-color:#f38ba8}
+ .ol-chk .mark{font-size:18px;line-height:1;width:22px;flex:none;text-align:center;padding-top:1px} .ol-chk.ok .mark{color:#a6e3a1} .ol-chk.bad .mark{color:#f38ba8}
+ .ol-chk .t{font-size:12.5px;color:#d7dde4} .ol-chk .w{font-size:11px;color:#8aa0b4;margin-top:3px;line-height:1.45} .ol-chk .w b{color:#d7dde4;font-weight:500}
+ .ol-sides{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px} .ol-sidebox{flex:1;min-width:230px;background:#1e2630;border-radius:6px;padding:9px 12px;font-size:12px;color:#8aa0b4;line-height:1.5}
+ .ol-sidebox .h{color:#d7dde4;font-size:12.5px} .ol-sidebox .h .badge{margin-left:6px;vertical-align:1px}
+ .ol-todo{margin-top:12px;padding:10px 12px;border-radius:6px;background:#12291c;border-left:3px solid #a6e3a1;color:#8aa0b4;font-size:12px;line-height:1.55} .ol-todo b{color:#a6e3a1;font-weight:600} .ol-todo em{color:#d7dde4;font-style:normal}
+ .ol-pnl3{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;margin-top:8px}
+ .ol-pcol{background:#161d25;border-radius:6px;padding:10px 12px;border-top:3px solid} .ol-pcol.all{border-color:#7dc4e4} .ol-pcol.long{border-color:#89b4fa} .ol-pcol.short{border-color:#cba6f7}
+ .ol-pcol .ph{display:flex;align-items:baseline;gap:8px} .ol-pcol .ph .n{font-size:11px;letter-spacing:.5px;color:#8aa0b4} .ol-pcol .ph .badge{margin-left:auto}
+ .ol-pcol .net{font-size:26px;line-height:1.2;font-variant-numeric:tabular-nums;margin-top:2px} .ol-pcol .sub{font-size:11px;color:#8aa0b4}
+ .ol-pcol svg{width:100%;height:auto;display:block;margin:8px 0 4px} .ol-pcol table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:4px}
+ .ol-pcol td{font-size:11.5px;padding:2px 0;border:0} .ol-pcol td:first-child{color:#6b7886} .ol-pcol td:last-child{text-align:right} .ol-pcol .hl td{border-top:1px solid #2a3138;padding-top:5px}
+ .ol-alt{margin-top:6px;padding:6px 8px;border-radius:4px;background:#1e2630;font-size:11.5px;color:#8aa0b4;line-height:1.5}
+ .ol-alt .r{display:flex;justify-content:space-between;gap:8px} .ol-alt .r b{font-weight:500;font-variant-numeric:tabular-nums} .ol-alt .d{color:#6b7886;font-size:10.5px}
+ .ol-pnote{margin-top:8px;font-size:11.5px;color:#8aa0b4;line-height:1.5;max-width:110ch}
+ details.ol-more{margin-top:14px} details.ol-more>summary{cursor:pointer;color:#7dc4e4;font-size:12px;letter-spacing:.4px;list-style:none}
+ details.ol-more>summary::before{content:"▸ ";color:#6b7886} details.ol-more[open]>summary::before{content:"▾ "}
+ .ol-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px;margin-top:12px}
+ .ol-chart{background:#161d25;border-radius:6px;padding:10px 12px;min-width:0} .ol-chart .t{font-size:11px;color:#7dc4e4;letter-spacing:.5px}
+ .ol-chart .d{font-size:11px;color:#8aa0b4;margin:2px 0 6px;line-height:1.45} .ol-chart svg{width:100%;height:auto;display:block}
+ .ol-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:#8aa0b4;margin-top:6px} .ol-legend i{display:inline-block;width:14px;height:0;border-top:2px solid;vertical-align:middle;margin-right:5px}
+ .ol-legend i.dash{border-top-style:dashed} .ol-legend i.box{height:9px;border:0;opacity:.55;vertical-align:-1px}
+ .ol-recs{width:100%;border-collapse:collapse;margin-top:8px;font-variant-numeric:tabular-nums} .ol-recs td,.ol-recs th{font-size:12px;padding:6px 8px;border-bottom:1px solid #2a3138;text-align:left;vertical-align:top}
+ .ol-recs th{color:#8aa0b4;font-weight:500;white-space:nowrap} .ol-recs td.rk{color:#6b7886;white-space:nowrap} .ol-recs td .chg{white-space:nowrap} .ol-recs td .chg b{color:#d7dde4;font-weight:500}
+ .ol-recs td .ev{display:block;color:#8aa0b4;font-size:11px;line-height:1.45;max-width:56ch;white-space:normal} .ol-recs tr.done td{opacity:.75} .ol-recs button{padding:3px 9px;font-size:11px;white-space:nowrap}
+ .b-done{background:#12291c;color:#a6e3a1} .b-hold{background:#232c36;color:#8aa0b4}
+ .ol-ckpt{display:flex;gap:10px;align-items:center;margin-top:10px;padding:8px 10px;background:#161d25;border-radius:6px;font-size:12px;color:#8aa0b4}
+ .ol-ckpt .bar{flex:1;height:6px;background:#1e2630;border-radius:3px;overflow:hidden} .ol-ckpt .bar i{display:block;height:100%;background:#7dc4e4}
+ body.ol-busy #outlook{opacity:.75}
 </style></head><body>
 <h2>open15_vol_breakout — decision log</h2>
 <div class="muted">Every day is persisted — pick one from the history list. Today auto-refreshes 5s during the window.
@@ -833,6 +886,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  <div id="c_rollsrc" class="muted" style="margin-top:6px"></div>
  <div id="c_eff" class="muted" style="margin-top:6px"></div>
 </fieldset>
+<div id="outlook" class="atmcard" style="display:none"></div>
 <div class="layout">
  <div class="side">
   <div class="muted" style="margin-bottom:6px">history</div>
@@ -1067,7 +1121,8 @@ async function saveCfg(){
 }
 document.getElementById('c_side').addEventListener('change',syncShadowUi);
 document.getElementById('c_shadow').addEventListener('change',syncShadowUi);
-loadCfg();
+// SETTINGS OUTLOOK (issue #711) reads the populated form, so it waits for the config load
+loadCfg().catch(()=>null).then(()=>{if(window.olInit)window.olInit();});
 </script>
 <script>
 let curDate=null, curEvents=[], curJournal=[], curFilter='all', digests=[];
@@ -2375,6 +2430,237 @@ function renderScorecard(j){
   box.style.display='';
   box.innerHTML=h;
 }
+// ---- SETTINGS OUTLOOK (issue #711): is it making money, and what to change --
+// Strategy-wide card between the config fieldset and the day layout. Reads the
+// config form LIVE (debounced re-fetch on every change) and never saves; every
+// figure is computed server-side by services/open15_settings_outlook.py from
+// real_closed_rows + the intra-hold minute paths the chart already fetches.
+let olData=null, olTimer=null, olScope='real', olSample='all', olView='as_traded', olBusy=false;
+const OL_FIELDS={max_trades:'c_maxt',margin_per_slot:'c_margin',stop_loss_inr:'c_slinr',profit_target_inr:'c_ptarget',trail_giveback_inr:'c_ptrail'};
+const olR=v=>(v==null?'&mdash;':((v<0?'&minus;':'+')+'&#8377;'+Math.abs(Math.round(v)).toLocaleString('en-IN')));
+const olRa=v=>(v==null?'&mdash;':('&#8377;'+Math.abs(Math.round(v)).toLocaleString('en-IN')));
+const olP=v=>(v==null?'&mdash;':(Math.round(v*1000)/10).toFixed(1)+'%');
+const olN=v=>(v==null?'&mdash;':Math.round(v).toLocaleString('en-IN'));
+const olSign=v=>((v||0)>=0?'pos':'neg');
+function olDraftParams(){
+  const p=new URLSearchParams();
+  for(const k in OL_FIELDS){const el=document.getElementById(OL_FIELDS[k]); if(el&&el.value!=='')p.set(k,el.value);}
+  const sl=document.getElementById('c_sl'), pl=document.getElementById('c_plock');
+  if(sl)p.set('stop_loss_enabled',sl.checked?'1':'0');
+  if(pl)p.set('profit_lock_enabled',pl.checked?'1':'0');
+  p.set('scope',olScope); p.set('sample',olSample);
+  return p;
+}
+async function loadOutlook(){
+  const box=document.getElementById('outlook'); if(!box)return;
+  if(!olData){box.style.display='';box.innerHTML='<span class="atitle">SETTINGS OUTLOOK</span>'+
+    '<span class="asub">loading &mdash; the first load per restart fetches the intra-hold minute paths (about one broker call per real fill)&hellip;</span>';}
+  olBusy=true; document.body.classList.add('ol-busy');
+  try{const r=await fetch('/open15_vol_breakout/api/settings_outlook?'+olDraftParams()); olData=await r.json();}
+  catch(e){olData={status:'error',message:'fetch failed: '+e};}
+  olBusy=false; document.body.classList.remove('ol-busy');
+  renderOutlook();
+}
+function olSchedule(){clearTimeout(olTimer); olTimer=setTimeout(loadOutlook,400);}
+function olInit(){
+  const ids=[]; for(const k in OL_FIELDS)ids.push(OL_FIELDS[k]); ids.push('c_sl','c_plock');
+  for(const id of ids){const el=document.getElementById(id); if(el){el.addEventListener('input',olSchedule);el.addEventListener('change',olSchedule);}}
+  loadOutlook();
+}
+window.olInit=olInit;
+function olSetScope(s){olScope=s;loadOutlook();}
+function olSetSample(s){olSample=s;loadOutlook();}
+function olSetView(v){olView=v;renderOutlook();}
+function olPutInForm(field,value){
+  // fills the config form above and lets the normal debounce re-fetch; the
+  // operator still presses the form's own save
+  const map={trade_side:'c_side',stop_loss_inr:'c_slinr',profit_target_inr:'c_ptarget',trail_giveback_inr:'c_ptrail',margin_per_slot:'c_margin',max_trades:'c_maxt'};
+  const el=document.getElementById(map[field]); if(!el)return;
+  if(field==='stop_loss_inr'){const sl=document.getElementById('c_sl'); if(sl)sl.checked=(+value)>0;}
+  if(field==='profit_target_inr'){const pl=document.getElementById('c_plock'); if(pl)pl.checked=(+value)>0;}
+  el.value=value; el.dispatchEvent(new Event('change'));
+  if(field==='trade_side'&&window.syncShadowUi)syncShadowUi();
+  el.scrollIntoView({block:'center',behavior:'smooth'});
+}
+window.olSetScope=olSetScope;window.olSetSample=olSetSample;window.olSetView=olSetView;window.olPutInForm=olPutInForm;
+
+function olVerdictBox(j){
+  const st=j.stats, v=j.verdict, be=(st.breakeven_wr_ex_best??st.breakeven_wr), unit=j.unit;
+  const u=unit==='pct'?'% of premium':'&#8377;';
+  const wrTxt=Math.round(st.win_rate*100), beTxt=Math.round(be*100);
+  const exp=st.expectancy_ex_best??st.expectancy;
+  const perTrade=unit==='pct'?((exp>=0?'+':'')+exp.toFixed(1)+'% of premium per trade'):(olR(exp)+' per trade');
+  const tpd=j.sensitivity?j.sensitivity.trades_per_day:null;
+  const month=(unit==='inr'&&tpd!=null)?(' &asymp; '+olR(exp*tpd*j.constants.month_days)+' per '+j.constants.month_days+' days'):'';
+  let answer;
+  if(v.status==='edge_confirmed')answer='<b>Yes, and the sample now supports it.</b> All three checks are green.';
+  else if(v.status==='losing')answer='<b>No.</b> The win rate is below the rate needed to pay for the losses.';
+  else answer='<b>On paper, '+(st.win_rate-be>0.06?'yes':'slightly')+'. Not proven.</b> A trade wins '+wrTxt+' times in 100 and needs '+beTxt+' to break even; after '+st.n+' trades that margin is inside the noise'+(v.checks[2].ok?'':', and the last '+st.recent.n+' trades ran below it')+'.';
+  const chk=(c,i)=>{
+    const t=['Win rate above breakeven?','Above breakeven even at the low end of the plausible range?','Is the recent run holding up?'][i];
+    let w;
+    if(i===0)w=(c.ok?'<b>Yes.</b> ':'<b>No.</b> ')+olP(c.wr)+' vs '+olP(c.breakeven)+'.';
+    else if(i===1)w=(c.ok?'<b>Yes.</b> ':'<b>No.</b> ')+'With '+st.n+' trades the true win rate could be anywhere from <b>'+olP(c.lo)+' to '+olP(c.hi)+'</b>'+(c.ok?'.':', and '+olP(be)+' sits inside that range, so the edge is not proven.');
+    else w=(c.ok?'<b>Yes.</b> ':'<b>No.</b> ')+'The last '+c.n+' trades won <b>'+olP(c.wr)+'</b>'+(unit==='inr'?(' and made <b>'+olR(c.net)+'</b>'):'')+(c.ok?'.':'. Another '+c.n+' like these and the strategy is losing money.');
+    return '<div class="ol-chk '+(c.ok?'ok':'bad')+'"><div class="mark">'+(c.ok?'&#10003;':'&#10007;')+'</div><div><div class="t">'+(i+1)+' &middot; '+t+'</div><div class="w">'+w+'</div></div></div>';
+  };
+  const side=(k,s)=>{
+    if(!s||!s.n)return '<div class="ol-sidebox"><div class="h">'+(k==='long'?'Longs':'Shorts')+' <span class="badge b-src">NO TRADES</span></div></div>';
+    const ok=s.win_rate>be; const exb=s.total_ex_best;
+    return '<div class="ol-sidebox"><div class="h">'+(k==='long'?'Longs':'Shorts')+' <span class="badge '+(ok?'b-right':'b-wrong')+'">'+(ok?'WORKING':'NOT WORKING')+'</span></div>'+
+      olP(s.win_rate)+' win rate ('+s.wins+' of '+s.n+') &middot; '+(unit==='inr'?olR(s.total):((s.total>=0?'+':'')+s.total.toFixed(0)+'%'))+' &middot; '+Math.abs(Math.round((s.win_rate-be)*100))+' points '+(ok?'above':'<em>below</em>')+' breakeven.'+
+      (exb<=0?(' Without its best trade ('+esc(s.best_symbol)+' '+esc(s.best_date)+'): <span class="neg">'+(unit==='inr'?olR(exb):exb.toFixed(0)+'%')+'</span>.'):'')+'</div>';
+  };
+  let todo;
+  if(v.status==='edge_confirmed')todo='<b>What this means today:</b> <em>the edge is confirmed on this sample; size can go up in steps, re-checking this box at each step.</em>';
+  else if(v.status==='losing')todo='<b>What this means today:</b> <em>pause the strategy; a settings change cannot fix a win rate below breakeven.</em>';
+  else todo='<b>What this means today:</b> <em>keep trading at the current size, apply only the changes the rules below support, add no capital, and look at this box again at '+v.checkpoint.target+' trades</em> ('+v.checkpoint.fills+' so far). Three green checks &rarr; the edge is confirmed. Check 1 red &rarr; pause.';
+  const cnt=j.counts;
+  const scope='<div class="ol-scope"><span>count</span><div class="ol-seg">'+
+    '<button class="'+(j.scope==='real'?'on':'')+'" onclick="olSetScope(&quot;real&quot;)">real fills only</button>'+
+    '<button class="'+(j.scope==='real_sim'?'on':'')+'" onclick="olSetScope(&quot;real_sim&quot;)">real + simulated</button></div>'+
+    '<span class="muted" style="font-size:11px">simulated = a trigger that fired live but sent no order (cap reached, profit lock, unaffordable). Never broker-rejected rows, never bar-reconstructed replays.</span>'+
+    '<div class="ol-cls"><span class="in">real '+cnt.real+' &middot; in</span><span class="'+(j.scope==='real_sim'?'sim in':'')+'">sim live-decided '+(j.scope==='real_sim'?cnt.sim_live_decided+' &middot; in':'off')+'</span><span class="out">paper (rejected)</span><span class="out">shadow (other side)</span><span class="out">replay-reconstructed</span></div></div>';
+  return '<div class="ol-vbox"><p class="q">Is this strategy making money?</p><div class="a">'+answer+'</div>'+scope+
+    '<div class="ol-cmp"><div class="big"><span class="k">WIN RATE</span><span class="v">'+wrTxt+'%</span><span class="s">'+st.wins+' wins of '+st.n+' trades'+(j.sample!=='all'?' &middot; sample: '+esc(j.sample.replace(/_/g,' ')):'')+'</span></div>'+
+    '<span class="vs">must beat</span>'+
+    '<div class="big"><span class="k">BREAKEVEN WIN RATE</span><span class="v amber">'+beTxt+'%</span><span class="s">avg win '+(unit==='inr'?olRa(st.avg_win_ex_best??st.avg_win):(st.avg_win_ex_best??st.avg_win).toFixed(1)+'%')+' &middot; avg loss '+(unit==='inr'?olRa(st.avg_loss):st.avg_loss.toFixed(1)+'%')+(st.breakeven_wr!==be?'<br>'+Math.round(st.breakeven_wr*100)+'% if the best trade ('+esc(st.best_symbol)+') stays in':'')+'</span></div>'+
+    '<div class="gap">margin <b class="'+olSign(st.win_rate-be)+'">'+((st.win_rate-be)>=0?'+':'')+Math.round((st.win_rate-be)*100)+' points</b> &asymp; <b class="'+olSign(exp)+'">'+perTrade+'</b>'+month+'.</div></div>'+
+    '<div class="ol-checks">'+v.checks.map(chk).join('')+'</div>'+
+    '<div class="ol-sides">'+side('long',j.sides.long)+side('short',j.sides.short)+'</div>'+
+    '<div class="ol-todo">'+todo+'</div></div>';
+}
+
+function olSpark(cum,color){
+  const W=260,H=64; if(!cum||!cum.length)return '';
+  const lo=Math.min(0,...cum), hi=Math.max(0,...cum), rng=(hi-lo)||1;
+  const y=v=>(H-4-(v-lo)/rng*(H-8)).toFixed(1);
+  const pts=['0,'+y(0)].concat(cum.map((v,i)=>((4+i*(W-8)/Math.max(1,cum.length-1)).toFixed(1))+','+y(v)));
+  return '<svg viewBox="0 0 '+W+' '+H+'"><line x1="0" y1="'+y(0)+'" x2="'+W+'" y2="'+y(0)+'" stroke="#3a4652"/>'+
+    '<polyline points="'+pts.join(' ')+'" fill="none" stroke="'+color+'" stroke-width="1.8"/>'+
+    '<circle cx="'+(W-4)+'" cy="'+y(cum[cum.length-1])+'" r="3" fill="'+color+'"/></svg>';
+}
+function olPnlCard(j){
+  const P=j.pnl, sv=j.saved, dr=j.draft;
+  const setTxt=s=>olN(s.stop_on?s.stop:0)+' / '+olN(s.lock_on?s.target:0)+' / '+olN(s.trail);
+  const col=(k,name,cls,color,badge,badgecls)=>{
+    const a=P[k].as_traded; if(!a||!a.n)return '<div class="ol-pcol '+cls+'"><div class="ph"><span class="n">'+name+'</span></div><div class="sub">no trades</div></div>';
+    const view=olView==='as_traded'?null:P[k][olView];
+    const big=view?view.net:a.total;
+    const sub=view?(view.n+' trades taken &middot; '+view.stops+' stops &middot; '+view.lock_days+' lock days &middot; '+view.trail_days+' trail exits &middot; '+view.skipped+' skipped &middot; '+view.closed_form_rows+' closed-form'):(a.n+' trades &middot; '+a.days+' days &middot; '+olR(a.per_day)+' per day');
+    const alt='<div class="ol-alt"><div class="r"><span>as traded</span><b class="'+olSign(a.total)+'">'+olR(a.total)+'</b></div>'+
+      '<div class="r"><span>saved '+setTxt(sv)+' on every day</span><b class="'+olSign(P[k].saved.net)+'">'+olR(P[k].saved.net)+'</b></div>'+
+      '<div class="r"><span>draft '+setTxt(dr)+'</span><b class="'+olSign(P[k].draft.net)+'">'+olR(P[k].draft.net)+'</b></div>'+
+      '<div class="r"><span>saved stop alone, no lock</span><b class="'+olSign(P[k].stop_only.net)+'">'+olR(P[k].stop_only.net)+'</b></div>'+
+      '<div class="d">saved: '+P[k].saved.stops+' stops, '+P[k].saved.lock_days+' lock days, '+P[k].saved.skipped+' entries skipped'+(P[k].saved.closed_form_rows?(' &middot; '+P[k].saved.closed_form_rows+' rows closed-form (contract expired)'):'')+'</div></div>';
+    const rows=[['gross / charges',olR(a.gross)+' / '+olR(-a.charges)],['win rate',olP(a.win_rate)+' ('+a.wins+' of '+a.n+')'],['avg per trade',olR(a.expectancy)],['best / worst',olR(a.best)+' / '+olR(a.worst)],['worst drawdown',olR(a.max_drawdown)],['last '+a.recent.n+' trades','<span class="'+olSign(a.recent.total)+'">'+olR(a.recent.total)+'</span>'],['without the best trade','<span class="'+olSign(a.total_ex_best)+'">'+olR(a.total_ex_best)+'</span>']];
+    return '<div class="ol-pcol '+cls+'"><div class="ph"><span class="n">'+name+'</span><span class="badge '+badgecls+'">'+badge+'</span></div>'+
+      '<div class="net '+olSign(big)+'">'+olR(big)+'</div><div class="sub">'+sub+'</div>'+olSpark(a.cum,color)+
+      '<table>'+rows.map((r,i)=>'<tr'+(i===rows.length-1?' class="hl"':'')+'><td>'+r[0]+'</td><td>'+r[1]+'</td></tr>').join('')+'</table>'+
+      '<div class="sub" style="margin-top:6px">'+(a.charges_pct_of_gross!=null?('charges took <b style="color:#f9e2af;font-weight:500">'+a.charges_pct_of_gross+'%</b> of gross'):'')+'</div>'+alt+'</div>';
+  };
+  const first=j.counts.days?(P.all.as_traded.first_date||''):'';
+  return '<div class="sec">profit &amp; loss &mdash; <span class="muted">net of modelled charges &middot; real fills &middot; same rows as the /strategies Live column</span>'+
+    '<span class="ol-seg" style="margin-left:10px;vertical-align:middle"><button class="'+(olView==='as_traded'?'on':'')+'" onclick="olSetView(&quot;as_traded&quot;)">as traded</button><button class="'+(olView==='saved'?'on':'')+'" onclick="olSetView(&quot;saved&quot;)">saved settings applied to every day</button><button class="'+(olView==='draft'?'on':'')+'" onclick="olSetView(&quot;draft&quot;)">draft settings applied</button></span>'+
+    '<span class="muted" style="margin-left:8px">stop &amp; lock only apply from the day they were saved &mdash; the applied views replay them over every day since '+esc(first)+'</span></div>'+
+    '<div class="ol-pnl3">'+col('all','ALL TRADES','all','#7dc4e4','BOTH SIDES','b-cur')+col('long','LONGS ONLY','long','#89b4fa',(P.long.as_traded.n||0)+' of '+(P.all.as_traded.n||0),'b-right')+col('short','SHORTS ONLY','short','#cba6f7',(P.short.as_traded.n||0)+' of '+(P.all.as_traded.n||0),'b-wrong')+'</div>'+
+    '<div class="ol-pnote">The big number follows the view toggle; the grey box under each column always shows all four. "Longs only" is the long fills as they happened &mdash; a longs-only setting would have given every slot to longs, so the cap-skipped long triggers (simulated scope) are the upper bound of what it missed.</div>';
+}
+
+function olSensitivity(j){
+  const s=j.sensitivity, st=j.stats_inr; if(!s||!st||!st.n)return '';
+  const W=520,H=230,x0=40,x1=500,y0=18,y1=194;
+  const xs=s.wr_grid, allV=s.line_ex_best.map(p=>p[1]).concat(s.line_all.map(p=>p[1]));
+  let lo=Math.min(0,...allV), hi=Math.max(0,...allV); const pad=(hi-lo)*0.05; lo-=pad; hi+=pad;
+  const X=wr=>(x0+(wr-xs[0])/(xs[xs.length-1]-xs[0])*(x1-x0)), Y=v=>(y1-(v-lo)/(hi-lo)*(y1-y0));
+  const line=(pts,color,dash)=>'<polyline points="'+pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ')+'" fill="none" stroke="'+color+'" stroke-width="'+(dash?1.5:2.2)+'"'+(dash?' stroke-dasharray="4 4" opacity=".7"':'')+'/>';
+  const be=s.breakeven, wr=st.win_rate, lo95=st.wilson_lo, hi95=st.wilson_hi, rec=st.recent.win_rate;
+  const onLine=w=>{const p=s.line_ex_best; const i=Math.max(0,Math.min(p.length-1,Math.round((w-xs[0])/0.01))); return p[i][1];};
+  const ticks=[];const step=(hi-lo)>200000?100000:((hi-lo)>80000?50000:25000);
+  for(let v=Math.ceil(lo/step)*step; v<=hi; v+=step)ticks.push(v);
+  let g='<svg viewBox="0 0 '+W+' '+H+'" role="img">';
+  if(lo95!=null)g+='<rect x="'+X(Math.max(xs[0],lo95)).toFixed(1)+'" y="'+y0+'" width="'+(X(Math.min(xs[xs.length-1],hi95))-X(Math.max(xs[0],lo95))).toFixed(1)+'" height="'+(y1-y0)+'" fill="#7dc4e4" opacity=".08"/>';
+  for(const v of ticks)g+='<line x1="'+x0+'" y1="'+Y(v).toFixed(1)+'" x2="'+x1+'" y2="'+Y(v).toFixed(1)+'" stroke="'+(v===0?'#3a4652':'#2c3640')+'" stroke-width="'+(v===0?1.5:1)+'"/><text x="36" y="'+(Y(v)+3).toFixed(1)+'" fill="#6b7886" font-size="10" text-anchor="end">'+(v===0?'0':(v>0?'+':'&minus;')+(Math.abs(v)>=100000?(Math.abs(v)/100000).toFixed(1)+'L':Math.round(Math.abs(v)/1000)+'k'))+'</text>';
+  for(let w=0.30;w<=0.651;w+=0.05)g+='<text x="'+X(w).toFixed(1)+'" y="210" fill="#6b7886" font-size="10" text-anchor="middle">'+Math.round(w*100)+'%</text>';
+  g+=line(s.line_all,'#8aa0b4',true)+line(s.line_ex_best,'#a6e3a1',false);
+  if(be!=null)g+='<line x1="'+X(be).toFixed(1)+'" y1="'+y0+'" x2="'+X(be).toFixed(1)+'" y2="'+y1+'" stroke="#f9e2af" stroke-dasharray="2 3"/><text x="'+(X(be)+4).toFixed(1)+'" y="'+(y0+10)+'" fill="#f9e2af" font-size="10">breakeven '+olP(be)+'</text>';
+  const mark=(w,color,label,dy)=>{if(w==null||w<xs[0]||w>xs[xs.length-1])return '';return '<circle cx="'+X(w).toFixed(1)+'" cy="'+Y(onLine(w)).toFixed(1)+'" r="4" fill="'+color+'" stroke="#0f1419" stroke-width="1.5"/><text x="'+(X(w)+6).toFixed(1)+'" y="'+(Y(onLine(w))+dy).toFixed(1)+'" fill="'+color+'" font-size="10">'+label+'</text>';};
+  g+='<line x1="'+X(wr).toFixed(1)+'" y1="'+y0+'" x2="'+X(wr).toFixed(1)+'" y2="'+y1+'" stroke="#7dc4e4" stroke-width="1.2"/>';
+  g+=mark(wr,'#a6e3a1','now '+olP(wr)+' &rarr; &asymp; '+olR(onLine(wr)),-6);
+  g+=mark(rec,'#f38ba8','last '+st.recent.n+': '+olP(rec),14);
+  const L=j.sides_inr.long, S=j.sides_inr.short;
+  if(L&&L.n)g+=mark(L.win_rate,'#89b4fa','longs '+olP(L.win_rate),-6);
+  if(S&&S.n)g+=mark(S.win_rate,'#cba6f7','shorts '+olP(S.win_rate),14);
+  g+='</svg>';
+  return '<div class="ol-chart"><div class="t">EXPECTED '+j.constants.month_days+'-DAY NET vs WIN RATE</div><div class="d">Redrawn on every change to the config form. Payoff shape fixed at the observed averages ('+s.trades_per_day+' trades/day). The shaded band is the 95% interval of the win rate itself &mdash; where it crosses zero the settings are not proven either way.</div>'+g+
+    '<div class="ol-legend"><span><i style="border-color:#a6e3a1"></i>payoff without the best trade</span><span><i class="dash" style="border-color:#8aa0b4"></i>payoff with it</span><span><i class="box" style="background:#7dc4e4"></i>win-rate 95% CI</span></div></div>';
+}
+function olFan(j){
+  const pr={}; for(const p of j.presets)pr[p.key]=p;
+  const a=pr.as_traded, s=pr.saved, d=pr.draft; if(!a||!a.bootstrap)return '';
+  const W=520,H=230,x0=40,x1=500,y0=18,y1=194;
+  const vals=[a,s,d].filter(p=>p&&p.bootstrap).flatMap(p=>[p.bootstrap.p10,p.bootstrap.p90]);
+  let lo=Math.min(0,...vals), hi=Math.max(0,...vals); const pad=(hi-lo)*0.06; lo-=pad; hi+=pad;
+  const Y=v=>(y1-(v-lo)/(hi-lo)*(y1-y0)), mx=(x0+x1)/2;
+  const fan=(p,color,op,dash,label,dy)=>{const b=p.bootstrap; if(!b)return '';
+    return '<path d="M'+x0+','+Y(0).toFixed(1)+' Q'+mx+','+((Y(0)+Y(b.p10))/2).toFixed(1)+' '+x1+','+Y(b.p10).toFixed(1)+' L'+x1+','+Y(b.p90).toFixed(1)+' Q'+mx+','+((Y(0)+Y(b.p90))/2).toFixed(1)+' '+x0+','+Y(0).toFixed(1)+' Z" fill="'+color+'" opacity="'+op+'"/>'+
+      '<path d="M'+x0+','+Y(0).toFixed(1)+' Q'+mx+','+((Y(0)+Y(b.p50))/2-6).toFixed(1)+' '+x1+','+Y(b.p50).toFixed(1)+'" fill="none" stroke="'+color+'" stroke-width="'+(dash?1.5:2.2)+'"'+(dash?' stroke-dasharray="5 3"':'')+'/>'+
+      '<text x="'+(x1+4)+'" y="'+(Y(b.p50)+dy).toFixed(1)+'" fill="'+color+'" font-size="10">'+label+' '+olR(b.p50)+'</text>';};
+  const ticks=[];const step=(hi-lo)>200000?100000:((hi-lo)>80000?50000:25000);
+  for(let v=Math.ceil(lo/step)*step; v<=hi; v+=step)ticks.push(v);
+  let g='<svg viewBox="0 0 '+(W+40)+' '+H+'" role="img">';
+  for(const v of ticks)g+='<line x1="'+x0+'" y1="'+Y(v).toFixed(1)+'" x2="'+x1+'" y2="'+Y(v).toFixed(1)+'" stroke="'+(v===0?'#3a4652':'#2c3640')+'" stroke-width="'+(v===0?1.5:1)+'"/><text x="36" y="'+(Y(v)+3).toFixed(1)+'" fill="#6b7886" font-size="10" text-anchor="end">'+(v===0?'0':(v>0?'+':'&minus;')+(Math.abs(v)>=100000?(Math.abs(v)/100000).toFixed(1)+'L':Math.round(Math.abs(v)/1000)+'k'))+'</text>';
+  for(let i=0;i<=4;i++)g+='<text x="'+(x0+i*(x1-x0)/4).toFixed(1)+'" y="210" fill="#6b7886" font-size="10" text-anchor="middle">'+(i===0?'day 0':Math.round(i*j.constants.month_days/4))+'</text>';
+  g+=fan(a,'#8aa0b4',0.14,true,'as traded',4)+fan(s,'#7dc4e4',0.10,true,'saved',4)+fan(d,'#a6e3a1',0.16,false,'draft',4)+'</svg>';
+  const row=p=>'<tr><td>'+esc(p.label)+'</td><td class="num">'+olR(p.bootstrap?p.bootstrap.p10:null)+'</td><td class="num">'+olR(p.bootstrap?p.bootstrap.p50:null)+'</td><td class="num">'+olR(p.bootstrap?p.bootstrap.p90:null)+'</td><td class="num">'+(p.bootstrap?Math.round(p.bootstrap.p_positive*100)+'%':'&mdash;')+'</td></tr>';
+  return '<div class="ol-chart"><div class="t">'+j.constants.month_days+'-DAY EQUITY FAN &middot; P10 / P50 / P90</div><div class="d">'+j.constants.bootstrap_months.toLocaleString('en-IN')+' bootstrap months of '+j.constants.month_days+' days drawn from the replayed days. P50 = the typical month; P10 = only 1 month in 10 does worse; P90 = only 1 in 10 does better. Rows whose contract expired are closed-form and cannot show a stopped-out winner, so the stop is flattered.</div>'+g+
+    '<table class="sltab"><tr><th>settings</th><th class="num">P10</th><th class="num">P50</th><th class="num">P90</th><th class="num">P(month &gt; 0)</th></tr>'+[a,s,d].filter(Boolean).map(row).join('')+'</table></div>';
+}
+function olPresets(j){
+  const setTxt=s=>olN(s.max_trades>=99?'&ndash;':s.max_trades)+' slots &middot; stop '+olN(s.stop_on===false?0:s.stop)+' &middot; lock '+olN(s.lock_on===false?0:s.target)+' &middot; trail '+olN(s.trail);
+  let h='<div class="sec">setting presets &mdash; <span class="muted">same engine, same sample &middot; replayed net over the recorded days, then bootstrapped</span></div><div style="overflow-x:auto"><table class="sltab"><tr><th>preset</th><th>settings</th><th class="num">replayed net</th><th class="num">trades</th><th class="num">win rate</th><th class="num">stops</th><th class="num">lock days</th><th class="num">skipped</th><th class="num">P10</th><th class="num">P50</th><th class="num">P90</th><th class="num">P(&gt;0)</th><th>engine</th></tr>';
+  for(const p of j.presets){const b=p.bootstrap||{};
+    h+='<tr'+(p.key==='saved'?' class="cur"':'')+'><td>'+esc(p.label)+'</td><td>'+setTxt(p.settings)+'</td><td class="num '+olSign(p.net)+'">'+olR(p.net)+'</td><td class="num">'+p.n+'</td><td class="num">'+olP(p.win_rate)+'</td><td class="num">'+p.stops+'</td><td class="num">'+p.lock_days+'</td><td class="num">'+p.skipped+'</td><td class="num">'+olR(b.p10)+'</td><td class="num">'+olR(b.p50)+'</td><td class="num">'+olR(b.p90)+'</td><td class="num">'+(b.p_positive!=null?Math.round(b.p_positive*100)+'%':'&mdash;')+'</td><td><span class="badge b-pend">replay '+(p.n-p.closed_form_rows)+' &middot; closed-form '+p.closed_form_rows+'</span></td></tr>';}
+  return h+'</table></div>';
+}
+function olRecs(j){
+  const names={side:'trade side',stop:'stop loss / trade',trail:'trail give-back',target:'day profit target',size:'slots &times; capital'};
+  const fmt=(f,v)=>(f==='trade_side'?esc(String(v)):(v==null?'&mdash;':olN(v)));
+  let h='<div class="sec">what to change &mdash; <span class="muted">rules in code (services/open15_settings_outlook.py), re-evaluated on every load; each line names the numbers it was derived from</span></div>'+
+    '<div style="overflow-x:auto"><table class="ol-recs"><tr><th>#</th><th>change</th><th>evidence (live)</th><th class="num">effect</th><th>status</th><th></th></tr>';
+  j.recommendations.forEach((r,i)=>{
+    const badge=r.status==='in_effect'?'<span class="badge b-done">IN EFFECT</span>':(r.status==='hold'?'<span class="badge b-hold">HOLD</span>':'<span class="badge b-pend">NOT APPLIED</span>');
+    const chg=r.status==='hold'?('<b>'+fmt(r.field,r.from)+' (keep)</b>'):(r.status==='in_effect'?('<b>'+fmt(r.field,r.to)+' (keep)</b>'):('<b>'+fmt(r.field,r.from)+' &rarr; '+fmt(r.field,r.to)+'</b>'));
+    const btn=r.status==='recommend'?('<button onclick="olPutInForm(&quot;'+r.field+'&quot;,&quot;'+String(r.to)+'&quot;)">put in form</button>'):'';
+    h+='<tr'+(r.status!=='recommend'?' class="done"':'')+'><td class="rk">'+(i+1)+'</td><td><span class="chg">'+names[r.rule]+' '+chg+'</span></td><td><span class="ev">'+esc(r.evidence)+'</span></td><td class="num"><span class="ev">'+esc(r.effect)+'</span></td><td>'+badge+'</td><td>'+btn+'</td></tr>';
+  });
+  h+='</table></div>';
+  const cp=j.verdict.checkpoint||{fills:0,target:80};
+  h+='<div class="ol-ckpt"><span>checkpoint</span><div class="bar"><i style="width:'+Math.min(100,Math.round(cp.fills/cp.target*100))+'%"></i></div><span><b style="color:#d7dde4;font-weight:500">'+cp.fills+' / '+cp.target+'</b> real fills &middot; at '+cp.target+': check 1 red &rarr; <span class="neg">PAUSE</span>, not tune &middot; all three green &rarr; <span class="pos">EDGE CONFIRMED</span></span></div>';
+  h+='<div class="foot">"put in form" fills the config fieldset above and marks the card draft; nothing is saved until you press its <em>save</em>. Once the saved config matches a row it reads IN EFFECT, and the rule keeps re-checking it on new fills. The stop rule is judged on the side you trade (trade side in the saved config), because the same stop helped shorts and hurt longs on the first 41 fills.</div>';
+  return h;
+}
+function renderOutlook(){
+  const box=document.getElementById('outlook'); if(!box)return;
+  const j=olData; box.style.display='';
+  const title='<span class="atitle">SETTINGS OUTLOOK</span>';
+  if(!j||j.status!=='ok'){box.innerHTML=title+'<span class="asub">'+(j&&j.status==='no_data'?'no real closed live fills yet &mdash; the card fills from the first one':('unavailable: '+esc((j&&j.message)||'outlook failed')))+'</span>';return;}
+  const dd=Object.keys(j.draft_differs||{});
+  const setTxt=s=>olN(s.max_trades)+' &times; '+olRa(s.margin_per_slot)+' &middot; SL '+olN(s.stop_on?s.stop:0)+' &middot; lock '+olN(s.lock_on?s.target:0)+' &middot; trail '+olN(s.trail);
+  const pillCls=j.verdict.status==='edge_confirmed'?'ol-pill ok':(j.verdict.status==='losing'?'ol-pill bad':'ol-pill');
+  let h=title+'<span class="asub">'+j.counts.real+' real fills &middot; '+j.counts.days+' days &middot; net &#8377; after modelled charges &middot; paths for '+j.counts.paths_available+' fills, '+j.counts.paths_missing+' closed-form &middot; follows the config form as you edit it</span>'+
+    '<span class="ol-verdict">verdict <span class="'+pillCls+'">'+esc(j.verdict.label)+' &middot; '+j.verdict.green+' of 3 checks green</span></span>';
+  h+='<div class="ol-strip"><span class="badge b-cur">saved '+setTxt(j.saved)+'</span>'+(dd.length?('<span class="badge b-pend">draft '+dd.map(k=>esc(k)+' '+olN(j.draft_differs[k][0])+'&rarr;'+olN(j.draft_differs[k][1])).join(' &middot; ')+' &middot; unsaved</span>'):'<span class="muted" style="font-size:11px">form matches the saved config</span>')+
+    '<label class="muted" style="margin-left:auto;font-size:11px">sample <select onchange="olSetSample(this.value)" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:2px 6px;font-size:11px">'+
+    [['all','all fills'],['ex_best_day','exclude best day'],['last_20','last 20 fills'],['longs','longs only'],['shorts','shorts only'],['sim_only','simulated only']].map(o=>'<option value="'+o[0]+'"'+(j.sample===o[0]?' selected':'')+'>'+o[1]+'</option>').join('')+'</select></label></div>';
+  h+=olVerdictBox(j);
+  h+=olPnlCard(j);
+  h+='<details class="ol-more"'+(window.__olOpen?' open':'')+' ontoggle="window.__olOpen=this.open"><summary>HOW THIS WAS WORKED OUT &mdash; chart, equity fan, presets and recommendations</summary>'+
+    '<div class="ol-charts">'+olSensitivity(j)+olFan(j)+'</div>'+olPresets(j)+olRecs(j)+'</details>';
+  h+='<div class="foot">Sample = <code>real_closed_rows(mode=live)</code>, net via <code>net_pnl_of_row</code> (one convention, #552). Breakeven win rate = avg loss &divide; (avg win + avg loss), computed without the single best trade. CI = Wilson 95%. Replay = the draft stop / lock / trail walked minute by minute over each row&#39;s intra-hold marks from <code>/api/pnl_curve</code>; rows whose contract has expired are closed-form (final loss truncated at the stop, no path effects). Simulated rows (mixed scope) are 1 lot at the quote LTP, so that scope works in % of premium and rupee P&amp;L stays real-only. Nothing on this card places, cancels or sizes an order.</div>';
+  box.innerHTML=h;
+}
+
 armLivePoll();
 loadLadderPreview();
 loadDays();
@@ -2571,6 +2857,61 @@ def stop_scorecard():
     except Exception:
         logger.exception("open15: stop scorecard failed")
         return jsonify({"status": "error", "message": "scorecard failed — see logs"})
+
+
+@open15_bp.route("/api/settings_outlook", methods=["GET"])
+@check_session_validity
+def settings_outlook():
+    """Is the strategy making money with these settings, and what should
+    change? (issue #711 - the /logs SETTINGS OUTLOOK card).
+
+    Query: the five config-form fields as a DRAFT (``max_trades``,
+    ``margin_per_slot``, ``stop_loss_inr``, ``stop_loss_enabled``,
+    ``profit_target_inr``, ``profit_lock_enabled``, ``trail_giveback_inr``) -
+    omitted fields fall back to the saved row; ``scope`` = ``real`` (default) |
+    ``real_sim``; ``sample`` = ``all`` | ``ex_best_day`` | ``last_20`` |
+    ``longs`` | ``shorts`` | ``sim_only``. Read-only; nothing is saved. Always
+    HTTP 200 with a labelled ``status`` (the card renders failure as text).
+    The first call per process fetches the intra-hold minute paths the chart
+    already uses (~1 broker history call per real fill, then cached).
+    """
+    from services import open15_settings_outlook as so
+
+    def _num(key):
+        v = request.args.get(key)
+        if v in (None, ""):
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    def _flag(key):
+        v = request.args.get(key)
+        if v in (None, ""):
+            return None
+        return v.lower() in ("1", "true", "on", "yes")
+
+    draft = {
+        "max_trades": int(_num("max_trades")) if _num("max_trades") is not None else None,
+        "margin_per_slot": _num("margin_per_slot"),
+        "stop_loss_inr": _num("stop_loss_inr"),
+        "stop_loss_enabled": _flag("stop_loss_enabled"),
+        "profit_target_inr": _num("profit_target_inr"),
+        "profit_lock_enabled": _flag("profit_lock_enabled"),
+        "trail_giveback_inr": _num("trail_giveback_inr"),
+    }
+    scope = request.args.get("scope") or "real"
+    if scope not in ("real", "real_sim"):
+        scope = "real"
+    sample = request.args.get("sample") or "all"
+    if sample not in ("all", "ex_best_day", "last_20", "longs", "shorts", "sim_only"):
+        sample = "all"
+    try:
+        return jsonify(so.compute_outlook(draft, scope=scope, sample=sample))
+    except Exception:
+        logger.exception("open15: settings outlook failed")
+        return jsonify({"status": "error", "message": "outlook failed - see logs"})
 
 
 @open15_bp.route("/api/live_pnl", methods=["GET"])
