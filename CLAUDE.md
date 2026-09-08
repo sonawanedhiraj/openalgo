@@ -1693,6 +1693,43 @@ tunables: keep the stop only if after 20 events cumulative stop-saved > 0 AND
 ≥ 50% of stops were right). `GET /open15_vol_breakout/api/stop_scorecard`.
 No env flag (#651). Tests: `test/test_open15_sl_counterfactual.py`.
 
+**Settings Outlook — "is it making money, and what should change?" (issue
+#711).** A strategy-wide card on `/open15_vol_breakout/logs`, between the
+config fieldset and the history/day layout (never inside the per-day view),
+backed by the pure engine `services/open15_settings_outlook.py` and
+`GET /open15_vol_breakout/api/settings_outlook` (session auth, read-only,
+always HTTP 200 with a labelled `status`). It reads the config form LIVE — a
+debounced re-fetch on every change to slots / capital / stop / target /
+trail — and never saves; "put in form" only fills the fieldset. Rules, each
+load-bearing:
+- **Real fills only, one convention.** Rows are `real_closed_rows(mode='live')`
+  priced by `net_pnl_of_row` (#552) — the same row set as the /strategies Live
+  column and its `_side_split` (#458), so the two pages cannot disagree.
+  `scope=real_sim` adds only LIVE-DECIDED simulated triggers (`fill='sim'`,
+  cap / lock / unaffordable — never paper, never `replay_missed_day`) and then
+  works in **% of premium paid**, because a 1-lot quote-priced sim row and a
+  2-lot filled row do not add in rupees; rupee P&L stays real-only.
+- **Nothing new is persisted.** The stop / lock / trail replay walks each
+  row's intra-hold minute marks from `open15_pnl_curve.build_pnl_curve` — the
+  series the chart already draws. A row whose contract has expired has no
+  marks and is **closed-form** (final loss truncated at the stop; a dipping
+  winner cannot be seen, so the stop is flattered); every replayed figure
+  carries its `replay N / closed-form M` split. First call per process costs
+  ~one broker history call per real fill, then it is cached.
+- **The P&L card is as-traded AND replayed.** The stop and lock only went live
+  on 2026-09-04, so the journal's numbers describe a mix of regimes; the
+  "saved settings applied to every day" / "draft settings applied" views show
+  what the same trades would have paid under the rules now in force.
+- **The stop is judged on the side you trade.** On the first 41 fills the
+  same ₹2,500 stop LOWERED long P&L (7 winners stopped before they turned)
+  and RAISED short P&L (short losers run). The stop rule replays on
+  `trade_side`'s rows, so a longs-only deployment is not told to keep a stop
+  that only ever paid on shorts.
+- **Verdict = three boolean checks, recommendations = five named rules with
+  code constants** (side / stop / trail / target / size; `CHECKPOINT_FILLS`,
+  `STOP_GRID`, `TARGET_GRID`, …). No LLM, no env flags (#651 rule). Tests:
+  `test/test_open15_settings_outlook.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.

@@ -163,3 +163,39 @@ pick_contract" only by comment, which is exactly how the pair drifts.
 next-month `opt_symbol`) trade a structurally different book — lower gamma,
 wider spreads, thinner OI, higher lot cost. Real money, stays in real P&L, but
 per-trade comparisons should segment them (same class of note as #581/#595/#643).
+
+### 2026-09-08 — #711: Settings Outlook card; the stop's sign flips by side
+
+Replayed all 41 real live fills (2026-08-06..09-08, 17 days) through the #696
+rules on the intra-hold minute paths `/api/pnl_curve` already serves (28 fills
+with marks, 13 expired-AUG-contract fills closed-form). The stop and lock only
+went live on 09-04, so the journal's P&L is "as traded" for 33 of 41 rows —
+the new `/logs` card shows both.
+
+| net Rs | as traded | stop 2,500 alone | saved 2,500 / 8,000 / 1,500 |
+|---|---|---|---|
+| all | +50,751 | +49,663 | +58,534 |
+| longs | +13,524 | +1,391 | +12,363 |
+| shorts | +37,226 | +48,271 | +48,271 |
+
+- **Same stop, opposite effect by side.** Long losers do not run (worst −9.3k),
+  so a Rs2,500 stop mostly clips winners on their first dip (TCS −3,172 →
+  +6,561; WIPRO; CGPOWER). Short losers run (MAXHEALTH −13,117, HINDALCO
+  −5,329), so the stop pays there. The card's stop rule therefore replays on
+  the saved `trade_side`'s rows — a longs-only deployment must not be told to
+  keep a stop that only ever paid on shorts. The stop scorecard (#704) cannot
+  see this: it only prices stops that fired, never the winners a stop would
+  have killed.
+- **The lock is where the gain is** (skips after 08-20 PFC +17.9k, 08-26
+  HINDZINC +11.1k), not the stop.
+- **Edge not proven.** Win rate 46.3% vs 41.7% breakeven (ex the BRITANNIA
+  +37,553 outlier; 35.6% with it), Wilson 95% 32–61%, last 20 fills 30% /
+  −Rs22,846. Each side minus its best trade is ≈ flat (longs −1,549, shorts
+  −327). Longs' modelled charges are 49% of their gross. Re-decide at 80 real
+  fills (~mid-Oct 2026): check 1 (WR > breakeven) red → pause, not tune.
+- Trail Rs1,500 is below one tick on the biggest lots (IDEA 71,475 × Rs0.05 =
+  Rs3,574) — a lock can be ended by a single tick of noise.
+- Card: `/open15_vol_breakout/logs` → SETTINGS OUTLOOK (verdict, P&L
+  as-traded vs settings-replayed, real-only vs real+live-decided-sim scope,
+  sensitivity chart, fan, presets, five rules). Engine
+  `services/open15_settings_outlook.py`; endpoint `GET /api/settings_outlook`.
