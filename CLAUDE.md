@@ -1562,6 +1562,39 @@ TRIGGERS and read `5` on a day with zero fills. One-off repair for pre-#548 rows
 `uv run python -m services.open15_rejection_backfill --date YYYY-MM-DD [--apply]`
 (dry-run default, NOT wired into the runtime).
 
+**A refusal the order could never have survived is NOT paper (issue #715).**
+The #595 filter judges the ATM contract at SELECTION time and day-caches the
+verdict per `(symbol, side)`; the trigger resolves the contract again from the
+trigger price, which can be a DIFFERENT strike (MAXHEALTH 2026-09-09: added
+09:16 unblocked, triggered 09:17:57 on the 1010CE with 321 lots). The broker
+then refuses it, and until #715 the #548 path filed that as a PAPER fill and
+priced it — +₹15,855 of paper P&L on a contract that cannot be bought under
+ANY variant of the strategy (nine rows across five days carried the same
+message). Paper answers *"what would this order have done had the broker not
+refused it"*, which only means something when the SAME order could have
+filled (a static-IP 403, an RMS funds refusal). A structural refusal is a
+different claim. `services/open15_liquidity.classify_unfillable_rejection`
+names it from the broker's text (`oi_below_broker_min`; a transient refusal
+returns `None` and stays paper), and BOTH rejection seams — placement
+(`_journal_rejection`) and post-ACK demotion (`verify_entries`) — journal it
+in the paper-cap shape: `status='rejected'`, **`fill='none'`**,
+`reason='entry_rejected_unfillable'`, not registered in `positions` (a `none`
+row left there would be counted as REAL by `_count_fills`), never priced at
+`flatten`, absent from every P&L bucket, and it spends neither the paper cap
+(which bounds what a rejecting broker can SIMULATE) nor a `max_trades` slot.
+No new event name (#615/#622): `entry_rejected` carries `fill='none'` +
+`unfillable=<reason>`; the digest counts `unfillable` apart from `paper`
+(still subtracted from `entered`), and both row builders badge it
+"unfillable · not priced". No env flag (#651). One-off repair for rows filed
+before #715 (journal AND day log — drops the `exit_paper`, relabels the
+`entry_rejected`, moves the `summary` count): `uv run python -m
+services.open15_unfillable_repair --date YYYY-MM-DD | --all [--apply]`
+(dry-run default, NOT wired into the runtime). Entry itself still has NO
+pre-check — the broker remains the authority (#595); the entry-time
+`_option_liquidity` snapshot already carries the traded contract's OI at zero
+broker cost, so closing the strike-drift gap is a follow-up, not a mapper
+change. Tests: `test/test_open15_unfillable_rejection.py`.
+
 **The excluded side can be measured without being traded (issue #581, default
 OFF).** `trade_side` was set to `long_only` because July parity had the short
 side at **−₹2,485 / 20% win rate** (options) against longs at +₹13,680 — but

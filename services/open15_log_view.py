@@ -157,6 +157,7 @@ def summarize_day(
     entered = 0
     entry_syms: set[str] = set()
     paper_syms: set[str] = set()
+    unfillable_syms: set[str] = set()  # could never have filled — no bucket (#715)
     sim_syms: set[str] = set()
     shadow_syms: set[str] = set()
     error_syms: set[str] = set()  # entries that RAISED (issue #643)
@@ -194,7 +195,14 @@ def summarize_day(
         elif kind == "entry" and ev.get("order_status") == "success":
             entry_syms.add(ev.get("symbol", ""))
         elif kind == "entry_rejected":
-            paper_syms.add(ev.get("symbol", ""))
+            # issue #715 — a STRUCTURAL refusal (the broker's OI floor) is not
+            # paper: the contract could never have filled, so nothing is priced
+            # and no bucket claims it. Counted apart so a day that hit the floor
+            # says so, and still subtracted from ``entered`` below.
+            if ev.get("unfillable"):
+                unfillable_syms.add(ev.get("symbol", ""))
+            else:
+                paper_syms.add(ev.get("symbol", ""))
         elif kind == "entry_skipped" and ev.get("fill") == "sim":
             sim_syms.add(ev.get("symbol", ""))
         elif kind == "entry_shadow":
@@ -228,7 +236,7 @@ def summarize_day(
     # detectable the two sets were disjoint, so a plain count was right; now it
     # double-counts, showing the same symbol as entered AND paper. An entry that
     # was ultimately refused did not stand.
-    entered = len(entry_syms - paper_syms - error_syms)
+    entered = len(entry_syms - paper_syms - unfillable_syms - error_syms)
     pnl = trades_pnl if trades_pnl is not None else (pnl_from_events if saw_exit_pnl else None)
     ppnl = paper_pnl if paper_pnl is not None else (paper_from_events if saw_paper_pnl else None)
     spnl = sim_pnl if sim_pnl is not None else (sim_from_events if saw_sim_pnl else None)
@@ -245,6 +253,7 @@ def summarize_day(
         "liq_excluded_stage2": liq_excluded_stage2,
         "entered": entered,
         "paper": len(paper_syms),
+        "unfillable": len(unfillable_syms),
         "sim": len(sim_syms),
         "shadow": len(shadow_syms),
         "errors": len(error_syms),
@@ -415,16 +424,20 @@ def selection_outcomes(
             )
         elif kind == "entry_rejected":
             # a rejected entry is a real measurement, just not a real fill — it
-            # keeps its outcome row so the CSV stays complete (issue #548)
+            # keeps its outcome row so the CSV stays complete (issue #548).
+            # A structural refusal (issue #715) keeps the row too, but with NO
+            # fill class: it could never have filled, so it is never priced.
             sym = ev.get("symbol")
             if sym not in rows:
                 continue
+            unfillable = ev.get("unfillable")
             rows[sym].update(
                 entered=False,
-                fill="paper",
+                fill="none" if unfillable else "paper",
+                unfillable=unfillable,
                 qty=ev.get("qty"),
                 trigger_price=ev.get("entry_price"),
-                skip_reason="entry_rejected",
+                skip_reason="entry_rejected_unfillable" if unfillable else "entry_rejected",
                 error_message=ev.get("error"),
                 instrument=ev.get("instrument") or "stock",
                 opt_symbol=ev.get("contract"),

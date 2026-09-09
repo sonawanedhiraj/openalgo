@@ -32,11 +32,55 @@ strategy worse. These are measurements; a rule needs its own evidence.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+# ---- unfillable broker rejections (issue #715) ------------------------------ #
+# A broker-rejected entry becomes a PAPER fill (#548) so the day stays
+# measurable: paper answers "what would this order have done had the broker
+# not refused it". That question only has an answer when the SAME order could
+# have filled — a static-IP 403, an RMS funds refusal. Some refusals are
+# structural instead: the contract cannot be bought under ANY variant of the
+# strategy, so pricing it measures nothing and pollutes the paper bucket with
+# money that was never obtainable (MAXHEALTH 2026-09-09: +Rs15,855 of paper
+# P&L on a contract Zerodha's OI floor blocks outright).
+UNFILLABLE_REASON = "entry_rejected_unfillable"
+
+# ``reason`` -> compiled pattern over the broker's rejection text. Zerodha's OI
+# rule reads "MIS LIMIT orders are blocked for this <SYM> contract due to its
+# open interest (OI) being less than 500 lots." (#595). Match the CLAIM, not the
+# exact prose, so a wording tweak on their side does not silently re-open the
+# paper bucket — but keep it narrow: a transient refusal must stay paper.
+_UNFILLABLE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "oi_below_broker_min",
+        re.compile(
+            r"open\s+interest.{0,40}?(less\s+than|below)|oi-based-restrictions",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+)
+
+
+def classify_unfillable_rejection(message: str | None) -> str | None:
+    """The structural reason a rejected entry could NEVER have filled, else None.
+
+    ``None`` means "treat as an ordinary rejection" (paper, #548). Only a
+    positive match reclassifies — an empty or unrecognised message is the
+    ordinary case, never a guess.
+    """
+    if not message:
+        return None
+    text = str(message)
+    for reason, pat in _UNFILLABLE_PATTERNS:
+        if pat.search(text):
+            return reason
+    return None
 
 
 def _get(row: Any, key: str):

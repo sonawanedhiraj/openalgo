@@ -278,7 +278,7 @@ def test_alert_is_sent_once_per_day_not_once_per_rejection():
     init_db()
     sent = []
     svc = _mk_service([], max_trades=3)
-    svc._alert_rejection = lambda symbol, qty, msg: sent.append(symbol) or None
+    svc._alert_rejection = lambda symbol, qty, msg, **kw: sent.append(symbol) or None
     _run_to_selection(svc)
     _trigger(svc, "AAA")
     lc = svc.core.sym["CCC"]["fc"]["low"]
@@ -290,7 +290,7 @@ def test_alert_is_sent_once_per_day_not_once_per_rejection():
     calls = []
     svc2._rejection_alert_date = None
     orig_notify = svc2._alert_rejection
-    svc2._alert_rejection = lambda s, q, m: (calls.append(s), orig_notify(s, q, m))[0]
+    svc2._alert_rejection = lambda s, q, m, **kw: (calls.append(s), orig_notify(s, q, m))[0]
     svc2._alert_rejection("AAA", 10, REJECT_MSG)
     first = svc2._rejection_alert_date
     svc2._alert_rejection("CCC", 10, REJECT_MSG)

@@ -1916,6 +1916,8 @@ class Open15BreakoutService:
         self._cash_at_arm: float | None = None
         self._cash_reserved: dict[str, float] = {}
         self._cash_refetched = False
+        # structural broker refusals — could never have filled (issue #715)
+        self._unfillable_today: list[str] = []
         # tick capture. Universe mode (#528, default): every universe symbol's
         # ticks stream to disk for the whole window. Targeted mode (legacy):
         # only the day's SELECTED symbols are persisted, plus their 09:15
@@ -2282,6 +2284,7 @@ class Open15BreakoutService:
         self._cash_at_arm = available_cash
         self._cash_reserved = {}
         self._cash_refetched = False
+        self._unfillable_today = []
         # NOT IN F&O -> NOT WATCHED (issue #647). A fact from today's master
         # contract, applied unconditionally in option mode: a symbol with no NFO
         # contracts cannot fill under any variant, so watching it produces no
@@ -2766,6 +2769,7 @@ class Open15BreakoutService:
         """
         from database.open15_breakout_db import update_trade
         from services.open15_fill_reconcile import fetch_fill, is_terminal_unfilled
+        from services.open15_liquidity import UNFILLABLE_REASON, classify_unfillable_rejection
 
         try:
             from database.auth_db import get_first_available_api_key
@@ -2815,12 +2819,20 @@ class Open15BreakoutService:
                 continue
 
             msg = leg["message"] or f"broker reported the entry {status}"
+            # A structural refusal (Zerodha's OI floor, #595) could never have
+            # filled, so it is not demoted to PAPER — it leaves the run entirely
+            # (issue #715): out of `self.positions`, where `_count_fills` would
+            # otherwise read a `none` row as real and `flatten` would price it.
+            unfillable = classify_unfillable_rejection(msg)
             # The position dict is what `_count_fills` reads for the max_trades
             # budget and what `flatten` dispatches on, so both have to move — a
             # journal-only update would free the slot in the report and not in
             # the run.
             with self._lock:
-                if symbol in self.positions:
+                if unfillable:
+                    self.positions.pop(symbol, None)
+                    self._unfillable_today.append(symbol)
+                elif symbol in self.positions:
                     self.positions[symbol].update(status="paper", fill="paper", entry_verified=True)
             # RMS refused it after the ACK — nothing was bought, so give the cash
             # back to the ledger (issue #643). Without this a post-ACK rejection
@@ -2830,9 +2842,9 @@ class Open15BreakoutService:
                 pos["row_id"],
                 status="rejected",
                 entry_status="rejected",
-                fill="paper",
+                fill="none" if unfillable else "paper",
                 error_message=msg[:255],
-                reason="entry_rejected",
+                reason=UNFILLABLE_REASON if unfillable else "entry_rejected",
             )
             # `entry_rejected`, NOT a new event name. The digest and the row
             # builder in open15_log_view already render this one, and the /logs
@@ -2849,19 +2861,24 @@ class Open15BreakoutService:
                 order_id=pos["entry_order_id"],
                 order_status=status,
                 error=msg,
-                fill="paper",
+                fill="none" if unfillable else "paper",
                 paper_capped=False,
+                unfillable=unfillable,
                 slot_released=True,
                 # what separates this from a placement-time rejection: the
                 # broker had already ACKNOWLEDGED the order when we entered it
                 post_ack=True,
             )
-            self._alert_rejection(symbol, pos.get("quantity") or 0, msg)
+            self._alert_rejection(symbol, pos.get("quantity") or 0, msg, unfillable=unfillable)
             # Gap A (issue #659): our entry was refused, but the child mirror
             # fired at ACK time and may have filled. No parent exit will ever
             # fire for a paper row, so close the child now, not at 15:20.
             self._flatten_child_mirrors_for(
-                symbol, pos, "parent entry demoted to paper (post-ACK reject)"
+                symbol,
+                pos,
+                "parent entry refused post-ACK (unfillable)"
+                if unfillable
+                else "parent entry demoted to paper (post-ACK reject)",
             )
             demoted += 1
         return demoted
@@ -3578,6 +3595,8 @@ class Open15BreakoutService:
             sim=n_sim,
             # the switched-off side, priced at full slot size (issue #581)
             shadow=n_shadow,
+            # structural broker refusals — never priced, no bucket (issue #715)
+            unfillable=len(self._unfillable_today),
             # seed vs rolling split (issue #529): `selected` counts the whole
             # watch list, so without this the seed cohort is unreadable
             rolling_added=len(self.core.rolling_adds),
@@ -4134,7 +4153,9 @@ class Open15BreakoutService:
             )
         return min(remaining, fresh)
 
-    def _alert_rejection(self, symbol: str, qty: int, msg: str) -> None:
+    def _alert_rejection(
+        self, symbol: str, qty: int, msg: str, unfillable: str | None = None
+    ) -> None:
         """Log loudly + Telegram once per day. Never raises into the entry path."""
         logger.error(
             "[%s] open15 ENTRY REJECTED %s qty=%s — %s",
@@ -4147,16 +4168,25 @@ class Open15BreakoutService:
         if self._rejection_alert_date == today:
             return
         self._rejection_alert_date = today
+        if unfillable:
+            tail = (
+                "No position was taken. This contract could NEVER have filled "
+                f"({unfillable.replace('_', ' ')}) — recorded as UNFILLABLE, not paper: "
+                "it is not priced and joins no P&L bucket (issue #715)."
+            )
+        else:
+            tail = (
+                "No position was taken. Today's rejected entries are recorded as "
+                "PAPER fills (simulated as if run in sandbox) so the day stays "
+                "measurable — they are excluded from realized P&L."
+            )
         try:
             from services.notification_service import get_notification_service
 
             get_notification_service().notify(
                 "open15_breakout",
                 f"⚠ open15_vol_breakout [{_mode()}]: broker REJECTED entry {symbol} "
-                f"qty={qty}\n{msg}\n\n"
-                f"No position was taken. Today's rejected entries are recorded as "
-                f"PAPER fills (simulated as if run in sandbox) so the day stays "
-                f"measurable — they are excluded from realized P&L.",
+                f"qty={qty}\n{msg}\n\n{tail}",
             )
         except Exception:
             logger.exception("open15: rejection alert failed for %s", symbol)
@@ -4169,15 +4199,38 @@ class Open15BreakoutService:
         ``fill='paper'``. It is registered in ``self.positions`` so ``flatten``
         prices the sandbox-equivalent exit at the normal exit time; beyond the
         paper cap it is journaled terminal immediately with no pricing.
+
+        **A structural refusal is never paper (issue #715).** Paper answers
+        "what would this order have done had the broker not refused it", which
+        only means something when the SAME order could have filled — a
+        static-IP 403, an RMS funds refusal. Zerodha's OI floor (#595) is a
+        different claim: the contract cannot be bought under ANY variant of the
+        strategy, so pricing it measures nothing and the paper bucket fills
+        with money that was never obtainable (MAXHEALTH 2026-09-09 read
+        +Rs15,855 of paper P&L on a contract the broker blocks outright). Such
+        a row takes the paper-cap shape instead — ``fill='none'``,
+        ``reason='entry_rejected_unfillable'``, not registered, never priced —
+        and it does not spend the paper cap, which exists to bound how much a
+        rejecting broker can SIMULATE. It still frees its ``max_trades`` slot:
+        it is not a trade either.
         """
         from database.open15_breakout_db import insert_trade
+        from services.open15_liquidity import UNFILLABLE_REASON, classify_unfillable_rejection
 
         # the order never reached the market, so the cash it reserved is still
         # ours to spend on a later trigger (issue #643)
         self._release_cash(action["symbol"])
+        unfillable = classify_unfillable_rejection(msg)
         _real, n_paper, _n_sim, _n_shadow = self._count_fills()
         max_trades = int((self.day_config or {}).get("max_trades") or _max_trades_default())
-        priced = n_paper < max_trades
+        paper_capped = unfillable is None and n_paper >= max_trades
+        priced = unfillable is None and not paper_capped
+        if unfillable:
+            reason = UNFILLABLE_REASON
+        elif paper_capped:
+            reason = "entry_rejected_paper_cap"
+        else:
+            reason = "entry_rejected"
         row_id = insert_trade(
             **row_kw,
             quantity=qty,
@@ -4185,7 +4238,7 @@ class Open15BreakoutService:
             entry_status="error",
             status="rejected",
             fill="paper" if priced else "none",
-            reason="entry_rejected" if priced else "entry_rejected_paper_cap",
+            reason=reason,
             error_message=msg,
         )
         if priced:
@@ -4203,6 +4256,9 @@ class Open15BreakoutService:
                         if k in row_kw
                     },
                 }
+        elif unfillable:
+            with self._lock:
+                self._unfillable_today.append(action["symbol"])
         self._log_event(
             "entry_rejected",
             symbol=action["symbol"],
@@ -4216,10 +4272,12 @@ class Open15BreakoutService:
             watch_source=action.get("watch_source") or "seed",
             error=msg,
             fill="paper" if priced else "none",
-            paper_capped=not priced,
+            paper_capped=paper_capped,
+            # the structural reason this could never have filled, else None (#715)
+            unfillable=unfillable,
             slot_released=True,
         )
-        self._alert_rejection(action["symbol"], qty, msg)
+        self._alert_rejection(action["symbol"], qty, msg, unfillable=unfillable)
 
     def _trade_date(self) -> str:
         """The day's ONE date key — journal row and day log must never differ.

@@ -639,6 +639,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .b-shadow{background:#153037;color:#94e2d5}
  .b-residual{background:#3a2a16;color:#fab387}
  .b-err{background:#3a1b1b;color:#f38ba8}
+ .b-unfill{background:#3a2a1b;color:#fab387}
  .ev-entry_shadow,.ev-exit_shadow{color:#94e2d5}
  /* issue #583 — amber like the other "held, not traded" events, and distinct
     from the red rejection colours: an exclusion is a decision, not a failure */
@@ -1152,6 +1153,7 @@ async function loadDays(){
     el.innerHTML='<div class="d1"><span>'+esc(d.date)+'</span>'+right+'</div>'+
       '<div class="muted">'+(skip?esc(d.status):(d.selected+' sel &middot; '+d.entered+
         ' filled'+(d.paper?(' &middot; '+d.paper+' paper'):'')+
+        (d.unfillable?(' &middot; '+d.unfillable+' unfillable'):'')+
         (d.sim?(' &middot; '+d.sim+' sim'):'')+
         (d.shadow?(' &middot; '+d.shadow+' shadow'):'')))+'</div>';
     el.onclick=()=>{userPicked=true;selectDay(d.date);};
@@ -1212,11 +1214,19 @@ function renderRejected(){
   if(!rej.length){box.innerHTML='';return;}
   const msgs=[...new Set(rej.map(e=>e.error).filter(Boolean))];
   const capped=rej.filter(e=>e.paper_capped).length;
+  // issue #715 — a STRUCTURAL refusal (the broker's OI floor) is not paper:
+  // the contract could never have filled, so it is not priced at all
+  const unfill=rej.filter(e=>e.unfillable).length;
+  const priced=rej.length-capped-unfill;
   box.innerHTML='<div class="rejbanner"><div class="rt">'+rej.length+
     ' '+(rej.length===1?'entry':'entries')+' rejected by broker — no live position was taken</div>'+
     msgs.map(m=>'<div class="rm">'+esc(m)+'</div>').join('')+
-    '<div class="rn">Values below are simulated as if the day had run in sandbox. No money moved.'+
+    '<div class="rn">'+
+    (priced?'Paper values below are simulated as if the day had run in sandbox. No money moved.':
+      'Nothing is priced. No money moved.')+
     (capped?(' '+capped+' beyond the paper cap '+(capped===1?'was':'were')+' left unpriced.'):'')+
+    (unfill?(' '+unfill+' could never have filled (broker OI floor) and '+(unfill===1?'is':'are')+
+      ' recorded as <span class="badge b-unfill">unfillable</span>, not paper — not priced, no P&amp;L bucket.'):'')+
     '</div></div>';
 }
 function renderChips(){
@@ -1249,12 +1259,18 @@ function renderChips(){
   // on the entries chip because a lost trigger is a fact about the day, and
   // before #643 its only trace was a line in errors.jsonl.
   const errors=dig.errors??curEvents.filter(e=>e.event==='entry_error').length;
+  // issue #715 — broker refusals that could NEVER have filled (OI floor). Not
+  // paper: nothing is priced and no bucket claims them; counted so the day
+  // says it hit the floor instead of reading as a quiet one.
+  const unfillable=dig.unfillable??summ.unfillable??
+    curEvents.filter(e=>e.event==='entry_rejected'&&e.unfillable).length;
   const chips=[['status',summ.day||dig.status||'—'],['mode',armed.mode||'—'],
     ['instrument',armed.instrument||(summ.instrument||'—')],
     ['universe',armed.universe??'—'],['vol&times;',armed.vol_mult??'—'],
     // a literal '\\u00B7', NOT '&middot;': chip VALUES go through esc() (keys are
     // inserted raw), so an HTML entity here renders as the text "&middot;"
     ['entries',filled+' filled'+(paper?(' \\u00B7 '+paper+' paper'):'')+
+      (unfillable?(' \\u00B7 '+unfillable+' unfillable'):'')+
       (sim?(' \\u00B7 '+sim+' sim'):'')+
       (shadow?(' \\u00B7 '+shadow+' shadow'):'')+
       (errors?(' \\u00B7 '+errors+' error'+(errors===1?'':'s')):'')+
@@ -1564,13 +1580,24 @@ function renderSel(){
       // issue #548 — the order never reached the market; what follows is a
       // sandbox-equivalent simulation and is badged as such
       const r=rows[e.symbol];
-      r.fill='paper'; r.qty=e.qty;
+      r.qty=e.qty;
       if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.entry_price;
         r.entryBid=e.bid; r.entryAsk=e.ask; r.tick=e.tick_size;}
       else{r.stockEntry=e.entry_price;}
-      r.out='<span class="badge b-paper">paper</span> '+
-        '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
-        esc(e.entry_price)+'</span>';
+      if(e.unfillable){
+        // issue #715 — the refusal is STRUCTURAL (the broker's OI floor): this
+        // contract could never have filled under any variant of the strategy,
+        // so it is not paper — nothing is priced and no P&L bucket claims it
+        r.fill='none'; r.unfillable=e.unfillable;
+        r.out='<span class="badge b-unfill">unfillable</span> '+
+          '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+esc(e.entry_price)+
+          ' &middot; '+esc(String(e.unfillable).replace(/_/g,' '))+' &middot; not priced</span>';
+      }else{
+        r.fill='paper';
+        r.out='<span class="badge b-paper">paper</span> '+
+          '<span class="muted" title="'+esc(e.error||'')+'">rejected @ '+
+          esc(e.entry_price)+'</span>';
+      }
     }else if(e.event==='entry_error'){
       // issue #643 — the trigger was legal and the entry code RAISED. Before
       // this event existed the exception unwound into the ZMQ loop and the row
