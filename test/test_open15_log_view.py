@@ -84,6 +84,7 @@ def test_summarize_day_traded():
         # a pre-#548 day has no entry_rejected/exit_paper events, so the paper
         # cohort is empty and paper P&L is absent (not 0 — nothing was simulated)
         "paper": 0,
+        "unfillable": 0,
         "paper_pnl": None,
         # likewise a pre-#555 day has no entry_skipped/exit_sim events, so the
         # sim cohort is empty and its P&L is absent rather than 0 — "nothing was
