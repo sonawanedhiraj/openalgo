@@ -421,6 +421,8 @@ class TestRiskFromDayLog:
         assert rk["peak"] == 7242.5 and rk["peak_gross"] == 7242.5
         assert rk["floor"] == 5242.5 and rk["floor_gross"] == 5242.5
         assert rk["trail_giveback_inr"] == 2000.0 and rk["path"] == []
+        # nothing dates the peak on an events-only day; the shortfall is derivable
+        assert rk["peak_at"] is None and rk["exit_shortfall"] == 120.0
 
     def test_716_day_uses_the_path_and_peaks(self):
         events = [

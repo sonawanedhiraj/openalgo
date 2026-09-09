@@ -825,7 +825,9 @@ def risk_from_day_log(events: list | None) -> dict | None:
         "mark_basis": lock.get("mark_basis") or "ltp",
         "peak": _g(exit_ev or peak_ev or lock, "peak", "day_pnl"),
         "peak_gross": _g(exit_ev or peak_ev or lock, "peak_gross", None),
-        "peak_at": (peak_ev or lock).get("ts"),
+        # only a profit_peak event dates the peak; on an events-only day the
+        # lock is the last thing we know before the exit
+        "peak_at": peak_ev.get("ts") if peak_ev else None,
         "floor": _g(exit_ev or peak_ev or lock, "floor"),
         "floor_gross": _g(exit_ev or peak_ev or lock, "floor_gross", None),
         "peaks": [
@@ -844,7 +846,17 @@ def risk_from_day_log(events: list | None) -> dict | None:
         "trail_at": exit_ev.get("ts") if exit_ev else None,
         "exit_pnl": _g(exit_ev, "gross", "day_pnl") if exit_ev else None,
         "exit_pnl_net": _g(exit_ev, "net", "day_pnl") if exit_ev else None,
-        "exit_shortfall": exit_ev.get("shortfall") if exit_ev else None,
+        "exit_shortfall": (
+            exit_ev.get("shortfall")
+            if exit_ev and exit_ev.get("shortfall") is not None
+            else (
+                round(float(exit_ev["floor"]) - float(exit_ev["day_pnl"]), 2)
+                if exit_ev
+                and exit_ev.get("floor") is not None
+                and exit_ev.get("day_pnl") is not None
+                else None
+            )
+        ),
         "breach_polls": exit_ev.get("breach_polls") if exit_ev else None,
         "polls_since_lock": exit_ev.get("polls_since_lock") if exit_ev else None,
         "path": list(path_ev.get("polls") or []) if path_ev else [],

@@ -2339,7 +2339,7 @@ function renderPnlCurve(){
       s+='<line x1="'+X(pkE[0])+'" x2="'+(ML+PW)+'" y1="'+Y(pkE[1])+'" y2="'+Y(pkE[1])+'" stroke="#f9e2af" stroke-width=".8" stroke-dasharray="1.5 5" stroke-opacity=".6"/>';
       s+='<line x1="'+X(flE[0])+'" x2="'+(ML+PW)+'" y1="'+Y(flE[1])+'" y2="'+Y(flE[1])+'" stroke="#cba6f7" stroke-width=".8" stroke-dasharray="1.5 5" stroke-opacity=".6"/>';
       labels.push({y:Y(pkE[1]),col:'#f9e2af',txt:'peak '+fmtR(RK.peak!=null?RK.peak:pkE[1])+netTag+(RK.peak_at?(' ('+RK.peak_at.slice(0,8)+')'):'')});
-      labels.push({y:Y(flE[1]),col:'#cba6f7',txt:'floor '+fmtR(RK.floor!=null?RK.floor:flE[1])+netTag+(RK.trail_giveback_inr!=null?(' (peak &minus; '+Math.round(RK.trail_giveback_inr).toLocaleString('en-IN')+')'):'')});
+      labels.push({y:Y(flE[1]),col:'#cba6f7',txt:'floor '+fmtR(RK.floor!=null?RK.floor:flE[1])+netTag+(RK.trail_giveback_inr!=null?(' (peak - '+Math.round(RK.trail_giveback_inr).toLocaleString('en-IN')+')'):'')});
     }
     if(polls.length>1)
       s+='<path d="'+pathOf(polls.map(q=>[q.x,q.gross]))+'" fill="none" stroke="#d7dde4" stroke-width="2.4" stroke-linejoin="round"/>';
