@@ -249,9 +249,11 @@ def _patch_quotes(monkeypatch, ltps):
 
     def fake(contracts):
         calls.append(list(contracts))
-        return ltps
+        # issue #716: the seam returns the touch too; bid == ltp keeps these
+        # LTP-era expectations byte-identical
+        return None if ltps is None else {k: {"ltp": v, "bid": v, "ask": v} for k, v in ltps.items()}
 
-    monkeypatch.setattr(curve, "_batched_ltp", fake)
+    monkeypatch.setattr(curve, "_batched_quotes", fake)
     return calls
 
 
@@ -298,7 +300,7 @@ def test_live_pnl_closed_and_idle(monkeypatch):
 def test_live_pnl_unreadable_quotes_degrade(monkeypatch):
     monkeypatch.setattr(curve, "_today_ist", lambda: DATE)
     _row(status="open", exit_ts=None, pnl=None, charges_inr=None)
-    monkeypatch.setattr(curve, "_batched_ltp", lambda contracts: None)
+    monkeypatch.setattr(curve, "_batched_quotes", lambda contracts: None)
 
     j = curve.live_pnl()
     assert j["status"] == "live"

@@ -295,9 +295,9 @@ def _patch_live(monkeypatch, ltps: dict[str, float], now_hhmm: str = "09:25"):
 
     def fake_batch(contracts):
         calls.append([c for c, _ in contracts])
-        return {c: ltps[c] for c, _ in contracts if c in ltps}
+        return {c: {"ltp": ltps[c], "bid": ltps[c], "ask": ltps[c]} for c, _ in contracts if c in ltps}
 
-    monkeypatch.setattr(curve, "_batched_ltp", fake_batch)
+    monkeypatch.setattr(curve, "_batched_quotes", fake_batch)
     monkeypatch.setattr(curve, "_today_ist", lambda: DATE)
     h, m = (int(x) for x in now_hhmm.split(":"))
     now = IST.localize(dt.datetime(2026, 9, 7, h, m, 30))
