@@ -162,17 +162,27 @@ def _account_status(account: dict, date_utc: str, after_exit_time: bool) -> dict
     account_id = account["id"]
     broker = account.get("broker") or "zerodha"
     trades = _todays_open15_trades(account_id, date_utc)
+    enabled = bool(account.get("is_enabled"))
+    connected = enabled and _is_connected(account)
     result = {
         "account_id": account_id,
         "display_name": account["display_name"],
         "broker": broker,
-        "connected": _is_connected(account),
+        "enabled": enabled,
+        "connected": connected,
         "trades": trades,
         "positions": [],
         "positions_readable": False,
         "open_after_exit": False,
         "day_pnl": None,
     }
+
+    # No broker call for a disabled child or one with no login today (#719):
+    # a disabled child keeps whatever token it last had, and reading its book
+    # with a days-old token is a guaranteed 403 traceback on every 30 s poll.
+    # ``_is_connected`` is the same date pre-filter the auto-login watcher uses.
+    if not connected:
+        return result
 
     token = get_auth_token(broker_accounts_db.auth_name(account_id))
     if not token:

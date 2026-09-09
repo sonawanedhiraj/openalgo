@@ -12,6 +12,8 @@ from __future__ import annotations
 import sys
 import types
 
+import pytest
+
 import services.broker_session_health as health
 
 
@@ -70,14 +72,17 @@ def test_is_live_broker_session_routes_through_probe_token(monkeypatch):
     import database.auth_db as auth_db
 
     auth_obj = types.SimpleNamespace(broker="fakeb", auth="ciphertext")
+    lookups = []
 
     class _Query:
         @staticmethod
         def filter_by(**kw):
+            lookups.append(kw)
             return types.SimpleNamespace(first=lambda: auth_obj)
 
     monkeypatch.setattr(auth_db.Auth, "query", _Query(), raising=False)
     monkeypatch.setattr(auth_db, "decrypt_token", lambda v: "key:tok")
+    monkeypatch.setattr(health, "primary_username", lambda: "rajandran")
 
     calls = []
 
@@ -88,3 +93,40 @@ def test_is_live_broker_session_routes_through_probe_token(monkeypatch):
     monkeypatch.setattr(health, "probe_token", fake_probe)
     assert health.is_live_broker_session() is True
     assert calls == [("fakeb", "key:tok")]
+    # #719: the PRIMARY's own row, never "the first non-revoked row" — with the
+    # primary revoked and a child logged in, first() returned the child.
+    assert lookups == [{"name": "rajandran", "is_revoked": False}]
+
+
+def test_is_live_broker_session_false_without_admin_user(monkeypatch):
+    """No admin user → no primary row to probe → dead, never a table scan."""
+    import database.auth_db as auth_db
+
+    monkeypatch.setattr(health, "primary_username", lambda: None)
+    monkeypatch.setattr(
+        auth_db.Auth,
+        "query",
+        types.SimpleNamespace(filter_by=lambda **kw: pytest.fail("must not scan the table")),
+        raising=False,
+    )
+    assert health.is_live_broker_session() is False
+
+
+def test_is_live_session_for_probes_named_row(monkeypatch):
+    """Child rows (``acct:<id>``) are probed by name through the same core."""
+    import database.auth_db as auth_db
+
+    lookups = []
+    auth_obj = types.SimpleNamespace(broker="fakeb", auth="ciphertext")
+
+    class _Query:
+        @staticmethod
+        def filter_by(**kw):
+            lookups.append(kw)
+            return types.SimpleNamespace(first=lambda: auth_obj)
+
+    monkeypatch.setattr(auth_db.Auth, "query", _Query(), raising=False)
+    monkeypatch.setattr(auth_db, "decrypt_token", lambda v: "key:tok")
+    monkeypatch.setattr(health, "probe_token", lambda broker, token: False)
+    assert health.is_live_session_for("acct:3") is False
+    assert lookups == [{"name": "acct:3", "is_revoked": False}]

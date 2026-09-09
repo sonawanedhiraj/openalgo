@@ -41,7 +41,12 @@ def child():
         api_secret="secret_kid_a_0123456789",  # pragma: allowlist secret
         capital_inr=100000,
     )
-    return account
+    # #719: the card only reads the broker book of an ENABLED child with a
+    # login today — add_account creates a disabled row, so opt it in.
+    broker_accounts_db.update_account(
+        account["id"], is_enabled=True, last_login_at=__import__("datetime").datetime.utcnow()
+    )
+    return broker_accounts_db.get_account(account["id"])
 
 
 class FakeBrokerModule:
@@ -64,8 +69,12 @@ class FakeBrokerModule:
 
 
 def _wire(monkeypatch, module, token="key:token"):
+    import services.broker_accounts_service as accounts
+
     monkeypatch.setattr(svc, "_broker_module", lambda broker: module)
     monkeypatch.setattr(svc, "get_auth_token", lambda name: token)
+    # ``_is_connected`` reads the real auth table; mirror the wired token instead.
+    monkeypatch.setattr(accounts, "_is_connected", lambda account: token is not None)
     # Symbol mapping is identity in tests — matching logic is what's under test.
     monkeypatch.setattr(svc, "_br_symbol", lambda broker, symbol, exchange: symbol)
 

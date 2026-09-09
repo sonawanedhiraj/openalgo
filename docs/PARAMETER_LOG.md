@@ -2482,6 +2482,30 @@ ran in the 15:30-17:00 periodic window).
   (the loop used to floor it at 3 s) are correctness changes with no flag.
 - **History:** 2026-09-09 — introduced by issue #716.
 
+## `AUTO_LOGIN_EARLIEST_TIME` (issue #719, 2026-09-09)
+
+- **What:** IST clock time before which the headless auto-login (boot hook +
+  `BrokerAutoLoginWatcher`) never *initiates* a Kite login. Default `07:30`.
+  The manual "Auto login now" button and the OAuth flow ignore it.
+- **Why:** Kite flushes every access token between ~06:45 and 07:30 IST (Kite
+  staff on the developer forum: "cleared in between 06:45 AM to 07:30 AM";
+  "create an access token post 07:30 AM [and] it should be valid for the whole
+  day"; the docs say "6 AM"). A token minted by a 06:00 boot WILL be flushed, so
+  logging in before this time only spends one of the day's logins. The watcher
+  also uses it to classify a stored token: one written before today's
+  `AUTO_LOGIN_EARLIEST_TIME` is in the flush cohort, so a single dead probe past
+  it confirms the death (no `AUTO_LOGIN_DEAD_CONFIRM_COUNT` wait).
+- **Also read by** `utils.session.classify_stored_token`: a token written at or
+  after this time today is *trusted* on cookie expiry; one written between
+  `SESSION_EXPIRY_TIME` and this time is *probed*.
+- **Not a switch (same commit, #651 rule):** the session-expiry path
+  preserving a broker token newer than the expiry boundary (the
+  `auth.token_updated_at` stamp), the primary liveness probe keying on the
+  admin username instead of "the first non-revoked auth row", and the
+  `/accounts` open15 card skipping the broker for disabled / not-connected
+  children are correctness changes with no flag.
+- **History:** 2026-09-09 — introduced by issue #719.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

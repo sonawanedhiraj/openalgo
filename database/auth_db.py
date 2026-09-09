@@ -2,6 +2,7 @@
 
 import base64
 import os
+from datetime import datetime
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -184,6 +185,14 @@ class Auth(Base):
     broker = Column(String(20), nullable=False)
     user_id = Column(String(255), nullable=True)  # Add user_id column
     is_revoked = Column(Boolean, default=False)
+    # When the stored token was last WRITTEN (naive UTC, repo contract). Issue
+    # #719: the session-expiry path used to infer "token is dead" from "browser
+    # cookie is older than 03:00 IST" — true only while the operator's browser
+    # was the sole writer. The headless auto-login (#654) writes tokens with no
+    # browser at all, so the cookie's age says nothing about the token's age;
+    # this column is what lets ``revoke_user_tokens`` tell the two apart. NULL
+    # on rows written before the column existed (treated as legacy → revoke).
+    token_updated_at = Column(DateTime, nullable=True)
 
     # Samco 2FA fields
     secret_api_key = Column(Text, nullable=True)
@@ -439,6 +448,47 @@ def init_db():
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(Base, engine, "Auth DB", logger)
+    _migrate_auth_columns()
+
+
+def _migrate_auth_columns() -> None:
+    """Idempotent column adds on a pre-existing ``auth`` table (issue #719).
+
+    ``create_all`` never alters an existing table, so an install that predates
+    the column would otherwise fail on the first read. Same shape as
+    ``broker_accounts_db``'s migrations. Never raises — a failed migration is
+    logged and the app boots with the legacy (always-revoke) behaviour.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            cols = [row[1] for row in conn.execute(text("PRAGMA table_info(auth)")).fetchall()]
+            if cols and "token_updated_at" not in cols:
+                conn.execute(text("ALTER TABLE auth ADD COLUMN token_updated_at DATETIME"))
+                conn.commit()
+                logger.info("auth.token_updated_at column added (issue #719)")
+    except Exception:
+        logger.exception("auth.token_updated_at migration failed")
+
+
+def get_token_updated_at(name):
+    """When the stored token for ``name`` was last written (naive UTC), or None.
+
+    Reads the DB directly (no cache) — it is consulted on the session-expiry
+    path, where a stale cached answer is exactly the failure mode (#719).
+    None when the row is missing, revoked, or predates the column.
+    """
+    try:
+        auth_obj = Auth.query.filter_by(name=name).first()
+        if not auth_obj or auth_obj.is_revoked:
+            return None
+        return auth_obj.token_updated_at
+    except Exception:
+        logger.exception(f"get_token_updated_at: read failed for {name}")
+        return None
+    finally:
+        db_session.remove()
 
 
 def safe_decrypt_token(value):
@@ -518,6 +568,8 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
     """
     encrypted_token = encrypt_token(auth_token)
     encrypted_feed_token = encrypt_token(feed_token) if feed_token else None
+    # Stamp only real token writes; a revoke carries no token to date (#719).
+    token_updated_at = None if revoke else datetime.utcnow()
 
     auth_obj = Auth.query.filter_by(name=name).first()
     if auth_obj:
@@ -526,6 +578,7 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
         auth_obj.broker = broker
         auth_obj.user_id = user_id
         auth_obj.is_revoked = revoke
+        auth_obj.token_updated_at = token_updated_at
     else:
         auth_obj = Auth(
             name=name,
@@ -534,6 +587,7 @@ def upsert_auth(name, auth_token, broker, feed_token=None, user_id=None, revoke=
             broker=broker,
             user_id=user_id,
             is_revoked=revoke,
+            token_updated_at=token_updated_at,
         )
         db_session.add(auth_obj)
     db_session.commit()

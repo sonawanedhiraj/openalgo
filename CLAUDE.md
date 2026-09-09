@@ -304,7 +304,22 @@ All surfaces share the Sandbox engine (₹1 Crore sandbox capital, exchange-alig
   is probed, not just auto-login ones: a confirmed-dead session that was alive earlier today on a child
   with the `Auto` switch OFF Telegram-alerts once/day ("manual login needed") instead of healing. Note the
   `/accounts` UI badge itself is still the date-only check — the watcher (master switch ON) is what
-  detects a killed session.
+  detects a killed session. **Session expiry must never destroy the token the auto-login just wrote
+  (issue #719):** `utils/session.revoke_user_tokens` used to infer "token dead" from "browser cookie older
+  than `SESSION_EXPIRY_TIME` 03:00" — true only while the operator's browser was the sole token writer.
+  Every morning 2026-09-04..09-09 the boot auto-login minted a token and the operator's first visit with
+  yesterday's cookie revoked it 40 s later (a second Kite login/day). The `auth` table now carries
+  `token_updated_at`; on cookie expiry a token stamped at/after **`AUTO_LOGIN_EARLIEST_TIME`** (07:30 IST)
+  that morning is preserved untouched (no revoke, no ZMQ invalidation, no WS reconnect), one stamped
+  between 03:00 and 07:30 is PROBED (alive → kept, dead → `invalidate_auth`), and an older/unstamped one
+  takes the legacy revoke. Explicit `/auth/logout` stays destructive. **Kite flushes every access token
+  06:45–07:30 IST** (staff on the Kite Connect forum; the docs say "6 AM"), so the boot hook and watcher
+  never *initiate* a login before 07:30 — a 06:00 token would only be flushed again — and a token stamped
+  before 07:30 is in the flush cohort: one dead probe past 07:30 confirms it (no 2-tick wait). The
+  primary liveness probe (`broker_session_health.is_live_broker_session`) keys on the admin username;
+  it used to take the first non-revoked `auth` row, which with the primary revoked was a child or the
+  orphan legacy `admin` row. The `/accounts` open15 card no longer reads the broker book of a disabled
+  or not-connected child (two 403 tracebacks per 30 s poll before).
 
 ## Development Environment Setup
 

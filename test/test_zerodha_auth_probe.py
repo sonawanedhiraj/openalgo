@@ -136,6 +136,8 @@ class TestHealthProbePrefersTestAuthToken:
 
         monkeypatch.setattr("database.auth_db.Auth", _FakeAuth)
         monkeypatch.setattr("database.auth_db.decrypt_token", lambda cipher: "key:tok")
+        # #719: the probe is keyed by the admin username, not a table scan.
+        monkeypatch.setattr(broker_session_health, "primary_username", lambda: "tester")
 
         fake_importlib = types.SimpleNamespace(import_module=lambda name: probe_module)
         monkeypatch.setattr(broker_session_health, "importlib", fake_importlib)

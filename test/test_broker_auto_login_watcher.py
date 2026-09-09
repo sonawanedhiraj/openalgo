@@ -359,3 +359,129 @@ def test_alert_reaches_notification_service(monkeypatch):
     assert sent == [("broker_auto_login", "⚠️ manual login needed for child kid1")], (
         "alert never reached the notification service (the #688 silent drop)"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #719 — Kite flushes tokens 06:45–07:30 IST: never mint before 07:30,
+# and treat a pre-flush token's death as expected (confirm on the first probe).
+# --------------------------------------------------------------------------- #
+from datetime import UTC
+from datetime import time as _time  # noqa: E402
+
+EARLIEST = _time(7, 30)
+
+
+def _utc_naive(dt_ist: datetime) -> datetime:
+    return dt_ist.astimezone(UTC).replace(tzinfo=None)
+
+
+def test_no_login_before_earliest_even_when_dead():
+    state = w.WatcherState()
+    logins = []
+    now = datetime(2026, 9, 9, 7, 0, tzinfo=_IST)  # boot at 07:00, token dead
+    for _ in range(3):
+        out = w.evaluate_once(
+            state,
+            now,
+            probe_primary=lambda: False,
+            login_primary=lambda: logins.append(1) or _ok("primary"),
+            list_child_targets=lambda: [],
+            probe_child=lambda aid: True,
+            login_child=lambda aid, name: _ok("child"),
+            dead_confirm=1,
+            earliest=EARLIEST,
+        )
+        assert out == []
+    assert logins == []
+    assert state.get(w.PRIMARY).dead_streak == 0  # not even counted
+
+
+def test_pre_flush_token_death_confirms_on_first_probe():
+    """Token minted 06:00, probe dead at 07:35 → re-login immediately, no 2-tick wait."""
+    state = w.WatcherState()
+    stamp = _utc_naive(datetime(2026, 9, 9, 6, 0, tzinfo=_IST))
+    out = _run_719(state, datetime(2026, 9, 9, 7, 35, tzinfo=_IST), stamp=stamp)
+    assert [r["scope"] for r in out] == ["primary"]
+
+
+def test_yesterdays_token_death_confirms_on_first_probe():
+    state = w.WatcherState()
+    stamp = _utc_naive(datetime(2026, 9, 8, 9, 0, tzinfo=_IST))
+    out = _run_719(state, datetime(2026, 9, 9, 8, 0, tzinfo=_IST), stamp=stamp)
+    assert [r["scope"] for r in out] == ["primary"]
+
+
+def test_post_flush_token_keeps_two_tick_confirmation():
+    """A token minted after 07:30 that reads dead once is a transient blip until confirmed."""
+    state = w.WatcherState()
+    stamp = _utc_naive(datetime(2026, 9, 9, 9, 0, tzinfo=_IST))
+    now = datetime(2026, 9, 9, 10, 0, tzinfo=_IST)
+    assert _run_719(state, now, stamp=stamp) == []
+    assert [r["scope"] for r in _run_719(state, now, stamp=stamp)] == ["primary"]
+
+
+def test_unknown_stamp_keeps_two_tick_confirmation():
+    state = w.WatcherState()
+    now = datetime(2026, 9, 9, 10, 0, tzinfo=_IST)
+    assert _run_719(state, now, stamp=None) == []
+    assert len(_run_719(state, now, stamp=None)) == 1
+
+
+def test_child_pre_flush_token_confirms_on_first_probe():
+    state = w.WatcherState()
+    stamps = {
+        "primary": _utc_naive(datetime(2026, 9, 9, 9, 0, tzinfo=_IST)),
+        "child:3": _utc_naive(datetime(2026, 9, 9, 6, 10, tzinfo=_IST)),
+    }
+    out = w.evaluate_once(
+        state,
+        datetime(2026, 9, 9, 8, 0, tzinfo=_IST),
+        probe_primary=lambda: True,
+        login_primary=lambda: _ok("primary"),
+        list_child_targets=lambda: [(3, "Didi", True)],
+        probe_child=lambda aid: False,
+        login_child=lambda aid, name: _ok(f"child:{aid}"),
+        dead_confirm=2,
+        token_stamp=lambda key: stamps.get(key),
+        earliest=EARLIEST,
+    )
+    assert [r["scope"] for r in out] == ["child:3"]
+
+
+def test_raising_stamp_reader_degrades_to_unknown():
+    state = w.WatcherState()
+
+    def boom(key):
+        raise RuntimeError("db locked")
+
+    now = datetime(2026, 9, 9, 10, 0, tzinfo=_IST)
+    assert _run_719(state, now, stamp_fn=boom) == []
+
+
+def test_expected_dead_pure():
+    now = datetime(2026, 9, 9, 8, 0, tzinfo=_IST)
+    assert w._expected_dead(None, now, EARLIEST) is False
+    assert w._expected_dead(_utc_naive(datetime(2026, 9, 9, 6, 0, tzinfo=_IST)), now, EARLIEST)
+    assert not w._expected_dead(_utc_naive(datetime(2026, 9, 9, 7, 30, tzinfo=_IST)), now, EARLIEST)
+    # before earliest nothing is "expected" — the watcher is deferring anyway
+    early = datetime(2026, 9, 9, 7, 0, tzinfo=_IST)
+    assert not w._expected_dead(
+        _utc_naive(datetime(2026, 9, 8, 9, 0, tzinfo=_IST)), early, EARLIEST
+    )
+    # tz-aware stamps are accepted too
+    assert w._expected_dead(datetime(2026, 9, 9, 6, 0, tzinfo=_IST), now, EARLIEST)
+
+
+def _run_719(state, now, *, stamp=None, stamp_fn=None):
+    return w.evaluate_once(
+        state,
+        now,
+        probe_primary=lambda: False,
+        login_primary=lambda: _ok("primary"),
+        list_child_targets=lambda: [],
+        probe_child=lambda aid: True,
+        login_child=lambda aid, name: _ok("child"),
+        dead_confirm=2,
+        token_stamp=stamp_fn or (lambda key: stamp),
+        earliest=EARLIEST,
+    )
