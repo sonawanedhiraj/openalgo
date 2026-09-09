@@ -93,6 +93,7 @@ def config():
         _residual_sizing_enabled_default,
         _stop_loss_enabled_default,
         _stop_loss_inr_default,
+        _trail_confirm_polls_default,
         _trail_giveback_default,
         get_open15_service,
     )
@@ -107,6 +108,9 @@ def config():
     )
     from services.open15_breakout_service import (
         clamp_shadow_max_trades as _clamp_shadow_max_trades,
+    )
+    from services.open15_breakout_service import (
+        clamp_trail_confirm_polls as _clamp_confirm,
     )
     from services.open15_pnl_curve import _live_poll_default
 
@@ -282,6 +286,9 @@ def config():
         trail_giveback = (
             None if trail_giveback in (None, "") else _clamp_rupees(trail_giveback, 1500.0)
         )
+        # issue #716 — polls a floor breach must hold; 1 = pre-#716 behaviour
+        trail_confirm = body.get("trail_confirm_polls")
+        trail_confirm = None if trail_confirm in (None, "") else _clamp_confirm(trail_confirm, 2)
         stop_loss = _opt_bool("stop_loss_enabled")
         stop_loss_inr = body.get("stop_loss_inr")
         stop_loss_inr = (
@@ -343,6 +350,7 @@ def config():
             profit_lock_enabled=profit_lock,
             profit_target_inr=profit_target,
             trail_giveback_inr=trail_giveback,
+            trail_confirm_polls=trail_confirm,
             stop_loss_enabled=stop_loss,
             stop_loss_inr=stop_loss_inr,
         )
@@ -405,6 +413,7 @@ def config():
                 "profit_lock_enabled": _profit_lock_enabled_default(),
                 "profit_target_inr": _profit_target_default(),
                 "trail_giveback_inr": _trail_giveback_default(),
+                "trail_confirm_polls": _trail_confirm_polls_default(),
                 "stop_loss_enabled": _stop_loss_enabled_default(),
                 "stop_loss_inr": _stop_loss_inr_default(),
             },
@@ -649,6 +658,11 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
     like summary); a stop loss rides the normal exit event + reason. */
  .ev-profit_target_locked{color:#f9e2af;font-weight:bold}
  .ev-profit_trail_exit{color:#cba6f7;font-weight:bold}
+ /* issue #716: the trail between lock and exit — a peak raise (lock colour),
+    the first floor breach (trail colour), and the persisted per-poll path */
+ .ev-profit_peak{color:#f9e2af}
+ .ev-profit_trail_breach{color:#cba6f7}
+ .ev-risk_path{color:#8aa0b4}
  /* stop-loss counterfactual (issue #704): a measurement, muted like the other
     enrichment events */
  .ev-stop_counterfactual,.ev-stop_counterfactual_backfill{color:#8aa0b4}
@@ -800,6 +814,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    &#8377;<input id="c_ptarget" type="number" min="0" max="1000000" step="500" style="width:76px"></label>
   <label class="muted" style="margin-left:10px">trail give-back
    &#8377;<input id="c_ptrail" type="number" min="0" max="100000" step="250" style="width:66px"></label>
+  <label class="muted" style="margin-left:10px">confirm
+   <input id="c_pconfirm" type="number" min="1" max="5" step="1" style="width:40px"> polls</label>
   <label style="margin-left:14px"><input id="c_sl" type="checkbox"> per-trade stop loss</label>
   <label class="muted" style="margin-left:10px">max loss/trade
    &#8377;<input id="c_slinr" type="number" min="0" max="100000" step="100" style="width:66px"></label>
@@ -810,6 +826,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    The peak day P&amp;L is then tracked; retrace by the give-back from the peak and ALL open rows are
    flattened (give-back 0 = book at target immediately). <b>Stop loss is TRADE-wise:</b> an open
    trade whose OWN MTM falls to &minus;&#8377;amount is squared off alone; the day keeps trading.
+   <b>Issue #716:</b> open rows are marked at the <b>bid</b> (what they can be sold at), never the
+   last print, and the day P&amp;L the rule reads is <b>net</b> of modelled exit charges; a floor
+   breach must hold for <b>confirm</b> consecutive polls before the flatten (1 = act on a single poll).
+   The trail is drawn on the intra-hold chart below (peak, floor, lock and exit guides, every poll).
    Both rules run on a background monitor at the live-poll cadence &mdash; the same batched quotes
    the P&amp;L chart reads, page open or not. Risk exits are normal parent orders, so child-account
    mirrors flatten automatically. Thresholds apply at the next 09:10 arm; 0 = rule off.</span>
@@ -952,6 +972,7 @@ async function loadCfg(){
   document.getElementById('c_plock').checked=!!(o.profit_lock_enabled??d.profit_lock_enabled);
   document.getElementById('c_ptarget').value=o.profit_target_inr??d.profit_target_inr??5000;
   document.getElementById('c_ptrail').value=o.trail_giveback_inr??d.trail_giveback_inr??1500;
+  document.getElementById('c_pconfirm').value=o.trail_confirm_polls??d.trail_confirm_polls??2;
   document.getElementById('c_sl').checked=!!(o.stop_loss_enabled??d.stop_loss_enabled);
   document.getElementById('c_slinr').value=o.stop_loss_inr??d.stop_loss_inr??1200;
   if(window.armLivePoll)armLivePoll();  // later script block; guarded for ordering
@@ -1034,6 +1055,7 @@ async function saveCfg(){
     profit_lock_enabled:document.getElementById('c_plock').checked,
     profit_target_inr:+document.getElementById('c_ptarget').value,
     trail_giveback_inr:+document.getElementById('c_ptrail').value,
+    trail_confirm_polls:+document.getElementById('c_pconfirm').value,
     stop_loss_enabled:document.getElementById('c_sl').checked,
     stop_loss_inr:+document.getElementById('c_slinr').value};
   const msg=document.getElementById('c_msg');
@@ -2002,6 +2024,8 @@ function renderTimeline(){
     // the sorted per-name cost list is the card's data, not timeline prose —
     // rendered raw it is a ~15 KB cell (issue #591)
     if(event==='atm_lot_cost')rest.costs='['+(rest.costs||[]).length+' names — see ladder card]';
+    // the per-poll trail path (issue #716) is the chart's data, not timeline prose
+    if(event==='risk_path'){rest.polls='['+(rest.polls||[]).length+' polls — drawn on the intra-hold chart]';delete rest.columns;}
     const tr=document.createElement('tr');
     tr.innerHTML='<td>'+esc(ts)+'</td><td class="ev-'+esc(event)+'">'+esc(event)+'</td><td>'+
       esc(JSON.stringify(rest).slice(1,-1).replaceAll('"',''))+'</td>';
@@ -2086,8 +2110,12 @@ function renderRiskCard(j){
   if(!risk||(!risk.profit_lock_enabled&&!risk.stop_loss_enabled)||
      (risk.day_status!=='armed'&&risk.day_status!=='done')){
     box.style.display='none';box.innerHTML='';return;}
-  const mtm=(j.status==='live'&&j.portfolio_mtm!=null)?j.portfolio_mtm:0;
+  // issue #716: the rule reads NET (bid marks minus modelled exit charges);
+  // the card shows the same number the rule saw, gross beside it
+  const mtmG=(j.status==='live'&&j.portfolio_mtm!=null)?j.portfolio_mtm:0;
+  const mtm=(j.status==='live'&&j.portfolio_mtm_net!=null)?j.portfolio_mtm_net:mtmG;
   const day=(risk.realized_net||0)+mtm;
+  const dayG=(risk.realized_net||0)+mtmG;
   let state='ENTRIES OPEN',cls='risk-open';
   if(risk.trail_done){state='DAY DONE \\u2014 profit booked';cls='risk-done';}
   else if(risk.locked){state='PROFIT LOCKED \\u2014 trailing';cls='risk-locked';}
@@ -2103,14 +2131,21 @@ function renderRiskCard(j){
         rupAbs(risk.trail_giveback_inr))
       :'profit lock off')+
     ' \\u00B7 '+(risk.stop_loss_enabled?('trade SL '+rupAbs(risk.stop_loss_inr)):'stop loss off')+
-    ' \\u00B7 monitor '+(risk.monitor_alive?'running':'not running')+
-    ' \\u00B7 open MTM is estimated gross; exit charges land at close</span>'+
+    (risk.profit_lock_enabled&&risk.trail_confirm_polls?(' &middot; confirm '+risk.trail_confirm_polls+' poll'+(risk.trail_confirm_polls===1?'':'s')):'')+
+    ' &middot; marks: '+esc(risk.mark_basis||(j.mark_basis||'&mdash;'))+
+    ' &middot; poll '+esc(String(j.poll_interval_s||window.__livePollS||'?'))+'s'+
+    (risk.poll_interval_effective&&risk.poll_interval_effective!==(j.poll_interval_s||window.__livePollS)?(' (effective '+risk.poll_interval_effective+'s)'):'')+
+    ' &middot; monitor '+(risk.monitor_alive?'running':'not running')+
+    ' &middot; day P&amp;L is net of modelled exit charges (#716)</span>'+
     '<div class="riskchips">'+
     chip('state','<span class="badge '+cls+'">'+state+'</span>')+
     chip('day P&amp;L (net, real)',rup(day),day>=0?'pos':'neg')+
+    chip('gross',rup(dayG),dayG>=0?'pos':'neg')+
     (risk.profit_lock_enabled?chip('target',rupAbs(risk.profit_target_inr)):'')+
-    chip('peak since lock',risk.peak!=null?rupAbs(risk.peak):'\\u2014')+
-    chip('trail floor',risk.floor!=null?rupAbs(risk.floor):'\\u2014')+
+    chip('peak since lock',risk.peak!=null?rupAbs(risk.peak):'&mdash;')+
+    chip('trail floor',risk.floor!=null?rupAbs(risk.floor):'&mdash;')+
+    (risk.locked&&!risk.trail_done&&risk.floor!=null?chip('headroom to floor',rup(day-risk.floor),(day-risk.floor)>=0?'pos':'neg'):'')+
+    (risk.locked&&!risk.trail_done?chip('breach',(risk.breach_polls||0)+' / '+(risk.trail_confirm_polls||1)+' polls'):'')+
     (risk.locked_at?chip('locked at',risk.locked_at):'')+
     (risk.trail_at?chip('booked at',risk.trail_at):'')+
     '</div>';
@@ -2173,6 +2208,48 @@ function renderPnlCurve(){
   if(L&&L.portfolio_mtm!=null&&liveX!=null)port.push([liveX,L.portfolio_mtm]);
   for(const p of port){if(p[0]<xmin)xmin=p[0];if(p[0]>xmax)xmax=p[0];
     if(p[1]<ymin)ymin=p[1];if(p[1]>ymax)ymax=p[1];}
+  // ---- trail overlay (issue #716): drawn INSIDE this chart, never a second one.
+  // Live: the monitor's own risk state rides /api/live_pnl. Past day (or after
+  // the exit today): replayed from the day log by the curve API — the
+  // ``risk_path`` event when the day ran with #716, else the lock / peak /
+  // exit events alone (2026-09-09 has only those; guides + steps still draw).
+  const RK=(L&&L.risk&&L.risk.locked)?L.risk:((j.risk&&j.risk.locked)?j.risk:null);
+  const normPoll=q=>{
+    if(Array.isArray(q)){const mk=q[7]||{};
+      return {x:toX(q[0]),ts:q[0],gross:q[1],net:q[2],pg:q[3],fg:q[4],breach:q[5],action:q[6],
+        marks:Object.keys(mk).map(s=>({sym:s,mark:mk[s][0],basis:mk[s][1],ltp:mk[s][2],mtm:mk[s][3]}))};}
+    const mk=q.marks||{};
+    return {x:toX(q.ts),ts:q.ts,gross:q.gross,net:q.net,pg:q.peak_gross,fg:q.floor_gross,breach:q.breach,action:q.action,
+      marks:Object.keys(mk).map(s=>({sym:s,mark:mk[s].mark,basis:mk[s].basis,ltp:mk[s].ltp,mtm:mk[s].mtm}))};
+  };
+  let polls=[],pkSteps=[],flSteps=[],lockX=null,lockY=null,trailX=null;
+  if(RK){
+    polls=(RK.path||[]).map(normPoll).filter(q=>q.x!=null&&!isNaN(q.x)&&q.gross!=null);
+    lockX=RK.locked_at?toX(RK.locked_at):null;
+    trailX=RK.trail_at?toX(RK.trail_at):null;
+    const lockG=RK.lock_pnl!=null?RK.lock_pnl:RK.peak_gross;
+    lockY=lockG;
+    // peak / floor as stepped series on the chart's GROSS axis
+    const locked=polls.filter(q=>q.pg!=null);
+    if(locked.length){
+      for(const q of locked){pkSteps.push([q.x,q.pg]);flSteps.push([q.x,q.fg]);}
+    }else if(lockX!=null){
+      let pk=lockG,fl=(RK.floor_gross!=null&&RK.peaks&&!RK.peaks.length)?RK.floor_gross:(lockG-(RK.trail_giveback_inr||0));
+      pkSteps.push([lockX,pk]);flSteps.push([lockX,fl]);
+      for(const pe of (RK.peaks||[])){const px=toX(pe.ts);
+        if(pe.peak_gross!=null){pk=pe.peak_gross;fl=pe.floor_gross!=null?pe.floor_gross:pk-(RK.trail_giveback_inr||0);}
+        pkSteps.push([px,pk]);flSteps.push([px,fl]);}
+      const endX=trailX!=null?trailX:(liveX!=null?liveX:null);
+      if(endX!=null){
+        const pkEnd=RK.peak_gross!=null?RK.peak_gross:pk, flEnd=RK.floor_gross!=null?RK.floor_gross:fl;
+        pkSteps.push([endX,pkEnd]);flSteps.push([endX,flEnd]);}
+    }
+    for(const q of polls){if(q.x<xmin)xmin=q.x;if(q.x>xmax)xmax=q.x;if(q.gross<ymin)ymin=q.gross;if(q.gross>ymax)ymax=q.gross;}
+    for(const q of pkSteps.concat(flSteps)){if(q[0]<xmin)xmin=q[0];if(q[0]>xmax)xmax=q[0];if(q[1]<ymin)ymin=q[1];if(q[1]>ymax)ymax=q[1];}
+    if(lockX!=null){if(lockX<xmin)xmin=lockX;if(lockX>xmax)xmax=lockX;}
+    if(trailX!=null){if(trailX<xmin)xmin=trailX;if(trailX>xmax)xmax=trailX;}
+    if(lockY!=null){if(lockY<ymin)ymin=lockY;if(lockY>ymax)ymax=lockY;}
+  }
   // portfolio had no row been stopped (server-derived, only on a stop day)
   const portNS=stopped.length?(j.portfolio_no_stop||[]).map(q=>[m2x(q[0]),q[1]]):[];
   if(portNS.length&&j.portfolio_no_stop_final)
@@ -2244,6 +2321,48 @@ function renderPnlCurve(){
     s+='<circle cx="'+X(pl[0])+'" cy="'+Y(pl[1])+'" r="3.8" fill="#d7dde4" stroke="#0f1419" stroke-width="1.5"/>';
     labels.push({y:Y(pl[1]),col:'#d7dde4',txt:'PORT '+fmtR(pl[1]),bold:1});
   }
+  // ---- trail overlay (issue #716) on top of the portfolio line
+  const stepPath=arr=>{if(arr.length<1)return '';let d='M'+X(arr[0][0]).toFixed(1)+' '+Y(arr[0][1]).toFixed(1);
+    for(let i=1;i<arr.length;i++){d+=' L'+X(arr[i][0]).toFixed(1)+' '+Y(arr[i-1][1]).toFixed(1)+' L'+X(arr[i][0]).toFixed(1)+' '+Y(arr[i][1]).toFixed(1);}
+    return d;};
+  if(RK){
+    const netTag=RK.net_available===false?'':' net';
+    if(pkSteps.length&&flSteps.length){
+      // shaded give-back band between the peak and the floor
+      const fwd=[];for(let i=0;i<pkSteps.length;i++){if(i)fwd.push([pkSteps[i][0],pkSteps[i-1][1]]);fwd.push(pkSteps[i]);}
+      const back=[];for(let i=flSteps.length-1;i>=0;i--){back.push(flSteps[i]);if(i)back.push([flSteps[i][0],flSteps[i-1][1]]);}
+      s+='<polygon points="'+fwd.concat(back).map(q=>X(q[0]).toFixed(1)+','+Y(q[1]).toFixed(1)).join(' ')+'" fill="#cba6f7" fill-opacity=".14"/>';
+      s+='<path d="'+stepPath(pkSteps)+'" fill="none" stroke="#f9e2af" stroke-width="1.8" stroke-linejoin="round"/>';
+      s+='<path d="'+stepPath(flSteps)+'" fill="none" stroke="#cba6f7" stroke-width="1.6" stroke-dasharray="4 3" stroke-linejoin="round"/>';
+      const pkE=pkSteps[pkSteps.length-1],flE=flSteps[flSteps.length-1];
+      // dotted leaders to the label margin so the values read at any x-scale
+      s+='<line x1="'+X(pkE[0])+'" x2="'+(ML+PW)+'" y1="'+Y(pkE[1])+'" y2="'+Y(pkE[1])+'" stroke="#f9e2af" stroke-width=".8" stroke-dasharray="1.5 5" stroke-opacity=".6"/>';
+      s+='<line x1="'+X(flE[0])+'" x2="'+(ML+PW)+'" y1="'+Y(flE[1])+'" y2="'+Y(flE[1])+'" stroke="#cba6f7" stroke-width=".8" stroke-dasharray="1.5 5" stroke-opacity=".6"/>';
+      labels.push({y:Y(pkE[1]),col:'#f9e2af',txt:'peak '+fmtR(RK.peak!=null?RK.peak:pkE[1])+netTag+(RK.peak_at?(' ('+RK.peak_at.slice(0,8)+')'):'')});
+      labels.push({y:Y(flE[1]),col:'#cba6f7',txt:'floor '+fmtR(RK.floor!=null?RK.floor:flE[1])+netTag+(RK.trail_giveback_inr!=null?(' (peak &minus; '+Math.round(RK.trail_giveback_inr).toLocaleString('en-IN')+')'):'')});
+    }
+    if(polls.length>1)
+      s+='<path d="'+pathOf(polls.map(q=>[q.x,q.gross]))+'" fill="none" stroke="#d7dde4" stroke-width="2.4" stroke-linejoin="round"/>';
+    for(const q of polls){
+      const mk=q.marks.map(m=>esc(m.sym)+' '+(m.mark!=null?m.mark:'?')+(m.basis&&m.basis!=='ltp'?(' '+m.basis+(m.ltp!=null?' (ltp '+m.ltp+')':'')):' ltp')).join(' &middot; ');
+      const tip=esc(String(q.ts).slice(0,8))+' &middot; '+mk+' &middot; day '+fmtR(q.gross)+' gross'+(q.net!=null?(' / '+fmtR(q.net)+' net'):'')+
+        (q.pg!=null?(' &middot; peak '+fmtR(q.pg)+' &middot; floor '+fmtR(q.fg)):'')+' &middot; '+esc(String(q.action||''));
+      s+='<circle cx="'+X(q.x).toFixed(1)+'" cy="'+Y(q.gross).toFixed(1)+'" r="'+(q.action==='peak'||q.action==='exit'||q.action==='locked'?2.6:1.9)+'" fill="#d7dde4" stroke="#0f1419" stroke-width="1"><title>'+tip+'</title></circle>';
+    }
+    if(lockX!=null){
+      s+='<line x1="'+X(lockX)+'" x2="'+X(lockX)+'" y1="'+MT+'" y2="'+(MT+PH)+'" stroke="#f9e2af" stroke-width="1" stroke-dasharray="4 3" stroke-opacity=".8"/>';
+      s+='<text x="'+(X(lockX)-3)+'" y="'+(MT-3)+'" text-anchor="end" font-size="9.5" fill="#f9e2af">lock '+esc(String(RK.locked_at||'').slice(0,8))+'</text>';
+      if(lockY!=null){
+        s+='<circle cx="'+X(lockX)+'" cy="'+Y(lockY)+'" r="5.5" fill="none" stroke="#f9e2af" stroke-width="2"/>';
+        labels.push({y:Y(lockY),col:'#f9e2af',txt:'lock '+fmtR(RK.lock_pnl_net!=null?RK.lock_pnl_net:lockY)+netTag+(RK.target!=null?(' (target '+Math.round(RK.target).toLocaleString('en-IN')+')'):'')});
+      }
+    }
+    if(trailX!=null){
+      s+='<line x1="'+X(trailX)+'" x2="'+X(trailX)+'" y1="'+MT+'" y2="'+(MT+PH)+'" stroke="#cba6f7" stroke-width="1" stroke-dasharray="4 3" stroke-opacity=".8"/>';
+      s+='<text x="'+(X(trailX)+3)+'" y="'+(MT-3)+'" text-anchor="start" font-size="9.5" fill="#cba6f7">trail exit '+esc(String(RK.trail_at||'').slice(0,8))+
+        (RK.exit_shortfall!=null?(' &middot; Rs'+Math.round(RK.exit_shortfall).toLocaleString('en-IN')+' under floor'):'')+'</text>';
+    }
+  }
   labels.sort((a,b)=>a.y-b.y);
   for(let i=1;i<labels.length;i++)if(labels[i].y-labels[i-1].y<12)labels[i].y=labels[i-1].y+12;
   for(const lb of labels)
@@ -2277,7 +2396,31 @@ function renderPnlCurve(){
     ' &nbsp; <span style="color:#d7dde4">&#9644; portfolio</span>'+
     (anySL?' &nbsp; <span style="color:#cba6f7">&#9670; stop-loss exit</span>':'')+
     (anyTP?' &nbsp; <span style="color:#a6e3a1">&#9670; profit-trail exit</span>':'')+
+    (RK?' &nbsp; <span style="color:#f9e2af">&#9675; lock &nbsp; &#9644; peak</span> &nbsp; <span style="color:#cba6f7">- - floor = peak &minus; give-back</span>'+
+      (polls.length?' &nbsp; <span style="color:#d7dde4">&#8226; one point per monitor poll (hover)</span>':''):'')+
     (stopped.length?' &nbsp; <span style="color:#8aa0b4">&#8212; &#8212; dashed = after the exit, to the scheduled exit (not held)</span>':'');
+  // the trail in one line (issue #716): what locked, what the peak was, and
+  // exactly how the exit was reached — or, live, where the floor sits now
+  let trailLine='';
+  if(RK){
+    const t8=v=>String(v||'').slice(0,8);
+    const netTag=RK.net_available===false?' gross':' net';
+    trailLine='<div class="muted" style="margin-top:6px">trail: locked '+esc(t8(RK.locked_at))+' at <span class="pos">'+
+      fmtR(RK.lock_pnl_net!=null?RK.lock_pnl_net:(RK.lock_pnl||0))+netTag+'</span>'+
+      (RK.lock_pnl!=null&&RK.lock_pnl_net!=null&&RK.lock_pnl!==RK.lock_pnl_net?(' ('+fmtR(RK.lock_pnl)+' gross)'):'')+
+      (RK.peak!=null?(' &middot; peak '+fmtR(RK.peak)+netTag+(RK.peak_at?(' at '+esc(t8(RK.peak_at))):'')):'')+
+      (RK.trail_done
+        ?(' &middot; breached '+esc(t8(RK.breach_at||RK.trail_at))+' at '+fmtR(RK.exit_pnl_net!=null?RK.exit_pnl_net:(RK.exit_pnl||0))+netTag+
+          (RK.exit_shortfall!=null?(', Rs'+Math.round(RK.exit_shortfall).toLocaleString('en-IN')+' under the floor'):'')+
+          (RK.breach_polls!=null?(', confirmed on poll '+RK.breach_polls+' of '+(RK.trail_confirm_polls||RK.breach_polls)):'')+
+          (RK.polls_since_lock!=null?(' &middot; '+RK.polls_since_lock+' poll'+(RK.polls_since_lock===1?'':'s')+' between lock and exit'):''))
+        :(' &middot; trailing, floor '+fmtR(RK.floor!=null?RK.floor:0)+netTag+
+          (RK.headroom!=null?(', headroom '+fmtR(RK.headroom)):'')+
+          (RK.breach_polls?(', breach '+RK.breach_polls+' / '+(RK.trail_confirm_polls||1)+' polls'):'')))+
+      ' &middot; marks: '+esc(RK.mark_basis||'ltp')+
+      (RK.source==='events'?' &middot; pre-#716 day: lock/exit events only, no per-poll path, values gross':'')+
+      '</div>';
+  }
   let stopLine='';
   if(stopped.length){
     const pending=stopped.filter(t=>t.stop_saved==null).length;
@@ -2290,14 +2433,15 @@ function renderPnlCurve(){
       (' &middot; '+pending+' counterfactual'+(pending===1?'':'s')+' not stamped yet (live at the exit, or bars at the summary / next arm)'))+
       ' &middot; held-to-exit is priced at the 1m close, so it slightly flatters holding</div>';
   }
-  const sub=(L?('LIVE &mdash; marks vs entry fill, one batched quote per poll ('+
+  const sub=(L?('LIVE &mdash; marks at the '+esc(L.mark_basis||'ltp')+' vs entry fill, one batched quote per poll ('+
       (L.poll_interval_s||window.__livePollS||5)+'s)')
     :'marks = 1m closes vs entry fill &middot; final point = broker fill')+
+    (RK&&polls.length?' &middot; between lock and exit: every monitor poll':'')+
     ' &middot; gross Rs'+
     (unav.length?(' &middot; '+unav.length+' trade'+(unav.length===1?'':'s')+' unavailable'):'');
   box.style.display='';
   box.innerHTML=title+'<span class="asub">'+sub+'</span>'+
-    '<div class="muted" style="margin:6px 0 2px;font-size:11px">'+legend+'</div>'+s+take+stopLine+
+    '<div class="muted" style="margin:6px 0 2px;font-size:11px">'+legend+'</div>'+s+take+stopLine+trailLine+
     (unav.length?('<div class="muted" style="margin-top:4px">unavailable: '+
       unav.map(t=>esc(t.symbol)+' ('+esc(t.reason||'')+')').join('; ')+'</div>'):'');
 }

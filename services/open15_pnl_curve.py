@@ -287,6 +287,15 @@ def build_pnl_curve(date: str) -> dict:
             if row.status != "closed":
                 all_closed = False
         payload = _assemble(date, trades)
+        # trail overlay (issue #716): replayed from the day log so a past day
+        # draws the same guides/steps the live page drew; None when no lock
+        try:
+            from database.open15_breakout_db import get_day_log
+
+            payload["risk"] = risk_from_day_log(get_day_log(date))
+        except Exception:
+            logger.exception("open15 pnl-curve: risk overlay replay failed for %s", date)
+            payload["risk"] = None
     except Exception:
         logger.exception("open15 pnl-curve: build failed for %s", date)
         return {"status": "error", "date": date, "message": "curve build failed — see logs"}
@@ -492,8 +501,14 @@ _LIVE_CACHE: dict[str, tuple[float, dict]] = {}
 _LIVE_LOCK = threading.Lock()
 
 
-def _batched_ltp(contracts: list[tuple[str, str]]) -> dict[str, float] | None:
-    """{contract symbol: ltp} via one ``get_multiquotes`` call; None on failure."""
+def _batched_quotes(contracts: list[tuple[str, str]]) -> dict[str, dict] | None:
+    """``{contract symbol: {ltp, bid, ask}}`` via ONE ``get_multiquotes`` call;
+    None on failure.
+
+    Bid/ask ride the same response the LTP always came from (#555), so marking
+    at the touch costs no extra broker call. A missing/zero side is reported
+    as ``None`` — the mark helper falls back to the LTP and SAYS so.
+    """
     try:
         from database.auth_db import get_first_available_api_key
         from services.quotes_service import get_multiquotes
@@ -507,17 +522,80 @@ def _batched_ltp(contracts: list[tuple[str, str]]) -> dict[str, float] | None:
         if not ok:
             logger.warning("open15 live-pnl: batch quote failed: %s", data)
             return None
-        out: dict[str, float] = {}
+        out: dict[str, dict] = {}
         for r in (data or {}).get("results") or []:
             if not isinstance(r, dict):
                 continue
             d = r.get("data") or {}
             ltp = d.get("ltp")
-            if ltp:
-                out[r.get("symbol")] = float(ltp)
+            if not ltp:
+                continue
+
+            def _px(v):
+                try:
+                    f = float(v)
+                except (TypeError, ValueError):
+                    return None
+                return f if f > 0 else None
+
+            out[r.get("symbol")] = {
+                "ltp": float(ltp),
+                "bid": _px(d.get("bid")),
+                "ask": _px(d.get("ask")),
+            }
         return out
     except Exception:
         logger.exception("open15 live-pnl: batch quote raised")
+        return None
+
+
+def _batched_ltp(contracts: list[tuple[str, str]]) -> dict[str, float] | None:
+    """{contract symbol: ltp} — thin view over ``_batched_quotes``."""
+    q = _batched_quotes(contracts)
+    if q is None:
+        return None
+    return {s: v["ltp"] for s, v in q.items()}
+
+
+def mark_for_row(row, quote: dict | None) -> tuple[float | None, str]:
+    """(price the open row is marked at, basis label) — issue #716.
+
+    The mark is what the position could be CLOSED at right now, not the last
+    print: a long premium / long stock is marked at the **bid**, a short stock
+    at the **ask**. The LTP is the fallback when the touch is missing, and the
+    label says which one was used, so a mark can never silently change basis.
+    On 2026-09-09 a single MCX print at 113.40 (bid 109.80) lifted the trail's
+    peak by Rs1,600 and the next poll tripped the floor by Rs120.
+    """
+    if not quote:
+        return None, "none"
+    ltp = quote.get("ltp")
+    want = "ask" if _row_sign(row) < 0 else "bid"
+    px = quote.get(want)
+    if px:
+        return float(px), want
+    if ltp:
+        return float(ltp), "ltp"
+    return None, "none"
+
+
+def exit_charges_estimate(row, basis: float | None, mark: float | None, qty: int) -> float | None:
+    """Modelled charges of the round trip if the row were closed at ``mark``
+    now (issue #716) — the same helpers the journal uses at exit, so the net
+    the risk rule sees and the net the journal records agree."""
+    if not basis or not mark or not qty:
+        return None
+    try:
+        if (row.instrument or "stock") == "option":
+            from services.open15_option_shadow import option_round_trip_charges
+
+            return option_round_trip_charges(basis * qty, mark * qty)
+        from services.open15_breakout_service import mis_round_trip_charges
+
+        buy_px, sell_px = (basis, mark) if row.side == "L" else (mark, basis)
+        return mis_round_trip_charges(buy_px * qty, sell_px * qty)
+    except Exception:
+        logger.exception("open15 live-pnl: charge estimate failed for %s", row.symbol)
         return None
 
 
@@ -547,13 +625,15 @@ def _ghost_rows_now(rows) -> list:
     return [r for r in stopped if r.cf_pnl is None]
 
 
-def _ghost_marks(ghost_rows, marks: dict[str, float] | None) -> list[dict]:
+def _ghost_marks(ghost_rows, quotes: dict[str, dict] | None) -> list[dict]:
+    """Ghosts stay marked at the LTP on purpose: the counterfactual they feed
+    is compared against the 1m-close bars backfill (#704), which is LTP-based."""
     out = []
     for r in ghost_rows:
         contract, _ex = _row_contract(r)
         basis, basis_src = _entry_basis(r)
         qty = int(r.entry_fill_qty or r.quantity or 0)
-        ltp = (marks or {}).get(contract)
+        ltp = ((quotes or {}).get(contract) or {}).get("ltp")
         mtm = None
         if ltp is not None and basis is not None and qty:
             mtm = round((ltp - basis) * qty * _row_sign(r), 2)
@@ -611,28 +691,42 @@ def live_pnl() -> dict:
                 "poll_interval_s": interval,
             }
             if ghost_rows:
-                marks = _batched_ltp([_row_contract(r) for r in ghost_rows])
+                quotes = _batched_quotes([_row_contract(r) for r in ghost_rows])
                 payload["asof"] = _now_ist().strftime("%H:%M:%S")
-                payload["ghost"] = _ghost_marks(ghost_rows, marks)
-                payload["ghost_quotes_ok"] = marks is not None
+                payload["ghost"] = _ghost_marks(ghost_rows, quotes)
+                payload["ghost_quotes_ok"] = quotes is not None
             # cache the terminal answer briefly too — the page may poll from
             # several tabs, and "no open trades" need not hit the DB each time
             with _LIVE_LOCK:
                 _LIVE_CACHE[today] = (now_mono, payload)
             return payload
 
-        marks = _batched_ltp([_row_contract(r) for r in open_rows + ghost_rows])
+        quotes = _batched_quotes([_row_contract(r) for r in open_rows + ghost_rows])
         trades = []
         total = 0.0
+        total_net = 0.0
+        charges_total = 0.0
+        bases: set[str] = set()
         for r in open_rows:
             contract, _ex = _row_contract(r)
             basis, basis_src = _entry_basis(r)
             qty = int(r.entry_fill_qty or r.quantity or 0)
-            ltp = (marks or {}).get(contract)
+            quote = (quotes or {}).get(contract)
+            ltp = (quote or {}).get("ltp")
+            # issue #716: mark at the touch (bid for a long premium), never the
+            # last print; the basis label travels with the number
+            mark, mark_basis = mark_for_row(r, quote)
             mtm = None
-            if ltp is not None and basis is not None and qty:
-                mtm = round((ltp - basis) * qty * _row_sign(r), 2)
+            mtm_net = None
+            charges_est = None
+            if mark is not None and basis is not None and qty:
+                mtm = round((mark - basis) * qty * _row_sign(r), 2)
+                charges_est = exit_charges_estimate(r, basis, mark, qty)
+                mtm_net = round(mtm - (charges_est or 0.0), 2)
                 total += mtm
+                total_net += mtm_net
+                charges_total += charges_est or 0.0
+                bases.add(mark_basis)
             trades.append(
                 {
                     "symbol": r.symbol,
@@ -642,7 +736,13 @@ def live_pnl() -> dict:
                     "entry_basis": basis,
                     "basis": basis_src,
                     "ltp": ltp,
+                    "bid": (quote or {}).get("bid"),
+                    "ask": (quote or {}).get("ask"),
+                    "mark": mark,
+                    "mark_basis": mark_basis,
                     "mtm": mtm,
+                    "charges_est": charges_est,
+                    "mtm_net": mtm_net,
                 }
             )
         payload = {
@@ -652,11 +752,14 @@ def live_pnl() -> dict:
             "poll_interval_s": interval,
             "trades": trades,
             "portfolio_mtm": round(total, 2),
-            "quotes_ok": marks is not None,
+            "portfolio_mtm_net": round(total_net, 2),
+            "charges_est_total": round(charges_total, 2),
+            "mark_basis": (bases.pop() if len(bases) == 1 else ("mixed" if bases else "none")),
+            "quotes_ok": quotes is not None,
         }
         if ghost_rows:
-            payload["ghost"] = _ghost_marks(ghost_rows, marks)
-            payload["ghost_quotes_ok"] = marks is not None
+            payload["ghost"] = _ghost_marks(ghost_rows, quotes)
+            payload["ghost_quotes_ok"] = quotes is not None
         with _LIVE_LOCK:
             _LIVE_CACHE[today] = (now_mono, payload)
         return payload
@@ -665,3 +768,94 @@ def live_pnl() -> dict:
         return {"status": "error", "date": today, "poll_interval_s": interval}
     finally:
         db_session.remove()
+
+
+# ---------------------------------------------------------------------------
+# risk overlay replay (issue #716) — the trail as the day log recorded it
+# ---------------------------------------------------------------------------
+RISK_EVENTS = ("profit_target_locked", "profit_peak", "profit_trail_breach", "profit_trail_exit")
+
+
+def risk_from_day_log(events: list | None) -> dict | None:
+    """The intra-hold chart's trail overlay for a PAST day, rebuilt from the
+    persisted decision log (issue #716).
+
+    Two sources, one shape: the ``risk_path`` event (every monitor poll, written
+    once at the trail exit / scheduled flatten / summary) when the day ran with
+    #716 in the process, and the lock / peak / breach / exit events alone for a
+    day that predates it (2026-09-09 has only the lock and the exit — the
+    guides and the steps still draw from those). ``None`` when the day never
+    locked, so any other day's payload is unchanged.
+    """
+    if not events:
+        return None
+    lock = peak_ev = breach = exit_ev = path_ev = None
+    peaks: list[dict] = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        name = e.get("event")
+        if name == "profit_target_locked" and lock is None:
+            lock = e
+        elif name == "profit_peak":
+            peaks.append(e)
+            peak_ev = e
+        elif name == "profit_trail_breach" and breach is None:
+            breach = e
+        elif name == "profit_trail_exit" and exit_ev is None:
+            exit_ev = e
+        elif name == "risk_path":
+            path_ev = e
+    if lock is None:
+        return None
+
+    def _g(ev, key, alt=None):
+        v = ev.get(key)
+        return v if v is not None else (ev.get(alt) if alt else None)
+
+    out = {
+        "source": "risk_path" if path_ev else "events",
+        "locked": True,
+        "locked_at": lock.get("ts"),
+        "lock_pnl": _g(lock, "gross", "day_pnl"),
+        "lock_pnl_net": _g(lock, "net", "day_pnl"),
+        "target": lock.get("target"),
+        "trail_giveback_inr": lock.get("trail_giveback"),
+        "trail_confirm_polls": lock.get("confirm_polls"),
+        "mark_basis": lock.get("mark_basis") or "ltp",
+        "peak": _g(exit_ev or peak_ev or lock, "peak", "day_pnl"),
+        "peak_gross": _g(exit_ev or peak_ev or lock, "peak_gross", None),
+        "peak_at": (peak_ev or lock).get("ts"),
+        "floor": _g(exit_ev or peak_ev or lock, "floor"),
+        "floor_gross": _g(exit_ev or peak_ev or lock, "floor_gross", None),
+        "peaks": [
+            {
+                "ts": p.get("ts"),
+                "peak": p.get("peak"),
+                "peak_gross": p.get("peak_gross"),
+                "floor": p.get("floor"),
+                "floor_gross": p.get("floor_gross"),
+                "moved_by": p.get("moved_by"),
+            }
+            for p in peaks
+        ],
+        "breach_at": breach.get("ts") if breach else None,
+        "trail_done": exit_ev is not None,
+        "trail_at": exit_ev.get("ts") if exit_ev else None,
+        "exit_pnl": _g(exit_ev, "gross", "day_pnl") if exit_ev else None,
+        "exit_pnl_net": _g(exit_ev, "net", "day_pnl") if exit_ev else None,
+        "exit_shortfall": exit_ev.get("shortfall") if exit_ev else None,
+        "breach_polls": exit_ev.get("breach_polls") if exit_ev else None,
+        "polls_since_lock": exit_ev.get("polls_since_lock") if exit_ev else None,
+        "path": list(path_ev.get("polls") or []) if path_ev else [],
+        "n_polls": (path_ev.get("n") if path_ev else 0) or 0,
+    }
+    # pre-#716 events carried one gross ``day_pnl`` — say so rather than
+    # pretend a net number existed
+    if not path_ev and lock.get("gross") is None:
+        out["peak_gross"] = out["peak_gross"] if out["peak_gross"] is not None else out["peak"]
+        out["floor_gross"] = out["floor_gross"] if out["floor_gross"] is not None else out["floor"]
+        out["net_available"] = False
+    else:
+        out["net_available"] = True
+    return out

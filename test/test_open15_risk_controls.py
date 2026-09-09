@@ -34,6 +34,14 @@ DATE = "2026-09-03"
 
 
 @pytest.fixture(autouse=True)
+def _single_poll_trail(monkeypatch):
+    """These suites pin the #696 state machine on ONE poll; #716 defaults the
+    breach confirmation to 2 polls (its own tests live in
+    test_open15_trail_visibility.py)."""
+    monkeypatch.setenv("OPEN15_TRAIL_CONFIRM_POLLS", "1")
+
+
+@pytest.fixture(autouse=True)
 def _clean_journal():
     """Empty the journal between tests (same-date rows leak across tests)."""
     from database.open15_breakout_db import Open15Trade, db_session, init_db

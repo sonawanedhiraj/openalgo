@@ -508,6 +508,24 @@ def _stop_loss_enabled_default() -> bool:
     return os.getenv("OPEN15_STOP_LOSS", "false").lower() == "true"
 
 
+TRAIL_CONFIRM_POLLS_MIN = 1
+TRAIL_CONFIRM_POLLS_MAX = 5
+
+
+def clamp_trail_confirm_polls(raw, default: int = 2) -> int:
+    """1..5 consecutive polls a floor breach must hold before the trail
+    flattens (issue #716). 1 = the pre-#716 single-poll behaviour."""
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return default
+    return max(TRAIL_CONFIRM_POLLS_MIN, min(TRAIL_CONFIRM_POLLS_MAX, v))
+
+
+def _trail_confirm_polls_default() -> int:
+    return clamp_trail_confirm_polls(os.getenv("OPEN15_TRAIL_CONFIRM_POLLS", "2"), 2)
+
+
 def _stop_loss_inr_default() -> float:
     return clamp_risk_rupees(os.getenv("OPEN15_STOP_LOSS_INR", "1200"), 1200.0)
 
@@ -523,6 +541,18 @@ def _fresh_risk_state() -> dict:
         "trail_at": None,
         "last_trail_retry": 0.0,
         "sl_alerted": [],
+        # issue #716: the trail as it happened — one point per monitor poll
+        # (bounded), the running breach count, and whether the path has been
+        # written to the day log yet (once, at the trail exit / flatten /
+        # summary, whichever comes first)
+        "path": [],
+        "breach_polls": 0,
+        "polls_since_lock": 0,
+        "path_logged": False,
+        "mark_basis": None,
+        "poll_interval_effective": None,
+        "last_day_pnl": None,
+        "last_day_pnl_gross": None,
         # issue #704: per-poll ghost marks of stopped rows, keyed by journal
         # row id -> [(HH:MM:SS, mtm)], plus the last quote seen per row. The
         # flatten at the scheduled exit stamps these as the LIVE counterfactual.
@@ -1151,10 +1181,17 @@ def _resolve_risk_config(cfg: dict) -> dict:
         if sl_inr_cfg is None
         else clamp_risk_rupees(sl_inr_cfg, _stop_loss_inr_default())
     )
+    confirm_cfg = cfg.get("trail_confirm_polls")
+    confirm = (
+        _trail_confirm_polls_default()
+        if confirm_cfg is None
+        else clamp_trail_confirm_polls(confirm_cfg, _trail_confirm_polls_default())
+    )
     return {
         "profit_lock_enabled": lock_on and target > 0,
         "profit_target_inr": target,
         "trail_giveback_inr": giveback,
+        "trail_confirm_polls": confirm,
         "stop_loss_enabled": sl_on and sl_inr > 0,
         "stop_loss_inr": sl_inr,
     }
@@ -2390,6 +2427,7 @@ class Open15BreakoutService:
             profit_lock_enabled=self.day_config["profit_lock_enabled"],
             profit_target_inr=self.day_config["profit_target_inr"],
             trail_giveback_inr=self.day_config["trail_giveback_inr"],
+            trail_confirm_polls=self.day_config["trail_confirm_polls"],
             stop_loss_enabled=self.day_config["stop_loss_enabled"],
             stop_loss_inr=self.day_config["stop_loss_inr"],
         )
@@ -3109,6 +3147,10 @@ class Open15BreakoutService:
         # the scheduled exit, the instant a held row would have been
         # flattened. Before any exit order, off the tick thread.
         self._stamp_ghost_counterfactuals()
+        # the trail path (issue #716): written once, here if the trail never
+        # fired (a locked day that ran to the scheduled exit, or one that
+        # never locked)
+        self._log_risk_path()
         with self._lock:
             paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
             # SIM (#555) and SHADOW (#581) are both "no order was ever sent"
@@ -3229,11 +3271,14 @@ class Open15BreakoutService:
                 from services.open15_pnl_curve import resolve_live_poll_interval
 
                 interval = resolve_live_poll_interval()
+                # issue #716: the clamp (2..60 s) IS the trust boundary; the
+                # old ``max(3, interval)`` silently ignored a configured 2 s
+                self._risk["poll_interval_effective"] = interval
                 self._risk_tick()
             except Exception:
                 # one broken cycle must not kill the monitor for the day
                 logger.exception("open15: risk-monitor tick failed")
-            _time.sleep(max(3, interval))
+            _time.sleep(max(1, interval))
 
     def _risk_tick(self) -> None:
         """One monitor cycle: refresh live MTM, then stops first, day rule second.
@@ -3259,11 +3304,18 @@ class Open15BreakoutService:
             return
         open_trades: list[dict] = []
         open_mtm = 0.0
+        open_mtm_net = 0.0
         if payload.get("status") == "live":
             if not payload.get("quotes_ok"):
                 return
             open_trades = payload.get("trades") or []
             open_mtm = float(payload.get("portfolio_mtm") or 0.0)
+            # issue #716: the day rule is NET — modelled exit charges come
+            # off the open MTM (the pre-#716 gross read locked at Rs6,395 on a
+            # Rs5,500 target that was ~Rs5,375 net). A payload without the
+            # net field (older cache shape) falls back to gross.
+            net_field = payload.get("portfolio_mtm_net")
+            open_mtm_net = float(net_field if net_field is not None else open_mtm)
         r = self._risk
         if r.get("trail_done"):
             # a failed trail exit keeps its row open (the shared exit path's
@@ -3304,23 +3356,46 @@ class Open15BreakoutService:
                 return
         if not lock_on:
             return
-        day_pnl = self._today_realized_net() + open_mtm
+        realized = self._today_realized_net()
+        day_pnl = realized + open_mtm_net
+        day_pnl_gross = realized + open_mtm
         target = float(cfg.get("profit_target_inr") or 0.0)
         giveback = float(cfg.get("trail_giveback_inr") or 0.0)
+        confirm = int(cfg.get("trail_confirm_polls") or 1)
+        marks = self._poll_marks(open_trades)
+        r["mark_basis"] = payload.get("mark_basis") if open_trades else r.get("mark_basis")
+        r["last_day_pnl"] = round(day_pnl, 2)
+        r["last_day_pnl_gross"] = round(day_pnl_gross, 2)
+        charges_est = float(payload.get("charges_est_total") or 0.0) if open_trades else 0.0
+        asof = payload.get("asof") or self._now_ist().strftime("%H:%M:%S")
         if not r.get("locked"):
             if target <= 0 or day_pnl < target:
+                if open_trades:
+                    self._record_poll(
+                        asof, day_pnl, day_pnl_gross, charges_est, marks, "below_target"
+                    )
                 return
             with self._lock:
                 r["locked"] = True
                 r["locked_at"] = self._now_ist().strftime("%H:%M:%S")
                 r["peak"] = day_pnl
                 r["floor"] = day_pnl - giveback
+                r["breach_polls"] = 0
+                r["polls_since_lock"] = 0
+            self._record_poll(asof, day_pnl, day_pnl_gross, charges_est, marks, "locked")
             self._log_event(
                 "profit_target_locked",
                 day_pnl=round(day_pnl, 2),
+                net=round(day_pnl, 2),
+                gross=round(day_pnl_gross, 2),
                 target=target,
                 trail_giveback=giveback,
+                confirm_polls=confirm,
                 floor=round(day_pnl - giveback, 2),
+                floor_gross=round(day_pnl_gross - giveback, 2),
+                peak_gross=round(day_pnl_gross, 2),
+                mark_basis=r.get("mark_basis"),
+                marks=marks,
                 open_trades=len(open_trades),
             )
             try:
@@ -3329,23 +3404,193 @@ class Open15BreakoutService:
                 get_notification_service().notify(
                     "open15_breakout",
                     f"🔒 open15_vol_breakout [{_mode()}]: DAY PROFIT LOCKED — "
-                    f"day P&L ₹{day_pnl:,.0f} ≥ target ₹{target:,.0f}. No new "
+                    f"day P&L ₹{day_pnl:,.0f} net ≥ target ₹{target:,.0f}. No new "
                     f"entries today; trailing the locked profit with a "
-                    f"₹{giveback:,.0f} give-back from the peak.",
+                    f"₹{giveback:,.0f} give-back from the peak "
+                    f"({confirm} poll{'s' if confirm != 1 else ''} to confirm).",
                 )
             except Exception:
                 logger.exception("open15: profit-lock alert failed")
             if giveback <= 0:
                 # give-back 0 = "book at target": flatten immediately
-                self._profit_trail_flatten(day_pnl)
+                self._profit_trail_flatten(day_pnl, day_pnl_gross, marks, confirm)
             return
+        with self._lock:
+            r["polls_since_lock"] = int(r.get("polls_since_lock") or 0) + 1
         peak = float(r.get("peak") or day_pnl)
         if day_pnl > peak:
             with self._lock:
                 r["peak"] = day_pnl
                 r["floor"] = day_pnl - giveback
+                r["breach_polls"] = 0
+            moved_by = self._peak_mover(marks)
+            self._record_poll(asof, day_pnl, day_pnl_gross, charges_est, marks, "peak")
+            self._log_event(
+                "profit_peak",
+                peak=round(day_pnl, 2),
+                peak_gross=round(day_pnl_gross, 2),
+                prev_peak=round(peak, 2),
+                floor=round(day_pnl - giveback, 2),
+                floor_gross=round(day_pnl_gross - giveback, 2),
+                moved_by=moved_by,
+                mark_basis=r.get("mark_basis"),
+            )
         elif open_trades and r.get("floor") is not None and day_pnl <= float(r["floor"]):
-            self._profit_trail_flatten(day_pnl)
+            floor = float(r["floor"])
+            with self._lock:
+                r["breach_polls"] = int(r.get("breach_polls") or 0) + 1
+                n_breach = r["breach_polls"]
+            if n_breach == 1:
+                self._log_event(
+                    "profit_trail_breach",
+                    day_pnl=round(day_pnl, 2),
+                    net=round(day_pnl, 2),
+                    gross=round(day_pnl_gross, 2),
+                    floor=round(floor, 2),
+                    shortfall=round(floor - day_pnl, 2),
+                    polls_required=confirm,
+                    marks=marks,
+                )
+            if n_breach >= confirm:
+                self._record_poll(asof, day_pnl, day_pnl_gross, charges_est, marks, "exit")
+                self._profit_trail_flatten(day_pnl, day_pnl_gross, marks, confirm)
+            else:
+                self._record_poll(
+                    asof, day_pnl, day_pnl_gross, charges_est, marks, f"breach {n_breach}/{confirm}"
+                )
+        else:
+            if r.get("breach_polls"):
+                # recovered above the floor before the confirmation completed
+                with self._lock:
+                    r["breach_polls"] = 0
+                self._record_poll(asof, day_pnl, day_pnl_gross, charges_est, marks, "recovered")
+            else:
+                self._record_poll(asof, day_pnl, day_pnl_gross, charges_est, marks, "trailing")
+
+    @staticmethod
+    def _poll_marks(open_trades: list[dict]) -> dict:
+        """Per-symbol mark snapshot for the events/path (issue #716)."""
+        out = {}
+        for t in open_trades or []:
+            sym = t.get("symbol")
+            if not sym:
+                continue
+            out[sym] = {
+                "mark": t.get("mark", t.get("ltp")),
+                "basis": t.get("mark_basis") or ("ltp" if t.get("ltp") is not None else None),
+                "ltp": t.get("ltp"),
+                "bid": t.get("bid"),
+                "ask": t.get("ask"),
+                "mtm": t.get("mtm"),
+                "mtm_net": t.get("mtm_net"),
+            }
+        return out
+
+    def _peak_mover(self, marks: dict) -> dict | None:
+        """Which symbol's MTM rose most since the previous poll — the mark that
+        moved the peak, named in the ``profit_peak`` event (issue #716)."""
+        try:
+            prev = (self._risk.get("path") or [])[-1]
+        except IndexError:
+            return None
+        prev_marks = (prev or {}).get("marks") or {}
+        best = None
+        for sym, m in (marks or {}).items():
+            cur = m.get("mtm")
+            old = (prev_marks.get(sym) or {}).get("mtm")
+            if cur is None or old is None:
+                continue
+            delta = float(cur) - float(old)
+            if best is None or delta > best["delta"]:
+                best = {
+                    "symbol": sym,
+                    "delta": round(delta, 2),
+                    "mark": m.get("mark"),
+                    "basis": m.get("basis"),
+                    "ltp": m.get("ltp"),
+                    "bid": m.get("bid"),
+                }
+        return best
+
+    def _record_poll(
+        self,
+        asof: str,
+        net: float,
+        gross: float,
+        charges_est: float,
+        marks: dict,
+        action: str,
+    ) -> None:
+        """Append one point to the in-memory trail path (issue #716)."""
+        r = self._risk
+        point = {
+            "ts": asof,
+            "net": round(net, 2),
+            "gross": round(gross, 2),
+            "charges_est": round(charges_est, 2),
+            "peak": round(float(r["peak"]), 2) if r.get("peak") is not None else None,
+            "floor": round(float(r["floor"]), 2) if r.get("floor") is not None else None,
+            # the chart's axis is gross: the same peak/floor with the modelled
+            # charges added back, so every line sits on one axis
+            "peak_gross": (
+                round(float(r["peak"]) + charges_est, 2) if r.get("peak") is not None else None
+            ),
+            "floor_gross": (
+                round(float(r["floor"]) + charges_est, 2) if r.get("floor") is not None else None
+            ),
+            "breach": int(r.get("breach_polls") or 0),
+            "action": action,
+            "marks": marks,
+        }
+        with self._lock:
+            path = r.setdefault("path", [])
+            path.append(point)
+            if len(path) > 900:
+                del path[: len(path) - 900]
+
+    def _log_risk_path(self) -> None:
+        """Persist the trail path ONCE to the day log (issue #716) — at the
+        trail exit, the scheduled flatten, or the summary, whichever is first.
+        A path without a lock is still written when non-empty, so a day that
+        never locked can show how close it came."""
+        r = self._risk
+        with self._lock:
+            if r.get("path_logged") or not r.get("path"):
+                return
+            r["path_logged"] = True
+            polls = [
+                [
+                    p["ts"],
+                    p["gross"],
+                    p["net"],
+                    p["peak_gross"],
+                    p["floor_gross"],
+                    p["breach"],
+                    p["action"],
+                    {
+                        s: [m.get("mark"), m.get("basis"), m.get("ltp"), m.get("mtm")]
+                        for s, m in (p.get("marks") or {}).items()
+                    },
+                ]
+                for p in r["path"]
+            ]
+        self._log_event(
+            "risk_path",
+            n=len(polls),
+            columns=[
+                "ts",
+                "gross",
+                "net",
+                "peak_gross",
+                "floor_gross",
+                "breach",
+                "action",
+                "marks{sym:[mark,basis,ltp,mtm]}",
+            ],
+            mark_basis=r.get("mark_basis"),
+            poll_interval_s=r.get("poll_interval_effective"),
+            polls=polls,
+        )
 
     def _track_ghosts(self, payload: dict) -> None:
         """Record each risk-exited row's live mark for the counterfactual
@@ -3460,7 +3705,13 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: stop-loss alert failed")
 
-    def _profit_trail_flatten(self, day_pnl: float) -> None:
+    def _profit_trail_flatten(
+        self,
+        day_pnl: float,
+        day_pnl_gross: float | None = None,
+        marks: dict | None = None,
+        confirm: int | None = None,
+    ) -> None:
         """The trail fired (or give-back is 0): book the day, flatten REAL rows.
 
         Only rows an order was actually filled for are exited here. Paper, sim
@@ -3478,12 +3729,26 @@ class Open15BreakoutService:
         with self._lock:
             r["trail_done"] = True
             r["trail_at"] = self._now_ist().strftime("%H:%M:%S")
+        floor_v = float(r["floor"]) if r.get("floor") is not None else None
+        gross_v = day_pnl if day_pnl_gross is None else day_pnl_gross
+        charges_delta = gross_v - day_pnl
         self._log_event(
             "profit_trail_exit",
             day_pnl=round(day_pnl, 2),
+            net=round(day_pnl, 2),
+            gross=round(gross_v, 2),
             peak=round(float(r.get("peak") or day_pnl), 2),
-            floor=round(float(r["floor"]), 2) if r.get("floor") is not None else None,
+            peak_gross=round(float(r.get("peak") or day_pnl) + charges_delta, 2),
+            floor=round(floor_v, 2) if floor_v is not None else None,
+            floor_gross=round(floor_v + charges_delta, 2) if floor_v is not None else None,
+            shortfall=round(floor_v - day_pnl, 2) if floor_v is not None else None,
+            breach_polls=int(r.get("breach_polls") or 0),
+            polls_required=confirm,
+            polls_since_lock=int(r.get("polls_since_lock") or 0),
+            mark_basis=r.get("mark_basis"),
+            marks=marks or {},
         )
+        self._log_risk_path()
         try:
             from services.notification_service import get_notification_service
 
@@ -3542,6 +3807,24 @@ class Open15BreakoutService:
             "realized_net": round(self._today_realized_net(), 2),
             "monitor_alive": bool(self._risk_thread and self._risk_thread.is_alive()),
             "day_status": self.day_status,
+            # issue #716 — the trail as it is happening
+            "trail_confirm_polls": cfg.get("trail_confirm_polls"),
+            "breach_polls": int(r.get("breach_polls") or 0),
+            "polls_since_lock": int(r.get("polls_since_lock") or 0),
+            "mark_basis": r.get("mark_basis"),
+            "poll_interval_configured": cfg.get("live_poll_interval_s"),
+            "poll_interval_effective": r.get("poll_interval_effective"),
+            "day_pnl_net": r.get("last_day_pnl"),
+            "day_pnl_gross": r.get("last_day_pnl_gross"),
+            "headroom": (
+                round(float(r["last_day_pnl"]) - float(r["floor"]), 2)
+                if r.get("locked")
+                and r.get("floor") is not None
+                and r.get("last_day_pnl") is not None
+                else None
+            ),
+            "path": [dict(pt) for pt in (r.get("path") or [])[-600:]],
+            "n_polls": len(r.get("path") or []),
         }
 
     def summary(self) -> None:
@@ -3595,6 +3878,7 @@ class Open15BreakoutService:
         # stopped row the live stamp missed; broker 1m lag means rows still
         # NULL here are retried by the next 09:10 arm's catch-up
         self._backfill_stop_counterfactuals(self._trade_date())
+        self._log_risk_path()  # #716 backstop: a flatten that raised before it
         if _opt_shadow_enabled():
             # ATM option shadow pricing (issue #435). Broker current-day 1m
             # history lags ~5-15 min, so rows left unpriced here are retried

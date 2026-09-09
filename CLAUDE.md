@@ -1635,6 +1635,32 @@ reason=stop_loss`; the day keeps trading). Rules, each load-bearing:
   for the Day Risk card. A mid-day poll-interval save applies within one
   cycle; the risk THRESHOLDS stay arm-frozen (a mid-day target change would
   make the day's lock/peak state ambiguous).
+- **Marks are the touch, the rule reads NET, and one poll is not a verdict
+  (issue #716).** On 2026-09-09 the trail locked at 09:21:22 on ₹6,395 GROSS
+  (≈₹5,375 net against a ₹5,500 target), a single MCX print at 113.40 (bid
+  109.80) lifted the peak by ₹1,600 three seconds later, and the next poll
+  read ₹120 under the raised floor — SELLs went out six seconds after the
+  lock, with nothing in the day log between the two events. Now: open REAL
+  rows are marked at the **bid** (long premium / long stock; a short stock at
+  the ask) from the same `get_multiquotes` response — LTP only as a labelled
+  fallback (`mark_basis`); `live_pnl` carries `mtm` (gross at the mark),
+  `charges_est` (the SAME `option_round_trip_charges` / `mis_round_trip_charges`
+  the journal uses at exit) and `mtm_net`, and the lock / peak / floor are
+  evaluated on `portfolio_mtm_net`; a floor breach must hold for
+  `trail_confirm_polls` consecutive polls (UI, default 2, 1 = the old
+  single-poll behaviour, count resets on recovery) before the flatten; and the
+  monitor runs at the clamped `live_poll_interval_s` (the old `max(3, …)`
+  silently ignored a configured 2 s). **The trail is data, on the EXISTING
+  intra-hold chart — never a second chart:** `profit_peak` (each raise, naming
+  the mark that moved it), `profit_trail_breach` (first poll under the floor,
+  with the count) and an enriched `profit_trail_exit` (marks, `breach_polls`,
+  `polls_since_lock`) join the timeline, and the per-poll `risk_path` is
+  persisted ONCE (trail exit / scheduled flatten / summary, whichever first).
+  `risk_from_day_log` replays a past day from `risk_path`, or from the
+  lock/exit events alone for a pre-#716 day (2026-09-09 still draws its
+  guides and steps, labelled gross). Ghost marks (#704/#713) stay at the LTP
+  on purpose — their counterfactual is compared against 1m-close bars. Env
+  seed `OPEN15_TRAIL_CONFIRM_POLLS`; tests `test/test_open15_trail_visibility.py`.
 - **Stops first, day rule second — and never on the same snapshot.** A fired
   stop invalidates the realized/MTM split, so the day rule waits for the next
   cycle's refreshed quotes. Unknown marks (`quotes_ok` false) fire nothing.

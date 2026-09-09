@@ -323,6 +323,8 @@ class Open15Config(Base):
     profit_lock_enabled = Column(Integer, nullable=True)  # 0/1
     profit_target_inr = Column(Float, nullable=True)  # day net P&L that locks
     trail_giveback_inr = Column(Float, nullable=True)  # retrace from peak that flattens
+    # issue #716: consecutive polls a floor breach must hold before the flatten
+    trail_confirm_polls = Column(Integer, nullable=True)
     stop_loss_enabled = Column(Integer, nullable=True)  # 0/1
     stop_loss_inr = Column(Float, nullable=True)  # max loss per open trade
     updated_by = Column(String(64), nullable=True)
@@ -433,6 +435,8 @@ def _ensure_columns():
             "profit_lock_enabled": "INTEGER",
             "profit_target_inr": "FLOAT",
             "trail_giveback_inr": "FLOAT",
+            # issue #716 — NULL resolves to the env seed (2 polls)
+            "trail_confirm_polls": "INTEGER",
             "stop_loss_enabled": "INTEGER",
             "stop_loss_inr": "FLOAT",
         },
@@ -525,6 +529,7 @@ def get_config() -> dict | None:
             ),
             "profit_target_inr": row.profit_target_inr,
             "trail_giveback_inr": row.trail_giveback_inr,
+            "trail_confirm_polls": row.trail_confirm_polls,
             "stop_loss_enabled": (
                 None if row.stop_loss_enabled is None else bool(row.stop_loss_enabled)
             ),
@@ -572,6 +577,7 @@ def save_config(
     profit_lock_enabled: bool | None = None,
     profit_target_inr: float | None = None,
     trail_giveback_inr: float | None = None,
+    trail_confirm_polls: int | None = None,
     stop_loss_enabled: bool | None = None,
     stop_loss_inr: float | None = None,
 ) -> bool:
@@ -630,6 +636,7 @@ def save_config(
         )
         row.profit_target_inr = profit_target_inr
         row.trail_giveback_inr = trail_giveback_inr
+        row.trail_confirm_polls = None if trail_confirm_polls is None else int(trail_confirm_polls)
         row.stop_loss_enabled = None if stop_loss_enabled is None else int(bool(stop_loss_enabled))
         row.stop_loss_inr = stop_loss_inr
         row.updated_by = updated_by

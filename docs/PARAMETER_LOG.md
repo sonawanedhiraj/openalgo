@@ -2465,6 +2465,23 @@ ran in the 15:30-17:00 periodic window).
   `MULTI_ACCOUNT_ENABLED` + trading-day gates.
 - **History:** 2026-09-05 — introduced by issue #700.
 
+## `OPEN15_TRAIL_CONFIRM_POLLS` / `open15_config.trail_confirm_polls` (issue #716, 2026-09-09)
+
+- **What:** consecutive risk-monitor polls a profit-trail floor breach must
+  hold before every open REAL row is flattened. UI field "confirm … polls"
+  beside the give-back on `/open15_vol_breakout/logs`; the DB row wins, the
+  env var is the first-boot seed (#484 rule). Clamped 1..5. Default `2`.
+- **Why:** on 2026-09-09 the trail fired on ONE poll — a single MCX option
+  print at 113.40 (bid 109.80) raised the peak, and the very next poll read
+  ₹120 under the raised floor. Two polls (~4-6 s) filters a stray print; `1`
+  restores the pre-#716 single-poll behaviour. The count resets when a poll
+  reads back above the floor.
+- **Not switches (same commit, #651 rule):** marking open rows at the bid
+  instead of the LTP, evaluating the lock/peak/floor NET of modelled exit
+  charges, and running the monitor at the clamped `live_poll_interval_s`
+  (the loop used to floor it at 3 s) are correctness changes with no flag.
+- **History:** 2026-09-09 — introduced by issue #716.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits
