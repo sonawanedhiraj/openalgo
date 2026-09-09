@@ -124,12 +124,15 @@ def probe_token(broker: str, auth_token: str) -> bool:
 
 
 def is_live_broker_session() -> bool:
-    """Return True only when a probe against the stored broker token succeeds.
+    """Return True only when a probe against the PRIMARY's stored token succeeds.
 
-    Probes the first non-revoked auth row via :func:`probe_token`. Returns
-    False when:
+    Probes the admin user's own auth row via :func:`probe_token`. It used to
+    take the *first* non-revoked row of the whole table (issue #719): with the
+    primary revoked and a child logged in, ``first()`` returned a child row (or
+    the orphan legacy ``admin`` row) and the watcher judged the primary alive
+    off someone else's token — so it never healed it. Returns False when:
 
-    - No non-revoked auth row exists.
+    - No admin user, or no non-revoked auth row under that username.
     - The stored auth token is empty / undecryptable.
     - The broker module cannot be imported.
     - The probe raises or returns a payload classified as failure.
@@ -137,10 +140,23 @@ def is_live_broker_session() -> bool:
     Never raises. Designed for boot-time polling: cheap, idempotent, safe to
     call every few seconds.
     """
+    username = primary_username()
+    if not username:
+        return False
+    return is_live_session_for(username)
+
+
+def is_live_session_for(name: str) -> bool:
+    """Broker-verified liveness of the auth row stored under ``name``.
+
+    ``name`` is the admin username for the primary or ``acct:<id>`` for a
+    child. Same failure semantics as :func:`is_live_broker_session`; never
+    raises.
+    """
     try:
         from database.auth_db import Auth, decrypt_token
 
-        auth_obj = Auth.query.filter_by(is_revoked=False).first()
+        auth_obj = Auth.query.filter_by(name=name, is_revoked=False).first()
         if not auth_obj or not auth_obj.broker:
             return False
 
@@ -152,6 +168,22 @@ def is_live_broker_session() -> bool:
     except Exception:
         logger.exception("broker_session_health: live-session probe raised")
         return False
+
+
+def primary_username() -> str | None:
+    """The admin user's username — the ONLY auth row that is the primary session.
+
+    Child rows live under ``acct:<id>``; never let a table scan pick them up as
+    the primary (#719). None when no user exists yet (pre-setup install).
+    """
+    try:
+        from database.user_db import find_user_by_username
+
+        admin = find_user_by_username()
+        return admin.username if admin else None
+    except Exception:
+        logger.exception("broker_session_health: admin user lookup raised")
+        return None
 
 
 def _active_broker() -> str | None:

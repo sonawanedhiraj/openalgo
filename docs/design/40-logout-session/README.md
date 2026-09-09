@@ -2,7 +2,7 @@
 
 ## Overview
 
-OpenAlgo implements automatic session expiry at a configurable time daily (default 3:00 AM IST) to ensure security and force re-authentication. When a session expires or user logs out, multiple caches are cleared and tokens are revoked.
+OpenAlgo implements automatic session expiry at a configurable time daily (default 3:00 AM IST) to ensure security and force re-authentication. When a session expires or user logs out, multiple caches are cleared and tokens are revoked — **except** that session expiry preserves a stored broker token that is NEWER than the expiry boundary (issue #719, see "Fresh-token guard" below). Explicit logout always revokes.
 
 ## Session Expiry Flow
 
@@ -226,6 +226,38 @@ def check_session_validity(f):
         return f(*args, **kwargs)
     return decorated_function
 ```
+
+## Fresh-token guard on session expiry (issue #719)
+
+`revoke_user_tokens()` used to infer "the broker token is dead" from "the browser
+cookie is older than `SESSION_EXPIRY_TIME`". That inference held only while the
+operator's browser was the sole writer of the token. The headless auto-login
+(issue #654) writes tokens with **no browser session at all**, so every morning
+the boot auto-login minted a fresh token and the operator's first visit with
+yesterday's cookie revoked it 40 seconds later (2026-09-04 … 09-09) — a second
+Kite login per day plus a burst of `Cached auth token was revoked` errors.
+
+The `auth` table now carries `token_updated_at` (naive UTC, stamped by
+`upsert_auth` on every non-revoke write; NULL on rows from before the column
+existed). On cookie expiry `utils.session.classify_stored_token` gives one of
+three verdicts, relative to the morning the cookie expired on:
+
+| Stored token written … | Verdict | What happens |
+| --- | --- | --- |
+| before the `SESSION_EXPIRY_TIME` boundary, or unstamped | `stale` | legacy path: DB revoke, caches, ZMQ invalidation |
+| at/after `AUTO_LOGIN_EARLIEST_TIME` (07:30 IST — Kite's flush is over) | `trusted` | **nothing** touches the row; only the browser session is cleared |
+| between the two (inside Kite's 06:45–07:30 flush window) | `probe` | ask the broker: alive → preserved; dead → `invalidate_auth` + legacy path |
+
+The guard runs first in `revoke_user_tokens`, so it covers every caller: the
+`check_session_validity` decorator, `invalidate_session_if_invalid`, the
+stale-session branches in `auth.login`, and the `before_request` hook (which
+never revoked the DB but did publish the ZMQ invalidation that made the WS
+proxy reconnect on a dead token). The `/auth/logout` route does not go through
+it and stays destructive. Tests: `test/test_session_expiry_preserves_fresh_token.py`.
+
+Resulting morning journey with auto-login on: open OpenAlgo → password (+TOTP)
+→ `_try_resume_broker_session` probes the preserved token → dashboard. One Kite
+login per day.
 
 ## Manual Logout
 

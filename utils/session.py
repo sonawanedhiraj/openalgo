@@ -94,6 +94,109 @@ def is_session_valid():
     return True
 
 
+def _broker_token_safe_after():
+    """IST clock time after which a freshly minted broker token survives the day.
+
+    Kite flushes every access token between ~06:45 and 07:30 IST (staff on the
+    Kite Connect forum; the docs say "6 AM"), so a token written before this
+    time on a given morning is expected to die. Shared with the auto-login
+    watcher via ``AUTO_LOGIN_EARLIEST_TIME`` (default ``07:30``).
+    """
+    raw = os.getenv("AUTO_LOGIN_EARLIEST_TIME", "07:30")
+    try:
+        hour, minute = (int(x) for x in raw.split(":", 1))
+        return hour, minute
+    except (TypeError, ValueError):
+        return 7, 30
+
+
+def classify_stored_token(username, now_ist=None):
+    """Say whether the stored broker token for ``username`` may outlive the cookie.
+
+    The session-expiry path (issue #719) used to revoke the DB token whenever the
+    browser cookie was older than ``SESSION_EXPIRY_TIME`` — which was only ever
+    true while the operator's browser was the sole token writer. The headless
+    auto-login writes tokens with no browser, so the cookie's age says nothing
+    about the token's age. Verdicts, keyed on ``auth.token_updated_at``:
+
+    - ``"stale"``   — no stamp (legacy row) or written before the expiry boundary
+                     of the morning this cookie expired on → legacy revoke.
+    - ``"trusted"`` — written at/after that morning's ``AUTO_LOGIN_EARLIEST_TIME``
+                     (post-flush) → keep, no broker call needed.
+    - ``"probe"``   — written after the boundary but inside the flush window
+                     (an operator-forced early login) → only the broker knows.
+
+    Pure given ``now_ist``; never raises (a read failure is ``"stale"``, i.e.
+    the pre-#719 behaviour).
+    """
+    try:
+        from database.auth_db import get_token_updated_at
+
+        stamp = get_token_updated_at(username)
+    except Exception:
+        logger.exception(f"classify_stored_token: stamp read failed for {username}")
+        return "stale"
+    if stamp is None:
+        return "stale"
+
+    ist = pytz.timezone("Asia/Kolkata")
+    if stamp.tzinfo is None:
+        stamp = pytz.utc.localize(stamp)  # repo contract: naive timestamps are UTC
+    stamp_ist = stamp.astimezone(ist)
+    if now_ist is None:
+        now_ist = datetime.now(pytz.utc).astimezone(ist)
+
+    expiry_time = os.getenv("SESSION_EXPIRY_TIME", "03:00")
+    hour, minute = map(int, expiry_time.split(":"))
+    boundary = now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now_ist < boundary:
+        boundary -= timedelta(days=1)
+    if stamp_ist < boundary:
+        return "stale"
+
+    safe_hour, safe_minute = _broker_token_safe_after()
+    safe_after = boundary.replace(hour=safe_hour, minute=safe_minute)
+    if stamp_ist >= safe_after:
+        return "trusted"
+    return "probe"
+
+
+def _stored_token_is_fresh(username):
+    """True when the stored broker token must be PRESERVED on cookie expiry.
+
+    ``trusted`` → True without a broker call. ``probe`` → ask the broker; a dead
+    token is invalidated here (``invalidate_auth`` does the cache/ZMQ/pool
+    cleanup) so background subsystems stop retrying it, and the auto-login
+    watcher re-logs in. ``stale`` → False (legacy revoke). Never raises.
+    """
+    try:
+        verdict = classify_stored_token(username)
+        if verdict == "trusted":
+            return True
+        if verdict == "stale":
+            return False
+        from services.broker_session_health import is_live_session_for
+
+        alive = is_live_session_for(username)
+        if alive:
+            logger.info(
+                f"Session cookie expired for {username}; stored broker token was written "
+                "inside the Kite flush window but the broker still accepts it — preserved"
+            )
+            return True
+        logger.info(
+            f"Session cookie expired for {username}; stored broker token was written inside "
+            "the Kite flush window and the broker rejects it — invalidating"
+        )
+        from database.auth_db import invalidate_auth
+
+        invalidate_auth(username)
+        return False
+    except Exception:
+        logger.exception(f"_stored_token_is_fresh: verdict failed for {username}")
+        return False
+
+
 def revoke_user_tokens(revoke_db_tokens=True):
     """
     Revoke auth tokens for the current user when session expires.
@@ -102,12 +205,26 @@ def revoke_user_tokens(revoke_db_tokens=True):
     This ensures WebSocket proxy and other processes clear their stale cached tokens.
     See GitHub issue #765 for details on the cross-process cache synchronization problem.
 
+    A stored token that is NEWER than the expiry boundary (written by the
+    headless auto-login after the operator's cookie went stale, issue #719) is
+    preserved untouched — no DB revoke, no cache invalidation, no WS-proxy
+    reconnect, no master-contract cache clear. Only the browser session is
+    stale, and the caller clears that. Explicit ``/auth/logout`` does not come
+    through here and stays destructive.
+
     Args:
         revoke_db_tokens (bool): If True, revokes the token in the database (Invalidates API Key).
                                  If False, only clears local caches (Preserves API Key).
     """
     if "user" in session:
         username = session.get("user")
+        if _stored_token_is_fresh(username):
+            logger.info(
+                f"Session cookie expired for {username}; stored broker token is fresh "
+                "(written after today's expiry boundary) — preserved, only the browser "
+                "session is cleared (issue #719)"
+            )
+            return
         try:
             from database.auth_db import auth_cache, feed_token_cache, upsert_auth
 

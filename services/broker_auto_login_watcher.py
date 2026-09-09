@@ -45,7 +45,7 @@ import os
 import threading
 import time as _time
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 
 from utils.logging import get_logger
 
@@ -64,6 +64,15 @@ _DEFAULT_MAX_ATTEMPTS = 5
 # right before the next reset. Env-tunable.
 _DEFAULT_START = "06:15"
 _DEFAULT_END = "23:30"
+# Earliest clock time (IST) at which a scheduled login is worth making (issue
+# #719). Kite flushes every access token between ~06:45 and 07:30 IST (staff on
+# the Kite Connect developer forum: "cleared in between 06:45 AM to 07:30 AM";
+# "create an access token post 07:30 AM [and] it should be valid for the whole
+# day"), so a token minted by a 06:00 boot WILL die. Before this time the boot
+# hook and the watcher only defer — the manual "Auto login now" button and the
+# OAuth flow ignore it (operator intent). Also read by
+# ``utils.session.classify_stored_token``.
+_DEFAULT_EARLIEST = "07:30"
 # Backoff base between attempts on one target within a day (seconds), doubled per
 # prior attempt and capped, so a persistently-failing target is retried rarely.
 _BACKOFF_BASE_SEC = 300
@@ -128,6 +137,30 @@ def _window() -> tuple[time, time]:
     start = _parse_time(os.getenv("AUTO_LOGIN_WATCH_START", _DEFAULT_START), time(6, 15))
     end = _parse_time(os.getenv("AUTO_LOGIN_WATCH_END", _DEFAULT_END), time(23, 30))
     return start, end
+
+
+def _earliest() -> time:
+    """IST clock time before which no scheduled login is initiated (#719)."""
+    return _parse_time(os.getenv("AUTO_LOGIN_EARLIEST_TIME", _DEFAULT_EARLIEST), time(7, 30))
+
+
+def _expected_dead(stamp, now: datetime, earliest: time) -> bool:
+    """True when the stored token is in this morning's Kite flush cohort (#719).
+
+    ``stamp`` is when the token was written (naive UTC per the repo contract, or
+    tz-aware). A token written before today's ``earliest`` — yesterday's token,
+    or one minted by a pre-flush boot — is EXPECTED to be dead once the clock
+    passes ``earliest``, so one dead probe is confirmation enough; waiting the
+    usual two ticks would only delay the heal. Unknown stamp → False (keep the
+    transient-blip protection).
+    """
+    if stamp is None or now.time() < earliest:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    stamp_local = stamp.astimezone(now.tzinfo or _IST)
+    cutoff = now.replace(hour=earliest.hour, minute=earliest.minute, second=0, microsecond=0)
+    return stamp_local < cutoff
 
 
 # --------------------------------------------------------------------------- #
@@ -200,6 +233,8 @@ def evaluate_once(
     login_child,
     dead_confirm: int | None = None,
     max_attempts: int | None = None,
+    token_stamp=None,
+    earliest: time | None = None,
 ) -> list[dict]:
     """Run one watch evaluation. Returns a list of action results (empty if idle).
 
@@ -213,6 +248,14 @@ def evaluate_once(
       * ``probe_child(id) -> bool`` — True when that child's broker session is
         live (broker-verified, issue #658).
       * ``login_child(id, name) -> dict`` — the child auto-login result.
+      * ``token_stamp(key) -> datetime | None`` — when that target's stored
+        token was written (issue #719); None/omitted = unknown. A token written
+        before today's ``earliest`` is in the Kite flush cohort, so a single
+        dead probe past ``earliest`` confirms it (no 2-tick wait).
+
+    Before ``earliest`` (default 07:30 IST, ``AUTO_LOGIN_EARLIEST_TIME``) the
+    evaluation is skipped entirely: a login minted inside Kite's 06:45–07:30
+    flush window would only be flushed again (#719).
 
     A confirmed-dead target with ``can_heal=False`` never attempts a login: if
     it was alive earlier today (a mid-session kill, not a not-yet-logged-in
@@ -223,11 +266,28 @@ def evaluate_once(
     """
     if not (_is_trading_day(now.date()) and _within_window(now.time())):
         return []
+    earliest = earliest if earliest is not None else _earliest()
+    if now.time() < earliest:
+        logger.debug(
+            "auto-login watcher: before %02d:%02d IST — deferring (Kite flush window)",
+            earliest.hour,
+            earliest.minute,
+        )
+        return []
 
     dead_confirm = dead_confirm if dead_confirm is not None else _dead_confirm_count()
     max_attempts = max_attempts if max_attempts is not None else _max_attempts()
     now_ts = now.timestamp()
     results: list[dict] = []
+
+    def _stamp(key: str):
+        if token_stamp is None:
+            return None
+        try:
+            return token_stamp(key)
+        except Exception:
+            logger.exception(f"auto-login watcher: token stamp read for {key} raised")
+            return None
 
     # ---- primary --------------------------------------------------------- #
     results.extend(
@@ -240,6 +300,7 @@ def evaluate_once(
             login=login_primary,
             dead_confirm=dead_confirm,
             max_attempts=max_attempts,
+            expected_dead=_expected_dead(_stamp(PRIMARY), now, earliest),
         )
     )
 
@@ -264,6 +325,7 @@ def evaluate_once(
                 dead_confirm=dead_confirm,
                 max_attempts=max_attempts,
                 alert_only=not can_heal,
+                expected_dead=_expected_dead(_stamp(key), now, earliest),
             )
         )
     return results
@@ -280,11 +342,16 @@ def _evaluate_target(
     dead_confirm: int,
     max_attempts: int,
     alert_only: bool = False,
+    expected_dead: bool = False,
 ) -> list[dict]:
     """Evaluate one target: probe → confirm → (attempt if under cap + backoff-ready).
 
     ``alert_only`` (issue #658): never login; a confirmed mid-session death
     (was alive earlier today) alerts once per day instead.
+
+    ``expected_dead`` (issue #719): the stored token predates this morning's
+    Kite flush, so a dead probe is not a transient blip — confirm on the first
+    one instead of waiting ``dead_confirm`` ticks.
     """
     target.roll_day(today)
 
@@ -300,6 +367,12 @@ def _evaluate_target(
         return []
 
     target.dead_streak += 1
+    if expected_dead and target.dead_streak < dead_confirm:
+        logger.info(
+            f"auto-login watcher: {key} dead and its token predates today's Kite flush — "
+            "confirming on the first probe"
+        )
+        dead_confirm = 1
     if target.dead_streak < dead_confirm:
         logger.info(
             f"auto-login watcher: {key} dead ({target.dead_streak}/{dead_confirm}) — "
@@ -410,6 +483,21 @@ def _login_child(account_id: int, name: str) -> dict:
     return _auto_login_child(account_id, name)
 
 
+def _token_stamp(key: str):
+    """When the target's stored token was written (naive UTC), or None (#719)."""
+    from database.auth_db import get_token_updated_at
+
+    if key == PRIMARY:
+        from services.broker_session_health import primary_username
+
+        name = primary_username()
+    else:
+        from database import broker_accounts_db as accounts_db
+
+        name = accounts_db.auth_name(int(key.split(":", 1)[1]))
+    return get_token_updated_at(name) if name else None
+
+
 def _alert(message: str) -> None:
     """Best-effort loud alert (log + Telegram). Never raises."""
     logger.error(message)
@@ -456,6 +544,7 @@ def _watch_loop() -> None:
                 list_child_targets=_list_child_targets,
                 probe_child=_probe_child,
                 login_child=_login_child,
+                token_stamp=_token_stamp,
             )
             for r in results:
                 logger.info(
@@ -482,10 +571,22 @@ def _boot_worker() -> None:
     _stop_event.wait(_BOOT_WAIT_POLL_SEC)
     try:
         if watcher_enabled() and not _probe_primary():
-            logger.info("broker auto-login: no live session at boot — attempting auto-login")
-            from services.broker_auto_login_service import auto_login_all
+            earliest = _earliest()
+            if datetime.now(_IST).time() < earliest:
+                # A token minted now would be flushed by Kite between ~06:45 and
+                # 07:30 IST (#719); the watcher's first tick past ``earliest``
+                # makes the one login that lasts the day.
+                logger.info(
+                    "broker auto-login: no live session at boot — deferring auto-login "
+                    "until %02d:%02d IST (Kite flushes tokens 06:45–07:30)",
+                    earliest.hour,
+                    earliest.minute,
+                )
+            else:
+                logger.info("broker auto-login: no live session at boot — attempting auto-login")
+                from services.broker_auto_login_service import auto_login_all
 
-            auto_login_all()
+                auto_login_all()
     except Exception:
         logger.exception("broker auto-login boot attempt failed")
     start_watcher()
