@@ -572,3 +572,38 @@ class TestLivePnlBidMarks:
         (t,) = j["trades"]
         assert t["mark"] == 190.0 and t["mark_basis"] == "ltp"
         assert j["mark_basis"] == "ltp"
+
+
+class TestConfigColumnMigration:
+    def test_pre_716_table_gains_the_column_on_init(self):
+        """An install whose open15_config predates #716 must read its stored
+        row after ``init_db()`` (the branch-preview against the live DB, which
+        skips init_db, failed exactly here: 'no such column ... trail_confirm_polls')."""
+        from sqlalchemy import text
+
+        from database import open15_breakout_db as o15db
+
+        with o15db.engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS open15_config"))
+            conn.execute(
+                text(
+                    "CREATE TABLE open15_config (id INTEGER PRIMARY KEY, margin_per_slot FLOAT, "
+                    "sizing_mode VARCHAR(16), vol_mult FLOAT, updated_by VARCHAR(32), updated_at DATETIME, "
+                    "profit_lock_enabled INTEGER, profit_target_inr FLOAT, trail_giveback_inr FLOAT, "
+                    "stop_loss_enabled INTEGER, stop_loss_inr FLOAT)"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO open15_config (id, profit_lock_enabled, profit_target_inr, trail_giveback_inr) "
+                    "VALUES (1, 1, 5500, 2000)"
+                )
+            )
+        o15db.init_db()
+        cfg = o15db.get_config()
+        assert cfg is not None, "get_config must not fall back to env defaults after init_db"
+        assert cfg["profit_target_inr"] == 5500 and cfg["trail_confirm_polls"] is None
+        assert o15db.save_config(
+            60000.0, "fixed", 1.5, "test", trail_confirm_polls=3, profit_lock_enabled=True
+        )
+        assert o15db.get_config()["trail_confirm_polls"] == 3
