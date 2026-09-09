@@ -3104,9 +3104,10 @@ class Open15BreakoutService:
         with NO order placed. They are handled first so a position promoted back
         to ``open`` by the verification is squared off in this same pass.
         """
-        # stop-loss counterfactual (issue #704): stamp the tracked ghost marks
-        # NOW — this job fires at the scheduled exit, the instant a held row
-        # would have been flattened. Before any exit order, off the tick thread.
+        # risk-exit counterfactual (issues #704/#713): stamp the tracked ghost
+        # marks of every stop-loss / profit-trail row NOW — this job fires at
+        # the scheduled exit, the instant a held row would have been
+        # flattened. Before any exit order, off the tick thread.
         self._stamp_ghost_counterfactuals()
         with self._lock:
             paper_pos = {s: p for s, p in self.positions.items() if p.get("status") == "paper"}
@@ -3245,9 +3246,11 @@ class Open15BreakoutService:
         from services.open15_pnl_curve import invalidate_live_cache, live_pnl
 
         payload = live_pnl()  # refreshes the shared cache — the chart reads this too
-        # stopped rows' ghost marks (issue #704) — recorded for the live
-        # counterfactual and NOTHING else: they are not in ``trades``, so the
-        # stop and day rules below cannot see them by construction
+        # risk-exited rows' ghost marks (#704 stop loss, #713 profit trail) —
+        # recorded for the live counterfactual and NOTHING else: they are not
+        # in ``trades``, so the stop and day rules below cannot see them by
+        # construction. Runs BEFORE the ``trail_done`` early return so a
+        # trail-exited day keeps marking its contracts to the scheduled exit.
         self._track_ghosts(payload)
         cfg = self.day_config or {}
         lock_on = bool(cfg.get("profit_lock_enabled"))
@@ -3345,7 +3348,8 @@ class Open15BreakoutService:
             self._profit_trail_flatten(day_pnl)
 
     def _track_ghosts(self, payload: dict) -> None:
-        """Record each stopped row's live mark for the counterfactual (#704)."""
+        """Record each risk-exited row's live mark for the counterfactual
+        (#704 stop loss, #713 profit trail)."""
         try:
             ghosts = payload.get("ghost") or []
             if not ghosts:
@@ -3365,7 +3369,8 @@ class Open15BreakoutService:
 
     def _stamp_ghost_counterfactuals(self) -> None:
         """At the scheduled exit, write the LIVE counterfactual for every
-        stopped row the monitor tracked (issue #704).
+        risk-exited row the monitor tracked (#704 stop loss, #713 profit
+        trail).
 
         Runs at the head of ``flatten`` — the job that fires AT the scheduled
         exit — so the stamp uses the last quote before the real exits go out,
@@ -3376,13 +3381,13 @@ class Open15BreakoutService:
         """
         try:
             from database.open15_breakout_db import (
-                stop_loss_rows,
+                risk_exit_rows,
                 stop_saved_of_row,
                 update_trade,
             )
             from services.open15_sl_counterfactual import derive_from_live, scheduled_exit_min
 
-            rows = stop_loss_rows(trade_date=self._trade_date(), unpriced_only=True)
+            rows = risk_exit_rows(trade_date=self._trade_date(), unpriced_only=True)
             if not rows:
                 return
             with self._lock:
@@ -3401,9 +3406,12 @@ class Open15BreakoutService:
                     saved = stop_saved_of_row(
                         {**cf, "pnl": row.pnl, "charges_inr": row.charges_inr}
                     )
+                    # one event name for both risk exits (#615/#622 rule);
+                    # ``reason`` says which rule the row was closed by
                     self._log_event(
                         "stop_counterfactual",
                         symbol=row.symbol,
+                        reason=row.reason,
                         source="live",
                         held_gross=cf["cf_pnl"],
                         held_charges=cf["cf_charges_inr"],
@@ -3459,6 +3467,12 @@ class Open15BreakoutService:
         and shadow rows are deliberately left for the scheduled exit-time
         flatten — they are measurements priced to the configured exit, and an
         early risk exit of real money must not truncate them.
+
+        The exited rows are not forgotten (issue #713): journaled with
+        ``reason='profit_trail'`` they keep riding the monitor's batched quote
+        as ghost marks to the scheduled exit, stamped at ``flatten`` and
+        back-filled from bars exactly like a stop-loss row (#704), so the
+        chart continues past the booked profit and "held vs booked" is data.
         """
         r = self._risk
         with self._lock:

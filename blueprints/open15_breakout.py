@@ -2137,7 +2137,9 @@ function renderPnlCurve(){
   const ghostX=G?toX(G.asof):null;
   let xmin=1e9,xmax=-1e9,ymin=0,ymax=0;
   const lines=[];
-  const stopped=usable.filter(t=>t.stop_loss);
+  // risk exits (#704 stop loss, #713 profit trail): both continue dashed
+  const stopped=usable.filter(t=>t.risk_exit);
+  const anySL=stopped.some(t=>t.stop_loss), anyTP=stopped.some(t=>t.profit_trail);
   usable.forEach((t,i)=>{
     const ex=m2x(t.entry_minute)+(t.entry_second||0)/60;
     const arr=[[ex,0]];
@@ -2148,11 +2150,12 @@ function renderPnlCurve(){
     if(lv&&liveX!=null)arr.push([liveX,lv.mtm]);
     for(const p of arr){xmin=Math.min(xmin,p[0]);xmax=Math.max(xmax,p[0]);
       ymin=Math.min(ymin,p[1]);ymax=Math.max(ymax,p[1]);}
-    // stop-loss counterfactual (issue #704): the contract's marks AFTER the
-    // stop, to the scheduled exit — drawn dashed from the stop point. Not
-    // money: the row's real P&L is the solid line's last point.
+    // risk-exit counterfactual (#704/#713): the contract's marks AFTER a
+    // stop-loss or profit-trail exit, to the scheduled exit — drawn dashed
+    // from the exit point. Not money: the row's real P&L is the solid
+    // line's last point.
     let garr=null;
-    if(t.stop_loss&&t.final){
+    if(t.risk_exit&&t.final){
       garr=[arr[arr.length-1]];
       for(const q of (t.ghost||[]))garr.push([m2x(q[0]),q[1]]);
       let gv=null;
@@ -2210,7 +2213,7 @@ function renderPnlCurve(){
     s+='<path d="'+pathOf(portNS)+'" fill="none" stroke="#8aa0b4" stroke-width="1.5" stroke-dasharray="6 4" stroke-linejoin="round"/>';
     const pn=portNS[portNS.length-1];
     s+='<circle cx="'+X(pn[0])+'" cy="'+Y(pn[1])+'" r="3" fill="#8aa0b4" stroke="#0f1419" stroke-width="1.5"/>';
-    labels.push({y:Y(pn[1]),col:'#8aa0b4',txt:'PORT if no stop '+fmtR(pn[1])});
+    labels.push({y:Y(pn[1]),col:'#8aa0b4',txt:(anyTP?'PORT if held ':'PORT if no stop ')+fmtR(pn[1])});
   }
   for(const ln of lines){
     s+='<path d="'+pathOf(ln.arr)+'" fill="none" stroke="'+ln.col+'" stroke-width="1.8" stroke-linejoin="round"/>';
@@ -2220,14 +2223,16 @@ function renderPnlCurve(){
       s+='<path d="'+pathOf(ln.garr)+'" fill="none" stroke="'+ln.col+'" stroke-opacity=".55" stroke-width="1.6" stroke-dasharray="5 4" stroke-linejoin="round"/>';
       const ge=ln.garr[ln.garr.length-1];
       s+='<circle cx="'+X(ge[0])+'" cy="'+Y(ge[1])+'" r="3" fill="'+ln.col+'" fill-opacity=".55" stroke="#0f1419" stroke-width="1.5"/>';
-      // the stop itself: a mauve diamond, the risk-event colour on this page
+      // the exit itself: a diamond — mauve for a stop loss (the risk-event
+      // colour on this page), green for a profit-trail exit (#713)
+      const isTP=!!ln.t.profit_trail;
       const cx=X(last[0]),cy=Y(last[1]);
-      s+='<path d="M'+cx+' '+(cy-5.5)+' L'+(cx+5.5)+' '+cy+' L'+cx+' '+(cy+5.5)+' L'+(cx-5.5)+' '+cy+' Z" fill="#cba6f7" stroke="#0f1419" stroke-width="1.3"/>';
+      s+='<path d="M'+cx+' '+(cy-5.5)+' L'+(cx+5.5)+' '+cy+' L'+cx+' '+(cy+5.5)+' L'+(cx-5.5)+' '+cy+' Z" fill="'+(isTP?'#a6e3a1':'#cba6f7')+'" stroke="#0f1419" stroke-width="1.3"/>';
       const sv=ln.t.stop_saved;
       labels.push({y:Y(ge[1]),col:ln.col,dim:1,txt:ln.t.symbol+' held '+fmtR(ge[1])+
-        (sv!=null?(' (stop '+(sv>=0?'saved ':'cost ')+fmtR(sv)+' net)'):
+        (sv!=null?(' ('+(isTP?'trail ':'stop ')+(sv>=0?'saved ':'cost ')+fmtR(sv)+' net)'):
           (ln.t.cf_source==='curve'?' (unstamped)':''))});
-      labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' SL '+fmtR(last[1])});
+      labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+(isTP?' TP ':' SL ')+fmtR(last[1])});
     }else{
       s+='<circle cx="'+X(last[0])+'" cy="'+Y(last[1])+'" r="3.2" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
       labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' '+fmtR(last[1])});
@@ -2270,14 +2275,18 @@ function renderPnlCurve(){
     ' '+esc(ln.t.side)+(ln.t.instrument==='option'?' &middot; '+
     esc(String(ln.t.contract||'').replace(ln.t.symbol,'')):'')+'</span>').join(' &nbsp; ')+
     ' &nbsp; <span style="color:#d7dde4">&#9644; portfolio</span>'+
-    (stopped.length?(' &nbsp; <span style="color:#cba6f7">&#9670; stop-loss exit</span>'+
-      ' &nbsp; <span style="color:#8aa0b4">&#8212; &#8212; dashed = after the stop, to the scheduled exit (not held)</span>'):'');
+    (anySL?' &nbsp; <span style="color:#cba6f7">&#9670; stop-loss exit</span>':'')+
+    (anyTP?' &nbsp; <span style="color:#a6e3a1">&#9670; profit-trail exit</span>':'')+
+    (stopped.length?' &nbsp; <span style="color:#8aa0b4">&#8212; &#8212; dashed = after the exit, to the scheduled exit (not held)</span>':'');
   let stopLine='';
   if(stopped.length){
     const pending=stopped.filter(t=>t.stop_saved==null).length;
-    stopLine='<div class="muted" style="margin-top:6px">stop loss today: '+stopped.length+' exit'+
-      (stopped.length===1?'':'s')+(j.stop_saved_total!=null?(' &middot; net effect <span class="'+
-      (j.stop_saved_total>=0?'pos':'neg')+'">'+fmtR(j.stop_saved_total)+'</span> (positive = the stops avoided a bigger loss)'):
+    const nSL=stopped.filter(t=>t.stop_loss).length, nTP=stopped.length-nSL;
+    const what=[nSL?('stop loss: '+nSL+' exit'+(nSL===1?'':'s')):'',
+      nTP?('profit trail: '+nTP+' exit'+(nTP===1?'':'s')):''].filter(Boolean).join(' &middot; ');
+    stopLine='<div class="muted" style="margin-top:6px">'+what+
+      (j.stop_saved_total!=null?(' &middot; net effect <span class="'+
+      (j.stop_saved_total>=0?'pos':'neg')+'">'+fmtR(j.stop_saved_total)+'</span> (positive = exiting early beat holding to the scheduled exit)'):
       (' &middot; '+pending+' counterfactual'+(pending===1?'':'s')+' not stamped yet (live at the exit, or bars at the summary / next arm)'))+
       ' &middot; held-to-exit is priced at the 1m close, so it slightly flatters holding</div>';
   }
