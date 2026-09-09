@@ -2181,7 +2181,7 @@ function renderPnlCurve(){
     if(p[1]<ymin)ymin=p[1];if(p[1]>ymax)ymax=p[1];}
   if(xmax-xmin<3)xmax=xmin+3;
   const pad=Math.max((ymax-ymin)*0.1,200); ymin-=pad; ymax+=pad;
-  const W=920,H=300,ML=58,MR=170,MT=16,MB=26,PW=W-ML-MR,PH=H-MT-MB;
+  const W=960,H=300,ML=58,MR=225,MT=16,MB=26,PW=W-ML-MR,PH=H-MT-MB;
   const X=v=>ML+(v-(xmin-0.4))/((xmax+0.4)-(xmin-0.4))*PW;
   const Y=v=>MT+(ymax-v)/(ymax-ymin)*PH;
   let s='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block">';
