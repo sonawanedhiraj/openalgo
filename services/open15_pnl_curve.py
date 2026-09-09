@@ -276,7 +276,9 @@ def build_pnl_curve(date: str) -> dict:
         trades = []
         all_closed = True
         sched_exit = None
-        if any(getattr(r, "reason", None) == "stop_loss" for r in rows):
+        from database.open15_breakout_db import RISK_EXIT_REASONS
+
+        if any(getattr(r, "reason", None) in RISK_EXIT_REASONS for r in rows):
             from services.open15_sl_counterfactual import scheduled_exit_min
 
             sched_exit = scheduled_exit_min(date)
@@ -313,7 +315,13 @@ def build_pnl_curve(date: str) -> dict:
 
 
 def _trade_curve(row, date: str, sched_exit_min: int | None = None) -> dict:
-    from database.open15_breakout_db import net_pnl_of_row, stop_saved_of_row
+    from database.open15_breakout_db import (
+        PROFIT_TRAIL_REASON,
+        RISK_EXIT_REASONS,
+        STOP_LOSS_REASON,
+        net_pnl_of_row,
+        stop_saved_of_row,
+    )
 
     contract, exchange = _row_contract(row)
     sign = _row_sign(row)
@@ -347,11 +355,15 @@ def _trade_curve(row, date: str, sched_exit_min: int | None = None) -> dict:
         "final": None,
         "unavailable": False,
         "reason": None,
-        # stop-loss counterfactual (issue #704): the contract's marks AFTER a
-        # stop exit, to the scheduled exit. Never money — the chart draws them
-        # dashed and the only derived figure is ``stop_saved`` (one definition,
-        # ``stop_saved_of_row``). Empty on every non-stopped row.
-        "stop_loss": (row.reason == "stop_loss") and row.status == "closed",
+        # risk-exit counterfactual (issues #704/#713): the contract's marks
+        # AFTER a stop-loss or profit-trail exit, to the scheduled exit. Never
+        # money — the chart draws them dashed and the only derived figure is
+        # ``stop_saved`` (one definition, ``stop_saved_of_row``). Empty on
+        # every row the scheduled flatten closed. ``risk_exit`` gates the
+        # ghost; ``stop_loss`` / ``profit_trail`` say which rule fired.
+        "stop_loss": (row.reason == STOP_LOSS_REASON) and row.status == "closed",
+        "profit_trail": (row.reason == PROFIT_TRAIL_REASON) and row.status == "closed",
+        "risk_exit": (row.reason in RISK_EXIT_REASONS) and row.status == "closed",
         "ghost": [],
         "ghost_final": None,
         "cf_pnl": row.cf_pnl,
@@ -390,9 +402,9 @@ def _trade_curve(row, date: str, sched_exit_min: int | None = None) -> dict:
     if row.status == "closed" and exit_min is not None and row.pnl is not None:
         out["final"] = [_min_to_hhmm(exit_min), round(float(row.pnl), 2)]
 
-    # ghost marks: the stop minute's own bar (its close is after the stop)
-    # through the last full bar before the SCHEDULED exit (issue #704)
-    if out["stop_loss"] and exit_min is not None and sched_exit_min is not None:
+    # ghost marks: the exit minute's own bar (its close is after the risk
+    # exit) through the last full bar before the SCHEDULED exit (#704/#713)
+    if out["risk_exit"] and exit_min is not None and sched_exit_min is not None:
         for m in range(exit_min, sched_exit_min):
             hhmm = _min_to_hhmm(m)
             close = closes.get(hhmm)
@@ -425,11 +437,12 @@ def _assemble(date: str, trades: list[dict]) -> dict:
         exit_hhmm = max(f[0] for f in finals)
         portfolio_final = [exit_hhmm, round(sum(f[1] for f in finals), 2)]
 
-    # portfolio if no stop (issue #704): the real marks plus, after each stop,
-    # that row's ghost marks — what the book would have read had every stopped
-    # row been held to the scheduled exit. Present only on a day with a stop,
-    # so a no-stop day's payload is unchanged.
-    stopped = [t for t in usable if t["stop_loss"]]
+    # portfolio if held (issues #704/#713): the real marks plus, after each
+    # risk exit (stop loss or profit trail), that row's ghost marks — what the
+    # book would have read had every such row been held to the scheduled
+    # exit. Present only on a day with a risk exit, so any other day's payload
+    # is unchanged. (Key names keep the #704 ``no_stop`` spelling.)
+    stopped = [t for t in usable if t["risk_exit"]]
     portfolio_no_stop = []
     portfolio_no_stop_final = None
     stop_saved_total = None
@@ -509,12 +522,15 @@ def _batched_ltp(contracts: list[tuple[str, str]]) -> dict[str, float] | None:
 
 
 def _ghost_rows_now(rows) -> list:
-    """Today's stop-closed rows still inside the counterfactual window.
+    """Today's risk-exit rows (stop loss / profit trail) still inside the
+    counterfactual window.
 
     A row already stamped (``cf_pnl`` set) or past the scheduled exit leaves
     the batch — the quote spend stops exactly when the window closes.
     """
-    stopped = [r for r in rows if r.reason == "stop_loss" and r.status == "closed"]
+    from database.open15_breakout_db import RISK_EXIT_REASONS
+
+    stopped = [r for r in rows if r.reason in RISK_EXIT_REASONS and r.status == "closed"]
     if not stopped:
         return []
     if all(r.cf_pnl is not None for r in stopped):
@@ -553,6 +569,7 @@ def _ghost_marks(ghost_rows, marks: dict[str, float] | None) -> list[dict]:
                 "ltp": ltp,
                 "mtm": mtm,
                 "stopped_at": r.exit_ts,
+                "reason": r.reason,
             }
         )
     return out

@@ -687,6 +687,12 @@ def net_pnl_of_row(row) -> float:
 
 
 STOP_LOSS_REASON = "stop_loss"
+# issue #713: the profit-lock/trail flatten (#696) is the OTHER risk exit. A
+# row it closes keeps being MARKED to the scheduled exit exactly like a
+# stopped one — same ``cf_*`` columns, same ``stop_saved_of_row`` definition —
+# so "would holding to the exit have paid more?" has data on both sides.
+PROFIT_TRAIL_REASON = "profit_trail"
+RISK_EXIT_REASONS = (STOP_LOSS_REASON, PROFIT_TRAIL_REASON)
 
 
 def cf_net_of_row(row) -> float | None:
@@ -703,13 +709,15 @@ def cf_net_of_row(row) -> float | None:
 
 
 def stop_saved_of_row(row) -> float | None:
-    """How much the stop loss SAVED on this row, net Rs (issue #704).
+    """How much the risk exit SAVED on this row, net Rs (issue #704).
 
     ``net_pnl_of_row(row) - cf_net_of_row(row)``: positive means holding to the
-    scheduled exit would have lost more than the stop did; negative means the
-    stop cost money. None while the counterfactual is unpriced. This is the
-    ONLY definition — the chart label, the scorecard and any research read it
-    here, never re-derive it (the #552 rule, one convention).
+    scheduled exit would have paid less than the early exit did; negative means
+    the early exit cost money. Reads the same for a stop-loss row (held would
+    have lost more) and a profit-trail row (held would have given back more,
+    issue #713). None while the counterfactual is unpriced. This is the ONLY
+    definition — the chart label, the scorecard and any research read it here,
+    never re-derive it (the #552 rule, one convention).
     """
     cf_net = cf_net_of_row(row)
     if cf_net is None:
@@ -717,14 +725,19 @@ def stop_saved_of_row(row) -> float | None:
     return round(net_pnl_of_row(row) - cf_net, 2)
 
 
-def stop_loss_rows(trade_date: str | None = None, unpriced_only: bool = False) -> list:
-    """REAL rows the per-trade stop loss closed (``reason='stop_loss'``, #696),
-    oldest first. ``unpriced_only`` narrows to rows whose counterfactual is
-    still NULL (the backfill's work list). Fail-open to ``[]``.
+def risk_exit_rows(
+    trade_date: str | None = None,
+    unpriced_only: bool = False,
+    reasons: tuple[str, ...] = RISK_EXIT_REASONS,
+) -> list:
+    """REAL rows a RISK exit closed — the per-trade stop loss (#696) or the
+    profit-trail flatten (#713) — oldest first. ``unpriced_only`` narrows to
+    rows whose counterfactual is still NULL (the backfill's work list).
+    Fail-open to ``[]``.
     """
     try:
         q = db_session.query(Open15Trade).filter(
-            Open15Trade.reason == STOP_LOSS_REASON,
+            Open15Trade.reason.in_(reasons),
             Open15Trade.status == "closed",
             _REAL_FILL,
         )
@@ -734,10 +747,18 @@ def stop_loss_rows(trade_date: str | None = None, unpriced_only: bool = False) -
             q = q.filter(Open15Trade.cf_pnl.is_(None))
         return q.order_by(Open15Trade.trade_date.asc(), Open15Trade.id.asc()).all()
     except Exception:
-        logger.exception("open15: stop_loss_rows read failed — failing open to []")
+        logger.exception("open15: risk_exit_rows read failed — failing open to []")
         return []
     finally:
         db_session.remove()
+
+
+def stop_loss_rows(trade_date: str | None = None, unpriced_only: bool = False) -> list:
+    """Stop-loss rows ONLY (``reason='stop_loss'``) — the scorecard's
+    population. Its pre-registered decision rule judges the STOP; a trail
+    exit priced the same way is a different question and never joins it.
+    """
+    return risk_exit_rows(trade_date, unpriced_only, reasons=(STOP_LOSS_REASON,))
 
 
 def total_realized_pnl() -> float:

@@ -12,13 +12,17 @@ the result on the row as a **counterfactual**, never as money:
   entry-fill basis and quantity the real row used, modelled charges on that
   counterfactual round trip, and the worst / best marks between the stop and
   the exit (how far the contract ran against and for us once we were out).
-- ``backfill_missing(date=None)`` — prices every stop row whose counterfactual
-  is still NULL from the broker 1m bars the intra-hold curve already fetches
+- ``backfill_missing(date=None)`` — prices every RISK-exit row (stop loss,
+  and since issue #713 the profit-trail flatten too — the other early exit,
+  marked the same way so the chart continues past a booked profit) whose
+  counterfactual is still NULL from the broker 1m bars the intra-hold curve
+  already fetches
   (``cf_source='bars'``). Called from the summary job and the next 09:10 arm,
   so a restart between the stop and the exit loses nothing, and usable as a
   CLI for historical rows (dry-run default).
 - ``scorecard()`` — every stop since the rule went live, with the
-  pre-registered decision rule applied, for the /logs card.
+  pre-registered decision rule applied, for the /logs card. STOP rows only:
+  the rule judges the stop, and a trail exit is a different question.
 
 The LIVE capture (``cf_source='live'``) lives in the strategy service: the
 risk monitor already polls ``live_pnl()`` every cycle, stopped rows ride the
@@ -231,18 +235,19 @@ def derive_from_live(
 
 
 def backfill_missing(trade_date: str | None = None, apply: bool = True) -> dict:
-    """Price every unpriced stop row from broker 1m bars (``cf_source='bars'``).
+    """Price every unpriced risk-exit row (stop loss / profit trail) from
+    broker 1m bars (``cf_source='bars'``).
 
     Idempotent (only NULL rows are touched) and per-row fail-graceful: a row
     whose bars are not yet available stays NULL for the next backstop. Returns
     ``{checked, priced, pending, rows}``; with ``apply=False`` nothing is
     written (the CLI's dry run) and ``rows`` carries what would be.
     """
-    from database.open15_breakout_db import stop_loss_rows, update_trade
+    from database.open15_breakout_db import risk_exit_rows, update_trade
     from services.open15_pnl_curve import _closes_by_minute, _fetch_bars, _row_contract
 
     out: dict = {"checked": 0, "priced": 0, "pending": 0, "rows": []}
-    rows = stop_loss_rows(trade_date=trade_date, unpriced_only=True)
+    rows = risk_exit_rows(trade_date=trade_date, unpriced_only=True)
     bars_cache: dict[tuple[str, str], dict[str, float] | None] = {}
     exit_cache: dict[str, int] = {}
     for row in rows:
@@ -382,10 +387,11 @@ def scorecard() -> dict:
 
 def _cli() -> int:
     ap = argparse.ArgumentParser(
-        description="Price the stop-loss counterfactual for unpriced open15 stop rows "
-        "from broker 1m bars (issue #704). Dry-run by default."
+        description="Price the held-to-exit counterfactual for unpriced open15 "
+        "stop-loss / profit-trail rows from broker 1m bars (issues #704/#713). "
+        "Dry-run by default."
     )
-    ap.add_argument("--date", help="YYYY-MM-DD; default = every unpriced stop row")
+    ap.add_argument("--date", help="YYYY-MM-DD; default = every unpriced risk-exit row")
     ap.add_argument("--apply", action="store_true", help="write the journal (default: dry run)")
     ap.add_argument("--scorecard", action="store_true", help="print the scorecard and exit")
     args = ap.parse_args()

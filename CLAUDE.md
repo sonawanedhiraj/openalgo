@@ -1693,6 +1693,22 @@ tunables: keep the stop only if after 20 events cumulative stop-saved > 0 AND
 ≥ 50% of stops were right). `GET /open15_vol_breakout/api/stop_scorecard`.
 No env flag (#651). Tests: `test/test_open15_sl_counterfactual.py`.
 
+**A profit-trail exit is marked to the scheduled exit the same way (issue
+#713).** The profit lock/trail flatten (`reason=profit_trail`, #696) is the
+OTHER risk exit, and until #713 every gate above read `reason == 'stop_loss'`
+only — so the chart on `/logs` stopped dead at a booked profit while a stopped
+row continued dashed. `open15_breakout_db.RISK_EXIT_REASONS` (`stop_loss`,
+`profit_trail`) now gates the whole pipeline through `risk_exit_rows`: the
+monitor's ghost marks (recorded BEFORE the `trail_done` early return, so a
+trail-exited day keeps marking), the live stamp at `flatten`, the bars
+backfill, and the curve's ghost series / "PORT if held" twin — same `cf_*`
+columns, same `stop_saved_of_row` (positive = exiting early beat holding),
+same `stop_counterfactual` event with a `reason` field (no new event names,
+#615/#622). The chart draws a **green** diamond and a `TP` label for a trail
+exit against the mauve `SL` one. **The scorecard stays stop-only**
+(`stop_loss_rows`): its pre-registered rule judges the stop, and a trail exit
+is a different question. Tests: `test/test_open15_trail_counterfactual.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.
