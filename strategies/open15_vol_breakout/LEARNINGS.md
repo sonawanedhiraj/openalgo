@@ -163,3 +163,49 @@ pick_contract" only by comment, which is exactly how the pair drifts.
 next-month `opt_symbol`) trade a structurally different book — lower gamma,
 wider spreads, thinner OI, higher lot cost. Real money, stays in real P&L, but
 per-trade comparisons should segment them (same class of note as #581/#595/#643).
+
+### 2026-09-10 — short-side review (32 short signals, all buckets) + both-sides levers; #721 volume ceiling
+
+Every short signal since the side went live (real 15, paper 3, shadow 6, sim 3,
+plus refusals) was scored on the STOCK move trigger→09:30 (independent of
+option pricing), with broker 1m bars for the stock, NIFTY and a hand-mapped
+sector index per name. Real shorts: +₹34.1k but **3 trades in Aug 19–21 are
++₹62k; the 11 since Aug 26 are 2 of 11, −₹28k**. Stock-basis WR 41%, median
+−0.01%. Findings (in-sample, n=32, CIs overlap — treat as hypotheses):
+
+- **Gap size inverts.** Gap ≤ −1.5%: 33% WR; the top-3 seed gappers (−2…−3%):
+  25%, −₹11k; mild gaps (−0.7…0): 50%, +₹44k. A bigger-gap floor removes the
+  winners. Do NOT add one.
+- **More volume is worse.** Ratio at trigger <1.6×: 56% WR, +₹59k; 1.6–2.0×:
+  27%, −₹22k; ≥2.0×: 0 of 3. Same on longs (67% vs 30%). → #721 ceiling.
+- **Sector-down has no discriminating power.** 30 of 32 shorts already had the
+  sector down from the open, 28 of 32 below prev close; winners −0.46% vs losers
+  −0.52% at trigger. What correlates is the sector's move DURING the hold
+  (winners −0.16%, losers +0.06%), unknowable at entry. Do NOT add a sector gate.
+- **Trigger time.** ≤09:19: 64% WR; 09:20–09:24: 36%; ≥09:25: 14%. Both sides
+  (longs 70/50/20). Winners need 6–10 min to develop (+0.14% at +3 min, +0.52%
+  at +10). A 09:23 `no_entry_after` removes 7 real trades since Aug 18, all 7
+  losers (−₹23.7k); a 09:20 cutoff would lose BRITANNIA +37.5k and IDEA +15k.
+- **First-candle shape (shorts only).** 09:15 candle closing in its lower
+  third: 48% WR, +₹40k; closing higher (already bounced): 0 of 11 net winners.
+  Mirrored onto longs it removes +₹7.7k of winners — shorts-only lever.
+- **Exit timing is right.** 09:26 exit does not help; 09:30→11:00 is −0.15%
+  for shorts (they bounce). A time-stop lowered the mean in every variant.
+- **Stop/lock replay (#711 engine, 46 real fills, 27 with minute paths).** Today's
+  rules (stop 2,500 + lock 5,500/trail 2,000) on the pre-rules window: +₹49.3k →
+  +₹58.9k. The stop flips sign by side: +₹10.8k on shorts, −₹12.5k on longs
+  (Aug 28 TCS +6.6k→−3.7k, WIPRO +1.7k→−4.7k); the lock/trail is +₹6k. Stop
+  4,000 is the best long result. → #722 per-side stops. Caveat: 19 fills are on
+  expired AUG contracts (closed-form), so the stop's benefit is an upper bound.
+
+**Pre-registered decisions (re-decide at ~80 real fills, ~mid-Oct 2026):**
+(1) keep the #721 ceiling only if the `vol_ratio_cap` sim cohort is net
+negative on the NEW fills alone AND the kept cohort's WR is ≥10 points higher;
+(2) keep the 09:23 cutoff only if the 09:23–09:29 shadow/sim cohort is net
+negative on the new fills; (3) judge the per-side stop on each side's own
+settings-outlook replay, never on the pooled scorecard.
+
+Learnings: **a gate that fires on a threshold crossing carries a second
+variable — how far past the threshold it was — and that variable is a
+different market event**, not more of the same; and **a filter that keeps
+31 of 32 rows has no power regardless of how sensible it sounds** (sector-down).

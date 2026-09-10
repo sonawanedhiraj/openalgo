@@ -85,6 +85,7 @@ def config():
         _liq_min_pctile_default,
         _liq_reentry_days_default,
         _liq_reentry_pctile_default,
+        _max_vol_ratio_default,
         _min_oi_lots_default,
         _profit_lock_enabled_default,
         _profit_target_default,
@@ -289,6 +290,11 @@ def config():
         # issue #716 — polls a floor breach must hold; 1 = pre-#716 behaviour
         trail_confirm = body.get("trail_confirm_polls")
         trail_confirm = None if trail_confirm in (None, "") else _clamp_confirm(trail_confirm, 2)
+        # issue #721 - volume-ratio ceiling; clamp-don't-reject, empty = env seed
+        from services.open15_breakout_service import clamp_max_vol_ratio as _clamp_max_vr
+
+        max_vol_ratio = body.get("max_vol_ratio")
+        max_vol_ratio = None if max_vol_ratio in (None, "") else _clamp_max_vr(max_vol_ratio, 0.0)
         stop_loss = _opt_bool("stop_loss_enabled")
         stop_loss_inr = body.get("stop_loss_inr")
         stop_loss_inr = (
@@ -353,6 +359,7 @@ def config():
             trail_confirm_polls=trail_confirm,
             stop_loss_enabled=stop_loss,
             stop_loss_inr=stop_loss_inr,
+            max_vol_ratio=max_vol_ratio,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -416,6 +423,8 @@ def config():
                 "trail_confirm_polls": _trail_confirm_polls_default(),
                 "stop_loss_enabled": _stop_loss_enabled_default(),
                 "stop_loss_inr": _stop_loss_inr_default(),
+                # issue #721 - volume-ratio ceiling seed (0 = off)
+                "max_vol_ratio": _max_vol_ratio_default(),
             },
             "override": get_config(),
             "effective_today": effective,
@@ -740,6 +749,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <select id="c_sizing" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
    <option value="fixed">fixed</option><option value="compound">compounding</option></select></label>
  <label class="muted" style="margin-left:14px">volume filter (x avg) <input id="c_vol" type="number" min="1.0" max="5.0" step="0.1" style="width:60px"></label>
+ <label class="muted" style="margin-left:14px" title="issue #721: a trigger whose cum-volume/avg ratio is at or above this is NOT traded — journaled as a sim-priced entry_skipped · vol_ratio_cap (no order, no slot). 0 = off. Measured 2026-08-18..09-10: ≥1.7x was 2 winners of 8 on both sides.">volume ceiling (x avg, 0=off) <input id="c_maxvr" type="number" min="0" max="10" step="0.1" style="width:60px"></label>
  <label class="muted" style="margin-left:14px">instrument
   <select id="c_instr" style="background:#1e2630;color:#d7dde4;border:1px solid #2a3138;padding:4px">
    <option value="stock">stock</option><option value="atm_option">ATM option</option></select></label>
@@ -824,6 +834,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    (realized real fills + live MTM of open real rows &mdash; paper/sim/shadow never count) reaches the
    target, no new entries for the rest of the day (journaled
    <code>entry_skipped &middot; profit_target_locked</code>, slot not consumed; exits never gated).
+   <b>Volume ceiling (issue #721):</b> a trigger whose cum-volume/avg ratio is at or above the
+   ceiling is declined on BOTH sides (shadow included) and journaled
+   <code>entry_skipped &middot; vol_ratio_cap</code>, sim-priced at 1 lot so the skipped cohort keeps
+   being measured; no order, no slot. 0 = off.
    The peak day P&amp;L is then tracked; retrace by the give-back from the peak and ALL open rows are
    flattened (give-back 0 = book at target immediately). <b>Stop loss is TRADE-wise:</b> an open
    trade whose OWN MTM falls to &minus;&#8377;amount is squared off alone; the day keeps trading.
@@ -976,6 +990,8 @@ async function loadCfg(){
   document.getElementById('c_pconfirm').value=o.trail_confirm_polls??d.trail_confirm_polls??2;
   document.getElementById('c_sl').checked=!!(o.stop_loss_enabled??d.stop_loss_enabled);
   document.getElementById('c_slinr').value=o.stop_loss_inr??d.stop_loss_inr??1200;
+  // volume-ratio ceiling (issue #721) — `??` so a stored 0 beats a non-zero env seed
+  document.getElementById('c_maxvr').value=o.max_vol_ratio??d.max_vol_ratio??0;
   if(window.armLivePoll)armLivePoll();  // later script block; guarded for ordering
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
@@ -1014,7 +1030,7 @@ async function loadCfg(){
       ' | max trades '+effMaxTrades(e)+
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
-      lev+' | vol_mult '+e.vol_mult+
+      lev+' | vol_mult '+e.vol_mult+(e.max_vol_ratio?(' (ceiling '+e.max_vol_ratio+'x)'):'')+
       ' | entries 09:16–'+nea+' | exit '+ext+
       ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'')+
       ' | rolling watch-list '+(e.rolling_watchlist_enabled
@@ -1058,7 +1074,8 @@ async function saveCfg(){
     trail_giveback_inr:+document.getElementById('c_ptrail').value,
     trail_confirm_polls:+document.getElementById('c_pconfirm').value,
     stop_loss_enabled:document.getElementById('c_sl').checked,
-    stop_loss_inr:+document.getElementById('c_slinr').value};
+    stop_loss_inr:+document.getElementById('c_slinr').value,
+    max_vol_ratio:+document.getElementById('c_maxvr').value};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -1837,7 +1854,7 @@ function detailFor(sym,r,needed){
     ]));
   }
 
-  if(r.fill==='sim'||/unaffordable|max_trades_cap/.test(r.skipReason||'')){
+  if(r.fill==='sim'||/unaffordable|max_trades_cap|vol_ratio_cap/.test(r.skipReason||'')){
     // the arithmetic that skipped it — currently only derivable by hand
     const armed=curEvents.find(e=>e.event==='armed')||{};
     const need=(r.lotSize&&r.optEntry)?(r.lotSize*r.optEntry):null;

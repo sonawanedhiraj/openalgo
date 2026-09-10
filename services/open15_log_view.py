@@ -84,6 +84,8 @@ _ARMED_PASSTHROUGH = (
     "trail_giveback_inr",
     "stop_loss_enabled",
     "stop_loss_inr",
+    # issue #721
+    "max_vol_ratio",
 )
 
 
