@@ -183,6 +183,49 @@ def _opt_shadow_enabled() -> bool:
     return os.getenv("OPEN15_OPT_SHADOW_ENABLED", "true").lower() == "true"
 
 
+MAX_VOL_RATIO_MAX = 10.0
+
+
+def clamp_max_vol_ratio(raw, default: float = 0.0) -> float:
+    """0..10 x average minute volume; 0 disables the ceiling (issue #721).
+    The UI number input is a hint, never a trust boundary."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return min(MAX_VOL_RATIO_MAX, max(0.0, v))
+
+
+def _max_vol_ratio_default() -> float:
+    """Env seed for the trigger volume-ratio CEILING (issue #721). 0 = off.
+
+    Measured on the first 42 real fills (2026-08-18..09-10): triggers whose
+    cum-volume/baseline ratio was >= 1.7x at the trigger instant were 2
+    winners of 8 (net -Rs26k) against 17 of 34 below it (+Rs71k), on BOTH
+    sides. A ratio far above the 1.5x gate means the burst arrived before
+    the level broke (absorption) or in one climactic print - either way it
+    is spent by the time the trigger fires. Ships OFF; the operator turns it
+    on from /logs and the skipped cohort keeps being measured as sim rows.
+    """
+    return clamp_max_vol_ratio(os.getenv("OPEN15_MAX_VOL_RATIO", "0"), 0.0)
+
+
+def resolve_max_vol_ratio(cfg: dict, vol_mult: float) -> float:
+    """Effective ceiling for the day: stored row wins over the env seed; a
+    ceiling at or below the entry gate would refuse EVERY trigger, so it
+    resolves to OFF with a warning rather than silently killing the day."""
+    raw = cfg.get("max_vol_ratio")
+    ceiling = _max_vol_ratio_default() if raw is None else clamp_max_vol_ratio(raw, 0.0)
+    if 0.0 < ceiling <= float(vol_mult):
+        logger.warning(
+            "open15: max_vol_ratio %.2f is not above vol_mult %.2f - ceiling OFF for today",
+            ceiling,
+            vol_mult,
+        )
+        return 0.0
+    return ceiling
+
+
 def _sim_skipped_enabled() -> bool:
     """Price triggers no order was sent for (unaffordable / cap), issue #555."""
     return os.getenv("OPEN15_SIM_SKIPPED_ENABLED", "true").lower() == "true"
@@ -1061,6 +1104,8 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "margin_effective": round(margin_eff, 2),
         "sizing_mode": sizing_mode,
         "vol_mult": vol_mult,
+        # issue #721 - volume-ratio ceiling at the trigger (0 = off)
+        "max_vol_ratio": resolve_max_vol_ratio(cfg, vol_mult),
         "leverage": lev,
         "notional": round(margin_eff * lev, 2),
         "cum_realized_pnl": round(cum_realized_pnl, 2),
@@ -2371,6 +2416,9 @@ class Open15BreakoutService:
             universe=len(self.universe),
             prev_closes=len(prev),
             vol_mult=self.day_config["vol_mult"],
+            # issue #721 - the ceiling the day ran with (0 = off), so a
+            # ``vol_ratio_cap`` skip is replayable against its own rule
+            max_vol_ratio=self.day_config["max_vol_ratio"],
             top_n=_top_n(),
             mode=_mode(),
             no_entry_after=self.day_config["no_entry_after"],
@@ -4690,6 +4738,11 @@ class Open15BreakoutService:
             symbol=action["symbol"],
             reason=reason,
             watch_source=action.get("watch_source") or "seed",
+            # issue #721 - the trigger ratio rides every skip, so a capped
+            # trigger and a cap/lock skip read on one axis
+            vol_ratio=round(
+                float(action["cum_vol_at_trigger"]) / max(float(action["baseline_vol"]), 1.0), 2
+            ),
             fill="sim" if sim_qty else None,
             **extra,
         )
@@ -4878,6 +4931,30 @@ class Open15BreakoutService:
         from database.open15_breakout_db import insert_trade
 
         cfg = self.day_config or {}
+        # VOLUME-RATIO CEILING (issue #721) - checked ahead of everything,
+        # the shadow side included: the shadow cohort is only comparable to
+        # the traded one if it was decided by the same rules, so a capped
+        # trigger on either side lands in the SIM bucket under one reason.
+        # The core still fires the trigger (identical legality, #581), and
+        # the service declines it here so the skipped cohort keeps being
+        # measured: sim-priced like a cap skip, no order, no slot consumed.
+        ceiling = float(cfg.get("max_vol_ratio") or 0.0)
+        if ceiling > 0.0:
+            ratio = float(action["cum_vol_at_trigger"]) / max(float(action["baseline_vol"]), 1.0)
+            if ratio >= ceiling:
+                logger.info(
+                    "open15: %s trigger at %.2fx avg volume >= ceiling %.2fx - skipped (sim)",
+                    action["symbol"],
+                    ratio,
+                    ceiling,
+                )
+                self._journal_skip(
+                    action,
+                    "vol_ratio_cap",
+                    instrument="option" if cfg.get("instrument") == "atm_option" else "stock",
+                    **self._sim_context(action, cfg),
+                )
+                return
         # SHADOW SIDE (issue #581) — checked FIRST, ahead of every path that can
         # reach ``order_placer``. This side is switched off by ``trade_side``;
         # it is watched only so the excluded cohort can be scored against the
