@@ -294,6 +294,16 @@ def config():
         stop_loss_inr = (
             None if stop_loss_inr in (None, "") else _clamp_rupees(stop_loss_inr, 1200.0)
         )
+        # issue #722 — per-side overrides; empty = same as the common value,
+        # a posted 0 = stop OFF for that side only
+        stop_loss_inr_long = body.get("stop_loss_inr_long")
+        stop_loss_inr_long = (
+            None if stop_loss_inr_long in (None, "") else _clamp_rupees(stop_loss_inr_long, 0.0)
+        )
+        stop_loss_inr_short = body.get("stop_loss_inr_short")
+        stop_loss_inr_short = (
+            None if stop_loss_inr_short in (None, "") else _clamp_rupees(stop_loss_inr_short, 0.0)
+        )
         if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
             # an inverted band would readmit a name the same day it was excluded,
             # which is the flapping the hysteresis exists to prevent
@@ -353,6 +363,8 @@ def config():
             trail_confirm_polls=trail_confirm,
             stop_loss_enabled=stop_loss,
             stop_loss_inr=stop_loss_inr,
+            stop_loss_inr_long=stop_loss_inr_long,
+            stop_loss_inr_short=stop_loss_inr_short,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -416,6 +428,9 @@ def config():
                 "trail_confirm_polls": _trail_confirm_polls_default(),
                 "stop_loss_enabled": _stop_loss_enabled_default(),
                 "stop_loss_inr": _stop_loss_inr_default(),
+                # issue #722 — no env seed: an unset side follows the common value
+                "stop_loss_inr_long": None,
+                "stop_loss_inr_short": None,
             },
             "override": get_config(),
             "effective_today": effective,
@@ -820,6 +835,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label style="margin-left:14px"><input id="c_sl" type="checkbox"> per-trade stop loss</label>
   <label class="muted" style="margin-left:10px">max loss/trade
    &#8377;<input id="c_slinr" type="number" min="0" max="100000" step="100" style="width:66px"></label>
+  <label class="muted" style="margin-left:8px" title="issue #722: per-side override of the stop. Blank = same as the common amount; 0 = stop OFF for longs only.">longs &#8377;<input id="c_slinr_l" type="number" min="0" max="100000" step="100" placeholder="= common" style="width:74px"></label>
+  <label class="muted" style="margin-left:8px" title="issue #722: per-side override of the stop. Blank = same as the common amount; 0 = stop OFF for shorts only.">shorts &#8377;<input id="c_slinr_s" type="number" min="0" max="100000" step="100" placeholder="= common" style="width:74px"></label>
   <span class="leg">issue #696. <b>Profit lock is DAY-wise:</b> once the day's cumulative NET P&amp;L
    (realized real fills + live MTM of open real rows &mdash; paper/sim/shadow never count) reaches the
    target, no new entries for the rest of the day (journaled
@@ -827,6 +844,9 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    The peak day P&amp;L is then tracked; retrace by the give-back from the peak and ALL open rows are
    flattened (give-back 0 = book at target immediately). <b>Stop loss is TRADE-wise:</b> an open
    trade whose OWN MTM falls to &minus;&#8377;amount is squared off alone; the day keeps trading.
+   <b>Per-side stops (issue #722):</b> the longs / shorts amounts override the common one for that
+   side (blank = common, 0 = off for that side) &mdash; replaying the first 41 live fills, the
+   same &#8377;2,500 stop RAISED short P&amp;L and LOWERED long P&amp;L (#711).
    <b>Issue #716:</b> open rows are marked at the <b>bid</b> (what they can be sold at), never the
    last print, and the day P&amp;L the rule reads is <b>net</b> of modelled exit charges; a floor
    breach must hold for <b>confirm</b> consecutive polls before the flatten (1 = act on a single poll).
@@ -976,6 +996,10 @@ async function loadCfg(){
   document.getElementById('c_pconfirm').value=o.trail_confirm_polls??d.trail_confirm_polls??2;
   document.getElementById('c_sl').checked=!!(o.stop_loss_enabled??d.stop_loss_enabled);
   document.getElementById('c_slinr').value=o.stop_loss_inr??d.stop_loss_inr??1200;
+  // per-side stop overrides (issue #722) — blank means "same as common", so a
+  // NULL row must render EMPTY, never as the common number (that would save it)
+  document.getElementById('c_slinr_l').value=(o.stop_loss_inr_long==null?'':o.stop_loss_inr_long);
+  document.getElementById('c_slinr_s').value=(o.stop_loss_inr_short==null?'':o.stop_loss_inr_short);
   if(window.armLivePoll)armLivePoll();  // later script block; guarded for ordering
   syncShadowUi();
   // which source each rolling field resolved from, so "saved" is visible
@@ -1058,7 +1082,10 @@ async function saveCfg(){
     trail_giveback_inr:+document.getElementById('c_ptrail').value,
     trail_confirm_polls:+document.getElementById('c_pconfirm').value,
     stop_loss_enabled:document.getElementById('c_sl').checked,
-    stop_loss_inr:+document.getElementById('c_slinr').value};
+    stop_loss_inr:+document.getElementById('c_slinr').value,
+    // empty string posts as '' (= leave NULL); a typed 0 posts as 0 (= side off)
+    stop_loss_inr_long:(v=>v===''?'':+v)(document.getElementById('c_slinr_l').value),
+    stop_loss_inr_short:(v=>v===''?'':+v)(document.getElementById('c_slinr_s').value)};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -2134,6 +2161,10 @@ function renderRiskCard(j){
   const risk=j&&j.risk;
   // before the arm the payload carries constructor defaults, not the day's —
   // only an armed (or finished) day has a truthful risk state to show
+  // issue #722 — per-side stops: print both when they differ, one number otherwise
+  const slLabel=r=>{const l=r.stop_loss_inr_long,s=r.stop_loss_inr_short;
+    if(l==null||s==null||l===s)return rupAbs(l??r.stop_loss_inr);
+    return 'L '+(l>0?rupAbs(l):'off')+' / S '+(s>0?rupAbs(s):'off');};
   if(!risk||(!risk.profit_lock_enabled&&!risk.stop_loss_enabled)||
      (risk.day_status!=='armed'&&risk.day_status!=='done')){
     box.style.display='none';box.innerHTML='';return;}
@@ -2157,7 +2188,7 @@ function renderRiskCard(j){
       ?('day target '+rupAbs(risk.profit_target_inr)+' \\u00B7 give-back '+
         rupAbs(risk.trail_giveback_inr))
       :'profit lock off')+
-    ' \\u00B7 '+(risk.stop_loss_enabled?('trade SL '+rupAbs(risk.stop_loss_inr)):'stop loss off')+
+    ' \\u00B7 '+(risk.stop_loss_enabled?('trade SL '+slLabel(risk)):'stop loss off')+
     (risk.profit_lock_enabled&&risk.trail_confirm_polls?(' &middot; confirm '+risk.trail_confirm_polls+' poll'+(risk.trail_confirm_polls===1?'':'s')):'')+
     ' &middot; marks: '+esc(risk.mark_basis||(j.mark_basis||'&mdash;'))+
     ' &middot; poll '+esc(String(j.poll_interval_s||window.__livePollS||'?'))+'s'+

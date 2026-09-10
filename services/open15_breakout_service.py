@@ -1181,6 +1181,17 @@ def _resolve_risk_config(cfg: dict) -> dict:
         if sl_inr_cfg is None
         else clamp_risk_rupees(sl_inr_cfg, _stop_loss_inr_default())
     )
+
+    # issue #722 — per-side overrides. ``None`` (NULL row / absent) means
+    # "same as the common value"; a stored 0 means "OFF for this side". The
+    # common value stays the fallback so an install that never set a side
+    # keeps the exact pre-#722 behaviour.
+    def _side(key: str) -> float:
+        raw = cfg.get(key)
+        return sl_inr if raw is None else clamp_risk_rupees(raw, sl_inr)
+
+    sl_long = _side("stop_loss_inr_long")
+    sl_short = _side("stop_loss_inr_short")
     confirm_cfg = cfg.get("trail_confirm_polls")
     confirm = (
         _trail_confirm_polls_default()
@@ -1192,9 +1203,29 @@ def _resolve_risk_config(cfg: dict) -> dict:
         "profit_target_inr": target,
         "trail_giveback_inr": giveback,
         "trail_confirm_polls": confirm,
-        "stop_loss_enabled": sl_on and sl_inr > 0,
+        # enabled if ANY side has a positive threshold — a common 0 with a
+        # long-only 4000 is a legal "longs only" stop
+        "stop_loss_enabled": sl_on and max(sl_inr, sl_long, sl_short) > 0,
         "stop_loss_inr": sl_inr,
+        "stop_loss_inr_long": sl_long,
+        "stop_loss_inr_short": sl_short,
     }
+
+
+def stop_loss_for_side(cfg: dict, side) -> float:
+    """The per-trade stop threshold for a row of ``side`` (issue #722).
+
+    ``side`` is the journal's ``'L'`` / ``'S'`` (``'long'`` / ``'short'`` and
+    ``'BUY'`` / ``'SELL'`` are accepted for callers that carry the word). Reads
+    the resolved ``day_config`` keys and falls back to the common
+    ``stop_loss_inr`` when a side key is missing (an older ``day_config``
+    shape), so the monitor can never meet an armed rule with no number.
+    """
+    s = str(side or "").upper()
+    common = float((cfg or {}).get("stop_loss_inr") or 0.0)
+    key = "stop_loss_inr_short" if s in ("S", "SHORT", "SELL") else "stop_loss_inr_long"
+    raw = (cfg or {}).get(key)
+    return common if raw is None else float(raw or 0.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -2433,6 +2464,9 @@ class Open15BreakoutService:
             trail_confirm_polls=self.day_config["trail_confirm_polls"],
             stop_loss_enabled=self.day_config["stop_loss_enabled"],
             stop_loss_inr=self.day_config["stop_loss_inr"],
+            # issue #722 — per-side thresholds the day ran with
+            stop_loss_inr_long=self.day_config["stop_loss_inr_long"],
+            stop_loss_inr_short=self.day_config["stop_loss_inr_short"],
         )
         # ATM lot-cost coverage ladder (issue #591) — what capital/slot covers
         # how much of the universe, priced from the latest EOD option-liquidity
@@ -3347,16 +3381,21 @@ class Open15BreakoutService:
                     self._profit_trail_exits("profit_trail")
             return
         if sl_on and open_trades:
-            sl_inr = float(cfg.get("stop_loss_inr") or 0.0)
             fired = False
             for t in open_trades:
                 mtm = t.get("mtm")
                 symbol = t.get("symbol")
-                if mtm is None or sl_inr <= 0 or mtm > -sl_inr:
+                if mtm is None:
                     continue
                 with self._lock:
                     pos = self.positions.get(symbol)
                 if not pos or pos.get("status") != "open":
+                    continue
+                # issue #722 — the threshold is the SIDE's own (0 = off for
+                # that side); the position's journaled side is the authority,
+                # the live payload's a fallback for an older positions shape
+                sl_inr = stop_loss_for_side(cfg, pos.get("side") or t.get("side"))
+                if sl_inr <= 0 or mtm > -sl_inr:
                     continue
                 logger.warning(
                     "open15: per-trade stop loss hit for %s (MTM %.2f <= -%.2f)",
@@ -3815,6 +3854,8 @@ class Open15BreakoutService:
             "trail_giveback_inr": cfg.get("trail_giveback_inr"),
             "stop_loss_enabled": bool(cfg.get("stop_loss_enabled")),
             "stop_loss_inr": cfg.get("stop_loss_inr"),
+            "stop_loss_inr_long": cfg.get("stop_loss_inr_long"),
+            "stop_loss_inr_short": cfg.get("stop_loss_inr_short"),
             "locked": bool(r.get("locked")),
             "locked_at": r.get("locked_at"),
             "peak": r.get("peak"),
