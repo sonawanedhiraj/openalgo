@@ -333,6 +333,10 @@ class Open15Config(Base):
     # number for both sides is the wrong shape.
     stop_loss_inr_long = Column(Float, nullable=True)
     stop_loss_inr_short = Column(Float, nullable=True)
+    # issue #721 — volume-ratio CEILING at the trigger (x avg minute volume).
+    # NULL resolves to the env seed (0 = off); a trigger at/above it is
+    # journaled as a sim-priced ``vol_ratio_cap`` skip, never ordered.
+    max_vol_ratio = Column(Float, nullable=True)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -450,6 +454,9 @@ def _ensure_columns():
             # as it did before
             "stop_loss_inr_long": "FLOAT",
             "stop_loss_inr_short": "FLOAT",
+            # issue #721 — NULL resolves to the env seed (0 = off), so an
+            # existing install arms exactly as it did before
+            "max_vol_ratio": "FLOAT",
         },
     }
     try:
@@ -547,6 +554,7 @@ def get_config() -> dict | None:
             "stop_loss_inr": row.stop_loss_inr,
             "stop_loss_inr_long": row.stop_loss_inr_long,
             "stop_loss_inr_short": row.stop_loss_inr_short,
+            "max_vol_ratio": row.max_vol_ratio,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -595,6 +603,7 @@ def save_config(
     stop_loss_inr: float | None = None,
     stop_loss_inr_long: float | None = None,
     stop_loss_inr_short: float | None = None,
+    max_vol_ratio: float | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -656,6 +665,7 @@ def save_config(
         row.stop_loss_inr = stop_loss_inr
         row.stop_loss_inr_long = stop_loss_inr_long
         row.stop_loss_inr_short = stop_loss_inr_short
+        row.max_vol_ratio = max_vol_ratio
         row.updated_by = updated_by
         db_session.commit()
         return True

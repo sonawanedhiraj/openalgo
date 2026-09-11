@@ -1798,6 +1798,27 @@ exit against the mauve `SL` one. **The scorecard stays stop-only**
 (`stop_loss_rows`): its pre-registered rule judges the stop, and a trail exit
 is a different question. Tests: `test/test_open15_trail_counterfactual.py`.
 
+**Volume-ratio CEILING at the trigger (issue #721, `open15_config.max_vol_ratio`,
+env seed `OPEN15_MAX_VOL_RATIO`, default 0 = off).** The gate fires the instant
+cum-volume-in-minute ≥ `vol_mult`× the average while price is beyond the level,
+so the ratio AT the trigger says which condition came last: ~1.5× means price
+was already beyond the level and volume caught up (steady build); far above
+it means the volume arrived while price sat at the level (absorption) or in
+one climactic print. On the first 42 real fills of the both-sides deployment
+(2026-08-18..09-10) triggers at ≥1.7× were 2 winners of 8 (−₹26k) against 17
+of 34 below (+₹71k), on BOTH sides, and the untraded shadow/sim cohort agreed.
+With a ceiling set, a trigger at/above it is declined in `_enter` — ahead of
+the shadow check, so BOTH cohorts are decided by one rule — and journaled
+`entry_skipped · vol_ratio_cap`, **sim-priced at 1 lot** (the skipped cohort
+keeps being measured), no order, **no `max_trades` slot consumed**. The core
+still fires the trigger (identical legality, the #581 rule); a ceiling at or
+below `vol_mult` resolves OFF with a warning rather than refusing every
+trigger. `vol_ratio` rides every `entry_skipped` event, `armed` records the
+ceiling, the effective-config line prints `(ceiling 1.7x)`. **Pre-registered
+decision** (LEARNINGS 2026-09-10): at ~80 real fills, keep the ceiling only
+if the `vol_ratio_cap` sim cohort is still net negative on the NEW fills
+alone. Tests: `test/test_open15_vol_ratio_cap.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.

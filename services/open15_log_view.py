@@ -87,6 +87,8 @@ _ARMED_PASSTHROUGH = (
     # issue #722
     "stop_loss_inr_long",
     "stop_loss_inr_short",
+    # issue #721
+    "max_vol_ratio",
 )
 
 
