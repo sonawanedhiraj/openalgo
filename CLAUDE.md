@@ -1726,8 +1726,23 @@ reason=stop_loss`; the day keeps trading). Rules, each load-bearing:
   restart after 09:15:30 takes the existing `skipped_late_boot` path (this
   process does not manage the day), so day-scoped in-process risk state
   satisfies the #624 never-re-decide rule by construction.
+**The stop is per SIDE (issue #722):** `open15_config.stop_loss_inr_long` /
+`stop_loss_inr_short` override the common `stop_loss_inr` for that side
+(NULL = same as common, so an install that never set a side keeps the exact
+pre-#722 behaviour; 0 = stop OFF for that side only; `stop_loss_enabled` is
+true when ANY side has a positive threshold). Replaying the first 41 live
+fills (#711), the same ₹2,500 stop RAISED short P&L (short losers run) and
+LOWERED long P&L (long losers do not run, so the stop clips winners on their
+dip — Aug 28 TCS +6.6k→−3.7k, WIPRO +1.7k→−4.7k); one number for both sides
+is the wrong shape. The monitor reads `stop_loss_for_side(cfg, pos['side'])`
+per open row; `armed`, `risk_status()` (Day Risk card prints
+`trade SL L ₹4,000 / S ₹2,500` when they differ), the config API (blank →
+NULL, 0 → 0) and two UI inputs beside the common stop carry both. The stop
+counterfactual/scorecard are unchanged (they read `reason=stop_loss` rows).
+Tests: `test/test_open15_per_side_stop.py`.
 Config: `open15_config.{profit_lock_enabled, profit_target_inr,
-trail_giveback_inr, stop_loss_enabled, stop_loss_inr}` (NULL → env seeds
+trail_giveback_inr, stop_loss_enabled, stop_loss_inr, stop_loss_inr_long,
+stop_loss_inr_short}` (NULL → env seeds
 `OPEN15_PROFIT_LOCK` / `OPEN15_PROFIT_TARGET_INR` /
 `OPEN15_TRAIL_GIVEBACK_INR` / `OPEN15_STOP_LOSS` / `OPEN15_STOP_LOSS_INR`,
 first-boot only; a 0 threshold resolves the rule OFF). The `armed` event

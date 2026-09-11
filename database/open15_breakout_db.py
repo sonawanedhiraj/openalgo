@@ -327,6 +327,12 @@ class Open15Config(Base):
     trail_confirm_polls = Column(Integer, nullable=True)
     stop_loss_enabled = Column(Integer, nullable=True)  # 0/1
     stop_loss_inr = Column(Float, nullable=True)  # max loss per open trade
+    # issue #722 — per-SIDE stop overrides. NULL = same as ``stop_loss_inr``;
+    # 0 = stop OFF for that side only. The same Rs2,500 stop raised short
+    # P&L and lowered long P&L on the first 41 live fills (#711), so one
+    # number for both sides is the wrong shape.
+    stop_loss_inr_long = Column(Float, nullable=True)
+    stop_loss_inr_short = Column(Float, nullable=True)
     # issue #721 — volume-ratio CEILING at the trigger (x avg minute volume).
     # NULL resolves to the env seed (0 = off); a trigger at/above it is
     # journaled as a sim-priced ``vol_ratio_cap`` skip, never ordered.
@@ -443,6 +449,11 @@ def _ensure_columns():
             "trail_confirm_polls": "INTEGER",
             "stop_loss_enabled": "INTEGER",
             "stop_loss_inr": "FLOAT",
+            # issue #722 — both NULL on an existing install, which resolves
+            # to the common ``stop_loss_inr``, so the next arm behaves exactly
+            # as it did before
+            "stop_loss_inr_long": "FLOAT",
+            "stop_loss_inr_short": "FLOAT",
             # issue #721 — NULL resolves to the env seed (0 = off), so an
             # existing install arms exactly as it did before
             "max_vol_ratio": "FLOAT",
@@ -541,6 +552,8 @@ def get_config() -> dict | None:
                 None if row.stop_loss_enabled is None else bool(row.stop_loss_enabled)
             ),
             "stop_loss_inr": row.stop_loss_inr,
+            "stop_loss_inr_long": row.stop_loss_inr_long,
+            "stop_loss_inr_short": row.stop_loss_inr_short,
             "max_vol_ratio": row.max_vol_ratio,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
@@ -588,6 +601,8 @@ def save_config(
     trail_confirm_polls: int | None = None,
     stop_loss_enabled: bool | None = None,
     stop_loss_inr: float | None = None,
+    stop_loss_inr_long: float | None = None,
+    stop_loss_inr_short: float | None = None,
     max_vol_ratio: float | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
@@ -648,6 +663,8 @@ def save_config(
         row.trail_confirm_polls = None if trail_confirm_polls is None else int(trail_confirm_polls)
         row.stop_loss_enabled = None if stop_loss_enabled is None else int(bool(stop_loss_enabled))
         row.stop_loss_inr = stop_loss_inr
+        row.stop_loss_inr_long = stop_loss_inr_long
+        row.stop_loss_inr_short = stop_loss_inr_short
         row.max_vol_ratio = max_vol_ratio
         row.updated_by = updated_by
         db_session.commit()
