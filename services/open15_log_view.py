@@ -48,6 +48,11 @@ CSV_COLUMNS = [
     # left after earlier fills, so the row is a different SIZE and per-trade
     # comparisons across days have to be able to exclude it.
     "sizing_basis",
+    # issue #726 — R63 trade rating: the FINAL grade frozen at the trigger and
+    # the PROVISIONAL grade the symbol was first watched under. Appended so
+    # every existing column keeps its index.
+    "rating",
+    "rating_provisional",
 ]
 
 
@@ -356,6 +361,9 @@ def selection_outcomes(
                     watch_source="seed",
                     gap_pct=gaps.get(sym),
                     entered=False,
+                    rating_provisional=((ev.get("rating_provisional") or {}).get(sym) or {}).get(
+                        "grade"
+                    ),
                 )
         elif kind == "watchlist_add":
             # a rolling add is a watched symbol too (issue #529) — it gets its
@@ -382,6 +390,10 @@ def selection_outcomes(
                 side=ev.get("side"),
                 watch_source="rolling",
                 gap_pct=ev.get("pct_change"),
+                rating_provisional=((ev.get("rating_provisional") or {}).get(sym) or {}).get(
+                    "grade"
+                )
+                or rows[sym].get("rating_provisional"),
             )
         elif kind == "entry":
             sym = ev.get("symbol")
@@ -402,6 +414,7 @@ def selection_outcomes(
                 # issue #643 — slot vs residual sizing. Pre-#643 events carry
                 # neither, which reads as the full slot they in fact were.
                 sizing_basis=ev.get("sizing_basis"),
+                rating=ev.get("rating") or rows[sym].get("rating"),
             )
         elif kind == "watch_stats":
             # every selected symbol, entered ones included (issue #524). Only
@@ -443,6 +456,7 @@ def selection_outcomes(
                 qty=ev.get("qty"),
                 trigger_price=ev.get("entry_price"),
                 skip_reason="entry_rejected_unfillable" if unfillable else "entry_rejected",
+                rating=ev.get("rating") or rows[sym].get("rating"),
                 error_message=ev.get("error"),
                 instrument=ev.get("instrument") or "stock",
                 opt_symbol=ev.get("contract"),
@@ -460,6 +474,7 @@ def selection_outcomes(
                 trigger_price=ev.get("trigger_price"),
                 skip_reason="entry_error",
                 error_message=ev.get("error"),
+                rating=ev.get("rating") or rows[sym].get("rating"),
             )
         elif kind == "entry_shadow":
             # the switched-off side (issue #581): a full measurement row, but no
@@ -474,6 +489,7 @@ def selection_outcomes(
                 qty=ev.get("qty"),
                 trigger_price=ev.get("trigger_price"),
                 skip_reason=ev.get("reason"),
+                rating=ev.get("rating") or rows[sym].get("rating"),
                 vol_ratio_at_trigger=ev.get("vol_ratio"),
                 instrument=ev.get("instrument") or "stock",
                 opt_symbol=ev.get("contract"),
@@ -499,6 +515,8 @@ def selection_outcomes(
             sym = ev.get("symbol")
             if sym in rows:
                 rows[sym]["skip_reason"] = ev.get("reason")
+                if ev.get("rating"):
+                    rows[sym]["rating"] = ev.get("rating")
                 if ev.get("fill") == "sim":
                     rows[sym]["fill"] = "sim"
                 if ev.get("opt_symbol"):

@@ -33,6 +33,7 @@ import threading
 
 from flask import Blueprint, jsonify, request
 
+from services.open15_rating import normalize_trade_grades as _normalize_grades
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -295,6 +296,12 @@ def config():
 
         max_vol_ratio = body.get("max_vol_ratio")
         max_vol_ratio = None if max_vol_ratio in (None, "") else _clamp_max_vr(max_vol_ratio, 0.0)
+        # issue #726 - which R63 grades place orders. '' = leave NULL (env seed);
+        # anything else is normalised to a subset of ABC (clamp-don't-reject)
+        trade_grades_raw = body.get("trade_grades")
+        trade_grades = (
+            None if trade_grades_raw in (None, "") else _normalize_grades(trade_grades_raw)
+        )
         stop_loss = _opt_bool("stop_loss_enabled")
         stop_loss_inr = body.get("stop_loss_inr")
         stop_loss_inr = (
@@ -372,6 +379,7 @@ def config():
             stop_loss_inr_long=stop_loss_inr_long,
             stop_loss_inr_short=stop_loss_inr_short,
             max_vol_ratio=max_vol_ratio,
+            trade_grades=trade_grades,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -440,6 +448,8 @@ def config():
                 "stop_loss_inr_short": None,
                 # issue #721 - volume-ratio ceiling seed (0 = off)
                 "max_vol_ratio": _max_vol_ratio_default(),
+                # issue #726 - grade filter seed (ABC = trade everything)
+                "trade_grades": _normalize_grades(_os.getenv("OPEN15_TRADE_GRADES")),
             },
             "override": get_config(),
             "effective_today": effective,
@@ -672,6 +682,18 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .b-shadow{background:#153037;color:#94e2d5}
  .b-residual{background:#3a2a16;color:#fab387}
  .b-err{background:#3a1b1b;color:#f38ba8}
+ /* issue #726 — R63 trade-rating chip. Outlined = provisional (what a trigger
+    NOW would get), filled = final (frozen at the trigger). One colour per
+    grade; `will` says whether that grade places an order or is paper. */
+ .gr{display:inline-block;min-width:20px;text-align:center;padding:0 3px;border-radius:3px;
+     font-weight:600;font-size:11px;border:1.5px solid;line-height:16px}
+ .gr.A{color:#94e2d5;border-color:#94e2d5}.gr.B{color:#f9e2af;border-color:#f9e2af}
+ .gr.C{color:#f38ba8;border-color:#f38ba8}
+ .gr.final.A{background:#94e2d5;color:#0b1a16}.gr.final.B{background:#f9e2af;color:#1d1606}
+ .gr.final.C{background:#f38ba8;color:#2a0e12}
+ .will{font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;padding:0 5px;
+       border-radius:3px;border:1px solid;margin-left:3px}
+ .will.real{color:#89b4fa;border-color:#3b5a86}.will.paper{color:#cba6f7;border-color:#5a4a80}
  .b-unfill{background:#3a2a1b;color:#fab387}
  .ev-entry_shadow,.ev-exit_shadow{color:#94e2d5}
  /* issue #583 — amber like the other "held, not traded" events, and distinct
@@ -782,6 +804,13 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label class="muted" style="margin-left:14px">shadow rows/day
    <input id="c_shadowmax" type="number" min="0" max="10" step="1" style="width:44px"></label>
   <span id="c_shadowhint" class="muted" style="margin-left:10px"></span>
+ </div>
+ <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
+  <span class="muted" title="issue #726 / R63: A = trigger by 09:22, volume ratio below 1.55x, universe median above -0.30%; C = trigger after 09:24 or universe median at/below -0.30%; B = the rest. Grades not ticked are paper-traded at full slot size (shadow rows, reason rating_excluded) so every grade keeps being measured.">trade rating (R63) — grades that place orders</span>
+  <label class="muted" style="margin-left:14px"><input id="c_grA" type="checkbox"> <span class="gr final A">A</span></label>
+  <label class="muted" style="margin-left:8px"><input id="c_grB" type="checkbox"> <span class="gr final B">B</span></label>
+  <label class="muted" style="margin-left:8px"><input id="c_grC" type="checkbox"> <span class="gr final C">C</span></label>
+  <span class="muted" style="margin-left:10px">unticked grades are <span style="color:#cba6f7">paper-traded</span> (shadow, full slot, no order) · live vs sandbox is the /strategies toggle · applies at the next 09:10 arm</span>
  </div>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
   <span class="muted">rolling watch-list (issue #529 — measurement, off by default)</span>
@@ -907,7 +936,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    <span class="muted">&mdash; click a row for fills, liquidity and the decision detail</span></div>
   <div id="rollCfg" class="muted"></div>
   <table id="sel"><thead><tr><th style="width:16px"></th><th>symbol</th><th>side</th>
-   <th>source</th><th>gap %</th>
+   <th>source</th><th>gap %</th><th title="R63 trade rating (issue #726): outlined = provisional, filled = final at the trigger">grade</th>
    <th id="selVolHdr">max vol&times;</th><th>entry</th><th>exit</th><th>qty</th>
    <th>net P&amp;L</th><th>outcome</th></tr></thead><tbody></tbody></table>
   <div id="liqNote" class="muted" style="margin-top:6px"></div>
@@ -970,6 +999,9 @@ async function loadCfg(){
   document.getElementById('c_shadow').checked=
     !!(o.shadow_excluded_side??d.shadow_excluded_side);
   document.getElementById('c_shadowmax').value=o.shadow_max_trades??d.shadow_max_trades??3;
+  // trade rating (issue #726): a stored subset wins over the env seed
+  {const tg=String(o.trade_grades||d.trade_grades||'ABC').toUpperCase();
+   for(const g of ['A','B','C'])document.getElementById('c_gr'+g).checked=tg.includes(g);}
   // option-liquidity gates (issue #583) — `??` again, so a stored false/0 wins
   document.getElementById('c_liqgate').checked=
     !!(o.option_liquidity_gate_enabled??d.option_liquidity_gate_enabled);
@@ -1055,6 +1087,7 @@ async function loadCfg(){
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
       lev+' | vol_mult '+e.vol_mult+(e.max_vol_ratio?(' (ceiling '+e.max_vol_ratio+'x)'):'')+
+      ' | grades traded '+(e.trade_grades||'ABC')+(String(e.trade_grades||'ABC')!=='ABC'?' (rest paper)':'')+
       ' | entries 09:16–'+nea+' | exit '+ext+
       ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'')+
       ' | rolling watch-list '+(e.rolling_watchlist_enabled
@@ -1102,7 +1135,8 @@ async function saveCfg(){
     // empty string posts as '' (= leave NULL); a typed 0 posts as 0 (= side off)
     stop_loss_inr_long:(v=>v===''?'':+v)(document.getElementById('c_slinr_l').value),
     stop_loss_inr_short:(v=>v===''?'':+v)(document.getElementById('c_slinr_s').value),
-    max_vol_ratio:+document.getElementById('c_maxvr').value};
+    max_vol_ratio:+document.getElementById('c_maxvr').value,
+    trade_grades:['A','B','C'].filter(g=>document.getElementById('c_gr'+g).checked).join('')};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -1148,6 +1182,9 @@ let expanded=new Set();
 // only published to the decision log at the exit job, so mid-window it comes
 // from /api/status instead. Cleared whenever a past day is selected.
 let liveWatch={}, liveNeeded=null, liveFeed=null;
+// issue #726 — live rating block from /api/status (universe median, phase,
+// per-symbol provisional grades). Cleared whenever a past day is selected.
+let liveRating=null;
 // which coverage-ladder row's drill-down is open (issue #591) — kept across
 // the 5s live refresh so it does not collapse under the operator, cleared
 // when a different day is picked (same contract as `expanded` above). Keyed
@@ -1232,8 +1269,8 @@ async function loadLiveWatch(){
   try{
     const r=await fetch('/open15_vol_breakout/api/status'); const s=await r.json();
     liveWatch=s.watch_stats||{}; liveNeeded=s.vol_needed??null;
-    liveFeed=s.feed_health||null;
-  }catch(e){liveWatch={}; liveNeeded=null; liveFeed=null;}
+    liveFeed=s.feed_health||null; liveRating=s.rating||null;
+  }catch(e){liveWatch={}; liveNeeded=null; liveFeed=null; liveRating=null;}
 }
 async function selectDay(date){
   if(date!==curDate){expanded.clear();ladderOpen.atm=null;} // a different day's rows are different rows
@@ -1242,7 +1279,7 @@ async function selectDay(date){
   const r=await fetch('/open15_vol_breakout/api/decision_log?date='+date); const j=await r.json();
   curEvents=j.events||[];
   curJournal=j.journal||[];   // authoritative prices/P&L (issue #557)
-  if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null; liveFeed=null;}
+  if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null; liveFeed=null; liveRating=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderRejected(); renderLogLostBanner(); renderChips(); renderCapital(); renderAtmLadder();
   renderRolling(); renderSel(); renderTimeline(); loadPnlCurve(); loadScorecard();
@@ -1351,6 +1388,18 @@ function renderChips(){
   if(shadow||dig.shadow_pnl!=null)
     chips.push(['shadow P&amp;L <span class="net">net</span>',
       dig.shadow_pnl==null?'—':rupee(dig.shadow_pnl)]);
+  // issue #726 — the grade filter the day ran with, the live tape while the
+  // window is open, and the per-grade split once the summary has run
+  if(armed.trade_grades)chips.push(['grades traded',String(armed.trade_grades)]);
+  if(liveRating&&liveRating.univ_median_pct!=null)
+    chips.push(['tape \u00b7 univ median',(liveRating.univ_median_pct>=0?'+':'')+
+      liveRating.univ_median_pct+'% \u00b7 '+(liveRating.phase||'')]);
+  for(const g of ['A','B','C']){
+    const bg=(summ.by_grade||{})[g]; if(!bg)continue;
+    const part=(b,l)=>b&&b.n?(l+' '+b.n+' ('+b.wins+'W) '+rupee(b.net)):'';
+    const txt=[part(bg.real,'real'),part(bg.paper,'paper')].filter(Boolean).join(' \u00b7 ');
+    if(txt)chips.push(['grade '+g,txt]);
+  }
   // feed-health chip (issue #677): live status for today, else the day's last
   // feed_health event. Days with neither (all history pre-#677, healthy days)
   // render no chip — absence means "nothing observed", never "ok".
@@ -1389,6 +1438,30 @@ function renderChips(){
       '><span class="k">'+k+'</span><span class="v'+
       (val!=null?(val>=0?' pos':' neg'):'')+'">'+esc(v)+'</span></div>';
   }).join('')+feedHtml;
+}
+// issue #726 — the grade cell. FINAL (row triggered): filled chip + what the
+// row actually was (real order / paper). PROVISIONAL (still watching): the
+// live grade from /api/status when the window is open, else the grade the
+// symbol was selected under; `will` says what the day's trade_grades would
+// do with it. Absent = the day predates the rating.
+function tradeGrades(){
+  const a=curEvents.find(e=>e.event==='armed')||{};
+  return String(a.trade_grades||(liveRating&&liveRating.trade_grades)||'ABC').toUpperCase();
+}
+function gradeCell(r){
+  if(r.rating){
+    const will=r.fill==='real'?'real':((r.fill==='shadow'&&r.ratingExcluded)?'paper':'');
+    return '<span class="gr final '+esc(r.rating)+'" title="final — frozen at the trigger">'+
+      esc(r.rating)+'</span>'+(will?('<span class="will '+will+'">'+will+'</span>'):'');
+  }
+  const lr=r.ratingLive; const g=lr?lr.grade:r.ratingProv;
+  if(!g)return '<span class="muted">&mdash;</span>';
+  const will=tradeGrades().includes(g)?'real':'paper';
+  const fails=(lr&&lr.fails&&lr.fails.length)?lr.fails.join(', '):'';
+  return '<span class="gr '+esc(g)+'" title="provisional — if it triggered now'+
+    (lr?' (live)':' (at selection)')+(fails?(' · fails: '+esc(fails)):'')+'">'+esc(g)+'</span>'+
+    '<span class="will '+will+'">'+will+'</span>'+
+    (lr&&lr.vol_ratio_now!=null?('<span class="muted" style="font-size:10px"> '+esc(lr.vol_ratio_now)+'&times;</span>'):'');
 }
 function srcBadge(src){
   return '<span class="badge '+(src==='rolling'?'b-roll':'b-seed')+'">'+esc(src||'seed')+'</span>';
@@ -1593,7 +1666,8 @@ function renderSel(){
       for(const[s,side]of Object.entries(e.selected||{})){
         // never downgrade a row a `watchlist_add` already proved rolling (#545)
         if(rows[s]&&rows[s].src==='rolling')continue;
-        rows[s]={side,src:'seed',gap:(e.gaps_pct||{})[s],out:'no trigger'};
+        rows[s]={side,src:'seed',gap:(e.gaps_pct||{})[s],out:'no trigger',
+          ratingProv:((e.rating_provisional||{})[s]||{}).grade};
       }
     }else if(e.event==='watchlist_add'){
       // rolling adds are watched symbols too (issue #529) — they belong in the
@@ -1609,6 +1683,7 @@ function renderSel(){
       // the add's own fields (issue #559) — these are what the separate rolling
       // table used to carry, and they belong on the row they describe
       wr.addAt=e.at||e.ts; wr.addRank=e.rank; wr.addSize=e.watch_size;
+      wr.ratingProv=((e.rating_provisional||{})[e.symbol]||{}).grade??wr.ratingProv;
     }else if(e.event==='watch_stats'){
       // every selected symbol, entered ones included (issue #524)
       for(const[s,st]of Object.entries(e.stats||{})){
@@ -1629,6 +1704,7 @@ function renderSel(){
     }else if(!rows[e.symbol]){continue;
     }else if(e.event==='entry'){
       const r=rows[e.symbol];
+      r.rating=e.rating??r.rating;
       r.fill='real'; r.qty=e.qty; r.stockEntry=e.trigger_price;
       r.level=e.level??r.level; r.at=e.at; r.volRatio=e.vol_ratio;
       r.orderId=e.order_id;
@@ -1646,6 +1722,7 @@ function renderSel(){
       // issue #548 — the order never reached the market; what follows is a
       // sandbox-equivalent simulation and is badged as such
       const r=rows[e.symbol];
+      r.rating=e.rating??r.rating;
       r.qty=e.qty;
       if(e.instrument==='option'){r.instr='option'; r.contract=e.contract; r.optEntry=e.entry_price;
         r.entryBid=e.bid; r.entryAsk=e.ask; r.tick=e.tick_size;}
@@ -1670,6 +1747,7 @@ function renderSel(){
       // kept its 'no trigger' default, which is what the page showed for GVT&D
       // on 2026-08-19 beside a GREEN (gate-cleared) volume cell.
       const r=rows[e.symbol];
+      r.rating=e.rating??r.rating;
       r.entryError=true; r.stockEntry=r.stockEntry??e.trigger_price;
       r.out='<span class="badge b-err">error</span> '+
         '<span class="neg" title="'+esc(e.error||'')+'">entry failed '+esc(e.at||'')+
@@ -1679,6 +1757,7 @@ function renderSel(){
       // real and legal; no order was placed for it, so it is badged and its
       // P&L never joins the real bucket.
       const r=rows[e.symbol];
+      r.rating=e.rating??r.rating; r.ratingExcluded=!!e.rating_excluded;
       r.fill='shadow'; r.qty=e.qty; r.level=e.level??r.level; r.at=e.at;
       r.volRatio=e.vol_ratio; r.skipReason=e.reason;
       // BOTH legs, always (issue #555): in option mode the P&L is on the
@@ -1691,6 +1770,7 @@ function renderSel(){
         ' &middot; no order placed ('+esc(e.reason||'side_excluded')+')</span>';
     }else if(e.event==='entry_skipped'){
       const r=rows[e.symbol];
+      r.rating=e.rating??r.rating;
       r.skipReason=e.reason;
       if(e.fill==='sim')r.fill='sim';
       if(e.opt_symbol){r.instr='option'; r.contract=e.opt_symbol; r.optEntry=e.opt_entry_premium;
@@ -1767,6 +1847,12 @@ function renderSel(){
       liveSyms.add(s);
     }
   }
+  // issue #726 — mid-window the provisional grade comes from /api/status and
+  // moves with the clock and the tape; a FINAL grade (the row triggered)
+  // always wins over it
+  for(const[s,lr]of Object.entries((liveRating&&liveRating.provisional)||{})){
+    if(rows[s]&&!rows[s].rating)rows[s].ratingLive=lr;
+  }
   const needed=volNeeded();
   // "beyond" is load-bearing in the label (issue #525): the number shown is the
   // peak anywhere, while green means the gate's while-beyond peak cleared it
@@ -1783,12 +1869,13 @@ function renderSel(){
       '</td><td>'+srcBadge(r.src)+
       (r.addAt?('<span class="leg">#'+esc(r.addRank)+' @ '+esc(r.addAt)+'</span>'):'')+
       '</td><td>'+(r.gap??'')+
+      '</td><td>'+gradeCell(r)+
       '</td><td>'+fmtVol(r.vol,r.volBeyond,needed,liveSyms.has(s))+
       '</td><td>'+legCell(r,'entry')+'</td><td>'+legCell(r,'exit')+
       '</td><td>'+qtyCell(r)+'</td><td>'+pnlCell(r)+'</td><td>'+r.out+'</td>';
     const det=document.createElement('tr');
     det.className='detail';
-    det.innerHTML='<td></td><td colspan="10">'+detailFor(s,r,needed)+'</td>';
+    det.innerHTML='<td></td><td colspan="11">'+detailFor(s,r,needed)+'</td>';
     // Expansion survives the 5s auto-refresh (issue #559). The live day
     // re-renders this whole table every tick, so without this an operator
     // reading a row's fills during the window has it snap shut under them.
@@ -1802,7 +1889,7 @@ function renderSel(){
     tb.appendChild(tr); tb.appendChild(det);
   }
   if(!Object.keys(rows).length)
-    tb.innerHTML='<tr><td colspan="11" class="muted">no selection this day</td></tr>';
+    tb.innerHTML='<tr><td colspan="12" class="muted">no selection this day</td></tr>';
   renderLiqNote(rows);
 }
 function toggleDetail(tr){

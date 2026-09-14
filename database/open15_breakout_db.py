@@ -233,6 +233,17 @@ class Open15Trade(Base):
     cf_mfe = Column(Float, nullable=True)
     cf_mfe_minute = Column(String(5), nullable=True)
     cf_source = Column(String(8), nullable=True)
+    # issue #726 — the R63 A/B/C trade rating, frozen at the trigger. Every
+    # cohort (real / paper / sim / shadow / none) is graded so the grade filter
+    # can be judged on the rows it did NOT trade. The two ``rating_*`` inputs
+    # are recorded raw so the thresholds can be re-cut at the pre-registered
+    # ~40-new-fill review without re-reading tick logs.
+    rating = Column(String(1), nullable=True)  # A | B | C
+    rating_univ_median_pct = Column(Float, nullable=True)  # tape at the trigger
+    rating_vol_ratio = Column(Float, nullable=True)  # volume ratio at the trigger
+    # what the chip showed when the symbol was first watched (seed / rolling
+    # add) — measures how often a grade decayed before the trigger
+    rating_provisional_at_add = Column(String(1), nullable=True)
     # full broker rejection text — ``reason`` stays a short machine-readable code
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -337,6 +348,11 @@ class Open15Config(Base):
     # NULL resolves to the env seed (0 = off); a trigger at/above it is
     # journaled as a sim-priced ``vol_ratio_cap`` skip, never ordered.
     max_vol_ratio = Column(Float, nullable=True)
+    # issue #726 — which R63 grades place orders: a subset of "ABC" (NULL =
+    # env seed OPEN15_TRADE_GRADES, itself defaulting to "ABC" = everything).
+    # Grades NOT listed are paper-traded at full slot size (shadow rows,
+    # reason ``rating_excluded``) so every grade keeps being measured.
+    trade_grades = Column(String(8), nullable=True)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -404,6 +420,11 @@ def _ensure_columns():
             "cf_mfe": "FLOAT",
             "cf_mfe_minute": "VARCHAR(5)",
             "cf_source": "VARCHAR(8)",
+            # issue #726 — trade rating
+            "rating": "VARCHAR(1)",
+            "rating_univ_median_pct": "FLOAT",
+            "rating_vol_ratio": "FLOAT",
+            "rating_provisional_at_add": "VARCHAR(1)",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -457,6 +478,7 @@ def _ensure_columns():
             # issue #721 — NULL resolves to the env seed (0 = off), so an
             # existing install arms exactly as it did before
             "max_vol_ratio": "FLOAT",
+            "trade_grades": "VARCHAR(8)",
         },
     }
     try:
@@ -555,6 +577,7 @@ def get_config() -> dict | None:
             "stop_loss_inr_long": row.stop_loss_inr_long,
             "stop_loss_inr_short": row.stop_loss_inr_short,
             "max_vol_ratio": row.max_vol_ratio,
+            "trade_grades": row.trade_grades,
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -604,6 +627,7 @@ def save_config(
     stop_loss_inr_long: float | None = None,
     stop_loss_inr_short: float | None = None,
     max_vol_ratio: float | None = None,
+    trade_grades: str | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -666,6 +690,7 @@ def save_config(
         row.stop_loss_inr_long = stop_loss_inr_long
         row.stop_loss_inr_short = stop_loss_inr_short
         row.max_vol_ratio = max_vol_ratio
+        row.trade_grades = trade_grades
         row.updated_by = updated_by
         db_session.commit()
         return True
@@ -1000,5 +1025,48 @@ def real_closed_rows(mode: str | None = None) -> list:
     except Exception:
         logger.exception("real_closed_rows read failed — failing open to []")
         return []
+    finally:
+        db_session.remove()
+
+
+def grade_breakdown(trade_date: str) -> dict[str, dict]:
+    """Per-grade counts and NET P&L for one day (issue #726).
+
+    ``real`` = real fills; ``paper`` = every priced NON-real row (broker-paper,
+    sim, shadow — including the ``rating_excluded`` shadow rows the grade
+    filter declined). The two are never summed: the whole point is to judge
+    the grade filter on the rows it did NOT trade. Net through
+    :func:`net_pnl_of_row` — the one convention (#552). Fail-open to ``{}``.
+    """
+    try:
+        rows = (
+            db_session.query(Open15Trade)
+            .filter(Open15Trade.trade_date == trade_date, Open15Trade.rating.isnot(None))
+            .all()
+        )
+        out: dict[str, dict] = {}
+        for r in rows:
+            g = out.setdefault(
+                r.rating,
+                {
+                    "real": {"n": 0, "wins": 0, "net": 0.0},
+                    "paper": {"n": 0, "wins": 0, "net": 0.0},
+                    "unpriced": 0,
+                },
+            )
+            bucket = "real" if (r.fill is None or r.fill not in NON_REAL_FILLS) else "paper"
+            if r.pnl is None:
+                g["unpriced"] += 1
+                continue
+            net = net_pnl_of_row(r)
+            b = g[bucket]
+            b["n"] += 1
+            b["wins"] += int(net > 0)
+            b["net"] = round(b["net"] + net, 2)
+        return out
+    except Exception:
+        db_session.rollback()
+        logger.exception("open15: grade breakdown failed for %s", trade_date)
+        return {}
     finally:
         db_session.remove()

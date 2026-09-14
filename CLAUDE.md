@@ -1819,6 +1819,44 @@ decision** (LEARNINGS 2026-09-10): at ~80 real fills, keep the ceiling only
 if the `vol_ratio_cap` sim cohort is still net negative on the NEW fills
 alone. Tests: `test/test_open15_vol_ratio_cap.py`.
 
+**Trade rating A/B/C at the trigger + grade filter (issue #726, R63).** Every
+trigger is graded on the ZMQ tick thread by the pure `services/open15_rating.py`
+(no I/O): **C** = universe median return 09:15-open→now ≤ −0.30 % OR trigger after
+09:24:00; **A** = not C AND trigger ≤ 09:22:00 AND volume ratio < 1.55×; **B** =
+the rest. These are the only three checks that survived R63's 44-row holdout
+(freshness-of-break, level extension, gap band and option spread fit the 48
+real fills at 86 % and reversed on the holdout — do not add them back without
+new data); thresholds are **code constants**, pre-registered, not knobs. The
+universe median is built from `core.last_price` and the 09:15 opens the core
+already holds (a free NIFTY proxy, ~200 floats, no broker call). The grade is
+frozen on the action FIRST in `_enter`, so every cohort carries it (real, paper,
+sim ceiling skip, shadow side, rejection, `entry_error`) — journal columns
+`rating` / `rating_univ_median_pct` / `rating_vol_ratio` /
+`rating_provisional_at_add`, and `rating` rides the existing `entry*` events
+(no new event names, #615/#622). `open15_config.trade_grades` (subset of `ABC`,
+NULL → env seed `OPEN15_TRADE_GRADES`, default `ABC` = byte-identical to before;
+three checkboxes on `/logs`, applied at the 09:10 arm) is the ONLY gate: a
+grade not listed is **paper-traded at full slot size** through the #581 shadow
+seam (`fill='shadow'`, `reason='rating_excluded'`, `entry_shadow` with
+`rating_excluded: true`) — no order, no `max_trades` slot, never in real P&L,
+shares `shadow_max_trades`. The check sits after the #721 ceiling and the
+shadow-side branch, so a capped trigger is still sim-priced and one rule decides
+both cohorts. A raising grader leaves the trigger UNGRADED and it trades as
+before (fail open — the grade is instrumentation until it gates, and an
+ungraded trigger must never be lost). Live: `get_status()['rating']` carries
+the universe median, the phase (`A-eligible until 09:22` → `B at best until
+09:24` → `C`), `trade_grades` and a per-symbol **provisional** grade (what a
+trigger NOW would get; `clean_vol` cannot fail before there is a ratio) that the
+`/logs` watch list renders as an outlined chip, re-read every 5 s status poll;
+the `selection` / `watchlist_add` events stamp `rating_provisional`, the
+`armed` event stamps `trade_grades` + `rating_rules`, and `summary` carries
+`by_grade` (real vs paper n / wins / net per grade, from
+`open15_breakout_db.grade_breakdown`). Real-vs-sandbox routing is untouched
+(the #440 two controls). **Pre-registered (R63 §6):** at ~40 NEW real fills
+promote C to a sim-priced veto only if the C paper cohort is net-negative AND
+≥ 15 pts below A+B on the new fills alone; A/B never gate; if it fails, delete
+the grade rather than re-tune it. Tests: `test/test_open15_trade_rating.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.
