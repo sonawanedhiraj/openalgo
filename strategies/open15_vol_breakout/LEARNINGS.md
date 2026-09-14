@@ -209,3 +209,36 @@ Learnings: **a gate that fires on a threshold crossing carries a second
 variable — how far past the threshold it was — and that variable is a
 different market event**, not more of the same; and **a filter that keeps
 31 of 32 rows has no power regardless of how sensible it sounds** (sector-down).
+
+### 2026-09-14 — R63: what the winners share, and an A/B/C rating that gates nothing yet (issue #725)
+
+All 48 real fills (33 L / 15 S) scored on per-second tick features from `tick_logs/open15/`, with a
+44-row holdout (shadow/sim/paper/rejected, stock basis) and news from the store plus web lookups.
+Report: `docs/research/strategy/open15_vol_breakout/2026-09-14_r63_winner_patterns_and_trade_rating.md`.
+
+- **Winners on both sides:** trigger ≤09:22, vol ratio at trigger <1.55x (crossed the gate, did not
+  blow through it), universe median return 09:15→trigger > −0.3%, and immediate follow-through
+  (longs up >0.1% at +60 s: 77% WR / +₹40.9k; flat-or-against at +60 s: 25% / −₹27k). Losers are late,
+  stale (price sat beyond the level for minutes before volume arrived), or fired into a falling tape
+  (longs with universe < −0.3%: 1 of 8; shorts 0 of 3).
+- **Only three checks survive the holdout** — `early`, `market_ok`, `clean_vol`. The intuitive extras
+  (freshness of the break, 09:15 high ≥1% over prev close, gap band, option spread) fit the 48 at 86% WR
+  and reverse or vanish on the 44. Do not add them back without new data.
+- **Rating v2:** C = late (>09:24) OR broad-weak tape; A = early AND clean-vol and not C; B = rest.
+  Real: A 76% / +₹95.7k (n=17), B 38% / −₹24.3k, **C 13% / −₹31.6k**. C is the robust half — 20% and
+  10% in the two time halves, 40% WR / negative median on the holdout. A was 9/9 in August and 4/8 in
+  September; expect ~60–65%.
+- **News is not a prerequisite:** BRITANNIA +₹37.6k, PFC +₹17.9k, HAL +₹5.6k had none. Scheduled-data
+  gap-ups ≥1.5% all faded (HEROMOTOCO monthly sales, ANGELONE monthly update, HDFCBANK CEO — 0 of 3);
+  unscheduled company news on a modest gap won (CGPOWER cyberattack short, IDEA rebrand momentum,
+  NATIONALUM/EGA deal, HINDZINC OFS rebound, the 08-28 IT ADR trio). The `market_intel` RSS pair missed
+  5 of 12 catalysts; an NSE-filings feed would have carried 4 of them.
+- **Plan (observational first):** stamp `rating` + raw inputs on every trigger in `_enter` (all
+  cohorts, no broker call on the tick thread), chip on `/logs`, per-grade line in the digest. **Gate
+  nothing.** Pre-registered at 40 NEW real fills (~late Oct 2026): promote C to a sim-priced veto only
+  if C is net-negative AND ≥15 pts below A+B on the new fills alone; A/B never gate; if the rule fails,
+  delete the grade rather than re-tune it.
+
+Learnings: **a rating built on the sample it is scored on will always look like an edge — score it on
+the rows the strategy did NOT trade before believing it**; and **the veto half of a rating is worth
+more than the promise half** — "don't take this" generalised, "take this" did not.
