@@ -236,6 +236,15 @@ NULL field = env default; **applies at the next 09:10 arm**):
   `top_n`). The parity targets in `config_snapshot.json` are both-sides
   numbers, so a one-sided day is not comparable to them — the logs page flags
   it.
+- `trade_grades` (issue #726, R63) — subset of `ABC`, default `ABC` (trade
+  everything; env seed `OPEN15_TRADE_GRADES`). Every trigger is graded at the
+  trigger — **C** = universe median 09:15-open→now ≤ −0.30 % or trigger after
+  09:24; **A** = not C, trigger ≤ 09:22, volume ratio < 1.55×; **B** = rest —
+  and a grade not listed here is paper-traded at full slot size (shadow row,
+  `reason='rating_excluded'`, no order, no `max_trades` slot). The watch list
+  shows a provisional grade live; the journal stores the final one
+  (`rating`, `rating_univ_median_pct`, `rating_vol_ratio`,
+  `rating_provisional_at_add`). Thresholds are code constants (pre-registered).
 - `shadow_excluded_side` (issue #581) — `false` (default) | `true`. Shadow-logs
   the side `trade_side` excludes, per §3. Meaningless (and disabled in the UI)
   when `trade_side` is `both`, since nothing is excluded — the server derives

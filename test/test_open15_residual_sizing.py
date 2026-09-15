@@ -306,7 +306,7 @@ def test_the_chips_row_runs_without_a_reference_error():
     # wrapper below supplies one
     body = body.rstrip().removesuffix("}")
     events = [
-        {"event": "armed", "universe": 4, "mode": "live", "vol_mult": 1.5},
+        {"event": "armed", "universe": 4, "mode": "live", "vol_mult": 1.5, "trade_grades": "AB"},
         {"event": "selection", "selected": {"AAA": "L"}, "gaps_pct": {}, "source": "scheduler"},
         {"event": "entry_error", "symbol": "AAA", "error": "boom"},
         {
@@ -317,7 +317,13 @@ def test_the_chips_row_runs_without_a_reference_error():
             "last_tick": None,
             "selection_source": "scheduler",
         },
-        {"event": "summary", "day": "done", "selected": 1},
+        {
+            "event": "summary",
+            "day": "done",
+            "selected": 1,
+            # issue #726 — the per-grade chips must execute in the harness too
+            "by_grade": {"A": {"real": {"n": 1, "wins": 1, "net": 500.0}, "paper": {"n": 0}}},
+        },
     ]
     script = (
         "const esc=s=>String(s);\n"
@@ -328,6 +334,9 @@ def test_the_chips_row_runs_without_a_reference_error():
         "const curDate='2026-08-19';\n"
         # mirrors the page's own `let liveWatch={}, liveNeeded=null, liveFeed=null;`
         "const liveFeed=null;\n"
+        # issue #726 — the page declares `liveRating` on that same line
+        "const liveRating={univ_median_pct:-0.12,phase:'A-eligible until 09:22',"
+        "trade_grades:'AB'};\n"
         "const digests=[{date:'2026-08-19',status:'done',selected:1,entered:0,"
         "paper:0,sim:0,shadow:0,errors:1,pnl:null}];\n"
         f"function renderChips(){{{body}}}\n"

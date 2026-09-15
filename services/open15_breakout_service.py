@@ -67,6 +67,17 @@ from typing import Any
 
 import pytz
 
+from services.open15_rating import (
+    RULES as RATING_RULES,
+)
+from services.open15_rating import (
+    grade_trigger,
+    normalize_trade_grades,
+    phase_label,
+    rating_kw,
+    sec_of_day,
+    universe_median_pct,
+)
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -1106,6 +1117,10 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "vol_mult": vol_mult,
         # issue #721 - volume-ratio ceiling at the trigger (0 = off)
         "max_vol_ratio": resolve_max_vol_ratio(cfg, vol_mult),
+        # issue #726 - which R63 grades place orders (the rest are paper-traded)
+        "trade_grades": normalize_trade_grades(
+            cfg.get("trade_grades") or os.getenv("OPEN15_TRADE_GRADES")
+        ),
         "leverage": lev,
         "notional": round(margin_eff * lev, 2),
         "cum_realized_pnl": round(cum_realized_pnl, 2),
@@ -2011,6 +2026,9 @@ class Open15BreakoutService:
         self.core: Open15Core | None = None
         self._sched = None  # scheduler handle from register_jobs (arm reschedules on it)
         self.positions: dict[str, dict[str, Any]] = {}  # symbol -> journal/fill info
+        # issue #726 - provisional grade each watched symbol carried when it was
+        # first watched (seed / rolling add); stamped on its journal row later
+        self._prov_at_add: dict[str, str] = {}
         self.day_status = "idle"  # idle / armed / skipped_late_boot / holiday / done
         self.universe: set[str] = set()
         self._lock = threading.Lock()
@@ -2435,6 +2453,7 @@ class Open15BreakoutService:
                 oi_filter_fn=oi_filter_fn,
             )
             self.positions = {}
+            self._prov_at_add = {}
             self.day_status = "armed"
             self._feed_ticks = 0
             self._feed_symbols = set()
@@ -2450,6 +2469,10 @@ class Open15BreakoutService:
             # issue #721 - the ceiling the day ran with (0 = off), so a
             # ``vol_ratio_cap`` skip is replayable against its own rule
             max_vol_ratio=self.day_config["max_vol_ratio"],
+            # issue #726 - the grades that placed orders and the rules they
+            # were graded by, so a past day is replayable against its own filter
+            trade_grades=self.day_config["trade_grades"],
+            rating_rules=dict(RATING_RULES),
             top_n=_top_n(),
             mode=_mode(),
             no_entry_after=self.day_config["no_entry_after"],
@@ -3972,6 +3995,9 @@ class Open15BreakoutService:
             # seed vs rolling split (issue #529): `selected` counts the whole
             # watch list, so without this the seed cohort is unreadable
             rolling_added=len(self.core.rolling_adds),
+            # issue #726 - per-grade real vs paper counts and net, so the day
+            # says what the grade filter did AND what it declined
+            by_grade=self._grade_breakdown(),
             day=self.day_status,
             captured_drift=drifts,
         )
@@ -4202,7 +4228,8 @@ class Open15BreakoutService:
         if core.rolling_enabled:
             try:
                 for add in core.maybe_rerank(tick_ts):
-                    self._log_event("watchlist_add", **add)
+                    prov = self._provisional_for([add["symbol"]])
+                    self._log_event("watchlist_add", **add, rating_provisional=prov)
                 self._drain_liquidity_exclusions(core)
             except Exception:
                 # the rolling watch list is additive instrumentation on top of
@@ -4273,6 +4300,8 @@ class Open15BreakoutService:
             prev_closes={s: core.prev_closes.get(s) for s in seed},
             candidates=len(core.gaps),
             source=source,
+            # issue #726 - the provisional grade at selection time
+            rating_provisional=self._provisional_for(seed),
         )
 
     # ---- feed health (issue #677) ----------------------------------------- #
@@ -4635,6 +4664,7 @@ class Open15BreakoutService:
         self._log_event(
             "entry_rejected",
             symbol=action["symbol"],
+            rating=action.get("rating"),
             instrument=row_kw.get("instrument", "stock"),
             contract=row_kw.get("opt_symbol"),
             qty=qty,
@@ -4748,6 +4778,7 @@ class Open15BreakoutService:
             status="skipped",
             reason=reason,
             fill="sim" if sim_qty else None,
+            **rating_kw(action),
             **extra,
         )
         if sim_qty:
@@ -4761,6 +4792,7 @@ class Open15BreakoutService:
                     "status": "sim",
                     "fill": "sim",
                     "sim_reason": reason,
+                    "rating": action.get("rating"),
                     # No order was ever sent, so there is nothing that could have
                     # half-reached the exchange: `flatten` must NOT run the book
                     # verification that exists for rejections. Reading the book
@@ -4785,6 +4817,7 @@ class Open15BreakoutService:
                 float(action["cum_vol_at_trigger"]) / max(float(action["baseline_vol"]), 1.0), 2
             ),
             fill="sim" if sim_qty else None,
+            rating=action.get("rating"),
             **extra,
         )
 
@@ -4837,7 +4870,7 @@ class Open15BreakoutService:
             return extra, lot, "side_excluded_unaffordable"
         return extra, lots * lot, "side_excluded"
 
-    def _journal_shadow(self, action: dict, cfg: dict) -> None:
+    def _journal_shadow(self, action: dict, cfg: dict, reason_override: str | None = None) -> None:
         """Journal a trigger on the switched-off side — NO ORDER (issue #581).
 
         This method never calls ``order_placer``. That is the whole contract:
@@ -4889,6 +4922,7 @@ class Open15BreakoutService:
                     status="skipped",
                     reason=reason,
                     fill="none",
+                    **rating_kw(action),
                 )
                 self._log_event(
                     "entry_skipped",
@@ -4897,9 +4931,15 @@ class Open15BreakoutService:
                     watch_source=action.get("watch_source") or "seed",
                     fill="none",
                     shadow=True,
+                    rating=action.get("rating"),
                 )
                 return
             extra, qty, reason = sized
+            if reason_override:
+                # issue #726 - the grade filter declined this trigger; the row is
+                # a shadow in every mechanical sense (no order, full slot) but
+                # the REASON says which rule kept it out of the real book
+                reason = reason_override
             row_id = insert_trade(
                 trade_date=self._trade_date(),
                 symbol=action["symbol"],
@@ -4922,6 +4962,7 @@ class Open15BreakoutService:
                 status="skipped",
                 reason=reason,
                 fill="shadow",
+                **rating_kw(action),
                 **extra,
             )
             with self._lock:
@@ -4933,6 +4974,7 @@ class Open15BreakoutService:
                     "status": "shadow",
                     "fill": "shadow",
                     "sim_reason": reason,
+                    "rating": action.get("rating"),
                     "no_order_attempted": True,
                     **{
                         k: extra[k]
@@ -4957,8 +4999,13 @@ class Open15BreakoutService:
                 vol_ratio=round(action["cum_vol_at_trigger"] / max(action["baseline_vol"], 1), 2),
                 reason=reason,
                 fill="shadow",
+                rating=action.get("rating"),
+                rating_excluded=bool(reason_override),
                 note=(
-                    "no order placed — this side is switched off by trade_side; "
+                    "no order placed — grade not in trade_grades; "
+                    "paper-traded at full slot size, no money moved"
+                    if reason_override
+                    else "no order placed — this side is switched off by trade_side; "
                     "priced for measurement only, no money moved"
                 ),
             )
@@ -4968,10 +5015,140 @@ class Open15BreakoutService:
                 action.get("symbol"),
             )
 
+    # ---- trade rating (issue #726) ---------------------------------------- #
+    def universe_median(self) -> tuple[float | None, int]:
+        """Equal-weight universe median return (%) 09:15 open -> last LTP.
+
+        Built from state the core already holds (``last_price`` written by
+        ``on_tick``, the 09:15 open from ``first_candle``) — no broker call,
+        no lock (single writer on the tick thread, one-pass reads). Fail-open
+        to ``(None, 0)``.
+        """
+        core = self.core
+        if core is None:
+            return None, 0
+        try:
+            ltps = dict(core.last_price)
+            opens = {}
+            for sym in ltps:
+                fc = core.first_candle(sym)
+                if fc and fc.get("open"):
+                    opens[sym] = fc["open"]
+            return universe_median_pct(opens, ltps)
+        except Exception:
+            logger.exception("open15: universe median failed")
+            return None, 0
+
+    def _now_sec(self) -> int:
+        now = self._now_ist()
+        return now.hour * 3600 + now.minute * 60 + now.second
+
+    def _provisional_for(self, symbols) -> dict[str, dict]:
+        """Provisional grade per symbol = what a trigger NOW would get (vol
+        unknown, so ``clean_vol`` cannot fail yet). Records the first grade a
+        symbol was watched under, for the ``rating_provisional_at_add`` column.
+        Never raises — instrumentation must not cost a seed entry.
+        """
+        out: dict[str, dict] = {}
+        try:
+            med, _n = self.universe_median()
+            g = grade_trigger(self._now_sec(), med, None)
+            for sym in symbols:
+                out[sym] = {"grade": g["grade"], "fails": list(g["fails"])}
+                self._prov_at_add.setdefault(sym, g["grade"])
+        except Exception:
+            logger.exception("open15: provisional rating failed")
+        return out
+
+    def _rate_action(self, action: dict) -> None:
+        """Freeze the FINAL grade on a trigger action (tick thread, no I/O).
+
+        Attaches ``rating`` / ``rating_inputs`` / ``rating_provisional_at_add``
+        to the action so every journal writer and event below carries them.
+        A raising grader leaves the action ungraded — logged, never blocking
+        the entry (fail OPEN: the grade is instrumentation until it gates,
+        and even then an ungraded trigger trades as before).
+        """
+        try:
+            ratio = float(action["cum_vol_at_trigger"]) / max(float(action["baseline_vol"]), 1.0)
+            med, n = self.universe_median()
+            g = grade_trigger(
+                sec_of_day(action.get("trigger_minute"), action.get("trigger_second")),
+                med,
+                ratio,
+            )
+            action["rating"] = g["grade"]
+            action["rating_fails"] = g["fails"]
+            action["rating_inputs"] = {**g["inputs"], "univ_n": n}
+            action["rating_provisional_at_add"] = self._prov_at_add.get(action["symbol"])
+        except Exception:
+            logger.exception(
+                "open15: rating failed for %s — trigger left ungraded", action.get("symbol")
+            )
+
+    def rating_status(self) -> dict:
+        """What the /logs page renders live (issue #726)."""
+        core = self.core
+        cfg = self.day_config or {}
+        try:
+            med, n = self.universe_median()
+            now_sec = self._now_sec()
+            prov: dict[str, dict] = {}
+            if core is not None:
+                g = grade_trigger(now_sec, med, None)
+                stats = core.watch_snapshot()
+                for sym in list(core.selected):
+                    st = stats.get(sym) or {}
+                    prov[sym] = {
+                        "grade": g["grade"],
+                        "fails": list(g["fails"]),
+                        "vol_ratio_now": st.get("max_vol_ratio_beyond"),
+                        "entered": bool(st.get("entered")),
+                        "at_add": self._prov_at_add.get(sym),
+                    }
+            trade_grades = cfg.get("trade_grades") or normalize_trade_grades(None)
+            counts = {"A": 0, "B": 0, "C": 0}
+            with self._lock:
+                for p in self.positions.values():
+                    r = p.get("rating")
+                    if r in counts:
+                        counts[r] += 1
+            return {
+                "univ_median_pct": med,
+                "univ_n": n,
+                "phase": phase_label(now_sec, med),
+                "trade_grades": trade_grades,
+                "rules": dict(RATING_RULES),
+                "provisional": prov,
+                "counts": counts,
+            }
+        except Exception:
+            logger.exception("open15: rating status failed")
+            return {
+                "univ_median_pct": None,
+                "provisional": {},
+                "trade_grades": cfg.get("trade_grades"),
+            }
+
+    def _grade_breakdown(self) -> dict:
+        try:
+            from database.open15_breakout_db import grade_breakdown
+
+            return grade_breakdown(self._trade_date())
+        except Exception:
+            logger.exception("open15: grade breakdown failed")
+            return {}
+
     def _enter(self, action: dict) -> None:
         from database.open15_breakout_db import insert_trade
 
         cfg = self.day_config or {}
+        # TRADE RATING (issue #726) - graded FIRST so every cohort below (sim
+        # ceiling skip, shadow side, cap skip, real entry, rejection) carries
+        # the grade it was decided with. The grade is measurement on every
+        # path; it GATES only in the ``trade_grades`` block after the shadow
+        # side check.
+        self._rate_action(action)
         # VOLUME-RATIO CEILING (issue #721) - checked ahead of everything,
         # the shadow side included: the shadow cohort is only comparable to
         # the traded one if it was decided by the same rules, so a capped
@@ -5005,6 +5182,20 @@ class Open15BreakoutService:
         # ``max_trades_cap`` sim row.
         if action.get("shadow"):
             self._journal_shadow(action, cfg)
+            return
+        # GRADE FILTER (issue #726) - a grade the operator does not trade is
+        # paper-traded at full slot size through the shadow seam: no order, no
+        # ``max_trades`` slot, never in real P&L, exit priced at the scheduled
+        # time like every shadow row. Ungraded (grader raised) trades as before.
+        grade = action.get("rating")
+        if grade and grade not in (cfg.get("trade_grades") or normalize_trade_grades(None)):
+            logger.info(
+                "open15: %s trigger graded %s, not in trade_grades=%s - paper (shadow)",
+                action["symbol"],
+                grade,
+                cfg.get("trade_grades"),
+            )
+            self._journal_shadow(action, cfg, reason_override="rating_excluded")
             return
         # DAY profit lock (issue #696) — checked ahead of the max_trades cap so
         # a locked-out trigger neither consumes a slot nor is mislabelled as a
@@ -5080,6 +5271,7 @@ class Open15BreakoutService:
             "trigger_price": action["price"],
             "watch_source": action.get("watch_source") or "seed",
             "sizing_basis": sizing_basis,
+            **rating_kw(action),
         }
         if not ok:
             self._journal_rejection(action, row_kw, qty, self._order_error(resp))
@@ -5100,6 +5292,7 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open",
                 "fill": "real",
+                "rating": action.get("rating"),
                 # kept so the deferred verification can ask the broker what
                 # really happened to this order (issue #626)
                 "entry_order_id": str(resp.get("orderid") or ""),
@@ -5108,6 +5301,7 @@ class Open15BreakoutService:
             "entry",
             symbol=action["symbol"],
             side=side_word,
+            rating=action.get("rating"),
             watch_source=action.get("watch_source") or "seed",
             qty=qty,
             trigger_price=round(action["price"], 2),
@@ -5158,6 +5352,7 @@ class Open15BreakoutService:
                 status="error",
                 reason="entry_error",
                 error_message=msg[:255],
+                **rating_kw(action),
             )
         except Exception:
             logger.exception("open15: entry-error journal write failed for %s", symbol)
@@ -5165,6 +5360,7 @@ class Open15BreakoutService:
             self._log_event(
                 "entry_error",
                 symbol=symbol,
+                rating=action.get("rating"),
                 watch_source=action.get("watch_source") or "seed",
                 trigger_price=round(float(action.get("price") or 0.0), 2),
                 at=f"{action.get('trigger_minute')}:{int(action.get('trigger_second') or 0):02d}",
@@ -5414,6 +5610,7 @@ class Open15BreakoutService:
             "opt_entry_volume": opt_volume,
             "opt_entry_oi": opt_oi,
             "sizing_basis": sizing_basis,
+            **rating_kw(action),
             **liq_kw,
         }
         if not ok:
@@ -5435,6 +5632,7 @@ class Open15BreakoutService:
                 "row_id": row_id,
                 "status": "open",
                 "fill": "real",
+                "rating": action.get("rating"),
                 # kept so the deferred verification can ask the broker what
                 # really happened to this order (issue #626)
                 "entry_order_id": str(resp.get("orderid") or ""),
@@ -5447,6 +5645,7 @@ class Open15BreakoutService:
             "entry",
             symbol=action["symbol"],
             side="BUY",
+            rating=action.get("rating"),
             watch_source=action.get("watch_source") or "seed",
             instrument="option",
             contract=contract["symbol"],
@@ -5609,6 +5808,8 @@ class Open15BreakoutService:
             },
             "tick_capture": bool(self._tick_writer),
             "tick_capture_universe": bool(self._tick_writer) and self._capture_universe,
+            # issue #726 - live grade inputs + per-symbol provisional grades
+            "rating": self.rating_status(),
             "config": dict(self.day_config or {}),
             "day_log": self.day_log[-100:],
         }
