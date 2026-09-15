@@ -171,13 +171,17 @@ def _dates(d_from: str, d_to: str) -> list[str]:
 
 def run(d_from: str, d_to: str, apply: bool, tick_dir: str = TICK_DIR) -> dict:
     """Backfill the range. Returns a per-date report; writes only with ``apply``."""
-    from database.open15_breakout_db import get_day_log
+    from database.open15_breakout_db import get_day_log, init_db
     from services.open15_option_shadow import (
         enrich_watched,
         enrich_watched_pending,
         resolve_atm_option,
     )
 
+    # the app adds post-ship columns at boot (`_ensure_columns`); a CLI run
+    # against a DB the branch code has never booted on must do the same, or
+    # every ORM read of `break_at` fails and the day reports zero rows
+    init_db()
     report: dict[str, dict] = {}
     for date in _dates(d_from, d_to):
         events = get_day_log(date)
