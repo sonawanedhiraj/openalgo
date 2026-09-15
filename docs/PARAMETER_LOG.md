@@ -2234,6 +2234,34 @@ ran in the 15:30-17:00 periodic window).
     P&L, no label — so it was impossible to tell whether the slot capital or the
     signal was what capped the strategy.
 
+## `OPEN15_WATCHED_CF` (default `true`) / UI `open15_config.watched_cf_enabled`
+
+- **Where:** `services/open15_breakout_service.py` `_watched_cf_enabled_default()`,
+  resolved in `resolve_day_config` (`watched_cf_enabled`, NULL row → env seed),
+  stamped on the `armed` event, consumed at the summary job
+  (`open15_option_shadow.enrich_watched`) and the next 09:10 arm's catch-up
+  (`enrich_watched_pending`).
+- **What it controls:** whether every watch-list name that ended the entry
+  window with NO trigger but DID break the 09:15 candle high/low is priced as
+  if 1 lot of the ATM option had been bought at the first break (no volume
+  gate) and sold at the exit-time bar open — from broker 1m bars, after the
+  exit, off the tick thread. Journal row `fill='watched'`, `reason='no_trigger'`,
+  `break_at`/`break_price`; the number is `opt_pnl` (1 lot, net); `pnl` is
+  NULL. Names that never broke the level are not priced.
+- **Never an order, never money.** No order, no `max_trades` slot, never in
+  `positions`; `watched` is in `NON_REAL_FILLS` and `pnl` is NULL, so no total
+  on the page, sidebar or dashboard can pick it up.
+- **Why a knob:** a measurement (the `OPEN15_SIM_SKIPPED_ENABLED` shape); it
+  costs ~10 bar fetches a day at the broker's 3 req/s. Off leaves the
+  `no_entry` break capture in place (free) and prices nothing.
+- **Backfill (current month only):** `uv run python -m
+  services.open15_watched_backfill [--from --to] [--apply]` rebuilds the break
+  from the #528 tick capture for days logged before the change; Kite drops a
+  contract at expiry, so earlier months cannot be priced.
+- **History:**
+  - **2026-09-15:** Introduced by issue #728 (operator: "just the numbers so
+    that enough data is collected to find patterns"). No decision rule yet.
+
 ## `OPEN15_LIQUIDITY_PATH_ENABLED` (default `true`)
 
 - **Where:** `services/open15_option_shadow.py` `enrich_liquidity_paths()`.

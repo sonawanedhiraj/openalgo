@@ -1857,6 +1857,29 @@ promote C to a sim-priced veto only if the C paper cohort is net-negative AND
 ≥ 15 pts below A+B on the new fills alone; A/B never gate; if it fails, delete
 the grade rather than re-tune it. Tests: `test/test_open15_trade_rating.py`.
 
+**The untriggered watch list is priced at the 09:15 break (issue #728, numbers
+only).** Every watched name (seed + rolling) that ends the entry window with
+NO trigger but DID break the 09:15 candle high/low gets ONE counterfactual: 1 lot
+of the ATM option bought at the open of the minute after the first break (no
+volume gate), sold at the `exit_time` bar open, from broker 1m bars after the
+exit (`open15_option_shadow.enrich_watched`; retried by the next 09:10 arm via
+`enrich_watched_pending`). The break is recorded on the tick thread from the
+tick in hand (`Open15Core.on_tick` → `watch_stats.first_break_ts/price`, carried
+on the `no_entry` event) — no broker call there (#626). Journal row
+`fill='watched'`, `reason='no_trigger'`, `break_at`/`break_price`; the number is
+`opt_pnl` (read ONLY through `watched_net_of_row`); **`pnl` stays NULL** and
+`watched` is in `NON_REAL_FILLS`, so nothing on the page, sidebar or dashboard
+can sum it. Never in `positions`, never a slot, never an order. Names that never
+broke the level are `no break` and unpriced. One new event
+`watched_counterfactual` (both row builders + tests, #615/#622); the day
+digest/chip carry `watched` / `watched_nobreak` / `watched_priced` /
+`watched_pnl`; CSV gains `break_at, break_price, wcf_*`. Knob
+`OPEN15_WATCHED_CF` (UI `watched_cf_enabled`, default on). Backfill for the
+current month only (Kite drops expired contracts): `uv run python -m
+services.open15_watched_backfill [--from --to] [--apply]`, dry-run default,
+breaks rebuilt from the #528 tick capture. **No decision rule yet** — write it
+at ~100 rows. Tests: `test/test_open15_watched_counterfactual.py`.
+
 **Ops: boot OpenAlgo before 09:15 IST on trading days** — a late boot skips the
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.

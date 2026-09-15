@@ -149,6 +149,26 @@ at full slot size). The sim bucket answers whether the *slot capital* or the
 on the side we do not trade. One blended figure answers neither. Only real rows
 may enter any published performance number.
 
+**A FIFTH class, `fill='watched'` (issue #728), is not a bucket at all.** A
+watch-list name that ended the entry window with NO trigger but DID break the
+09:15 candle high (long) / low (short) is priced as if 1 lot of the ATM option
+had been bought at the first break — no volume gate — and sold at the
+`exit_time` bar open, from broker 1m bars after the exit (entry = open of the
+minute after the break minute; MAE/MFE from bar lows/highs over the hold;
+`cf_source='bars'`). The break itself (`break_at`, `break_price`) is recorded
+on the tick thread from the tick already in hand — no broker call. The number
+lives in `opt_pnl` (read through `watched_net_of_row`); **`pnl` stays NULL by
+construction**, `watched` is in `NON_REAL_FILLS`, the row is never registered
+in `positions`, and it never enters any sum on the page, the sidebar or the
+dashboard. Names that never broke the level are NOT priced (`no break`) —
+inventing an entry for them would be a different strategy in the same column.
+Numbers only, no decision rule yet: the eventual question is whether the
+volume gate earns its keep (triggered cohorts' per-lot net vs this cohort's
+over the same days); write that rule at ~100 rows, not on day one. Bars carry
+no bid/ask, so every watched number is optimistic by ~the round-trip spread
+and the page says `bars · 1 lot` beside each. Plan:
+`docs/research/strategy/open15_vol_breakout/2026-09-15_watched_break_counterfactual_plan.md`.
+
 **Reading the shadow bucket honestly.** Shadow rows price both legs at the quote
 LTP, so their net is optimistic by roughly the round-trip spread — the same
 caveat as sim and paper (§4b), and it matters more here because the whole
@@ -270,6 +290,8 @@ NULL field = env default; **applies at the next 09:10 arm**):
 `OPEN15_MARGIN_PER_SLOT` (30000) · `OPEN15_LEVERAGE` (5) ·
 `OPEN15_TRADE_SIDE` (both) ·
 `OPEN15_SHADOW_EXCLUDED_SIDE` (**false**) · `OPEN15_SHADOW_MAX_TRADES` (3) ·
+`OPEN15_WATCHED_CF` (**true** — price the untriggered watch list at the 09:15
+break, issue #728; UI `watched_cf_enabled`) ·
 `OPEN15_ROLLING_WATCHLIST_ENABLED` (**false**) · `OPEN15_ROLLING_CADENCE_S`
 (30) · `OPEN15_ROLLING_TOP_N` (3) ·
 `OPEN15_TICK_CAPTURE` (true) · `OPEN15_TICK_CAPTURE_UNIVERSE` (true).

@@ -53,6 +53,18 @@ CSV_COLUMNS = [
     # every existing column keeps its index.
     "rating",
     "rating_provisional",
+    # issue #728 — watched-break counterfactual for the names that never
+    # triggered: the first 09:15-level break and what 1 lot of the ATM option
+    # would have done from there to the exit (bars). NULL on every other row.
+    "break_at",
+    "break_price",
+    "wcf_contract",
+    "wcf_entry",
+    "wcf_exit",
+    "wcf_net",
+    "wcf_mae",
+    "wcf_mfe",
+    "wcf_status",
 ]
 
 
@@ -94,6 +106,8 @@ _ARMED_PASSTHROUGH = (
     "stop_loss_inr_short",
     # issue #721
     "max_vol_ratio",
+    # issue #728
+    "watched_cf_enabled",
 )
 
 
@@ -139,6 +153,7 @@ def summarize_day(
     paper_pnl: float | None = None,
     sim_pnl: float | None = None,
     shadow_pnl: float | None = None,
+    watched_pnl: float | None = None,
 ) -> dict:
     """One-line digest of a day's decision log for the history sidebar.
 
@@ -171,6 +186,13 @@ def summarize_day(
     sim_syms: set[str] = set()
     shadow_syms: set[str] = set()
     error_syms: set[str] = set()  # entries that RAISED (issue #643)
+    # issue #728 — never-triggered names: broke the level (priceable) vs never
+    # broke it (not priced), and how many the bars pass has priced so far
+    watched_syms: set[str] = set()
+    nobreak_syms: set[str] = set()
+    watched_priced_syms: set[str] = set()
+    watched_from_events = 0.0
+    saw_watched_pnl = False
     rolling_added = 0  # symbols appended intraday by the rolling watch list (#529)
     # option-liquidity exclusions (#583): stage 1 = both sides dead, at arm;
     # stage 2 = the assigned side is dead, at seed selection or a rolling add
@@ -238,6 +260,15 @@ def summarize_day(
         elif kind == "exit_shadow" and ev.get("pnl") is not None:
             shadow_from_events += float(ev["pnl"])
             saw_shadow_pnl = True
+        elif kind == "no_entry" and ev.get("symbol"):
+            if ev.get("level_broken") or ev.get("first_break_at"):
+                watched_syms.add(ev["symbol"])
+            else:
+                nobreak_syms.add(ev["symbol"])
+        elif kind == "watched_counterfactual" and ev.get("pnl") is not None:
+            watched_priced_syms.add(ev.get("symbol", ""))
+            watched_from_events += float(ev["pnl"])
+            saw_watched_pnl = True
         elif kind == "summary":
             status = ev.get("day") or status
             selected = ev.get("selected", selected)
@@ -252,6 +283,11 @@ def summarize_day(
     spnl = sim_pnl if sim_pnl is not None else (sim_from_events if saw_sim_pnl else None)
     shpnl = (
         shadow_pnl if shadow_pnl is not None else (shadow_from_events if saw_shadow_pnl else None)
+    )
+    wpnl = (
+        watched_pnl
+        if watched_pnl is not None
+        else (watched_from_events if saw_watched_pnl else None)
     )
     return {
         "date": date,
@@ -271,6 +307,11 @@ def summarize_day(
         "paper_pnl": round(ppnl, 2) if ppnl is not None else None,
         "sim_pnl": round(spnl, 2) if spnl is not None else None,
         "shadow_pnl": round(shpnl, 2) if shpnl is not None else None,
+        # issue #728 — the fifth bucket: 1-lot bars-priced, never money
+        "watched": len(watched_syms),
+        "watched_nobreak": len(nobreak_syms),
+        "watched_priced": len(watched_priced_syms),
+        "watched_pnl": round(wpnl, 2) if wpnl is not None else None,
         "events": len(events),
     }
 
@@ -316,7 +357,7 @@ def apply_journal(rows: dict[str, dict], journal: list[dict] | None) -> None:
     """
     if not journal:
         return
-    from database.open15_breakout_db import net_pnl_of_row
+    from database.open15_breakout_db import WATCHED_FILL, net_pnl_of_row, watched_net_of_row
 
     for jr in journal:
         row = rows.get(jr.get("symbol"))
@@ -331,6 +372,25 @@ def apply_journal(rows: dict[str, dict], journal: list[dict] | None) -> None:
         row["qty"] = jr.get("quantity") or jr.get("sim_quantity")
         if jr.get("pnl") is not None:
             row["pnl"] = round(net_pnl_of_row(jr), 2)
+        if jr.get("fill") == WATCHED_FILL:
+            # issue #728 — the journal is the only source once the day is
+            # sealed (the arm-time catch-up prices rows on a LATER day and
+            # cannot append events to the day it corrects). ``pnl`` is NULL
+            # on these rows by construction; the number is ``opt_pnl``.
+            row["entered"] = False
+            row["break_at"] = jr.get("break_at")
+            row["break_price"] = jr.get("break_price")
+            row["wcf_contract"] = jr.get("opt_symbol")
+            row["wcf_entry"] = jr.get("opt_entry_premium")
+            row["wcf_exit"] = jr.get("opt_exit_premium")
+            row["wcf_net"] = watched_net_of_row(jr)
+            row["wcf_mae"] = jr.get("cf_mae")
+            row["wcf_mfe"] = jr.get("cf_mfe")
+            row["wcf_status"] = (
+                "priced"
+                if jr.get("opt_pnl") is not None
+                else ("no_contract" if not jr.get("opt_symbol") else "bars_pending")
+            )
 
 
 def selection_outcomes(
@@ -439,6 +499,43 @@ def selection_outcomes(
                 level_broken=ev.get("level_broken"),
                 max_vol_ratio=ev.get("max_vol_ratio"),
                 vol_needed=ev.get("needed"),
+            )
+            # issue #728 — the first 09:15-level break, recorded on the tick
+            # thread; present only on days armed after the change
+            if ev.get("first_break_at"):
+                rows[sym].update(
+                    break_at=ev.get("first_break_at"),
+                    break_price=ev.get("first_break_price"),
+                )
+                if rows[sym].get("wcf_status") is None:
+                    rows[sym]["wcf_status"] = "bars_pending"
+            elif not ev.get("level_broken") and rows[sym].get("wcf_status") is None:
+                rows[sym]["wcf_status"] = "no_break"
+        elif kind == "watched_counterfactual":
+            # issue #728 — 1 lot of the ATM option bought at the break, no
+            # volume gate, sold at the exit; bars, not money. ``entered`` stays
+            # False and ``pnl`` stays None so it can never join a P&L bucket.
+            sym = ev.get("symbol")
+            if sym not in rows:
+                continue
+            rows[sym].update(
+                entered=False,
+                fill="watched",
+                skip_reason="no_trigger",
+                instrument="option",
+                opt_symbol=ev.get("contract"),
+                opt_entry_premium=ev.get("entry_premium"),
+                opt_exit_premium=ev.get("exit_premium"),
+                qty=ev.get("lot_size"),
+                break_at=ev.get("break_at") or rows[sym].get("break_at"),
+                break_price=ev.get("break_price") or rows[sym].get("break_price"),
+                wcf_contract=ev.get("contract"),
+                wcf_entry=ev.get("entry_premium"),
+                wcf_exit=ev.get("exit_premium"),
+                wcf_net=ev.get("pnl"),
+                wcf_mae=ev.get("mae"),
+                wcf_mfe=ev.get("mfe"),
+                wcf_status=ev.get("status") or "priced",
             )
         elif kind == "entry_rejected":
             # a rejected entry is a real measurement, just not a real fill — it

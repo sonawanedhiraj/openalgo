@@ -261,9 +261,16 @@ fetch_1m_bars = _fetch_1m_bars
 
 
 def premiums_from_bars(
-    bars: list[dict], trigger_minute: str, tz_name: str = "Asia/Kolkata"
+    bars: list[dict],
+    trigger_minute: str,
+    tz_name: str = "Asia/Kolkata",
+    exit_minute: str | None = None,
 ) -> tuple[float | None, float | None]:
-    """Extract (entry_premium, exit_premium) from 1m bars per the locked convention."""
+    """Extract (entry_premium, exit_premium) from 1m bars per the locked convention.
+
+    ``exit_minute`` (``HH:MM``) is the day's configured exit time (issue #728);
+    ``None`` keeps the historical 09:30 default.
+    """
     import pytz
 
     tz = pytz.timezone(tz_name)
@@ -281,6 +288,13 @@ def premiums_from_bars(
         return None, None
     trig = dt.time(h, m)
     nxt = (dt.datetime.combine(dt.date.today(), trig) + dt.timedelta(minutes=1)).time()
+    exit_t = _EXIT_MINUTE
+    if exit_minute:
+        try:
+            eh, em = (int(x) for x in exit_minute.split(":"))
+            exit_t = dt.time(eh, em)
+        except (ValueError, AttributeError):
+            exit_t = _EXIT_MINUTE
 
     entry = None
     if nxt in by_minute:
@@ -289,10 +303,10 @@ def premiums_from_bars(
         entry = by_minute[trig].get("close")
 
     exit_p = None
-    if _EXIT_MINUTE in by_minute:
-        exit_p = by_minute[_EXIT_MINUTE].get("open")
+    if exit_t in by_minute:
+        exit_p = by_minute[exit_t].get("open")
     else:
-        before = [t for t in by_minute if t <= _EXIT_MINUTE]
+        before = [t for t in by_minute if t <= exit_t]
         if before:
             exit_p = by_minute[max(before)].get("close")
     return (
@@ -514,6 +528,449 @@ def enrich_missing(max_rows: int = 20) -> dict:
         else:
             skipped += 1
     return {"status": "ok", "priced": done, "skipped": skipped}
+
+
+# --------------------------------------------------------------------------- #
+# Watched-break counterfactual (issue #728)
+# --------------------------------------------------------------------------- #
+# A watch-list name that ended the entry window WITHOUT a trigger but DID break
+# the 09:15 candle high (long) / low (short) is priced as if 1 lot of the ATM
+# option had been bought at the first break — no volume gate — and sold at the
+# scheduled exit. Numbers only: the row is ``fill='watched'``, ``pnl`` stays
+# NULL, and the value lives in ``opt_pnl`` (the #435 shadow column, 1 lot, net).
+#
+# Conventions (locked, code constants): entry = OPEN of the minute AFTER the
+# break minute (fallback break-minute close); exit = OPEN of the ``exit_time``
+# bar (fallback last bar at/before it); MAE/MFE from bar lows/highs over
+# [entry minute, exit minute); ``cf_source='bars'``. Bars carry no bid/ask, so
+# every number is optimistic by ~the round-trip spread and is labelled so.
+
+WATCHED_SOURCE = "bars"
+
+
+def _minute_of(hhmmss: str | None) -> str | None:
+    """``'09:19:42'`` -> ``'09:19'``; ``None``/garbage -> ``None``."""
+    if not hhmmss or not isinstance(hhmmss, str):
+        return None
+    parts = hhmmss.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+    except ValueError:
+        return None
+
+
+def marks_from_bars(
+    bars: list[dict],
+    entry_minute: str,
+    exit_minute: str,
+    entry_price: float,
+    qty: int,
+    sign: int = 1,
+    tz_name: str = "Asia/Kolkata",
+) -> dict:
+    """Worst / best mark of a position over ``[entry_minute, exit_minute)``.
+
+    ``sign`` +1 for a long (every option row), -1 for a short stock. Returns
+    ``{"mae", "mae_minute", "mfe", "mfe_minute"}`` (rupees for ``qty``), or an
+    empty dict when no bar falls in the window.
+    """
+    import pytz
+
+    tz = pytz.timezone(tz_name)
+    try:
+        eh, em = (int(x) for x in entry_minute.split(":"))
+        xh, xm = (int(x) for x in exit_minute.split(":"))
+    except (ValueError, AttributeError):
+        return {}
+    lo, hi = dt.time(eh, em), dt.time(xh, xm)
+    worst = best = None
+    worst_m = best_m = None
+    for b in bars:
+        try:
+            ts = dt.datetime.fromtimestamp(int(b["timestamp"]), tz=pytz.UTC).astimezone(tz)
+            h_px, l_px = float(b["high"]), float(b["low"])
+        except (KeyError, ValueError, TypeError, OSError):
+            continue
+        t = ts.time().replace(second=0, microsecond=0)
+        if t < lo or t >= hi:
+            continue
+        # for a long the low is the worst mark; for a short the high is
+        adverse = (l_px if sign > 0 else h_px) - entry_price
+        favour = (h_px if sign > 0 else l_px) - entry_price
+        mae_v = sign * adverse * qty
+        mfe_v = sign * favour * qty
+        if worst is None or mae_v < worst:
+            worst, worst_m = mae_v, t.strftime("%H:%M")
+        if best is None or mfe_v > best:
+            best, best_m = mfe_v, t.strftime("%H:%M")
+    if worst is None:
+        return {}
+    return {
+        "mae": round(worst, 2),
+        "mae_minute": worst_m,
+        "mfe": round(best, 2),
+        "mfe_minute": best_m,
+    }
+
+
+def _armed_of(events: list[dict]) -> dict:
+    for ev in events or []:
+        if ev.get("event") == "armed":
+            return ev
+    return {}
+
+
+def watched_candidates(events: list[dict], breaks: dict | None = None) -> list[dict]:
+    """Every ``no_entry`` symbol of a day, with its break (if any).
+
+    ``breaks`` (``{symbol: {"break_at": "HH:MM:SS", "break_price": float}}``)
+    overrides / supplies the break for days whose ``no_entry`` events predate
+    the tick-thread capture (the backfill CLI rebuilds it from the tick logs).
+    Returns dicts with ``symbol, side, watch_source, level_broken, break_at,
+    break_price, gap_pct``.
+    """
+    gaps: dict[str, float] = {}
+    out: list[dict] = []
+    for ev in events or []:
+        kind = ev.get("event")
+        if kind == "selection":
+            gaps.update(ev.get("gaps_pct") or {})
+        elif kind == "watchlist_add" and ev.get("symbol"):
+            gaps[ev["symbol"]] = ev.get("pct_change")
+        elif kind == "no_entry" and ev.get("symbol"):
+            sym = ev["symbol"]
+            b = (breaks or {}).get(sym) or {}
+            out.append(
+                {
+                    "symbol": sym,
+                    "side": ev.get("side"),
+                    "watch_source": ev.get("watch_source") or "seed",
+                    "level_broken": bool(ev.get("level_broken")) or bool(b.get("break_at")),
+                    "break_at": b.get("break_at") or ev.get("first_break_at"),
+                    "break_price": b.get("break_price") or ev.get("first_break_price"),
+                    "gap_pct": gaps.get(sym),
+                }
+            )
+    return out
+
+
+def _price_watched(
+    opt_symbol: str,
+    lot: int,
+    break_at: str,
+    exit_minute: str,
+    trade_date: str,
+) -> dict | None:
+    """Price ONE watched row from bars. ``None`` = bars not available yet."""
+    bars = _fetch_1m_bars(opt_symbol, trade_date)
+    if not bars:
+        return None
+    break_min = _minute_of(break_at)
+    if not break_min:
+        return None
+    entry, exit_p = premiums_from_bars(bars, break_min, exit_minute=exit_minute)
+    if entry is None or exit_p is None:
+        return None
+    charges = option_round_trip_charges(entry * lot, exit_p * lot)
+    gross = round((exit_p - entry) * lot, 2)
+    net = round(gross - (charges or 0.0), 2)
+    # the entry is the open of the minute AFTER the break minute
+    try:
+        bh, bm = (int(x) for x in break_min.split(":"))
+        entry_minute = (
+            dt.datetime.combine(dt.date.today(), dt.time(bh, bm)) + dt.timedelta(minutes=1)
+        ).strftime("%H:%M")
+    except ValueError:
+        entry_minute = break_min
+    marks = marks_from_bars(bars, entry_minute, exit_minute, entry, lot, sign=1)
+    return {
+        "entry_premium": entry,
+        "exit_premium": exit_p,
+        "gross": gross,
+        "charges": charges,
+        "pnl": net,
+        "mae": marks.get("mae"),
+        "mae_minute": marks.get("mae_minute"),
+        "mfe": marks.get("mfe"),
+        "mfe_minute": marks.get("mfe_minute"),
+        "entry_minute": entry_minute,
+    }
+
+
+def enrich_watched(
+    trade_date: str,
+    events: list[dict],
+    breaks: dict | None = None,
+    max_rows: int = 40,
+) -> dict:
+    """Journal + price the watched-break counterfactual for one day (issue #728).
+
+    Idempotent and fail-graceful. For every ``no_entry`` symbol that broke its
+    level and has a break time: insert the ``fill='watched'`` journal row once
+    (contract resolved at the break price), then price it from bars. A row the
+    broker cannot serve bars for yet stays unpriced and is retried by
+    :func:`enrich_watched_pending` (the next 09:10 arm's catch-up).
+
+    Returns ``{"status", "watched", "no_break", "no_break_time", "no_contract",
+    "priced", "pending", "already", "unsupported", "rows": [...]}`` where
+    ``rows`` are the details of rows priced IN THIS CALL — what the service
+    emits as ``watched_counterfactual`` events.
+    """
+    from database.open15_breakout_db import (
+        WATCHED_FILL,
+        WATCHED_REASON,
+        Open15Trade,
+        db_session,
+        insert_trade,
+        update_trade,
+    )
+
+    armed = _armed_of(events)
+    exit_minute = armed.get("exit_time") or "09:30"
+    instrument = armed.get("instrument") or "stock"
+    mode = armed.get("mode")
+    res = {
+        "status": "ok",
+        "watched": 0,
+        "no_break": 0,
+        "no_break_time": 0,
+        "no_contract": 0,
+        "priced": 0,
+        "pending": 0,
+        "already": 0,
+        "unsupported": 0,
+        "rows": [],
+    }
+    cands = watched_candidates(events, breaks)
+    if not cands:
+        return res
+    if instrument != "atm_option":
+        # the counterfactual is the strategy AS CONFIGURED minus one gate; a
+        # stock-mode day has no option leg to price and is reported, not guessed
+        res["unsupported"] = len(cands)
+        return res
+
+    # existing watched rows for the day — keyed by symbol
+    try:
+        existing = {
+            r.symbol: {
+                "id": r.id,
+                "opt_symbol": r.opt_symbol,
+                "opt_lot_size": r.opt_lot_size,
+                "opt_pnl": r.opt_pnl,
+                "break_at": r.break_at,
+                "cf_exit_minute": r.cf_exit_minute,
+                "reason": r.reason,
+            }
+            for r in db_session.query(Open15Trade)
+            .filter(Open15Trade.trade_date == trade_date, Open15Trade.fill == WATCHED_FILL)
+            .all()
+        }
+    except Exception:
+        logger.exception("open15 watched: journal scan failed for %s", trade_date)
+        return {**res, "status": "error"}
+    finally:
+        db_session.remove()
+
+    work = 0
+    for c in cands:
+        if not c["level_broken"]:
+            res["no_break"] += 1
+            continue
+        if not c.get("break_at") or not c.get("break_price"):
+            res["no_break_time"] += 1
+            continue
+        res["watched"] += 1
+        row = existing.get(c["symbol"])
+        if row is None:
+            contract = resolve_atm_option(
+                c["symbol"], c["side"], float(c["break_price"]), trade_date
+            )
+            kw = {
+                "trade_date": trade_date,
+                "symbol": c["symbol"],
+                "side": c["side"],
+                "mode": mode,
+                "instrument": "option",
+                "gap_pct": c.get("gap_pct"),
+                "break_at": c["break_at"],
+                "break_price": float(c["break_price"]),
+                "quantity": 0,
+                "watch_source": c["watch_source"],
+                "status": "skipped",
+                "reason": WATCHED_REASON if contract else "no_contract",
+                "fill": WATCHED_FILL,
+                "cf_exit_minute": exit_minute,
+                "cf_source": WATCHED_SOURCE,
+            }
+            if contract:
+                kw.update(
+                    opt_symbol=contract["symbol"],
+                    opt_lot_size=int(contract["lotsize"]),
+                    opt_tick_size=contract.get("ticksize"),
+                    sim_quantity=int(contract["lotsize"]),
+                )
+            rid = insert_trade(**kw)
+            if not contract:
+                res["no_contract"] += 1
+                logger.info(
+                    "open15 watched: no alive contract for %s %s — journaled unpriced",
+                    c["symbol"],
+                    trade_date,
+                )
+                continue
+            row = {
+                "id": rid,
+                "opt_symbol": contract["symbol"],
+                "opt_lot_size": int(contract["lotsize"]),
+                "opt_pnl": None,
+                "break_at": c["break_at"],
+                "cf_exit_minute": exit_minute,
+                "reason": WATCHED_REASON,
+            }
+        if row.get("opt_pnl") is not None:
+            res["already"] += 1
+            continue
+        if not row.get("opt_symbol"):
+            res["no_contract"] += 1
+            continue
+        if work >= max_rows:
+            res["pending"] += 1
+            continue
+        work += 1
+        priced = _price_watched(
+            row["opt_symbol"],
+            int(row["opt_lot_size"] or 1),
+            row.get("break_at") or c["break_at"],
+            row.get("cf_exit_minute") or exit_minute,
+            trade_date,
+        )
+        if priced is None:
+            res["pending"] += 1
+            logger.info(
+                "open15 watched: bars not available yet for %s (%s) — will retry",
+                row["opt_symbol"],
+                trade_date,
+            )
+            continue
+        ok = update_trade(
+            row["id"],
+            opt_entry_premium=priced["entry_premium"],
+            opt_exit_premium=priced["exit_premium"],
+            opt_charges_inr=priced["charges"],
+            opt_pnl=priced["pnl"],
+            cf_mae=priced["mae"],
+            cf_mae_minute=priced["mae_minute"],
+            cf_mfe=priced["mfe"],
+            cf_mfe_minute=priced["mfe_minute"],
+            cf_source=WATCHED_SOURCE,
+            cf_exit_minute=row.get("cf_exit_minute") or exit_minute,
+        )
+        if not ok:
+            res["pending"] += 1
+            continue
+        res["priced"] += 1
+        res["rows"].append(
+            {
+                "symbol": c["symbol"],
+                "side": c["side"],
+                "watch_source": c["watch_source"],
+                "break_at": row.get("break_at") or c["break_at"],
+                "break_price": float(c["break_price"]),
+                "contract": row["opt_symbol"],
+                "lot_size": int(row["opt_lot_size"] or 1),
+                "entry_minute": priced["entry_minute"],
+                "entry_premium": priced["entry_premium"],
+                "exit_minute": row.get("cf_exit_minute") or exit_minute,
+                "exit_premium": priced["exit_premium"],
+                "gross": priced["gross"],
+                "charges": priced["charges"],
+                "pnl": priced["pnl"],
+                "mae": priced["mae"],
+                "mfe": priced["mfe"],
+                "source": WATCHED_SOURCE,
+                "status": "priced",
+                "note": "never triggered — priced as if 1 lot bought at the 09:15 break, "
+                "no volume gate; bars, not money",
+            }
+        )
+    return res
+
+
+def enrich_watched_pending(max_rows: int = 40) -> dict:
+    """Catch-up: price any ``fill='watched'`` row still lacking ``opt_pnl``.
+
+    Called from the next 09:10 arm (the broker's same-day 1m lag) and the
+    backfill CLI. Reads everything it needs from the row itself, so it needs
+    no day log. Idempotent.
+    """
+    from database.open15_breakout_db import WATCHED_FILL, Open15Trade, db_session, update_trade
+
+    try:
+        rows = (
+            db_session.query(Open15Trade)
+            .filter(
+                Open15Trade.fill == WATCHED_FILL,
+                Open15Trade.opt_pnl.is_(None),
+                Open15Trade.opt_symbol.isnot(None),
+                Open15Trade.break_at.isnot(None),
+            )
+            .order_by(Open15Trade.id.desc())
+            .limit(max_rows)
+            .all()
+        )
+        work = [
+            {
+                "id": r.id,
+                "symbol": r.symbol,
+                "trade_date": r.trade_date,
+                "opt_symbol": r.opt_symbol,
+                "lot": int(r.opt_lot_size or 1),
+                "break_at": r.break_at,
+                "exit_minute": r.cf_exit_minute or "09:30",
+            }
+            for r in rows
+        ]
+    except Exception:
+        logger.exception("open15 watched: pending scan failed")
+        return {"status": "error", "priced": 0, "pending": 0}
+    finally:
+        db_session.remove()
+
+    priced = pending = 0
+    for w in work:
+        p = _price_watched(
+            w["opt_symbol"], w["lot"], w["break_at"], w["exit_minute"], w["trade_date"]
+        )
+        if p is None:
+            pending += 1
+            continue
+        ok = update_trade(
+            w["id"],
+            opt_entry_premium=p["entry_premium"],
+            opt_exit_premium=p["exit_premium"],
+            opt_charges_inr=p["charges"],
+            opt_pnl=p["pnl"],
+            cf_mae=p["mae"],
+            cf_mae_minute=p["mae_minute"],
+            cf_mfe=p["mfe"],
+            cf_mfe_minute=p["mfe_minute"],
+            cf_source=WATCHED_SOURCE,
+        )
+        if ok:
+            priced += 1
+            logger.info(
+                "open15 watched catch-up: %s %s -> %s net %.2f",
+                w["trade_date"],
+                w["symbol"],
+                w["opt_symbol"],
+                p["pnl"],
+            )
+        else:
+            pending += 1
+    return {"status": "ok", "priced": priced, "pending": pending}
 
 
 if __name__ == "__main__":

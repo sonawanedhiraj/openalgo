@@ -97,6 +97,7 @@ def config():
         _stop_loss_inr_default,
         _trail_confirm_polls_default,
         _trail_giveback_default,
+        _watched_cf_enabled_default,
         get_open15_service,
     )
     from services.open15_breakout_service import (
@@ -303,6 +304,8 @@ def config():
             None if trade_grades_raw in (None, "") else _normalize_grades(trade_grades_raw)
         )
         stop_loss = _opt_bool("stop_loss_enabled")
+        # issue #728 — price the untriggered watch list at the 09:15 break
+        watched_cf = _opt_bool("watched_cf_enabled")
         stop_loss_inr = body.get("stop_loss_inr")
         stop_loss_inr = (
             None if stop_loss_inr in (None, "") else _clamp_rupees(stop_loss_inr, 1200.0)
@@ -380,6 +383,7 @@ def config():
             stop_loss_inr_short=stop_loss_inr_short,
             max_vol_ratio=max_vol_ratio,
             trade_grades=trade_grades,
+            watched_cf_enabled=watched_cf,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -450,6 +454,8 @@ def config():
                 "max_vol_ratio": _max_vol_ratio_default(),
                 # issue #726 - grade filter seed (ABC = trade everything)
                 "trade_grades": _normalize_grades(_os.getenv("OPEN15_TRADE_GRADES")),
+                # issue #728 - watched-break counterfactual seed (on)
+                "watched_cf_enabled": _watched_cf_enabled_default(),
             },
             "override": get_config(),
             "effective_today": effective,
@@ -591,6 +597,7 @@ def decision_log_days():
         shadow_pnl_by_date,
         sim_pnl_by_date,
         trades_pnl_by_date,
+        watched_pnl_by_date,
     )
     from services.open15_log_view import summarize_day
 
@@ -599,6 +606,7 @@ def decision_log_days():
         paper_by_date = paper_pnl_by_date()
         sim_by_date = sim_pnl_by_date()
         shadow_by_date = shadow_pnl_by_date()
+        watched_by_date = watched_pnl_by_date()
         out = []
         for date, events, source in _all_day_logs():
             digest = summarize_day(
@@ -608,6 +616,7 @@ def decision_log_days():
                 paper_pnl=paper_by_date.get(date),
                 sim_pnl=sim_by_date.get(date),
                 shadow_pnl=shadow_by_date.get(date),
+                watched_pnl=watched_by_date.get(date),
             )
             digest["source"] = source
             out.append(digest)
@@ -695,6 +704,12 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
        border-radius:3px;border:1px solid;margin-left:3px}
  .will.real{color:#89b4fa;border-color:#3b5a86}.will.paper{color:#cba6f7;border-color:#5a4a80}
  .b-unfill{background:#3a2a1b;color:#fab387}
+ /* issue #728 — the watched-break counterfactual: its OWN colour (slate blue),
+    never the green/red money colours and never sim mauve / shadow teal */
+ .b-watched{background:#1b2b3a;color:#89b4fa}
+ .wnum{color:#89b4fa}
+ .brk{color:#89b4fa;font-size:10px;letter-spacing:.06em;text-transform:uppercase;border:1px solid #3b5a86;border-radius:3px;padding:0 4px;margin-right:4px}
+ .ev-watched_counterfactual,.ev-watched_cf{color:#89b4fa}
  .ev-entry_shadow,.ev-exit_shadow{color:#94e2d5}
  /* issue #583 — amber like the other "held, not traded" events, and distinct
     from the red rejection colours: an exclusion is a decision, not a failure */
@@ -804,6 +819,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label class="muted" style="margin-left:14px">shadow rows/day
    <input id="c_shadowmax" type="number" min="0" max="10" step="1" style="width:44px"></label>
   <span id="c_shadowhint" class="muted" style="margin-left:10px"></span>
+ </div>
+ <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
+  <span class="muted" title="issue #728: for every watched name that never triggered but DID break the 09:15 candle high (long) / low (short): 1 lot of the ATM option, bought at the open of the minute after the first break, sold at the exit-time bar open, priced from broker 1m bars after the exit. No order, no slot, never in any P&amp;L bucket. Names that never broke the level are not priced.">watched-break counterfactual (issue #728 — numbers only, bars, 1 lot)</span>
+  <label class="muted" style="margin-left:14px"><input id="c_watched" type="checkbox"> price the untriggered watch list at the 09:15 break</label>
  </div>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
   <span class="muted" title="issue #726 / R63: A = trigger by 09:22, volume ratio below 1.55x, universe median above -0.30%; C = trigger after 09:24 or universe median at/below -0.30%; B = the rest. Grades not ticked are paper-traded at full slot size (shadow rows, reason rating_excluded) so every grade keeps being measured.">trade rating (R63) — grades that place orders</span>
@@ -999,6 +1018,8 @@ async function loadCfg(){
   document.getElementById('c_shadow').checked=
     !!(o.shadow_excluded_side??d.shadow_excluded_side);
   document.getElementById('c_shadowmax').value=o.shadow_max_trades??d.shadow_max_trades??3;
+  // watched-break counterfactual (issue #728) — `??` so a stored false beats the env seed
+  document.getElementById('c_watched').checked=!!(o.watched_cf_enabled??d.watched_cf_enabled);
   // trade rating (issue #726): a stored subset wins over the env seed
   {const tg=String(o.trade_grades||d.trade_grades||'ABC').toUpperCase();
    for(const g of ['A','B','C'])document.getElementById('c_gr'+g).checked=tg.includes(g);}
@@ -1111,6 +1132,7 @@ async function saveCfg(){
     rolling_top_n:+document.getElementById('c_rolltn').value,
     shadow_excluded_side:document.getElementById('c_shadow').checked,
     shadow_max_trades:+document.getElementById('c_shadowmax').value,
+    watched_cf_enabled:document.getElementById('c_watched').checked,
     option_liquidity_gate_enabled:document.getElementById('c_liqgate').checked,
     option_liquidity_min_pctile:+document.getElementById('c_liqmin').value,
     option_liquidity_reentry_pctile:+document.getElementById('c_liqre').value,
@@ -1258,7 +1280,8 @@ async function loadDays(){
         ' filled'+(d.paper?(' &middot; '+d.paper+' paper'):'')+
         (d.unfillable?(' &middot; '+d.unfillable+' unfillable'):'')+
         (d.sim?(' &middot; '+d.sim+' sim'):'')+
-        (d.shadow?(' &middot; '+d.shadow+' shadow'):'')))+'</div>';
+        (d.shadow?(' &middot; '+d.shadow+' shadow'):'')+
+        (d.watched?(' &middot; '+d.watched+' watched'):'')))+'</div>';
     el.onclick=()=>{userPicked=true;selectDay(d.date);};
     box.appendChild(el);
   }
@@ -1388,6 +1411,15 @@ function renderChips(){
   if(shadow||dig.shadow_pnl!=null)
     chips.push(['shadow P&amp;L <span class="net">net</span>',
       dig.shadow_pnl==null?'—':rupee(dig.shadow_pnl)]);
+  // issue #728 — the fifth bucket: never-triggered names priced at the 09:15
+  // break, 1 lot each, from bars. Not money; shown in its own colour.
+  const watched=dig.watched??summ.watched??0;
+  const nobreak=dig.watched_nobreak??summ.watched_nobreak??0;
+  if(watched||nobreak||dig.watched_pnl!=null)
+    chips.push(['watched <span class="net">1 lot \u00b7 bars</span>',
+      (dig.watched_pnl==null?'—':rupee(dig.watched_pnl))+' \u00b7 '+watched+' broke'+
+      (nobreak?(' \u00b7 '+nobreak+' no break'):'')+
+      (dig.watched_priced?(' \u00b7 '+dig.watched_priced+' priced'):'')]);
   // issue #726 — the grade filter the day ran with, the live tape while the
   // window is open, and the per-grade split once the summary has run
   if(armed.trade_grades)chips.push(['grades traded',String(armed.trade_grades)]);
@@ -1803,16 +1835,33 @@ function renderSel(){
       // a stale "-> +Rs316" beside a correctly reconciled "-Rs288.15" in the
       // same row — the exact divergence #557 was opened for, surviving in the
       // one cell that was prose rather than data.
+    }else if(e.event==='watched_counterfactual'){
+      // issue #728 — 1 lot of the ATM option bought at the first 09:15-level
+      // break (no volume gate), sold at the exit; bars, not money. The row
+      // never triggered, so nothing here may read as a fill or a P&L.
+      const r=rows[e.symbol];
+      r.fill='watched'; r.instr='option'; r.contract=e.contract; r.lotSize=e.lot_size;
+      r.qty=e.lot_size; r.breakAt=e.break_at??r.breakAt; r.breakPrice=e.break_price??r.breakPrice;
+      r.optEntry=e.entry_premium; r.optExit=e.exit_premium;
+      r.wcfNet=e.pnl; r.wcfGross=e.gross; r.wcfCharges=e.charges;
+      r.wcfMae=e.mae; r.wcfMfe=e.mfe; r.wcfStatus='priced';
+      r.wcfEntryMin=e.entry_minute; r.wcfExitMin=e.exit_minute;
     }else if(e.event==='no_entry'){
       rows[e.symbol].vol=e.max_vol_ratio;
       rows[e.symbol].volBeyond=e.max_vol_ratio_while_beyond;
       rows[e.symbol].levelBroken=e.level_broken; rows[e.symbol].needed=e.needed;
+      // issue #728 — the first break is the counterfactual entry moment
+      if(e.first_break_at){rows[e.symbol].breakAt=e.first_break_at;
+        rows[e.symbol].breakPrice=e.first_break_price;
+        rows[e.symbol].wcfStatus??='bars_pending';}
+      else if(!e.level_broken)rows[e.symbol].wcfStatus??='no_break';
       // the gate compares the ratio measured WHILE price is beyond the level
       // (on_tick: `beyond and cum_in_min >= vol_mult*baseline`), so the outcome
       // must quote max_vol_ratio_while_beyond — the `max vol×` column's
       // peak-anywhere number can be >= needed on a symbol that never entered.
       const vb=e.max_vol_ratio_while_beyond??e.max_vol_ratio;
-      rows[e.symbol].out=e.level_broken?('level broken &middot; vol '+vb+
+      rows[e.symbol].out=e.level_broken?('level broken'+
+        (e.first_break_at?(' '+esc(e.first_break_at)):'')+' &middot; vol '+vb+
         '&times; &lt; '+e.needed+' while beyond'):'level never broken';
     }
   }
@@ -1872,7 +1921,7 @@ function renderSel(){
       '</td><td>'+gradeCell(r)+
       '</td><td>'+fmtVol(r.vol,r.volBeyond,needed,liveSyms.has(s))+
       '</td><td>'+legCell(r,'entry')+'</td><td>'+legCell(r,'exit')+
-      '</td><td>'+qtyCell(r)+'</td><td>'+pnlCell(r)+'</td><td>'+r.out+'</td>';
+      '</td><td>'+qtyCell(r)+'</td><td>'+pnlCell(r)+'</td><td>'+r.out+watchedOut(r)+'</td>';
     const det=document.createElement('tr');
     det.className='detail';
     det.innerHTML='<td></td><td colspan="11">'+detailFor(s,r,needed)+'</td>';
@@ -1994,6 +2043,23 @@ function detailFor(sym,r,needed){
     ]));
   }
 
+  if(r.fill==='watched'||r.breakAt){
+    // issue #728 — what 1 lot would have done from the break to the exit
+    boxes.push(dbox('WATCHED COUNTERFACTUAL',[
+      ['entry rule','first 09:15-level break, no volume gate'],
+      ['break',r.breakAt?(esc(r.breakAt)+(r.breakPrice!=null?(' @ '+px(r.breakPrice)):'')):null],
+      ['contract',r.contract?('<span class="opt">'+esc(r.contract)+'</span>'+
+        (r.lotSize?(' &middot; lot '+r.lotSize):'')):null],
+      ['entry premium',r.optEntry!=null?(px(r.optEntry)+
+        (r.wcfEntryMin?(' <span class="muted">('+esc(r.wcfEntryMin)+' bar open)</span>'):'')):null],
+      ['exit premium',r.optExit!=null?(px(r.optExit)+' <span class="muted">(exit bar open)</span>'):null],
+      ['gross / charges',r.wcfGross!=null?(rupee2(r.wcfGross)+' / '+rupee2(r.wcfCharges||0)):null],
+      ['net (1 lot)',r.wcfNet!=null?('<span class="wnum">'+rupee2(r.wcfNet)+'</span>'):null],
+      ['worst / best mark',r.wcfMae!=null?(rupee2(r.wcfMae)+' / '+rupee2(r.wcfMfe??0)):null],
+      ['status',r.wcfStatus?esc(String(r.wcfStatus).replace(/_/g,' ')):null],
+      ['source','bars &middot; not money &middot; never in any P&amp;L bucket'],
+    ]));
+  }
   boxes.push(dbox('DECISION',[
     ['level',r.level!=null?px(r.level):null],
     ['trigger',r.at?(esc(r.at)+(r.stockEntry?(' @ '+px(r.stockEntry)):'')):null],
@@ -2082,6 +2148,16 @@ function applyJournal(rows){
     r.entryVol=j.opt_entry_volume??r.entryVol; r.entryOi=j.opt_entry_oi??r.entryOi;
     r.exitVol=j.opt_exit_volume??r.exitVol;    r.exitOi=j.opt_exit_oi??r.exitOi;
     if(j.liquidity_path&&j.liquidity_path.minutes)r.oiPath=j.liquidity_path;
+    if(j.fill==='watched'){
+      // issue #728 — once the day is sealed the journal is the ONLY source
+      // (the arm-time catch-up prices rows on a later day). `pnl` is NULL on
+      // these rows by construction; the number is `opt_pnl` (1 lot, net).
+      r.breakAt=j.break_at??r.breakAt; r.breakPrice=j.break_price??r.breakPrice;
+      r.wcfNet=j.opt_pnl; r.wcfCharges=j.opt_charges_inr;
+      r.wcfGross=(j.opt_pnl!=null)?Math.round((j.opt_pnl+(j.opt_charges_inr||0))*100)/100:null;
+      r.wcfMae=j.cf_mae; r.wcfMfe=j.cf_mfe;
+      r.wcfStatus=(j.opt_pnl!=null)?'priced':(j.opt_symbol?'bars_pending':'no_contract');
+    }
     if(j.pnl!=null){
       // the journal stores GROSS in `pnl` with charges separate; every number
       // this page shows is NET (issue #552). Copying `pnl` straight across
@@ -2093,7 +2169,28 @@ function applyJournal(rows){
 }
 const dash='<span class="muted">&mdash;</span>';
 function px(v){return v==null?null:(Math.round(v*100)/100).toFixed(2);}
+function watchedOut(r){
+  // issue #728 — the counterfactual line under a never-triggered outcome
+  if(r.fill!=='watched'&&!r.breakAt)return '';
+  if(r.wcfStatus==='no_contract')return '<span class="leg">no alive contract at the break &middot; not priced</span>';
+  if(r.wcfNet==null)return '<span class="leg">if entered at the break: bars pending</span>';
+  return '<span class="leg">if entered at the break: '+px(r.optEntry)+' &rarr; '+px(r.optExit)+
+    ' &middot; bars &middot; 1 lot</span>';
+}
 function legCell(r,leg){
+  if(r.fill==='watched'||(r.breakAt&&r.net==null&&!r.stockEntry)){
+    // issue #728 — no trigger: the entry cell shows the BREAK, tagged so it
+    // can never be read as a fill; the exit cell shows the exit-bar premium
+    if(leg==='entry'){
+      if(!r.breakAt)return dash;
+      return '<span class="brk">break</span>'+esc(r.breakAt)+
+        (r.breakPrice!=null?(' @ '+px(r.breakPrice)):'')+
+        (r.contract?('<span class="leg"><span class="opt">'+esc(shortC(r.contract))+'</span> '+
+          (r.optEntry!=null?px(r.optEntry):'<span class="muted">pending</span>')+'</span>'):'');
+    }
+    return r.optExit!=null?(px(r.optExit)+'<span class="leg">'+esc(r.wcfExitMin||'exit')+
+      ' bar open</span>'):dash;
+  }
   // stock line on top, option leg beneath. In option mode the P&L is on the
   // premium while the signal is on the stock, so a cell showing only one of them
   // cannot be reconciled against its own P&L (issue #555).
@@ -2146,7 +2243,7 @@ function qtyCell(r){
   // is 0, and the number below it is the PRICING size — never the other way
   // round, or a shadow row would read as a position that existed.
   const leg=lotsLeg(r);
-  if(r.fill==='sim'||r.fill==='shadow')
+  if(r.fill==='sim'||r.fill==='shadow'||r.fill==='watched')
     return '<span class="muted">0</span><span class="leg">'+esc(r.fill)+' '+
       esc(r.qty??'')+(leg?(' &middot; '+leg):'')+'</span>';
   if(r.qty==null)return dash;
@@ -2160,6 +2257,16 @@ function qtyCell(r){
     (res?('<span class="leg">'+res+'</span>'):'');
 }
 function pnlCell(r){
+  if(r.fill==='watched'){
+    // issue #728 — its own colour, never pos/neg: this is not money
+    if(r.wcfNet==null)return '<span class="badge b-pend">'+
+      (r.wcfStatus==='no_contract'?'no contract':'bars pending')+'</span>';
+    return '<span class="wnum">'+(r.wcfNet>=0?'+':'')+'&#8377;'+r.wcfNet+'</span> '+
+      '<span class="badge b-watched" title="never triggered \u2014 1 lot of the ATM option at '+
+      'the first 09:15 break, no volume gate; bars, not money">watched</span>'+
+      '<span class="leg">gross '+(r.wcfGross??'?')+' &middot; charges '+(r.wcfCharges??'?')+
+      ' &middot; 1 lot &middot; bars</span>';
+  }
   if(r.net==null)return dash;
   const cls=r.net>=0?'pos':'neg';
   const badge={real:'<span class="badge b-real">real</span>',
@@ -2738,6 +2845,15 @@ def serialize_trade(r) -> dict:
         "opt_entry_premium": r.opt_entry_premium,
         "opt_exit_premium": r.opt_exit_premium,
         "opt_pnl": r.opt_pnl,
+        "opt_charges_inr": r.opt_charges_inr,
+        # watched-break counterfactual (issue #728) — the first 09:15-level
+        # break of a name that never triggered, plus the bars-priced marks.
+        # NULL on every row that is not ``fill='watched'``.
+        "break_at": r.break_at,
+        "break_price": r.break_price,
+        "cf_mae": r.cf_mae,
+        "cf_mfe": r.cf_mfe,
+        "cf_source": r.cf_source,
         # contract liquidity at each decision moment (issue #488) —
         # research fields; NULL means "not captured", not "zero"
         "opt_entry_volume": r.opt_entry_volume,
