@@ -232,6 +232,15 @@ class Open15Trade(Base):
     cf_mae_minute = Column(String(5), nullable=True)
     cf_mfe = Column(Float, nullable=True)
     cf_mfe_minute = Column(String(5), nullable=True)
+    # Watched-break counterfactual (issue #728) — a watch-list name that never
+    # TRIGGERED but did break the 09:15 candle high/low. ``fill='watched'``,
+    # ``reason='no_trigger'``; the break moment is the row's only entry
+    # observation (there is no trigger, so ``trigger_price`` stays NULL). The
+    # pricing reuses the #435 option-shadow columns (1 lot, bars, next-minute
+    # open -> exit open) and the #704 ``cf_mae``/``cf_mfe``/``cf_source``;
+    # ``pnl`` stays NULL so no existing sum can ever pick the row up.
+    break_at = Column(String(8), nullable=True)  # HH:MM:SS IST of the first break
+    break_price = Column(Float, nullable=True)  # stock price at that tick
     cf_source = Column(String(8), nullable=True)
     # issue #726 — the R63 A/B/C trade rating, frozen at the trigger. Every
     # cohort (real / paper / sim / shadow / none) is graded so the grade filter
@@ -353,6 +362,9 @@ class Open15Config(Base):
     # Grades NOT listed are paper-traded at full slot size (shadow rows,
     # reason ``rating_excluded``) so every grade keeps being measured.
     trade_grades = Column(String(8), nullable=True)
+    # issue #728 — price the untriggered watch list at the 09:15 break (0/1;
+    # NULL = env seed ``OPEN15_WATCHED_CF``, default on). A measurement knob.
+    watched_cf_enabled = Column(Integer, nullable=True)
     updated_by = Column(String(64), nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -425,6 +437,10 @@ def _ensure_columns():
             "rating_univ_median_pct": "FLOAT",
             "rating_vol_ratio": "FLOAT",
             "rating_provisional_at_add": "VARCHAR(1)",
+            # issue #728 — watched-break counterfactual; NULL on every
+            # existing row (none of them is a watched row)
+            "break_at": "VARCHAR(8)",
+            "break_price": "FLOAT",
         },
         "open15_config": {
             "instrument": "VARCHAR(16)",
@@ -479,6 +495,8 @@ def _ensure_columns():
             # existing install arms exactly as it did before
             "max_vol_ratio": "FLOAT",
             "trade_grades": "VARCHAR(8)",
+            # issue #728 — NULL resolves to the env seed (on)
+            "watched_cf_enabled": "INTEGER",
         },
     }
     try:
@@ -578,6 +596,9 @@ def get_config() -> dict | None:
             "stop_loss_inr_short": row.stop_loss_inr_short,
             "max_vol_ratio": row.max_vol_ratio,
             "trade_grades": row.trade_grades,
+            "watched_cf_enabled": (
+                None if row.watched_cf_enabled is None else bool(row.watched_cf_enabled)
+            ),
             "updated_by": row.updated_by,
             "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         }
@@ -628,6 +649,7 @@ def save_config(
     stop_loss_inr_short: float | None = None,
     max_vol_ratio: float | None = None,
     trade_grades: str | None = None,
+    watched_cf_enabled: bool | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -691,6 +713,9 @@ def save_config(
         row.stop_loss_inr_short = stop_loss_inr_short
         row.max_vol_ratio = max_vol_ratio
         row.trade_grades = trade_grades
+        row.watched_cf_enabled = (
+            None if watched_cf_enabled is None else int(bool(watched_cf_enabled))
+        )
         row.updated_by = updated_by
         db_session.commit()
         return True
@@ -713,7 +738,13 @@ def save_config(
 # ``replay`` (issue #600) is a session the strategy never ran, rebuilt from 1m
 # bars after the fact. Its P&L carries an entry-timing band wide enough to flip
 # sign, so it must never reach compound sizing or any published figure.
-NON_REAL_FILLS = ("paper", "sim", "none", "shadow", "replay")
+# ``watched`` (issue #728) is a watch-list name that never triggered, priced at
+# 1 lot from bars as if entered at its first 09:15-level break. Its ``pnl`` is
+# NULL by construction (the number lives in ``opt_pnl``), so this entry is the
+# second lock, not the first.
+NON_REAL_FILLS = ("paper", "sim", "none", "shadow", "replay", "watched")
+WATCHED_FILL = "watched"
+WATCHED_REASON = "no_trigger"
 
 _REAL_FILL = (Open15Trade.fill.is_(None)) | (Open15Trade.fill.notin_(NON_REAL_FILLS))
 
@@ -743,6 +774,46 @@ def net_pnl_of_row(row) -> float:
     """Python-side twin of :func:`net_pnl_expr` for an ORM row / mapping."""
     get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
     return float(get("pnl") or 0.0) - float(get("charges_inr") or 0.0)
+
+
+def watched_net_of_row(row) -> float | None:
+    """NET 1-lot counterfactual of a ``fill='watched'`` row, or None (issue #728).
+
+    The ONE reader for this number (the #552 shape). The value lives in
+    ``opt_pnl`` — the #435 option-shadow column, already net of modelled
+    charges for 1 lot — and never in ``pnl``, so ``net_pnl_expr`` /
+    ``total_realized_pnl`` cannot see it. A non-watched row returns None even
+    when its ``opt_pnl`` is set: that column is the ATM shadow of a real stock
+    trade there, a different measurement.
+    """
+    get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
+    if get("fill") != WATCHED_FILL or get("opt_pnl") is None:
+        return None
+    return round(float(get("opt_pnl")), 2)
+
+
+def watched_pnl_by_date() -> dict[str, float]:
+    """Sum of 1-lot watched-break nets per trade_date (issue #728).
+
+    A FIFTH bucket, never folded into any other: these rows were never
+    triggered, so the number answers only "what would the level break alone
+    have paid?" — bars-priced, 1 lot each, optimistic by ~the spread.
+    """
+    try:
+        from sqlalchemy import func
+
+        rows = (
+            db_session.query(Open15Trade.trade_date, func.sum(Open15Trade.opt_pnl))
+            .filter(Open15Trade.fill == WATCHED_FILL, Open15Trade.opt_pnl.isnot(None))
+            .group_by(Open15Trade.trade_date)
+            .all()
+        )
+        return {d: round(float(v), 2) for d, v in rows if v is not None}
+    except Exception:
+        logger.exception("open15: watched per-date aggregation failed")
+        return {}
+    finally:
+        db_session.remove()
 
 
 STOP_LOSS_REASON = "stop_loss"

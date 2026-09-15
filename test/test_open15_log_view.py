@@ -96,6 +96,12 @@ def test_summarize_day_traded():
         # distinguishable from "it was watched and broke even"
         "shadow": 0,
         "shadow_pnl": None,
+        # issue #728 — the never-triggered names: OFSS broke its level (priceable
+        # at the break), DRREDDY never did; nothing was priced on a pre-#728 day
+        "watched": 1,
+        "watched_nobreak": 1,
+        "watched_priced": 0,
+        "watched_pnl": None,
         # a pre-#643 day has no entry_error events: no trigger was ever lost to
         # a raise. 0, not None — this is a COUNT, and the absence of errors is
         # a fact, unlike an absent P&L bucket which was never measured.

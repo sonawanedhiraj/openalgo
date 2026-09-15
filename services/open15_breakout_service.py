@@ -97,6 +97,14 @@ _EXIT_TIME_DEFAULT = "09:30"
 _EXIT_LATEST_MIN = 15 * 60 + 10  # 15:10
 
 
+def _hms(ts) -> str | None:
+    """``datetime`` -> ``'HH:MM:SS'`` (IST wall time as carried on the tick); None-safe."""
+    try:
+        return ts.strftime("%H:%M:%S") if ts is not None else None
+    except Exception:
+        return None
+
+
 def parse_hhmm(value) -> int | None:
     """``"HH:MM"`` -> minutes since midnight, or None on malformed input."""
     try:
@@ -435,6 +443,15 @@ def _shadow_excluded_side_default() -> bool:
 
 def _shadow_max_trades_default() -> int:
     return clamp_shadow_max_trades(os.getenv("OPEN15_SHADOW_MAX_TRADES", "3"))
+
+
+def _watched_cf_enabled_default() -> bool:
+    """Price the untriggered watch list at the 09:15 break (issue #728).
+
+    A measurement knob (the ``OPEN15_SIM_SKIPPED_ENABLED`` shape): it costs
+    ~10 bar fetches a day off-thread after the exit and never touches an order.
+    """
+    return os.getenv("OPEN15_WATCHED_CF", "true").strip().lower() in ("1", "true", "yes", "on")
 
 
 def shadow_side_for(trade_side: str, enabled: bool) -> str | None:
@@ -1096,6 +1113,9 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         if shadow_max_cfg is None
         else clamp_shadow_max_trades(shadow_max_cfg)
     )
+    # watched-break counterfactual (issue #728) — same ``is None`` treatment
+    watched_cfg = cfg.get("watched_cf_enabled")
+    watched_cf_enabled = _watched_cf_enabled_default() if watched_cfg is None else bool(watched_cfg)
     # residual-cash sizing (issue #643) — shared resolution with the child
     # mirror fan-out (issue #690), so parent and child read one definition
     residual_enabled, residual_reserve_pct, residual_min_lots = resolve_residual_params(cfg)
@@ -1134,6 +1154,7 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "rolling_top_n": rolling_top_n,
         "shadow_excluded_side": shadow_enabled,
         "shadow_max_trades": shadow_max_trades,
+        "watched_cf_enabled": watched_cf_enabled,
         # ---- residual-cash sizing (issue #643) -----------------------------
         "residual_sizing_enabled": residual_enabled,
         "residual_reserve_pct": residual_reserve_pct,
@@ -1789,6 +1810,12 @@ class Open15Core:
         if beyond:
             ws["level_broken"] = True
             ws["max_vol_ratio_beyond"] = max(ws["max_vol_ratio_beyond"] or 0.0, ratio)
+            # issue #728 — the FIRST break is the counterfactual entry moment
+            # for a name that never triggers. Recorded from the tick already
+            # in hand: no broker call, no work beyond two dict writes.
+            if ws.get("first_break_ts") is None:
+                ws["first_break_ts"] = ts
+                ws["first_break_price"] = price
         if beyond and cum_in_min >= self.vol_mult * baseline:
             action = {
                 "symbol": symbol,
@@ -1841,6 +1868,9 @@ class Open15Core:
                 "level_broken": bool(ws.get("level_broken", False)),
                 "entered": sym in self.entered,
                 "watch_source": self.watch_source.get(sym, "seed"),
+                # issue #728 — first 09:15-level break (None until it happens)
+                "first_break_at": _hms(ws.get("first_break_ts")),
+                "first_break_price": ws.get("first_break_price"),
             }
             for sym, ws in list(self.watch_stats.items())
         }
@@ -2492,6 +2522,9 @@ class Open15BreakoutService:
             shadow_excluded_side=self.day_config["shadow_excluded_side"],
             shadow_side=self.day_config["shadow_side"],
             shadow_max_trades=self.day_config["shadow_max_trades"],
+            # issue #728 — whether the untriggered watch list gets priced at
+            # the 09:15 break after the exit (numbers only, never an order)
+            watched_cf_enabled=self.day_config["watched_cf_enabled"],
             sizing_mode=self.day_config["sizing_mode"],
             margin_per_slot=self.day_config["margin_per_slot"],
             margin_effective=self.day_config["margin_effective"],
@@ -2642,6 +2675,16 @@ class Open15BreakoutService:
         # stop-loss counterfactual catch-up (issue #704): any stop row, any
         # day, whose held-to-exit mark is still NULL
         self._backfill_stop_counterfactuals(None)
+        # watched-break catch-up (issue #728): any watched row whose bars the
+        # broker had not served at the summary
+        try:
+            from services.open15_option_shadow import enrich_watched_pending
+
+            res = enrich_watched_pending()
+            if res.get("priced"):
+                logger.info("open15 watched catch-up: %s", res)
+        except Exception:
+            logger.exception("open15: watched-break catch-up failed")
 
     def _window_minutes(self) -> tuple[int, int]:
         """Today's effective (entry-cutoff, exit) as minutes since midnight."""
@@ -3350,6 +3393,9 @@ class Open15BreakoutService:
                         max_vol_ratio=round(ws.get("max_vol_ratio") or 0.0, 2),
                         max_vol_ratio_while_beyond=round(ws.get("max_vol_ratio_beyond") or 0.0, 2),
                         needed=self._vol_needed(),
+                        # issue #728 — the counterfactual entry moment
+                        first_break_at=_hms(ws.get("first_break_ts")),
+                        first_break_price=ws.get("first_break_price"),
                     )
             self._persist_day_log()
 
@@ -3998,6 +4044,10 @@ class Open15BreakoutService:
             # issue #726 - per-grade real vs paper counts and net, so the day
             # says what the grade filter did AND what it declined
             by_grade=self._grade_breakdown(),
+            # issue #728 — never-triggered names: how many broke the level
+            # (priceable at the break) vs never did (not priced)
+            watched=self._watched_counts()[0],
+            watched_nobreak=self._watched_counts()[1],
             day=self.day_status,
             captured_drift=drifts,
         )
@@ -4036,6 +4086,21 @@ class Open15BreakoutService:
             self._log_event("opt_liquidity_path", **res)
         except Exception:
             logger.exception("open15: liquidity-path enrichment failed")
+        # watched-break counterfactual (issue #728): 1 lot of the ATM option
+        # bought at the first 09:15-level break for every watched name that
+        # never triggered, priced from bars. Same broker lag as the shadow, so
+        # rows left unpriced here are retried by the next 09:10 arm's catch-up.
+        # Journal rows carry the number in ``opt_pnl``; ``pnl`` stays NULL.
+        if self.day_config.get("watched_cf_enabled", True):
+            try:
+                from services.open15_option_shadow import enrich_watched
+
+                wres = enrich_watched(self._trade_date(), list(self.day_log))
+                for detail in wres.pop("rows", []):
+                    self._log_event("watched_counterfactual", **detail)
+                self._log_event("watched_cf", **wres)
+            except Exception:
+                logger.exception("open15: watched-break counterfactual failed")
         if self._tick_writer is not None:
             try:
                 flushed = self._tick_writer.flush_now()
@@ -4043,6 +4108,22 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: tick flush failed")
         self._persist_day_log()
+
+    def _watched_counts(self) -> tuple[int, int]:
+        """``(broke_level, never_broke)`` among selected-but-not-entered names (#728)."""
+        core = self.core
+        if not core:
+            return 0, 0
+        broke = nobreak = 0
+        for sym in list(core.selected):
+            if sym in core.entered:
+                continue
+            ws = core.watch_stats.get(sym, {})
+            if ws.get("level_broken"):
+                broke += 1
+            else:
+                nobreak += 1
+        return broke, nobreak
 
     def _persist_day_log(self) -> None:
         """Snapshot today's decision log so the UI can query past days.
