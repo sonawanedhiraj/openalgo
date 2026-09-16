@@ -821,7 +821,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <span id="c_shadowhint" class="muted" style="margin-left:10px"></span>
  </div>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
-  <span class="muted" title="issue #728: for every watched name that never triggered but DID break the 09:15 candle high (long) / low (short): 1 lot of the ATM option, bought at the open of the minute after the first break, sold at the exit-time bar open, priced from broker 1m bars after the exit. No order, no slot, never in any P&amp;L bucket. Names that never broke the level are not priced.">watched-break counterfactual (issue #728 — numbers only, bars, 1 lot)</span>
+  <span class="muted" title="issue #728: for every watched name that never triggered but DID break the 09:15 candle high (long) / low (short): 1 lot of the ATM option, bought at the open of the minute after the first break, sold at the exit-time bar open, priced from broker 1m bars after the exit. No order, no slot, never in any P&amp;L bucket. Names that never broke the level are not priced.">watched-break counterfactual (issues #728/#730 — numbers only, live quote poll at the exit, bars as fallback, 1 lot)</span>
   <label class="muted" style="margin-left:14px"><input id="c_watched" type="checkbox"> price the untriggered watch list at the 09:15 break</label>
  </div>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
@@ -1846,6 +1846,9 @@ function renderSel(){
       r.wcfNet=e.pnl; r.wcfGross=e.gross; r.wcfCharges=e.charges;
       r.wcfMae=e.mae; r.wcfMfe=e.mfe; r.wcfStatus='priced';
       r.wcfEntryMin=e.entry_minute; r.wcfExitMin=e.exit_minute;
+      r.wcfSource=e.source||'bars';  // issue #730 — live quote poll vs bars
+      r.entryBid??=e.entry_bid; r.entryAsk??=e.entry_ask;
+      r.exitBid??=e.exit_bid; r.exitAsk??=e.exit_ask;
     }else if(e.event==='no_entry'){
       rows[e.symbol].vol=e.max_vol_ratio;
       rows[e.symbol].volBeyond=e.max_vol_ratio_while_beyond;
@@ -2051,13 +2054,15 @@ function detailFor(sym,r,needed){
       ['contract',r.contract?('<span class="opt">'+esc(r.contract)+'</span>'+
         (r.lotSize?(' &middot; lot '+r.lotSize):'')):null],
       ['entry premium',r.optEntry!=null?(px(r.optEntry)+
-        (r.wcfEntryMin?(' <span class="muted">('+esc(r.wcfEntryMin)+' bar open)</span>'):'')):null],
-      ['exit premium',r.optExit!=null?(px(r.optExit)+' <span class="muted">(exit bar open)</span>'):null],
+        (r.wcfEntryMin?(' <span class="muted">('+esc(r.wcfEntryMin)+
+          (r.wcfSource==='live'?' quote':' bar open')+')</span>'):'')):null],
+      ['exit premium',r.optExit!=null?(px(r.optExit)+' <span class="muted">('+
+        (r.wcfSource==='live'?'last quote before the exit':'exit bar open')+')</span>'):null],
       ['gross / charges',r.wcfGross!=null?(rupee2(r.wcfGross)+' / '+rupee2(r.wcfCharges||0)):null],
       ['net (1 lot)',r.wcfNet!=null?('<span class="wnum">'+rupee2(r.wcfNet)+'</span>'):null],
       ['worst / best mark',r.wcfMae!=null?(rupee2(r.wcfMae)+' / '+rupee2(r.wcfMfe??0)):null],
       ['status',r.wcfStatus?esc(String(r.wcfStatus).replace(/_/g,' ')):null],
-      ['source','bars &middot; not money &middot; never in any P&amp;L bucket'],
+      ['source',wcfSrc(r)+' &middot; not money &middot; never in any P&amp;L bucket'],
     ]));
   }
   boxes.push(dbox('DECISION',[
@@ -2157,6 +2162,7 @@ function applyJournal(rows){
       r.wcfGross=(j.opt_pnl!=null)?Math.round((j.opt_pnl+(j.opt_charges_inr||0))*100)/100:null;
       r.wcfMae=j.cf_mae; r.wcfMfe=j.cf_mfe;
       r.wcfStatus=(j.opt_pnl!=null)?'priced':(j.opt_symbol?'bars_pending':'no_contract');
+      r.wcfSource=j.cf_source||r.wcfSource;
     }
     if(j.pnl!=null){
       // the journal stores GROSS in `pnl` with charges separate; every number
@@ -2169,13 +2175,14 @@ function applyJournal(rows){
 }
 const dash='<span class="muted">&mdash;</span>';
 function px(v){return v==null?null:(Math.round(v*100)/100).toFixed(2);}
+function wcfSrc(r){return r.wcfSource==='live'?'live quote':'bars';}
 function watchedOut(r){
   // issue #728 — the counterfactual line under a never-triggered outcome
   if(r.fill!=='watched'&&!r.breakAt)return '';
   if(r.wcfStatus==='no_contract')return '<span class="leg">no alive contract at the break &middot; not priced</span>';
-  if(r.wcfNet==null)return '<span class="leg">if entered at the break: bars pending</span>';
+  if(r.wcfNet==null)return '<span class="leg">if entered at the break: priced at the exit (live quotes; bars as fallback)</span>';
   return '<span class="leg">if entered at the break: '+px(r.optEntry)+' &rarr; '+px(r.optExit)+
-    ' &middot; bars &middot; 1 lot</span>';
+    ' &middot; '+wcfSrc(r)+' &middot; 1 lot</span>';
 }
 function legCell(r,leg){
   if(r.fill==='watched'||(r.breakAt&&r.net==null&&!r.stockEntry)){
@@ -2189,7 +2196,7 @@ function legCell(r,leg){
           (r.optEntry!=null?px(r.optEntry):'<span class="muted">pending</span>')+'</span>'):'');
     }
     return r.optExit!=null?(px(r.optExit)+'<span class="leg">'+esc(r.wcfExitMin||'exit')+
-      ' bar open</span>'):dash;
+      (r.wcfSource==='live'?' quote':' bar open')+'</span>'):dash;
   }
   // stock line on top, option leg beneath. In option mode the P&L is on the
   // premium while the signal is on the stock, so a cell showing only one of them
@@ -2260,12 +2267,12 @@ function pnlCell(r){
   if(r.fill==='watched'){
     // issue #728 — its own colour, never pos/neg: this is not money
     if(r.wcfNet==null)return '<span class="badge b-pend">'+
-      (r.wcfStatus==='no_contract'?'no contract':'bars pending')+'</span>';
+      (r.wcfStatus==='no_contract'?'no contract':'pending')+'</span>';
     return '<span class="wnum">'+(r.wcfNet>=0?'+':'')+'&#8377;'+r.wcfNet+'</span> '+
       '<span class="badge b-watched" title="never triggered \u2014 1 lot of the ATM option at '+
       'the first 09:15 break, no volume gate; bars, not money">watched</span>'+
       '<span class="leg">gross '+(r.wcfGross??'?')+' &middot; charges '+(r.wcfCharges??'?')+
-      ' &middot; 1 lot &middot; bars</span>';
+      ' &middot; 1 lot &middot; '+wcfSrc(r)+'</span>';
   }
   if(r.net==null)return dash;
   const cls=r.net>=0?'pos':'neg';

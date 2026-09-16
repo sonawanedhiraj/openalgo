@@ -538,10 +538,20 @@ def _batched_quotes(contracts: list[tuple[str, str]]) -> dict[str, dict] | None:
                     return None
                 return f if f > 0 else None
 
+            def _n(v):
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    return None
+
             out[r.get("symbol")] = {
                 "ltp": float(ltp),
                 "bid": _px(d.get("bid")),
                 "ask": _px(d.get("ask")),
+                # issue #730 — the watched-break rows record contract
+                # liquidity at both legs; free, it was in the response
+                "volume": _n(d.get("volume")),
+                "oi": _n(d.get("oi")),
             }
         return out
     except Exception:
@@ -625,6 +635,35 @@ def _ghost_rows_now(rows) -> list:
     return [r for r in stopped if r.cf_pnl is None]
 
 
+def _watched_marks(watched: list[dict], quotes: dict[str, dict] | None) -> list[dict]:
+    """Per-contract quote snapshot for the watched-break tracker (issue #730).
+
+    ``watched`` is the risk thread's in-memory list of ``{symbol, contract,
+    lot, side, break_at}`` — not journal rows: a watched name can still
+    trigger after its break, so nothing is journaled until the exit. LTP-
+    marked like the ghosts (the sim / paper / shadow convention); bid, ask,
+    volume and OI ride along as instrumentation.
+    """
+    out = []
+    for w in watched or []:
+        q = (quotes or {}).get(w.get("contract")) or {}
+        out.append(
+            {
+                "symbol": w.get("symbol"),
+                "side": w.get("side"),
+                "contract": w.get("contract"),
+                "lot": int(w.get("lot") or 1),
+                "break_at": w.get("break_at"),
+                "ltp": q.get("ltp"),
+                "bid": q.get("bid"),
+                "ask": q.get("ask"),
+                "volume": q.get("volume"),
+                "oi": q.get("oi"),
+            }
+        )
+    return out
+
+
 def _ghost_marks(ghost_rows, quotes: dict[str, dict] | None) -> list[dict]:
     """Ghosts stay marked at the LTP on purpose: the counterfactual they feed
     is compared against the 1m-close bars backfill (#704), which is LTP-based."""
@@ -655,7 +694,7 @@ def _ghost_marks(ghost_rows, quotes: dict[str, dict] | None) -> list[dict]:
     return out
 
 
-def live_pnl() -> dict:
+def live_pnl(watched: list[dict] | None = None) -> dict:
     """Live MTM of today's open real trades; ``status`` drives the page.
 
     ``live``   -> trades are open; payload carries per-trade + portfolio MTM.
@@ -664,6 +703,11 @@ def live_pnl() -> dict:
 
     Cached in-process for ~80% of the configured poll interval, so any number
     of open browser tabs still produce at most one broker call per interval.
+
+    ``watched`` (issue #730) is the risk monitor's list of watched-break
+    contracts to mark on the same batch; only the monitor passes it, and a
+    call that carries one bypasses the cache READ (so a page poll that won
+    the race cannot cost the tracker a mark) while still refreshing it.
     """
     from database.open15_breakout_db import db_session
 
@@ -674,7 +718,7 @@ def live_pnl() -> dict:
 
     with _LIVE_LOCK:
         hit = _LIVE_CACHE.get(today)
-    if hit and (now_mono - hit[0]) < ttl:
+    if not watched and hit and (now_mono - hit[0]) < ttl:
         return hit[1]
 
     try:
@@ -684,24 +728,37 @@ def live_pnl() -> dict:
         # #704) — a "ghost" mark, reported apart from the trades and NEVER
         # summed into portfolio_mtm or read by the risk rules
         ghost_rows = _ghost_rows_now(rows)
+        # watched-break rows (issue #730) ride the same batch — never in
+        # ``trades`` / ``portfolio_mtm``; reported under ``watched``
+        watched_rows = list(watched or [])
         if not open_rows:
             payload = {
                 "status": "closed" if rows else "idle",
                 "date": today,
                 "poll_interval_s": interval,
             }
-            if ghost_rows:
-                quotes = _batched_quotes([_row_contract(r) for r in ghost_rows])
+            if ghost_rows or watched_rows:
+                quotes = _batched_quotes(
+                    [_row_contract(r) for r in ghost_rows]
+                    + [(w["contract"], "NFO") for w in watched_rows]
+                )
                 payload["asof"] = _now_ist().strftime("%H:%M:%S")
-                payload["ghost"] = _ghost_marks(ghost_rows, quotes)
-                payload["ghost_quotes_ok"] = quotes is not None
+                if ghost_rows:
+                    payload["ghost"] = _ghost_marks(ghost_rows, quotes)
+                    payload["ghost_quotes_ok"] = quotes is not None
+                if watched_rows:
+                    payload["watched"] = _watched_marks(watched_rows, quotes)
+                    payload["watched_quotes_ok"] = quotes is not None
             # cache the terminal answer briefly too — the page may poll from
             # several tabs, and "no open trades" need not hit the DB each time
             with _LIVE_LOCK:
                 _LIVE_CACHE[today] = (now_mono, payload)
             return payload
 
-        quotes = _batched_quotes([_row_contract(r) for r in open_rows + ghost_rows])
+        quotes = _batched_quotes(
+            [_row_contract(r) for r in open_rows + ghost_rows]
+            + [(w["contract"], "NFO") for w in watched_rows]
+        )
         trades = []
         total = 0.0
         total_net = 0.0
@@ -760,6 +817,9 @@ def live_pnl() -> dict:
         if ghost_rows:
             payload["ghost"] = _ghost_marks(ghost_rows, quotes)
             payload["ghost_quotes_ok"] = quotes is not None
+        if watched_rows:
+            payload["watched"] = _watched_marks(watched_rows, quotes)
+            payload["watched_quotes_ok"] = quotes is not None
         with _LIVE_LOCK:
             _LIVE_CACHE[today] = (now_mono, payload)
         return payload

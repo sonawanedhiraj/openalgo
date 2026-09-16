@@ -1860,10 +1860,26 @@ the grade rather than re-tune it. Tests: `test/test_open15_trade_rating.py`.
 **The untriggered watch list is priced at the 09:15 break (issue #728, numbers
 only).** Every watched name (seed + rolling) that ends the entry window with
 NO trigger but DID break the 09:15 candle high/low gets ONE counterfactual: 1 lot
-of the ATM option bought at the open of the minute after the first break (no
-volume gate), sold at the `exit_time` bar open, from broker 1m bars after the
-exit (`open15_option_shadow.enrich_watched`; retried by the next 09:10 arm via
-`enrich_watched_pending`). The break is recorded on the tick thread from the
+of the ATM option bought at the first 09:15-level break (no volume gate), sold
+at the scheduled exit. **Priced LIVE on the risk monitor's batched quote poll
+(issue #730), bars as the fallback.** The risk thread picks up each break
+from `watch_stats` at its next poll, resolves the ATM contract (master
+contract, no broker call) and rides it on the SAME `get_multiquotes` batch
+the open trades and #704 ghosts use — zero extra broker calls; the first quote
+after the break is the entry mark (LTP, the sim convention; bid/ask/volume/OI
+kept), every poll extends the MAE/MFE path, and `flatten` stamps the last
+quote as the exit (`_stamp_watched_live`, `cf_source='live'`), so the number
+is on `/logs` at 09:30. **Nothing is journaled until the exit**: a watched
+name can still trigger after its break, and a triggered name has no
+counterfactual (it is dropped the poll it enters). The watched marks are
+reported under `live_pnl()['watched']`, never in `trades`/`portfolio_mtm`,
+so the stop and trail rules cannot see them by construction. The bars pass
+(`open15_option_shadow.enrich_watched` at the 09:35 summary, retried by the
+next 09:10 arm via `enrich_watched_pending`; entry = open of the minute after
+the break, exit = `exit_time` bar open, `cf_source='bars'`) now prices only
+what the poll left unpriced — a restart mid-window, a contract with no quote —
+and re-prices BOTH legs when it does (one convention per row; the page and
+CSV say which via `wcf_source`). The break is recorded on the tick thread from the
 tick in hand (`Open15Core.on_tick` → `watch_stats.first_break_ts/price`, carried
 on the `no_entry` event) — no broker call there (#626). Journal row
 `fill='watched'`, `reason='no_trigger'`, `break_at`/`break_price`; the number is

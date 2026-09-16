@@ -322,7 +322,7 @@ def test_selection_outcomes_carry_the_break_and_the_counterfactual():
     assert pg["wcf_status"] == "no_break" and pg["wcf_net"] is None
     assert "wcf_net" in CSV_COLUMNS and "break_at" in CSV_COLUMNS
     header = render_csv([infy]).split("\n")[0]
-    assert header.endswith("wcf_status")
+    assert header.endswith("wcf_status,wcf_source")
 
 
 def test_journal_overlay_prices_a_sealed_day_without_an_event():

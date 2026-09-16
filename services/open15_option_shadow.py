@@ -656,6 +656,84 @@ def watched_candidates(events: list[dict], breaks: dict | None = None) -> list[d
     return out
 
 
+def insert_watched_row(
+    trade_date: str,
+    cand: dict,
+    contract: dict | None,
+    exit_minute: str,
+    mode: str | None,
+) -> int | None:
+    """Journal ONE ``fill='watched'`` row (issues #728/#730) — the single
+    writer for both the live quote-poll path and the bars pass, so the two
+    cannot drift. ``cf_source`` is left NULL here: whichever pricer stamps
+    the row sets it (``live`` / ``bars``). ``contract`` None journals a
+    ``no_contract`` row so the day says so.
+    """
+    from database.open15_breakout_db import WATCHED_FILL, WATCHED_REASON, insert_trade
+
+    kw = {
+        "trade_date": trade_date,
+        "symbol": cand["symbol"],
+        "side": cand["side"],
+        "mode": mode,
+        "instrument": "option",
+        "gap_pct": cand.get("gap_pct"),
+        "break_at": cand["break_at"],
+        "break_price": float(cand["break_price"]),
+        "quantity": 0,
+        "watch_source": cand.get("watch_source") or "seed",
+        "status": "skipped",
+        "reason": WATCHED_REASON if contract else "no_contract",
+        "fill": WATCHED_FILL,
+        "cf_exit_minute": exit_minute,
+    }
+    if contract:
+        kw.update(
+            opt_symbol=contract["symbol"],
+            opt_lot_size=int(contract["lotsize"]),
+            opt_tick_size=contract.get("ticksize"),
+            sim_quantity=int(contract["lotsize"]),
+        )
+    return insert_trade(**kw)
+
+
+def live_watched_fields(
+    entry_premium: float,
+    exit_premium: float,
+    lot: int,
+    path: list[tuple[str, float]],
+) -> dict:
+    """Journal fields for a watched row priced from the LIVE quote poll (#730).
+
+    ``path`` is ``[(HH:MM:SS, ltp), ...]`` — every poll from the entry mark
+    to the exit; MAE/MFE are the worst / best of those LTP marks for 1 lot,
+    the same LTP convention the ghosts use (#704). Pure; no I/O.
+    """
+    gross = round((exit_premium - entry_premium) * lot, 2)
+    charges = option_round_trip_charges(entry_premium * lot, exit_premium * lot)
+    net = round(gross - (charges or 0.0), 2)
+    worst = best = None
+    worst_at = best_at = None
+    for at, ltp in path or []:
+        v = round((float(ltp) - entry_premium) * lot, 2)
+        if worst is None or v < worst:
+            worst, worst_at = v, at
+        if best is None or v > best:
+            best, best_at = v, at
+    return {
+        "opt_exit_premium": exit_premium,
+        "opt_charges_inr": charges,
+        "opt_pnl": net,
+        "cf_mae": worst,
+        "cf_mae_minute": _minute_of(worst_at) if worst_at else None,
+        "cf_mfe": best,
+        "cf_mfe_minute": _minute_of(best_at) if best_at else None,
+        "cf_source": "live",
+        "gross": gross,
+        "charges": charges,
+    }
+
+
 def _price_watched(
     opt_symbol: str,
     lot: int,
@@ -707,6 +785,12 @@ def enrich_watched(
 ) -> dict:
     """Journal + price the watched-break counterfactual for one day (issue #728).
 
+    Since issue #730 this is the FALLBACK: the risk monitor prices most rows
+    live at the exit (``cf_source='live'``); this pass inserts + prices only
+    what the poll left unpriced (restart mid-window, no quote for the
+    contract). A row with a live entry mark but no exit is re-priced here
+    on bars for BOTH legs — one convention per row.
+
     Idempotent and fail-graceful. For every ``no_entry`` symbol that broke its
     level and has a break time: insert the ``fill='watched'`` journal row once
     (contract resolved at the break price), then price it from bars. A row the
@@ -723,7 +807,6 @@ def enrich_watched(
         WATCHED_REASON,
         Open15Trade,
         db_session,
-        insert_trade,
         update_trade,
     )
 
@@ -788,31 +871,7 @@ def enrich_watched(
             contract = resolve_atm_option(
                 c["symbol"], c["side"], float(c["break_price"]), trade_date
             )
-            kw = {
-                "trade_date": trade_date,
-                "symbol": c["symbol"],
-                "side": c["side"],
-                "mode": mode,
-                "instrument": "option",
-                "gap_pct": c.get("gap_pct"),
-                "break_at": c["break_at"],
-                "break_price": float(c["break_price"]),
-                "quantity": 0,
-                "watch_source": c["watch_source"],
-                "status": "skipped",
-                "reason": WATCHED_REASON if contract else "no_contract",
-                "fill": WATCHED_FILL,
-                "cf_exit_minute": exit_minute,
-                "cf_source": WATCHED_SOURCE,
-            }
-            if contract:
-                kw.update(
-                    opt_symbol=contract["symbol"],
-                    opt_lot_size=int(contract["lotsize"]),
-                    opt_tick_size=contract.get("ticksize"),
-                    sim_quantity=int(contract["lotsize"]),
-                )
-            rid = insert_trade(**kw)
+            rid = insert_watched_row(trade_date, c, contract, exit_minute, mode)
             if not contract:
                 res["no_contract"] += 1
                 logger.info(
