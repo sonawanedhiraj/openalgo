@@ -153,9 +153,14 @@ may enter any published performance number.
 watch-list name that ended the entry window with NO trigger but DID break the
 09:15 candle high (long) / low (short) is priced as if 1 lot of the ATM option
 had been bought at the first break — no volume gate — and sold at the
-`exit_time` bar open, from broker 1m bars after the exit (entry = open of the
-minute after the break minute; MAE/MFE from bar lows/highs over the hold;
-`cf_source='bars'`). The break itself (`break_at`, `break_price`) is recorded
+scheduled exit. **Priced live (issue #730):** the risk monitor's batched quote
+poll carries the contract from the poll after the break; entry = the first
+quote after the break (LTP, bid/ask kept), exit = the last quote before the
+flatten, MAE/MFE over the polls (`cf_source='live'`, on the page at 09:30).
+Bars are the fallback (entry = open of the minute after the break minute, exit
+= `exit_time` bar open, MAE/MFE from bar lows/highs; `cf_source='bars'`), used
+only for rows the poll left unpriced. Nothing is journaled until the exit — a
+watched name can still trigger after its break. The break itself (`break_at`, `break_price`) is recorded
 on the tick thread from the tick already in hand — no broker call. The number
 lives in `opt_pnl` (read through `watched_net_of_row`); **`pnl` stays NULL by
 construction**, `watched` is in `NON_REAL_FILLS`, the row is never registered

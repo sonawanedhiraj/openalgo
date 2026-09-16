@@ -629,6 +629,12 @@ def _fresh_risk_state() -> dict:
         # flatten at the scheduled exit stamps these as the LIVE counterfactual.
         "ghost_path": {},
         "ghost_last": {},
+        # issue #730: watched-break tracker — per symbol {contract, lot, side,
+        # watch_source, break_at, break_price, gap_pct, entry (first quote at/
+        # after the break), path [(HH:MM:SS, ltp)], last quote}. Nothing is
+        # journaled until the scheduled exit: a watched name can still
+        # trigger after its break, and a triggered name has no counterfactual.
+        "watched_track": {},
     }
 
 
@@ -3312,6 +3318,9 @@ class Open15BreakoutService:
         # the scheduled exit, the instant a held row would have been
         # flattened. Before any exit order, off the tick thread.
         self._stamp_ghost_counterfactuals()
+        # watched-break rows (issue #730): journal + price from the live marks
+        # the monitor collected since each name's break — same instant
+        self._stamp_watched_live()
         # the trail path (issue #716): written once, here if the trail never
         # fired (a locked day that ran to the scheduled exit, or one that
         # never locked)
@@ -3458,13 +3467,20 @@ class Open15BreakoutService:
         """
         from services.open15_pnl_curve import invalidate_live_cache, live_pnl
 
-        payload = live_pnl()  # refreshes the shared cache — the chart reads this too
+        watched = self._register_watched_breaks()
+        # the watched contracts ride the SAME batched quote call (issue #730);
+        # (the kwarg is passed only when there is something to mark — every
+        # existing caller and test fake of live_pnl takes no arguments)
+        payload = (
+            live_pnl(watched=watched) if watched else live_pnl()
+        )  # refreshes the shared cache — the chart reads this too
         # risk-exited rows' ghost marks (#704 stop loss, #713 profit trail) —
         # recorded for the live counterfactual and NOTHING else: they are not
         # in ``trades``, so the stop and day rules below cannot see them by
         # construction. Runs BEFORE the ``trail_done`` early return so a
         # trail-exited day keeps marking its contracts to the scheduled exit.
         self._track_ghosts(payload)
+        self._track_watched(payload)
         cfg = self.day_config or {}
         lock_on = bool(cfg.get("profit_lock_enabled"))
         sl_on = bool(cfg.get("stop_loss_enabled"))
@@ -3841,6 +3857,212 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: ghost counterfactual stamp failed")
 
+    # ---- watched-break counterfactual on the live quote poll (issue #730) -- #
+    def _register_watched_breaks(self) -> list[dict]:
+        """Pick up every watched name that broke its 09:15 level since the
+        last poll and start tracking its ATM contract on the batch.
+
+        Runs on the risk thread. The break itself was recorded on the tick
+        thread (``watch_stats.first_break_ts``, #728); this only resolves the
+        contract (master contract, no broker call) and returns the list the
+        batched quote call should carry. A name that has TRIGGERED is never
+        tracked (and is dropped the poll it triggers): a real / paper / sim /
+        shadow row is a different measurement, not a counterfactual.
+        """
+        core = self.core
+        cfg = self.day_config or {}
+        if core is None or not cfg.get("watched_cf_enabled", True):
+            return []
+        if cfg.get("instrument") != "atm_option":
+            return []
+        try:
+            from services.open15_option_shadow import resolve_atm_option
+
+            with self._lock:
+                track = self._risk.setdefault("watched_track", {})
+            snap = core.watch_snapshot()
+            for sym, ws in snap.items():
+                if ws.get("entered") or sym in core.entered:
+                    if sym in track:
+                        with self._lock:
+                            track.pop(sym, None)
+                    continue
+                if not ws.get("first_break_at") or sym in track:
+                    continue
+                side = core.selected.get(sym)
+                if not side:
+                    continue
+                contract = resolve_atm_option(
+                    sym, side, float(ws["first_break_price"]), self._trade_date()
+                )
+                rec = {
+                    "symbol": sym,
+                    "side": side,
+                    "watch_source": ws.get("watch_source") or "seed",
+                    "break_at": ws["first_break_at"],
+                    "break_price": float(ws["first_break_price"]),
+                    "gap_pct": (round(core.gaps[sym] * 100, 2) if sym in core.gaps else None),
+                    "contract": contract["symbol"] if contract else None,
+                    "lot": int(contract["lotsize"]) if contract else None,
+                    "ticksize": contract.get("ticksize") if contract else None,
+                    "entry": None,
+                    "path": [],
+                    "last": None,
+                }
+                with self._lock:
+                    track[sym] = rec
+                logger.info(
+                    "open15 watched: %s broke its level at %s @ %.2f — tracking %s on the quote poll",
+                    sym,
+                    rec["break_at"],
+                    rec["break_price"],
+                    rec["contract"] or "NO CONTRACT",
+                )
+            with self._lock:
+                return [
+                    {
+                        "symbol": r["symbol"],
+                        "contract": r["contract"],
+                        "lot": r["lot"],
+                        "side": r["side"],
+                        "break_at": r["break_at"],
+                    }
+                    for r in track.values()
+                    if r.get("contract")
+                ]
+        except Exception:
+            logger.exception("open15: watched-break registration failed")
+            return []
+
+    def _track_watched(self, payload: dict) -> None:
+        """Record each poll's quote for the tracked watched contracts (#730).
+
+        The FIRST quote seen after the break is the entry mark (LTP, the sim
+        convention; bid/ask/volume/OI kept as instrumentation); every later
+        quote extends the path for MAE/MFE. A name that triggered meanwhile
+        is dropped. Never raises into the monitor.
+        """
+        try:
+            marks = payload.get("watched") or []
+            if not marks:
+                return
+            asof = payload.get("asof") or self._now_ist().strftime("%H:%M:%S")
+            core = self.core
+            with self._lock:
+                track = self._risk.setdefault("watched_track", {})
+                for m in marks:
+                    sym = m.get("symbol")
+                    rec = track.get(sym)
+                    if rec is None:
+                        continue
+                    if core is not None and sym in core.entered:
+                        track.pop(sym, None)
+                        continue
+                    ltp = m.get("ltp")
+                    if ltp is None:
+                        continue
+                    q = {k: m.get(k) for k in ("ltp", "bid", "ask", "volume", "oi")}
+                    if rec["entry"] is None:
+                        rec["entry"] = {**q, "at": asof}
+                    rec["path"].append((asof, float(ltp)))
+                    rec["last"] = {**q, "at": asof}
+        except Exception:
+            logger.exception("open15: watched tracking failed")
+
+    def _stamp_watched_live(self) -> None:
+        """At the scheduled exit, journal + price every tracked watched name
+        from its live marks (#730). Runs at the head of ``flatten`` beside the
+        ghost stamp — the last quote before the real exits go out.
+
+        A name with no entry mark (never quoted) or one that triggered is
+        left to the bars pass / the trigger's own row. Idempotent per day:
+        the tracker is cleared once stamped. Never raises into the flatten.
+        """
+        try:
+            from database.open15_breakout_db import update_trade
+            from services.open15_option_shadow import (
+                insert_watched_row,
+                live_watched_fields,
+            )
+
+            core = self.core
+            with self._lock:
+                track = dict(self._risk.get("watched_track") or {})
+                self._risk["watched_track"] = {}
+            if not track:
+                return
+            exit_minute = (self.day_config or {}).get("exit_time") or "09:30"
+            n_priced = 0
+            for sym, rec in track.items():
+                if core is not None and sym in core.entered:
+                    continue
+                if not rec.get("contract") or not rec.get("entry") or not rec.get("last"):
+                    logger.info(
+                        "open15 watched: %s not priced live (%s) — bars pass will price it",
+                        sym,
+                        "no contract" if not rec.get("contract") else "no quote seen",
+                    )
+                    continue
+                contract = {
+                    "symbol": rec["contract"],
+                    "lotsize": rec["lot"],
+                    "ticksize": rec.get("ticksize"),
+                }
+                rid = insert_watched_row(self._trade_date(), rec, contract, exit_minute, _mode())
+                if not rid:
+                    continue
+                entry, last = rec["entry"], rec["last"]
+                fields = live_watched_fields(
+                    float(entry["ltp"]), float(last["ltp"]), int(rec["lot"]), rec["path"]
+                )
+                gross, charges = fields.pop("gross"), fields.pop("charges")
+                update_trade(
+                    rid,
+                    opt_entry_premium=float(entry["ltp"]),
+                    opt_entry_bid=entry.get("bid"),
+                    opt_entry_ask=entry.get("ask"),
+                    opt_entry_volume=entry.get("volume"),
+                    opt_entry_oi=entry.get("oi"),
+                    opt_exit_bid=last.get("bid"),
+                    opt_exit_ask=last.get("ask"),
+                    opt_exit_volume=last.get("volume"),
+                    opt_exit_oi=last.get("oi"),
+                    **fields,
+                )
+                n_priced += 1
+                self._log_event(
+                    "watched_counterfactual",
+                    symbol=sym,
+                    side=rec["side"],
+                    watch_source=rec["watch_source"],
+                    break_at=rec["break_at"],
+                    break_price=rec["break_price"],
+                    contract=rec["contract"],
+                    lot_size=int(rec["lot"]),
+                    entry_minute=entry["at"],
+                    entry_premium=float(entry["ltp"]),
+                    entry_bid=entry.get("bid"),
+                    entry_ask=entry.get("ask"),
+                    exit_minute=last["at"],
+                    exit_premium=float(last["ltp"]),
+                    exit_bid=last.get("bid"),
+                    exit_ask=last.get("ask"),
+                    gross=gross,
+                    charges=charges,
+                    pnl=fields["opt_pnl"],
+                    mae=fields["cf_mae"],
+                    mfe=fields["cf_mfe"],
+                    polls=len(rec["path"]),
+                    source="live",
+                    status="priced",
+                    note="never triggered — priced as if 1 lot bought at the 09:15 break, "
+                    "no volume gate; live quotes, not money",
+                )
+            if n_priced:
+                logger.info("open15 watched: %d row(s) priced live at the exit", n_priced)
+        except Exception:
+            logger.exception("open15: watched live stamp failed")
+
     def _backfill_stop_counterfactuals(self, trade_date: str | None) -> None:
         """Bars backstop for the live stamp (issue #704); never raises."""
         try:
@@ -4108,6 +4330,25 @@ class Open15BreakoutService:
             except Exception:
                 logger.exception("open15: tick flush failed")
         self._persist_day_log()
+
+    def _watched_live_status(self) -> dict:
+        """``{symbol: {contract, break_at, entry, last, polls}}`` (#730)."""
+        try:
+            with self._lock:
+                track = dict(self._risk.get("watched_track") or {})
+            return {
+                s: {
+                    "contract": r.get("contract"),
+                    "break_at": r.get("break_at"),
+                    "entry": (r.get("entry") or {}).get("ltp"),
+                    "entry_at": (r.get("entry") or {}).get("at"),
+                    "last": (r.get("last") or {}).get("ltp"),
+                    "polls": len(r.get("path") or []),
+                }
+                for s, r in track.items()
+            }
+        except Exception:
+            return {}
 
     def _watched_counts(self) -> tuple[int, int]:
         """``(broke_level, never_broke)`` among selected-but-not-entered names (#728)."""
@@ -5867,6 +6108,8 @@ class Open15BreakoutService:
             # live near-miss stats so the decision-log UI can fill `max vol×`
             # during the window instead of waiting for the exit job (issue #524)
             "watch_stats": core.watch_snapshot() if core else {},
+            # issue #730 — watched-break names on the quote poll right now
+            "watched_live": self._watched_live_status(),
             # feed health (issues #677/#682) — what the /logs chip reads live.
             # State is computed HERE (not the minute job's transition memory)
             # so the chip is current even between job ticks.

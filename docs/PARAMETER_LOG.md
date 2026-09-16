@@ -2261,6 +2261,10 @@ ran in the 15:30-17:00 periodic window).
 - **History:**
   - **2026-09-15:** Introduced by issue #728 (operator: "just the numbers so
     that enough data is collected to find patterns"). No decision rule yet.
+  - **2026-09-16:** Issue #730 — pricing moved onto the risk monitor's batched
+    quote poll (zero extra broker calls, priced at the 09:30 exit,
+    `cf_source='live'`); the bars pass is now the fallback. The knob still
+    gates both paths.
 
 ## `OPEN15_LIQUIDITY_PATH_ENABLED` (default `true`)
 

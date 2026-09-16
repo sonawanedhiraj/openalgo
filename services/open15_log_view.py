@@ -65,6 +65,8 @@ CSV_COLUMNS = [
     "wcf_mae",
     "wcf_mfe",
     "wcf_status",
+    # issue #730 — live quote poll vs bars
+    "wcf_source",
 ]
 
 
@@ -391,6 +393,7 @@ def apply_journal(rows: dict[str, dict], journal: list[dict] | None) -> None:
                 if jr.get("opt_pnl") is not None
                 else ("no_contract" if not jr.get("opt_symbol") else "bars_pending")
             )
+            row["wcf_source"] = jr.get("cf_source")
 
 
 def selection_outcomes(
@@ -536,6 +539,7 @@ def selection_outcomes(
                 wcf_mae=ev.get("mae"),
                 wcf_mfe=ev.get("mfe"),
                 wcf_status=ev.get("status") or "priced",
+                wcf_source=ev.get("source") or "bars",
             )
         elif kind == "entry_rejected":
             # a rejected entry is a real measurement, just not a real fill — it
