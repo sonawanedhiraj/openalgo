@@ -1909,3 +1909,100 @@ def test_eod_flatten_disabled_mode_no_store_call(monkeypatch):
     mock_book.assert_not_called()
     store.assert_not_called()
     mock_dispatch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #734: the stop-loss confirmation re-check must be direction-aware.
+#
+# The core fires a SHORT's stop on ``price >= stop_loss``; the service's 3 s
+# confirmation used the LONG check (``price > stop -> cancel``) for both sides,
+# so a short still running AWAY from its stop was cancelled every time and only
+# exited on a re-touch. A runaway short had no working stop until the 15:14
+# watchdog. These tests drive ``_confirm_and_place_exit`` directly (the timer
+# is bypassed) with the engine's own ``positions`` / ``last_prices`` state.
+# ---------------------------------------------------------------------------
+
+
+def _seed_position(service, *, qty: int, entry: float, stop: float, last: float) -> None:
+    from services.simplified_stock_engine_core import Position
+
+    service.engine.positions["RELIANCE"] = Position(
+        symbol="RELIANCE",
+        entry_price=entry,
+        qty=qty,
+        stop_loss=stop,
+        entry_time=dt.datetime(2026, 9, 18, 10, 30),
+        risk_per_share=abs(entry - stop),
+    )
+    service.engine.last_prices["RELIANCE"] = last
+    service.engine.pending_exits["RELIANCE"] = _make_exit_signal()
+
+
+def _confirm(service, signal):
+    placed = []
+    with patch.object(service, "_place_exit_order", side_effect=lambda s, k, n: placed.append(s)):
+        service._confirm_and_place_exit(signal, api_key="k", strategy_name="s")
+    return placed
+
+
+def _short_signal() -> ExitSignal:
+    return ExitSignal(
+        symbol="RELIANCE",
+        action="BUY",
+        quantity=10,
+        reason="stop_loss",
+        reference_price=2510.0,
+        exchange="NSE",
+        product="MIS",
+        pricetype="MARKET",
+    )
+
+
+def test_short_stop_confirm_places_exit_when_price_ran_away_above_stop():
+    """The runaway short: stop 2510, price gapped to 2530 and never re-touched.
+
+    The confirmation MUST place the exit — this is the case that had no stop
+    until the EOD watchdog before #734.
+    """
+    service = _make_service(MODE_SANDBOX)
+    _seed_position(service, qty=-10, entry=2500.0, stop=2510.0, last=2530.0)
+    placed = _confirm(service, _short_signal())
+    assert len(placed) == 1, "short still beyond its stop must be exited"
+    assert "RELIANCE" in service.engine.pending_exits
+
+
+def test_short_stop_confirm_cancels_when_price_came_back_below_stop():
+    """Short stop 2510; at the confirm instant price is back at 2505 -> cancel."""
+    service = _make_service(MODE_SANDBOX)
+    _seed_position(service, qty=-10, entry=2500.0, stop=2510.0, last=2505.0)
+    placed = _confirm(service, _short_signal())
+    assert placed == []
+    assert "RELIANCE" not in service.engine.pending_exits
+
+
+def test_short_stop_confirm_places_exit_when_price_sits_exactly_at_stop():
+    service = _make_service(MODE_SANDBOX)
+    _seed_position(service, qty=-10, entry=2500.0, stop=2510.0, last=2510.0)
+    assert len(_confirm(service, _short_signal())) == 1
+
+
+def test_long_stop_confirm_places_exit_when_price_ran_away_below_stop():
+    """LONG behaviour is unchanged: stop 2490, price 2470 -> exit."""
+    service = _make_service(MODE_SANDBOX)
+    _seed_position(service, qty=10, entry=2500.0, stop=2490.0, last=2470.0)
+    assert len(_confirm(service, _make_exit_signal())) == 1
+
+
+def test_long_stop_confirm_cancels_when_price_bounced_back_above_stop():
+    service = _make_service(MODE_SANDBOX)
+    _seed_position(service, qty=10, entry=2500.0, stop=2490.0, last=2495.0)
+    placed = _confirm(service, _make_exit_signal())
+    assert placed == []
+    assert "RELIANCE" not in service.engine.pending_exits
+
+
+def test_stop_confirm_cancels_when_position_is_gone():
+    service = _make_service(MODE_SANDBOX)
+    service.engine.pending_exits["RELIANCE"] = _make_exit_signal()
+    assert _confirm(service, _make_exit_signal()) == []
+    assert "RELIANCE" not in service.engine.pending_exits
