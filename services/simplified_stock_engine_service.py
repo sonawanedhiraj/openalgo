@@ -545,7 +545,19 @@ class SimplifiedStockEngineService:
             with self._lock:
                 pos = self.engine.positions.get(signal.symbol)
                 price = self.engine.last_prices.get(signal.symbol)
-                if not pos or price is None or price > pos.stop_loss:
+                # Direction-aware re-check (issue #734). The core fires a LONG's
+                # stop on ``price <= stop`` and a SHORT's on ``price >= stop``,
+                # so "price bounced back through the stop -> cancel" is
+                # ``price > stop`` for a long and ``price < stop`` for a short.
+                # Using the long check for both sides cancelled every short
+                # that was still running AWAY from its stop and only exited it
+                # on a re-touch — a runaway short had no working stop until the
+                # 15:14 EOD watchdog.
+                if pos is None or price is None:
+                    self.engine.clear_pending_exit(signal.symbol)
+                    return
+                bounced_back = (price > pos.stop_loss) if pos.qty > 0 else (price < pos.stop_loss)
+                if bounced_back:
                     self.engine.clear_pending_exit(signal.symbol)
                     return
             self._place_exit_order(signal, api_key, strategy_name)

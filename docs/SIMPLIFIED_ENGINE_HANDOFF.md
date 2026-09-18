@@ -136,7 +136,7 @@ Hooked into `on_quote()` after price/volume extraction; no-op when disabled.
 | `ATR_ENTRY_MIN_MULT` | `0.5` | Min candle range / ATR for entry |
 | `VOLUME_MULTIPLIER` | `2.5` | Required volume vs reference candle |
 | `TRAIL_ATR_MULT` | `0.5` | Trailing distance floor in ATR units |
-| `SL_CONFIRM_SECONDS` | `3.0` | SL confirmation debounce |
+| `SL_CONFIRM_SECONDS` | `3.0` | SL confirmation debounce — after the tick stop fires, the exit is placed only if price is still beyond the stop at +N s (long: `price <= stop`, short: `price >= stop`); a bounce back through the stop cancels. Until issue #734 the re-check used the long comparison for both sides, so a short only exited on a re-touch of its stop. R67 measured 0 s as marginally better (+Rs1.3k OOS on 83 tick trades) |
 | `GLOBAL_PROFIT_LOCK` | `true` | Enable portfolio-wide profit lock |
 | `BUY_ENABLED` / `SELL_ENABLED` | `true` | Per-direction kill switches |
 | `FUNDS_FLOOR` | `=CAPITAL` | Live-mode funds gate floor |
