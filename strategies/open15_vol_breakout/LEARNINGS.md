@@ -242,3 +242,33 @@ Report: `docs/research/strategy/open15_vol_breakout/2026-09-14_r63_winner_patter
 Learnings: **a rating built on the sample it is scored on will always look like an edge — score it on
 the rows the strategy did NOT trade before believing it**; and **the veto half of a rating is worth
 more than the promise half** — "don't take this" generalised, "take this" did not.
+
+### 2026-09-18 — R64: hold the winners beyond 09:30 with a profit trail? REJECT (issue #732)
+
+All 23 real winners (19 `eod_0930` + 4 in-window `profit_trail`) re-priced from their
+actual exit fill to 15:10 — broker 1m option bars for the 16 Sep-contract rows, a
+Black-Scholes proxy off the stock path (IV solved from the exit fill) for the 7 expired
+Aug-contract rows. Report:
+`docs/research/strategy/open15_vol_breakout/2026-09-18_r64_hold_winners_beyond_0930.md`.
+
+- **The burst does not continue.** 18 of 23 winners close below their exit price within
+  5 minutes (median: the next minute); median 15-min low −4.4% of premium, median 15:10
+  mark −1.6%. MFE +₹244k vs MAE −₹246k after the exit — symmetric noise.
+- **Fixed holds lose:** →10:00 −₹7.3k, →11:00 −₹21.5k, →13:00 −₹52k, →15:10 −₹12.5k
+  (real bars only: −₹33k at 15:10). Longs −₹80k held to close; the 6 short winners +₹67k
+  but 3 are modelled and the 09-10 stock-basis review had all shorts bouncing 09:30→11:00.
+- **Every trail loses or is one trade:** 10/15/20/30%-of-peak −₹18k/−₹61k/−₹52k/−₹11k;
+  ₹2k/3k/5k give-back +₹12.8k/−₹6k/−₹22k (the +₹12.8k is 10 better/13 worse, HINDZINC +
+  modelled PFC). A breakeven floor at the exit price, checked on minute lows, **stops 22
+  of 23 out at the first minute** — R59's 0%-offset result again.
+- **The two runners (HINDZINC +₹23.6k MFE, HAL modelled +₹12.3k) are not identifiable at
+  09:30** — same early/A-shaped triggers as LICHSGFIN/DIXON/IDEA, which gave back ₹9–22k.
+- Third independent confirmation that the exit time is right (R59 July stock legs, the
+  09-10 stock-basis check, now option marks). Not deployed; no config change.
+- **Pre-registered, shorts only:** re-look only with ≥15 REAL short winners on real option
+  bars, 30%-of-peak trail, and the held cohort must beat the flat exit in both halves.
+
+Learnings: **a breakeven stop placed at a local high is an exit, not a stop** — check
+floors against the minute LOW, a close-based floor flatters by the first bar; and **when
+MFE and MAE after an exit are equal and opposite, no trail geometry can extract the MFE**
+— the trail question is answered by the path's asymmetry, not by the stop parameters.
