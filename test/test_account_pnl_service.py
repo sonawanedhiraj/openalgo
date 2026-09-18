@@ -176,6 +176,17 @@ def test_modelled_charges_are_per_leg_and_side_aware():
     sell = svc.modelled_leg_charges("NFO", "X26SEP100CE", "SELL", 10000.0)
     assert sell > buy  # STT sits on the sell leg
     assert svc.modelled_leg_charges("NFO", "X26SEP100CE", "BUY", 0) == 0.0
+    # option schedule verified 2026-09-18 against zerodha.com/charges (#736):
+    # brokerage 20 + NSE txn 0.03553% (3.553) + SEBI 0.01 + GST 18% (4.24)
+    # = 27.80 on the BUY leg, + stamp 0.003% (0.30) -> 28.10;
+    # SELL leg swaps the stamp for STT 0.15% of premium (15.00) -> 42.80
+    assert buy == pytest.approx(28.10, abs=0.01)
+    assert sell == pytest.approx(42.80, abs=0.01)
+    # the two per-leg numbers must sum to the round-trip model exactly (they
+    # are the same schedule split by leg) so the twins cannot drift apart
+    from services.open15_option_shadow import option_round_trip_charges
+
+    assert buy + sell == pytest.approx(option_round_trip_charges(10000.0, 10000.0), abs=0.02)
 
 
 # ---------------------------------------------------------------------------

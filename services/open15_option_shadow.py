@@ -43,16 +43,21 @@ _EXIT_MINUTE = dt.time(9, 30)
 def option_round_trip_charges(buy_premium_value: float, sell_premium_value: float) -> float | None:
     """Modelled Zerodha option round-trip charges in Rs for one lot.
 
-    Brokerage flat Rs20 per executed leg, NSE txn 0.3503% of premium turnover,
-    STT 0.0625% of the sell-side premium, SEBI Rs10/crore, stamp 0.003% of the
-    buy leg, 18% GST on brokerage + exchange txn + SEBI.
+    Brokerage flat Rs20 per executed leg, NSE txn 0.03553% of premium turnover,
+    STT 0.15% of the sell-side premium (Budget 2026, effective 2026-04-01),
+    SEBI Rs10/crore, stamp 0.003% of the buy leg, 18% GST on brokerage +
+    exchange txn + SEBI. Rates verified 2026-09-18 against zerodha.com/charges
+    (issue #736 — until then the txn rate was 10x NSE's and the STT was the
+    pre-2024 0.0625%; every option row journaled before that fix carries the
+    old schedule). ``account_pnl_service.modelled_leg_charges`` is the per-leg
+    twin — change both together.
     """
     if not buy_premium_value or not sell_premium_value:
         return None
     turnover = buy_premium_value + sell_premium_value
     brokerage = 40.0
-    exch_txn = 0.003503 * turnover
-    stt = 0.000625 * sell_premium_value
+    exch_txn = 0.0003553 * turnover
+    stt = 0.0015 * sell_premium_value
     sebi = 0.000001 * turnover
     stamp = 0.00003 * buy_premium_value
     gst = 0.18 * (brokerage + exch_txn + sebi)
