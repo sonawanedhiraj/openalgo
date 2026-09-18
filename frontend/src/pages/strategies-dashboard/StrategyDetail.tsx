@@ -56,6 +56,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AccountPnlCard } from './AccountPnlCard'
+import { CasStraddleCard } from './CasStraddleCard'
 import { IntradayPullbackEvalCard } from './IntradayPullbackEvalCard'
 
 // ---------------------------------------------------------------------------
@@ -2231,6 +2232,9 @@ export default function StrategyDetailPage() {
 
       {/* Today's per-pick evaluation — why entries did/didn't fire (issue #412) */}
       {data.name === 'intraday_pullback_top2' && <IntradayPullbackEvalCard />}
+
+      {/* Settings + today + expiry sessions (issue #740) */}
+      {data.name === 'cas_320_expiry_straddle' && <CasStraddleCard />}
 
       {/* Trades + LLM decisions (merged, issue #358) */}
       <TradesAndDecisionsCard data={data} />

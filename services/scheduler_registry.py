@@ -105,6 +105,7 @@ _SF = "strategy:sector_follow_cap5_vol"
 _O15 = "strategy:open15_vol_breakout"
 _IPB = "strategy:intraday_pullback_top2"
 _SE = "strategy:simplified_engine"
+_CAS = "strategy:cas_320_expiry_straddle"
 _FEED = "data_feed"
 _REPORTS = "reports"
 _SANDBOX = "sandbox"
@@ -112,6 +113,86 @@ _PY = "python_strategy_host"
 
 
 CATALOG: tuple[JobSpec, ...] = (
+    # ---- cas_320_expiry_straddle (issue #740) ---------------------------
+    JobSpec(
+        job_id="cas_straddle_daily_reset",
+        label="Daily reset",
+        group=_CAS,
+        scheduler=SCHED_SHARED,
+        schedule="09:00 mon-fri",
+        description="Clears the per-day straddle state (legs, ladder, samples).",
+        tier=TIER_PROTECTED,
+        safety_note="Without the reset yesterday's legs would read as today's open book.",
+    ),
+    JobSpec(
+        job_id="cas_straddle_arm",
+        label="Arm (expiry check + ladder)",
+        group=_CAS,
+        scheduler=SCHED_SHARED,
+        schedule="15:12 mon-fri",
+        description=(
+            "Checks trading day + expiry day per underlying from the master "
+            "contract, snapshots the UI config, resolves the ATM ±2 ladder and "
+            "starts the monitor thread. Idle on a non-expiry day."
+        ),
+        tier=TIER_GUARDED,
+    ),
+    JobSpec(
+        job_id="cas_straddle_entry",
+        label="Entry (ATM CE + PE)",
+        group=_CAS,
+        scheduler=SCHED_SHARED,
+        schedule="15:20:00 mon-fri",
+        description=(
+            "BUYs the ATM call and put (NRML, lots × lotsize) for every "
+            "underlying toggled on; refuses when the premium exceeds the cap."
+        ),
+        tier=TIER_GUARDED,
+    ),
+    JobSpec(
+        job_id="cas_straddle_hard_exit",
+        label="Hard exit",
+        group=_CAS,
+        scheduler=SCHED_SHARED,
+        schedule="hard_exit_time (UI, default 15:28:00) mon-fri",
+        description=(
+            "SELLs any leg with a bid at the configured time; a leg with no bid "
+            "is left to cash-settle at zero. Re-scheduled at each 15:12 arm."
+        ),
+        tier=TIER_PROTECTED,
+        safety_note=(
+            "The scheduled way out of a long expiring straddle before the "
+            "15:28-15:30 random auction close; the 15:38 fallback is the only later net."
+        ),
+    ),
+    JobSpec(
+        job_id="cas_straddle_fallback_flatten",
+        label="Fallback flatten",
+        group=_CAS,
+        scheduler=SCHED_SHARED,
+        schedule="15:38 mon-fri",
+        description=(
+            "SELLs whatever the position book still affirmatively holds "
+            "(unreadable book still sends for a confirmed fill) before the 15:40 close."
+        ),
+        tier=TIER_PROTECTED,
+        safety_note=(
+            "A long ITM option left past 15:40 is exercised (STT on intrinsic) "
+            "instead of sold; an OTM one expires at zero. Last backstop for a rejected exit."
+        ),
+    ),
+    JobSpec(
+        job_id="cas_straddle_eod_summary",
+        label="EOD summary",
+        group=_CAS,
+        scheduler=SCHED_SHARED,
+        schedule="15:45 mon-fri",
+        description=(
+            "Session digest per underlying (IIV path, straddle cost, peak bid, "
+            "settlement counterfactual) + Telegram."
+        ),
+        tier=TIER_FREE,
+    ),
     # ---- futures_follow_cap50 -------------------------------------------
     JobSpec(
         job_id="futures_follow_daily_reset",

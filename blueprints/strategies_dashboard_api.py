@@ -250,6 +250,7 @@ def _get_strategy_mode(name: str) -> str:
 # construction. The UI notes this rather than faking rows.
 _FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
 _INTRADAY_PULLBACK_FOLDER = "intraday_pullback_top2"
+_CAS_STRADDLE_FOLDER = "cas_320_expiry_straddle"
 _SECTOR_FOLLOW_FOLDER = "sector_follow_cap5_vol"
 _VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
@@ -1314,6 +1315,107 @@ def _pnl_curve_intraday_pullback(window_days: int | None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# cas_320_expiry_straddle (issue #740)
+# ---------------------------------------------------------------------------
+
+
+def _cas_straddle_stats() -> dict:
+    """Today's open legs, realized net P&L and last activity from ``cas_straddle_trades``.
+
+    Net P&L routes through ``net_pnl_of_row`` (the one definition — paper legs
+    and unpriced legs are ``None``, never 0). The strategy is intraday, so the
+    realization date IS ``trade_date``.
+    """
+    try:
+        from database.cas_straddle_db import CasStraddleTrade, net_pnl_of_row
+        from database.cas_straddle_db import db_session as cs_session
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        rows = cs_session.query(CasStraddleTrade).all()
+        today = [r for r in rows if r.trade_date == today_str]
+        open_legs = [r for r in rows if r.fill == "real" and r.status in ("placed", "open")]
+        pnls = [net_pnl_of_row(r) for r in today]
+        today_pnl = sum(p for p in pnls if p is not None)
+        last = max((r.created_at for r in rows if r.created_at), default=None)
+        return {
+            "open_positions": len(open_legs),
+            "today_net_pnl": round(today_pnl, 2),
+            "today_unpriced_exits": sum(
+                1
+                for r in today
+                if r.status == "closed" and r.fill == "real" and r.exit_price is None
+            ),
+            "last_trade_at": last.isoformat() if last else None,
+            "today_trade_count": len(today),
+        }
+    except Exception:
+        logger.exception("Failed to aggregate cas_straddle stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
+    finally:
+        try:
+            from database.cas_straddle_db import db_session as cs_session
+
+            cs_session.remove()
+        except Exception:
+            pass
+
+
+def _cas_straddle_lifetime() -> dict[str, dict]:
+    """Per-mode since-inception realized stats over closed REAL legs."""
+    capital = _snapshot_capital(_CAS_STRADDLE_FOLDER, "capital_inr")
+
+    def _agg(rows: list) -> dict:
+        from database.cas_straddle_db import net_pnl_of_row
+
+        pairs = [(r, net_pnl_of_row(r)) for r in rows]
+        pairs = [(r, p) for r, p in pairs if p is not None]
+        pnls = [p for _r, p in pairs]
+        daily = [(_date_of_str(r.trade_date), p) for r, p in pairs]
+        return {**_lifetime_from_pnls(pnls), **compute_realized_metrics(daily, capital_inr=capital)}
+
+    out = {"sandbox": _agg([]), "live": _agg([])}
+    try:
+        from database.cas_straddle_db import real_closed_rows
+
+        buckets: dict[str, list] = {"sandbox": [], "live": []}
+        for r in real_closed_rows():
+            m = (r.mode or "").lower()
+            if m in buckets:
+                buckets[m].append(r)
+        out = {m: _agg(rs) for m, rs in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate cas_straddle lifetime stats")
+    return out
+
+
+def _pnl_curve_cas_straddle(window_days: int | None) -> list[dict]:
+    """Daily realized net P&L (closed real legs) keyed by ``trade_date``."""
+    try:
+        from database.cas_straddle_db import net_pnl_of_row, real_closed_rows
+
+        rows = real_closed_rows()
+        if window_days:
+            cutoff = (datetime.now(_IST) - timedelta(days=window_days)).date().isoformat()
+            rows = [r for r in rows if r.trade_date >= cutoff]
+        by_date: dict[str, float] = {}
+        for r in rows:
+            p = net_pnl_of_row(r)
+            if p is None:
+                continue
+            by_date[r.trade_date] = by_date.get(r.trade_date, 0.0) + p
+        return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
+    except Exception:
+        logger.exception("Failed to build pnl_curve for cas_straddle")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Health LED
 # ---------------------------------------------------------------------------
 
@@ -1402,6 +1504,8 @@ def _build_summary(name: str) -> dict:
         stats = _open15_stats()
     elif name == _INTRADAY_PULLBACK_FOLDER:
         stats = _intraday_pullback_stats()
+    elif name == _CAS_STRADDLE_FOLDER:
+        stats = _cas_straddle_stats()
 
     # Effective order routing RIGHT NOW (issue #440): the per-strategy
     # dispatch verdict an order would get — 'live' only when the navbar is on
@@ -1607,6 +1711,18 @@ def strategy_detail(name: str):
         }
         if lifetime["live"]["closed_trades"] > 0:
             performance["live"] = {**lifetime["live"]}
+    elif name == _CAS_STRADDLE_FOLDER:
+        stats = _cas_straddle_stats()
+        lifetime = _cas_straddle_lifetime()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
+        }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
 
     # Recent trades (last 50)
     recent_trades: list[dict] = []
@@ -1663,6 +1779,21 @@ def strategy_detail(name: str):
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == _CAS_STRADDLE_FOLDER:
+        try:
+            from database.cas_straddle_db import recent_trades as _cas_recent
+            from database.cas_straddle_db import trade_to_dict as _cas_row
+
+            recent_trades = [
+                {
+                    **_cas_row(r),
+                    "price": r.entry_price,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in _cas_recent(50)
             ]
         except Exception:
             logger.exception("Failed to fetch recent trades for %s", name)
@@ -1876,6 +2007,8 @@ def pnl_curve(name: str):
         points = _pnl_curve_intraday_pullback(window_days)
     elif name == "open15_vol_breakout":
         points = _pnl_curve_open15(window_days)
+    elif name == _CAS_STRADDLE_FOLDER:
+        points = _pnl_curve_cas_straddle(window_days)
     # Other strategies: empty series (no journal yet)
 
     return jsonify({"status": "success", "data": {"window": window, "points": points}})

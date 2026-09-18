@@ -640,3 +640,157 @@ export async function getAccountsPnl(
   )
   return res.data.data
 }
+
+// ---------------------------------------------------------------------------
+// cas_320_expiry_straddle (issue #740) — Settings card + today + sessions
+// ---------------------------------------------------------------------------
+
+export interface CasStraddleConfig {
+  trade_nifty: boolean
+  trade_sensex: boolean
+  lots_nifty: number
+  lots_sensex: number
+  max_premium_inr: number
+  target_mult: number
+  hard_exit_time: string
+  poll_interval_s: number
+}
+
+export interface CasStraddleConfigResponse {
+  defaults: CasStraddleConfig
+  /** The stored row (NULL fields = code default) or null when never saved. */
+  override: (Partial<CasStraddleConfig> & { updated_at?: string | null }) | null
+  effective: CasStraddleConfig
+  applies_at: string
+  day_config?: CasStraddleConfig | null
+  lotsizes?: Record<string, number | null>
+}
+
+export interface CasStraddleLeg {
+  side: 'CE' | 'PE'
+  symbol: string
+  exchange: string
+  strike: number
+  expiry: string
+  lots: number
+  quantity: number
+  entry_ref_price: number | null
+  entry_price: number | null
+  entry_qty: number | null
+  entry_order_id: string | null
+  status: string
+  fill: 'real' | 'paper'
+  exit_price: number | null
+  exit_reason: string | null
+  net_pnl?: number | null
+  error_message: string | null
+}
+
+export interface CasStraddleEval {
+  cost: number
+  combined_bid: number
+  charges_est: number
+  net_value: number
+  target_value: number
+  at: string
+}
+
+export interface CasStraddleUnderlying {
+  expiry_day: boolean
+  expiry?: string | null
+  nearest_expiry: string | null
+  trade: boolean
+  lots: number
+  lotsize?: number | null
+  quantity?: number | null
+  atm?: number | null
+  atm_fixed?: boolean
+  close_1515?: number | null
+  contracts?: { CE?: string; PE?: string }
+  ladder?: string[]
+  entered?: boolean
+  entry_skipped?: string | null
+  exit_done?: boolean
+  target_polls?: number
+  last_eval?: CasStraddleEval | null
+  n_polls?: number
+  legs?: CasStraddleLeg[]
+  errors?: string[]
+  armed: boolean
+}
+
+export interface CasStraddleStatus {
+  strategy: string
+  mode: 'sandbox' | 'live'
+  manual_pause: boolean
+  trade_date: string | null
+  armed: boolean
+  armed_at: string | null
+  monitor_alive: boolean
+  config: CasStraddleConfig
+  day_config: CasStraddleConfig | null
+  schedule: Record<string, string>
+  underlyings: Record<string, CasStraddleUnderlying>
+}
+
+export interface CasStraddleSession {
+  trade_date: string
+  underlying: string
+  exchange: string | null
+  expiry: string | null
+  atm_strike: number | null
+  close_1515: number | null
+  first_print: number | null
+  first_print_at: string | null
+  iiv_low: number | null
+  iiv_low_at: string | null
+  iiv_high: number | null
+  iiv_high_at: string | null
+  iiv_close: number | null
+  straddle_ask_1520: number | null
+  straddle_bid_1520: number | null
+  max_combined_bid: number | null
+  max_combined_bid_at: string | null
+  t_first_target: string | null
+  combined_bid_1525: number | null
+  combined_bid_1528: number | null
+  combined_bid_1530: number | null
+  combined_bid_1535: number | null
+  spread_pct_1520: number | null
+  settle: number | null
+  settle_intrinsic: number | null
+  traded: boolean
+  n_polls: number | null
+}
+
+const CAS_BASE = '/cas_320_expiry_straddle/api'
+
+export async function getCasStraddleStatus(): Promise<CasStraddleStatus> {
+  const res = await webClient.get<{ status: string; data: CasStraddleStatus }>(`${CAS_BASE}/status`)
+  return res.data.data
+}
+
+export async function getCasStraddleConfig(): Promise<CasStraddleConfigResponse> {
+  const res = await webClient.get<{ status: string; data: CasStraddleConfigResponse }>(
+    `${CAS_BASE}/config`
+  )
+  return res.data.data
+}
+
+export async function saveCasStraddleConfig(
+  values: Partial<CasStraddleConfig>
+): Promise<CasStraddleConfigResponse> {
+  const res = await webClient.post<{ status: string; data: CasStraddleConfigResponse }>(
+    `${CAS_BASE}/config`,
+    values
+  )
+  return res.data.data
+}
+
+export async function getCasStraddleSessions(limit = 30): Promise<CasStraddleSession[]> {
+  const res = await webClient.get<{ status: string; data: { sessions: CasStraddleSession[] } }>(
+    `${CAS_BASE}/sessions`,
+    { params: { limit: String(limit) } }
+  )
+  return res.data.data.sessions
+}
