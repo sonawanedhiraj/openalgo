@@ -541,16 +541,35 @@ class SimplifiedStockEngineService:
         thread.start()
 
     def _confirm_and_place_exit(self, signal: ExitSignal, api_key: str, strategy_name: str) -> None:
+        """Re-check a pending stop-loss after ``sl_confirm_seconds`` and place it
+        only if price is STILL beyond the stop.
+
+        The cancel test must mirror the core's fire test per direction (issue
+        #734): the core fires a LONG stop on ``price <= stop_loss`` and a SHORT
+        stop on ``price >= stop_loss``, so "price recovered" is ``price > stop``
+        for a long but ``price < stop`` for a short. The old check used the long
+        form for both, which CLEARED a short's exit while price kept running
+        away from it and only placed it on a later re-touch — a short that never
+        came back had no working stop until the 15:14 EOD watchdog.
+        """
         try:
             with self._lock:
                 pos = self.engine.positions.get(signal.symbol)
                 price = self.engine.last_prices.get(signal.symbol)
-                if not pos or price is None or price > pos.stop_loss:
+                if not pos or price is None or self._stop_recovered(pos, price):
                     self.engine.clear_pending_exit(signal.symbol)
                     return
             self._place_exit_order(signal, api_key, strategy_name)
         finally:
             self._sl_timers.pop(signal.symbol, None)
+
+    @staticmethod
+    def _stop_recovered(pos: Position, price: float) -> bool:
+        """True iff price has moved back to the safe side of the stop (the
+        inverse of the core's per-direction stop-fire condition)."""
+        if pos.qty > 0:
+            return price > pos.stop_loss
+        return price < pos.stop_loss
 
     def _entry_held_by_override(self) -> bool:
         """Mode-only: consult the ephemeral ``strategy_runtime_override`` table.
