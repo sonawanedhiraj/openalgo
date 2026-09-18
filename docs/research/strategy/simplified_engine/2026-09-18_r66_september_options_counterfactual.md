@@ -229,3 +229,133 @@ rows / 5 futures symbols; `fo_bhavcopy_eod` is EOD-only and ends 2026-05-29);
 `openalgo.db` holds no premium series (only the `option_liquidity_daily` spread/OI scores);
 the broker API serves 1m bars for any contract still in Kite's instrument list — i.e. the
 current month, so **this analysis is only reproducible until the 29-SEP-26 expiry**.
+
+## Addendum (2026-09-18, operator challenge): the 1-minute sampling error, and what IS working
+
+**Challenge:** the equity journal records a real intrabar fill when the stop fires, but the option
+leg can only be sampled at 1-minute bar boundaries, so all 32 stop-outs — where the whole loss
+sits — carry an unquantified exit-price error, and stops that fire at a local extreme and
+retrace before the bar closes would not be symmetric. Both tasks below are on the same 41
+trades, primary scenario (1.47% spread, live charges).
+
+### A. Bounding the error
+
+**Finer data does not exist.** Kite's historical API serves `minute` as its finest interval
+(`broker/zerodha/api/data.py` `timeframe_map`); there is no second/tick history endpoint. The
+install's own tick logs (`tick_logs/ticks-2026-09*.jsonl`, 3.9M ticks on 09-18) carry the
+UNDERLYING equity ticks only — no option ticks were ever subscribed. The underlying at the
+true stop instant is already known exactly: it is the journal's `exit_price` (the fill).
+
+**4×4 envelope** — entry priced at the entry minute's {O,H,L,C} × exit at the exit minute's
+{O,H,L,C}; cell = total net (wins/41):
+
+| entry \ exit | open | high | low | close |
+|---|---|---|---|---|
+| open | −5,170 (20) | **+2,014** (22) | −18,199 (20) | −11,987 (22) |
+| high | −11,974 (20) | −4,790 (22) | −25,003 (20) | −18,791 (20) |
+| low | **+1,473** (21) | **+8,657** (22) | −11,556 (21) | −5,344 (22) |
+| close | −4,301 (21) | **+2,883** (22) | −17,330 (21) | **−11,118** (22) ← R66 |
+
+Range **−₹25,003 → +₹8,657**. The sign flips in 4 of 16 cells, every one of which requires
+selling at the exit minute's HIGH on all 41 trades (or buying at the entry minute's LOW). For
+a stop-out that is the wrong end of the minute by construction — the stop fires because the
+underlying is moving against the position, so the call's high inside that minute is before
+the stop, not after it. The exit-minute option range is a median 2.66% of premium (p75 4.5%),
+which is the size of the ambiguity per trade. Stop-outs alone: exit@open −₹9,811, @close
+−₹16,127, @high −₹3,107, @low −₹22,011 — never positive.
+
+**Delta cross-check at the true fill instant** (option ≈ minute close + BS delta × (underlying
+fill − underlying minute close); IV solved per contract from the bar, median 26.6%, median
+|Δ| 0.48; both legs adjusted):
+
+| | close/close (R66) | exit leg at fill instant | both legs at fill instant |
+|---|---|---|---|
+| all 41 | −11,118 (22 wins) | −11,618 (21) | **−13,946** (20) |
+| 32 stop-outs | −16,127 | −16,850 | −19,291 |
+| LONG / SHORT | +1,022 / −12,140 | −135 / −11,483 | −752 / −13,194 |
+
+The hypothesised asymmetry exists but is small and points the *other* way: the underlying
+stop fill sits a median ₹0.12 on the adverse side of its minute's close (53% of stops; the fill
+lands at a median 16% of the minute's range from the close, i.e. near it, not at the
+extreme), and entries fill a median ₹0.05 above the entry-minute close (56% "paid up"). Using
+bar closes was therefore mildly *optimistic*; the fill-instant estimate is ₹2.8k worse, and the
+LONG side's +₹1,022 becomes −₹752.
+
+**Verdict on A: the REJECT survives everywhere the fill can physically be** — all four
+"consistent" cells (O/O −5.2k, C/C −11.1k, C/O −4.3k, O/C −12.0k) and the fill-instant estimate
+are negative. It flips only in best-print corners that a market order cannot realise. The
+LONG/CE side is inside the ambiguous zone either way (−4.9k to +10.8k across its envelope,
+−0.8k at the fill instant, n=15) — unresolved, not positive.
+
+### B. What the data says is working
+
+**B1. Long-only.** September: equity LONG −₹1,711 (8/15), options LONG +₹1,022 → −₹752 at the
+fill instant. Full sample (R65 frame, 345 trades, equity actual):
+
+| | n | WR | gross | net | IS n / WR / net | OOS n / WR / net |
+|---|---|---|---|---|---|---|
+| LONG | 169 | **56.8%** | −235 | **−13,096** | 116 / 52.6 / −10,436 | 53 / 66.0 / −2,660 |
+| SHORT | 176 | 50.0% | +2,758 | −11,091 | 115 / 54.8 / +1,568 | 61 / 41.0 / −12,659 |
+
+By month, LONG net: Jun +12 (22), Jul −9,056 (81), Aug −2,342 (51), Sep −1,711 (15) —
+positive in **1 of 4 months** and gross-negative before charges. The long side's persistent
+win-rate edge is real (56.8%, 66% OOS) but it is a **win-rate edge, not a P&L edge**: mean
+gross winner ₹280 vs mean gross loser ₹419, payoff ratio 0.67, and 146 of 169 exits are
+stops (−₹17.5k). Long-only does not make the equity book positive in any window; the option
+long side cannot be priced for Jun–Aug (contracts expired, `fo_bhavcopy_eod` ends 05-29).
+
+**B2. Runners, MFE and trail rules (options, 41 trades).** Option MFE during the hold: winners
+median +10.4% of premium, losers +0.8%; rest-of-day MFE: winners +15.3%, losers +7.4%. Only
+**20% of trades ever reach +20% of premium** during the day and 7% reach +50%; of the 32
+stop-outs, 16% reach +20% later. Day MAE median −8.3%. Premium-based rules, all on the option
+bars after entry (trail floors re-checked on minute LOWS where marked):
+
+| rule | net | wins | LONG | SHORT |
+|---|---|---|---|---|
+| baseline: live underlying stop | −11,118 | 22 | +1,022 | −12,140 |
+| **hold to 15:19, no stop at all** | **−4,329** | 21 | −5,220 | **+891** |
+| premium hard stop −30%, else hold | −7,712 | 21 | −4,778 | −2,934 |
+| premium hard stop −50% / trail 50% of peak | −4,329 | 21 | −5,220 | +891 (never triggers) |
+| trail 30% of peak premium from entry (closes / LOWS) | −14,319 / −12,823 | 21 | −11,004 / −10,352 | −3,316 / −2,472 |
+| live stop for losers; after +20% trail ⅓ of gain (closes / LOWS) | −13,570 / −12,681 | 22 | +436 / +1,308 | −14,007 / −13,989 |
+| live stop for losers; after +30% trail ½ of gain (closes / LOWS) | −12,181 / −12,047 | 22 | +277 / +410 | −12,457 |
+| live stop for losers; winners hold to EOD | −11,435 | 22 | +1,022 | −12,457 |
+
+No trail rule captures more than the live rule: the runners are already held to EOD by the
+watchdog (8–9 trades), the winners' MFE is too shallow for a trail to lock (a trail activated
+at +20% reaches only 3 trades), and every tight trail re-introduces stop churn (−14k). The
+only rule that beats baseline is **removing the stop entirely** — and that gain is the SHORT
+side (+₹891 vs −₹12,140), i.e. September's PE stop-outs bounced back, which is the same bounce
+R62/R65 documented as the reason the short side lost. R65's full-sample check of the identical
+idea on equity (losing stop-outs held to EOD) was gross −₹36.6k. One month of options
+contradicting four months of equity is not a rule; it is the September regime.
+
+**B3. Liquidity.** Tiers by the contract's day volume (lots), with the same-day post-close
+spread and the open15 intraday capture (23 of 41 names have one; sweep ≈ 2.17× the intraday
+capture):
+
+| day volume | n | sweep sp | intraday sp | premium | gross | net (1.47%) | net (0%) | equity |
+|---|---|---|---|---|---|---|---|---|
+| < 1k lots | 8 | 5.3% | 5.0% | 16.9 | +7,216 | +4,380 | +6,492 | −669 |
+| 1k–3k | 8 | 4.7% | 1.6% | 8.7 | −247 | −2,333 | −862 | −1,922 |
+| 3k–10k | 13 | 3.1% | 1.4% | 19.8 | −5,383 | −9,851 | −6,528 | −2,499 |
+| > 10k | 12 | 2.4% | 1.2% | 37.7 | +625 | −3,314 | −410 | −1,082 |
+
+Result does not improve with liquidity — the best tier is the thinnest one (ZYDUSLIFE 09-03
++5.3k on 305 lots/day, TORNTPHARM 541 lots), which is noise, not execution quality.
+**Tight books** (≥ 3,000 lots/day AND same-day spread ≤ 3%): **13 trades survive** — ADANIENT,
+BSE, TCS, COALINDIA ×2, PATANJALI, PAYTM, SBICARD, GODREJCP, HDFCLIFE, RBLBANK, VBL, HCLTECH.
+On them: net **+₹2,351** at 1.47% (7/13), +₹3,695 at each name's own intraday spread, +₹318
+at their own sweep median 2.33%, +₹682 at the fill instant; equity on the same 13: −₹1,315.
+But: **without RBLBANK it is −₹724** (6/12), the 9 LONG trades net −₹856 and the +₹3,206 is 4
+SHORT trades, median trade +₹375, and dropping the top two gives −₹2,592. The ≥ 10k-lot cut
+(12 trades) is −₹3,314. The loose 28 are −₹13,469. So the spread IS tractable — a tight-book
+filter removes ~₹10k of the ₹9.8k spread bill — but what is left is a 13-trade, one-trade-
+dependent, sign-ambiguous number, not a strategy.
+
+**What to carry forward from B:** (i) a **liquidity gate is the one structural improvement** —
+28 of 41 September trades were in books where the spread alone exceeds the signal's typical
+₹240–₹810 win, so any future option overlay must filter on day-volume-in-lots and a measured
+intraday spread before it exists at all; (ii) the long side's edge is win-rate, not payoff —
+raising it needs bigger winners, not fewer losers, and no trail tested here delivers that;
+(iii) the verdict stands at REJECT, with the tight-book long/short question open at n=13.
