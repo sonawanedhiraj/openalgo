@@ -183,9 +183,12 @@ def modelled_leg_charges(exchange: str, symbol: str, action: str, value: float) 
     sell = (action or "").upper() == "SELL"
     buy = not sell
     if _is_option(symbol, exchange):
+        # NSE txn 0.03553% of premium, STT 0.15% of sell-side premium (Budget
+        # 2026, effective 2026-04-01) — verified 2026-09-18, issue #736; keep in
+        # step with open15_option_shadow.option_round_trip_charges
         brokerage = 20.0
-        exch_txn = 0.003503 * value
-        stt = 0.000625 * value if sell else 0.0
+        exch_txn = 0.0003553 * value
+        stt = 0.0015 * value if sell else 0.0
     elif exchange in ("NFO", "BFO"):  # futures
         brokerage = min(20.0, 0.0003 * value)
         exch_txn = 0.0000173 * value

@@ -13,6 +13,8 @@ anything broken in the wiring between components surfaces here, not in market.
 import datetime as dt
 import json
 
+import pytest
+
 from services.open15_breakout_service import Open15BreakoutService, Open15Core, resolve_day_config
 
 
@@ -283,9 +285,11 @@ def test_option_mode_full_session(monkeypatch):
     assert row.instrument == "option" and row.opt_symbol == "AAA28JUL26105CE"
     assert row.opt_entry_premium == 152.0 and row.opt_exit_premium == 170.0
     assert row.pnl == (170.0 - 152.0) * 150  # real premium P&L on full qty
-    assert row.charges_inr is not None and 200 < row.charges_inr < 350
-    # per-lot net for the shadow-consistent columns
-    assert row.opt_lot_size == 75 and 1150 < row.opt_pnl < 1330
+    # #736 schedule on buy 22800 / sell 25500: brokerage 40 + NSE txn 17.16
+    # + STT 38.25 + SEBI 0.05 + stamp 0.68 + GST 10.30 = 106.44
+    assert row.charges_inr == pytest.approx(106.44, abs=0.01)
+    # per-lot net for the shadow-consistent columns: 1350 gross - 106.44 / 2 lots
+    assert row.opt_lot_size == 75 and row.opt_pnl == pytest.approx(1296.78, abs=0.01)
     db_session.remove()
 
 
