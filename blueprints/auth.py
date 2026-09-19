@@ -289,8 +289,12 @@ def _try_resume_broker_session(username):
 
 
 @auth_bp.route("/login", methods=["GET", "POST"])
-@limiter.limit(LOGIN_RATE_LIMIT_MIN)
-@limiter.limit(LOGIN_RATE_LIMIT_HOUR)
+# GET only redirects on session state (no credential is checked), so it must
+# never share the brute-force budget with POST — a background poll hitting a
+# check_session_validity redirect here after session expiry can otherwise
+# exhaust LOGIN_RATE_LIMIT_HOUR on its own and lock out real logins (#742).
+@limiter.limit(LOGIN_RATE_LIMIT_MIN, methods=["POST"])
+@limiter.limit(LOGIN_RATE_LIMIT_HOUR, methods=["POST"])
 def login():
     # Handle POST requests first (for React SPA / AJAX login)
     if request.method == "POST":
@@ -576,8 +580,9 @@ def two_factor_configure():
 
 
 @auth_bp.route("/broker", methods=["GET", "POST"])
-@limiter.limit(LOGIN_RATE_LIMIT_MIN)
-@limiter.limit(LOGIN_RATE_LIMIT_HOUR)
+# Same GET-vs-POST split as /login above (#742) — GET only redirects.
+@limiter.limit(LOGIN_RATE_LIMIT_MIN, methods=["POST"])
+@limiter.limit(LOGIN_RATE_LIMIT_HOUR, methods=["POST"])
 def broker_login():
     if session.get("logged_in"):
         return redirect("/dashboard")
@@ -590,7 +595,9 @@ def broker_login():
 
 
 @auth_bp.route("/reset-password", methods=["GET", "POST"])
-@limiter.limit(RESET_RATE_LIMIT)  # Password reset rate limit
+# GET is an unconditional redirect to the SPA route — same GET-vs-POST split
+# as /login above (#742).
+@limiter.limit(RESET_RATE_LIMIT, methods=["POST"])  # Password reset rate limit
 def reset_password():
     # GET requests are handled by React frontend - redirect there
     if request.method == "GET":

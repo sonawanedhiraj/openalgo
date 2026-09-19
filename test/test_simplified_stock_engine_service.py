@@ -1708,6 +1708,118 @@ def test_runtime_override_never_blocks_exit_order():
     mock_sandbox.assert_called_once()
 
 
+# ----------------------------------------------------------------------
+# #734 — stop-loss confirmation re-check must be direction-aware.
+#
+# The core fires a LONG stop on `price <= stop_loss` and a SHORT stop on
+# `price >= stop_loss`. `_confirm_and_place_exit` re-checks after
+# `sl_confirm_seconds` and must CANCEL only when price has recovered to the
+# safe side of the stop — `price > stop` for a long, `price < stop` for a
+# short. The pre-#734 check used the long form for both, so a short still
+# running away from its stop had its exit CLEARED and was only placed on a
+# later re-touch; a short that never came back had no stop until the 15:14
+# EOD watchdog.
+# ----------------------------------------------------------------------
+
+
+def _seed_confirm_exit(service, *, qty: int, stop_loss: float, last_price: float) -> ExitSignal:
+    """Open a position with a pending stop_loss exit and a last tick price at
+    the confirm instant, then return the pending signal."""
+    from services.simplified_stock_engine_core import Position
+
+    is_long = qty > 0
+    signal = ExitSignal(
+        symbol="RELIANCE",
+        action="SELL" if is_long else "BUY",
+        quantity=abs(qty),
+        reason="stop_loss",
+        reference_price=stop_loss,
+        exchange="NSE",
+        product="MIS",
+        pricetype="MARKET",
+    )
+    service.engine.positions[signal.symbol] = Position(
+        symbol=signal.symbol,
+        entry_price=2500.0,
+        qty=qty,
+        stop_loss=stop_loss,
+        entry_time=dt.datetime(2026, 5, 17, 10, 30),
+        risk_per_share=10.0,
+    )
+    service.engine.pending_exits[signal.symbol] = signal
+    service.engine.last_prices[signal.symbol] = last_price
+    service._sl_timers[signal.symbol] = object()  # stand-in for the fired Timer
+    return signal
+
+
+@pytest.mark.parametrize(
+    ("qty", "stop_loss", "last_price", "expect_placed"),
+    [
+        # LONG: still at/below the stop -> place; bounced above -> cancel.
+        pytest.param(10, 2490.0, 2485.0, True, id="long-still-below-stop-places"),
+        pytest.param(10, 2490.0, 2490.0, True, id="long-at-stop-places"),
+        pytest.param(10, 2490.0, 2492.0, False, id="long-recovered-above-stop-cancels"),
+        # SHORT: still at/above the stop -> place (the #734 runaway case);
+        # fallen back below -> cancel.
+        pytest.param(-10, 2510.0, 2515.0, True, id="short-still-above-stop-places"),
+        pytest.param(-10, 2510.0, 2510.0, True, id="short-at-stop-places"),
+        pytest.param(-10, 2510.0, 2508.0, False, id="short-recovered-below-stop-cancels"),
+    ],
+)
+def test_confirm_and_place_exit_is_direction_aware(qty, stop_loss, last_price, expect_placed):
+    service = _make_service(MODE_SANDBOX)
+    signal = _seed_confirm_exit(service, qty=qty, stop_loss=stop_loss, last_price=last_price)
+
+    with patch.object(SimplifiedStockEngineService, "_place_exit_order") as mock_place:
+        service._confirm_and_place_exit(signal, api_key="test-key", strategy_name="trend-up")
+
+    if expect_placed:
+        mock_place.assert_called_once_with(signal, "test-key", "trend-up")
+        # A placed exit stays pending until the fill confirms it.
+        assert signal.symbol in service.engine.pending_exits
+    else:
+        mock_place.assert_not_called()
+        # A cancelled exit is cleared so the core can re-fire on the next tick.
+        assert signal.symbol not in service.engine.pending_exits
+    # The confirm timer slot is released either way.
+    assert signal.symbol not in service._sl_timers
+
+
+def test_confirm_and_place_exit_short_runaway_places_without_retouch():
+    """The exact #734 failure shape: a SHORT gaps through its stop and keeps
+    rising. At the confirm instant price is well beyond the stop and has never
+    re-touched it. The exit MUST be placed — pre-fix it was cleared."""
+    service = _make_service(MODE_SANDBOX)
+    signal = _seed_confirm_exit(service, qty=-10, stop_loss=2510.0, last_price=2540.0)
+
+    with patch.object(SimplifiedStockEngineService, "_place_exit_order") as mock_place:
+        service._confirm_and_place_exit(signal, api_key="test-key", strategy_name="trend-up")
+
+    mock_place.assert_called_once()
+    assert signal.symbol in service.engine.pending_exits
+
+
+def test_confirm_and_place_exit_cancels_when_position_gone_or_no_price():
+    """Guard clauses are direction-independent: no position or no last tick
+    price -> cancel without placing, for both directions."""
+    for qty in (10, -10):
+        service = _make_service(MODE_SANDBOX)
+        signal = _seed_confirm_exit(service, qty=qty, stop_loss=2500.0, last_price=2500.0)
+        service.engine.last_prices.pop(signal.symbol)
+        with patch.object(SimplifiedStockEngineService, "_place_exit_order") as mock_place:
+            service._confirm_and_place_exit(signal, api_key="k", strategy_name="s")
+        mock_place.assert_not_called()
+        assert signal.symbol not in service.engine.pending_exits
+
+        service = _make_service(MODE_SANDBOX)
+        signal = _seed_confirm_exit(service, qty=qty, stop_loss=2500.0, last_price=2500.0)
+        service.engine.positions.pop(signal.symbol)
+        with patch.object(SimplifiedStockEngineService, "_place_exit_order") as mock_place:
+            service._confirm_and_place_exit(signal, api_key="k", strategy_name="s")
+        mock_place.assert_not_called()
+        assert signal.symbol not in service.engine.pending_exits
+
+
 def test_no_override_allows_entry():
     """No active override → entries proceed normally (mode-only default)."""
     service = _make_service(MODE_SANDBOX)

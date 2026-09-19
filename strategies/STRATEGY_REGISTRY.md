@@ -188,7 +188,7 @@ A tick-validated replay of 345 simplified-engine trades under 106 exit configura
 
 ## Currently Testing (In-Flight Experiments)
 
-(none active)
+- **cas_320_expiry_straddle — expiry-day ATM straddle across the closing auction (issue #740, shipped 2026-09-19).** Buys the ATM CE + PE on NIFTY (Tue, NFO) / SENSEX (Thu, BFO) weekly expiry days at 15:20:00 IST, sells at 2× combined bid (net) or 15:28:00. Source: an operator-supplied video whose own "backtest" is look-ahead on 4 samples. **No historical data exists** (Kite drops expired weeklies; historify index 1m is padded flat 15:15–15:28) → the strategy records every 2-s poll of the ATM ±2 ladder across 15:14–15:41 on every expiry day (`cas_straddle_polls` / `cas_straddle_sessions`) and trades the sandbox book from boot. **R69 verdict is INSUFFICIENT until ≥ 30 expiry sessions (~Jan 2027); pre-registered primary = video-faithful (15:15 ATM, 15:20:00 ask entry, 2× bid target net of charges, 15:28 hard exit); variants measured from the polls (strike from the first print, entry 15:20:30/15:21/15:22, 1.5×/3×/no target, 15:25/15:29:30/hold-to-settlement, ±1 strangle).** Regulatory kill: SEBI paper (comments closed 2026-10-03) proposing to hide the IIV / VWAP settlement. Verified facts + plan: `strategies/cas_320_expiry_straddle/PLAN.md`.
 
 ## Rejected Strategies — Full Audit Trail
 

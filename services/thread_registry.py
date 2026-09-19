@@ -356,6 +356,24 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_PROTECTED,
     ),
     ThreadSpec(
+        thread_name="cas-straddle-monitor",
+        label="CAS straddle monitor",
+        group=GROUP_LOOP,
+        owner="services/cas_straddle_service.py",
+        description=(
+            "Expiry-day poll loop (issue #740): ONE batched quote call per cycle "
+            "for spot + the ATM ±2 ladder of both underlyings, journals every "
+            "poll to cas_straddle_polls, fixes the ATM from the 15:15:00 print "
+            "and evaluates the combined-bid target on the same batch. Alive "
+            "only 15:12-15:41 IST on an expiry day, so 'not started' is normal."
+        ),
+        # declared at the clamp MAX (the real cadence is the UI-configurable
+        # poll_interval_s, 2-60s) so a slow-but-legal setting never reads stale
+        cadence_sec=60,
+        window="15:12 - 15:41 IST (expiry days)",
+        tier=TIER_PROTECTED,
+    ),
+    ThreadSpec(
         thread_name="SimplifiedTickLogWriter",
         label="Tick-log writer",
         group=GROUP_TRANSPORT,

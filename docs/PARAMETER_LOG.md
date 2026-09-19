@@ -18,6 +18,44 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Modelled option charges schedule — NSE txn + STT corrected (issue #736, 2026-09-18)
+
+Code-default constants, not env vars. Two statutory rates in the Zerodha
+option round-trip model were wrong; both were verified against
+https://zerodha.com/charges/ on 2026-09-18 (the STT hike is Budget 2026,
+effective 2026-04-01). The model lives in exactly two places — the
+round-trip form `services/open15_option_shadow.option_round_trip_charges`
+and its per-leg twin `services/account_pnl_service.modelled_leg_charges`
+— and every consumer (`open15_breakout_service` option-mode exit pricing,
+`open15_fill_reconcile`, `open15_rejection_backfill`,
+`open15_postack_reject_repair`, `backtest/options_open15/july_502_run.py`,
+child-account P&L) imports one of them. Change both together.
+
+| Component | Was | Now | Note |
+|---|---|---|---|
+| NSE transaction charge (options) | `0.003503` × premium turnover (0.3503%) | `0.0003553` (0.03553%) | old value was ~10× NSE's rate |
+| STT (options) | `0.000625` × sell premium (0.0625%) | `0.0015` (0.15% of sell-side premium) | 0.10% → 0.15% from 2026-04-01 |
+| Brokerage Rs20/order, SEBI Rs10/crore, stamp 0.003% buy, GST 18% on brokerage+txn+SEBI | unchanged | unchanged | verified correct |
+
+Worked example (BAJAJ-AUTO, buy Rs11,400 / sell Rs12,750 premium): **Rs 76.82**
+now vs ~Rs 155 before. Net effect: modelled option charges fall ~65% (the txn
+overstatement dominates the STT understatement).
+
+**Journal impact — NOT rewritten.** Every `open15_trades` option row written
+before this landed carries the old schedule in `charges_inr` (gross `pnl` is
+unaffected; the derived net is what moves). Measured read-only on 2026-09-18:
+the 52 real option rows 2026-08-06 → 2026-09-17 hold Rs 26,308.93 of
+modelled charges vs Rs 8,832.74 under the corrected schedule — derived net
+P&L understated by Rs 17,476 (~Rs 336/trade); sim/shadow/paper rows are
+affected the same way. `reconcile_fills` is gated on
+`fill_reconcile_status`, so already-reconciled rows are **not** silently
+re-derived — the fix is forward-only from the next option-mode exit. A
+one-off operator repair (dry-run default, `--apply`) recomputing
+`charges_inr` from the persisted `entry_fill_price`/`exit_fill_price` is
+warranted (no broker call needed) and is tracked as issue #738; research
+numbers in R59/R63/R64 that read net option P&L from the journal predate the
+fix, R66 used the corrected schedule itself.
+
 ### open15 intra-hold P&L curve + live P&L poll (issue #692, added 2026-09-01)
 
 Read-only observability on `/open15_vol_breakout/logs`: the "Intra-hold P&L —
@@ -2537,6 +2575,33 @@ ran in the 15:30-17:00 periodic window).
   `/accounts` open15 card skipping the broker for disabled / not-connected
   children are correctness changes with no flag.
 - **History:** 2026-09-09 — introduced by issue #719.
+
+## `cas_straddle_config` — UI-only tunables of `cas_320_expiry_straddle` (issue #740, 2026-09-19)
+
+- **What:** the single-row table behind the Settings card on
+  `/strategies/cas_320_expiry_straddle` (`POST /cas_320_expiry_straddle/api/config`).
+  **There are NO env vars for this strategy** (operator rule 2026-09-19): a NULL
+  field falls through to the code default constant in
+  `services/cas_straddle_service.DEFAULTS`, and the DB row is the only knob.
+  A save applies at the next 15:12 IST arm; the effective config is stamped into
+  `cas_straddle_sessions.config_json` so a day's record is never ambiguous.
+
+  | Field | Bounds | Code default | Meaning |
+  |---|---|---|---|
+  | `trade_nifty` / `trade_sensex` | bool | true / true | place straddles on NSE/NFO / BSE/BFO (polls are recorded either way) |
+  | `lots_nifty` / `lots_sensex` | 1–10 | 1 / 1 | lots per leg; quantity = lots × `SymToken.lotsize` (never overridable) |
+  | `max_premium_inr` | 1,000–1,000,000 | 15,000 | per-underlying per-expiry premium cap — an entry above it is REFUSED, never trimmed |
+  | `target_mult` | 1.1–5.0 | 2.0 | exit when the combined BID net of modelled charges ≥ this × entry cost for 2 consecutive polls |
+  | `hard_exit_time` | 15:20:30–15:37:00 | 15:28:00 | timed SELL; a leg with no bid is left to cash-settle at 0 |
+  | `poll_interval_s` | 2–60 | 2 | monitor cadence (applies within one cycle) |
+
+- **Why bounds are refused, not clamped:** the UI must be able to say what was
+  rejected; a silently stored different number reads as "the save reverted" (#698).
+- **Not a switch (#651 rule):** the 15:38 fallback flatten, fill verification
+  (an ACK is not a fill), the paper demotion of a rejected entry, the
+  believed-filled asymmetry on an unreadable book and the ATM ±2 ladder
+  recording are correctness behaviour with no flag.
+- **History:** 2026-09-19 — introduced by issue #740.
 
 ## Other tunables (placeholder — populate as discovered)
 

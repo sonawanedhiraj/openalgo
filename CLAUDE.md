@@ -1900,6 +1900,49 @@ at ~100 rows. Tests: `test/test_open15_watched_counterfactual.py`.
 day loudly. Flags `OPEN15_*` (default mode `sandbox`; `observe` = journal-only);
 `NOTIFY_OPEN15_BREAKOUT` gates the rejection alert.
 
+**Sandbox measurement strategy**: [`strategies/cas_320_expiry_straddle/`](strategies/cas_320_expiry_straddle/)
+— expiry-day **ATM straddle across the closing auction session** (issue #740). On
+weekly index-option expiry days — NIFTY on NFO (Tuesdays) and SENSEX on BFO
+(Thursdays), **decided from the master contract, never `weekday()`** (holiday
+shifts land on a Monday) — `CasStraddleService` (`services/cas_straddle_service.py`)
+arms at 15:12, fixes the ATM from the **15:15:00 spot print** (the last
+continuous print — after 15:15 every chart's "spot" is the auction's Indicative
+Index Value, which nothing trades at), BUYs the ATM CE + PE at **15:20:00**
+(`NRML`, `lots × SymToken.lotsize`; NIFTY 65 / SENSEX 20 as of 2026-09), and SELLs
+both when the combined **bid** net of modelled charges reaches `target_mult ×`
+cost for 2 consecutive polls, else at `hard_exit_time` (default 15:28:00 — a leg
+with no bid is left to cash-settle at 0). Derivatives trade to **15:40**;
+Zerodha's F&O MIS square-off is 15:26, hence NRML. A 15:38 PROTECTED fallback
+flatten squares off what the `mode_key`-resolved position book still holds.
+**Mode is exactly open15's:** `sandbox` or `live` via the `/strategies` toggle
+(`resolve_order_mode('cas_320_expiry_straddle')`, default-deny sandbox) — **no env
+flag, no observe state; it trades the sandbox book from the first expiry day.**
+The only other controls are the **Settings card** on
+`/strategies/cas_320_expiry_straddle` (single-row `cas_straddle_config`, NULL →
+code default, no env seeds: per-underlying trade toggles, lots 1–10, premium cap
+that REFUSES rather than trims, target multiple, hard exit time, poll interval;
+applies at the next 15:12 arm and is stamped into the session row) and
+`pause`/`resume`. Rules that carry over from open15, each load-bearing: an ACK is
+not a fill (every leg verified through the order book; a rejected ENTRY is
+`fill='paper'`, a rejected EXIT is `status='error'` + alert, never paper); only an
+AFFIRMATIVE non-zero book justifies squaring off an unverified leg, while a
+confirmed fill is still sold on an unreadable book; `net_pnl_of_row` over
+`real_closed_rows` is the ONE P&L definition. The monitor thread
+`cas-straddle-monitor` records **every 2-s poll of spot + the ATM ±2 ladder for
+BOTH underlyings regardless of the trade toggles** (`cas_straddle_polls`) and a
+per-(date, underlying) digest (`cas_straddle_sessions`: 15:15 close, first IIV
+print, IIV low/high, straddle cost at 15:20, peak combined bid, settlement,
+effective config) — **this is the R69 backtest dataset, because no historical
+weekly index-option data exists** (Kite drops expired contracts; historify's
+index 1m is padded flat from 15:15). Charges use Zerodha's published 2026-09
+options schedule per exchange (`option_leg_charges`: ₹20/order, STT 0.15%
+sell-side, NSE 0.03553% / BSE 0.0325% of premium). Pre-registered kill: SEBI's
+consultation paper (comments closed 2026-10-03) proposing to hide the IIV / move
+settlement to a VWAP — either lands → operator flips to sandbox, recording
+continues. Plan + verified facts: `strategies/cas_320_expiry_straddle/PLAN.md`.
+Tests: `test/test_cas_straddle_service.py` (incl. the real `place_order_with_auth`
+routing seam), `test/test_cas_straddle_db.py`, `test/test_cas_straddle_blueprint.py`.
+
 ## Data freshness validation (sector_follow_cap5_vol)
 
 A durable guard against the class of failure that produced the 2026-05-29→06-10

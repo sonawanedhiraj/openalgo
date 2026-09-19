@@ -1,0 +1,41 @@
+{
+  "version": "0.1.0",
+  "mode": "sandbox",
+  "deployable": true,
+  "strategy_name": "cas_320_expiry_straddle",
+  "classification": "expiry-day non-directional index-option straddle across the NSE/BSE closing auction session (measurement deployment, issue #740)",
+  "underlyings": {
+    "NIFTY": {"spot_exchange": "NSE_INDEX", "option_exchange": "NFO", "weekly_expiry": "Tuesday (master contract decides; shifts on holidays)"},
+    "SENSEX": {"spot_exchange": "BSE_INDEX", "option_exchange": "BFO", "weekly_expiry": "Thursday (master contract decides; shifts on holidays)"}
+  },
+  "instrument": "current-week ATM CE + ATM PE, same strike, expiring today",
+  "product": "NRML",
+  "order_type": "MARKET in sandbox; marketable LIMIT (ask + 5 ticks / bid - 5 ticks) in live",
+  "atm_basis": "spot at 15:15:00 IST (last continuous print) -> nearest listed strike",
+  "entry_time_ist": "15:20:00",
+  "target_rule": "combined BID value of the open legs, net of modelled exit charges, >= target_mult x entry cost for 2 consecutive polls",
+  "hard_exit_time_ist": "15:28:00 (UI-editable, clamped 15:20:30..15:37:00)",
+  "fallback_flatten_time_ist": "15:38 (protected)",
+  "eod_summary_time_ist": "15:45",
+  "arm_time_ist": "15:12",
+  "monitor_window_ist": "15:14-15:41",
+  "ui_config": {
+    "table": "cas_straddle_config (single row; NULL = code default; no env seeds)",
+    "trade_nifty": true,
+    "trade_sensex": true,
+    "lots_nifty": 1,
+    "lots_sensex": 1,
+    "max_premium_inr": 15000,
+    "target_mult": 2.0,
+    "hard_exit_time": "15:28:00",
+    "poll_interval_s": 2
+  },
+  "lot_multiple": "read from SymToken.lotsize at the 15:12 arm (NIFTY 65 / SENSEX 20 as of 2026-09); never overridable",
+  "ladder_recorded": "ATM +/-2 strikes, both sides, both underlyings, every poll, regardless of the trade toggles",
+  "stop_loss": "none - the premium paid is the max loss; no averaging, no re-entry",
+  "kill_criteria": "SEBI/NSE discontinue the IIV display or move expiry settlement to a VWAP -> operator flips to sandbox; pre-registered in PLAN.md",
+  "charges_model": "Zerodha schedule verified 2026-09-19: Rs20/order, STT 0.15% sell-side premium, NSE 0.03553% / BSE 0.0325% of premium, SEBI Rs10/cr, stamp 0.003% buy, GST 18%",
+  "capital_inr": 30000,
+  "backtest_reference": "none yet - R69 runs on the strategy's own cas_straddle_polls / cas_straddle_sessions (no historical weekly index-option data exists)",
+  "llm_context": "cas_320_expiry_straddle buys the at-the-money call AND put on NIFTY (Tuesday, NFO) and SENSEX (Thursday, BFO) weekly expiry days at 15:20 IST, one to ten lots each, NRML, and sells both when the combined bid reaches a multiple of the premium paid (default 2x) or at a hard time exit before the 15:40 derivatives close. It is a non-directional bet that the closing-auction indicative index swings further than the straddle costs. The premium paid is the maximum loss. It is a measurement deployment: no historical data exists for a backtest, so the strategy records every 2-second quote of the ATM ladder across the auction on every expiry day."
+}

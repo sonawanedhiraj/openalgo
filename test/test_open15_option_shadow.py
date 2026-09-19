@@ -2,6 +2,7 @@
 
 import datetime as dt
 
+import pytest
 import pytz
 
 from services.open15_option_shadow import (
@@ -99,8 +100,28 @@ def test_pick_contract_fails_open_when_every_expiry_is_blocked():
 def test_option_charges_model():
     # BAJAJ-AUTO 22-Jul real numbers: buy 152x75=11400, sell 170x75=12750
     c = option_round_trip_charges(11_400.0, 12_750.0)
-    # brokerage 40 + txn 0.3503% x 24150 = 84.60 + STT 7.97 + GST 22.43 + stamp 0.34 -> ~155
-    assert c is not None and 150.0 < c < 160.0
+    # Schedule verified 2026-09-18 against zerodha.com/charges (issue #736):
+    #   brokerage 40
+    #   NSE txn 0.03553% x 24150 = 8.58
+    #   STT 0.15% x 12750 (sell premium) = 19.125
+    #   SEBI Rs10/crore x 24150 = 0.02
+    #   stamp 0.003% x 11400 (buy) = 0.34
+    #   GST 18% x (40 + 8.58 + 0.02) = 8.75
+    #   -> 76.82  (the pre-#736 schedule — txn 0.3503%, STT 0.0625% — gave ~155)
+    assert c == pytest.approx(76.82, abs=0.01)
+    # each component pinned to its rate, so a slip in one cannot hide in the sum
+    brokerage, turnover, sell, buy = 40.0, 24_150.0, 12_750.0, 11_400.0
+    exch_txn = 0.0003553 * turnover
+    sebi = 0.000001 * turnover
+    expected = (
+        brokerage
+        + exch_txn
+        + 0.0015 * sell
+        + sebi
+        + 0.00003 * buy
+        + 0.18 * (brokerage + exch_txn + sebi)
+    )
+    assert c == pytest.approx(round(expected, 2), abs=0.005)
     assert option_round_trip_charges(0.0, 12_750.0) is None
 
 
@@ -171,8 +192,9 @@ def test_enrich_missing_prices_closed_rows(monkeypatch):
     assert row.opt_symbol == "BAJAJ-AUTO28JUL2610700CE"
     assert row.opt_entry_premium == 152.00 and row.opt_exit_premium == 170.00
     assert row.opt_lot_size == 75
-    # gross (170-152)*75 = 1350, minus ~155 charges -> ~1195 net
-    assert 1180.0 < row.opt_pnl < 1210.0
+    # gross (170-152)*75 = 1350, minus 76.82 modelled charges (#736 schedule;
+    # see test_option_charges_model) -> 1273.18 net
+    assert row.opt_pnl == pytest.approx(1350.0 - 76.82, abs=0.01)
     db_session.remove()
 
     # idempotent: second run finds nothing to price
