@@ -184,6 +184,10 @@ class NotificationService:
             # the unknown-event-type gate (the prior warn-and-drop behavior that
             # forced tasks to fall back to direct Bot API calls).
             "task_complete": _env_bool("NOTIFY_TASK_COMPLETE", default=True),
+            # cas_320_expiry_straddle (issue #740): arm / entry / exit / EOD
+            # digest / rejection alerts. Default ON; the platform master
+            # NOTIFY_TELEGRAM_ENABLED is the only switch above it.
+            "cas_straddle": _env_bool("NOTIFY_CAS_STRADDLE", default=True),
             # Daily trading-day funnel diagnostic (issue #159). Default ON —
             # the next "zero trades on a healthy-looking day" surfaces as a
             # 15:35 IST Telegram message naming the drop-off layer instead of

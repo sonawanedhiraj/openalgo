@@ -2576,6 +2576,33 @@ ran in the 15:30-17:00 periodic window).
   children are correctness changes with no flag.
 - **History:** 2026-09-09 — introduced by issue #719.
 
+## `cas_straddle_config` — UI-only tunables of `cas_320_expiry_straddle` (issue #740, 2026-09-19)
+
+- **What:** the single-row table behind the Settings card on
+  `/strategies/cas_320_expiry_straddle` (`POST /cas_320_expiry_straddle/api/config`).
+  **There are NO env vars for this strategy** (operator rule 2026-09-19): a NULL
+  field falls through to the code default constant in
+  `services/cas_straddle_service.DEFAULTS`, and the DB row is the only knob.
+  A save applies at the next 15:12 IST arm; the effective config is stamped into
+  `cas_straddle_sessions.config_json` so a day's record is never ambiguous.
+
+  | Field | Bounds | Code default | Meaning |
+  |---|---|---|---|
+  | `trade_nifty` / `trade_sensex` | bool | true / true | place straddles on NSE/NFO / BSE/BFO (polls are recorded either way) |
+  | `lots_nifty` / `lots_sensex` | 1–10 | 1 / 1 | lots per leg; quantity = lots × `SymToken.lotsize` (never overridable) |
+  | `max_premium_inr` | 1,000–1,000,000 | 15,000 | per-underlying per-expiry premium cap — an entry above it is REFUSED, never trimmed |
+  | `target_mult` | 1.1–5.0 | 2.0 | exit when the combined BID net of modelled charges ≥ this × entry cost for 2 consecutive polls |
+  | `hard_exit_time` | 15:20:30–15:37:00 | 15:28:00 | timed SELL; a leg with no bid is left to cash-settle at 0 |
+  | `poll_interval_s` | 2–60 | 2 | monitor cadence (applies within one cycle) |
+
+- **Why bounds are refused, not clamped:** the UI must be able to say what was
+  rejected; a silently stored different number reads as "the save reverted" (#698).
+- **Not a switch (#651 rule):** the 15:38 fallback flatten, fill verification
+  (an ACK is not a fill), the paper demotion of a rejected entry, the
+  believed-filled asymmetry on an unreadable book and the ATM ±2 ladder
+  recording are correctness behaviour with no flag.
+- **History:** 2026-09-19 — introduced by issue #740.
+
 ## Other tunables (placeholder — populate as discovered)
 
 The following are known tunables that should be cataloged in subsequent commits

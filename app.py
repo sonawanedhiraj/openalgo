@@ -49,6 +49,7 @@ from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.broker_totp import broker_totp_bp  # Broker external-TOTP helper
+from blueprints.cas_straddle import cas_straddle_bp  # cas_320_expiry_straddle control/config
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
 from blueprints.core import core_bp
 from blueprints.custom_straddle import custom_straddle_bp  # Import custom straddle blueprint
@@ -315,6 +316,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(chartink_bp)
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
+    app.register_blueprint(cas_straddle_bp)  # cas_320_expiry_straddle control/config (#740)
     app.register_blueprint(intraday_pullback_bp)  # intraday_pullback_top2 control/observability
     app.register_blueprint(open15_bp)  # open15_vol_breakout control/observability
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
@@ -1019,6 +1021,18 @@ def setup_environment(app):
                 logger.debug("Open15 breakout service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize Open15 breakout service: {e}")
+
+            # cas_320_expiry_straddle — expiry-day ATM straddle across the
+            # closing auction (issue #740). Unconditional: no env flag. Trades
+            # the sandbox book from the first expiry day; the /strategies
+            # Live/Sandbox toggle is the only way it goes live.
+            try:
+                from services.cas_straddle_service import init_cas_straddle_service
+
+                init_cas_straddle_service(app=app)
+                logger.debug("CAS straddle service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize CAS straddle service: {e}")
 
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
