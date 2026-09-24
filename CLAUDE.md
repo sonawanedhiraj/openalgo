@@ -61,6 +61,24 @@ ingestion → one distinct alert, then the ladder resumes. The
 `websocket_proxy` subprocess on unexpected exit (`ws_proxy_died` alert, capped
 `WS_PROXY_MAX_RESTARTS_PER_DAY`/day). See `docs/SYSTEM_MAP.md` Processes §6.
 
+**Whole-process death (the 2026-09-24 10055 abort — issue #744):** the same
+libzmq assertion can take down the ENTIRE process (Flask, ZMQ and WS share one
+PID), which no in-process watchdog survives. Evidence lives in `db/health.db`:
+the Health Monitor's 10 s `health_metrics` rows are the seconds before the
+death, and they showed free system RAM falling 533 → 237 MB. Socket buffers
+come from the Windows **non-paged pool** (machine-wide, never paged — a bigger
+page file does NOT help), so the predictors are machine-wide. The collector now
+reads them (`utils/system_health.py`: free RAM, non-paged pool, commit, TCP),
+alerts through `notify("system_health")` (Telegram threshold alerts ship OFF —
+`SYSTEM_HEALTH_ALERTS_ENABLED` — while calibrating), recommends apps to close
+ranked by working set (never kills anything), and detects an unclean exit at
+the next boot via `db/health_run_state.json` (atexit marks clean; abort skips
+atexit) → `db/health_unclean_exit.json` + banner on `/health` + Telegram with
+the Windows Event 1000 crash record. A Ctrl+C/SIGINT stop is clean and is not
+reported. The navbar dot polls `GET /health/api/system` (gate `"user" in
+session`, plain 401 — never `check_session_validity`). See `docs/SYSTEM_MAP.md`
+Processes §7.
+
 ## Task Tracking — Every Task Is a GitHub Issue
 
 Every unit of work — feature, bug fix, documentation, **or backtest round** —

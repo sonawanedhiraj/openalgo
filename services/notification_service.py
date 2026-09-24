@@ -261,6 +261,12 @@ class NotificationService:
             # A shutdown must never be silent — the alert is the audit trail
             # that pairs with the boot dirty-check on the next start.
             "system_shutdown": _env_bool("NOTIFY_SYSTEM_SHUTDOWN", default=True),
+            # Machine-wide system health (issue #744): free RAM / non-paged
+            # pool / TCP alerts and the unclean-exit report after a crash.
+            # Threshold alerts are additionally gated by
+            # SYSTEM_HEALTH_ALERTS_ENABLED (off while calibrating); the
+            # unclean-exit report is not. Caller: utils/system_health.py.
+            "system_health": _env_bool("NOTIFY_SYSTEM_HEALTH", default=True),
         }
         # Whether to deliver messages for event_types NOT in per_event (i.e.
         # future callers that ship without a registry entry). When True (default)

@@ -121,3 +121,7 @@ log/boot_*
 log/error_digest_*.json
 # issue #700 — one-time Console tradebook exports (child account data)
 imports/
+
+# System health run state + unclean-exit report (issue #744)
+db/health_run_state.json
+db/health_unclean_exit.json
