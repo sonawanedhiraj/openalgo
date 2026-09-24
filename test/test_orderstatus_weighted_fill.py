@@ -6,13 +6,14 @@ order's fill from the tradebook with a loop that ``break``-ed on the FIRST
 matching trade, so the first partial's price was published as the whole order's
 fill — the reconciled day P&L was Rs912.50 off the broker's own number.
 
-Two-layer fix, both pinned here:
+Pinned here (#641, revised by #746):
 
-1. When the broker mapper preserves the orderbook's own ``average_price``
-   (Zerodha does as of #641), that number IS the volume-weighted average and is
-   used directly — no tradebook call at all.
-2. When it doesn't (30+ other brokers), the tradebook fallback volume-weights
-   ALL trades belonging to the order.
+1. The tradebook, volume-weighting ALL trades of the order at full precision,
+   is the fill price. Zerodha's orderbook ``average_price`` is rounded to 2
+   decimals (VMM 2026-09-24: 1.42 / 1.70 against true 1.417778 / 1.704444 —
+   a Rs291 gross error at 43,650 qty), so it can no longer win.
+2. The orderbook ``average_price`` is only the fallback when the tradebook has
+   no trades for the order or cannot be read.
 """
 
 from services.mode_service import EffectiveMode
@@ -68,14 +69,60 @@ def _call(orderid="260819190169554"):
     return resp["data"]
 
 
-def test_the_orderbooks_own_weighted_average_wins_without_a_tradebook_call(monkeypatch):
-    """Layer 1: the broker already did the volume-weighting — use it."""
+def test_tradebook_vwap_beats_the_rounded_orderbook_average(monkeypatch):
+    """#746: the VMM 2026-09-24 entry — 9 partials, orderbook said 1.42."""
+    prices = [1.40, 1.40, 1.41, 1.41, 1.42, 1.43, 1.43, 1.43, 1.43]
+    trades = [{"orderid": "E", "quantity": 4850, "average_price": p} for p in prices]
+    calls = _wire(monkeypatch, _order(orderid="E", quantity=43650, average_price=1.42), trades)
+
+    px = _call("E")["average_price"]
+
+    assert calls["tradebook"] == 1
+    assert px != 1.42
+    assert round(px * 43650, 2) == 61886.0, "qty x price must reproduce the traded value"
+
+
+def test_vmm_gross_matches_the_brokers_realised(monkeypatch):
+    """Entry and exit both from the tradebook: gross = Zerodha's 12,513.00."""
+    entry = [1.40, 1.40, 1.41, 1.41, 1.42, 1.43, 1.43, 1.43, 1.43]
+    exit_ = [
+        (4850, 1.73),
+        (4850, 1.72),
+        (4850, 1.70),
+        (14550, 1.70),
+        (4850, 1.70),
+        (4850, 1.70),
+        (4850, 1.69),
+    ]
+    trades = [{"orderid": "E", "quantity": 4850, "average_price": p} for p in entry]
+    trades += [{"orderid": "X", "quantity": q, "average_price": p} for q, p in exit_]
+
+    _wire(monkeypatch, _order(orderid="E", average_price=1.42), trades)
+    e = _call("E")["average_price"]
+    _wire(monkeypatch, _order(orderid="X", average_price=1.70), trades)
+    x = _call("X")["average_price"]
+
+    assert round((x - e) * 43650, 2) == 12513.0  # rounded orderbook avgs gave 12,222
+
+
+def test_orderbook_average_is_the_fallback_when_the_tradebook_has_no_rows(monkeypatch):
     calls = _wire(monkeypatch, _order(average_price=21.1375), trades=[])
 
-    data = _call()
+    assert _call()["average_price"] == 21.1375
+    assert calls["tradebook"] == 1
 
-    assert data["average_price"] == 21.1375
-    assert calls["tradebook"] == 0, "no second broker round-trip when the answer is present"
+
+def test_orderbook_average_is_the_fallback_when_the_tradebook_is_unreadable(monkeypatch):
+    import services.orderstatus_service as osvc
+
+    _wire(monkeypatch, _order(average_price=21.1375), trades=[])
+    monkeypatch.setattr(
+        osvc,
+        "get_tradebook",
+        lambda auth_token, broker: (False, {"status": "error", "message": "down"}, 500),
+    )
+
+    assert _call()["average_price"] == 21.1375
 
 
 def test_the_tradebook_fallback_volume_weights_every_partial(monkeypatch):
