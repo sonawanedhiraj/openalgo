@@ -18,6 +18,35 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### Machine-wide system health + Health Monitor thread thresholds (issue #744, 2026-09-24)
+
+- **Why:** 2026-09-24 09:40:09 IST the whole OpenAlgo process died on a libzmq
+  WSAENOBUFS (10055) abort; free system RAM had fallen 533 → 237 MB in the ten
+  minutes before, recorded by the Health Monitor and seen by no one.
+- **New tunables** (env, read at boot; code defaults are STARTING values —
+  recalibrate from 3–5 trading days of `health_metrics` minima before turning
+  alerts on):
+
+  | Env var | Default | Meaning |
+  |---|---|---|
+  | `SYSTEM_HEALTH_ENABLED` | `true` | machine-wide readings + unclean-exit detection |
+  | `SYSTEM_HEALTH_ALERTS_ENABLED` | **`false`** | Telegram for threshold alerts (calibration phase); DB alerts + UI always on |
+  | `SYSTEM_HEALTH_RAM_WARN_MB` / `_CRIT_MB` | 400 / 250 | free system RAM |
+  | `SYSTEM_HEALTH_NONPAGED_WARN_MB` / `_CRIT_MB` | 1024 / 1536 | Windows non-paged pool |
+  | `SYSTEM_HEALTH_NONPAGED_GROWTH_WARN_MB_PER_H` | 100 | pool growth over the last hour |
+  | `SYSTEM_HEALTH_TCP_WARN` | 2000 | system-wide TCP entries |
+  | `SYSTEM_HEALTH_SUSTAIN_SAMPLES` | 3 | consecutive 10 s samples before a level changes |
+  | `SYSTEM_HEALTH_FREE_RAM_TARGET_MB` | 1500 | "Free up memory" suggests apps until this is reached |
+  | `NOTIFY_SYSTEM_HEALTH` | `true` | per-event Telegram toggle (also gates the unclean-exit report) |
+
+- **Changed defaults:** `HEALTH_THREAD_WARNING_THRESHOLD` 50 → **100**,
+  `HEALTH_THREAD_CRITICAL_THRESHOLD` 100 → **150**. A normal session runs 48–69
+  Python threads (`health.db`, 2026-09-17..24), so warn=50 kept the Health
+  Monitor's overall status permanently "warn" — a status nobody reads.
+  (`HEALTH_MEMORY_*` is unchanged; this install already overrides it to
+  3000/5000 in `.env`.)
+- **History:** 2026-09-24 — introduced by issue #744.
+
 ### Modelled option charges schedule — NSE txn + STT corrected (issue #736, 2026-09-18)
 
 Code-default constants, not env vars. Two statutory rates in the Zerodha

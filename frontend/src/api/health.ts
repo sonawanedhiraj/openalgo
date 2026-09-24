@@ -87,6 +87,8 @@ export interface HistoricalMetric {
   ws_connections: number
   threads: number
   overall_status: 'pass' | 'warn' | 'fail'
+  sys_available_mb?: number | null
+  sys_nonpaged_mb?: number | null
 }
 
 export interface HealthStats {
@@ -229,4 +231,111 @@ export async function resolveAlert(alertId: number): Promise<void> {
  */
 export function exportMetricsCSV(hours = 24): string {
   return `/health/export?hours=${hours}`
+}
+
+// ---------------------------------------------------------------------------
+// Machine-wide system health (issue #744)
+// ---------------------------------------------------------------------------
+
+export type HealthLevel = 'pass' | 'warn' | 'fail'
+
+export interface SystemAppGroup {
+  app: string
+  class: 'safe' | 'careful' | 'unknown'
+  how: string
+  rss_mb: number
+  processes: number
+  suggested?: boolean
+  reaches_target?: boolean
+}
+
+export interface SystemRecommendations {
+  available_mb: number | null
+  target_mb: number
+  need_mb: number | null
+  safe: SystemAppGroup[]
+  careful: SystemAppGroup[]
+  unknown: SystemAppGroup[]
+}
+
+export interface SystemRule {
+  label: string
+  level: HealthLevel
+  raw: HealthLevel
+  value: number | null
+}
+
+export interface UncleanExitReport {
+  detected_at: string
+  previous_pid: number | null
+  previous_started_at: string | null
+  last_sample: {
+    at: string
+    available_mb: number | null
+    nonpaged_mb: number | null
+    rss_mb: number | null
+  } | null
+  min_available_mb: number | null
+  min_available_at: string | null
+  top_apps: Array<{ app: string; rss_mb: number; class: string }> | null
+  crash: {
+    time_local?: string | null
+    application?: string | null
+    module?: string | null
+    exception_code?: string | null
+    meaning?: string | null
+  } | null
+}
+
+export interface SystemHealth {
+  enabled: boolean
+  timestamp?: string
+  status?: HealthLevel
+  alerts_enabled?: boolean
+  readings?: {
+    available_mb: number | null
+    total_mb: number | null
+    nonpaged_mb: number | null
+    nonpaged_growth_mb_per_h: number | null
+    commit_mb: number | null
+    commit_limit_mb: number | null
+    commit_pct: number | null
+    handles: number | null
+    tcp_system: number | null
+    tcp_openalgo: number | null
+    platform_supported: boolean
+  }
+  rules?: Record<'free_ram' | 'nonpaged' | 'tcp', SystemRule>
+  thresholds?: {
+    ram_warn_mb: number
+    ram_fail_mb: number
+    nonpaged_warn_mb: number
+    nonpaged_fail_mb: number
+    nonpaged_growth_warn_mb_per_h: number
+    tcp_warn: number
+    sustain_samples: number
+    free_ram_target_mb: number
+  }
+  recommendations?: SystemRecommendations | null
+  unclean_exit: UncleanExitReport | null
+}
+
+/**
+ * Machine-wide system health. Uses plain fetch, NOT webClient: the navbar
+ * polls this from every page, and webClient redirects to /login on a 401.
+ * Returns null on any failure so a background poll can never disrupt a page.
+ */
+export async function getSystemHealth(): Promise<SystemHealth | null> {
+  try {
+    const response = await fetch('/health/api/system', { credentials: 'same-origin' })
+    if (!response.ok) return null
+    return (await response.json()) as SystemHealth
+  } catch {
+    return null
+  }
+}
+
+/** Hide the unclean-exit banner (user action on /health). */
+export async function dismissUncleanExit(): Promise<void> {
+  await webClient.post('/health/api/system/unclean_exit/dismiss')
 }

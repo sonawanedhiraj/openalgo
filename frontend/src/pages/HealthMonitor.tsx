@@ -38,15 +38,19 @@ import { useEffect, useRef, useState } from 'react'
 import {
   acknowledgeAlert,
   type CurrentMetrics,
+  dismissUncleanExit,
   exportMetricsCSV,
   getActiveAlerts,
   getCurrentMetrics,
   getHealthStats,
   getMetricsHistory,
+  getSystemHealth,
   type HealthAlert,
   type HealthStats,
   type HistoricalMetric,
+  type SystemHealth,
 } from '@/api/health'
+import { SystemHealthPanel } from '@/components/health/SystemHealthPanel'
 // Alert components removed - using custom styled divs for theme compatibility
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -153,6 +157,7 @@ export default function HealthMonitor() {
   const [historicalMetrics, setHistoricalMetrics] = useState<HistoricalMetric[]>([])
   const [stats, setStats] = useState<HealthStats | null>(null)
   const [alerts, setAlerts] = useState<HealthAlert[]>([])
+  const [systemHealth, setSystemHealth] = useState<SystemHealth | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -171,12 +176,14 @@ export default function HealthMonitor() {
     try {
       setRefreshing(true)
 
-      const [metricsData, historyData, statsData, alertsData] = await Promise.all([
+      const [metricsData, historyData, statsData, alertsData, systemData] = await Promise.all([
         getCurrentMetrics(),
         getMetricsHistory(CHART_HOURS),
         getHealthStats(HISTORY_HOURS),
         getActiveAlerts(),
+        getSystemHealth(),
       ])
+      setSystemHealth(systemData)
 
       setCurrentMetrics(metricsData)
       setHistoricalMetrics(historyData)
@@ -409,6 +416,15 @@ export default function HealthMonitor() {
     }
   }
 
+  const handleDismissUncleanExit = async () => {
+    try {
+      await dismissUncleanExit()
+      fetchData()
+    } catch {
+      showToast.error('Failed to dismiss the report', 'monitoring')
+    }
+  }
+
   const handleExport = () => {
     window.open(exportMetricsCSV(24), '_blank')
     showToast.success('Exporting metrics to CSV', 'monitoring')
@@ -473,6 +489,13 @@ export default function HealthMonitor() {
           </div>
         </div>
       )}
+
+      {/* Machine-wide system health (issue #744) */}
+      <SystemHealthPanel
+        health={systemHealth}
+        history={historicalMetrics}
+        onDismissUncleanExit={handleDismissUncleanExit}
+      />
 
       {/* Metric Cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">

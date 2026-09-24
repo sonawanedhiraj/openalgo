@@ -63,9 +63,15 @@ DB_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_DB_CRITICAL_THRESHOLD", "20"))
 WS_WARNING_THRESHOLD = int(os.getenv("HEALTH_WS_WARNING_THRESHOLD", "10"))
 WS_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_WS_CRITICAL_THRESHOLD", "20"))
 
-# Thread Thresholds
-THREAD_WARNING_THRESHOLD = int(os.getenv("HEALTH_THREAD_WARNING_THRESHOLD", "50"))
-THREAD_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_THREAD_CRITICAL_THRESHOLD", "100"))
+# Thread Thresholds (Python threads). Raised from 50/100 by issue #744: a normal
+# session runs 48-69 threads (health.db, 2026-09-17..24), so warn=50 kept the
+# overall status permanently "warn" and nobody read it.
+THREAD_WARNING_THRESHOLD = int(os.getenv("HEALTH_THREAD_WARNING_THRESHOLD", "100"))
+THREAD_CRITICAL_THRESHOLD = int(os.getenv("HEALTH_THREAD_CRITICAL_THRESHOLD", "150"))
+
+# Machine-wide health (issue #744) — created in init_health_monitoring
+_system_monitor = None
+_run_state = None
 
 # Global collector thread
 _collector_thread = None
@@ -535,6 +541,62 @@ def get_process_metrics(limit: int = 5):
         return []
 
 
+def get_system_metrics(memory_metrics=None):
+    """Machine-wide readings + rule evaluation (issue #744). Never raises."""
+    monitor = _system_monitor
+    if monitor is None:
+        return None
+    try:
+        from utils import system_health
+
+        reading = system_health.read_system()
+        if reading.get("available_mb") is None and memory_metrics:
+            reading["available_mb"] = memory_metrics.get("available_mb")
+        apps = None
+        if monitor.apps_due():
+            procs, own = system_health.collect_processes()
+            apps = system_health.classify_apps(
+                procs, own, reading.get("available_mb"), monitor.config.free_ram_target_mb
+            )
+        snapshot = monitor.evaluate(reading, apps=apps)
+        return {
+            **reading,
+            "status": snapshot["status"],
+            # Stored only when refreshed (~once a minute) to keep health.db small.
+            "top_apps": apps["top"] if apps else None,
+        }
+    except Exception as e:
+        logger.exception(f"Error getting system metrics: {e}")
+        return None
+
+
+def get_system_snapshot():
+    """Latest machine-wide snapshot for the UI (in-memory, no DB)."""
+    monitor = _system_monitor
+    snapshot = dict(monitor.latest) if monitor is not None and monitor.latest else {}
+    snapshot["enabled"] = monitor is not None
+    snapshot["unclean_exit"] = _run_state.current_report() if _run_state is not None else None
+    return snapshot
+
+
+def dismiss_unclean_exit():
+    return _run_state.dismiss() if _run_state is not None else False
+
+
+def _send_pending_unclean_exit_alert():
+    """Deliver the boot-time unclean-exit alert once the Telegram bot has started."""
+    if _run_state is None:
+        return
+    report = _run_state.take_pending_alert()
+    if report is None:
+        return
+    from utils import system_health
+
+    message = system_health.RunStateTracker.format_alert(report)
+    logger.warning("system_health: %s", message.replace(chr(10), " | "))
+    system_health.send_notification(message)
+
+
 def collect_metrics():
     """
     Collect all metrics and log to database.
@@ -550,6 +612,7 @@ def collect_metrics():
         ws_metrics = get_websocket_metrics()
         thread_metrics = get_thread_metrics()
         process_metrics = get_process_metrics()
+        system_metrics = get_system_metrics(memory_metrics)
 
         # Log to database
         HealthMetric.log_metrics(
@@ -559,11 +622,19 @@ def collect_metrics():
             ws_metrics=ws_metrics,
             thread_metrics=thread_metrics,
             process_metrics=process_metrics,
+            system_metrics=system_metrics,
         )
 
         # Update cache for fast access
         overall_status = "pass"
-        for metrics in [fd_metrics, memory_metrics, db_metrics, ws_metrics, thread_metrics]:
+        for metrics in [
+            fd_metrics,
+            memory_metrics,
+            db_metrics,
+            ws_metrics,
+            thread_metrics,
+            system_metrics,
+        ]:
             if metrics.get("status") == "fail":
                 overall_status = "fail"
                 break
@@ -581,6 +652,7 @@ def collect_metrics():
                     "websocket": ws_metrics,
                     "threads": thread_metrics,
                     "processes": process_metrics,
+                    "system": system_metrics,
                 }
             )
 
@@ -605,6 +677,7 @@ def _collector_loop():
         _beat("HealthCollector")
         try:
             collect_metrics()
+            _send_pending_unclean_exit_alert()
         except Exception as e:
             logger.exception(f"Error in collector loop: {e}")
 
@@ -676,9 +749,44 @@ def init_health_monitoring(app):
         # Purge old metrics
         purge_old_metrics(days=HEALTH_RETENTION_DAYS)
 
+        # Machine-wide health + unclean-exit detection (issue #744). The run
+        # state is checked BEFORE the collector starts so the newest samples
+        # still belong to the previous run.
+        _init_system_health()
+
         # Start collector (background daemon thread)
         start_health_collector()
 
         logger.debug("Health monitoring initialized successfully (background mode)")
     except Exception as e:
         logger.exception(f"Error initializing health monitoring: {e}")
+
+
+def _init_system_health():
+    global _system_monitor, _run_state
+    try:
+        import atexit
+
+        from database.health_db import HEALTH_DATABASE_URL, read_run_tail
+        from utils import system_health
+
+        config = system_health.SystemHealthConfig.from_env()
+        if not config.enabled:
+            logger.info("System health is disabled (SYSTEM_HEALTH_ENABLED=false)")
+            return
+        _system_monitor = system_health.SystemHealthMonitor(config=config)
+
+        db_path = HEALTH_DATABASE_URL.replace("sqlite:///", "")
+        state_dir = os.path.dirname(db_path) if "sqlite" in HEALTH_DATABASE_URL else "db"
+        _run_state = system_health.RunStateTracker(state_dir or "db")
+
+        def _tail(started):
+            try:
+                return read_run_tail(started)
+            finally:
+                health_session.remove()
+
+        _run_state.begin(sample_reader=_tail)
+        atexit.register(_run_state.mark_clean)
+    except Exception as e:
+        logger.exception(f"Error initializing system health: {e}")

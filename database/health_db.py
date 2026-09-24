@@ -89,6 +89,19 @@ class HealthMetric(HealthBase):
     # Process Usage (top memory consumers)
     process_details = Column(JSON)  # List of process info
 
+    # Machine-wide readings (issue #744). Socket buffers come from the Windows
+    # non-paged pool, a machine-wide resource, so these are what predicts the
+    # libzmq 10055 abort -- not OpenAlgo's own process numbers.
+    sys_nonpaged_mb = Column(Float)
+    sys_commit_mb = Column(Float)
+    sys_commit_limit_mb = Column(Float)
+    sys_handles = Column(Integer)
+    sys_tcp_total = Column(Integer)
+    proc_tcp = Column(Integer)
+    sys_status = Column(String(20))  # pass | warn | fail
+    # Top apps by working set; written ~once a minute, SQL NULL in between.
+    sys_top_apps = Column(JSON(none_as_null=True))
+
     # Overall Health (following draft-inadarei-api-health-check)
     overall_status = Column(String(20))  # pass | warn | fail
 
@@ -100,6 +113,7 @@ class HealthMetric(HealthBase):
         ws_metrics=None,
         thread_metrics=None,
         process_metrics=None,
+        system_metrics=None,
     ):
         """Log health metrics (background thread only - zero API latency impact)"""
         try:
@@ -118,6 +132,8 @@ class HealthMetric(HealthBase):
                 statuses.append(ws_metrics.get("status", "pass"))
             if thread_metrics:
                 statuses.append(thread_metrics.get("status", "pass"))
+            if system_metrics:
+                statuses.append(system_metrics.get("status", "pass"))
 
             # Overall status is worst of all individual statuses
             if "fail" in statuses:
@@ -157,6 +173,15 @@ class HealthMetric(HealthBase):
                 thread_status=thread_metrics.get("status") if thread_metrics else "unknown",
                 # Processes
                 process_details=process_metrics if process_metrics else None,
+                # Machine-wide (issue #744)
+                sys_nonpaged_mb=(system_metrics or {}).get("nonpaged_mb"),
+                sys_commit_mb=(system_metrics or {}).get("commit_mb"),
+                sys_commit_limit_mb=(system_metrics or {}).get("commit_limit_mb"),
+                sys_handles=(system_metrics or {}).get("handles"),
+                sys_tcp_total=(system_metrics or {}).get("tcp_system"),
+                proc_tcp=(system_metrics or {}).get("tcp_openalgo"),
+                sys_status=(system_metrics or {}).get("status") if system_metrics else None,
+                sys_top_apps=(system_metrics or {}).get("top_apps"),
                 # Overall
                 overall_status=overall_status,
             )
@@ -364,6 +389,22 @@ class HealthAlert(HealthBase):
             return None
 
     @staticmethod
+    def resolve_metric_alerts(metric_name):
+        """Resolve every open alert for ``metric_name`` (issue #744).
+
+        ``auto_resolve_alerts`` assumes higher-is-worse; free RAM is
+        lower-is-worse, so the system rules resolve explicitly on recovery.
+        """
+        try:
+            for alert in HealthAlert.query.filter_by(metric_name=metric_name, resolved=False).all():
+                alert.resolved = True
+                alert.resolved_at = datetime.now(UTC)
+            health_session.commit()
+        except Exception as e:
+            logger.exception(f"Error resolving alerts for {metric_name}: {str(e)}")
+            health_session.rollback()
+
+    @staticmethod
     def get_active_alerts():
         """Get all active (not resolved) alerts"""
         try:
@@ -443,6 +484,75 @@ def init_health_db():
     from database.db_init_helper import init_db_with_logging
 
     init_db_with_logging(HealthBase, health_engine, "Health Monitoring DB", logger)
+    ensure_health_metric_columns()
+
+
+def ensure_health_metric_columns(engine=None):
+    """Add columns introduced after a ``health_metrics`` table was created.
+
+    ``create_all`` never alters an existing table, so an install created before
+    issue #744 would otherwise miss the machine-wide columns. Idempotent.
+    Returns the list of columns added.
+    """
+    from sqlalchemy import inspect, text
+
+    engine = engine or health_engine
+    added = []
+    try:
+        existing = {c["name"] for c in inspect(engine).get_columns("health_metrics")}
+        with engine.begin() as conn:
+            for column in HealthMetric.__table__.columns:
+                if column.name in existing:
+                    continue
+                ddl_type = column.type.compile(dialect=engine.dialect)
+                conn.execute(
+                    text(f"ALTER TABLE health_metrics ADD COLUMN {column.name} {ddl_type}")
+                )
+                added.append(column.name)
+        if added:
+            logger.info(f"Health Monitoring DB: added column(s) {', '.join(added)}")
+    except Exception as e:
+        logger.exception(f"Error migrating health_metrics columns: {str(e)}")
+    return added
+
+
+def read_run_tail(started_at, minutes=5):
+    """Summarise the final samples of a run that started at ``started_at`` (issue #744).
+
+    Called at boot BEFORE this run's collector writes anything, so the newest
+    rows belong to the previous run. Returns ``last_sample``,
+    ``min_available_mb``/``min_available_at`` over its final ``minutes`` and the
+    latest recorded ``top_apps``.
+    """
+    q = HealthMetric.query
+    if started_at is not None:
+        q = q.filter(HealthMetric.timestamp >= started_at.astimezone(UTC).replace(tzinfo=None))
+    last = q.order_by(HealthMetric.timestamp.desc()).first()
+    if last is None:
+        return {}
+    cutoff = last.timestamp - timedelta(minutes=minutes)
+    tail = q.filter(HealthMetric.timestamp >= cutoff).all()
+    lows = [m for m in tail if m.memory_available_mb is not None]
+    low = min(lows, key=lambda m: m.memory_available_mb) if lows else None
+    # top_apps is written ~once a minute; rows in between may hold JSON 'null'
+    # rather than SQL NULL, so pick the newest truthy value in Python.
+    recent = q.order_by(HealthMetric.timestamp.desc()).limit(120).all()
+    top_apps = next((m.sys_top_apps for m in recent if m.sys_top_apps), None)
+
+    def _iso(ts):
+        return ts.replace(tzinfo=UTC).isoformat() if ts.tzinfo is None else ts.isoformat()
+
+    return {
+        "last_sample": {
+            "at": _iso(last.timestamp),
+            "available_mb": last.memory_available_mb,
+            "nonpaged_mb": last.sys_nonpaged_mb,
+            "rss_mb": last.memory_rss_mb,
+        },
+        "min_available_mb": low.memory_available_mb if low else None,
+        "min_available_at": _iso(low.timestamp) if low else None,
+        "top_apps": top_apps,
+    }
 
 
 def purge_old_metrics(days=7):

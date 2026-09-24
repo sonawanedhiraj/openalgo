@@ -21,11 +21,16 @@ import time
 from datetime import datetime
 
 import pytz
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, Response, jsonify, request, session
 
 from database.health_db import HealthAlert, HealthMetric, health_session
 from limiter import limiter
-from utils.health_monitor import check_db_connectivity, get_cached_health_status
+from utils.health_monitor import (
+    check_db_connectivity,
+    dismiss_unclean_exit,
+    get_cached_health_status,
+    get_system_snapshot,
+)
 from utils.logging import get_logger
 from utils.session import check_session_validity
 
@@ -383,6 +388,42 @@ def get_current_metrics():
         return jsonify({"error": str(e)}), 500
 
 
+# ----------------------------------------------------------------------------
+# Machine-wide system health (issue #744)
+#
+# Polled by the navbar status dot on every page, so the gate is deliberately
+# NON-destructive: `"user" in session` + a plain 401. check_session_validity's
+# failure path revokes broker tokens and clears the session — a navbar poll
+# must never be able to do that.
+# ----------------------------------------------------------------------------
+
+
+@health_bp.route("/api/system", methods=["GET"])
+@limiter.limit("120/minute")
+def get_system_health():
+    """Machine-wide status, readings, free-up-memory advice, unclean-exit report."""
+    if "user" not in session:
+        return jsonify({"error": "Not logged in"}), 401
+    try:
+        return jsonify(get_system_snapshot())
+    except Exception as e:
+        logger.exception(f"Error fetching system health: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@health_bp.route("/api/system/unclean_exit/dismiss", methods=["POST"])
+@limiter.limit("30/minute")
+def dismiss_system_unclean_exit():
+    """Hide the unclean-exit banner (the report file is kept)."""
+    if "user" not in session:
+        return jsonify({"error": "Not logged in"}), 401
+    try:
+        return jsonify({"dismissed": bool(dismiss_unclean_exit())})
+    except Exception as e:
+        logger.exception(f"Error dismissing unclean-exit report: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @health_bp.route("/api/history", methods=["GET"])
 @check_session_validity
 @limiter.limit("60/minute")
@@ -402,6 +443,8 @@ def get_metrics_history():
                     "ws_connections": m.ws_connections_total,
                     "threads": m.thread_count,
                     "overall_status": m.overall_status,
+                    "sys_available_mb": m.memory_available_mb,
+                    "sys_nonpaged_mb": m.sys_nonpaged_mb,
                 }
                 for m in metrics
             ]

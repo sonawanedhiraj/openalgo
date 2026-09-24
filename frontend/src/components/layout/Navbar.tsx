@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { authApi } from '@/api/auth'
 import { LogoutConfirmDialog } from '@/components/auth/LogoutConfirmDialog'
+import { SystemHealthDot } from '@/components/layout/SystemHealthDot'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -188,6 +189,9 @@ export function Navbar() {
 
         {/* Right Side */}
         <div className="ml-auto flex items-center gap-1 sm:gap-2">
+          {/* Machine-wide system health (issue #744) */}
+          <SystemHealthDot />
+
           {/* Broker Badge */}
           {user?.broker && (
             <Badge variant="outline" className="hidden sm:flex text-xs">
