@@ -25,14 +25,22 @@ import time
 from datetime import datetime
 
 import pyotp
+from sqlalchemy.exc import OperationalError
 
 from database import broker_accounts_db as accounts_db
-from database.auth_db import get_auth_token, upsert_auth
+from database.auth_db import db_session, get_auth_token, upsert_auth
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 BROKER_API_URL = os.getenv("BROKER_API_URL", "https://api.kite.trade")
+
+# Bounded retry for the child auth write when SQLite reports "database is
+# locked" (issue #500). 4 attempts at 0.4s doubling ≈ 2.8s of cover on top of
+# the engine's own busy timeout — enough to ride out a master-contract bulk
+# insert without making a login callback feel hung.
+AUTH_WRITE_ATTEMPTS = 4
+AUTH_WRITE_BASE_DELAY_SEC = 0.4
 
 # Canonical mode_keys a child may mirror. Deliberately a curated list (the
 # strategies dashboard hardcodes per-engine builders the same way); extend when
@@ -178,6 +186,53 @@ def _exchange_token(
         return None, f"API error: {message}"
 
 
+def _store_child_auth(
+    name: str,
+    token: str,
+    broker: str,
+    attempts: int | None = None,
+    base_delay: float | None = None,
+) -> None:
+    """``upsert_auth`` with a bounded retry on SQLite's "database is locked".
+
+    Issue #500. The child login's 1-row write routinely collides with the
+    primary login's master-contract bulk insert (107k rows into the same
+    ``openalgo.db``), which held the lock for ~9 s on 2026-07-31. Retrying is
+    worth the complexity here specifically because the caller cannot simply try
+    again: the request_token is single-use and already spent.
+
+    ``db_session.rollback()`` before each retry is load-bearing — ``upsert_auth``
+    commits with no rollback on failure, so a naive retry would fail on the
+    poisoned transaction rather than on the lock.
+
+    ``attempts``/``base_delay`` default to the module constants at CALL time
+    (not def time) so a test can shrink the backoff.
+    """
+    attempts = AUTH_WRITE_ATTEMPTS if attempts is None else attempts
+    base_delay = AUTH_WRITE_BASE_DELAY_SEC if base_delay is None else base_delay
+
+    for attempt in range(attempts):
+        try:
+            upsert_auth(name, token, broker)
+            return
+        except OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            try:
+                db_session.rollback()
+            except Exception:  # pragma: no cover - rollback is best-effort
+                logger.exception("rollback before auth-write retry failed")
+            delay = base_delay * (2**attempt)
+            logger.warning(
+                "auth write for %s hit 'database is locked' (attempt %d/%d) — retrying in %.1fs",
+                name,
+                attempt + 1,
+                attempts,
+                delay,
+            )
+            time.sleep(delay)
+
+
 def complete_login(account_id: int, request_token: str) -> tuple[bool, str | None]:
     """Exchange the callback's request_token and store the child auth row.
 
@@ -198,8 +253,32 @@ def complete_login(account_id: int, request_token: str) -> tuple[bool, str | Non
 
     # Same "<api_key>:<access_token>" format the Zerodha order API expects
     # (brlogin.py does this for the primary).
-    upsert_auth(accounts_db.auth_name(account_id), f"{api_key}:{access_token}", broker)
-    accounts_db.update_account(account_id, last_login_at=datetime.utcnow())
+    #
+    # Both writes are guarded, ASYMMETRICALLY — issue #500. The exchange above
+    # has already burned the request_token (Kite tokens are single-use), so an
+    # exception escaping here costs the operator a full re-login AND renders a
+    # raw 500 instead of the `(ok, error)` this function promises its caller.
+    try:
+        _store_child_auth(accounts_db.auth_name(account_id), f"{api_key}:{access_token}", broker)
+    except Exception:
+        logger.exception(f"Child account {account_id}: storing the auth row failed")
+        return False, (
+            "Broker login succeeded but saving the session failed (database busy). "
+            "Click Connect again."
+        )
+
+    # last_login_at is cosmetic; the auth row above is what actually arms
+    # mirroring. A failure HERE must not report the login as failed — that
+    # would send the operator to redo a login that already worked, and
+    # `update_account` re-raises (database/broker_accounts_db.py).
+    try:
+        accounts_db.update_account(account_id, last_login_at=datetime.utcnow())
+    except Exception:
+        logger.exception(
+            f"Child account {account_id}: last_login_at stamp failed — "
+            f"the login itself SUCCEEDED and mirroring is armed"
+        )
+
     logger.info(f"Child account {account_id} connected (broker={broker})")
     return True, None
 

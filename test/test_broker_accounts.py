@@ -259,6 +259,107 @@ def test_complete_login_failure_paths(accounts_db, monkeypatch):
     assert get_auth_token(accounts_db.auth_name(account["id"]), bypass_cache=True) is None
 
 
+def _locked_error() -> Exception:
+    """The exact SQLAlchemy wrapper the 2026-07-31 500 carried (issue #500)."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(
+        "UPDATE auth SET auth=? WHERE auth.id = ?",
+        {},
+        Exception("database is locked"),
+    )
+
+
+def test_complete_login_survives_transient_db_lock(accounts_db, monkeypatch):
+    """A lock that clears (master-contract insert finishing) must not cost a login.
+
+    Issue #500: the request_token is already burned by the time we write, so a
+    retry here is the difference between "connected" and "redo the whole Kite
+    login".
+    """
+    from database.auth_db import get_auth_token
+    from services import broker_accounts_service as svc
+
+    account = _add(accounts_db)
+    monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
+    # raising=False so this test still EXERCISES the login path on a
+    # pre-fix tree (where the constant does not exist) — otherwise it
+    # would fail with AttributeError, proving only that the test is new.
+    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0, raising=False)
+
+    real_upsert = svc.upsert_auth
+    calls = {"n": 0}
+
+    def flaky_upsert(name, token, broker):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _locked_error()
+        return real_upsert(name, token, broker)
+
+    monkeypatch.setattr(svc, "upsert_auth", flaky_upsert)
+
+    ok, error = svc.complete_login(account["id"], "req_token")
+    assert ok is True and error is None
+    assert calls["n"] == 2, "expected exactly one retry after the lock"
+    assert (
+        get_auth_token(accounts_db.auth_name(account["id"]), bypass_cache=True)
+        == "child_api_key:access123"
+    )
+
+
+def test_complete_login_returns_error_when_auth_write_stays_locked(accounts_db, monkeypatch):
+    """A persistent lock returns (False, msg) — it must NEVER raise into Flask.
+
+    Pre-fix this exception escaped `complete_login` and rendered a raw 500 at
+    /zerodha/callback (issue #500).
+    """
+    from database.auth_db import get_auth_token
+    from services import broker_accounts_service as svc
+
+    account = _add(accounts_db)
+    monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
+    # raising=False so this test still EXERCISES the login path on a
+    # pre-fix tree (where the constant does not exist) — otherwise it
+    # would fail with AttributeError, proving only that the test is new.
+    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0, raising=False)
+
+    def always_locked(name, token, broker):
+        raise _locked_error()
+
+    monkeypatch.setattr(svc, "upsert_auth", always_locked)
+
+    ok, error = svc.complete_login(account["id"], "req_token")
+    assert ok is False
+    assert "database busy" in error.lower()
+    assert get_auth_token(accounts_db.auth_name(account["id"]), bypass_cache=True) is None
+
+
+def test_complete_login_succeeds_when_only_last_login_stamp_fails(accounts_db, monkeypatch):
+    """The cosmetic stamp must not be able to mask a login that actually worked.
+
+    Issue #500 defect 3: `update_account` re-raises, so a lock on the SECOND
+    write left the child genuinely connected while /accounts showed it as never
+    logged in — and the operator saw a 500.
+    """
+    from database.auth_db import get_auth_token
+    from services import broker_accounts_service as svc
+
+    account = _add(accounts_db)
+    monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
+
+    def boom(account_id, **fields):
+        raise _locked_error()
+
+    monkeypatch.setattr(accounts_db, "update_account", boom)
+
+    ok, error = svc.complete_login(account["id"], "req_token")
+    assert ok is True and error is None, "auth row was written — this login SUCCEEDED"
+    assert (
+        get_auth_token(accounts_db.auth_name(account["id"]), bypass_cache=True)
+        == "child_api_key:access123"
+    )
+
+
 def test_stale_login_date_counts_as_disconnected(accounts_db, monkeypatch):
     from services import broker_accounts_service as svc
 
@@ -422,6 +523,34 @@ def test_child_callback_failure_redirects_with_error(brlogin_client, monkeypatch
 
     resp = brlogin_client.get("/zerodha/callback?account_id=notanumber&request_token=x")
     assert resp.status_code == 302
+    assert "/accounts?error=" in resp.headers["Location"]
+
+
+def test_child_callback_returns_302_not_500_when_db_is_locked(
+    brlogin_client, accounts_db, monkeypatch
+):
+    """End-to-end guard for the 2026-07-31 incident (issue #500).
+
+    The DB lock is injected at the REAL seam (`upsert_auth`), not by stubbing
+    `complete_login` — the whole defect was that the exception escaped
+    `complete_login`, so a test that stubs it out cannot see this regression.
+    """
+    import services.broker_accounts_service as svc
+
+    account = _add(accounts_db)
+    monkeypatch.setattr(svc, "_exchange_token", lambda k, s, rt: ("access123", None))
+    # raising=False so this test still EXERCISES the login path on a
+    # pre-fix tree (where the constant does not exist) — otherwise it
+    # would fail with AttributeError, proving only that the test is new.
+    monkeypatch.setattr(svc, "AUTH_WRITE_BASE_DELAY_SEC", 0.0, raising=False)
+
+    def always_locked(name, token, broker):
+        raise _locked_error()
+
+    monkeypatch.setattr(svc, "upsert_auth", always_locked)
+
+    resp = brlogin_client.get(f"/zerodha/callback?account_id={account['id']}&request_token=rt123")
+    assert resp.status_code == 302, "a locked DB must not surface as a 500 page"
     assert "/accounts?error=" in resp.headers["Location"]
 
 
