@@ -253,6 +253,10 @@ class Open15Trade(Base):
     # what the chip showed when the symbol was first watched (seed / rolling
     # add) — measures how often a grade decayed before the trigger
     rating_provisional_at_add = Column(String(1), nullable=True)
+    # issue #748 — ``live`` (frozen at the trigger) | ``backfill`` (rebuilt from
+    # the #528 tick capture after the fact; R63's fitting sample). NULL on a
+    # graded row predates the column and is a live grade.
+    rating_source = Column(String(8), nullable=True)
     # full broker rejection text — ``reason`` stays a short machine-readable code
     error_message = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -437,6 +441,9 @@ def _ensure_columns():
             "rating_univ_median_pct": "FLOAT",
             "rating_vol_ratio": "FLOAT",
             "rating_provisional_at_add": "VARCHAR(1)",
+            # issue #748 — NULL on every existing row (all graded rows so far
+            # were graded live)
+            "rating_source": "VARCHAR(8)",
             # issue #728 — watched-break counterfactual; NULL on every
             # existing row (none of them is a watched row)
             "break_at": "VARCHAR(8)",
@@ -878,6 +885,72 @@ def risk_exit_rows(
         return q.order_by(Open15Trade.trade_date.asc(), Open15Trade.id.asc()).all()
     except Exception:
         logger.exception("open15: risk_exit_rows read failed — failing open to []")
+        return []
+    finally:
+        db_session.remove()
+
+
+def net_of_row_under(row, apply_sl: bool = True, apply_trail: bool = True) -> float | None:
+    """NET P&L of a row with the risk exits optionally UNDONE (issue #748).
+
+    ``apply_sl=False`` replaces a ``reason='stop_loss'`` row's P&L with its
+    held-to-scheduled-exit counterfactual; ``apply_trail=False`` does the same
+    for a ``reason='profit_trail'`` row. Every other row — a timed exit, and
+    every paper/shadow row (never stopped or trailed) — is its own
+    :func:`net_pnl_of_row`. Returns None when an undone exit's counterfactual
+    is not priced yet: the caller counts it PENDING, never as Rs0.
+    Both flags on = as traded = exactly ``net_pnl_of_row``.
+    """
+    get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
+    reason = get("reason")
+    if (reason == STOP_LOSS_REASON and not apply_sl) or (
+        reason == PROFIT_TRAIL_REASON and not apply_trail
+    ):
+        cf = cf_net_of_row(row)
+        return None if cf is None else round(cf, 2)
+    return round(net_pnl_of_row(row), 2)
+
+
+#: fill classes priced at the FULL slot size a real entry would have used —
+#: broker-rejected paper (#548) and shadow (#581 excluded side, #726
+#: ``rating_excluded``). ``sim`` is deliberately absent: it is priced at 1 lot,
+#: and a rupee drawdown over mixed sizes means nothing.
+FULL_SLOT_PAPER_FILLS = ("paper", "shadow")
+
+
+def grade_scorecard_rows(mode: str | None = None) -> list[dict]:
+    """Priced rows behind the grade scorecard (issue #748), as plain dicts in
+    trigger order: every closed REAL fill plus every priced full-slot paper
+    row. ``cohort`` is ``real`` or ``paper``. Fail-open to ``[]``.
+    """
+    try:
+        q = db_session.query(Open15Trade).filter(
+            Open15Trade.pnl.isnot(None),
+            (_REAL_FILL & (Open15Trade.status == "closed"))
+            | Open15Trade.fill.in_(FULL_SLOT_PAPER_FILLS),
+        )
+        if mode:
+            q = q.filter(Open15Trade.mode == mode)
+        rows = q.order_by(
+            Open15Trade.trade_date.asc(),
+            Open15Trade.trigger_minute.asc(),
+            Open15Trade.trigger_second.asc(),
+            Open15Trade.id.asc(),
+        ).all()
+        cols = (
+            "id", "trade_date", "symbol", "side", "mode", "fill", "reason", "status",
+            "trigger_minute", "trigger_second", "pnl", "charges_inr", "cf_pnl",
+            "cf_charges_inr", "rating", "rating_source", "rating_univ_median_pct",
+            "rating_vol_ratio",
+        )  # fmt: skip
+        out = []
+        for r in rows:
+            d = {c: getattr(r, c, None) for c in cols}
+            d["cohort"] = "paper" if r.fill in FULL_SLOT_PAPER_FILLS else "real"
+            out.append(d)
+        return out
+    except Exception:
+        logger.exception("open15: grade scorecard read failed — failing open to []")
         return []
     finally:
         db_session.remove()

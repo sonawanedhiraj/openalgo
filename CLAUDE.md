@@ -1875,6 +1875,38 @@ promote C to a sim-priced veto only if the C paper cohort is net-negative AND
 ≥ 15 pts below A+B on the new fills alone; A/B never gate; if it fails, delete
 the grade rather than re-tune it. Tests: `test/test_open15_trade_rating.py`.
 
+**Grade scorecard — every grade across every day (issue #748, numbers only).**
+The "GRADE SCORECARD" card on `/open15_vol_breakout/logs` (`GET
+/open15_vol_breakout/api/grade_scorecard?apply_sl=&apply_trail=&window=&mode=`,
+`services/open15_grade_scorecard.py`, pure over
+`open15_breakout_db.grade_scorecard_rows`) prints the A/B/C descriptions
+(`open15_rating.describe_grades()`, built from the grader's own constants) and,
+per grade, trades / overall, long and short win rate / net / avg / **max
+drawdown** (peak-to-trough of cumulative net, trigger order). Two checkboxes
+UNDO the stop loss and/or the profit-trail exit: an undone exit is valued at its
+held-to-scheduled-exit counterfactual through `net_of_row_under` (the #704/#713
+`cf_*` columns, one convention — both on == `net_pnl_of_row`); an unpriced one
+is counted **pending**, never Rs0. Two cohorts, never merged: **real** and
+**real + full-slot paper** (`FULL_SLOT_PAPER_FILLS` = broker-paper + shadow);
+1-lot `sim` is in neither (a rupee drawdown over mixed sizes means nothing).
+A **tape × side** table buckets `rating_univ_median_pct` (≤ −0.30 / flat /
+≥ +0.30) by long/short — the check on whether the side-blind `market_ok` rule
+should become side-aware. The card re-fetches every 60 s, so a trade joins it at
+its close and a stopped trade's held value at the scheduled exit. **Grades
+before 2026-09-15 are backfilled** (`open15_trades.rating_source='backfill'`;
+`live`/NULL = frozen at the trigger) by the one-off `uv run python -m
+services.open15_rating_backfill [--date] [--apply]` (dry-run default, NOT
+wired): same `grade_trigger`, volume ratio from the row, tape from the #528 tick
+capture anchored on the **historify 09:15 1m open** — the broker open live reads
+via `first_candles` (`source: quotes`). Re-grading the 26 live-graded rows this
+way reproduced 26/26 grades (median tape diff 0.003 %); the capture's first tick
+lags the open (median 0.155 %) and is only a per-symbol fallback. R63's own
+table used a 09:15:05 anchor, so 7 of its 48 published grades differ from the
+backfill — the backfill is the live semantics. Days whose capture holds < 50
+symbols (before 2026-08-04 it was the watch list only) stay ungraded. Backfilled
+rows are R63's fitting sample; the card's window selector separates them.
+Tests: `test/test_open15_grade_scorecard.py`.
+
 **The untriggered watch list is priced at the 09:15 break (issue #728, numbers
 only).** Every watched name (seed + rolling) that ends the entry window with
 NO trigger but DID break the 09:15 candle high/low gets ONE counterfactual: 1 lot
