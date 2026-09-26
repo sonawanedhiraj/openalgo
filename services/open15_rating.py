@@ -50,6 +50,50 @@ RULES = {
 }
 
 
+#: ``open15_trades.rating_source`` (issue #748): a grade frozen at the trigger
+#: by the running service, or rebuilt afterwards from the #528 tick capture by
+#: ``services.open15_rating_backfill``. Backfilled grades cover the rows R63 was
+#: FITTED on, so every consumer must be able to tell the two apart.
+RATING_SOURCE_LIVE = "live"
+RATING_SOURCE_BACKFILL = "backfill"
+
+
+def _hhmm(sec: int) -> str:
+    return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}"
+
+
+def describe_grades() -> dict[str, dict[str, str]]:
+    """Plain-language A/B/C descriptions, built from the SAME constants the
+    grader reads (issue #748) so the page can never describe a rule that is
+    not the one running. ``title`` is a 2-4 word name, ``text`` one sentence.
+    """
+    early, closed = _hhmm(EARLY_CUTOFF_S), _hhmm(CLOSED_AFTER_S)
+    mkt = f"{MARKET_MIN_PCT:+.2f}%"
+    return {
+        "A": {
+            "title": "clean early break",
+            "text": (
+                f"Triggered by {early}, volume ratio under {CLEAN_VOL_MAX:g}x (crossed the "
+                f"gate, did not blow through it), and the F&O median move since 09:15 above {mkt}."
+            ),
+        },
+        "B": {
+            "title": "playable",
+            "text": (
+                f"F&O median above {mkt} and triggered by {closed}, but after {early} "
+                f"or with the volume ratio at {CLEAN_VOL_MAX:g}x or more."
+            ),
+        },
+        "C": {
+            "title": "weak tape or late",
+            "text": (
+                f"F&O median move since 09:15 at or below {mkt} (a falling tape), "
+                f"or triggered after {closed}."
+            ),
+        },
+    }
+
+
 def normalize_trade_grades(raw: Any) -> str:
     """Canonical ``trade_grades`` string: a sorted subset of ``"ABC"``.
 
@@ -184,4 +228,5 @@ def rating_kw(action: Mapping[str, Any]) -> dict[str, Any]:
         "rating_univ_median_pct": inputs.get("univ_median_pct"),
         "rating_vol_ratio": inputs.get("vol_ratio"),
         "rating_provisional_at_add": action.get("rating_provisional_at_add"),
+        "rating_source": RATING_SOURCE_LIVE,
     }

@@ -741,6 +741,14 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  .sltab{width:100%;border-collapse:collapse;margin-top:6px;font-variant-numeric:tabular-nums}
  .sltab td,.sltab th{font-size:12px;padding:3px 8px;white-space:nowrap}
  .sltab td.num,.sltab th.num{text-align:right}
+ /* issue #748 — grade scorecard */
+ .gsctl{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin:8px 0;padding:6px 10px;background:#1a2129;border-radius:4px;font-size:12px}
+ .gsctl label{display:flex;gap:5px;align-items:center;cursor:pointer}
+ .gsdesc{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin:6px 0 10px}
+ .gsdesc div{background:#1a2129;border-radius:4px;padding:6px 9px;font-size:12px;color:#8aa0b4;line-height:1.45}
+ .gsdesc b{color:#d7dde4;font-weight:500;margin-left:4px}
+ .gshd{margin:12px 0 2px;color:#d7dde4;font-size:12.5px}
+ .gstab td.all{font-weight:600;border-top:1px solid #2a3440}
  .risk-open{background:#12291c;color:#a6e3a1;border:1px solid #2e5140}
  .risk-locked{background:#332a17;color:#f9e2af;border:1px solid #5c4d2a}
  .risk-done{background:#1b2b3a;color:#89b4fa;border:1px solid #2c4a6e}
@@ -949,6 +957,7 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <div id="riskcard" class="atmcard" style="display:none"></div>
   <div id="pnlcard" class="atmcard" style="display:none"></div>
   <div id="slcard" class="atmcard" style="display:none"></div>
+  <div id="gscard" class="atmcard" style="display:none"></div>
   <div id="capcard" class="atmcard" style="display:none"></div>
   <div id="atmcard" class="atmcard" style="display:none"></div>
   <div class="sec">selection outcomes
@@ -1305,7 +1314,7 @@ async function selectDay(date){
   if(j.source==='live'){await loadLiveWatch();}else{liveWatch={}; liveNeeded=null; liveFeed=null; liveRating=null;}
   document.getElementById('status').textContent=j.date+' ('+j.source+') — '+curEvents.length+' events';
   renderRejected(); renderLogLostBanner(); renderChips(); renderCapital(); renderAtmLadder();
-  renderRolling(); renderSel(); renderTimeline(); loadPnlCurve(); loadScorecard();
+  renderRolling(); renderSel(); renderTimeline(); loadPnlCurve(); loadScorecard(); loadGradeCard();
   document.querySelectorAll('#days .day').forEach(el=>
     el.classList.toggle('sel',el.querySelector('span').textContent===date));
 }
@@ -2721,6 +2730,105 @@ function renderPnlCurve(){
     (unav.length?('<div class="muted" style="margin-top:4px">unavailable: '+
       unav.map(t=>esc(t.symbol)+' ('+esc(t.reason||'')+')').join('; ')+'</div>'):'');
 }
+// ---- grade scorecard (issue #748): how each R63 grade has actually done ------
+// Numbers only. The two checkboxes UNDO an exit (valued at its held-to-exit
+// counterfactual); the two cohorts are never merged; sim (1 lot) is in neither.
+// NB: this page lives in a non-raw Python string - no backslashes in here.
+const gsState={sl:true,tr:true,win:'all',mode:''};
+// keeps up with the day on its own: a trade joins at its close, a stopped
+// trade's held-to-exit value at the scheduled exit (pending until then)
+let gsTimer=null, gsAt=null;
+function gsAutoRefresh(){if(gsTimer)return;gsTimer=setInterval(()=>{if(!document.hidden)loadGradeCard();},60000);}
+function gsSet(el){gsState[el.dataset.gs]=el.type==='checkbox'?el.checked:el.value;loadGradeCard();}
+async function loadGradeCard(){
+  const box=document.getElementById('gscard'); if(!box)return;
+  const q='apply_sl='+(gsState.sl?1:0)+'&apply_trail='+(gsState.tr?1:0)+
+    '&window='+gsState.win+(gsState.mode?('&mode='+gsState.mode):'');
+  gsAutoRefresh();
+  try{const r=await fetch('/open15_vol_breakout/api/grade_scorecard?'+q);gsAt=new Date();renderGradeCard(await r.json());}
+  catch(e){box.style.display='';box.innerHTML='<span class="atitle">GRADE SCORECARD</span>'+
+    '<span class="asub">unavailable: request failed</span>';}
+}
+function renderGradeCard(j){
+  const box=document.getElementById('gscard'); if(!box)return;
+  box.style.display='';
+  const title='<span class="atitle">GRADE SCORECARD</span>';
+  if(!j||j.status!=='ok'){box.innerHTML=title+
+    '<span class="asub">unavailable: '+esc((j&&j.message)||'scorecard failed')+'</span>';return;}
+  const rup=v=>v==null?'&mdash;':((v<0?'-Rs':'+Rs')+Math.abs(Math.round(v)).toLocaleString('en-IN'));
+  const pct=v=>v==null?'&mdash;':(Math.round(v*100)+'%');
+  const cls=v=>v==null?'':(v>=0?'pos':'neg');
+  const basis=j.apply_sl&&j.apply_trail?'as traded (stop loss + profit trail)':
+    j.apply_sl?'stop loss on, profit trail undone':
+    j.apply_trail?'profit trail on, stop loss undone':
+    'no stop, no trail &mdash; every real trade held to the scheduled exit';
+  const ck=(k,on,lab)=>`<label><input type="checkbox" data-gs="${k}"${on?' checked':''} onchange="gsSet(this)"> ${lab}</label>`;
+  const sel=(k,cur,opts)=>`<select data-gs="${k}" onchange="gsSet(this)">`+
+    opts.map(o=>`<option value="${o[0]}"${o[0]===cur?' selected':''}>${o[1]}</option>`).join('')+'</select>';
+  const lg=esc(j.live_grading_from);
+  let h=title+'<span class="asub">'+basis+(j.since?(' &middot; since '+esc(j.since)):'')+' &middot; net Rs'+
+    (gsAt?(' &middot; updated '+gsAt.toTimeString().slice(0,8)+' (every 60s)'):'')+'</span>';
+  h+='<div class="gsctl">'+ck('sl',j.apply_sl,'Apply stop loss')+ck('tr',j.apply_trail,'Apply profit-trail exit')+
+    sel('win',j.window,[['all','All days'],['r63','R63 sample (before '+lg+')'],['live','Live grading ('+lg+' on)']])+
+    sel('mode',gsState.mode,[['','Live + sandbox'],['live','Live only'],['sandbox','Sandbox only']])+
+    '<span class="muted">unchecked = that exit is undone; the trade is held to the scheduled exit</span></div>';
+  const d=j.descriptions||{};
+  h+='<div class="gsdesc">'+['A','B','C'].map(g=>'<div><span class="gr final '+g+'">'+g+'</span><b>'+
+    esc((d[g]||{}).title||'')+'</b><br>'+esc((d[g]||{}).text||'')+'</div>').join('')+'</div>';
+  const side=s=>s&&s.n?(pct(s.win_rate)+' <span class="muted">('+s.n+')</span>'):'&mdash; <span class="muted">(0)</span>';
+  const dd=m=>m&&m.dd<0?('<span class="neg">'+rup(m.dd)+'</span><br><span class="muted">'+
+    (m.peak_date?esc(m.peak_date.slice(5)):'start')+' &rarr; '+esc((m.trough_date||'').slice(5))+'</span>'):'&mdash;';
+  const gradeTable=c=>{
+    let t='<div style="overflow-x:auto"><table class="sltab gstab"><tr><th>grade</th><th class="num">trades</th>'+
+      '<th class="num">win rate</th><th class="num">long WR</th><th class="num">short WR</th>'+
+      '<th class="num">net</th><th class="num">avg</th><th class="num">max DD</th></tr>';
+    const row=(lab,s,tot)=>{
+      const a=tot?' all':'';
+      return '<tr><td class="'+a+'">'+lab+'</td><td class="num'+a+'">'+s.n+'</td>'+
+        '<td class="num'+a+'">'+pct(s.win_rate)+'</td><td class="num'+a+'">'+side(s.long)+'</td>'+
+        '<td class="num'+a+'">'+side(s.short)+'</td>'+
+        '<td class="num '+cls(s.n?s.net:null)+a+'">'+(s.n?rup(s.net):'&mdash;')+'</td>'+
+        '<td class="num'+a+'">'+rup(s.avg)+'</td><td class="num'+a+'">'+dd(s.max_dd)+'</td></tr>';
+    };
+    for(const g of ['A','B','C'])t+=row('<span class="gr final '+g+'">'+g+'</span>',c.grades[g],false);
+    if(c.grades.U&&c.grades.U.n)t+=row('<span class="muted">ungraded</span>',c.grades.U,false);
+    t+=row('all',c.all,true);
+    return t+'</table></div>';
+  };
+  const tapeTable=c=>{
+    const e=j.tape_edge_pct.toFixed(2);
+    const labs={down:'F&amp;O median &le; -'+e+'%',flat:'-'+e+'% to +'+e+'%',up:'&ge; +'+e+'%',unknown:'not recorded'};
+    let t='<div style="overflow-x:auto"><table class="sltab gstab"><tr><th>tape at trigger</th>'+
+      '<th class="num">long trades</th><th class="num">long WR</th><th class="num">long net</th>'+
+      '<th class="num">short trades</th><th class="num">short WR</th><th class="num">short net</th></tr>';
+    for(const b of ['down','flat','up','unknown']){
+      const L=c.tape_side[b].long,S=c.tape_side[b].short;
+      if(b==='unknown'&&!L.n&&!S.n)continue;
+      t+='<tr><td>'+labs[b]+'</td><td class="num">'+L.n+'</td><td class="num">'+pct(L.win_rate)+'</td>'+
+        '<td class="num '+cls(L.n?L.net:null)+'">'+(L.n?rup(L.net):'&mdash;')+'</td>'+
+        '<td class="num">'+S.n+'</td><td class="num">'+pct(S.win_rate)+'</td>'+
+        '<td class="num '+cls(S.n?S.net:null)+'">'+(S.n?rup(S.net):'&mdash;')+'</td></tr>';
+    }
+    return t+'</table></div>';
+  };
+  const C=j.cohorts;
+  h+='<div class="gshd">Real fills <span class="muted">&mdash; money actually traded'+
+    (j.pending.real?(' &middot; <span style="color:#f9e2af">'+j.pending.real+
+      ' pending (counterfactual not priced yet)</span>'):'')+'</span></div>'+gradeTable(C.real)+
+    '<div class="gshd">Real + full-slot paper <span class="muted">&mdash; adds broker-rejected paper and shadow rows '+
+    '(excluded side / excluded grade), all at full slot size</span></div>'+gradeTable(C.full_slot)+
+    '<div class="gshd">Tape &times; side <span class="muted">&mdash; F&amp;O median move 09:15 &rarr; trigger. '+
+    'Grade C treats a falling tape as bad for BOTH sides; this is where that gets checked</span></div>'+
+    '<div class="muted" style="margin:2px 0">real fills</div>'+tapeTable(C.real)+
+    '<div class="muted" style="margin:6px 0 2px">real + full-slot paper</div>'+tapeTable(C.full_slot);
+  h+='<div class="muted" style="margin-top:8px;font-size:11px">Net = after modelled charges. An undone exit is '+
+    'valued at its held-to-exit counterfactual; paper and shadow rows were never stopped or trailed, so the '+
+    'checkboxes move only real rows. Max DD = worst fall from a peak of cumulative net, trades in trigger order. '+
+    '1-lot sim rows are excluded (different size). '+
+    (j.n_backfilled?('<span style="color:#f9e2af">'+j.n_backfilled+' of these rows were graded after the fact '+
+      'from tick capture &mdash; the sample R63 was fitted on, so they flatter the rating.</span>'):'')+'</div>';
+  box.innerHTML=h;
+}
 // ---- stop-loss scorecard (issue #704): is the per-trade stop paying for itself?
 async function loadScorecard(){
   const box=document.getElementById('slcard'); if(!box)return;
@@ -3009,6 +3117,39 @@ def stop_scorecard():
     except Exception:
         logger.exception("open15: stop scorecard failed")
         return jsonify({"status": "error", "message": "scorecard failed — see logs"})
+
+
+@open15_bp.route("/api/grade_scorecard", methods=["GET"])
+@check_session_validity
+def grade_scorecard():
+    """Per-grade win rates (overall / long / short), net and max drawdown, with
+    the stop loss and profit-trail exit each optionally undone (issue #748).
+
+    Query: ``apply_sl`` / ``apply_trail`` (``1`` default, ``0`` = undo that
+    exit), ``window`` (``all`` | ``r63`` | ``live``), ``mode`` (``live`` |
+    ``sandbox``, omit = both). Read-only on the journal, no broker call; always
+    HTTP 200 with a labelled ``status`` (the card renders failure as text).
+    """
+    from services.open15_grade_scorecard import scorecard as grade_card
+
+    def _flag(name: str) -> bool:
+        return (request.args.get(name) or "1").strip() not in ("0", "false", "off")
+
+    mode = request.args.get("mode") or None
+    if mode not in (None, "live", "sandbox"):
+        mode = None
+    try:
+        return jsonify(
+            grade_card(
+                apply_sl=_flag("apply_sl"),
+                apply_trail=_flag("apply_trail"),
+                window=request.args.get("window") or "all",
+                mode=mode,
+            )
+        )
+    except Exception:
+        logger.exception("open15: grade scorecard failed")
+        return jsonify({"status": "error", "message": "grade scorecard failed — see logs"})
 
 
 @open15_bp.route("/api/live_pnl", methods=["GET"])
