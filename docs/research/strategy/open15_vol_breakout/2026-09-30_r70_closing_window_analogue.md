@@ -140,21 +140,16 @@ and 14:45→15:14.
 | NIFTY intraday momentum into the close | Real pre-CAS (t ≈ 5) but ≈ cost, and gone post-CAS. |
 | 15:15–15:30 VWAP-close reversal | The only large effect, and CAS removed the window. |
 
-## Side finding: the premise itself is thin
+## Side finding (CORRECTED by R70b below)
 
-Over the full 683 days, open15 at the **open** under the tick-faithful
-bar-close model is also net-negative in equity terms. Gross is −0.017% for
-top-3 and +0.024% for the A grade (A = trigger ≤ 09:22 with universe median
-above −0.30%).
+The first pass said "open15 at the open is net-negative under the faithful
+model". That holds for the bar harness, but **the bar harness cannot express the
+two things that make open15 work**:
 
-The live A-grade win rate rests on a short window. The 46-day tick replay
-shows a 70.6% win rate on 17 A-ish trades, with H1 +0.60% and H2 +0.06%. That
-is consistent with the R63 note that A was 9/9 in August and 4/8 in September.
+- the A grade's tick-only `ratio < 1.55×`;
+- the rolling top-mover watch list.
 
-This does not change the R63 pre-registered decision, which is already on
-track. But **"A-grade wins" is not yet established beyond these two months.**
-Any extension of the idea (to the close or elsewhere) inherits that
-uncertainty.
+R70b replays both on ticks: the opening edge is real on the post-CAS sample.
 
 Caveats:
 - Equity returns, not the options open15 trades live. Options lever the move,
@@ -171,3 +166,115 @@ Caveats:
   version is already being recorded by `cas_320_expiry_straddle` (R69).
 - **Opening-auction analogue at the close** (trading the CAS itself): that is
   R69's territory.
+
+
+---
+
+# R70b addendum (2026-10-04): tick-exact replay, operator follow-up
+
+> "Testing using the minute closing entry does not test correctly — there are
+> large moves mid-minute. Check if we have tick logs."
+
+## Tick data found
+
+- `tick_logs/ticks-YYYYMMDD-*.jsonl` is the simplified-engine ticklog: all day,
+  about 210 F&O symbols, about 1 tick per second per symbol, 2026-09-01 →
+  10-01.
+  - It has **17 usable post-CAS days** covering 14:25–15:16. Three files had no
+    closing ticks.
+  - The morning is mostly absent from this log.
+- `tick_logs/open15/` covers 09:14:58–09:30 for every universe symbol,
+  2026-07-22 → 10-01. That gives 37 post-CAS days for the opening control.
+- Extractor: `backtest/close15/extract_ticks.py` →
+  `data/ticks/<day>.parquet`.
+
+## 1. Entry: mid-minute moves do not change the entry price
+
+`replay_close_ticks.py` mirrors `Open15Core.on_tick` on each closing window.
+In the trade's direction, the bar close is only **0.003–0.010% worse** than the
+trigger tick, and the next tick only 0.003–0.006% worse.
+
+All closing windows stay net-negative with tick entries:
+
+| Window (17 days) | All triggers, net | Top-3/side, net |
+|---|---:|---:|
+| 14:30–14:45 | −0.106% (n = 4,017) | −0.126% |
+| 14:45–15:00 | −0.119% | −0.065% |
+| 14:55–15:10 | −0.098% | −0.105% |
+| 15:00–15:14:55 | −0.119% | −0.210% |
+
+This matches the opening calibration (α = 1.00).
+
+## 2. Exit: tick-exact targets / stops / trails do not help
+
+`exit_grid_ticks.py` tested 30 first-touch target × stop combinations and 3
+trailing stops, filled at the touching tick.
+
+- The close simply does not move. Median MFE is 0.13–0.17%, and **only 6–18%
+  of closing trades ever reach +0.4%, vs 36% at the open.**
+- **0 of 33 rules are positive in both halves in any closing window.** The best
+  closing cell is −0.035% net.
+
+## 3. What actually makes open15 work, and that it does not transfer
+
+Live journal (`live_vs_stock.py`): 58 real fills. The underlying move from the
+trigger tick to 09:30:
+
+| Grade | n | stock move | win | journal net |
+|---|---:|---:|---:|---:|
+| **A** | 23 | **+0.50%** | 83% | **+₹90,954** |
+| B | 17 | −0.13% | 47% | −₹28,924 |
+| C | 18 | −0.05% | 28% | −₹28,320 |
+
+**The edge is in the underlying, not the options overlay.**
+
+Tick replay (`mover_A.py`, post-CAS): full A grade (trigger ≤ t0+7, tick ratio
+< 1.55×, universe tape > −0.30%) × a **rolling top-N mover watch list**
+(best day-return rank ≤ N at any minute before the trigger, additive like
+#529). Gross % per trade, equity, cost 0.10%:
+
+| Window | Top-5 A long | Top-5 A short | Top-10 A long / short | All-symbol A long / short |
+|---|---|---|---|---|
+| **OPEN 09:15–09:30** | **75.7% win, +0.43 (n 37), H1 +0.46 / H2 +0.21 net** | **75%, +0.44 (n 20), H1 +0.61 / H2 +0.08** | +0.26 / +0.30 | +0.02 / +0.08 |
+| 14:30–14:45 | 22%, −0.17 (n 9) | 56%, +0.06 (n 9) | −0.13 / +0.04 | −0.05 / +0.05 |
+| 14:45–15:00 | 25%, −0.14 (n 4) | 83%, +0.09 (n 12) | −0.09 / +0.03 | −0.05 / 0.00 |
+| 14:55–15:10 | 44%, −0.05 (n 9) | 70%, 0.00 (n 10) | −0.08 / +0.01 | −0.05 / +0.06 |
+| 15:00–15:14:55 | 8%, −0.22 (n 12) | 53%, 0.00 (n 15) | −0.11 / −0.01 | −0.03 / +0.01 |
+
+- **At the open, the effect weakens as the watch list widens** (top-5 > top-10
+  > all), and both sides and both halves are positive.
+- **At the close, the same filter picks LOSING longs.** The day's top gainers
+  that break their window-open high on a clean volume burst give the move back
+  into the close. Shorts are flat.
+
+The two halves of the open15 edge are both opening-specific:
+
+- **Mover selection:** the overnight gap is new information that keeps
+  repricing. A 14:30 day-mover's move is already done.
+- **A grade:** an early, clean volume burst in a healthy tape is price
+  discovery at 09:16. Late in the day, the same burst is flow.
+
+## Final verdict R70 / R70b: REJECT the closing analogue (tick-confirmed)
+
+**What works (opening, keep):**
+- rolling top-5 movers × A grade, both sides;
+- a wider watch list dilutes it, so keep `rolling_top_n` small.
+
+**What does not work (closing, every variant tested):**
+- the open15 rule in 4 closing windows (5 pre-CAS with bars);
+- the A grade on its own;
+- top-3/5/10 rolling movers × A;
+- 33 tick-exact exit rules;
+- quintile predictors;
+- NIFTY intraday momentum;
+- extreme-day subsets.
+
+**Untestable:** the CAS-safe end of the window is ~15:10. Zerodha squares off
+MIS in CAS stocks at 15:12, and 15:15–15:40 is auction or index-option
+territory (R69).
+
+Caveats:
+- The opening edge rests on 37 post-CAS days (n = 57 top-5 A). Keep the R63
+  pre-registered check.
+- The closing sample is 17 days, but the closing result agrees with 683 days of
+  bars.
