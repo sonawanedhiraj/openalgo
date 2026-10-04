@@ -1,8 +1,10 @@
 """Persistence for the ``cas_auction_reversal`` strategy (issue #752).
 
-Three additive tables in the main database (``openalgo.db``). This module owns
+Four additive tables in the main database (``openalgo.db``). This module owns
 ONLY these tables and touches nothing else:
 
+* ``cas_ar_config``     — the single-row (id=1) UI-editable config (issue #755);
+  NULL fields fall through to the ``CAS_AR_*`` env seed, then the code default.
 * ``cas_ar_trades``     — one row per position: the CNC BUY taken in the
   closing auction (status ``placed``/``open``/``rejected``/``error``) and its
   T+1 morning SELL (``closed`` with realized P&L).
@@ -137,8 +139,26 @@ class CasArCandidate(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class CasArConfig(Base):
+    """Single-row (id=1) UI-editable config (issue #755). Every field nullable:
+    NULL = fall through to the ``CAS_AR_*`` env seed, then the code default."""
+
+    __tablename__ = "cas_ar_config"
+
+    id = Column(Integer, primary_key=True)
+    threshold_pct = Column(Float, nullable=True)
+    max_positions = Column(Integer, nullable=True)
+    capital_per_trade_inr = Column(Float, nullable=True)
+    poll_interval_s = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(64), nullable=True)
+
+
+CONFIG_FIELDS = ("threshold_pct", "max_positions", "capital_per_trade_inr", "poll_interval_s")
+
+
 def init_db() -> None:
-    """Create the three tables if missing (idempotent)."""
+    """Create the four tables if missing (idempotent)."""
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("cas_ar_* tables ready")
@@ -341,3 +361,47 @@ def candidate_to_dict(c) -> dict:
         out[k] = out[k].isoformat() if out[k] else None
     out["selected"] = bool(out["selected"])
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Config (issue #755)
+# --------------------------------------------------------------------------- #
+def get_config() -> dict | None:
+    """The UI config row as a dict (None if never saved). NULL fields stay None
+    so the service can fall through to the env seed / code default."""
+    try:
+        row = db_session.query(CasArConfig).filter(CasArConfig.id == 1).first()
+        if row is None:
+            return None
+        out = {f: getattr(row, f) for f in CONFIG_FIELDS}
+        out["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
+        out["updated_by"] = row.updated_by
+        return out
+    except Exception:
+        logger.exception("cas_ar: get_config failed")
+        return None
+    finally:
+        db_session.remove()
+
+
+def save_config(values: dict, updated_by: str = "ui") -> dict | None:
+    """Upsert the single config row. Only keys in ``CONFIG_FIELDS`` are written;
+    a key set to None clears that override. Returns the stored row or None."""
+    try:
+        row = db_session.query(CasArConfig).filter(CasArConfig.id == 1).first()
+        if row is None:
+            row = CasArConfig(id=1)
+            db_session.add(row)
+        for f in CONFIG_FIELDS:
+            if f in values:
+                setattr(row, f, values[f])
+        row.updated_by = updated_by
+        row.updated_at = datetime.utcnow()
+        db_session.commit()
+    except Exception:
+        logger.exception("cas_ar: save_config failed")
+        db_session.rollback()
+        return None
+    finally:
+        db_session.remove()
+    return get_config()

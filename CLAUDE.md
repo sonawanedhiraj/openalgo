@@ -2058,9 +2058,22 @@ Known live gap: the Zerodha holdings mapper drops `t1_quantity`, so the live
 T+1 exit falls back to the journalled quantity instead of capping to the book.
 That is not a stranding risk, because a CNC SELL cannot short.
 
-API: `/cas_auction_reversal/api/{status,candidates,trades,pause,resume}`.
+**Settings card (issue #755).** `/strategies/cas_auction_reversal` carries a
+Settings form. It writes the single-row `cas_ar_config` (`threshold_pct`,
+`max_positions`, `capital_per_trade_inr`, `poll_interval_s`).
+- **Precedence per field:** UI row → `CAS_AR_*` env seed → code default.
+  The card labels each value `saved` / `.env` / `default`.
+- **POST refuses out-of-range values; it never clamps them.** Env seeds are
+  clamped.
+- **A save applies at the next 15:14:30 arm.** The arm stamps the config it
+  ran with (shown as "Today's arm ran with").
+- **`config_snapshot.json` is display-only:** the service never reads it.
+
+API: `/cas_auction_reversal/api/{status,config,candidates,trades,pause,resume}`.
 Tests: `test/test_cas_auction_reversal_service.py` (incl. the `place_order`
-routing seam), `test/test_holdings_mode_routing.py`.
+routing seam), `test/test_cas_auction_reversal_config.py`,
+`test/test_holdings_mode_routing.py`, and
+`frontend/src/pages/strategies-dashboard/__tests__/CasAuctionReversalCard.test.tsx`.
 
 ## Data freshness validation (sector_follow_cap5_vol)
 

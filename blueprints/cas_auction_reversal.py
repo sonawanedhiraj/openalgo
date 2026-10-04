@@ -14,7 +14,15 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from database.auth_db import verify_api_key
-from services.cas_auction_reversal_service import STRATEGY_NAME, get_service
+from services.cas_auction_reversal_service import (
+    BOUNDS,
+    DEFAULTS,
+    STRATEGY_NAME,
+    config_sources,
+    get_service,
+    resolve_config,
+    validate_config,
+)
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -70,6 +78,60 @@ def status():
     if err:
         return err
     return jsonify({"status": "success", "data": svc.get_status()})
+
+
+APPLIES_AT = "next 15:14:30 IST arm"
+
+
+def _config_payload(row: dict | None) -> dict:
+    svc = get_service()
+    return {
+        "defaults": DEFAULTS,
+        "bounds": {
+            k: {"min": lo, "max": hi, "integer": typ is int} for k, (lo, hi, typ) in BOUNDS.items()
+        },
+        "override": row,
+        "effective": resolve_config(row),
+        "sources": config_sources(row),
+        "applies_at": APPLIES_AT,
+        # what TODAY's arm actually ran with (None before 15:14:30 / after a restart)
+        "day_config": (svc.day.get("config") if svc is not None else None),
+    }
+
+
+@cas_auction_reversal_bp.route("/api/config", methods=["GET", "POST"])
+def config():
+    """UI-editable config (issue #755).
+
+    GET  → ``{defaults, bounds, override, effective, sources, applies_at, day_config}``.
+    POST → validate (out-of-range values are REFUSED, never clamped) + upsert the
+    single ``cas_ar_config`` row; ``null`` clears a field back to env/default.
+    Applies at the next 15:14:30 IST arm.
+    """
+    if not (_authed() or _session_ok()):
+        return _unauthorized()
+    from database.cas_auction_reversal_db import get_config, save_config
+
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            values, errors = validate_config(body)
+            if errors:
+                return (
+                    jsonify({"status": "error", "message": "; ".join(errors), "errors": errors}),
+                    400,
+                )
+            if not values:
+                return jsonify({"status": "error", "message": "no config fields in body"}), 400
+            stored = save_config(values, updated_by="api" if _authed() else "ui")
+            if stored is None:
+                return jsonify({"status": "error", "message": "config save failed"}), 500
+            logger.info("cas_ar config saved: %s (applies at the %s)", values, APPLIES_AT)
+            return jsonify({"status": "success", "data": _config_payload(stored)})
+        return jsonify({"status": "success", "data": _config_payload(get_config())})
+    except Exception:
+        logger.exception("cas_ar config endpoint failed")
+        return jsonify({"status": "error", "message": "config read/save failed"}), 500
 
 
 @cas_auction_reversal_bp.route("/api/candidates", methods=["GET"])

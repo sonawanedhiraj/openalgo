@@ -794,3 +794,90 @@ export async function getCasStraddleSessions(limit = 30): Promise<CasStraddleSes
   )
   return res.data.data.sessions
 }
+
+// ---------------------------------------------------------------------------
+// cas_auction_reversal (issue #752 / #755) — Settings card + today
+// ---------------------------------------------------------------------------
+
+export interface CasArConfig {
+  threshold_pct: number
+  max_positions: number
+  capital_per_trade_inr: number
+  poll_interval_s: number
+}
+
+export type CasArSource = 'ui' | 'env' | 'default'
+
+export interface CasArConfigResponse {
+  defaults: CasArConfig
+  bounds: Record<keyof CasArConfig, { min: number; max: number; integer: boolean }>
+  /** The stored row (NULL fields = env seed / code default) or null when never saved. */
+  override:
+    | (Partial<CasArConfig> & { updated_at?: string | null; updated_by?: string | null })
+    | null
+  effective: CasArConfig
+  sources: Record<keyof CasArConfig, CasArSource>
+  applies_at: string
+  day_config?: CasArConfig | null
+}
+
+export interface CasArCandidate {
+  symbol: string
+  ref_price: number
+  iep: number
+  dislocation_pct: number
+  rank: number
+  selected: boolean
+  skip_reason: string | null
+  qty?: number
+}
+
+export interface CasArEntry {
+  symbol: string
+  qty: number
+  status: string
+  order_id: string | null
+  entry_price?: number
+  message?: string | null
+}
+
+export interface CasArStatus {
+  strategy: string
+  trade_date: string | null
+  mode: string
+  armed: boolean
+  manual_pause: boolean
+  config: CasArConfig
+  universe: number
+  polls: number
+  last_poll_at: string | null
+  decided: boolean
+  iep_feed?: { with_iep: number; moved: number } | null
+  candidates: CasArCandidate[] | null
+  entries: CasArEntry[] | null
+  schedule: Record<string, string>
+}
+
+const CAS_AR_BASE = '/cas_auction_reversal/api'
+
+export async function getCasArStatus(): Promise<CasArStatus> {
+  const res = await webClient.get<{ status: string; data: CasArStatus }>(`${CAS_AR_BASE}/status`)
+  return res.data.data
+}
+
+export async function getCasArConfig(): Promise<CasArConfigResponse> {
+  const res = await webClient.get<{ status: string; data: CasArConfigResponse }>(
+    `${CAS_AR_BASE}/config`
+  )
+  return res.data.data
+}
+
+export async function saveCasArConfig(
+  values: Partial<Record<keyof CasArConfig, number | null>>
+): Promise<CasArConfigResponse> {
+  const res = await webClient.post<{ status: string; data: CasArConfigResponse }>(
+    `${CAS_AR_BASE}/config`,
+    values
+  )
+  return res.data.data
+}
