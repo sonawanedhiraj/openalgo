@@ -56,6 +56,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AccountPnlCard } from './AccountPnlCard'
+import { CasAuctionReversalCard } from './CasAuctionReversalCard'
 import { CasStraddleCard } from './CasStraddleCard'
 import { IntradayPullbackEvalCard } from './IntradayPullbackEvalCard'
 
@@ -2235,6 +2236,7 @@ export default function StrategyDetailPage() {
 
       {/* Settings + today + expiry sessions (issue #740) */}
       {data.name === 'cas_320_expiry_straddle' && <CasStraddleCard />}
+      {data.name === 'cas_auction_reversal' && <CasAuctionReversalCard />}
 
       {/* Trades + LLM decisions (merged, issue #358) */}
       <TradesAndDecisionsCard data={data} />

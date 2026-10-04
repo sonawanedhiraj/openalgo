@@ -18,6 +18,18 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### cas_auction_reversal Settings card (issue #755, 2026-10-04)
+
+- **What changed:** the four `CAS_AR_*` tunables below became editable from
+  the **Settings card** on `/strategies/cas_auction_reversal`. They are stored
+  in the single-row `cas_ar_config` table.
+- **Precedence per field:** UI row → `CAS_AR_*` env seed → code default.
+  The env vars are now only seeds behind a NULL UI field.
+- **Bounds unchanged.** The UI REFUSES values outside them; env seeds are
+  still clamped. A save applies at the next 15:14:30 arm.
+- **Reality at ship time:** no `cas_ar_config` row and no `CAS_AR_*` env vars,
+  so the code defaults apply (0.5% / 10 / Rs50,000 / 15 s).
+
 ### cas_auction_reversal tunables (issue #752, 2026-10-04)
 
 - **Why:** new sandbox strategy from R71b/R71c (#751). It buys, CNC, the F&O

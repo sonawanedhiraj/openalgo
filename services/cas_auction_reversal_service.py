@@ -42,9 +42,16 @@ Daily schedule (IST, mon-fri, trading days only):
   measurement), entry-vs-close check, Telegram.
 
 Mode: ``sandbox`` or ``live`` per order via ``resolve_order_mode(STRATEGY_NAME)``
-(the /strategies toggle, default-deny sandbox). Live is NOT ready: the Zerodha
-holdings mapper drops ``t1_quantity``, so a live T+1 exit would read 0 shares —
-``config_snapshot.json`` keeps ``deployable: false`` until that is fixed.
+(the /strategies toggle, default-deny sandbox). Going live is the operator's
+call on the pre-registered IEP gate in PLAN.md. Known live gap: the Zerodha
+holdings mapper drops ``t1_quantity``, so the live T+1 exit falls back to the
+journalled quantity instead of capping to the book — not a stranding risk,
+because a CNC SELL cannot open a short.
+
+Config (issue #755): the Settings card on /strategies/cas_auction_reversal writes
+the single-row ``cas_ar_config``. Per field, the effective value is the UI row,
+else the ``CAS_AR_*`` env seed, else the code default; it is read at each 15:14:30
+arm, so a save applies at the next arm.
 
 Every external effect is injected with a production default so the decision
 logic is unit-testable with no broker, no DB and no clock.
@@ -94,23 +101,108 @@ _FILLED = {"complete", "completed", "filled", "executed", "traded"}
 # --------------------------------------------------------------------------- #
 # Tunables (env, clamped) — see docs/PARAMETER_LOG.md
 # --------------------------------------------------------------------------- #
-def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+DEFAULTS: dict[str, float | int] = {
+    "threshold_pct": 0.5,
+    "max_positions": 10,
+    "capital_per_trade_inr": 50_000.0,
+    "poll_interval_s": 15,
+}
+# field -> (min, max, type). The UI refuses outside these; env seeds are clamped.
+BOUNDS: dict[str, tuple[float, float, type]] = {
+    "threshold_pct": (0.2, 5.0, float),
+    "max_positions": (1, 30, int),
+    "capital_per_trade_inr": (5_000.0, 1_000_000.0, float),
+    "poll_interval_s": (5, 60, int),
+}
+ENV_SEEDS = {
+    "threshold_pct": "CAS_AR_THRESHOLD_PCT",
+    "max_positions": "CAS_AR_MAX_POSITIONS",
+    "capital_per_trade_inr": "CAS_AR_CAPITAL_PER_TRADE_INR",
+    "poll_interval_s": "CAS_AR_POLL_INTERVAL_S",
+}
+
+
+def _clamp(key: str, v) -> float | int:
+    lo, hi, typ = BOUNDS[key]
+    return typ(min(max(float(v), lo), hi))
+
+
+def _env_value(key: str):
+    raw = os.getenv(ENV_SEEDS[key])
+    if raw is None or str(raw).strip() == "":
+        return None
     try:
-        v = float(os.getenv(name, default))
+        return float(raw)
     except (TypeError, ValueError):
-        v = default
-    return min(max(v, lo), hi)
+        return None
 
 
-def resolve_config() -> dict:
-    return {
-        "threshold_pct": _env_float("CAS_AR_THRESHOLD_PCT", 0.5, 0.2, 5.0),
-        "max_positions": int(_env_float("CAS_AR_MAX_POSITIONS", 10, 1, 30)),
-        "capital_per_trade_inr": _env_float(
-            "CAS_AR_CAPITAL_PER_TRADE_INR", 50_000, 5_000, 1_000_000
-        ),
-        "poll_interval_s": int(_env_float("CAS_AR_POLL_INTERVAL_S", 15, 5, 60)),
-    }
+def config_sources(row: dict | None = None) -> dict[str, str]:
+    """Where each effective value comes from: ``ui`` | ``env`` | ``default``."""
+    row = row or {}
+    out = {}
+    for k in DEFAULTS:
+        if row.get(k) is not None:
+            out[k] = "ui"
+        elif _env_value(k) is not None:
+            out[k] = "env"
+        else:
+            out[k] = "default"
+    return out
+
+
+def resolve_config(row: dict | None = None) -> dict:
+    """Effective config: UI row → ``CAS_AR_*`` env seed → code default, clamped."""
+    row = row or {}
+    out = {}
+    for k, default in DEFAULTS.items():
+        v = row.get(k)
+        if v is None:
+            v = _env_value(k)
+        out[k] = _clamp(k, default if v is None else v)
+    return out
+
+
+def validate_config(body: dict) -> tuple[dict, list[str]]:
+    """Validate a POSTed config body → ``(values_to_store, errors)``.
+
+    Only keys present in ``body`` are considered; an explicit ``null`` clears
+    the override. Values outside ``BOUNDS`` are REFUSED, never clamped, so the
+    UI can say exactly what was rejected.
+    """
+    values: dict = {}
+    errors: list[str] = []
+    for key, (lo, hi, typ) in BOUNDS.items():
+        if key not in body:
+            continue
+        v = body[key]
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            values[key] = None
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be a number")
+            continue
+        if typ is int and f != int(f):
+            errors.append(f"{key} must be a whole number")
+            continue
+        if not (lo <= f <= hi):
+            errors.append(f"{key} must be between {lo:g} and {hi:g}")
+            continue
+        values[key] = typ(f)
+    return values, errors
+
+
+def production_config_reader() -> dict:
+    """The effective config the 15:14:30 arm runs with (DB row → env → default)."""
+    try:
+        from database.cas_auction_reversal_db import get_config
+
+        return resolve_config(get_config())
+    except Exception:
+        logger.exception("cas_ar: config read failed — env/defaults")
+        return resolve_config(None)
 
 
 # --------------------------------------------------------------------------- #
@@ -445,7 +537,7 @@ class CasAuctionReversalService:
         self._mode_resolver = mode_resolver or production_mode_resolver
         self._notify = notifier or production_notifier
         self._trading_day = trading_day_checker or production_trading_day_checker
-        self._config_reader = config_reader or resolve_config
+        self._config_reader = config_reader or production_config_reader
         self._now = now or (lambda: datetime.now(_IST))
         self._sleep = sleep or _time.sleep
         self._journal = journal
@@ -1056,6 +1148,13 @@ class CasAuctionReversalService:
         except Exception:
             logger.debug("cas_ar: alert failed", exc_info=True)
 
+    def _safe_config(self) -> dict:
+        try:
+            return self._config_reader()
+        except Exception:
+            logger.exception("cas_ar: config read failed")
+            return resolve_config(None)
+
     def get_status(self) -> dict:
         d = self.day
         return {
@@ -1064,7 +1163,7 @@ class CasAuctionReversalService:
             "mode": d.get("mode") or self.current_mode(),
             "armed": d.get("armed"),
             "manual_pause": self.manual_pause,
-            "config": d.get("config") or resolve_config(),
+            "config": d.get("config") or self._safe_config(),
             "universe": len(d.get("universe") or []),
             "polls": d.get("n_polls"),
             "last_poll_at": d["last_poll_at"].isoformat() if d.get("last_poll_at") else None,
@@ -1239,7 +1338,11 @@ __all__ = [
     "dislocation_pct",
     "get_service",
     "init_cas_auction_reversal_service",
+    "BOUNDS",
+    "DEFAULTS",
+    "config_sources",
     "resolve_config",
+    "validate_config",
     "select_candidates",
     "size_qty",
 ]
