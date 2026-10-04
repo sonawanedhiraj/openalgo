@@ -234,6 +234,12 @@ class BrokerData:
                 "prev_close": quote.get("ohlc", {}).get("close", 0),
                 "volume": quote.get("volume", 0),
                 "oi": quote.get("oi", 0),
+                # Closing Auction Session (issue #752): Kite's Quote API carries the
+                # auction's indicative equilibrium price + imbalance during 15:15-15:30
+                # (absent/None outside CAS). Passed through, never defaulted to 0 —
+                # 0 would read as a real price.
+                "indicative_close_price": quote.get("indicative_close_price"),
+                "total_imbalance_qty": quote.get("total_imbalance_qty"),
             }
 
         except ZerodhaPermissionError as e:
@@ -409,6 +415,9 @@ class BrokerData:
                     "prev_close": quote.get("ohlc", {}).get("close", 0),
                     "volume": quote.get("volume", 0),
                     "oi": quote.get("oi", 0),
+                    # CAS indicative close + imbalance (issue #752); None outside CAS
+                    "indicative_close_price": quote.get("indicative_close_price"),
+                    "total_imbalance_qty": quote.get("total_imbalance_qty"),
                 },
             }
             results.append(result_item)

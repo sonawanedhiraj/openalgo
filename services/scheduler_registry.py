@@ -106,6 +106,7 @@ _O15 = "strategy:open15_vol_breakout"
 _IPB = "strategy:intraday_pullback_top2"
 _SE = "strategy:simplified_engine"
 _CAS = "strategy:cas_320_expiry_straddle"
+_CAR = "strategy:cas_auction_reversal"
 _FEED = "data_feed"
 _REPORTS = "reports"
 _SANDBOX = "sandbox"
@@ -113,6 +114,92 @@ _PY = "python_strategy_host"
 
 
 CATALOG: tuple[JobSpec, ...] = (
+    # ---- cas_auction_reversal (issue #752) -------------------------------
+    JobSpec(
+        job_id="cas_ar_daily_reset",
+        label="Daily reset",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="09:00 mon-fri",
+        description="Clears the per-day auction-reversal state (universe, polls, candidates).",
+        tier=TIER_PROTECTED,
+        safety_note="Without the reset yesterday's candidates would read as today's decision.",
+    ),
+    JobSpec(
+        job_id="cas_ar_exit",
+        label="T+1 exit (CNC sell)",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="09:16 mon-fri",
+        description=(
+            "SELLs (CNC MARKET) every position bought in an earlier day's closing "
+            "auction; quantity from the strategy's own holdings + positions (mode_key)."
+        ),
+        tier=TIER_PROTECTED,
+        safety_note=(
+            "CNC has no auto square-off: without this job a position is held "
+            "indefinitely. A CNC SELL cannot open a short, so it always sends."
+        ),
+    ),
+    JobSpec(
+        job_id="cas_ar_exit_retry",
+        label="T+1 exit retry",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="09:20 mon-fri",
+        description="Re-runs the T+1 exit for anything still open (idempotent).",
+        tier=TIER_PROTECTED,
+        safety_note="Backstop for a rejected / unconfirmed 09:16 SELL.",
+    ),
+    JobSpec(
+        job_id="cas_ar_arm",
+        label="Arm (universe + monitor)",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="15:14:30 mon-fri",
+        description=(
+            "Builds the tradeable F&O stock universe and starts the "
+            "cas-auction-reversal-monitor poll loop (15:14:30-15:33)."
+        ),
+        tier=TIER_GUARDED,
+    ),
+    JobSpec(
+        job_id="cas_ar_decide",
+        label="Decide (auction dislocation)",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="15:23:30 mon-fri",
+        description=(
+            "Selects names whose indicative auction close is >= threshold below the "
+            "last continuous print. LIVE: CNC LIMIT buys into the auction now; "
+            "SANDBOX: queued for the 15:32 fill."
+        ),
+        tier=TIER_GUARDED,
+    ),
+    JobSpec(
+        job_id="cas_ar_fill",
+        label="Fill + verify",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="15:32 mon-fri",
+        description=(
+            "SANDBOX: places the queued CNC buys at the printed auction close. Both "
+            "modes: verifies every entry against the order book (#626)."
+        ),
+        tier=TIER_GUARDED,
+    ),
+    JobSpec(
+        job_id="cas_ar_eod_summary",
+        label="EOD summary",
+        group=_CAR,
+        scheduler=SCHED_SHARED,
+        schedule="15:45 mon-fri",
+        description=(
+            "Records the final auction close for every candidate (the IEP-vs-close "
+            "measurement) + Telegram summary."
+        ),
+        tier=TIER_FREE,
+    ),
     # ---- cas_320_expiry_straddle (issue #740) ---------------------------
     JobSpec(
         job_id="cas_straddle_daily_reset",

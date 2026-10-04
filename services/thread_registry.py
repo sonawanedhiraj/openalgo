@@ -356,6 +356,35 @@ CATALOG: tuple[ThreadSpec, ...] = (
         tier=TIER_PROTECTED,
     ),
     ThreadSpec(
+        thread_name="cas-auction-reversal-monitor",
+        label="CAS auction reversal monitor",
+        group=GROUP_LOOP,
+        owner="services/cas_auction_reversal_service.py",
+        description=(
+            "Closing-auction poll loop (issue #752): ONE batched quote per cycle for "
+            "the tradeable F&O stock universe, journals last price + the auction's "
+            "indicative close + imbalance to cas_ar_polls, freezes the reference "
+            "(last continuous print) after 15:15:00. Alive only 15:14:30-15:33 IST "
+            "on trading days, so 'not started' is normal; it marks itself done."
+        ),
+        # declared at the clamp MAX of CAS_AR_POLL_INTERVAL_S (5-60s)
+        cadence_sec=60,
+        window="15:14:30 - 15:33 IST",
+        tier=TIER_GUARDED,
+    ),
+    ThreadSpec(
+        thread_name="cas-auction-reversal-boot",
+        label="CAS auction reversal boot catch-up",
+        group=GROUP_BOOT,
+        owner="services/cas_auction_reversal_service.py",
+        description=(
+            "One-shot after boot: arms if booted inside 15:14:30-15:23:30, or runs "
+            "the T+1 CNC exit if booted after 09:16 (until 15:10) so a restart "
+            "never strands an overnight position."
+        ),
+        tier=TIER_PROTECTED,
+    ),
+    ThreadSpec(
         thread_name="cas-straddle-monitor",
         label="CAS straddle monitor",
         group=GROUP_LOOP,

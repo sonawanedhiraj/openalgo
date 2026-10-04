@@ -1993,6 +1993,66 @@ continues. Plan + verified facts: `strategies/cas_320_expiry_straddle/PLAN.md`.
 Tests: `test/test_cas_straddle_service.py` (incl. the real `place_order_with_auth`
 routing seam), `test/test_cas_straddle_db.py`, `test/test_cas_straddle_blueprint.py`.
 
+**Sandbox measurement strategy**: [`strategies/cas_auction_reversal/`](strategies/cas_auction_reversal/)
+— **buy the F&O stocks the closing auction pushes DOWN, CNC, sell T+1 09:16** (issue
+#752, from R71b/R71c #751).
+
+**The research edge:** auction close >= 0.5% below the 15:14 print → +0.60% by the
+T+1 09:15 bar close, 79% win, ~14 names a day, 9/9 weeks positive, ~+0.35% net of
+CNC.
+
+**`CasAuctionReversalService`** (`services/cas_auction_reversal_service.py`) runs
+these jobs:
+- **15:14:30 arm:** universe = `tradeable_universe()` filtered to `NSE` by
+  `resolve_exchange_for_symbol`, so indices are out. Starts the
+  `cas-auction-reversal-monitor` thread: one batched quote every
+  `CAS_AR_POLL_INTERVAL_S` until 15:33, journaled to `cas_ar_polls`.
+- **The reference price** is the frozen LTP after 15:15:00, i.e. the last
+  continuous print.
+- **15:23:30 decide:** `indicative_close_price` <= ref × (1 − `CAS_AR_THRESHOLD_PCT`),
+  top `CAS_AR_MAX_POSITIONS`, `floor(CAS_AR_CAPITAL_PER_TRADE_INR / price)` shares.
+  Every crossing name goes to `cas_ar_candidates`, selected or not.
+- **15:32 fill + verify.**
+- **15:45 EOD:** the final auction close per candidate. This is the pre-registered
+  20-session IEP-vs-close measurement in PLAN.md.
+- **09:16 T+1 exit, plus a 09:20 retry and a boot catch-up until 15:10.**
+
+Rules, each load-bearing:
+- **The vehicle is CNC IN the auction.** MIS is squared off at 15:12 in CAS
+  stocks, and stock futures capture only ~4–30% of the auction dip (R71c). The
+  short mirror cannot be traded: there is no overnight CNC short.
+- **The IEP needs the quote mapper.** Kite's Quote API carries
+  `indicative_close_price` / `total_imbalance_qty` during CAS (not the WebSocket).
+  The Zerodha `get_quotes` / `get_multiquotes` mapper now passes both through as
+  `None` outside CAS. Never default them to 0: 0 reads as a price.
+- **The sandbox buys AFTER the auction prints.** During CAS a stock's LTP is frozen
+  at the 15:15 print, and a sandbox MARKET order fills at the ask. So the sandbox
+  entry is a CNC LIMIT at the post-auction LTP at 15:32 (the sandbox fills a
+  marketable LIMIT at LTP = the auction close). LIVE places a CNC LIMIT at
+  IEP × 1.002 into the 15:20–15:25 order window at decide time.
+- **The T+1 exit reads HOLDINGS through `mode_key`.** The sandbox moves
+  yesterday's CNC position into holdings at the 03:00 session expiry, so
+  `holdings_service.get_holdings` gained `mode_key` (the #497 rule,
+  `test/test_holdings_mode_routing.py`). The book quantity is the `max`, never
+  the sum, of holdings and CNC positions.
+- **The exit always sends.** A CNC SELL can never open a short (sandbox and
+  broker both refuse to sell shares not held), so an unreadable or flat book
+  still sends the journalled quantity. Not sending is the only way to strand a
+  position.
+- **An ACK is not a fill (#626).** Every entry and exit is verified through the
+  order book. A refused entry becomes `fill='paper'` and never joins P&L.
+- **One P&L definition:** `net_pnl_of_row` over `real_closed_rows`. P&L realizes
+  on the EXIT day, so the dashboard keys "today" and the curve on `exit_at`.
+
+**Mode** is sandbox / live via the `/strategies` toggle, default sandbox, no
+observe state. `deployable: false` until the Zerodha holdings mapper carries
+`t1_quantity`: without it a live T+1 exit reads 0 shares for yesterday's buys.
+The IEP gate in PLAN.md must also pass first.
+
+API: `/cas_auction_reversal/api/{status,candidates,trades,pause,resume}`.
+Tests: `test/test_cas_auction_reversal_service.py` (incl. the `place_order`
+routing seam), `test/test_holdings_mode_routing.py`.
+
 ## Data freshness validation (sector_follow_cap5_vol)
 
 A durable guard against the class of failure that produced the 2026-05-29→06-10
