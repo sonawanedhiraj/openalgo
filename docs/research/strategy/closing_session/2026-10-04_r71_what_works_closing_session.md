@@ -24,7 +24,31 @@ name:
 - stock futures ≈ 0.06% (STT 0.05% sell);
 - NIFTY futures ≈ 0.06%.
 
-## Answer
+## Answer: what works (updated with R71b, below)
+
+1. **CLOSING-AUCTION REVERSAL (best result in this round).** Buy the stocks the
+   closing auction pushed down, sell at the next open. Post-CAS the auction
+   overshoots and the next session undoes it.
+   - **Auction >= 0.5% below the 15:14 print:** +0.42% to the T+1 open, +0.60%
+     to the T+1 09:15 bar close, 79% win, ~14 names a day, 9/9 weeks positive,
+     **about +0.35% net of CNC delivery costs**.
+   - **The short mirror** (auction >= 0.5% above): +0.32% / +0.64%, 83% win.
+   - **The same mechanism held pre-CAS:** buying the 5 biggest fallers into the
+     close made +0.49% to the T+1 open, 84% of 636 days up, every year
+     positive.
+   - **Executable** through the Kite Quote API's `indicative_close_price`
+     (live since 2026-08-10), with orders placed 15:20-15:25.
+   - **Pre-registered next step: record the 15:20-15:30 indicative price.**
+     Full details in R71b below.
+2. **Index strong-close overnight long:** index in the top 20% of its day range
+   at the close -> long index futures overnight.
+   - Pre-CAS, from the tradeable 15:29 print: NIFTY +0.149% (net +0.09%),
+     BANKNIFTY +0.142%, FINNIFTY +0.152%, MIDCPNIFTY +0.340%; every year and
+     both halves positive.
+   - Post-CAS sample too small (8-12 trades) and so far negative. Measure,
+     don't deploy.
+
+### First pass (kept for the record)
 
 | Rank | What | Pre-CAS (636 d) | Post-CAS (41–42 d) | Status |
 |---|---|---|---|---|
@@ -143,3 +167,121 @@ Details: R70 report,
 - Stock-futures capital: ~₹5–10L notional per lot, ~20% margin.
 - Hedged numbers subtract the equal-weight universe, an approximation of a
   NIFTY-futures short.
+
+
+---
+
+# R71b: what works, part 2 (2026-10-04)
+
+## A. Closing-auction reversal: PROMISING, strongest result of R70/R71
+
+Scripts: `stock_overnight_cas.py` (decile map) and `close_pressure_reversal.py`.
+
+**Decile map (overnight from the close, both eras).** The strongest feature by
+far is the stock's own move *into the close*: 15:14 last continuous price ->
+close (the 15:29 print pre-CAS, the auction price post-CAS).
+
+| Era | Top-minus-bottom decile spread | t | Halves |
+|---|---:|---:|---|
+| Pre-CAS (636 days) | -0.388% | -26.3 | both negative |
+| Post-CAS (41 days) | -0.544% | -6.3 | both negative |
+
+Other features that agree across eras:
+- **gap** (stocks that gapped up also do better overnight): +0.234 pre / +0.112 post;
+- **range_pos / last-90-min** (reversal).
+
+**Portfolio: top-5 per side by the into-close move.**
+
+| | Pre-CAS (636 d) | Post-CAS (41 d) |
+|---|---|---|
+| avg into-close move | losers -0.79% / risers +0.85% | losers -0.87% / risers +1.14% |
+| LONG losers -> T+1 open | **+0.488%** (trim +0.495, 84% days up, H1 +0.55 / H2 +0.43) | **+0.293%** (76% days up) |
+| LONG losers -> T+1 09:15 bar close | +0.342% | **+0.434%** (83%) |
+| SHORT risers -> T+1 open / 09:15c | +0.04 / +0.01 | **+0.50 / +0.75** |
+| L-S -> T+1 open | +0.529 (t 19) | +0.793 (t 5.5) |
+| universe -> T+1 open | +0.166 | -0.007 |
+| by year (LONG, open) | 2024 +0.62, 2025 +0.39, 2026 +0.44 | |
+
+**Post-CAS threshold version** (auction move vs the 15:14 print; returns to
+the T+1 09:15 bar close):
+
+| abs(auction move) >= | Long side (auction fell) | Short side (auction rose) |
+|---|---|---|
+| 0.30% | 31/day, +0.43%, 75% win, net +0.18% (CNC .25) | 52/day, +0.50%, 76% win |
+| **0.50%** | **14/day, +0.60%, 79% win, net +0.35%** | 26/day, +0.64%, 83% win |
+| 0.75% | 5.5/day, +0.94%, 88% win, net +0.69% | 11/day, +0.84%, 87% win |
+| 1.00% | 2.9/day, +1.22%, 91% win, net +0.97% | 5.4/day, +1.20%, 92% win |
+
+Every week (9/9) is positive on both sides at >= 0.5%.
+
+**Why it is real (mechanism):** closing-price pressure. Index, MOC and
+square-off flow crowds into one clearing price, and the next session's open
+(also an auction, the pre-open) resets it. This is not bid-ask bounce: both
+ends are single clearing prices.
+
+**Checks done:**
+- The daily close equals the auction print (94% exact against ticks).
+- The auction is a large liquidity event: on 2026-09-29 RELIANCE traded 7.9M
+  shares in it, about a third of its day.
+- Trimmed means agree with the raw means.
+- Both halves and every week are positive.
+- The same sign held pre-CAS on 636 days.
+
+**How it would be executed (verified):**
+- Kite Connect Quote API exposes `indicative_close_price` (the IEP) and
+  `total_imbalance_qty` during CAS, since 10-13 Aug 2026. Quote API only, no
+  WebSocket.
+- Market orders are accepted in CAS only 15:20-15:25; limit orders until the
+  random close, 15:28-15:30.
+- **Long side:** at 15:20-15:25, batch-quote the F&O universe, buy CNC in the
+  auction where the IEP is >= 0.5% below the 15:14 print, sell at the T+1 open
+  (pre-open) or 09:15.
+  - It must be CNC: MIS in CAS stocks is squared off at 15:12.
+  - A LIMIT at or near the IEP fills at the final auction price only if the
+    dislocation persists, which is the useful asymmetry.
+- **Short side:** cannot be done in cash (no overnight CNC short). It would
+  need stock futures sold ~15:25-15:40, whose prices may not follow the
+  auction dislocation. **Unverified; long side first.**
+
+**The one thing not yet measurable:** the signal here is the FINAL auction
+price; live you act on the IEP at ~15:25. No historical IEP exists.
+
+**Pre-registered next step:**
+1. Build an IEP recorder: Quote-API polls of `indicative_close_price` and
+   `total_imbalance_qty` for the F&O universe every ~15 s, 15:15-15:31,
+   recorded like `cas_straddle_polls`.
+2. After 20 sessions, re-run this table with the 15:25 IEP as the signal and
+   the final close as the fill.
+3. Promote to a sandbox strategy only if, on IEP signals, the long side at
+   >= 0.5% still makes >= +0.40% gross to the T+1 09:15 close, with >= 70% win.
+
+## B. Index strong-close overnight long: PROMISING (pre-CAS), unmeasured post-CAS
+
+Scripts: `index_overnight.py`, `index_overnight_fixed.py`, `index_trend_1514.py`.
+
+**Rule:** index in the top 20% of its day range at the close -> long index
+futures, exit at the T+1 open.
+
+**Correcting a bias.** The pre-CAS official index close was a 15:00-15:30 VWAP,
+and on strong-close days it sits *below* the last print. That inflated the
+first numbers by 15-30%. With the tradeable 15:29 print as entry:
+
+| Index | Long rp > 0.8 overnight | Net | Short rp < 0.2 |
+|---|---|---:|---:|
+| NIFTY | +0.149% (n 162, 64% up, H1 +0.17 / H2 +0.13) | +0.09 | +0.107 |
+| BANKNIFTY | +0.142% | +0.08 | +0.122 |
+| FINNIFTY | +0.152% | +0.09 | +0.151 |
+| MIDCPNIFTY | +0.340% (n 50) | +0.28 | +0.172 |
+
+- Every year is positive.
+- Deciding at 15:14 (a CAS-stable time) keeps the long side (NIFTY +0.115 net,
+  BANKNIFTY +0.140, MIDCPNIFTY +0.249); the short side fades.
+- Post-CAS: 3-6 longs per index, mixed. Measure only.
+
+## C. Tested and not useful (from this pass)
+
+- **Overnight short ATM straddles** on NIFTY / BANKNIFTY (bhavcopy 2022-26):
+  - sold at the close, bought at the T+1 open: gross about 0 (opening IV pop);
+  - bought at the T+1 close: only small DTE-3 cells positive, halves disagree.
+- **Calendar effects:** day-of-week, turn-of-month and holiday gaps are
+  inconsistent across halves.
