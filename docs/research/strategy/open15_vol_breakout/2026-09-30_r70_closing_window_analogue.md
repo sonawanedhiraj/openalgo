@@ -354,3 +354,70 @@ days. It matters as a *cost* for any long position still open at 15:00
 **REJECT unchanged.** Selecting by active scanner volume does not create a
 closing-window edge in either direction. The only positive short cell is
 market-wide post-CAS drift.
+
+---
+
+# R70d addendum (2026-10-04): the MORNING breakout stocks in the closing session
+
+> "Retest with the morning breakout stocks but for closing session."
+
+`backtest/close15/morning_to_close.py`. Four morning groups. Side = the
+morning direction; returns are signed in that direction, so a negative number
+means fading the morning would have won.
+
+| Group | Definition | n / days |
+|---|---|---|
+| seed | open15's 09:16 list: top-3 gap-up (L) / gap-down (S) | 4,082 / 681 (2024-01 →) |
+| seed_brk | seed names that triggered open15 by 09:29 (bar-close model) | 643 / 433 |
+| live | every `open15_trades` row (all fill classes) | 225 / 42 (2026-07-22 →) |
+| tickA | tick-replayed morning A-grade × rolling top-5 movers (the winning cohort) | 62 / 33 |
+
+Outcomes, in each of the 4 closing windows:
+- **hold:** t0 open → window end;
+- **trig:** open15 rule in the window, bar-close entry;
+- **tick:** same rule on ticks;
+- **→cls:** t0 → last continuous close.
+- Plus **carry:** 09:30 → close.
+- Every group is also split by whether the morning trade won.
+
+## Result: no closing edge, in either direction
+
+**seed, pre-CAS (≈1,900 trades per side per window):**
+- Continuation gross is between −0.023% and +0.021% in every window and
+  outcome.
+- Fading is therefore ≈ 0 as well. Both are 0.08–0.12% under cost.
+
+**seed_brk and morning-won vs morning-lost:**
+- No consistent difference. Best pre-CAS cell: longs that broke out, 15:00
+  hold, +0.042% gross.
+
+**live (post-CAS):**
+- Longs lose in every window (−0.003% to −0.093% gross).
+- Shorts are positive 14:55→15:10 (hold +0.117%, 74% win, n = 86). That is
+  the market-wide post-CAS drift (−0.077% in that window, R70c) plus ~0.04%.
+
+**tickA (the morning winners):**
+- No continuation into the close. Longs −0.04% to +0.02%, shorts −0.09% to
+  +0.04%, ticks worse.
+
+**Small-n post-CAS short cells** (seed_brk S, n = 19, +0.09% to +0.14%):
+- Same drift; too small to separate from it.
+
+## The one real pattern: all-day drift, not a closing window
+
+Carry 09:30 → close, seed list, pre-CAS (637 days):
+- **gap-up longs −0.130%** (morning gainers give back the rest of the day);
+- **gap-down shorts +0.101%** (morning losers keep falling).
+
+Both say *shorting the morning seed names from 09:30 to the close* earns
+≈ +0.115% gross ≈ +0.015% net. That is sub-cost.
+
+Post-CAS it is larger (longs −0.44%, shorts +0.42%), but the shorts' halves
+diverge, and 42 days of a falling Aug–Sep tape cannot separate it from market
+drift. **Watch item, not a strategy.** It does confirm R64: do not hold open15
+winners past 09:30.
+
+## Verdict
+
+**REJECT unchanged.** The morning breakout names carry no information into the
+closing window.
