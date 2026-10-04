@@ -62,7 +62,10 @@ def import_broker_module(broker_name: str) -> dict[str, Any] | None:
 
 
 def get_holdings_with_auth(
-    auth_token: str, broker: str, original_data: dict[str, Any] = None
+    auth_token: str,
+    broker: str,
+    original_data: dict[str, Any] = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get holdings details using provided auth token.
@@ -71,6 +74,10 @@ def get_holdings_with_auth(
         auth_token: Authentication token for the broker API
         broker: Name of the broker
         original_data: Original request data (for sandbox mode, optional for internal calls)
+        mode_key: Strategy identity (issue #752, the #497 rule). When supplied the
+            book is resolved by ``resolve_order_mode(mode_key)`` — the SAME resolver
+            that routed the strategy's orders — instead of the platform analyze
+            overlay. ``None`` keeps the overlay behavior for UI reads.
 
     Returns:
         Tuple containing:
@@ -81,9 +88,17 @@ def get_holdings_with_auth(
     # Read path: SANDBOX → sandbox source; LIVE/SKIP/DISABLED → broker source.
     # SKIP/DISABLED are not order rejections for reads — operator still wants
     # to see state. Internal calls (no original_data) use the live broker.
-    from services.mode_service import EffectiveMode, resolve_effective_mode
+    #
+    # A strategy reading back its OWN CNC holdings (the T+1 exit of a CNC buy:
+    # the sandbox moves yesterday's CNC position into holdings at the 03:00
+    # session expiry) must resolve the book with `resolve_order_mode(mode_key)`.
+    # With the overlay, a sandbox strategy running with Analyze OFF would read
+    # the empty LIVE broker holdings — the futures_follow #497 failure shape.
+    from services.mode_service import EffectiveMode, resolve_effective_mode, resolve_order_mode
 
-    if resolve_effective_mode() is EffectiveMode.SANDBOX and original_data:
+    book_mode = resolve_order_mode(mode_key) if mode_key else resolve_effective_mode()
+
+    if book_mode is EffectiveMode.SANDBOX and original_data:
         from services.sandbox_service import sandbox_get_holdings
 
         api_key = original_data.get("apikey")
@@ -141,7 +156,10 @@ def get_holdings_with_auth(
 
 
 def get_holdings(
-    api_key: str | None = None, auth_token: str | None = None, broker: str | None = None
+    api_key: str | None = None,
+    auth_token: str | None = None,
+    broker: str | None = None,
+    mode_key: str | None = None,
 ) -> tuple[bool, dict[str, Any], int]:
     """
     Get holdings details.
@@ -151,6 +169,7 @@ def get_holdings(
         api_key: OpenAlgo API key (for API-based calls)
         auth_token: Direct broker authentication token (for internal calls)
         broker: Direct broker name (for internal calls)
+        mode_key: Strategy identity — see ``get_holdings_with_auth`` (issue #752).
 
     Returns:
         Tuple containing:
@@ -164,11 +183,11 @@ def get_holdings(
         if AUTH_TOKEN is None:
             return False, {"status": "error", "message": "Invalid openalgo apikey"}, 403
         original_data = {"apikey": api_key}
-        return get_holdings_with_auth(AUTH_TOKEN, broker_name, original_data)
+        return get_holdings_with_auth(AUTH_TOKEN, broker_name, original_data, mode_key=mode_key)
 
     # Case 2: Direct internal call with auth_token and broker
     elif auth_token and broker:
-        return get_holdings_with_auth(auth_token, broker, None)
+        return get_holdings_with_auth(auth_token, broker, None, mode_key=mode_key)
 
     # Case 3: Invalid parameters
     else:

@@ -188,6 +188,9 @@ class NotificationService:
             # digest / rejection alerts. Default ON; the platform master
             # NOTIFY_TELEGRAM_ENABLED is the only switch above it.
             "cas_straddle": _env_bool("NOTIFY_CAS_STRADDLE", default=True),
+            # cas_auction_reversal (issue #752): arm / decide / entry rejections /
+            # T+1 exit / EOD IEP-vs-close summary. Default ON.
+            "cas_auction_reversal": _env_bool("NOTIFY_CAS_AUCTION_REVERSAL", default=True),
             # Daily trading-day funnel diagnostic (issue #159). Default ON —
             # the next "zero trades on a healthy-looking day" surfaces as a
             # 15:35 IST Telegram message naming the drop-off layer instead of

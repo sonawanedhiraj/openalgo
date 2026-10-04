@@ -18,6 +18,25 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### cas_auction_reversal tunables (issue #752, 2026-10-04)
+
+- **Why:** new sandbox strategy from R71b/R71c (#751). It buys, CNC, the F&O
+  stocks whose closing-auction indicative close is far below the last continuous
+  print, and sells T+1 09:16.
+- **New tunables** (env, read at each 15:14:30 arm, clamped):
+
+  | Env var | Default | Clamp | Meaning |
+  |---|---|---|---|
+  | `CAS_AR_THRESHOLD_PCT` | 0.5 | 0.2–5.0 | buy when IEP <= ref × (1 − x/100) |
+  | `CAS_AR_MAX_POSITIONS` | 10 | 1–30 | deepest-first cap per day |
+  | `CAS_AR_CAPITAL_PER_TRADE_INR` | 50000 | 5k–10L | `floor(capital / price)` shares |
+  | `CAS_AR_POLL_INTERVAL_S` | 15 | 5–60 | monitor batched-quote cadence 15:14:30–15:33 |
+  | `NOTIFY_CAS_AUCTION_REVERSAL` | true | — | Telegram toggle for the strategy's alerts |
+
+- **Code constants (not knobs):** decide 15:23:30, sandbox fill 15:32, exit 09:16,
+  retry 09:20, live LIMIT buffer +0.2%.
+- **Env reality:** none set in `.env`, so the defaults apply.
+
 ### Machine-wide system health + Health Monitor thread thresholds (issue #744, 2026-09-24)
 
 - **Why:** 2026-09-24 09:40:09 IST the whole OpenAlgo process died on a libzmq

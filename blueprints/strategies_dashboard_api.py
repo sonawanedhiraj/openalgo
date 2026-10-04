@@ -251,6 +251,7 @@ def _get_strategy_mode(name: str) -> str:
 _FUTURES_FOLLOW_FOLDER = "futures_follow_cap50"
 _INTRADAY_PULLBACK_FOLDER = "intraday_pullback_top2"
 _CAS_STRADDLE_FOLDER = "cas_320_expiry_straddle"
+_CAS_AR_FOLDER = "cas_auction_reversal"
 _SECTOR_FOLLOW_FOLDER = "sector_follow_cap5_vol"
 _VETO_ENABLED_STRATEGIES = {_SIMPLIFIED_ENGINE_FOLDER, _FUTURES_FOLLOW_FOLDER}
 
@@ -1416,6 +1417,111 @@ def _pnl_curve_cas_straddle(window_days: int | None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# cas_auction_reversal (issue #752) — CNC bought in the closing auction, sold
+# T+1 09:16. P&L REALIZES on the exit day, so "today" and the curve key on the
+# IST date of ``exit_at``, never on the entry ``trade_date``.
+# ---------------------------------------------------------------------------
+
+
+def _cas_ar_exit_date(r) -> str | None:
+    if not r.exit_at:
+        return None
+    return (r.exit_at + timedelta(hours=5, minutes=30)).date().isoformat()
+
+
+def _cas_ar_stats() -> dict:
+    """Open positions (bought, not yet sold), today's realized net P&L (exits
+    today) and last activity from ``cas_ar_trades`` via ``net_pnl_of_row``."""
+    try:
+        from database.cas_auction_reversal_db import CasArTrade, net_pnl_of_row
+        from database.cas_auction_reversal_db import db_session as car_session
+
+        today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+        rows = car_session.query(CasArTrade).all()
+        open_pos = [r for r in rows if r.fill == "real" and r.status in ("placed", "open")]
+        exited_today = [r for r in rows if _cas_ar_exit_date(r) == today_str]
+        pnls = [net_pnl_of_row(r) for r in exited_today]
+        last = max((r.created_at for r in rows if r.created_at), default=None)
+        return {
+            "open_positions": len(open_pos),
+            "today_net_pnl": round(sum(p for p in pnls if p is not None), 2),
+            "today_unpriced_exits": sum(
+                1 for r in exited_today if r.status == "closed" and r.exit_price is None
+            ),
+            "last_trade_at": last.isoformat() if last else None,
+            "today_trade_count": sum(1 for r in rows if r.trade_date == today_str)
+            + len(exited_today),
+        }
+    except Exception:
+        logger.exception("Failed to aggregate cas_auction_reversal stats")
+        return {
+            "open_positions": 0,
+            "today_net_pnl": 0.0,
+            "today_unpriced_exits": 0,
+            "last_trade_at": None,
+            "today_trade_count": 0,
+        }
+    finally:
+        try:
+            from database.cas_auction_reversal_db import db_session as car_session
+
+            car_session.remove()
+        except Exception:
+            pass
+
+
+def _cas_ar_lifetime() -> dict[str, dict]:
+    """Per-mode since-inception realized stats over closed REAL trades."""
+    capital = _snapshot_capital(_CAS_AR_FOLDER, "capital_inr")
+
+    def _agg(rows: list) -> dict:
+        from database.cas_auction_reversal_db import net_pnl_of_row
+
+        pairs = [(r, net_pnl_of_row(r)) for r in rows]
+        pairs = [(r, p) for r, p in pairs if p is not None]
+        pnls = [p for _r, p in pairs]
+        daily = [(_date_of_str(_cas_ar_exit_date(r) or r.trade_date), p) for r, p in pairs]
+        return {**_lifetime_from_pnls(pnls), **compute_realized_metrics(daily, capital_inr=capital)}
+
+    out = {"sandbox": _agg([]), "live": _agg([])}
+    try:
+        from database.cas_auction_reversal_db import real_closed_rows
+
+        buckets: dict[str, list] = {"sandbox": [], "live": []}
+        for r in real_closed_rows():
+            m = (r.mode or "").lower()
+            if m in buckets:
+                buckets[m].append(r)
+        out = {m: _agg(rs) for m, rs in buckets.items()}
+    except Exception:
+        logger.exception("Failed to aggregate cas_auction_reversal lifetime stats")
+    return out
+
+
+def _pnl_curve_cas_ar(window_days: int | None) -> list[dict]:
+    """Daily realized net P&L (closed real trades) keyed by the EXIT date."""
+    try:
+        from database.cas_auction_reversal_db import net_pnl_of_row, real_closed_rows
+
+        cutoff = (
+            (datetime.now(_IST) - timedelta(days=window_days)).date().isoformat()
+            if window_days
+            else None
+        )
+        by_date: dict[str, float] = {}
+        for r in real_closed_rows():
+            p = net_pnl_of_row(r)
+            d = _cas_ar_exit_date(r)
+            if p is None or d is None or (cutoff and d < cutoff):
+                continue
+            by_date[d] = by_date.get(d, 0.0) + p
+        return [{"date": d, "pnl": round(v, 2)} for d, v in sorted(by_date.items())]
+    except Exception:
+        logger.exception("Failed to build pnl_curve for cas_auction_reversal")
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Health LED
 # ---------------------------------------------------------------------------
 
@@ -1506,6 +1612,8 @@ def _build_summary(name: str) -> dict:
         stats = _intraday_pullback_stats()
     elif name == _CAS_STRADDLE_FOLDER:
         stats = _cas_straddle_stats()
+    elif name == _CAS_AR_FOLDER:
+        stats = _cas_ar_stats()
 
     # Effective order routing RIGHT NOW (issue #440): the per-strategy
     # dispatch verdict an order would get — 'live' only when the navbar is on
@@ -1711,6 +1819,18 @@ def strategy_detail(name: str):
         }
         if lifetime["live"]["closed_trades"] > 0:
             performance["live"] = {**lifetime["live"]}
+    elif name == _CAS_AR_FOLDER:
+        stats = _cas_ar_stats()
+        lifetime = _cas_ar_lifetime()
+        performance["sandbox"] = {
+            "open_positions": stats["open_positions"],
+            "today_net_pnl": stats["today_net_pnl"],
+            "today_unpriced_exits": stats["today_unpriced_exits"],
+            "last_trade_at": stats["last_trade_at"],
+            **lifetime["sandbox"],
+        }
+        if lifetime["live"]["closed_trades"] > 0:
+            performance["live"] = {**lifetime["live"]}
     elif name == _CAS_STRADDLE_FOLDER:
         stats = _cas_straddle_stats()
         lifetime = _cas_straddle_lifetime()
@@ -1779,6 +1899,16 @@ def strategy_detail(name: str):
                     "created_at": r.created_at.isoformat() if r.created_at else None,
                 }
                 for r in rows
+            ]
+        except Exception:
+            logger.exception("Failed to fetch recent trades for %s", name)
+    elif name == _CAS_AR_FOLDER:
+        try:
+            from database.cas_auction_reversal_db import recent_trades as _car_recent
+            from database.cas_auction_reversal_db import trade_to_dict as _car_row
+
+            recent_trades = [
+                {**_car_row(r), "side": "BUY", "price": r.entry_price} for r in _car_recent(50)
             ]
         except Exception:
             logger.exception("Failed to fetch recent trades for %s", name)
@@ -2009,6 +2139,8 @@ def pnl_curve(name: str):
         points = _pnl_curve_open15(window_days)
     elif name == _CAS_STRADDLE_FOLDER:
         points = _pnl_curve_cas_straddle(window_days)
+    elif name == _CAS_AR_FOLDER:
+        points = _pnl_curve_cas_ar(window_days)
     # Other strategies: empty series (no journal yet)
 
     return jsonify({"status": "success", "data": {"window": window, "points": points}})

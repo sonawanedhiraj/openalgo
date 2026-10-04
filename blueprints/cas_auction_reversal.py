@@ -1,0 +1,140 @@
+"""Observability + operator-control endpoints for cas_auction_reversal (issue #752).
+
+Additive blueprint over the ``CasAuctionReversalService`` singleton
+(services/cas_auction_reversal_service.py). URL prefix: ``/cas_auction_reversal``.
+
+Auth follows ``blueprints/cas_straddle.py``: mutating endpoints take an API key
+(``X-API-KEY`` header / ``apikey`` in body or query); read-only endpoints ALSO
+accept a valid logged-in browser session. ``@check_session_validity`` is
+deliberately NOT used — its failure path revokes broker tokens.
+"""
+
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, request
+
+from database.auth_db import verify_api_key
+from services.cas_auction_reversal_service import STRATEGY_NAME, get_service
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+cas_auction_reversal_bp = Blueprint(
+    "cas_auction_reversal_bp", __name__, url_prefix=f"/{STRATEGY_NAME}"
+)
+
+
+def _extract_api_key() -> str | None:
+    key = request.headers.get("X-API-KEY")
+    if not key:
+        key = (request.get_json(silent=True) or {}).get("apikey")
+    if not key:
+        key = request.args.get("apikey")
+    return key
+
+
+def _authed() -> bool:
+    key = _extract_api_key()
+    return bool(key and verify_api_key(key))
+
+
+def _session_ok() -> bool:
+    try:
+        from utils.session import is_session_valid
+
+        return bool(is_session_valid())
+    except Exception:
+        return False
+
+
+def _unauthorized():
+    return jsonify({"status": "error", "message": "Invalid or missing API key"}), 401
+
+
+def _service_or_503():
+    svc = get_service()
+    if svc is None:
+        return None, (
+            jsonify({"status": "error", "message": "cas_auction_reversal service not initialised"}),
+            503,
+        )
+    return svc, None
+
+
+@cas_auction_reversal_bp.route("/api/status", methods=["GET"])
+def status():
+    """Mode, config, today's arm/poll/decision state and entries."""
+    if not (_authed() or _session_ok()):
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    return jsonify({"status": "success", "data": svc.get_status()})
+
+
+@cas_auction_reversal_bp.route("/api/candidates", methods=["GET"])
+def candidates():
+    """Every symbol that crossed the threshold on ``?date=YYYY-MM-DD`` (default
+    today): reference print, indicative close at the decision, selected / skip
+    reason, and (after 15:45) the final auction close."""
+    if not (_authed() or _session_ok()):
+        return _unauthorized()
+    svc = get_service()
+    day = request.args.get("date") or (svc.trade_date() if svc else None)
+    if not day:
+        return jsonify({"status": "error", "message": "date required"}), 400
+    try:
+        from database.cas_auction_reversal_db import (
+            candidate_to_dict,
+            candidates_for_date,
+            poll_count,
+        )
+
+        rows = [candidate_to_dict(c) for c in candidates_for_date(day)]
+        return jsonify(
+            {
+                "status": "success",
+                "data": {"date": day, "polls": poll_count(day), "candidates": rows},
+            }
+        )
+    except Exception:
+        logger.exception("cas_ar candidates endpoint failed")
+        return jsonify({"status": "error", "message": "candidates read failed"}), 500
+
+
+@cas_auction_reversal_bp.route("/api/trades", methods=["GET"])
+def trades():
+    """Most recent trades (entries + T+1 exits), newest first."""
+    if not (_authed() or _session_ok()):
+        return _unauthorized()
+    try:
+        from database.cas_auction_reversal_db import recent_trades, trade_to_dict
+
+        limit = max(1, min(int(request.args.get("limit", 50)), 200))
+        return jsonify(
+            {"status": "success", "data": [trade_to_dict(r) for r in recent_trades(limit)]}
+        )
+    except Exception:
+        logger.exception("cas_ar trades endpoint failed")
+        return jsonify({"status": "error", "message": "trades read failed"}), 500
+
+
+@cas_auction_reversal_bp.route("/api/pause", methods=["POST"])
+def pause():
+    """Hold new entries (durable runtime override). T+1 exits still run."""
+    if not _authed():
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    return jsonify(svc.pause())
+
+
+@cas_auction_reversal_bp.route("/api/resume", methods=["POST"])
+def resume():
+    if not _authed():
+        return _unauthorized()
+    svc, err = _service_or_503()
+    if err:
+        return err
+    return jsonify(svc.resume())

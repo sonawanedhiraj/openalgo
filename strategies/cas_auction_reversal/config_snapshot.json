@@ -1,0 +1,35 @@
+{
+  "version": "0.1.0",
+  "mode": "sandbox",
+  "deployable": false,
+  "strategy_name": "cas_auction_reversal",
+  "classification": "overnight mean-reversion of the NSE closing-auction price dislocation in F&O cash stocks (sandbox measurement deployment, issue #752)",
+  "universe": "tradeable F&O stocks (scanner_universe.tradeable_universe, NSE only — indices excluded; every F&O stock is CAS-eligible)",
+  "instrument": "cash equity, CNC (delivery). MIS is impossible (CAS stocks square off 15:12); stock futures capture only ~4-30% of the auction dip (R71c)",
+  "reference_price": "last continuous print = frozen LTP after 15:15:00 (the research's 15:14 bar close)",
+  "signal": "Kite Quote API indicative_close_price <= reference x (1 - threshold_pct/100) at the 15:23:30 decision",
+  "selection": "deepest dislocation first, top max_positions; floor(capital_per_trade_inr / price) shares",
+  "entry_live": "CNC LIMIT BUY at indicative close x 1.002 placed into the auction at 15:23:30 (orders accepted 15:20-15:25); filled at the single auction price",
+  "entry_sandbox": "queued at 15:23:30; CNC LIMIT BUY at the post-auction LTP (= the auction close) at 15:32 — the sandbox fills a marketable LIMIT at LTP",
+  "exit": "T+1 09:16 CNC SELL MARKET (retry 09:20; boot catch-up until 15:10); quantity from the strategy's own holdings + positions via mode_key",
+  "stop_loss": "none — the research hold is close -> T+1 open",
+  "tunables": {
+    "CAS_AR_THRESHOLD_PCT": 0.5,
+    "CAS_AR_MAX_POSITIONS": 10,
+    "CAS_AR_CAPITAL_PER_TRADE_INR": 50000,
+    "CAS_AR_POLL_INTERVAL_S": 15
+  },
+  "capital_inr": 500000,
+  "charges_model": "Zerodha equity delivery (verified 2026-10-04): STT 0.1% both sides, NSE txn 0.00307%, SEBI Rs10/cr, stamp 0.015% buy, GST 18% on txn+SEBI, DP Rs15.34 per scrip",
+  "live_blockers": [
+    "Zerodha holdings mapper drops t1_quantity: a live T+1 exit would read 0 shares for yesterday's buys",
+    "IEP-vs-close predictiveness unmeasured: the pre-registered 20-session gate (PLAN.md) must pass first"
+  ],
+  "backtest_reference": "R71b/R71c, docs/research/strategy/closing_session/2026-10-04_r71_what_works_closing_session.md",
+  "parity_target": {
+    "net_pct_per_trade": 0.35,
+    "win_rate_pct": 79,
+    "basis": "post-CAS 2026-08-03..10-01, auction >= 0.5% below the 15:14 print, exit T+1 09:15 bar close, net of 0.25% CNC"
+  },
+  "llm_context": "cas_auction_reversal buys, in cash delivery (CNC), the F&O stocks whose NSE closing-auction price is set at least 0.5% below their last continuous print, and sells them the next morning at 09:16. The bet is that the auction overshoots on order imbalance and the next session's opening auction undoes it. It decides at 15:23:30 from the exchange's indicative closing price and holds overnight with no stop."
+}

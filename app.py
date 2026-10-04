@@ -49,6 +49,9 @@ from blueprints.broker_credentials import (
     broker_credentials_bp,  # Import the broker credentials blueprint
 )
 from blueprints.broker_totp import broker_totp_bp  # Broker external-TOTP helper
+from blueprints.cas_auction_reversal import (  # cas_auction_reversal control/observability
+    cas_auction_reversal_bp,
+)
 from blueprints.cas_straddle import cas_straddle_bp  # cas_320_expiry_straddle control/config
 from blueprints.chartink import chartink_bp  # Import the chartink blueprint
 from blueprints.core import core_bp
@@ -317,6 +320,7 @@ def create_app(testing: bool = False):
     app.register_blueprint(sector_follow_bp)  # sector_follow_cap5_vol observability/control
     app.register_blueprint(futures_follow_bp)  # futures_follow_cap50 observability/control
     app.register_blueprint(cas_straddle_bp)  # cas_320_expiry_straddle control/config (#740)
+    app.register_blueprint(cas_auction_reversal_bp)  # cas_auction_reversal (#752)
     app.register_blueprint(intraday_pullback_bp)  # intraday_pullback_top2 control/observability
     app.register_blueprint(open15_bp)  # open15_vol_breakout control/observability
     app.register_blueprint(mode_status_bp)  # Stage-0 mode resolver status endpoint
@@ -1033,6 +1037,19 @@ def setup_environment(app):
                 logger.debug("CAS straddle service initialized")
             except Exception as e:
                 logger.error(f"Failed to initialize CAS straddle service: {e}")
+
+            # cas_auction_reversal — buy the F&O stocks the closing auction pushes
+            # down (CNC), sell T+1 09:16 (issue #752). Unconditional: no env flag;
+            # sandbox by default, the /strategies toggle is the only way live.
+            try:
+                from services.cas_auction_reversal_service import (
+                    init_cas_auction_reversal_service,
+                )
+
+                init_cas_auction_reversal_service(app=app)
+                logger.debug("CAS auction reversal service initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize CAS auction reversal service: {e}")
 
             # Scanner-vs-Chartink EOD comparison (retires the Cowork-side
             # "scanner-vs-chartink-daily-comparison" scheduled task). Registers a
