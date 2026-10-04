@@ -1997,9 +1997,11 @@ routing seam), `test/test_cas_straddle_db.py`, `test/test_cas_straddle_blueprint
 — **buy the F&O stocks the closing auction pushes DOWN, CNC, sell T+1 09:16** (issue
 #752, from R71b/R71c #751).
 
-**The research edge:** auction close >= 0.5% below the 15:14 print → +0.60% by the
-T+1 09:15 bar close, 79% win, ~14 names a day, 9/9 weeks positive, ~+0.35% net of
-CNC.
+**The research edge:**
+- R71b, all qualifying stocks, GROSS: auction close >= 0.5% below the 15:14
+  print → +0.60% by the T+1 09:15 bar close, 79% gross win, ~14 names a day.
+- **Strategy-faithful (top 10/day, Rs50k, net of CNC charges):** 280 trades / 40 days, 61.8% net win, +0.286% net per trade (`backtest/close15/cas_ar_parity.py`, the /strategies Backtest column).
+- **Never quote the gross figures as the strategy's win rate.**
 
 **`CasAuctionReversalService`** (`services/cas_auction_reversal_service.py`) runs
 these jobs:
@@ -2049,9 +2051,12 @@ Rules, each load-bearing:
   on the EXIT day, so the dashboard keys "today" and the curve on `exit_at`.
 
 **Mode** is sandbox / live via the `/strategies` toggle, default sandbox, no
-observe state. `deployable: false` until the Zerodha holdings mapper carries
-`t1_quantity`: without it a live T+1 exit reads 0 shares for yesterday's buys.
-The IEP gate in PLAN.md must also pass first.
+observe state, `deployable: true`. The flip to live is gated by the operator on
+the IEP rule in PLAN.md.
+
+Known live gap: the Zerodha holdings mapper drops `t1_quantity`, so the live
+T+1 exit falls back to the journalled quantity instead of capping to the book.
+That is not a stranding risk, because a CNC SELL cannot short.
 
 API: `/cas_auction_reversal/api/{status,candidates,trades,pause,resume}`.
 Tests: `test/test_cas_auction_reversal_service.py` (incl. the `place_order`

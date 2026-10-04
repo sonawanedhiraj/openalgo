@@ -1,7 +1,7 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "mode": "sandbox",
-  "deployable": false,
+  "deployable": true,
   "strategy_name": "cas_auction_reversal",
   "classification": "overnight mean-reversion of the NSE closing-auction price dislocation in F&O cash stocks (sandbox measurement deployment, issue #752)",
   "universe": "tradeable F&O stocks (scanner_universe.tradeable_universe, NSE only — indices excluded; every F&O stock is CAS-eligible)",
@@ -21,15 +21,96 @@
   },
   "capital_inr": 500000,
   "charges_model": "Zerodha equity delivery (verified 2026-10-04): STT 0.1% both sides, NSE txn 0.00307%, SEBI Rs10/cr, stamp 0.015% buy, GST 18% on txn+SEBI, DP Rs15.34 per scrip",
-  "live_blockers": [
-    "Zerodha holdings mapper drops t1_quantity: a live T+1 exit would read 0 shares for yesterday's buys",
-    "IEP-vs-close predictiveness unmeasured: the pre-registered 20-session gate (PLAN.md) must pass first"
-  ],
   "backtest_reference": "R71b/R71c, docs/research/strategy/closing_session/2026-10-04_r71_what_works_closing_session.md",
   "parity_target": {
-    "net_pct_per_trade": 0.35,
-    "win_rate_pct": 79,
-    "basis": "post-CAS 2026-08-03..10-01, auction >= 0.5% below the 15:14 print, exit T+1 09:15 bar close, net of 0.25% CNC"
+    "window": "post-CAS 2026-08-03..2026-09-30 (40 entry days) — strategy-faithful replay, threshold 0.5%, top 10/day, Rs50k each",
+    "n_trades": 280,
+    "win_rate_pct": 61.8,
+    "net_pnl_inr": 38599.0,
+    "max_dd_pct": -0.61,
+    "cagr_pct": 54.6,
+    "sharpe": 6.02,
+    "avg_net_pct_per_trade": 0.286,
+    "green_days_pct": 72.5,
+    "capital_base_inr": 500000,
+    "entry_convention": "BUY at the official auction close (= the sandbox 15:32 fill); SELL at the T+1 09:15 bar close (= the 09:16 exit)",
+    "charges": "Zerodha CNC delivery per round trip (cnc_round_trip_charges): STT 0.1% both sides, stamp, txn, GST, DP Rs15.34",
+    "win_definition": "net of charges > 0",
+    "source": "backtest/close15/cas_ar_parity.py; research docs/research/strategy/closing_session/2026-10-04_r71_what_works_closing_session.md (R71b)",
+    "caveat": "40 entry days only; CAGR/Sharpe are annualised from 2 months and indicative. Signal uses the FINAL auction close — live decides on the 15:23:30 indicative close (unmeasured until the IEP recorder has 20 sessions). R71b's '79% / 91% win' figures are GROSS and UNCAPPED (every qualifying stock, no 10/day cap, no charges)."
   },
-  "llm_context": "cas_auction_reversal buys, in cash delivery (CNC), the F&O stocks whose NSE closing-auction price is set at least 0.5% below their last continuous print, and sells them the next morning at 09:16. The bet is that the auction overshoots on order imbalance and the next session's opening auction undoes it. It decides at 15:23:30 from the exchange's indicative closing price and holds overnight with no stop."
+  "llm_context": "cas_auction_reversal buys, in cash delivery (CNC), the F&O stocks whose NSE closing-auction price is set at least 0.5% below their last continuous print, and sells them the next morning at 09:16. The bet is that the auction overshoots on order imbalance and the next session's opening auction undoes it. It decides at 15:23:30 from the exchange's indicative closing price and holds overnight with no stop.",
+  "live_gate": "Operator decision, pre-registered in PLAN.md: flip to live only after 20 sandbox sessions show IEP-signalled names at >= 0.5% making >= +0.40% gross to the T+1 09:15 close with >= 70% gross win. Known live gap (not a stranding risk): the Zerodha holdings mapper drops t1_quantity, so the T+1 exit falls back to the journalled quantity instead of capping to the book (a CNC SELL cannot short).",
+  "backtest_threshold_tiers": [
+    {
+      "threshold_pct": 0.3,
+      "trades": 400,
+      "per_day": 9.8,
+      "win_net_pct": 55.8,
+      "avg_net_pct": 0.129,
+      "net_pnl_inr": 24551.0,
+      "max_dd_pct": -2.49,
+      "days_with_trades": 41
+    },
+    {
+      "threshold_pct": 0.5,
+      "trades": 280,
+      "per_day": 7.0,
+      "win_net_pct": 61.8,
+      "avg_net_pct": 0.286,
+      "net_pnl_inr": 38599.0,
+      "max_dd_pct": -0.61,
+      "days_with_trades": 40
+    },
+    {
+      "threshold_pct": 0.75,
+      "trades": 116,
+      "per_day": 4.0,
+      "win_net_pct": 73.3,
+      "avg_net_pct": 0.702,
+      "net_pnl_inr": 39232.0,
+      "max_dd_pct": -0.21,
+      "days_with_trades": 29
+    },
+    {
+      "threshold_pct": 1.0,
+      "trades": 53,
+      "per_day": 3.3,
+      "win_net_pct": 79.2,
+      "avg_net_pct": 1.096,
+      "net_pnl_inr": 27958.0,
+      "max_dd_pct": -0.16,
+      "days_with_trades": 16
+    }
+  ],
+  "backtest_threshold_tiers_uncapped_gross_R71b": [
+    {
+      "threshold_pct": 0.3,
+      "events": 1258,
+      "per_day": 30.7,
+      "win_gross_pct": 75,
+      "avg_gross_pct": 0.426
+    },
+    {
+      "threshold_pct": 0.5,
+      "events": 577,
+      "per_day": 14.1,
+      "win_gross_pct": 79,
+      "avg_gross_pct": 0.596
+    },
+    {
+      "threshold_pct": 0.75,
+      "events": 224,
+      "per_day": 5.5,
+      "win_gross_pct": 88,
+      "avg_gross_pct": 0.938
+    },
+    {
+      "threshold_pct": 1.0,
+      "events": 117,
+      "per_day": 2.9,
+      "win_gross_pct": 91,
+      "avg_gross_pct": 1.224
+    }
+  ]
 }

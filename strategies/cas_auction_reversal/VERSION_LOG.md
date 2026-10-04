@@ -1,5 +1,16 @@
 # cas_auction_reversal — Version Log
 
+## v0.1.1 — 2026-10-04
+
+- **`deployable: true`.** `false` rendered a "Scaffold" badge on /strategies
+  although the strategy routes to sandbox by default.
+- **`parity_target` now carries the Backtest column's keys** from a
+  strategy-faithful replay (`backtest/close15/cas_ar_parity.py`):
+  280 trades, 61.8% net win, Rs38,599 net,
+  max DD -0.61%, CAGR 54.6% / Sharpe 6.02 (2-month window, indicative).
+- **Threshold tiers** (net, capped, and R71b's gross uncapped) are recorded under
+  `backtest_threshold_tiers*`.
+
 ## v0.1.0 — 2026-10-04
 
 Initial ship (issue #752), sandbox-only (`deployable: false`).
