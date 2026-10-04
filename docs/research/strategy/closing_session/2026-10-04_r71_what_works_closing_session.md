@@ -285,3 +285,51 @@ first numbers by 15-30%. With the tradeable 15:29 print as entry:
   - bought at the T+1 close: only small DTE-3 cells positive, halves disagree.
 - **Calendar effects:** day-of-week, turn-of-month and holiday gaps are
   inconsistent across halves.
+
+
+---
+
+# R71c: vehicle for the auction reversal — CNC or stock futures? (2026-10-04)
+
+**Question.** Buy the auction-dip names in CNC (in the auction), or buy stock
+futures?
+
+**Data.**
+- 1m bars for the Oct-26 and Nov-26 stock futures of 207 F&O names, fetched
+  through OpenAlgo `/api/v1/history`
+  (`backtest/close15/fetch_futures_1m.py`).
+- The September near-month contract has expired and is no longer fetchable,
+  so each day uses the most-traded of the two available contracts in the
+  15:00–15:40 window. That was the next month for September days.
+- Matched to 3,268 post-CAS auction events (`futures_capture.py`). 541 of
+  them had futures that traded at least 15 one-minute bars between 15:15
+  and 15:39 ("liquid").
+
+**Result: the dislocation lives only in the CASH auction. Futures barely
+follow it.**
+
+| \|auction move\| ≥ 0.5% | n | Futures share of the stock's auction dip at 15:25 / 15:31 / 15:39 | Futures reversal to T+1 09:15c (best entry, 15:31) | CNC reversal (auction fill) |
+|---|---:|---|---:|---:|
+| LONG (pushed down), all | 566 | 4% / 27% / 27% | +0.183% → **net +0.12** | +0.605% → **net +0.355** |
+| LONG, liquid futures | 154 | 9% / 34% / 30% | +0.217% → net +0.16 | +0.859% → net +0.61 |
+| SHORT (pushed up), all | 1,007 | 0% / 0% / 6% | +0.105% → net +0.045 | (no CNC short) |
+| SHORT, liquid futures | 121 | 10% / 30% / 24% | +0.310% → net +0.25 | — |
+
+Larger dislocations (≥ 1%) look the same. Long futures net about +0.21%
+against CNC about +0.98%. Short futures are near zero, and negative at
+≥ 0.75%.
+
+**Why.** Futures keep trading continuously through the auction and stay near
+fair value. Arbitrage cannot pull them to an auction price that only exists at
+~15:29:30 and reverts the next morning. At 15:25, when the order has to go in,
+futures show about 4% of the dip. Even right after the print (15:31) they show
+only about 30%.
+
+**Verdict: use CNC, bought in the closing auction.**
+- **Long side:** CNC captures about 3× the futures edge, net of its higher
+  0.25% cost (+0.355 vs +0.12 at ≥ 0.5%).
+- **Short side:** effectively not tradeable. CNC cannot short overnight, and
+  futures capture almost none of the move. Drop it.
+- **Caveat:** these are next/far-month contracts. The near month may track the
+  cash price somewhat better, but the liquid subset gives the same ~30%
+  answer.
