@@ -347,3 +347,27 @@ def test_production_order_placer_routes_cnc_with_the_strategy_mode_key(monkeypat
         "LIMIT",
         "961.4",
     )
+
+
+def test_decide_alerts_when_the_iep_never_leaves_the_last_print():
+    """Outside CAS Kite returns indicative_close_price == last price (verified
+    2026-10-04). If that is all the decision sees, say so loudly."""
+    clock, broker, notes = Clock(datetime(2026, 10, 5, 15, 14, 30, tzinfo=IST)), Broker(), []
+    svc = _svc(clock, broker, notes=notes)
+    svc.arm()
+    for s in ("AAA", "BBB", "CCC", "DDD"):
+        broker.quotes[s] = {"ltp": 100.0, "iep": 100.0, "imbalance_qty": 0, "volume": 10}
+    clock.at("15:15:05")
+    svc.poll_once()
+    clock.at("15:23:30")
+    assert svc.run_decide()["status"] == "no_entries"
+    assert svc.day["iep_feed"] == {"with_iep": 4, "moved": 0}
+    assert any("not reaching the quote feed" in n for n in notes)
+
+
+def test_healthy_iep_feed_does_not_alert():
+    clock, broker, notes = Clock(datetime(2026, 10, 5, 15, 0, tzinfo=IST)), Broker(), []
+    svc = _svc(clock, broker, notes=notes)
+    _run_session(clock, broker, svc)
+    assert svc.day["iep_feed"]["moved"] == 4
+    assert not any("not reaching" in n for n in notes)

@@ -154,6 +154,21 @@ def select_candidates(
     return rows
 
 
+def iep_feed_health(ref: dict[str, float], last: dict[str, dict]) -> dict:
+    """How many symbols carry an indicative close, and how many of those differ
+    from their reference print. Outside CAS Kite returns IEP == last price, so
+    ``moved == 0`` with ``with_iep > 0`` means the auction price is not arriving."""
+    with_iep = moved = 0
+    for sym, q in last.items():
+        iep, r = q.get("iep"), ref.get(sym)
+        if not iep or not r:
+            continue
+        with_iep += 1
+        if abs(iep / r - 1.0) > 1e-4:
+            moved += 1
+    return {"with_iep": with_iep, "moved": moved}
+
+
 def size_qty(capital_inr: float, price: float | None) -> int:
     if not price or price <= 0:
         return 0
@@ -653,6 +668,18 @@ class CasAuctionReversalService:
         if last_at is None or (self._now() - last_at).total_seconds() > STALE_POLL_S:
             self.poll_once()
         cfg = self.day["config"]
+        feed = iep_feed_health(self._reference(), self.day.get("last") or {})
+        with self._lock:
+            self.day["iep_feed"] = feed
+        if feed["with_iep"] and feed["moved"] == 0:
+            # Outside CAS Kite returns indicative_close_price == the last price, so
+            # "every IEP equals its reference print" means the auction price is NOT
+            # reaching us — zero candidates would otherwise look like a quiet day.
+            self._alert(
+                f"⚠️ cas_auction_reversal {self.day['trade_date']}: indicative close equals the "
+                f"last print for all {feed['with_iep']} symbols at the decision — the auction "
+                "price is not reaching the quote feed. No trades today."
+            )
         cands = select_candidates(
             self._reference(),
             self.day.get("last") or {},
@@ -1042,6 +1069,7 @@ class CasAuctionReversalService:
             "polls": d.get("n_polls"),
             "last_poll_at": d["last_poll_at"].isoformat() if d.get("last_poll_at") else None,
             "decided": d.get("decided"),
+            "iep_feed": d.get("iep_feed"),
             "candidates": d.get("candidates"),
             "entries": d.get("entries"),
             "summary": d.get("summary"),

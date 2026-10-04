@@ -2023,8 +2023,12 @@ Rules, each load-bearing:
   short mirror cannot be traded: there is no overnight CNC short.
 - **The IEP needs the quote mapper.** Kite's Quote API carries
   `indicative_close_price` / `total_imbalance_qty` during CAS (not the WebSocket).
-  The Zerodha `get_quotes` / `get_multiquotes` mapper now passes both through as
-  `None` outside CAS. Never default them to 0: 0 reads as a price.
+  The Zerodha `get_quotes` / `get_multiquotes` mapper now passes both through.
+- **Outside CAS Kite returns IEP = the last price and imbalance 0** (verified
+  2026-10-04). So the field's presence never means "auction running": it is
+  always compared with the frozen last print. If no symbol's IEP differs from
+  its print at the decision, `iep_feed_health` Telegram-alerts instead of
+  showing a silent zero-trade day.
 - **The sandbox buys AFTER the auction prints.** During CAS a stock's LTP is frozen
   at the 15:15 print, and a sandbox MARKET order fills at the ask. So the sandbox
   entry is a CNC LIMIT at the post-auction LTP at 15:32 (the sandbox fills a
