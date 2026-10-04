@@ -278,3 +278,79 @@ Caveats:
   pre-registered check.
 - The closing sample is 17 days, but the closing result agrees with 683 days of
   bars.
+
+---
+
+# R70c addendum (2026-10-04): in-house scanner names (active volume) at the close
+
+> "You tested the morning breakout stocks — volume may have dried up. What about
+> the stocks the in-house scanner shows with active volume?"
+
+Note: R70/R70b never reused the morning names. Selection at each closing window
+was the day's top movers at t0, plus every stock as a base rate.
+
+## Scanner watch list
+
+`backtest/close15/scanner_close.py`:
+- Hits = R56 replayed scanner first-fires (2025-06-20 → 06-24) plus live
+  in-house `scan_results` (06-25 → 10-01, every fire). That is 22,165 hits on
+  4,646 symbol-days.
+- Live hits peak in the afternoon (4,585 in the 14:00 hour).
+- A name joins window t0 in the **scanner's own direction** (BUY → long,
+  SELL → short) if it fired before t0. Three lookbacks: any time, last 60 min,
+  last 30 min.
+
+Outcomes measured:
+- **hold:** enter at the t0 open, exit at the window end;
+- **trig:** open15 trigger on bars;
+- **tick / tickA:** open15 trigger on ticks (17 days), plus the A grade;
+- **→cls:** hold from t0 to the last continuous close.
+
+## Result
+
+**Pre-CAS (≈230 days), all 4 windows × 3 lookbacks × 2 sides:**
+- Every cell is net-negative.
+- Best: BUY names fired in the last 30 min, 14:45→close, gross +0.09% / net
+  −0.008%, failing in H2.
+
+**Post-CAS longs** (BUY names) lose everywhere, −0.02% to −0.13% gross.
+
+**Post-CAS shorts:** one positive cell. SELL names, 14:55→15:10, held with no
+trigger:
+
+| Variant | n | Win | Gross | Net | H1 / H2 |
+|---|---:|---:|---:|---:|---|
+| Hold | 273 (37 days) | 68.5% | +0.134% | +0.034% | both + |
+| Tick A | 20 | 80% | +0.125% | +0.025% | |
+
+**This is not a scanner edge.** The whole F&O universe falls 14:55→15:10 on
+33 of 37 post-CAS days (avg −0.077%). The scanner-SELL short beats the
+universe by only **+0.029%**. Pre-CAS the same cell was +0.040% gross and
+−0.007% vs universe.
+
+## A new structural observation: post-CAS 15:00–15:09 sell pressure
+
+Cumulative return from the 14:30 open (`close_drift_profile.py`):
+
+| | 15:00→15:09 | Down days | Pre-CAS same stretch |
+|---|---:|---:|---|
+| Equal-weight F&O universe | −0.05% | 74% | +0.02%, 41% down |
+| NIFTY | −0.03% | 71% | ≈ 0 |
+
+The timing fits forced or pre-emptive exits of intraday longs before Zerodha's
+15:12 MIS square-off in CAS stocks. That square-off sat at 15:20 inside the
+continuous session before 2026-08-03.
+
+It is **too small to trade**:
+- −0.05% per stock vs ~0.10% MIS round trip;
+- −0.03% on NIFTY vs futures round-trip costs of the same order.
+
+It also rests on only 42 days. **Watch item:** re-measure at ~100 post-CAS
+days. It matters as a *cost* for any long position still open at 15:00
+(sector_follow's 15:05 entry buys into this dip, which may help its fills).
+
+## Verdict
+
+**REJECT unchanged.** Selecting by active scanner volume does not create a
+closing-window edge in either direction. The only positive short cell is
+market-wide post-CAS drift.
