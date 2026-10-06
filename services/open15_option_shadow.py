@@ -673,8 +673,25 @@ def insert_watched_row(
     cannot drift. ``cf_source`` is left NULL here: whichever pricer stamps
     the row sets it (``live`` / ``bars``). ``contract`` None journals a
     ``no_contract`` row so the day says so.
+
+    One row per ``(trade_date, symbol, side)`` (issue #757): returns ``None``
+    when the day already has one, so no caller can journal a name twice.
     """
-    from database.open15_breakout_db import WATCHED_FILL, WATCHED_REASON, insert_trade
+    from database.open15_breakout_db import (
+        WATCHED_FILL,
+        WATCHED_REASON,
+        insert_trade,
+        watched_row_exists,
+    )
+
+    if watched_row_exists(trade_date, cand["symbol"], cand["side"]):
+        logger.warning(
+            "open15 watched: %s %s %s already journaled — duplicate refused",
+            trade_date,
+            cand["symbol"],
+            cand["side"],
+        )
+        return None
 
     kw = {
         "trade_date": trade_date,
@@ -877,6 +894,11 @@ def enrich_watched(
                 c["symbol"], c["side"], float(c["break_price"]), trade_date
             )
             rid = insert_watched_row(trade_date, c, contract, exit_minute, mode)
+            if rid is None:
+                # refused as a duplicate (#757) or the insert failed — either
+                # way there is no row of ours to price here
+                res["already"] += 1
+                continue
             if not contract:
                 res["no_contract"] += 1
                 logger.info(

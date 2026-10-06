@@ -799,6 +799,29 @@ def watched_net_of_row(row) -> float | None:
     return round(float(get("opt_pnl")), 2)
 
 
+def watched_row_exists(trade_date: str, symbol: str, side: str | None) -> bool:
+    """True when the day already has a ``fill='watched'`` row for this name (#757).
+
+    Fails OPEN (returns False, so the insert goes ahead) on a read error: a
+    missing counterfactual row is worse than a rare duplicate, which the
+    repair CLI can remove.
+    """
+    try:
+        q = db_session.query(Open15Trade.id).filter(
+            Open15Trade.trade_date == trade_date,
+            Open15Trade.symbol == symbol,
+            Open15Trade.fill == WATCHED_FILL,
+        )
+        if side is not None:
+            q = q.filter(Open15Trade.side == side)
+        return q.first() is not None
+    except Exception:
+        logger.exception("open15: watched-row existence check failed")
+        return False
+    finally:
+        db_session.remove()
+
+
 def watched_pnl_by_date() -> dict[str, float]:
     """Sum of 1-lot watched-break nets per trade_date (issue #728).
 

@@ -327,7 +327,13 @@ def test_stamp_skips_names_without_a_quote_or_that_triggered(monkeypatch):
     # never quoted: left to the bars pass
     svc._stamp_watched_live()
     assert _rows() == [] and svc._risk["watched_track"] == {}
-    # quoted, then triggered before the exit: never journaled as watched
+    # once stamped, the day is closed (#757): nothing re-tracks
+    assert svc._register_watched_breaks() == []
+    # quoted, then triggered before the exit: never journaled as watched (a
+    # fresh day — the arm resets the risk state)
+    from services.open15_breakout_service import _fresh_risk_state
+
+    svc._risk = _fresh_risk_state()
     svc._register_watched_breaks()
     svc._track_watched(
         {

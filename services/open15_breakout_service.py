@@ -635,6 +635,11 @@ def _fresh_risk_state() -> dict:
         # journaled until the scheduled exit: a watched name can still
         # trigger after its break, and a triggered name has no counterfactual.
         "watched_track": {},
+        # issue #757: set by the FIRST stamp at the scheduled exit. The +2 min
+        # retry flatten runs the stamp again, and the monitor keeps polling in
+        # between — without this the retry re-tracked every name and journaled
+        # a second row priced over ~2 minutes.
+        "watched_stamped": False,
     }
 
 
@@ -3875,6 +3880,10 @@ class Open15BreakoutService:
             return []
         if cfg.get("instrument") != "atm_option":
             return []
+        # the scheduled exit has stamped the day (#757): the counterfactual is
+        # closed, so nothing rides the quote poll any more
+        if self._risk.get("watched_stamped"):
+            return []
         try:
             from services.open15_option_shadow import resolve_atm_option
 
@@ -3975,8 +3984,13 @@ class Open15BreakoutService:
         ghost stamp — the last quote before the real exits go out.
 
         A name with no entry mark (never quoted) or one that triggered is
-        left to the bars pass / the trigger's own row. Idempotent per day:
-        the tracker is cleared once stamped. Never raises into the flatten.
+        left to the bars pass / the trigger's own row. Once per day (#757):
+        ``flatten`` also runs as the +2 min retry, and the monitor keeps
+        re-registering broken names between the two runs, so clearing the
+        tracker alone was not enough — the retry journaled every name a second
+        time. The ``watched_stamped`` flag stops both the re-tracking and the
+        second stamp; ``insert_watched_row`` refuses a duplicate row as a
+        second lock. Never raises into the flatten.
         """
         try:
             from database.open15_breakout_db import update_trade
@@ -3987,6 +4001,10 @@ class Open15BreakoutService:
 
             core = self.core
             with self._lock:
+                if self._risk.get("watched_stamped"):
+                    self._risk["watched_track"] = {}
+                    return
+                self._risk["watched_stamped"] = True
                 track = dict(self._risk.get("watched_track") or {})
                 self._risk["watched_track"] = {}
             if not track:

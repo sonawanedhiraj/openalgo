@@ -506,3 +506,168 @@ def test_cli_dry_run_writes_nothing_and_apply_prices(tmp_path, monkeypatch):
     assert r.fill == "watched" and r.break_at == "09:17:12" and r.opt_pnl is not None
     rep2 = cli.run(DATE, DATE, apply=True, tick_dir=tick_dir)
     assert rep2[DATE]["result"]["already"] == 1 and len(_rows()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# issue #757 — the 09:30 stamp + the 09:32 retry flatten journaled every name
+# twice; one row per (date, symbol, side), priced at the scheduled exit
+# --------------------------------------------------------------------------- #
+class _FlattenCore:
+    """Just enough of ``Open15Core`` for the monitor and a full ``flatten``."""
+
+    def __init__(self):
+        self.selected = {"INFY": "L"}
+        self.entered: dict = {}
+        self.gaps = {"INFY": 0.0456}
+        self.sym = {"INFY": {}}
+        self.finalized = True
+        self.watch_source = {"INFY": "seed"}
+        self.watch_stats = {
+            "INFY": {"level_broken": True, "max_vol_ratio": 1.1, "max_vol_ratio_beyond": 1.1}
+        }
+
+    def watch_snapshot(self):
+        return {
+            "INFY": {
+                "level_broken": True,
+                "entered": False,
+                "watch_source": "seed",
+                "first_break_at": "09:17:12",
+                "first_break_price": 1636.4,
+            }
+        }
+
+
+def _watched_svc(monkeypatch):
+    from services import open15_pnl_curve as curve
+    from services.open15_breakout_service import Open15BreakoutService
+
+    monkeypatch.setattr(shadow, "resolve_atm_option", _contract)
+    quote = {"ltp": 24.3, "asof": "09:17:16"}
+
+    def fake_live_pnl(watched=None):
+        return {
+            "status": "idle",
+            "date": DATE,
+            "asof": quote["asof"],
+            "watched": [
+                {"symbol": w["symbol"], "contract": w["contract"], "ltp": quote["ltp"]}
+                for w in (watched or [])
+            ],
+            "watched_quotes_ok": True,
+        }
+
+    monkeypatch.setattr(curve, "live_pnl", fake_live_pnl)
+    svc = Open15BreakoutService(order_placer=lambda mode, order: {"status": "success"})
+    svc.core = _FlattenCore()
+    svc._log_date = DATE
+    svc.day_status = "armed"
+    svc.day_config = {
+        **svc.day_config,
+        "instrument": "atm_option",
+        "watched_cf_enabled": True,
+        "exit_time": "09:30",
+    }
+    return svc, quote
+
+
+def test_exit_then_retry_flatten_journals_one_watched_row_per_name(monkeypatch):
+    svc, quote = _watched_svc(monkeypatch)
+    svc._risk_tick()  # 09:17:16 — break registered, entry mark 24.3
+    quote.update(ltp=25.85, asof="09:29:58")
+    svc._risk_tick()
+    svc.flatten("eod_0930")
+    assert len(_rows()) == 1
+    # the monitor keeps polling between the exit and the +2 min retry — before
+    # #757 this re-tracked INFY with a fresh entry mark
+    quote.update(ltp=26.5, asof="09:30:05")
+    svc._risk_tick()
+    assert svc._risk["watched_track"] == {}
+    quote.update(ltp=26.1, asof="09:31:58")
+    svc._risk_tick()
+    svc.flatten("eod_retry_0932")
+    rows = _rows()
+    assert len(rows) == 1
+    r = rows[0]
+    assert (r.opt_entry_premium, r.opt_exit_premium) == (24.3, 25.85)  # the 09:30 stamp
+    ev = [e for e in svc.day_log if e["event"] == "watched_counterfactual"]
+    assert len(ev) == 1 and ev[0]["pnl"] == r.opt_pnl
+
+
+def test_insert_watched_row_refuses_a_duplicate_name():
+    cand = {"symbol": "INFY", "side": "L", "break_at": "09:17:12", "break_price": 1636.4}
+    contract = _contract("INFY", "L", 1636.4, DATE)
+    assert shadow.insert_watched_row(DATE, cand, contract, "09:30", "live") is not None
+    assert shadow.insert_watched_row(DATE, cand, contract, "09:30", "live") is None
+    # another side, another day, another name: each is its own row
+    assert shadow.insert_watched_row(DATE, {**cand, "side": "S"}, contract, "09:30", "live")
+    assert shadow.insert_watched_row("2026-09-16", cand, contract, "09:30", "live")
+    assert shadow.insert_watched_row(DATE, {**cand, "symbol": "TCS"}, None, "09:30", "live")
+    assert len(_rows()) == 4
+
+
+def _dup_day():
+    """Two watched rows + two events per name, the pre-#757 shape."""
+    for sym, side, pnl1, pnl2 in (("INFY", "L", 620.0, -103.8), ("TCS", "S", -40.0, -96.0)):
+        for pnl in (pnl1, pnl2):
+            o15db.db_session.add(
+                o15db.Open15Trade(
+                    trade_date=DATE,
+                    symbol=sym,
+                    side=side,
+                    fill="watched",
+                    reason="no_trigger",
+                    status="skipped",
+                    quantity=0,
+                    cf_source="live",
+                    opt_pnl=pnl,
+                )
+            )
+    # a real trade on the same day must never be touched
+    o15db.db_session.add(
+        o15db.Open15Trade(trade_date=DATE, symbol="SBIN", side="L", status="closed", pnl=50.0)
+    )
+    o15db.db_session.commit()
+    o15db.db_session.remove()
+    events = [
+        {"event": "watched_counterfactual", "symbol": "INFY", "side": "L", "pnl": 620.0},
+        {"event": "watched_counterfactual", "symbol": "TCS", "side": "S", "pnl": -40.0},
+        {"event": "watched_counterfactual", "symbol": "INFY", "side": "L", "pnl": -103.8},
+        {"event": "watched_counterfactual", "symbol": "TCS", "side": "S", "pnl": -96.0},
+        {"event": "summary", "watched": 2, "watched_nobreak": 1},
+        {"event": "watched_cf", "watched": 2, "already": 2, "priced": 0},
+    ]
+    assert o15db.save_day_log(DATE, events)
+
+
+def _watched_only():
+    return [r for r in _rows() if r.fill == "watched"]
+
+
+def test_dup_repair_dry_run_writes_nothing():
+    from services import open15_watched_dup_repair as rep
+
+    _dup_day()
+    res = rep.repair(DATE, apply=False)
+    assert sorted(d["symbol"] for d in res["found"]) == ["INFY", "TCS"]
+    assert all(d["id"] > d["kept_id"] for d in res["found"])
+    assert "would drop 2" in res["day_logs"][DATE]
+    assert len(_watched_only()) == 4
+    assert len(o15db.get_day_log(DATE)) == 6
+
+
+def test_dup_repair_apply_keeps_the_exit_stamp_and_is_idempotent():
+    from services import open15_watched_dup_repair as rep
+
+    _dup_day()
+    res = rep.repair(DATE, apply=True, backup=False)
+    assert res["deleted"] == 2
+    assert [(r.symbol, r.opt_pnl) for r in _watched_only()] == [("INFY", 620.0), ("TCS", -40.0)]
+    assert o15db.watched_pnl_by_date()[DATE] == 580.0
+    log = o15db.get_day_log(DATE)
+    wcf = [e for e in log if e["event"] == "watched_counterfactual"]
+    assert [(e["symbol"], e["pnl"]) for e in wcf] == [("INFY", 620.0), ("TCS", -40.0)]
+    assert [e["event"] for e in log][-2:] == ["summary", "watched_cf"]  # counts untouched
+    # the real trade survives; a second run finds nothing
+    assert [r.symbol for r in _rows() if r.fill != "watched"] == ["SBIN"]
+    assert rep.repair(DATE, apply=True, backup=False)["status"] == "nothing to repair"
