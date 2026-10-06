@@ -2047,6 +2047,21 @@ Rules, each load-bearing:
   position.
 - **An ACK is not a fill (#626).** Every entry and exit is verified through the
   order book. A refused entry becomes `fill='paper'` and never joins P&L.
+- **Entry LIMITs use the symbol's own tick and round UP (issue #759).** A
+  hard-coded nearest-₹0.05 rounding priced BANDHANBNK's 168.27 auction close at
+  168.25 on the first session, so the buy never filled. The tick comes from the
+  master contract (0.01 / 0.05 / 0.1) through
+  `synthetic_market_order_service._tick_size` / `_round_to_tick`.
+- **An entry never filled is not a position (#759).** At 15:45 an entry still
+  unfilled is cancelled (`cancel_order` routes a sandbox order id to the
+  sandbox book) and journalled `status='unfilled'`, `fill='none'`. The T+1
+  exit re-checks any row still `placed`: filled → sold; refused → paper;
+  stale → cancelled + `unfilled`, no SELL. An unreadable status still sends.
+- **Holidays.** Jobs are mon-fri, and the arm and the exit ask
+  `is_trading_day(d, 'NSE')`; a weekday `SPECIAL_SESSION` (Muhurat-style, no
+  15:15 auction) does not arm. The exit sells every real entry dated before
+  today, so a holiday carries the position to the next trading day; the EOD
+  summary and `/api/status` (`next_exit_date`) name that day.
 - **One P&L definition:** `net_pnl_of_row` over `real_closed_rows`. P&L realizes
   on the EXIT day, so the dashboard keys "today" and the curve on `exit_at`.
 

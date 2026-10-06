@@ -63,7 +63,12 @@ class Broker:
         self.holdings = []
         self.positions = []
         self.book_readable = True
+        self.cancelled = []
         self._n = 0
+
+    def cancel(self, oid):
+        self.cancelled.append(oid)
+        return {"status": "success", "orderid": oid}
 
     def quote_batch(self, symbols):
         return {s: dict(self.quotes[s]) for s in symbols if s in self.quotes}
@@ -76,6 +81,8 @@ class Broker:
 
     def fill(self, oid):
         o = next(o for o in self.orders if o["orderid"] == oid)
+        if self.fill_status == "pending":
+            return {"status": "pending", "price": None, "qty": None, "message": None}
         if self.fill_status == "rejected":
             return {
                 "status": "rejected",
@@ -92,7 +99,7 @@ class Broker:
         return self.holdings, self.positions
 
 
-def _svc(clock, broker, mode="sandbox", notes=None, paused=False):
+def _svc(clock, broker, mode="sandbox", notes=None, paused=False, ticks=None):
     notes = notes if notes is not None else []
     svc = CasAuctionReversalService(
         universe_provider=lambda: ["AAA", "BBB", "CCC", "DDD"],
@@ -104,6 +111,9 @@ def _svc(clock, broker, mode="sandbox", notes=None, paused=False):
         notifier=notes.append,
         trading_day_checker=lambda d: True,
         config_reader=lambda: dict(CFG),
+        tick_size_reader=lambda s: (ticks or {}).get(s, 0.05),
+        order_canceller=broker.cancel,
+        next_trading_day=lambda d: d + timedelta(days=3 if d.weekday() == 4 else 1),
         now=clock,
         sleep=lambda s: None,
     )
@@ -371,3 +381,192 @@ def test_healthy_iep_feed_does_not_alert():
     _run_session(clock, broker, svc)
     assert svc.day["iep_feed"]["moved"] == 4
     assert not any("not reaching" in n for n in notes)
+
+
+# --------------------------------------------------------------------------- issue #759
+def test_buy_limit_rounds_up_on_the_symbols_own_tick():
+    from services.cas_auction_reversal_service import buy_limit_price
+
+    assert buy_limit_price(168.27, 0.01) == 168.27  # BANDHANBNK: exact, not 168.25
+    assert buy_limit_price(168.27, 0.05) == 168.30  # never below the price to cross
+    assert buy_limit_price(1368.94, 0.1) == 1369.0
+    assert buy_limit_price(99.25, 0.05) == 99.25
+
+
+def test_sandbox_entry_uses_the_symbol_tick():
+    clock, broker = Clock(datetime(2026, 10, 5, 15, 0, tzinfo=IST)), Broker()
+    svc = _svc(clock, broker, ticks={"AAA": 0.01})
+    _run_session(clock, broker, svc)
+    broker.quotes["AAA"]["ltp"] = 99.27
+    broker.quotes["CCC"]["ltp"] = 98.12
+    clock.at("15:32:00")
+    svc.run_fill()
+    by = {o["symbol"]: o["price"] for o in broker.orders}
+    assert by == {"AAA": 99.27, "CCC": 98.15}  # 0.01 exact; 0.05 rounds UP
+
+
+def test_unfilled_entry_is_cancelled_at_eod_and_never_sold():
+    clock, broker, notes = Clock(datetime(2026, 10, 5, 15, 0, tzinfo=IST)), Broker(), []
+    svc = _svc(clock, broker, notes=notes)
+    _run_session(clock, broker, svc)
+    broker.quotes["AAA"]["ltp"] = 99.25
+    broker.quotes["CCC"]["ltp"] = 98.10
+    broker.fill_status = "pending"  # the LIMIT never executes
+    clock.at("15:32:00")
+    assert svc.run_fill()["unverified"] == 2
+    clock.at("15:45:00")
+    summary = svc.run_eod_summary()
+    assert sorted(summary["entries_unfilled"]) == ["AAA", "CCC"]
+    assert sorted(broker.cancelled) == sorted(o["orderid"] for o in broker.orders)
+    rows = cdb.trades_for_date("2026-10-05")
+    assert all(r.status == "unfilled" and r.fill == "none" for r in rows)
+    assert cdb.net_pnl_of_row(rows[0]) is None
+    assert any("never filled" in n for n in notes)
+    assert cdb.open_positions(before_date="2026-10-06") == []
+    clock.at("09:16:00", datetime(2026, 10, 6).date())
+    n = len(broker.orders)
+    assert svc.run_exit() == {"status": "no_positions"} and len(broker.orders) == n
+
+
+def test_eod_never_cancels_a_filled_entry():
+    clock, broker = Clock(datetime(2026, 10, 5, 15, 0, tzinfo=IST)), Broker()
+    svc = _svc(clock, broker)
+    _run_session(clock, broker, svc)
+    broker.quotes["AAA"]["ltp"] = 99.25
+    broker.quotes["CCC"]["ltp"] = 98.10
+    clock.at("15:32:00")
+    svc.run_fill()
+    clock.at("15:45:00")
+    assert svc.run_eod_summary()["entries_unfilled"] == []
+    assert broker.cancelled == []
+
+
+def _placed_row(symbol="BANDHANBNK", oid="OLD1"):
+    return cdb.record_trade(
+        mode="sandbox",
+        trade_date="2026-10-05",
+        symbol=symbol,
+        exchange="NSE",
+        product="CNC",
+        quantity=297,
+        entry_order_id=oid,
+        status="placed",
+        fill="real",
+    )
+
+
+def test_t1_exit_settles_a_stale_placed_row_instead_of_selling():
+    """The 2026-10-05 BANDHANBNK shape: a row left 'placed' is not a position."""
+    broker = Broker()
+    rid = _placed_row()
+    broker.orders.append({"symbol": "BANDHANBNK", "quantity": 297, "orderid": "OLD1"})
+    broker.fill_status = "pending"
+    clock = Clock(datetime(2026, 10, 6, 9, 16, tzinfo=IST))
+    svc = _svc(clock, broker)
+    assert svc.run_exit() == {"status": "no_positions"}
+    assert [o for o in broker.orders if o.get("action") == "SELL"] == []
+    assert broker.cancelled == ["OLD1"]
+    r = next(r for r in cdb.trades_for_date("2026-10-05") if r.id == rid)
+    assert r.status == "unfilled" and r.fill == "none"
+
+
+def test_t1_exit_sells_a_placed_row_that_did_fill():
+    broker = Broker()
+    _placed_row()
+    broker.orders.append(
+        {"symbol": "BANDHANBNK", "quantity": 297, "orderid": "OLD1", "price": 168.27}
+    )
+    broker.holdings = [{"symbol": "BANDHANBNK", "exchange": "NSE", "quantity": 297}]
+    clock = Clock(datetime(2026, 10, 6, 9, 16, tzinfo=IST))
+    svc = _svc(clock, broker)
+    out = svc.run_exit()
+    assert out["results"][0]["status"] == "closed"
+    r = cdb.real_closed_rows()[0]
+    assert r.entry_price == 168.27 and r.entry_qty == 297
+
+
+def test_t1_exit_with_unreadable_entry_status_still_sends():
+    broker = Broker()
+    _placed_row()
+    clock = Clock(datetime(2026, 10, 6, 9, 16, tzinfo=IST))
+    svc = _svc(clock, broker)
+    svc._fill_reader = lambda oid: None if oid == "OLD1" else broker.fill(oid)
+    svc.run_exit()
+    assert [(o["symbol"], o["action"]) for o in broker.orders] == [("BANDHANBNK", "SELL")]
+
+
+def test_holiday_skips_the_exit_and_the_next_trading_day_sells():
+    broker = Broker()
+    clock, svc = _bought_yesterday(broker)  # bought Mon 2026-10-05
+    svc._trading_day = lambda d: d.isoformat() != "2026-10-06"  # Tue = holiday
+    assert svc.run_exit() == {"status": "skipped", "reason": "not_trading_day"}
+    assert all(o["action"] == "BUY" for o in broker.orders)
+    clock.at("09:16:00", datetime(2026, 10, 7).date())
+    broker.holdings = [
+        {"symbol": "AAA", "exchange": "NSE", "quantity": 503},
+        {"symbol": "CCC", "exchange": "NSE", "quantity": 509},
+    ]
+    out = svc.run_exit()
+    assert {r["symbol"] for r in out["results"] if r["status"] == "closed"} == {"AAA", "CCC"}
+
+
+def test_eod_summary_names_the_exit_day_across_a_weekend():
+    clock, broker, notes = Clock(datetime(2026, 10, 9, 15, 0, tzinfo=IST)), Broker(), []
+    svc = _svc(clock, broker, notes=notes)  # Friday
+    _run_session(clock, broker, svc)
+    broker.quotes["AAA"]["ltp"] = 99.25
+    broker.quotes["CCC"]["ltp"] = 98.10
+    clock.at("15:32:00")
+    svc.run_fill()
+    clock.at("15:45:00")
+    assert svc.run_eod_summary()["exit_on"] == "2026-10-12"
+    assert any("T+1 exit 2026-10-12 09:16" in n for n in notes)
+
+
+def test_production_trading_day_checker_uses_the_nse_calendar(monkeypatch):
+    from datetime import date
+
+    import database.market_calendar_db as mcal
+    import services.data_freshness_service as dfs
+    from services.cas_auction_reversal_service import production_trading_day_checker
+
+    seen = []
+
+    def fake_is_trading_day(d, exchange=None):
+        seen.append(exchange)
+        return d != date(2026, 10, 20)  # Dussehra
+
+    monkeypatch.setattr(dfs, "is_trading_day", fake_is_trading_day)
+    monkeypatch.setattr(
+        mcal,
+        "get_special_session",
+        lambda d, ex: {"start_ms": 1, "end_ms": 2} if d == date(2026, 11, 9) else None,
+    )
+    assert production_trading_day_checker(date(2026, 10, 20)) is False
+    assert production_trading_day_checker(date(2026, 11, 9)) is False  # special session
+    assert production_trading_day_checker(date(2026, 10, 21)) is True
+    assert set(seen) == {"NSE"}
+
+
+def test_production_canceller_uses_cancel_order_with_the_api_key(monkeypatch):
+    import services.cancel_order_service as cos
+    import services.cas_auction_reversal_service as mod
+
+    calls = []
+
+    def fake_cancel(orderid, api_key=None, auth_token=None, broker=None):
+        calls.append((orderid, api_key))
+        return True, {"status": "success", "orderid": orderid}, 200
+
+    monkeypatch.setattr(cos, "cancel_order", fake_cancel)
+    monkeypatch.setattr(mod, "_api_key", lambda: "k")
+    assert mod.production_order_canceller("26100512278900")["status"] == "success"
+    assert calls == [("26100512278900", "k")]
+
+
+def test_production_next_trading_day_skips_the_weekend():
+    from datetime import date
+
+    from services.cas_auction_reversal_service import production_next_trading_day
+
+    assert production_next_trading_day(date(2026, 10, 9)) == date(2026, 10, 12)
