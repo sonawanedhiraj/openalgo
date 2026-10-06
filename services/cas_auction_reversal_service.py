@@ -37,9 +37,21 @@ Daily schedule (IST, mon-fri, trading days only):
   auction participant pays (a sandbox MARKET order would take the ask, and the
   depth after 15:30 is not a market). Both modes: every entry is verified
   through the order book — an ACK is not a fill (#626); a refused entry is
-  ``fill='paper'`` and never joins P&L.
+  ``fill='paper'`` and never joins P&L. Every entry LIMIT is priced on the
+  symbol's own tick (``SymToken.tick_size``) and a BUY rounds UP, so it is
+  never below the price it must cross (issue #759: a nearest-0.05 rounding put
+  168.27 at 168.25 and the buy never filled).
 * 15:45 ``eod_summary`` — the final auction close for every candidate (the
-  measurement), entry-vs-close check, Telegram.
+  measurement), entry-vs-close check, Telegram. An entry STILL unfilled here
+  is cancelled and journalled ``status='unfilled'`` (``fill='none'``): it is
+  not a position, so the T+1 exit never tries to sell it (#759).
+
+Holidays: every job is ``mon-fri`` and the arm and the exit additionally ask
+the NSE holiday calendar (``data_freshness_service.is_trading_day`` with
+``exchange='NSE'``). A weekday ``SPECIAL_SESSION`` (a Muhurat-style evening
+session — no closing auction at 15:15) does not arm. Entries made before a
+holiday are exited at 09:16 on the next trading day (the exit sells every real
+entry dated before today, so a skipped day carries forward by construction).
 
 Mode: ``sandbox`` or ``live`` per order via ``resolve_order_mode(STRATEGY_NAME)``
 (the /strategies toggle, default-deny sandbox). Going live is the operator's
@@ -76,7 +88,6 @@ STRATEGY_NAME = "cas_auction_reversal"
 NOTIFY_EVENT = "cas_auction_reversal"
 EXCHANGE = "NSE"
 PRODUCT = "CNC"
-TICK = 0.05
 
 # Fixed schedule (code constants — the research measured exactly these points).
 RESET_TIME = time(9, 0)
@@ -208,8 +219,12 @@ def production_config_reader() -> dict:
 # --------------------------------------------------------------------------- #
 # Pure helpers
 # --------------------------------------------------------------------------- #
-def round_to_tick(px: float, tick: float = TICK) -> float:
-    return round(round(px / tick) * tick, 2)
+def buy_limit_price(px: float, tick: float) -> float:
+    """A BUY LIMIT on the symbol's own tick, rounded UP — never below the price
+    it has to cross (issue #759). Reuses the synthetic-market rounding."""
+    from services.synthetic_market_order_service import _round_to_tick
+
+    return _round_to_tick(float(px), float(tick), "BUY")
 
 
 def dislocation_pct(iep: float | None, ref: float | None) -> float | None:
@@ -476,10 +491,51 @@ def production_notifier(message: str) -> None:
         logger.debug("cas_ar: notify failed", exc_info=True)
 
 
+def production_tick_size(symbol: str) -> float:
+    """The symbol's own NSE tick from the master contract (0.01 / 0.05 / 0.1 …)."""
+    from services.synthetic_market_order_service import _tick_size
+
+    return _tick_size(symbol, EXCHANGE)
+
+
+def production_order_canceller(order_id: str) -> dict:
+    """Cancel one entry. ``cancel_order`` routes a sandbox order id to the
+    sandbox book (``sandbox_order_exists``) and anything else to the broker."""
+    from services.cancel_order_service import cancel_order
+
+    api_key = _api_key()
+    if not api_key:
+        return {"status": "error", "message": "no api key available"}
+    ok, resp, _ = cancel_order(str(order_id), api_key=api_key)
+    resp = dict(resp or {})
+    resp.setdefault("status", "success" if ok else "error")
+    return resp
+
+
 def production_trading_day_checker(d: date) -> bool:
+    """An NSE trading day with a normal session (so a closing auction exists):
+    weekday, not an NSE holiday, and not a weekday SPECIAL_SESSION (Muhurat-style
+    evening session). Reuses the shared calendar; fails open like it does."""
     from services.data_freshness_service import is_trading_day
 
-    return is_trading_day(d)
+    if not is_trading_day(d, EXCHANGE):
+        return False
+    try:
+        from database.market_calendar_db import get_special_session
+
+        if get_special_session(d, EXCHANGE):
+            logger.info("cas_ar: %s is an NSE special session — no closing auction", d)
+            return False
+    except Exception:
+        logger.debug("cas_ar: special-session lookup failed — treating as normal", exc_info=True)
+    return True
+
+
+def production_next_trading_day(d: date) -> date:
+    """The NSE trading day after ``d`` — when the T+1 exit will actually run."""
+    from services.open15_option_shadow import next_trading_day
+
+    return next_trading_day(d)
 
 
 def _beat(name: str) -> None:
@@ -523,6 +579,9 @@ class CasAuctionReversalService:
         notifier: Callable[[str], None] | None = None,
         trading_day_checker: Callable[[date], bool] | None = None,
         config_reader: Callable[[], dict] | None = None,
+        tick_size_reader: Callable[[str], float] | None = None,
+        order_canceller: Callable[[str], dict] | None = None,
+        next_trading_day: Callable[[date], date] | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
         journal: bool = True,
@@ -538,6 +597,9 @@ class CasAuctionReversalService:
         self._notify = notifier or production_notifier
         self._trading_day = trading_day_checker or production_trading_day_checker
         self._config_reader = config_reader or production_config_reader
+        self._tick_size = tick_size_reader or production_tick_size
+        self._cancel = order_canceller or production_order_canceller
+        self._next_trading_day = next_trading_day or production_next_trading_day
         self._now = now or (lambda: datetime.now(_IST))
         self._sleep = sleep or _time.sleep
         self._journal = journal
@@ -825,7 +887,7 @@ class CasAuctionReversalService:
         if mode == "live":
             # Into the auction now: the exchange fills at the single auction price.
             for c in orders:
-                price = round_to_tick(c["iep"] * (1 + LIVE_LIMIT_BUFFER_PCT / 100.0))
+                price = self._buy_limit(c["symbol"], c["iep"] * (1 + LIVE_LIMIT_BUFFER_PCT / 100.0))
                 self._place_entry(c, pricetype="LIMIT", price=price, mode=mode)
             return {"status": "placed", "mode": mode, "orders": len(orders)}
         with self._lock:
@@ -856,13 +918,22 @@ class CasAuctionReversalService:
                     self._record_skip(c, "qty_zero")
                     continue
                 c["qty"] = qty
-                self._place_entry(c, pricetype="LIMIT", price=round_to_tick(close), mode="sandbox")
+                price = self._buy_limit(c["symbol"], close)
+                self._place_entry(c, pricetype="LIMIT", price=price, mode="sandbox")
                 placed += 1
         verified = self._verify_entries()
         with self._lock:
             self.day["filled"] = True
             self.day["pending"] = []
         return {"status": "done", "placed": placed, **verified}
+
+    def _buy_limit(self, symbol: str, px: float) -> float:
+        try:
+            tick = float(self._tick_size(symbol))
+        except Exception:
+            logger.exception("cas_ar: tick lookup failed for %s — using 0.05", symbol)
+            tick = 0.05
+        return buy_limit_price(px, tick if tick > 0 else 0.05)
 
     def _record_skip(self, c: dict, reason: str) -> None:
         if not self._journal:
@@ -975,6 +1046,63 @@ class CasAuctionReversalService:
                     logger.exception("cas_ar: entry verify journal failed")
         return {"filled": filled, "rejected": rejected, "unverified": pending}
 
+    def _mark_unfilled(self, row_id, order_id, note: str) -> dict:
+        """Cancel a never-filled entry and journal it as ``unfilled`` — no
+        position, no P&L bucket, never sold (issue #759)."""
+        cancel = None
+        if order_id:
+            try:
+                cancel = self._cancel(str(order_id))
+            except Exception as e:
+                logger.exception("cas_ar: cancel raised for %s", order_id)
+                cancel = {"status": "error", "message": str(e)}
+        if row_id and self._journal:
+            try:
+                from database.cas_auction_reversal_db import UNFILLED_FILL, update_trade
+
+                update_trade(row_id, status="unfilled", fill=UNFILLED_FILL, error_message=note)
+            except Exception:
+                logger.exception("cas_ar: unfilled journal failed")
+        return cancel or {}
+
+    def _cancel_unfilled_entries(self) -> list[str]:
+        """15:45: an entry still ``placed`` after the auction never filled
+        (a CNC LIMIT that was not marketable). Cancel it so it cannot fill later
+        as an untracked holding, and stop calling it a position."""
+        out = []
+        for e in self.day.get("entries") or []:
+            if e["status"] != "placed":
+                continue
+            res = None
+            if e.get("order_id"):
+                try:
+                    res = self._fill_reader(e["order_id"])
+                except Exception:
+                    logger.exception("cas_ar: EOD fill read raised for %s", e["symbol"])
+            if res and res["status"] == "filled":
+                continue  # _verify_entries already handles fills; never cancel one
+            cancel = self._mark_unfilled(
+                e.get("row_id"),
+                e.get("order_id"),
+                "entry not filled by the EOD check — cancelled",
+            )
+            e["status"] = "unfilled"
+            out.append(e["symbol"])
+            logger.warning("cas_ar: entry %s unfilled at EOD — cancel %s", e["symbol"], cancel)
+        if out:
+            self._alert(
+                f"⚠️ cas_auction_reversal: {len(out)} entr{'y' if len(out) == 1 else 'ies'} "
+                f"never filled — cancelled: {', '.join(out)}"
+            )
+        return out
+
+    def _exit_date_str(self) -> str | None:
+        try:
+            return self._next_trading_day(self._now().date()).isoformat()
+        except Exception:
+            logger.debug("cas_ar: next trading day lookup failed", exc_info=True)
+            return None
+
     # ----- 15:45 EOD summary ---------------------------------------------- #
     def run_eod_summary(self) -> dict:
         self._ensure_day()
@@ -983,6 +1111,7 @@ class CasAuctionReversalService:
             return {"status": "skipped", "reason": "not_armed"}
         if any(e["status"] == "placed" for e in self.day.get("entries") or []):
             self._verify_entries()  # backstop for slow propagation
+        unfilled = self._cancel_unfilled_entries()
         cands = self.day.get("candidates") or []
         closes = self._quote_batch([c["symbol"] for c in cands]) if cands else {}
         closes = closes or {}
@@ -1026,13 +1155,17 @@ class CasAuctionReversalService:
             "candidates": len(cands),
             "selected": sum(1 for c in cands if c["selected"]),
             "entries_open": n_open,
+            "entries_unfilled": unfilled,
             "still_below_threshold_at_close": still,
+            "exit_on": self._exit_date_str(),
         }
         with self._lock:
             self.day["summary"] = summary
         lines = [
             f"📉 cas_auction_reversal {tds} ({summary['mode']})",
-            f"polls {summary['polls']} · candidates {summary['candidates']} · bought {n_open}",
+            f"polls {summary['polls']} · candidates {summary['candidates']} · bought {n_open}"
+            + (f" · unfilled+cancelled {len(unfilled)}" if unfilled else "")
+            + (f" · T+1 exit {summary['exit_on']} 09:16" if n_open and summary["exit_on"] else ""),
             f"IEP→close: {still}/{len(hit)} still ≥{self.day['config']['threshold_pct']}% below the last print at the close",
         ]
         for c in [c for c in cands if c["selected"]][:12]:
@@ -1055,7 +1188,7 @@ class CasAuctionReversalService:
             return {"status": "skipped", "reason": "journal_disabled"}
         from database.cas_auction_reversal_db import open_positions, update_trade
 
-        rows = open_positions(before_date=today.isoformat())
+        rows = self._settle_placed_rows(open_positions(before_date=today.isoformat()))
         if not rows:
             return {"status": "no_positions"}
         try:
@@ -1138,6 +1271,42 @@ class CasAuctionReversalService:
             )
         return {"status": "done", "results": out}
 
+    def _settle_placed_rows(self, rows: list) -> list:
+        """A row still ``placed`` on a later day was never confirmed. Ask the
+        order book: filled → it is a position (sell it); refused / cancelled /
+        still pending a day later → ``unfilled``, nothing to sell. An UNREADABLE
+        status keeps the row — the exit always sends (a CNC SELL cannot short)."""
+        from database.cas_auction_reversal_db import update_trade
+
+        keep = []
+        for r in rows:
+            if r.status != "placed" or not r.entry_order_id:
+                keep.append(r)
+                continue
+            try:
+                res = self._fill_reader(r.entry_order_id)
+            except Exception:
+                logger.exception("cas_ar exit: entry status raised for %s", r.symbol)
+                res = None
+            if res is None:
+                keep.append(r)
+            elif res["status"] == "filled":
+                qty = res["qty"] if res.get("qty") is not None else r.quantity
+                update_trade(r.id, status="open", entry_price=res["price"], entry_qty=qty)
+                r.status, r.entry_price, r.entry_qty = "open", res["price"], qty
+                keep.append(r)
+            elif res["status"] == "rejected":  # refused post-ACK (#626) → paper
+                update_trade(
+                    r.id, status="rejected", fill="paper", error_message=res.get("message")
+                )
+                logger.warning("cas_ar exit: %s entry was refused — nothing to sell", r.symbol)
+            else:  # still pending a trading day later: it never filled
+                self._mark_unfilled(
+                    r.id, r.entry_order_id, "entry never filled (stale order) — cancelled, no sell"
+                )
+                logger.warning("cas_ar exit: %s entry never filled — cancelled, skipped", r.symbol)
+        return keep
+
     def run_exit_retry(self) -> dict:
         return self.run_exit(reason="retry")
 
@@ -1172,6 +1341,7 @@ class CasAuctionReversalService:
             "candidates": d.get("candidates"),
             "entries": d.get("entries"),
             "summary": d.get("summary"),
+            "next_exit_date": self._exit_date_str(),
             "schedule": {
                 "exit": EXIT_TIME.isoformat(),
                 "exit_retry": EXIT_RETRY_TIME.isoformat(),

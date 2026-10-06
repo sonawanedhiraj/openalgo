@@ -6,8 +6,9 @@ ONLY these tables and touches nothing else:
 * ``cas_ar_config``     — the single-row (id=1) UI-editable config (issue #755);
   NULL fields fall through to the ``CAS_AR_*`` env seed, then the code default.
 * ``cas_ar_trades``     — one row per position: the CNC BUY taken in the
-  closing auction (status ``placed``/``open``/``rejected``/``error``) and its
-  T+1 morning SELL (``closed`` with realized P&L).
+  closing auction (status ``placed``/``open``/``rejected``/``error``, or
+  ``unfilled`` + ``fill='none'`` when it never filled and was cancelled —
+  issue #759) and its T+1 morning SELL (``closed`` with realized P&L).
 * ``cas_ar_polls``      — every monitor poll for every universe symbol across
   15:14:30–15:33 IST: last price, the auction's indicative close
   (``indicative_close_price``) and imbalance. This is the pre-registered
@@ -61,7 +62,10 @@ Base.query = db_session.query_property()
 # ``real`` is money. ``paper`` = the broker REFUSED the entry (placement or
 # post-ACK, the #548/#626 shape) — nothing was held, never joins real P&L.
 REAL_FILL = "real"
-NON_REAL_FILLS = ("paper",)
+# ``none`` = the entry never filled and was cancelled (status ``unfilled``,
+# issue #759): no position, no P&L bucket — not even paper.
+UNFILLED_FILL = "none"
+NON_REAL_FILLS = ("paper", UNFILLED_FILL)
 TRADE_STATUSES = ("placed", "open", "closed", "rejected", "error")
 
 
