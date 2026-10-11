@@ -3,7 +3,7 @@ import os
 import re
 import time
 from datetime import date, datetime
-from threading import Thread
+from threading import Lock, Thread
 
 import pytz
 from flask import current_app as app
@@ -351,6 +351,103 @@ def async_master_contract_download(broker):
     return master_contract_status
 
 
+# Single-flight guard for the master contract job (issue #766). One download OR
+# cache load per broker per process at a time. On 2026-10-11 the boot auto-login
+# started a download at 08:51:14 and the browser login resumed the same session
+# at 08:51:52; ``should_download_master_contract`` reads only the last COMPLETED
+# download, so it started a second full 110k-row download while the first was
+# still writing — part of the ~1.5 GB boot RSS peak behind the 10055 abort (#744).
+_master_contract_job_lock = Lock()
+_master_contract_jobs_in_flight: set[str] = set()
+
+
+def is_master_contract_job_running(broker):
+    """True while a master contract download/load for ``broker`` is in flight."""
+    with _master_contract_job_lock:
+        return broker in _master_contract_jobs_in_flight
+
+
+def start_master_contract_job(broker, force_download=False):
+    """Start the master contract download (or cached load) unless one is in flight.
+
+    The single entry point every caller uses — login, headless auto-login, session
+    resume and the manual download button. The in-flight check is atomic with
+    claiming the slot, and it happens BEFORE ``init_broker_status``: resetting the
+    status to ``pending`` under a running job could leave it stuck there once
+    that job has already written ``success``.
+
+    Args:
+        broker: Broker name.
+        force_download: Skip the smart-download check and always download.
+
+    Returns:
+        ``"download"`` or ``"load"`` when a job was started, ``None`` when one
+        was already in flight (the running job finishes the work for everyone).
+    """
+    with _master_contract_job_lock:
+        if broker in _master_contract_jobs_in_flight:
+            logger.info(
+                f"Master contract job for {broker} already in flight — not starting another"
+            )
+            return None
+        _master_contract_jobs_in_flight.add(broker)
+
+    def _release():
+        with _master_contract_job_lock:
+            _master_contract_jobs_in_flight.discard(broker)
+
+    try:
+        init_broker_status(broker)
+        if force_download:
+            should_download, reason = True, "forced"
+        else:
+            should_download, reason = should_download_master_contract(broker)
+        logger.info(
+            f"Smart download check for {broker}: should_download={should_download}, reason={reason}"
+        )
+        target = (
+            async_master_contract_download if should_download else load_existing_master_contract
+        )
+
+        def _run():
+            try:
+                target(broker)
+            except Exception:
+                logger.exception(f"Master contract job for {broker} raised")
+            finally:
+                _release()
+
+        Thread(target=_run, daemon=True).start()
+        return "download" if should_download else "load"
+    except Exception:
+        _release()
+        raise
+
+
+def ensure_master_contract_loaded(broker):
+    """Start the master contract job only if this process has not loaded it yet.
+
+    For a session RESUME (issue #766): the broker token is unchanged, so a job is
+    needed only when the symbol cache is not loaded in this process — e.g. a
+    restart that found the token still live at boot, when no login ran. Returns
+    what ``start_master_contract_job`` returned, or ``"loaded"`` when nothing was
+    needed. Never raises.
+    """
+    try:
+        from database.token_db_enhanced import get_cache
+
+        cache = get_cache()
+        if cache.cache_loaded and cache.is_cache_valid():
+            return "loaded"
+    except Exception:
+        logger.exception("ensure_master_contract_loaded: cache check failed — loading anyway")
+    try:
+        return start_master_contract_job(broker)
+    except Exception:
+        logger.exception(f"ensure_master_contract_loaded: could not start job for {broker}")
+        return None
+
+
 def notify_broker_session_refreshed(username, broker):
     """Emit a SocketIO ``broker_session_refreshed`` event after a broker re-login.
 
@@ -521,29 +618,15 @@ def handle_auth_success(auth_token, user_session_key, broker, feed_token=None, u
     )
     if inserted_id:
         logger.info(f"Database record upserted with ID: {inserted_id}")
-        # Initialize master contract status for this broker
-        init_broker_status(broker)
+        # Smart download or cached load, single-flight (issue #766). Started
+        # before the notify so the status row already reads pending/downloading
+        # when ws_recovery's master-contract wait polls it.
+        start_master_contract_job(broker)
 
         # Notify the UI that a fresh broker session landed (event-driven; the WS
         # proxy reconnects off the ZMQ cache-invalidation event upsert_auth()
         # publishes — see notify_broker_session_refreshed for the layer split).
         notify_broker_session_refreshed(user_session_key, broker)
-
-        # Smart download: Check if we need to download or can use cached data
-        should_download, reason = should_download_master_contract(broker)
-        logger.info(
-            f"Smart download check for {broker}: should_download={should_download}, reason={reason}"
-        )
-
-        if should_download:
-            # Start async download in background thread
-            thread = Thread(target=async_master_contract_download, args=(broker,), daemon=True)
-            thread.start()
-        else:
-            # Use cached data - load existing master contract
-            logger.info(f"Skipping download for {broker}: {reason}")
-            thread = Thread(target=load_existing_master_contract, args=(broker,), daemon=True)
-            thread.start()
 
         # Return JSON for AJAX requests (React), redirect for OAuth callbacks
         if is_ajax_request():

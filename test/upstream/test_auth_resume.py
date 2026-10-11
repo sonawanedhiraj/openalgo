@@ -104,14 +104,18 @@ def test_resume_accepts_valid_broker_validation(monkeypatch, app_context):
         get_margin_data=lambda token: {"availablecash": "100.00"},
     )
 
-    def fake_auth_success(**kwargs):
+    # Fork change (issue #766): a resume runs only the session block
+    # (establish_login_session) plus ensure_master_contract_loaded, never the
+    # full handle_auth_success, because the token being resumed is the stored one.
+    def fake_establish(**kwargs):
         session["logged_in"] = True
         session["broker"] = kwargs["broker"]
 
     monkeypatch.setattr(auth_db, "get_auth_token_dbquery", lambda username: _auth_record())
     monkeypatch.setattr(auth_db, "decrypt_token", lambda token: "plain-token")
     monkeypatch.setattr(importlib, "import_module", lambda module_path: fake_funds)
-    monkeypatch.setattr(auth_utils, "handle_auth_success", fake_auth_success)
+    monkeypatch.setattr(auth_utils, "establish_login_session", fake_establish)
+    monkeypatch.setattr(auth_utils, "ensure_master_contract_loaded", lambda broker: "loaded")
 
     response, status_code = auth_bp_module._try_resume_broker_session("rajandran")
 

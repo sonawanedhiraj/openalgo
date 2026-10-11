@@ -1,12 +1,10 @@
-from threading import Thread
-
 from flask import Blueprint, jsonify, request, session
 
-from database.master_contract_status_db import check_if_ready, get_status, init_broker_status
+from database.master_contract_status_db import check_if_ready, get_status
 from utils.auth_utils import (
-    async_master_contract_download,
     get_master_contract_cutoff,
     should_download_master_contract,
+    start_master_contract_job,
 )
 from utils.logging import get_logger
 from utils.session import check_session_validity
@@ -181,10 +179,15 @@ def force_master_contract_download():
                     {"status": "skipped", "message": reason, "should_download": False}
                 ), 200
 
-        # Initialize status and start download
-        init_broker_status(broker)
-        thread = Thread(target=async_master_contract_download, args=(broker,), daemon=True)
-        thread.start()
+        # Single-flight (issue #766): never a second download alongside a running one.
+        if start_master_contract_job(broker, force_download=True) is None:
+            return jsonify(
+                {
+                    "status": "skipped",
+                    "message": "A master contract download is already in progress",
+                    "should_download": False,
+                }
+            ), 200
 
         return jsonify(
             {"status": "success", "message": "Master contract download started", "started": True}

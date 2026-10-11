@@ -249,24 +249,30 @@ def _try_resume_broker_session(username):
             _mark_stale_and_return_none()
             return None
 
-        # Token is valid — resume the session via handle_auth_success
+        # Token is valid — resume the session.
         logger.info(f"Resuming existing broker session for {username} (broker: {broker})")
 
-        from utils.auth_utils import handle_auth_success
+        from utils.auth_utils import ensure_master_contract_loaded, establish_login_session
 
-        # Call handle_auth_success for its side effects (session setup, DB upsert,
-        # master contract loading) but ignore its response format — the login
-        # endpoint must always return JSON for the React frontend's fetch() call.
+        # The token being resumed IS the stored token, so this is the session
+        # block of handle_auth_success only (issue #766). Calling the full
+        # handle_auth_success re-wrote the same token: upsert_auth published
+        # CACHE_INVALIDATE (WS pool torn down and rebuilt), broker_session_refreshed
+        # fired a second time, a second master contract download started beside
+        # the auto-login's (2026-10-11 boot peak, #744), and token_updated_at was
+        # re-stamped to now, which made a pre-07:30 token look post-flush (#719).
         try:
-            handle_auth_success(
-                auth_token=auth_token,
+            establish_login_session(
                 user_session_key=username,
                 broker=broker,
                 feed_token=feed_token,
                 user_id=user_id,
             )
+            # Still needed when this process never loaded the symbol cache (a
+            # restart that found the token live at boot). Single-flight, never raises.
+            ensure_master_contract_loaded(broker)
         except Exception as e:
-            logger.error(f"handle_auth_success failed during resume: {e}", exc_info=True)
+            logger.error(f"Session setup failed during resume: {e}", exc_info=True)
             # Clear partial session state and fall through to OAuth
             session.pop("logged_in", None)
             session.pop("broker", None)
