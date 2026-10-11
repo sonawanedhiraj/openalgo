@@ -515,6 +515,11 @@ def _effective_today(svc) -> tuple[dict | None, str]:
       ``holiday``     — the arm's #682 trading-day gate fired: NSE is closed
                         today, deliberately no arm and no day log.
 
+    Both preview sources resolve through ``load_arm_config`` — the arm's own
+    loader — never ``svc.day_config`` (issue #764): on a process that has not
+    armed today that is the constructor's env-only snapshot, and the holiday
+    gate returns before the arm loads anything, so it ignored the saved row.
+
     Never raises: an unreadable day log degrades to ``not_armed`` rather than
     taking down the config endpoint the form depends on.
     """
@@ -525,12 +530,12 @@ def _effective_today(svc) -> tuple[dict | None, str]:
     from services.open15_log_view import effective_from_armed
 
     if svc is None:
-        return None, "not_armed"
+        return _next_arm_config(svc), "not_armed"
     today = _dt.datetime.now(_pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
     if svc.day_status == "armed" and svc._log_date == today:
         return svc.day_config, "armed"
     if svc.day_status == "holiday" and svc._log_date == today:
-        return svc.day_config, "holiday"
+        return _next_arm_config(svc), "holiday"
     try:
         from database.open15_breakout_db import get_day_log
 
@@ -540,7 +545,22 @@ def _effective_today(svc) -> tuple[dict | None, str]:
                 return armed, "armed_log"
     except Exception:
         logger.exception("open15: armed-snapshot lookup failed")
-    return svc.day_config, "not_armed"
+    return _next_arm_config(svc), "not_armed"
+
+
+def _next_arm_config(svc) -> dict | None:
+    """What the next arm will resolve (issue #764), via the arm's own loader.
+
+    Falls back to ``svc.day_config`` only if the loader itself raises, so the
+    config endpoint the form depends on never 500s.
+    """
+    try:
+        from services.open15_breakout_service import load_arm_config
+
+        return load_arm_config()
+    except Exception:
+        logger.exception("open15: next-arm config preview failed")
+        return getattr(svc, "day_config", None)
 
 
 @open15_bp.route("/api/ladder_preview", methods=["GET"])

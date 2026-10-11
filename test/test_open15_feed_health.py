@@ -275,7 +275,7 @@ def test_holiday_gate_fails_open_to_arming(monkeypatch):
     assert svc.day_status == "skipped_late_boot"
 
 
-def test_effective_today_labels_holiday():
+def test_effective_today_labels_holiday(monkeypatch):
     """The #645 label-the-state rule: a holiday day must say so, never present
     itself as a generic 'not armed'."""
     import pytz as _pytz
@@ -288,9 +288,14 @@ def test_effective_today_labels_holiday():
     svc = _Svc()
     svc.day_status = "holiday"
     svc._log_date = dt.datetime.now(_pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d")
-    svc.day_config = {"instrument": "stock"}
+    svc.day_config = {"instrument": "stock"}  # stale constructor snapshot
+    # issue #764: the holiday gate returns before the arm loads anything, so
+    # the preview is what the NEXT arm resolves, not this snapshot
+    import services.open15_breakout_service as mod
+
+    monkeypatch.setattr(mod, "load_arm_config", lambda: {"instrument": "atm_option"})
     cfg, src = _effective_today(svc)
-    assert src == "holiday" and cfg == {"instrument": "stock"}
+    assert src == "holiday" and cfg == {"instrument": "atm_option"}
 
 
 def test_log_view_twin_tolerates_new_event_and_selection_key():
