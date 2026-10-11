@@ -168,12 +168,72 @@ def test_a_restart_falls_back_to_the_persisted_armed_event(monkeypatch):
 
 def test_a_day_that_never_armed_says_so_instead_of_asserting_defaults(monkeypatch):
     import database.open15_breakout_db as db
+    import services.open15_breakout_service as mod
     from blueprints.open15_breakout import _effective_today
 
     monkeypatch.setattr(db, "get_day_log", lambda date: None)
+    monkeypatch.setattr(mod, "load_arm_config", lambda: {"instrument": "atm_option"})
     eff, src = _effective_today(_Svc("idle"))
 
-    assert src == "not_armed" and eff["instrument"] == "stock"
+    # labelled as a preview, and the preview is the ARM's resolution (#764)
+    assert src == "not_armed" and eff["instrument"] == "atm_option"
+
+
+def test_the_not_armed_preview_reads_the_saved_row_not_env_defaults(monkeypatch):
+    """issue #764 - the 2026-10-11 case. The process had not armed, so
+    ``svc.day_config`` was the constructor's env-only snapshot; the line read
+    `stock | margin 30000 | grades A both · B both · C both` under a form
+    showing the saved ATM option / 60000 / A-only row."""
+    import database.open15_breakout_db as db
+    from blueprints.open15_breakout import _effective_today
+    from services.open15_breakout_service import resolve_day_config
+
+    saved = {
+        "margin_per_slot": 60000.0,
+        "sizing_mode": "fixed",
+        "vol_mult": 1.5,
+        "instrument": "atm_option",
+        "trade_side": "both",
+        "trade_grades": "A",
+    }
+    monkeypatch.setattr(db, "get_day_log", lambda date: None)
+    monkeypatch.setattr(db, "get_config", lambda: dict(saved))
+    stale = resolve_day_config(None, 0.0)
+    eff, src = _effective_today(_Svc("idle", None, stale))
+
+    assert src == "not_armed"
+    assert eff["instrument"] == "atm_option"
+    assert eff["margin_per_slot"] == 60000.0
+    assert eff["grade_sides"] == "A:LS,B:-,C:-"
+    assert eff == resolve_day_config(saved, 0.0)  # exactly what arm() resolves
+
+
+def test_a_failing_preview_loader_degrades_to_the_snapshot(monkeypatch):
+    """The endpoint backs the config FORM: a raising loader must not 500 it."""
+    import database.open15_breakout_db as db
+    import services.open15_breakout_service as mod
+    from blueprints.open15_breakout import _effective_today
+
+    def boom():
+        raise RuntimeError("loader down")
+
+    monkeypatch.setattr(db, "get_day_log", lambda date: None)
+    monkeypatch.setattr(mod, "load_arm_config", boom)
+    eff, src = _effective_today(_Svc("idle"))
+
+    assert src == "not_armed" and eff == {"instrument": "stock", "max_trades": 3}
+
+
+def test_arm_and_preview_share_one_loader():
+    """One function, so the preview and the arm cannot drift (#764)."""
+    import inspect
+
+    import services.open15_breakout_service as mod
+
+    src = inspect.getsource(mod.Open15BreakoutService.arm)
+    assert "load_arm_inputs()" in src
+    assert "get_config()" not in src
+    assert "load_arm_inputs()" in inspect.getsource(mod.load_arm_config)
 
 
 def test_yesterdays_arm_is_not_served_as_todays(monkeypatch):

@@ -1082,6 +1082,39 @@ def read_available_cash() -> float | None:
         return None
 
 
+def load_arm_inputs() -> tuple[dict | None, float]:
+    """``(saved_config_row, cum_realized_pnl)`` exactly as the 09:10 arm reads them.
+
+    The one place the arm loads its config inputs, shared with the /logs
+    "the next 09:10 arm will use" preview (``load_arm_config``, issue #764).
+    Before this, the preview served the constructor's ``resolve_day_config(
+    None, 0.0)``, i.e. env-only defaults that ignored the saved row, so on
+    any non-armed day the line contradicted the form above it. One loader
+    means the preview and the arm cannot drift.
+
+    Fails soft to env defaults (logged), exactly as the arm always did.
+    """
+    try:
+        from database.open15_breakout_db import get_config, total_realized_pnl
+
+        cfg_row = get_config()
+        cum_pnl = (
+            total_realized_pnl()
+            if (cfg_row or {}).get("sizing_mode") == "compound"
+            or (os.getenv("OPEN15_SIZING_MODE", "fixed") == "compound")
+            else 0.0
+        )
+    except Exception:
+        logger.exception("open15: config load failed — using env defaults")
+        cfg_row, cum_pnl = None, 0.0
+    return cfg_row, cum_pnl
+
+
+def load_arm_config() -> dict:
+    """The day config an arm would resolve right now (issue #764)."""
+    return resolve_day_config(*load_arm_inputs())
+
+
 def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     """Merge the UI config row over env defaults into today's effective config.
 
@@ -2440,19 +2473,7 @@ class Open15BreakoutService:
                 self._capture_universe = universe_capture
             except Exception:
                 logger.exception("open15: tick writer init failed — capture disabled today")
-        try:
-            from database.open15_breakout_db import get_config, total_realized_pnl
-
-            cfg_row = get_config()
-            cum_pnl = (
-                total_realized_pnl()
-                if (cfg_row or {}).get("sizing_mode") == "compound"
-                or (os.getenv("OPEN15_SIZING_MODE", "fixed") == "compound")
-                else 0.0
-            )
-        except Exception:
-            logger.exception("open15: config load failed — using env defaults")
-            cfg_row, cum_pnl = None, 0.0
+        cfg_row, cum_pnl = load_arm_inputs()
         self.day_config = resolve_day_config(cfg_row, cum_pnl)
         # The budget must fit the ACCOUNT, not just the config (issue #626).
         # Done here rather than in resolve_day_config because it needs a broker
