@@ -91,6 +91,11 @@ def _self_initialising_modules() -> set[str]:
     init: `telegram_db` and `whatsapp_db` create their tables on module load
     (app.py even imports `get_bot_config` purely to trigger it). Detecting this
     keeps the coverage rule honest instead of papering over it with exemptions.
+
+    A module-level ``Base.metadata.create_all(...)`` counts too:
+    `master_contract_status_db` creates its table that way on import. Before
+    #766 it only passed by accident, through a blueprint importing
+    ``init_broker_status``, which writes a status row and creates no table.
     """
     out: set[str] = set()
     for path in sorted(DB_DIR.glob("*.py")):
@@ -99,11 +104,11 @@ def _self_initialising_modules() -> set[str]:
         except SyntaxError:  # pragma: no cover - defensive
             continue
         for node in tree.body:  # module level only, not inside a function
-            if (
-                isinstance(node, ast.Expr)
-                and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Name)
-                and node.value.func.id.startswith("init")
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+                continue
+            func = node.value.func
+            if (isinstance(func, ast.Name) and func.id.startswith("init")) or (
+                isinstance(func, ast.Attribute) and func.attr == "create_all"
             ):
                 out.add(path.stem)
     return out
