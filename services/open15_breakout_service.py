@@ -71,8 +71,12 @@ from services.open15_rating import (
     RULES as RATING_RULES,
 )
 from services.open15_rating import (
+    grade_side_allows,
+    grade_sides_blocked,
     grade_trigger,
-    normalize_trade_grades,
+    grades_traded,
+    legacy_grade_sides,
+    normalize_grade_sides,
     phase_label,
     rating_kw,
     sec_of_day,
@@ -452,6 +456,18 @@ def _watched_cf_enabled_default() -> bool:
     ~10 bar fetches a day off-thread after the exit and never touches an order.
     """
     return os.getenv("OPEN15_WATCHED_CF", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _grade_sides_of(cfg: dict) -> str:
+    """The day's ``grade_sides`` policy (issue #762).
+
+    ``resolve_day_config`` always sets it; a hand-built or pre-#762 config
+    falls back to its #726 ``trade_grades`` + ``trade_side``, which is exactly
+    the rule that config was armed with.
+    """
+    return cfg.get("grade_sides") or legacy_grade_sides(
+        cfg.get("trade_grades"), cfg.get("trade_side") or "both"
+    )
 
 
 def shadow_side_for(trade_side: str, enabled: bool) -> str | None:
@@ -1130,6 +1146,11 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
     # residual-cash sizing (issue #643) — shared resolution with the child
     # mirror fan-out (issue #690), so parent and child read one definition
     residual_enabled, residual_reserve_pct, residual_min_lots = resolve_residual_params(cfg)
+    grade_sides = normalize_grade_sides(
+        cfg.get("grade_sides") or os.getenv("OPEN15_GRADE_SIDES") or None,
+        cfg.get("trade_grades") or os.getenv("OPEN15_TRADE_GRADES"),
+        trade_side,
+    )
     no_entry_after = cfg.get("no_entry_after") or _no_entry_after_default()
     exit_time = cfg.get("exit_time") or _exit_time_default()
     if validate_window(no_entry_after, exit_time):
@@ -1148,10 +1169,13 @@ def resolve_day_config(cfg_row: dict | None, cum_realized_pnl: float) -> dict:
         "vol_mult": vol_mult,
         # issue #721 - volume-ratio ceiling at the trigger (0 = off)
         "max_vol_ratio": resolve_max_vol_ratio(cfg, vol_mult),
-        # issue #726 - which R63 grades place orders (the rest are paper-traded)
-        "trade_grades": normalize_trade_grades(
-            cfg.get("trade_grades") or os.getenv("OPEN15_TRADE_GRADES")
-        ),
+        # issue #762 - which SIDES each R63 grade places orders on (the rest
+        # are paper-traded). Derived from the #726 ``trade_grades`` + the day's
+        # ``trade_side`` when unset, so an install that never saves it is
+        # unchanged; ``trade_grades`` below is the read-only view of it.
+        "grade_sides": grade_sides,
+        "trade_grades": grades_traded(grade_sides),
+        "grade_sides_blocked": grade_sides_blocked(grade_sides, trade_side),
         "leverage": lev,
         "notional": round(margin_eff * lev, 2),
         "cum_realized_pnl": round(cum_realized_pnl, 2),
@@ -2513,6 +2537,8 @@ class Open15BreakoutService:
             # issue #726 - the grades that placed orders and the rules they
             # were graded by, so a past day is replayable against its own filter
             trade_grades=self.day_config["trade_grades"],
+            # issue #762 - the per-grade side policy the day was decided by
+            grade_sides=self.day_config.get("grade_sides"),
             rating_rules=dict(RATING_RULES),
             top_n=_top_n(),
             mode=_mode(),
@@ -5342,8 +5368,11 @@ class Open15BreakoutService:
                 rating=action.get("rating"),
                 rating_excluded=bool(reason_override),
                 note=(
-                    "no order placed — grade not in trade_grades; "
-                    "paper-traded at full slot size, no money moved"
+                    "no order placed — grade "
+                    + str(action.get("rating"))
+                    + " does not trade the "
+                    + ("long" if action.get("side") == "L" else "short")
+                    + " side (grade_sides); paper-traded at full slot size, no money moved"
                     if reason_override
                     else "no order placed — this side is switched off by trade_side; "
                     "priced for measurement only, no money moved"
@@ -5446,7 +5475,8 @@ class Open15BreakoutService:
                         "entered": bool(st.get("entered")),
                         "at_add": self._prov_at_add.get(sym),
                     }
-            trade_grades = cfg.get("trade_grades") or normalize_trade_grades(None)
+            grade_sides = _grade_sides_of(cfg)
+            trade_grades = grades_traded(grade_sides)
             counts = {"A": 0, "B": 0, "C": 0}
             with self._lock:
                 for p in self.positions.values():
@@ -5458,6 +5488,7 @@ class Open15BreakoutService:
                 "univ_n": n,
                 "phase": phase_label(now_sec, med),
                 "trade_grades": trade_grades,
+                "grade_sides": grade_sides,
                 "rules": dict(RATING_RULES),
                 "provisional": prov,
                 "counts": counts,
@@ -5523,17 +5554,22 @@ class Open15BreakoutService:
         if action.get("shadow"):
             self._journal_shadow(action, cfg)
             return
-        # GRADE FILTER (issue #726) - a grade the operator does not trade is
-        # paper-traded at full slot size through the shadow seam: no order, no
-        # ``max_trades`` slot, never in real P&L, exit priced at the scheduled
-        # time like every shadow row. Ungraded (grader raised) trades as before.
+        # GRADE x SIDE FILTER (issues #726/#762) - a grade the operator does
+        # not trade ON THIS SIDE is paper-traded at full slot size through the
+        # shadow seam: no order, no ``max_trades`` slot, never in real P&L, exit
+        # priced at the scheduled time like every shadow row. It has to live
+        # here, not at selection: ``trade_side`` decides which sides are
+        # WATCHED before any grade exists, and the grade is only known now.
+        # Ungraded (grader raised) trades as before.
         grade = action.get("rating")
-        if grade and grade not in (cfg.get("trade_grades") or normalize_trade_grades(None)):
+        grade_sides = _grade_sides_of(cfg)
+        if grade and not grade_side_allows(grade_sides, grade, action.get("side")):
             logger.info(
-                "open15: %s trigger graded %s, not in trade_grades=%s - paper (shadow)",
+                "open15: %s %s trigger graded %s, not traded by grade_sides=%s - paper (shadow)",
                 action["symbol"],
+                action.get("side"),
                 grade,
-                cfg.get("trade_grades"),
+                grade_sides,
             )
             self._journal_shadow(action, cfg, reason_override="rating_excluded")
             return

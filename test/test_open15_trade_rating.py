@@ -451,4 +451,4 @@ def test_logs_page_js_grade_cell_exists():
     src = open(bp.__file__, encoding="utf-8").read()
     assert "function gradeCell(r)" in src
     assert "rating_excluded" in src
-    assert "c_grA" in src and "trade_grades" in src
+    assert "c_grmatrix" in src and "trade_grades" in src

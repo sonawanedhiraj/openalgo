@@ -366,6 +366,12 @@ class Open15Config(Base):
     # Grades NOT listed are paper-traded at full slot size (shadow rows,
     # reason ``rating_excluded``) so every grade keeps being measured.
     trade_grades = Column(String(8), nullable=True)
+    # issue #762 — which SIDES each grade places orders on, e.g.
+    # "A:LS,B:L,C:-" (L long, S short, - off). NULL = derived from
+    # ``trade_grades`` + ``trade_side`` (env seed OPEN15_GRADE_SIDES), so an
+    # install that never saves it arms exactly as before. Excluded
+    # grade/side triggers are paper-traded like ``rating_excluded`` rows.
+    grade_sides = Column(String(32), nullable=True)
     # issue #728 — price the untriggered watch list at the 09:15 break (0/1;
     # NULL = env seed ``OPEN15_WATCHED_CF``, default on). A measurement knob.
     watched_cf_enabled = Column(Integer, nullable=True)
@@ -502,6 +508,8 @@ def _ensure_columns():
             # existing install arms exactly as it did before
             "max_vol_ratio": "FLOAT",
             "trade_grades": "VARCHAR(8)",
+            # issue #762 — NULL derives from trade_grades + trade_side
+            "grade_sides": "VARCHAR(32)",
             # issue #728 — NULL resolves to the env seed (on)
             "watched_cf_enabled": "INTEGER",
         },
@@ -603,6 +611,7 @@ def get_config() -> dict | None:
             "stop_loss_inr_short": row.stop_loss_inr_short,
             "max_vol_ratio": row.max_vol_ratio,
             "trade_grades": row.trade_grades,
+            "grade_sides": row.grade_sides,
             "watched_cf_enabled": (
                 None if row.watched_cf_enabled is None else bool(row.watched_cf_enabled)
             ),
@@ -657,6 +666,7 @@ def save_config(
     max_vol_ratio: float | None = None,
     trade_grades: str | None = None,
     watched_cf_enabled: bool | None = None,
+    grade_sides: str | None = None,
 ) -> bool:
     """Upsert the single config row. Fail-graceful."""
     try:
@@ -720,6 +730,7 @@ def save_config(
         row.stop_loss_inr_short = stop_loss_inr_short
         row.max_vol_ratio = max_vol_ratio
         row.trade_grades = trade_grades
+        row.grade_sides = grade_sides
         row.watched_cf_enabled = (
             None if watched_cf_enabled is None else int(bool(watched_cf_enabled))
         )
