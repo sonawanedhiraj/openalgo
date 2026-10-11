@@ -33,6 +33,9 @@ import threading
 
 from flask import Blueprint, jsonify, request
 
+from services.open15_rating import grade_sides_all_off as _grade_sides_all_off
+from services.open15_rating import grades_traded as _grades_traded
+from services.open15_rating import normalize_grade_sides as _normalize_grade_sides
 from services.open15_rating import normalize_trade_grades as _normalize_grades
 from utils.logging import get_logger
 from utils.session import check_session_validity
@@ -303,6 +306,25 @@ def config():
         trade_grades = (
             None if trade_grades_raw in (None, "") else _normalize_grades(trade_grades_raw)
         )
+        # issue #762 - which SIDES each grade places orders on ("A:LS,B:L,C:-").
+        # '' = leave NULL (derived from trade_grades + trade_side). An explicit
+        # all-off policy is REFUSED rather than normalised: unlike a typo, it is
+        # a clear request to stop trading, and silently falling back to "trade
+        # everything" would do the opposite of what was asked.
+        grade_sides_raw = body.get("grade_sides")
+        grade_sides = None
+        if grade_sides_raw not in (None, ""):
+            if _grade_sides_all_off(grade_sides_raw):
+                errors.append(
+                    "grade sides: at least one grade must trade at least one side "
+                    "(to stop trading, use the /strategies toggle or pause)"
+                )
+            else:
+                grade_sides = _normalize_grade_sides(
+                    grade_sides_raw, trade_grades, trade_side or "both"
+                )
+                # keep the #726 column in step for every pre-#762 reader
+                trade_grades = _grades_traded(grade_sides)
         stop_loss = _opt_bool("stop_loss_enabled")
         # issue #728 — price the untriggered watch list at the 09:15 break
         watched_cf = _opt_bool("watched_cf_enabled")
@@ -384,6 +406,7 @@ def config():
             max_vol_ratio=max_vol_ratio,
             trade_grades=trade_grades,
             watched_cf_enabled=watched_cf,
+            grade_sides=grade_sides,
         )
         if not ok:
             return jsonify({"status": "error", "errors": ["save failed"]}), 500
@@ -454,6 +477,12 @@ def config():
                 "max_vol_ratio": _max_vol_ratio_default(),
                 # issue #726 - grade filter seed (ABC = trade everything)
                 "trade_grades": _normalize_grades(_os.getenv("OPEN15_TRADE_GRADES")),
+                # issue #762 - per-grade side seed; unset derives from the two above
+                "grade_sides": _normalize_grade_sides(
+                    _os.getenv("OPEN15_GRADE_SIDES") or None,
+                    _os.getenv("OPEN15_TRADE_GRADES"),
+                    _os.getenv("OPEN15_TRADE_SIDE", "both"),
+                ),
                 # issue #728 - watched-break counterfactual seed (on)
                 "watched_cf_enabled": _watched_cf_enabled_default(),
             },
@@ -833,11 +862,10 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label class="muted" style="margin-left:14px"><input id="c_watched" type="checkbox"> price the untriggered watch list at the 09:15 break</label>
  </div>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
-  <span class="muted" title="issue #726 / R63: A = trigger by 09:22, volume ratio below 1.55x, universe median above -0.30%; C = trigger after 09:24 or universe median at/below -0.30%; B = the rest. Grades not ticked are paper-traded at full slot size (shadow rows, reason rating_excluded) so every grade keeps being measured.">trade rating (R63) — grades that place orders</span>
-  <label class="muted" style="margin-left:14px"><input id="c_grA" type="checkbox"> <span class="gr final A">A</span></label>
-  <label class="muted" style="margin-left:8px"><input id="c_grB" type="checkbox"> <span class="gr final B">B</span></label>
-  <label class="muted" style="margin-left:8px"><input id="c_grC" type="checkbox"> <span class="gr final C">C</span></label>
-  <span class="muted" style="margin-left:10px">unticked grades are <span style="color:#cba6f7">paper-traded</span> (shadow, full slot, no order) · live vs sandbox is the /strategies toggle · applies at the next 09:10 arm</span>
+  <span class="muted" title="issue #726 / R63: A = trigger by 09:22, volume ratio below 1.55x, universe median above -0.30%; C = trigger after 09:24 or universe median at/below -0.30%; B = the rest. issue #762: each grade trades the sides ticked here; an unticked grade/side is paper-traded at full slot size (shadow rows, reason rating_excluded) so every cell keeps being measured. The grade is only known at the trigger, so the trade side above still decides which sides are WATCHED.">trade rating (R63) — sides each grade places orders on</span>
+  <span id="c_grmatrix"></span>
+  <span class="muted" style="margin-left:10px">unticked cells are <span style="color:#cba6f7">paper-traded</span> (shadow, full slot, no order) · live vs sandbox is the /strategies toggle · applies at the next 09:10 arm</span>
+  <div id="c_grhint" style="margin-top:4px;color:#f9e2af"></div>
  </div>
  <div style="margin-top:8px;padding-top:8px;border-top:1px solid #2a3138">
   <span class="muted">rolling watch-list (issue #529 — measurement, off by default)</span>
@@ -979,6 +1007,71 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
  </div>
 </div>
 <script>
+// ---- per-grade sides (issue #762) -----------------------------------------
+// "A:LS,B:L,C:-" — L long, S short, - off. Mirrors services/open15_rating.py;
+// the server re-derives and enforces, these only render and explain.
+const GS_SIDES={both:'LS',long_only:'L',short_only:'S'};
+function gsParse(gs){
+  const o={A:'',B:'',C:''};
+  for(const part of String(gs||'').split(',')){
+    const kv=part.split(':');
+    const k=String(kv[0]||'').trim().toUpperCase();
+    if(k in o)o[k]=['L','S'].filter(x=>String(kv[1]||'').toUpperCase().includes(x)).join('');
+  }
+  return o;
+}
+function gsLegacy(tg,side){
+  const t=String(tg||'ABC').toUpperCase(), sd=GS_SIDES[side||'both']||'LS';
+  return ['A','B','C'].map(g=>g+':'+(t.includes(g)?sd:'-')).join(',');
+}
+function gsAllows(gs,g,side){
+  if(!g||(side!=='L'&&side!=='S'))return true;
+  return (gsParse(gs)[g]||'').includes(side);
+}
+function gsLabel(gs){
+  const p=gsParse(gs), nm={LS:'both',L:'long',S:'short','':'paper'};
+  return ['A','B','C'].map(g=>g+' '+nm[p[g]]).join(' · ');
+}
+function gsFromForm(){
+  return ['A','B','C'].map(g=>{
+    const v=['L','S'].filter(x=>document.getElementById('c_gr'+g+x).checked).join('');
+    return g+':'+(v||'-');
+  }).join(',');
+}
+function buildGradeMatrix(){
+  const box=document.getElementById('c_grmatrix');
+  if(box.childElementCount)return;
+  box.innerHTML=['A','B','C'].map(g=>
+    '<span style="margin-left:14px"><span class="gr final '+g+'">'+g+'</span>'+
+    '<label class="muted" style="margin-left:4px"><input id="c_gr'+g+'L" type="checkbox"> long</label>'+
+    '<label class="muted" style="margin-left:4px"><input id="c_gr'+g+'S" type="checkbox"> short</label></span>'
+  ).join('');
+  box.querySelectorAll('input').forEach(i=>i.addEventListener('change',syncGradeHint));
+}
+function setGradeForm(gs){
+  buildGradeMatrix();
+  const p=gsParse(gs);
+  for(const g of ['A','B','C'])for(const x of ['L','S'])
+    document.getElementById('c_gr'+g+x).checked=p[g].includes(x);
+  syncGradeHint();
+}
+// The grade is only known at the TRIGGER, but trade side decides at SELECTION
+// which sides are watched — so a grade/side the trade side excludes can never
+// fire. Say so next to the control instead of letting it look effective.
+function syncGradeHint(){
+  const side=document.getElementById('c_side').value, allowed=GS_SIDES[side]||'LS';
+  const p=gsParse(gsFromForm()), blocked=[], any=Object.values(p).some(v=>v);
+  for(const g of ['A','B','C'])for(const x of p[g])
+    if(!allowed.includes(x))blocked.push(g+' '+(x==='L'?'long':'short'));
+  const h=document.getElementById('c_grhint');
+  h.textContent=!any
+    ?'⚠ no grade trades any side — the save will be refused (pause from /strategies instead)'
+    :(blocked.length
+      ?('⚠ '+blocked.join(', ')+' can never trigger: trade side is '+
+        ({long_only:'longs only',short_only:'shorts only'}[side]||side)+
+        ' — set trade side to “both” to watch that side')
+      :'');
+}
 // Shadowing only means something when a side is EXCLUDED, so with trade side
 // `both` the controls are disabled and say why. The server derives the same
 // answer independently (shadow_side_for) — this is the explanation, not the
@@ -1029,9 +1122,11 @@ async function loadCfg(){
   document.getElementById('c_shadowmax').value=o.shadow_max_trades??d.shadow_max_trades??3;
   // watched-break counterfactual (issue #728) — `??` so a stored false beats the env seed
   document.getElementById('c_watched').checked=!!(o.watched_cf_enabled??d.watched_cf_enabled);
-  // trade rating (issue #726): a stored subset wins over the env seed
-  {const tg=String(o.trade_grades||d.trade_grades||'ABC').toUpperCase();
-   for(const g of ['A','B','C'])document.getElementById('c_gr'+g).checked=tg.includes(g);}
+  // trade rating sides (issues #726/#762): a stored policy wins; a stored
+  // pre-#762 grade subset is shown as the policy it resolves to; else the seed
+  setGradeForm(o.grade_sides||(o.trade_grades
+    ?gsLegacy(o.trade_grades,o.trade_side||d.trade_side)
+    :d.grade_sides)||gsLegacy('ABC',o.trade_side||d.trade_side));
   // option-liquidity gates (issue #583) — `??` again, so a stored false/0 wins
   document.getElementById('c_liqgate').checked=
     !!(o.option_liquidity_gate_enabled??d.option_liquidity_gate_enabled);
@@ -1117,7 +1212,9 @@ async function loadCfg(){
       ' | '+e.sizing_mode+' | margin '+e.margin_effective+' (base '+e.margin_per_slot+
       (e.sizing_mode==='compound'?(' + cum P&L '+e.cum_realized_pnl):'')+
       lev+' | vol_mult '+e.vol_mult+(e.max_vol_ratio?(' (ceiling '+e.max_vol_ratio+'x)'):'')+
-      ' | grades traded '+(e.trade_grades||'ABC')+(String(e.trade_grades||'ABC')!=='ABC'?' (rest paper)':'')+
+      ' | grades '+gsLabel(e.grade_sides||gsLegacy(e.trade_grades,sd))+
+      ((e.grade_sides_blocked&&e.grade_sides_blocked.length)
+        ?(' ⚠ '+e.grade_sides_blocked.join(', ')+' never watched'):'')+
       ' | entries 09:16–'+nea+' | exit '+ext+
       ((nea!=='09:29'||ext!=='09:30')?' ⚠ non-default window (R58 measured 09:29/09:30)':'')+
       ' | rolling watch-list '+(e.rolling_watchlist_enabled
@@ -1167,7 +1264,8 @@ async function saveCfg(){
     stop_loss_inr_long:(v=>v===''?'':+v)(document.getElementById('c_slinr_l').value),
     stop_loss_inr_short:(v=>v===''?'':+v)(document.getElementById('c_slinr_s').value),
     max_vol_ratio:+document.getElementById('c_maxvr').value,
-    trade_grades:['A','B','C'].filter(g=>document.getElementById('c_gr'+g).checked).join('')};
+    grade_sides:gsFromForm(),
+    trade_grades:['A','B','C'].filter(g=>gsParse(gsFromForm())[g]).join('')};
   const msg=document.getElementById('c_msg');
   try{
     const tok=await csrfToken();
@@ -1198,6 +1296,7 @@ async function saveCfg(){
   if(window.loadLadderPreview)loadLadderPreview();
 }
 document.getElementById('c_side').addEventListener('change',syncShadowUi);
+document.getElementById('c_side').addEventListener('change',syncGradeHint);
 document.getElementById('c_shadow').addEventListener('change',syncShadowUi);
 loadCfg();
 </script>
@@ -1431,7 +1530,8 @@ function renderChips(){
       (dig.watched_priced?(' \u00b7 '+dig.watched_priced+' priced'):'')]);
   // issue #726 — the grade filter the day ran with, the live tape while the
   // window is open, and the per-grade split once the summary has run
-  if(armed.trade_grades)chips.push(['grades traded',String(armed.trade_grades)]);
+  if(armed.grade_sides)chips.push(['grades traded',gsLabel(armed.grade_sides)]);
+  else if(armed.trade_grades)chips.push(['grades traded',String(armed.trade_grades)]);
   if(liveRating&&liveRating.univ_median_pct!=null)
     chips.push(['tape \u00b7 univ median',(liveRating.univ_median_pct>=0?'+':'')+
       liveRating.univ_median_pct+'% \u00b7 '+(liveRating.phase||'')]);
@@ -1485,9 +1585,10 @@ function renderChips(){
 // live grade from /api/status when the window is open, else the grade the
 // symbol was selected under; `will` says what the day's trade_grades would
 // do with it. Absent = the day predates the rating.
-function tradeGrades(){
+function gradeSides(){
   const a=curEvents.find(e=>e.event==='armed')||{};
-  return String(a.trade_grades||(liveRating&&liveRating.trade_grades)||'ABC').toUpperCase();
+  return a.grade_sides||(liveRating&&liveRating.grade_sides)||
+    gsLegacy(a.trade_grades||(liveRating&&liveRating.trade_grades),a.trade_side);
 }
 function gradeCell(r){
   if(r.rating){
@@ -1497,7 +1598,7 @@ function gradeCell(r){
   }
   const lr=r.ratingLive; const g=lr?lr.grade:r.ratingProv;
   if(!g)return '<span class="muted">&mdash;</span>';
-  const will=tradeGrades().includes(g)?'real':'paper';
+  const will=gsAllows(gradeSides(),g,r.side)?'real':'paper';
   const fails=(lr&&lr.fails&&lr.fails.length)?lr.fails.join(', '):'';
   return '<span class="gr '+esc(g)+'" title="provisional — if it triggered now'+
     (lr?' (live)':' (at selection)')+(fails?(' · fails: '+esc(fails)):'')+'">'+esc(g)+'</span>'+

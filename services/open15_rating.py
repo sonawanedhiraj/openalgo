@@ -113,6 +113,155 @@ def normalize_trade_grades(raw: Any) -> str:
     return "".join(g for g in GRADES if g in kept) or ALL_GRADES
 
 
+#: ``trade_side`` -> the sides it lets through, as ``grade_sides`` letters
+_SIDES_OF_TRADE_SIDE = {"both": "LS", "long_only": "L", "short_only": "S"}
+_SIDE_NAMES = {"L": "long", "S": "short"}
+
+
+def _sides_from(value: Any) -> str | None:
+    """``"LS"`` / ``"long"`` / ``["L"]`` / ``"-"`` -> canonical ``"LS"``/``"L"``/``"S"``/``""``.
+
+    ``None`` when the value says nothing recognisable (the grade then keeps
+    its fallback) — distinct from ``""``, which is an explicit "off".
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        text = "".join(str(x) for x in value)
+    else:
+        text = str(value)
+    text = text.strip().upper()
+    if text in ("", "-", "OFF", "NONE"):
+        return ""
+    if text == "BOTH":
+        return "LS"
+    if text in ("LONG", "LONG_ONLY"):
+        return "L"
+    if text in ("SHORT", "SHORT_ONLY"):
+        return "S"
+    if set(text) <= {"L", "S"}:
+        return "".join(s for s in "LS" if s in text)
+    return None
+
+
+def format_grade_sides(policy: Mapping[str, str]) -> str:
+    """``{"A": "LS", "B": "L", "C": ""}`` -> ``"A:LS,B:L,C:-"`` (the stored form)."""
+    return ",".join(f"{g}:{policy.get(g) or '-'}" for g in GRADES)
+
+
+def legacy_grade_sides(trade_grades: Any = None, trade_side: str | None = "both") -> str:
+    """The ``grade_sides`` equivalent of the pre-#762 controls.
+
+    A grade in ``trade_grades`` places orders on whatever ``trade_side``
+    allows, a grade outside it on nothing — exactly what the #726 checkbox
+    filter did, so an install that never sets ``grade_sides`` is unchanged.
+    """
+    grades = normalize_trade_grades(trade_grades)
+    sides = _SIDES_OF_TRADE_SIDE.get(str(trade_side or "both").lower(), "LS")
+    return format_grade_sides({g: (sides if g in grades else "") for g in GRADES})
+
+
+def parse_grade_sides(canonical: str) -> dict[str, str]:
+    """``"A:LS,B:L,C:-"`` -> ``{"A": "LS", "B": "L", "C": ""}`` (no fallback)."""
+    out = dict.fromkeys(GRADES, "")
+    for part in str(canonical or "").split(","):
+        g, _, v = part.partition(":")
+        g = g.strip().upper()
+        sides = _sides_from(v)
+        if g in out and sides is not None:
+            out[g] = sides
+    return out
+
+
+def normalize_grade_sides(
+    raw: Any, trade_grades: Any = None, trade_side: str | None = "both"
+) -> str:
+    """Canonical ``grade_sides`` (issue #762): which SIDES each grade trades.
+
+    Accepts ``"A:LS,B:L,C:-"``, ``{"A": "both", "B": "long"}`` or ``None``.
+    A grade the input does not mention keeps its legacy value
+    (:func:`legacy_grade_sides`), so a partial setting never silently turns
+    a grade off. ``None`` / unparseable / every-grade-off resolves to the
+    legacy policy — clamp-don't-reject like every other ``open15_config``
+    knob: a typo must not silently stop the strategy trading. (The config
+    API refuses an all-off save explicitly, so the operator is told.)
+    """
+    fallback = parse_grade_sides(legacy_grade_sides(trade_grades, trade_side))
+    if raw is None:
+        return format_grade_sides(fallback)
+    if isinstance(raw, Mapping):
+        items = [(str(k), v) for k, v in raw.items()]
+    else:
+        items = []
+        for part in str(raw).split(","):
+            g, sep, v = part.partition(":")
+            if sep:
+                items.append((g, v))
+    policy = dict(fallback)
+    seen = False
+    for g, v in items:
+        g = g.strip().upper()
+        sides = _sides_from(v)
+        if g in policy and sides is not None:
+            policy[g] = sides
+            seen = True
+    if not seen or not any(policy.values()):
+        return format_grade_sides(fallback)
+    return format_grade_sides(policy)
+
+
+def grade_sides_all_off(raw: Any) -> bool:
+    """True when ``raw`` EXPLICITLY sets every grade to no side.
+
+    :func:`normalize_grade_sides` resolves that to the legacy fallback (so a
+    corrupt stored value never stops trading); the config API uses this to
+    refuse the save instead, because from the UI it is a deliberate request
+    and "fall back to trading everything" would invert it.
+    """
+    if isinstance(raw, Mapping):
+        items = {str(k).strip().upper(): v for k, v in raw.items()}
+    else:
+        items = {}
+        for part in str(raw or "").split(","):
+            g, sep, v = part.partition(":")
+            if sep:
+                items[g.strip().upper()] = v
+    return all(g in items and _sides_from(items[g]) == "" for g in GRADES)
+
+
+def grade_side_allows(canonical: str, grade: str | None, side: str | None) -> bool:
+    """Does grade ``grade`` place orders on ``side`` (``"L"`` / ``"S"``)?
+
+    An ungraded trigger (``grade`` falsy — the grader raised) is allowed:
+    the grade is instrumentation until it gates, and an ungraded trigger
+    trades as before (#726 fail-open). An unknown side is likewise allowed;
+    the side was already decided at selection by ``trade_side``.
+    """
+    if not grade or side not in ("L", "S"):
+        return True
+    return side in parse_grade_sides(canonical).get(grade, "")
+
+
+def grades_traded(canonical: str) -> str:
+    """The grades that place orders on at least one side — the ``trade_grades``
+    view of a ``grade_sides`` policy, kept for every pre-#762 reader."""
+    policy = parse_grade_sides(canonical)
+    return "".join(g for g in GRADES if policy[g])
+
+
+def grade_sides_blocked(canonical: str, trade_side: str | None) -> list[str]:
+    """Grade/side pairs the policy enables but ``trade_side`` never watches.
+
+    ``trade_side`` decides at SELECTION which sides get onto the watch list;
+    the grade is only known at the trigger. So a grade that asks for shorts
+    while ``trade_side`` is ``long_only`` can never fire — the page says so
+    rather than letting the setting look effective. ``["A short"]`` etc.
+    """
+    allowed = _SIDES_OF_TRADE_SIDE.get(str(trade_side or "both").lower(), "LS")
+    policy = parse_grade_sides(canonical)
+    return [f"{g} {_SIDE_NAMES[s]}" for g in GRADES for s in policy[g] if s not in allowed]
+
+
 def sec_of_day(hhmm: str | None, second: int | None) -> int | None:
     """``"09:21"`` + ``33`` -> seconds after midnight; ``None`` on bad input."""
     try:

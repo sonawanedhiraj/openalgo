@@ -1875,6 +1875,27 @@ promote C to a sim-priced veto only if the C paper cohort is net-negative AND
 ≥ 15 pts below A+B on the new fills alone; A/B never gate; if it fails, delete
 the grade rather than re-tune it. Tests: `test/test_open15_trade_rating.py`.
 
+**Per-grade long/short (issue #762).** `open15_config.grade_sides` (e.g.
+`A:LS,B:L,C:-` — L long, S short, `-` off; env seed `OPEN15_GRADE_SIDES`;
+six checkboxes on `/logs`) says which SIDES each grade places orders on, and
+supersedes `trade_grades` as the gate (`trade_grades` is now derived from it —
+the grades with any side — and kept in step for pre-#762 readers). NULL derives
+from `trade_grades` + `trade_side`, so an install that never saves it is
+byte-identical. Rules: (1) **it is enforced in `_enter`, never at selection** —
+`trade_side` decides which sides get onto the watch list before any grade
+exists, and the grade is only known at the trigger; so `trade_side` stays the
+outer limit, and a grade asking for a side it excludes can never fire —
+`resolve_day_config` reports such pairs as `grade_sides_blocked` and the form +
+effective line flag them. (2) An excluded grade/side reuses the #726 shadow seam
+unchanged (`fill='shadow'`, `reason='rating_excluded'`, full slot, no order, no
+`max_trades` slot, shares `shadow_max_trades`) — the row's own `side` + `rating`
+say which cell kept it out. (3) An explicit all-off save is REFUSED by
+`/api/config` (to stop trading use the `/strategies` toggle or pause); a stored
+garbage/all-off value falls back to the legacy policy rather than stopping the
+strategy. `armed` stamps `grade_sides`, `rating_status()` carries it, and the
+provisional chip resolves real/paper per side. Tests:
+`test/test_open15_grade_sides.py`.
+
 **Grade scorecard — every grade across every day (issue #748, numbers only).**
 The "GRADE SCORECARD" card on `/open15_vol_breakout/logs` (`GET
 /open15_vol_breakout/api/grade_scorecard?apply_sl=&apply_trail=&window=&mode=`,

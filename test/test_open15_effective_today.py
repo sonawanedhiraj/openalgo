@@ -238,10 +238,16 @@ def _render_eff(effective, source):
         0
     ]
     body = body.rstrip().removesuffix("}")
+    # the per-grade side helpers the line formats with (issue #762)
+    gs = (
+        "const GS_SIDES="
+        + _LOGS_PAGE.split("const GS_SIDES=")[1].split("function gsFromForm(){")[0]
+    )
     script = (
         "const out={};\n"
         "const document={getElementById:()=>({set textContent(v){out.t=v;}})};\n"
         f"const j={json.dumps({'effective_today': effective, 'effective_source': source})};\n"
+        f"{gs}\n"
         f"function effMaxTrades(e){{{fn}}}\n"
         "const e=j.effective_today;\n"
         f"{body}\n"
@@ -303,3 +309,30 @@ def test_the_live_armed_path_is_unchanged():
     assert line.startswith("effective today: atm_option")
     assert ") x 5 = notional 300000" in line
     assert "undefined" not in line
+
+
+def test_the_line_states_the_per_grade_sides():
+    """issue #762 - the policy is printed per grade, and a grade/side the trade
+    side never watches is flagged on the same line; a pre-#762 day (no
+    ``grade_sides``) renders the policy its ``trade_grades`` resolved to."""
+    base = {
+        "instrument": "stock",
+        "trade_side": "long_only",
+        "sizing_mode": "fixed",
+        "margin_effective": 30000,
+        "margin_per_slot": 30000,
+        "leverage": 5,
+        "notional": 150000,
+        "max_trades": 3,
+        "vol_mult": 1.5,
+    }
+    line = _render_eff(
+        {**base, "grade_sides": "A:LS,B:L,C:-", "grade_sides_blocked": ["A short"]}, "armed"
+    )
+    # node stdout is decoded with the console code page on Windows, so match
+    # around the non-ASCII separator rather than on it
+    assert "grades A both" in line and "B long" in line and "C paper" in line
+    assert "A short never watched" in line
+    legacy = _render_eff({**base, "trade_grades": "AB"}, "armed")
+    assert "grades A long" in legacy and "B long" in legacy and "C paper" in legacy
+    assert "undefined" not in legacy
