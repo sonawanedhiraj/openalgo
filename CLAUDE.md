@@ -79,6 +79,24 @@ reported. The navbar dot polls `GET /health/api/system` (gate `"user" in
 session`, plain 401 — never `check_session_validity`). See `docs/SYSTEM_MAP.md`
 Processes §7.
 
+**Boot memory peak (2026-10-11 repeat, issue #766).** The 08:54 abort followed a
+~1.5 GB boot RSS peak, and two parts of it were duplicated work. (1) **The master
+contract job is single-flight:** every caller (login, headless auto-login, session
+resume, the manual download button) goes through
+`utils.auth_utils.start_master_contract_job`, which runs one download OR cached load
+per broker per process. A second caller while one is in flight starts nothing, and
+it does not reset the status row either. The smart-download check alone could not
+prevent this, because it reads only COMPLETED downloads. (2) **A session resume is
+the session block only:** `_try_resume_broker_session` re-uses the STORED token, so
+it calls `establish_login_session` plus `ensure_master_contract_loaded` (a job only
+if this process never loaded the symbol cache). It never calls the full
+`handle_auth_success`. Before #766 a browser login at boot re-ran `upsert_auth` on
+the same token, which caused four duplicates: CACHE_INVALIDATE tore down and rebuilt
+the WS pool; `broker_session_refreshed` fired a second time; a second master
+contract download ran beside the auto-login's; and `token_updated_at` was
+re-stamped to now, which made a pre-07:30 flush-cohort token look fresh to the #719
+expiry rule. Tests: `test/test_master_contract_single_flight.py`.
+
 ## Task Tracking — Every Task Is a GitHub Issue
 
 Every unit of work — feature, bug fix, documentation, **or backtest round** —

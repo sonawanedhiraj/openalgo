@@ -9,8 +9,8 @@ The primary path reproduces exactly the **broker-side** subset of
 ``utils.auth_utils.handle_auth_success`` (the session/cookie parts are skipped —
 there is no request):
 
-    upsert_auth(...)  ->  init_broker_status(...)  ->  notify_broker_session_refreshed(...)
-    ->  smart master-contract download
+    upsert_auth(...)  ->  start_master_contract_job(...)  (single-flight, #766)
+    ->  notify_broker_session_refreshed(...)
 
 ``upsert_auth`` is what publishes the ZMQ ``CACHE_INVALIDATE`` (WS-proxy adapter
 reconnect + re-subscribe) and ``notify_broker_session_refreshed`` is what drives
@@ -24,7 +24,6 @@ every outcome is returned (and, at the ``auto_login_all`` level, Telegrammed).
 """
 
 import os
-from threading import Thread
 
 from utils.logging import get_logger
 
@@ -107,22 +106,14 @@ def _apply_primary_session(api_key: str, access_token: str) -> None:
     if not inserted_id:
         raise RuntimeError("upsert_auth did not return a row id.")
 
-    from database.master_contract_status_db import init_broker_status
-    from utils.auth_utils import (
-        async_master_contract_download,
-        load_existing_master_contract,
-        notify_broker_session_refreshed,
-        should_download_master_contract,
-    )
+    from utils.auth_utils import notify_broker_session_refreshed, start_master_contract_job
 
-    init_broker_status(BROKER)
+    # Single-flight (issue #766): a concurrent browser login cannot start a second
+    # 110k-row download while this one is still writing.
+    job = start_master_contract_job(BROKER)
+    logger.info(f"Auto-login master-contract job: {job or 'already in flight'}")
     # Publishes SocketIO + event-bus BrokerSessionRefreshedEvent -> WS reconnect + gap replay.
     notify_broker_session_refreshed(username, BROKER)
-
-    should_download, reason = should_download_master_contract(BROKER)
-    target = async_master_contract_download if should_download else load_existing_master_contract
-    logger.info(f"Auto-login master-contract: should_download={should_download} ({reason})")
-    Thread(target=target, args=(BROKER,), daemon=True).start()
 
 
 def auto_login_children() -> list[dict]:
