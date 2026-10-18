@@ -62,7 +62,7 @@ class TestRows:
             "IDEA",
         ]
         assert [r.symbol for r in o15db.stop_loss_rows()] == ["BAJAJ-AUTO"]
-        assert o15db.RISK_EXIT_REASONS == ("stop_loss", "profit_trail")
+        assert o15db.RISK_EXIT_REASONS == ("stop_loss", "profit_trail", "take_profit")
 
     def test_scorecard_never_counts_a_trail_exit(self):
         _trail_row(cf_pnl=-5250.0, cf_charges_inr=130.0, cf_source="bars")

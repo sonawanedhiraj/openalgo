@@ -328,6 +328,7 @@ def _trade_curve(row, date: str, sched_exit_min: int | None = None) -> dict:
         PROFIT_TRAIL_REASON,
         RISK_EXIT_REASONS,
         STOP_LOSS_REASON,
+        TAKE_PROFIT_REASON,
         net_pnl_of_row,
         stop_saved_of_row,
     )
@@ -372,6 +373,8 @@ def _trade_curve(row, date: str, sched_exit_min: int | None = None) -> dict:
         # ghost; ``stop_loss`` / ``profit_trail`` say which rule fired.
         "stop_loss": (row.reason == STOP_LOSS_REASON) and row.status == "closed",
         "profit_trail": (row.reason == PROFIT_TRAIL_REASON) and row.status == "closed",
+        # issue #770 — the per-trade underlying take-profit
+        "take_profit": (row.reason == TAKE_PROFIT_REASON) and row.status == "closed",
         "risk_exit": (row.reason in RISK_EXIT_REASONS) and row.status == "closed",
         "ghost": [],
         "ghost_final": None,

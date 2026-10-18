@@ -6,7 +6,8 @@ no broker call, no clock. Reports NUMBERS only — no verdict, no decision rule
 
 Three switches, each answering a different question:
 
-- ``apply_sl`` / ``apply_trail`` — with either OFF, that risk exit is undone and
+- ``apply_sl`` / ``apply_trail`` / ``apply_tp`` (take-profit, #770) — with any
+  OFF, that risk exit is undone and
   the row is valued at its held-to-scheduled-exit counterfactual (#704/#713),
   through :func:`net_of_row_under` (one convention, #552). A row whose
   counterfactual is not priced yet is counted ``pending`` and left out — never
@@ -116,6 +117,7 @@ def build_scorecard(
     apply_sl: bool = True,
     apply_trail: bool = True,
     window: str = "all",
+    apply_tp: bool = True,
 ) -> dict[str, Any]:
     """Pure core: the rows in, the card payload out (testable without a DB)."""
     from database.open15_breakout_db import net_of_row_under
@@ -130,7 +132,7 @@ def build_scorecard(
     for r in rows:
         if not _in_window(r, window):
             continue
-        net = net_of_row_under(r, apply_sl, apply_trail)
+        net = net_of_row_under(r, apply_sl, apply_trail, apply_tp)
         is_real = r.get("cohort") == "real"
         if net is None:
             pending["full_slot"] += 1
@@ -153,6 +155,7 @@ def build_scorecard(
         "status": "ok",
         "apply_sl": apply_sl,
         "apply_trail": apply_trail,
+        "apply_tp": apply_tp,
         "window": window,
         "live_grading_from": LIVE_GRADING_FROM,
         "since": since,
@@ -170,9 +173,10 @@ def scorecard(
     apply_trail: bool = True,
     window: str = "all",
     mode: str | None = None,
+    apply_tp: bool = True,
 ) -> dict[str, Any]:
     from database.open15_breakout_db import grade_scorecard_rows
 
-    out = build_scorecard(grade_scorecard_rows(mode), apply_sl, apply_trail, window)
+    out = build_scorecard(grade_scorecard_rows(mode), apply_sl, apply_trail, window, apply_tp)
     out["mode"] = mode or "all"
     return out

@@ -248,8 +248,10 @@ def test_endpoint(monkeypatch):
     monkeypatch.setattr(sess, "is_session_valid", lambda: True)
     seen = {}
 
-    def fake(apply_sl, apply_trail, window, mode):
-        seen.update(apply_sl=apply_sl, apply_trail=apply_trail, window=window, mode=mode)
+    def fake(apply_sl, apply_trail, window, mode, apply_tp=True):
+        seen.update(
+            apply_sl=apply_sl, apply_trail=apply_trail, window=window, mode=mode, apply_tp=apply_tp
+        )
         return {"status": "ok"}
 
     monkeypatch.setattr("services.open15_grade_scorecard.scorecard", fake)
@@ -259,7 +261,16 @@ def test_endpoint(monkeypatch):
     c = app.test_client()
     r = c.get("/open15_vol_breakout/api/grade_scorecard?apply_sl=0&window=live&mode=bad")
     assert r.status_code == 200 and r.get_json()["status"] == "ok"
-    assert seen == {"apply_sl": False, "apply_trail": True, "window": "live", "mode": None}
+    assert seen == {
+        "apply_sl": False,
+        "apply_trail": True,
+        "window": "live",
+        "mode": None,
+        "apply_tp": True,
+    }
+    # issue #770 — the take-profit undo toggle reaches the scorecard
+    c.get("/open15_vol_breakout/api/grade_scorecard?apply_tp=0")
+    assert seen["apply_tp"] is False
 
 
 def test_card_on_logs_page():

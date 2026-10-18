@@ -617,6 +617,39 @@ def _stop_loss_inr_default() -> float:
     return clamp_risk_rupees(os.getenv("OPEN15_STOP_LOSS_INR", "1200"), 1200.0)
 
 
+# issue #770 — per-trade TAKE-PROFIT on the UNDERLYING's move from the trigger
+# price, in percent. 0.5..3.0 is the range the R74 follow-up replay (#769)
+# measured; a value outside it is clamped, never rejected.
+TAKE_PROFIT_PCT_MIN = 0.5
+TAKE_PROFIT_PCT_MAX = 3.0
+
+
+def clamp_take_profit_pct(raw, default: float, allow_zero: bool = False) -> float:
+    """Underlying move (%) that takes profit on one row (issue #770).
+
+    ``allow_zero`` is for the per-side overrides, where a stored 0 means "OFF
+    for this side" (the #722 stop convention); the common value is always a
+    real threshold — "off" is the enabled flag's job.
+    """
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    if allow_zero and v <= 0:
+        return 0.0
+    return min(TAKE_PROFIT_PCT_MAX, max(TAKE_PROFIT_PCT_MIN, v))
+
+
+def _take_profit_enabled_default() -> bool:
+    return os.getenv("OPEN15_TAKE_PROFIT", "false").lower() == "true"
+
+
+def _take_profit_pct_default() -> float:
+    return clamp_take_profit_pct(os.getenv("OPEN15_TAKE_PROFIT_UNDERLYING_PCT", "1.0"), 1.0)
+
+
 def _fresh_risk_state() -> dict:
     """Day-scoped risk-control state (issue #696), reset at every arm."""
     return {
@@ -628,6 +661,8 @@ def _fresh_risk_state() -> dict:
         "trail_at": None,
         "last_trail_retry": 0.0,
         "sl_alerted": [],
+        "tp_alerted": [],  # issue #770 — one Telegram per symbol/day
+        "tp_last_try": {},  # issue #770 — symbol -> monotonic time of last exit attempt
         # issue #716: the trail as it happened — one point per monitor poll
         # (bounded), the running breach count, and whether the path has been
         # written to the day log yet (once, at the trail exit / flatten /
@@ -1341,6 +1376,23 @@ def _resolve_risk_config(cfg: dict) -> dict:
 
     sl_long = _side("stop_loss_inr_long")
     sl_short = _side("stop_loss_inr_short")
+    # issue #770 — take-profit on the underlying's move. Same NULL/0 shape as
+    # the #722 per-side stop: NULL = the common %, 0 = OFF for that side.
+    tp_cfg = cfg.get("take_profit_enabled")
+    tp_on = _take_profit_enabled_default() if tp_cfg is None else bool(tp_cfg)
+    tp_pct_cfg = cfg.get("take_profit_underlying_pct")
+    tp_pct = (
+        _take_profit_pct_default()
+        if tp_pct_cfg is None
+        else clamp_take_profit_pct(tp_pct_cfg, _take_profit_pct_default())
+    )
+
+    def _tp_side(key: str) -> float:
+        raw = cfg.get(key)
+        return tp_pct if raw is None else clamp_take_profit_pct(raw, tp_pct, allow_zero=True)
+
+    tp_long = _tp_side("take_profit_pct_long")
+    tp_short = _tp_side("take_profit_pct_short")
     confirm_cfg = cfg.get("trail_confirm_polls")
     confirm = (
         _trail_confirm_polls_default()
@@ -1358,7 +1410,39 @@ def _resolve_risk_config(cfg: dict) -> dict:
         "stop_loss_inr": sl_inr,
         "stop_loss_inr_long": sl_long,
         "stop_loss_inr_short": sl_short,
+        # enabled if ANY side has a positive threshold (a 0 long + 1.0 short
+        # is a legal "shorts only" take-profit)
+        "take_profit_enabled": tp_on and max(tp_long, tp_short) > 0,
+        "take_profit_underlying_pct": tp_pct,
+        "take_profit_pct_long": tp_long,
+        "take_profit_pct_short": tp_short,
     }
+
+
+def take_profit_pct_for_side(cfg: dict, side) -> float:
+    """The take-profit threshold (% underlying move) for a row of ``side``
+    (issue #770). Mirrors :func:`stop_loss_for_side`: a missing side key falls
+    back to the common value; 0 = off for that side."""
+    s = str(side or "").upper()
+    common = float((cfg or {}).get("take_profit_underlying_pct") or 0.0)
+    key = "take_profit_pct_short" if s in ("S", "SHORT", "SELL") else "take_profit_pct_long"
+    raw = (cfg or {}).get(key)
+    return common if raw is None else float(raw or 0.0)
+
+
+def underlying_move_pct(side, trigger_price, ltp) -> float | None:
+    """Underlying move (%) from the trigger price IN THE TRADE'S DIRECTION
+    (issue #770): positive = in the trade's favour, for a long or a short.
+    None when either price is unknown — an unknown move fires nothing."""
+    try:
+        trig = float(trigger_price)
+        px = float(ltp)
+    except (TypeError, ValueError):
+        return None
+    if not (trig > 0 and px > 0):
+        return None
+    d = (px - trig) if str(side or "").upper() in ("L", "LONG", "BUY") else (trig - px)
+    return d / trig * 100.0
 
 
 def stop_loss_for_side(cfg: dict, side) -> float:
@@ -2629,6 +2713,11 @@ class Open15BreakoutService:
             # issue #722 — per-side thresholds the day ran with
             stop_loss_inr_long=self.day_config["stop_loss_inr_long"],
             stop_loss_inr_short=self.day_config["stop_loss_inr_short"],
+            # issue #770 — the take-profit the day ran with
+            take_profit_enabled=self.day_config["take_profit_enabled"],
+            take_profit_underlying_pct=self.day_config["take_profit_underlying_pct"],
+            take_profit_pct_long=self.day_config["take_profit_pct_long"],
+            take_profit_pct_short=self.day_config["take_profit_pct_short"],
         )
         # ATM lot-cost coverage ladder (issue #591) — what capital/slot covers
         # how much of the universe, priced from the latest EOD option-liquidity
@@ -3534,6 +3623,15 @@ class Open15BreakoutService:
         self._track_ghosts(payload)
         self._track_watched(payload)
         cfg = self.day_config or {}
+        # issue #770 — the take-profit reads the UNDERLYING's LTP the core
+        # already holds, not the option quote, so it neither depends on
+        # ``quotes_ok`` nor spends a broker call. A fired take-profit ends the
+        # cycle like a fired stop: the next cycle re-reads a snapshot that no
+        # longer contains the exited row.
+        if cfg.get("take_profit_enabled") and self._take_profit_exits(cfg):
+            invalidate_live_cache()
+            self._reconcile_and_log(attempts=2, delay_s=4.0)
+            return
         lock_on = bool(cfg.get("profit_lock_enabled"))
         sl_on = bool(cfg.get("stop_loss_enabled"))
         if not (lock_on or sl_on):
@@ -4146,6 +4244,81 @@ class Open15BreakoutService:
         except Exception:
             logger.exception("open15: stop-counterfactual backfill failed")
 
+    def _take_profit_exits(self, cfg: dict) -> bool:
+        """Square off every REAL open row whose underlying has moved at least
+        its side's take-profit % from the trigger price (issue #770).
+
+        Only ``status == 'open'`` rows are considered: paper/sim/shadow rows
+        never carry that status, so nothing that was never ordered can be sent
+        an exit (the #548/#581 rule); a non-``real`` fill is skipped too, belt
+        and braces. The exit goes through ``_exit_open_row`` — the one exit
+        path — so the #626 book verification, the #641 fill reconcile and the
+        child-mirror fan-out apply unchanged. Returns True when at least one
+        exit order was SENT.
+        """
+        core = self.core
+        if core is None:
+            return False
+        with self._lock:
+            open_pos = {
+                s: p
+                for s, p in self.positions.items()
+                if p.get("status") == "open" and (p.get("fill") or "real") == "real"
+            }
+        import time as _time
+
+        fired = False
+        last_try = self._risk.setdefault("tp_last_try", {})
+        for symbol, pos in open_pos.items():
+            tp_pct = take_profit_pct_for_side(cfg, pos.get("side"))
+            if tp_pct <= 0:
+                continue
+            move = underlying_move_pct(
+                pos.get("side"), pos.get("trigger_price"), core.last_price.get(symbol)
+            )
+            if move is None or move < tp_pct:
+                continue
+            # A failed exit keeps its row ``open`` (the shared path's retry
+            # semantics). Retry at most once a minute per symbol, so a
+            # persistently-rejecting broker neither gets a market order every
+            # poll nor starves the stop / day rule (a fired cycle returns
+            # early). The scheduled flatten stays the final backstop.
+            now = _time.monotonic()
+            if now - last_try.get(symbol, -1e9) < 60.0:
+                continue
+            last_try[symbol] = now
+            logger.warning(
+                "open15: take-profit hit for %s (%s underlying %+.2f%% >= %.2f%%)",
+                symbol,
+                pos.get("side"),
+                move,
+                tp_pct,
+            )
+            if self._exit_open_row(symbol, pos, "take_profit"):
+                fired = True
+                self._alert_take_profit(symbol, move, tp_pct)
+        return fired
+
+    def _alert_take_profit(self, symbol: str, move_pct: float, tp_pct: float) -> None:
+        """Telegram a fired take-profit, once per (symbol, day) — a failed exit
+        keeps its row open and is retried every cycle, which must not become a
+        message storm."""
+        r = self._risk
+        if symbol in (r.get("tp_alerted") or []):
+            return
+        r.setdefault("tp_alerted", []).append(symbol)
+        try:
+            from services.notification_service import get_notification_service
+
+            get_notification_service().notify(
+                "open15_breakout",
+                f"🎯 open15_vol_breakout [{_mode()}]: TAKE PROFIT — {symbol} "
+                f"squared off, underlying {move_pct:+.2f}% from trigger "
+                f"(target {tp_pct:.2f}%). Other trades keep running.",
+            )
+        except Exception:
+            logger.exception("open15: take-profit alert failed")
+
     def _alert_stop_loss(self, symbol: str, mtm: float, sl_inr: float) -> None:
         """Telegram a fired stop, deduped per (symbol, day) so the 60s trail
         retry gate can never turn one stop into a message storm."""
@@ -4260,6 +4433,10 @@ class Open15BreakoutService:
             "stop_loss_inr": cfg.get("stop_loss_inr"),
             "stop_loss_inr_long": cfg.get("stop_loss_inr_long"),
             "stop_loss_inr_short": cfg.get("stop_loss_inr_short"),
+            "take_profit_enabled": bool(cfg.get("take_profit_enabled")),
+            "take_profit_underlying_pct": cfg.get("take_profit_underlying_pct"),
+            "take_profit_pct_long": cfg.get("take_profit_pct_long"),
+            "take_profit_pct_short": cfg.get("take_profit_pct_short"),
             "locked": bool(r.get("locked")),
             "locked_at": r.get("locked_at"),
             "peak": r.get("peak"),

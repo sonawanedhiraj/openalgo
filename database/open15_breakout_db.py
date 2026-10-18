@@ -357,6 +357,13 @@ class Open15Config(Base):
     # number for both sides is the wrong shape.
     stop_loss_inr_long = Column(Float, nullable=True)
     stop_loss_inr_short = Column(Float, nullable=True)
+    # issue #770 — per-trade TAKE-PROFIT on the underlying's move (%) from the
+    # trigger price. NULL = env seed (OFF / 1.0%); per-side NULL = the common
+    # %, 0 = off for that side (the #722 shape).
+    take_profit_enabled = Column(Integer, nullable=True)  # 0/1
+    take_profit_underlying_pct = Column(Float, nullable=True)
+    take_profit_pct_long = Column(Float, nullable=True)
+    take_profit_pct_short = Column(Float, nullable=True)
     # issue #721 — volume-ratio CEILING at the trigger (x avg minute volume).
     # NULL resolves to the env seed (0 = off); a trigger at/above it is
     # journaled as a sim-priced ``vol_ratio_cap`` skip, never ordered.
@@ -504,6 +511,11 @@ def _ensure_columns():
             # as it did before
             "stop_loss_inr_long": "FLOAT",
             "stop_loss_inr_short": "FLOAT",
+            # issue #770 — all NULL on an existing install = take-profit OFF
+            "take_profit_enabled": "INTEGER",
+            "take_profit_underlying_pct": "FLOAT",
+            "take_profit_pct_long": "FLOAT",
+            "take_profit_pct_short": "FLOAT",
             # issue #721 — NULL resolves to the env seed (0 = off), so an
             # existing install arms exactly as it did before
             "max_vol_ratio": "FLOAT",
@@ -609,6 +621,12 @@ def get_config() -> dict | None:
             "stop_loss_inr": row.stop_loss_inr,
             "stop_loss_inr_long": row.stop_loss_inr_long,
             "stop_loss_inr_short": row.stop_loss_inr_short,
+            "take_profit_enabled": (
+                None if row.take_profit_enabled is None else bool(row.take_profit_enabled)
+            ),
+            "take_profit_underlying_pct": row.take_profit_underlying_pct,
+            "take_profit_pct_long": row.take_profit_pct_long,
+            "take_profit_pct_short": row.take_profit_pct_short,
             "max_vol_ratio": row.max_vol_ratio,
             "trade_grades": row.trade_grades,
             "grade_sides": row.grade_sides,
@@ -663,6 +681,10 @@ def save_config(
     stop_loss_inr: float | None = None,
     stop_loss_inr_long: float | None = None,
     stop_loss_inr_short: float | None = None,
+    take_profit_enabled: bool | None = None,
+    take_profit_underlying_pct: float | None = None,
+    take_profit_pct_long: float | None = None,
+    take_profit_pct_short: float | None = None,
     max_vol_ratio: float | None = None,
     trade_grades: str | None = None,
     watched_cf_enabled: bool | None = None,
@@ -728,6 +750,12 @@ def save_config(
         row.stop_loss_inr = stop_loss_inr
         row.stop_loss_inr_long = stop_loss_inr_long
         row.stop_loss_inr_short = stop_loss_inr_short
+        row.take_profit_enabled = (
+            None if take_profit_enabled is None else int(bool(take_profit_enabled))
+        )
+        row.take_profit_underlying_pct = take_profit_underlying_pct
+        row.take_profit_pct_long = take_profit_pct_long
+        row.take_profit_pct_short = take_profit_pct_short
         row.max_vol_ratio = max_vol_ratio
         row.trade_grades = trade_grades
         row.grade_sides = grade_sides
@@ -863,7 +891,11 @@ STOP_LOSS_REASON = "stop_loss"
 # stopped one — same ``cf_*`` columns, same ``stop_saved_of_row`` definition —
 # so "would holding to the exit have paid more?" has data on both sides.
 PROFIT_TRAIL_REASON = "profit_trail"
-RISK_EXIT_REASONS = (STOP_LOSS_REASON, PROFIT_TRAIL_REASON)
+# issue #770: the per-trade underlying take-profit is the THIRD risk exit. Its
+# rows are marked to the scheduled exit like the other two, so "TP saved" is
+# measured on the same ``cf_*`` columns and ``stop_saved_of_row`` definition.
+TAKE_PROFIT_REASON = "take_profit"
+RISK_EXIT_REASONS = (STOP_LOSS_REASON, PROFIT_TRAIL_REASON, TAKE_PROFIT_REASON)
 
 
 def cf_net_of_row(row) -> float | None:
@@ -924,12 +956,15 @@ def risk_exit_rows(
         db_session.remove()
 
 
-def net_of_row_under(row, apply_sl: bool = True, apply_trail: bool = True) -> float | None:
+def net_of_row_under(
+    row, apply_sl: bool = True, apply_trail: bool = True, apply_tp: bool = True
+) -> float | None:
     """NET P&L of a row with the risk exits optionally UNDONE (issue #748).
 
     ``apply_sl=False`` replaces a ``reason='stop_loss'`` row's P&L with its
     held-to-scheduled-exit counterfactual; ``apply_trail=False`` does the same
-    for a ``reason='profit_trail'`` row. Every other row — a timed exit, and
+    for a ``reason='profit_trail'`` row, and ``apply_tp=False`` for a
+    ``reason='take_profit'`` row (issue #770). Every other row — a timed exit, and
     every paper/shadow row (never stopped or trailed) — is its own
     :func:`net_pnl_of_row`. Returns None when an undone exit's counterfactual
     is not priced yet: the caller counts it PENDING, never as Rs0.
@@ -937,8 +972,10 @@ def net_of_row_under(row, apply_sl: bool = True, apply_trail: bool = True) -> fl
     """
     get = row.get if isinstance(row, dict) else lambda k: getattr(row, k, None)
     reason = get("reason")
-    if (reason == STOP_LOSS_REASON and not apply_sl) or (
-        reason == PROFIT_TRAIL_REASON and not apply_trail
+    if (
+        (reason == STOP_LOSS_REASON and not apply_sl)
+        or (reason == PROFIT_TRAIL_REASON and not apply_trail)
+        or (reason == TAKE_PROFIT_REASON and not apply_tp)
     ):
         cf = cf_net_of_row(row)
         return None if cf is None else round(cf, 2)
