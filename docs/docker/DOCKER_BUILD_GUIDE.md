@@ -67,18 +67,18 @@ docker run -d \
 
 The Dockerfile uses **multi-stage builds** for optimization:
 
-1. **Python Builder Stage** (`python:3.12-bullseye`)
+1. **Python Builder Stage** (`python:3.12-bookworm`)
    - Installs `uv` package manager
    - Creates virtual environment
    - Installs all Python dependencies from `pyproject.toml`
    - Installs Gunicorn with eventlet support
 
-2. **Frontend Builder Stage** (`node:20-bullseye-slim`)
+2. **Frontend Builder Stage** (`node:24-bookworm-slim`)
    - Installs npm dependencies
    - Builds React frontend (`npm run build`)
    - Outputs to `frontend/dist/`
 
-3. **Production Stage** (`python:3.12-slim-bullseye`)
+3. **Production Stage** (`python:3.12-slim-bookworm`)
    - Minimal base image
    - **Installs runtime libraries for numba/scipy:**
      - `libopenblas0` - BLAS/LAPACK for linear algebra
@@ -103,7 +103,7 @@ None required - all configuration is in `.env` file.
 
 ### Image Size
 
-- **Base image** (`python:3.12-slim-bullseye`): ~145 MB
+- **Base image** (`python:3.12-slim-bookworm`): ~145 MB
 - **Python dependencies**: ~650 MB
 - **Runtime libraries**: ~15 MB
 - **Frontend dist**: ~5 MB
