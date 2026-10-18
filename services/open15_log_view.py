@@ -106,6 +106,11 @@ _ARMED_PASSTHROUGH = (
     # issue #722
     "stop_loss_inr_long",
     "stop_loss_inr_short",
+    # issue #770
+    "take_profit_enabled",
+    "take_profit_underlying_pct",
+    "take_profit_pct_long",
+    "take_profit_pct_short",
     # issue #721
     "max_vol_ratio",
     # issue #728

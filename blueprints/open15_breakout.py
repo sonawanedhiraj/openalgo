@@ -98,9 +98,12 @@ def config():
         _residual_sizing_enabled_default,
         _stop_loss_enabled_default,
         _stop_loss_inr_default,
+        _take_profit_enabled_default,
+        _take_profit_pct_default,
         _trail_confirm_polls_default,
         _trail_giveback_default,
         _watched_cf_enabled_default,
+        clamp_take_profit_pct,
         get_open15_service,
     )
     from services.open15_breakout_service import (
@@ -342,6 +345,26 @@ def config():
         stop_loss_inr_short = (
             None if stop_loss_inr_short in (None, "") else _clamp_rupees(stop_loss_inr_short, 0.0)
         )
+        # issue #770 — take-profit on the underlying's move (%). Empty = NULL
+        # (env seed for the common value; "same as common" for a side); a
+        # posted side 0 = take-profit OFF for that side only.
+        take_profit = _opt_bool("take_profit_enabled")
+        tp_pct = body.get("take_profit_underlying_pct")
+        tp_pct = (
+            None
+            if tp_pct in (None, "")
+            else clamp_take_profit_pct(tp_pct, _take_profit_pct_default())
+        )
+        tp_long = body.get("take_profit_pct_long")
+        tp_long = (
+            None if tp_long in (None, "") else clamp_take_profit_pct(tp_long, 0.0, allow_zero=True)
+        )
+        tp_short = body.get("take_profit_pct_short")
+        tp_short = (
+            None
+            if tp_short in (None, "")
+            else clamp_take_profit_pct(tp_short, 0.0, allow_zero=True)
+        )
         if liq_min is not None and liq_reentry is not None and liq_reentry < liq_min:
             # an inverted band would readmit a name the same day it was excluded,
             # which is the flapping the hysteresis exists to prevent
@@ -403,6 +426,10 @@ def config():
             stop_loss_inr=stop_loss_inr,
             stop_loss_inr_long=stop_loss_inr_long,
             stop_loss_inr_short=stop_loss_inr_short,
+            take_profit_enabled=take_profit,
+            take_profit_underlying_pct=tp_pct,
+            take_profit_pct_long=tp_long,
+            take_profit_pct_short=tp_short,
             max_vol_ratio=max_vol_ratio,
             trade_grades=trade_grades,
             watched_cf_enabled=watched_cf,
@@ -473,6 +500,12 @@ def config():
                 # issue #722 — no env seed: an unset side follows the common value
                 "stop_loss_inr_long": None,
                 "stop_loss_inr_short": None,
+                # issue #770 — take-profit seeds (service owns the defaults);
+                # no side seed: an unset side follows the common %
+                "take_profit_enabled": _take_profit_enabled_default(),
+                "take_profit_underlying_pct": _take_profit_pct_default(),
+                "take_profit_pct_long": None,
+                "take_profit_pct_short": None,
                 # issue #721 - volume-ratio ceiling seed (0 = off)
                 "max_vol_ratio": _max_vol_ratio_default(),
                 # issue #726 - grade filter seed (ABC = trade everything)
@@ -974,6 +1007,21 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
    mirrors flatten automatically. Thresholds apply at the next 09:10 arm; 0 = rule off.</span>
  </div>
  <div style="margin-top:6px">
+  <label><input id="c_tp" type="checkbox"> per-trade take-profit</label>
+  <label class="muted" style="margin-left:8px">underlying move
+   <input id="c_tppct" type="number" min="0.5" max="3" step="0.25" style="width:52px"> %</label>
+  <label class="muted" style="margin-left:8px" title="issue #770: per-side override. Blank = same as the common %; 0 = take-profit OFF for longs only.">longs <input id="c_tppct_l" type="number" min="0" max="3" step="0.25" placeholder="= common" style="width:70px"> %</label>
+  <label class="muted" style="margin-left:8px" title="issue #770: per-side override. Blank = same as the common %; 0 = take-profit OFF for shorts only.">shorts <input id="c_tppct_s" type="number" min="0" max="3" step="0.25" placeholder="= common" style="width:70px"> %</label>
+  <span class="leg">issue #770. <b>Take-profit is TRADE-wise and reads the STOCK, not the option:</b>
+   once a real open trade's underlying has moved the configured % in the trade's direction from its
+   trigger price, that trade alone is squared off (<code>reason take_profit</code>); the day keeps
+   trading. Evaluated on the same background monitor as the stop, from the stock LTP already on the
+   feed &mdash; no extra broker call. Paper / sim / shadow rows are never squared off. The held-to-exit
+   value keeps being marked, so the chart and scorecard show what the take-profit saved or cost.
+   Clamped 0.5&ndash;3.0 % (the range the #769 replay measured); per-side blank = common, 0 = off
+   for that side. Applies at the next 09:10 arm.</span>
+ </div>
+ <div style="margin-top:6px">
   <label><input id="c_residual" type="checkbox"> spend the residual cash</label>
   <label class="muted" style="margin-left:14px">keep back
    <input id="c_residualres" type="number" min="0" max="25" step="0.5" style="width:48px"> %</label>
@@ -1191,6 +1239,11 @@ async function loadCfg(){
   // NULL row must render EMPTY, never as the common number (that would save it)
   document.getElementById('c_slinr_l').value=(o.stop_loss_inr_long==null?'':o.stop_loss_inr_long);
   document.getElementById('c_slinr_s').value=(o.stop_loss_inr_short==null?'':o.stop_loss_inr_short);
+  // take-profit (issue #770) — `??` so a stored false beats a true env seed
+  document.getElementById('c_tp').checked=!!(o.take_profit_enabled??d.take_profit_enabled);
+  document.getElementById('c_tppct').value=o.take_profit_underlying_pct??d.take_profit_underlying_pct??1.0;
+  document.getElementById('c_tppct_l').value=(o.take_profit_pct_long==null?'':o.take_profit_pct_long);
+  document.getElementById('c_tppct_s').value=(o.take_profit_pct_short==null?'':o.take_profit_pct_short);
   // volume-ratio ceiling (issue #721) — `??` so a stored 0 beats a non-zero env seed
   document.getElementById('c_maxvr').value=o.max_vol_ratio??d.max_vol_ratio??0;
   if(window.armLivePoll)armLivePoll();  // later script block; guarded for ordering
@@ -1283,6 +1336,10 @@ async function saveCfg(){
     // empty string posts as '' (= leave NULL); a typed 0 posts as 0 (= side off)
     stop_loss_inr_long:(v=>v===''?'':+v)(document.getElementById('c_slinr_l').value),
     stop_loss_inr_short:(v=>v===''?'':+v)(document.getElementById('c_slinr_s').value),
+    take_profit_enabled:document.getElementById('c_tp').checked,
+    take_profit_underlying_pct:+document.getElementById('c_tppct').value,
+    take_profit_pct_long:(v=>v===''?'':+v)(document.getElementById('c_tppct_l').value),
+    take_profit_pct_short:(v=>v===''?'':+v)(document.getElementById('c_tppct_s').value),
     max_vol_ratio:+document.getElementById('c_maxvr').value,
     grade_sides:gsFromForm(),
     trade_grades:['A','B','C'].filter(g=>gsParse(gsFromForm())[g]).join('')};
@@ -2513,7 +2570,11 @@ function renderRiskCard(j){
   const slLabel=r=>{const l=r.stop_loss_inr_long,s=r.stop_loss_inr_short;
     if(l==null||s==null||l===s)return rupAbs(l??r.stop_loss_inr);
     return 'L '+(l>0?rupAbs(l):'off')+' / S '+(s>0?rupAbs(s):'off');};
-  if(!risk||(!risk.profit_lock_enabled&&!risk.stop_loss_enabled)||
+  // issue #770 — take-profit %: both sides when they differ, one number otherwise
+  const tpLabel=r=>{const l=r.take_profit_pct_long,s=r.take_profit_pct_short;
+    if(l==null||s==null||l===s)return (l??r.take_profit_underlying_pct)+'%';
+    return 'L '+(l>0?l+'%':'off')+' / S '+(s>0?s+'%':'off');};
+  if(!risk||(!risk.profit_lock_enabled&&!risk.stop_loss_enabled&&!risk.take_profit_enabled)||
      (risk.day_status!=='armed'&&risk.day_status!=='done')){
     box.style.display='none';box.innerHTML='';return;}
   // issue #716: the rule reads NET (bid marks minus modelled exit charges);
@@ -2537,6 +2598,7 @@ function renderRiskCard(j){
         rupAbs(risk.trail_giveback_inr))
       :'profit lock off')+
     ' \\u00B7 '+(risk.stop_loss_enabled?('trade SL '+slLabel(risk)):'stop loss off')+
+    ' \\u00B7 '+(risk.take_profit_enabled?('trade TP '+tpLabel(risk)+' underlying'):'take-profit off')+
     (risk.profit_lock_enabled&&risk.trail_confirm_polls?(' &middot; confirm '+risk.trail_confirm_polls+' poll'+(risk.trail_confirm_polls===1?'':'s')):'')+
     ' &middot; marks: '+esc(risk.mark_basis||(j.mark_basis||'&mdash;'))+
     ' &middot; poll '+esc(String(j.poll_interval_s||window.__livePollS||'?'))+'s'+
@@ -2580,7 +2642,8 @@ function renderPnlCurve(){
   const lines=[];
   // risk exits (#704 stop loss, #713 profit trail): both continue dashed
   const stopped=usable.filter(t=>t.risk_exit);
-  const anySL=stopped.some(t=>t.stop_loss), anyTP=stopped.some(t=>t.profit_trail);
+  const anySL=stopped.some(t=>t.stop_loss), anyTP=stopped.some(t=>t.profit_trail),
+    anyTK=stopped.some(t=>t.take_profit);
   usable.forEach((t,i)=>{
     const ex=m2x(t.entry_minute)+(t.entry_second||0)/60;
     const arr=[[ex,0]];
@@ -2708,14 +2771,15 @@ function renderPnlCurve(){
       s+='<circle cx="'+X(ge[0])+'" cy="'+Y(ge[1])+'" r="3" fill="'+ln.col+'" fill-opacity=".55" stroke="#0f1419" stroke-width="1.5"/>';
       // the exit itself: a diamond — mauve for a stop loss (the risk-event
       // colour on this page), green for a profit-trail exit (#713)
-      const isTP=!!ln.t.profit_trail;
+      // issue #770: the take-profit is a third kind - teal diamond, "TK"/"TP saved"
+      const isTP=!!ln.t.profit_trail, isTK=!!ln.t.take_profit;
       const cx=X(last[0]),cy=Y(last[1]);
-      s+='<path d="M'+cx+' '+(cy-5.5)+' L'+(cx+5.5)+' '+cy+' L'+cx+' '+(cy+5.5)+' L'+(cx-5.5)+' '+cy+' Z" fill="'+(isTP?'#a6e3a1':'#cba6f7')+'" stroke="#0f1419" stroke-width="1.3"/>';
+      s+='<path d="M'+cx+' '+(cy-5.5)+' L'+(cx+5.5)+' '+cy+' L'+cx+' '+(cy+5.5)+' L'+(cx-5.5)+' '+cy+' Z" fill="'+(isTK?'#94e2d5':isTP?'#a6e3a1':'#cba6f7')+'" stroke="#0f1419" stroke-width="1.3"/>';
       const sv=ln.t.stop_saved;
       labels.push({y:Y(ge[1]),col:ln.col,dim:1,txt:ln.t.symbol+' held '+fmtR(ge[1])+
-        (sv!=null?(' ('+(isTP?'trail ':'stop ')+(sv>=0?'saved ':'cost ')+fmtR(sv)+' net)'):
+        (sv!=null?(' ('+(isTK?'TP ':isTP?'trail ':'stop ')+(sv>=0?'saved ':'cost ')+fmtR(sv)+' net)'):
           (ln.t.cf_source==='curve'?' (unstamped)':''))});
-      labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+(isTP?' TP ':' SL ')+fmtR(last[1])});
+      labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+(isTK?' TK ':isTP?' TP ':' SL ')+fmtR(last[1])});
     }else{
       s+='<circle cx="'+X(last[0])+'" cy="'+Y(last[1])+'" r="3.2" fill="'+ln.col+'" stroke="#0f1419" stroke-width="1.5"/>';
       labels.push({y:Y(last[1]),col:ln.col,txt:ln.t.symbol+' '+fmtR(last[1])});
@@ -2830,9 +2894,11 @@ function renderPnlCurve(){
   let stopLine='';
   if(stopped.length){
     const pending=stopped.filter(t=>t.stop_saved==null).length;
-    const nSL=stopped.filter(t=>t.stop_loss).length, nTP=stopped.length-nSL;
+    const nSL=stopped.filter(t=>t.stop_loss).length, nTK=stopped.filter(t=>t.take_profit).length,
+      nTP=stopped.length-nSL-nTK;
     const what=[nSL?('stop loss: '+nSL+' exit'+(nSL===1?'':'s')):'',
-      nTP?('profit trail: '+nTP+' exit'+(nTP===1?'':'s')):''].filter(Boolean).join(' &middot; ');
+      nTP?('profit trail: '+nTP+' exit'+(nTP===1?'':'s')):'',
+      nTK?('take-profit: '+nTK+' exit'+(nTK===1?'':'s')):''].filter(Boolean).join(' &middot; ');
     stopLine='<div class="muted" style="margin-top:6px">'+what+
       (j.stop_saved_total!=null?(' &middot; net effect <span class="'+
       (j.stop_saved_total>=0?'pos':'neg')+'">'+fmtR(j.stop_saved_total)+'</span> (positive = exiting early beat holding to the scheduled exit)'):
@@ -2855,7 +2921,7 @@ function renderPnlCurve(){
 // Numbers only. The two checkboxes UNDO an exit (valued at its held-to-exit
 // counterfactual); the two cohorts are never merged; sim (1 lot) is in neither.
 // NB: this page lives in a non-raw Python string - no backslashes in here.
-const gsState={sl:true,tr:true,win:'all',mode:''};
+const gsState={sl:true,tr:true,tk:true,win:'all',mode:''};
 // keeps up with the day on its own: a trade joins at its close, a stopped
 // trade's held-to-exit value at the scheduled exit (pending until then)
 let gsTimer=null, gsAt=null;
@@ -2863,7 +2929,7 @@ function gsAutoRefresh(){if(gsTimer)return;gsTimer=setInterval(()=>{if(!document
 function gsSet(el){gsState[el.dataset.gs]=el.type==='checkbox'?el.checked:el.value;loadGradeCard();}
 async function loadGradeCard(){
   const box=document.getElementById('gscard'); if(!box)return;
-  const q='apply_sl='+(gsState.sl?1:0)+'&apply_trail='+(gsState.tr?1:0)+
+  const q='apply_sl='+(gsState.sl?1:0)+'&apply_trail='+(gsState.tr?1:0)+'&apply_tp='+(gsState.tk?1:0)+
     '&window='+gsState.win+(gsState.mode?('&mode='+gsState.mode):'');
   gsAutoRefresh();
   try{const r=await fetch('/open15_vol_breakout/api/grade_scorecard?'+q);gsAt=new Date();renderGradeCard(await r.json());}
@@ -2879,17 +2945,18 @@ function renderGradeCard(j){
   const rup=v=>v==null?'&mdash;':((v<0?'-Rs':'+Rs')+Math.abs(Math.round(v)).toLocaleString('en-IN'));
   const pct=v=>v==null?'&mdash;':(Math.round(v*100)+'%');
   const cls=v=>v==null?'':(v>=0?'pos':'neg');
-  const basis=j.apply_sl&&j.apply_trail?'as traded (stop loss + profit trail)':
-    j.apply_sl?'stop loss on, profit trail undone':
-    j.apply_trail?'profit trail on, stop loss undone':
-    'no stop, no trail &mdash; every real trade held to the scheduled exit';
+  const tkOn=j.apply_tp!==false;
+  const basis=(j.apply_sl&&j.apply_trail&&tkOn?'as traded (stop loss + profit trail + take-profit)':
+    !j.apply_sl&&!j.apply_trail&&!tkOn?'no stop, no trail, no take-profit &mdash; every real trade held to the scheduled exit':
+    [j.apply_sl?'stop loss on':'stop loss undone',j.apply_trail?'profit trail on':'profit trail undone',
+     tkOn?'take-profit on':'take-profit undone'].join(', '));
   const ck=(k,on,lab)=>`<label><input type="checkbox" data-gs="${k}"${on?' checked':''} onchange="gsSet(this)"> ${lab}</label>`;
   const sel=(k,cur,opts)=>`<select data-gs="${k}" onchange="gsSet(this)">`+
     opts.map(o=>`<option value="${o[0]}"${o[0]===cur?' selected':''}>${o[1]}</option>`).join('')+'</select>';
   const lg=esc(j.live_grading_from);
   let h=title+'<span class="asub">'+basis+(j.since?(' &middot; since '+esc(j.since)):'')+' &middot; net Rs'+
     (gsAt?(' &middot; updated '+gsAt.toTimeString().slice(0,8)+' (every 60s)'):'')+'</span>';
-  h+='<div class="gsctl">'+ck('sl',j.apply_sl,'Apply stop loss')+ck('tr',j.apply_trail,'Apply profit-trail exit')+
+  h+='<div class="gsctl">'+ck('sl',j.apply_sl,'Apply stop loss')+ck('tr',j.apply_trail,'Apply profit-trail exit')+ck('tk',tkOn,'Apply take-profit')+
     sel('win',j.window,[['all','All days'],['r63','R63 sample (before '+lg+')'],['live','Live grading ('+lg+' on)']])+
     sel('mode',gsState.mode,[['','Live + sandbox'],['live','Live only'],['sandbox','Sandbox only']])+
     '<span class="muted">unchecked = that exit is undone; the trade is held to the scheduled exit</span></div>';
@@ -3246,7 +3313,8 @@ def grade_scorecard():
     """Per-grade win rates (overall / long / short), net and max drawdown, with
     the stop loss and profit-trail exit each optionally undone (issue #748).
 
-    Query: ``apply_sl`` / ``apply_trail`` (``1`` default, ``0`` = undo that
+    Query: ``apply_sl`` / ``apply_trail`` / ``apply_tp`` (take-profit, #770)
+    (``1`` default, ``0`` = undo that
     exit), ``window`` (``all`` | ``r63`` | ``live``), ``mode`` (``live`` |
     ``sandbox``, omit = both). Read-only on the journal, no broker call; always
     HTTP 200 with a labelled ``status`` (the card renders failure as text).
@@ -3266,6 +3334,7 @@ def grade_scorecard():
                 apply_trail=_flag("apply_trail"),
                 window=request.args.get("window") or "all",
                 mode=mode,
+                apply_tp=_flag("apply_tp"),
             )
         )
     except Exception:

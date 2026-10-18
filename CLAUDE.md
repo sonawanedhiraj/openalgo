@@ -1834,6 +1834,48 @@ exit against the mauve `SL` one. **The scorecard stays stop-only**
 (`stop_loss_rows`): its pre-registered rule judges the stop, and a trail exit
 is a different question. Tests: `test/test_open15_trail_counterfactual.py`.
 
+**Per-trade TAKE-PROFIT on the underlying's move (issue #770, default OFF).**
+The third risk exit. Once a REAL `open` row's underlying stock has moved
+`take_profit_underlying_pct` (seed 1.0, clamped 0.5–3.0) **in the trade's
+direction from its trigger price**, that row alone is squared off
+(`reason=take_profit`); the day keeps trading. Evidence (#769, R74 follow-up,
+`backtest/open15_2y/followthrough.py`): on the tick-exact replay 2026-08-04 →
+10-16 a +1.0/+1.25/+1.5% underlying take-profit was the ONE exit rule that
+added return in BOTH date halves (most for A shorts); on 22 live real trades
+with option marks a +15% premium TP added ~Rs4.5k on only 2 hits — direction,
+not proof, which is why it ships OFF and is measured. Rules:
+- **It reads the STOCK, never the option quote.** Evaluated at the head of
+  `_risk_tick` (the `open15-risk-monitor` thread, never the ZMQ tick thread)
+  from `core.last_price` — zero broker calls, and independent of `quotes_ok`
+  (an option-quote outage that silences the stop and day rule does not silence
+  it). A fired take-profit ends the cycle like a fired stop (invalidate the
+  live cache, reconcile fills, let the next snapshot drive the other rules).
+- **One exit path.** `_take_profit_exits` → `_exit_open_row`, so the #626
+  book verification (a book-flat entry is papered, nothing is sent), #641
+  fill reconcile and the child-mirror fan-out apply unchanged. Only
+  `status=='open'` + `fill=='real'` rows are considered — paper/sim/shadow are
+  never squared off. A rejected exit keeps the row open and is retried **at
+  most once a minute per symbol** (`_risk['tp_last_try']`) so a rejecting
+  broker gets neither an order per poll nor the power to starve the stop.
+- **Per SIDE like the #722 stop:** `take_profit_pct_long` / `_short`
+  (NULL = common, 0 = OFF for that side; enabled when any side is positive),
+  read through `take_profit_pct_for_side`.
+- **Measured, not just applied.** `TAKE_PROFIT_REASON` joins
+  `RISK_EXIT_REASONS`, so a take-profit row is ghost-marked to the scheduled
+  exit and stamped/back-filled exactly like a stop or trail row (same `cf_*`
+  columns, same `stop_saved_of_row`); the curve flags it `take_profit` (teal
+  diamond, `TK` label, "TP saved/cost ±Rs"), and the grade scorecard has a
+  third undo toggle (`apply_tp`, through `net_of_row_under`). The STOP-LOSS
+  SCORECARD stays stop-only. No new event names — the exit is the ordinary
+  `exit` event with `reason=take_profit`.
+Config: `open15_config.{take_profit_enabled, take_profit_underlying_pct,
+take_profit_pct_long, take_profit_pct_short}` (NULL → env seeds
+`OPEN15_TAKE_PROFIT` (false) / `OPEN15_TAKE_PROFIT_UNDERLYING_PCT` (1.0));
+UI row under the stop loss on `/open15_vol_breakout/logs`, applied at the next
+09:10 arm and stamped into the `armed` event; the Day Risk card prints
+`trade TP 1.0% underlying` (or `L … / S …`). Telegram once per symbol/day.
+Tests: `test/test_open15_take_profit.py`.
+
 **Volume-ratio CEILING at the trigger (issue #721, `open15_config.max_vol_ratio`,
 env seed `OPEN15_MAX_VOL_RATIO`, default 0 = off).** The gate fires the instant
 cum-volume-in-minute ≥ `vol_mult`× the average while price is beyond the level,

@@ -18,6 +18,28 @@ the latest decisions automatically.
 
 ## Active parameters
 
+### open15 per-trade underlying take-profit (issue #770, 2026-10-18)
+
+- **Why:** R74 follow-up (#769): on the tick-exact replay 2026-08-04 → 10-16
+  (293 triggers) a take-profit at +1.0 / +1.25 / +1.5% underlying move added
+  return in BOTH date halves for the traded cohort (+0.047/+0.034,
+  +0.106/+0.026, +0.025/+0.027 %/trade, stock basis), most for A shorts. Ships
+  **OFF** so it can be switched on from the UI and its counterfactual measured.
+- **New tunables** (UI row on `/open15_vol_breakout/logs` → `open15_config`;
+  NULL falls back to the env seed; applied at the next 09:10 arm):
+
+  | Field / env seed | Default | Clamp | Meaning |
+  |---|---|---|---|
+  | `take_profit_enabled` / `OPEN15_TAKE_PROFIT` | false | — | master switch |
+  | `take_profit_underlying_pct` / `OPEN15_TAKE_PROFIT_UNDERLYING_PCT` | 1.0 | 0.5–3.0 | underlying move (%) from trigger, in the trade's direction |
+  | `take_profit_pct_long` | NULL | 0 or 0.5–3.0 | longs override; NULL = common, 0 = off for longs |
+  | `take_profit_pct_short` | NULL | 0 or 0.5–3.0 | shorts override; NULL = common, 0 = off for shorts |
+
+- **Code constant (not a knob):** a rejected take-profit exit is retried at
+  most once a minute per symbol.
+- **Reality at ship time:** no `OPEN15_TAKE_PROFIT*` in `.env` and the four
+  columns are NULL on the existing row → take-profit OFF.
+
 ### cas_auction_reversal Settings card (issue #755, 2026-10-04)
 
 - **What changed:** the four `CAS_AR_*` tunables below became editable from
