@@ -1010,8 +1010,8 @@ _LOGS_PAGE = """<!doctype html><html><head><meta charset="utf-8">
   <label><input id="c_tp" type="checkbox"> per-trade take-profit</label>
   <label class="muted" style="margin-left:8px">underlying move
    <input id="c_tppct" type="number" min="0.5" max="3" step="0.25" style="width:52px"> %</label>
-  <label class="muted" style="margin-left:8px" title="issue #770: per-side override. Blank = same as the common %; 0 = take-profit OFF for longs only.">longs <input id="c_tppct_l" type="number" min="0" max="3" step="0.25" placeholder="= common" style="width:70px"> %</label>
-  <label class="muted" style="margin-left:8px" title="issue #770: per-side override. Blank = same as the common %; 0 = take-profit OFF for shorts only.">shorts <input id="c_tppct_s" type="number" min="0" max="3" step="0.25" placeholder="= common" style="width:70px"> %</label>
+  <label class="muted" style="margin-left:8px" title="issue #770: per-side override. Blank = same as the common %; 0 = take-profit OFF for longs only.">longs <input id="c_tppct_l" type="number" min="0" max="3" step="0.25" placeholder="= common" style="width:86px"> %</label>
+  <label class="muted" style="margin-left:8px" title="issue #770: per-side override. Blank = same as the common %; 0 = take-profit OFF for shorts only.">shorts <input id="c_tppct_s" type="number" min="0" max="3" step="0.25" placeholder="= common" style="width:86px"> %</label>
   <span class="leg">issue #770. <b>Take-profit is TRADE-wise and reads the STOCK, not the option:</b>
    once a real open trade's underlying has moved the configured % in the trade's direction from its
    trigger price, that trade alone is squared off (<code>reason take_profit</code>); the day keeps
