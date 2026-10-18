@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.4
 # ------------------------------ Python Builder Stage ----------------------- #
-FROM python:3.12-bullseye AS python-builder
+FROM python:3.12-bookworm AS python-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -37,7 +37,7 @@ RUN cd frontend && npm run build
 
 # --------------------------------------------------------------------------- #
 # ------------------------------ Production Stage --------------------------- #
-FROM python:3.12-slim-bullseye AS production
+FROM python:3.12-slim-bookworm AS production
 # 0 – set timezone to IST (Asia/Kolkata) & install runtime dependencies
 #     chromium + fonts-liberation are required by Kaleido 1.x (plotly static
 #     image export) which drives a real headless Chromium via choreographer.
