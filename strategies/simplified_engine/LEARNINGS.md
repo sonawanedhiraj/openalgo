@@ -1027,3 +1027,22 @@ Full report: `docs/research/strategy/simplified_engine/2026-09-07_r62_oos_valida
   12:27 (bug #707; gross −₹3,499 at the 15:19 close, so that day is ≈ −₹4,100 not −₹280).
 - **Decision rule going forward:** any claim on this strategy is split IS/OOS by date, net of
   charges, with a placebo. Recommendation: pause, or run only as a labelled measurement.
+
+## 2026-10-29 — R76: win rate is fine, payoff is not; R65's counter-NIFTY label fails
+
+Full report: `docs/research/strategy/simplified_engine/2026-10-29_r76_false_positive_winrate_fresh_window.md` (issue #775).
+
+- **The fresh window (09-19 → 10-27, 129 trades) won 63.6% and still lost −₹5,303.**
+  - Avg win ₹224 vs avg loss ₹504: the engine needs ~69% winners to break even.
+  - Charges (~₹76/trade) take gross payoff 0.66 down to net 0.44.
+  - "Removing false positives" cannot fix a 2.2× loss-to-win size ratio.
+- **No entry filter is positive in all three windows.** Every cohort tested flips sign at
+  least once: before-11:00, first trade, no-loss-yet-today, SHORT-only, VIX, trade #, and
+  same-direction count.
+- **The counter-NIFTY label fails its R65 pre-registration.** W3: 65% win, −₹1,915,
+  placebo p 0.69, and the LONG side has reversed. Leave it as an observational label.
+- **Run total (06-01 → 10-27, 474 trades):** gross +₹7,074, charges ₹36,564, net −₹29,490.
+- **Brokerage sensitivity:** ₹0 brokerage (Kotak Neo API) brings W3 to near break-even, but
+  not to an edge.
+- **Next lead:** a different entry mechanic (R60b retrace-limit entry). A filter on the
+  current entry will not get there.
