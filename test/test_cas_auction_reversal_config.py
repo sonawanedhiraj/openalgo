@@ -22,6 +22,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 ENV_KEYS = (
     "CAS_AR_THRESHOLD_PCT",
     "CAS_AR_MAX_POSITIONS",
+    "CAS_AR_MIN_CANDIDATES",
     "CAS_AR_CAPITAL_PER_TRADE_INR",
     "CAS_AR_POLL_INTERVAL_S",
 )
@@ -43,6 +44,7 @@ def test_defaults_when_nothing_is_set():
     assert resolve_config(None) == {
         "threshold_pct": 0.5,
         "max_positions": 10,
+        "min_candidates": 10,
         "capital_per_trade_inr": 50_000.0,
         "poll_interval_s": 15,
     }
@@ -60,6 +62,7 @@ def test_env_seed_beats_default_and_ui_beats_env(monkeypatch):
     assert config_sources(row) == {
         "threshold_pct": "ui",
         "max_positions": "env",
+        "min_candidates": "default",
         "capital_per_trade_inr": "default",
         "poll_interval_s": "default",
     }
@@ -182,3 +185,16 @@ def test_config_post_with_api_key_is_attributed_to_api(client):
     )
     assert r.status_code == 200
     assert r.get_json()["data"]["override"]["updated_by"] == "api"
+
+
+# --------------------------------------------------------------------------- breadth gate (#777)
+def test_min_candidates_validates_and_round_trips():
+    from services.cas_auction_reversal_service import validate_config
+
+    values, errors = validate_config({"min_candidates": 0})
+    assert values == {"min_candidates": 0} and not errors  # 0 = gate off, a real value
+    assert validate_config({"min_candidates": 500})[1]  # out of range is refused
+    assert validate_config({"min_candidates": 2.5})[1]
+    cdb.save_config({"min_candidates": 7}, updated_by="test")
+    assert cdb.get_config()["min_candidates"] == 7
+    assert resolve_config(cdb.get_config())["min_candidates"] == 7

@@ -2095,6 +2095,10 @@ these jobs:
 - **15:23:30 decide:** `indicative_close_price` <= ref × (1 − `CAS_AR_THRESHOLD_PCT`),
   top `CAS_AR_MAX_POSITIONS`, `floor(CAS_AR_CAPITAL_PER_TRADE_INR / price)` shares.
   Every crossing name goes to `cas_ar_candidates`, selected or not.
+- **Breadth gate (issue #777):** fewer than `min_candidates` (default 10, 0 = off)
+  crossing names at the decision → no order that day; the candidates are still
+  journalled with `skip_reason='breadth_gate'`. Forward sandbox 2026-10-05..11-05:
+  >= 10 names → +₹11,759 / 80 trades; < 10 → −₹9,977 / 45. The R71b bars agree.
 - **15:32 fill + verify.**
 - **15:45 EOD:** the final auction close per candidate. This is the pre-registered
   20-session IEP-vs-close measurement in PLAN.md.
@@ -2156,7 +2160,7 @@ That is not a stranding risk, because a CNC SELL cannot short.
 
 **Settings card (issue #755).** `/strategies/cas_auction_reversal` carries a
 Settings form. It writes the single-row `cas_ar_config` (`threshold_pct`,
-`max_positions`, `capital_per_trade_inr`, `poll_interval_s`).
+`max_positions`, `min_candidates` — API/env only until the card gains the field, `capital_per_trade_inr`, `poll_interval_s`).
 - **Precedence per field:** UI row → `CAS_AR_*` env seed → code default.
   The card labels each value `saved` / `.env` / `default`.
 - **POST refuses out-of-range values; it never clamps them.** Env seeds are

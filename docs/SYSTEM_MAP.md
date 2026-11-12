@@ -272,7 +272,7 @@ session that involves diagnostics, mid-market changes, or unexpected behavior.
   | `cas_ar_exit` | 09:16 | PROTECTED: CNC SELL MARKET for every earlier-day entry. Quantity from the strategy's own holdings + positions (`mode_key`, `max` not sum). A CNC sell cannot short, so an unreadable or flat book still sends the journalled qty. Fill verified |
   | `cas_ar_exit_retry` | 09:20 | PROTECTED: same pass for anything still open (idempotent) |
   | `cas_ar_arm` | 15:14:30 | Universe (`tradeable_universe()` ∩ `NSE`) + start the `cas-auction-reversal-monitor` thread |
-  | `cas_ar_decide` | 15:23:30 | Candidates by `indicative_close_price` vs the frozen 15:15 print; top `CAS_AR_MAX_POSITIONS`. LIVE: CNC LIMIT at IEP × 1.002 into the auction. SANDBOX: queued |
+  | `cas_ar_decide` | 15:23:30 | Candidates by `indicative_close_price` vs the frozen 15:15 print; top `CAS_AR_MAX_POSITIONS`; no entries when fewer than `CAS_AR_MIN_CANDIDATES` (10) names cross (breadth gate, #777). LIVE: CNC LIMIT at IEP × 1.002 into the auction. SANDBOX: queued |
   | `cas_ar_fill` | 15:32 | SANDBOX: CNC LIMIT at the post-auction LTP (= the auction close). Both modes: entry fill verification (#626); refused → `fill='paper'` |
   | `cas_ar_eod_summary` | 15:45 | Final auction close per candidate (the IEP-vs-close measurement) + Telegram |
 
