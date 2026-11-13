@@ -8,6 +8,12 @@
 > none of the handover's 5-step plan was started.
 
 **Headline: at Zerodha's real current charges the strategy is underwater before any further work.**
+
+**Data (see §0):**
+- **Kite serves NIFTY 50 1-minute bars from 2015-01-09.** Kite is now the primary dataset.
+- **The handover's public file is a Kite dump.** All 851,460 of its bars are identical to Kite's,
+  and Kite returns the same backtest result. So the data was clean, and the mismatch against the
+  handover is in its code.
 - **Real cost:** a 1-lot NIFTY futures round trip costs **5.95 bps** of notional, measured with
   Kite's own charges calculator at 2026-11-13 prices. **STT alone is 5.00 bps** of that (0.05% on
   the sell leg since 2026-04-01). The handover assumed **2.5 bps**.
@@ -18,7 +24,45 @@
 - **Breakeven is below today's cost either way:** about 5.0 bps for our reproduction and about
   3.5 bps for the handover's figures.
 
-## 1. Reproduction — CONTRADICTED (numbers differ; shown side by side, not tuned)
+## 0. Data source — why public data, and what Kite and historify hold (addendum, 2026-11-13)
+
+Dheeraj asked: "Why public data if we can download from Zerodha or leverage historify data?"
+He was right to ask. The answer, measured:
+
+| Source | NIFTY 50 index 1-minute coverage | Role in R77 |
+|---|---|---|
+| **Kite historical API** (token 256265) | **From 2015-01-09 09:15 to today.** Probed back to 2008: every January 2008–2014 returns 0 bars, and the first bar Kite has is 2015-01-09 09:15. | **Primary dataset** (2015-01-09 → 2024-03-28 fetched, 2,274 days, 851,610 bars) |
+| Public GitHub file (sandeepkapri) | 2015-01-09 → 2024-03-27 12:59 | **Fidelity check only.** It tests that our code reads the handover's own data the same way |
+| historify.duckdb | **From 2024-01-01** to 2026-11-12, 265,519 bars. Confirmed unchanged (read through the app's local-DB history path; the file is locked while OpenAlgo runs) | Third cross-check where it overlaps |
+
+**Bar-by-bar comparison (decisive for the data question):**
+- **Public file vs Kite, 2015-01-09 → 2024-03-27:**
+  - **All 851,460 public bars match a Kite bar exactly**, 100.000% on open, high, low and close.
+  - All 2,273 days are in both, with identical bar counts per day.
+  - No timestamp offset: shifting by ±1 minute drops the match to 0.8%.
+  - No OHLC violations and no bad prints.
+  - **The public file is a Kite dump.** Its only defects are at the end: **2024-03-27 is truncated at 12:59** (150 bars short, and its last bar was captured mid-minute: close 22,169.95 vs Kite's 22,169.30), and **2024-03-28 is missing**.
+  - The 30 short days (1–8 bars missing) are in Kite too. They are Kite's own gaps, not file corruption.
+- **Kite vs historify:**
+  - 2024-01-01 → 2024-03-28: 22,980 bars, **100% identical**.
+  - Over the holdout window (2024-04-01 → 2026-11-12): 242,479 bars, **100% identical**, with the same days and the same bar counts.
+- **Conclusion:** the handover's baseline was not built on dirty data. **Kite is now the primary dataset** (auditable, current, and the same source as everything else we run). The public file stays only as the code-fidelity check.
+
+**Baseline on Kite vs the public file:** same span; Kite has one more full day, because its 2024-03-27 is complete.
+
+| Source | Days | Gross bps/day (Sharpe) | Net @2.5 bps (Sharpe) | Net @ real 5.95 bps (Sharpe) | Changes/day |
+|---|---:|---:|---:|---:|---:|
+| Public file, full days only | 2,229 | +4.18 (1.46) | +2.08 (0.72) | −0.82 (−0.28) | 1.68 |
+| **Kite, full days only** | 2,230 | **+4.18 (1.46)** | **+2.08 (0.72)** | **−0.82 (−0.28)** | 1.68 |
+| Public file, ≥90%-complete days | 2,235 | +4.44 (1.54) | +2.36 (0.82) | −0.51 (−0.18) | 1.66 |
+| Kite, ≥90%-complete days | 2,236 | +4.44 (1.54) | +2.36 (0.82) | −0.51 (−0.18) | 1.66 |
+| *Handover (reported)* | *2,263* | *+4.60 (1.63)* | *+1.32 (0.46)* | *−3.16 (re-costed)* | *2.61* |
+
+- **The results are identical across the two sources.** So the gap against the handover (mainly 1.7 vs 2.6 position changes a day) **comes from the implementation, not the data**.
+- Resolving it needs the handover's `noise_boundary.py`.
+- The cost verdict is the same on every source: **negative at today's 5.95 bps**.
+
+## 1. Reproduction on the public file — a code-fidelity check (CONTRADICTED on turnover; shown side by side, not tuned)
 
 **Data:** github.com/sandeepkapri/Nifty50-Minute-Data, `nifty50_candlestick_data.csv`
 (51.3 MB, 852,087 bars).
@@ -185,6 +229,8 @@ Net bps/day, net %/yr and net Sharpe. Gross does not change with cost: A +4.18 b
 
 ```
 uv run python backtest/noise_boundary_r77/kite_checks.py     # Kite: charges, continuous probe, token, holdout (read-only)
+uv run python backtest/noise_boundary_r77/kite_1m_depth.py   # Kite 1m depth probe + 2015-2024 fetch (read-only)
+uv run python backtest/noise_boundary_r77/crosscheck.py      # public vs Kite vs historify, baseline on Kite
 cd backtest/noise_boundary_r77 && uv run python noise_boundary.py
 ```
 
