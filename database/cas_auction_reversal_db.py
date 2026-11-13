@@ -152,19 +152,45 @@ class CasArConfig(Base):
     id = Column(Integer, primary_key=True)
     threshold_pct = Column(Float, nullable=True)
     max_positions = Column(Integer, nullable=True)
+    min_candidates = Column(Integer, nullable=True)  # breadth gate (#777)
     capital_per_trade_inr = Column(Float, nullable=True)
     poll_interval_s = Column(Integer, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = Column(String(64), nullable=True)
 
 
-CONFIG_FIELDS = ("threshold_pct", "max_positions", "capital_per_trade_inr", "poll_interval_s")
+CONFIG_FIELDS = (
+    "threshold_pct",
+    "max_positions",
+    "min_candidates",
+    "capital_per_trade_inr",
+    "poll_interval_s",
+)
+
+
+def _ensure_columns() -> None:
+    """Add columns introduced after the table first shipped (create_all never alters)."""
+    from sqlalchemy import text
+
+    wanted = {"cas_ar_config": {"min_candidates": "INTEGER"}}
+    try:
+        with engine.connect() as conn:
+            for table, cols in wanted.items():
+                existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table})"))}
+                for col, ddl in cols.items():
+                    if col not in existing:
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                        logger.info("%s: added column %s", table, col)
+            conn.commit()
+    except Exception:
+        logger.exception("Failed to ensure cas_ar columns")
 
 
 def init_db() -> None:
     """Create the four tables if missing (idempotent)."""
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_columns()
         logger.info("cas_ar_* tables ready")
     except Exception as e:
         logger.exception(f"Failed to init cas_ar tables: {e}")
