@@ -1,0 +1,164 @@
+{
+ "equity_CNC_50k": {
+  "notional": 49569,
+  "legs": {
+   "BUY": {
+    "brokerage": 0,
+    "stt": 49.5689,
+    "exch": 1.52176523,
+    "sebi": 0.0495689,
+    "stamp": 7,
+    "gst": 0.28284014339999997,
+    "total": 58.4230742734
+   },
+   "SELL": {
+    "brokerage": 0,
+    "stt": 49.5689,
+    "exch": 1.52176523,
+    "sebi": 0.0495689,
+    "stamp": 0,
+    "gst": 0.28284014339999997,
+    "total": 51.4230742734
+   }
+  },
+  "round_trip_inr_ex_dp": 109.85,
+  "bps_ex_dp": 22.16,
+  "round_trip_inr_with_dp": 125.19,
+  "bps_with_dp": 25.25
+ },
+ "equity_CNC_1L": {
+  "notional": 100478,
+  "legs": {
+   "BUY": {
+    "brokerage": 0,
+    "stt": 100.4775,
+    "exch": 3.0846592499999996,
+    "sebi": 0.1004775,
+    "stamp": 15,
+    "gst": 0.573324615,
+    "total": 119.23596136500001
+   },
+   "SELL": {
+    "brokerage": 0,
+    "stt": 100.4775,
+    "exch": 3.0846592499999996,
+    "sebi": 0.1004775,
+    "stamp": 0,
+    "gst": 0.573324615,
+    "total": 104.23596136500001
+   }
+  },
+  "round_trip_inr_ex_dp": 223.47,
+  "bps_ex_dp": 22.24,
+  "round_trip_inr_with_dp": 238.81,
+  "bps_with_dp": 23.77
+ },
+ "equity_CNC_5L": {
+  "notional": 499708,
+  "legs": {
+   "BUY": {
+    "brokerage": 0,
+    "stt": 499.70810000000006,
+    "exch": 15.341038670000001,
+    "sebi": 0.4997081,
+    "stamp": 75,
+    "gst": 2.8513344186,
+    "total": 593.4001811886001
+   },
+   "SELL": {
+    "brokerage": 0,
+    "stt": 499.70810000000006,
+    "exch": 15.341038670000001,
+    "sebi": 0.4997081,
+    "stamp": 0,
+    "gst": 2.8513344186,
+    "total": 518.4001811886001
+   }
+  },
+  "round_trip_inr_ex_dp": 1111.8,
+  "bps_ex_dp": 22.25,
+  "round_trip_inr_with_dp": 1127.14,
+  "bps_with_dp": 22.56
+ },
+ "ETF_CNC_50k_BANKBEES": {
+  "notional": 49828,
+  "legs": {
+   "BUY": {
+    "brokerage": 0,
+    "stt": 0,
+    "exch": 1.529709469,
+    "sebi": 0.04982767,
+    "stamp": 7,
+    "gst": 0.28431668501999996,
+    "total": 8.86385382402
+   },
+   "SELL": {
+    "brokerage": 0,
+    "stt": 0.4982767,
+    "exch": 1.529709469,
+    "sebi": 0.04982767,
+    "stamp": 0,
+    "gst": 0.28431668501999996,
+    "total": 2.36213052402
+   }
+  },
+  "round_trip_inr_ex_dp": 11.23,
+  "bps_ex_dp": 2.25,
+  "round_trip_inr_with_dp": 26.57,
+  "bps_with_dp": 5.33
+ },
+ "ETF_CNC_1L_BANKBEES": {
+  "notional": 100286,
+  "legs": {
+   "BUY": {
+    "brokerage": 0,
+    "stt": 0,
+    "exch": 3.0787823490000004,
+    "sebi": 0.10028607,
+    "stamp": 15,
+    "gst": 0.5722323154200001,
+    "total": 18.75130073442
+   },
+   "SELL": {
+    "brokerage": 0,
+    "stt": 1.0028607,
+    "exch": 3.0787823490000004,
+    "sebi": 0.10028607,
+    "stamp": 0,
+    "gst": 0.5722323154200001,
+    "total": 4.75416143442
+   }
+  },
+  "round_trip_inr_ex_dp": 23.51,
+  "bps_ex_dp": 2.34,
+  "round_trip_inr_with_dp": 38.85,
+  "bps_with_dp": 3.87
+ },
+ "ETF_CNC_50k_ITBEES": {
+  "notional": 49998,
+  "legs": {
+   "BUY": {
+    "brokerage": 0,
+    "stt": 0,
+    "exch": 1.5349410559999999,
+    "sebi": 0.04999807999999999,
+    "stamp": 7,
+    "gst": 0.28528904448,
+    "total": 8.87022818048
+   },
+   "SELL": {
+    "brokerage": 0,
+    "stt": 0.4999808,
+    "exch": 1.5349410559999999,
+    "sebi": 0.04999807999999999,
+    "stamp": 0,
+    "gst": 0.28528904448,
+    "total": 2.3702089804799997
+   }
+  },
+  "round_trip_inr_ex_dp": 11.24,
+  "bps_ex_dp": 2.25,
+  "round_trip_inr_with_dp": 26.58,
+  "bps_with_dp": 5.32
+ }
+}

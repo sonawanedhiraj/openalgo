@@ -1,0 +1,283 @@
+{
+ "ltp": {
+  "NFO:NIFTY26DECFUT": 25335,
+  "NFO:RELIANCE26DECFUT": 1351.4,
+  "NFO:TATASTEEL26DECFUT": 187.91,
+  "NSE:BANKBEES": 630.73,
+  "NSE:ITBEES": 35.51,
+  "NSE:RELIANCE": 1339.7,
+  "NSE:TATASTEEL": 186.68
+ },
+ "cases": {
+  "equity_MIS_86k": {
+   "notional": 85741.0,
+   "qty": 64,
+   "price": 1339.7,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 2.63224256,
+     "sebi": 0.0857408,
+     "stamp": 3,
+     "gst": 4.089237004799999,
+     "total": 29.807220364799996
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 21.435200000000002,
+     "exch": 2.63224256,
+     "sebi": 0.0857408,
+     "stamp": 0,
+     "gst": 4.089237004799999,
+     "total": 48.2424203648
+    }
+   },
+   "round_trip_inr": 78.05,
+   "round_trip_bps_of_notional": 9.1
+  },
+  "equity_MIS_5L": {
+   "notional": 499708.0,
+   "qty": 373,
+   "price": 1339.7,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 15.341038670000001,
+     "sebi": 0.4997081,
+     "stamp": 15,
+     "gst": 6.4513344186,
+     "total": 57.2920811886
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 124.92702500000001,
+     "exch": 15.341038670000001,
+     "sebi": 0.4997081,
+     "stamp": 0,
+     "gst": 6.4513344186,
+     "total": 167.21910618860002
+    }
+   },
+   "round_trip_inr": 224.51,
+   "round_trip_bps_of_notional": 4.49
+  },
+  "equity_CNC_50k": {
+   "notional": 49569.0,
+   "qty": 37,
+   "price": 1339.7,
+   "legs": {
+    "BUY": {
+     "brokerage": 14.870669999999999,
+     "stt": 0,
+     "exch": 1.52176523,
+     "sebi": 0.0495689,
+     "stamp": 1,
+     "gst": 2.9595607434,
+     "total": 20.4015648734
+    },
+    "SELL": {
+     "brokerage": 14.870669999999999,
+     "stt": 12.392225,
+     "exch": 1.52176523,
+     "sebi": 0.0495689,
+     "stamp": 0,
+     "gst": 2.9595607434,
+     "total": 31.7937898734
+    }
+   },
+   "round_trip_inr": 52.2,
+   "round_trip_bps_of_notional": 10.53
+  },
+  "equity_CNC_1L": {
+   "notional": 100478.0,
+   "qty": 75,
+   "price": 1339.7,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 3.0846592499999996,
+     "sebi": 0.1004775,
+     "stamp": 3,
+     "gst": 4.173324615,
+     "total": 30.358461364999997
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 25.119375,
+     "exch": 3.0846592499999996,
+     "sebi": 0.1004775,
+     "stamp": 0,
+     "gst": 4.173324615,
+     "total": 52.477836365
+    }
+   },
+   "round_trip_inr": 82.84,
+   "round_trip_bps_of_notional": 8.24
+  },
+  "equity_CNC_5L": {
+   "notional": 499708.0,
+   "qty": 373,
+   "price": 1339.7,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 15.341038670000001,
+     "sebi": 0.4997081,
+     "stamp": 15,
+     "gst": 6.4513344186,
+     "total": 57.2920811886
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 124.92702500000001,
+     "exch": 15.341038670000001,
+     "sebi": 0.4997081,
+     "stamp": 0,
+     "gst": 6.4513344186,
+     "total": 167.21910618860002
+    }
+   },
+   "round_trip_inr": 224.51,
+   "round_trip_bps_of_notional": 4.49
+  },
+  "ETF_CNC_50k_BANKBEES": {
+   "notional": 49828.0,
+   "qty": 79,
+   "price": 630.73,
+   "legs": {
+    "BUY": {
+     "brokerage": 14.948300999999999,
+     "stt": 0,
+     "exch": 1.529709469,
+     "sebi": 0.04982767,
+     "stamp": 1,
+     "gst": 2.9750108650199993,
+     "total": 20.50284900402
+    },
+    "SELL": {
+     "brokerage": 14.948300999999999,
+     "stt": 12.4569175,
+     "exch": 1.529709469,
+     "sebi": 0.04982767,
+     "stamp": 0,
+     "gst": 2.9750108650199993,
+     "total": 31.95976650402
+    }
+   },
+   "round_trip_inr": 52.46,
+   "round_trip_bps_of_notional": 10.53
+  },
+  "ETF_CNC_50k_ITBEES": {
+   "notional": 49998.0,
+   "qty": 1408,
+   "price": 35.51,
+   "legs": {
+    "BUY": {
+     "brokerage": 14.999423999999998,
+     "stt": 0,
+     "exch": 1.5349410559999999,
+     "sebi": 0.04999807999999999,
+     "stamp": 1,
+     "gst": 2.98518536448,
+     "total": 20.569548500479996
+    },
+    "SELL": {
+     "brokerage": 14.999423999999998,
+     "stt": 12.499519999999999,
+     "exch": 1.5349410559999999,
+     "sebi": 0.04999807999999999,
+     "stamp": 0,
+     "gst": 2.98518536448,
+     "total": 32.06906850047999
+    }
+   },
+   "round_trip_inr": 52.64,
+   "round_trip_bps_of_notional": 10.53
+  },
+  "NIFTY_fut_1lot": {
+   "notional": 1646775.0,
+   "qty": 65,
+   "price": 25335.0,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 30.135982499999997,
+     "sebi": 1.6467749999999999,
+     "stamp": 33,
+     "gst": 9.320896349999998,
+     "total": 94.10365385
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 823.3875,
+     "exch": 30.135982499999997,
+     "sebi": 1.6467749999999999,
+     "stamp": 0,
+     "gst": 9.320896349999998,
+     "total": 884.49115385
+    }
+   },
+   "round_trip_inr": 978.59,
+   "round_trip_bps_of_notional": 5.94
+  },
+  "RELIANCE_fut_1lot": {
+   "notional": 675700.0,
+   "qty": 500,
+   "price": 1351.4,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 12.365310000000001,
+     "sebi": 0.6757,
+     "stamp": 14,
+     "gst": 5.9473818,
+     "total": 52.9883918
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 337.85,
+     "exch": 12.365310000000001,
+     "sebi": 0.6757,
+     "stamp": 0,
+     "gst": 5.9473818,
+     "total": 376.8383918
+    }
+   },
+   "round_trip_inr": 429.83,
+   "round_trip_bps_of_notional": 6.36
+  },
+  "TATASTEEL_fut_1lot": {
+   "notional": 516752.0,
+   "qty": 2750,
+   "price": 187.91,
+   "legs": {
+    "BUY": {
+     "brokerage": 20,
+     "stt": 0,
+     "exch": 9.456570750000001,
+     "sebi": 0.5167525,
+     "stamp": 10,
+     "gst": 5.395198185,
+     "total": 45.368521435
+    },
+    "SELL": {
+     "brokerage": 20,
+     "stt": 258.37625,
+     "exch": 9.456570750000001,
+     "sebi": 0.5167525,
+     "stamp": 0,
+     "gst": 5.395198185,
+     "total": 293.744771435
+    }
+   },
+   "round_trip_inr": 339.11,
+   "round_trip_bps_of_notional": 6.56
+  }
+ }
+}
