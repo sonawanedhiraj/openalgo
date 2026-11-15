@@ -1,0 +1,160 @@
+{
+ "window": [
+  "2026-06-30",
+  "2026-11-13"
+ ],
+ "days": 88,
+ "days_inhouse_produced_any_hit": 85,
+ "BUY|all_days": {
+  "chartink_symdays": 288,
+  "inhouse_symdays": 555,
+  "both": 226,
+  "only_chartink": 62,
+  "only_inhouse": 329,
+  "recall_of_chartink_pct": 78.5,
+  "precision_vs_chartink_pct": 40.7,
+  "jaccard": 0.366,
+  "first_hit_lag_min_inhouse_minus_chartink": {
+   "median": -13.7,
+   "p25": -27.9,
+   "p75": -7.3,
+   "inhouse_earlier_pct": 88.1
+  }
+ },
+ "BUY|inhouse_alive_days": {
+  "chartink_symdays": 269,
+  "inhouse_symdays": 555,
+  "both": 226,
+  "only_chartink": 43,
+  "only_inhouse": 329,
+  "recall_of_chartink_pct": 84.0,
+  "precision_vs_chartink_pct": 40.7,
+  "jaccard": 0.378,
+  "first_hit_lag_min_inhouse_minus_chartink": {
+   "median": -13.7,
+   "p25": -27.9,
+   "p75": -7.3,
+   "inhouse_earlier_pct": 88.1
+  }
+ },
+ "SELL|all_days": {
+  "chartink_symdays": 299,
+  "inhouse_symdays": 708,
+  "both": 236,
+  "only_chartink": 63,
+  "only_inhouse": 472,
+  "recall_of_chartink_pct": 78.9,
+  "precision_vs_chartink_pct": 33.3,
+  "jaccard": 0.306,
+  "first_hit_lag_min_inhouse_minus_chartink": {
+   "median": -9.2,
+   "p25": -18.8,
+   "p75": -3.5,
+   "inhouse_earlier_pct": 80.9
+  }
+ },
+ "SELL|inhouse_alive_days": {
+  "chartink_symdays": 263,
+  "inhouse_symdays": 708,
+  "both": 236,
+  "only_chartink": 27,
+  "only_inhouse": 472,
+  "recall_of_chartink_pct": 89.7,
+  "precision_vs_chartink_pct": 33.3,
+  "jaccard": 0.321,
+  "first_hit_lag_min_inhouse_minus_chartink": {
+   "median": -9.2,
+   "p25": -18.8,
+   "p75": -3.5,
+   "inhouse_earlier_pct": 80.9
+  }
+ },
+ "ALL|all_days": {
+  "chartink_symdays": 587,
+  "inhouse_symdays": 1263,
+  "both": 462,
+  "only_chartink": 125,
+  "only_inhouse": 801,
+  "recall_of_chartink_pct": 78.7,
+  "precision_vs_chartink_pct": 36.6,
+  "jaccard": 0.333,
+  "first_hit_lag_min_inhouse_minus_chartink": {
+   "median": -12.1,
+   "p25": -23.8,
+   "p75": -4.1,
+   "inhouse_earlier_pct": 84.4
+  }
+ },
+ "ALL|inhouse_alive_days": {
+  "chartink_symdays": 532,
+  "inhouse_symdays": 1263,
+  "both": 462,
+  "only_chartink": 70,
+  "only_inhouse": 801,
+  "recall_of_chartink_pct": 86.8,
+  "precision_vs_chartink_pct": 36.6,
+  "jaccard": 0.347,
+  "first_hit_lag_min_inhouse_minus_chartink": {
+   "median": -12.1,
+   "p25": -23.8,
+   "p75": -4.1,
+   "inhouse_earlier_pct": 84.4
+  }
+ },
+ "monthly_ALL": {
+  "2026-06": {
+   "ck": 1,
+   "ih": 1,
+   "both": 0
+  },
+  "2026-07": {
+   "ck": 238,
+   "ih": 390,
+   "both": 158
+  },
+  "2026-08": {
+   "ck": 122,
+   "ih": 259,
+   "both": 108
+  },
+  "2026-09": {
+   "ck": 127,
+   "ih": 243,
+   "both": 112
+  },
+  "2026-10": {
+   "ck": 50,
+   "ih": 275,
+   "both": 45
+  },
+  "2026-11": {
+   "ck": 49,
+   "ih": 95,
+   "both": 39
+  }
+ },
+ "top_symbols_chartink_only_on_alive_days": {
+  "MPHASIS": 3,
+  "PATANJALI": 3,
+  "ATHERENERG": 3,
+  "HYUNDAI": 2,
+  "HCLTECH": 2,
+  "RBLBANK": 2,
+  "VOLTAS": 2,
+  "TCS": 2,
+  "COLPAL": 1,
+  "ADANIENT": 1
+ },
+ "top_symbols_inhouse_only": {
+  "ZYDUSLIFE": 13,
+  "SAMMAANCAP": 12,
+  "NAM-INDIA": 11,
+  "PNBHOUSING": 11,
+  "VOLTAS": 11,
+  "MPHASIS": 11,
+  "EXIDEIND": 11,
+  "INFY": 11,
+  "360ONE": 10,
+  "TIINDIA": 10
+ }
+}
