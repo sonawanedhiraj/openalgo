@@ -1,0 +1,1235 @@
+{
+"resolved": {
+"AARTIIND": {
+"token": 1793,
+"via": null
+},
+"ABB": {
+"token": 3329,
+"via": null
+},
+"ABBOTINDIA": {
+"token": 4583169,
+"via": null
+},
+"ABCAPITAL": {
+"token": 5533185,
+"via": null
+},
+"ABFRL": {
+"token": 7707649,
+"via": null
+},
+"ACC": {
+"token": 5633,
+"via": null
+},
+"ADANIENSOL": {
+"token": 2615553,
+"via": null
+},
+"ADANIENT": {
+"token": 6401,
+"via": null
+},
+"ADANIGREEN": {
+"token": 912129,
+"via": null
+},
+"ADANIPORTS": {
+"token": 3861249,
+"via": null
+},
+"ADANIPOWER": {
+"token": 4451329,
+"via": null
+},
+"AJANTPHARM": {
+"token": 2079745,
+"via": null
+},
+"ALKEM": {
+"token": 2995969,
+"via": null
+},
+"AMARAJABAT": {
+"token": 25601,
+"via": "ARE&M"
+},
+"AMBUJACEM": {
+"token": 325121,
+"via": null
+},
+"ANGELONE": {
+"token": 82945,
+"via": null
+},
+"APLAPOLLO": {
+"token": 6599681,
+"via": null
+},
+"APLLTD": {
+"token": 6483969,
+"via": null
+},
+"APOLLOHOSP": {
+"token": 40193,
+"via": null
+},
+"APOLLOTYRE": {
+"token": 41729,
+"via": null
+},
+"ARVIND": {
+"token": 49409,
+"via": null
+},
+"ASHOKLEY": {
+"token": 54273,
+"via": null
+},
+"ASIANPAINT": {
+"token": 60417,
+"via": null
+},
+"ASTRAL": {
+"token": 3691009,
+"via": null
+},
+"ATGL": {
+"token": 1552897,
+"via": null
+},
+"ATUL": {
+"token": 67329,
+"via": null
+},
+"AUBANK": {
+"token": 5436929,
+"via": null
+},
+"AUROPHARMA": {
+"token": 70401,
+"via": null
+},
+"AXISBANK": {
+"token": 1510401,
+"via": null
+},
+"BAJAJ-AUTO": {
+"token": 4267265,
+"via": null
+},
+"BAJAJFINSV": {
+"token": 4268801,
+"via": null
+},
+"BAJFINANCE": {
+"token": 81153,
+"via": null
+},
+"BALKRISIND": {
+"token": 85761,
+"via": null
+},
+"BALRAMCHIN": {
+"token": 87297,
+"via": null
+},
+"BANDHANBNK": {
+"token": 579329,
+"via": null
+},
+"BANKBARODA": {
+"token": 1195009,
+"via": null
+},
+"BANKINDIA": {
+"token": 1214721,
+"via": null
+},
+"BATAINDIA": {
+"token": 94977,
+"via": null
+},
+"BDL": {
+"token": 548865,
+"via": null
+},
+"BEL": {
+"token": 98049,
+"via": null
+},
+"BEML": {
+"token": 101121,
+"via": null
+},
+"BERGEPAINT": {
+"token": 103425,
+"via": null
+},
+"BHARATFORG": {
+"token": 108033,
+"via": null
+},
+"BHARTIARTL": {
+"token": 2714625,
+"via": null
+},
+"BHEL": {
+"token": 112129,
+"via": null
+},
+"BIOCON": {
+"token": 2911489,
+"via": null
+},
+"BLUESTARCO": {
+"token": 2127617,
+"via": null
+},
+"BOSCHLTD": {
+"token": 558337,
+"via": null
+},
+"BPCL": {
+"token": 134657,
+"via": null
+},
+"BRITANNIA": {
+"token": 140033,
+"via": null
+},
+"BSE": {
+"token": 5013761,
+"via": null
+},
+"BSOFT": {
+"token": 1790465,
+"via": null
+},
+"CADILAHC": {
+"token": 2029825,
+"via": "ZYDUSLIFE"
+},
+"CAMS": {
+"token": 87553,
+"via": null
+},
+"CANBK": {
+"token": 2763265,
+"via": null
+},
+"CANFINHOME": {
+"token": 149249,
+"via": null
+},
+"CASTROLIND": {
+"token": 320001,
+"via": null
+},
+"CDSL": {
+"token": 5420545,
+"via": null
+},
+"CEATLTD": {
+"token": 3905025,
+"via": null
+},
+"CENTURYTEX": {
+"token": 160001,
+"via": "ABREL"
+},
+"CESC": {
+"token": 160769,
+"via": null
+},
+"CGPOWER": {
+"token": 194561,
+"via": null
+},
+"CHAMBLFERT": {
+"token": 163073,
+"via": null
+},
+"CHENNPETRO": {
+"token": 524545,
+"via": null
+},
+"CHOLAFIN": {
+"token": 175361,
+"via": null
+},
+"CIPLA": {
+"token": 177665,
+"via": null
+},
+"COALINDIA": {
+"token": 5215745,
+"via": null
+},
+"COFORGE": {
+"token": 2955009,
+"via": null
+},
+"COLPAL": {
+"token": 3876097,
+"via": null
+},
+"CONCOR": {
+"token": 1215745,
+"via": null
+},
+"COROMANDEL": {
+"token": 189185,
+"via": null
+},
+"CROMPTON": {
+"token": 4376065,
+"via": null
+},
+"CUB": {
+"token": 1459457,
+"via": null
+},
+"CUMMINSIND": {
+"token": 486657,
+"via": null
+},
+"CYIENT": {
+"token": 1471489,
+"via": null
+},
+"DABUR": {
+"token": 197633,
+"via": null
+},
+"DALBHARAT": {
+"token": 2067201,
+"via": null
+},
+"DCBBANK": {
+"token": 3513601,
+"via": null
+},
+"DEEPAKNTR": {
+"token": 5105409,
+"via": null
+},
+"DELHIVERY": {
+"token": 2457345,
+"via": null
+},
+"DELTACORP": {
+"token": 3851265,
+"via": null
+},
+"DISHTV": {
+"token": 3721473,
+"via": null
+},
+"DIVISLAB": {
+"token": 2800641,
+"via": null
+},
+"DIXON": {
+"token": 5552641,
+"via": null
+},
+"DLF": {
+"token": 3771393,
+"via": null
+},
+"DMART": {
+"token": 5097729,
+"via": null
+},
+"DRREDDY": {
+"token": 225537,
+"via": null
+},
+"EICHERMOT": {
+"token": 232961,
+"via": null
+},
+"ENGINERSIN": {
+"token": 1256193,
+"via": null
+},
+"ESCORTS": {
+"token": 245249,
+"via": null
+},
+"ETERNAL": {
+"token": 1304833,
+"via": null
+},
+"EXIDEIND": {
+"token": 173057,
+"via": null
+},
+"FEDERALBNK": {
+"token": 261889,
+"via": null
+},
+"FORTIS": {
+"token": 3735553,
+"via": null
+},
+"FSL": {
+"token": 3661825,
+"via": null
+},
+"GAIL": {
+"token": 1207553,
+"via": null
+},
+"GLENMARK": {
+"token": 1895937,
+"via": null
+},
+"GMRAIRPORT": {
+"token": 3463169,
+"via": null
+},
+"GMRINFRA": {
+"token": 3463169,
+"via": "GMRAIRPORT"
+},
+"GNFC": {
+"token": 300545,
+"via": null
+},
+"GODFRYPHLP": {
+"token": 302337,
+"via": null
+},
+"GODREJCP": {
+"token": 2585345,
+"via": null
+},
+"GODREJIND": {
+"token": 2796801,
+"via": null
+},
+"GODREJPROP": {
+"token": 4576001,
+"via": null
+},
+"GRANULES": {
+"token": 3039233,
+"via": null
+},
+"GRASIM": {
+"token": 315393,
+"via": null
+},
+"GSFC": {
+"token": 319233,
+"via": null
+},
+"GUJGASLTD": {
+"token": 2713345,
+"via": "known"
+},
+"HAL": {
+"token": 589569,
+"via": null
+},
+"HAVELLS": {
+"token": 2513665,
+"via": null
+},
+"HCLTECH": {
+"token": 1850625,
+"via": null
+},
+"HDFCAMC": {
+"token": 1086465,
+"via": null
+},
+"HDFCBANK": {
+"token": 341249,
+"via": null
+},
+"HDFCLIFE": {
+"token": 119553,
+"via": null
+},
+"HEROMOTOCO": {
+"token": 345089,
+"via": null
+},
+"HINDALCO": {
+"token": 348929,
+"via": null
+},
+"HINDCOPPER": {
+"token": 4592385,
+"via": null
+},
+"HINDPETRO": {
+"token": 359937,
+"via": null
+},
+"HINDUNILVR": {
+"token": 356865,
+"via": null
+},
+"HINDZINC": {
+"token": 364545,
+"via": null
+},
+"HONAUT": {
+"token": 874753,
+"via": null
+},
+"HUDCO": {
+"token": 5331201,
+"via": null
+},
+"IBULHSGFIN": {
+"token": 7712001,
+"via": "SAMMAANCAP"
+},
+"ICICIBANK": {
+"token": 1270529,
+"via": null
+},
+"ICICIGI": {
+"token": 5573121,
+"via": null
+},
+"ICICIPRULI": {
+"token": 4774913,
+"via": "known"
+},
+"IDBI": {
+"token": 377857,
+"via": null
+},
+"IDEA": {
+"token": 3677697,
+"via": null
+},
+"IDFCFIRSTB": {
+"token": 2863105,
+"via": null
+},
+"IEX": {
+"token": 56321,
+"via": null
+},
+"IFCI": {
+"token": 381697,
+"via": null
+},
+"IGL": {
+"token": 2883073,
+"via": null
+},
+"IIFL": {
+"token": 3023105,
+"via": null
+},
+"INDHOTEL": {
+"token": 387073,
+"via": null
+},
+"INDIACEM": {
+"token": 387841,
+"via": null
+},
+"INDIAMART": {
+"token": 2745857,
+"via": null
+},
+"INDIANB": {
+"token": 3663105,
+"via": null
+},
+"INDIGO": {
+"token": 2865921,
+"via": null
+},
+"INDUSINDBK": {
+"token": 1346049,
+"via": null
+},
+"INDUSTOWER": {
+"token": 7458561,
+"via": null
+},
+"INFRATEL": {
+"token": 7458561,
+"via": "INDUSTOWER"
+},
+"INFY": {
+"token": 408065,
+"via": null
+},
+"INOXWIND": {
+"token": 2010113,
+"via": null
+},
+"INTELLECT": {
+"token": 1517057,
+"via": null
+},
+"IOC": {
+"token": 415745,
+"via": null
+},
+"IPCALAB": {
+"token": 418049,
+"via": null
+},
+"IRB": {
+"token": 3920129,
+"via": null
+},
+"IRCTC": {
+"token": 3484417,
+"via": null
+},
+"IREDA": {
+"token": 5186817,
+"via": null
+},
+"IRFC": {
+"token": 519425,
+"via": null
+},
+"ITC": {
+"token": 424961,
+"via": null
+},
+"JINDALSTEL": {
+"token": 1723649,
+"via": null
+},
+"JIOFIN": {
+"token": 4644609,
+"via": null
+},
+"JISLJALEQS": {
+"token": 2661633,
+"via": null
+},
+"JKCEMENT": {
+"token": 3397121,
+"via": null
+},
+"JSL": {
+"token": 2876417,
+"via": null
+},
+"JSWENERGY": {
+"token": 4574465,
+"via": null
+},
+"JSWSTEEL": {
+"token": 3001089,
+"via": null
+},
+"JUBLFOOD": {
+"token": 4632577,
+"via": null
+},
+"JUSTDIAL": {
+"token": 7670273,
+"via": null
+},
+"KAJARIACER": {
+"token": 462849,
+"via": null
+},
+"KALYANKJIL": {
+"token": 756481,
+"via": null
+},
+"KAYNES": {
+"token": 3095553,
+"via": null
+},
+"KEI": {
+"token": 3407361,
+"via": null
+},
+"KOTAKBANK": {
+"token": 492033,
+"via": null
+},
+"KPITTECH": {
+"token": 2478849,
+"via": null
+},
+"KSCL": {
+"token": 3832833,
+"via": null
+},
+"KTKBANK": {
+"token": 2061825,
+"via": null
+},
+"L&TFH": {
+"token": 6386689,
+"via": "LTF"
+},
+"LALPATHLAB": {
+"token": 2983425,
+"via": null
+},
+"LAURUSLABS": {
+"token": 4923905,
+"via": null
+},
+"LICHSGFIN": {
+"token": 511233,
+"via": null
+},
+"LICI": {
+"token": 2426881,
+"via": null
+},
+"LODHA": {
+"token": 824321,
+"via": null
+},
+"LT": {
+"token": 2939649,
+"via": null
+},
+"LTF": {
+"token": 6386689,
+"via": null
+},
+"LTI": {
+"token": 4561409,
+"via": "LTM"
+},
+"LTIM": {
+"token": 4561409,
+"via": "LTM"
+},
+"LTTS": {
+"token": 4752385,
+"via": null
+},
+"LUPIN": {
+"token": 2672641,
+"via": null
+},
+"M&M": {
+"token": 519937,
+"via": null
+},
+"M&MFIN": {
+"token": 3400961,
+"via": null
+},
+"MANAPPURAM": {
+"token": 4879617,
+"via": null
+},
+"MANKIND": {
+"token": 3937281,
+"via": null
+},
+"MARICO": {
+"token": 1041153,
+"via": null
+},
+"MARUTI": {
+"token": 2815745,
+"via": null
+},
+"MAXHEALTH": {
+"token": 5728513,
+"via": null
+},
+"MAZDOCK": {
+"token": 130305,
+"via": null
+},
+"MCDOWELL-N": {
+"token": 2674433,
+"via": "UNITDSPR"
+},
+"MCX": {
+"token": 7982337,
+"via": null
+},
+"METROPOLIS": {
+"token": 2452737,
+"via": null
+},
+"MFSL": {
+"token": 548353,
+"via": null
+},
+"MGL": {
+"token": 4488705,
+"via": null
+},
+"MOTHERSON": {
+"token": 1076225,
+"via": null
+},
+"MOTHERSUMI": {
+"token": 1076225,
+"via": "MOTHERSON"
+},
+"MPHASIS": {
+"token": 1152769,
+"via": null
+},
+"MRF": {
+"token": 582913,
+"via": null
+},
+"MRPL": {
+"token": 584449,
+"via": null
+},
+"MUTHOOTFIN": {
+"token": 6054401,
+"via": null
+},
+"NAM-INDIA": {
+"token": 91393,
+"via": null
+},
+"NATIONALUM": {
+"token": 1629185,
+"via": null
+},
+"NAUKRI": {
+"token": 3520257,
+"via": null
+},
+"NAVINFLUOR": {
+"token": 3756033,
+"via": null
+},
+"NBCC": {
+"token": 8042241,
+"via": null
+},
+"NCC": {
+"token": 593665,
+"via": null
+},
+"NESTLEIND": {
+"token": 4598529,
+"via": null
+},
+"NHPC": {
+"token": 4454401,
+"via": null
+},
+"NIITTECH": {
+"token": 2955009,
+"via": "COFORGE"
+},
+"NMDC": {
+"token": 3924993,
+"via": null
+},
+"NTPC": {
+"token": 2977281,
+"via": null
+},
+"NYKAA": {
+"token": 1675521,
+"via": null
+},
+"OBEROIRLTY": {
+"token": 5181953,
+"via": null
+},
+"OFSS": {
+"token": 2748929,
+"via": null
+},
+"OIL": {
+"token": 4464129,
+"via": null
+},
+"ONGC": {
+"token": 633601,
+"via": null
+},
+"PAGEIND": {
+"token": 3689729,
+"via": null
+},
+"PATANJALI": {
+"token": 4359425,
+"via": null
+},
+"PAYTM": {
+"token": 1716481,
+"via": null
+},
+"PCJEWELLER": {
+"token": 7455745,
+"via": null
+},
+"PERSISTENT": {
+"token": 4701441,
+"via": null
+},
+"PETRONET": {
+"token": 2905857,
+"via": null
+},
+"PFC": {
+"token": 3660545,
+"via": null
+},
+"PFIZER": {
+"token": 676609,
+"via": null
+},
+"PHOENIXLTD": {
+"token": 3725313,
+"via": null
+},
+"PIDILITIND": {
+"token": 681985,
+"via": null
+},
+"PIIND": {
+"token": 6191105,
+"via": null
+},
+"PNB": {
+"token": 2730497,
+"via": null
+},
+"PNBHOUSING": {
+"token": 4840449,
+"via": null
+},
+"POLICYBZR": {
+"token": 1703937,
+"via": null
+},
+"POLYCAB": {
+"token": 2455041,
+"via": null
+},
+"POONAWALLA": {
+"token": 2919169,
+"via": null
+},
+"POWERGRID": {
+"token": 3834113,
+"via": null
+},
+"PPLPHARMA": {
+"token": 2962177,
+"via": null
+},
+"PRESTIGE": {
+"token": 5197313,
+"via": null
+},
+"PTC": {
+"token": 2906881,
+"via": null
+},
+"PVR": {
+"token": 3365633,
+"via": "PVRINOX"
+},
+"PVRINOX": {
+"token": 3365633,
+"via": null
+},
+"RAIN": {
+"token": 3926273,
+"via": null
+},
+"RAMCOCEM": {
+"token": 523009,
+"via": null
+},
+"RAYMOND": {
+"token": 731905,
+"via": null
+},
+"RBLBANK": {
+"token": 4708097,
+"via": null
+},
+"RECLTD": {
+"token": 3930881,
+"via": null
+},
+"RELIANCE": {
+"token": 738561,
+"via": null
+},
+"REPCOHOME": {
+"token": 7577089,
+"via": null
+},
+"RPOWER": {
+"token": 3906305,
+"via": null
+},
+"RVNL": {
+"token": 2445313,
+"via": null
+},
+"SAIL": {
+"token": 758529,
+"via": null
+},
+"SBICARD": {
+"token": 4600577,
+"via": null
+},
+"SBILIFE": {
+"token": 5582849,
+"via": null
+},
+"SBIN": {
+"token": 779521,
+"via": null
+},
+"SHREECEM": {
+"token": 794369,
+"via": null
+},
+"SHRIRAMFIN": {
+"token": 1102337,
+"via": null
+},
+"SIEMENS": {
+"token": 806401,
+"via": null
+},
+"SJVN": {
+"token": 4834049,
+"via": null
+},
+"SOLARINDS": {
+"token": 3412993,
+"via": null
+},
+"SONACOMS": {
+"token": 1199105,
+"via": null
+},
+"SOUTHBANK": {
+"token": 1522689,
+"via": null
+},
+"SRF": {
+"token": 837889,
+"via": null
+},
+"SRTRANSFIN": {
+"token": 1102337,
+"via": "SHRIRAMFIN"
+},
+"STAR": {
+"token": 1887745,
+"via": null
+},
+"SUNPHARMA": {
+"token": 857857,
+"via": null
+},
+"SUNTV": {
+"token": 3431425,
+"via": null
+},
+"SUPREMEIND": {
+"token": 860929,
+"via": null
+},
+"SUZLON": {
+"token": 3076609,
+"via": null
+},
+"SYNGENE": {
+"token": 2622209,
+"via": null
+},
+"TATACHEM": {
+"token": 871681,
+"via": null
+},
+"TATACOMM": {
+"token": 952577,
+"via": null
+},
+"TATACONSUM": {
+"token": 878593,
+"via": null
+},
+"TATAELXSI": {
+"token": 873217,
+"via": null
+},
+"TATAGLOBAL": {
+"token": 878593,
+"via": "TATACONSUM"
+},
+"TATAMOTORS": {
+"token": 884737,
+"via": "TMPV"
+},
+"TATAPOWER": {
+"token": 877057,
+"via": null
+},
+"TATASTEEL": {
+"token": 895745,
+"via": null
+},
+"TATATECH": {
+"token": 5195009,
+"via": null
+},
+"TCS": {
+"token": 2953217,
+"via": null
+},
+"TECHM": {
+"token": 3465729,
+"via": null
+},
+"TIINDIA": {
+"token": 79873,
+"via": null
+},
+"TITAGARH": {
+"token": 3945985,
+"via": null
+},
+"TITAN": {
+"token": 897537,
+"via": null
+},
+"TORNTPHARM": {
+"token": 900609,
+"via": null
+},
+"TORNTPOWER": {
+"token": 3529217,
+"via": null
+},
+"TRENT": {
+"token": 502785,
+"via": null
+},
+"TVSMOTOR": {
+"token": 2170625,
+"via": null
+},
+"UBL": {
+"token": 4278529,
+"via": null
+},
+"ULTRACEMCO": {
+"token": 2952193,
+"via": null
+},
+"UNIONBANK": {
+"token": 2752769,
+"via": null
+},
+"UNITDSPR": {
+"token": 2674433,
+"via": null
+},
+"UNOMINDA": {
+"token": 3623425,
+"via": null
+},
+"UPL": {
+"token": 2889473,
+"via": null
+},
+"VBL": {
+"token": 4843777,
+"via": null
+},
+"VEDL": {
+"token": 784129,
+"via": null
+},
+"VGUARD": {
+"token": 3932673,
+"via": null
+},
+"VOLTAS": {
+"token": 951809,
+"via": null
+},
+"WHIRLPOOL": {
+"token": 4610817,
+"via": null
+},
+"WIPRO": {
+"token": 969473,
+"via": null
+},
+"WOCKPHARMA": {
+"token": 1921537,
+"via": null
+},
+"YESBANK": {
+"token": 3050241,
+"via": null
+},
+"ZEEL": {
+"token": 975873,
+"via": null
+},
+"ZOMATO": {
+"token": 1304833,
+"via": "ETERNAL"
+},
+"ZYDUSLIFE": {
+"token": 2029825,
+"via": null
+}
+},
+"unresolved": {
+"ALBK": 6,
+"BHARATFIN": 7,
+"DHFL": 9,
+"EQUITAS": 20,
+"GSPL": 13,
+"HDFC": 55,
+"HEXAWARE": 12,
+"HFCL": 7,
+"IDFC": 40,
+"IDFCBANK": 1,
+"INFIBEAM": 6,
+"JETAIRWAYS": 6,
+"JPASSOCIAT": 3,
+"MINDTREE": 47,
+"ORIENTBANK": 6,
+"PEL": 78,
+"RCOM": 3,
+"RELCAPITAL": 9,
+"RELINFRA": 9,
+"SREINFRA": 3,
+"SYNDIBANK": 6,
+"TATAMTRDVR": 13,
+"TV18BRDCST": 6,
+"KPIT": 2,
+"UJJIVAN": 20
+},
+"bad_mapping": {
+"KPIT": "old KPIT Technologies became Birlasoft (BSOFT); KPITTECH is a different company",
+"UJJIVAN": "Ujjivan Financial Services merged into Ujjivan SFB, a different listed entity"
+}
+}
