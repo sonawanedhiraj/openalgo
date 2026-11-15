@@ -66,3 +66,41 @@ Issue #784. Nothing below may be changed after results exist; a changed threshol
 - **Placebo:** keep a random subset of the same size from the same exit/side/period VALIDATE pool; 2,000 draws; p = share of draws with net expectancy ≥ the filter's (R67 method).
 - **Day-block bootstrap CI** (95%, 2,000 resamples by date) for every reported VALIDATE expectancy.
 - Every variant evaluated is written to `data/variant_ledger.csv` with its count. Any rule that works in one period only is reported as noise.
+
+## Addendum A (2026-11-15, still BEFORE any 2024–2025 result; fetch not yet complete)
+
+### Exit (h) — hybrid, the one exit R67 did not sweep
+- **Entry, initial stop and quantity Q:** identical to (a), (b) and (c).
+- **Partial:** when the 1m bar reaches entry ± 1R, sell floor(Q/2) at exactly entry ± 1R.
+  - Stop-first applies within a bar: if the stop and +1R are both inside the same bar, the stop wins and nothing is partialled.
+  - If Q = 1 there is no partial, and the single share follows the remainder rule from +1R.
+- **Remainder stop protection:**
+  - From the bar AFTER the partial, the remainder's stop is at least breakeven (entry).
+  - Trail formula: stop = max(previous stop, entry, best 1m CLOSE since entry − 1.0 × R) for longs; mirrored for shorts.
+  - The trail is evaluated on each 1m close and applies from the next bar.
+  - A gap through the stop fills at the bar open.
+- **Session end:** whatever remains exits at the 15:19 close.
+- **Charges:** three orders (entry, partial, remainder), Zerodha's ₹20 cap per order, same rates.
+- No other hybrid parameters are tried. Neighbours for the plateau (partial at 0.75R and 1.25R, trail 1.0R) are reported as stability only.
+
+### R-threshold ladder (doc 17.2)
+- **Thresholds:** for k ∈ {0.5, 1, 1.5, 2}R, long and short separately and by period, report:
+  - n;
+  - % reaching k before −1R;
+  - median minutes from entry to reach k;
+  - % of those that subsequently hit the initial stop before 15:20.
+- **Two populations:**
+  - Engine entries (entry and stop are the engine's).
+  - All armed signals: reference = 5m close at fire, R = 1.5 × the engine's 5m Wilder ATR at arm.
+- **Giveback, measured on exit (a):** peak unrealised R up to the actual exit, realised gross R, and the gap between them. Report the distribution (median, p75, p90).
+
+### Long-side removal (doc 17.5)
+This is a HYPOTHESIS, not a decision. Pre-registered test: "short-only beats both-sides" requires short-only net expectancy per DAY > both-sides net expectancy per day on TRAIN and on VALIDATE, under the same exit, with the day-block bootstrap CI of the difference excluding 0 on VALIDATE. Otherwise the long side is not removed on this evidence.
+
+### Ledger fields (doc 17.6)
+One row per variant, failures included:
+- **Provenance and sample:** code hash (sha of the r80 scripts) + config, date split, signal count, executed trades.
+- **P&L and costs:** gross, net, each charge component (brokerage, STT, exchange, SEBI, GST, stamp), net expectancy, net profit factor.
+- **Risk:** max drawdown (cumulative net in trade order), risk-cap breaches (net loss > ₹500 on a trade).
+- **Attainment and uncertainty:** R-threshold attainment, day-block 95% CI.
+- **Slippage:** the base assumption is 0. The pre-registered adverse stress is 5 bps per round trip (2.5 per side, about R79's measured 2.4 bps entry slippage), reported for every row.
