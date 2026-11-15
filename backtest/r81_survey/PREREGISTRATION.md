@@ -1,5 +1,8 @@
 # R81 — pre-registration of new-entry hypotheses (written 2026-11-15, BEFORE any test)
 
+> **SUPERSEDED / WITHDRAWN before any test (2026-11-15).** Replaced by `backtest/r81_entry/PREREGISTRATION.md`. None of H1–H6 was run.
+
+
 - **Issue:** #785.
 - **Status: NOT RUN.** No hypothesis below has been computed on any data. They run only after Dheeraj approves this list (or an amended one). An amendment is a new commit, made before any result.
 - **Survey and cost floors** that motivate the list: `docs/research/strategy/r81_new_entry/2026-11-15_r81_survey_cost_floors_preregistration.md`.
