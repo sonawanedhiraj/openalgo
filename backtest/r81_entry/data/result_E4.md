@@ -8,10 +8,16 @@
 | validate | all | 688 | 2.81 | -11.4 | -1.21 | -136.9 | -14.52 | -91.6 | 49.7 | 0.45 | -7.64 | [-170.1, -99.9] | 94397.0 | 22.5 | BELOW |
 | validate | long | 436 | 1.78 | -14.5 | -1.53 | -140.3 | -14.83 | -94.9 | 50.0 | 0.43 | -6.02 | [-185.5, -92.6] | 61418.0 | 23.2 | BELOW |
 | validate | short | 252 | 1.03 | -6.1 | -0.65 | -130.9 | -13.98 | -85.9 | 49.2 | 0.48 | -4.22 | [-185.4, -69.9] | 32978.0 | 21.4 | BELOW |
+| holdout | all | 893 | 2.45 | 7.1 | 0.76 | -117.7 | -12.61 | -72.9 | 53.4 | 0.46 | -5.95 | [-154.9, -74.8] | 109363.0 | 32.0 | BELOW |
+| holdout | long | 517 | 1.42 | -13.9 | -1.5 | -138.4 | -14.9 | -93.8 | 53.6 | 0.38 | -6.58 | [-180.2, -94.7] | 71970.0 | 32.1 | BELOW |
+| holdout | short | 376 | 1.03 | 36.0 | 3.83 | -89.3 | -9.5 | -44.2 | 53.2 | 0.57 | -2.41 | [-153.8, -11.7] | 42096.0 | 31.9 | BELOW |
 
 - **Half-years (train)**, trades:net ₹/trade: 2019H1 341:-120.9, 2019H2 336:-152.9, 2020H1 257:-135.9, 2020H2 347:-133.5, 2021H1 315:-159.7, 2021H2 344:-162.9, 2022H1 273:-154.9, 2022H2 332:-107.7
 - **Neighbours (train)**, net ₹/trade: {'E4_c0.5': -130.0, 'E4_c0.7': -133.5, 'E4_v1.25': -138.4, 'E4_v1.75': -138.0}
 - **Half-years (validate)**, trades:net ₹/trade: 2023H1 343:-155.3, 2023H2 345:-118.5
 - **Placebo (validate)**, stop-or-15:20 lookup: all: n=688, actual ₹-83.2, timing p=0.945 (pctile 5.5), selection p=0.132 (pctile 86.8); long: n=436, actual ₹-71.3, timing p=0.758 (pctile 24.2), selection p=0.045 (pctile 95.5); short: n=252, actual ₹-103.8, timing p=0.935 (pctile 6.5), selection p=0.731 (pctile 26.9)
 - **Neighbours (validate)**, net ₹/trade: {'E4_c0.5': -115.6, 'E4_c0.7': -127.1, 'E4_v1.25': -129.6, 'E4_v1.75': -125.6}
-- **Gates:** {"half_years_positive": "0/10", "half_years_ok": false, "train_pos": "False", "validate_pos": "False", "plateau": {"E4_c0.5": -115.6, "E4_c0.7": -127.1, "E4_v1.25": -129.6, "E4_v1.75": -125.6}, "plateau_ok": false, "placebo_validate_ok": false}
+- **Half-years (holdout)**, trades:net ₹/trade: 2024H1 226:-131.3, 2024H2 346:-137.7, 2025H1 321:-86.6
+- **Placebo (holdout)**, stop-or-15:20 lookup: all: n=893, actual ₹-111.3, timing p=0.756 (pctile 24.4), selection p=0.513 (pctile 48.7); long: n=517, actual ₹-120.0, timing p=0.646 (pctile 35.4), selection p=0.478 (pctile 52.2); short: n=376, actual ₹-99.3, timing p=0.702 (pctile 29.8), selection p=0.49 (pctile 51.0)
+- **Neighbours (holdout)**, net ₹/trade: {'E4_c0.5': -135.9, 'E4_c0.7': -109.7, 'E4_v1.25': -125.9, 'E4_v1.75': -116.6}
+- **Gates:** {"half_years_positive": "0/10", "half_years_ok": false, "train_pos": "False", "validate_pos": "False", "plateau": {"E4_c0.5": -115.6, "E4_c0.7": -127.1, "E4_v1.25": -129.6, "E4_v1.75": -125.6}, "plateau_ok": false, "placebo_validate_ok": false, "holdout_pos": "False", "holdout_t": -5.95, "placebo_holdout_ok": false, "verdict": "NOT A RESULT"}
