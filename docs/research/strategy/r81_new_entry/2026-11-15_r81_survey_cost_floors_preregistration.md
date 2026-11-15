@@ -1,5 +1,8 @@
 # R81 — before searching for a new entry: what we already have, what it must clear, and what to test
 
+> **SUPERSEDED (2026-11-15, same day, before any test ran).** Dheeraj redirected R81 to the simplified stock engine's entry. The current R81 is `docs/research/strategy/simplified_engine/2026-11-15_r81_new_entry_rules_preregistration.md` with `backtest/r81_entry/PREREGISTRATION.md`. The facts below (sector rotation never executed, cost floors, dashboard earnings, the sector_follow exit defect) remain accurate as of this date, but the candidate list here is withdrawn.
+
+
 - **Issue:** #785.
 - **Stage:** survey + cost floors + pre-registration. **No hypothesis has been tested.** The candidate list in §4 waits for Dheeraj's approval.
 - **Pre-registration:** `backtest/r81_survey/PREREGISTRATION.md`, committed with this doc before any result.
