@@ -1,0 +1,14 @@
+approximate: keeps the first k engine entries of each day (later engine state not re-simulated)
+cap1 | train/long n=151 a=-86 b=-29 c=-51 h=-116 | train/short n=89 a=10 b=72 c=60 h=28 | val/long n=59 a=-8 b=83 c=9 h=78 | val/short n=56 a=-93 b=-180 c=-160 h=-143
+cap2 | train/long n=310 a=-83 b=-27 c=-38 h=-74 | train/short n=163 a=-18 b=15 c=36 h=10 | val/long n=128 a=-21 b=-13 c=0 h=7 | val/short n=97 a=-72 b=-124 c=-133 h=-111
+cap3 | train/long n=448 a=-94 b=-59 c=-52 h=-88 | train/short n=236 a=-11 b=24 c=18 h=4 | val/long n=177 a=-60 b=-61 c=-40 h=-49 | val/short n=142 a=-97 b=-150 c=-138 h=-115
+cap6 | train/long n=741 a=-84 b=-62 c=-61 h=-86 | train/short n=397 a=-59 b=-24 c=-5 h=-40 | val/long n=285 a=-52 b=-63 c=-47 h=-48 | val/short n=232 a=-102 b=-163 c=-133 h=-115
+    count        mean       
+per train  val  train    val
+k                           
+1     240  115  -50.0  -50.0
+2     233  110  -71.0  -36.0
+3     211   94  -77.0 -157.0
+4     187   80  -91.0  -25.0
+5     150   65  -73.0 -107.0
+6     117   53 -114.0  -94.0
