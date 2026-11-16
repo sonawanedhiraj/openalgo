@@ -49,3 +49,14 @@ Signals on the last trading day of the period at the close; trades at the NEXT t
 - **Low volatility (B2):** leverage-constrained investors overpay for high-beta names, so low-vol stocks earn more per unit of risk.
 - **Short-term reversal (B5):** compensation for providing liquidity to forced or impatient sellers.
 - **Risk parity (A, B3):** momentum and low-vol pay off in different regimes, so combining them lowers drawdown.
+
+## Batch C (appended BEFORE any batch-B result was seen; run only if no B candidate passes)
+Same costs, universe, periods, execution, gates and placebo as batch B. Long-only CNC, monthly unless stated, equal weight, N = 10.
+
+| Id | Rule | Neighbours | Rationale |
+|---|---|---|---|
+| C1 RESMOM | Top 10 by 6-1 cumulative **residual** return (daily returns minus beta×NIFTY, beta from the prior 252 days) | 3-1; 12-1; N=20 | Idiosyncratic momentum is the under-reaction part without the market-timing crash risk |
+| C2 52WH | Top 10 by close / max(close, prior 252d) | N=5; N=20; 126d high | Anchoring to the 52-week high delays the reaction to good news |
+| C3 SMOOTH | From the top 30 by 6-1 momentum, the 10 with the lowest 60d vol | top-20 pool; top-50 pool; N=5 | Momentum built from many small moves (frog-in-the-pan) persists more than jump-driven momentum |
+| C4 B3Q | B3 (risk-parity momentum + low-vol) rebalanced **quarterly** (Mar/Jun/Sep/Dec ends) | B1 quarterly; B2 quarterly | Slow premia; a quarter's hold halves turnover and the DP + STT drag |
+| C5 FNOADD | Names in month M's F&O list but not M−1's: buy at the first open of M, hold 3 months (overlapping cohorts, equal weight) | hold 1 month; hold 6 months | F&O inclusion brings liquidity, arbitrage capital and attention (investor recognition) |
