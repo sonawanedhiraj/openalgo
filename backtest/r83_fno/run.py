@@ -270,7 +270,8 @@ def run_A():
 def holdout():
     fr = json.load(open(K.D / "frozen.json"))
     rows = []
-    for cand in fr["to_holdout"]:
+    key = sys.argv[2] if len(sys.argv) > 2 else "to_holdout"
+    for cand in fr[key]:
         if cand.startswith("B6"):
             kw = {"B6": {}, "B6_3-1": {"look": 63}, "B6_12-1": {"look": 252}, "B6_n5": {"n": 5}}[
                 cand
@@ -303,7 +304,7 @@ def holdout():
         rows[-1].update(placebo_p=pl["p"])
         print(cand, pl, flush=True)
     df = pd.DataFrame(rows)
-    df.to_csv(K.D / "holdout.csv", index=False)
+    df.to_csv(K.D / ("holdout.csv" if key == "to_holdout" else f"holdout_{key}.csv"), index=False)
     print(df.to_string())
 
 

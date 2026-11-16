@@ -16,5 +16,13 @@
  ],
  "rule": "TRAIN and VALIDATE excess > 0 (B1 only at capital >= Rs1L; fails at Rs20k on DP/integer-share frictions). Neighbours run on holdout for reporting only; plateau gate is on VALIDATE (prereg).",
  "B1_min_capital": 100000,
- "batch_C": "TRAIN/VALIDATE computed; holdout only if B1 and B6 both fail (prereg)"
+ "batch_C": "TRAIN/VALIDATE computed; holdout only if B1 and B6 both fail (prereg)",
+ "batch_C_to_holdout": [
+  "C1",
+  "C1_3-1",
+  "C1_12-1",
+  "C1_n20"
+ ],
+ "batch_C_rule": "primary C1 only: TRAIN+VALIDATE excess >0 from Rs1L (C2,C3,C4,C5 primaries fail TRAIN or VALIDATE at every capital). Neighbours run for reporting; plateau gate on VALIDATE.",
+ "C1_min_capital": 100000
 }
