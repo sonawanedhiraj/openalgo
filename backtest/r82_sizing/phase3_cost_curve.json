@@ -1,0 +1,137 @@
+[
+ {
+  "notional": 10000,
+  "charges_rs": 10.63,
+  "charges_bps": 10.63,
+  "brk_gst_bps": 7.08,
+  "slip_bps": 4.8,
+  "bar_bps": 15.43,
+  "bar_rs": 15.4
+ },
+ {
+  "notional": 25000,
+  "charges_rs": 26.57,
+  "charges_bps": 10.63,
+  "brk_gst_bps": 7.08,
+  "slip_bps": 4.8,
+  "bar_bps": 15.43,
+  "bar_rs": 38.6
+ },
+ {
+  "notional": 50000,
+  "charges_rs": 53.14,
+  "charges_bps": 10.63,
+  "brk_gst_bps": 7.08,
+  "slip_bps": 4.8,
+  "bar_bps": 15.43,
+  "bar_rs": 77.1
+ },
+ {
+  "notional": 66667,
+  "charges_rs": 70.85,
+  "charges_bps": 10.63,
+  "brk_gst_bps": 7.08,
+  "slip_bps": 4.8,
+  "bar_bps": 15.43,
+  "bar_rs": 102.9
+ },
+ {
+  "notional": 75000,
+  "charges_rs": 73.81,
+  "charges_bps": 9.84,
+  "brk_gst_bps": 6.29,
+  "slip_bps": 4.8,
+  "bar_bps": 14.64,
+  "bar_rs": 109.8
+ },
+ {
+  "notional": 86000,
+  "charges_rs": 77.71,
+  "charges_bps": 9.04,
+  "brk_gst_bps": 5.49,
+  "slip_bps": 4.8,
+  "bar_bps": 13.84,
+  "bar_rs": 119.0
+ },
+ {
+  "notional": 92000,
+  "charges_rs": 79.84,
+  "charges_bps": 8.68,
+  "brk_gst_bps": 5.13,
+  "slip_bps": 4.8,
+  "bar_bps": 13.48,
+  "bar_rs": 124.0
+ },
+ {
+  "notional": 98000,
+  "charges_rs": 81.97,
+  "charges_bps": 8.36,
+  "brk_gst_bps": 4.82,
+  "slip_bps": 4.8,
+  "bar_bps": 13.16,
+  "bar_rs": 129.0
+ },
+ {
+  "notional": 100000,
+  "charges_rs": 82.68,
+  "charges_bps": 8.27,
+  "brk_gst_bps": 4.72,
+  "slip_bps": 4.8,
+  "bar_bps": 13.07,
+  "bar_rs": 130.7
+ },
+ {
+  "notional": 150000,
+  "charges_rs": 100.42,
+  "charges_bps": 6.69,
+  "brk_gst_bps": 3.15,
+  "slip_bps": 4.8,
+  "bar_bps": 11.49,
+  "bar_rs": 172.4
+ },
+ {
+  "notional": 200000,
+  "charges_rs": 118.16,
+  "charges_bps": 5.91,
+  "brk_gst_bps": 2.36,
+  "slip_bps": 4.8,
+  "bar_bps": 10.71,
+  "bar_rs": 214.2
+ },
+ {
+  "notional": 286000,
+  "charges_rs": 148.68,
+  "charges_bps": 5.2,
+  "brk_gst_bps": 1.65,
+  "slip_bps": 4.8,
+  "bar_bps": 10.0,
+  "bar_rs": 286.0
+ },
+ {
+  "notional": 500000,
+  "charges_rs": 224.61,
+  "charges_bps": 4.49,
+  "brk_gst_bps": 0.94,
+  "slip_bps": 4.8,
+  "bar_bps": 9.29,
+  "bar_rs": 464.6
+ },
+ {
+  "notional": 1000000,
+  "charges_rs": 402.01,
+  "charges_bps": 4.02,
+  "brk_gst_bps": 0.47,
+  "slip_bps": 4.8,
+  "bar_bps": 8.82,
+  "bar_rs": 882.0
+ },
+ {
+  "notional": 100000000.0,
+  "charges_rs": 35528.4,
+  "charges_bps": 3.55,
+  "brk_gst_bps": 0.0,
+  "slip_bps": 4.8,
+  "bar_bps": 8.35,
+  "bar_rs": 83528.4
+ }
+]
