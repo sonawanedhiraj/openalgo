@@ -15,7 +15,7 @@ import strategies as S
 
 CAPS = [20_000, 100_000, 500_000, 1_000_000]
 SLIPS = [0.0, 0.0005, 0.0015]
-PY = {"M": 12, "W": 52}
+PY = {"M": 12, "W": 52, "Q": 4}
 rng = np.random.default_rng(83)
 
 
@@ -118,9 +118,40 @@ def placebo(cand, lo, hi, draws=1000):
     }
 
 
+def placebo_ls(lo, hi, look=126, skip=21, n=10, draws=1000):
+    """B6 placebo: random disjoint long-n / short-n sets from the same eligible pool each month (gross)."""
+    Op, Cl, *_ = K.panel()
+    days = Cl.index
+    ends = K.period_ends("M", lo, hi)
+    act, rand = [], []
+    for a, b in zip(ends[:-1], ends[1:], strict=False):
+        el = K.eligible(a)
+        s = S.mom_scores(a, el, look, skip)
+        if len(s) < 2 * n:
+            continue
+        ea, eb = days[days.get_loc(a) + 1], days[min(days.get_loc(b) + 1, len(days) - 1)]
+        r = (
+            Op.loc[eb, list(s.index)].fillna(Cl.loc[:eb, list(s.index)].ffill().iloc[-1])
+            / Op.loc[ea, list(s.index)]
+            - 1
+        ).replace([np.inf, -np.inf], np.nan)
+        r = r.fillna(r.mean())
+        act.append(r[s.nlargest(n).index].mean() - r[s.nsmallest(n).index].mean())
+        rv = r.values
+        dr = []
+        for _ in range(draws):
+            p = rng.permutation(len(rv))
+            dr.append(rv[p[:n]].mean() - rv[p[n : 2 * n]].mean())
+        rand.append(dr)
+    a = np.mean(act)
+    rnd = np.mean(np.array(rand), axis=0)
+    return {"actual_gross_per_month": round(float(a), 5), "p": round(float((rnd >= a).mean()), 3)}
+
+
 def tv():
     rows = []
-    cands = [k for k in S.REG if k.startswith("B")]
+    batch = sys.argv[2] if len(sys.argv) > 2 else "B"
+    cands = [k for k in S.REG if k.startswith(batch)]
     for cand in cands:
         for per, (lo, hi) in (("train", K.TRAIN), ("validate", K.VALID)):
             for cap in CAPS:
@@ -140,7 +171,7 @@ def tv():
                         )
                     )
             print(cand, per, "done", flush=True)
-    for per, (lo, hi) in (("train", K.TRAIN), ("validate", K.VALID)):
+    for per, (lo, hi) in (("train", K.TRAIN), ("validate", K.VALID)) if batch == "B" else ():
         for nm, kw in (
             ("B6", {}),
             ("B6_3-1", {"look": 63}),
@@ -159,7 +190,7 @@ def tv():
                 )
             )
     df = pd.DataFrame(rows)
-    df.to_csv(K.D / "tv.csv", index=False)
+    df.to_csv(K.D / f"tv_{batch}.csv", index=False)
     print(
         df[(df.capital.isin([20_000, None]) | df.capital.isna()) & (df.slip_bps == 5.0)][
             [
@@ -245,7 +276,20 @@ def holdout():
                 cand
             ]
             m, st = b6(*K.HOLD, **kw)
-            rows.append(dict(cand=cand, capital=None, slip_bps=5.0, **st))
+            pl = placebo_ls(*K.HOLD, **kw)
+            hy = K.half_years(m)
+            m.to_csv(K.D / f"hold_{cand}.csv", index=False)
+            rows.append(
+                dict(
+                    cand=cand,
+                    capital=None,
+                    slip_bps=5.0,
+                    **st,
+                    placebo_p=pl["p"],
+                    half_years=json.dumps(hy),
+                )
+            )
+            print(cand, st, pl, flush=True)
             continue
         for cap in CAPS:
             for slip in SLIPS:

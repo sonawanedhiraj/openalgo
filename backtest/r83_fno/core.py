@@ -72,6 +72,7 @@ def panel():
     return Op, Cl, V, int(art.values.sum()), art
 
 
+@lru_cache(maxsize=1)
 def daily_returns():
     Op, Cl, V, _, art = panel()
     r = Cl / Cl.ffill().shift() - 1
@@ -86,9 +87,16 @@ def universe():
 
 
 def eligible(day):
+    return list(_eligible(day))
+
+
+@lru_cache(maxsize=4096)
+def _eligible(day):
     """PIT F&O names eligible at signal date `day` (Timestamp)."""
     Op, Cl, V, _, _ = panel()
-    mk = day.strftime("%Y-%m")
+    mk = (day + pd.Timedelta(days=5)).strftime(
+        "%Y-%m"
+    )  # trading month: list of M-1 month-end (prereg)
     names = [s for s in universe().get(mk, set()) if s in Cl.columns]
     loc = Cl.index.get_loc(day)
     if loc < 252:
@@ -98,7 +106,7 @@ def eligible(day):
     px = hist.iloc[-1]
     adv = V.iloc[max(0, loc - 19) : loc + 1][names].median()
     ok = n_ok & (px >= 50) & (adv >= 1e8)
-    return sorted(ok.index[ok.fillna(False)])
+    return tuple(sorted(ok.index[ok.fillna(False)]))
 
 
 def period_ends(freq, lo, hi):
@@ -108,7 +116,7 @@ def period_ends(freq, lo, hi):
         (Cl.index >= pd.Timestamp(lo) - pd.Timedelta(days=40)) & (Cl.index <= pd.Timestamp(hi))
     ]
     s = pd.Series(idx, index=idx)
-    key = idx.to_period("M") if freq == "M" else idx.to_period("W-FRI")
+    key = {"M": idx.to_period("M"), "W": idx.to_period("W-FRI"), "Q": idx.to_period("Q")}[freq]
     ends = s.groupby(key).max().values
     return [pd.Timestamp(x) for x in ends]
 
@@ -222,6 +230,7 @@ def ew_benchmark(freq, lo, hi, names_fn=None):
 
 def stats(m, per_year):
     """m: frame with ret, bench columns (per period). Returns metric dict."""
+    m = m.dropna(subset=["ret", "bench"])
     x = m.ret.values
     ex = (m.ret - m.bench).values
     n = len(x)
@@ -248,5 +257,6 @@ def stats(m, per_year):
 
 
 def half_years(m):
+    m = m.dropna(subset=["ret", "bench"])
     h = m.start.dt.year.astype(str) + np.where(m.start.dt.month <= 6, "H1", "H2")
     return (m.ret - m.bench).groupby(h.values).mean().round(4).to_dict()

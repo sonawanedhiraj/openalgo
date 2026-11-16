@@ -1,0 +1,20 @@
+{
+ "to_holdout": [
+  "B1",
+  "B6",
+  "B6_3-1",
+  "B6_12-1",
+  "B6_n5",
+  "B1_3-1",
+  "B1_12-1",
+  "B1_n5",
+  "B1_n20"
+ ],
+ "primary": [
+  "B1",
+  "B6"
+ ],
+ "rule": "TRAIN and VALIDATE excess > 0 (B1 only at capital >= Rs1L; fails at Rs20k on DP/integer-share frictions). Neighbours run on holdout for reporting only; plateau gate is on VALIDATE (prereg).",
+ "B1_min_capital": 100000,
+ "batch_C": "TRAIN/VALIDATE computed; holdout only if B1 and B6 both fail (prereg)"
+}

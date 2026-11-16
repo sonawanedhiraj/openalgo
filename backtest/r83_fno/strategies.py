@@ -194,3 +194,93 @@ REG = {
     "B5_n20": B5(n=20),
 }
 FREQ = {k: ("W" if k.startswith("B5") else "M") for k in REG}
+
+
+# ------------------------------------------------------------------ batch C (pre-registered 9606ae3a1)
+def resid_scores(day, names, look, skip):
+    r = K.daily_returns()
+    loc = r.index.get_loc(day)
+    win = r.iloc[max(0, loc - 252 - look) : loc + 1]
+    mkt = win["IDX:NIFTY"]
+    est, hold = win.iloc[: -look - 1], win.iloc[-look - 1 :]
+    out = {}
+    for s in names:
+        x = est[s]
+        ok = x.notna() & est["IDX:NIFTY"].notna()
+        if ok.sum() < 120:
+            continue
+        b = np.cov(x[ok], mkt.loc[est.index][ok])[0, 1] / np.var(mkt.loc[est.index][ok], ddof=1)
+        e = (hold[s] - b * hold["IDX:NIFTY"]).iloc[: len(hold) - skip]
+        if e.notna().sum() < 0.9 * (look - skip):
+            continue
+        out[s] = float(e.sum())
+    return pd.Series(out, dtype=float)
+
+
+def C1(look=126, skip=21, n=10):
+    def f(day):
+        return eq(list(resid_scores(day, K.eligible(day), look, skip).nlargest(n).index))
+
+    return f
+
+
+def C2(n=10, look=252):
+    def f(day):
+        el = K.eligible(day)
+        h = _hist(day, el, look)
+        s = (h.iloc[-1] / h.max()).dropna()
+        return eq(list(s.nlargest(n).index))
+
+    return f
+
+
+def C3(pool=30, n=10):
+    def f(day):
+        el = K.eligible(day)
+        top = list(mom_scores(day, el, 126, 21).nlargest(pool).index)
+        return eq(list(vol_scores(day, top, 60).nsmallest(n).index))
+
+    return f
+
+
+def C5(hold=3):
+    U = K.universe()
+    keys = sorted(U)
+
+    def f(day):
+        mk = (day + pd.Timedelta(days=5)).strftime("%Y-%m")  # month that trading starts in
+        if mk not in U:
+            return {}
+        i = keys.index(mk)
+        adds = set()
+        for j in range(max(1, i - hold + 1), i + 1):
+            adds |= U[keys[j]] - U[keys[j - 1]]
+        el = set(K.eligible(day))
+        return eq(sorted(adds & el))
+
+    return f
+
+
+REG.update(
+    {
+        "C1": C1(),
+        "C1_3-1": C1(63, 21),
+        "C1_12-1": C1(252, 21),
+        "C1_n20": C1(n=20),
+        "C2": C2(),
+        "C2_n5": C2(n=5),
+        "C2_n20": C2(n=20),
+        "C2_126": C2(look=126),
+        "C3": C3(),
+        "C3_p20": C3(pool=20),
+        "C3_p50": C3(pool=50),
+        "C3_n5": C3(n=5),
+        "C4": B3(),
+        "C4_B1": B1(),
+        "C4_B2": B2(),
+        "C5": C5(),
+        "C5_h1": C5(1),
+        "C5_h6": C5(6),
+    }
+)
+FREQ.update({k: ("Q" if k.startswith("C4") else "M") for k in REG if k.startswith("C")})
