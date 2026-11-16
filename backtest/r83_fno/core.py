@@ -155,6 +155,7 @@ def simulate(
         if w is None:
             w = {}
         costs = 0.0
+        dp = 0.0
         tgt = {}
         for s, wt in w.items():
             p = px.get(s, np.nan)
@@ -172,6 +173,7 @@ def simulate(
                     p = cl_prev.get(s, 0)
                 v = (q0 - q1) * p * (1 - slip)
                 c = cost(v, False) + DP
+                dp += DP
                 cash += v - c
                 costs += c + (q0 - q1) * p * slip
                 turnover += v
@@ -205,6 +207,10 @@ def simulate(
                 "turnover": turnover,
                 "n_names": len(sh),
                 "names": ",".join(sorted(sh)),
+                "n_target": len(w),
+                "n_held_target": sum(1 for x in w if sh.get(x, 0) > 0),
+                "cash_frac": cash / eq if eq else np.nan,
+                "dp": dp,
             }
         )
         prev_exec, prev_eq = ex, eq
