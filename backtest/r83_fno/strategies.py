@@ -142,8 +142,10 @@ def A(look=126, n=3, lv_look=60, rp=True):
     def f(day):
         idx = ["IDX:" + x for x in SECTOR_A]
         h = _hist(day, idx, max(look, lv_look) + 1)
+        if len(h) < look + 1:
+            return {}
         m = (h.iloc[-1] / h.iloc[-1 - look] - 1).dropna().nlargest(n)
-        r = h.pct_change().iloc[-lv_look:]
+        r = h.pct_change(fill_method=None).iloc[-lv_look:]
         v = r.std().dropna()
         lv = v.nsmallest(n)
         legs = [list(m.index), list(lv.index)]
