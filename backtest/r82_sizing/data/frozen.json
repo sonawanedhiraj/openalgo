@@ -1,0 +1,80 @@
+{
+ "BASE": {
+  "selected": "APCT.X1",
+  "selected_validate_net_rs": -37.7,
+  "unreachable_budgets": [
+   "A1000"
+  ],
+  "train_S0L_X0_net_rs": -74.2,
+  "pool_size": 8,
+  "top5": [
+   [
+    "APCT.X1",
+    -37.7
+   ],
+   [
+    "APCT.X0",
+    -38.4
+   ],
+   [
+    "APCT.XLi5",
+    -38.6
+   ],
+   [
+    "APCT.XL5",
+    -38.9
+   ],
+   [
+    "APCT.XS",
+    -44.0
+   ]
+  ]
+ },
+ "E3S": {
+  "selected": "A1000.XS",
+  "selected_validate_net_rs": 12.4,
+  "unreachable_budgets": [],
+  "train_S0L_X0_net_rs": -5.3,
+  "pool_size": 11,
+  "top5": [
+   [
+    "A1000.XS",
+    12.4
+   ],
+   [
+    "S0L.X0",
+    -11.8
+   ],
+   [
+    "S0L.XL5",
+    -33.2
+   ],
+   [
+    "APCT.XLi5",
+    -36.4
+   ],
+   [
+    "APCT.XL5",
+    -43.4
+   ]
+  ]
+ },
+ "frozen_at_commit_note": "selection made by score_r82.py select() on TRAIN+VALIDATE only; holdout not yet run",
+ "holdout_plan": {
+  "BASE": [
+   "APCT.X1",
+   "APCT.X0",
+   "A500.X1",
+   "S0L.X0",
+   "S0.X0"
+  ],
+  "E3S": [
+   "A1000.XS",
+   "A750.XS",
+   "A1000_nomin.X0",
+   "A1000.X0",
+   "S0L.X0",
+   "S0.X0"
+  ]
+ }
+}
