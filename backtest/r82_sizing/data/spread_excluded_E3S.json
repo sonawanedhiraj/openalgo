@@ -1,0 +1,31 @@
+{
+ "cand": "E3S",
+ "train": [
+  "2019-01-01",
+  "2022-12-31"
+ ],
+ "cut_bps": 4.98,
+ "excluded": [
+  "ADANIENT",
+  "APOLLOTYRE",
+  "ASTRAL",
+  "BAJFINANCE",
+  "BEL",
+  "EXIDEIND",
+  "GUJGASLTD",
+  "INDHOTEL",
+  "INFRATEL",
+  "M&MFIN",
+  "MANAPPURAM",
+  "MCX",
+  "NTPC",
+  "ONGC",
+  "RAMCOCEM",
+  "RECLTD",
+  "SAIL",
+  "SUNTV",
+  "TATAPOWER",
+  "VEDL"
+ ],
+ "n_symbols": 97
+}
