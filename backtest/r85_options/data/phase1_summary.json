@@ -1,0 +1,21 @@
+{
+ "calendar_days": 1952,
+ "days_with_file": 1941,
+ "missing_sessions": [
+  "2019-10-27",
+  "2020-02-01",
+  "2020-11-14",
+  "2021-03-30",
+  "2023-11-12",
+  "2024-01-20",
+  "2024-03-02",
+  "2024-05-18",
+  "2025-02-01",
+  "2026-02-01",
+  "2026-11-08"
+ ],
+ "non_calendar_days_in_files": [],
+ "legacy_lot_formula_matches_udiff_lot_within_2pct": 0.9718,
+ "lot_check_n": 121034,
+ "opt_rows_total": 76417240
+}
