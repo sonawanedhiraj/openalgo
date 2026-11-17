@@ -1,0 +1,23 @@
+{
+ "to_holdout": [
+  "O4",
+  "O5"
+ ],
+ "neighbours_reported": [
+  "O4_z075",
+  "O4_z125",
+  "O5_z075",
+  "O5_z125",
+  "O5_ic"
+ ],
+ "rule": "TRAIN and VALIDATE net per trade > 0 at central spread (prereg). O1,O2,O3 fail TRAIN.",
+ "plateau_on_validate": {
+  "O4": "pass (z075 +1277, z125 +1411)",
+  "O5": "FAIL (O5_ic -797, t -3.0)"
+ },
+ "half_years_2019_2023": {
+  "O4": "9/10 positive (train 2019H1..2023H1 + validate 2023H1,H2)",
+  "O5": "5/10"
+ },
+ "disclosure": "Prereg delivery-margin ramp (10/25/45/70% of CONTRACT VALUE) overstates NSE/Zerodha practice (10/25/45% of VaR+ELM at E-4..E-2; E-1 25% of contract value per Zerodha). Affects capital only; gates use prereg model; capital reported under both."
+}

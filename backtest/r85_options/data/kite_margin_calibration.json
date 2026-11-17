@@ -1,0 +1,622 @@
+[
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "short_put_5",
+  "strikes": [
+   "RELIANCE26DEC1270PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 80254,
+  "notional": 669850,
+  "initial_total": 86679
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "short_call_5",
+  "strikes": [
+   "RELIANCE26DEC1410CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 89069,
+  "notional": 669850,
+  "initial_total": 99469
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "strangle_5",
+  "strikes": [
+   "RELIANCE26DEC1270PE",
+   "RELIANCE26DEC1410CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 106178,
+  "notional": 669850,
+  "initial_total": 123003
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "short_put_10",
+  "strikes": [
+   "RELIANCE26DEC1210PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 64764,
+  "notional": 669850,
+  "initial_total": 67439
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "short_call_10",
+  "strikes": [
+   "RELIANCE26DEC1470CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 76409,
+  "notional": 669850,
+  "initial_total": 80884
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "strangle_10",
+  "strikes": [
+   "RELIANCE26DEC1210PE",
+   "RELIANCE26DEC1470CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 97268,
+  "notional": 669850,
+  "initial_total": 104418
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "bull_put_5_10",
+  "strikes": [
+   "RELIANCE26DEC1270PE",
+   "RELIANCE26DEC1210PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 43054,
+  "notional": 669850,
+  "initial_total": 89354
+ },
+ {
+  "sym": "RELIANCE",
+  "S": 1339.7,
+  "lot": 500,
+  "case": "bear_call_5_10",
+  "strikes": [
+   "RELIANCE26DEC1410CE",
+   "RELIANCE26DEC1470CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 41224,
+  "notional": 669850,
+  "initial_total": 103944
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "short_put_5",
+  "strikes": [
+   "SBIN26DEC1030PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 100461,
+  "notional": 810000,
+  "initial_total": 106123
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "short_call_5",
+  "strikes": [
+   "SBIN26DEC1130CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 108546,
+  "notional": 810000,
+  "initial_total": 120246
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "strangle_5",
+  "strikes": [
+   "SBIN26DEC1030PE",
+   "SBIN26DEC1130CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 131509,
+  "notional": 810000,
+  "initial_total": 148872
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "short_put_10",
+  "strikes": [
+   "SBIN26DEC970PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 77443,
+  "notional": 810000,
+  "initial_total": 79281
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "short_call_10",
+  "strikes": [
+   "SBIN26DEC1190CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 89788,
+  "notional": 810000,
+  "initial_total": 93426
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "strangle_10",
+  "strikes": [
+   "SBIN26DEC970PE",
+   "SBIN26DEC1190CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 116577,
+  "notional": 810000,
+  "initial_total": 122052
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "bull_put_5_10",
+  "strikes": [
+   "SBIN26DEC1030PE",
+   "SBIN26DEC970PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 59249,
+  "notional": 810000,
+  "initial_total": 107961
+ },
+ {
+  "sym": "SBIN",
+  "S": 1080.0,
+  "lot": 750,
+  "case": "bear_call_5_10",
+  "strikes": [
+   "SBIN26DEC1130CE",
+   "SBIN26DEC1190CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 55341,
+  "notional": 810000,
+  "initial_total": 123883
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "short_put_5",
+  "strikes": [
+   "TCS26DEC2280PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 66990,
+  "notional": 541688,
+  "initial_total": 75743
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "short_call_5",
+  "strikes": [
+   "TCS26DEC2520CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 77790,
+  "notional": 541688,
+  "initial_total": 89535
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "strangle_5",
+  "strikes": [
+   "TCS26DEC2280PE",
+   "TCS26DEC2520CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 88458,
+  "notional": 541688,
+  "initial_total": 108956
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "short_put_10",
+  "strikes": [
+   "TCS26DEC2160PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 54573,
+  "notional": 541688,
+  "initial_total": 58431
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "short_call_10",
+  "strikes": [
+   "TCS26DEC2640CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 66516,
+  "notional": 541688,
+  "initial_total": 72489
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "strangle_10",
+  "strikes": [
+   "TCS26DEC2160PE",
+   "TCS26DEC2640CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 81994,
+  "notional": 541688,
+  "initial_total": 91827
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "bull_put_5_10",
+  "strikes": [
+   "TCS26DEC2280PE",
+   "TCS26DEC2160PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 34305,
+  "notional": 541688,
+  "initial_total": 79602
+ },
+ {
+  "sym": "TCS",
+  "S": 2407.5,
+  "lot": 225,
+  "case": "bear_call_5_10",
+  "strikes": [
+   "TCS26DEC2520CE",
+   "TCS26DEC2640CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 34134,
+  "notional": 541688,
+  "initial_total": 95509
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "short_put_5",
+  "strikes": [
+   "TATAPOWER26DEC330PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 60048,
+  "notional": 504600,
+  "initial_total": 67153
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "short_call_5",
+  "strikes": [
+   "TATAPOWER26DEC365CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 69256,
+  "notional": 504600,
+  "initial_total": 79261
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "strangle_5",
+  "strikes": [
+   "TATAPOWER26DEC330PE",
+   "TATAPOWER26DEC365CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 81192,
+  "notional": 504600,
+  "initial_total": 98302
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "short_put_10",
+  "strikes": [
+   "TATAPOWER26DEC315PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 47738,
+  "notional": 504600,
+  "initial_total": 50855
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "short_call_10",
+  "strikes": [
+   "TATAPOWER26DEC385CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 56322,
+  "notional": 504600,
+  "initial_total": 60599
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "strangle_10",
+  "strikes": [
+   "TATAPOWER26DEC315PE",
+   "TATAPOWER26DEC385CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 70738,
+  "notional": 504600,
+  "initial_total": 78133
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "bull_put_5_10",
+  "strikes": [
+   "TATAPOWER26DEC330PE",
+   "TATAPOWER26DEC315PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 32846,
+  "notional": 504600,
+  "initial_total": 70271
+ },
+ {
+  "sym": "TATAPOWER",
+  "S": 348.0,
+  "lot": 1450,
+  "case": "bear_call_5_10",
+  "strikes": [
+   "TATAPOWER26DEC365CE",
+   "TATAPOWER26DEC385CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 35253,
+  "notional": 504600,
+  "initial_total": 83538
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "short_put_5",
+  "strikes": [
+   "DLF26DEC720PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 96668,
+  "notional": 720812,
+  "initial_total": 108306
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "short_call_5",
+  "strikes": [
+   "DLF26DEC800CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 107346,
+  "notional": 720812,
+  "initial_total": 119221
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "strangle_5",
+  "strikes": [
+   "DLF26DEC720PE",
+   "DLF26DEC800CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 120805,
+  "notional": 720812,
+  "initial_total": 144317
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "short_put_10",
+  "strikes": [
+   "DLF26DEC680PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 78856,
+  "notional": 720812,
+  "initial_total": 83416
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "short_call_10",
+  "strikes": [
+   "DLF26DEC830CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 98625,
+  "notional": 720812,
+  "initial_total": 105323
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "strangle_10",
+  "strikes": [
+   "DLF26DEC680PE",
+   "DLF26DEC830CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 119161,
+  "notional": 720812,
+  "initial_total": 130419
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "bull_put_5_10",
+  "strikes": [
+   "DLF26DEC720PE",
+   "DLF26DEC680PE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 46888,
+  "notional": 720812,
+  "initial_total": 112866
+ },
+ {
+  "sym": "DLF",
+  "S": 758.75,
+  "lot": 950,
+  "case": "bear_call_5_10",
+  "strikes": [
+   "DLF26DEC800CE",
+   "DLF26DEC830CE"
+  ],
+  "span": 0,
+  "exposure": 0,
+  "premium": 0,
+  "total": 37712,
+  "notional": 720812,
+  "initial_total": 125919
+ }
+]
