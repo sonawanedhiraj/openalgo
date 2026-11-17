@@ -26,7 +26,11 @@ DELIVERY_RAMP = {
     3: 0.25,
     2: 0.45,
     1: 0.70,
-}  # E-k -> % of contract value on ITM shorts (O4 only)
+}  # E-k -> % of contract value on ITM shorts (O4 only) -- PRE-REGISTERED model
+# Capital-only sensitivity (R85 disclosure): broker practice = 10/25/45% of VaR+ELM (~25% of value) at E-4..E-2,
+# 25% of contract value at E-1 (Zerodha). Selected with env R85_RAMP=practice; P&L is unaffected.
+if __import__("os").environ.get("R85_RAMP") == "practice":
+    DELIVERY_RAMP = {4: 0.025, 3: 0.0625, 2: 0.1125, 1: 0.25}
 SPREAD = {
     "zero": (0.0, 0.0),
     "central": (0.015, 0.05),
@@ -72,14 +76,17 @@ _con = None
 def con():
     global _con
     if _con is None:
-        _con = duckdb.connect()
-        _con.execute(
-            "create view fo as select date, kind, symbol, expiry, cast(strike as double) strike, opt, "
-            'cast("open" as double) "open", cast(high as double) high, cast(low as double) low, cast("close" as double) "close", '
-            "cast(settle as double) settle, cast(contracts as double) contracts, cast(value_lakh as double) value_lakh, "
-            "cast(oi as double) oi, cast(lot as double) lot, cast(underlying as double) underlying, fmt "
-            f"from read_parquet('{GLOB}', union_by_name=true)"
-        )
+        db = D / "fo.duckdb"
+        if db.exists():
+            _con = duckdb.connect(str(db), read_only=True)
+        else:
+            _con = duckdb.connect()
+            _con.execute(
+                "create view fo as select date, kind, symbol, expiry, cast(strike as double) strike, opt, "
+                'cast("close" as double) "close", cast(settle as double) settle, cast(contracts as double) contracts, '
+                "cast(value_lakh as double) value_lakh, cast(oi as double) oi, cast(lot as double) lot, fmt "
+                f"from read_parquet('{GLOB}', union_by_name=true)"
+            )
     return _con
 
 

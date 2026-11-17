@@ -1,0 +1,9 @@
+{
+ "cand": "O4",
+ "period": "holdout",
+ "draws": 30,
+ "actual_net_per_trade": 450.7,
+ "placebo_mean": -471.8,
+ "placebo_p95": 43.7,
+ "p": 0.0
+}

@@ -398,6 +398,7 @@ def placebo(cand, period, actual, draws):
             vals.append(np.mean([t["net"] for t in tr]))
     vals = np.array(vals)
     return {
+        "vals": vals.tolist(),
         "draws": int(len(vals)),
         "p": round(float((vals >= actual).mean()), 3) if len(vals) else None,
         "placebo_mean": round(float(vals.mean()), 1) if len(vals) else None,
@@ -411,13 +412,16 @@ if __name__ == "__main__":
     period = sys.argv[2]
     scen = sys.argv[3] if len(sys.argv) > 3 else "central"
     draws = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    tag = sys.argv[5] if len(sys.argv) > 5 else ""
     rows = []
     for c in cands:
         tr = run_cand(c, period, scen)
         st, T, daily = summarize(tr, period)
         if len(T):
-            T.to_parquet(E.D / f"trades_{c}_{period}_{scen}.parquet", index=False)
-            daily.rename("pnl").to_frame().to_parquet(E.D / f"daily_{c}_{period}_{scen}.parquet")
+            T.to_parquet(E.D / f"trades_{c}_{period}_{scen}{tag}.parquet", index=False)
+            daily.rename("pnl").to_frame().to_parquet(
+                E.D / f"daily_{c}_{period}_{scen}{tag}.parquet"
+            )
             hy = (
                 T.assign(
                     h=T.entry.dt.year.astype(str) + np.where(T.entry.dt.month <= 6, "H1", "H2")
@@ -433,6 +437,7 @@ if __name__ == "__main__":
                 {
                     f"placebo_{k}": v
                     for k, v in placebo(c, period, st["net_per_trade"], draws).items()
+                    if k != "vals"
                 }
             )
         rows.append({"cand": c, "period": period, "scen": scen, **st})
@@ -453,5 +458,5 @@ if __name__ == "__main__":
             flush=True,
         )
     pd.DataFrame(rows).to_csv(
-        E.D / f"summary_{period}_{scen}_{sys.argv[1].replace(',', '-')[:40]}.csv", index=False
+        E.D / f"summary_{period}_{scen}{tag}_{sys.argv[1].replace(',', '-')[:40]}.csv", index=False
     )
