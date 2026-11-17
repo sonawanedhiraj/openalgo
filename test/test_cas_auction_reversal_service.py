@@ -570,3 +570,31 @@ def test_production_next_trading_day_skips_the_weekend():
     from services.cas_auction_reversal_service import production_next_trading_day
 
     assert production_next_trading_day(date(2026, 10, 9)) == date(2026, 10, 12)
+
+
+# --------------------------------------------------------------------------- breadth gate (#777)
+def test_breadth_gate_selects_nothing_below_the_minimum():
+    ref = {"A": 100.0, "B": 100.0, "C": 100.0}
+    last = {"A": {"iep": 99.3}, "B": {"iep": 99.8}, "C": {"iep": 98.0}}
+    held = select_candidates(ref, last, 0.5, 10, min_candidates=3)
+    assert [r["symbol"] for r in held] == ["C", "A"]  # still ranked and returned
+    assert not any(r["selected"] for r in held)
+    assert {r["skip_reason"] for r in held} == {"breadth_gate"}
+    at_min = select_candidates(ref, last, 0.5, 10, min_candidates=2)
+    assert all(r["selected"] for r in at_min)
+    off = select_candidates(ref, last, 0.5, 10, min_candidates=0)
+    assert all(r["selected"] for r in off)
+
+
+def test_breadth_gate_day_places_no_order_but_journals_every_candidate(monkeypatch):
+    monkeypatch.setitem(CFG, "min_candidates", 3)  # the session has 2 crossing names
+    clock, broker = Clock(datetime(2026, 10, 5, 15, 0, tzinfo=IST)), Broker()
+    svc = _svc(clock, broker)
+    _run_session(clock, broker, svc)
+    clock.at("15:32:00")
+    svc.run_fill()
+    assert broker.orders == []
+    cands = cdb.candidates_for_date("2026-10-05")
+    assert {c.symbol for c in cands} == {"AAA", "CCC"}
+    assert {c.skip_reason for c in cands} == {"breadth_gate"}
+    assert not any(c.selected for c in cands)

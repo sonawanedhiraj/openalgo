@@ -31,3 +31,22 @@
   cancelled at 15:45 and journalled `unfilled`; the exit verifies `placed`
   rows before selling. One session says nothing about the edge — the
   backtest's net win rate is 62%.
+
+## 2026-11-12 — the edge is a BREADTH effect (issue #777)
+
+- **Change:** when fewer than `min_candidates` names cross the threshold at the 15:23:30
+  decision, no order is placed that day. Candidates are still journalled
+  (`skip_reason='breadth_gate'`). UI row → `CAS_AR_MIN_CANDIDATES` → default 10; 0 = off.
+- **Why:** the first 19 sandbox sessions (2026-10-05..11-05, 125 trades) were break-even:
+  gross +₹17,160, CNC charges ₹15,378, net +₹1,782 (+0.275% gross per trade, 44% net win).
+  Split by candidates at the decision: >= 10 → 8 days, 80 trades, **+₹11,759**;
+  < 10 → 11 days, 45 trades, **−₹9,977**.
+- **Independent check** (R71b bars, 2026-08-03..09-29, final-close dislocation >= 0.5%,
+  top 10/day, 0.25% cost): < 5 names → −0.21%/trade; 5–9 → −0.04%; >= 10 → +0.57%
+  (H1 +0.44, H2 +0.65; 16 days, 160 trades).
+- **Caveats:** the gate was found on the forward sample and confirmed on the backtest
+  sample; 8 kept forward days is small. The original pre-registered gate (>= +0.40% gross,
+  >= 70% win at 20 sessions) FAILS ungated (0.275% / 44%); gated it is ~0.54% gross and
+  62% win — the win-rate leg still fails. Stays sandbox, `deployable: false`.
+- **Pre-registered check:** after 10 more gated-in days, net of the kept trades must be
+  > 0, else remove the gate and reject the strategy.

@@ -115,6 +115,7 @@ _FILLED = {"complete", "completed", "filled", "executed", "traded"}
 DEFAULTS: dict[str, float | int] = {
     "threshold_pct": 0.5,
     "max_positions": 10,
+    "min_candidates": 10,
     "capital_per_trade_inr": 50_000.0,
     "poll_interval_s": 15,
 }
@@ -122,12 +123,15 @@ DEFAULTS: dict[str, float | int] = {
 BOUNDS: dict[str, tuple[float, float, type]] = {
     "threshold_pct": (0.2, 5.0, float),
     "max_positions": (1, 30, int),
+    # breadth gate (issue #777): 0 = off
+    "min_candidates": (0, 200, int),
     "capital_per_trade_inr": (5_000.0, 1_000_000.0, float),
     "poll_interval_s": (5, 60, int),
 }
 ENV_SEEDS = {
     "threshold_pct": "CAS_AR_THRESHOLD_PCT",
     "max_positions": "CAS_AR_MAX_POSITIONS",
+    "min_candidates": "CAS_AR_MIN_CANDIDATES",
     "capital_per_trade_inr": "CAS_AR_CAPITAL_PER_TRADE_INR",
     "poll_interval_s": "CAS_AR_POLL_INTERVAL_S",
 }
@@ -234,11 +238,20 @@ def dislocation_pct(iep: float | None, ref: float | None) -> float | None:
 
 
 def select_candidates(
-    ref: dict[str, float], last: dict[str, dict], threshold_pct: float, max_positions: int
+    ref: dict[str, float],
+    last: dict[str, dict],
+    threshold_pct: float,
+    max_positions: int,
+    min_candidates: int = 0,
 ) -> list[dict]:
     """Rank every symbol whose indicative close sits >= threshold below its
     reference print. Returns ALL crossing symbols (rank 1 = deepest), each with
-    ``selected`` set for the first ``max_positions``."""
+    ``selected`` set for the first ``max_positions``.
+
+    Breadth gate (issue #777): when fewer than ``min_candidates`` symbols cross,
+    NONE is selected (``skip_reason='breadth_gate'``). A broad auction sell-off
+    reverts overnight; a lone dislocated name mostly does not. 0 = off.
+    """
     rows = []
     for sym, q in last.items():
         d = dislocation_pct(q.get("iep"), ref.get(sym))
@@ -258,6 +271,10 @@ def select_candidates(
         r["rank"] = i
         r["selected"] = i <= max_positions
         r["skip_reason"] = None if r["selected"] else "max_positions"
+    if min_candidates and len(rows) < min_candidates:
+        for r in rows:
+            r["selected"] = False
+            r["skip_reason"] = "breadth_gate"
     return rows
 
 
@@ -839,7 +856,14 @@ class CasAuctionReversalService:
             self.day.get("last") or {},
             cfg["threshold_pct"],
             cfg["max_positions"],
+            int(cfg.get("min_candidates", 0) or 0),
         )
+        if cands and all(c.get("skip_reason") == "breadth_gate" for c in cands):
+            logger.info(
+                "cas_ar breadth gate: %d candidate(s) < min %s — no entries today",
+                len(cands),
+                cfg.get("min_candidates"),
+            )
         paused = self._entry_held_by_override()
         mode = self.current_mode()
         tds = self.day["trade_date"]

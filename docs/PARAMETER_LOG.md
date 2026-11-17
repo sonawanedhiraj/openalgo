@@ -63,6 +63,7 @@ the latest decisions automatically.
   |---|---|---|---|
   | `CAS_AR_THRESHOLD_PCT` | 0.5 | 0.2–5.0 | buy when IEP <= ref × (1 − x/100) |
   | `CAS_AR_MAX_POSITIONS` | 10 | 1–30 | deepest-first cap per day |
+  | `CAS_AR_MIN_CANDIDATES` | 10 | 0–200 | breadth gate (issue #777, 2026-11-12): fewer names crossing the threshold at the decision → no entries that day (`skip_reason='breadth_gate'`); 0 = off. Forward sandbox 2026-10-05..11-05: ≥10 → +₹11,759 / 80 trades, <10 → −₹9,977 / 45; backtest 08-03..09-29 agrees |
   | `CAS_AR_CAPITAL_PER_TRADE_INR` | 50000 | 5k–10L | `floor(capital / price)` shares |
   | `CAS_AR_POLL_INTERVAL_S` | 15 | 5–60 | monitor batched-quote cadence 15:14:30–15:33 |
   | `NOTIFY_CAS_AUCTION_REVERSAL` | true | — | Telegram toggle for the strategy's alerts |
